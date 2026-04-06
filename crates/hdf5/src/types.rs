@@ -170,6 +170,7 @@ impl CompoundType {
 /// assert_eq!(s.0, "hello");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct VarLenUnicode(pub String);
 
 impl std::str::FromStr for VarLenUnicode {
@@ -179,11 +180,6 @@ impl std::str::FromStr for VarLenUnicode {
     }
 }
 
-impl Default for VarLenUnicode {
-    fn default() -> Self {
-        Self(String::new())
-    }
-}
 
 impl std::fmt::Display for VarLenUnicode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

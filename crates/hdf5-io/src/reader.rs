@@ -173,7 +173,7 @@ impl Hdf5Reader {
         let (header, _) = ObjectHeader::decode_any(&buf)?;
 
         for msg in &header.messages {
-            if msg.msg_type == MSG_SYMBOL_TABLE as u8 {
+            if msg.msg_type == MSG_SYMBOL_TABLE {
                 // Symbol table message: btree_addr(O) + heap_addr(O)
                 let sa = ctx.sizeof_addr as usize;
                 if msg.data.len() >= 2 * sa {
@@ -290,8 +290,51 @@ impl Hdf5Reader {
         addr: u64,
         name: &str,
     ) -> IoResult<Option<DatasetReadInfo>> {
+        // Read the primary object header chunk
         let buf = handle.read_at_most(addr, 4096)?;
-        let (header, _) = ObjectHeader::decode_any(&buf)?;
+        let (mut header, _) = ObjectHeader::decode_any(&buf)?;
+
+        // Follow continuation messages (type 0x10) to read additional chunks.
+        // This is essential for v1 headers that span multiple chunks.
+        let sa = ctx.sizeof_addr as usize;
+        let ss = ctx.sizeof_size as usize;
+        let mut continuations: Vec<(u64, u64)> = Vec::new();
+        for msg in &header.messages {
+            if msg.msg_type == MSG_OBJ_HEADER_CONTINUATION && msg.data.len() >= sa + ss {
+                let cont_addr = read_uint(&msg.data, sa);
+                let cont_len = read_uint(&msg.data[sa..], ss);
+                continuations.push((cont_addr, cont_len));
+            }
+        }
+
+        // Parse messages from continuation chunks
+        for (cont_addr, cont_len) in continuations {
+            if cont_addr == UNDEF_ADDR || cont_len == 0 {
+                continue;
+            }
+            let cont_buf = handle.read_at_most(cont_addr, cont_len as usize)?;
+            // Parse messages from the continuation chunk (v1 format: no header prefix)
+            let mut pos = 0;
+            while pos + 8 <= cont_buf.len() {
+                let msg_type = u16::from_le_bytes([cont_buf[pos], cont_buf[pos + 1]]);
+                let data_size = u16::from_le_bytes([cont_buf[pos + 2], cont_buf[pos + 3]]) as usize;
+                let msg_flags = cont_buf[pos + 4];
+                pos += 8; // type(2) + size(2) + flags(1) + reserved(3)
+                if pos + data_size > cont_buf.len() {
+                    break;
+                }
+                if msg_type != 0 {
+                    header.messages.push(hdf5_format::object_header::ObjectHeaderMessage {
+                        msg_type: msg_type as u8,
+                        flags: msg_flags,
+                        data: cont_buf[pos..pos + data_size].to_vec(),
+                    });
+                }
+                pos += data_size;
+                // v1 alignment to 8 bytes
+                pos = (pos + 7) & !7;
+            }
+        }
 
         let mut datatype = None;
         let mut dataspace = None;
@@ -314,7 +357,7 @@ impl Hdf5Reader {
                         layout = Some(dl);
                     }
                 }
-                _ => {} // ignore other messages
+                _ => {}
             }
         }
 
@@ -458,7 +501,7 @@ impl Hdf5Reader {
 
                 // Compute number of chunks along the unlimited dimension (dim 0)
                 let chunks_dim0 = if chunk_dims[0] > 0 {
-                    (dims[0] + chunk_dims[0] - 1) / chunk_dims[0]
+                    dims[0].div_ceil(chunk_dims[0])
                 } else {
                     0
                 };
@@ -584,7 +627,7 @@ impl Hdf5Reader {
 
         // Compute number of chunks per dimension
         let chunks_per_dim: Vec<u64> = (0..ndims)
-            .map(|d| (dims[d] + chunk_dims[d] - 1) / chunk_dims[d])
+            .map(|d| dims[d].div_ceil(chunk_dims[d]))
             .collect();
 
         // Read each chunk and place it in the correct position
@@ -823,7 +866,7 @@ mod tests {
         let stab_msg_wire = 8 + stab_msg_data_size;
         let stab_msg_wire_aligned = (stab_msg_wire + 7) & !7;
         let root_ohdr_data_size = stab_msg_wire_aligned;
-        let root_ohdr_total = 12 + root_ohdr_data_size; // v1 header + messages
+        let root_ohdr_total = 16 + root_ohdr_data_size; // v1 16-byte prefix + messages
         let root_ohdr_total_aligned = (root_ohdr_total + 7) & !7;
 
         // Local heap header: after root ohdr
@@ -842,7 +885,7 @@ mod tests {
         let btree_addr = heap_data_addr + heap_data_size as u64;
         // B-tree header: TREE(4) + type(1) + level(1) + entries_used(2) + left(sa) + right(sa)
         // Plus interleaved keys/children: key[0](ss), child[0](sa), key[1](ss)
-        let btree_size = 4 + 1 + 1 + 2 + 2 * sa + 2 * ss + 1 * sa;
+        let btree_size = 4 + 1 + 1 + 2 + 2 * sa + 2 * ss + sa;
         let btree_size_aligned = (btree_size + 7) & !7;
 
         // SNOD: after B-tree
@@ -874,7 +917,7 @@ mod tests {
         let dl_msg_wire_aligned = (dl_msg_wire + 7) & !7;
 
         let ds_ohdr_data_size = ds_msg_wire_aligned + dt_msg_wire_aligned + dl_msg_wire_aligned;
-        let ds_ohdr_total = 12 + ds_ohdr_data_size;
+        let ds_ohdr_total = 16 + ds_ohdr_data_size; // v1 16-byte prefix
         let ds_ohdr_total_aligned = (ds_ohdr_total + 7) & !7;
 
         // Raw data: after dataset object header
@@ -920,13 +963,14 @@ mod tests {
             file.push(0);
         }
 
-        // 2. Root group object header (v1)
+        // 2. Root group object header (v1, 16-byte prefix)
         assert_eq!(file.len(), root_ohdr_addr as usize);
         file.push(1); // version
         file.push(0); // reserved
         file.extend_from_slice(&1u16.to_le_bytes()); // num_messages = 1
         file.extend_from_slice(&1u32.to_le_bytes()); // obj_ref_count
         file.extend_from_slice(&(root_ohdr_data_size as u32).to_le_bytes());
+        file.extend_from_slice(&[0u8; 4]); // reserved padding (v1 alignment)
         // Symbol table message (type 0x0011)
         file.extend_from_slice(&0x0011u16.to_le_bytes()); // type
         file.extend_from_slice(&(stab_msg_data_size as u16).to_le_bytes()); // size
@@ -994,13 +1038,14 @@ mod tests {
             file.push(0);
         }
 
-        // 7. Dataset object header (v1)
+        // 7. Dataset object header (v1, 16-byte prefix)
         assert_eq!(file.len(), ds_ohdr_addr as usize);
         file.push(1); // version
         file.push(0); // reserved
         file.extend_from_slice(&3u16.to_le_bytes()); // num_messages = 3
         file.extend_from_slice(&1u32.to_le_bytes()); // obj_ref_count
         file.extend_from_slice(&(ds_ohdr_data_size as u32).to_le_bytes());
+        file.extend_from_slice(&[0u8; 4]); // reserved padding (v1 alignment)
 
         // Message 1: Dataspace (type 0x01) - version 1
         file.extend_from_slice(&0x0001u16.to_le_bytes());
@@ -1017,7 +1062,7 @@ mod tests {
             write_le(&mut file, d, ss);
         }
         // Pad message
-        let target = ds_ohdr_addr as usize + 12 + ds_msg_wire_aligned;
+        let target = ds_ohdr_addr as usize + 16 + ds_msg_wire_aligned;
         while file.len() < target {
             file.push(0);
         }
@@ -1035,7 +1080,7 @@ mod tests {
         file.extend_from_slice(&(element_size as u32).to_le_bytes()); // element size
         file.extend_from_slice(&0u16.to_le_bytes()); // bit_offset
         file.extend_from_slice(&((element_size * 8) as u16).to_le_bytes()); // bit_precision
-        let target = ds_ohdr_addr as usize + 12 + ds_msg_wire_aligned + dt_msg_wire_aligned;
+        let target = ds_ohdr_addr as usize + 16 + ds_msg_wire_aligned + dt_msg_wire_aligned;
         while file.len() < target {
             file.push(0);
         }
@@ -1137,7 +1182,7 @@ mod tests {
             let mut writer = Hdf5Writer::create(&path).unwrap();
             let datatype = hdf5_format::messages::datatype::DatatypeMessage::i32_type();
             let idx = writer.create_dataset("test", datatype, &[4]).unwrap();
-            let data = vec![1i32, 2, 3, 4];
+            let data = [1i32, 2, 3, 4];
             let raw: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
             writer.write_dataset_raw(idx, &raw).unwrap();
             writer.close().unwrap();
@@ -1155,5 +1200,64 @@ mod tests {
         assert_eq!(vals, vec![1, 2, 3, 4]);
 
         std::fs::remove_file(&path).ok();
+    }
+}
+
+#[cfg(test)]
+mod h5py_debug_tests {
+    use super::*;
+
+    #[test]
+    fn debug_read_h5py() {
+        let path = std::path::Path::new("/tmp/test_h5py_default.h5");
+        if !path.exists() { return; }
+        
+        let mut handle = FileHandle::open_read(path).unwrap();
+        let sb_buf = handle.read_at_most(0, 1024).unwrap();
+        let version = detect_superblock_version(&sb_buf).unwrap();
+        eprintln!("Superblock version: {}", version);
+        
+        let sb = SuperblockV0V1::decode(&sb_buf).unwrap();
+        eprintln!("sizeof_addr={}, sizeof_size={}", sb.sizeof_offsets, sb.sizeof_lengths);
+        eprintln!("STE: obj_header={}, cache_type={}, btree={}, heap={}",
+            sb.root_symbol_table_entry.obj_header_addr,
+            sb.root_symbol_table_entry.cache_type,
+            sb.root_symbol_table_entry.btree_addr,
+            sb.root_symbol_table_entry.heap_addr);
+        
+        let ctx = FormatContext {
+            sizeof_addr: sb.sizeof_offsets,
+            sizeof_size: sb.sizeof_lengths,
+        };
+        
+        // Read local heap
+        let heap_buf = handle.read_at_most(sb.root_symbol_table_entry.heap_addr, 128).unwrap();
+        let heap_hdr = LocalHeapHeader::decode(&heap_buf, ctx.sizeof_addr as usize, ctx.sizeof_size as usize).unwrap();
+        eprintln!("Heap data_addr={}, data_size={}", heap_hdr.data_addr, heap_hdr.data_size);
+        
+        let heap_data = handle.read_at(heap_hdr.data_addr, heap_hdr.data_size as usize).unwrap();
+        eprintln!("Heap data bytes: {:?}", &heap_data[..std::cmp::min(64, heap_data.len())]);
+        
+        // Read btree
+        let btree_buf = handle.read_at_most(sb.root_symbol_table_entry.btree_addr, 8192).unwrap();
+        let btree = BTreeV1Node::decode(&btree_buf, ctx.sizeof_addr as usize, ctx.sizeof_size as usize).unwrap();
+        eprintln!("BTree: type={}, level={}, entries={}, children={:?}", 
+            btree.node_type, btree.level, btree.entries_used, btree.children);
+        
+        // Read SNOD
+        for &child in &btree.children {
+            let snod_buf = handle.read_at_most(child, 8192).unwrap();
+            let snod = SymbolTableNode::decode(&snod_buf, ctx.sizeof_addr as usize, ctx.sizeof_size as usize).unwrap();
+            eprintln!("SNOD at {}: {} entries", child, snod.entries.len());
+            for entry in &snod.entries {
+                let name = local_heap_get_string(&heap_data, entry.name_offset).unwrap();
+                eprintln!("  entry: name='{}' (offset={}), obj_header={}, cache_type={}",
+                    name, entry.name_offset, entry.obj_header_addr, entry.cache_type);
+            }
+        }
+        
+        // Try full open
+        let reader = Hdf5Reader::open(path).unwrap();
+        eprintln!("Datasets found: {:?}", reader.dataset_names());
     }
 }

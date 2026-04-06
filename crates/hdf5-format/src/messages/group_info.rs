@@ -15,7 +15,7 @@ const FLAG_PHASE_CHANGE: u8 = 0x01;
 const FLAG_ESTIMATED: u8 = 0x02;
 
 /// Group info message payload.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct GroupInfoMessage {
     /// Max links before switching to dense storage.
     pub max_compact: Option<u16>,
@@ -28,15 +28,6 @@ pub struct GroupInfoMessage {
 }
 
 impl GroupInfoMessage {
-    /// Default group info — HDF5 library defaults.
-    pub fn default() -> Self {
-        Self {
-            max_compact: None,
-            min_dense: None,
-            est_num_entries: None,
-            est_name_len: None,
-        }
-    }
 
     /// Group info with phase-change thresholds.
     pub fn with_phase_change(max_compact: u16, min_dense: u16) -> Self {

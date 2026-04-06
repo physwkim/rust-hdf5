@@ -577,6 +577,7 @@ impl DatatypeMessage {
     }
 
     /// Decode from a byte buffer.  Returns `(message, bytes_consumed)`.
+    #[allow(clippy::only_used_in_recursion)]
     pub fn decode(buf: &[u8], ctx: &FormatContext) -> FormatResult<(Self, usize)> {
         if buf.len() < 8 {
             return Err(FormatError::BufferTooShort {

@@ -1,7 +1,7 @@
-/// Jenkins lookup3 hash (hashlittle) -- a byte-exact port of HDF5's H5checksum.c.
-///
-/// This implementation produces the same output as the C `H5_checksum_lookup3`
-/// function for all inputs.
+//! Jenkins lookup3 hash (hashlittle) -- a byte-exact port of HDF5's H5checksum.c.
+//!
+//! This implementation produces the same output as the C `H5_checksum_lookup3`
+//! function for all inputs.
 
 /// Rotate left (bit rotation).
 #[inline(always)]

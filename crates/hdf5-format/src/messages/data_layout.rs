@@ -475,7 +475,7 @@ fn enc_bytes_for_value(v: u64) -> u8 {
         return 1;
     }
     let bits_needed = 64 - v.leading_zeros(); // 1..=64
-    ((bits_needed + 7) / 8) as u8
+    bits_needed.div_ceil(8) as u8
 }
 
 // ======================================================================= tests

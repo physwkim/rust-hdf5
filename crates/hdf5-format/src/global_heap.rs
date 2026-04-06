@@ -60,7 +60,7 @@ impl GlobalHeapCollection {
         let index = if self.objects.is_empty() {
             1
         } else {
-            self.objects.iter().map(|o| o.index).max().unwrap() + 1
+            self.objects.iter().map(|o| o.index).max().unwrap_or(0) + 1
         };
         self.objects.push(GlobalHeapObject { index, data });
         index

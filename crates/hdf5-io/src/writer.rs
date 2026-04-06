@@ -518,7 +518,7 @@ impl Hdf5Writer {
         let ndims = dims.len();
         let mut num_chunks: u64 = 1;
         for d in 0..ndims {
-            num_chunks *= (dims[d] + chunk_dims[d] - 1) / chunk_dims[d];
+            num_chunks *= dims[d].div_ceil(chunk_dims[d]);
         }
 
         // Create FA header
@@ -687,7 +687,7 @@ impl Hdf5Writer {
         let mut linear_idx: u64 = 0;
         let mut stride: u64 = 1;
         for d in (0..ndims).rev() {
-            let n_chunks_in_dim = (dims[d] + chunk_dims[d] - 1) / chunk_dims[d];
+            let n_chunks_in_dim = dims[d].div_ceil(chunk_dims[d]);
             linear_idx += chunk_coords[d] * stride;
             stride *= n_chunks_in_dim;
         }

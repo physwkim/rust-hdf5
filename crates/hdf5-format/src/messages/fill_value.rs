@@ -24,9 +24,8 @@ pub struct FillValueMessage {
     pub fill_value: Option<Vec<u8>>,
 }
 
-impl FillValueMessage {
-    /// Default fill value: late allocation, write on alloc, default zeros.
-    pub fn default() -> Self {
+impl Default for FillValueMessage {
+    fn default() -> Self {
         Self {
             alloc_time: 2,      // late
             fill_write_time: 0, // on alloc
@@ -34,6 +33,9 @@ impl FillValueMessage {
             fill_value: None,
         }
     }
+}
+
+impl FillValueMessage {
 
     /// A user-defined fill value.
     pub fn with_value(data: Vec<u8>) -> Self {

@@ -194,7 +194,7 @@ mod tests {
         // Write
         {
             let file = H5File::create(&path).unwrap();
-            let ds = file.new_dataset::<u8>().shape(&[4, 4]).create("data").unwrap();
+            let ds = file.new_dataset::<u8>().shape([4, 4]).create("data").unwrap();
             ds.write_raw(&[0u8; 16]).unwrap();
             file.close().unwrap();
         }
@@ -222,7 +222,7 @@ mod tests {
         // Write
         {
             let file = H5File::create(&path).unwrap();
-            let ds = file.new_dataset::<f64>().shape(&[2, 3]).create("matrix").unwrap();
+            let ds = file.new_dataset::<f64>().shape([2, 3]).create("matrix").unwrap();
             ds.write_raw(&values).unwrap();
             file.close().unwrap();
         }
@@ -245,10 +245,10 @@ mod tests {
 
         {
             let file = H5File::create(&path).unwrap();
-            let ds1 = file.new_dataset::<i32>().shape(&[3]).create("ints").unwrap();
+            let ds1 = file.new_dataset::<i32>().shape([3]).create("ints").unwrap();
             ds1.write_raw(&[10i32, 20, 30]).unwrap();
 
-            let ds2 = file.new_dataset::<f32>().shape(&[2, 2]).create("floats").unwrap();
+            let ds2 = file.new_dataset::<f32>().shape([2, 2]).create("floats").unwrap();
             ds2.write_raw(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
 
             file.close().unwrap();
@@ -290,15 +290,15 @@ mod integration_tests {
         let path = "/tmp/test_hdf5rs_integration.h5";
         let file = H5File::create(path).unwrap();
 
-        let ds = file.new_dataset::<u8>().shape(&[4usize, 4]).create("data_u8").unwrap();
+        let ds = file.new_dataset::<u8>().shape([4usize, 4]).create("data_u8").unwrap();
         let data: Vec<u8> = (0..16).collect();
         ds.write_raw(&data).unwrap();
 
-        let ds2 = file.new_dataset::<f64>().shape(&[3usize, 2]).create("data_f64").unwrap();
+        let ds2 = file.new_dataset::<f64>().shape([3usize, 2]).create("data_f64").unwrap();
         let fdata: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         ds2.write_raw(&fdata).unwrap();
 
-        let ds3 = file.new_dataset::<i32>().shape(&[5usize]).create("values").unwrap();
+        let ds3 = file.new_dataset::<i32>().shape([5usize]).create("values").unwrap();
         let idata: Vec<i32> = vec![-10, -5, 0, 5, 10];
         ds3.write_raw(&idata).unwrap();
 
@@ -315,7 +315,7 @@ mod integration_tests {
 
         // Create a chunked dataset with unlimited first dimension
         let ds = file.new_dataset::<f64>()
-            .shape(&[0usize, 4])
+            .shape([0usize, 4])
             .chunk(&[1, 4])
             .max_shape(&[None, Some(4)])
             .create("streaming_data")
@@ -343,7 +343,7 @@ mod integration_tests {
         let file = H5File::create(path).unwrap();
 
         let ds = file.new_dataset::<i32>()
-            .shape(&[0usize, 3])
+            .shape([0usize, 3])
             .chunk(&[1, 3])
             .max_shape(&[None, Some(3)])
             .create("data")
@@ -370,7 +370,7 @@ mod integration_tests {
 
         let ds = file
             .new_dataset::<f32>()
-            .shape(&[10usize])
+            .shape([10usize])
             .create("temperature")
             .unwrap();
         let data: Vec<f32> = (0..10).map(|i| i as f32 * 1.5).collect();
@@ -424,7 +424,7 @@ mod integration_tests {
         {
             let file = H5File::create(&path).unwrap();
             let ds = file.new_dataset::<i32>()
-                .shape(&[0usize, 3])
+                .shape([0usize, 3])
                 .chunk(&[1, 3])
                 .max_shape(&[None, Some(3)])
                 .create("table")
@@ -452,5 +452,32 @@ mod integration_tests {
         }
 
         std::fs::remove_file(&path).ok();
+    }
+}
+
+#[cfg(test)]
+mod h5py_compat_tests {
+    use super::*;
+
+    #[test]
+    fn read_h5py_generated_file() {
+        let path = "/tmp/test_h5py_default.h5";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skipping: h5py test file not found");
+            return;
+        }
+        let file = H5File::open(path).unwrap();
+
+        let ds = file.dataset("data").unwrap();
+        assert_eq!(ds.shape(), vec![4, 5]);
+        let data = ds.read_raw::<f64>().unwrap();
+        assert_eq!(data.len(), 20);
+        assert!((data[0]).abs() < 1e-10);
+        assert!((data[19] - 19.0).abs() < 1e-10);
+
+        let ds2 = file.dataset("images").unwrap();
+        assert_eq!(ds2.shape(), vec![3, 64, 64]);
+        let images = ds2.read_raw::<u16>().unwrap();
+        assert_eq!(images.len(), 3 * 64 * 64);
     }
 }

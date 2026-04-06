@@ -369,7 +369,7 @@ impl Bt2InternalNode {
     /// Compute the number of bytes needed for the child_nrecords packed field.
     fn nrec_bytes(num_children: usize, max_nrec: u32) -> usize {
         let bits_per_child = std::cmp::max(1, (32 - max_nrec.leading_zeros()) as usize);
-        (num_children * bits_per_child + 7) / 8
+        (num_children * bits_per_child).div_ceil(8)
     }
 
     /// Compute the encoded size.
@@ -429,7 +429,7 @@ impl Bt2InternalNode {
             // Write the value across potentially multiple bytes
             let combined = (value as u64) << bit_shift;
             let bytes = combined.to_le_bytes();
-            let bytes_needed = (bits_per_child + bit_shift + 7) / 8;
+            let bytes_needed = (bits_per_child + bit_shift).div_ceil(8);
             for j in 0..bytes_needed {
                 if byte_offset + j < nrec_bytes {
                     packed[byte_offset + j] |= bytes[j];

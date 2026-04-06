@@ -383,7 +383,7 @@ impl ExtensibleArrayDataBlock {
 
     /// Number of bytes needed for the block_offset field.
     pub fn block_offset_size(max_nelmts_bits: u8) -> usize {
-        std::cmp::max(1, ((max_nelmts_bits as usize) + 7) / 8)
+        std::cmp::max(1, (max_nelmts_bits as usize).div_ceil(8))
     }
 
     /// Compute the encoded size.

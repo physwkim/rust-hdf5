@@ -497,7 +497,7 @@ mod tests {
     fn write_raw_size_mismatch() {
         let path = temp_path("size_mismatch");
         let file = H5File::create(&path).unwrap();
-        let ds = file.new_dataset::<u8>().shape(&[4]).create("data").unwrap();
+        let ds = file.new_dataset::<u8>().shape([4]).create("data").unwrap();
         // Provide 3 elements instead of 4
         let result = ds.write_raw(&[1u8, 2, 3]);
         assert!(result.is_err());
@@ -511,7 +511,7 @@ mod tests {
 
         {
             let file = H5File::create(&path).unwrap();
-            let ds = file.new_dataset::<u8>().shape(&[10]).create("seq").unwrap();
+            let ds = file.new_dataset::<u8>().shape([10]).create("seq").unwrap();
             ds.write_raw(&data).unwrap();
             file.close().unwrap();
         }
@@ -534,7 +534,7 @@ mod tests {
 
         {
             let file = H5File::create(&path).unwrap();
-            let ds = file.new_dataset::<i32>().shape(&[2, 3]).create("matrix").unwrap();
+            let ds = file.new_dataset::<i32>().shape([2, 3]).create("matrix").unwrap();
             ds.write_raw(&data).unwrap();
             file.close().unwrap();
         }
@@ -559,7 +559,7 @@ mod tests {
             let file = H5File::create(&path).unwrap();
             let ds = file
                 .new_dataset::<f64>()
-                .shape(&[2, 3, 4])
+                .shape([2, 3, 4])
                 .create("cube")
                 .unwrap();
             ds.write_raw(&data).unwrap();
@@ -581,7 +581,7 @@ mod tests {
     fn cannot_read_in_write_mode() {
         let path = temp_path("no_read_write");
         let file = H5File::create(&path).unwrap();
-        let ds = file.new_dataset::<u8>().shape(&[4]).create("x").unwrap();
+        let ds = file.new_dataset::<u8>().shape([4]).create("x").unwrap();
         ds.write_raw(&[1u8, 2, 3, 4]).unwrap();
         let result = ds.read_raw::<u8>();
         assert!(result.is_err());
@@ -594,7 +594,7 @@ mod tests {
 
         {
             let file = H5File::create(&path).unwrap();
-            let ds = file.new_dataset::<u8>().shape(&[4]).create("x").unwrap();
+            let ds = file.new_dataset::<u8>().shape([4]).create("x").unwrap();
             ds.write_raw(&[1u8, 2, 3, 4]).unwrap();
             file.close().unwrap();
         }
@@ -619,7 +619,7 @@ mod tests {
 
         {
             let file = H5File::open(&path).unwrap();
-            let result = file.new_dataset::<u8>().shape(&[4]).create("x");
+            let result = file.new_dataset::<u8>().shape([4]).create("x");
             assert!(result.is_err());
         }
 
@@ -633,7 +633,7 @@ mod tests {
         let file = H5File::create(&path).unwrap();
         let ds = file
             .new_dataset::<f32>()
-            .shape(&[5, 10, 3])
+            .shape([5, 10, 3])
             .create("tensor")
             .unwrap();
         assert_eq!(ds.shape(), vec![5, 10, 3]);
@@ -647,7 +647,7 @@ mod tests {
 
         {
             let file = H5File::create(&path).unwrap();
-            let ds = file.new_dataset::<f64>().shape(&[4]).create("data").unwrap();
+            let ds = file.new_dataset::<f64>().shape([4]).create("data").unwrap();
             ds.write_raw(&[1.0f64, 2.0, 3.0, 4.0]).unwrap();
             file.close().unwrap();
         }
@@ -669,7 +669,7 @@ mod tests {
 
         let ds = {
             let file = H5File::create(&path).unwrap();
-            file.new_dataset::<u8>().shape(&[4]).create("x").unwrap()
+            file.new_dataset::<u8>().shape([4]).create("x").unwrap()
         };
         // file is dropped here, but ds still holds Rc to the inner state
         ds.write_raw(&[1u8, 2, 3, 4]).unwrap();
@@ -685,7 +685,7 @@ mod tests {
         let path = temp_path("attr_scalar_string");
         {
             let file = H5File::create(&path).unwrap();
-            let ds = file.new_dataset::<u8>().shape(&[4]).create("data").unwrap();
+            let ds = file.new_dataset::<u8>().shape([4]).create("data").unwrap();
             ds.write_raw(&[1u8, 2, 3, 4]).unwrap();
 
             let attr = ds
@@ -718,34 +718,34 @@ mod tests {
         {
             let file = H5File::create(&path).unwrap();
 
-            let ds = file.new_dataset::<u8>().shape(&[2]).create("u8").unwrap();
+            let ds = file.new_dataset::<u8>().shape([2]).create("u8").unwrap();
             ds.write_raw(&[1u8, 2]).unwrap();
 
-            let ds = file.new_dataset::<i8>().shape(&[2]).create("i8").unwrap();
+            let ds = file.new_dataset::<i8>().shape([2]).create("i8").unwrap();
             ds.write_raw(&[-1i8, 1]).unwrap();
 
-            let ds = file.new_dataset::<u16>().shape(&[2]).create("u16").unwrap();
+            let ds = file.new_dataset::<u16>().shape([2]).create("u16").unwrap();
             ds.write_raw(&[100u16, 200]).unwrap();
 
-            let ds = file.new_dataset::<i16>().shape(&[2]).create("i16").unwrap();
+            let ds = file.new_dataset::<i16>().shape([2]).create("i16").unwrap();
             ds.write_raw(&[-100i16, 100]).unwrap();
 
-            let ds = file.new_dataset::<u32>().shape(&[2]).create("u32").unwrap();
+            let ds = file.new_dataset::<u32>().shape([2]).create("u32").unwrap();
             ds.write_raw(&[1000u32, 2000]).unwrap();
 
-            let ds = file.new_dataset::<i32>().shape(&[2]).create("i32").unwrap();
+            let ds = file.new_dataset::<i32>().shape([2]).create("i32").unwrap();
             ds.write_raw(&[-1000i32, 1000]).unwrap();
 
-            let ds = file.new_dataset::<u64>().shape(&[2]).create("u64").unwrap();
+            let ds = file.new_dataset::<u64>().shape([2]).create("u64").unwrap();
             ds.write_raw(&[10000u64, 20000]).unwrap();
 
-            let ds = file.new_dataset::<i64>().shape(&[2]).create("i64").unwrap();
+            let ds = file.new_dataset::<i64>().shape([2]).create("i64").unwrap();
             ds.write_raw(&[-10000i64, 10000]).unwrap();
 
-            let ds = file.new_dataset::<f32>().shape(&[2]).create("f32").unwrap();
+            let ds = file.new_dataset::<f32>().shape([2]).create("f32").unwrap();
             ds.write_raw(&[1.5f32, 2.5]).unwrap();
 
-            let ds = file.new_dataset::<f64>().shape(&[2]).create("f64").unwrap();
+            let ds = file.new_dataset::<f64>().shape([2]).create("f64").unwrap();
             ds.write_raw(&[3.14f64, 2.718]).unwrap();
 
             file.close().unwrap();

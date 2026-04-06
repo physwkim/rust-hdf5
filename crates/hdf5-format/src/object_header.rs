@@ -350,9 +350,11 @@ impl ObjectHeader {
     ///   data: data_size bytes (padded to 8-byte alignment)
     /// ```
     pub fn decode_v1(buf: &[u8]) -> FormatResult<(Self, usize)> {
-        if buf.len() < 12 {
+        // V1 header prefix is 16 bytes: version(1) + reserved(1) + num_msg(2)
+        // + ref_count(4) + chunk0_data_size(4) + reserved_padding(4)
+        if buf.len() < 16 {
             return Err(FormatError::BufferTooShort {
-                needed: 12,
+                needed: 16,
                 available: buf.len(),
             });
         }
@@ -367,8 +369,9 @@ impl ObjectHeader {
         let _obj_ref_count = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
         let header_data_size =
             u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
+        // buf[12..16] = reserved alignment padding
 
-        let total_consumed = 12 + header_data_size;
+        let total_consumed = 16 + header_data_size;
         if buf.len() < total_consumed {
             return Err(FormatError::BufferTooShort {
                 needed: total_consumed,
@@ -376,7 +379,7 @@ impl ObjectHeader {
             });
         }
 
-        let msg_data_start = 12; // offset where message data begins
+        let msg_data_start = 16; // offset where message data begins (after 16-byte prefix)
         let mut pos = msg_data_start;
         let messages_end = msg_data_start + header_data_size;
         let mut messages = Vec::with_capacity(num_messages);
@@ -471,6 +474,7 @@ mod tests_v1 {
         buf.extend_from_slice(&(messages.len() as u16).to_le_bytes());
         buf.extend_from_slice(&1u32.to_le_bytes()); // ref count
         buf.extend_from_slice(&(msg_data.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&[0u8; 4]); // reserved padding (align to 16 bytes)
         buf.extend_from_slice(&msg_data);
         buf
     }
@@ -479,7 +483,7 @@ mod tests_v1 {
     fn test_decode_v1_empty() {
         let buf = build_v1_header(&[]);
         let (hdr, consumed) = ObjectHeader::decode_v1(&buf).unwrap();
-        assert_eq!(consumed, 12);
+        assert_eq!(consumed, 16); // 16-byte prefix, no messages
         assert!(hdr.messages.is_empty());
     }
 
