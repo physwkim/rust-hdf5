@@ -13,7 +13,6 @@ pub mod messages;
 pub mod object_header;
 pub mod superblock;
 pub mod symbol_table;
-pub mod zstd;
 
 /// Format context carrying file-level encoding parameters
 #[derive(Debug, Clone, Copy)]

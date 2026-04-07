@@ -466,22 +466,9 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
             "LZ4 filter requires the 'lz4' feature".into(),
         )),
 
-        // =====================================================================
-        // ZSTD (32015) — pure Rust compressor + decompressor, zero C deps
-        // =====================================================================
-        #[cfg(feature = "zstandard")]
-        FILTER_ZSTD => {
-            if compress {
-                let level = filter.cd_values.first().copied().unwrap_or(3) as i32;
-                Ok(crate::zstd::compress(data, level))
-            } else {
-                crate::zstd::decompress(data)
-                    .map_err(|e| FormatError::InvalidData(format!("ZSTD decompress: {}", e)))
-            }
-        }
-        #[cfg(not(feature = "zstandard"))]
+        // ZSTD (32015) — not supported (EPICS does not use zstd)
         FILTER_ZSTD => Err(FormatError::UnsupportedFeature(
-            "ZSTD requires 'zstandard' feature".into(),
+            "ZSTD filter is not supported".into(),
         )),
 
         // =====================================================================
