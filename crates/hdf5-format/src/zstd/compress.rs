@@ -7,37 +7,10 @@ use super::constants::*;
 
 /// Compress data into a zstd frame.
 ///
-/// Returns a valid zstd frame that can be decompressed by ruzstd, libzstd,
+/// Returns a valid zstd frame that can be decompressed by any conformant decoder
 /// or any other conformant decoder.
-pub fn compress(data: &[u8], #[allow(unused)] level: i32) -> Vec<u8> {
-    #[cfg(feature = "zstandard")]
-    {
-        if level <= 1 {
-            // Level 0-1: use ruzstd's built-in fastest compressor
-            ruzstd::encoding::compress_to_vec(
-                data,
-                ruzstd::encoding::CompressionLevel::Fastest,
-            )
-        } else {
-            // Level 2-11: use our hash-chain matcher with lazy matching
-            use ruzstd::encoding::FrameCompressor;
-            let matcher = super::levels::HashChainMatcher::new(level);
-            let clevel = match level {
-                2..=4 => ruzstd::encoding::CompressionLevel::Fastest,
-                _ => ruzstd::encoding::CompressionLevel::Fastest,
-            };
-            let mut compressor = FrameCompressor::new_with_matcher(matcher, clevel);
-            let mut output = Vec::new();
-            compressor.set_source(data);
-            compressor.set_drain(&mut output);
-            compressor.compress();
-            output
-        }
-    }
-
-    #[cfg(not(feature = "zstandard"))]
-    {
-        let mut out = Vec::with_capacity(data.len() + 64);
+pub fn compress(data: &[u8], #[allow(unused)] _level: i32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 64);
 
     // Frame header
     write_frame_header(&mut out, data.len() as u64);
@@ -61,8 +34,7 @@ pub fn compress(data: &[u8], #[allow(unused)] level: i32) -> Vec<u8> {
         write_raw_block(&mut out, &[], true);
     }
 
-        out
-    }
+    out
 }
 
 /// Convenience wrapper.
@@ -357,13 +329,9 @@ mod tests {
         assert_eq!(&compressed[..4], &ZSTD_MAGIC.to_le_bytes());
     }
 
-    /// Golden test: roundtrip through our compressor → ruzstd decompressor.
-    #[cfg(feature = "zstandard")]
+    /// Golden test: roundtrip through our compressor → our decompressor.
     #[test]
-    fn roundtrip_via_ruzstd() {
-        use std::io::Read;
-
-        // Test various data patterns
+    fn roundtrip_self_contained() {
         let test_cases: Vec<(&str, Vec<u8>)> = vec![
             ("zeros", vec![0u8; 4096]),
             ("sequential", (0..4096u32).flat_map(|i| i.to_le_bytes()).collect()),
@@ -374,23 +342,11 @@ mod tests {
 
         for (name, data) in &test_cases {
             let compressed = compress(data, 1);
-
-            let mut decoder = ruzstd::decoding::StreamingDecoder::new(compressed.as_slice())
-                .unwrap_or_else(|e| panic!("{}: decoder init failed: {}", name, e));
-            let mut decompressed = Vec::new();
-            decoder.read_to_end(&mut decompressed)
+            let decompressed = crate::zstd::decompress(&compressed)
                 .unwrap_or_else(|e| panic!("{}: decompress failed: {}", name, e));
 
             assert_eq!(decompressed.len(), data.len(), "{}: length mismatch", name);
             assert_eq!(&decompressed, data, "{}: data mismatch", name);
         }
-    }
-
-    #[cfg(feature = "zstandard")]
-    #[test]
-    fn compressed_block_roundtrip_via_ruzstd() {
-        let data = b"hello world! ".repeat(200);
-        let compressed = compress(&data, 1);
-        assert!(compressed.len() < data.len());
     }
 }

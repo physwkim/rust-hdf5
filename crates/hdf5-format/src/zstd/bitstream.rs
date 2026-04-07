@@ -83,7 +83,8 @@ impl BackwardBitWriter {
     pub fn add_bits(&mut self, value: u64, nbits: u32) {
         debug_assert!(nbits <= 57);
         debug_assert!(self.bit_pos + nbits <= 64);
-        self.bits |= value << self.bit_pos;
+        let mask = if nbits == 64 { u64::MAX } else { (1u64 << nbits) - 1 };
+        self.bits |= (value & mask) << self.bit_pos;
         self.bit_pos += nbits;
     }
 

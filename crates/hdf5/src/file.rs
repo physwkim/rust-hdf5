@@ -470,8 +470,8 @@ mod integration_tests {
 
     #[test]
     fn write_file_for_h5dump() {
-        let path = "/tmp/test_hdf5rs_integration.h5";
-        let file = H5File::create(path).unwrap();
+        let path = std::env::temp_dir().join("test_hdf5rs_integration.h5");
+        let file = H5File::create(&path).unwrap();
 
         let ds = file.new_dataset::<u8>().shape([4usize, 4]).create("data_u8").unwrap();
         let data: Vec<u8> = (0..16).collect();
@@ -488,13 +488,13 @@ mod integration_tests {
         file.close().unwrap();
 
         // File exists
-        assert!(std::path::Path::new(path).exists());
+        assert!(path.exists());
     }
 
     #[test]
     fn write_chunked_file_for_h5dump() {
-        let path = "/tmp/test_hdf5rs_chunked.h5";
-        let file = H5File::create(path).unwrap();
+        let path = std::env::temp_dir().join("test_hdf5rs_chunked.h5");
+        let file = H5File::create(&path).unwrap();
 
         // Create a chunked dataset with unlimited first dimension
         let ds = file.new_dataset::<f64>()
@@ -517,13 +517,13 @@ mod integration_tests {
 
         file.close().unwrap();
 
-        assert!(std::path::Path::new(path).exists());
+        assert!(path.exists());
     }
 
     #[test]
     fn write_chunked_many_frames_for_h5dump() {
-        let path = "/tmp/test_hdf5rs_chunked_many.h5";
-        let file = H5File::create(path).unwrap();
+        let path = std::env::temp_dir().join("test_hdf5rs_chunked_many.h5");
+        let file = H5File::create(&path).unwrap();
 
         let ds = file.new_dataset::<i32>()
             .shape([0usize, 3])
@@ -541,15 +541,15 @@ mod integration_tests {
         ds.extend(&[10, 3]).unwrap();
         file.close().unwrap();
 
-        assert!(std::path::Path::new(path).exists());
+        assert!(path.exists());
     }
 
     #[test]
     fn write_dataset_with_attributes() {
         use crate::types::VarLenUnicode;
 
-        let path = "/tmp/test_hdf5rs_attributes.h5";
-        let file = H5File::create(path).unwrap();
+        let path = std::env::temp_dir().join("test_hdf5rs_attributes.h5");
+        let file = H5File::create(&path).unwrap();
 
         let ds = file
             .new_dataset::<f32>()
@@ -596,7 +596,7 @@ mod integration_tests {
 
         file.close().unwrap();
 
-        assert!(std::path::Path::new(path).exists());
+        assert!(path.exists());
     }
 
     #[test]

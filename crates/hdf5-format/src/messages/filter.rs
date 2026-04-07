@@ -454,7 +454,7 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
         }
 
         // =====================================================================
-        // ZSTD (32015) — pure Rust: built-in compressor + ruzstd decompressor
+        // ZSTD (32015) — pure Rust compressor + decompressor, zero C deps
         // =====================================================================
         #[cfg(feature = "zstandard")]
         FILTER_ZSTD => {
@@ -462,13 +462,8 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
                 let level = filter.cd_values.first().copied().unwrap_or(3) as i32;
                 Ok(crate::zstd::compress(data, level))
             } else {
-                use std::io::Read;
-                let mut dec = ruzstd::decoding::StreamingDecoder::new(data)
-                    .map_err(|e| FormatError::InvalidData(format!("ZSTD init: {}", e)))?;
-                let mut out = Vec::new();
-                dec.read_to_end(&mut out)
-                    .map_err(|e| FormatError::InvalidData(format!("ZSTD decompress: {}", e)))?;
-                Ok(out)
+                crate::zstd::decompress(data)
+                    .map_err(|e| FormatError::InvalidData(format!("ZSTD decompress: {}", e)))
             }
         }
         #[cfg(not(feature = "zstandard"))]

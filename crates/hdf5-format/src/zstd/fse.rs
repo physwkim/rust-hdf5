@@ -156,6 +156,7 @@ pub fn encode_sequences(
     bw.add_bits(off_values[last] as u64, of_bits_n);
     bw.flush_bits();
 
+
     // Encode remaining sequences in reverse order
     if nb_seq >= 2 {
         for n in (0..last).rev() {
