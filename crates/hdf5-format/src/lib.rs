@@ -12,6 +12,7 @@ pub mod local_heap;
 pub mod messages;
 pub mod object_header;
 pub mod superblock;
+pub mod szip;
 pub mod symbol_table;
 
 /// Format context carrying file-level encoding parameters

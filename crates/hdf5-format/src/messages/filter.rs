@@ -373,9 +373,22 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
                 Ok(data[..data.len() - 4].to_vec())
             }
         }
-        FILTER_SZIP => Err(FormatError::UnsupportedFeature(
-            "SZIP filter requires external libsz library (not bundled)".into(),
-        )),
+        FILTER_SZIP => {
+            // cd_values: [options_mask, bits_per_pixel, pixels_per_block, pixels_per_scanline]
+            let options_mask = filter.cd_values.first().copied().unwrap_or(0);
+            let bits_per_pixel = filter.cd_values.get(1).copied().unwrap_or(8);
+            let pixels_per_block = filter.cd_values.get(2).copied().unwrap_or(32);
+            let pixels_per_scanline = filter.cd_values.get(3).copied().unwrap_or(256);
+            if compress {
+                crate::szip::compress(data, bits_per_pixel, pixels_per_block, pixels_per_scanline, options_mask)
+                    .map_err(|e| FormatError::InvalidData(format!("SZIP compress: {}", e)))
+            } else {
+                let output_size = filter.cd_values.get(4).copied().unwrap_or(0) as usize;
+                let out_size = if output_size > 0 { output_size } else { data.len() * 4 };
+                crate::szip::decompress(data, out_size, bits_per_pixel, pixels_per_block, pixels_per_scanline, options_mask)
+                    .map_err(|e| FormatError::InvalidData(format!("SZIP decompress: {}", e)))
+            }
+        }
         // =====================================================================
         // LZ4 (32004) — C-compatible block framing: 8-byte BE orig_size +
         // 4-byte BE block_size, then per-block: 4-byte BE compressed_size + data

@@ -14,6 +14,10 @@ hdf5-io = { path = "../hdf5-io" }
 [features]
 default = []
 threadsafe = []
+lz4 = ["hdf5-format/lz4"]
+blosc = ["hdf5-format/blosc"]
+bzip2 = ["hdf5-format/bzip2_filter"]
+all_filters = ["hdf5-format/all_filters"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
