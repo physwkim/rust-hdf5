@@ -23,6 +23,67 @@ pub const EA_VERSION: u8 = 0;
 
 /// Class ID for unfiltered chunks (H5EA_CLS_CHUNK).
 pub const EA_CLS_CHUNK: u8 = 0;
+/// Class ID for filtered chunks (H5EA_CLS_FILT_CHUNK).
+pub const EA_CLS_FILT_CHUNK: u8 = 1;
+
+/// A filtered chunk element stored in the extensible array.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FilteredChunkEntry {
+    /// Address of the compressed chunk data in the file.
+    pub addr: u64,
+    /// Size of the compressed chunk in bytes.
+    pub nbytes: u64,
+    /// Filter mask — bit N set means filter N was NOT applied.
+    pub filter_mask: u32,
+}
+
+impl FilteredChunkEntry {
+    pub fn undef() -> Self {
+        Self {
+            addr: UNDEF_ADDR,
+            nbytes: 0,
+            filter_mask: 0,
+        }
+    }
+
+    pub fn is_undef(&self) -> bool {
+        self.addr == UNDEF_ADDR
+    }
+
+    /// Compute raw element size on disk: sizeof_addr + chunk_size_len + 4.
+    pub fn raw_size(sizeof_addr: u8, chunk_size_len: u8) -> u8 {
+        sizeof_addr + chunk_size_len + 4
+    }
+
+    /// Encode a single filtered entry.
+    pub fn encode(&self, sizeof_addr: usize, chunk_size_len: usize) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(sizeof_addr + chunk_size_len + 4);
+        buf.extend_from_slice(&self.addr.to_le_bytes()[..sizeof_addr]);
+        buf.extend_from_slice(&self.nbytes.to_le_bytes()[..chunk_size_len]);
+        buf.extend_from_slice(&self.filter_mask.to_le_bytes());
+        buf
+    }
+
+    /// Decode a single filtered entry.
+    pub fn decode(buf: &[u8], sizeof_addr: usize, chunk_size_len: usize) -> Self {
+        let addr = read_addr(buf, sizeof_addr);
+        let nbytes = read_size(&buf[sizeof_addr..], chunk_size_len);
+        let off = sizeof_addr + chunk_size_len;
+        let filter_mask = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+        Self { addr, nbytes, filter_mask }
+    }
+}
+
+/// Compute chunk_size_len: bytes needed to encode the uncompressed chunk size.
+/// Formula from HDF5 C: 1 + (log2(chunk_size) + 8) / 8, capped at 8.
+pub fn compute_chunk_size_len(uncompressed_chunk_bytes: u64) -> u8 {
+    if uncompressed_chunk_bytes == 0 {
+        return 1;
+    }
+    let log2 = 63 - uncompressed_chunk_bytes.leading_zeros();
+    let len = 1 + (log2 + 8) / 8;
+    std::cmp::min(len, 8) as u8
+}
 
 /// Extensible array header.
 ///
@@ -61,6 +122,26 @@ impl ExtensibleArrayHeader {
         Self {
             class_id: EA_CLS_CHUNK,
             raw_elmt_size: ctx.sizeof_addr,
+            max_nelmts_bits: 32,
+            idx_blk_elmts: 4,
+            data_blk_min_elmts: 16,
+            sup_blk_min_data_ptrs: 4,
+            max_dblk_page_nelmts_bits: 10,
+            num_sblks_created: 0,
+            size_sblks_created: 0,
+            num_dblks_created: 0,
+            size_dblks_created: 0,
+            max_idx_set: 0,
+            num_elmts_realized: 0,
+            idx_blk_addr: UNDEF_ADDR,
+        }
+    }
+
+    /// Create a new header for filtered (compressed) chunk indexing.
+    pub fn new_for_filtered_chunks(ctx: &FormatContext, chunk_size_len: u8) -> Self {
+        Self {
+            class_id: EA_CLS_FILT_CHUNK,
+            raw_elmt_size: FilteredChunkEntry::raw_size(ctx.sizeof_addr, chunk_size_len),
             max_nelmts_bits: 32,
             idx_blk_elmts: 4,
             data_blk_min_elmts: 16,
@@ -217,6 +298,197 @@ pub struct ExtensibleArrayIndexBlock {
     pub dblk_addrs: Vec<u64>,
     /// Super block addresses.
     pub sblk_addrs: Vec<u64>,
+}
+
+/// Filtered variant of the extensible array index block.
+///
+/// Stores `FilteredChunkEntry` elements instead of raw addresses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilteredIndexBlock {
+    pub class_id: u8,
+    pub header_addr: u64,
+    pub elements: Vec<FilteredChunkEntry>,
+    pub dblk_addrs: Vec<u64>,
+    pub sblk_addrs: Vec<u64>,
+}
+
+impl FilteredIndexBlock {
+    pub fn new(header_addr: u64, idx_blk_elmts: u8, ndblk_addrs: usize, nsblk_addrs: usize) -> Self {
+        Self {
+            class_id: EA_CLS_FILT_CHUNK,
+            header_addr,
+            elements: vec![FilteredChunkEntry::undef(); idx_blk_elmts as usize],
+            dblk_addrs: vec![UNDEF_ADDR; ndblk_addrs],
+            sblk_addrs: vec![UNDEF_ADDR; nsblk_addrs],
+        }
+    }
+
+    pub fn encode(&self, ctx: &FormatContext, chunk_size_len: u8) -> Vec<u8> {
+        let sa = ctx.sizeof_addr as usize;
+        let elmt_size = FilteredChunkEntry::raw_size(ctx.sizeof_addr, chunk_size_len) as usize;
+        let size = 4 + 1 + 1 + sa
+            + self.elements.len() * elmt_size
+            + self.dblk_addrs.len() * sa
+            + self.sblk_addrs.len() * sa
+            + 4;
+        let mut buf = Vec::with_capacity(size);
+
+        buf.extend_from_slice(&EAIB_SIGNATURE);
+        buf.push(EA_VERSION);
+        buf.push(self.class_id);
+        buf.extend_from_slice(&self.header_addr.to_le_bytes()[..sa]);
+
+        for elem in &self.elements {
+            buf.extend_from_slice(&elem.encode(sa, chunk_size_len as usize));
+        }
+        for &addr in &self.dblk_addrs {
+            buf.extend_from_slice(&addr.to_le_bytes()[..sa]);
+        }
+        for &addr in &self.sblk_addrs {
+            buf.extend_from_slice(&addr.to_le_bytes()[..sa]);
+        }
+
+        let cksum = checksum_metadata(&buf);
+        buf.extend_from_slice(&cksum.to_le_bytes());
+        debug_assert_eq!(buf.len(), size);
+        buf
+    }
+
+    pub fn decode(
+        buf: &[u8],
+        ctx: &FormatContext,
+        idx_blk_elmts: usize,
+        ndblk_addrs: usize,
+        nsblk_addrs: usize,
+        chunk_size_len: u8,
+    ) -> FormatResult<Self> {
+        let sa = ctx.sizeof_addr as usize;
+        let elmt_size = FilteredChunkEntry::raw_size(ctx.sizeof_addr, chunk_size_len) as usize;
+        let min_size = 4 + 1 + 1 + sa
+            + idx_blk_elmts * elmt_size
+            + ndblk_addrs * sa
+            + nsblk_addrs * sa
+            + 4;
+
+        if buf.len() < min_size {
+            return Err(FormatError::BufferTooShort { needed: min_size, available: buf.len() });
+        }
+        if buf[0..4] != EAIB_SIGNATURE {
+            return Err(FormatError::InvalidSignature);
+        }
+        if buf[4] != EA_VERSION {
+            return Err(FormatError::InvalidVersion(buf[4]));
+        }
+
+        let data_end = min_size - 4;
+        let stored = u32::from_le_bytes([buf[data_end], buf[data_end+1], buf[data_end+2], buf[data_end+3]]);
+        let computed = checksum_metadata(&buf[..data_end]);
+        if stored != computed {
+            return Err(FormatError::ChecksumMismatch { expected: stored, computed });
+        }
+
+        let class_id = buf[5];
+        let mut pos = 6;
+        let header_addr = read_addr(&buf[pos..], sa); pos += sa;
+
+        let mut elements = Vec::with_capacity(idx_blk_elmts);
+        for _ in 0..idx_blk_elmts {
+            elements.push(FilteredChunkEntry::decode(&buf[pos..], sa, chunk_size_len as usize));
+            pos += elmt_size;
+        }
+        let mut dblk_addrs = Vec::with_capacity(ndblk_addrs);
+        for _ in 0..ndblk_addrs {
+            dblk_addrs.push(read_addr(&buf[pos..], sa)); pos += sa;
+        }
+        let mut sblk_addrs = Vec::with_capacity(nsblk_addrs);
+        for _ in 0..nsblk_addrs {
+            sblk_addrs.push(read_addr(&buf[pos..], sa)); pos += sa;
+        }
+
+        Ok(Self { class_id, header_addr, elements, dblk_addrs, sblk_addrs })
+    }
+}
+
+/// Filtered variant of the extensible array data block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilteredDataBlock {
+    pub class_id: u8,
+    pub header_addr: u64,
+    pub block_offset: u64,
+    pub elements: Vec<FilteredChunkEntry>,
+}
+
+impl FilteredDataBlock {
+    pub fn new(header_addr: u64, block_offset: u64, nelmts: usize) -> Self {
+        Self {
+            class_id: EA_CLS_FILT_CHUNK,
+            header_addr,
+            block_offset,
+            elements: vec![FilteredChunkEntry::undef(); nelmts],
+        }
+    }
+
+    pub fn encode(&self, ctx: &FormatContext, max_nelmts_bits: u8, chunk_size_len: u8) -> Vec<u8> {
+        let sa = ctx.sizeof_addr as usize;
+        let bo_size = ExtensibleArrayDataBlock::block_offset_size(max_nelmts_bits);
+        let elmt_size = FilteredChunkEntry::raw_size(ctx.sizeof_addr, chunk_size_len) as usize;
+        let size = 4 + 1 + 1 + sa + bo_size + self.elements.len() * elmt_size + 4;
+        let mut buf = Vec::with_capacity(size);
+
+        buf.extend_from_slice(&EADB_SIGNATURE);
+        buf.push(EA_VERSION);
+        buf.push(self.class_id);
+        buf.extend_from_slice(&self.header_addr.to_le_bytes()[..sa]);
+        buf.extend_from_slice(&self.block_offset.to_le_bytes()[..bo_size]);
+
+        for elem in &self.elements {
+            buf.extend_from_slice(&elem.encode(sa, chunk_size_len as usize));
+        }
+
+        let cksum = checksum_metadata(&buf);
+        buf.extend_from_slice(&cksum.to_le_bytes());
+        debug_assert_eq!(buf.len(), size);
+        buf
+    }
+
+    pub fn decode(
+        buf: &[u8],
+        ctx: &FormatContext,
+        max_nelmts_bits: u8,
+        nelmts: usize,
+        chunk_size_len: u8,
+    ) -> FormatResult<Self> {
+        let sa = ctx.sizeof_addr as usize;
+        let bo_size = ExtensibleArrayDataBlock::block_offset_size(max_nelmts_bits);
+        let elmt_size = FilteredChunkEntry::raw_size(ctx.sizeof_addr, chunk_size_len) as usize;
+        let min_size = 4 + 1 + 1 + sa + bo_size + nelmts * elmt_size + 4;
+
+        if buf.len() < min_size {
+            return Err(FormatError::BufferTooShort { needed: min_size, available: buf.len() });
+        }
+        if buf[0..4] != EADB_SIGNATURE { return Err(FormatError::InvalidSignature); }
+        if buf[4] != EA_VERSION { return Err(FormatError::InvalidVersion(buf[4])); }
+
+        let data_end = min_size - 4;
+        let stored = u32::from_le_bytes([buf[data_end], buf[data_end+1], buf[data_end+2], buf[data_end+3]]);
+        let computed = checksum_metadata(&buf[..data_end]);
+        if stored != computed {
+            return Err(FormatError::ChecksumMismatch { expected: stored, computed });
+        }
+
+        let class_id = buf[5];
+        let mut pos = 6;
+        let header_addr = read_addr(&buf[pos..], sa); pos += sa;
+        let block_offset = read_size(&buf[pos..], bo_size); pos += bo_size;
+
+        let mut elements = Vec::with_capacity(nelmts);
+        for _ in 0..nelmts {
+            elements.push(FilteredChunkEntry::decode(&buf[pos..], sa, chunk_size_len as usize));
+            pos += elmt_size;
+        }
+
+        Ok(Self { class_id, header_addr, block_offset, elements })
+    }
 }
 
 impl ExtensibleArrayIndexBlock {

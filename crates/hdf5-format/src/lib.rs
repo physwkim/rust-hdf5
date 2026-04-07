@@ -1,4 +1,11 @@
+//! Pure Rust HDF5 on-disk format codec.
+//!
+//! This crate handles encoding and decoding of HDF5 binary structures
+//! (superblock, object headers, messages, chunk indices) without performing
+//! any file I/O. It is used by `hdf5-io` and `hdf5` crates.
+
 pub mod checksum;
+pub mod zstd;
 pub mod superblock;
 pub mod object_header;
 pub mod messages;

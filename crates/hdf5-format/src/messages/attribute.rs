@@ -55,6 +55,16 @@ impl AttributeMessage {
         }
     }
 
+    /// Create a scalar numeric attribute with raw bytes as value.
+    pub fn scalar_numeric(name: &str, datatype: DatatypeMessage, data: Vec<u8>) -> Self {
+        Self {
+            name: name.to_string(),
+            datatype,
+            dataspace: DataspaceMessage::scalar(),
+            data,
+        }
+    }
+
     /// Encode the attribute message into a byte vector.
     ///
     /// The result is the raw payload for an object header message of type
@@ -109,27 +119,35 @@ impl AttributeMessage {
 
     /// Decode an attribute message from a byte buffer.
     ///
-    /// Returns `(message, bytes_consumed)`.
+    /// Supports versions 1, 2, and 3:
+    /// - v1: 8-byte header, each field padded to 8-byte alignment
+    /// - v2: 8-byte header, no alignment padding
+    /// - v3: 9-byte header (adds charset byte), no alignment padding
     pub fn decode(buf: &[u8], ctx: &FormatContext) -> FormatResult<(Self, usize)> {
-        if buf.len() < 9 {
-            return Err(FormatError::BufferTooShort {
-                needed: 9,
-                available: buf.len(),
-            });
+        if buf.len() < 8 {
+            return Err(FormatError::BufferTooShort { needed: 8, available: buf.len() });
         }
 
         let version = buf[0];
-        if version != ATTR_VERSION {
+        if !(1..=ATTR_VERSION).contains(&version) {
             return Err(FormatError::InvalidVersion(version));
         }
 
-        // flags at buf[1] (ignored for now)
+        // flags at buf[1]
         let name_size = u16::from_le_bytes([buf[2], buf[3]]) as usize;
         let datatype_size = u16::from_le_bytes([buf[4], buf[5]]) as usize;
         let dataspace_size = u16::from_le_bytes([buf[6], buf[7]]) as usize;
-        // charset at buf[8] (ignored for now, we always use UTF-8)
 
-        let mut pos = 9;
+        let mut pos = if version >= 3 {
+            // v3 has charset byte at offset 8
+            9
+        } else {
+            // v1, v2: no charset byte
+            8
+        };
+
+        // v1 pads each field to 8-byte alignment
+        let align = if version == 1 { 8 } else { 1 };
 
         // Name
         let needed = pos + name_size;
@@ -147,6 +165,8 @@ impl AttributeMessage {
         };
         let name = String::from_utf8_lossy(&buf[pos..name_end]).to_string();
         pos += name_size;
+        // v1 alignment
+        if align > 1 { pos = (pos + align - 1) & !(align - 1); }
 
         // Datatype
         let needed = pos + datatype_size;
@@ -158,6 +178,7 @@ impl AttributeMessage {
         }
         let (datatype, _) = DatatypeMessage::decode(&buf[pos..pos + datatype_size], ctx)?;
         pos += datatype_size;
+        if align > 1 { pos = (pos + align - 1) & !(align - 1); }
 
         // Dataspace
         let needed = pos + dataspace_size;
@@ -169,6 +190,7 @@ impl AttributeMessage {
         }
         let (dataspace, _) = DataspaceMessage::decode(&buf[pos..pos + dataspace_size], ctx)?;
         pos += dataspace_size;
+        if align > 1 { pos = (pos + align - 1) & !(align - 1); }
 
         // Data: remaining bytes = datatype.element_size() * number_of_elements
         let num_elements: u64 = if dataspace.dims.is_empty() {
@@ -253,10 +275,10 @@ mod tests {
     fn decode_bad_version() {
         let msg = AttributeMessage::scalar_string("x", "y");
         let mut encoded = msg.encode(&ctx());
-        encoded[0] = 1; // wrong version
+        encoded[0] = 0; // invalid version
         let err = AttributeMessage::decode(&encoded, &ctx()).unwrap_err();
         match err {
-            FormatError::InvalidVersion(1) => {}
+            FormatError::InvalidVersion(0) => {}
             other => panic!("unexpected error: {:?}", other),
         }
     }

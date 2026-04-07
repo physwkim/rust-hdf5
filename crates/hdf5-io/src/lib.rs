@@ -1,3 +1,8 @@
+//! I/O engine for the pure Rust HDF5 library.
+//!
+//! Provides buffered file I/O, append-only allocation, dataset reading/writing,
+//! and SWMR (Single Writer Multiple Reader) protocol support.
+
 pub mod file_handle;
 pub mod allocator;
 pub mod writer;

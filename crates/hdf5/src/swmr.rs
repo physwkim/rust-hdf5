@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use hdf5_io::Hdf5Reader;
 use hdf5_io::SwmrWriter as IoSwmrWriter;
 
 use crate::error::Result;
@@ -81,5 +82,83 @@ impl SwmrFileWriter {
     pub fn close(self) -> Result<()> {
         self.inner.close()?;
         Ok(())
+    }
+}
+
+/// SWMR reader for monitoring a streaming HDF5 file.
+///
+/// Opens a file being written by a concurrent [`SwmrFileWriter`] and
+/// periodically calls [`refresh`](Self::refresh) to pick up new data.
+///
+/// ```no_run
+/// use hdf5::swmr::SwmrFileReader;
+///
+/// let mut reader = SwmrFileReader::open("stream.h5").unwrap();
+///
+/// loop {
+///     reader.refresh().unwrap();
+///     let names = reader.dataset_names();
+///     if let Some(shape) = reader.dataset_shape("frames").ok() {
+///         println!("frames shape: {:?}", shape);
+///         if shape[0] > 0 {
+///             let data = reader.read_dataset_raw("frames").unwrap();
+///             println!("got {} bytes", data.len());
+///             break;
+///         }
+///     }
+///     std::thread::sleep(std::time::Duration::from_millis(100));
+/// }
+/// ```
+pub struct SwmrFileReader {
+    reader: Hdf5Reader,
+}
+
+impl SwmrFileReader {
+    /// Open an HDF5 file for SWMR reading.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let reader = Hdf5Reader::open_swmr(path.as_ref())?;
+        Ok(Self { reader })
+    }
+
+    /// Re-read the superblock and dataset metadata from disk.
+    ///
+    /// Call this periodically to pick up new data written by the concurrent
+    /// SWMR writer.
+    pub fn refresh(&mut self) -> Result<()> {
+        self.reader.refresh()?;
+        Ok(())
+    }
+
+    /// Return the names of all datasets.
+    pub fn dataset_names(&self) -> Vec<String> {
+        self.reader.dataset_names().iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Return the current shape of a dataset.
+    pub fn dataset_shape(&self, name: &str) -> Result<Vec<u64>> {
+        Ok(self.reader.dataset_shape(name)?)
+    }
+
+    /// Read the raw bytes of a dataset.
+    pub fn read_dataset_raw(&mut self, name: &str) -> Result<Vec<u8>> {
+        Ok(self.reader.read_dataset_raw(name)?)
+    }
+
+    /// Read a dataset as a typed vector.
+    pub fn read_dataset<T: H5Type>(&mut self, name: &str) -> Result<Vec<T>> {
+        let raw = self.reader.read_dataset_raw(name)?;
+        if raw.len() % T::element_size() != 0 {
+            return Err(crate::error::Hdf5Error::TypeMismatch(format!(
+                "raw data size {} is not a multiple of element size {}",
+                raw.len(), T::element_size(),
+            )));
+        }
+        let count = raw.len() / T::element_size();
+        let mut result = Vec::<T>::with_capacity(count);
+        unsafe {
+            std::ptr::copy_nonoverlapping(raw.as_ptr(), result.as_mut_ptr() as *mut u8, raw.len());
+            result.set_len(count);
+        }
+        Ok(result)
     }
 }

@@ -15,13 +15,18 @@ use hdf5_format::messages::dataspace::DataspaceMessage;
 use hdf5_format::messages::datatype::DatatypeMessage;
 use hdf5_format::messages::link::LinkMessage;
 use hdf5_format::messages::link::LinkTarget;
+use hdf5_format::messages::attribute::AttributeMessage;
 use hdf5_format::messages::data_layout::{self, DataLayoutMessage};
+use hdf5_format::messages::filter::{FilterPipeline, self};
+use hdf5_format::global_heap::{GlobalHeapCollection, decode_vlen_reference, vlen_reference_size};
 use hdf5_format::local_heap::{LocalHeapHeader, local_heap_get_string};
 use hdf5_format::symbol_table::SymbolTableNode;
 use hdf5_format::btree_v1::BTreeV1Node;
 use hdf5_format::{FormatContext, UNDEF_ADDR};
 
 use crate::file_handle::FileHandle;
+#[cfg(feature = "mmap")]
+use crate::file_handle::MmapFileHandle;
 use crate::IoResult;
 
 /// Read-side metadata for a single dataset.
@@ -34,6 +39,10 @@ pub struct DatasetReadInfo {
     pub dataspace: DataspaceMessage,
     /// Data layout (contiguous or compact).
     pub layout: DataLayoutMessage,
+    /// Filter pipeline for compressed chunks (None = uncompressed).
+    pub filter_pipeline: Option<FilterPipeline>,
+    /// Attributes attached to this dataset.
+    pub attributes: Vec<AttributeMessage>,
 }
 
 /// Internal enum to represent what we know about the root group from the
@@ -61,9 +70,25 @@ pub struct Hdf5Reader {
     #[allow(dead_code)]
     root_group_info: RootGroupInfo,
     datasets: Vec<DatasetReadInfo>,
+    /// Attributes on the root group (file-level attributes).
+    root_attributes: Vec<AttributeMessage>,
 }
 
 impl Hdf5Reader {
+    /// Open an existing HDF5 file using memory-mapped I/O for zero-copy reads.
+    ///
+    /// Available when the `mmap` feature is enabled. The entire file is
+    /// mapped into memory, avoiding read syscalls. This can be significantly
+    /// faster for random-access patterns on large files.
+    #[cfg(feature = "mmap")]
+    pub fn open_mmap(path: &Path) -> IoResult<(Self, MmapFileHandle)> {
+        // Open normally first to parse metadata
+        let reader = Self::open(path)?;
+        // Also open an mmap handle for zero-copy data access
+        let mmap = MmapFileHandle::open(path)?;
+        Ok((reader, mmap))
+    }
+
     /// Open an existing HDF5 file in SWMR read mode.
     ///
     /// Currently identical to `open()`, but indicates intent to use
@@ -109,6 +134,16 @@ impl Hdf5Reader {
         // Walk link messages to discover datasets.
         let datasets = Self::discover_datasets_from_links(&mut handle, &root_header, &ctx)?;
 
+        // Collect root group attributes
+        let mut root_attributes = Vec::new();
+        for msg in &root_header.messages {
+            if msg.msg_type == MSG_ATTRIBUTE {
+                if let Ok((attr, _)) = AttributeMessage::decode(&msg.data, &ctx) {
+                    root_attributes.push(attr);
+                }
+            }
+        }
+
         Ok(Self {
             handle,
             ctx,
@@ -117,6 +152,7 @@ impl Hdf5Reader {
                 root_group_object_header_address: sb.root_group_object_header_address,
             },
             datasets,
+            root_attributes,
         })
     }
 
@@ -160,6 +196,7 @@ impl Hdf5Reader {
                 heap_addr,
             },
             datasets,
+            root_attributes: Vec::new(),
         })
     }
 
@@ -188,20 +225,51 @@ impl Hdf5Reader {
     }
 
     /// Discover datasets by walking link messages in a v2 object header.
+    /// Recursively descends into groups, prefixing dataset names with the group path.
     fn discover_datasets_from_links(
         handle: &mut FileHandle,
         root_header: &ObjectHeader,
         ctx: &FormatContext,
     ) -> IoResult<Vec<DatasetReadInfo>> {
+        Self::discover_datasets_recursive(handle, root_header, ctx, "")
+    }
+
+    fn discover_datasets_recursive(
+        handle: &mut FileHandle,
+        header: &ObjectHeader,
+        ctx: &FormatContext,
+        prefix: &str,
+    ) -> IoResult<Vec<DatasetReadInfo>> {
         let mut datasets = Vec::new();
-        for msg in &root_header.messages {
+        for msg in &header.messages {
             if msg.msg_type == MSG_LINK {
                 let (link, _) = LinkMessage::decode(&msg.data, ctx)?;
                 if let LinkTarget::Hard { address } = &link.target {
+                    let full_name = if prefix.is_empty() {
+                        link.name.clone()
+                    } else {
+                        format!("{}/{}", prefix, link.name)
+                    };
+
+                    // Try to read as a dataset
                     if let Some(info) = Self::read_dataset_from_object_header(
-                        handle, ctx, *address, &link.name,
+                        handle, ctx, *address, &full_name,
                     )? {
                         datasets.push(info);
+                    } else {
+                        // Not a dataset — might be a group. Try reading its
+                        // object header for link messages.
+                        let child_buf = handle.read_at_most(*address, 8192)?;
+                        if let Ok((child_header, _)) = ObjectHeader::decode_any(&child_buf) {
+                            let has_links = child_header.messages.iter()
+                                .any(|m| m.msg_type == MSG_LINK);
+                            if has_links {
+                                let child_ds = Self::discover_datasets_recursive(
+                                    handle, &child_header, ctx, &full_name,
+                                )?;
+                                datasets.extend(child_ds);
+                            }
+                        }
                     }
                 }
             }
@@ -339,6 +407,8 @@ impl Hdf5Reader {
         let mut datatype = None;
         let mut dataspace = None;
         let mut layout = None;
+        let mut filter_pipeline = None;
+        let mut attributes = Vec::new();
 
         for msg in &header.messages {
             match msg.msg_type {
@@ -357,6 +427,18 @@ impl Hdf5Reader {
                         layout = Some(dl);
                     }
                 }
+                MSG_FILTER_PIPELINE => {
+                    if let Ok((fp, _)) = FilterPipeline::decode(&msg.data) {
+                        if !fp.filters.is_empty() {
+                            filter_pipeline = Some(fp);
+                        }
+                    }
+                }
+                MSG_ATTRIBUTE => {
+                    if let Ok((attr, _)) = AttributeMessage::decode(&msg.data, ctx) {
+                        attributes.push(attr);
+                    }
+                }
                 _ => {}
             }
         }
@@ -367,6 +449,8 @@ impl Hdf5Reader {
                 datatype: dt,
                 dataspace: ds,
                 layout: dl,
+                filter_pipeline,
+                attributes,
             }))
         } else {
             Ok(None)
@@ -381,6 +465,32 @@ impl Hdf5Reader {
     /// Return metadata for a dataset by name.
     pub fn dataset_info(&self, name: &str) -> Option<&DatasetReadInfo> {
         self.datasets.iter().find(|d| d.name == name)
+    }
+
+    /// Return the attribute names of a dataset.
+    pub fn dataset_attr_names(&self, name: &str) -> IoResult<Vec<String>> {
+        let info = self.dataset_info(name)
+            .ok_or_else(|| crate::IoError::NotFound(name.to_string()))?;
+        Ok(info.attributes.iter().map(|a| a.name.clone()).collect())
+    }
+
+    /// Return a specific attribute by dataset name and attribute name.
+    pub fn dataset_attr(&self, ds_name: &str, attr_name: &str) -> IoResult<&AttributeMessage> {
+        let info = self.dataset_info(ds_name)
+            .ok_or_else(|| crate::IoError::NotFound(ds_name.to_string()))?;
+        info.attributes.iter()
+            .find(|a| a.name == attr_name)
+            .ok_or_else(|| crate::IoError::NotFound(format!("{}:{}", ds_name, attr_name)))
+    }
+
+    /// Return the names of root-level (file) attributes.
+    pub fn root_attr_names(&self) -> Vec<String> {
+        self.root_attributes.iter().map(|a| a.name.clone()).collect()
+    }
+
+    /// Return a root-level attribute by name.
+    pub fn root_attr(&self, name: &str) -> Option<&AttributeMessage> {
+        self.root_attributes.iter().find(|a| a.name == name)
     }
 
     /// Return the dimensions of a dataset.
@@ -400,6 +510,9 @@ impl Hdf5Reader {
         // Clone layout to avoid borrow conflict with &mut self in read methods.
         let layout = info.layout.clone();
 
+        // Clone filter pipeline to avoid borrow conflict.
+        let pipeline = info.filter_pipeline.clone();
+
         match &layout {
             DataLayoutMessage::Contiguous { address, size } => {
                 if *address == UNDEF_ADDR {
@@ -413,7 +526,7 @@ impl Hdf5Reader {
                 // The layout's chunk_dims include the element size as
                 // the trailing dimension. Strip it for chunk indexing.
                 let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
-                self.read_chunked_v4(name, real_chunk_dims, *index_address, *index_type, earray_params.as_ref())
+                self.read_chunked_v4(name, real_chunk_dims, *index_address, *index_type, earray_params.as_ref(), pipeline.as_ref())
             }
         }
     }
@@ -458,8 +571,9 @@ impl Hdf5Reader {
         index_address: u64,
         index_type: data_layout::ChunkIndexType,
         earray_params: Option<&data_layout::EarrayParams>,
+        pipeline: Option<&FilterPipeline>,
     ) -> IoResult<Vec<u8>> {
-        use hdf5_format::chunk_index::extensible_array::*;
+        use hdf5_format::chunk_index::extensible_array::{self as ea, *};
 
         let info = self.dataset_info(name)
             .ok_or_else(|| crate::IoError::NotFound(name.to_string()))?;
@@ -473,14 +587,19 @@ impl Hdf5Reader {
                 if index_address == UNDEF_ADDR || total_size == 0 {
                     return Ok(vec![]);
                 }
-                let data = self.handle.read_at(index_address, total_size as usize)?;
+                let data = if let Some(pipeline) = pipeline {
+                    let raw = self.handle.read_at_most(index_address, total_size as usize * 2)?;
+                    filter::reverse_filters(pipeline, &raw)?
+                } else {
+                    self.handle.read_at(index_address, total_size as usize)?
+                };
                 Ok(data)
             }
             data_layout::ChunkIndexType::FixedArray => {
-                self.read_chunked_fixed_array(name, chunk_dims, index_address)
+                self.read_chunked_fixed_array(name, chunk_dims, index_address, pipeline)
             }
             data_layout::ChunkIndexType::BTreeV2 => {
-                self.read_chunked_btree_v2(name, chunk_dims, index_address)
+                self.read_chunked_btree_v2(name, chunk_dims, index_address, pipeline)
             }
             data_layout::ChunkIndexType::ExtensibleArray => {
                 let params = earray_params.ok_or_else(|| {
@@ -499,14 +618,12 @@ impl Hdf5Reader {
                     return Ok(vec![]);
                 }
 
-                // Compute number of chunks along the unlimited dimension (dim 0)
                 let chunks_dim0 = if chunk_dims[0] > 0 {
                     dims[0].div_ceil(chunk_dims[0])
                 } else {
                     0
                 };
 
-                // Read index block
                 let ndblk_addrs = compute_ndblk_addrs(params.sup_blk_min_data_ptrs);
                 let nsblk_addrs = compute_nsblk_addrs(
                     params.idx_blk_elmts,
@@ -514,65 +631,133 @@ impl Hdf5Reader {
                     params.sup_blk_min_data_ptrs,
                     params.max_nelmts_bits,
                 );
-                let iblk_buf = self.handle.read_at_most(ea_hdr.idx_blk_addr, 8192)?;
-                let iblk = ExtensibleArrayIndexBlock::decode(
-                    &iblk_buf, &self.ctx,
-                    params.idx_blk_elmts as usize,
-                    ndblk_addrs, nsblk_addrs,
-                )?;
 
-                // Collect chunk addresses
-                let mut chunk_addrs: Vec<u64> = Vec::new();
-                for &addr in &iblk.elements {
-                    chunk_addrs.push(addr);
-                }
+                let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
+                let is_filtered = ea_hdr.class_id == ea::EA_CLS_FILT_CHUNK;
 
-                // Read data blocks if needed
-                let mut dblk_nelmts = params.data_blk_min_elmts as usize;
-                for &dblk_addr in &iblk.dblk_addrs {
-                    if dblk_addr == UNDEF_ADDR {
-                        // Add UNDEF entries for the unallocated block
-                        chunk_addrs.extend(std::iter::repeat_n(UNDEF_ADDR, dblk_nelmts));
-                    } else {
-                        let dblk_buf = self.handle.read_at_most(dblk_addr, 4096)?;
-                        let dblk = ExtensibleArrayDataBlock::decode(
-                            &dblk_buf, &self.ctx,
-                            params.max_nelmts_bits, dblk_nelmts,
-                        )?;
-                        for &addr in &dblk.elements {
-                            chunk_addrs.push(addr);
+                // Collect chunk entries: (address, compressed_size)
+                let mut chunk_entries: Vec<(u64, u64)> = Vec::new();
+
+                // Data block sizes follow the pattern: min, min, 2*min, 2*min, 4*min, 4*min, ...
+                let min_elmts = params.data_blk_min_elmts as usize;
+
+                if is_filtered {
+                    let chunk_size_len = ea_hdr.raw_elmt_size - self.ctx.sizeof_addr - 4;
+
+                    let iblk_buf = self.handle.read_at_most(ea_hdr.idx_blk_addr, 65536)?;
+                    let fiblk = ea::FilteredIndexBlock::decode(
+                        &iblk_buf, &self.ctx,
+                        params.idx_blk_elmts as usize,
+                        ndblk_addrs, nsblk_addrs, chunk_size_len,
+                    )?;
+
+                    for e in &fiblk.elements {
+                        chunk_entries.push((e.addr, e.nbytes));
+                    }
+
+                    let mut dblk_nelmts = min_elmts;
+                    let mut pair_count = 0usize;
+                    for &dblk_addr in &fiblk.dblk_addrs {
+                        if dblk_addr == UNDEF_ADDR {
+                            chunk_entries.extend(std::iter::repeat_n((UNDEF_ADDR, 0), dblk_nelmts));
+                        } else {
+                            let dblk_buf = self.handle.read_at_most(dblk_addr, 65536)?;
+                            let dblk = ea::FilteredDataBlock::decode(
+                                &dblk_buf, &self.ctx,
+                                params.max_nelmts_bits, dblk_nelmts, chunk_size_len,
+                            )?;
+                            for e in &dblk.elements {
+                                chunk_entries.push((e.addr, e.nbytes));
+                            }
+                        }
+                        if chunk_entries.len() >= chunks_dim0 as usize { break; }
+                        pair_count += 1;
+                        if pair_count >= 2 {
+                            pair_count = 0;
+                            dblk_nelmts *= 2;
                         }
                     }
-                    // Data blocks grow: first 2 are min size, then double
-                    // For simplicity, keep at min for now
-                    if chunk_addrs.len() >= chunks_dim0 as usize {
-                        break;
+                } else {
+                    let iblk_buf = self.handle.read_at_most(ea_hdr.idx_blk_addr, 8192)?;
+                    let iblk = ExtensibleArrayIndexBlock::decode(
+                        &iblk_buf, &self.ctx,
+                        params.idx_blk_elmts as usize,
+                        ndblk_addrs, nsblk_addrs,
+                    )?;
+                    for &addr in &iblk.elements {
+                        chunk_entries.push((addr, chunk_bytes));
                     }
-                    dblk_nelmts *= 2;
+                    let mut dblk_nelmts = min_elmts;
+                    let mut pair_count = 0usize;
+                    for &dblk_addr in &iblk.dblk_addrs {
+                        if dblk_addr == UNDEF_ADDR {
+                            chunk_entries.extend(std::iter::repeat_n((UNDEF_ADDR, 0), dblk_nelmts));
+                        } else {
+                            let dblk_buf = self.handle.read_at_most(dblk_addr, 65536)?;
+                            let dblk = ExtensibleArrayDataBlock::decode(
+                                &dblk_buf, &self.ctx,
+                                params.max_nelmts_bits, dblk_nelmts,
+                            )?;
+                            for &addr in &dblk.elements {
+                                chunk_entries.push((addr, chunk_bytes));
+                            }
+                        }
+                        if chunk_entries.len() >= chunks_dim0 as usize { break; }
+                        pair_count += 1;
+                        if pair_count >= 2 {
+                            pair_count = 0;
+                            dblk_nelmts *= 2;
+                        }
+                    }
                 }
 
-                // Compute chunk byte size
-                let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
-
-                // Total output size
                 let total_size: u64 = dims.iter().product::<u64>() * element_size;
                 let mut output = vec![0u8; total_size as usize];
 
-                // Read each chunk
-                for i in 0..chunks_dim0 as usize {
-                    if i >= chunk_addrs.len() {
-                        break;
+                let n_chunks = std::cmp::min(chunks_dim0 as usize, chunk_entries.len());
+
+                if let Some(pl) = pipeline {
+                    // Read all raw chunks first, then decompress (optionally in parallel)
+                    let mut raw_chunks: Vec<Option<Vec<u8>>> = Vec::with_capacity(n_chunks);
+                    for &(addr, nbytes) in &chunk_entries[..n_chunks] {
+                        if addr == UNDEF_ADDR {
+                            raw_chunks.push(None);
+                        } else {
+                            raw_chunks.push(Some(self.handle.read_at(addr, nbytes as usize)?));
+                        }
                     }
-                    let addr = chunk_addrs[i];
-                    if addr == UNDEF_ADDR {
-                        continue;
+
+                    #[cfg(feature = "parallel")]
+                    let decompressed: Vec<Option<Vec<u8>>> = {
+                        use rayon::prelude::*;
+                        raw_chunks.into_par_iter()
+                            .map(|raw| raw.map(|r| filter::reverse_filters(pl, &r).unwrap_or(r)))
+                            .collect()
+                    };
+                    #[cfg(not(feature = "parallel"))]
+                    let decompressed: Vec<Option<Vec<u8>>> = raw_chunks.into_iter()
+                        .map(|raw| raw.map(|r| filter::reverse_filters(pl, &r).unwrap_or(r)))
+                        .collect();
+
+                    for (i, chunk_data) in decompressed.iter().enumerate() {
+                        if let Some(data) = chunk_data {
+                            let offset = i as u64 * chunk_bytes;
+                            let end = std::cmp::min(offset + chunk_bytes, total_size);
+                            let copy_len = (end - offset) as usize;
+                            output[offset as usize..offset as usize + copy_len]
+                                .copy_from_slice(&data[..copy_len]);
+                        }
                     }
-                    let chunk_data = self.handle.read_at(addr, chunk_bytes as usize)?;
-                    let offset = i as u64 * chunk_bytes;
-                    let end = std::cmp::min(offset + chunk_bytes, total_size);
-                    let copy_len = (end - offset) as usize;
-                    output[offset as usize..offset as usize + copy_len]
-                        .copy_from_slice(&chunk_data[..copy_len]);
+                } else {
+                    for (i, &(addr, nbytes)) in chunk_entries[..n_chunks].iter().enumerate() {
+                        if addr == UNDEF_ADDR { continue; }
+                        let chunk_data = self.handle.read_at(addr, nbytes as usize)?;
+                        let offset = i as u64 * chunk_bytes;
+                        let end = std::cmp::min(offset + chunk_bytes, total_size);
+                        let copy_len = (end - offset) as usize;
+                        output[offset as usize..offset as usize + copy_len]
+                            .copy_from_slice(&chunk_data[..copy_len]);
+                    }
                 }
 
                 Ok(output)
@@ -589,6 +774,7 @@ impl Hdf5Reader {
         name: &str,
         chunk_dims: &[u64],
         index_address: u64,
+        pipeline: Option<&FilterPipeline>,
     ) -> IoResult<Vec<u8>> {
         use hdf5_format::chunk_index::fixed_array::*;
 
@@ -628,31 +814,49 @@ impl Hdf5Reader {
             .map(|d| dims[d].div_ceil(chunk_dims[d]))
             .collect();
 
-        // Read each chunk and place it in the correct position
-        for linear_idx in 0..fa_hdr.num_elmts as usize {
-            if linear_idx >= fa_dblk.elements.len() {
-                break;
-            }
+        // Read all chunk raw data sequentially (I/O must be serial)
+        let n_chunks = std::cmp::min(fa_hdr.num_elmts as usize, fa_dblk.elements.len());
+        let mut raw_chunks: Vec<(usize, Option<Vec<u8>>)> = Vec::with_capacity(n_chunks);
+        for linear_idx in 0..n_chunks {
             let addr = fa_dblk.elements[linear_idx];
             if addr == UNDEF_ADDR {
-                continue;
+                raw_chunks.push((linear_idx, None));
+            } else if pipeline.is_some() {
+                raw_chunks.push((linear_idx, Some(self.handle.read_at_most(addr, chunk_bytes as usize * 2)?)));
+            } else {
+                raw_chunks.push((linear_idx, Some(self.handle.read_at(addr, chunk_bytes as usize)?)));
             }
+        }
 
-            // Convert linear index to multidimensional chunk coordinates
-            let mut remaining = linear_idx as u64;
+        // Decompress in parallel if filter pipeline is set
+        let decompressed: Vec<(usize, Option<Vec<u8>>)> = if let Some(pl) = pipeline {
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                raw_chunks.into_par_iter()
+                    .map(|(idx, raw)| (idx, raw.map(|r| filter::reverse_filters(pl, &r).unwrap_or(r))))
+                    .collect()
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                raw_chunks.into_iter()
+                    .map(|(idx, raw)| (idx, raw.map(|r| filter::reverse_filters(pl, &r).unwrap_or(r))))
+                    .collect()
+            }
+        } else {
+            raw_chunks
+        };
+
+        // Place chunks into output
+        for (linear_idx, chunk_data) in &decompressed {
+            let Some(data) = chunk_data else { continue };
+            let mut remaining = *linear_idx as u64;
             let mut coords = vec![0u64; ndims];
             for d in (0..ndims).rev() {
                 coords[d] = remaining % chunks_per_dim[d];
                 remaining /= chunks_per_dim[d];
             }
-
-            let chunk_data = self.handle.read_at(addr, chunk_bytes as usize)?;
-
-            // Copy chunk data into output at the correct position
-            // For each element in the chunk, compute its position in the output
-            self.copy_chunk_to_output(
-                &chunk_data, &mut output, &dims, chunk_dims, &coords, element_size,
-            );
+            self.copy_chunk_to_output(data, &mut output, &dims, chunk_dims, &coords, element_size);
         }
 
         Ok(output)
@@ -664,6 +868,7 @@ impl Hdf5Reader {
         name: &str,
         chunk_dims: &[u64],
         index_address: u64,
+        pipeline: Option<&FilterPipeline>,
     ) -> IoResult<Vec<u8>> {
         use hdf5_format::chunk_index::btree_v2::*;
 
@@ -721,18 +926,40 @@ impl Hdf5Reader {
         let total_size: u64 = dims.iter().product::<u64>() * element_size;
         let mut output = vec![0u8; total_size as usize];
 
-        // Read each chunk and place it in the correct position
-        for rec in &records {
+        // Read all chunk raw data sequentially
+        let mut raw_chunks: Vec<(usize, Option<Vec<u8>>)> = Vec::with_capacity(records.len());
+        for (i, rec) in records.iter().enumerate() {
             if rec.chunk_address == UNDEF_ADDR {
-                continue;
+                raw_chunks.push((i, None));
+            } else if pipeline.is_some() {
+                raw_chunks.push((i, Some(self.handle.read_at_most(rec.chunk_address, chunk_bytes as usize * 2)?)));
+            } else {
+                raw_chunks.push((i, Some(self.handle.read_at(rec.chunk_address, chunk_bytes as usize)?)));
             }
-            let chunk_data = self.handle.read_at(rec.chunk_address, chunk_bytes as usize)?;
+        }
 
-            // The scaled_offsets are the chunk coordinates
-            self.copy_chunk_to_output(
-                &chunk_data, &mut output, &dims, chunk_dims,
-                &rec.scaled_offsets, element_size,
-            );
+        // Decompress in parallel
+        let decompressed: Vec<(usize, Option<Vec<u8>>)> = if let Some(pl) = pipeline {
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                raw_chunks.into_par_iter()
+                    .map(|(i, raw)| (i, raw.map(|r| filter::reverse_filters(pl, &r).unwrap_or(r))))
+                    .collect()
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                raw_chunks.into_iter()
+                    .map(|(i, raw)| (i, raw.map(|r| filter::reverse_filters(pl, &r).unwrap_or(r))))
+                    .collect()
+            }
+        } else {
+            raw_chunks
+        };
+
+        for (i, chunk_data) in &decompressed {
+            let Some(data) = chunk_data else { continue };
+            self.copy_chunk_to_output(data, &mut output, &dims, chunk_dims, &records[*i].scaled_offsets, element_size);
         }
 
         Ok(output)
@@ -809,6 +1036,365 @@ impl Hdf5Reader {
             }
         }
     }
+
+    /// Read variable-length string data from a dataset.
+    ///
+    /// h5py stores vlen strings as global heap references. Each element
+    /// in the raw data is a (collection_address, object_index) pair that
+    /// points to a string blob in a global heap collection.
+    ///
+    /// Returns a Vec<String> with one entry per element.
+    pub fn read_vlen_strings(&mut self, name: &str) -> IoResult<Vec<String>> {
+        let info = self.dataset_info(name)
+            .ok_or_else(|| crate::IoError::NotFound(name.to_string()))?;
+        let dims = info.dataspace.dims.clone();
+        let layout = info.layout.clone();
+        let total_elements: u64 = dims.iter().product();
+
+        let raw = match &layout {
+            DataLayoutMessage::Contiguous { address, size } => {
+                if *address == UNDEF_ADDR { return Ok(vec![]); }
+                self.handle.read_at(*address, *size as usize)?
+            }
+            DataLayoutMessage::Compact { data } => data.clone(),
+            _ => {
+                // For chunked, read the full dataset first
+                self.read_dataset_raw(name)?
+            }
+        };
+
+        let ref_size = vlen_reference_size(&self.ctx);
+        let mut strings = Vec::with_capacity(total_elements as usize);
+
+        // Cache global heap collections to avoid re-reading
+        let mut heap_cache: std::collections::HashMap<u64, GlobalHeapCollection> =
+            std::collections::HashMap::new();
+
+        for i in 0..total_elements as usize {
+            let offset = i * ref_size;
+            if offset + ref_size > raw.len() {
+                break;
+            }
+
+            let (collection_addr, obj_index) =
+                decode_vlen_reference(&raw[offset..], &self.ctx)?;
+
+            if collection_addr == UNDEF_ADDR || collection_addr == 0 {
+                strings.push(String::new());
+                continue;
+            }
+
+            // Read or get cached global heap collection
+            let collection = if let Some(c) = heap_cache.get(&collection_addr) {
+                c.clone()
+            } else {
+                let heap_buf = self.handle.read_at_most(collection_addr, 65536)?;
+                let (coll, _) = GlobalHeapCollection::decode(&heap_buf, &self.ctx)?;
+                heap_cache.insert(collection_addr, coll.clone());
+                coll
+            };
+
+            if let Some(data) = collection.get_object(obj_index as u16) {
+                // h5py stores vlen strings as UTF-8 (or ASCII) bytes
+                let s = String::from_utf8_lossy(data).to_string();
+                strings.push(s);
+            } else {
+                strings.push(String::new());
+            }
+        }
+
+        Ok(strings)
+    }
+
+    /// Collect chunk (address, size) entries from an EA index.
+    /// Returns a vector indexed by chunk linear index.
+    fn collect_ea_chunk_entries(
+        &mut self,
+        index_address: u64,
+        params: &data_layout::EarrayParams,
+        dims: &[u64],
+        chunk_dims: &[u64],
+        element_size: u64,
+    ) -> IoResult<Vec<(u64, u64)>> {
+        use hdf5_format::chunk_index::extensible_array::{self as ea, *};
+
+        if index_address == UNDEF_ADDR { return Ok(vec![]); }
+
+        let hdr_buf = self.handle.read_at_most(index_address, 256)?;
+        let ea_hdr = ExtensibleArrayHeader::decode(&hdr_buf, &self.ctx)?;
+        if ea_hdr.idx_blk_addr == UNDEF_ADDR { return Ok(vec![]); }
+
+        let chunks_dim0 = if chunk_dims[0] > 0 { dims[0].div_ceil(chunk_dims[0]) } else { 0 };
+        let ndblk_addrs = compute_ndblk_addrs(params.sup_blk_min_data_ptrs);
+        let nsblk_addrs = compute_nsblk_addrs(
+            params.idx_blk_elmts, params.data_blk_min_elmts,
+            params.sup_blk_min_data_ptrs, params.max_nelmts_bits,
+        );
+        let chunk_bytes = chunk_dims.iter().product::<u64>() * element_size;
+        let is_filtered = ea_hdr.class_id == ea::EA_CLS_FILT_CHUNK;
+        let min_elmts = params.data_blk_min_elmts as usize;
+        let mut entries: Vec<(u64, u64)> = Vec::new();
+
+        if is_filtered {
+            let chunk_size_len = ea_hdr.raw_elmt_size - self.ctx.sizeof_addr - 4;
+            let iblk_buf = self.handle.read_at_most(ea_hdr.idx_blk_addr, 65536)?;
+            let fiblk = ea::FilteredIndexBlock::decode(
+                &iblk_buf, &self.ctx, params.idx_blk_elmts as usize,
+                ndblk_addrs, nsblk_addrs, chunk_size_len,
+            )?;
+            for e in &fiblk.elements { entries.push((e.addr, e.nbytes)); }
+            let mut nelmts = min_elmts;
+            let mut pair = 0usize;
+            for &dblk_addr in &fiblk.dblk_addrs {
+                if dblk_addr == UNDEF_ADDR {
+                    entries.extend(std::iter::repeat_n((UNDEF_ADDR, 0), nelmts));
+                } else {
+                    let buf = self.handle.read_at_most(dblk_addr, 65536)?;
+                    let dblk = ea::FilteredDataBlock::decode(&buf, &self.ctx, params.max_nelmts_bits, nelmts, chunk_size_len)?;
+                    for e in &dblk.elements { entries.push((e.addr, e.nbytes)); }
+                }
+                if entries.len() >= chunks_dim0 as usize { break; }
+                pair += 1;
+                if pair >= 2 { pair = 0; nelmts *= 2; }
+            }
+        } else {
+            let iblk_buf = self.handle.read_at_most(ea_hdr.idx_blk_addr, 8192)?;
+            let iblk = ExtensibleArrayIndexBlock::decode(
+                &iblk_buf, &self.ctx, params.idx_blk_elmts as usize, ndblk_addrs, nsblk_addrs,
+            )?;
+            for &addr in &iblk.elements { entries.push((addr, chunk_bytes)); }
+            let mut nelmts = min_elmts;
+            let mut pair = 0usize;
+            for &dblk_addr in &iblk.dblk_addrs {
+                if dblk_addr == UNDEF_ADDR {
+                    entries.extend(std::iter::repeat_n((UNDEF_ADDR, 0), nelmts));
+                } else {
+                    let buf = self.handle.read_at_most(dblk_addr, 65536)?;
+                    let dblk = ExtensibleArrayDataBlock::decode(&buf, &self.ctx, params.max_nelmts_bits, nelmts)?;
+                    for &addr in &dblk.elements { entries.push((addr, chunk_bytes)); }
+                }
+                if entries.len() >= chunks_dim0 as usize { break; }
+                pair += 1;
+                if pair >= 2 { pair = 0; nelmts *= 2; }
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Read a slice (hyperslab) of a contiguous dataset.
+    ///
+    /// `starts` and `counts` define the N-dimensional selection:
+    /// starts[d] is the first index along dim d, counts[d] is how many.
+    /// Returns the selected data in row-major order.
+    pub fn read_slice(
+        &mut self,
+        name: &str,
+        starts: &[u64],
+        counts: &[u64],
+    ) -> IoResult<Vec<u8>> {
+        let info = self.dataset_info(name)
+            .ok_or_else(|| crate::IoError::NotFound(name.to_string()))?;
+        let dims = info.dataspace.dims.clone();
+        let element_size = info.datatype.element_size() as u64;
+        let layout = info.layout.clone();
+        let pipeline = info.filter_pipeline.clone();
+        let ndims = dims.len();
+
+        if starts.len() != ndims || counts.len() != ndims {
+            return Err(crate::IoError::InvalidState(
+                "starts/counts length must match dataset rank".into(),
+            ));
+        }
+        for d in 0..ndims {
+            if starts[d] + counts[d] > dims[d] {
+                return Err(crate::IoError::InvalidState(format!(
+                    "slice out of bounds: dim {} start {} + count {} > {}",
+                    d, starts[d], counts[d], dims[d]
+                )));
+            }
+        }
+
+        let out_elems: u64 = counts.iter().product();
+        let out_bytes = (out_elems * element_size) as usize;
+
+        match &layout {
+            DataLayoutMessage::Contiguous { address, .. } => {
+                if *address == UNDEF_ADDR {
+                    return Ok(vec![0u8; out_bytes]);
+                }
+
+                let strides = compute_strides(&dims, element_size);
+
+                // For 1D, simple contiguous read
+                if ndims == 1 {
+                    let offset = *address + starts[0] * element_size;
+                    return self.handle.read_at(offset, (counts[0] * element_size) as usize)
+                        .map_err(Into::into);
+                }
+
+                // Multi-dimensional: read row by row along the last dimension
+                let mut output = vec![0u8; out_bytes];
+                let row_bytes = (counts[ndims - 1] * element_size) as usize;
+
+                // Iterate over all rows in the slice
+                let mut coords = vec![0u64; ndims - 1];
+                let n_rows: u64 = counts[..ndims - 1].iter().product();
+
+                for row in 0..n_rows {
+                    // Compute file offset
+                    let mut file_offset = *address + starts[ndims - 1] * element_size;
+                    for d in 0..ndims - 1 {
+                        file_offset += (starts[d] + coords[d]) * strides[d];
+                    }
+
+                    let out_offset = row as usize * row_bytes;
+                    let data = self.handle.read_at(file_offset, row_bytes)?;
+                    output[out_offset..out_offset + row_bytes].copy_from_slice(&data);
+
+                    // Increment coords (carry)
+                    for d in (0..ndims - 1).rev() {
+                        coords[d] += 1;
+                        if coords[d] < counts[d] {
+                            break;
+                        }
+                        coords[d] = 0;
+                    }
+                }
+
+                Ok(output)
+            }
+            DataLayoutMessage::Compact { data } => {
+                // Same logic but from in-memory data
+                let strides = compute_strides(&dims, element_size);
+
+                let mut output = vec![0u8; out_bytes];
+                let row_bytes = (counts[ndims - 1] * element_size) as usize;
+                let n_rows: u64 = if ndims > 1 { counts[..ndims - 1].iter().product() } else { 1 };
+
+                let mut coords = vec![0u64; ndims.saturating_sub(1)];
+                for row in 0..n_rows {
+                    let mut src_offset = (starts[ndims - 1] * element_size) as usize;
+                    for d in 0..ndims.saturating_sub(1) {
+                        src_offset += ((starts[d] + coords[d]) * strides[d]) as usize;
+                    }
+                    let out_offset = row as usize * row_bytes;
+                    output[out_offset..out_offset + row_bytes]
+                        .copy_from_slice(&data[src_offset..src_offset + row_bytes]);
+
+                    for d in (0..ndims.saturating_sub(1)).rev() {
+                        coords[d] += 1;
+                        if coords[d] < counts[d] { break; }
+                        coords[d] = 0;
+                    }
+                }
+                Ok(output)
+            }
+            DataLayoutMessage::ChunkedV4 { chunk_dims: layout_chunk_dims, index_address, index_type, earray_params, .. } => {
+                let real_chunk_dims = &layout_chunk_dims[..layout_chunk_dims.len() - 1];
+                let fp = pipeline.clone();
+
+                // Optimized path for 1D-chunked streaming (chunk_dim0 == 1, EA index):
+                // Read only the chunks that overlap [starts[0]..starts[0]+counts[0]).
+                let can_optimize = ndims >= 2
+                    && real_chunk_dims[0] == 1
+                    && *index_type == data_layout::ChunkIndexType::ExtensibleArray;
+
+                if can_optimize {
+                    let all_entries = self.collect_ea_chunk_entries(
+                        *index_address, earray_params.as_ref().unwrap(),
+                        &dims, real_chunk_dims, element_size,
+                    )?;
+                    let mut output = vec![0u8; out_bytes];
+                    let out_strides = compute_strides(counts, element_size);
+                    let chunk_inner_dims = &real_chunk_dims[1..];
+                    let chunk_strides = compute_strides(chunk_inner_dims, element_size);
+                    let inner_starts = &starts[1..];
+                    let inner_counts = &counts[1..];
+                    let inner_ndims = inner_starts.len();
+                    let row_bytes = (inner_counts[inner_ndims - 1] * element_size) as usize;
+                    let n_inner_rows: u64 = if inner_ndims > 1 {
+                        inner_counts[..inner_ndims - 1].iter().product()
+                    } else { 1 };
+
+                    for fi in 0..counts[0] {
+                        let gi = starts[0] + fi;
+                        if (gi as usize) >= all_entries.len() { break; }
+                        let (addr, nbytes) = all_entries[gi as usize];
+                        if addr == UNDEF_ADDR { continue; }
+
+                        let chunk_data = if let Some(ref pl) = fp {
+                            let raw = self.handle.read_at(addr, nbytes as usize)?;
+                            filter::reverse_filters(pl, &raw)?
+                        } else {
+                            self.handle.read_at(addr, nbytes as usize)?
+                        };
+
+                        let mut ic = vec![0u64; inner_ndims.saturating_sub(1)];
+                        for _irow in 0..n_inner_rows {
+                            let mut src_off = (inner_starts[inner_ndims - 1] * element_size) as usize;
+                            let mut dst_off = (fi * out_strides[0]) as usize;
+                            for d in 0..inner_ndims.saturating_sub(1) {
+                                src_off += ((inner_starts[d] + ic[d]) * chunk_strides[d]) as usize;
+                                dst_off += (ic[d] * out_strides[d + 1]) as usize;
+                            }
+                            if src_off + row_bytes <= chunk_data.len() && dst_off + row_bytes <= output.len() {
+                                output[dst_off..dst_off + row_bytes]
+                                    .copy_from_slice(&chunk_data[src_off..src_off + row_bytes]);
+                            }
+                            for d in (0..inner_ndims.saturating_sub(1)).rev() {
+                                ic[d] += 1;
+                                if ic[d] < inner_counts[d] { break; }
+                                ic[d] = 0;
+                            }
+                        }
+                    }
+                    Ok(output)
+                } else {
+                    // Fallback: read full dataset and extract slice
+                    let full = self.read_dataset_raw(name)?;
+                    let mut output = vec![0u8; out_bytes];
+                    let src_strides = compute_strides(&dims, element_size);
+                    let row_bytes = (counts[ndims - 1] * element_size) as usize;
+                    let n_rows: u64 = if ndims > 1 { counts[..ndims - 1].iter().product() } else { 1 };
+                    if ndims == 1 {
+                        let src_off = (starts[0] * element_size) as usize;
+                        output[..row_bytes].copy_from_slice(&full[src_off..src_off + row_bytes]);
+                    } else {
+                        let out_strides = compute_strides(counts, element_size);
+                        let mut coords = vec![0u64; ndims - 1];
+                        for _row in 0..n_rows {
+                            let mut src_off = (starts[ndims - 1] * element_size) as usize;
+                            let mut out_off = 0usize;
+                            for d in 0..ndims - 1 {
+                                src_off += ((starts[d] + coords[d]) * src_strides[d]) as usize;
+                                out_off += (coords[d] * out_strides[d]) as usize;
+                            }
+                            output[out_off..out_off + row_bytes]
+                                .copy_from_slice(&full[src_off..src_off + row_bytes]);
+                            for d in (0..ndims - 1).rev() {
+                                coords[d] += 1;
+                                if coords[d] < counts[d] { break; }
+                                coords[d] = 0;
+                            }
+                        }
+                    }
+                    Ok(output)
+                }
+            }
+        }
+    }
+}
+
+/// Compute row-major strides for an N-dimensional array.
+fn compute_strides(dims: &[u64], element_size: u64) -> Vec<u64> {
+    let ndims = dims.len();
+    if ndims == 0 { return vec![]; }
+    let mut strides = vec![0u64; ndims];
+    strides[ndims - 1] = element_size;
+    for d in (0..ndims - 1).rev() {
+        strides[d] = strides[d + 1] * dims[d + 1];
+    }
+    strides
 }
 
 /// Read a little-endian unsigned integer of `n` bytes into a u64.

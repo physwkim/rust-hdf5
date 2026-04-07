@@ -104,6 +104,75 @@ impl H5Type for f64 {
     }
 }
 
+/// HDF5 boolean type, stored as u8 (0=false, 1=true).
+///
+/// This is a `Copy` type that can be used with `H5Type`:
+/// ```
+/// use hdf5::types::HBool;
+/// let t: HBool = true.into();
+/// let b: bool = t.into();
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(transparent)]
+pub struct HBool(pub u8);
+
+impl From<bool> for HBool {
+    fn from(b: bool) -> Self { Self(b as u8) }
+}
+
+impl From<HBool> for bool {
+    fn from(h: HBool) -> Self { h.0 != 0 }
+}
+
+impl H5Type for HBool {
+    fn hdf5_type() -> DatatypeMessage { DatatypeMessage::bool_type() }
+    fn element_size() -> usize { 1 }
+}
+
+/// Complex number with f32 real and imaginary parts (8 bytes total).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[repr(C)]
+pub struct Complex32 {
+    pub re: f32,
+    pub im: f32,
+}
+
+impl H5Type for Complex32 {
+    fn hdf5_type() -> DatatypeMessage {
+        use hdf5_format::messages::datatype::CompoundMember;
+        DatatypeMessage::Compound {
+            size: 8,
+            members: vec![
+                CompoundMember { name: "r".to_string(), offset: 0, datatype: DatatypeMessage::f32_type() },
+                CompoundMember { name: "i".to_string(), offset: 4, datatype: DatatypeMessage::f32_type() },
+            ],
+        }
+    }
+    fn element_size() -> usize { 8 }
+}
+
+/// Complex number with f64 real and imaginary parts (16 bytes total).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[repr(C)]
+pub struct Complex64 {
+    pub re: f64,
+    pub im: f64,
+}
+
+impl H5Type for Complex64 {
+    fn hdf5_type() -> DatatypeMessage {
+        use hdf5_format::messages::datatype::CompoundMember;
+        DatatypeMessage::Compound {
+            size: 16,
+            members: vec![
+                CompoundMember { name: "r".to_string(), offset: 0, datatype: DatatypeMessage::f64_type() },
+                CompoundMember { name: "i".to_string(), offset: 8, datatype: DatatypeMessage::f64_type() },
+            ],
+        }
+    }
+    fn element_size() -> usize { 16 }
+}
+
 /// A description of a compound (struct) type for use with HDF5 datasets.
 ///
 /// Users can build compound types manually to describe structured data.

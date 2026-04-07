@@ -6,7 +6,7 @@
 
 use crate::attribute::AttrBuilder;
 use crate::error::{Hdf5Error, Result};
-use crate::file::{H5FileInner, SharedInner, borrow_inner_mut, clone_inner};
+use crate::file::{H5FileInner, SharedInner, borrow_inner, borrow_inner_mut, clone_inner};
 use crate::types::H5Type;
 
 // ---------------------------------------------------------------------------
@@ -30,6 +30,9 @@ pub struct DatasetBuilder<T: H5Type> {
     shape: Option<Vec<usize>>,
     chunk_dims: Option<Vec<usize>>,
     max_shape: Option<Vec<Option<usize>>>,
+    deflate_level: Option<u32>,
+    shuffle_deflate_level: Option<u32>,
+    group_path: Option<String>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -40,6 +43,22 @@ impl<T: H5Type> DatasetBuilder<T> {
             shape: None,
             chunk_dims: None,
             max_shape: None,
+            deflate_level: None,
+            shuffle_deflate_level: None,
+            group_path: None,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn new_in_group(file_inner: SharedInner, group_path: String) -> Self {
+        Self {
+            file_inner,
+            shape: None,
+            chunk_dims: None,
+            max_shape: None,
+            deflate_level: None,
+            shuffle_deflate_level: None,
+            group_path: Some(group_path),
             _marker: std::marker::PhantomData,
         }
     }
@@ -47,9 +66,17 @@ impl<T: H5Type> DatasetBuilder<T> {
     /// Set the dataset dimensions.
     ///
     /// This is required before calling [`create`](Self::create).
+    /// Use an empty slice `&[]` for a scalar (0-dimensional) dataset.
     #[must_use]
     pub fn shape<S: AsRef<[usize]>>(mut self, dims: S) -> Self {
         self.shape = Some(dims.as_ref().to_vec());
+        self
+    }
+
+    /// Create a scalar (0-dimensional) dataset holding a single value.
+    #[must_use]
+    pub fn scalar(mut self) -> Self {
+        self.shape = Some(vec![]);
         self
     }
 
@@ -80,6 +107,27 @@ impl<T: H5Type> DatasetBuilder<T> {
         self
     }
 
+    /// Enable deflate (gzip) compression with the given level (0-9).
+    ///
+    /// Requires chunked storage (call `.chunk()` before `.create()`).
+    /// Level 0 = no compression, 9 = maximum compression. Default is 6.
+    #[must_use]
+    pub fn deflate(mut self, level: u32) -> Self {
+        self.deflate_level = Some(level);
+        self
+    }
+
+    /// Enable shuffle + deflate compression.
+    ///
+    /// Shuffle reorders bytes by position within elements before compression,
+    /// which typically improves compression ratios for numeric data.
+    /// Requires chunked storage.
+    #[must_use]
+    pub fn shuffle_deflate(mut self, level: u32) -> Self {
+        self.shuffle_deflate_level = Some(level);
+        self
+    }
+
     /// Finalize and create the dataset with the given `name`.
     ///
     /// The name is the link name within the root group (e.g. `"data"` or
@@ -88,6 +136,19 @@ impl<T: H5Type> DatasetBuilder<T> {
         let shape = self.shape.ok_or_else(|| {
             Hdf5Error::InvalidState("shape must be set before calling create()".into())
         })?;
+
+        // Build the full name: if created within a group, prefix with group path
+        let full_name = if let Some(ref gp) = self.group_path {
+            if gp == "/" {
+                name.to_string()
+            } else {
+                let trimmed = gp.trim_start_matches('/');
+                format!("{}/{}", trimmed, name)
+            }
+        } else {
+            name.to_string()
+        };
+        let group_path = self.group_path.clone();
 
         let dims_u64: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
         let datatype = T::hdf5_type();
@@ -109,9 +170,28 @@ impl<T: H5Type> DatasetBuilder<T> {
                 let mut inner = borrow_inner_mut(&self.file_inner);
                 match &mut *inner {
                     H5FileInner::Writer(writer) => {
-                        writer.create_chunked_dataset(
-                            name, datatype, &dims_u64, &max_u64, &chunk_u64,
-                        )?
+                        let idx = if let Some(level) = self.shuffle_deflate_level {
+                            let pipeline = hdf5_format::messages::filter::FilterPipeline::shuffle_deflate(
+                                T::element_size() as u32, level,
+                            );
+                            writer.create_chunked_dataset_with_pipeline(
+                                &full_name, datatype, &dims_u64, &max_u64, &chunk_u64, pipeline,
+                            )?
+                        } else if let Some(level) = self.deflate_level {
+                            writer.create_chunked_dataset_compressed(
+                                &full_name, datatype, &dims_u64, &max_u64, &chunk_u64, level,
+                            )?
+                        } else {
+                            writer.create_chunked_dataset(
+                                &full_name, datatype, &dims_u64, &max_u64, &chunk_u64,
+                            )?
+                        };
+                        if let Some(ref gp) = group_path {
+                            if gp != "/" {
+                                        writer.assign_dataset_to_group(gp, idx)?;
+                            }
+                        }
+                        idx
                     }
                     H5FileInner::Reader(_) => {
                         return Err(Hdf5Error::InvalidState(
@@ -139,7 +219,13 @@ impl<T: H5Type> DatasetBuilder<T> {
                 let mut inner = borrow_inner_mut(&self.file_inner);
                 match &mut *inner {
                     H5FileInner::Writer(writer) => {
-                        writer.create_dataset(name, datatype, &dims_u64)?
+                        let idx = writer.create_dataset(&full_name, datatype, &dims_u64)?;
+                        if let Some(ref gp) = group_path {
+                            if gp != "/" {
+                                        writer.assign_dataset_to_group(gp, idx)?;
+                            }
+                        }
+                        idx
                     }
                     H5FileInner::Reader(_) => {
                         return Err(Hdf5Error::InvalidState(
@@ -254,6 +340,86 @@ impl H5Dataset {
         match &self.info {
             DatasetInfo::Writer { element_size, .. } => *element_size,
             DatasetInfo::Reader { element_size, .. } => *element_size,
+        }
+    }
+
+    /// Return the chunk dimensions, if this is a chunked dataset.
+    pub fn chunk_dims(&self) -> Option<Vec<usize>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let inner = borrow_inner(&self.file_inner);
+                if let H5FileInner::Reader(reader) = &*inner {
+                    if let Some(info) = reader.dataset_info(name) {
+                        if let hdf5_format::messages::data_layout::DataLayoutMessage::ChunkedV4 { chunk_dims, .. } = &info.layout {
+                            // Strip trailing element-size dimension
+                            return Some(chunk_dims[..chunk_dims.len() - 1].iter().map(|&d| d as usize).collect());
+                        }
+                    }
+                }
+                None
+            }
+            DatasetInfo::Writer { .. } => None,
+        }
+    }
+
+    /// Return whether this is a chunked dataset.
+    pub fn is_chunked(&self) -> bool {
+        match &self.info {
+            DatasetInfo::Writer { chunked, .. } => *chunked,
+            DatasetInfo::Reader { name, .. } => {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Reader(reader) => {
+                        if let Some(info) = reader.dataset_info(name) {
+                            matches!(info.layout, hdf5_format::messages::data_layout::DataLayoutMessage::ChunkedV4 { .. })
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    /// Return the names of all attributes on this dataset (read mode only).
+    pub fn attr_names(&self) -> Result<Vec<String>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Reader(reader) => {
+                        Ok(reader.dataset_attr_names(name)?)
+                    }
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "attr_names not available in write mode".into(),
+            )),
+        }
+    }
+
+    /// Open an attribute by name (read mode only).
+    pub fn attr(&self, attr_name: &str) -> Result<crate::attribute::H5Attribute> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Reader(reader) => {
+                        let attr_msg = reader.dataset_attr(name, attr_name)?;
+                        Ok(crate::attribute::H5Attribute::new_reader(
+                            clone_inner(&self.file_inner),
+                            attr_msg.name.clone(),
+                            attr_msg.data.clone(),
+                        ))
+                    }
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "attr() not available in write mode".into(),
+            )),
         }
     }
 
@@ -382,6 +548,37 @@ impl H5Dataset {
         }
     }
 
+    /// Write multiple chunks in a batch, optionally compressing in parallel.
+    ///
+    /// `chunks` is a slice of `(chunk_index, raw_data)` pairs. When a filter
+    /// pipeline is configured and the `parallel` feature is enabled, all
+    /// chunks are compressed concurrently via rayon.
+    pub fn write_chunks_batch(&self, chunks: &[(usize, &[u8])]) -> Result<()> {
+        match &self.info {
+            DatasetInfo::Writer { index, chunked, .. } => {
+                if !*chunked {
+                    return Err(Hdf5Error::InvalidState(
+                        "write_chunks_batch is only for chunked datasets".into(),
+                    ));
+                }
+                let pairs: Vec<(u64, &[u8])> = chunks.iter()
+                    .map(|(idx, data)| (*idx as u64, *data))
+                    .collect();
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Writer(writer) => {
+                        writer.write_chunks_batch(*index, &pairs)?;
+                        Ok(())
+                    }
+                    _ => Err(Hdf5Error::InvalidState("file is no longer in write mode".into())),
+                }
+            }
+            DatasetInfo::Reader { .. } => Err(Hdf5Error::InvalidState(
+                "cannot write in read mode".into(),
+            )),
+        }
+    }
+
     /// Extend the dimensions of a chunked dataset.
     pub fn extend(&self, new_dims: &[usize]) -> Result<()> {
         match &self.info {
@@ -424,6 +621,125 @@ impl H5Dataset {
                 }
             }
             DatasetInfo::Reader { .. } => Ok(()),
+        }
+    }
+
+    /// Read a slice (hyperslab) of the dataset as a typed vector.
+    ///
+    /// `starts` and `counts` define the N-dimensional selection:
+    /// `starts[d]` = first index along dim d, `counts[d]` = how many elements.
+    pub fn read_slice<T: H5Type>(&self, starts: &[usize], counts: &[usize]) -> Result<Vec<T>> {
+        match &self.info {
+            DatasetInfo::Reader { name, element_size, .. } => {
+                if T::element_size() != *element_size {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "read type has element size {} but dataset has element size {}",
+                        T::element_size(), element_size,
+                    )));
+                }
+                let starts_u64: Vec<u64> = starts.iter().map(|&s| s as u64).collect();
+                let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
+
+                let raw = {
+                    let mut inner = borrow_inner_mut(&self.file_inner);
+                    match &mut *inner {
+                        H5FileInner::Reader(reader) => {
+                            reader.read_slice(name, &starts_u64, &counts_u64)?
+                        }
+                        _ => return Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                    }
+                };
+
+                if raw.len() % T::element_size() != 0 {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "raw data size {} is not a multiple of element size {}",
+                        raw.len(), T::element_size(),
+                    )));
+                }
+
+                let count = raw.len() / T::element_size();
+                let mut result = Vec::<T>::with_capacity(count);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        raw.as_ptr(), result.as_mut_ptr() as *mut u8, raw.len(),
+                    );
+                    result.set_len(count);
+                }
+                Ok(result)
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read_slice from a dataset in write mode".into(),
+            )),
+        }
+    }
+
+    /// Write a typed slice to a sub-region of a contiguous dataset.
+    ///
+    /// `starts` and `counts` define the N-dimensional selection.
+    pub fn write_slice<T: H5Type>(&self, starts: &[usize], counts: &[usize], data: &[T]) -> Result<()> {
+        match &self.info {
+            DatasetInfo::Writer { index, element_size, chunked, .. } => {
+                if *chunked {
+                    return Err(Hdf5Error::InvalidState(
+                        "write_slice is only for contiguous datasets".into(),
+                    ));
+                }
+                if T::element_size() != *element_size {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "write type has element size {} but dataset expects {}",
+                        T::element_size(), element_size,
+                    )));
+                }
+
+                let expected: usize = counts.iter().product();
+                if data.len() != expected {
+                    return Err(Hdf5Error::InvalidState(format!(
+                        "data length {} does not match slice size {}",
+                        data.len(), expected,
+                    )));
+                }
+
+                let starts_u64: Vec<u64> = starts.iter().map(|&s| s as u64).collect();
+                let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
+
+                let byte_len = data.len() * T::element_size();
+                let raw = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len)
+                };
+
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Writer(writer) => {
+                        writer.write_slice(*index, &starts_u64, &counts_u64, raw)?;
+                        Ok(())
+                    }
+                    _ => Err(Hdf5Error::InvalidState("file is no longer in write mode".into())),
+                }
+            }
+            DatasetInfo::Reader { .. } => Err(Hdf5Error::InvalidState(
+                "cannot write in read mode".into(),
+            )),
+        }
+    }
+
+    /// Read variable-length strings from a dataset.
+    ///
+    /// This handles h5py-style vlen string datasets that store strings
+    /// as global heap references. Returns one String per element.
+    pub fn read_vlen_strings(&self) -> Result<Vec<String>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => {
+                        Ok(reader.read_vlen_strings(name)?)
+                    }
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read vlen strings from a dataset in write mode".into(),
+            )),
         }
     }
 
@@ -635,6 +951,37 @@ mod tests {
     }
 
     #[test]
+    fn numeric_attr_roundtrip() {
+        let path = temp_path("num_attr");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file.new_dataset::<f32>().shape([4]).create("data").unwrap();
+            ds.write_raw(&[1.0f32; 4]).unwrap();
+
+            let a1 = ds.new_attr::<f64>().shape(()).create("scale").unwrap();
+            a1.write_numeric(&1.2345f64).unwrap();
+
+            let a2 = ds.new_attr::<i32>().shape(()).create("count").unwrap();
+            a2.write_numeric(&42i32).unwrap();
+
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("data").unwrap();
+
+            let scale = ds.attr("scale").unwrap();
+            let val: f64 = scale.read_numeric().unwrap();
+            assert!((val - 1.2345).abs() < 1e-10);
+
+            let count = ds.attr("count").unwrap();
+            let val: i32 = count.read_numeric().unwrap();
+            assert_eq!(val, 42);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn cannot_create_dataset_in_read_mode() {
         let path = temp_path("no_create_read");
 
@@ -662,6 +1009,93 @@ mod tests {
             .create("tensor")
             .unwrap();
         assert_eq!(ds.shape(), vec![5, 10, 3]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn slice_roundtrip_2d() {
+        let path = temp_path("slice_2d");
+
+        // Create a 4x5 dataset, write full, then read a slice
+        let data: Vec<i32> = (0..20).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file.new_dataset::<i32>().shape([4, 5]).create("mat").unwrap();
+            ds.write_raw(&data).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("mat").unwrap();
+            // Read rows 1..3, cols 2..4 (2x2 slice)
+            let slice = ds.read_slice::<i32>(&[1, 2], &[2, 2]).unwrap();
+            // Row 1: [5,6,7,8,9] -> cols 2..4 = [7,8]
+            // Row 2: [10,11,12,13,14] -> cols 2..4 = [12,13]
+            assert_eq!(slice, vec![7, 8, 12, 13]);
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn write_slice_2d() {
+        let path = temp_path("write_slice_2d");
+
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file.new_dataset::<f32>().shape([3, 4]).create("data").unwrap();
+            ds.write_raw(&[0.0f32; 12]).unwrap();
+            // Overwrite a 2x2 sub-region
+            ds.write_slice(&[1, 1], &[2, 2], &[10.0f32, 20.0, 30.0, 40.0]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("data").unwrap();
+            let full = ds.read_raw::<f32>().unwrap();
+            // Row 0: [0,0,0,0]
+            // Row 1: [0,10,20,0]
+            // Row 2: [0,30,40,0]
+            assert_eq!(full, vec![
+                0.0, 0.0, 0.0, 0.0,
+                0.0, 10.0, 20.0, 0.0,
+                0.0, 30.0, 40.0, 0.0,
+            ]);
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn attr_read_roundtrip() {
+        use crate::types::VarLenUnicode;
+        let path = temp_path("attr_read");
+
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file.new_dataset::<u8>().shape([4]).create("data").unwrap();
+            ds.write_raw(&[1u8, 2, 3, 4]).unwrap();
+            let a1 = ds.new_attr::<VarLenUnicode>().shape(()).create("units").unwrap();
+            a1.write_string("meters").unwrap();
+            let a2 = ds.new_attr::<VarLenUnicode>().shape(()).create("desc").unwrap();
+            a2.write_string("test data").unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("data").unwrap();
+
+            let names = ds.attr_names().unwrap();
+            assert!(names.contains(&"units".to_string()));
+            assert!(names.contains(&"desc".to_string()));
+
+            let units = ds.attr("units").unwrap();
+            assert_eq!(units.read_string().unwrap(), "meters");
+
+            let desc = ds.attr("desc").unwrap();
+            assert_eq!(desc.read_string().unwrap(), "test data");
+        }
 
         std::fs::remove_file(&path).ok();
     }

@@ -14,3 +14,10 @@ hdf5-io = { path = "../hdf5-io" }
 [features]
 default = []
 threadsafe = []
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "io_bench"
+harness = false

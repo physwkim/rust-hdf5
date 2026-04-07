@@ -218,6 +218,19 @@ impl DatatypeMessage {
         }
     }
 
+    /// Boolean type (stored as 1-byte enum: 0=FALSE, 1=TRUE).
+    ///
+    /// HDF5 represents booleans as an enumerated type over u8.
+    pub fn bool_type() -> Self {
+        Self::Enum {
+            base: Box::new(Self::u8_type()),
+            members: vec![
+                EnumMember { name: "FALSE".to_string(), value: vec![0] },
+                EnumMember { name: "TRUE".to_string(), value: vec![1] },
+            ],
+        }
+    }
+
     /// Null-terminated ASCII fixed-length string.
     pub fn fixed_string(size: u32) -> Self {
         Self::FixedString {

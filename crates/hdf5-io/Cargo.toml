@@ -9,8 +9,10 @@ repository.workspace = true
 
 [dependencies]
 hdf5-format = { path = "../hdf5-format" }
+memmap2 = { version = "0.9", optional = true }
 rayon = { version = "1", optional = true }
 
 [features]
 default = ["parallel"]
-parallel = ["rayon", "hdf5-format/parallel"]
+parallel = ["rayon", "hdf5-format/parallel", "hdf5-format/deflate"]
+mmap = ["memmap2"]
