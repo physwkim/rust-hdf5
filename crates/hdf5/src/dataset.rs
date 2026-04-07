@@ -32,6 +32,7 @@ pub struct DatasetBuilder<T: H5Type> {
     max_shape: Option<Vec<Option<usize>>>,
     deflate_level: Option<u32>,
     shuffle_deflate_level: Option<u32>,
+    custom_pipeline: Option<hdf5_format::messages::filter::FilterPipeline>,
     group_path: Option<String>,
     _marker: std::marker::PhantomData<T>,
 }
@@ -45,6 +46,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             max_shape: None,
             deflate_level: None,
             shuffle_deflate_level: None,
+            custom_pipeline: None,
             group_path: None,
             _marker: std::marker::PhantomData,
         }
@@ -58,6 +60,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             max_shape: None,
             deflate_level: None,
             shuffle_deflate_level: None,
+            custom_pipeline: None,
             group_path: Some(group_path),
             _marker: std::marker::PhantomData,
         }
@@ -128,6 +131,16 @@ impl<T: H5Type> DatasetBuilder<T> {
         self
     }
 
+    /// Set a custom filter pipeline for compression.
+    ///
+    /// This takes precedence over [`deflate`](Self::deflate) and
+    /// [`shuffle_deflate`](Self::shuffle_deflate). Requires chunked storage.
+    #[must_use]
+    pub fn filter_pipeline(mut self, pipeline: hdf5_format::messages::filter::FilterPipeline) -> Self {
+        self.custom_pipeline = Some(pipeline);
+        self
+    }
+
     /// Finalize and create the dataset with the given `name`.
     ///
     /// The name is the link name within the root group (e.g. `"data"` or
@@ -170,7 +183,11 @@ impl<T: H5Type> DatasetBuilder<T> {
                 let mut inner = borrow_inner_mut(&self.file_inner);
                 match &mut *inner {
                     H5FileInner::Writer(writer) => {
-                        let idx = if let Some(level) = self.shuffle_deflate_level {
+                        let idx = if let Some(pipeline) = self.custom_pipeline {
+                            writer.create_chunked_dataset_with_pipeline(
+                                &full_name, datatype, &dims_u64, &max_u64, &chunk_u64, pipeline,
+                            )?
+                        } else if let Some(level) = self.shuffle_deflate_level {
                             let pipeline =
                                 hdf5_format::messages::filter::FilterPipeline::shuffle_deflate(
                                     T::element_size() as u32,
