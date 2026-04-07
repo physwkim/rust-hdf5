@@ -7,31 +7,58 @@ use super::constants::*;
 
 /// Compress data into a zstd frame.
 ///
-/// Returns a valid zstd frame that can be decompressed by any conformant decoder
-/// or any other conformant decoder.
-pub fn compress(data: &[u8], #[allow(unused)] _level: i32) -> Vec<u8> {
+/// `level` controls the compression strategy:
+/// - 0: no compression (raw blocks, fastest)
+/// - 1-2: greedy matching (fast, hash_log=14)
+/// - 3-5: lazy matching (better ratio, hash_log=15)
+/// - 6-8: lazy matching + deeper search (hash_log=16)
+/// - 9-11: lazy matching + deepest search (hash_log=17)
+///
+/// Returns a valid zstd frame decompressible by any conformant decoder.
+pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() + 64);
-
-    // Frame header
     write_frame_header(&mut out, data.len() as u64);
 
-    // Split into blocks (max 128KB each)
+    if data.is_empty() {
+        write_raw_block(&mut out, &[], true);
+        return out;
+    }
+
     let blocks: Vec<&[u8]> = data.chunks(ZSTD_BLOCKSIZE_MAX).collect();
     let n_blocks = blocks.len();
 
-    for (i, block) in blocks.iter().enumerate() {
-        let is_last = i == n_blocks - 1;
-        match compress_block(block) {
-            Some(compressed) if compressed.len() < block.len() => {
-                write_compressed_block(&mut out, &compressed, is_last);
-            }
-            _ => write_raw_block(&mut out, block, is_last),
+    if level <= 0 {
+        // Level 0: raw blocks only
+        for (i, block) in blocks.iter().enumerate() {
+            write_raw_block(&mut out, block, i == n_blocks - 1);
         }
+        return out;
     }
 
-    // Handle empty input
-    if data.is_empty() {
-        write_raw_block(&mut out, &[], true);
+    // Level 1+: compress blocks (optionally in parallel)
+    let params = MatchParams::from_level(level);
+
+    #[cfg(feature = "parallel")]
+    let compressed_blocks: Vec<Option<Vec<u8>>> = {
+        use rayon::prelude::*;
+        blocks.par_iter()
+            .map(|block| compress_block(block, &params))
+            .collect()
+    };
+
+    #[cfg(not(feature = "parallel"))]
+    let compressed_blocks: Vec<Option<Vec<u8>>> = blocks.iter()
+        .map(|block| compress_block(block, &params))
+        .collect();
+
+    for (i, compressed) in compressed_blocks.iter().enumerate() {
+        let is_last = i == n_blocks - 1;
+        match compressed {
+            Some(c) if c.len() < blocks[i].len() => {
+                write_compressed_block(&mut out, c, is_last);
+            }
+            _ => write_raw_block(&mut out, blocks[i], is_last),
+        }
     }
 
     out
@@ -116,8 +143,26 @@ struct Sequence {
     ml: u32,   // match length (raw, not -3)
 }
 
-fn compress_block(data: &[u8]) -> Option<Vec<u8>> {
-    let sequences = find_matches(data);
+/// Match finder parameters, derived from compression level.
+struct MatchParams {
+    hash_log: u32,
+    lazy_depth: u32,   // 0=greedy, 1=lazy, 2=lazy2
+    search_depth: u32, // hash chain search depth
+}
+
+impl MatchParams {
+    fn from_level(level: i32) -> Self {
+        match level {
+            0..=2 => Self { hash_log: 14, lazy_depth: 0, search_depth: 4 },
+            3..=5 => Self { hash_log: 15, lazy_depth: 1, search_depth: 16 },
+            6..=8 => Self { hash_log: 16, lazy_depth: 1, search_depth: 64 },
+            _     => Self { hash_log: 17, lazy_depth: 1, search_depth: 128 },
+        }
+    }
+}
+
+fn compress_block(data: &[u8], params: &MatchParams) -> Option<Vec<u8>> {
+    let sequences = find_matches(data, params);
 
     if sequences.is_empty() {
         return None; // No matches found, use raw block
@@ -149,59 +194,127 @@ fn compress_block(data: &[u8]) -> Option<Vec<u8>> {
     Some(block)
 }
 
-/// Greedy hash-based match finder (zstd level 1 strategy).
-fn find_matches(data: &[u8]) -> Vec<Sequence> {
+/// Hash chain match finder with configurable lazy depth.
+///
+/// - `lazy_depth=0`: greedy — take first match (level 1-2)
+/// - `lazy_depth=1`: lazy — check next position for better match (level 3+)
+fn find_matches(data: &[u8], params: &MatchParams) -> Vec<Sequence> {
     if data.len() < ZSTD_MINMATCH + 1 {
         return vec![];
     }
 
-    let hash_log = 14u32;
-    let hash_size = 1usize << hash_log;
+    let hash_size = 1usize << params.hash_log;
+    let hash_mask = (hash_size - 1) as u32;
     let mut hash_table = vec![0u32; hash_size];
+    let mut chain = vec![0u32; data.len()];
     let mut sequences = Vec::new();
-    let mut anchor = 0usize; // start of current literal run
+    let mut anchor = 0usize;
     let mut ip = 0usize;
 
     while ip + ZSTD_MINMATCH < data.len() {
-        let h = hash4(&data[ip..]) & ((hash_size - 1) as u32);
-        let match_pos = hash_table[h as usize] as usize;
-        hash_table[h as usize] = ip as u32;
+        // Try to find a match at current position
+        let best = find_best_at(data, ip, &hash_table, &chain, hash_mask, params.search_depth);
 
-        // Check match
-        if match_pos > 0
-            && ip - match_pos < (1 << 24) // max offset
-            && ip - match_pos > 0
-            && data[match_pos..].len() >= ZSTD_MINMATCH
-            && data[match_pos..match_pos + 4] == data[ip..ip + 4]
-        {
-            // Found a match — extend it
-            let mut ml = 4;
-            let max_ml = std::cmp::min(data.len() - ip, data.len() - match_pos);
-            while ml < max_ml && data[match_pos + ml] == data[ip + ml] {
-                ml += 1;
+        if let Some((offset, match_len)) = best {
+            let mut final_off = offset;
+            let mut final_len = match_len;
+            let mut final_ip = ip;
+
+            // Lazy matching: check if next position gives a better match
+            if params.lazy_depth >= 1 && ip + 1 + ZSTD_MINMATCH < data.len() {
+                insert_hash(&mut hash_table, &mut chain, data, ip, hash_mask);
+                if let Some((off2, len2)) = find_best_at(data, ip + 1, &hash_table, &chain, hash_mask, params.search_depth) {
+                    if len2 > final_len + 1 {
+                        final_off = off2;
+                        final_len = len2;
+                        final_ip = ip + 1;
+                    }
+                }
             }
 
-            if ml >= ZSTD_MINMATCH {
-                let ll = (ip - anchor) as u32;
-                let offset = (ip - match_pos) as u32;
+            let ll = (final_ip - anchor) as u32;
+            sequences.push(Sequence { ll, off: final_off as u32, ml: final_len as u32 });
 
-                sequences.push(Sequence { ll, off: offset, ml: ml as u32 });
-                ip += ml;
-                anchor = ip;
-                continue;
+            // Insert all positions within the match for future matching
+            for p in ip..std::cmp::min(final_ip + final_len, data.len().saturating_sub(ZSTD_MINMATCH)) {
+                insert_hash(&mut hash_table, &mut chain, data, p, hash_mask);
             }
+
+            ip = final_ip + final_len;
+            anchor = ip;
+        } else {
+            insert_hash(&mut hash_table, &mut chain, data, ip, hash_mask);
+            ip += 1;
         }
-
-        ip += 1;
     }
 
     sequences
 }
 
-/// 4-byte hash function (from zstd fast strategy).
-fn hash4(data: &[u8]) -> u32 {
+/// Insert position into hash chain.
+#[inline]
+fn insert_hash(hash_table: &mut [u32], chain: &mut [u32], data: &[u8], pos: usize, mask: u32) {
+    if pos + 4 > data.len() { return; }
+    let h = hash4(&data[pos..], mask);
+    chain[pos] = hash_table[h];
+    hash_table[h] = pos as u32;
+}
+
+/// Find the best match at `pos` by walking the hash chain.
+fn find_best_at(
+    data: &[u8], pos: usize,
+    hash_table: &[u32], chain: &[u32],
+    mask: u32, max_depth: u32,
+) -> Option<(usize, usize)> {
+    if pos + ZSTD_MINMATCH > data.len() { return None; }
+    let h = hash4(&data[pos..], mask);
+    let mut candidate = hash_table[h] as usize;
+    let mut best_len = ZSTD_MINMATCH - 1;
+    let mut best_off = 0;
+
+    for _ in 0..max_depth {
+        if candidate >= pos || pos - candidate > (1 << 24) { break; }
+        if candidate + ZSTD_MINMATCH > data.len() { break; }
+
+        // Quick 4-byte check
+        if data[candidate..candidate + 4] == data[pos..pos + 4] {
+            let ml = common_prefix_len(&data[candidate..], &data[pos..]);
+            if ml > best_len {
+                best_len = ml;
+                best_off = pos - candidate;
+            }
+        }
+
+        let next = chain[candidate] as usize;
+        if next >= candidate { break; }
+        candidate = next;
+    }
+
+    if best_len >= ZSTD_MINMATCH { Some((best_off, best_len)) } else { None }
+}
+
+/// Fast common prefix length using 8-byte chunks.
+#[inline]
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    let max = std::cmp::min(a.len(), b.len());
+    let mut i = 0;
+    while i + 8 <= max {
+        let va = u64::from_le_bytes(a[i..i+8].try_into().unwrap());
+        let vb = u64::from_le_bytes(b[i..i+8].try_into().unwrap());
+        if va != vb {
+            return i + ((va ^ vb).trailing_zeros() / 8) as usize;
+        }
+        i += 8;
+    }
+    while i < max && a[i] == b[i] { i += 1; }
+    i
+}
+
+/// 4-byte multiplicative hash, result masked to table size.
+#[inline]
+fn hash4(data: &[u8], mask: u32) -> usize {
     let v = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    v.wrapping_mul(0x9E3779B1) >> 18
+    (v.wrapping_mul(0x9E3779B1) as usize) & (mask as usize)
 }
 
 // =========================================================================
