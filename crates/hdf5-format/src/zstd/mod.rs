@@ -1,8 +1,5 @@
 #![allow(dead_code, clippy::needless_range_loop, clippy::len_without_is_empty)]
-//! Pure Rust Zstandard compressor.
-//!
-//! Produces valid zstd frames compatible with any standard decoder.
-//! Both compression and decompression are fully self-contained — zero external dependencies.
+//! Pure Rust Zstandard codec — compress + decompress, zero external dependencies.
 
 pub mod bitstream;
 pub mod constants;
