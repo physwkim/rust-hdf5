@@ -672,6 +672,7 @@ mod integration_tests {
     }
 
     #[test]
+    #[cfg(feature = "deflate")]
     fn compressed_chunked_roundtrip() {
         let path = std::env::temp_dir().join("hdf5_compressed_roundtrip.h5");
 
@@ -718,6 +719,7 @@ mod integration_tests {
     }
 
     #[test]
+    #[cfg(feature = "deflate")]
     fn compressed_chunked_many_frames() {
         let path = std::env::temp_dir().join("hdf5_compressed_many.h5");
 
@@ -818,6 +820,7 @@ mod integration_tests {
     }
 
     #[test]
+    #[cfg(feature = "deflate")]
     fn shuffle_deflate_roundtrip() {
         let path = std::env::temp_dir().join("hdf5_shuf_defl.h5");
         {
@@ -1082,6 +1085,7 @@ mod h5py_compat_tests {
 
     /// Verify our files can be read by h5dump (if available).
     #[test]
+    #[cfg(feature = "deflate")]
     fn h5dump_validates_our_files() {
         // Check if h5dump is available
         let h5dump = std::process::Command::new("h5dump")
