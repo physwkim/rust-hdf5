@@ -1,10 +1,10 @@
-# hdf5-rs
+# rust-hdf5
 
 Pure Rust HDF5 library — no C dependencies.
 
 Read and write HDF5 files with contiguous, chunked, and compressed datasets, hierarchical groups, attributes, SWMR streaming, and hyperslab I/O.
 
-## Why hdf5-rs?
+## Why rust-hdf5?
 
 - **Zero C dependencies** — no `libhdf5`, no `h5cc`, no system packages. Works anywhere Rust compiles.
 - **Memory safe** — Rust's type system prevents buffer overflows, use-after-free, and data races. Minimal `unsafe` only for type reinterpretation.
@@ -33,13 +33,13 @@ Read and write HDF5 files with contiguous, chunked, and compressed datasets, hie
 
 ```toml
 [dependencies]
-hdf5 = { path = "crates/hdf5" }
+rust-hdf5 = "0.1"
 ```
 
 ### Write
 
 ```rust
-use hdf5::H5File;
+use rust_hdf5::H5File;
 
 let file = H5File::create("output.h5")?;
 let ds = file.new_dataset::<f64>()
@@ -52,7 +52,7 @@ file.close()?;
 ### Read
 
 ```rust
-use hdf5::H5File;
+use rust_hdf5::H5File;
 
 let file = H5File::open("output.h5")?;
 let ds = file.dataset("matrix")?;
@@ -63,7 +63,7 @@ assert_eq!(data.len(), 20_000);
 ### Chunked + compressed streaming
 
 ```rust
-use hdf5::H5File;
+use rust_hdf5::H5File;
 
 let file = H5File::create("stream.h5")?;
 let ds = file.new_dataset::<f32>()
@@ -85,7 +85,7 @@ file.close()?;
 ### Groups
 
 ```rust
-use hdf5::H5File;
+use rust_hdf5::H5File;
 
 let file = H5File::create("groups.h5")?;
 let det = file.create_group("detector")?;
@@ -106,7 +106,7 @@ assert_eq!(ds.shape(), vec![64, 64]);
 ### Hyperslab (slice) I/O
 
 ```rust
-use hdf5::H5File;
+use rust_hdf5::H5File;
 
 let file = H5File::create("slice.h5")?;
 let ds = file.new_dataset::<i32>()
@@ -128,7 +128,7 @@ assert_eq!(region, vec![1, 2, 3, 4, 5, 6]);
 ### Attributes
 
 ```rust
-use hdf5::{H5File, VarLenUnicode};
+use rust_hdf5::{H5File, VarLenUnicode};
 
 let file = H5File::create("attrs.h5")?;
 let ds = file.new_dataset::<f32>().shape(&[10]).create("data")?;
@@ -148,7 +148,7 @@ assert_eq!(units.read_string()?, "kelvin");
 ### Append mode
 
 ```rust
-use hdf5::H5File;
+use rust_hdf5::H5File;
 
 // Add datasets to an existing file
 let file = H5File::open_rw("existing.h5")?;
@@ -160,7 +160,7 @@ file.close()?;
 ### SWMR streaming
 
 ```rust
-use hdf5::swmr::{SwmrFileWriter, SwmrFileReader};
+use rust_hdf5::swmr::{SwmrFileWriter, SwmrFileReader};
 
 // Writer process
 let mut writer = SwmrFileWriter::create("swmr.h5")?;
@@ -175,22 +175,6 @@ let mut reader = SwmrFileReader::open("swmr.h5")?;
 reader.refresh()?;
 let data = reader.read_dataset::<f32>("frames")?;
 ```
-
-## Crate structure
-
-```
-hdf5-rs/
-├── crates/
-│   ├── hdf5-format/   # On-disk format codec (encode/decode, no I/O)
-│   ├── hdf5-io/       # I/O engine (file handles, reader, writer, SWMR)
-│   └── hdf5/          # Public API (H5File, H5Dataset, H5Group, H5Attribute)
-```
-
-| Crate | Description |
-|-------|-------------|
-| `hdf5-format` | Pure format codec — superblock, object headers, messages, chunk indices |
-| `hdf5-io` | I/O layer — buffered file handles, allocator, reader, writer, SWMR protocol |
-| `hdf5` | High-level API — fluent builders, typed read/write, groups, attributes |
 
 ## Supported types
 
@@ -210,8 +194,8 @@ hdf5-rs/
 
 ## Compression filters
 
-| Filter | Feature flag | Crate |
-|--------|-------------|-------|
+| Filter | Feature flag | Dependency |
+|--------|-------------|------------|
 | Deflate (gzip) | `deflate` (default) | `flate2` |
 | Shuffle | built-in | — |
 | Fletcher-32 | built-in | — |
@@ -221,19 +205,22 @@ hdf5-rs/
 ```toml
 # Enable LZ4 + Zstandard
 [dependencies]
-hdf5-format = { path = "crates/hdf5-format", features = ["lz4", "zstd"] }
+rust-hdf5 = { version = "0.1", features = ["lz4", "zstd"] }
 ```
 
 ## Feature flags
 
-| Feature | Crate | Description |
-|---------|-------|-------------|
-| `deflate` | `hdf5-format` | Deflate compression (default) |
-| `lz4` | `hdf5-format` | LZ4 compression |
-| `zstd` | `hdf5-format` | Zstandard compression (`rust-zstd`) |
-| `parallel` | `hdf5-io` | Parallel chunk compression via rayon (default) |
-| `threadsafe` | `hdf5` | `Send + Sync` file handles (`Arc<Mutex>`) |
-| `mmap` | `hdf5-io` | Memory-mapped read-only file access |
+| Feature | Description |
+|---------|-------------|
+| `deflate` | Deflate compression (default) |
+| `lz4` | LZ4 compression |
+| `zstd` | Zstandard compression |
+| `bzip2` | BZIP2 compression |
+| `blosc` | Blosc meta-compressor |
+| `all_filters` | All compression filters |
+| `parallel` | Parallel chunk compression via rayon |
+| `threadsafe` | `Send + Sync` file handles (`Arc<Mutex>`) |
+| `mmap` | Memory-mapped read-only file access |
 
 ## HDF5 format support
 
@@ -258,7 +245,7 @@ hdf5-format = { path = "crates/hdf5-format", features = ["lz4", "zstd"] }
 ## Benchmarks
 
 ```sh
-cargo bench -p hdf5
+cargo bench
 ```
 
 Benchmarks cover contiguous read/write, chunked write, and compressed write throughput using [criterion](https://bheisler.github.io/criterion.rs/).
@@ -266,7 +253,7 @@ Benchmarks cover contiguous read/write, chunked write, and compressed write thro
 ## Testing
 
 ```sh
-cargo test --workspace
+cargo test --all-features
 ```
 
 Tests cover format codec, I/O roundtrips, compression, groups, attributes, SWMR, slice I/O, append mode with dataset resize, scalar datasets, and h5dump validation.
