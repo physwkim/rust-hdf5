@@ -605,7 +605,7 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
             if compress {
                 blosc_compress(data, filter)
             } else {
-                blosc_decompress(data)
+                blosc_decompress(data, filter)
             }
         }
         #[cfg(not(feature = "blosc"))]
@@ -1201,15 +1201,108 @@ fn frexp_f64(x: f64) -> (f64, i32) {
 }
 
 // =========================================================================
-// BLOSC (32001) — compress via LZ4 sub-codec, decompress by parsing header
+// BLOSC (32001) — sub-codec dispatch: BloscLZ, LZ4, LZ4HC, Snappy, Zlib, Zstd
 // =========================================================================
+
+/// Blosc compressor codes (cd_values[6]).
+#[cfg(feature = "blosc")]
+const BLOSC_BLOSCLZ: u32 = 0;
+#[cfg(feature = "blosc")]
+const BLOSC_LZ4: u32 = 1;
+#[cfg(feature = "blosc")]
+const BLOSC_LZ4HC: u32 = 2;
+#[cfg(feature = "blosc")]
+const BLOSC_SNAPPY: u32 = 3;
+#[cfg(feature = "blosc")]
+const BLOSC_ZLIB: u32 = 4;
+#[cfg(feature = "blosc")]
+const BLOSC_ZSTD: u32 = 5;
+
+#[cfg(feature = "blosc")]
+fn blosc_sub_compress(compressor: u32, data: &[u8]) -> FormatResult<Vec<u8>> {
+    match compressor {
+        BLOSC_BLOSCLZ => Ok(blosclz_compress(data, 5)),
+        BLOSC_LZ4 | BLOSC_LZ4HC => {
+            // LZ4HC decompresses identically to LZ4; we compress with standard LZ4
+            Ok(lz4_flex::compress(data))
+        }
+        BLOSC_SNAPPY => {
+            let mut enc = snap::raw::Encoder::new();
+            enc.compress_vec(data)
+                .map_err(|e| FormatError::InvalidData(format!("blosc snappy compress: {}", e)))
+        }
+        #[cfg(feature = "deflate")]
+        BLOSC_ZLIB => {
+            use flate2::write::ZlibEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::new(6));
+            enc.write_all(data)
+                .map_err(|e| FormatError::InvalidData(format!("blosc zlib: {}", e)))?;
+            enc.finish()
+                .map_err(|e| FormatError::InvalidData(format!("blosc zlib: {}", e)))
+        }
+        #[cfg(not(feature = "deflate"))]
+        BLOSC_ZLIB => Err(FormatError::UnsupportedFeature(
+            "blosc zlib sub-codec requires the 'deflate' feature".into(),
+        )),
+        #[cfg(feature = "zstd")]
+        BLOSC_ZSTD => Ok(rust_zstd::compress(data, 3)),
+        #[cfg(not(feature = "zstd"))]
+        BLOSC_ZSTD => Err(FormatError::UnsupportedFeature(
+            "blosc zstd sub-codec requires the 'zstd' feature".into(),
+        )),
+        other => Err(FormatError::UnsupportedFeature(format!(
+            "blosc compressor code {}",
+            other
+        ))),
+    }
+}
+
+#[cfg(feature = "blosc")]
+fn blosc_sub_decompress(compressor: u32, data: &[u8], nbytes: usize) -> FormatResult<Vec<u8>> {
+    match compressor {
+        BLOSC_BLOSCLZ => blosclz_decompress(data, nbytes),
+        BLOSC_LZ4 | BLOSC_LZ4HC => lz4_flex::decompress(data, nbytes)
+            .map_err(|e| FormatError::InvalidData(format!("blosc lz4: {}", e))),
+        BLOSC_SNAPPY => {
+            let mut dec = snap::raw::Decoder::new();
+            dec.decompress_vec(data)
+                .map_err(|e| FormatError::InvalidData(format!("blosc snappy: {}", e)))
+        }
+        #[cfg(feature = "deflate")]
+        BLOSC_ZLIB => {
+            use flate2::read::ZlibDecoder;
+            use std::io::Read;
+            let mut dec = ZlibDecoder::new(data);
+            let mut out = Vec::with_capacity(nbytes);
+            dec.read_to_end(&mut out)
+                .map_err(|e| FormatError::InvalidData(format!("blosc zlib: {}", e)))?;
+            Ok(out)
+        }
+        #[cfg(not(feature = "deflate"))]
+        BLOSC_ZLIB => Err(FormatError::UnsupportedFeature(
+            "blosc zlib sub-codec requires the 'deflate' feature".into(),
+        )),
+        #[cfg(feature = "zstd")]
+        BLOSC_ZSTD => rust_zstd::decompress(data)
+            .map_err(|e| FormatError::InvalidData(format!("blosc zstd: {}", e))),
+        #[cfg(not(feature = "zstd"))]
+        BLOSC_ZSTD => Err(FormatError::UnsupportedFeature(
+            "blosc zstd sub-codec requires the 'zstd' feature".into(),
+        )),
+        other => Err(FormatError::UnsupportedFeature(format!(
+            "blosc compressor code {}",
+            other
+        ))),
+    }
+}
 
 #[cfg(feature = "blosc")]
 fn blosc_compress(data: &[u8], filter: &Filter) -> FormatResult<Vec<u8>> {
     let typesize = filter.cd_values.get(2).copied().unwrap_or(1) as usize;
-    let _clevel = filter.cd_values.get(4).copied().unwrap_or(5);
     let doshuffle = filter.cd_values.get(5).copied().unwrap_or(1);
-    let _compressor = filter.cd_values.get(6).copied().unwrap_or(1); // default LZ4
+    let compressor = filter.cd_values.get(6).copied().unwrap_or(BLOSC_LZ4);
 
     // Apply byte-shuffle if requested
     let shuffled = if doshuffle == 1 && typesize > 1 {
@@ -1218,8 +1311,7 @@ fn blosc_compress(data: &[u8], filter: &Filter) -> FormatResult<Vec<u8>> {
         data.to_vec()
     };
 
-    // Compress with LZ4
-    let compressed = lz4_flex::compress(&shuffled);
+    let compressed = blosc_sub_compress(compressor, &shuffled)?;
 
     // Build blosc header (16 bytes)
     let flags: u8 = if doshuffle == 1 { 0x01 } else { 0x00 };
@@ -1229,7 +1321,7 @@ fn blosc_compress(data: &[u8], filter: &Filter) -> FormatResult<Vec<u8>> {
 
     let mut out = Vec::with_capacity(cbytes as usize);
     out.push(2); // blosc format version
-    out.push(1); // lz4 version
+    out.push(1); // compressor format version (always 1, matches C blosc)
     out.push(flags);
     out.push(typesize as u8);
     out.extend_from_slice(&nbytes.to_le_bytes());
@@ -1240,26 +1332,23 @@ fn blosc_compress(data: &[u8], filter: &Filter) -> FormatResult<Vec<u8>> {
 }
 
 #[cfg(feature = "blosc")]
-fn blosc_decompress(data: &[u8]) -> FormatResult<Vec<u8>> {
+fn blosc_decompress(data: &[u8], filter: &Filter) -> FormatResult<Vec<u8>> {
     if data.len() < 16 {
         return Err(FormatError::InvalidData("blosc: header too short".into()));
     }
     let _version = data[0];
-    let _versionlz = data[1];
     let flags = data[2];
     let typesize = data[3] as usize;
     let nbytes = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-    let _blocksize = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
-    let _cbytes = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
 
     let compressed_data = &data[16..];
+    let compressor = filter.cd_values.get(6).copied().unwrap_or(BLOSC_LZ4);
 
     // Check for memcpy flag (flags bit 1)
     let decompressed = if flags & 0x02 != 0 {
         compressed_data[..nbytes].to_vec()
     } else {
-        lz4_flex::decompress(compressed_data, nbytes)
-            .map_err(|e| FormatError::InvalidData(format!("blosc lz4: {}", e)))?
+        blosc_sub_decompress(compressor, compressed_data, nbytes)?
     };
 
     // Unshuffle if byte-shuffle flag set
@@ -1268,6 +1357,390 @@ fn blosc_decompress(data: &[u8]) -> FormatResult<Vec<u8>> {
     } else {
         Ok(decompressed)
     }
+}
+
+// =========================================================================
+// BloscLZ — pure Rust port of the FastLZ-derived LZ77 compressor
+// =========================================================================
+
+#[cfg(feature = "blosc")]
+const BLOSCLZ_MAX_COPY: usize = 32;
+#[cfg(feature = "blosc")]
+const BLOSCLZ_MAX_DISTANCE: usize = 8191;
+#[cfg(feature = "blosc")]
+const BLOSCLZ_MAX_FARDISTANCE: usize = 65535 + BLOSCLZ_MAX_DISTANCE - 1;
+
+#[cfg(feature = "blosc")]
+fn blosclz_hash(seq: u32, hashlog: u32) -> u32 {
+    seq.wrapping_mul(2654435761) >> (32 - hashlog)
+}
+
+#[cfg(feature = "blosc")]
+fn blosclz_compress(input: &[u8], clevel: u32) -> Vec<u8> {
+    let length = input.len();
+    if length < 16 {
+        return Vec::new();
+    }
+
+    let hashlog_table: [u32; 10] = [0, 12, 13, 14, 14, 14, 14, 14, 14, 14];
+    let clevel = (clevel as usize).clamp(1, 9);
+    let hashlog = hashlog_table[clevel];
+    let htab_size = 1usize << hashlog;
+    let mut htab = vec![0u32; htab_size];
+
+    let ipshift: usize = if clevel <= 2 { 3 } else { 4 };
+    let minlen: usize = if clevel <= 2 { 3 } else { 4 };
+
+    let maxout = length + length / 20 + 66;
+    let mut out = Vec::with_capacity(maxout);
+    let op_limit = maxout;
+
+    let ip_bound = length - 1;
+    let ip_limit = if length >= 12 {
+        length - 12
+    } else {
+        return Vec::new();
+    };
+
+    // Start with literal copy
+    let mut copy: usize = 4;
+    out.push((BLOSCLZ_MAX_COPY - 1) as u8);
+    out.push(input[0]);
+    out.push(input[1]);
+    out.push(input[2]);
+    out.push(input[3]);
+    let mut ip: usize = 4;
+
+    while ip < ip_limit {
+        if out.len() + 2 > op_limit {
+            return Vec::new();
+        }
+
+        let anchor = ip;
+        let seq = u32::from_le_bytes([input[ip], input[ip + 1], input[ip + 2], input[ip + 3]]);
+        let hval = blosclz_hash(seq, hashlog) as usize;
+        let r = htab[hval] as usize;
+        let distance = anchor.wrapping_sub(r);
+
+        htab[hval] = anchor as u32;
+
+        if distance == 0 || distance >= BLOSCLZ_MAX_FARDISTANCE {
+            // literal
+            out.push(input[anchor]);
+            ip = anchor + 1;
+            copy += 1;
+            if copy == BLOSCLZ_MAX_COPY {
+                copy = 0;
+                if out.len() + 1 > op_limit {
+                    return Vec::new();
+                }
+                out.push((BLOSCLZ_MAX_COPY - 1) as u8);
+            }
+            continue;
+        }
+
+        // Check first 4 bytes for match
+        if r + 3 < length
+            && input[r] == input[ip]
+            && input[r + 1] == input[ip + 1]
+            && input[r + 2] == input[ip + 2]
+            && input[r + 3] == input[ip + 3]
+        {
+            // match found
+        } else {
+            // literal
+            out.push(input[anchor]);
+            ip = anchor + 1;
+            copy += 1;
+            if copy == BLOSCLZ_MAX_COPY {
+                copy = 0;
+                if out.len() + 1 > op_limit {
+                    return Vec::new();
+                }
+                out.push((BLOSCLZ_MAX_COPY - 1) as u8);
+            }
+            continue;
+        }
+
+        // Extend match
+        let mut ref_pos = r + 4;
+        ip = anchor + 4;
+        let dist_biased = distance - 1;
+
+        if dist_biased == 0 {
+            // RLE run
+            let x = input[ip - 1];
+            while ip < ip_bound && ref_pos < length && input[ref_pos] == x {
+                ip += 1;
+                ref_pos += 1;
+            }
+        } else {
+            while ip < ip_bound && ref_pos < length && input[ref_pos] == input[ip] {
+                ip += 1;
+                ref_pos += 1;
+            }
+        }
+
+        // Bias length
+        if ip > ipshift {
+            ip -= ipshift;
+        } else {
+            ip = anchor + 1;
+            out.push(input[anchor]);
+            copy += 1;
+            if copy == BLOSCLZ_MAX_COPY {
+                copy = 0;
+                if out.len() + 1 > op_limit {
+                    return Vec::new();
+                }
+                out.push((BLOSCLZ_MAX_COPY - 1) as u8);
+            }
+            continue;
+        }
+
+        let len = ip - anchor;
+        if len < minlen || (len <= 5 && dist_biased >= BLOSCLZ_MAX_DISTANCE) {
+            ip = anchor + 1;
+            out.push(input[anchor]);
+            copy += 1;
+            if copy == BLOSCLZ_MAX_COPY {
+                copy = 0;
+                if out.len() + 1 > op_limit {
+                    return Vec::new();
+                }
+                out.push((BLOSCLZ_MAX_COPY - 1) as u8);
+            }
+            continue;
+        }
+
+        // Adjust copy count
+        if copy > 0 {
+            let idx = out.len() - copy - 1;
+            out[idx] = (copy - 1) as u8;
+        } else {
+            out.pop();
+        }
+        copy = 0;
+
+        // Encode match
+        if dist_biased < BLOSCLZ_MAX_DISTANCE {
+            if len < 7 {
+                if out.len() + 2 > op_limit {
+                    return Vec::new();
+                }
+                out.push(((len << 5) + (dist_biased >> 8)) as u8);
+                out.push((dist_biased & 255) as u8);
+            } else {
+                if out.len() + 1 > op_limit {
+                    return Vec::new();
+                }
+                out.push(((7 << 5) + (dist_biased >> 8)) as u8);
+                let mut remaining = len - 7;
+                while remaining >= 255 {
+                    if out.len() + 1 > op_limit {
+                        return Vec::new();
+                    }
+                    out.push(255);
+                    remaining -= 255;
+                }
+                if out.len() + 2 > op_limit {
+                    return Vec::new();
+                }
+                out.push(remaining as u8);
+                out.push((dist_biased & 255) as u8);
+            }
+        } else {
+            // Far distance
+            let far_dist = dist_biased - BLOSCLZ_MAX_DISTANCE;
+            if len < 7 {
+                if out.len() + 4 > op_limit {
+                    return Vec::new();
+                }
+                out.push(((len << 5) + 31) as u8);
+                out.push(255);
+                out.push((far_dist >> 8) as u8);
+                out.push((far_dist & 255) as u8);
+            } else {
+                if out.len() + 1 > op_limit {
+                    return Vec::new();
+                }
+                out.push((7 << 5) + 31);
+                let mut remaining = len - 7;
+                while remaining >= 255 {
+                    if out.len() + 1 > op_limit {
+                        return Vec::new();
+                    }
+                    out.push(255);
+                    remaining -= 255;
+                }
+                if out.len() + 4 > op_limit {
+                    return Vec::new();
+                }
+                out.push(remaining as u8);
+                out.push(255);
+                out.push((far_dist >> 8) as u8);
+                out.push((far_dist & 255) as u8);
+            }
+        }
+
+        // Update hash at match boundary
+        if ip + 3 < length {
+            let seq = u32::from_le_bytes([input[ip], input[ip + 1], input[ip + 2], input[ip + 3]]);
+            let hval = blosclz_hash(seq, hashlog) as usize;
+            htab[hval] = ip as u32;
+        }
+        ip += 1;
+        if clevel == 9 && ip + 3 < length {
+            let seq = u32::from_le_bytes([input[ip], input[ip + 1], input[ip + 2], input[ip + 3]]);
+            let hval = blosclz_hash(seq, hashlog) as usize;
+            htab[hval] = ip as u32;
+        }
+        ip += 1;
+
+        if out.len() + 1 > op_limit {
+            return Vec::new();
+        }
+        out.push((BLOSCLZ_MAX_COPY - 1) as u8);
+    }
+
+    // Left-over as literal copy
+    while ip <= ip_bound {
+        if out.len() + 2 > op_limit {
+            return Vec::new();
+        }
+        out.push(input[ip]);
+        ip += 1;
+        copy += 1;
+        if copy == BLOSCLZ_MAX_COPY {
+            copy = 0;
+            if out.len() + 1 > op_limit {
+                return Vec::new();
+            }
+            out.push((BLOSCLZ_MAX_COPY - 1) as u8);
+        }
+    }
+
+    // Finalize
+    if copy > 0 {
+        let idx = out.len() - copy - 1;
+        out[idx] = (copy - 1) as u8;
+    } else {
+        out.pop();
+    }
+
+    // Set BloscLZ marker (bit 5 of first byte)
+    if !out.is_empty() {
+        out[0] |= 1 << 5;
+    }
+
+    out
+}
+
+#[cfg(feature = "blosc")]
+fn blosclz_decompress(input: &[u8], maxout: usize) -> FormatResult<Vec<u8>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::with_capacity(maxout);
+    let mut ip = 0usize;
+    let ip_limit = input.len();
+
+    // First byte: strip BloscLZ marker (bit 5)
+    let mut ctrl = (input[ip] & 31) as u32;
+    ip += 1;
+
+    loop {
+        if ctrl >= 32 {
+            // Match
+            let mut len = ((ctrl >> 5) - 1) as usize;
+            let ofs = ((ctrl & 31) << 8) as usize;
+
+            if len == 6 {
+                loop {
+                    if ip >= ip_limit {
+                        return Err(FormatError::InvalidData("blosclz: truncated".into()));
+                    }
+                    let code = input[ip] as usize;
+                    ip += 1;
+                    len += code;
+                    if code != 255 {
+                        break;
+                    }
+                }
+            }
+
+            if ip >= ip_limit {
+                return Err(FormatError::InvalidData("blosclz: truncated".into()));
+            }
+            let code = input[ip] as usize;
+            ip += 1;
+            len += 3;
+
+            let mut ref_offset = ofs + code; // distance from current output pos
+
+            // Far distance
+            if code == 255 && ofs == (31 << 8) {
+                if ip + 1 >= ip_limit {
+                    return Err(FormatError::InvalidData("blosclz: truncated far".into()));
+                }
+                let far_ofs = ((input[ip] as usize) << 8) + input[ip + 1] as usize;
+                ip += 2;
+                ref_offset = far_ofs + BLOSCLZ_MAX_DISTANCE;
+            }
+
+            ref_offset += 1; // distance is biased by 1
+
+            if ref_offset > out.len() {
+                return Err(FormatError::InvalidData(
+                    "blosclz: bad back-reference".into(),
+                ));
+            }
+            if out.len() + len > maxout {
+                return Err(FormatError::InvalidData("blosclz: output overflow".into()));
+            }
+
+            let ref_start = out.len() - ref_offset;
+            if ref_offset == 1 {
+                // RLE: repeat single byte
+                let b = out[ref_start];
+                out.resize(out.len() + len, b);
+            } else {
+                // Copy with possible overlap
+                for i in 0..len {
+                    let b = out[ref_start + i];
+                    out.push(b);
+                }
+            }
+
+            if ip >= ip_limit {
+                break;
+            }
+            ctrl = input[ip] as u32;
+            ip += 1;
+        } else {
+            // Literal
+            let count = (ctrl + 1) as usize;
+            if out.len() + count > maxout {
+                return Err(FormatError::InvalidData("blosclz: output overflow".into()));
+            }
+            if ip + count > ip_limit {
+                return Err(FormatError::InvalidData(
+                    "blosclz: truncated literal".into(),
+                ));
+            }
+            out.extend_from_slice(&input[ip..ip + count]);
+            ip += count;
+
+            if ip >= ip_limit {
+                break;
+            }
+            ctrl = input[ip] as u32;
+            ip += 1;
+        }
+    }
+
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1699,7 +2172,7 @@ mod tests {
         assert_eq!(decompressed, data);
     }
 
-    // --- BLOSC roundtrip ---
+    // --- BLOSC roundtrip (LZ4, default) ---
     #[cfg(feature = "blosc")]
     #[test]
     fn blosc_roundtrip() {
@@ -1708,11 +2181,10 @@ mod tests {
             filters: vec![Filter {
                 id: FILTER_BLOSC,
                 flags: 0,
-                cd_values: vec![2, 2, 4, data.len() as u32, 5, 1, 1],
+                cd_values: vec![2, 2, 4, data.len() as u32, 5, 1, BLOSC_LZ4],
             }],
         };
         let compressed = apply_filters(&pipeline, &data).unwrap();
-        // Verify blosc header
         assert!(compressed.len() >= 16);
         assert_eq!(compressed[0], 2); // format version
         let nbytes =
@@ -1721,6 +2193,178 @@ mod tests {
 
         let decompressed = reverse_filters(&pipeline, &compressed).unwrap();
         assert_eq!(decompressed, data);
+    }
+
+    // --- BLOSC + BloscLZ ---
+    #[cfg(feature = "blosc")]
+    #[test]
+    fn blosc_blosclz_roundtrip() {
+        let data = golden_f32_data();
+        let pipeline = FilterPipeline {
+            filters: vec![Filter {
+                id: FILTER_BLOSC,
+                flags: 0,
+                cd_values: vec![2, 2, 4, data.len() as u32, 5, 1, BLOSC_BLOSCLZ],
+            }],
+        };
+        let compressed = apply_filters(&pipeline, &data).unwrap();
+        let decompressed = reverse_filters(&pipeline, &compressed).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    // --- BLOSC + LZ4HC ---
+    #[cfg(feature = "blosc")]
+    #[test]
+    fn blosc_lz4hc_roundtrip() {
+        let data = golden_f32_data();
+        let pipeline = FilterPipeline {
+            filters: vec![Filter {
+                id: FILTER_BLOSC,
+                flags: 0,
+                cd_values: vec![2, 2, 4, data.len() as u32, 5, 1, BLOSC_LZ4HC],
+            }],
+        };
+        let compressed = apply_filters(&pipeline, &data).unwrap();
+        let decompressed = reverse_filters(&pipeline, &compressed).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    // --- BLOSC + Snappy ---
+    #[cfg(feature = "blosc")]
+    #[test]
+    fn blosc_snappy_roundtrip() {
+        let data = golden_f32_data();
+        let pipeline = FilterPipeline {
+            filters: vec![Filter {
+                id: FILTER_BLOSC,
+                flags: 0,
+                cd_values: vec![2, 2, 4, data.len() as u32, 5, 1, BLOSC_SNAPPY],
+            }],
+        };
+        let compressed = apply_filters(&pipeline, &data).unwrap();
+        let decompressed = reverse_filters(&pipeline, &compressed).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    // --- BLOSC + Zlib (requires deflate feature) ---
+    #[cfg(all(feature = "blosc", feature = "deflate"))]
+    #[test]
+    fn blosc_zlib_roundtrip() {
+        let data = golden_f32_data();
+        let pipeline = FilterPipeline {
+            filters: vec![Filter {
+                id: FILTER_BLOSC,
+                flags: 0,
+                cd_values: vec![2, 2, 4, data.len() as u32, 5, 1, BLOSC_ZLIB],
+            }],
+        };
+        let compressed = apply_filters(&pipeline, &data).unwrap();
+        let decompressed = reverse_filters(&pipeline, &compressed).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    // --- BLOSC + Zstd (requires zstd feature) ---
+    #[cfg(all(feature = "blosc", feature = "zstd"))]
+    #[test]
+    fn blosc_zstd_roundtrip() {
+        let data = golden_f32_data();
+        let pipeline = FilterPipeline {
+            filters: vec![Filter {
+                id: FILTER_BLOSC,
+                flags: 0,
+                cd_values: vec![2, 2, 4, data.len() as u32, 5, 1, BLOSC_ZSTD],
+            }],
+        };
+        let compressed = apply_filters(&pipeline, &data).unwrap();
+        let decompressed = reverse_filters(&pipeline, &compressed).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    // --- BloscLZ pure roundtrip (no shuffle) ---
+    #[cfg(feature = "blosc")]
+    #[test]
+    fn blosclz_pure_roundtrip() {
+        let data: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
+        let compressed = blosclz_compress(&data, 5);
+        assert!(!compressed.is_empty());
+        let decompressed = blosclz_decompress(&compressed, data.len()).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    // --- BloscLZ with highly compressible data ---
+    #[cfg(feature = "blosc")]
+    #[test]
+    fn blosclz_repeated_data() {
+        let data = vec![42u8; 8192];
+        let compressed = blosclz_compress(&data, 5);
+        assert!(!compressed.is_empty());
+        assert!(compressed.len() < data.len());
+        let decompressed = blosclz_decompress(&compressed, data.len()).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    // --- BloscLZ golden tests: decompress data produced by C blosclz_compress ---
+    #[cfg(feature = "blosc")]
+    #[test]
+    fn blosclz_golden_decompress_rle() {
+        // C blosclz_compress(5, [0x42; 512], ..., 0) -> 12 bytes
+        let compressed: &[u8] = &[
+            0x23, 0x42, 0x42, 0x42, 0x42, 0xe0, 0xff, 0xf2, 0x03, 0x01, 0x42, 0x42,
+        ];
+        let expected = vec![0x42u8; 512];
+        let decompressed = blosclz_decompress(compressed, 512).unwrap();
+        assert_eq!(decompressed, expected);
+    }
+
+    #[cfg(feature = "blosc")]
+    #[test]
+    fn blosclz_golden_decompress_pattern16() {
+        // C blosclz_compress(9, [i%16; 1024], ..., 0) -> 26 bytes
+        let compressed: &[u8] = &[
+            0x2f, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+            0x0d, 0x0e, 0x0f, 0xe0, 0xff, 0xff, 0xff, 0xe8, 0x0f, 0x01, 0x0e, 0x0f,
+        ];
+        let expected: Vec<u8> = (0..1024).map(|i| (i % 16) as u8).collect();
+        let decompressed = blosclz_decompress(compressed, 1024).unwrap();
+        assert_eq!(decompressed, expected);
+    }
+
+    #[cfg(feature = "blosc")]
+    #[test]
+    fn blosclz_golden_decompress_pattern4() {
+        // C blosclz_compress(5, [i%4; 1024], ..., 0) -> 14 bytes
+        let compressed: &[u8] = &[
+            0x23, 0x00, 0x01, 0x02, 0x03, 0xe0, 0xff, 0xff, 0xff, 0xf4, 0x03, 0x01, 0x02, 0x03,
+        ];
+        let expected: Vec<u8> = (0..1024).map(|i| (i % 4) as u8).collect();
+        let decompressed = blosclz_decompress(compressed, 1024).unwrap();
+        assert_eq!(decompressed, expected);
+    }
+
+    #[cfg(feature = "blosc")]
+    #[test]
+    fn blosclz_golden_decompress_mixed() {
+        // C blosclz_compress(5, mixed 2048-byte pattern, ..., 0) -> 40 bytes
+        let compressed: &[u8] = &[
+            0x23, 0xaa, 0xaa, 0xaa, 0xaa, 0xe0, 0xff, 0xf4, 0x03, 0x07, 0x00, 0x01, 0x02, 0x03,
+            0x04, 0x05, 0x06, 0x07, 0xe0, 0xff, 0xf0, 0x07, 0x00, 0xbb, 0xe0, 0xff, 0xf7, 0x00,
+            0x03, 0x00, 0x01, 0x02, 0x03, 0xe0, 0xff, 0xf2, 0x03, 0x01, 0x02, 0x03,
+        ];
+        let mut expected = vec![0u8; 2048];
+        for i in 0..512 {
+            expected[i] = 0xAA;
+        }
+        for i in 512..1024 {
+            expected[i] = (i % 8) as u8;
+        }
+        for i in 1024..1536 {
+            expected[i] = 0xBB;
+        }
+        for i in 1536..2048 {
+            expected[i] = (i % 4) as u8;
+        }
+        let decompressed = blosclz_decompress(compressed, 2048).unwrap();
+        assert_eq!(decompressed, expected);
     }
 
     // --- Shuffle + BZIP2 combined golden test ---
