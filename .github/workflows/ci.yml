@@ -30,11 +30,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: No default features
-        run: cargo test -p hdf5-format --no-default-features
+        run: cargo test --no-default-features
       - name: All features
-        run: cargo test --workspace --all-features
+        run: cargo test --all-features
       - name: Threadsafe
-        run: cargo test -p hdf5 --features threadsafe
+        run: cargo test --features threadsafe
 
   clippy:
     name: Clippy
