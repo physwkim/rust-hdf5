@@ -242,7 +242,17 @@ impl H5File {
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
-                writer.create_vlen_string_dataset(name, strings)?;
+                let idx = writer.create_vlen_string_dataset(name, strings)?;
+                // If the name contains '/', assign the dataset to its parent group
+                if let Some(slash_pos) = name.rfind('/') {
+                    let group_path = &name[..slash_pos];
+                    let abs_group_path = if group_path.starts_with('/') {
+                        group_path.to_string()
+                    } else {
+                        format!("/{}", group_path)
+                    };
+                    writer.assign_dataset_to_group(&abs_group_path, idx)?;
+                }
                 Ok(())
             }
             H5FileInner::Reader(_) => {

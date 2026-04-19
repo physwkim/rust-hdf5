@@ -155,6 +155,31 @@ impl H5Group {
         Ok(result)
     }
 
+    /// Create a variable-length string dataset and write data within this group.
+    pub fn write_vlen_strings(&self, name: &str, strings: &[&str]) -> Result<()> {
+        let full_name = if self.name == "/" {
+            name.to_string()
+        } else {
+            let trimmed = self.name.trim_start_matches('/');
+            format!("{}/{}", trimmed, name)
+        };
+
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                let idx = writer.create_vlen_string_dataset(&full_name, strings)?;
+                if self.name != "/" {
+                    writer.assign_dataset_to_group(&self.name, idx)?;
+                }
+                Ok(())
+            }
+            H5FileInner::Reader(_) => {
+                Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
+            }
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
     /// List sub-group names that are direct children of this group.
     pub fn group_names(&self) -> Result<Vec<String>> {
         let inner = borrow_inner(&self.file_inner);
