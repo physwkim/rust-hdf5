@@ -1059,8 +1059,10 @@ impl Hdf5Writer {
         let ref_size = crate::format::global_heap::vlen_reference_size(&self.ctx);
         let data_size = (num_strings as usize) * ref_size;
         let mut raw_data = Vec::with_capacity(data_size);
-        for &obj_idx in &obj_indices {
+        for (i, &obj_idx) in obj_indices.iter().enumerate() {
+            let seq_len = strings[i].len() as u32;
             raw_data.extend_from_slice(&encode_vlen_reference(
+                seq_len,
                 gcol_addr,
                 obj_idx as u32,
                 &self.ctx,

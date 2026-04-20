@@ -18,10 +18,11 @@
 //!
 //! A variable-length reference stored in dataset raw data is:
 //! ```text
+//! sequence_length     (u32 LE, length of the vlen sequence)
 //! collection_address  (sizeof_addr bytes LE, address of the GCOL)
 //! object_index        (u32 LE, index within the collection)
 //! ```
-//! Total vlen reference size = sizeof_addr + 4 bytes.
+//! Total vlen reference size = 4 + sizeof_addr + 4 bytes.
 
 use crate::format::{FormatContext, FormatError, FormatResult};
 
@@ -30,6 +31,9 @@ const GCOL_SIGNATURE: [u8; 4] = *b"GCOL";
 
 /// Global heap collection version.
 const GCOL_VERSION: u8 = 1;
+
+/// Minimum collection size required by the HDF5 C library (H5HG_MINALLOC).
+const GCOL_MIN_SIZE: usize = 4096;
 
 /// A single object within a global heap collection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +82,8 @@ impl GlobalHeapCollection {
     ///
     /// The encoded blob includes the GCOL header and all heap objects,
     /// followed by a free-space marker (index=0 object).
+    /// The total size is padded to at least 4096 bytes (H5HG_MINALLOC)
+    /// for compatibility with the HDF5 C library.
     pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
         let ss = ctx.sizeof_size as usize;
 
@@ -91,7 +97,13 @@ impl GlobalHeapCollection {
         }
         // Free-space marker: index(2) + ref_count(2) + reserved(4) + size(ss) = 8 + ss
         let free_marker_size = 2 + 2 + 4 + ss;
-        let collection_size = header_size + objects_size + free_marker_size;
+        let content_size = header_size + objects_size + free_marker_size;
+
+        // HDF5 C library requires collection_size >= 4096 (H5HG_MINALLOC)
+        let collection_size = content_size.max(GCOL_MIN_SIZE);
+        // HDF5 convention: free marker size = collection_size - header - objects
+        // (includes the free marker's own header in the "free space")
+        let free_space = collection_size - header_size - objects_size;
 
         let mut buf = Vec::with_capacity(collection_size);
 
@@ -115,11 +127,14 @@ impl GlobalHeapCollection {
             }
         }
 
-        // Free-space marker (index = 0)
+        // Free-space marker (index = 0) with remaining space
         buf.extend_from_slice(&0u16.to_le_bytes()); // index = 0
         buf.extend_from_slice(&0u16.to_le_bytes()); // ref_count = 0
         buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
-        buf.extend_from_slice(&0u64.to_le_bytes()[..ss]); // size = 0
+        buf.extend_from_slice(&(free_space as u64).to_le_bytes()[..ss]); // free space size
+
+        // Zero-fill remaining space
+        buf.resize(collection_size, 0);
 
         debug_assert_eq!(buf.len(), collection_size);
         buf
@@ -208,14 +223,17 @@ impl Default for GlobalHeapCollection {
 
 /// Encode a variable-length reference (used in dataset raw data).
 ///
-/// A vlen reference is: collection_address (sizeof_addr bytes) + object_index (u32).
+/// On-disk format per element:
+///   sequence_length (u32 LE) + collection_address (sizeof_addr bytes) + object_index (u32 LE).
 pub fn encode_vlen_reference(
+    sequence_length: u32,
     collection_addr: u64,
     object_index: u32,
     ctx: &FormatContext,
 ) -> Vec<u8> {
     let sa = ctx.sizeof_addr as usize;
-    let mut buf = Vec::with_capacity(sa + 4);
+    let mut buf = Vec::with_capacity(4 + sa + 4);
+    buf.extend_from_slice(&sequence_length.to_le_bytes());
     buf.extend_from_slice(&collection_addr.to_le_bytes()[..sa]);
     buf.extend_from_slice(&object_index.to_le_bytes());
     buf
@@ -223,23 +241,30 @@ pub fn encode_vlen_reference(
 
 /// Decode a variable-length reference from dataset raw data.
 ///
-/// Returns `(collection_address, object_index)`.
-pub fn decode_vlen_reference(buf: &[u8], ctx: &FormatContext) -> FormatResult<(u64, u32)> {
+/// Returns `(sequence_length, collection_address, object_index)`.
+pub fn decode_vlen_reference(buf: &[u8], ctx: &FormatContext) -> FormatResult<(u32, u64, u32)> {
     let sa = ctx.sizeof_addr as usize;
-    if buf.len() < sa + 4 {
+    let total = 4 + sa + 4;
+    if buf.len() < total {
         return Err(FormatError::BufferTooShort {
-            needed: sa + 4,
+            needed: total,
             available: buf.len(),
         });
     }
-    let addr = read_size(buf, sa);
-    let index = u32::from_le_bytes([buf[sa], buf[sa + 1], buf[sa + 2], buf[sa + 3]]);
-    Ok((addr, index))
+    let seq_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let addr = read_size(&buf[4..], sa);
+    let index = u32::from_le_bytes([
+        buf[4 + sa],
+        buf[4 + sa + 1],
+        buf[4 + sa + 2],
+        buf[4 + sa + 3],
+    ]);
+    Ok((seq_len, addr, index))
 }
 
-/// Return the size of a vlen reference in bytes: sizeof_addr + 4.
+/// Return the size of a vlen reference in bytes: 4 + sizeof_addr + 4.
 pub fn vlen_reference_size(ctx: &FormatContext) -> usize {
-    ctx.sizeof_addr as usize + 4
+    4 + ctx.sizeof_addr as usize + 4
 }
 
 /// Round `n` up to the next multiple of 8.
@@ -335,9 +360,10 @@ mod tests {
     #[test]
     fn vlen_reference_roundtrip() {
         let c = ctx();
-        let encoded = encode_vlen_reference(0x1234_5678_9ABC_DEF0, 42, &c);
+        let encoded = encode_vlen_reference(5, 0x1234_5678_9ABC_DEF0, 42, &c);
         assert_eq!(encoded.len(), vlen_reference_size(&c));
-        let (addr, idx) = decode_vlen_reference(&encoded, &c).unwrap();
+        let (seq_len, addr, idx) = decode_vlen_reference(&encoded, &c).unwrap();
+        assert_eq!(seq_len, 5);
         assert_eq!(addr, 0x1234_5678_9ABC_DEF0);
         assert_eq!(idx, 42);
     }
@@ -345,17 +371,18 @@ mod tests {
     #[test]
     fn vlen_reference_4byte_roundtrip() {
         let c = ctx4();
-        let encoded = encode_vlen_reference(0x1234_5678, 7, &c);
-        assert_eq!(encoded.len(), 8); // 4 + 4
-        let (addr, idx) = decode_vlen_reference(&encoded, &c).unwrap();
+        let encoded = encode_vlen_reference(10, 0x1234_5678, 7, &c);
+        assert_eq!(encoded.len(), 12); // 4 + 4 + 4
+        let (seq_len, addr, idx) = decode_vlen_reference(&encoded, &c).unwrap();
+        assert_eq!(seq_len, 10);
         assert_eq!(addr, 0x1234_5678);
         assert_eq!(idx, 7);
     }
 
     #[test]
     fn vlen_reference_size_check() {
-        assert_eq!(vlen_reference_size(&ctx()), 12);
-        assert_eq!(vlen_reference_size(&ctx4()), 8);
+        assert_eq!(vlen_reference_size(&ctx()), 16);
+        assert_eq!(vlen_reference_size(&ctx4()), 12);
     }
 
     #[test]

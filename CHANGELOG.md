@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.2
+
+### Bug Fixes
+
+- Fix vlen string h5py/HDF5 C library incompatibility. Three issues corrected:
+  - Vlen references were missing the 4-byte `sequence_length` prefix
+    (wrote `addr+index` instead of `seq_len+addr+index`).
+  - Global heap collection size was below the HDF5 minimum of 4096 bytes
+    (`H5HG_MINALLOC`), causing "global heap size is too small" errors.
+  - Free-space marker size was miscalculated (off by 16 bytes).
+- Files written by rust-hdf5 are now fully readable by h5py and h5dump.
+
 ## 0.2.1
 
 ### Bug Fixes

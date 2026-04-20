@@ -307,8 +307,8 @@ impl DatatypeMessage {
             Self::Enum { base, .. } => base.element_size(),
             Self::VarLenString { .. } => {
                 // Default assumption: sizeof_addr = 8
-                // vlen ref = sizeof_addr + 4 = 12
-                12
+                // vlen ref = 4 (seq_len) + sizeof_addr + 4 (index) = 16
+                16
             }
             Self::Array { dims, base } => {
                 let product: u32 = dims.iter().product();
@@ -323,14 +323,14 @@ impl DatatypeMessage {
     /// `sizeof_addr`.
     pub fn element_size_ctx(&self, ctx: &FormatContext) -> u32 {
         match self {
-            Self::VarLenString { .. } => ctx.sizeof_addr as u32 + 4,
+            Self::VarLenString { .. } => ctx.sizeof_addr as u32 + 8,
             _ => self.element_size(),
         }
     }
 
     /// Returns the size of a variable-length reference for a given context.
     pub fn vlen_ref_size(ctx: &FormatContext) -> u32 {
-        ctx.sizeof_addr as u32 + 4
+        ctx.sizeof_addr as u32 + 8
     }
 }
 
@@ -1218,10 +1218,10 @@ mod tests {
     #[test]
     fn vlen_string_element_size() {
         let msg = DatatypeMessage::vlen_string_utf8();
-        // Default: sizeof_addr=8, so 8+4 = 12
-        assert_eq!(msg.element_size(), 12);
-        assert_eq!(msg.element_size_ctx(&ctx()), 12);
-        assert_eq!(msg.element_size_ctx(&ctx4()), 8);
+        // Default: sizeof_addr=8, so 4+8+4 = 16
+        assert_eq!(msg.element_size(), 16);
+        assert_eq!(msg.element_size_ctx(&ctx()), 16);
+        assert_eq!(msg.element_size_ctx(&ctx4()), 12);
     }
 
     #[test]
@@ -1241,9 +1241,9 @@ mod tests {
         let (decoded, consumed) = DatatypeMessage::decode(&encoded, &c).unwrap();
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded, msg);
-        // Size field in the encoded bytes should be 4+4=8
+        // Size field in the encoded bytes should be 4+4+4=12
         let sz = u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]);
-        assert_eq!(sz, 8);
+        assert_eq!(sz, 12);
     }
 
     // ---- compound roundtrips ----

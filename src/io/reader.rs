@@ -1170,7 +1170,8 @@ impl Hdf5Reader {
                 break;
             }
 
-            let (collection_addr, obj_index) = decode_vlen_reference(&raw[offset..], &self.ctx)?;
+            let (_seq_len, collection_addr, obj_index) =
+                decode_vlen_reference(&raw[offset..], &self.ctx)?;
 
             if collection_addr == UNDEF_ADDR || collection_addr == 0 {
                 strings.push(String::new());
