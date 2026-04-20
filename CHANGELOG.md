@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.4
+
+### Bug Fixes
+
+- Remove 64KB hard limit on global heap collection reads for vlen strings.
+  Previously, collections larger than 64KB were truncated, causing decode
+  failures on files with many or large variable-length strings. Now reads
+  the actual collection size from the GCOL header.
+
 ## 0.2.3
 
 ### Added

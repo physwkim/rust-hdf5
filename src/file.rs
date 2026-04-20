@@ -262,6 +262,45 @@ impl H5File {
         }
     }
 
+    /// Create a chunked, deflate-compressed variable-length string dataset.
+    ///
+    /// Like `write_vlen_strings`, but stores the vlen references in chunked
+    /// layout with deflate compression. `chunk_size` is the number of strings
+    /// per chunk, and `compression_level` is 0-9 (6 is a good default).
+    pub fn write_vlen_strings_compressed(
+        &self,
+        name: &str,
+        strings: &[&str],
+        chunk_size: usize,
+        compression_level: u32,
+    ) -> Result<()> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                let idx = writer.create_vlen_string_dataset_compressed(
+                    name,
+                    strings,
+                    chunk_size,
+                    compression_level,
+                )?;
+                if let Some(slash_pos) = name.rfind('/') {
+                    let group_path = &name[..slash_pos];
+                    let abs_group_path = if group_path.starts_with('/') {
+                        group_path.to_string()
+                    } else {
+                        format!("/{}", group_path)
+                    };
+                    writer.assign_dataset_to_group(&abs_group_path, idx)?;
+                }
+                Ok(())
+            }
+            H5FileInner::Reader(_) => {
+                Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
+            }
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
     /// Open an existing dataset by name (read mode).
     pub fn dataset(&self, name: &str) -> Result<H5Dataset> {
         let inner = borrow_inner(&self.inner);
@@ -825,6 +864,33 @@ mod integration_tests {
             let ds = file.dataset("names").unwrap();
             let strings = ds.read_vlen_strings().unwrap();
             assert_eq!(strings, vec!["alice", "bob", "charlie"]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn vlen_string_compressed_roundtrip() {
+        let path = std::env::temp_dir().join("hdf5_vlen_compressed.h5");
+        let input: Vec<&str> = (0..100).map(|i| match i % 3 {
+            0 => "hello world",
+            1 => "compressed vlen string test",
+            _ => "rust-hdf5",
+        }).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_strings_compressed("texts", &input, 16, 6)
+                .unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("texts").unwrap();
+            let strings = ds.read_vlen_strings().unwrap();
+            assert_eq!(strings.len(), 100);
+            for (i, s) in strings.iter().enumerate() {
+                assert_eq!(s, input[i]);
+            }
         }
         std::fs::remove_file(&path).ok();
     }

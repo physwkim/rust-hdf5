@@ -1129,6 +1129,161 @@ impl Hdf5Writer {
         Ok(idx)
     }
 
+    /// Create a chunked, compressed variable-length string dataset.
+    ///
+    /// Strings are stored in the global heap (same as `create_vlen_string_dataset`),
+    /// but the vlen references are stored in chunked layout with deflate compression.
+    /// `chunk_size` is the number of strings per chunk.
+    pub fn create_vlen_string_dataset_compressed(
+        &mut self,
+        name: &str,
+        strings: &[&str],
+        chunk_size: usize,
+        compression_level: u32,
+    ) -> IoResult<usize> {
+        use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let num_strings = strings.len() as u64;
+
+        // Build a global heap collection with all strings
+        let mut gcol = GlobalHeapCollection::new();
+        let mut obj_indices = Vec::with_capacity(strings.len());
+        for s in strings {
+            let idx = gcol.add_object(s.as_bytes().to_vec());
+            obj_indices.push(idx);
+        }
+
+        // Encode and write the global heap collection
+        let gcol_encoded = gcol.encode(&self.ctx);
+        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
+        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+
+        // Build raw data: vlen references
+        let ref_size = crate::format::global_heap::vlen_reference_size(&self.ctx);
+        let data_size = (num_strings as usize) * ref_size;
+        let mut raw_data = Vec::with_capacity(data_size);
+        for (i, &obj_idx) in obj_indices.iter().enumerate() {
+            let seq_len = strings[i].len() as u32;
+            raw_data.extend_from_slice(&encode_vlen_reference(
+                seq_len,
+                gcol_addr,
+                obj_idx as u32,
+                &self.ctx,
+            ));
+        }
+
+        // Set up chunked compressed layout
+        let datatype = DatatypeMessage::vlen_string_utf8();
+        let element_size = datatype.element_size_ctx(&self.ctx) as u64;
+        let chunk_dims: Vec<u64> = vec![chunk_size as u64];
+        let dims: Vec<u64> = vec![num_strings];
+        let max_dims: Vec<u64> = vec![num_strings];
+        let chunk_bytes = chunk_size as u64 * element_size;
+        let chunk_size_len = compute_chunk_size_len(chunk_bytes);
+
+        let earray_params = EarrayParams::default_params();
+        let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs);
+        let nsblk_addrs = compute_nsblk_addrs(
+            earray_params.idx_blk_elmts,
+            earray_params.data_blk_min_elmts,
+            earray_params.sup_blk_min_data_ptrs,
+            earray_params.max_nelmts_bits,
+        );
+
+        // Create filtered EA header
+        let mut ea_header =
+            ExtensibleArrayHeader::new_for_filtered_chunks(&self.ctx, chunk_size_len);
+        ea_header.max_nelmts_bits = earray_params.max_nelmts_bits;
+        ea_header.idx_blk_elmts = earray_params.idx_blk_elmts;
+        ea_header.data_blk_min_elmts = earray_params.data_blk_min_elmts;
+        ea_header.sup_blk_min_data_ptrs = earray_params.sup_blk_min_data_ptrs;
+        ea_header.max_dblk_page_nelmts_bits = earray_params.max_dblk_page_nelmts_bits;
+
+        let hdr_encoded = ea_header.encode(&self.ctx);
+        let ea_header_addr = self.allocator.allocate(hdr_encoded.len() as u64);
+
+        // Create filtered index block
+        let filt_iblk = FilteredIndexBlock::new(
+            ea_header_addr,
+            earray_params.idx_blk_elmts,
+            ndblk_addrs,
+            nsblk_addrs,
+        );
+        let iblk_encoded = filt_iblk.encode(&self.ctx, chunk_size_len);
+        let ea_iblk_addr = self.allocator.allocate(iblk_encoded.len() as u64);
+
+        ea_header.idx_blk_addr = ea_iblk_addr;
+
+        let hdr_encoded = ea_header.encode(&self.ctx);
+        self.handle.write_at(ea_header_addr, &hdr_encoded)?;
+        self.handle.write_at(ea_iblk_addr, &iblk_encoded)?;
+
+        let dataspace = DataspaceMessage {
+            dims: dims.to_vec(),
+            max_dims: Some(max_dims.to_vec()),
+        };
+
+        let ea_iblk = ExtensibleArrayIndexBlock::new(
+            ea_header_addr,
+            earray_params.idx_blk_elmts,
+            ndblk_addrs,
+            nsblk_addrs,
+        );
+
+        let idx = self.datasets.len();
+        self.datasets.push(DatasetInfo {
+            name: name.to_string(),
+            datatype,
+            dataspace,
+            obj_header_addr: 0,
+            data_addr: UNDEF_ADDR,
+            data_size: 0,
+            attributes: Vec::new(),
+            obj_header_written_addr: None,
+            obj_header_encoded_size: 0,
+            filter_pipeline: Some(FilterPipeline::deflate(compression_level)),
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
+            fixed_array: None,
+            btree_v2: None,
+            chunked: Some(ChunkedDatasetInfo {
+                chunk_dims: chunk_dims.clone(),
+                max_dims: max_dims.clone(),
+                earray_params,
+                ea_header_addr,
+                ea_iblk_addr,
+                ndblk_addrs,
+                ea_header,
+                ea_iblk,
+                data_blocks: Vec::new(),
+                chunks_written: 0,
+                filt_iblk: Some(filt_iblk),
+                filt_data_blocks: Vec::new(),
+                chunk_size_len,
+            }),
+        });
+
+        // Write chunks of vlen references with compression
+        let chunk_byte_size = chunk_bytes as usize;
+        let num_chunks = (raw_data.len() + chunk_byte_size - 1) / chunk_byte_size;
+        for chunk_i in 0..num_chunks {
+            let start = chunk_i * chunk_byte_size;
+            let end = (start + chunk_byte_size).min(raw_data.len());
+            let chunk_data = if end - start < chunk_byte_size {
+                // Pad last chunk to full size
+                let mut padded = vec![0u8; chunk_byte_size];
+                padded[..end - start].copy_from_slice(&raw_data[start..end]);
+                padded
+            } else {
+                raw_data[start..end].to_vec()
+            };
+            self.write_chunk(idx, chunk_i as u64, &chunk_data)?;
+        }
+
+        Ok(idx)
+    }
+
     /// Add an attribute to a dataset.
     ///
     /// The attribute will be written as a message in the dataset's object

@@ -1182,7 +1182,16 @@ impl Hdf5Reader {
             let collection = if let Some(c) = heap_cache.get(&collection_addr) {
                 c.clone()
             } else {
-                let heap_buf = self.handle.read_at_most(collection_addr, 65536)?;
+                // Read GCOL header to determine the actual collection size.
+                // Header: signature(4) + version(1) + reserved(3) + collection_size(sizeof_size)
+                let ss = self.ctx.sizeof_size as usize;
+                let header_len = 4 + 1 + 3 + ss;
+                let header_buf = self.handle.read_at(collection_addr, header_len)?;
+                let mut size_bytes = [0u8; 8];
+                size_bytes[..ss].copy_from_slice(&header_buf[8..8 + ss]);
+                let collection_size = u64::from_le_bytes(size_bytes) as usize;
+
+                let heap_buf = self.handle.read_at(collection_addr, collection_size)?;
                 let (coll, _) = GlobalHeapCollection::decode(&heap_buf, &self.ctx)?;
                 heap_cache.insert(collection_addr, coll.clone());
                 coll
