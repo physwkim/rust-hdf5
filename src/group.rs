@@ -200,10 +200,7 @@ impl H5Group {
         match &mut *inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_string_dataset_compressed(
-                    &full_name,
-                    strings,
-                    chunk_size,
-                    pipeline,
+                    &full_name, strings, chunk_size, pipeline,
                 )?;
                 if self.name != "/" {
                     writer.assign_dataset_to_group(&self.name, idx)?;

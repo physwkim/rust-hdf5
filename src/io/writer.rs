@@ -1266,7 +1266,7 @@ impl Hdf5Writer {
 
         // Write chunks of vlen references with compression
         let chunk_byte_size = chunk_bytes as usize;
-        let num_chunks = (raw_data.len() + chunk_byte_size - 1) / chunk_byte_size;
+        let num_chunks = raw_data.len().div_ceil(chunk_byte_size);
         for chunk_i in 0..num_chunks {
             let start = chunk_i * chunk_byte_size;
             let end = (start + chunk_byte_size).min(raw_data.len());

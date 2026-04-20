@@ -279,12 +279,8 @@ impl H5File {
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
-                let idx = writer.create_vlen_string_dataset_compressed(
-                    name,
-                    strings,
-                    chunk_size,
-                    pipeline,
-                )?;
+                let idx = writer
+                    .create_vlen_string_dataset_compressed(name, strings, chunk_size, pipeline)?;
                 if let Some(slash_pos) = name.rfind('/') {
                     let group_path = &name[..slash_pos];
                     let abs_group_path = if group_path.starts_with('/') {
@@ -875,11 +871,13 @@ mod integration_tests {
     fn vlen_string_deflate_roundtrip() {
         use crate::format::messages::filter::FilterPipeline;
         let path = std::env::temp_dir().join("hdf5_vlen_deflate.h5");
-        let input: Vec<&str> = (0..100).map(|i| match i % 3 {
-            0 => "hello world",
-            1 => "compressed vlen string test",
-            _ => "rust-hdf5",
-        }).collect();
+        let input: Vec<&str> = (0..100)
+            .map(|i| match i % 3 {
+                0 => "hello world",
+                1 => "compressed vlen string test",
+                _ => "rust-hdf5",
+            })
+            .collect();
         {
             let file = H5File::create(&path).unwrap();
             file.write_vlen_strings_compressed("texts", &input, 16, FilterPipeline::deflate(6))
@@ -903,12 +901,14 @@ mod integration_tests {
     fn vlen_string_zstd_roundtrip() {
         use crate::format::messages::filter::FilterPipeline;
         let path = std::env::temp_dir().join("hdf5_vlen_zstd.h5");
-        let input: Vec<&str> = (0..200).map(|i| match i % 4 {
-            0 => "zstandard compression test",
-            1 => "variable length string",
-            2 => "rust-hdf5 chunked storage",
-            _ => "hello zstd world",
-        }).collect();
+        let input: Vec<&str> = (0..200)
+            .map(|i| match i % 4 {
+                0 => "zstandard compression test",
+                1 => "variable length string",
+                2 => "rust-hdf5 chunked storage",
+                _ => "hello zstd world",
+            })
+            .collect();
         {
             let file = H5File::create(&path).unwrap();
             file.write_vlen_strings_compressed("data", &input, 32, FilterPipeline::zstd(3))
