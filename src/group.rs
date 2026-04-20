@@ -20,6 +20,7 @@
 use crate::dataset::DatasetBuilder;
 use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
+use crate::format::messages::filter::FilterPipeline;
 use crate::types::H5Type;
 
 /// A handle to an HDF5 group.
@@ -180,13 +181,13 @@ impl H5Group {
         }
     }
 
-    /// Create a chunked, deflate-compressed variable-length string dataset within this group.
+    /// Create a chunked, compressed variable-length string dataset within this group.
     pub fn write_vlen_strings_compressed(
         &self,
         name: &str,
         strings: &[&str],
         chunk_size: usize,
-        compression_level: u32,
+        pipeline: FilterPipeline,
     ) -> Result<()> {
         let full_name = if self.name == "/" {
             name.to_string()
@@ -202,7 +203,7 @@ impl H5Group {
                     &full_name,
                     strings,
                     chunk_size,
-                    compression_level,
+                    pipeline,
                 )?;
                 if self.name != "/" {
                     writer.assign_dataset_to_group(&self.name, idx)?;

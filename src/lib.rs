@@ -93,5 +93,6 @@ pub use attribute::H5Attribute;
 pub use dataset::H5Dataset;
 pub use error::{Hdf5Error, Result};
 pub use file::H5File;
+pub use format::messages::filter::FilterPipeline;
 pub use group::H5Group;
 pub use types::{Complex32, Complex64, CompoundType, H5Type, HBool, VarLenUnicode};

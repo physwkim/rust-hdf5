@@ -1132,14 +1132,14 @@ impl Hdf5Writer {
     /// Create a chunked, compressed variable-length string dataset.
     ///
     /// Strings are stored in the global heap (same as `create_vlen_string_dataset`),
-    /// but the vlen references are stored in chunked layout with deflate compression.
-    /// `chunk_size` is the number of strings per chunk.
+    /// but the vlen references are stored in chunked layout with the given filter
+    /// pipeline (e.g., deflate, zstd). `chunk_size` is the number of strings per chunk.
     pub fn create_vlen_string_dataset_compressed(
         &mut self,
         name: &str,
         strings: &[&str],
         chunk_size: usize,
-        compression_level: u32,
+        pipeline: FilterPipeline,
     ) -> IoResult<usize> {
         use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
         use crate::format::messages::datatype::DatatypeMessage;
@@ -1242,7 +1242,7 @@ impl Hdf5Writer {
             attributes: Vec::new(),
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
-            filter_pipeline: Some(FilterPipeline::deflate(compression_level)),
+            filter_pipeline: Some(pipeline),
             append_buffer: Vec::new(),
             append_buffered_frames: 0,
             fixed_array: None,

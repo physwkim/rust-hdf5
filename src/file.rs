@@ -22,6 +22,7 @@ use crate::io::{Hdf5Reader, Hdf5Writer};
 
 use crate::dataset::{DatasetBuilder, H5Dataset};
 use crate::error::{Hdf5Error, Result};
+use crate::format::messages::filter::FilterPipeline;
 use crate::group::H5Group;
 use crate::types::H5Type;
 
@@ -262,17 +263,18 @@ impl H5File {
         }
     }
 
-    /// Create a chunked, deflate-compressed variable-length string dataset.
+    /// Create a chunked, compressed variable-length string dataset.
     ///
     /// Like `write_vlen_strings`, but stores the vlen references in chunked
-    /// layout with deflate compression. `chunk_size` is the number of strings
-    /// per chunk, and `compression_level` is 0-9 (6 is a good default).
+    /// layout with the given filter pipeline (e.g., `FilterPipeline::deflate(6)`
+    /// or `FilterPipeline::zstd(3)`). `chunk_size` is the number of strings
+    /// per chunk.
     pub fn write_vlen_strings_compressed(
         &self,
         name: &str,
         strings: &[&str],
         chunk_size: usize,
-        compression_level: u32,
+        pipeline: FilterPipeline,
     ) -> Result<()> {
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {
@@ -281,7 +283,7 @@ impl H5File {
                     name,
                     strings,
                     chunk_size,
-                    compression_level,
+                    pipeline,
                 )?;
                 if let Some(slash_pos) = name.rfind('/') {
                     let group_path = &name[..slash_pos];
@@ -870,8 +872,9 @@ mod integration_tests {
 
     #[test]
     #[cfg(feature = "deflate")]
-    fn vlen_string_compressed_roundtrip() {
-        let path = std::env::temp_dir().join("hdf5_vlen_compressed.h5");
+    fn vlen_string_deflate_roundtrip() {
+        use crate::format::messages::filter::FilterPipeline;
+        let path = std::env::temp_dir().join("hdf5_vlen_deflate.h5");
         let input: Vec<&str> = (0..100).map(|i| match i % 3 {
             0 => "hello world",
             1 => "compressed vlen string test",
@@ -879,7 +882,7 @@ mod integration_tests {
         }).collect();
         {
             let file = H5File::create(&path).unwrap();
-            file.write_vlen_strings_compressed("texts", &input, 16, 6)
+            file.write_vlen_strings_compressed("texts", &input, 16, FilterPipeline::deflate(6))
                 .unwrap();
             file.close().unwrap();
         }
@@ -888,6 +891,35 @@ mod integration_tests {
             let ds = file.dataset("texts").unwrap();
             let strings = ds.read_vlen_strings().unwrap();
             assert_eq!(strings.len(), 100);
+            for (i, s) in strings.iter().enumerate() {
+                assert_eq!(s, input[i]);
+            }
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn vlen_string_zstd_roundtrip() {
+        use crate::format::messages::filter::FilterPipeline;
+        let path = std::env::temp_dir().join("hdf5_vlen_zstd.h5");
+        let input: Vec<&str> = (0..200).map(|i| match i % 4 {
+            0 => "zstandard compression test",
+            1 => "variable length string",
+            2 => "rust-hdf5 chunked storage",
+            _ => "hello zstd world",
+        }).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_strings_compressed("data", &input, 32, FilterPipeline::zstd(3))
+                .unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("data").unwrap();
+            let strings = ds.read_vlen_strings().unwrap();
+            assert_eq!(strings.len(), 200);
             for (i, s) in strings.iter().enumerate() {
                 assert_eq!(s, input[i]);
             }
