@@ -26,7 +26,7 @@ Read and write HDF5 files with contiguous, chunked, and compressed datasets, hie
 - **Memory-mapped I/O** — optional zero-copy read-only access via `mmap` feature
 - **Thread safety** — optional `threadsafe` feature (`Arc<Mutex>` instead of `Rc<RefCell>`)
 - **Legacy format support** — reads v0/v1 superblock and v1 object header files (h5py, HDF5 C library)
-- **Variable-length strings** — reads h5py-style vlen string datasets via global heap
+- **Variable-length strings** — read and write h5py-compatible vlen string datasets via global heap
 - **Compound types** — user-defined struct types and complex numbers (`Complex32`, `Complex64`)
 
 ## Quick start
@@ -60,12 +60,33 @@ let data = ds.read_raw::<f64>()?;
 assert_eq!(data.len(), 20_000);
 ```
 
-### Chunked + compressed streaming
+### Chunked + append
 
 ```rust
 use rust_hdf5::H5File;
 
 let file = H5File::create("stream.h5")?;
+let ds = file.new_dataset::<f32>()
+    .shape(&[0usize, 256])
+    .chunk(&[1, 256])
+    .max_shape(&[None, Some(256)])
+    .create("sensor")?;
+
+// append() writes chunks and extends the shape automatically
+for _ in 0..1000 {
+    let frame = vec![0.0f32; 256];
+    ds.append(&frame)?;
+}
+assert_eq!(ds.shape(), vec![1000, 256]);
+file.close()?;
+```
+
+### Chunked + compressed (low-level)
+
+```rust
+use rust_hdf5::H5File;
+
+let file = H5File::create("compressed.h5")?;
 let ds = file.new_dataset::<f32>()
     .shape(&[0usize, 256])
     .chunk(&[1, 256])
@@ -190,7 +211,7 @@ let data = reader.read_dataset::<f32>("frames")?;
 | `Complex32` | Compound {re: f32, im: f32} |
 | `Complex64` | Compound {re: f64, im: f64} |
 | `CompoundType` | User-defined compound |
-| `VarLenUnicode` | Variable-length UTF-8 string (read) |
+| `VarLenUnicode` | Variable-length UTF-8 string |
 
 ## Compression filters
 
@@ -239,7 +260,7 @@ rust-hdf5 = { version = "0.2", features = ["lz4", "zstd"] }
 | Attributes | Yes | Yes |
 | SWMR protocol | Yes | Yes |
 | Hyperslab selection | Yes | Yes |
-| Variable-length strings | Yes | — |
+| Variable-length strings | Yes | Yes |
 | Compound types | Yes | Yes |
 
 ## Benchmarks

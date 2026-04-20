@@ -680,9 +680,7 @@ impl H5Dataset {
 
                 let chunk_dims = writer
                     .dataset_chunk_dims(ds_index)
-                    .ok_or_else(|| {
-                        Hdf5Error::InvalidState("dataset has no chunk info".into())
-                    })?
+                    .ok_or_else(|| Hdf5Error::InvalidState("dataset has no chunk info".into()))?
                     .to_vec();
                 let dims = writer.dataset_dims(ds_index).to_vec();
 
@@ -699,7 +697,7 @@ impl H5Dataset {
                     ));
                 }
 
-                if data.len() % frame_elems != 0 {
+                if !data.len().is_multiple_of(frame_elems) {
                     return Err(Hdf5Error::InvalidState(format!(
                         "data length {} is not a multiple of frame size {}",
                         data.len(),
@@ -745,12 +743,17 @@ impl H5Dataset {
                         // Full chunk — write
                         let end = byte_pos + frames_to_fill * frame_bytes;
                         if frames_to_fill == chunk_dim0 {
-                            writer.write_chunk(ds_index, chunk_idx as u64, &combined[byte_pos..end])?;
+                            writer.write_chunk(
+                                ds_index,
+                                chunk_idx as u64,
+                                &combined[byte_pos..end],
+                            )?;
                         } else {
                             // Partial start but fills to chunk boundary
                             let mut chunk_buf = vec![0u8; chunk_bytes];
                             let offset_in_chunk = (abs_frame % chunk_dim0) * frame_bytes;
-                            chunk_buf[offset_in_chunk..offset_in_chunk + frames_to_fill * frame_bytes]
+                            chunk_buf
+                                [offset_in_chunk..offset_in_chunk + frames_to_fill * frame_bytes]
                                 .copy_from_slice(&combined[byte_pos..end]);
                             writer.write_chunk(ds_index, chunk_idx as u64, &chunk_buf)?;
                         }
