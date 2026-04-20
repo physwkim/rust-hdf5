@@ -951,11 +951,7 @@ fn bitshuffle_decompress(data: &[u8], elem_size: usize, comp_type: u32) -> Forma
         data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
     ]) as usize;
     let block_bytes = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
-    let block_elems = if elem_size > 0 {
-        block_bytes / elem_size
-    } else {
-        0
-    };
+    let block_elems = block_bytes.checked_div(elem_size).unwrap_or(0);
 
     let mut output = Vec::with_capacity(orig_size);
     let mut rpos = 12;
