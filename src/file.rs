@@ -914,6 +914,53 @@ mod integration_tests {
     }
 
     #[test]
+    #[cfg(feature = "deflate")]
+    fn vlen_string_compressed_large_roundtrip() {
+        use crate::format::messages::filter::FilterPipeline;
+        let path = std::env::temp_dir().join("hdf5_vlen_large.h5");
+        // Simulate kodex scenario: 7189 strings, chunk_size 512
+        let input: Vec<String> = (0..7189)
+            .map(|i| format!("node-{:08x}-{}", i, "a".repeat(20 + (i % 30))))
+            .collect();
+        let input_refs: Vec<&str> = input.iter().map(|s| s.as_str()).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.create_group("nodes").unwrap();
+            file.write_vlen_strings_compressed(
+                "nodes/id",
+                &input_refs,
+                512,
+                FilterPipeline::deflate(6),
+            )
+            .unwrap();
+            file.close().unwrap();
+        }
+        // Read back
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("nodes/id").unwrap();
+            let strings = ds.read_vlen_strings().unwrap();
+            assert_eq!(strings.len(), 7189);
+            assert_eq!(strings[0], input[0]);
+            assert_eq!(strings[7188], input[7188]);
+        }
+        // Also test open_rw then re-read
+        {
+            let file = H5File::open_rw(&path).unwrap();
+            file.set_attr_string("version", "1.0").unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("nodes/id").unwrap();
+            let strings = ds.read_vlen_strings().unwrap();
+            assert_eq!(strings.len(), 7189);
+            assert_eq!(strings[0], input[0]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn vlen_string_write_read() {
         let path = std::env::temp_dir().join("hdf5_vlen_wr.h5");
         {

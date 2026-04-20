@@ -771,7 +771,7 @@ impl Hdf5Reader {
                         if addr == UNDEF_ADDR {
                             raw_chunks.push(None);
                         } else {
-                            raw_chunks.push(Some(self.handle.read_at(addr, nbytes as usize)?));
+                            raw_chunks.push(Some(self.handle.read_at_most(addr, nbytes as usize)?));
                         }
                     }
 
@@ -780,13 +780,13 @@ impl Hdf5Reader {
                         use rayon::prelude::*;
                         raw_chunks
                             .into_par_iter()
-                            .map(|raw| raw.map(|r| filter::reverse_filters(pl, &r).unwrap_or(r)))
+                            .map(|raw| raw.and_then(|r| filter::reverse_filters(pl, &r).ok()))
                             .collect()
                     };
                     #[cfg(not(feature = "parallel"))]
                     let decompressed: Vec<Option<Vec<u8>>> = raw_chunks
                         .into_iter()
-                        .map(|raw| raw.map(|r| filter::reverse_filters(pl, &r).unwrap_or(r)))
+                        .map(|raw| raw.and_then(|r| filter::reverse_filters(pl, &r).ok()))
                         .collect();
 
                     for (i, chunk_data) in decompressed.iter().enumerate() {
@@ -794,8 +794,11 @@ impl Hdf5Reader {
                             let offset = i as u64 * chunk_bytes;
                             let end = std::cmp::min(offset + chunk_bytes, total_size);
                             let copy_len = (end - offset) as usize;
-                            output[offset as usize..offset as usize + copy_len]
-                                .copy_from_slice(&data[..copy_len]);
+                            // Decompressed chunk may be shorter than expected if it
+                            // is the last chunk or decompression returned raw data.
+                            let src_len = copy_len.min(data.len());
+                            output[offset as usize..offset as usize + src_len]
+                                .copy_from_slice(&data[..src_len]);
                         }
                     }
                 } else {
@@ -803,12 +806,13 @@ impl Hdf5Reader {
                         if addr == UNDEF_ADDR {
                             continue;
                         }
-                        let chunk_data = self.handle.read_at(addr, nbytes as usize)?;
+                        let chunk_data = self.handle.read_at_most(addr, nbytes as usize)?;
                         let offset = i as u64 * chunk_bytes;
                         let end = std::cmp::min(offset + chunk_bytes, total_size);
                         let copy_len = (end - offset) as usize;
-                        output[offset as usize..offset as usize + copy_len]
-                            .copy_from_slice(&chunk_data[..copy_len]);
+                        let src_len = copy_len.min(chunk_data.len());
+                        output[offset as usize..offset as usize + src_len]
+                            .copy_from_slice(&chunk_data[..src_len]);
                     }
                 }
 
