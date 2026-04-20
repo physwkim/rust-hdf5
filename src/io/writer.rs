@@ -58,6 +58,10 @@ pub struct DatasetInfo {
     pub obj_header_encoded_size: usize,
     /// Filter pipeline for compressed chunks.
     pub filter_pipeline: Option<FilterPipeline>,
+    /// Buffer for partially filled chunks during append.
+    pub append_buffer: Vec<u8>,
+    /// Number of frames accumulated in `append_buffer`.
+    pub append_buffered_frames: u64,
 }
 
 /// Runtime metadata for a chunked dataset.
@@ -297,6 +301,8 @@ impl Hdf5Writer {
                 obj_header_written_addr: Some(*obj_addr),
                 obj_header_encoded_size: 0,
                 filter_pipeline: fp,
+                append_buffer: Vec::new(),
+                append_buffered_frames: 0,
             };
 
             // Reconstruct storage-specific metadata
@@ -476,6 +482,25 @@ impl Hdf5Writer {
         self.datasets.iter().position(|d| d.name == name)
     }
 
+    /// Return the chunk dimensions for a dataset, if chunked.
+    pub fn dataset_chunk_dims(&self, index: usize) -> Option<&[u64]> {
+        let ds = &self.datasets[index];
+        if let Some(ref c) = ds.chunked {
+            Some(&c.chunk_dims)
+        } else if let Some(ref f) = ds.fixed_array {
+            Some(&f.chunk_dims)
+        } else if let Some(ref b) = ds.btree_v2 {
+            Some(&b.chunk_dims)
+        } else {
+            None
+        }
+    }
+
+    /// Return the current dimensions of a dataset.
+    pub fn dataset_dims(&self, index: usize) -> &[u64] {
+        &self.datasets[index].dataspace.dims
+    }
+
     /// Return the names of all groups created so far.
     pub fn group_names(&self) -> Vec<&str> {
         self.groups.iter().map(|g| g.name.as_str()).collect()
@@ -599,6 +624,8 @@ impl Hdf5Writer {
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
             filter_pipeline: None,
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
         });
 
         Ok(idx)
@@ -676,6 +703,8 @@ impl Hdf5Writer {
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
             filter_pipeline: None,
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
             fixed_array: None,
             btree_v2: None,
             chunked: Some(ChunkedDatasetInfo {
@@ -1093,6 +1122,8 @@ impl Hdf5Writer {
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
             filter_pipeline: None,
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
         });
 
         Ok(idx)
@@ -1170,6 +1201,8 @@ impl Hdf5Writer {
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
             filter_pipeline: None,
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
             fixed_array: Some(FixedArrayDatasetInfo {
                 chunk_dims: chunk_dims.to_vec(),
                 fa_header_addr,
@@ -1232,6 +1265,8 @@ impl Hdf5Writer {
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
             filter_pipeline: None,
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
             btree_v2: Some(Bt2DatasetInfo {
                 chunk_dims: chunk_dims.to_vec(),
                 max_dims: max_dims.to_vec(),
@@ -1324,6 +1359,8 @@ impl Hdf5Writer {
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
             filter_pipeline: Some(FilterPipeline::deflate(compression_level)),
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
             fixed_array: None,
             btree_v2: None,
             chunked: Some(ChunkedDatasetInfo {
@@ -1417,6 +1454,8 @@ impl Hdf5Writer {
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
             filter_pipeline: Some(pipeline),
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
             fixed_array: None,
             btree_v2: None,
             chunked: Some(ChunkedDatasetInfo {
@@ -1938,7 +1977,53 @@ impl Hdf5Writer {
     // Internal helpers
     // ------------------------------------------------------------------
 
+    /// Flush any partial append buffers as zero-padded chunks.
+    fn flush_append_buffers(&mut self) -> IoResult<()> {
+        for i in 0..self.datasets.len() {
+            if self.datasets[i].append_buffer.is_empty() {
+                continue;
+            }
+            let chunk_dims = if let Some(ref c) = self.datasets[i].chunked {
+                c.chunk_dims.clone()
+            } else if let Some(ref f) = self.datasets[i].fixed_array {
+                f.chunk_dims.clone()
+            } else if let Some(ref b) = self.datasets[i].btree_v2 {
+                b.chunk_dims.clone()
+            } else {
+                continue;
+            };
+            let es = self.datasets[i].datatype.element_size() as usize;
+            let chunk_bytes: usize = chunk_dims.iter().map(|&d| d as usize).product::<usize>() * es;
+            let chunk_dim0 = chunk_dims[0] as usize;
+            let buffered_frames = self.datasets[i].append_buffered_frames as usize;
+            let current_dim0 = self.datasets[i].dataspace.dims[0] as usize;
+            let base_frame = current_dim0 - buffered_frames;
+            let chunk_idx = base_frame / chunk_dim0;
+
+            let buf = std::mem::take(&mut self.datasets[i].append_buffer);
+            self.datasets[i].append_buffered_frames = 0;
+
+            let mut chunk_buf = vec![0u8; chunk_bytes];
+            let frame_bytes = if self.datasets[i].dataspace.dims.len() > 1 {
+                self.datasets[i].dataspace.dims[1..]
+                    .iter()
+                    .map(|&d| d as usize)
+                    .product::<usize>()
+                    * es
+            } else {
+                es
+            };
+            let offset_in_chunk = (base_frame % chunk_dim0) * frame_bytes;
+            chunk_buf[offset_in_chunk..offset_in_chunk + buf.len()].copy_from_slice(&buf);
+            self.write_chunk(i, chunk_idx as u64, &chunk_buf)?;
+        }
+        Ok(())
+    }
+
     fn finalize(&mut self) -> IoResult<()> {
+        // Flush any partial append buffers before finalizing
+        self.flush_append_buffers()?;
+
         // If SWMR finalize was already done, re-write headers in place and
         // update the superblock with clean-close flags.
         if self.root_group_addr.is_some() {

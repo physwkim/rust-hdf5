@@ -622,6 +622,163 @@ impl H5Dataset {
         }
     }
 
+    /// Append data along the first dimension of a chunked dataset.
+    ///
+    /// `data` must contain a whole number of "frames" — slices along
+    /// dimension 0. For example, if the dataset has shape `[N, H, W]`
+    /// and `chunk_dims = [1, H, W]`, then `data.len()` must be a
+    /// multiple of `H * W`.
+    ///
+    /// This method writes the necessary chunks and extends the dataset
+    /// shape automatically.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("append.h5").unwrap();
+    /// let ds = file.new_dataset::<f64>()
+    ///     .shape(&[0, 3])
+    ///     .chunk(&[1, 3])
+    ///     .max_shape(&[None, Some(3)])
+    ///     .create("data")
+    ///     .unwrap();
+    /// ds.append(&[1.0, 2.0, 3.0]).unwrap();       // shape becomes [1, 3]
+    /// ds.append(&[4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).unwrap(); // shape becomes [3, 3]
+    /// ```
+    pub fn append<T: H5Type>(&self, data: &[T]) -> Result<()> {
+        match &self.info {
+            DatasetInfo::Writer {
+                index,
+                element_size,
+                chunked,
+                ..
+            } => {
+                if !*chunked {
+                    return Err(Hdf5Error::InvalidState(
+                        "append is only for chunked datasets".into(),
+                    ));
+                }
+                if T::element_size() != *element_size {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "append type has element size {} but dataset expects {}",
+                        T::element_size(),
+                        element_size,
+                    )));
+                }
+
+                let ds_index = *index;
+                let es = *element_size;
+
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                let writer = match &mut *inner {
+                    H5FileInner::Writer(w) => w,
+                    _ => {
+                        return Err(Hdf5Error::InvalidState(
+                            "file is no longer in write mode".into(),
+                        ))
+                    }
+                };
+
+                let chunk_dims = writer
+                    .dataset_chunk_dims(ds_index)
+                    .ok_or_else(|| {
+                        Hdf5Error::InvalidState("dataset has no chunk info".into())
+                    })?
+                    .to_vec();
+                let dims = writer.dataset_dims(ds_index).to_vec();
+
+                // Frame size = product of dims[1..]
+                let frame_elems: usize = if dims.len() > 1 {
+                    dims[1..].iter().map(|&d| d as usize).product()
+                } else {
+                    1
+                };
+
+                if frame_elems == 0 {
+                    return Err(Hdf5Error::InvalidState(
+                        "cannot append to dataset with zero-size trailing dimensions".into(),
+                    ));
+                }
+
+                if data.len() % frame_elems != 0 {
+                    return Err(Hdf5Error::InvalidState(format!(
+                        "data length {} is not a multiple of frame size {}",
+                        data.len(),
+                        frame_elems,
+                    )));
+                }
+
+                let n_new_frames = data.len() / frame_elems;
+                let current_dim0 = dims[0] as usize;
+
+                // Chunk size along first dimension
+                let chunk_dim0 = chunk_dims[0] as usize;
+                // Bytes per chunk = product of all chunk_dims * element_size
+                let chunk_bytes = chunk_dims.iter().map(|&d| d as usize).product::<usize>() * es;
+                let frame_bytes = frame_elems * es;
+
+                let raw = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * es)
+                };
+
+                // Merge buffered data with new data
+                let ds = &mut writer.datasets[ds_index];
+                let buffered_frames = ds.append_buffered_frames as usize;
+                let mut combined = std::mem::take(&mut ds.append_buffer);
+                combined.extend_from_slice(raw);
+                ds.append_buffered_frames = 0;
+
+                let total_frames = buffered_frames + n_new_frames;
+                let total_bytes = combined.len();
+
+                // Base chunk index: account for buffered frames
+                let base_dim0 = current_dim0 - buffered_frames;
+                let mut byte_pos = 0usize;
+                let mut frame_pos = 0usize;
+
+                while frame_pos < total_frames {
+                    let abs_frame = base_dim0 + frame_pos;
+                    let chunk_idx = abs_frame / chunk_dim0;
+                    let remaining_frames = total_frames - frame_pos;
+                    let frames_to_fill = chunk_dim0 - (abs_frame % chunk_dim0);
+
+                    if remaining_frames >= frames_to_fill {
+                        // Full chunk — write
+                        let end = byte_pos + frames_to_fill * frame_bytes;
+                        if frames_to_fill == chunk_dim0 {
+                            writer.write_chunk(ds_index, chunk_idx as u64, &combined[byte_pos..end])?;
+                        } else {
+                            // Partial start but fills to chunk boundary
+                            let mut chunk_buf = vec![0u8; chunk_bytes];
+                            let offset_in_chunk = (abs_frame % chunk_dim0) * frame_bytes;
+                            chunk_buf[offset_in_chunk..offset_in_chunk + frames_to_fill * frame_bytes]
+                                .copy_from_slice(&combined[byte_pos..end]);
+                            writer.write_chunk(ds_index, chunk_idx as u64, &chunk_buf)?;
+                        }
+                        byte_pos = end;
+                        frame_pos += frames_to_fill;
+                    } else {
+                        // Partial chunk — buffer for next append
+                        let ds = &mut writer.datasets[ds_index];
+                        ds.append_buffer = combined[byte_pos..total_bytes].to_vec();
+                        ds.append_buffered_frames = remaining_frames as u64;
+                        frame_pos = total_frames;
+                    }
+                }
+
+                // Extend dims to include all frames (buffered + new)
+                let logical_dim0 = base_dim0 + total_frames;
+                let mut new_dims: Vec<u64> = dims;
+                new_dims[0] = logical_dim0 as u64;
+                writer.extend_dataset(ds_index, &new_dims)?;
+
+                Ok(())
+            }
+            DatasetInfo::Reader { .. } => {
+                Err(Hdf5Error::InvalidState("cannot append in read mode".into()))
+            }
+        }
+    }
+
     /// Extend the dimensions of a chunked dataset.
     pub fn extend(&self, new_dims: &[usize]) -> Result<()> {
         match &self.info {
@@ -1331,6 +1488,104 @@ mod tests {
                 file.dataset("f64").unwrap().read_raw::<f64>().unwrap(),
                 vec![1.23456f64, 7.89012]
             );
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn append_chunked_roundtrip() {
+        let path = temp_path("append_chunked");
+
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<f64>()
+                .shape(&[0, 3])
+                .chunk(&[1, 3])
+                .max_shape(&[None, Some(3)])
+                .create("data")
+                .unwrap();
+
+            // Append one frame
+            ds.append(&[1.0f64, 2.0, 3.0]).unwrap();
+            // Append two frames at once
+            ds.append(&[4.0f64, 5.0, 6.0, 7.0, 8.0, 9.0]).unwrap();
+
+            file.close().unwrap();
+        }
+
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("data").unwrap();
+            assert_eq!(ds.shape(), vec![3, 3]);
+            let all = ds.read_raw::<f64>().unwrap();
+            assert_eq!(all, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn append_1d_chunked() {
+        let path = temp_path("append_1d");
+
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape(&[0])
+                .chunk(&[4])
+                .max_shape(&[None])
+                .create("values")
+                .unwrap();
+
+            ds.append(&[10i32, 20, 30]).unwrap(); // partial chunk
+            ds.append(&[40i32]).unwrap(); // fills chunk boundary
+            ds.append(&[50i32, 60, 70, 80]).unwrap(); // full chunk
+
+            file.close().unwrap();
+        }
+
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("values").unwrap();
+            assert_eq!(ds.shape(), vec![8]);
+            let all = ds.read_raw::<i32>().unwrap();
+            assert_eq!(all, vec![10, 20, 30, 40, 50, 60, 70, 80]);
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn append_partial_chunk_flushed_on_close() {
+        let path = temp_path("append_partial_close");
+
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<f64>()
+                .shape(&[0])
+                .chunk(&[4])
+                .max_shape(&[None])
+                .create("vals")
+                .unwrap();
+
+            // Append 5 elements: chunk 0 = full [1,2,3,4], chunk 1 = partial [5,0,0,0]
+            ds.append(&[1.0f64, 2.0, 3.0, 4.0, 5.0]).unwrap();
+            file.close().unwrap();
+        }
+
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("vals").unwrap();
+            assert_eq!(ds.shape(), vec![5]);
+            let all = ds.read_raw::<f64>().unwrap();
+            // The full dataset is 2 chunks * 4 = 8 elements; shape says 5
+            // read_raw reads total shape elements
+            assert_eq!(all.len(), 5);
+            assert_eq!(all, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
         }
 
         std::fs::remove_file(&path).ok();

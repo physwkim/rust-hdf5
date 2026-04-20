@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.3
+
+### Added
+
+- Add `H5Dataset::append` for incrementally appending data along the first
+  dimension of chunked datasets. Supports arbitrary `chunk_dims[0]` with
+  internal buffering of partial chunks (flushed automatically on close).
+
 ## 0.2.2
 
 ### Bug Fixes
