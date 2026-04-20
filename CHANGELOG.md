@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.6
+
+### Performance
+
+- Fix O(n²) vlen string read performance. Reading 24k+ strings previously
+  took ~50s due to cloning the entire GlobalHeapCollection per element and
+  using linear search for object lookup. Now uses cached reference with
+  HashMap index for O(1) access — same workload completes in <1s.
+
+### Bug Fixes
+
+- Harden chunked reader against corrupt/truncated files:
+  - Validate chunk addresses and sizes against file bounds before reading.
+  - Skip chunks where decompression fails instead of using raw compressed
+    bytes as data.
+  - Validate GCOL signature and collection_size before reading global heap.
+  - Add 64MB sanity limit on LZ4 decompressed size to prevent OOM.
+
 ## 0.2.5
 
 ### Bug Fixes
