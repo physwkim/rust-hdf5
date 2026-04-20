@@ -1190,12 +1190,20 @@ impl Hdf5Reader {
                 // Header: signature(4) + version(1) + reserved(3) + collection_size(sizeof_size)
                 let ss = self.ctx.sizeof_size as usize;
                 let header_len = 4 + 1 + 3 + ss;
-                let header_buf = self.handle.read_at(collection_addr, header_len)?;
+                let header_buf = self.handle.read_at_most(collection_addr, header_len)?;
+                if header_buf.len() < header_len || &header_buf[0..4] != b"GCOL" {
+                    strings.push(String::new());
+                    continue;
+                }
                 let mut size_bytes = [0u8; 8];
                 size_bytes[..ss].copy_from_slice(&header_buf[8..8 + ss]);
                 let collection_size = u64::from_le_bytes(size_bytes) as usize;
 
-                let heap_buf = self.handle.read_at(collection_addr, collection_size)?;
+                let heap_buf = self.handle.read_at_most(collection_addr, collection_size)?;
+                if heap_buf.len() < collection_size {
+                    strings.push(String::new());
+                    continue;
+                }
                 let (coll, _) = GlobalHeapCollection::decode(&heap_buf, &self.ctx)?;
                 heap_cache.insert(collection_addr, coll.clone());
                 coll
