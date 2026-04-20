@@ -2,6 +2,13 @@
 
 ## 0.2.4
 
+### Added
+
+- Add `write_vlen_strings_compressed()` API for writing chunked, compressed
+  variable-length string datasets. Accepts a `FilterPipeline` parameter
+  supporting deflate, zstd, or any custom filter combination.
+- Re-export `FilterPipeline` from crate root for ergonomic usage.
+
 ### Bug Fixes
 
 - Remove 64KB hard limit on global heap collection reads for vlen strings.
