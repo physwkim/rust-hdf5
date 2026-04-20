@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.5
+
+### Bug Fixes
+
+- Fix `open_rw` file corruption when modifying attributes without changing
+  datasets. Three issues corrected:
+  - Unmodified dataset links pointed to address 0 instead of preserving
+    the original object header address.
+  - `flush_dataset` was called on all chunked datasets including unmodified
+    ones, overwriting valid EA index structures with incomplete in-memory
+    copies.
+  - Root group attributes were lost because `open_append` did not load
+    existing attributes from the file.
+- `set_attr_string` now replaces existing attributes with the same name
+  instead of creating duplicates.
+
 ## 0.2.4
 
 ### Added
