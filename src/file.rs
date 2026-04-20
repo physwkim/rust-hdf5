@@ -849,6 +849,71 @@ mod integration_tests {
     }
 
     #[test]
+    fn open_rw_set_attr_preserves_file() {
+        let path = std::env::temp_dir().join("hdf5_open_rw_attr.h5");
+        // Create file with a dataset and an attribute
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([3usize])
+                .create("data")
+                .unwrap();
+            ds.write_raw(&[10i32, 20, 30]).unwrap();
+            file.set_attr_string("version", "1.0").unwrap();
+            file.close().unwrap();
+        }
+        // Open rw and modify the attribute
+        {
+            let file = H5File::open_rw(&path).unwrap();
+            file.set_attr_string("version", "2.0").unwrap();
+            file.close().unwrap();
+        }
+        // Verify: dataset intact, attribute updated
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("data").unwrap();
+            assert_eq!(ds.read_raw::<i32>().unwrap(), vec![10, 20, 30]);
+            let ver = file.attr_string("version").unwrap();
+            assert_eq!(ver, "2.0");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn open_rw_attr_with_compressed_dataset() {
+        use crate::format::messages::filter::FilterPipeline;
+        let path = std::env::temp_dir().join("hdf5_open_rw_compressed.h5");
+        let input: Vec<&str> = (0..50).map(|_| "test string data").collect();
+        // Create file with compressed vlen strings
+        {
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_strings_compressed("texts", &input, 16, FilterPipeline::deflate(6))
+                .unwrap();
+            file.set_attr_string("version", "1.0").unwrap();
+            file.close().unwrap();
+        }
+        // Open rw and modify attribute only
+        {
+            let file = H5File::open_rw(&path).unwrap();
+            file.set_attr_string("version", "2.0").unwrap();
+            file.close().unwrap();
+        }
+        // Verify: compressed dataset still readable, attribute updated
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("texts").unwrap();
+            let strings = ds.read_vlen_strings().unwrap();
+            assert_eq!(strings.len(), 50);
+            assert_eq!(strings[0], "test string data");
+            let ver = file.attr_string("version").unwrap();
+            assert_eq!(ver, "2.0");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn vlen_string_write_read() {
         let path = std::env::temp_dir().join("hdf5_vlen_wr.h5");
         {

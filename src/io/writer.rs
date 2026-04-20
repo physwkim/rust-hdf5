@@ -230,6 +230,18 @@ impl Hdf5Writer {
         let root_buf = handle.read_at_most(sb.root_group_object_header_address, 8192)?;
         let (root_header, _) = crate::format::object_header::ObjectHeader::decode(&root_buf)?;
 
+        // Collect existing root-level attributes
+        let mut root_attributes = Vec::new();
+        for msg in &root_header.messages {
+            if msg.msg_type == crate::format::messages::MSG_ATTRIBUTE {
+                if let Ok((a, _)) =
+                    crate::format::messages::attribute::AttributeMessage::decode(&msg.data, &ctx)
+                {
+                    root_attributes.push(a);
+                }
+            }
+        }
+
         let mut link_entries: Vec<(String, u64)> = Vec::new();
         Self::collect_links_recursive(&mut handle, &root_header, &ctx, "", &mut link_entries)?;
 
@@ -418,7 +430,7 @@ impl Hdf5Writer {
             ctx,
             datasets: existing_datasets,
             groups: Vec::new(),
-            root_attributes: Vec::new(),
+            root_attributes,
             closed: false,
             root_group_addr: None,
             root_group_encoded_size: 0,
@@ -1058,7 +1070,16 @@ impl Hdf5Writer {
         &mut self,
         attr: crate::format::messages::attribute::AttributeMessage,
     ) {
-        self.root_attributes.push(attr);
+        // Replace existing attribute with the same name, or append new one.
+        if let Some(pos) = self
+            .root_attributes
+            .iter()
+            .position(|a| a.name == attr.name)
+        {
+            self.root_attributes[pos] = attr;
+        } else {
+            self.root_attributes.push(attr);
+        }
     }
 
     /// Create a variable-length string dataset and write string data.
@@ -2182,8 +2203,15 @@ impl Hdf5Writer {
         // If SWMR finalize was already done, re-write headers in place and
         // update the superblock with clean-close flags.
         if self.root_group_addr.is_some() {
-            // Flush index structures for all chunked datasets.
+            // Flush index structures for modified chunked datasets.
             for i in 0..self.datasets.len() {
+                let modified = self.datasets[i]
+                    .chunked
+                    .as_ref()
+                    .is_some_and(|c| c.chunks_written > 0);
+                if !modified {
+                    continue;
+                }
                 if self.datasets[i].chunked.is_some()
                     || self.datasets[i].fixed_array.is_some()
                     || self.datasets[i].btree_v2.is_some()
@@ -2203,8 +2231,17 @@ impl Hdf5Writer {
             return Ok(());
         }
 
-        // 0. Flush all chunked dataset index structures.
+        // 0. Flush chunked dataset index structures (only modified datasets).
         for i in 0..self.datasets.len() {
+            if self.datasets[i].obj_header_written_addr.is_some() {
+                let modified = self.datasets[i]
+                    .chunked
+                    .as_ref()
+                    .is_some_and(|c| c.chunks_written > 0);
+                if !modified {
+                    continue;
+                }
+            }
             if self.datasets[i].chunked.is_some()
                 || self.datasets[i].fixed_array.is_some()
                 || self.datasets[i].btree_v2.is_some()
@@ -2224,6 +2261,9 @@ impl Hdf5Writer {
                     .as_ref()
                     .is_some_and(|c| c.chunks_written > 0);
                 if !modified {
+                    // Keep the original object header address for the root group link.
+                    self.datasets[i].obj_header_addr =
+                        self.datasets[i].obj_header_written_addr.unwrap();
                     continue;
                 }
             }
