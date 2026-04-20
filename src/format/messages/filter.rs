@@ -2347,17 +2347,13 @@ mod tests {
             0x03, 0x00, 0x01, 0x02, 0x03, 0xe0, 0xff, 0xf2, 0x03, 0x01, 0x02, 0x03,
         ];
         let mut expected = vec![0u8; 2048];
-        for i in 0..512 {
-            expected[i] = 0xAA;
+        expected[..512].fill(0xAA);
+        for (i, v) in expected[512..1024].iter_mut().enumerate() {
+            *v = ((512 + i) % 8) as u8;
         }
-        for i in 512..1024 {
-            expected[i] = (i % 8) as u8;
-        }
-        for i in 1024..1536 {
-            expected[i] = 0xBB;
-        }
-        for i in 1536..2048 {
-            expected[i] = (i % 4) as u8;
+        expected[1024..1536].fill(0xBB);
+        for (i, v) in expected[1536..2048].iter_mut().enumerate() {
+            *v = ((1536 + i) % 4) as u8;
         }
         let decompressed = blosclz_decompress(compressed, 2048).unwrap();
         assert_eq!(decompressed, expected);

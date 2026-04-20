@@ -1504,7 +1504,7 @@ mod tests {
             let file = H5File::create(&path).unwrap();
             let ds = file
                 .new_dataset::<f64>()
-                .shape(&[0, 3])
+                .shape([0, 3])
                 .chunk(&[1, 3])
                 .max_shape(&[None, Some(3)])
                 .create("data")
@@ -1537,7 +1537,7 @@ mod tests {
             let file = H5File::create(&path).unwrap();
             let ds = file
                 .new_dataset::<i32>()
-                .shape(&[0])
+                .shape([0])
                 .chunk(&[4])
                 .max_shape(&[None])
                 .create("values")
@@ -1569,7 +1569,7 @@ mod tests {
             let file = H5File::create(&path).unwrap();
             let ds = file
                 .new_dataset::<f64>()
-                .shape(&[0])
+                .shape([0])
                 .chunk(&[4])
                 .max_shape(&[None])
                 .create("vals")
