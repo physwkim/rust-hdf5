@@ -766,12 +766,17 @@ impl Hdf5Reader {
 
                 if let Some(pl) = pipeline {
                     // Read all raw chunks first, then decompress (optionally in parallel)
+                    let file_size = self.handle.file_size()?;
                     let mut raw_chunks: Vec<Option<Vec<u8>>> = Vec::with_capacity(n_chunks);
                     for &(addr, nbytes) in &chunk_entries[..n_chunks] {
-                        if addr == UNDEF_ADDR {
+                        if addr == UNDEF_ADDR
+                            || nbytes == 0
+                            || addr >= file_size
+                            || nbytes > file_size
+                        {
                             raw_chunks.push(None);
                         } else {
-                            raw_chunks.push(Some(self.handle.read_at_most(addr, nbytes as usize)?));
+                            raw_chunks.push(Some(self.handle.read_at(addr, nbytes as usize)?));
                         }
                     }
 
@@ -1164,9 +1169,12 @@ impl Hdf5Reader {
         let ref_size = vlen_reference_size(&self.ctx);
         let mut strings = Vec::with_capacity(total_elements as usize);
 
-        // Cache global heap collections to avoid re-reading
-        let mut heap_cache: std::collections::HashMap<u64, GlobalHeapCollection> =
-            std::collections::HashMap::new();
+        // Cache global heap collections to avoid re-reading.
+        // Store as (collection, index→offset lookup) for O(1) object access.
+        let mut heap_cache: std::collections::HashMap<
+            u64,
+            (GlobalHeapCollection, std::collections::HashMap<u16, usize>),
+        > = std::collections::HashMap::new();
 
         for i in 0..total_elements as usize {
             let offset = i * ref_size;
@@ -1183,11 +1191,8 @@ impl Hdf5Reader {
             }
 
             // Read or get cached global heap collection
-            let collection = if let Some(c) = heap_cache.get(&collection_addr) {
-                c.clone()
-            } else {
-                // Read GCOL header to determine the actual collection size.
-                // Header: signature(4) + version(1) + reserved(3) + collection_size(sizeof_size)
+            #[allow(clippy::map_entry)]
+            if !heap_cache.contains_key(&collection_addr) {
                 let ss = self.ctx.sizeof_size as usize;
                 let header_len = 4 + 1 + 3 + ss;
                 let header_buf = self.handle.read_at_most(collection_addr, header_len)?;
@@ -1199,19 +1204,25 @@ impl Hdf5Reader {
                 size_bytes[..ss].copy_from_slice(&header_buf[8..8 + ss]);
                 let collection_size = u64::from_le_bytes(size_bytes) as usize;
 
-                let heap_buf = self.handle.read_at_most(collection_addr, collection_size)?;
-                if heap_buf.len() < collection_size {
+                if collection_size == 0 || collection_size > 64 * 1024 * 1024 {
                     strings.push(String::new());
                     continue;
                 }
-                let (coll, _) = GlobalHeapCollection::decode(&heap_buf, &self.ctx)?;
-                heap_cache.insert(collection_addr, coll.clone());
-                coll
-            };
 
-            if let Some(data) = collection.get_object(obj_index as u16) {
-                // h5py stores vlen strings as UTF-8 (or ASCII) bytes
-                let s = String::from_utf8_lossy(data).to_string();
+                let heap_buf = self.handle.read_at(collection_addr, collection_size)?;
+                let (coll, _) = GlobalHeapCollection::decode(&heap_buf, &self.ctx)?;
+                let lookup: std::collections::HashMap<u16, usize> = coll
+                    .objects
+                    .iter()
+                    .enumerate()
+                    .map(|(i, o)| (o.index, i))
+                    .collect();
+                heap_cache.insert(collection_addr, (coll, lookup));
+            }
+
+            let (coll, lookup) = &heap_cache[&collection_addr];
+            if let Some(&idx) = lookup.get(&(obj_index as u16)) {
+                let s = String::from_utf8_lossy(&coll.objects[idx].data).to_string();
                 strings.push(s);
             } else {
                 strings.push(String::new());

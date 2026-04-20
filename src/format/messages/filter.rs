@@ -449,6 +449,14 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
                 let orig_size = u64::from_be_bytes([
                     data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                 ]) as usize;
+                // Sanity check: orig_size should not exceed a reasonable limit.
+                // HDF5 chunks are typically < 64MB.
+                if orig_size > 64 * 1024 * 1024 {
+                    return Err(FormatError::InvalidData(format!(
+                        "LZ4: orig_size {} exceeds 64MB limit",
+                        orig_size
+                    )));
+                }
                 let mut block_size =
                     u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
                 if block_size > orig_size {
