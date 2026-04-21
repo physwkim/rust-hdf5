@@ -62,6 +62,8 @@ pub struct DatasetInfo {
     pub append_buffer: Vec<u8>,
     /// Number of frames accumulated in `append_buffer`.
     pub append_buffered_frames: u64,
+    /// Soft-deleted: excluded from finalize output.
+    pub deleted: bool,
 }
 
 /// Runtime metadata for a chunked dataset.
@@ -138,6 +140,8 @@ pub struct GroupInfo {
     pub child_groups: Vec<usize>,
     /// File offset of this group's object header (set during finalize).
     pub obj_header_addr: u64,
+    /// Soft-deleted: excluded from finalize output.
+    pub deleted: bool,
 }
 
 /// HDF5 file writer.
@@ -315,6 +319,7 @@ impl Hdf5Writer {
                 filter_pipeline: fp,
                 append_buffer: Vec::new(),
                 append_buffered_frames: 0,
+                deleted: false,
             };
 
             // Reconstruct storage-specific metadata
@@ -486,12 +491,69 @@ impl Hdf5Writer {
 
     /// Return the names of all datasets created so far.
     pub fn dataset_names(&self) -> Vec<&str> {
-        self.datasets.iter().map(|d| d.name.as_str()).collect()
+        self.datasets
+            .iter()
+            .filter(|d| !d.deleted)
+            .map(|d| d.name.as_str())
+            .collect()
     }
 
     /// Find a dataset index by name.
     pub fn dataset_index(&self, name: &str) -> Option<usize> {
-        self.datasets.iter().position(|d| d.name == name)
+        self.datasets
+            .iter()
+            .position(|d| d.name == name && !d.deleted)
+    }
+
+    /// Soft-delete a dataset by name. The dataset is excluded from the file
+    /// on close. File space is not reclaimed.
+    pub fn delete_dataset(&mut self, name: &str) -> IoResult<()> {
+        let idx = self
+            .datasets
+            .iter()
+            .position(|d| d.name == name && !d.deleted)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        self.datasets[idx].deleted = true;
+        // Remove from parent group's child_datasets
+        for grp in &mut self.groups {
+            grp.child_datasets.retain(|&di| di != idx);
+        }
+        Ok(())
+    }
+
+    /// Soft-delete a group and all its child datasets and sub-groups.
+    /// File space is not reclaimed.
+    pub fn delete_group(&mut self, name: &str) -> IoResult<()> {
+        let name = if name.starts_with('/') {
+            name.to_string()
+        } else {
+            format!("/{}", name)
+        };
+        let gidx = self
+            .groups
+            .iter()
+            .position(|g| g.name == name && !g.deleted)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.clone()))?;
+        self.delete_group_recursive(gidx);
+        // Remove from parent's child_groups
+        if let Some(pidx) = self.groups[gidx].parent {
+            self.groups[pidx].child_groups.retain(|&gi| gi != gidx);
+        }
+        Ok(())
+    }
+
+    fn delete_group_recursive(&mut self, gidx: usize) {
+        self.groups[gidx].deleted = true;
+        // Delete child datasets
+        let child_ds: Vec<usize> = self.groups[gidx].child_datasets.clone();
+        for di in child_ds {
+            self.datasets[di].deleted = true;
+        }
+        // Recurse into child groups
+        let child_gs: Vec<usize> = self.groups[gidx].child_groups.clone();
+        for gi in child_gs {
+            self.delete_group_recursive(gi);
+        }
     }
 
     /// Return the chunk dimensions for a dataset, if chunked.
@@ -531,8 +593,12 @@ impl Hdf5Writer {
             format!("{}/{}", parent_path, name)
         };
 
-        // Check for duplicates
-        if self.groups.iter().any(|g| g.name == full_name) {
+        // Check for duplicates (ignore deleted groups)
+        if self
+            .groups
+            .iter()
+            .any(|g| g.name == full_name && !g.deleted)
+        {
             return Err(crate::io::IoError::InvalidState(format!(
                 "group '{}' already exists",
                 full_name
@@ -563,6 +629,7 @@ impl Hdf5Writer {
             child_datasets: Vec::new(),
             child_groups: Vec::new(),
             obj_header_addr: 0,
+            deleted: false,
         });
 
         // Register this group as a child of its parent
@@ -638,6 +705,7 @@ impl Hdf5Writer {
             filter_pipeline: None,
             append_buffer: Vec::new(),
             append_buffered_frames: 0,
+            deleted: false,
         });
 
         Ok(idx)
@@ -717,6 +785,7 @@ impl Hdf5Writer {
             filter_pipeline: None,
             append_buffer: Vec::new(),
             append_buffered_frames: 0,
+            deleted: false,
             fixed_array: None,
             btree_v2: None,
             chunked: Some(ChunkedDatasetInfo {
@@ -1145,6 +1214,7 @@ impl Hdf5Writer {
             filter_pipeline: None,
             append_buffer: Vec::new(),
             append_buffered_frames: 0,
+            deleted: false,
         });
 
         Ok(idx)
@@ -1266,6 +1336,7 @@ impl Hdf5Writer {
             filter_pipeline: Some(pipeline),
             append_buffer: Vec::new(),
             append_buffered_frames: 0,
+            deleted: false,
             fixed_array: None,
             btree_v2: None,
             chunked: Some(ChunkedDatasetInfo {
@@ -1505,6 +1576,7 @@ impl Hdf5Writer {
             filter_pipeline: None,
             append_buffer: Vec::new(),
             append_buffered_frames: 0,
+            deleted: false,
             fixed_array: Some(FixedArrayDatasetInfo {
                 chunk_dims: chunk_dims.to_vec(),
                 fa_header_addr,
@@ -1569,6 +1641,7 @@ impl Hdf5Writer {
             filter_pipeline: None,
             append_buffer: Vec::new(),
             append_buffered_frames: 0,
+            deleted: false,
             btree_v2: Some(Bt2DatasetInfo {
                 chunk_dims: chunk_dims.to_vec(),
                 max_dims: max_dims.to_vec(),
@@ -1663,6 +1736,7 @@ impl Hdf5Writer {
             filter_pipeline: Some(FilterPipeline::deflate(compression_level)),
             append_buffer: Vec::new(),
             append_buffered_frames: 0,
+            deleted: false,
             fixed_array: None,
             btree_v2: None,
             chunked: Some(ChunkedDatasetInfo {
@@ -1758,6 +1832,7 @@ impl Hdf5Writer {
             filter_pipeline: Some(pipeline),
             append_buffer: Vec::new(),
             append_buffered_frames: 0,
+            deleted: false,
             fixed_array: None,
             btree_v2: None,
             chunked: Some(ChunkedDatasetInfo {
@@ -2533,19 +2608,24 @@ impl Hdf5Writer {
 
         let grp = &self.groups[group_idx];
 
-        // Link messages for child datasets
+        // Link messages for child datasets (skip deleted)
         for &ds_idx in &grp.child_datasets {
             let ds = &self.datasets[ds_idx];
-            // Use only the leaf name (last component of the dataset name)
+            if ds.deleted {
+                continue;
+            }
             let leaf_name = ds.name.rsplit('/').next().unwrap_or(&ds.name);
             let link = LinkMessage::hard(leaf_name, ds.obj_header_addr);
             let link_msg = link.encode(&self.ctx);
             header.add_message(MSG_LINK, 0x00, link_msg);
         }
 
-        // Link messages for child groups
+        // Link messages for child groups (skip deleted)
         for &child_idx in &grp.child_groups {
             let child_grp = &self.groups[child_idx];
+            if child_grp.deleted {
+                continue;
+            }
             let leaf_name = child_grp.name.rsplit('/').next().unwrap_or(&child_grp.name);
             let link = LinkMessage::hard(leaf_name, child_grp.obj_header_addr);
             let link_msg = link.encode(&self.ctx);
@@ -2572,11 +2652,15 @@ impl Hdf5Writer {
         let datasets_in_subgroups: std::collections::HashSet<usize> = self
             .groups
             .iter()
+            .filter(|g| !g.deleted)
             .flat_map(|g| g.child_datasets.iter().copied())
             .collect();
 
         // Link messages for root-level datasets
         for (i, ds) in self.datasets.iter().enumerate() {
+            if ds.deleted {
+                continue;
+            }
             if !datasets_in_subgroups.contains(&i) {
                 let link = LinkMessage::hard(&ds.name, ds.obj_header_addr);
                 let link_msg = link.encode(&self.ctx);
@@ -2586,6 +2670,9 @@ impl Hdf5Writer {
 
         // Link messages for root-level groups (those with no parent)
         for grp in &self.groups {
+            if grp.deleted {
+                continue;
+            }
             if grp.parent.is_none() {
                 let leaf_name = grp.name.rsplit('/').next().unwrap_or(&grp.name);
                 let link = LinkMessage::hard(leaf_name, grp.obj_header_addr);

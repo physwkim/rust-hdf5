@@ -350,6 +350,32 @@ impl H5File {
         }
     }
 
+    /// Delete a dataset by name. The dataset is unlinked on close;
+    /// file space is not reclaimed.
+    pub fn delete_dataset(&self, name: &str) -> Result<()> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                writer.delete_dataset(name)?;
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot delete in read mode".into())),
+        }
+    }
+
+    /// Delete a group and all its child datasets/sub-groups.
+    /// File space is not reclaimed.
+    pub fn delete_group(&self, name: &str) -> Result<()> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                writer.delete_group(name)?;
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot delete in read mode".into())),
+        }
+    }
+
     /// Open an existing dataset by name (read mode).
     pub fn dataset(&self, name: &str) -> Result<H5Dataset> {
         let inner = borrow_inner(&self.inner);
@@ -1033,6 +1059,70 @@ mod integration_tests {
             let ds = file.dataset("texts").unwrap();
             let strings = ds.read_vlen_strings().unwrap();
             assert_eq!(strings, vec!["hello", "world", "foo", "bar", "baz"]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn delete_dataset_roundtrip() {
+        let path = std::env::temp_dir().join("hdf5_delete_ds.h5");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_strings("keep", &["a", "b"]).unwrap();
+            file.write_vlen_strings("remove", &["x", "y"]).unwrap();
+            file.delete_dataset("remove").unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let names = file.dataset_names();
+            assert!(names.contains(&"keep".to_string()));
+            assert!(!names.contains(&"remove".to_string()));
+            let ds = file.dataset("keep").unwrap();
+            assert_eq!(ds.read_vlen_strings().unwrap(), vec!["a", "b"]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn delete_group_roundtrip() {
+        let path = std::env::temp_dir().join("hdf5_delete_grp.h5");
+        {
+            let file = H5File::create(&path).unwrap();
+            let g1 = file.create_group("keep").unwrap();
+            g1.write_vlen_strings("data", &["a"]).unwrap();
+            let g2 = file.create_group("remove").unwrap();
+            g2.write_vlen_strings("data", &["x"]).unwrap();
+            file.delete_group("remove").unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let names = file.dataset_names();
+            assert!(names.contains(&"keep/data".to_string()));
+            assert!(!names.contains(&"remove/data".to_string()));
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn delete_and_recreate_group() {
+        let path = std::env::temp_dir().join("hdf5_delete_recreate.h5");
+        {
+            let file = H5File::create(&path).unwrap();
+            let g = file.create_group("nodes").unwrap();
+            g.write_vlen_strings("id", &["old1", "old2"]).unwrap();
+            file.delete_group("nodes").unwrap();
+            let g = file.create_group("nodes").unwrap();
+            g.write_vlen_strings("id", &["new1", "new2", "new3"])
+                .unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("nodes/id").unwrap();
+            let strings = ds.read_vlen_strings().unwrap();
+            assert_eq!(strings, vec!["new1", "new2", "new3"]);
         }
         std::fs::remove_file(&path).ok();
     }
