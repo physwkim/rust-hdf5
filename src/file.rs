@@ -299,6 +299,57 @@ impl H5File {
         }
     }
 
+    /// Create an empty chunked vlen string dataset ready for incremental appends.
+    ///
+    /// Use `append_vlen_strings` to add data. If `pipeline` is `Some`, chunks
+    /// are compressed (e.g., `Some(FilterPipeline::lz4())`).
+    pub fn create_appendable_vlen_dataset(
+        &self,
+        name: &str,
+        chunk_size: usize,
+        pipeline: Option<FilterPipeline>,
+    ) -> Result<()> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                let idx =
+                    writer.create_appendable_vlen_string_dataset(name, chunk_size, pipeline)?;
+                if let Some(slash_pos) = name.rfind('/') {
+                    let group_path = &name[..slash_pos];
+                    let abs_group_path = if group_path.starts_with('/') {
+                        group_path.to_string()
+                    } else {
+                        format!("/{}", group_path)
+                    };
+                    writer.assign_dataset_to_group(&abs_group_path, idx)?;
+                }
+                Ok(())
+            }
+            H5FileInner::Reader(_) => {
+                Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
+            }
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
+    /// Append variable-length strings to an existing chunked vlen string dataset.
+    pub fn append_vlen_strings(&self, name: &str, strings: &[&str]) -> Result<()> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                let ds_index = writer
+                    .dataset_index(name)
+                    .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?;
+                writer.append_vlen_strings(ds_index, strings)?;
+                Ok(())
+            }
+            H5FileInner::Reader(_) => {
+                Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
+            }
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
     /// Open an existing dataset by name (read mode).
     pub fn dataset(&self, name: &str) -> Result<H5Dataset> {
         let inner = borrow_inner(&self.inner);
@@ -909,6 +960,79 @@ mod integration_tests {
             assert_eq!(strings[0], "test string data");
             let ver = file.attr_string("version").unwrap();
             assert_eq!(ver, "2.0");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    #[cfg(feature = "lz4")]
+    fn append_vlen_strings_basic() {
+        use crate::format::messages::filter::FilterPipeline;
+        let path = std::env::temp_dir().join("hdf5_append_vlen.h5");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.create_appendable_vlen_dataset("names", 4, Some(FilterPipeline::lz4()))
+                .unwrap();
+            file.append_vlen_strings("names", &["alice", "bob", "charlie"])
+                .unwrap();
+            file.append_vlen_strings("names", &["dave", "eve"]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("names").unwrap();
+            let strings = ds.read_vlen_strings().unwrap();
+            assert_eq!(strings, vec!["alice", "bob", "charlie", "dave", "eve"]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    #[cfg(feature = "lz4")]
+    fn append_vlen_strings_large() {
+        use crate::format::messages::filter::FilterPipeline;
+        let path = std::env::temp_dir().join("hdf5_append_vlen_large.h5");
+        let batch1: Vec<String> = (0..5000).map(|i| format!("node-{:06}", i)).collect();
+        let batch2: Vec<String> = (5000..7189).map(|i| format!("node-{:06}", i)).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.create_appendable_vlen_dataset("data", 512, Some(FilterPipeline::lz4()))
+                .unwrap();
+            let r1: Vec<&str> = batch1.iter().map(|s| s.as_str()).collect();
+            file.append_vlen_strings("data", &r1).unwrap();
+            let r2: Vec<&str> = batch2.iter().map(|s| s.as_str()).collect();
+            file.append_vlen_strings("data", &r2).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("data").unwrap();
+            let strings = ds.read_vlen_strings().unwrap();
+            assert_eq!(strings.len(), 7189);
+            assert_eq!(strings[0], "node-000000");
+            assert_eq!(strings[7188], "node-007188");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn append_vlen_strings_uncompressed() {
+        let path = std::env::temp_dir().join("hdf5_append_vlen_unc.h5");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.create_appendable_vlen_dataset("texts", 8, None)
+                .unwrap();
+            file.append_vlen_strings("texts", &["hello", "world"])
+                .unwrap();
+            file.append_vlen_strings("texts", &["foo", "bar", "baz"])
+                .unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("texts").unwrap();
+            let strings = ds.read_vlen_strings().unwrap();
+            assert_eq!(strings, vec!["hello", "world", "foo", "bar", "baz"]);
         }
         std::fs::remove_file(&path).ok();
     }

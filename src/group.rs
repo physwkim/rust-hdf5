@@ -214,6 +214,62 @@ impl H5Group {
         }
     }
 
+    /// Create an empty chunked vlen string dataset ready for incremental appends.
+    pub fn create_appendable_vlen_dataset(
+        &self,
+        name: &str,
+        chunk_size: usize,
+        pipeline: Option<FilterPipeline>,
+    ) -> Result<()> {
+        let full_name = if self.name == "/" {
+            name.to_string()
+        } else {
+            let trimmed = self.name.trim_start_matches('/');
+            format!("{}/{}", trimmed, name)
+        };
+
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                let idx = writer
+                    .create_appendable_vlen_string_dataset(&full_name, chunk_size, pipeline)?;
+                if self.name != "/" {
+                    writer.assign_dataset_to_group(&self.name, idx)?;
+                }
+                Ok(())
+            }
+            H5FileInner::Reader(_) => {
+                Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
+            }
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
+    /// Append variable-length strings to an existing chunked vlen string dataset.
+    pub fn append_vlen_strings(&self, name: &str, strings: &[&str]) -> Result<()> {
+        let full_name = if self.name == "/" {
+            name.to_string()
+        } else {
+            let trimmed = self.name.trim_start_matches('/');
+            format!("{}/{}", trimmed, name)
+        };
+
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                let ds_index = writer
+                    .dataset_index(&full_name)
+                    .ok_or_else(|| Hdf5Error::NotFound(full_name.clone()))?;
+                writer.append_vlen_strings(ds_index, strings)?;
+                Ok(())
+            }
+            H5FileInner::Reader(_) => {
+                Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
+            }
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
     /// List sub-group names that are direct children of this group.
     pub fn group_names(&self) -> Result<Vec<String>> {
         let inner = borrow_inner(&self.file_inner);

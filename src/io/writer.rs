@@ -1305,6 +1305,132 @@ impl Hdf5Writer {
         Ok(idx)
     }
 
+    /// Create an empty chunked vlen string dataset ready for incremental appends.
+    ///
+    /// The dataset starts with `dims = [0]` and `max_dims = [unlimited]`.
+    /// Use `append_vlen_strings` to add data.
+    pub fn create_appendable_vlen_string_dataset(
+        &mut self,
+        name: &str,
+        chunk_size: usize,
+        pipeline: Option<FilterPipeline>,
+    ) -> IoResult<usize> {
+        let datatype = DatatypeMessage::vlen_string_utf8();
+        let chunk_dims: Vec<u64> = vec![chunk_size as u64];
+        let dims: Vec<u64> = vec![0];
+        let max_dims: Vec<u64> = vec![u64::MAX];
+
+        if let Some(ref pl) = pipeline {
+            self.create_chunked_dataset_with_pipeline(
+                name,
+                datatype,
+                &dims,
+                &max_dims,
+                &chunk_dims,
+                pl.clone(),
+            )
+        } else {
+            self.create_chunked_dataset(name, datatype, &dims, &max_dims, &chunk_dims)
+        }
+    }
+
+    /// Append variable-length strings to an existing chunked vlen string dataset.
+    ///
+    /// Creates a new global heap collection for the strings, builds vlen
+    /// references, and appends them as new chunks to the dataset.
+    pub fn append_vlen_strings(&mut self, ds_index: usize, strings: &[&str]) -> IoResult<()> {
+        use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+
+        if strings.is_empty() {
+            return Ok(());
+        }
+
+        // Build a new global heap collection for this batch
+        let mut gcol = GlobalHeapCollection::new();
+        let mut obj_indices = Vec::with_capacity(strings.len());
+        for s in strings {
+            let idx = gcol.add_object(s.as_bytes().to_vec());
+            obj_indices.push(idx);
+        }
+        let gcol_encoded = gcol.encode(&self.ctx);
+        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
+        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+
+        // Build raw vlen reference bytes
+        let ref_size = crate::format::global_heap::vlen_reference_size(&self.ctx);
+        let mut raw = Vec::with_capacity(strings.len() * ref_size);
+        for (i, &obj_idx) in obj_indices.iter().enumerate() {
+            let seq_len = strings[i].len() as u32;
+            raw.extend_from_slice(&encode_vlen_reference(
+                seq_len,
+                gcol_addr,
+                obj_idx as u32,
+                &self.ctx,
+            ));
+        }
+
+        // Use the same chunked-append logic as append<T>
+        let chunk_dims = self
+            .dataset_chunk_dims(ds_index)
+            .ok_or_else(|| crate::io::IoError::InvalidState("not a chunked dataset".into()))?
+            .to_vec();
+        let dims = self.dataset_dims(ds_index).to_vec();
+
+        let n_new_frames = strings.len();
+        let current_dim0 = dims[0] as usize;
+        let chunk_dim0 = chunk_dims[0] as usize;
+        let chunk_bytes = chunk_dim0 * ref_size;
+        let frame_bytes = ref_size;
+
+        // Merge buffered data with new data
+        let ds = &mut self.datasets[ds_index];
+        let buffered_frames = ds.append_buffered_frames as usize;
+        let mut combined = std::mem::take(&mut ds.append_buffer);
+        combined.extend_from_slice(&raw);
+        ds.append_buffered_frames = 0;
+
+        let total_frames = buffered_frames + n_new_frames;
+        let total_bytes = combined.len();
+        let base_dim0 = current_dim0 - buffered_frames;
+        let mut byte_pos = 0usize;
+        let mut frame_pos = 0usize;
+
+        while frame_pos < total_frames {
+            let abs_frame = base_dim0 + frame_pos;
+            let chunk_idx = abs_frame / chunk_dim0;
+            let remaining_frames = total_frames - frame_pos;
+            let frames_to_fill = chunk_dim0 - (abs_frame % chunk_dim0);
+
+            if remaining_frames >= frames_to_fill {
+                let end = byte_pos + frames_to_fill * frame_bytes;
+                if frames_to_fill == chunk_dim0 {
+                    self.write_chunk(ds_index, chunk_idx as u64, &combined[byte_pos..end])?;
+                } else {
+                    let mut chunk_buf = vec![0u8; chunk_bytes];
+                    let offset_in_chunk = (abs_frame % chunk_dim0) * frame_bytes;
+                    chunk_buf[offset_in_chunk..offset_in_chunk + frames_to_fill * frame_bytes]
+                        .copy_from_slice(&combined[byte_pos..end]);
+                    self.write_chunk(ds_index, chunk_idx as u64, &chunk_buf)?;
+                }
+                byte_pos = end;
+                frame_pos += frames_to_fill;
+            } else {
+                let ds = &mut self.datasets[ds_index];
+                ds.append_buffer = combined[byte_pos..total_bytes].to_vec();
+                ds.append_buffered_frames = remaining_frames as u64;
+                frame_pos = total_frames;
+            }
+        }
+
+        // Extend dims
+        let logical_dim0 = base_dim0 + total_frames;
+        let mut new_dims = dims;
+        new_dims[0] = logical_dim0 as u64;
+        self.extend_dataset(ds_index, &new_dims)?;
+
+        Ok(())
+    }
+
     /// Add an attribute to a dataset.
     ///
     /// The attribute will be written as a message in the dataset's object
