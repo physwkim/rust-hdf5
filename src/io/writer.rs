@@ -427,6 +427,63 @@ impl Hdf5Writer {
             existing_datasets.push(info);
         }
 
+        // Reconstruct group structure from dataset paths.
+        // e.g. dataset "nodes/id" implies group "/nodes" exists.
+        let mut groups: Vec<GroupInfo> = Vec::new();
+        let mut group_index_map: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        for (di, ds) in existing_datasets.iter().enumerate() {
+            let parts: Vec<&str> = ds.name.split('/').collect();
+            if parts.len() <= 1 {
+                continue; // root-level dataset, no group
+            }
+            // Build group hierarchy: e.g. "a/b/c" → groups "/a", "/a/b"
+            let mut path = String::new();
+            for part in &parts[..parts.len() - 1] {
+                let parent_path = if path.is_empty() {
+                    "/".to_string()
+                } else {
+                    path.clone()
+                };
+                if path.is_empty() {
+                    path = format!("/{}", part);
+                } else {
+                    path = format!("{}/{}", path, part);
+                }
+                if group_index_map.contains_key(&path) {
+                    continue;
+                }
+                let parent = if parent_path == "/" {
+                    None
+                } else {
+                    group_index_map.get(&parent_path).copied()
+                };
+                let gidx = groups.len();
+                groups.push(GroupInfo {
+                    name: path.clone(),
+                    parent,
+                    child_datasets: Vec::new(),
+                    child_groups: Vec::new(),
+                    obj_header_addr: 0,
+                    deleted: false,
+                });
+                if let Some(pidx) = parent {
+                    groups[pidx].child_groups.push(gidx);
+                }
+                group_index_map.insert(path.clone(), gidx);
+            }
+            // Assign dataset to its immediate parent group
+            let parent_path = if parts.len() == 2 {
+                format!("/{}", parts[0])
+            } else {
+                format!("/{}", parts[..parts.len() - 1].join("/"))
+            };
+            if let Some(&gidx) = group_index_map.get(&parent_path) {
+                groups[gidx].child_datasets.push(di);
+            }
+        }
+
         let allocator = FileAllocator::new(file_size);
 
         Ok(Self {
@@ -434,7 +491,7 @@ impl Hdf5Writer {
             allocator,
             ctx,
             datasets: existing_datasets,
-            groups: Vec::new(),
+            groups,
             root_attributes,
             closed: false,
             root_group_addr: None,

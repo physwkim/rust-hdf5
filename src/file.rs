@@ -1106,6 +1106,40 @@ mod integration_tests {
     }
 
     #[test]
+    fn open_rw_delete_recreate_group() {
+        let path = std::env::temp_dir().join("hdf5_rw_delete_recreate.h5");
+        // Step 1: create file with groups
+        {
+            let file = H5File::create(&path).unwrap();
+            let n = file.create_group("nodes").unwrap();
+            n.write_vlen_strings("id", &["a", "b", "c"]).unwrap();
+            let e = file.create_group("edges").unwrap();
+            e.write_vlen_strings("src", &["x", "y"]).unwrap();
+            file.close().unwrap();
+        }
+        // Step 2: open_rw, delete one group, recreate with new data
+        {
+            let file = H5File::open_rw(&path).unwrap();
+            file.delete_group("nodes").unwrap();
+            let n = file.create_group("nodes").unwrap();
+            n.write_vlen_strings("id", &["new1", "new2"]).unwrap();
+            file.close().unwrap();
+        }
+        // Step 3: verify
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("nodes/id").unwrap();
+            let s = ds.read_vlen_strings().unwrap();
+            assert_eq!(s, vec!["new1", "new2"]);
+            // edges should still be intact
+            let ds = file.dataset("edges/src").unwrap();
+            let s = ds.read_vlen_strings().unwrap();
+            assert_eq!(s, vec!["x", "y"]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn delete_and_recreate_group() {
         let path = std::env::temp_dir().join("hdf5_delete_recreate.h5");
         {
