@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.7
+
+### Added
+
+- `create_appendable_vlen_dataset()` + `append_vlen_strings()` for
+  incremental vlen string writes with chunked storage and optional
+  compression. Each append creates a new GCOL; partial chunks are
+  buffered automatically.
+- `delete_dataset(name)` and `delete_group(name)` for soft-deleting
+  datasets and groups (excluded from file on close, space not reclaimed).
+- `open_rw` now reconstructs group hierarchy from existing dataset paths,
+  enabling `delete_group` → `create_group` → write workflows.
+
 ## 0.2.6
 
 ### Performance
