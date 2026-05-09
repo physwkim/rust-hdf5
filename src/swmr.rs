@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use crate::io::locking::FileLocking;
 use crate::io::Hdf5Reader;
 use crate::io::SwmrWriter as IoSwmrWriter;
 
@@ -36,9 +37,19 @@ pub struct SwmrFileWriter {
 }
 
 impl SwmrFileWriter {
-    /// Create a new HDF5 file for SWMR streaming.
+    /// Create a new HDF5 file for SWMR streaming using the env-var-derived
+    /// locking policy.
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
         let inner = IoSwmrWriter::create(path.as_ref())?;
+        Ok(Self { inner })
+    }
+
+    /// Create a new HDF5 file for SWMR streaming with an explicit locking
+    /// policy. The writer holds an exclusive lock until [`Self::start_swmr`]
+    /// is called, at which point the lock is downgraded to shared so
+    /// concurrent SWMR readers can attach.
+    pub fn create_with_locking<P: AsRef<Path>>(path: P, locking: FileLocking) -> Result<Self> {
+        let inner = IoSwmrWriter::create_with_locking(path.as_ref(), locking)?;
         Ok(Self { inner })
     }
 
@@ -116,9 +127,18 @@ pub struct SwmrFileReader {
 }
 
 impl SwmrFileReader {
-    /// Open an HDF5 file for SWMR reading.
+    /// Open an HDF5 file for SWMR reading using the env-var-derived
+    /// locking policy. Takes a shared lock so it coexists with the
+    /// downgraded shared lock held by [`SwmrFileWriter`] after
+    /// `start_swmr`, and with other concurrent SWMR readers.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let reader = Hdf5Reader::open_swmr(path.as_ref())?;
+        Ok(Self { reader })
+    }
+
+    /// Open an HDF5 file for SWMR reading with an explicit locking policy.
+    pub fn open_with_locking<P: AsRef<Path>>(path: P, locking: FileLocking) -> Result<Self> {
+        let reader = Hdf5Reader::open_swmr_with_locking(path.as_ref(), locking)?;
         Ok(Self { reader })
     }
 

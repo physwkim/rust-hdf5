@@ -1,8 +1,9 @@
 [package]
 name = "rust-hdf5"
 description = "Pure Rust HDF5 library with full read/write and SWMR support"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
+rust-version = "1.89"
 license = "MIT"
 authors = ["Sang Woo Kim"]
 repository = "https://github.com/physwkim/rust-hdf5"

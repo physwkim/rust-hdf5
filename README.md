@@ -21,6 +21,7 @@ Read and write HDF5 files with contiguous, chunked, and compressed datasets, hie
 - **Groups** — hierarchical group structure with nested object headers
 - **Attributes** — string and numeric attributes on datasets and root
 - **SWMR** — Single Writer / Multiple Reader streaming protocol
+- **File locking** — OS-level advisory locks (`flock` / `LockFileEx`) honoring `HDF5_USE_FILE_LOCKING`
 - **Hyperslab I/O** — `read_slice` / `write_slice` for partial N-dimensional access
 - **Buffered I/O** — BufWriter/BufReader with automatic mode switching
 - **Memory-mapped I/O** — optional zero-copy read-only access via `mmap` feature
@@ -35,6 +36,9 @@ Read and write HDF5 files with contiguous, chunked, and compressed datasets, hie
 [dependencies]
 rust-hdf5 = "0.2"
 ```
+
+> Requires Rust 1.89+ (uses `std::fs::File::lock` for cross-platform
+> file locking).
 
 ### Write
 
@@ -196,6 +200,36 @@ let mut reader = SwmrFileReader::open("swmr.h5")?;
 reader.refresh()?;
 let data = reader.read_dataset::<f32>("frames")?;
 ```
+
+### File locking
+
+By default the library acquires an OS-level advisory lock matching the
+HDF5 C library: an exclusive lock on write opens, a shared lock on read
+opens. Multiple readers coexist; a writer blocks any other opener.
+
+```rust
+use rust_hdf5::{H5File, FileLocking};
+
+// Default — exclusive lock for writers, fails if another holder exists.
+let file = H5File::create("data.h5")?;
+
+// Disable locking entirely (useful on NFS without lock support).
+let file = H5File::options()
+    .no_locking()
+    .open_rw("data.h5")?;
+
+// Best-effort: try to lock, but don't fail on filesystem rejection.
+let file = H5File::options()
+    .best_effort_locking()
+    .open("data.h5")?;
+```
+
+Set `HDF5_USE_FILE_LOCKING=FALSE` (or `BEST_EFFORT`) in the environment
+to apply a non-default policy without code changes.
+
+A `SwmrFileWriter` holds an exclusive lock until `start_swmr()` is
+called, then downgrades to shared so concurrent `SwmrFileReader`s can
+attach while other writers remain blocked.
 
 ## Supported types
 

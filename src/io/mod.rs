@@ -6,6 +6,7 @@
 
 pub mod allocator;
 pub mod file_handle;
+pub mod locking;
 pub mod reader;
 pub mod swmr;
 pub mod writer;

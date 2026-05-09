@@ -18,6 +18,7 @@
 
 use std::path::Path;
 
+use crate::io::locking::FileLocking;
 use crate::io::{Hdf5Reader, Hdf5Writer};
 
 use crate::dataset::{DatasetBuilder, H5Dataset};
@@ -137,6 +138,23 @@ impl H5File {
         Ok(Self {
             inner: new_shared(H5FileInner::Writer(writer)),
         })
+    }
+
+    /// Start building open options for an HDF5 file.
+    ///
+    /// Use this to control file-locking behavior explicitly:
+    ///
+    /// ```no_run
+    /// use rust_hdf5::{H5File, FileLocking};
+    /// // Open with locking disabled (e.g. on NFS without lock support).
+    /// let file = H5File::options()
+    ///     .locking(FileLocking::Disabled)
+    ///     .open_rw("existing.h5")
+    ///     .unwrap();
+    /// # let _ = file;
+    /// ```
+    pub fn options() -> H5FileOptions {
+        H5FileOptions::default()
     }
 
     /// Return a handle to the root group.
@@ -449,6 +467,75 @@ impl H5File {
         // written to disk immediately via pwrite. This is a compatibility
         // method that does nothing for now.
         Ok(())
+    }
+}
+
+/// Builder controlling how an [`H5File`] is opened.
+///
+/// The default policy follows the HDF5 C library: an exclusive lock is
+/// acquired for write-mode opens and a shared lock for read-mode opens,
+/// honoring the `HDF5_USE_FILE_LOCKING` environment variable. Calling
+/// [`Self::locking`] overrides the env-var value.
+#[derive(Debug, Default, Clone)]
+pub struct H5FileOptions {
+    locking: Option<FileLocking>,
+}
+
+impl H5FileOptions {
+    /// Construct a fresh options builder with default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Override the locking policy. Bypasses the `HDF5_USE_FILE_LOCKING`
+    /// environment variable for the resulting open call.
+    pub fn locking(mut self, policy: FileLocking) -> Self {
+        self.locking = Some(policy);
+        self
+    }
+
+    /// Disable OS-level file locking entirely (equivalent to
+    /// `HDF5_USE_FILE_LOCKING=FALSE`).
+    pub fn no_locking(self) -> Self {
+        self.locking(FileLocking::Disabled)
+    }
+
+    /// Try to acquire the lock but do not fail if the filesystem rejects it
+    /// (equivalent to `HDF5_USE_FILE_LOCKING=BEST_EFFORT`).
+    pub fn best_effort_locking(self) -> Self {
+        self.locking(FileLocking::BestEffort)
+    }
+
+    fn resolved_locking(&self) -> FileLocking {
+        match self.locking {
+            Some(p) => p,
+            None => FileLocking::from_env_or(FileLocking::default()),
+        }
+    }
+
+    /// Create a new HDF5 file at `path` with the configured options.
+    pub fn create<P: AsRef<Path>>(self, path: P) -> Result<H5File> {
+        let writer = Hdf5Writer::create_with_locking(path.as_ref(), self.resolved_locking())?;
+        Ok(H5File {
+            inner: new_shared(H5FileInner::Writer(writer)),
+        })
+    }
+
+    /// Open an existing HDF5 file for reading with the configured options.
+    pub fn open<P: AsRef<Path>>(self, path: P) -> Result<H5File> {
+        let reader = Hdf5Reader::open_with_locking(path.as_ref(), self.resolved_locking())?;
+        Ok(H5File {
+            inner: new_shared(H5FileInner::Reader(reader)),
+        })
+    }
+
+    /// Open an existing HDF5 file for read/write with the configured options.
+    pub fn open_rw<P: AsRef<Path>>(self, path: P) -> Result<H5File> {
+        let writer =
+            Hdf5Writer::open_append_with_locking(path.as_ref(), self.resolved_locking())?;
+        Ok(H5File {
+            inner: new_shared(H5FileInner::Writer(writer)),
+        })
     }
 }
 

@@ -167,12 +167,24 @@ pub struct Hdf5Writer {
 }
 
 impl Hdf5Writer {
-    /// Create a new HDF5 file at `path`.
+    /// Create a new HDF5 file at `path` using the env-var-derived locking
+    /// policy (controlled by `HDF5_USE_FILE_LOCKING`).
     ///
     /// The superblock (48 bytes for v3 with 8-byte offsets) is reserved at
     /// offset 0 and written during `close()`.
     pub fn create(path: &Path) -> IoResult<Self> {
-        let handle = FileHandle::create(path)?;
+        Self::create_with_locking(
+            path,
+            crate::io::locking::FileLocking::from_env_or(Default::default()),
+        )
+    }
+
+    /// Create a new HDF5 file at `path` with an explicit locking policy.
+    pub fn create_with_locking(
+        path: &Path,
+        locking: crate::io::locking::FileLocking,
+    ) -> IoResult<Self> {
+        let handle = FileHandle::create_with_locking(path, locking)?;
         let ctx = FormatContext::default_v3();
 
         // Reserve space for the superblock. We compute the size from a dummy
@@ -209,18 +221,31 @@ impl Hdf5Writer {
         &self.ctx
     }
 
-    /// Open an existing HDF5 file for appending new datasets.
+    /// Open an existing HDF5 file for appending new datasets, using the
+    /// env-var-derived locking policy.
     ///
     /// Reads existing dataset object headers fully, reconstructing metadata
     /// for chunked datasets so that `write_chunk` and `extend_dataset` work
     /// on reopened datasets.
     pub fn open_append(path: &Path) -> IoResult<Self> {
+        Self::open_append_with_locking(
+            path,
+            crate::io::locking::FileLocking::from_env_or(Default::default()),
+        )
+    }
+
+    /// Open an existing HDF5 file for appending with an explicit locking
+    /// policy.
+    pub fn open_append_with_locking(
+        path: &Path,
+        locking: crate::io::locking::FileLocking,
+    ) -> IoResult<Self> {
         use crate::format::messages::attribute::AttributeMessage;
         use crate::format::messages::data_layout::DataLayoutMessage;
         use crate::format::messages::dataspace::DataspaceMessage;
         use crate::format::messages::datatype::DatatypeMessage;
 
-        let mut handle = FileHandle::open_readwrite(path)?;
+        let mut handle = FileHandle::open_readwrite_with_locking(path, locking)?;
         let file_size = handle.file_size()?;
 
         let sb_buf = handle.read_at_most(0, 256)?;

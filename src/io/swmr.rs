@@ -24,9 +24,25 @@ pub struct SwmrWriter {
 }
 
 impl SwmrWriter {
-    /// Create a new HDF5 file configured for SWMR.
+    /// Create a new HDF5 file configured for SWMR using the env-var-derived
+    /// locking policy.
     pub fn create(path: &Path) -> IoResult<Self> {
         let writer = Hdf5Writer::create(path)?;
+        Ok(Self {
+            writer,
+            swmr_active: false,
+        })
+    }
+
+    /// Create a new HDF5 file configured for SWMR with an explicit locking
+    /// policy. The writer takes an exclusive lock initially; once
+    /// [`Self::start_swmr`] is called, the lock is downgraded to shared so
+    /// concurrent SWMR readers can attach.
+    pub fn create_with_locking(
+        path: &Path,
+        locking: crate::io::locking::FileLocking,
+    ) -> IoResult<Self> {
+        let writer = Hdf5Writer::create_with_locking(path, locking)?;
         Ok(Self {
             writer,
             swmr_active: false,
@@ -67,6 +83,10 @@ impl SwmrWriter {
     /// in-place header updates via `flush()`.
     pub fn start_swmr(&mut self) -> IoResult<()> {
         self.writer.finalize_for_swmr()?;
+        // Downgrade the exclusive lock to shared so concurrent SWMR readers
+        // (which acquire shared locks) can attach. Other writers are still
+        // blocked because exclusive vs. shared conflicts.
+        self.writer.handle().downgrade_lock_to_shared()?;
         self.swmr_active = true;
         Ok(())
     }

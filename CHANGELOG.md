@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.8
+
+### Added
+
+- OS-level advisory file locking, mirroring the HDF5 C library:
+  - Read opens take a shared lock; write opens (`create` / `open_rw`)
+    take an exclusive lock.
+  - `SwmrFileWriter::start_swmr` downgrades the exclusive lock to shared
+    so concurrent `SwmrFileReader`s can attach while still blocking
+    other writers.
+  - Honors the `HDF5_USE_FILE_LOCKING` environment variable
+    (`TRUE` / `FALSE` / `BEST_EFFORT`).
+  - New `H5File::options()` builder with `.locking()`, `.no_locking()`,
+    and `.best_effort_locking()` for explicit per-open control.
+  - `SwmrFileWriter::create_with_locking` and
+    `SwmrFileReader::open_with_locking` for explicit SWMR control.
+  - Cross-platform: Unix (`flock` / `fcntl`) and Windows (`LockFileEx`)
+    via `std::fs::File::lock` (Rust 1.89+).
+- `FileLocking` and `LockMode` types re-exported at the crate root.
+
+### Changed
+
+- MSRV raised to 1.89 (uses stable `File::lock` / `File::try_lock` /
+  `File::unlock`).
+
+### Internal correctness
+
+- `H5File::create` opens the file without `O_TRUNC`, acquires the
+  exclusive lock, and only then calls `set_len(0)`. A pre-release
+  review caught that the previous order would destroy an existing
+  file's contents when the lock attempt lost a race, even though
+  `create()` returned an error.
+- `MmapFileHandle` now retains the underlying `File` so its shared
+  lock persists for the lifetime of the mmap.
+
 ## 0.2.7
 
 ### Added

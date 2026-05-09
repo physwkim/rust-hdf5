@@ -91,7 +91,8 @@ impl Hdf5Reader {
         Ok((reader, mmap))
     }
 
-    /// Open an existing HDF5 file in SWMR read mode.
+    /// Open an existing HDF5 file in SWMR read mode using the env-var-derived
+    /// locking policy.
     ///
     /// Currently identical to `open()`, but indicates intent to use
     /// `refresh()` for re-reading metadata written by a concurrent SWMR writer.
@@ -99,13 +100,34 @@ impl Hdf5Reader {
         Self::open(path)
     }
 
-    /// Open an existing HDF5 file for reading.
+    /// Open an existing HDF5 file in SWMR read mode with an explicit locking
+    /// policy.
+    pub fn open_swmr_with_locking(
+        path: &Path,
+        locking: crate::io::locking::FileLocking,
+    ) -> IoResult<Self> {
+        Self::open_with_locking(path, locking)
+    }
+
+    /// Open an existing HDF5 file for reading using the env-var-derived
+    /// locking policy.
     ///
     /// Auto-detects the superblock version and uses the appropriate code path:
     /// - v0/v1: legacy format with symbol tables and B-tree v1
     /// - v2/v3: modern format with link messages
     pub fn open(path: &Path) -> IoResult<Self> {
-        let mut handle = FileHandle::open_read(path)?;
+        Self::open_with_locking(
+            path,
+            crate::io::locking::FileLocking::from_env_or(Default::default()),
+        )
+    }
+
+    /// Open an existing HDF5 file for reading with an explicit locking policy.
+    pub fn open_with_locking(
+        path: &Path,
+        locking: crate::io::locking::FileLocking,
+    ) -> IoResult<Self> {
+        let mut handle = FileHandle::open_read_with_locking(path, locking)?;
 
         // Read enough bytes to detect the superblock version and parse it.
         let sb_buf = handle.read_at_most(0, 1024)?;

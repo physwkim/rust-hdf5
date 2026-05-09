@@ -1,0 +1,255 @@
+//! Cross-process file-locking integration tests.
+//!
+//! These tests open the same HDF5 file twice from the same process to verify
+//! that the OS-level advisory lock actually blocks conflicting opens. On Unix
+//! `flock(2)` and `fcntl(F_OFD_SETLK)` (which is what Rust's std uses
+//! internally on Linux/macOS) treat each open file description independently,
+//! so two opens within the same process can still conflict — exactly what we
+//! want to verify here.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use rust_hdf5::swmr::{SwmrFileReader, SwmrFileWriter};
+use rust_hdf5::{FileLocking, H5File};
+
+/// Force `FileLocking::Enabled` regardless of the shell's
+/// `HDF5_USE_FILE_LOCKING` setting. Each integration test below uses
+/// `enabled().{create,open,open_rw}` instead of the bare `H5File::create`
+/// helpers so that the test outcome doesn't depend on the operator's env.
+fn enabled() -> rust_hdf5::H5FileOptions {
+    H5File::options().locking(FileLocking::Enabled)
+}
+
+/// Per-test unique temp path. Avoids collisions when cargo runs tests in
+/// parallel.
+fn unique_tmp(label: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "rust_hdf5_lock_{}_{}_{}",
+        label,
+        std::process::id(),
+        n
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join(format!("{label}.h5"))
+}
+
+#[test]
+fn second_writer_open_is_blocked() {
+    let path = unique_tmp("two_writers");
+    let _file1 = enabled().create(&path).unwrap();
+
+    let err = enabled().open_rw(&path);
+    assert!(
+        err.is_err(),
+        "expected second writer open to fail with lock conflict"
+    );
+}
+
+#[test]
+fn reader_blocks_writer() {
+    let path = unique_tmp("reader_blocks_writer");
+    enabled().create(&path).unwrap().close().unwrap();
+    let _reader = enabled().open(&path).unwrap();
+    let err = enabled().open_rw(&path);
+    assert!(
+        err.is_err(),
+        "expected writer open to be blocked by reader's shared lock"
+    );
+}
+
+#[test]
+fn writer_blocks_reader() {
+    let path = unique_tmp("writer_blocks_reader");
+    let _writer = enabled().create(&path).unwrap();
+    let err = enabled().open(&path);
+    assert!(
+        err.is_err(),
+        "expected reader open to be blocked by writer's exclusive lock"
+    );
+}
+
+#[test]
+fn multiple_readers_coexist() {
+    let path = unique_tmp("multi_readers");
+    enabled().create(&path).unwrap().close().unwrap();
+    let _r1 = enabled().open(&path).unwrap();
+    let _r2 = enabled().open(&path).unwrap();
+    let _r3 = enabled().open(&path).unwrap();
+}
+
+#[test]
+fn disabled_locking_bypasses_conflict() {
+    let path = unique_tmp("disabled");
+    // Materialize a valid file first (close so the superblock is written).
+    enabled().create(&path).unwrap().close().unwrap();
+
+    let _w1 = H5File::options().no_locking().open_rw(&path).unwrap();
+    // With locking disabled the second writer should succeed.
+    let w2 = H5File::options().no_locking().open_rw(&path);
+    assert!(
+        w2.is_ok(),
+        "expected disabled-locking second open to succeed: {:?}",
+        w2.err()
+    );
+}
+
+#[test]
+fn best_effort_does_not_error_on_conflict() {
+    let path = unique_tmp("best_effort");
+    enabled().create(&path).unwrap().close().unwrap();
+
+    // First holder takes a real exclusive lock.
+    let _w1 = enabled().open_rw(&path).unwrap();
+    // Best-effort opener should not error even though the lock is contended.
+    let w2 = H5File::options().best_effort_locking().open_rw(&path);
+    assert!(
+        w2.is_ok(),
+        "expected best-effort open to succeed despite conflict: {:?}",
+        w2.err()
+    );
+}
+
+#[test]
+fn lock_releases_on_drop() {
+    let path = unique_tmp("release_on_drop");
+    // create()+close() leaves a valid file with no lingering lock.
+    enabled().create(&path).unwrap().close().unwrap();
+    {
+        let _w1 = enabled().open_rw(&path).unwrap();
+    } // _w1 dropped — lock released
+    // Now another writer should be able to open without error.
+    let w2 = enabled().open_rw(&path);
+    assert!(
+        w2.is_ok(),
+        "expected reopen after drop to succeed: {:?}",
+        w2.err()
+    );
+}
+
+#[test]
+fn create_with_lock_conflict_does_not_truncate_existing_file() {
+    // Regression: H5File::create used to call OpenOptions::truncate(true)
+    // before acquiring the lock, so a lock conflict on an existing file
+    // would destroy its contents while still returning an error.
+    let path = unique_tmp("preserve_on_conflict");
+
+    // Stage 1: create a real file with a known dataset and close it.
+    {
+        let f = enabled().create(&path).unwrap();
+        let ds = f.new_dataset::<u8>().shape([4]).create("data").unwrap();
+        ds.write_raw(&[1u8, 2, 3, 4]).unwrap();
+        f.close().unwrap();
+    }
+    let original_size = std::fs::metadata(&path).unwrap().len();
+    assert!(original_size > 0, "fixture file should be non-empty");
+
+    // Stage 2: hold the file open with an exclusive lock.
+    let _holder = enabled().open_rw(&path).unwrap();
+
+    // Stage 3: a second create() must error AND must not have truncated
+    // the file on disk.
+    let conflict = enabled().create(&path);
+    assert!(conflict.is_err(), "second create should fail under lock");
+    let size_after = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(
+        size_after, original_size,
+        "file must not be truncated when create() loses the lock race"
+    );
+}
+
+#[test]
+fn lock_releases_on_close() {
+    let path = unique_tmp("release_on_close");
+    let w1 = enabled().create(&path).unwrap();
+    w1.close().unwrap();
+    // After explicit close(), another writer must succeed.
+    let w2 = enabled().open_rw(&path);
+    assert!(
+        w2.is_ok(),
+        "expected reopen after close to succeed: {:?}",
+        w2.err()
+    );
+}
+
+#[test]
+fn options_locking_overrides_env() {
+    // Note: we don't mutate HDF5_USE_FILE_LOCKING here because cargo runs
+    // tests in parallel and that would race with other tests. Instead we
+    // verify that options().locking(...) takes effect by exercising both
+    // policies on the same path.
+    let path = unique_tmp("options_override");
+    enabled().create(&path).unwrap().close().unwrap();
+
+    let _w1 = enabled().open_rw(&path).unwrap();
+    let conflict = enabled().open_rw(&path);
+    assert!(conflict.is_err(), "Enabled policy should block second open");
+    let bypass = H5File::options()
+        .locking(FileLocking::Disabled)
+        .open_rw(&path);
+    assert!(bypass.is_ok(), "Disabled policy should bypass the lock");
+}
+
+#[test]
+fn swmr_reader_attaches_after_start_swmr() {
+    let path = unique_tmp("swmr_attach");
+
+    // Writer holds an exclusive lock.
+    let mut writer = SwmrFileWriter::create_with_locking(&path, FileLocking::Enabled).unwrap();
+    let _ds = writer
+        .create_streaming_dataset::<f32>("frames", &[4, 4])
+        .unwrap();
+
+    // Before start_swmr, the writer's exclusive lock blocks readers.
+    let too_early = SwmrFileReader::open_with_locking(&path, FileLocking::Enabled);
+    assert!(
+        too_early.is_err(),
+        "SWMR reader should be blocked before start_swmr"
+    );
+
+    // After start_swmr the writer downgrades to shared, so a SWMR
+    // reader (also shared) can attach.
+    writer.start_swmr().unwrap();
+    let reader = SwmrFileReader::open_with_locking(&path, FileLocking::Enabled);
+    assert!(
+        reader.is_ok(),
+        "SWMR reader should attach after start_swmr: {:?}",
+        reader.err()
+    );
+
+    // But another writer should still be blocked because the writer's
+    // shared lock conflicts with a new exclusive request.
+    let other_writer = enabled().open_rw(&path);
+    assert!(
+        other_writer.is_err(),
+        "second writer should still be blocked while SWMR writer holds shared lock"
+    );
+
+    drop(reader);
+    writer.close().unwrap();
+}
+
+#[test]
+fn swmr_disabled_locking_allows_concurrent_writer() {
+    let path = unique_tmp("swmr_no_lock");
+    let mut writer = SwmrFileWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+    let _ds = writer
+        .create_streaming_dataset::<f32>("frames", &[2, 2])
+        .unwrap();
+    writer.start_swmr().unwrap();
+
+    // With locking disabled, a second SWMR reader still attaches (it would
+    // even with locking enabled because of the shared-lock downgrade), and
+    // a second writer with locking disabled is also allowed (no enforcement).
+    let _r = SwmrFileReader::open_with_locking(&path, FileLocking::Disabled).unwrap();
+    let other_writer = H5File::options()
+        .no_locking()
+        .open_rw(&path);
+    assert!(
+        other_writer.is_ok(),
+        "disabled-locking second writer should succeed: {:?}",
+        other_writer.err()
+    );
+}
