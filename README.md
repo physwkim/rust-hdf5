@@ -228,8 +228,9 @@ Set `HDF5_USE_FILE_LOCKING=FALSE` (or `BEST_EFFORT`) in the environment
 to apply a non-default policy without code changes.
 
 A `SwmrFileWriter` holds an exclusive lock until `start_swmr()` is
-called, then downgrades to shared so concurrent `SwmrFileReader`s can
-attach while other writers remain blocked.
+called, then releases it so concurrent `SwmrFileReader`s can attach.
+The SWMR protocol assumes a single writer; the caller is responsible
+for ensuring no second writer attaches during streaming.
 
 ## Supported types
 

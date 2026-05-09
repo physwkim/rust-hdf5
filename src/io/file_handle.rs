@@ -113,18 +113,27 @@ impl FileHandle {
         self.lock_held
     }
 
-    /// Downgrade an exclusive lock to a shared lock so concurrent SWMR
-    /// readers can attach. No-op if the policy is [`FileLocking::Disabled`]
-    /// or no lock is held.
-    pub fn downgrade_lock_to_shared(&mut self) -> std::io::Result<()> {
+    /// Release the OS-level lock so concurrent SWMR readers (and other
+    /// openers) can attach. No-op if the policy is
+    /// [`FileLocking::Disabled`] or no lock is held.
+    ///
+    /// We don't try to *downgrade* the exclusive lock to shared here:
+    /// Windows' `LockFileEx` is a mandatory range lock, and an
+    /// `unlock` followed by `try_lock_shared` on the same handle leaves
+    /// the file in a state where subsequent `WriteFile` calls through
+    /// that handle can fail with `ERROR_LOCK_VIOLATION`. Instead we
+    /// release the lock entirely — matching the HDF5 C library, which
+    /// also doesn't enforce reader/writer separation purely through
+    /// OS locks during SWMR streaming.
+    pub fn release_lock(&mut self) -> std::io::Result<()> {
         if !self.lock_held || matches!(self.lock_policy, FileLocking::Disabled) {
             return Ok(());
         }
-        // Flush any pending writes so they hit disk before the lock window.
+        // Flush any pending writes so they hit disk before the lock
+        // window opens.
         self.flush_buffers()?;
-        let file_ref = self.get_file_ref();
-        let acquired = locking::downgrade_to_shared(file_ref, self.lock_policy)?;
-        self.lock_held = acquired;
+        locking::release(self.get_file_ref())?;
+        self.lock_held = false;
         Ok(())
     }
 

@@ -531,8 +531,7 @@ impl H5FileOptions {
 
     /// Open an existing HDF5 file for read/write with the configured options.
     pub fn open_rw<P: AsRef<Path>>(self, path: P) -> Result<H5File> {
-        let writer =
-            Hdf5Writer::open_append_with_locking(path.as_ref(), self.resolved_locking())?;
+        let writer = Hdf5Writer::open_append_with_locking(path.as_ref(), self.resolved_locking())?;
         Ok(H5File {
             inner: new_shared(H5FileInner::Writer(writer)),
         })

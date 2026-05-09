@@ -120,7 +120,7 @@ fn lock_releases_on_drop() {
     {
         let _w1 = enabled().open_rw(&path).unwrap();
     } // _w1 dropped — lock released
-    // Now another writer should be able to open without error.
+      // Now another writer should be able to open without error.
     let w2 = enabled().open_rw(&path);
     assert!(
         w2.is_ok(),
@@ -209,8 +209,12 @@ fn swmr_reader_attaches_after_start_swmr() {
         "SWMR reader should be blocked before start_swmr"
     );
 
-    // After start_swmr the writer downgrades to shared, so a SWMR
-    // reader (also shared) can attach.
+    // After start_swmr the writer releases its exclusive lock so a SWMR
+    // reader (which takes a shared lock) can attach. The SWMR protocol
+    // itself assumes a single writer — we don't enforce that via OS
+    // locks here because Windows `LockFileEx` semantics make the
+    // exclusive→shared downgrade unsafe for subsequent writes through
+    // the same handle.
     writer.start_swmr().unwrap();
     let reader = SwmrFileReader::open_with_locking(&path, FileLocking::Enabled);
     assert!(
@@ -218,15 +222,6 @@ fn swmr_reader_attaches_after_start_swmr() {
         "SWMR reader should attach after start_swmr: {:?}",
         reader.err()
     );
-
-    // But another writer should still be blocked because the writer's
-    // shared lock conflicts with a new exclusive request.
-    let other_writer = enabled().open_rw(&path);
-    assert!(
-        other_writer.is_err(),
-        "second writer should still be blocked while SWMR writer holds shared lock"
-    );
-
     drop(reader);
     writer.close().unwrap();
 }
@@ -244,9 +239,7 @@ fn swmr_disabled_locking_allows_concurrent_writer() {
     // even with locking enabled because of the shared-lock downgrade), and
     // a second writer with locking disabled is also allowed (no enforcement).
     let _r = SwmrFileReader::open_with_locking(&path, FileLocking::Disabled).unwrap();
-    let other_writer = H5File::options()
-        .no_locking()
-        .open_rw(&path);
+    let other_writer = H5File::options().no_locking().open_rw(&path);
     assert!(
         other_writer.is_ok(),
         "disabled-locking second writer should succeed: {:?}",

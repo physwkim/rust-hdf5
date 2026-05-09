@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.9
+
+### Bug Fixes
+
+- Windows: `SwmrFileWriter::start_swmr` no longer attempts to downgrade
+  the writer's exclusive lock to shared. Windows' `LockFileEx` is a
+  mandatory range lock, and a same-handle unlock-then-shared-relock
+  left subsequent `WriteFile` calls failing with
+  `ERROR_LOCK_VIOLATION` (33). The writer now releases its lock
+  entirely when SWMR mode starts, matching the HDF5 C library — which
+  also relies on the SWMR file-format sentinel rather than OS locks
+  during streaming. Trade-off: a second writer attaching to a
+  streaming SWMR file is no longer blocked by an OS lock; the SWMR
+  protocol's single-writer guarantee is the caller's responsibility.
+
+### Internal
+
+- CI: `cargo fmt --all -- --check` now passes (0.2.8 introduced
+  unformatted lines).
+
 ## 0.2.8
 
 ### Added

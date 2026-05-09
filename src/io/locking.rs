@@ -5,8 +5,13 @@
 //! - A read-only opener takes a **shared** lock; multiple readers are allowed.
 //! - A read/write opener takes an **exclusive** lock; conflicts with any
 //!   other lock holder.
-//! - SWMR writers initially take an exclusive lock, then **downgrade** to a
-//!   shared lock once SWMR mode starts so concurrent SWMR readers can attach.
+//! - SWMR writers initially take an exclusive lock and **release** it once
+//!   SWMR mode starts so concurrent SWMR readers can attach. (We don't
+//!   downgrade exclusive→shared on the same handle: Windows'
+//!   `LockFileEx` is mandatory and a same-handle unlock+shared-relock
+//!   leaves subsequent `WriteFile` calls failing with
+//!   `ERROR_LOCK_VIOLATION`. The HDF5 C library similarly relies on the
+//!   SWMR file-format sentinel rather than OS locks during streaming.)
 //!
 //! Locks are released automatically when the underlying [`std::fs::File`]
 //! is dropped (i.e. when the [`crate::io::file_handle::FileHandle`] closes).
@@ -128,19 +133,6 @@ pub fn release(file: &File) -> io::Result<()> {
     file.unlock()
 }
 
-/// Downgrade an exclusive lock to a shared lock.
-///
-/// There is a brief window between unlock and re-lock during which
-/// another process could acquire an exclusive lock. The HDF5 C
-/// library has the same race in its SWMR start-up path.
-pub fn downgrade_to_shared(file: &File, policy: FileLocking) -> io::Result<bool> {
-    if matches!(policy, FileLocking::Disabled) {
-        return Ok(false);
-    }
-    file.unlock()?;
-    try_acquire(file, LockMode::Shared, policy)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,10 +177,8 @@ mod tests {
 
     #[test]
     fn try_acquire_disabled_is_noop() {
-        let dir = std::env::temp_dir().join(format!(
-            "rust_hdf5_lock_disabled_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rust_hdf5_lock_disabled_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("noop.bin");
         let f = std::fs::File::create(&path).unwrap();
@@ -199,18 +189,12 @@ mod tests {
 
     #[test]
     fn try_acquire_exclusive_then_shared_fails() {
-        let dir = std::env::temp_dir().join(format!(
-            "rust_hdf5_lock_excl_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("rust_hdf5_lock_excl_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("conflict.bin");
         let f1 = std::fs::File::create(&path).unwrap();
         assert!(try_acquire(&f1, LockMode::Exclusive, FileLocking::Enabled).unwrap());
-        let f2 = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .unwrap();
+        let f2 = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
         let res = try_acquire(&f2, LockMode::Shared, FileLocking::Enabled);
         assert!(res.is_err(), "expected lock conflict");
         // Best-effort should silently fall through.
@@ -222,21 +206,13 @@ mod tests {
 
     #[test]
     fn shared_locks_coexist() {
-        let dir = std::env::temp_dir().join(format!(
-            "rust_hdf5_lock_shared_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rust_hdf5_lock_shared_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shared.bin");
         std::fs::File::create(&path).unwrap();
-        let f1 = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .unwrap();
-        let f2 = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .unwrap();
+        let f1 = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        let f2 = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
         assert!(try_acquire(&f1, LockMode::Shared, FileLocking::Enabled).unwrap());
         assert!(try_acquire(&f2, LockMode::Shared, FileLocking::Enabled).unwrap());
         release(&f1).unwrap();
@@ -245,32 +221,23 @@ mod tests {
     }
 
     #[test]
-    fn downgrade_releases_exclusive() {
-        let dir = std::env::temp_dir().join(format!(
-            "rust_hdf5_lock_downgrade_{}",
-            std::process::id()
-        ));
+    fn release_then_relock_works() {
+        let dir =
+            std::env::temp_dir().join(format!("rust_hdf5_lock_release_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("downgrade.bin");
+        let path = dir.join("release.bin");
         let f1 = std::fs::File::create(&path).unwrap();
         assert!(try_acquire(&f1, LockMode::Exclusive, FileLocking::Enabled).unwrap());
-        downgrade_to_shared(&f1, FileLocking::Enabled).unwrap();
+        // Release; another opener should now be able to take a fresh lock.
+        release(&f1).unwrap();
 
-        // Another shared lock should now succeed.
         let f2 = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .unwrap();
-        assert!(try_acquire(&f2, LockMode::Shared, FileLocking::Enabled).unwrap());
-        // But an exclusive opener should still be blocked.
-        let f3 = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .unwrap();
-        assert!(try_acquire(&f3, LockMode::Exclusive, FileLocking::Enabled).is_err());
+        assert!(try_acquire(&f2, LockMode::Exclusive, FileLocking::Enabled).unwrap());
 
-        release(&f1).unwrap();
         release(&f2).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

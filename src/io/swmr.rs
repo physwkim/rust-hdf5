@@ -83,10 +83,13 @@ impl SwmrWriter {
     /// in-place header updates via `flush()`.
     pub fn start_swmr(&mut self) -> IoResult<()> {
         self.writer.finalize_for_swmr()?;
-        // Downgrade the exclusive lock to shared so concurrent SWMR readers
-        // (which acquire shared locks) can attach. Other writers are still
-        // blocked because exclusive vs. shared conflicts.
-        self.writer.handle().downgrade_lock_to_shared()?;
+        // Release the writer's exclusive lock so concurrent SWMR readers
+        // can attach. Note: the SWMR protocol assumes a single writer —
+        // the caller is responsible for ensuring no second writer
+        // attaches once SWMR mode starts. (Holding a shared lock here
+        // would block other writers but breaks subsequent writes on
+        // Windows due to LockFileEx semantics.)
+        self.writer.handle().release_lock()?;
         self.swmr_active = true;
         Ok(())
     }
