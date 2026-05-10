@@ -96,6 +96,12 @@ fn disabled_locking_bypasses_conflict() {
     );
 }
 
+// Unix-only: this test relies on advisory-lock semantics. On Windows
+// `LockFileEx` is mandatory, so a second opener cannot read the file
+// while the first holder has an exclusive lock — even when the second
+// opener uses BestEffort and skips its own lock acquisition. The
+// HDF5 C library has the same limitation on Windows.
+#[cfg(unix)]
 #[test]
 fn best_effort_does_not_error_on_conflict() {
     let path = unique_tmp("best_effort");
@@ -175,17 +181,29 @@ fn lock_releases_on_close() {
 }
 
 #[test]
-fn options_locking_overrides_env() {
-    // Note: we don't mutate HDF5_USE_FILE_LOCKING here because cargo runs
-    // tests in parallel and that would race with other tests. Instead we
-    // verify that options().locking(...) takes effect by exercising both
-    // policies on the same path.
-    let path = unique_tmp("options_override");
+fn options_locking_overrides_env_enabled_blocks() {
+    // Cross-platform: with Enabled policy, a second open_rw must error.
+    // We don't mutate HDF5_USE_FILE_LOCKING here because cargo runs tests
+    // in parallel and that would race with other tests. Instead we use
+    // `options().locking(Enabled)` to be explicit.
+    let path = unique_tmp("options_override_enabled");
     enabled().create(&path).unwrap().close().unwrap();
 
     let _w1 = enabled().open_rw(&path).unwrap();
     let conflict = enabled().open_rw(&path);
     assert!(conflict.is_err(), "Enabled policy should block second open");
+}
+
+// Unix-only: a second opener with `Disabled` cannot read the file on
+// Windows while the first holder owns the exclusive `LockFileEx` range
+// — Windows locks are mandatory, not advisory.
+#[cfg(unix)]
+#[test]
+fn options_locking_disabled_bypasses_real_lock() {
+    let path = unique_tmp("options_override_disabled");
+    enabled().create(&path).unwrap().close().unwrap();
+
+    let _w1 = enabled().open_rw(&path).unwrap();
     let bypass = H5File::options()
         .locking(FileLocking::Disabled)
         .open_rw(&path);

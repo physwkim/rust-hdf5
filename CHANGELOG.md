@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.10
+
+### Documentation
+
+- Document Windows lock semantics: `LockFileEx` is mandatory, so
+  `FileLocking::Disabled` and `FileLocking::BestEffort` only control
+  whether *we* try to acquire a lock — they cannot bypass an
+  exclusive lock another handle already holds (the HDF5 C library
+  has the same limitation on Windows).
+
+### Tests
+
+- Two integration tests rely on advisory-lock semantics that don't
+  exist on Windows. Gated with `#[cfg(unix)]`:
+  `best_effort_does_not_error_on_conflict`,
+  `options_locking_disabled_bypasses_real_lock` (split out from
+  `options_locking_overrides_env`). The `Enabled`-policy half of
+  the original test runs cross-platform as
+  `options_locking_overrides_env_enabled_blocks`.
+
 ## 0.2.9
 
 ### Bug Fixes

@@ -38,17 +38,36 @@ pub enum LockMode {
 }
 
 /// File-locking policy applied at file open time.
+///
+/// # Platform notes
+///
+/// On Unix (`flock(2)` / `fcntl(F_OFD_SETLK)`) the lock is **advisory**:
+/// a handle without a lock can still read and write a file that another
+/// handle has locked. Setting [`FileLocking::Disabled`] or
+/// [`FileLocking::BestEffort`] therefore lets the opener bypass another
+/// process's lock at the cost of safety.
+///
+/// On Windows (`LockFileEx`) the lock is **mandatory**: while one
+/// handle holds an exclusive range lock, no other handle (regardless
+/// of locking policy) can read or write that range — `WriteFile` and
+/// `ReadFile` return `ERROR_LOCK_VIOLATION` (33). `Disabled` and
+/// `BestEffort` only control whether *we* try to acquire a lock, not
+/// whether the OS enforces locks held by other handles. The HDF5 C
+/// library has the same limitation on Windows.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum FileLocking {
     /// Acquire the lock; fail to open if it cannot be acquired
     /// (the HDF5 C-library default).
     #[default]
     Enabled,
-    /// Skip locking entirely.
+    /// Skip locking entirely. On Windows, OS-level locks held by other
+    /// handles still apply.
     Disabled,
-    /// Try to acquire the lock; on failure (filesystem doesn't
-    /// support locking, or another holder), proceed without one.
-    /// Useful on NFS and similar filesystems.
+    /// Try to acquire the lock; if the filesystem doesn't support
+    /// locking (e.g. NFS), proceed without one. On Unix this also
+    /// proceeds when the lock is contended; on Windows the resulting
+    /// reads/writes still fail at the OS level if another handle holds
+    /// a conflicting `LockFileEx` lock.
     BestEffort,
 }
 
