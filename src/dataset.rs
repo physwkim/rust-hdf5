@@ -1040,7 +1040,18 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("hdf5_dataset_test_{}.h5", name))
+        // Include PID + a per-call atomic counter so that concurrent
+        // cargo invocations and any kernel-level "lock not yet
+        // released" races between sequential opens cannot collide.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "hdf5_dataset_test_{}_{}_{}.h5",
+            name,
+            std::process::id(),
+            n
+        ))
     }
 
     #[test]

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.11
+
+### Tests
+
+- `dataset::tests` and `file::tests` `temp_path` helpers now produce
+  per-call unique paths (PID + atomic counter). Fixes intermittent
+  CI flakiness on macOS where a previous holder's `flock` release
+  was not yet visible when the next opener tried to acquire its
+  shared lock — surfaced by `dataset::tests::write_slice_2d`
+  intermittently failing with
+  `WouldBlock: unable to lock file: another process holds a
+  conflicting lock`.
+
 ## 0.2.10
 
 ### Documentation

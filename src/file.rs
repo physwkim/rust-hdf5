@@ -544,7 +544,19 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("hdf5_file_test_{}.h5", name))
+        // PID + atomic counter to avoid path collisions across
+        // concurrent cargo invocations or any flock/LockFileEx race
+        // where a previous close()'d file's lock is briefly visible
+        // when reopening the same path immediately.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "hdf5_file_test_{}_{}_{}.h5",
+            name,
+            std::process::id(),
+            n
+        ))
     }
 
     #[test]
