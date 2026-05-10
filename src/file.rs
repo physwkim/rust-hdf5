@@ -539,24 +539,29 @@ impl H5FileOptions {
 }
 
 #[cfg(test)]
+fn unique_test_path(name: &str) -> std::path::PathBuf {
+    // PID + atomic counter so each test invocation uses a distinct path,
+    // preventing collisions across concurrent cargo runs and any
+    // flock/LockFileEx race where a previous close()'d file's lock
+    // remains briefly visible when reopening the same path.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "rust_hdf5_test_{}_{}_{}.h5",
+        name,
+        std::process::id(),
+        n
+    ))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
 
     fn temp_path(name: &str) -> PathBuf {
-        // PID + atomic counter to avoid path collisions across
-        // concurrent cargo invocations or any flock/LockFileEx race
-        // where a previous close()'d file's lock is briefly visible
-        // when reopening the same path immediately.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "hdf5_file_test_{}_{}_{}.h5",
-            name,
-            std::process::id(),
-            n
-        ))
+        super::unique_test_path(name)
     }
 
     #[test]
@@ -709,9 +714,13 @@ mod tests {
 mod integration_tests {
     use super::*;
 
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        super::unique_test_path(name)
+    }
+
     #[test]
     fn write_file_for_h5dump() {
-        let path = std::env::temp_dir().join("test_hdf5rs_integration.h5");
+        let path = temp_path("integration");
         let file = H5File::create(&path).unwrap();
 
         let ds = file
@@ -746,7 +755,7 @@ mod integration_tests {
 
     #[test]
     fn write_chunked_file_for_h5dump() {
-        let path = std::env::temp_dir().join("test_hdf5rs_chunked.h5");
+        let path = temp_path("chunked");
         let file = H5File::create(&path).unwrap();
 
         // Create a chunked dataset with unlimited first dimension
@@ -776,7 +785,7 @@ mod integration_tests {
 
     #[test]
     fn write_chunked_many_frames_for_h5dump() {
-        let path = std::env::temp_dir().join("test_hdf5rs_chunked_many.h5");
+        let path = temp_path("chunked_many");
         let file = H5File::create(&path).unwrap();
 
         let ds = file
@@ -803,7 +812,7 @@ mod integration_tests {
     fn write_dataset_with_attributes() {
         use crate::types::VarLenUnicode;
 
-        let path = std::env::temp_dir().join("test_hdf5rs_attributes.h5");
+        let path = temp_path("attributes");
         let file = H5File::create(&path).unwrap();
 
         let ds = file
@@ -856,7 +865,7 @@ mod integration_tests {
 
     #[test]
     fn chunked_write_read_roundtrip() {
-        let path = std::env::temp_dir().join("hdf5_chunked_roundtrip.h5");
+        let path = temp_path("chunked_roundtrip");
 
         // Write
         {
@@ -896,7 +905,7 @@ mod integration_tests {
     #[test]
     #[cfg(feature = "deflate")]
     fn compressed_chunked_roundtrip() {
-        let path = std::env::temp_dir().join("hdf5_compressed_roundtrip.h5");
+        let path = temp_path("compressed_roundtrip");
 
         // Write compressed
         {
@@ -943,7 +952,7 @@ mod integration_tests {
     #[test]
     #[cfg(feature = "deflate")]
     fn compressed_chunked_many_frames() {
-        let path = std::env::temp_dir().join("hdf5_compressed_many.h5");
+        let path = temp_path("compressed_many");
 
         {
             let file = H5File::create(&path).unwrap();
@@ -980,7 +989,7 @@ mod integration_tests {
     }
     #[test]
     fn append_mode() {
-        let path = std::env::temp_dir().join("hdf5_append.h5");
+        let path = temp_path("append");
 
         // Create initial file
         {
@@ -1025,7 +1034,7 @@ mod integration_tests {
 
     #[test]
     fn open_rw_set_attr_preserves_file() {
-        let path = std::env::temp_dir().join("hdf5_open_rw_attr.h5");
+        let path = temp_path("open_rw_attr");
         // Create file with a dataset and an attribute
         {
             let file = H5File::create(&path).unwrap();
@@ -1059,7 +1068,7 @@ mod integration_tests {
     #[cfg(feature = "deflate")]
     fn open_rw_attr_with_compressed_dataset() {
         use crate::format::messages::filter::FilterPipeline;
-        let path = std::env::temp_dir().join("hdf5_open_rw_compressed.h5");
+        let path = temp_path("open_rw_compressed");
         let input: Vec<&str> = (0..50).map(|_| "test string data").collect();
         // Create file with compressed vlen strings
         {
@@ -1092,7 +1101,7 @@ mod integration_tests {
     #[cfg(feature = "lz4")]
     fn append_vlen_strings_basic() {
         use crate::format::messages::filter::FilterPipeline;
-        let path = std::env::temp_dir().join("hdf5_append_vlen.h5");
+        let path = temp_path("append_vlen");
         {
             let file = H5File::create(&path).unwrap();
             file.create_appendable_vlen_dataset("names", 4, Some(FilterPipeline::lz4()))
@@ -1115,7 +1124,7 @@ mod integration_tests {
     #[cfg(feature = "lz4")]
     fn append_vlen_strings_large() {
         use crate::format::messages::filter::FilterPipeline;
-        let path = std::env::temp_dir().join("hdf5_append_vlen_large.h5");
+        let path = temp_path("append_vlen_large");
         let batch1: Vec<String> = (0..5000).map(|i| format!("node-{:06}", i)).collect();
         let batch2: Vec<String> = (5000..7189).map(|i| format!("node-{:06}", i)).collect();
         {
@@ -1141,7 +1150,7 @@ mod integration_tests {
 
     #[test]
     fn append_vlen_strings_uncompressed() {
-        let path = std::env::temp_dir().join("hdf5_append_vlen_unc.h5");
+        let path = temp_path("append_vlen_unc");
         {
             let file = H5File::create(&path).unwrap();
             file.create_appendable_vlen_dataset("texts", 8, None)
@@ -1163,7 +1172,7 @@ mod integration_tests {
 
     #[test]
     fn delete_dataset_roundtrip() {
-        let path = std::env::temp_dir().join("hdf5_delete_ds.h5");
+        let path = temp_path("delete_ds");
         {
             let file = H5File::create(&path).unwrap();
             file.write_vlen_strings("keep", &["a", "b"]).unwrap();
@@ -1184,7 +1193,7 @@ mod integration_tests {
 
     #[test]
     fn delete_group_roundtrip() {
-        let path = std::env::temp_dir().join("hdf5_delete_grp.h5");
+        let path = temp_path("delete_grp");
         {
             let file = H5File::create(&path).unwrap();
             let g1 = file.create_group("keep").unwrap();
@@ -1205,7 +1214,7 @@ mod integration_tests {
 
     #[test]
     fn open_rw_delete_recreate_group() {
-        let path = std::env::temp_dir().join("hdf5_rw_delete_recreate.h5");
+        let path = temp_path("rw_delete_recreate");
         // Step 1: create file with groups
         {
             let file = H5File::create(&path).unwrap();
@@ -1239,7 +1248,7 @@ mod integration_tests {
 
     #[test]
     fn delete_and_recreate_group() {
-        let path = std::env::temp_dir().join("hdf5_delete_recreate.h5");
+        let path = temp_path("delete_recreate");
         {
             let file = H5File::create(&path).unwrap();
             let g = file.create_group("nodes").unwrap();
@@ -1263,7 +1272,7 @@ mod integration_tests {
     #[cfg(feature = "deflate")]
     fn vlen_string_compressed_large_roundtrip() {
         use crate::format::messages::filter::FilterPipeline;
-        let path = std::env::temp_dir().join("hdf5_vlen_large.h5");
+        let path = temp_path("vlen_large");
         // Simulate kodex scenario: 7189 strings, chunk_size 512
         let input: Vec<String> = (0..7189)
             .map(|i| format!("node-{:08x}-{}", i, "a".repeat(20 + (i % 30))))
@@ -1308,7 +1317,7 @@ mod integration_tests {
 
     #[test]
     fn vlen_string_write_read() {
-        let path = std::env::temp_dir().join("hdf5_vlen_wr.h5");
+        let path = temp_path("vlen_wr");
         {
             let file = H5File::create(&path).unwrap();
             file.write_vlen_strings("names", &["alice", "bob", "charlie"])
@@ -1328,7 +1337,7 @@ mod integration_tests {
     #[cfg(feature = "deflate")]
     fn vlen_string_deflate_roundtrip() {
         use crate::format::messages::filter::FilterPipeline;
-        let path = std::env::temp_dir().join("hdf5_vlen_deflate.h5");
+        let path = temp_path("vlen_deflate");
         let input: Vec<&str> = (0..100)
             .map(|i| match i % 3 {
                 0 => "hello world",
@@ -1358,7 +1367,7 @@ mod integration_tests {
     #[cfg(feature = "zstd")]
     fn vlen_string_zstd_roundtrip() {
         use crate::format::messages::filter::FilterPipeline;
-        let path = std::env::temp_dir().join("hdf5_vlen_zstd.h5");
+        let path = temp_path("vlen_zstd");
         let input: Vec<&str> = (0..200)
             .map(|i| match i % 4 {
                 0 => "zstandard compression test",
@@ -1388,7 +1397,7 @@ mod integration_tests {
     #[test]
     #[cfg(feature = "deflate")]
     fn shuffle_deflate_roundtrip() {
-        let path = std::env::temp_dir().join("hdf5_shuf_defl.h5");
+        let path = temp_path("shuf_defl");
         {
             let file = H5File::create(&path).unwrap();
             let ds = file
@@ -1422,7 +1431,7 @@ mod integration_tests {
 
     #[test]
     fn file_level_attributes() {
-        let path = std::env::temp_dir().join("hdf5_file_attr.h5");
+        let path = temp_path("file_attr");
         {
             let file = H5File::create(&path).unwrap();
             file.set_attr_string("title", "Test File").unwrap();
@@ -1451,7 +1460,7 @@ mod integration_tests {
 
     #[test]
     fn scalar_dataset_roundtrip() {
-        let path = std::env::temp_dir().join("hdf5_scalar.h5");
+        let path = temp_path("scalar");
         {
             let file = H5File::create(&path).unwrap();
             let ds = file.new_dataset::<f64>().scalar().create("pi").unwrap();
@@ -1472,7 +1481,7 @@ mod integration_tests {
 
     #[test]
     fn append_mode_extend_chunked() {
-        let path = std::env::temp_dir().join("hdf5_append_extend.h5");
+        let path = temp_path("append_extend");
 
         // Create with 5 frames
         {
@@ -1532,7 +1541,7 @@ mod integration_tests {
 
     #[test]
     fn group_hierarchy_roundtrip() {
-        let path = std::env::temp_dir().join("hdf5_groups_rt.h5");
+        let path = temp_path("groups_rt");
 
         {
             let file = H5File::create(&path).unwrap();
@@ -1597,7 +1606,7 @@ mod integration_tests {
 
     #[test]
     fn nested_groups_via_file_create_group() {
-        let path = std::env::temp_dir().join("hdf5_file_create_group.h5");
+        let path = temp_path("file_create_group");
 
         {
             let file = H5File::create(&path).unwrap();
@@ -1649,6 +1658,10 @@ mod integration_tests {
 mod h5py_compat_tests {
     use super::*;
 
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        super::unique_test_path(name)
+    }
+
     /// Verify our files can be read by h5dump (if available).
     #[test]
     #[cfg(feature = "deflate")]
@@ -1662,7 +1675,7 @@ mod h5py_compat_tests {
             return;
         }
 
-        let path = std::env::temp_dir().join("hdf5_h5dump_validate.h5");
+        let path = temp_path("h5dump_validate");
 
         // Write a comprehensive test file
         {

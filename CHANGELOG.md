@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.12
+
+### Reliability
+
+- `try_acquire` now retries briefly (~100 ms total: 10 attempts × 10 ms)
+  when `try_lock_*` returns `WouldBlock`. macOS in particular has been
+  observed to surface a stale lock for a short window after the
+  previous holder's `close(2)`; a brief retry distinguishes that
+  release-pending race from a real long-lived conflict without
+  meaningfully slowing the real-conflict path.
+
+### Tests
+
+- Centralized `unique_test_path` helper at `src/file.rs` module scope
+  (used by `mod tests`, `mod integration_tests`, `mod h5py_compat_tests`).
+  Equivalent helpers added to `src/io/reader.rs::tests` and
+  `src/io/writer.rs::tests::swmr_writer_append_frames`. All
+  unit/integration test paths now embed PID + atomic counter, so
+  concurrent cargo invocations and kernel-side flock races cannot
+  collide. Fixes intermittent CI failures of
+  `dataset::tests::type_mismatch_element_size` and
+  `file::integration_tests::append_mode`.
+
 ## 0.2.11
 
 ### Tests

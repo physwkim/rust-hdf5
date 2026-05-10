@@ -1636,6 +1636,21 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Per-call unique temp path. PID + atomic counter avoids
+    /// path collisions across concurrent cargo invocations and
+    /// kernel-side flock release races.
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "rust_hdf5_reader_test_{}_{}_{}.h5",
+            name,
+            std::process::id(),
+            n
+        ))
+    }
+
     /// Helper: write a little-endian u64 truncated to `n` bytes.
     fn write_le(buf: &mut Vec<u8>, value: u64, n: usize) {
         buf.extend_from_slice(&value.to_le_bytes()[..n]);
@@ -1928,7 +1943,7 @@ mod tests {
         let file_bytes = build_v0_file("my_dataset", &dims, &raw_data);
 
         // Write to a temp file
-        let path = std::env::temp_dir().join("hdf5_test_v0_reader.h5");
+        let path = temp_path("v0_reader");
         {
             let mut f = std::fs::File::create(&path).unwrap();
             f.write_all(&file_bytes).unwrap();
@@ -1964,7 +1979,7 @@ mod tests {
 
         let file_bytes = build_v0_file("data_1d", &dims, &raw_data);
 
-        let path = std::env::temp_dir().join("hdf5_test_v0_1d.h5");
+        let path = temp_path("v0_1d");
         {
             let mut f = std::fs::File::create(&path).unwrap();
             f.write_all(&file_bytes).unwrap();
@@ -1987,7 +2002,7 @@ mod tests {
     #[test]
     fn test_detect_v2v3_still_works() {
         // Verify that opening a v3 file written by our writer still works
-        let path = std::env::temp_dir().join("hdf5_test_detect_v3.h5");
+        let path = temp_path("detect_v3");
         {
             use crate::io::writer::Hdf5Writer;
             let mut writer = Hdf5Writer::create(&path).unwrap();

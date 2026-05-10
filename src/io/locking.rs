@@ -117,15 +117,35 @@ impl FileLocking {
 /// was skipped (policy = Disabled) or the attempt failed under
 /// [`FileLocking::BestEffort`]. Returns `Err` only when policy is
 /// [`FileLocking::Enabled`] and the lock could not be obtained.
+///
+/// On a `WouldBlock` response we retry briefly (about 100 ms total).
+/// macOS in particular has been observed to surface a stale lock
+/// state for a short window after the previous holder's `close(2)`,
+/// so a quick retry distinguishes a transient release-pending race
+/// from a real long-lived conflict without meaningfully slowing the
+/// real-conflict path.
 pub fn try_acquire(file: &File, mode: LockMode, policy: FileLocking) -> io::Result<bool> {
     if matches!(policy, FileLocking::Disabled) {
         return Ok(false);
     }
 
-    let attempt = match mode {
+    const RETRY_ATTEMPTS: u32 = 10;
+    const RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(10);
+
+    let mut attempt = match mode {
         LockMode::Shared => file.try_lock_shared(),
         LockMode::Exclusive => file.try_lock(),
     };
+    for _ in 0..RETRY_ATTEMPTS {
+        if !matches!(attempt, Err(std::fs::TryLockError::WouldBlock)) {
+            break;
+        }
+        std::thread::sleep(RETRY_SLEEP);
+        attempt = match mode {
+            LockMode::Shared => file.try_lock_shared(),
+            LockMode::Exclusive => file.try_lock(),
+        };
+    }
 
     match attempt {
         Ok(()) => Ok(true),

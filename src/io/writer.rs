@@ -3155,8 +3155,16 @@ mod tests {
     fn swmr_writer_append_frames() {
         use crate::io::swmr::SwmrWriter;
 
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_swmr_append.h5");
+        // Per-call unique path so concurrent cargo invocations and
+        // kernel-side flock release races cannot collide.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rust_hdf5_swmr_append_{}_{}.h5",
+            std::process::id(),
+            n
+        ));
 
         let mut swmr = SwmrWriter::create(&path).unwrap();
         let idx = swmr
