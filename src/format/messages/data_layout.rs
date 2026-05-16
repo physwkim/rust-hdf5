@@ -25,6 +25,11 @@ use crate::format::{FormatContext, FormatError, FormatResult, UNDEF_ADDR};
 
 const VERSION_3: u8 = 3;
 const VERSION_4: u8 = 4;
+/// Layout message version 5: structurally identical to version 4; it only
+/// changes how filtered-chunk sizes are encoded inside the chunk-index data
+/// structures (a fixed `sizeof_size` field). The reader derives that width
+/// from the chunk-index header, so v5 is decoded exactly like v4.
+const VERSION_5: u8 = 5;
 const CLASS_COMPACT: u8 = 0;
 const CLASS_CONTIGUOUS: u8 = 1;
 const CLASS_CHUNKED: u8 = 2;
@@ -338,7 +343,7 @@ impl DataLayoutMessage {
                 pos += compact_size;
                 Ok((Self::Compact { data }, pos))
             }
-            (VERSION_4, CLASS_CHUNKED) => {
+            (VERSION_4 | VERSION_5, CLASS_CHUNKED) => {
                 let sa = ctx.sizeof_addr as usize;
                 let mut pos = 2;
 

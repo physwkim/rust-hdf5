@@ -1784,6 +1784,91 @@ mod tests {
     }
 
     #[test]
+    fn ea_super_block_roundtrip() {
+        // 2000 chunks span several extensible-array super blocks. Before
+        // super-block support the writer errored at chunk index 228.
+        let path = temp_path("ea_super_rt");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0])
+                .chunk(&[1])
+                .max_shape(&[None])
+                .create("v")
+                .unwrap();
+            ds.append(&(0..2000).collect::<Vec<i32>>()).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let v = file.dataset("v").unwrap().read_raw::<i32>().unwrap();
+            assert_eq!(v.len(), 2000);
+            assert!(v.iter().enumerate().all(|(i, &x)| x == i as i32));
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn ea_filtered_super_block_roundtrip() {
+        // Compressed chunks across super blocks.
+        let path = temp_path("ea_filt_super");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0])
+                .chunk(&[1])
+                .max_shape(&[None])
+                .deflate(4)
+                .create("v")
+                .unwrap();
+            ds.append(&(0..600).collect::<Vec<i32>>()).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let v = file.dataset("v").unwrap().read_raw::<i32>().unwrap();
+            assert_eq!(v, (0..600).collect::<Vec<i32>>());
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn ea_super_block_open_append() {
+        // Reopen a dataset and append chunks that fall in super blocks.
+        let path = temp_path("ea_super_append");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0])
+                .chunk(&[1])
+                .max_shape(&[None])
+                .create("v")
+                .unwrap();
+            ds.append(&(0..300).collect::<Vec<i32>>()).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let mut w = crate::io::writer::Hdf5Writer::open_append(&path).unwrap();
+            let idx = w.dataset_index("v").unwrap();
+            for c in 300..900u64 {
+                w.write_chunk(idx, c, &(c as i32).to_le_bytes()).unwrap();
+            }
+            w.extend_dataset(idx, &[900]).unwrap();
+            w.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let v = file.dataset("v").unwrap().read_raw::<i32>().unwrap();
+            assert_eq!(v.len(), 900);
+            assert!(v.iter().enumerate().all(|(i, &x)| x == i as i32));
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn fill_value_contiguous_roundtrip() {
         let path = temp_path("fill_value_contig");
         {

@@ -687,8 +687,6 @@ impl Hdf5Reader {
         earray_params: Option<&data_layout::EarrayParams>,
         pipeline: Option<&FilterPipeline>,
     ) -> IoResult<Vec<u8>> {
-        use crate::format::chunk_index::extensible_array::{self as ea, *};
-
         let info = self
             .dataset_info(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
@@ -735,120 +733,20 @@ impl Hdf5Reader {
                     return Ok(vec![]);
                 }
 
-                // Read the EA header
-                let hdr_buf = self.handle.read_at_most(index_address, 256)?;
-                let ea_hdr = ExtensibleArrayHeader::decode(&hdr_buf, &self.ctx)?;
-
-                if ea_hdr.idx_blk_addr == UNDEF_ADDR {
-                    return Ok(vec![]);
-                }
-
+                let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
                 let chunks_dim0 = if chunk_dims[0] > 0 {
                     dims[0].div_ceil(chunk_dims[0])
                 } else {
                     0
                 };
 
-                let ndblk_addrs = compute_ndblk_addrs(params.sup_blk_min_data_ptrs);
-                let nsblk_addrs = compute_nsblk_addrs(
-                    params.idx_blk_elmts,
-                    params.data_blk_min_elmts,
-                    params.sup_blk_min_data_ptrs,
-                    params.max_nelmts_bits,
-                );
-
-                let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
-                let is_filtered = ea_hdr.class_id == ea::EA_CLS_FILT_CHUNK;
-
-                // Collect chunk entries: (address, compressed_size)
-                let mut chunk_entries: Vec<(u64, u64)> = Vec::new();
-
-                // Data block sizes follow the pattern: min, min, 2*min, 2*min, 4*min, 4*min, ...
-                let min_elmts = params.data_blk_min_elmts as usize;
-
-                if is_filtered {
-                    let chunk_size_len = ea_hdr.raw_elmt_size - self.ctx.sizeof_addr - 4;
-
-                    let iblk_buf = self.handle.read_at_most(ea_hdr.idx_blk_addr, 65536)?;
-                    let fiblk = ea::FilteredIndexBlock::decode(
-                        &iblk_buf,
-                        &self.ctx,
-                        params.idx_blk_elmts as usize,
-                        ndblk_addrs,
-                        nsblk_addrs,
-                        chunk_size_len,
-                    )?;
-
-                    for e in &fiblk.elements {
-                        chunk_entries.push((e.addr, e.nbytes));
-                    }
-
-                    let mut dblk_nelmts = min_elmts;
-                    let mut pair_count = 0usize;
-                    for &dblk_addr in &fiblk.dblk_addrs {
-                        if dblk_addr == UNDEF_ADDR {
-                            chunk_entries.extend(std::iter::repeat_n((UNDEF_ADDR, 0), dblk_nelmts));
-                        } else {
-                            let dblk_buf = self.handle.read_at_most(dblk_addr, 65536)?;
-                            let dblk = ea::FilteredDataBlock::decode(
-                                &dblk_buf,
-                                &self.ctx,
-                                params.max_nelmts_bits,
-                                dblk_nelmts,
-                                chunk_size_len,
-                            )?;
-                            for e in &dblk.elements {
-                                chunk_entries.push((e.addr, e.nbytes));
-                            }
-                        }
-                        if chunk_entries.len() >= chunks_dim0 as usize {
-                            break;
-                        }
-                        pair_count += 1;
-                        if pair_count >= 2 {
-                            pair_count = 0;
-                            dblk_nelmts *= 2;
-                        }
-                    }
-                } else {
-                    let iblk_buf = self.handle.read_at_most(ea_hdr.idx_blk_addr, 8192)?;
-                    let iblk = ExtensibleArrayIndexBlock::decode(
-                        &iblk_buf,
-                        &self.ctx,
-                        params.idx_blk_elmts as usize,
-                        ndblk_addrs,
-                        nsblk_addrs,
-                    )?;
-                    for &addr in &iblk.elements {
-                        chunk_entries.push((addr, chunk_bytes));
-                    }
-                    let mut dblk_nelmts = min_elmts;
-                    let mut pair_count = 0usize;
-                    for &dblk_addr in &iblk.dblk_addrs {
-                        if dblk_addr == UNDEF_ADDR {
-                            chunk_entries.extend(std::iter::repeat_n((UNDEF_ADDR, 0), dblk_nelmts));
-                        } else {
-                            let dblk_buf = self.handle.read_at_most(dblk_addr, 65536)?;
-                            let dblk = ExtensibleArrayDataBlock::decode(
-                                &dblk_buf,
-                                &self.ctx,
-                                params.max_nelmts_bits,
-                                dblk_nelmts,
-                            )?;
-                            for &addr in &dblk.elements {
-                                chunk_entries.push((addr, chunk_bytes));
-                            }
-                        }
-                        if chunk_entries.len() >= chunks_dim0 as usize {
-                            break;
-                        }
-                        pair_count += 1;
-                        if pair_count >= 2 {
-                            pair_count = 0;
-                            dblk_nelmts *= 2;
-                        }
-                    }
-                }
+                let chunk_entries = self.collect_ea_chunk_entries(
+                    index_address,
+                    params,
+                    &dims,
+                    chunk_dims,
+                    element_size,
+                )?;
 
                 let total_size: u64 = dims.iter().product::<u64>() * element_size;
                 let mut output = tiled_fill(total_size as usize, fill_value.as_deref());
@@ -1340,7 +1238,6 @@ impl Hdf5Reader {
         if index_address == UNDEF_ADDR {
             return Ok(vec![]);
         }
-
         let hdr_buf = self.handle.read_at_most(index_address, 256)?;
         let ea_hdr = ExtensibleArrayHeader::decode(&hdr_buf, &self.ctx)?;
         if ea_hdr.idx_blk_addr == UNDEF_ADDR {
@@ -1348,99 +1245,117 @@ impl Hdf5Reader {
         }
 
         let chunks_dim0 = if chunk_dims[0] > 0 {
-            dims[0].div_ceil(chunk_dims[0])
+            dims[0].div_ceil(chunk_dims[0]) as usize
         } else {
             0
         };
-        let ndblk_addrs = compute_ndblk_addrs(params.sup_blk_min_data_ptrs);
-        let nsblk_addrs = compute_nsblk_addrs(
+        let geo = EaGeometry::new(
             params.idx_blk_elmts,
             params.data_blk_min_elmts,
             params.sup_blk_min_data_ptrs,
             params.max_nelmts_bits,
+            params.max_dblk_page_nelmts_bits,
         );
         let chunk_bytes = chunk_dims.iter().product::<u64>() * element_size;
         let is_filtered = ea_hdr.class_id == ea::EA_CLS_FILT_CHUNK;
-        let min_elmts = params.data_blk_min_elmts as usize;
+        let chunk_size_len = if is_filtered {
+            ea_hdr.raw_elmt_size - self.ctx.sizeof_addr - 4
+        } else {
+            0
+        };
+        let max_nelmts_bits = params.max_nelmts_bits;
         let mut entries: Vec<(u64, u64)> = Vec::new();
 
-        if is_filtered {
-            let chunk_size_len = ea_hdr.raw_elmt_size - self.ctx.sizeof_addr - 4;
-            let iblk_buf = self.handle.read_at_most(ea_hdr.idx_blk_addr, 65536)?;
+        // Read the index block: direct elements + the data-block / super-block
+        // address arrays (the address arrays are filter-agnostic).
+        let (dblk_addrs, sblk_addrs): (Vec<u64>, Vec<u64>) = if is_filtered {
+            let buf = self.handle.read_at_most(ea_hdr.idx_blk_addr, 65536)?;
             let fiblk = ea::FilteredIndexBlock::decode(
-                &iblk_buf,
+                &buf,
                 &self.ctx,
                 params.idx_blk_elmts as usize,
-                ndblk_addrs,
-                nsblk_addrs,
+                geo.ndblk_addrs,
+                geo.nsblk_addrs,
                 chunk_size_len,
             )?;
             for e in &fiblk.elements {
                 entries.push((e.addr, e.nbytes));
             }
-            let mut nelmts = min_elmts;
-            let mut pair = 0usize;
-            for &dblk_addr in &fiblk.dblk_addrs {
-                if dblk_addr == UNDEF_ADDR {
-                    entries.extend(std::iter::repeat_n((UNDEF_ADDR, 0), nelmts));
+            (fiblk.dblk_addrs, fiblk.sblk_addrs)
+        } else {
+            let buf = self.handle.read_at_most(ea_hdr.idx_blk_addr, 65536)?;
+            let iblk = ExtensibleArrayIndexBlock::decode(
+                &buf,
+                &self.ctx,
+                params.idx_blk_elmts as usize,
+                geo.ndblk_addrs,
+                geo.nsblk_addrs,
+            )?;
+            for &addr in &iblk.elements {
+                entries.push((addr, chunk_bytes));
+            }
+            (iblk.dblk_addrs, iblk.sblk_addrs)
+        };
+
+        // Walk super blocks in order, collecting each data block's entries.
+        'outer: for (u, s) in geo.sblk.iter().enumerate() {
+            if entries.len() >= chunks_dim0 {
+                break;
+            }
+            let dblk_nelmts = s.dblk_nelmts as usize;
+            // Addresses of this super block's data blocks.
+            let this_dblk_addrs: Vec<u64> = if u < geo.iblock_nsblks {
+                let start = s.start_dblk as usize;
+                (0..s.ndblks as usize)
+                    .map(|d| dblk_addrs.get(start + d).copied().unwrap_or(UNDEF_ADDR))
+                    .collect()
+            } else {
+                let sblk_addr = sblk_addrs
+                    .get(u - geo.iblock_nsblks)
+                    .copied()
+                    .unwrap_or(UNDEF_ADDR);
+                if sblk_addr == UNDEF_ADDR {
+                    vec![UNDEF_ADDR; s.ndblks as usize]
                 } else {
+                    let buf = self.handle.read_at_most(sblk_addr, 65536)?;
+                    ExtensibleArraySuperBlock::decode(
+                        &buf,
+                        &self.ctx,
+                        max_nelmts_bits,
+                        s.ndblks as usize,
+                    )?
+                    .dblk_addrs
+                }
+            };
+            for &dblk_addr in &this_dblk_addrs {
+                if dblk_addr == UNDEF_ADDR {
+                    entries.extend(std::iter::repeat_n((UNDEF_ADDR, 0), dblk_nelmts));
+                } else if is_filtered {
                     let buf = self.handle.read_at_most(dblk_addr, 65536)?;
                     let dblk = ea::FilteredDataBlock::decode(
                         &buf,
                         &self.ctx,
-                        params.max_nelmts_bits,
-                        nelmts,
+                        max_nelmts_bits,
+                        dblk_nelmts,
                         chunk_size_len,
                     )?;
                     for e in &dblk.elements {
                         entries.push((e.addr, e.nbytes));
                     }
-                }
-                if entries.len() >= chunks_dim0 as usize {
-                    break;
-                }
-                pair += 1;
-                if pair >= 2 {
-                    pair = 0;
-                    nelmts *= 2;
-                }
-            }
-        } else {
-            let iblk_buf = self.handle.read_at_most(ea_hdr.idx_blk_addr, 8192)?;
-            let iblk = ExtensibleArrayIndexBlock::decode(
-                &iblk_buf,
-                &self.ctx,
-                params.idx_blk_elmts as usize,
-                ndblk_addrs,
-                nsblk_addrs,
-            )?;
-            for &addr in &iblk.elements {
-                entries.push((addr, chunk_bytes));
-            }
-            let mut nelmts = min_elmts;
-            let mut pair = 0usize;
-            for &dblk_addr in &iblk.dblk_addrs {
-                if dblk_addr == UNDEF_ADDR {
-                    entries.extend(std::iter::repeat_n((UNDEF_ADDR, 0), nelmts));
                 } else {
                     let buf = self.handle.read_at_most(dblk_addr, 65536)?;
                     let dblk = ExtensibleArrayDataBlock::decode(
                         &buf,
                         &self.ctx,
-                        params.max_nelmts_bits,
-                        nelmts,
+                        max_nelmts_bits,
+                        dblk_nelmts,
                     )?;
                     for &addr in &dblk.elements {
                         entries.push((addr, chunk_bytes));
                     }
                 }
-                if entries.len() >= chunks_dim0 as usize {
-                    break;
-                }
-                pair += 1;
-                if pair >= 2 {
-                    pair = 0;
-                    nelmts *= 2;
+                if entries.len() >= chunks_dim0 {
+                    break 'outer;
                 }
             }
         }

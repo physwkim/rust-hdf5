@@ -4,21 +4,20 @@ Reverse-engineered from the libhdf5 C source (`H5EApkg.h`, `H5EAhdr.c`,
 `H5EAcache.c`, `H5EA.c`, `H5EAiblock.c`, `H5EAdblock.c`) and verified against
 files produced by h5py 3.16 / libhdf5 2.0.0.
 
-This document exists because `rust-hdf5`'s current Extensible Array
-implementation is **not byte-compatible with libhdf5**: rust-hdf5 cannot read
-an h5py-created EA dataset, and h5py cannot read a rust-hdf5 EA dataset
-(`incorrect metadata checksum` in both directions). The EA index is used for
-every chunked dataset with exactly one unlimited dimension, so this breaks
-interoperability for all such datasets.
+This document originally recorded why `rust-hdf5`'s Extensible Array was **not
+byte-compatible with libhdf5**. Those defects have since been fixed; the
+document is kept as the format reference. The two defects were:
 
-The byte layout of the header, index block and data block in rust-hdf5 is
-already correct. The two defects are:
-
-1. **Data-block geometry.** rust-hdf5 sizes data blocks `16, 16, 32, 32, 64,
+1. **Data-block geometry.** rust-hdf5 sized data blocks `16, 16, 32, 32, 64,
    64, …` (doubling every two data blocks). libhdf5 sizes them `16, 32, 32,
-   64, 64, 128, …`. They already diverge at data-block index 1.
-2. **Super blocks (`EASB`) are not implemented.** Even a 500-chunk dataset
+   64, 64, 128, …`. They diverged at data-block index 1.
+2. **Super blocks (`EASB`) were not implemented.** Even a 500-chunk dataset
    needs one super block with default parameters.
+
+Both are now fixed (`EaGeometry` + `ExtensibleArraySuperBlock` in
+`extensible_array.rs`, with matching writer/reader walks). EA round-trips
+with h5py / libhdf5 in both directions, filtered and unfiltered, across
+super blocks.
 
 ## Creation parameters
 
@@ -233,21 +232,27 @@ must be validated **both** directions:
 `/tmp/make_ea_ref.py` and `/tmp/ea_dump*.py` hold the diagnostic scripts used
 to produce this document.
 
-## Implementation checklist
+## Implementation status
 
-1. `src/format/chunk_index/extensible_array.rs` — replace the geometry
-   functions with the formulas above (single source of truth for
+Done:
+
+1. `extensible_array.rs` — `EaGeometry` is the single source of truth for
    `nsblks`, `ndblks(u)`, `dblk_nelmts(u)`, `start_idx`, `start_dblk`,
-   `iblock_nsblks`, `ndblk_addrs`, `nsblk_addrs`, and the chunk-index lookup).
-2. Add `ExtensibleArraySuperBlock` (and a filtered variant) with `encode` /
-   `decode`.
-3. `src/io/writer.rs::write_chunk` — walk data blocks and super blocks using
-   the corrected geometry.
-4. `src/io/reader.rs` — rewrite the EA walk in `read_chunked_v4` and
-   `collect_ea_chunk_entries`.
-5. Filtered EA variants and `open_append` reconstruction.
-6. Round-trip tests against h5py in both directions.
+   `iblock_nsblks`, `ndblk_addrs`, `nsblk_addrs`, and the chunk lookup
+   (`EaGeometry::locate`).
+2. `ExtensibleArraySuperBlock` with `encode` / `decode` (super blocks are
+   filter-agnostic — they hold data-block addresses only).
+3. `writer.rs::write_chunk` walks data blocks and super blocks via
+   `EaGeometry`, creating super blocks on demand.
+4. `reader.rs::collect_ea_chunk_entries` walks the corrected geometry,
+   reading super blocks; `read_chunked_v4` delegates to it.
+5. Filtered EA and `open_append` both covered.
+6. Layout message version 5 is accepted (it is structurally identical to
+   version 4; libhdf5 emits v5 for filtered datasets).
 
-Paged data blocks (chunk index `> ~65,520`) can be deferred; until then the
-writer should error clearly rather than emit an unpaged block where libhdf5
-expects pages.
+Verified round-trip with h5py 3.16 / libhdf5 2.0.0 in both directions,
+filtered and unfiltered, across super blocks (1500–2000 chunks).
+
+Not done — paged data blocks (chunk index `> ~65,520` with default
+parameters): the writer errors clearly rather than emitting an unpaged block
+where libhdf5 expects pages.

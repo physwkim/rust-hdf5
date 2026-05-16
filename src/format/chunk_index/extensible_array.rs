@@ -17,6 +17,8 @@ pub const EAHD_SIGNATURE: [u8; 4] = *b"EAHD";
 pub const EAIB_SIGNATURE: [u8; 4] = *b"EAIB";
 /// Signature for the extensible array data block.
 pub const EADB_SIGNATURE: [u8; 4] = *b"EADB";
+/// Signature for the extensible array super block.
+pub const EASB_SIGNATURE: [u8; 4] = *b"EASB";
 
 /// Extensible array version.
 pub const EA_VERSION: u8 = 0;
@@ -864,51 +866,288 @@ pub fn compute_ndblk_addrs(sup_blk_min_data_ptrs: u8) -> usize {
     2 * (sup_blk_min_data_ptrs as usize - 1)
 }
 
-/// Compute the total number of super blocks (nsblks) for the given parameters.
-fn compute_nsblks(idx_blk_elmts: u8, data_blk_min_elmts: u8, max_nelmts_bits: u8) -> usize {
-    let max_nelmts: u64 = 1u64 << (max_nelmts_bits as u64);
-    let nelmts_remaining = max_nelmts - idx_blk_elmts as u64;
-
-    let mut nsblks = 0usize;
-    let mut acc = 0u64;
-    while acc < nelmts_remaining {
-        let (ndblks_in_sblk, dblk_size) = if nsblks < 2 {
-            (1u64, data_blk_min_elmts as u64)
-        } else {
-            let half = (nsblks - 2) / 2;
-            (
-                1u64 << (half + 1),
-                (data_blk_min_elmts as u64) << (half + 1),
-            )
-        };
-        acc = acc.saturating_add(ndblks_in_sblk.saturating_mul(dblk_size));
-        nsblks += 1;
-    }
-    nsblks
+/// `log2` of a power of two.
+fn log2_pow2(n: u64) -> u32 {
+    debug_assert!(n.is_power_of_two());
+    n.trailing_zeros()
 }
 
-/// Compute sblk_idx_start: the first super block whose data block addresses
-/// are NOT stored in the index block's dblk_addrs array.
-fn compute_sblk_idx_start(sup_blk_min_data_ptrs: u8, nsblks: usize) -> usize {
-    let ndblk_addrs = compute_ndblk_addrs(sup_blk_min_data_ptrs);
-    let mut dblks_counted = 0usize;
-    let mut sblk_idx_start = 0usize;
+/// Floor of `log2(n)` for `n >= 1`.
+fn log2_floor(n: u64) -> u32 {
+    debug_assert!(n >= 1);
+    63 - n.leading_zeros()
+}
 
-    for s in 0..nsblks {
-        let ndblks_in_sblk = if s < 2 {
-            1
-        } else {
-            let half = (s - 2) / 2;
-            1 << (half + 1)
-        };
+/// Layout of one extensible-array super block (`H5EA_sblk_info_t`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EaSblkInfo {
+    /// Number of data blocks in this super block.
+    pub ndblks: u64,
+    /// Number of elements in each data block of this super block.
+    pub dblk_nelmts: u64,
+    /// Index of the first element in this super block (excludes `idx_blk_elmts`).
+    pub start_idx: u64,
+    /// Global index of the first data block in this super block.
+    pub start_dblk: u64,
+}
 
-        if dblks_counted + ndblks_in_sblk > ndblk_addrs {
-            break;
+/// Where a chunk lives within the extensible array.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EaLoc {
+    /// Stored directly in the index block at `elem`.
+    Index { elem: usize },
+    /// Stored in a data block.
+    Dblk(EaChunkLoc),
+}
+
+/// Location of a chunk that lives in an EA data block.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EaChunkLoc {
+    /// Owning super-block index.
+    pub sblk_idx: usize,
+    /// Elements per data block in that super block.
+    pub dblk_nelmts: u64,
+    /// Element offset of the chunk within its data block.
+    pub offset_in_dblk: u64,
+    /// `block_offset` value to stamp into the data block header.
+    pub dblk_block_offset: u64,
+    /// Whether the data block exceeds the page size (paged — unsupported).
+    pub paged: bool,
+    /// How the data block address is reached.
+    pub path: EaDblkPath,
+}
+
+/// How an EA data block's address is reached from the index block.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EaDblkPath {
+    /// Address is `index_block.dblk_addrs[idx]`.
+    Direct { idx: usize },
+    /// Address is `super_block(index_block.sblk_addrs[sblk_off]).dblk_addrs[local_dblk]`.
+    ViaSblk {
+        sblk_off: usize,
+        local_dblk: usize,
+        ndblks_in_sblk: usize,
+        /// `block_offset` value for the super block header.
+        sblk_block_offset: u64,
+    },
+}
+
+/// Extensible-array geometry derived from the creation parameters, matching
+/// the libhdf5 on-disk layout (`H5EA__hdr_init`, `H5EAiblock.c`).
+#[derive(Debug, Clone)]
+pub struct EaGeometry {
+    pub idx_blk_elmts: u64,
+    pub data_blk_min_elmts: u64,
+    /// Elements per data block page (paging threshold).
+    pub dblk_page_nelmts: u64,
+    /// Super blocks whose data-block addresses live in the index block.
+    pub iblock_nsblks: usize,
+    /// Data-block address slots in the index block.
+    pub ndblk_addrs: usize,
+    /// Super-block address slots in the index block.
+    pub nsblk_addrs: usize,
+    /// Per-super-block layout, length = total super-block count.
+    pub sblk: Vec<EaSblkInfo>,
+}
+
+impl EaGeometry {
+    /// Derive the geometry from the EA creation parameters.
+    pub fn new(
+        idx_blk_elmts: u8,
+        data_blk_min_elmts: u8,
+        sup_blk_min_data_ptrs: u8,
+        max_nelmts_bits: u8,
+        max_dblk_page_nelmts_bits: u8,
+    ) -> Self {
+        let min = data_blk_min_elmts as u64;
+        let nsblks = 1 + (max_nelmts_bits as usize - log2_pow2(min) as usize);
+        let mut sblk = Vec::with_capacity(nsblks);
+        let mut start_idx = 0u64;
+        let mut start_dblk = 0u64;
+        for u in 0..nsblks {
+            let ndblks = 1u64 << (u / 2);
+            let dblk_nelmts = (1u64 << (u as u64).div_ceil(2)) * min;
+            sblk.push(EaSblkInfo {
+                ndblks,
+                dblk_nelmts,
+                start_idx,
+                start_dblk,
+            });
+            start_idx += ndblks * dblk_nelmts;
+            start_dblk += ndblks;
         }
-        dblks_counted += ndblks_in_sblk;
-        sblk_idx_start = s + 1;
+        let iblock_nsblks = 2 * log2_pow2(sup_blk_min_data_ptrs as u64) as usize;
+        Self {
+            idx_blk_elmts: idx_blk_elmts as u64,
+            data_blk_min_elmts: min,
+            dblk_page_nelmts: 1u64 << max_dblk_page_nelmts_bits,
+            iblock_nsblks,
+            ndblk_addrs: 2 * (sup_blk_min_data_ptrs as usize - 1),
+            nsblk_addrs: nsblks - iblock_nsblks,
+            sblk,
+        }
     }
-    sblk_idx_start
+
+    /// Super-block index containing chunk `idx` (`idx >= idx_blk_elmts`).
+    pub fn sblk_index(&self, idx: u64) -> usize {
+        let e = idx - self.idx_blk_elmts;
+        log2_floor(e / self.data_blk_min_elmts + 1) as usize
+    }
+
+    /// Locate chunk `idx` within the array.
+    pub fn locate(&self, idx: u64) -> EaLoc {
+        if idx < self.idx_blk_elmts {
+            return EaLoc::Index { elem: idx as usize };
+        }
+        let sblk_idx = self.sblk_index(idx);
+        let s = self.sblk[sblk_idx];
+        let elmt = (idx - self.idx_blk_elmts) - s.start_idx;
+        let local_dblk = elmt / s.dblk_nelmts;
+        let offset_in_dblk = elmt % s.dblk_nelmts;
+        let paged = s.dblk_nelmts > self.dblk_page_nelmts;
+        let path = if sblk_idx < self.iblock_nsblks {
+            let global_dblk = s.start_dblk + local_dblk;
+            EaDblkPath::Direct {
+                idx: global_dblk as usize,
+            }
+        } else {
+            EaDblkPath::ViaSblk {
+                sblk_off: sblk_idx - self.iblock_nsblks,
+                local_dblk: local_dblk as usize,
+                ndblks_in_sblk: s.ndblks as usize,
+                sblk_block_offset: s.start_idx,
+            }
+        };
+        // libhdf5 stamps the data block's block_offset using the *global*
+        // data-block index for index-block data blocks, and the local index
+        // for super-block data blocks (H5EA__lookup_elmt).
+        let dblk_block_offset = match path {
+            EaDblkPath::Direct { idx } => s.start_idx + (idx as u64) * s.dblk_nelmts,
+            EaDblkPath::ViaSblk { .. } => s.start_idx + local_dblk * s.dblk_nelmts,
+        };
+        EaLoc::Dblk(EaChunkLoc {
+            sblk_idx,
+            dblk_nelmts: s.dblk_nelmts,
+            offset_in_dblk,
+            dblk_block_offset,
+            paged,
+            path,
+        })
+    }
+}
+
+/// Extensible array super block (EASB).
+///
+/// Holds the data-block addresses for one super block. Used for super blocks
+/// whose data-block addresses do not fit in the index block. Paged data
+/// blocks (very large arrays) are not supported.
+///
+/// On-disk layout:
+/// ```text
+/// "EASB"(4) + version(1) + class_id(1)
+/// + header_addr(sizeof_addr)
+/// + block_offset(arr_off_size)
+/// + data_block_addresses(ndblks * sizeof_addr)
+/// + checksum(4)
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtensibleArraySuperBlock {
+    pub class_id: u8,
+    pub header_addr: u64,
+    pub block_offset: u64,
+    pub dblk_addrs: Vec<u64>,
+}
+
+impl ExtensibleArraySuperBlock {
+    /// Create an empty super block with `ndblks` undefined data-block slots.
+    pub fn new(class_id: u8, header_addr: u64, block_offset: u64, ndblks: usize) -> Self {
+        Self {
+            class_id,
+            header_addr,
+            block_offset,
+            dblk_addrs: vec![UNDEF_ADDR; ndblks],
+        }
+    }
+
+    /// Encoded size for `ndblks` data-block slots.
+    pub fn encoded_size(ctx: &FormatContext, max_nelmts_bits: u8, ndblks: usize) -> usize {
+        let sa = ctx.sizeof_addr as usize;
+        let bo = ExtensibleArrayDataBlock::block_offset_size(max_nelmts_bits);
+        4 + 1 + 1 + sa + bo + ndblks * sa + 4
+    }
+
+    pub fn encode(&self, ctx: &FormatContext, max_nelmts_bits: u8) -> Vec<u8> {
+        let sa = ctx.sizeof_addr as usize;
+        let bo = ExtensibleArrayDataBlock::block_offset_size(max_nelmts_bits);
+        let size = Self::encoded_size(ctx, max_nelmts_bits, self.dblk_addrs.len());
+        let mut buf = Vec::with_capacity(size);
+        buf.extend_from_slice(&EASB_SIGNATURE);
+        buf.push(EA_VERSION);
+        buf.push(self.class_id);
+        buf.extend_from_slice(&self.header_addr.to_le_bytes()[..sa]);
+        buf.extend_from_slice(&self.block_offset.to_le_bytes()[..bo]);
+        for &a in &self.dblk_addrs {
+            buf.extend_from_slice(&a.to_le_bytes()[..sa]);
+        }
+        let cksum = checksum_metadata(&buf);
+        buf.extend_from_slice(&cksum.to_le_bytes());
+        debug_assert_eq!(buf.len(), size);
+        buf
+    }
+
+    pub fn decode(
+        buf: &[u8],
+        ctx: &FormatContext,
+        max_nelmts_bits: u8,
+        ndblks: usize,
+    ) -> FormatResult<Self> {
+        let sa = ctx.sizeof_addr as usize;
+        let bo = ExtensibleArrayDataBlock::block_offset_size(max_nelmts_bits);
+        let min_size = 4 + 1 + 1 + sa + bo + ndblks * sa + 4;
+        if buf.len() < min_size {
+            return Err(FormatError::BufferTooShort {
+                needed: min_size,
+                available: buf.len(),
+            });
+        }
+        if buf[0..4] != EASB_SIGNATURE {
+            return Err(FormatError::InvalidSignature);
+        }
+        if buf[4] != EA_VERSION {
+            return Err(FormatError::InvalidVersion(buf[4]));
+        }
+        let data_end = min_size - 4;
+        let stored = u32::from_le_bytes([
+            buf[data_end],
+            buf[data_end + 1],
+            buf[data_end + 2],
+            buf[data_end + 3],
+        ]);
+        let computed = checksum_metadata(&buf[..data_end]);
+        if stored != computed {
+            return Err(FormatError::ChecksumMismatch {
+                expected: stored,
+                computed,
+            });
+        }
+        let class_id = buf[5];
+        let mut pos = 6;
+        let header_addr = read_addr(&buf[pos..], sa);
+        pos += sa;
+        let block_offset = read_size(&buf[pos..], bo);
+        pos += bo;
+        let mut dblk_addrs = Vec::with_capacity(ndblks);
+        for _ in 0..ndblks {
+            dblk_addrs.push(read_addr(&buf[pos..], sa));
+            pos += sa;
+        }
+        Ok(Self {
+            class_id,
+            header_addr,
+            block_offset,
+            dblk_addrs,
+        })
+    }
 }
 
 /// Compute nsblk_addrs for the index block: the number of super block
@@ -919,9 +1158,14 @@ pub fn compute_nsblk_addrs(
     sup_blk_min_data_ptrs: u8,
     max_nelmts_bits: u8,
 ) -> usize {
-    let nsblks = compute_nsblks(idx_blk_elmts, data_blk_min_elmts, max_nelmts_bits);
-    let sblk_idx_start = compute_sblk_idx_start(sup_blk_min_data_ptrs, nsblks);
-    nsblks - sblk_idx_start
+    EaGeometry::new(
+        idx_blk_elmts,
+        data_blk_min_elmts,
+        sup_blk_min_data_ptrs,
+        max_nelmts_bits,
+        10,
+    )
+    .nsblk_addrs
 }
 
 // ======================================================================= tests
@@ -1060,5 +1304,66 @@ mod tests {
         // sup_blk_min_data_ptrs=4, max_nelmts_bits=32
         // Should give nsblk_addrs=25 (matching HDF5 library)
         assert_eq!(compute_nsblk_addrs(4, 16, 4, 32), 25);
+    }
+
+    #[test]
+    fn ea_geometry_matches_libhdf5() {
+        // Verified against an h5py/libhdf5-produced EA file (/tmp/ea_ref.h5).
+        let g = EaGeometry::new(4, 16, 4, 32, 10);
+        assert_eq!(g.sblk.len(), 29, "nsblks");
+        assert_eq!(g.iblock_nsblks, 4);
+        assert_eq!(g.ndblk_addrs, 6);
+        assert_eq!(g.nsblk_addrs, 25);
+        // (ndblks, dblk_nelmts, start_idx, start_dblk) for the first 5 sblks.
+        let expect = [
+            (1u64, 16u64, 0u64, 0u64),
+            (1, 32, 16, 1),
+            (2, 32, 48, 2),
+            (2, 64, 112, 4),
+            (4, 64, 240, 6),
+        ];
+        for (u, &(nd, dn, si, sd)) in expect.iter().enumerate() {
+            let s = g.sblk[u];
+            assert_eq!(
+                (s.ndblks, s.dblk_nelmts, s.start_idx, s.start_dblk),
+                (nd, dn, si, sd),
+                "super block {}",
+                u
+            );
+        }
+        // chunk 4 (e=0): super block 0, direct data block 0, block_offset 0.
+        match g.locate(4) {
+            EaLoc::Dblk(l) => {
+                assert_eq!(l.sblk_idx, 0);
+                assert!(matches!(l.path, EaDblkPath::Direct { idx: 0 }));
+                assert_eq!(l.dblk_block_offset, 0);
+            }
+            _ => panic!("expected data block"),
+        }
+        // chunk 20 (e=16): super block 1, direct data block 1, block_offset 48.
+        match g.locate(20) {
+            EaLoc::Dblk(l) => {
+                assert!(matches!(l.path, EaDblkPath::Direct { idx: 1 }));
+                assert_eq!(l.dblk_block_offset, 48);
+            }
+            _ => panic!("expected data block"),
+        }
+        // chunk 244 (e=240): super block 4 -> reached via the index block's
+        // super-block address array.
+        match g.locate(244) {
+            EaLoc::Dblk(l) => {
+                assert_eq!(l.sblk_idx, 4);
+                match l.path {
+                    EaDblkPath::ViaSblk {
+                        sblk_off,
+                        local_dblk,
+                        sblk_block_offset,
+                        ..
+                    } => assert_eq!((sblk_off, local_dblk, sblk_block_offset), (0, 0, 240)),
+                    _ => panic!("expected super-block path"),
+                }
+            }
+            _ => panic!("expected data block"),
+        }
     }
 }
