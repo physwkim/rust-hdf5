@@ -4,6 +4,7 @@
 //!   offset: sizeof_addr bytes (LE) — address of continuation block
 //!   length: sizeof_size bytes (LE) — length of continuation block
 
+use crate::format::bytes::read_le_uint as read_uint;
 use crate::format::{FormatContext, FormatError, FormatResult};
 
 /// Object header continuation message payload.
@@ -49,13 +50,6 @@ impl ContinuationMessage {
 
         Ok((Self { offset, length }, needed))
     }
-}
-
-/// Read a little-endian unsigned integer of `n` bytes (1..=8) into a `u64`.
-fn read_uint(buf: &[u8], n: usize) -> u64 {
-    let mut tmp = [0u8; 8];
-    tmp[..n].copy_from_slice(&buf[..n]);
-    u64::from_le_bytes(tmp)
 }
 
 // ======================================================================= tests

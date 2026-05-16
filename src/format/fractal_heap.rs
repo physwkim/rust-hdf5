@@ -14,6 +14,7 @@
 //! `H5HF__cache_dblock_deserialize`, `H5HF__cache_iblock_deserialize`,
 //! `H5HF__dtable_decode`), `H5HFhdr.c`, `H5HFdtable.c`.
 
+use crate::format::bytes::read_le_uint as read_uint;
 use crate::format::checksum::checksum_metadata;
 use crate::format::{FormatContext, FormatError, FormatResult};
 
@@ -74,14 +75,6 @@ fn log2_of2(n: u64) -> u32 {
 /// Number of bytes needed to store a value spanning `bits` bits.
 fn size_of_offset_bits(bits: u16) -> u8 {
     bits.div_ceil(8) as u8
-}
-
-/// Read a little-endian unsigned integer of `n` bytes (1..=8) into a `u64`.
-fn read_uint(buf: &[u8], n: usize) -> u64 {
-    let mut tmp = [0u8; 8];
-    let n = n.min(8).min(buf.len());
-    tmp[..n].copy_from_slice(&buf[..n]);
-    u64::from_le_bytes(tmp)
 }
 
 fn need(buf: &[u8], pos: usize, n: usize) -> FormatResult<()> {
@@ -450,6 +443,37 @@ fn read_direct_block<R: BlockReader>(
     //         + block offset(heap_off_size) + optional checksum(4)
     let mut payload_start = prefix_min;
     if header.checksum_dblocks {
+        // Verify the direct-block checksum.
+        //
+        // libhdf5 (`H5HF__cache_dblock_verify_chksum` / `_pre_serialize` in
+        // H5HFcache.c) computes the Jenkins `H5_checksum_metadata` over the
+        // *entire* direct-block image (`dblock->size` bytes) with the 4-byte
+        // checksum field cleared to zero. The checksum field sits at
+        // `H5HF_MAN_ABS_DIRECT_OVERHEAD(hdr) - H5HF_SIZEOF_CHKSUM`, i.e.
+        // immediately after signature(4) + version(1) + heap-header
+        // address(sizeof_addr) + block offset(heap_off_size) = `prefix_min`.
+        //
+        // Filtered heaps store the checksum over the *decompressed* image;
+        // since this reader does not run the direct-block filter pipeline,
+        // verification is only performed for unfiltered heaps.
+        let chk_off = prefix_min;
+        if header.filter_len == 0 && buf.len() >= chk_off + 4 {
+            let stored = u32::from_le_bytes([
+                buf[chk_off],
+                buf[chk_off + 1],
+                buf[chk_off + 2],
+                buf[chk_off + 3],
+            ]);
+            let mut image = buf.clone();
+            image[chk_off..chk_off + 4].fill(0);
+            let computed = checksum_metadata(&image);
+            if stored != computed {
+                return Err(FormatError::ChecksumMismatch {
+                    expected: stored,
+                    computed,
+                });
+            }
+        }
         payload_start += 4;
     }
     if payload_start >= buf.len() {

@@ -15,6 +15,7 @@
 //!   [hard link]:  address (sizeof_addr bytes)
 //!   [soft link]:  target_length u16 LE + target string
 
+use crate::format::bytes::read_le_uint as read_uint;
 use crate::format::{FormatContext, FormatError, FormatResult};
 
 const VERSION: u8 = 1;
@@ -232,13 +233,6 @@ fn check_len(buf: &[u8], pos: usize, need: usize) -> FormatResult<()> {
     } else {
         Ok(())
     }
-}
-
-/// Read a little-endian unsigned integer of `n` bytes (1..=8) into a `u64`.
-fn read_uint(buf: &[u8], n: usize) -> u64 {
-    let mut tmp = [0u8; 8];
-    tmp[..n].copy_from_slice(&buf[..n]);
-    u64::from_le_bytes(tmp)
 }
 
 /// Minimum number of bytes (1, 2, 4, or 8) to represent `v`.

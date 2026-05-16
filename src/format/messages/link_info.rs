@@ -10,6 +10,7 @@
 //!   name_btree_address:   sizeof_addr bytes (UNDEF if compact storage)
 //!   [if bit 1]: creation_order_btree_address: sizeof_addr bytes
 
+use crate::format::bytes::read_le_addr as read_addr;
 use crate::format::{FormatContext, FormatError, FormatResult, UNDEF_ADDR};
 
 const VERSION: u8 = 0;
@@ -160,18 +161,6 @@ fn check_len(buf: &[u8], pos: usize, need: usize) -> FormatResult<()> {
         })
     } else {
         Ok(())
-    }
-}
-
-fn read_addr(buf: &[u8], n: usize) -> u64 {
-    // An "undefined address" is all-bits-one in sizeof_addr bytes.
-    // A 4-byte all-ones is UNDEF; a 4-byte non-all-ones is zero-extended.
-    if buf[..n].iter().all(|&b| b == 0xFF) {
-        UNDEF_ADDR
-    } else {
-        let mut tmp = [0u8; 8];
-        tmp[..n].copy_from_slice(&buf[..n]);
-        u64::from_le_bytes(tmp)
     }
 }
 

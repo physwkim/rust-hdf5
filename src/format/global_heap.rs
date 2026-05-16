@@ -24,6 +24,7 @@
 //! ```
 //! Total vlen reference size = 4 + sizeof_addr + 4 bytes.
 
+use crate::format::bytes::read_le_uint as read_size;
 use crate::format::{FormatContext, FormatError, FormatResult};
 
 /// Signature for a global heap collection.
@@ -278,13 +279,6 @@ pub fn vlen_reference_size(ctx: &FormatContext) -> usize {
 /// Round `n` up to the next multiple of 8.
 fn pad_to_8(n: usize) -> usize {
     (n + 7) & !7
-}
-
-/// Read a little-endian unsigned integer of `n` bytes (1..=8) into a `u64`.
-fn read_size(buf: &[u8], n: usize) -> u64 {
-    let mut tmp = [0u8; 8];
-    tmp[..n].copy_from_slice(&buf[..n]);
-    u64::from_le_bytes(tmp)
 }
 
 // ======================================================================= tests

@@ -8,6 +8,7 @@
 //!   Then ndims * sizeof_size bytes for current dimensions
 //!   Then (if flag bit 0) ndims * sizeof_size bytes for max dimensions
 
+use crate::format::bytes::read_le_uint as read_size;
 use crate::format::{FormatContext, FormatError, FormatResult};
 
 const VERSION: u8 = 2;
@@ -216,13 +217,6 @@ impl DataspaceMessage {
 
         Ok((Self { dims, max_dims }, pos))
     }
-}
-
-/// Read a little-endian unsigned integer of `n` bytes (1..=8) into a `u64`.
-fn read_size(buf: &[u8], n: usize) -> u64 {
-    let mut tmp = [0u8; 8];
-    tmp[..n].copy_from_slice(&buf[..n]);
-    u64::from_le_bytes(tmp)
 }
 
 // ======================================================================= tests

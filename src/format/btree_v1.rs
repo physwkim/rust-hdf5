@@ -28,7 +28,8 @@
 //! - Each child is sizeof_addr bytes: a chunk-data address at a leaf
 //!   node (level 0), or a sub-TREE address at an internal node.
 
-use crate::format::{FormatError, FormatResult, UNDEF_ADDR};
+use crate::format::bytes::{read_le_addr as read_addr, read_le_uint as read_uint};
+use crate::format::{FormatError, FormatResult};
 
 /// The 4-byte B-tree v1 signature.
 pub const BTREE_V1_SIGNATURE: [u8; 4] = *b"TREE";
@@ -243,27 +244,12 @@ impl ChunkBTreeV1Node {
     }
 }
 
-/// Read a little-endian unsigned integer of `n` bytes into a u64.
-fn read_uint(buf: &[u8], n: usize) -> u64 {
-    let mut tmp = [0u8; 8];
-    tmp[..n].copy_from_slice(&buf[..n]);
-    u64::from_le_bytes(tmp)
-}
-
-/// Read a little-endian address of `n` bytes, mapping all-ones to UNDEF_ADDR.
-fn read_addr(buf: &[u8], n: usize) -> u64 {
-    if buf[..n].iter().all(|&b| b == 0xFF) {
-        UNDEF_ADDR
-    } else {
-        read_uint(buf, n)
-    }
-}
-
 // ======================================================================= tests
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::UNDEF_ADDR;
 
     /// Build a group B-tree v1 node for testing.
     fn build_group_btree(

@@ -5,6 +5,7 @@
 //! any file I/O. It is used by `hdf5-io` and `hdf5` crates.
 
 pub mod btree_v1;
+pub(crate) mod bytes;
 pub mod checksum;
 pub mod chunk_index;
 pub mod fractal_heap;

@@ -12,6 +12,7 @@
 //!   - Type 10: unfiltered chunks (scaled offsets + chunk address)
 //!   - Type 11: filtered chunks (scaled offsets + chunk address + chunk_size + filter_mask)
 
+use crate::format::bytes::{read_le_addr as read_addr, read_le_uint as read_size};
 use crate::format::checksum::checksum_metadata;
 use crate::format::{FormatContext, FormatError, FormatResult, UNDEF_ADDR};
 
@@ -950,22 +951,6 @@ impl Bt2ChunkIndex {
 }
 
 // ========================================================================= helpers
-
-fn read_addr(buf: &[u8], n: usize) -> u64 {
-    if buf[..n].iter().all(|&b| b == 0xFF) {
-        UNDEF_ADDR
-    } else {
-        let mut tmp = [0u8; 8];
-        tmp[..n].copy_from_slice(&buf[..n]);
-        u64::from_le_bytes(tmp)
-    }
-}
-
-fn read_size(buf: &[u8], n: usize) -> u64 {
-    let mut tmp = [0u8; 8];
-    tmp[..n].copy_from_slice(&buf[..n]);
-    u64::from_le_bytes(tmp)
-}
 
 // ======================================================================= tests
 
