@@ -172,8 +172,12 @@ impl Hdf5Reader {
 
         // Walk link messages to discover datasets, group attributes, and
         // every group path that exists.
-        let (datasets, group_attributes, group_paths) =
-            Self::discover_datasets_from_links(&mut handle, &root_header, &ctx)?;
+        let (datasets, group_attributes, group_paths) = Self::discover_datasets_from_links(
+            &mut handle,
+            &root_header,
+            sb.root_group_object_header_address,
+            &ctx,
+        )?;
 
         // Collect root group attributes
         let mut root_attributes = Vec::new();
@@ -241,14 +245,24 @@ impl Hdf5Reader {
         });
 
         let (datasets, group_attributes, group_paths) = if has_links {
-            Self::discover_datasets_from_links(&mut handle, root_hdr.as_ref().unwrap(), &ctx)?
+            Self::discover_datasets_from_links(
+                &mut handle,
+                root_hdr.as_ref().unwrap(),
+                root_obj_addr,
+                &ctx,
+            )?
         } else {
             // Symbol-table storage: the STE scratch-pad caches the B-tree
             // and local heap; otherwise read them from the object header.
             let (btree_addr, heap_addr) = if ste_cache_type == 1 {
                 (ste_btree_addr, ste_heap_addr)
             } else {
-                Self::find_stab_in_object_header(&mut handle, &ctx, root_obj_addr)?
+                // Read the symbol-table message from the already-loaded
+                // full root header (which followed continuation blocks).
+                root_hdr
+                    .as_ref()
+                    .map(|h| Self::stab_from_header(h, &ctx))
+                    .unwrap_or((UNDEF_ADDR, UNDEF_ADDR))
             };
             if btree_addr != UNDEF_ADDR && heap_addr != UNDEF_ADDR {
                 Self::discover_datasets_from_btree(&mut handle, &ctx, btree_addr, heap_addr)?
@@ -277,28 +291,18 @@ impl Hdf5Reader {
         })
     }
 
-    /// Find symbol table message (btree_addr, heap_addr) in an object header.
-    fn find_stab_in_object_header(
-        handle: &mut FileHandle,
-        ctx: &FormatContext,
-        obj_header_addr: u64,
-    ) -> IoResult<(u64, u64)> {
-        let buf = handle.read_at_most(obj_header_addr, 4096)?;
-        let (header, _) = ObjectHeader::decode_any(&buf)?;
-
+    /// Extract the symbol-table message (btree_addr, heap_addr) from an
+    /// already-decoded object header.
+    fn stab_from_header(header: &ObjectHeader, ctx: &FormatContext) -> (u64, u64) {
         for msg in &header.messages {
             if msg.msg_type == MSG_SYMBOL_TABLE {
-                // Symbol table message: btree_addr(O) + heap_addr(O)
                 let sa = ctx.sizeof_addr as usize;
                 if msg.data.len() >= 2 * sa {
-                    let btree = read_uint(&msg.data, sa);
-                    let heap = read_uint(&msg.data[sa..], sa);
-                    return Ok((btree, heap));
+                    return (read_uint(&msg.data, sa), read_uint(&msg.data[sa..], sa));
                 }
             }
         }
-
-        Ok((UNDEF_ADDR, UNDEF_ADDR))
+        (UNDEF_ADDR, UNDEF_ADDR)
     }
 
     /// Discover datasets by walking link messages in a v2 object header.
@@ -307,6 +311,7 @@ impl Hdf5Reader {
     fn discover_datasets_from_links(
         handle: &mut FileHandle,
         root_header: &ObjectHeader,
+        root_addr: u64,
         ctx: &FormatContext,
     ) -> IoResult<(
         Vec<DatasetReadInfo>,
@@ -316,6 +321,9 @@ impl Hdf5Reader {
         let mut group_attrs = std::collections::HashMap::new();
         let mut group_paths = std::collections::BTreeSet::new();
         let mut visited = std::collections::HashSet::new();
+        // Seed the root object header so a hard link cycling back to the
+        // root is not descended into a second time.
+        visited.insert(root_addr);
         let datasets = Self::discover_datasets_recursive(
             handle,
             root_header,
@@ -605,9 +613,27 @@ impl Hdf5Reader {
                     Ok(None) => {}
                 }
 
-                // Not a dataset — it is a subgroup. Record its path from
-                // the actual symbol-table entry, whether or not it has
-                // datasets or attributes.
+                // Not a dataset. Read the object header to classify it.
+                let hdr = match Self::read_object_header_full(handle, ctx, entry.obj_header_addr) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+                // A committed (named) datatype object has a datatype message
+                // and no group-storage message — it is neither group nor
+                // dataset and must not be recorded as a group.
+                let is_group = hdr.messages.iter().any(|m| {
+                    m.msg_type == MSG_LINK
+                        || m.msg_type == MSG_LINK_INFO
+                        || m.msg_type == MSG_SYMBOL_TABLE
+                        || m.msg_type == MSG_GROUP_INFO
+                });
+                if !is_group && hdr.messages.iter().any(|m| m.msg_type == MSG_DATATYPE) {
+                    continue;
+                }
+
+                // It is a subgroup. Record its path from the actual
+                // symbol-table entry, whether or not it has datasets or
+                // attributes.
                 group_paths.insert(full_name.clone());
 
                 // Break cycles: descend into each group object header at
@@ -617,7 +643,7 @@ impl Hdf5Reader {
                 }
 
                 // Collect this subgroup's attributes (e.g. NeXus NX_class).
-                if let Ok(hdr) = Self::read_object_header_full(handle, ctx, entry.obj_header_addr) {
+                {
                     let mut attrs = Vec::new();
                     for m in &hdr.messages {
                         if m.msg_type == MSG_ATTRIBUTE {
@@ -637,9 +663,9 @@ impl Hdf5Reader {
                     // Scratch-pad caches the subgroup's symbol-table info.
                     (entry.btree_addr, entry.heap_addr)
                 } else {
-                    // No scratch pad — read the child object header for a
-                    // symbol-table message.
-                    Self::find_stab_in_object_header(handle, ctx, entry.obj_header_addr)?
+                    // No scratch pad — take the symbol-table message from
+                    // the child object header already read above.
+                    Self::stab_from_header(&hdr, ctx)
                 };
 
                 if sub_btree != UNDEF_ADDR && sub_heap != UNDEF_ADDR {
@@ -1141,8 +1167,12 @@ impl Hdf5Reader {
 
         // Re-scan datasets, group attributes, and group paths from link
         // messages.
-        let (datasets, group_attributes, group_paths) =
-            Self::discover_datasets_from_links(&mut self.handle, &root_header, &ctx)?;
+        let (datasets, group_attributes, group_paths) = Self::discover_datasets_from_links(
+            &mut self.handle,
+            &root_header,
+            sb.root_group_object_header_address,
+            &ctx,
+        )?;
 
         self._eof = sb.end_of_file_address;
         self.ctx = ctx;

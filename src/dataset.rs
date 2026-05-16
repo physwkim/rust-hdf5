@@ -707,6 +707,13 @@ impl H5Dataset {
                                     1
                                 };
                             }
+                            // A zero-extent dimension yields a grid of 0
+                            // chunks — there is no chunk to write.
+                            if grid.contains(&0) {
+                                return Err(Hdf5Error::InvalidState(
+                                    "dataset has a zero-extent dimension and no chunks".into(),
+                                ));
+                            }
                             let mut rem = chunk_idx as u64;
                             let mut coords = vec![0u64; dims.len()];
                             for d in (0..dims.len()).rev() {

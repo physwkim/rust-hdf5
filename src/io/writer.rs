@@ -1954,6 +1954,12 @@ impl Hdf5Writer {
     /// `bytes` must be exactly one element wide (matching the dataset's
     /// datatype). The value is emitted as a `fill_defined = 2` fill-value
     /// message in the dataset object header when the file is finalized.
+    ///
+    /// IMPORTANT: for a *contiguous* dataset this also immediately writes
+    /// the tiled fill value across the whole data block, so it must be
+    /// called BEFORE any `write_dataset_raw` / `write_slice` — otherwise the
+    /// fill write clobbers data already written. (The high-level builder
+    /// always calls this right after creating the dataset.)
     pub fn set_dataset_fill_value(&mut self, ds_index: usize, bytes: Vec<u8>) -> IoResult<()> {
         let ds = self.datasets.get_mut(ds_index).ok_or_else(|| {
             crate::io::IoError::InvalidState(format!("dataset index {} out of range", ds_index))
@@ -2698,8 +2704,14 @@ impl Hdf5Writer {
             // The compressed size is encoded in the FA header's
             // `chunk_size_len`-byte field; libhdf5 errors if it does not fit
             // (H5D_CHUNK_ENCODE_SIZE_CHECK) rather than truncating silently.
-            let chunk_size_len =
-                fa.fa_header.element_size as usize - self.ctx.sizeof_addr as usize - 4;
+            // element_size = sizeof_addr + chunk_size_len + 4 by construction.
+            let chunk_size_len = (fa.fa_header.element_size as usize)
+                .checked_sub(self.ctx.sizeof_addr as usize + 4)
+                .ok_or_else(|| {
+                    crate::io::IoError::InvalidState(
+                        "filtered fixed-array element size is too small".into(),
+                    )
+                })?;
             if chunk_size_len < 8 && compressed_size >= (1usize << (chunk_size_len * 8)) {
                 return Err(crate::io::IoError::InvalidState(format!(
                     "compressed chunk size {compressed_size} does not fit in the \

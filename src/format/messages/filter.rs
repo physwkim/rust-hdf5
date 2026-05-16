@@ -427,10 +427,14 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
         }
         FILTER_FLETCHER32 => {
             if compress {
-                // Fletcher-32 appends a 4-byte checksum
+                // Fletcher-32 appends a 4-byte checksum trailer. libhdf5
+                // (H5Zfletcher32.c) stores it as TWO 16-bit halves, each
+                // big-endian: sum1 (low 16 bits) first, then sum2 (high 16
+                // bits) — not the whole u32 big-endian.
                 let cksum = fletcher32(data);
                 let mut out = data.to_vec();
-                out.extend_from_slice(&cksum.to_be_bytes());
+                out.extend_from_slice(&(cksum as u16).to_be_bytes());
+                out.extend_from_slice(&((cksum >> 16) as u16).to_be_bytes());
                 Ok(out)
             } else {
                 // Strip the trailing 4-byte checksum
@@ -2102,6 +2106,29 @@ mod tests {
         assert_eq!(encoded.len(), data.len() + 4);
         let decoded = reverse_filters(&pipeline, &encoded).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn fletcher32_trailer_byte_order_matches_libhdf5() {
+        // libhdf5 stores the trailer as sum1(BE) then sum2(BE), not the
+        // whole u32 big-endian. The trailer must therefore be the low 16
+        // bits big-endian followed by the high 16 bits big-endian.
+        let pipeline = FilterPipeline {
+            filters: vec![Filter {
+                id: FILTER_FLETCHER32,
+                flags: 0,
+                cd_values: vec![],
+            }],
+        };
+        let data: Vec<u8> = (0..8i32).flat_map(|v| v.to_le_bytes()).collect();
+        let encoded = apply_filters(&pipeline, &data).unwrap();
+        let trailer = &encoded[encoded.len() - 4..];
+        let c = fletcher32(&data);
+        let mut want = ((c & 0xffff) as u16).to_be_bytes().to_vec();
+        want.extend_from_slice(&((c >> 16) as u16).to_be_bytes());
+        assert_eq!(trailer, &want[..]);
+        // Must NOT be the whole u32 big-endian (the previous bug).
+        assert_ne!(trailer, &c.to_be_bytes());
     }
 
     #[cfg(all(feature = "deflate", feature = "parallel"))]
