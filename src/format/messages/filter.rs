@@ -14,6 +14,23 @@
 //!   num_cd_values: u16 LE
 //!   cd_values:     num_cd_values * u32 LE
 //! ```
+//!
+//! Version 1 binary layout (written by libhdf5 / h5py with the default
+//! `libver` bounds):
+//! ```text
+//! Byte 0: version = 1
+//! Byte 1: number of filters
+//! Bytes 2..8: 6 reserved bytes
+//! For each filter:
+//!   filter_id:     u16 LE
+//!   name_length:   u16 LE        (always present, name padded to a
+//!                                 multiple of 8 bytes)
+//!   flags:         u16 LE
+//!   num_cd_values: u16 LE
+//!   name:          name_length bytes (NUL-padded to a multiple of 8)
+//!   cd_values:     num_cd_values * u32 LE
+//!   [if num_cd_values is odd: 4 bytes padding]
+//! ```
 
 use crate::format::{FormatError, FormatResult};
 
@@ -157,7 +174,10 @@ impl FilterPipeline {
         buf
     }
 
-    /// Decode a version-2 filter pipeline message.
+    /// Decode a filter pipeline message (version 1 or version 2).
+    ///
+    /// Version 1 is what libhdf5 / h5py writes with the default `libver`
+    /// bounds; version 2 is written for `libver` >= V18.
     pub fn decode(buf: &[u8]) -> FormatResult<(Self, usize)> {
         if buf.len() < 2 {
             return Err(FormatError::BufferTooShort {
@@ -167,12 +187,24 @@ impl FilterPipeline {
         }
 
         let version = buf[0];
-        if version != 2 {
+        if version != 1 && version != 2 {
             return Err(FormatError::InvalidVersion(version));
         }
 
         let nfilters = buf[1] as usize;
         let mut pos = 2;
+
+        // Version 1 carries 6 reserved bytes after the filter count.
+        if version == 1 {
+            if buf.len() < pos + 6 {
+                return Err(FormatError::BufferTooShort {
+                    needed: pos + 6,
+                    available: buf.len(),
+                });
+            }
+            pos += 6;
+        }
+
         let mut filters = Vec::with_capacity(nfilters);
 
         for _ in 0..nfilters {
@@ -186,26 +218,22 @@ impl FilterPipeline {
             let id = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
             pos += 2;
 
-            // For user-defined filters (id >= 256), read and skip the name.
-            if id >= 256 {
+            // The name length field is always present in version 1; in
+            // version 2 it is present only for user-defined filters
+            // (id >= 256, i.e. >= H5Z_FILTER_RESERVED).
+            let name_len = if version == 1 || id >= 256 {
                 if buf.len() < pos + 2 {
                     return Err(FormatError::BufferTooShort {
                         needed: pos + 2,
                         available: buf.len(),
                     });
                 }
-                let name_len = u16::from_le_bytes([buf[pos], buf[pos + 1]]) as usize;
+                let n = u16::from_le_bytes([buf[pos], buf[pos + 1]]) as usize;
                 pos += 2;
-                // Name is padded to a multiple of 8 bytes
-                let padded_len = (name_len + 7) & !7;
-                if buf.len() < pos + padded_len {
-                    return Err(FormatError::BufferTooShort {
-                        needed: pos + padded_len,
-                        available: buf.len(),
-                    });
-                }
-                pos += padded_len;
-            }
+                n
+            } else {
+                0
+            };
 
             // flags + num_cd_values
             if buf.len() < pos + 4 {
@@ -219,6 +247,23 @@ impl FilterPipeline {
             let num_cd = u16::from_le_bytes([buf[pos], buf[pos + 1]]) as usize;
             pos += 2;
 
+            // Filter name. Version 1 always pads the name to a multiple
+            // of 8 bytes; version 2 stores it unpadded.
+            if name_len > 0 {
+                let stored_len = if version == 1 {
+                    (name_len + 7) & !7
+                } else {
+                    name_len
+                };
+                if buf.len() < pos + stored_len {
+                    return Err(FormatError::BufferTooShort {
+                        needed: pos + stored_len,
+                        available: buf.len(),
+                    });
+                }
+                pos += stored_len;
+            }
+
             // cd_values
             if buf.len() < pos + num_cd * 4 {
                 return Err(FormatError::BufferTooShort {
@@ -231,6 +276,17 @@ impl FilterPipeline {
                 let v = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
                 pos += 4;
                 cd_values.push(v);
+            }
+
+            // Version 1 pads the client-data array to an even count.
+            if version == 1 && num_cd % 2 == 1 {
+                if buf.len() < pos + 4 {
+                    return Err(FormatError::BufferTooShort {
+                        needed: pos + 4,
+                        available: buf.len(),
+                    });
+                }
+                pos += 4;
             }
 
             filters.push(Filter {
@@ -1868,9 +1924,59 @@ mod tests {
 
     #[test]
     fn decode_bad_version() {
-        let buf = [1u8, 0]; // version 1
+        let buf = [3u8, 0]; // version 3 is not supported
         let err = FilterPipeline::decode(&buf).unwrap_err();
-        assert!(matches!(err, FormatError::InvalidVersion(1)));
+        assert!(matches!(err, FormatError::InvalidVersion(3)));
+    }
+
+    #[test]
+    fn decode_version_1_deflate() {
+        // Version-1 pipeline with a single deflate filter (id 1), one
+        // cd_value (the compression level). h5py default-libver shape.
+        let mut buf = vec![1u8, 1]; // version 1, 1 filter
+        buf.extend_from_slice(&[0u8; 6]); // 6 reserved bytes
+        buf.extend_from_slice(&1u16.to_le_bytes()); // filter id = deflate
+        buf.extend_from_slice(&8u16.to_le_bytes()); // name_length (padded)
+        buf.extend_from_slice(&0u16.to_le_bytes()); // flags
+        buf.extend_from_slice(&1u16.to_le_bytes()); // num_cd_values = 1
+        buf.extend_from_slice(b"deflate\0"); // 8-byte padded name
+        buf.extend_from_slice(&6u32.to_le_bytes()); // cd_values[0] = level 6
+        buf.extend_from_slice(&[0u8; 4]); // odd cd count -> 4-byte padding
+        let (pl, consumed) = FilterPipeline::decode(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(pl.filters.len(), 1);
+        assert_eq!(pl.filters[0].id, FILTER_DEFLATE);
+        assert_eq!(pl.filters[0].cd_values, vec![6]);
+    }
+
+    #[test]
+    fn decode_version_1_shuffle_then_deflate() {
+        // Two filters, shuffle (id 2, one cd_value -> odd, padded) then
+        // deflate (id 1).
+        let mut buf = vec![1u8, 2];
+        buf.extend_from_slice(&[0u8; 6]);
+        // shuffle
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&8u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(b"shuffle\0");
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 4]); // odd padding
+                                          // deflate
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(b"deflate\0");
+        buf.extend_from_slice(&5u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 4]); // odd padding
+        let (pl, consumed) = FilterPipeline::decode(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(pl.filters.len(), 2);
+        assert_eq!(pl.filters[0].id, FILTER_SHUFFLE);
+        assert_eq!(pl.filters[1].id, FILTER_DEFLATE);
+        assert_eq!(pl.filters[1].cd_values, vec![5]);
     }
 
     #[test]
