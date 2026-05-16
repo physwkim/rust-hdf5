@@ -23,6 +23,13 @@ pub const FA_CLIENT_CHUNK: u8 = 0;
 /// Client ID for filtered chunks.
 pub const FA_CLIENT_FILT_CHUNK: u8 = 1;
 
+/// Default `log2(max elements per data block page)`.
+///
+/// Matches libhdf5's `H5D_FARRAY_MAX_DBLK_PAGE_NELMTS_BITS` (`H5Dpkg.h`),
+/// i.e. 1024 elements per page. libhdf5 asserts this value is `> 0`
+/// (`H5Dfarray.c`), so 0 is never a valid on-disk value.
+pub const FA_MAX_DBLK_PAGE_NELMTS_BITS: u8 = 10;
+
 /// Fixed array header.
 ///
 /// On-disk layout:
@@ -48,7 +55,7 @@ impl FixedArrayHeader {
         Self {
             client_id: FA_CLIENT_CHUNK,
             element_size: ctx.sizeof_addr,
-            max_dblk_page_nelmts_bits: 0,
+            max_dblk_page_nelmts_bits: FA_MAX_DBLK_PAGE_NELMTS_BITS,
             num_elmts,
             data_blk_addr: UNDEF_ADDR,
         }
@@ -68,9 +75,37 @@ impl FixedArrayHeader {
         Self {
             client_id: FA_CLIENT_FILT_CHUNK,
             element_size,
-            max_dblk_page_nelmts_bits: 0,
+            max_dblk_page_nelmts_bits: FA_MAX_DBLK_PAGE_NELMTS_BITS,
             num_elmts,
             data_blk_addr: UNDEF_ADDR,
+        }
+    }
+
+    /// Number of elements per data block page (`1 << max_dblk_page_nelmts_bits`).
+    ///
+    /// Mirrors `dblk_page_nelmts` in libhdf5 (`H5FAcache.c`).
+    pub fn dblk_page_nelmts(&self) -> u64 {
+        1u64 << (self.max_dblk_page_nelmts_bits as u64)
+    }
+
+    /// Whether the data block for this array is paged.
+    ///
+    /// A data block is paged when `num_elmts > dblk_page_nelmts`
+    /// (`H5FAcache.c`: `if (hdr->cparam.nelmts > dblk_page_nelmts)`).
+    pub fn is_paged(&self) -> bool {
+        self.num_elmts > self.dblk_page_nelmts()
+    }
+
+    /// Number of pages in the (paged) data block.
+    ///
+    /// `npages = ceil(num_elmts / dblk_page_nelmts)` — encoded in C as
+    /// `((nelmts + dblk_page_nelmts) - 1) / dblk_page_nelmts`.
+    /// Returns 0 when the data block is not paged.
+    pub fn npages(&self) -> u64 {
+        if self.is_paged() {
+            self.num_elmts.div_ceil(self.dblk_page_nelmts())
+        } else {
+            0
         }
     }
 
@@ -424,6 +459,200 @@ impl FixedArrayDataBlock {
     }
 }
 
+/// Parsed prefix of a *paged* fixed array data block.
+///
+/// On-disk layout (`H5FA_DBLOCK_PREFIX_SIZE` + checksum):
+/// ```text
+/// "FADB"(4) + version=0(1) + client_id(1)
+/// + header_addr(sizeof_addr)
+/// + page_init_bitmap(ceil(npages/8) bytes)
+/// + checksum(4)
+/// ```
+/// The `npages` pages follow at `dblk_addr + prefix_size`, where
+/// `prefix_size` is the full size including the checksum.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FixedArrayPagedPrefix {
+    pub client_id: u8,
+    pub header_addr: u64,
+    /// Page-init bitmap, MSB-first: page `p` initialized iff
+    /// `bitmap[p / 8] & (0x80 >> (p % 8))` is non-zero.
+    pub page_init_bitmap: Vec<u8>,
+    /// Total size of the prefix on disk, including the 4-byte checksum.
+    /// Pages start at `dblk_addr + prefix_size`.
+    pub prefix_size: usize,
+}
+
+impl FixedArrayPagedPrefix {
+    /// Decode the prefix of a paged data block.
+    ///
+    /// `npages` comes from the header (`FixedArrayHeader::npages`).
+    pub fn decode(buf: &[u8], ctx: &FormatContext, npages: u64) -> FormatResult<Self> {
+        let sa = ctx.sizeof_addr as usize;
+        let bitmap_size = (npages as usize).div_ceil(8);
+        // signature(4) + version(1) + client_id(1) + header_addr(sa)
+        // + bitmap(bitmap_size) + checksum(4)
+        let prefix_size = 4 + 1 + 1 + sa + bitmap_size + 4;
+
+        if buf.len() < prefix_size {
+            return Err(FormatError::BufferTooShort {
+                needed: prefix_size,
+                available: buf.len(),
+            });
+        }
+
+        if buf[0..4] != FADB_SIGNATURE {
+            return Err(FormatError::InvalidSignature);
+        }
+
+        let version = buf[4];
+        if version != FA_VERSION {
+            return Err(FormatError::InvalidVersion(version));
+        }
+
+        // Verify checksum over everything before the trailing 4 bytes.
+        let data_end = prefix_size - 4;
+        let stored_cksum = u32::from_le_bytes([
+            buf[data_end],
+            buf[data_end + 1],
+            buf[data_end + 2],
+            buf[data_end + 3],
+        ]);
+        let computed_cksum = checksum_metadata(&buf[..data_end]);
+        if stored_cksum != computed_cksum {
+            return Err(FormatError::ChecksumMismatch {
+                expected: stored_cksum,
+                computed: computed_cksum,
+            });
+        }
+
+        let client_id = buf[5];
+        let mut pos = 6;
+        let header_addr = read_addr(&buf[pos..], sa);
+        pos += sa;
+        let page_init_bitmap = buf[pos..pos + bitmap_size].to_vec();
+
+        Ok(Self {
+            client_id,
+            header_addr,
+            page_init_bitmap,
+            prefix_size,
+        })
+    }
+
+    /// Whether page `p` has been initialized (MSB-first bit test).
+    ///
+    /// Mirrors `H5VM_bit_get`: `bitmap[p / 8] & (0x80 >> (p % 8))`.
+    pub fn page_initialized(&self, p: usize) -> bool {
+        let byte = p / 8;
+        if byte >= self.page_init_bitmap.len() {
+            return false;
+        }
+        (self.page_init_bitmap[byte] & (0x80u8 >> (p % 8))) != 0
+    }
+}
+
+/// Decode the unfiltered chunk addresses contained in a single data block page.
+///
+/// `page_buf` must start at the page address and contain at least
+/// `nelmts * sizeof_addr + 4` bytes. The trailing 4 bytes are a Jenkins
+/// checksum over the page elements.
+pub fn decode_unfiltered_page(
+    page_buf: &[u8],
+    ctx: &FormatContext,
+    nelmts: usize,
+) -> FormatResult<Vec<u64>> {
+    let sa = ctx.sizeof_addr as usize;
+    let page_size = nelmts * sa + 4;
+    if page_buf.len() < page_size {
+        return Err(FormatError::BufferTooShort {
+            needed: page_size,
+            available: page_buf.len(),
+        });
+    }
+
+    let data_end = page_size - 4;
+    let stored_cksum = u32::from_le_bytes([
+        page_buf[data_end],
+        page_buf[data_end + 1],
+        page_buf[data_end + 2],
+        page_buf[data_end + 3],
+    ]);
+    let computed_cksum = checksum_metadata(&page_buf[..data_end]);
+    if stored_cksum != computed_cksum {
+        return Err(FormatError::ChecksumMismatch {
+            expected: stored_cksum,
+            computed: computed_cksum,
+        });
+    }
+
+    let mut elements = Vec::with_capacity(nelmts);
+    let mut pos = 0;
+    for _ in 0..nelmts {
+        elements.push(read_addr(&page_buf[pos..], sa));
+        pos += sa;
+    }
+    Ok(elements)
+}
+
+/// Decode the filtered chunk entries contained in a single data block page.
+///
+/// `page_buf` must start at the page address and contain at least
+/// `nelmts * (sizeof_addr + chunk_size_len + 4) + 4` bytes. The trailing 4
+/// bytes are a Jenkins checksum over the page elements.
+pub fn decode_filtered_page(
+    page_buf: &[u8],
+    ctx: &FormatContext,
+    nelmts: usize,
+    chunk_size_len: usize,
+) -> FormatResult<Vec<FixedArrayFilteredChunkElement>> {
+    let sa = ctx.sizeof_addr as usize;
+    let elem_size = sa + chunk_size_len + 4;
+    let page_size = nelmts * elem_size + 4;
+    if page_buf.len() < page_size {
+        return Err(FormatError::BufferTooShort {
+            needed: page_size,
+            available: page_buf.len(),
+        });
+    }
+
+    let data_end = page_size - 4;
+    let stored_cksum = u32::from_le_bytes([
+        page_buf[data_end],
+        page_buf[data_end + 1],
+        page_buf[data_end + 2],
+        page_buf[data_end + 3],
+    ]);
+    let computed_cksum = checksum_metadata(&page_buf[..data_end]);
+    if stored_cksum != computed_cksum {
+        return Err(FormatError::ChecksumMismatch {
+            expected: stored_cksum,
+            computed: computed_cksum,
+        });
+    }
+
+    let mut elements = Vec::with_capacity(nelmts);
+    let mut pos = 0;
+    for _ in 0..nelmts {
+        let address = read_addr(&page_buf[pos..], sa);
+        pos += sa;
+        let chunk_size = read_size(&page_buf[pos..], chunk_size_len) as u32;
+        pos += chunk_size_len;
+        let filter_mask = u32::from_le_bytes([
+            page_buf[pos],
+            page_buf[pos + 1],
+            page_buf[pos + 2],
+            page_buf[pos + 3],
+        ]);
+        pos += 4;
+        elements.push(FixedArrayFilteredChunkElement {
+            address,
+            chunk_size,
+            filter_mask,
+        });
+    }
+    Ok(elements)
+}
+
 // ========================================================================= helpers
 
 fn read_addr(buf: &[u8], n: usize) -> u64 {
@@ -584,5 +813,162 @@ mod tests {
         let encoded = dblk.encode_unfiltered(&ctx8());
         let decoded = FixedArrayDataBlock::decode_unfiltered(&encoded, &ctx8(), 0).unwrap();
         assert!(decoded.elements.is_empty());
+    }
+
+    // ----------------------------------------------------------------- paging
+
+    #[test]
+    fn header_paging_geometry() {
+        // max_dblk_page_nelmts_bits = 2 => 4 elements per page.
+        let mut hdr = FixedArrayHeader::new_for_chunks(&ctx8(), 10);
+        hdr.max_dblk_page_nelmts_bits = 2;
+        assert_eq!(hdr.dblk_page_nelmts(), 4);
+        assert!(hdr.is_paged()); // 10 > 4
+        assert_eq!(hdr.npages(), 3); // ceil(10 / 4)
+
+        // num_elmts == dblk_page_nelmts => NOT paged (strict greater-than).
+        hdr.num_elmts = 4;
+        assert!(!hdr.is_paged());
+        assert_eq!(hdr.npages(), 0);
+
+        // One past the page size => paged with 2 pages.
+        hdr.num_elmts = 5;
+        assert!(hdr.is_paged());
+        assert_eq!(hdr.npages(), 2);
+    }
+
+    /// Build a paged FADB prefix buffer for `npages` pages.
+    fn build_paged_prefix(
+        ctx: &FormatContext,
+        client_id: u8,
+        header_addr: u64,
+        npages: usize,
+        init_bits: &[bool],
+    ) -> Vec<u8> {
+        let sa = ctx.sizeof_addr as usize;
+        let bitmap_size = npages.div_ceil(8);
+        let mut bitmap = vec![0u8; bitmap_size];
+        for (p, &on) in init_bits.iter().enumerate() {
+            if on {
+                bitmap[p / 8] |= 0x80u8 >> (p % 8);
+            }
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&FADB_SIGNATURE);
+        buf.push(FA_VERSION);
+        buf.push(client_id);
+        buf.extend_from_slice(&header_addr.to_le_bytes()[..sa]);
+        buf.extend_from_slice(&bitmap);
+        let cksum = checksum_metadata(&buf);
+        buf.extend_from_slice(&cksum.to_le_bytes());
+        buf
+    }
+
+    /// Build a single unfiltered data block page.
+    fn build_unfiltered_page(ctx: &FormatContext, addrs: &[u64]) -> Vec<u8> {
+        let sa = ctx.sizeof_addr as usize;
+        let mut buf = Vec::new();
+        for &a in addrs {
+            buf.extend_from_slice(&a.to_le_bytes()[..sa]);
+        }
+        let cksum = checksum_metadata(&buf);
+        buf.extend_from_slice(&cksum.to_le_bytes());
+        buf
+    }
+
+    /// Build a single filtered data block page.
+    fn build_filtered_page(
+        ctx: &FormatContext,
+        chunk_size_len: usize,
+        elems: &[FixedArrayFilteredChunkElement],
+    ) -> Vec<u8> {
+        let sa = ctx.sizeof_addr as usize;
+        let mut buf = Vec::new();
+        for e in elems {
+            buf.extend_from_slice(&e.address.to_le_bytes()[..sa]);
+            buf.extend_from_slice(&(e.chunk_size as u64).to_le_bytes()[..chunk_size_len]);
+            buf.extend_from_slice(&e.filter_mask.to_le_bytes());
+        }
+        let cksum = checksum_metadata(&buf);
+        buf.extend_from_slice(&cksum.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn paged_prefix_roundtrip_and_bitmap() {
+        let ctx = ctx8();
+        // 11 pages => 2-byte bitmap. Initialize pages 0, 7, 8, 10.
+        let mut init = vec![false; 11];
+        for &p in &[0usize, 7, 8, 10] {
+            init[p] = true;
+        }
+        let buf = build_paged_prefix(&ctx, FA_CLIENT_CHUNK, 0xABCD, 11, &init);
+
+        let prefix = FixedArrayPagedPrefix::decode(&buf, &ctx, 11).unwrap();
+        assert_eq!(prefix.client_id, FA_CLIENT_CHUNK);
+        assert_eq!(prefix.header_addr, 0xABCD);
+        assert_eq!(prefix.prefix_size, buf.len());
+        // signature(4)+version(1)+client(1)+addr(8)+bitmap(2)+cksum(4) = 20
+        assert_eq!(prefix.prefix_size, 20);
+        for p in 0..11 {
+            assert_eq!(prefix.page_initialized(p), init[p], "page {p}");
+        }
+    }
+
+    #[test]
+    fn paged_prefix_bad_checksum() {
+        let ctx = ctx8();
+        let mut buf = build_paged_prefix(&ctx, FA_CLIENT_CHUNK, 0x1000, 3, &[true, true, true]);
+        buf[6] ^= 0xFF;
+        let err = FixedArrayPagedPrefix::decode(&buf, &ctx, 3).unwrap_err();
+        assert!(matches!(err, FormatError::ChecksumMismatch { .. }));
+    }
+
+    #[test]
+    fn unfiltered_page_roundtrip() {
+        let ctx = ctx8();
+        let addrs = [0x100u64, UNDEF_ADDR, 0x300, 0x400];
+        let page = build_unfiltered_page(&ctx, &addrs);
+        let decoded = decode_unfiltered_page(&page, &ctx, 4).unwrap();
+        assert_eq!(decoded, addrs);
+    }
+
+    #[test]
+    fn unfiltered_page_bad_checksum() {
+        let ctx = ctx8();
+        let mut page = build_unfiltered_page(&ctx, &[0x100u64, 0x200]);
+        page[0] ^= 0xFF;
+        let err = decode_unfiltered_page(&page, &ctx, 2).unwrap_err();
+        assert!(matches!(err, FormatError::ChecksumMismatch { .. }));
+    }
+
+    #[test]
+    fn filtered_page_roundtrip() {
+        let ctx = ctx8();
+        let csl = 4;
+        let elems = vec![
+            FixedArrayFilteredChunkElement {
+                address: 0x2000,
+                chunk_size: 321,
+                filter_mask: 0,
+            },
+            FixedArrayFilteredChunkElement {
+                address: 0x3000,
+                chunk_size: 654,
+                filter_mask: 2,
+            },
+        ];
+        let page = build_filtered_page(&ctx, csl, &elems);
+        let decoded = decode_filtered_page(&page, &ctx, 2, csl).unwrap();
+        assert_eq!(decoded, elems);
+    }
+
+    #[test]
+    fn page_too_short_errors() {
+        let ctx = ctx8();
+        let page = build_unfiltered_page(&ctx, &[0x100u64, 0x200]);
+        // Ask for more elements than the buffer holds.
+        let err = decode_unfiltered_page(&page, &ctx, 4).unwrap_err();
+        assert!(matches!(err, FormatError::BufferTooShort { .. }));
     }
 }

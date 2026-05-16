@@ -881,16 +881,112 @@ impl Hdf5Reader {
             return Ok(vec![]);
         }
 
-        // Read FA data block
-        let dblk_buf = self.handle.read_at_most(fa_hdr.data_blk_addr, 65536)?;
-        let fa_dblk = FixedArrayDataBlock::decode_unfiltered(
-            &dblk_buf,
-            &self.ctx,
-            fa_hdr.num_elmts as usize,
-        )?;
+        let is_filtered = fa_hdr.client_id == FA_CLIENT_FILT_CHUNK;
+        let sizeof_addr = self.ctx.sizeof_addr as usize;
+        // chunk_size_len = element_size - sizeof_addr - filter_mask(4)
+        let chunk_size_len = if is_filtered {
+            (fa_hdr.element_size as usize)
+                .checked_sub(sizeof_addr + 4)
+                .ok_or_else(|| {
+                    crate::io::IoError::InvalidState(
+                        "fixed array filtered element_size too small".into(),
+                    )
+                })?
+        } else {
+            0
+        };
 
         // Compute chunk byte size
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
+
+        // Collect per-chunk (address, compressed_size). compressed_size is the
+        // exact on-disk byte count for filtered chunks, or chunk_bytes when
+        // unfiltered.
+        let num_elmts = fa_hdr.num_elmts as usize;
+        let mut chunk_entries: Vec<(u64, u64)> = Vec::with_capacity(num_elmts);
+
+        if fa_hdr.is_paged() {
+            // Paged data block: prefix (with page-init bitmap) followed by pages.
+            let npages = fa_hdr.npages();
+            let dblk_page_nelmts = fa_hdr.dblk_page_nelmts();
+            let prefix_len = 4 + 1 + 1 + sizeof_addr + (npages as usize).div_ceil(8) + 4;
+            let prefix_buf = self.handle.read_at_most(fa_hdr.data_blk_addr, prefix_len)?;
+            let prefix = FixedArrayPagedPrefix::decode(&prefix_buf, &self.ctx, npages)?;
+
+            let elem_size = if is_filtered {
+                sizeof_addr + chunk_size_len + 4
+            } else {
+                sizeof_addr
+            };
+            // All pages have the same on-disk stride; only the last page holds
+            // fewer elements (libhdf5: dblk_page_size is constant).
+            let page_stride = dblk_page_nelmts as usize * elem_size + 4;
+            let pages_base = fa_hdr.data_blk_addr + prefix.prefix_size as u64;
+
+            for p in 0..npages as usize {
+                // Elements on this page (last page may be short).
+                let page_nelmts = if p + 1 == npages as usize {
+                    let rem = fa_hdr.num_elmts % dblk_page_nelmts;
+                    if rem == 0 {
+                        dblk_page_nelmts
+                    } else {
+                        rem
+                    }
+                } else {
+                    dblk_page_nelmts
+                } as usize;
+
+                if !prefix.page_initialized(p) {
+                    // Uninitialized page: all chunk entries are undefined.
+                    chunk_entries.extend(std::iter::repeat_n((UNDEF_ADDR, 0u64), page_nelmts));
+                    continue;
+                }
+
+                let page_addr = pages_base + (p as u64) * page_stride as u64;
+                let page_size = page_nelmts * elem_size + 4;
+                let page_buf = self.handle.read_at_most(page_addr, page_size)?;
+
+                if is_filtered {
+                    let elems =
+                        decode_filtered_page(&page_buf, &self.ctx, page_nelmts, chunk_size_len)?;
+                    for e in elems {
+                        chunk_entries.push((e.address, e.chunk_size as u64));
+                    }
+                } else {
+                    let addrs = decode_unfiltered_page(&page_buf, &self.ctx, page_nelmts)?;
+                    for addr in addrs {
+                        chunk_entries.push((addr, chunk_bytes));
+                    }
+                }
+            }
+        } else {
+            // Non-paged data block: all elements live inline in the data block.
+            let elem_size = if is_filtered {
+                sizeof_addr + chunk_size_len + 4
+            } else {
+                sizeof_addr
+            };
+            let dblk_size = 4 + 1 + 1 + sizeof_addr + num_elmts * elem_size + 4;
+            let dblk_buf = self.handle.read_at_most(fa_hdr.data_blk_addr, dblk_size)?;
+
+            if is_filtered {
+                let fa_dblk = FixedArrayDataBlock::decode_filtered(
+                    &dblk_buf,
+                    &self.ctx,
+                    num_elmts,
+                    chunk_size_len,
+                )?;
+                for e in &fa_dblk.filtered_elements {
+                    chunk_entries.push((e.address, e.chunk_size as u64));
+                }
+            } else {
+                let fa_dblk =
+                    FixedArrayDataBlock::decode_unfiltered(&dblk_buf, &self.ctx, num_elmts)?;
+                for &addr in &fa_dblk.elements {
+                    chunk_entries.push((addr, chunk_bytes));
+                }
+            }
+        }
 
         // Total output size
         let total_size: u64 = dims.iter().product::<u64>() * element_size;
@@ -902,17 +998,20 @@ impl Hdf5Reader {
             .collect();
 
         // Read all chunk raw data sequentially (I/O must be serial)
-        let n_chunks = std::cmp::min(fa_hdr.num_elmts as usize, fa_dblk.elements.len());
+        let n_chunks = chunk_entries.len();
         let mut raw_chunks: Vec<(usize, Option<Vec<u8>>)> = Vec::with_capacity(n_chunks);
-        for linear_idx in 0..n_chunks {
-            let addr = fa_dblk.elements[linear_idx];
+        for (linear_idx, &(addr, comp_size)) in chunk_entries.iter().enumerate() {
             if addr == UNDEF_ADDR {
                 raw_chunks.push((linear_idx, None));
             } else if pipeline.is_some() {
-                raw_chunks.push((
-                    linear_idx,
-                    Some(self.handle.read_at_most(addr, chunk_bytes as usize * 2)?),
-                ));
+                // For filtered chunks the entry carries the exact compressed
+                // size; fall back to a generous estimate otherwise.
+                let read_len = if comp_size > 0 {
+                    comp_size as usize
+                } else {
+                    chunk_bytes as usize * 2
+                };
+                raw_chunks.push((linear_idx, Some(self.handle.read_at_most(addr, read_len)?)));
             } else {
                 raw_chunks.push((
                     linear_idx,
