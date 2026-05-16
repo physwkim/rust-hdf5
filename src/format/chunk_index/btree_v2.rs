@@ -704,10 +704,11 @@ impl Bt2ChunkIndex {
             }
         } else {
             for rec in &self.records {
+                // libhdf5 layout: chunk address first, then scaled offsets.
+                buf.extend_from_slice(&rec.chunk_address.to_le_bytes()[..sa]);
                 for &offset in &rec.scaled_offsets {
                     buf.extend_from_slice(&offset.to_le_bytes());
                 }
-                buf.extend_from_slice(&rec.chunk_address.to_le_bytes()[..sa]);
             }
         }
 
@@ -776,6 +777,9 @@ impl Bt2ChunkIndex {
         let mut records = Vec::with_capacity(num_records);
         let mut pos = 0;
         for _ in 0..num_records {
+            // libhdf5 record layout: chunk address first, then scaled offsets.
+            let chunk_address = read_addr(&record_data[pos..], sa);
+            pos += sa;
             let mut scaled_offsets = Vec::with_capacity(ndims);
             for _ in 0..ndims {
                 let offset = u64::from_le_bytes([
@@ -791,8 +795,6 @@ impl Bt2ChunkIndex {
                 scaled_offsets.push(offset);
                 pos += 8;
             }
-            let chunk_address = read_addr(&record_data[pos..], sa);
-            pos += sa;
             records.push(Bt2ChunkRecord {
                 scaled_offsets,
                 chunk_address,
@@ -1103,6 +1105,20 @@ mod tests {
         assert_eq!(records[1].chunk_address, 0x2000);
         assert_eq!(records[2].scaled_offsets, vec![1, 0]);
         assert_eq!(records[2].chunk_address, 0x3000);
+    }
+
+    #[test]
+    fn unfiltered_record_is_address_first() {
+        // libhdf5 (H5D__bt2_unfilt_encode) writes the chunk address before
+        // the scaled offsets. Lock that byte order in.
+        let ctx = ctx8();
+        let mut idx = Bt2ChunkIndex::new_unfiltered(2);
+        idx.insert(vec![3, 7], 0xABCD);
+        let bytes = idx.encode_records(&ctx);
+        // First 8 bytes = address, then two 8-byte scaled offsets.
+        assert_eq!(&bytes[0..8], &0xABCDu64.to_le_bytes());
+        assert_eq!(&bytes[8..16], &3u64.to_le_bytes());
+        assert_eq!(&bytes[16..24], &7u64.to_le_bytes());
     }
 
     #[test]

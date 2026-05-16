@@ -280,7 +280,16 @@ impl DataLayoutMessage {
                             buf.push(params.max_dblk_page_nelmts_bits);
                         }
                     }
-                    // BTreeV2, SingleChunk, Implicit: no extra parameters
+                    ChunkIndexType::BTreeV2 => {
+                        // node_size(4) + split_percent(1) + merge_percent(1).
+                        // The v2 B-tree header carries the authoritative
+                        // copies; readers consult those, so a valid default
+                        // here suffices.
+                        buf.extend_from_slice(&2048u32.to_le_bytes());
+                        buf.push(100);
+                        buf.push(40);
+                    }
+                    // SingleChunk, Implicit: no extra parameters.
                     _ => {}
                 }
 
@@ -421,7 +430,19 @@ impl DataLayoutMessage {
                         });
                         pos += 1;
                     }
-                    // BTreeV2, SingleChunk, Implicit: no extra parameters
+                    ChunkIndexType::BTreeV2 => {
+                        // node_size(4) + split_percent(1) + merge_percent(1).
+                        // The v2 B-tree header carries authoritative copies,
+                        // so the reader only needs to skip these.
+                        if buf.len() < pos + 6 {
+                            return Err(FormatError::BufferTooShort {
+                                needed: pos + 6,
+                                available: buf.len(),
+                            });
+                        }
+                        pos += 6;
+                    }
+                    // SingleChunk, Implicit: no extra parameters.
                     _ => {}
                 }
 
