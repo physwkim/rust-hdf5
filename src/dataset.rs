@@ -720,6 +720,13 @@ impl H5Dataset {
                         dims.len()
                     )));
                 }
+                if chunk_dims.len() != dims.len() {
+                    return Err(Hdf5Error::InvalidState(format!(
+                        "dataset chunk shape has {} dimensions but the dataspace has {}",
+                        chunk_dims.len(),
+                        dims.len()
+                    )));
+                }
 
                 if btree2 {
                     writer.write_chunk_btree_v2(*index, &coords, data)?;
