@@ -371,21 +371,17 @@ impl H5Group {
 
     /// Read one of this group's attributes as a string (read mode).
     pub fn attr_string(&self, name: &str) -> Result<String> {
-        let inner = borrow_inner(&self.file_inner);
-        match &*inner {
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
             H5FileInner::Reader(reader) => {
                 let attr = if self.name == "/" {
                     reader.root_attr(name)
                 } else {
                     reader.group_attr(self.name.trim_start_matches('/'), name)
                 }
-                .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?;
-                let end = attr
-                    .data
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(attr.data.len());
-                Ok(String::from_utf8_lossy(&attr.data[..end]).to_string())
+                .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?
+                .clone();
+                Ok(reader.attr_string_value(&attr)?)
             }
             _ => Err(Hdf5Error::InvalidState(
                 "attr_string is only available in read mode".into(),

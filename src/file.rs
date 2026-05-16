@@ -230,18 +230,14 @@ impl H5File {
 
     /// Read a file-level string attribute.
     pub fn attr_string(&self, name: &str) -> Result<String> {
-        let inner = borrow_inner(&self.inner);
-        match &*inner {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
             H5FileInner::Reader(reader) => {
                 let attr = reader
                     .root_attr(name)
-                    .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?;
-                let end = attr
-                    .data
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(attr.data.len());
-                Ok(String::from_utf8_lossy(&attr.data[..end]).to_string())
+                    .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?
+                    .clone();
+                Ok(reader.attr_string_value(&attr)?)
             }
             _ => Err(Hdf5Error::InvalidState("not in read mode".into())),
         }

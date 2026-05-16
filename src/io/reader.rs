@@ -216,11 +216,24 @@ impl Hdf5Reader {
             Self::find_stab_in_object_header(&mut handle, &ctx, ste.obj_header_addr)?
         };
 
-        let datasets = if btree_addr != UNDEF_ADDR && heap_addr != UNDEF_ADDR {
+        let (datasets, group_attributes) = if btree_addr != UNDEF_ADDR && heap_addr != UNDEF_ADDR {
             Self::discover_datasets_from_btree(&mut handle, &ctx, btree_addr, heap_addr)?
         } else {
-            Vec::new()
+            (Vec::new(), std::collections::HashMap::new())
         };
+
+        // Collect the root group's own attributes from its object header.
+        let mut root_attributes = Vec::new();
+        if let Ok(root_hdr) = Self::read_object_header_full(&mut handle, &ctx, ste.obj_header_addr)
+        {
+            for m in &root_hdr.messages {
+                if m.msg_type == MSG_ATTRIBUTE {
+                    if let Ok((a, _)) = AttributeMessage::decode(&m.data, &ctx) {
+                        root_attributes.push(a);
+                    }
+                }
+            }
+        }
 
         Ok(Self {
             handle,
@@ -232,8 +245,8 @@ impl Hdf5Reader {
                 heap_addr,
             },
             datasets,
-            root_attributes: Vec::new(),
-            group_attributes: std::collections::HashMap::new(),
+            root_attributes,
+            group_attributes,
         })
     }
 
@@ -438,14 +451,19 @@ impl Hdf5Reader {
     /// carries scratch-pad `btree_addr`/`heap_addr` for the subgroup; for
     /// other entries the child object header is read for a symbol-table
     /// message. Discovered dataset names are prefixed with the group path.
+    #[allow(clippy::type_complexity)]
     fn discover_datasets_from_btree(
         handle: &mut FileHandle,
         ctx: &FormatContext,
         btree_addr: u64,
         heap_addr: u64,
-    ) -> IoResult<Vec<DatasetReadInfo>> {
+    ) -> IoResult<(
+        Vec<DatasetReadInfo>,
+        std::collections::HashMap<String, Vec<AttributeMessage>>,
+    )> {
         let mut datasets = Vec::new();
         let mut visited = std::collections::HashSet::new();
+        let mut group_attrs = std::collections::HashMap::new();
         Self::discover_datasets_from_btree_recursive(
             handle,
             ctx,
@@ -455,8 +473,9 @@ impl Hdf5Reader {
             0,
             &mut datasets,
             &mut visited,
+            &mut group_attrs,
         )?;
-        Ok(datasets)
+        Ok((datasets, group_attrs))
     }
 
     /// Recursive worker for `discover_datasets_from_btree`. `prefix` is the
@@ -471,6 +490,7 @@ impl Hdf5Reader {
         depth: usize,
         datasets: &mut Vec<DatasetReadInfo>,
         visited: &mut std::collections::HashSet<u64>,
+        group_attrs: &mut std::collections::HashMap<String, Vec<AttributeMessage>>,
     ) -> IoResult<()> {
         // Bound legacy-group nesting depth on a hostile/corrupt file.
         const MAX_GROUP_DEPTH: usize = 256;
@@ -530,6 +550,21 @@ impl Hdf5Reader {
                     continue;
                 }
 
+                // Collect this subgroup's attributes (e.g. NeXus NX_class).
+                if let Ok(hdr) = Self::read_object_header_full(handle, ctx, entry.obj_header_addr) {
+                    let mut attrs = Vec::new();
+                    for m in &hdr.messages {
+                        if m.msg_type == MSG_ATTRIBUTE {
+                            if let Ok((a, _)) = AttributeMessage::decode(&m.data, ctx) {
+                                attrs.push(a);
+                            }
+                        }
+                    }
+                    if !attrs.is_empty() {
+                        group_attrs.insert(full_name.clone(), attrs);
+                    }
+                }
+
                 // Find its B-tree + local heap and recurse, prefixing names
                 // with the group path.
                 let (sub_btree, sub_heap) = if entry.cache_type == 1 {
@@ -551,6 +586,7 @@ impl Hdf5Reader {
                         depth + 1,
                         datasets,
                         visited,
+                        group_attrs,
                     )?;
                 }
             }
@@ -856,6 +892,45 @@ impl Hdf5Reader {
             .get(group_path)?
             .iter()
             .find(|a| a.name == name)
+    }
+
+    /// Decode an attribute's value as a string, resolving a variable-length
+    /// string attribute through the global heap (h5py writes string
+    /// attributes as variable-length by default).
+    pub fn attr_string_value(&mut self, attr: &AttributeMessage) -> IoResult<String> {
+        use crate::format::messages::datatype::DatatypeMessage;
+        if !matches!(attr.datatype, DatatypeMessage::VarLenString { .. }) {
+            // Fixed-length string: raw bytes, truncated at the first NUL.
+            let end = attr
+                .data
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(attr.data.len());
+            return Ok(String::from_utf8_lossy(&attr.data[..end]).to_string());
+        }
+        // Variable-length string: the attribute value is a global-heap
+        // reference (sequence length + collection address + object index).
+        if attr.data.len() < vlen_reference_size(&self.ctx) {
+            return Ok(String::new());
+        }
+        let (_seq, coll_addr, obj_index) = decode_vlen_reference(&attr.data, &self.ctx)?;
+        if coll_addr == UNDEF_ADDR || coll_addr == 0 {
+            return Ok(String::new());
+        }
+        let ss = self.ctx.sizeof_size as usize;
+        let header_len = 4 + 1 + 3 + ss;
+        let header_buf = self.handle.read_at_most(coll_addr, header_len)?;
+        if header_buf.len() < header_len || header_buf[0..4] != *b"GCOL" {
+            return Ok(String::new());
+        }
+        let collection_size = read_uint(&header_buf[8..], ss) as usize;
+        if collection_size == 0 || collection_size > 64 * 1024 * 1024 {
+            return Ok(String::new());
+        }
+        let heap_buf = self.handle.read_at(coll_addr, collection_size)?;
+        let (coll, _) = GlobalHeapCollection::decode(&heap_buf, &self.ctx)?;
+        let obj = coll.get_object(obj_index as u16).unwrap_or(&[]);
+        Ok(String::from_utf8_lossy(obj).to_string())
     }
 
     /// Return the dimensions of a dataset.
