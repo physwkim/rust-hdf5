@@ -858,12 +858,20 @@ fn read_size(buf: &[u8], n: usize) -> u64 {
     u64::from_le_bytes(tmp)
 }
 
-/// Compute ndblk_addrs for the index block given the default params.
+/// Compute ndblk_addrs for the index block given the creation params.
 ///
 /// For sup_blk_min_data_ptrs = K:
 ///   ndblk_addrs = 2 * (K - 1)
-pub fn compute_ndblk_addrs(sup_blk_min_data_ptrs: u8) -> usize {
-    2 * (sup_blk_min_data_ptrs as usize - 1)
+///
+/// Returns an error if `K` is zero (`K` comes straight out of a decoded
+/// file and a malformed value must not underflow).
+pub fn compute_ndblk_addrs(sup_blk_min_data_ptrs: u8) -> FormatResult<usize> {
+    if sup_blk_min_data_ptrs == 0 {
+        return Err(FormatError::InvalidData(
+            "extensible-array sup_blk_min_data_ptrs must be non-zero".into(),
+        ));
+    }
+    Ok(2 * (sup_blk_min_data_ptrs as usize - 1))
 }
 
 /// `log2` of a power of two.
@@ -952,15 +960,60 @@ pub struct EaGeometry {
 
 impl EaGeometry {
     /// Derive the geometry from the EA creation parameters.
+    ///
+    /// All parameters originate from a decoded file (the data-layout
+    /// message), so this validates them and returns a `FormatError` rather
+    /// than panicking on malformed or hostile input.
     pub fn new(
         idx_blk_elmts: u8,
         data_blk_min_elmts: u8,
         sup_blk_min_data_ptrs: u8,
         max_nelmts_bits: u8,
         max_dblk_page_nelmts_bits: u8,
-    ) -> Self {
+    ) -> FormatResult<Self> {
         let min = data_blk_min_elmts as u64;
-        let nsblks = 1 + (max_nelmts_bits as usize - log2_pow2(min) as usize);
+        if min == 0 || !min.is_power_of_two() {
+            return Err(FormatError::InvalidData(format!(
+                "extensible-array data_blk_min_elmts must be a non-zero power \
+                 of two, got {data_blk_min_elmts}"
+            )));
+        }
+        let sup = sup_blk_min_data_ptrs as u64;
+        if sup == 0 || !sup.is_power_of_two() {
+            return Err(FormatError::InvalidData(format!(
+                "extensible-array sup_blk_min_data_ptrs must be a non-zero \
+                 power of two, got {sup_blk_min_data_ptrs}"
+            )));
+        }
+        // `max_nelmts_bits` bounds the array's index space; keep it small
+        // enough that the per-super-block geometry cannot overflow u64.
+        let min_bits = log2_pow2(min);
+        if max_nelmts_bits as u32 > 64 || (max_nelmts_bits as u32) < min_bits {
+            return Err(FormatError::InvalidData(format!(
+                "extensible-array max_nelmts_bits {max_nelmts_bits} is out of \
+                 range for data_blk_min_elmts {data_blk_min_elmts}"
+            )));
+        }
+        if max_dblk_page_nelmts_bits >= 64 {
+            return Err(FormatError::InvalidData(format!(
+                "extensible-array max_dblk_page_nelmts_bits \
+                 {max_dblk_page_nelmts_bits} is too large"
+            )));
+        }
+        let nsblks = 1 + (max_nelmts_bits as usize - min_bits as usize);
+        let iblock_nsblks = 2 * log2_pow2(sup) as usize;
+        if iblock_nsblks > nsblks {
+            return Err(FormatError::InvalidData(
+                "extensible-array index block would hold more super blocks \
+                 than the array contains"
+                    .into(),
+            ));
+        }
+        let overflow = || {
+            FormatError::InvalidData(
+                "extensible-array geometry overflows the 64-bit index space".into(),
+            )
+        };
         let mut sblk = Vec::with_capacity(nsblks);
         let mut start_idx = 0u64;
         let mut start_dblk = 0u64;
@@ -973,11 +1026,12 @@ impl EaGeometry {
                 start_idx,
                 start_dblk,
             });
-            start_idx += ndblks * dblk_nelmts;
-            start_dblk += ndblks;
+            start_idx = start_idx
+                .checked_add(ndblks.checked_mul(dblk_nelmts).ok_or_else(overflow)?)
+                .ok_or_else(overflow)?;
+            start_dblk = start_dblk.checked_add(ndblks).ok_or_else(overflow)?;
         }
-        let iblock_nsblks = 2 * log2_pow2(sup_blk_min_data_ptrs as u64) as usize;
-        Self {
+        Ok(Self {
             idx_blk_elmts: idx_blk_elmts as u64,
             data_blk_min_elmts: min,
             dblk_page_nelmts: 1u64 << max_dblk_page_nelmts_bits,
@@ -985,7 +1039,7 @@ impl EaGeometry {
             ndblk_addrs: 2 * (sup_blk_min_data_ptrs as usize - 1),
             nsblk_addrs: nsblks - iblock_nsblks,
             sblk,
-        }
+        })
     }
 
     /// Super-block index containing chunk `idx` (`idx >= idx_blk_elmts`).
@@ -1027,12 +1081,19 @@ impl EaGeometry {
     }
 
     /// Locate chunk `idx` within the array.
-    pub fn locate(&self, idx: u64) -> EaLoc {
+    ///
+    /// Returns an error when `idx` exceeds the array's capacity (rather than
+    /// panicking on an out-of-bounds super-block index).
+    pub fn locate(&self, idx: u64) -> FormatResult<EaLoc> {
         if idx < self.idx_blk_elmts {
-            return EaLoc::Index { elem: idx as usize };
+            return Ok(EaLoc::Index { elem: idx as usize });
         }
         let sblk_idx = self.sblk_index(idx);
-        let s = self.sblk[sblk_idx];
+        let Some(&s) = self.sblk.get(sblk_idx) else {
+            return Err(FormatError::InvalidData(format!(
+                "chunk index {idx} exceeds the extensible array's capacity"
+            )));
+        };
         let elmt = (idx - self.idx_blk_elmts) - s.start_idx;
         let local_dblk = elmt / s.dblk_nelmts;
         let offset_in_dblk = elmt % s.dblk_nelmts;
@@ -1057,14 +1118,14 @@ impl EaGeometry {
             EaDblkPath::Direct { idx } => s.start_idx + (idx as u64) * s.dblk_nelmts,
             EaDblkPath::ViaSblk { .. } => s.start_idx + local_dblk * s.dblk_nelmts,
         };
-        EaLoc::Dblk(EaChunkLoc {
+        Ok(EaLoc::Dblk(EaChunkLoc {
             sblk_idx,
             dblk_nelmts: s.dblk_nelmts,
             offset_in_dblk,
             dblk_block_offset,
             paged,
             path,
-        })
+        }))
     }
 }
 
@@ -1195,15 +1256,15 @@ pub fn compute_nsblk_addrs(
     data_blk_min_elmts: u8,
     sup_blk_min_data_ptrs: u8,
     max_nelmts_bits: u8,
-) -> usize {
-    EaGeometry::new(
+) -> FormatResult<usize> {
+    Ok(EaGeometry::new(
         idx_blk_elmts,
         data_blk_min_elmts,
         sup_blk_min_data_ptrs,
         max_nelmts_bits,
         10,
-    )
-    .nsblk_addrs
+    )?
+    .nsblk_addrs)
 }
 
 // ======================================================================= tests
@@ -1274,7 +1335,7 @@ mod tests {
 
     #[test]
     fn index_block_roundtrip() {
-        let ndblk = compute_ndblk_addrs(4);
+        let ndblk = compute_ndblk_addrs(4).unwrap();
         assert_eq!(ndblk, 6);
 
         let mut iblk = ExtensibleArrayIndexBlock::new(0x500, 4, ndblk, 0);
@@ -1332,8 +1393,9 @@ mod tests {
     #[test]
     fn compute_ndblk_addrs_default() {
         // sup_blk_min_data_ptrs=4 => ndblk=6
-        assert_eq!(compute_ndblk_addrs(4), 6);
-        assert_eq!(compute_ndblk_addrs(2), 2);
+        assert_eq!(compute_ndblk_addrs(4).unwrap(), 6);
+        assert_eq!(compute_ndblk_addrs(2).unwrap(), 2);
+        assert!(compute_ndblk_addrs(0).is_err());
     }
 
     #[test]
@@ -1341,13 +1403,36 @@ mod tests {
         // Default params: idx_blk_elmts=4, data_blk_min_elmts=16,
         // sup_blk_min_data_ptrs=4, max_nelmts_bits=32
         // Should give nsblk_addrs=25 (matching HDF5 library)
-        assert_eq!(compute_nsblk_addrs(4, 16, 4, 32), 25);
+        assert_eq!(compute_nsblk_addrs(4, 16, 4, 32).unwrap(), 25);
+    }
+
+    #[test]
+    fn ea_geometry_rejects_malformed_params() {
+        // data_blk_min_elmts not a power of two.
+        assert!(EaGeometry::new(4, 17, 4, 32, 10).is_err());
+        // data_blk_min_elmts zero.
+        assert!(EaGeometry::new(4, 0, 4, 32, 10).is_err());
+        // sup_blk_min_data_ptrs zero.
+        assert!(EaGeometry::new(4, 16, 0, 32, 10).is_err());
+        // sup_blk_min_data_ptrs not a power of two.
+        assert!(EaGeometry::new(4, 16, 3, 32, 10).is_err());
+        // max_nelmts_bits smaller than log2(data_blk_min_elmts).
+        assert!(EaGeometry::new(4, 16, 4, 3, 10).is_err());
+        // Well-formed default params still succeed.
+        assert!(EaGeometry::new(4, 16, 4, 32, 10).is_ok());
+    }
+
+    #[test]
+    fn ea_locate_rejects_out_of_capacity_index() {
+        let g = EaGeometry::new(4, 16, 4, 32, 10).unwrap();
+        // 2^32 elements is the capacity; an index past it must error, not panic.
+        assert!(g.locate(u64::MAX).is_err());
     }
 
     #[test]
     fn ea_geometry_matches_libhdf5() {
         // Verified against an h5py/libhdf5-produced EA file (/tmp/ea_ref.h5).
-        let g = EaGeometry::new(4, 16, 4, 32, 10);
+        let g = EaGeometry::new(4, 16, 4, 32, 10).unwrap();
         assert_eq!(g.sblk.len(), 29, "nsblks");
         assert_eq!(g.iblock_nsblks, 4);
         assert_eq!(g.ndblk_addrs, 6);
@@ -1370,7 +1455,7 @@ mod tests {
             );
         }
         // chunk 4 (e=0): super block 0, direct data block 0, block_offset 0.
-        match g.locate(4) {
+        match g.locate(4).unwrap() {
             EaLoc::Dblk(l) => {
                 assert_eq!(l.sblk_idx, 0);
                 assert!(matches!(l.path, EaDblkPath::Direct { idx: 0 }));
@@ -1379,7 +1464,7 @@ mod tests {
             _ => panic!("expected data block"),
         }
         // chunk 20 (e=16): super block 1, direct data block 1, block_offset 48.
-        match g.locate(20) {
+        match g.locate(20).unwrap() {
             EaLoc::Dblk(l) => {
                 assert!(matches!(l.path, EaDblkPath::Direct { idx: 1 }));
                 assert_eq!(l.dblk_block_offset, 48);
@@ -1388,7 +1473,7 @@ mod tests {
         }
         // chunk 244 (e=240): super block 4 -> reached via the index block's
         // super-block address array.
-        match g.locate(244) {
+        match g.locate(244).unwrap() {
             EaLoc::Dblk(l) => {
                 assert_eq!(l.sblk_idx, 4);
                 match l.path {

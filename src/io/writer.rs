@@ -397,13 +397,13 @@ impl Hdf5Writer {
                                 data_blk_min_elmts: params.data_blk_min_elmts,
                                 max_dblk_page_nelmts_bits: params.max_dblk_page_nelmts_bits,
                             };
-                            let ndblk_addrs = compute_ndblk_addrs(ep.sup_blk_min_data_ptrs);
+                            let ndblk_addrs = compute_ndblk_addrs(ep.sup_blk_min_data_ptrs)?;
                             let nsblk_addrs = compute_nsblk_addrs(
                                 ep.idx_blk_elmts,
                                 ep.data_blk_min_elmts,
                                 ep.sup_blk_min_data_ptrs,
                                 ep.max_nelmts_bits,
-                            );
+                            )?;
 
                             // Read EA header
                             let hdr_buf = handle.read_at_most(*index_address, 256)?;
@@ -873,13 +873,13 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
     ) -> IoResult<usize> {
         let earray_params = EarrayParams::default_params();
-        let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs);
+        let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs)?;
         let nsblk_addrs = compute_nsblk_addrs(
             earray_params.idx_blk_elmts,
             earray_params.data_blk_min_elmts,
             earray_params.sup_blk_min_data_ptrs,
             earray_params.max_nelmts_bits,
-        );
+        )?;
 
         // Create EA header
         let mut ea_header = ExtensibleArrayHeader::new_for_chunks(&self.ctx);
@@ -1074,13 +1074,13 @@ impl Hdf5Writer {
                         p.sup_blk_min_data_ptrs,
                         p.max_nelmts_bits,
                         p.max_dblk_page_nelmts_bits,
-                    ),
+                    )?,
                     p.max_nelmts_bits,
                     c.chunk_size_len,
                     c.ea_header_addr,
                 )
             };
-            let loc = match geo.locate(chunk_idx) {
+            let loc = match geo.locate(chunk_idx)? {
                 EaLoc::Dblk(l) => l,
                 EaLoc::Index { .. } => unreachable!("chunk_idx >= idx_blk_elmts"),
             };
@@ -1491,13 +1491,13 @@ impl Hdf5Writer {
         let chunk_size_len = compute_chunk_size_len(chunk_bytes);
 
         let earray_params = EarrayParams::default_params();
-        let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs);
+        let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs)?;
         let nsblk_addrs = compute_nsblk_addrs(
             earray_params.idx_blk_elmts,
             earray_params.data_blk_min_elmts,
             earray_params.sup_blk_min_data_ptrs,
             earray_params.max_nelmts_bits,
-        );
+        )?;
 
         // Create filtered EA header
         let mut ea_header =
@@ -1859,8 +1859,8 @@ impl Hdf5Writer {
                 p.sup_blk_min_data_ptrs,
                 p.max_nelmts_bits,
                 p.max_dblk_page_nelmts_bits,
-            )
-            .locate(chunk_idx)
+            )?
+            .locate(chunk_idx)?
         };
         let loc = match ea_loc {
             EaLoc::Index { elem } => {
@@ -2117,13 +2117,13 @@ impl Hdf5Writer {
         let chunk_size_len = compute_chunk_size_len(chunk_bytes);
 
         let earray_params = EarrayParams::default_params();
-        let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs);
+        let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs)?;
         let nsblk_addrs = compute_nsblk_addrs(
             earray_params.idx_blk_elmts,
             earray_params.data_blk_min_elmts,
             earray_params.sup_blk_min_data_ptrs,
             earray_params.max_nelmts_bits,
-        );
+        )?;
 
         // Create filtered EA header
         let mut ea_header =
@@ -2217,13 +2217,13 @@ impl Hdf5Writer {
         let chunk_size_len = compute_chunk_size_len(chunk_bytes);
 
         let earray_params = EarrayParams::default_params();
-        let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs);
+        let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs)?;
         let nsblk_addrs = compute_nsblk_addrs(
             earray_params.idx_blk_elmts,
             earray_params.data_blk_min_elmts,
             earray_params.sup_blk_min_data_ptrs,
             earray_params.max_nelmts_bits,
-        );
+        )?;
 
         let mut ea_header =
             ExtensibleArrayHeader::new_for_filtered_chunks(&self.ctx, chunk_size_len);

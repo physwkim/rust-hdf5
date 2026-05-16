@@ -1351,7 +1351,7 @@ impl Hdf5Reader {
             params.sup_blk_min_data_ptrs,
             params.max_nelmts_bits,
             params.max_dblk_page_nelmts_bits,
-        );
+        )?;
         let chunk_bytes = chunk_dims.iter().product::<u64>() * element_size;
         let is_filtered = ea_hdr.class_id == ea::EA_CLS_FILT_CHUNK;
         let chunk_size_len = if is_filtered {
@@ -1425,12 +1425,18 @@ impl Hdf5Reader {
                 if sblk_addr == UNDEF_ADDR {
                     (vec![UNDEF_ADDR; s.ndblks as usize], Vec::new())
                 } else {
-                    let buf = self.handle.read_at_most(sblk_addr, 65536)?;
                     let page_init_total = if paged {
                         s.ndblks as usize * geo.dblk_page_init_size(u)
                     } else {
                         0
                     };
+                    // Size the read from the super block's geometry rather
+                    // than a fixed cap: signature+version+class+header_addr
+                    // + block_offset(<=8) + page-init bitmaps
+                    // + ndblks data-block addresses + checksum.
+                    let sblk_size =
+                        4 + 1 + 1 + sa + 8 + page_init_total + s.ndblks as usize * sa + 4;
+                    let buf = self.handle.read_at_most(sblk_addr, sblk_size)?;
                     let sb = ExtensibleArraySuperBlock::decode(
                         &buf,
                         &self.ctx,
@@ -1483,7 +1489,8 @@ impl Hdf5Reader {
                         }
                     }
                 } else if is_filtered {
-                    let buf = self.handle.read_at_most(dblk_addr, 65536)?;
+                    let dblk_size = prefix + dblk_nelmts * raw_elmt_size;
+                    let buf = self.handle.read_at_most(dblk_addr, dblk_size)?;
                     let dblk = ea::FilteredDataBlock::decode(
                         &buf,
                         &self.ctx,
@@ -1495,7 +1502,8 @@ impl Hdf5Reader {
                         entries.push((e.addr, e.nbytes));
                     }
                 } else {
-                    let buf = self.handle.read_at_most(dblk_addr, 65536)?;
+                    let dblk_size = prefix + dblk_nelmts * raw_elmt_size;
+                    let buf = self.handle.read_at_most(dblk_addr, dblk_size)?;
                     let dblk = ExtensibleArrayDataBlock::decode(
                         &buf,
                         &self.ctx,
