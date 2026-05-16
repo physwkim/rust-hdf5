@@ -91,6 +91,17 @@ pub struct Hdf5Reader {
     group_paths: std::collections::BTreeSet<String>,
 }
 
+/// Total byte length of `dims.product() * element_size`, computed with
+/// saturating arithmetic. `dims` and `element_size` are file-derived; a
+/// crafted file with huge dimensions thus yields a saturated (too-large)
+/// value — rejected downstream by the file-size/buffer checks — rather
+/// than panicking in a debug build or wrapping in release.
+fn saturating_byte_len(dims: &[u64], element_size: u64) -> u64 {
+    dims.iter()
+        .fold(1u64, |acc, &d| acc.saturating_mul(d))
+        .saturating_mul(element_size)
+}
+
 impl Hdf5Reader {
     /// Open an existing HDF5 file using memory-mapped I/O for zero-copy reads.
     ///
@@ -1226,7 +1237,7 @@ impl Hdf5Reader {
         match index_type {
             data_layout::ChunkIndexType::SingleChunk => {
                 // Single chunk: the index_address IS the chunk address
-                let total_size: u64 = dims.iter().product::<u64>() * element_size;
+                let total_size: u64 = saturating_byte_len(&dims, element_size);
                 if index_address == UNDEF_ADDR || total_size == 0 {
                     // An unallocated single chunk reads back entirely as the
                     // fill value (when one is defined); otherwise empty.
@@ -1281,7 +1292,7 @@ impl Hdf5Reader {
                     element_size,
                 )?;
 
-                let total_size: u64 = dims.iter().product::<u64>() * element_size;
+                let total_size: u64 = saturating_byte_len(&dims, element_size);
                 let mut output = tiled_fill(total_size as usize, fill_value.as_deref());
 
                 let n_chunks = std::cmp::min(chunks_dim0 as usize, chunk_entries.len());
@@ -1449,7 +1460,7 @@ impl Hdf5Reader {
         }
 
         // Compute chunk byte size
-        let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
+        let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
 
         // Collect per-chunk (address, compressed_size). compressed_size is the
         // exact on-disk byte count for filtered chunks, or chunk_bytes when
@@ -1541,7 +1552,7 @@ impl Hdf5Reader {
         }
 
         // Total output size
-        let total_size: u64 = dims.iter().product::<u64>() * element_size;
+        let total_size: u64 = saturating_byte_len(&dims, element_size);
         let mut output = tiled_fill(total_size as usize, fill_value.as_deref());
 
         // Compute number of chunks per dimension. A zero chunk dimension
@@ -1678,7 +1689,7 @@ impl Hdf5Reader {
 
         // Decode records
         // Compute chunk byte size
-        let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
+        let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
 
         // Unify filtered and unfiltered records into (address, read_size,
         // scaled offsets). read_size is the compressed size for filtered
@@ -1706,7 +1717,7 @@ impl Hdf5Reader {
             .collect()
         };
 
-        let total_size: u64 = dims.iter().product::<u64>() * element_size;
+        let total_size: u64 = saturating_byte_len(&dims, element_size);
         let mut output = tiled_fill(total_size as usize, fill_value.as_deref());
 
         // Read each chunk's raw bytes.
@@ -1840,7 +1851,7 @@ impl Hdf5Reader {
             )));
         }
 
-        let total_size: u64 = dims.iter().product::<u64>() * element_size;
+        let total_size: u64 = saturating_byte_len(&dims, element_size);
         let mut output = tiled_fill(total_size as usize, fill_value.as_deref());
 
         if b_tree_address == UNDEF_ADDR || total_size == 0 {
@@ -1856,7 +1867,7 @@ impl Hdf5Reader {
         self.collect_btree_v1_chunks(b_tree_address, ndims, file_size, 0, &mut entries)?;
 
         // The uncompressed byte size of a full chunk.
-        let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
+        let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
 
         // Read every chunk's raw bytes.
         let mut raw_chunks: Vec<Option<(Vec<u8>, Vec<u64>)>> = Vec::with_capacity(entries.len());
@@ -2201,7 +2212,7 @@ impl Hdf5Reader {
             params.max_nelmts_bits,
             params.max_dblk_page_nelmts_bits,
         )?;
-        let chunk_bytes = chunk_dims.iter().product::<u64>() * element_size;
+        let chunk_bytes = saturating_byte_len(chunk_dims, element_size);
         let is_filtered = ea_hdr.class_id == ea::EA_CLS_FILT_CHUNK;
         let chunk_size_len = if is_filtered {
             ea_hdr.raw_elmt_size - self.ctx.sizeof_addr - 4
