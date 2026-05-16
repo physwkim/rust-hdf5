@@ -404,8 +404,17 @@ fn assess_se(block: &[u32], block_size: usize, uncomp_len: u32) -> u32 {
     let mut len = 1u64;
     let mut i = 0;
     while i < block_size {
+        // `d` can reach ~2*u32::MAX (~2^33) when bits_per_sample is large, so
+        // `d * (d + 1)` (~2^66) overflows u64. SE's triangular code length is
+        // only ever compared against `uncomp_len`; any term that big means SE
+        // already lost, so saturate instead of wrapping (which would panic in
+        // debug and silently corrupt the cost estimate in release).
         let d = block[i] as u64 + block[i + 1] as u64;
-        len += d * (d + 1) / 2 + block[i + 1] as u64 + 1;
+        let triangular = d.saturating_mul(d + 1) / 2;
+        len = len
+            .saturating_add(triangular)
+            .saturating_add(block[i + 1] as u64)
+            .saturating_add(1);
         if len > uncomp_len as u64 {
             return u32::MAX;
         }
@@ -1123,6 +1132,27 @@ pub fn compress(
     // byte-interleaving them into 8-bit samples. The RAW option mask does
     // NOT influence this decision (see sz_compat.c).
     let interleave = bits_per_pixel == 32 || bits_per_pixel == 64;
+
+    // The true input pixel width in bytes, BEFORE any interleaving. libhdf5's
+    // H5Zszip.c only ever feeds SZ_BufftoBuffCompress buffers whose length is a
+    // whole multiple of the on-disk type size, and libaec's interleave_buffer
+    // computes `count = n / wordsize`, silently discarding the trailing
+    // `n % wordsize` bytes. Validate against the real pixel width here -- the
+    // post-interleave sample size is always 8 bits, so the old check against
+    // `bits_to_bytes(bits_per_sample)` collapsed to `is_multiple_of(1)` and
+    // never rejected anything on the 32/64-bit path. `bits_to_bytes` caps at 4,
+    // so it cannot express the 8-byte width of a 64-bit pixel; compute the
+    // ceiling-to-byte width directly.
+    let input_pixel_size = bits_per_pixel.div_ceil(8) as usize;
+    if !data.len().is_multiple_of(input_pixel_size) {
+        return Err(format!(
+            "input size {} is not a multiple of pixel size {} (bits_per_pixel={})",
+            data.len(),
+            input_pixel_size,
+            bits_per_pixel
+        ));
+    }
+
     let bits_per_sample;
     let input_buf: Vec<u8>;
 
@@ -1135,9 +1165,6 @@ pub fn compress(
     }
 
     let pixel_size = bits_to_bytes(bits_per_sample) as usize;
-    if !data.len().is_multiple_of(pixel_size) {
-        return Err("input size not a multiple of pixel size".into());
-    }
 
     let line_size_bytes = pixels_per_scanline as usize * pixel_size;
     let padded_line_pixels = rsi * block_size;
@@ -1190,6 +1217,19 @@ pub fn decompress(
     let flags = convert_options(options_mask);
     let block_size = pixels_per_block;
     let rsi = pixels_per_scanline.div_ceil(pixels_per_block);
+
+    // Symmetric to `compress`: `output_size` is the requested uncompressed
+    // length. On the 32/64-bit path it is fed through `deinterleave_buffer`,
+    // whose `count = n / wordsize` would silently drop the trailing
+    // `n % wordsize` bytes if `output_size` is not a whole pixel multiple.
+    // Reject such requests up front instead of returning a short buffer.
+    let output_pixel_size = bits_per_pixel.div_ceil(8) as usize;
+    if !output_size.is_multiple_of(output_pixel_size) {
+        return Err(format!(
+            "output size {} is not a multiple of pixel size {} (bits_per_pixel={})",
+            output_size, output_pixel_size, bits_per_pixel
+        ));
+    }
 
     // libaec's SZ_BufftoBuffDecompress byte-deinterleaves 32- and 64-bit
     // pixels back from 8-bit samples. The RAW option mask does NOT influence
@@ -1363,6 +1403,72 @@ mod tests {
         // Data with varying patterns to exercise different code paths
         let data: Vec<u8> = (0..256).map(|i| ((i * 7 + 13) % 256) as u8).collect();
         roundtrip(&data, 8, 16, 256, SZ_NN_OPTION_MASK | SZ_MSB_OPTION_MASK);
+    }
+
+    #[test]
+    fn test_compress_rejects_misaligned_32bit_input() {
+        // 32-bit pixels: input must be a multiple of 4 bytes. A 254-byte
+        // buffer is 2 bytes short of 64 pixels; without the alignment check
+        // interleave_buffer would silently drop the trailing 2 bytes.
+        let data = vec![1u8; 254];
+        let err = compress(&data, 32, 16, 64, SZ_NN_OPTION_MASK | SZ_MSB_OPTION_MASK)
+            .expect_err("misaligned 32-bit input must be rejected");
+        assert!(
+            err.contains("not a multiple of pixel size"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_compress_rejects_misaligned_64bit_input() {
+        // 64-bit pixels: input must be a multiple of 8 bytes. bits_to_bytes
+        // caps at 4, so the true pixel width (8) must be derived directly.
+        let data = vec![1u8; 36]; // 4 full 8-byte pixels + 4 stray bytes
+        let err = compress(&data, 64, 16, 32, SZ_NN_OPTION_MASK | SZ_MSB_OPTION_MASK)
+            .expect_err("misaligned 64-bit input must be rejected");
+        assert!(
+            err.contains("not a multiple of pixel size"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_compress_rejects_misaligned_16bit_input() {
+        // 16-bit non-interleaved path: input must be a multiple of 2 bytes.
+        let data = vec![1u8; 15];
+        let err = compress(&data, 16, 16, 128, SZ_NN_OPTION_MASK)
+            .expect_err("misaligned 16-bit input must be rejected");
+        assert!(
+            err.contains("not a multiple of pixel size"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_compress_accepts_aligned_8bit_odd_length() {
+        // 8-bit pixels have width 1: any length is aligned and must compress.
+        let data: Vec<u8> = (0..101u32).map(|i| i as u8).collect();
+        compress(&data, 8, 16, 101, SZ_NN_OPTION_MASK | SZ_MSB_OPTION_MASK)
+            .expect("8-bit input of any length must be accepted");
+    }
+
+    #[test]
+    fn test_decompress_rejects_misaligned_output_size() {
+        // Symmetric guard: a 32-bit output_size not a multiple of 4 would be
+        // truncated by deinterleave_buffer; it must be rejected instead.
+        let err = decompress(
+            &[0u8; 8],
+            254,
+            32,
+            16,
+            64,
+            SZ_NN_OPTION_MASK | SZ_MSB_OPTION_MASK,
+        )
+        .expect_err("misaligned 32-bit output size must be rejected");
+        assert!(
+            err.contains("not a multiple of pixel size"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[test]
