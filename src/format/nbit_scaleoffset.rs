@@ -1506,7 +1506,7 @@ mod tests {
         let vals: [u32; 3] = [0x1234, 0xABCD, 0x0001];
         let mut buf = Vec::new();
         for v in vals {
-            buf.extend_from_slice(&((v << 5) as u32).to_le_bytes());
+            buf.extend_from_slice(&(v << 5).to_le_bytes());
         }
         apply_datatype_conversion(&mut buf, &dt).unwrap();
         for (i, v) in vals.iter().enumerate() {
@@ -1539,7 +1539,7 @@ mod tests {
     fn conversion_standard_float_is_noop() {
         let dt = DatatypeMessage::f64_type();
         assert!(!datatype_needs_bit_conversion(&dt));
-        let mut buf = 3.14159f64.to_le_bytes().to_vec();
+        let mut buf = 12.5f64.to_le_bytes().to_vec();
         let before = buf.clone();
         apply_datatype_conversion(&mut buf, &dt).unwrap();
         assert_eq!(buf, before);
