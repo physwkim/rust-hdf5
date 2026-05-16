@@ -87,16 +87,18 @@ impl GlobalHeapCollection {
     pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
         let ss = ctx.sizeof_size as usize;
 
-        // Compute body size: sum of all object encodings + free-space marker
-        // Each object: 2 (index) + 2 (ref_count) + 4 (reserved) + ss (size) + padded_data
-        let header_size = 4 + 1 + 3 + ss; // GCOL + version + reserved + collection_size
+        // libhdf5 (H5HGpkg.h) 8-byte-aligns both the collection header and
+        // every object header (H5HG_ALIGN). For ss == 8 the raw sizes are
+        // already multiples of 8, so this is a no-op there and only matters
+        // for files with 4-byte lengths.
+        let header_size = pad_to_8(4 + 1 + 3 + ss); // GCOL + version + reserved + collection_size
+        let objhdr_size = pad_to_8(2 + 2 + 4 + ss); // index + ref_count + reserved + size
         let mut objects_size: usize = 0;
         for obj in &self.objects {
-            let padded = pad_to_8(obj.data.len());
-            objects_size += 2 + 2 + 4 + ss + padded;
+            objects_size += objhdr_size + pad_to_8(obj.data.len());
         }
-        // Free-space marker: index(2) + ref_count(2) + reserved(4) + size(ss) = 8 + ss
-        let free_marker_size = 2 + 2 + 4 + ss;
+        // Free-space marker carries the same (aligned) object header.
+        let free_marker_size = objhdr_size;
         let content_size = header_size + objects_size + free_marker_size;
 
         // HDF5 C library requires collection_size >= 4096 (H5HG_MINALLOC)
@@ -112,19 +114,18 @@ impl GlobalHeapCollection {
         buf.push(GCOL_VERSION);
         buf.extend_from_slice(&[0u8; 3]); // reserved
         buf.extend_from_slice(&(collection_size as u64).to_le_bytes()[..ss]);
+        buf.resize(header_size, 0); // pad header to 8-byte alignment
 
         // Objects
         for obj in &self.objects {
+            let obj_start = buf.len();
             buf.extend_from_slice(&obj.index.to_le_bytes());
             buf.extend_from_slice(&1u16.to_le_bytes()); // ref_count = 1
             buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
             buf.extend_from_slice(&(obj.data.len() as u64).to_le_bytes()[..ss]);
+            buf.resize(obj_start + objhdr_size, 0); // pad object header
             buf.extend_from_slice(&obj.data);
-            // Pad to 8-byte alignment
-            let pad = pad_to_8(obj.data.len()) - obj.data.len();
-            if pad > 0 {
-                buf.extend_from_slice(&vec![0u8; pad]);
-            }
+            buf.resize(buf.len() + (pad_to_8(obj.data.len()) - obj.data.len()), 0);
         }
 
         // Free-space marker (index = 0) with remaining space
@@ -145,7 +146,8 @@ impl GlobalHeapCollection {
     /// Returns the collection and the number of bytes consumed.
     pub fn decode(buf: &[u8], ctx: &FormatContext) -> FormatResult<(Self, usize)> {
         let ss = ctx.sizeof_size as usize;
-        let header_size = 4 + 1 + 3 + ss;
+        let header_size = pad_to_8(4 + 1 + 3 + ss);
+        let objhdr_size = pad_to_8(2 + 2 + 4 + ss);
 
         if buf.len() < header_size {
             return Err(FormatError::BufferTooShort {
@@ -181,7 +183,8 @@ impl GlobalHeapCollection {
         let mut pos = header_size;
         let mut objects = Vec::new();
 
-        while pos + 2 + 2 + 4 + ss <= collection_size {
+        while pos + objhdr_size <= collection_size {
+            let obj_start = pos;
             let index = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
             pos += 2;
             let _ref_count = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
@@ -190,7 +193,8 @@ impl GlobalHeapCollection {
                 u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
             pos += 4;
             let size = read_size(&buf[pos..], ss) as usize;
-            pos += ss;
+            // Skip any object-header alignment padding.
+            pos = obj_start + objhdr_size;
 
             if index == 0 {
                 // Free-space marker -- end of used objects

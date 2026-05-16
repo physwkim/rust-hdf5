@@ -10,6 +10,25 @@ use crate::format::{FormatContext, FormatError, FormatResult};
 
 const DT_VERSION: u8 = 1;
 
+/// libhdf5 `H5VM_limit_enc_size`: the number of bytes needed to encode any
+/// value in `0..=limit`. Used for version-3 compound member offsets, which
+/// are stored in `limit_enc_size(compound_size)` little-endian bytes.
+fn limit_enc_size(limit: u64) -> usize {
+    let log2 = if limit == 0 {
+        0
+    } else {
+        63 - limit.leading_zeros()
+    };
+    (log2 / 8 + 1) as usize
+}
+
+/// Read a little-endian unsigned integer of `n` (`<= 4`) bytes.
+fn read_uint_le(buf: &[u8], n: usize) -> u32 {
+    let mut tmp = [0u8; 4];
+    tmp[..n].copy_from_slice(&buf[..n]);
+    u32::from_le_bytes(tmp)
+}
+
 // Datatype class codes
 const CLASS_FIXED_POINT: u8 = 0;
 const CLASS_FLOATING_POINT: u8 = 1;
@@ -461,14 +480,19 @@ impl DatatypeMessage {
                 // bytes 4-7: element size
                 buf.extend_from_slice(&size.to_le_bytes());
 
+                // Version-3 member offsets are encoded in the minimum
+                // number of bytes that can represent the compound's size
+                // (H5VM_limit_enc_size / UINT32ENCODE_VAR).
+                let offset_nbytes = limit_enc_size(*size as u64);
+
                 // Properties: for each member
                 for member in members {
-                    // Name (null-terminated)
+                    // Name (null-terminated, no padding in version 3)
                     buf.extend_from_slice(member.name.as_bytes());
                     buf.push(0);
 
-                    // Byte offset (u32 LE for version 3)
-                    buf.extend_from_slice(&member.offset.to_le_bytes());
+                    // Byte offset, variable width.
+                    buf.extend_from_slice(&member.offset.to_le_bytes()[..offset_nbytes]);
 
                     // Member datatype (recursive)
                     let dt_encoded = member.datatype.encode(ctx);
@@ -610,7 +634,10 @@ impl DatatypeMessage {
 
         match class {
             CLASS_FIXED_POINT => {
-                if version != DT_VERSION {
+                // Versions 1-3 share the same fixed-point property layout;
+                // an atomic type's version is bumped when it is a member of
+                // a v3 compound/array.
+                if !(1..=3).contains(&version) {
                     return Err(FormatError::InvalidVersion(version));
                 }
                 if buf.len() < 12 {
@@ -641,7 +668,8 @@ impl DatatypeMessage {
                 ))
             }
             CLASS_FLOATING_POINT => {
-                if version != DT_VERSION {
+                // Versions 1-3 share the same floating-point property layout.
+                if !(1..=3).contains(&version) {
                     return Err(FormatError::InvalidVersion(version));
                 }
                 if buf.len() < 20 {
@@ -700,8 +728,8 @@ impl DatatypeMessage {
                 ))
             }
             CLASS_COMPOUND => {
-                // Compound: version 1 or 3
-                if version != 1 && version != 3 {
+                // Compound: versions 1, 2 and 3.
+                if !(1..=3).contains(&version) {
                     return Err(FormatError::UnsupportedFeature(format!(
                         "compound datatype version {}",
                         version
@@ -736,52 +764,35 @@ impl DatatypeMessage {
                         pos = name_start + padded;
                     }
 
-                    // Byte offset
-                    let offset = if version == 1 {
-                        // Version 1: 4-byte offset
-                        if pos + 4 > buf.len() {
-                            return Err(FormatError::BufferTooShort {
-                                needed: pos + 4,
-                                available: buf.len(),
-                            });
-                        }
-                        let o = u32::from_le_bytes([
-                            buf[pos],
-                            buf[pos + 1],
-                            buf[pos + 2],
-                            buf[pos + 3],
-                        ]);
-                        pos += 4;
+                    // Byte offset. Versions 1 and 2 use a fixed 4-byte
+                    // offset; version 3 uses limit_enc_size(size) bytes
+                    // (H5VM_limit_enc_size / UINT32DECODE_VAR).
+                    let offset_nbytes = if version == 3 {
+                        limit_enc_size(size as u64)
+                    } else {
+                        4
+                    };
+                    if pos + offset_nbytes > buf.len() {
+                        return Err(FormatError::BufferTooShort {
+                            needed: pos + offset_nbytes,
+                            available: buf.len(),
+                        });
+                    }
+                    let offset = read_uint_le(&buf[pos..], offset_nbytes);
+                    pos += offset_nbytes;
 
-                        // Version 1 has additional fields: dimensionality(1),
-                        // reserved(3), dim_perm(4), reserved(4), dim_sizes(4*4)
-                        // = 1 + 3 + 4 + 4 + 16 = 28 bytes
+                    if version == 1 {
+                        // Version 1 also carries: dimensionality(1),
+                        // reserved(3), dim_perm(4), reserved(4),
+                        // dim_sizes(4*4) = 28 bytes.
                         if pos + 28 > buf.len() {
                             return Err(FormatError::BufferTooShort {
                                 needed: pos + 28,
                                 available: buf.len(),
                             });
                         }
-                        pos += 28; // skip v1 dimension info
-
-                        o
-                    } else {
-                        // Version 3: 4-byte offset, no padding or dimension info
-                        if pos + 4 > buf.len() {
-                            return Err(FormatError::BufferTooShort {
-                                needed: pos + 4,
-                                available: buf.len(),
-                            });
-                        }
-                        let o = u32::from_le_bytes([
-                            buf[pos],
-                            buf[pos + 1],
-                            buf[pos + 2],
-                            buf[pos + 3],
-                        ]);
-                        pos += 4;
-                        o
-                    };
+                        pos += 28;
+                    }
 
                     // Member datatype (recursive)
                     let (member_dt, dt_consumed) = Self::decode(&buf[pos..], ctx)?;
@@ -797,8 +808,8 @@ impl DatatypeMessage {
                 Ok((Self::Compound { size, members }, pos))
             }
             CLASS_ENUM => {
-                // Enum: version 1
-                if version != DT_VERSION {
+                // Enum versions 1-3. Version 3 drops the 8-byte name padding.
+                if !(1..=3).contains(&version) {
                     return Err(FormatError::InvalidVersion(version));
                 }
                 let num_members = u16::from_le_bytes([flags0, flags1]) as usize;
@@ -824,10 +835,14 @@ impl DatatypeMessage {
                     }
                     let name = String::from_utf8_lossy(&buf[name_start..pos]).to_string();
                     pos += 1; // skip null
-                              // Version 1: pad name (including null) to 8-byte boundary
-                    let name_field_len = pos - name_start;
-                    let padded = (name_field_len + 7) & !7;
-                    pos = name_start + padded;
+                              // Versions 1 & 2 pad the name field (including
+                              // the null) to an 8-byte boundary; version 3
+                              // advances by exactly the name length.
+                    if version < 3 {
+                        let name_field_len = pos - name_start;
+                        let padded = (name_field_len + 7) & !7;
+                        pos = name_start + padded;
+                    }
                     names.push(name);
                 }
 

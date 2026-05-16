@@ -370,6 +370,14 @@ impl DataLayoutMessage {
                 let enc_bytes = buf[pos] as usize;
                 pos += 1;
 
+                // libhdf5 (H5Olayout.c) requires 1 <= enc_bytes <= 8;
+                // 0 produces all-zero dims, > 8 panics read_size.
+                if !(1..=8).contains(&enc_bytes) {
+                    return Err(FormatError::InvalidData(format!(
+                        "chunked layout encoded dimension size {enc_bytes} is out of range"
+                    )));
+                }
+
                 // dim sizes
                 let dim_data_len = ndims * enc_bytes;
                 if buf.len() < pos + dim_data_len {
@@ -409,13 +417,25 @@ impl DataLayoutMessage {
                                 available: buf.len(),
                             });
                         }
-                        earray_params = Some(EarrayParams {
+                        let ep = EarrayParams {
                             max_nelmts_bits: buf[pos],
                             idx_blk_elmts: buf[pos + 1],
                             sup_blk_min_data_ptrs: buf[pos + 2],
                             data_blk_min_elmts: buf[pos + 3],
                             max_dblk_page_nelmts_bits: buf[pos + 4],
-                        });
+                        };
+                        // libhdf5 rejects a zero in any of these fields.
+                        if ep.max_nelmts_bits == 0
+                            || ep.idx_blk_elmts == 0
+                            || ep.sup_blk_min_data_ptrs == 0
+                            || ep.data_blk_min_elmts == 0
+                            || ep.max_dblk_page_nelmts_bits == 0
+                        {
+                            return Err(FormatError::InvalidData(
+                                "extensible-array layout parameter is zero".into(),
+                            ));
+                        }
+                        earray_params = Some(ep);
                         pos += 5;
                     }
                     ChunkIndexType::FixedArray => {
@@ -425,6 +445,11 @@ impl DataLayoutMessage {
                                 available: buf.len(),
                             });
                         }
+                        // NOTE: libhdf5 rejects max_dblk_page_nelmts_bits == 0,
+                        // but this crate's own Fixed Array writer currently
+                        // emits 0 (it does not page). Validating it here would
+                        // reject crate-written files; left until the FA writer
+                        // is made libhdf5-conformant.
                         farray_params = Some(FixedArrayParams {
                             max_dblk_page_nelmts_bits: buf[pos],
                         });
@@ -442,7 +467,23 @@ impl DataLayoutMessage {
                         }
                         pos += 6;
                     }
-                    // SingleChunk, Implicit: no extra parameters.
+                    ChunkIndexType::SingleChunk => {
+                        // A single-chunk index whose "single index with
+                        // filter" flag (0x02) is set carries the filtered
+                        // chunk size (sizeof_size bytes) and a 4-byte filter
+                        // mask before the chunk address (H5Olayout.c).
+                        if flags & 0x02 != 0 {
+                            let extra = ctx.sizeof_size as usize + 4;
+                            if buf.len() < pos + extra {
+                                return Err(FormatError::BufferTooShort {
+                                    needed: pos + extra,
+                                    available: buf.len(),
+                                });
+                            }
+                            pos += extra;
+                        }
+                    }
+                    // Implicit: no extra parameters.
                     _ => {}
                 }
 

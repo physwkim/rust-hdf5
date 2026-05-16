@@ -628,25 +628,45 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
     }
 }
 
-/// Compute Fletcher-32 checksum over a byte buffer.
+/// Compute the Fletcher-32 checksum over a byte buffer, byte-exact with
+/// libhdf5's `H5_checksum_fletcher32`.
+///
+/// The accumulators are *not* reduced modulo 65535 per word; instead they
+/// are folded with `sum = (sum & 0xffff) + (sum >> 16)` after every group
+/// of at most 360 words (the largest run that cannot overflow `u32`) and
+/// twice at the end. Per-word `% 65535` is a different function — it maps
+/// an exact `0xFFFF` partial sum to `0` where the fold keeps `0xFFFF`.
 fn fletcher32(data: &[u8]) -> u32 {
     let mut sum1: u32 = 0;
     let mut sum2: u32 = 0;
 
-    // Process 16-bit words (big-endian pairs per HDF5 spec)
+    let mut words = data.len() / 2;
     let mut i = 0;
-    while i + 1 < data.len() {
-        let word = ((data[i] as u32) << 8) | (data[i + 1] as u32);
-        sum1 = (sum1 + word) % 65535;
-        sum2 = (sum2 + sum1) % 65535;
-        i += 2;
+    while words > 0 {
+        let mut tlen = words.min(360);
+        words -= tlen;
+        while tlen > 0 {
+            let word = ((data[i] as u32) << 8) | (data[i + 1] as u32);
+            sum1 = sum1.wrapping_add(word);
+            sum2 = sum2.wrapping_add(sum1);
+            i += 2;
+            tlen -= 1;
+        }
+        sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+        sum2 = (sum2 & 0xffff) + (sum2 >> 16);
     }
-    // Handle odd byte
-    if i < data.len() {
-        let word = (data[i] as u32) << 8;
-        sum1 = (sum1 + word) % 65535;
-        sum2 = (sum2 + sum1) % 65535;
+
+    // Odd trailing byte: contributes only its high byte.
+    if data.len() % 2 == 1 {
+        sum1 = sum1.wrapping_add((data[i] as u32) << 8);
+        sum2 = sum2.wrapping_add(sum1);
+        sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+        sum2 = (sum2 & 0xffff) + (sum2 >> 16);
     }
+
+    // Second reduction to fold the sums back into 16 bits.
+    sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+    sum2 = (sum2 & 0xffff) + (sum2 >> 16);
 
     (sum2 << 16) | sum1
 }
@@ -1898,6 +1918,21 @@ mod tests {
         assert!(compressed.len() < data.len());
         let decompressed = reverse_filters(&pipeline, &compressed).unwrap();
         assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn fletcher32_matches_libhdf5() {
+        // Reference values computed from a Python port of libhdf5's
+        // H5_checksum_fletcher32 (H5checksum.c).
+        assert_eq!(fletcher32(b""), 0x0000_0000);
+        assert_eq!(fletcher32(b"hi"), 0x6869_6869);
+        assert_eq!(fletcher32(b"hello world"), 0xfc27_91ce);
+        assert_eq!(fletcher32(b"abc"), 0x25c5_c462);
+        assert_eq!(fletcher32(&[0xFF, 0xFF]), 0xffff_ffff);
+        assert_eq!(fletcher32(&[0xFF; 4]), 0xffff_ffff);
+        let range256: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(fletcher32(&range256), 0x5575_c03f);
+        assert_eq!(fletcher32(&[0u8; 1000]), 0x0000_0000);
     }
 
     #[test]

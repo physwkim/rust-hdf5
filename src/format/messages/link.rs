@@ -8,7 +8,7 @@
 //!     bit 3:    link type present
 //!     bit 4:    charset field present
 //!   [if bit 3]: link_type u8 (0=hard, 1=soft, 64+=external)
-//!   [if bit 2]: creation_order u32 LE
+//!   [if bit 2]: creation_order i64 LE
 //!   [if bit 4]: charset u8 (0=ASCII, 1=UTF-8)
 //!   name_length: 1/2/4/8 bytes per bits 0-1
 //!   name:        name_length bytes (UTF-8)
@@ -155,11 +155,11 @@ impl LinkMessage {
             LINK_TYPE_HARD // default
         };
 
-        // creation order
+        // creation order — an 8-byte signed integer (H5Olink.c INT64DECODE),
+        // not 4. We don't store it, but the width must be skipped exactly.
         if has_creation_order {
-            check_len(buf, pos, 4)?;
-            // skip creation order (u32) — we don't store it in the struct
-            pos += 4;
+            check_len(buf, pos, 8)?;
+            pos += 8;
         }
 
         // charset

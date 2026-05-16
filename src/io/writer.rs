@@ -270,8 +270,12 @@ impl Hdf5Writer {
             sizeof_size: sb.sizeof_lengths,
         };
 
-        // Discover links from root group (and subgroups recursively)
-        let root_buf = handle.read_at_most(sb.root_group_object_header_address, 8192)?;
+        // Discover links from root group (and subgroups recursively).
+        // Read to end-of-file so a large object header (many attributes) is
+        // not truncated, which would silently drop datasets on reopen.
+        let root_addr = sb.root_group_object_header_address;
+        let root_buf =
+            handle.read_at_most(root_addr, file_size.saturating_sub(root_addr) as usize)?;
         let (root_header, _) = crate::format::object_header::ObjectHeader::decode(&root_buf)?;
 
         // Collect existing root-level attributes
@@ -291,8 +295,9 @@ impl Hdf5Writer {
 
         let mut existing_datasets = Vec::new();
         for (name, obj_addr) in &link_entries {
-            // Read the dataset's full object header
-            let ds_buf = handle.read_at_most(*obj_addr, 8192)?;
+            // Read the dataset's full object header (to EOF — see above).
+            let ds_buf =
+                handle.read_at_most(*obj_addr, file_size.saturating_sub(*obj_addr) as usize)?;
             let (ds_header, _) =
                 match crate::format::object_header::ObjectHeader::decode_any(&ds_buf) {
                     Ok(h) => h,
@@ -608,8 +613,13 @@ impl Hdf5Writer {
                         };
                         out.push((full_name.clone(), *address));
 
-                        // Try to recurse into groups
-                        if let Ok(child_buf) = handle.read_at_most(*address, 8192) {
+                        // Try to recurse into groups (read to EOF so a large
+                        // child object header is not truncated).
+                        let child_len = handle
+                            .file_size()
+                            .map(|fs| fs.saturating_sub(*address) as usize)
+                            .unwrap_or(8192);
+                        if let Ok(child_buf) = handle.read_at_most(*address, child_len) {
                             if let Ok((child_header, _)) =
                                 crate::format::object_header::ObjectHeader::decode_any(&child_buf)
                             {
