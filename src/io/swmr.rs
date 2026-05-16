@@ -75,6 +75,32 @@ impl SwmrWriter {
             .create_chunked_dataset(name, datatype, &dims, &max_dims, &chunk_dims)
     }
 
+    /// Create a streaming dataset whose frames are compressed with the given
+    /// filter pipeline.
+    pub fn create_streaming_dataset_compressed(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        frame_dims: &[u64],
+        pipeline: crate::format::messages::filter::FilterPipeline,
+    ) -> IoResult<usize> {
+        let mut dims = vec![0u64];
+        dims.extend_from_slice(frame_dims);
+        let mut max_dims = vec![u64::MAX];
+        max_dims.extend_from_slice(frame_dims);
+        let mut chunk_dims = vec![1u64];
+        chunk_dims.extend_from_slice(frame_dims);
+
+        self.writer.create_chunked_dataset_with_pipeline(
+            name,
+            datatype,
+            &dims,
+            &max_dims,
+            &chunk_dims,
+            pipeline,
+        )
+    }
+
     /// Set the SWMR flag in the superblock.
     ///
     /// This performs a full finalize: writes all dataset object headers, the

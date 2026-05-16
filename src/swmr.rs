@@ -71,6 +71,27 @@ impl SwmrFileWriter {
         Ok(idx)
     }
 
+    /// Create a streaming dataset whose frames are compressed.
+    ///
+    /// Like [`create_streaming_dataset`](Self::create_streaming_dataset) but
+    /// each appended frame is run through `pipeline` (e.g.
+    /// `FilterPipeline::deflate(4)`). SWMR appends and in-place header
+    /// updates work the same as for uncompressed streaming datasets.
+    pub fn create_streaming_dataset_compressed<T: H5Type>(
+        &mut self,
+        name: &str,
+        frame_dims: &[u64],
+        pipeline: crate::format::messages::filter::FilterPipeline,
+    ) -> Result<usize> {
+        let idx = self.inner.create_streaming_dataset_compressed(
+            name,
+            T::hdf5_type(),
+            frame_dims,
+            pipeline,
+        )?;
+        Ok(idx)
+    }
+
     /// Signal the start of SWMR mode.
     pub fn start_swmr(&mut self) -> Result<()> {
         self.inner.start_swmr()?;

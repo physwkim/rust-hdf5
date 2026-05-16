@@ -3563,6 +3563,52 @@ mod tests {
     }
 
     #[test]
+    fn swmr_writer_compressed_frames() {
+        use crate::io::swmr::SwmrWriter;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rust_hdf5_swmr_comp_{}_{}.h5",
+            std::process::id(),
+            n
+        ));
+
+        let mut swmr = SwmrWriter::create(&path).unwrap();
+        let pipeline = crate::format::messages::filter::FilterPipeline::deflate(4);
+        let idx = swmr
+            .create_streaming_dataset_compressed(
+                "detector",
+                DatatypeMessage::i32_type(),
+                &[8],
+                pipeline,
+            )
+            .unwrap();
+        swmr.start_swmr().unwrap();
+
+        for frame in 0..40i32 {
+            let raw: Vec<u8> = (0..8).flat_map(|i| (frame * 8 + i).to_le_bytes()).collect();
+            swmr.append_frame(idx, &raw).unwrap();
+            if frame % 7 == 0 {
+                swmr.flush().unwrap();
+            }
+        }
+        swmr.flush().unwrap();
+        swmr.close().unwrap();
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        assert_eq!(reader.dataset_shape("detector").unwrap(), vec![40, 8]);
+        let raw = reader.read_dataset_raw("detector").unwrap();
+        let values: Vec<i32> = raw
+            .chunks(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, (0..320).collect::<Vec<i32>>());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn group_hierarchy_writer_reader() {
         let dir = std::env::temp_dir();
         let path = dir.join("test_group_hierarchy.h5");
