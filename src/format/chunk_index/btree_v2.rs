@@ -214,6 +214,30 @@ impl Bt2Header {
         pos += 2;
         let depth = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
         pos += 2;
+
+        // Validate the geometry-driving fields, which come straight off disk.
+        // node_size must hold at least the metadata prefix
+        // (H5B2_METADATA_PREFIX_SIZE = 10); record_size must be non-zero; and
+        // depth is capped so the node-info geometry cannot overflow and the
+        // recursive node walk cannot exhaust the stack. A v2 B-tree whose
+        // every node holds the minimum two records still reaches u64 capacity
+        // well before depth 64, so any larger depth signals corruption.
+        if (node_size as u64) < 10 {
+            return Err(FormatError::InvalidData(format!(
+                "v2 B-tree node_size {node_size} is smaller than the metadata prefix"
+            )));
+        }
+        if record_size == 0 {
+            return Err(FormatError::InvalidData(
+                "v2 B-tree record_size must be non-zero".into(),
+            ));
+        }
+        if depth > 64 {
+            return Err(FormatError::InvalidData(format!(
+                "v2 B-tree depth {depth} is implausibly large"
+            )));
+        }
+
         let split_percent = buf[pos];
         pos += 1;
         let merge_percent = buf[pos];
@@ -558,8 +582,11 @@ impl Bt2Geometry {
     const PREFIX: u64 = 10;
 
     pub fn new(node_size: u32, rrec_size: u16, depth: u16, sizeof_addr: u8) -> Self {
+        // Saturating arithmetic throughout: `node_size` and `depth` are
+        // validated by `Bt2Header::decode`, but this stays panic-free even
+        // if constructed directly with degenerate parameters.
         let rrec = rrec_size.max(1) as u64;
-        let leaf_max = (node_size as u64 - Self::PREFIX) / rrec;
+        let leaf_max = (node_size as u64).saturating_sub(Self::PREFIX) / rrec;
         let max_nrec_size = limit_enc_size(leaf_max);
         let mut node_info = vec![Bt2NodeInfo {
             max_nrec: leaf_max,
@@ -575,7 +602,10 @@ impl Bt2Geometry {
             } else {
                 0
             };
-            let cum = (max_nrec + 1) * node_info[d - 1].cum_max_nrec + max_nrec;
+            let cum = max_nrec
+                .saturating_add(1)
+                .saturating_mul(node_info[d - 1].cum_max_nrec)
+                .saturating_add(max_nrec);
             node_info.push(Bt2NodeInfo {
                 max_nrec,
                 cum_max_nrec: cum,
@@ -967,6 +997,63 @@ mod tests {
 
         let decoded = Bt2Header::decode(&encoded, &ctx8()).unwrap();
         assert_eq!(decoded, hdr);
+    }
+
+    /// Re-encode a header buffer's checksum after patching a field, so the
+    /// decoder reaches field validation instead of failing on the checksum.
+    fn rechecksum(buf: &mut [u8]) {
+        let data_end = buf.len() - 4;
+        let cksum = checksum_metadata(&buf[..data_end]);
+        buf[data_end..].copy_from_slice(&cksum.to_le_bytes());
+    }
+
+    #[test]
+    fn header_decode_rejects_malformed_geometry_fields() {
+        // node_size at offset 6..10, record_size at 10..12, depth at 12..14.
+        let make = || {
+            let mut hdr = Bt2Header::new_for_chunks(&ctx8(), 2);
+            hdr.root_node_addr = 0x3000;
+            hdr.encode(&ctx8())
+        };
+
+        // node_size smaller than the metadata prefix.
+        let mut buf = make();
+        buf[6..10].copy_from_slice(&4u32.to_le_bytes());
+        rechecksum(&mut buf);
+        assert!(matches!(
+            Bt2Header::decode(&buf, &ctx8()),
+            Err(FormatError::InvalidData(_))
+        ));
+
+        // record_size zero.
+        let mut buf = make();
+        buf[10..12].copy_from_slice(&0u16.to_le_bytes());
+        rechecksum(&mut buf);
+        assert!(matches!(
+            Bt2Header::decode(&buf, &ctx8()),
+            Err(FormatError::InvalidData(_))
+        ));
+
+        // Implausibly large depth.
+        let mut buf = make();
+        buf[12..14].copy_from_slice(&5000u16.to_le_bytes());
+        rechecksum(&mut buf);
+        assert!(matches!(
+            Bt2Header::decode(&buf, &ctx8()),
+            Err(FormatError::InvalidData(_))
+        ));
+
+        // A well-formed header still decodes.
+        assert!(Bt2Header::decode(&make(), &ctx8()).is_ok());
+    }
+
+    #[test]
+    fn bt2_geometry_is_panic_free_on_degenerate_params() {
+        // node_size below the prefix, zero record size, oversized depth.
+        let _ = Bt2Geometry::new(4, 24, 0, 8);
+        let _ = Bt2Geometry::new(0, 0, 0, 8);
+        let _ = Bt2Geometry::new(4096, 24, 600, 8);
+        let _ = Bt2Geometry::new(u32::MAX, 1, 64, 8);
     }
 
     #[test]
