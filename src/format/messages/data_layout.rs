@@ -97,7 +97,10 @@ pub struct FixedArrayParams {
 impl FixedArrayParams {
     pub fn default_params() -> Self {
         Self {
-            max_dblk_page_nelmts_bits: 0,
+            // libhdf5 rejects 0 here; its default is 10 (1024 elements per
+            // data-block page). Must match the value the fixed-array
+            // header carries.
+            max_dblk_page_nelmts_bits: 10,
         }
     }
 }

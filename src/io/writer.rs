@@ -1436,7 +1436,7 @@ impl Hdf5Writer {
         let mut gcol = GlobalHeapCollection::new();
         let mut obj_indices = Vec::with_capacity(strings.len());
         for s in strings {
-            let idx = gcol.add_object(s.as_bytes().to_vec());
+            let idx = gcol.add_object(s.as_bytes().to_vec())?;
             obj_indices.push(idx);
         }
 
@@ -1513,7 +1513,7 @@ impl Hdf5Writer {
         let mut gcol = GlobalHeapCollection::new();
         let mut obj_indices = Vec::with_capacity(strings.len());
         for s in strings {
-            let idx = gcol.add_object(s.as_bytes().to_vec());
+            let idx = gcol.add_object(s.as_bytes().to_vec())?;
             obj_indices.push(idx);
         }
 
@@ -1692,7 +1692,7 @@ impl Hdf5Writer {
         let mut gcol = GlobalHeapCollection::new();
         let mut obj_indices = Vec::with_capacity(strings.len());
         for s in strings {
-            let idx = gcol.add_object(s.as_bytes().to_vec());
+            let idx = gcol.add_object(s.as_bytes().to_vec())?;
             obj_indices.push(idx);
         }
         let gcol_encoded = gcol.encode(&self.ctx);
@@ -3106,10 +3106,21 @@ mod tests {
     use crate::format::messages::datatype::DatatypeMessage;
     use crate::io::reader::Hdf5Reader;
 
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "rust_hdf5_w_{}_{}_{}.h5",
+            std::process::id(),
+            tag,
+            n
+        ))
+    }
+
     #[test]
     fn create_empty_file() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_empty.h5");
+        let path = temp_path("empty");
 
         let writer = Hdf5Writer::create(&path).unwrap();
         writer.close().unwrap();
@@ -3123,8 +3134,7 @@ mod tests {
 
     #[test]
     fn create_single_dataset() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_single.h5");
+        let path = temp_path("single");
 
         let mut writer = Hdf5Writer::create(&path).unwrap();
         let idx = writer
@@ -3147,8 +3157,7 @@ mod tests {
 
     #[test]
     fn create_multiple_datasets() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_multi.h5");
+        let path = temp_path("multi");
 
         let mut writer = Hdf5Writer::create(&path).unwrap();
 
@@ -3186,8 +3195,7 @@ mod tests {
 
     #[test]
     fn data_size_mismatch() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_mismatch.h5");
+        let path = temp_path("mismatch");
 
         let mut writer = Hdf5Writer::create(&path).unwrap();
         let idx = writer
@@ -3201,8 +3209,7 @@ mod tests {
 
     #[test]
     fn create_chunked_dataset_simple() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_chunked_simple.h5");
+        let path = temp_path("chunked_simple");
 
         let mut writer = Hdf5Writer::create(&path).unwrap();
         let idx = writer
@@ -3247,8 +3254,7 @@ mod tests {
 
     #[test]
     fn chunked_dataset_many_frames() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_chunked_many.h5");
+        let path = temp_path("chunked_many");
 
         let mut writer = Hdf5Writer::create(&path).unwrap();
         let idx = writer
@@ -3290,8 +3296,7 @@ mod tests {
 
     #[test]
     fn create_fixed_array_dataset_roundtrip() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_fixed_array.h5");
+        let path = temp_path("fixed_array");
 
         let mut writer = Hdf5Writer::create(&path).unwrap();
         let idx = writer
@@ -3354,8 +3359,7 @@ mod tests {
 
     #[test]
     fn create_btree_v2_dataset_roundtrip() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_btree_v2.h5");
+        let path = temp_path("btree_v2");
 
         let mut writer = Hdf5Writer::create(&path).unwrap();
         let idx = writer
@@ -3421,8 +3425,7 @@ mod tests {
     #[cfg(feature = "parallel")]
     #[test]
     fn parallel_batch_write_roundtrip() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_parallel_batch.h5");
+        let path = temp_path("parallel_batch");
 
         let mut writer = Hdf5Writer::create(&path).unwrap();
         let idx = writer
@@ -3571,8 +3574,7 @@ mod tests {
 
     #[test]
     fn group_hierarchy_writer_reader() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_group_hierarchy.h5");
+        let path = temp_path("group_hierarchy");
 
         let mut writer = Hdf5Writer::create(&path).unwrap();
 

@@ -60,14 +60,18 @@ impl GlobalHeapCollection {
     }
 
     /// Add a data blob to the collection. Returns the 1-based object index.
-    pub fn add_object(&mut self, data: Vec<u8>) -> u16 {
-        let index = if self.objects.is_empty() {
-            1
-        } else {
-            self.objects.iter().map(|o| o.index).max().unwrap_or(0) + 1
-        };
+    pub fn add_object(&mut self, data: Vec<u8>) -> FormatResult<u16> {
+        let max_index = self.objects.iter().map(|o| o.index).max().unwrap_or(0);
+        // Object index 0 is the reserved free-space marker, so the usable
+        // range is 1..=u16::MAX. Refuse to wrap past it.
+        if max_index == u16::MAX {
+            return Err(FormatError::InvalidData(
+                "global heap collection is full (65535 objects)".into(),
+            ));
+        }
+        let index = max_index + 1;
         self.objects.push(GlobalHeapObject { index, data });
-        index
+        Ok(index)
     }
 
     /// Retrieve the data for an object by its 1-based index.
@@ -316,7 +320,7 @@ mod tests {
     #[test]
     fn single_object_roundtrip() {
         let mut coll = GlobalHeapCollection::new();
-        let idx = coll.add_object(b"hello".to_vec());
+        let idx = coll.add_object(b"hello".to_vec()).unwrap();
         assert_eq!(idx, 1);
 
         let encoded = coll.encode(&ctx());
@@ -330,9 +334,9 @@ mod tests {
     #[test]
     fn multiple_objects_roundtrip() {
         let mut coll = GlobalHeapCollection::new();
-        let i1 = coll.add_object(b"alpha".to_vec());
-        let i2 = coll.add_object(b"beta".to_vec());
-        let i3 = coll.add_object(b"gamma delta".to_vec());
+        let i1 = coll.add_object(b"alpha".to_vec()).unwrap();
+        let i2 = coll.add_object(b"beta".to_vec()).unwrap();
+        let i3 = coll.add_object(b"gamma delta".to_vec()).unwrap();
         assert_eq!(i1, 1);
         assert_eq!(i2, 2);
         assert_eq!(i3, 3);
@@ -417,7 +421,7 @@ mod tests {
     fn ctx4_roundtrip() {
         let c = ctx4();
         let mut coll = GlobalHeapCollection::new();
-        coll.add_object(b"test data".to_vec());
+        coll.add_object(b"test data".to_vec()).unwrap();
         let encoded = coll.encode(&c);
         let (decoded, consumed) = GlobalHeapCollection::decode(&encoded, &c).unwrap();
         assert_eq!(consumed, encoded.len());
@@ -428,9 +432,10 @@ mod tests {
     fn object_data_alignment() {
         // Verify that data of odd sizes still roundtrips correctly due to padding
         let mut coll = GlobalHeapCollection::new();
-        coll.add_object(vec![1]); // 1 byte -> padded to 8
-        coll.add_object(vec![2, 3, 4, 5, 6, 7, 8, 9, 10]); // 9 bytes -> padded to 16
-        coll.add_object(vec![11, 12, 13, 14, 15, 16, 17, 18]); // 8 bytes -> stays 8
+        coll.add_object(vec![1]).unwrap(); // 1 byte -> padded to 8
+        coll.add_object(vec![2, 3, 4, 5, 6, 7, 8, 9, 10]).unwrap(); // 9 bytes -> padded to 16
+        coll.add_object(vec![11, 12, 13, 14, 15, 16, 17, 18])
+            .unwrap(); // 8 bytes -> stays 8
 
         let encoded = coll.encode(&ctx());
         let (decoded, _) = GlobalHeapCollection::decode(&encoded, &ctx()).unwrap();
@@ -448,7 +453,7 @@ mod tests {
     #[test]
     fn empty_data_object() {
         let mut coll = GlobalHeapCollection::new();
-        coll.add_object(vec![]);
+        coll.add_object(vec![]).unwrap();
         let encoded = coll.encode(&ctx());
         let (decoded, _) = GlobalHeapCollection::decode(&encoded, &ctx()).unwrap();
         assert_eq!(decoded.get_object(1), Some([].as_slice()));
