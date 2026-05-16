@@ -842,7 +842,7 @@ impl ExtensibleArrayDataBlock {
 
 // ========================================================================= helpers
 
-fn read_addr(buf: &[u8], n: usize) -> u64 {
+pub(crate) fn read_addr(buf: &[u8], n: usize) -> u64 {
     if buf[..n].iter().all(|&b| b == 0xFF) {
         UNDEF_ADDR
     } else {
@@ -994,6 +994,38 @@ impl EaGeometry {
         log2_floor(e / self.data_blk_min_elmts + 1) as usize
     }
 
+    /// Whether super block `u`'s data blocks are paged (data block larger
+    /// than one page).
+    pub fn is_sblk_paged(&self, u: usize) -> bool {
+        self.sblk[u].dblk_nelmts > self.dblk_page_nelmts
+    }
+
+    /// Number of pages in each data block of super block `u`.
+    pub fn npages(&self, u: usize) -> u64 {
+        if self.is_sblk_paged(u) {
+            self.sblk[u].dblk_nelmts / self.dblk_page_nelmts
+        } else {
+            0
+        }
+    }
+
+    /// Size of the page-init bitmap for one data block of super block `u`.
+    pub fn dblk_page_init_size(&self, u: usize) -> usize {
+        (self.npages(u) as usize).div_ceil(8)
+    }
+
+    /// On-disk size of one data block page (`H5EA_DBLK_PAGE_SIZE`).
+    pub fn dblk_page_size(&self, raw_elmt_size: usize) -> usize {
+        self.dblk_page_nelmts as usize * raw_elmt_size + 4
+    }
+
+    /// On-disk size of a data block prefix (`H5EA_DBLOCK_PREFIX_SIZE`):
+    /// magic + version + class + header addr + block offset + checksum.
+    pub fn dblk_prefix_size(&self, sizeof_addr: u8, max_nelmts_bits: u8) -> usize {
+        let arr_off = ExtensibleArrayDataBlock::block_offset_size(max_nelmts_bits);
+        4 + 1 + 1 + sizeof_addr as usize + arr_off + 4
+    }
+
     /// Locate chunk `idx` within the array.
     pub fn locate(&self, idx: u64) -> EaLoc {
         if idx < self.idx_blk_elmts {
@@ -1047,6 +1079,7 @@ impl EaGeometry {
 /// "EASB"(4) + version(1) + class_id(1)
 /// + header_addr(sizeof_addr)
 /// + block_offset(arr_off_size)
+/// + [page-init bitmaps: ndblks * dblk_page_init_size — only if data blocks paged]
 /// + data_block_addresses(ndblks * sizeof_addr)
 /// + checksum(4)
 /// ```
@@ -1056,36 +1089,34 @@ pub struct ExtensibleArraySuperBlock {
     pub header_addr: u64,
     pub block_offset: u64,
     pub dblk_addrs: Vec<u64>,
+    /// Page-init bitmaps (`ndblks * dblk_page_init_size` bytes); empty when
+    /// the super block's data blocks are not paged.
+    pub page_init: Vec<u8>,
 }
 
 impl ExtensibleArraySuperBlock {
-    /// Create an empty super block with `ndblks` undefined data-block slots.
+    /// Create an empty (non-paged) super block with `ndblks` undefined slots.
     pub fn new(class_id: u8, header_addr: u64, block_offset: u64, ndblks: usize) -> Self {
         Self {
             class_id,
             header_addr,
             block_offset,
             dblk_addrs: vec![UNDEF_ADDR; ndblks],
+            page_init: Vec::new(),
         }
-    }
-
-    /// Encoded size for `ndblks` data-block slots.
-    pub fn encoded_size(ctx: &FormatContext, max_nelmts_bits: u8, ndblks: usize) -> usize {
-        let sa = ctx.sizeof_addr as usize;
-        let bo = ExtensibleArrayDataBlock::block_offset_size(max_nelmts_bits);
-        4 + 1 + 1 + sa + bo + ndblks * sa + 4
     }
 
     pub fn encode(&self, ctx: &FormatContext, max_nelmts_bits: u8) -> Vec<u8> {
         let sa = ctx.sizeof_addr as usize;
         let bo = ExtensibleArrayDataBlock::block_offset_size(max_nelmts_bits);
-        let size = Self::encoded_size(ctx, max_nelmts_bits, self.dblk_addrs.len());
+        let size = 4 + 1 + 1 + sa + bo + self.page_init.len() + self.dblk_addrs.len() * sa + 4;
         let mut buf = Vec::with_capacity(size);
         buf.extend_from_slice(&EASB_SIGNATURE);
         buf.push(EA_VERSION);
         buf.push(self.class_id);
         buf.extend_from_slice(&self.header_addr.to_le_bytes()[..sa]);
         buf.extend_from_slice(&self.block_offset.to_le_bytes()[..bo]);
+        buf.extend_from_slice(&self.page_init);
         for &a in &self.dblk_addrs {
             buf.extend_from_slice(&a.to_le_bytes()[..sa]);
         }
@@ -1095,15 +1126,19 @@ impl ExtensibleArraySuperBlock {
         buf
     }
 
+    /// Decode a super block. `page_init_total` is the total size of the
+    /// page-init bitmap region (`ndblks * dblk_page_init_size`); pass 0 when
+    /// the super block's data blocks are not paged.
     pub fn decode(
         buf: &[u8],
         ctx: &FormatContext,
         max_nelmts_bits: u8,
         ndblks: usize,
+        page_init_total: usize,
     ) -> FormatResult<Self> {
         let sa = ctx.sizeof_addr as usize;
         let bo = ExtensibleArrayDataBlock::block_offset_size(max_nelmts_bits);
-        let min_size = 4 + 1 + 1 + sa + bo + ndblks * sa + 4;
+        let min_size = 4 + 1 + 1 + sa + bo + page_init_total + ndblks * sa + 4;
         if buf.len() < min_size {
             return Err(FormatError::BufferTooShort {
                 needed: min_size,
@@ -1136,6 +1171,8 @@ impl ExtensibleArraySuperBlock {
         pos += sa;
         let block_offset = read_size(&buf[pos..], bo);
         pos += bo;
+        let page_init = buf[pos..pos + page_init_total].to_vec();
+        pos += page_init_total;
         let mut dblk_addrs = Vec::with_capacity(ndblks);
         for _ in 0..ndblks {
             dblk_addrs.push(read_addr(&buf[pos..], sa));
@@ -1146,6 +1183,7 @@ impl ExtensibleArraySuperBlock {
             header_addr,
             block_offset,
             dblk_addrs,
+            page_init,
         })
     }
 }

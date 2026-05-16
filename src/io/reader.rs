@@ -1394,38 +1394,93 @@ impl Hdf5Reader {
         };
 
         // Walk super blocks in order, collecting each data block's entries.
+        let sa = self.ctx.sizeof_addr as usize;
+        let raw_elmt_size = if is_filtered {
+            ea::FilteredChunkEntry::raw_size(self.ctx.sizeof_addr, chunk_size_len) as usize
+        } else {
+            sa
+        };
         'outer: for (u, s) in geo.sblk.iter().enumerate() {
             if entries.len() >= chunks_dim0 {
                 break;
             }
             let dblk_nelmts = s.dblk_nelmts as usize;
-            // Addresses of this super block's data blocks.
-            let this_dblk_addrs: Vec<u64> = if u < geo.iblock_nsblks {
+            let paged = geo.is_sblk_paged(u);
+
+            // This super block's data-block addresses, plus its page-init
+            // bitmap region (empty unless the super block is paged).
+            let (this_dblk_addrs, page_init): (Vec<u64>, Vec<u8>) = if u < geo.iblock_nsblks {
                 let start = s.start_dblk as usize;
-                (0..s.ndblks as usize)
-                    .map(|d| dblk_addrs.get(start + d).copied().unwrap_or(UNDEF_ADDR))
-                    .collect()
+                (
+                    (0..s.ndblks as usize)
+                        .map(|d| dblk_addrs.get(start + d).copied().unwrap_or(UNDEF_ADDR))
+                        .collect(),
+                    Vec::new(),
+                )
             } else {
                 let sblk_addr = sblk_addrs
                     .get(u - geo.iblock_nsblks)
                     .copied()
                     .unwrap_or(UNDEF_ADDR);
                 if sblk_addr == UNDEF_ADDR {
-                    vec![UNDEF_ADDR; s.ndblks as usize]
+                    (vec![UNDEF_ADDR; s.ndblks as usize], Vec::new())
                 } else {
                     let buf = self.handle.read_at_most(sblk_addr, 65536)?;
-                    ExtensibleArraySuperBlock::decode(
+                    let page_init_total = if paged {
+                        s.ndblks as usize * geo.dblk_page_init_size(u)
+                    } else {
+                        0
+                    };
+                    let sb = ExtensibleArraySuperBlock::decode(
                         &buf,
                         &self.ctx,
                         max_nelmts_bits,
                         s.ndblks as usize,
-                    )?
-                    .dblk_addrs
+                        page_init_total,
+                    )?;
+                    (sb.dblk_addrs, sb.page_init)
                 }
             };
-            for &dblk_addr in &this_dblk_addrs {
+
+            let pis = geo.dblk_page_init_size(u);
+            let npages = geo.npages(u) as usize;
+            let page_size = geo.dblk_page_size(raw_elmt_size);
+            let prefix = geo.dblk_prefix_size(self.ctx.sizeof_addr, max_nelmts_bits);
+
+            for (d, &dblk_addr) in this_dblk_addrs.iter().enumerate() {
                 if dblk_addr == UNDEF_ADDR {
                     entries.extend(std::iter::repeat_n((UNDEF_ADDR, 0), dblk_nelmts));
+                } else if paged {
+                    // Paged data block: only a prefix lives at `dblk_addr`;
+                    // the elements live in `npages` page structures that
+                    // follow it on disk.
+                    let bitmap = &page_init[d * pis..(d + 1) * pis];
+                    for p in 0..npages {
+                        // libhdf5 page-init bitmaps are MSB-first (H5VM bit ops).
+                        let initialized = bitmap[p / 8] & (0x80u8 >> (p % 8)) != 0;
+                        if !initialized {
+                            entries.extend(std::iter::repeat_n(
+                                (UNDEF_ADDR, 0),
+                                geo.dblk_page_nelmts as usize,
+                            ));
+                            continue;
+                        }
+                        let page_addr = dblk_addr + prefix as u64 + (p as u64) * page_size as u64;
+                        let page = self.handle.read_at(page_addr, page_size)?;
+                        for k in 0..geo.dblk_page_nelmts as usize {
+                            let off = k * raw_elmt_size;
+                            if is_filtered {
+                                let e = ea::FilteredChunkEntry::decode(
+                                    &page[off..],
+                                    sa,
+                                    chunk_size_len as usize,
+                                );
+                                entries.push((e.addr, e.nbytes));
+                            } else {
+                                entries.push((read_addr(&page[off..], sa), chunk_bytes));
+                            }
+                        }
+                    }
                 } else if is_filtered {
                     let buf = self.handle.read_at_most(dblk_addr, 65536)?;
                     let dblk = ea::FilteredDataBlock::decode(

@@ -1146,11 +1146,14 @@ impl Hdf5Writer {
                         c.ea_header.size_sblks_created += enc.len() as u64;
                     }
                     let sb_buf = self.handle.read_at_most(sblk_addr, 65536)?;
+                    // The writer never creates paged super blocks (it errors
+                    // before the paging threshold), so page_init_total is 0.
                     let sb = ExtensibleArraySuperBlock::decode(
                         &sb_buf,
                         &self.ctx,
                         max_nelmts_bits,
                         ndblks_in_sblk,
+                        0,
                     )?;
                     dblk_addr = sb.dblk_addrs[local_dblk];
                     parent = DblkParent::SuperBlock {
@@ -1238,6 +1241,7 @@ impl Hdf5Writer {
                             &self.ctx,
                             max_nelmts_bits,
                             ndblks_in_sblk,
+                            0,
                         )?;
                         sb.dblk_addrs[local_dblk] = dblk_addr;
                         let enc = sb.encode(&self.ctx, max_nelmts_bits);
