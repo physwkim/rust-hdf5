@@ -192,6 +192,12 @@ impl FilterPipeline {
         }
 
         let nfilters = buf[1] as usize;
+        // libhdf5 caps a pipeline at H5Z_MAX_NFILTERS (32).
+        if nfilters > 32 {
+            return Err(FormatError::InvalidData(format!(
+                "filter pipeline declares {nfilters} filters (max 32)"
+            )));
+        }
         let mut pos = 2;
 
         // Version 1 carries 6 reserved bytes after the filter count.
@@ -230,6 +236,13 @@ impl FilterPipeline {
                 }
                 let n = u16::from_le_bytes([buf[pos], buf[pos + 1]]) as usize;
                 pos += 2;
+                // libhdf5 (H5Opline.c) requires a version-1 filter name
+                // length to be a multiple of 8.
+                if version == 1 && !n.is_multiple_of(8) {
+                    return Err(FormatError::InvalidData(format!(
+                        "version-1 filter name length {n} is not a multiple of 8"
+                    )));
+                }
                 n
             } else {
                 0
