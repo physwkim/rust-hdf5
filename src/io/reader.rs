@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use crate::format::btree_v1::{BTreeV1Node, ChunkBTreeV1Node};
+use crate::format::bytes::read_le_uint as read_uint;
 use crate::format::fractal_heap::{self, BlockReader, FractalHeapHeader};
 use crate::format::global_heap::{
     decode_vlen_reference, vlen_reference_size, GlobalHeapCollection,
@@ -1915,9 +1916,7 @@ impl Hdf5Reader {
                     strings.push(String::new());
                     continue;
                 }
-                let mut size_bytes = [0u8; 8];
-                size_bytes[..ss].copy_from_slice(&header_buf[8..8 + ss]);
-                let collection_size = u64::from_le_bytes(size_bytes) as usize;
+                let collection_size = read_uint(&header_buf[8..], ss) as usize;
 
                 if collection_size == 0 || collection_size > 64 * 1024 * 1024 {
                     strings.push(String::new());
@@ -2469,13 +2468,6 @@ fn compute_strides(dims: &[u64], element_size: u64) -> Vec<u64> {
         strides[d] = strides[d + 1] * dims[d + 1];
     }
     strides
-}
-
-/// Read a little-endian unsigned integer of `n` bytes into a u64.
-fn read_uint(buf: &[u8], n: usize) -> u64 {
-    let mut tmp = [0u8; 8];
-    tmp[..n].copy_from_slice(&buf[..n]);
-    u64::from_le_bytes(tmp)
 }
 
 /// Adapts a `FileHandle` to the `BlockReader` trait used by the fractal-heap

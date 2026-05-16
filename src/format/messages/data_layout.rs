@@ -28,6 +28,7 @@
 //!   + [for earray: 5 param bytes]
 //!   + index_address(sizeof_addr)
 
+use crate::format::bytes::{read_le_addr as read_addr, read_le_uint as read_size};
 use crate::format::{FormatContext, FormatError, FormatResult, UNDEF_ADDR};
 
 const VERSION_3: u8 = 3;
@@ -640,24 +641,6 @@ impl DataLayoutMessage {
 }
 
 // ========================================================================= helpers
-
-/// Read a little-endian address of `n` bytes, mapping all-ones to `UNDEF_ADDR`.
-fn read_addr(buf: &[u8], n: usize) -> u64 {
-    if buf[..n].iter().all(|&b| b == 0xFF) {
-        UNDEF_ADDR
-    } else {
-        let mut tmp = [0u8; 8];
-        tmp[..n].copy_from_slice(&buf[..n]);
-        u64::from_le_bytes(tmp)
-    }
-}
-
-/// Read a little-endian size of `n` bytes.
-fn read_size(buf: &[u8], n: usize) -> u64 {
-    let mut tmp = [0u8; 8];
-    tmp[..n].copy_from_slice(&buf[..n]);
-    u64::from_le_bytes(tmp)
-}
 
 /// Compute the minimum number of bytes (1-8) needed to encode `v`.
 fn enc_bytes_for_value(v: u64) -> u8 {

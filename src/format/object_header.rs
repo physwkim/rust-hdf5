@@ -245,9 +245,8 @@ impl ObjectHeader {
             });
         }
 
-        let mut size_bytes = [0u8; 8];
-        size_bytes[..chunk0_size_bytes].copy_from_slice(&buf[pos..pos + chunk0_size_bytes]);
-        let chunk0_data_size = u64::from_le_bytes(size_bytes) as usize;
+        let chunk0_data_size =
+            crate::format::bytes::read_le_uint(&buf[pos..], chunk0_size_bytes) as usize;
         pos += chunk0_size_bytes;
 
         // We need chunk0_data_size bytes of messages + 4 bytes of checksum

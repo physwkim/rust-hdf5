@@ -14,6 +14,7 @@
 //! data_addr: sizeof_addr bytes LE
 //! ```
 
+use crate::format::bytes::read_le_uint as read_uint;
 use crate::format::{FormatError, FormatResult};
 
 /// The 4-byte local heap signature.
@@ -94,13 +95,6 @@ pub fn local_heap_get_string(heap_data: &[u8], offset: u64) -> FormatResult<Stri
 
     String::from_utf8(heap_data[start..end].to_vec())
         .map_err(|e| FormatError::InvalidData(format!("invalid UTF-8 in local heap string: {}", e)))
-}
-
-/// Read a little-endian unsigned integer of `n` bytes into a u64.
-fn read_uint(buf: &[u8], n: usize) -> u64 {
-    let mut tmp = [0u8; 8];
-    tmp[..n].copy_from_slice(&buf[..n]);
-    u64::from_le_bytes(tmp)
 }
 
 // ======================================================================= tests

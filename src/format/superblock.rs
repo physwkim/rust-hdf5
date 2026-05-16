@@ -202,10 +202,9 @@ fn validate_sizeof(sizeof_offsets: u8, sizeof_lengths: u8) -> FormatResult<()> {
 /// Decode a little-endian address of `size` bytes from `buf` at `*pos`,
 /// advancing `*pos` past the consumed bytes.
 fn decode_offset(buf: &[u8], pos: &mut usize, size: usize) -> u64 {
-    let mut bytes = [0u8; 8];
-    bytes[..size].copy_from_slice(&buf[*pos..*pos + size]);
+    let v = crate::format::bytes::read_le_uint(&buf[*pos..], size);
     *pos += size;
-    u64::from_le_bytes(bytes)
+    v
 }
 
 #[cfg(test)]

@@ -8,6 +8,8 @@
 //!   - Index Block (EAIB): holds direct chunk addresses and pointers to data/super blocks
 //!   - Data Block (EADB): holds additional chunk addresses when the index block is full
 
+pub(crate) use crate::format::bytes::read_le_addr as read_addr;
+use crate::format::bytes::read_le_uint as read_size;
 use crate::format::checksum::checksum_metadata;
 use crate::format::{FormatContext, FormatError, FormatResult, UNDEF_ADDR};
 
@@ -843,22 +845,6 @@ impl ExtensibleArrayDataBlock {
 }
 
 // ========================================================================= helpers
-
-pub(crate) fn read_addr(buf: &[u8], n: usize) -> u64 {
-    if buf[..n].iter().all(|&b| b == 0xFF) {
-        UNDEF_ADDR
-    } else {
-        let mut tmp = [0u8; 8];
-        tmp[..n].copy_from_slice(&buf[..n]);
-        u64::from_le_bytes(tmp)
-    }
-}
-
-fn read_size(buf: &[u8], n: usize) -> u64 {
-    let mut tmp = [0u8; 8];
-    tmp[..n].copy_from_slice(&buf[..n]);
-    u64::from_le_bytes(tmp)
-}
 
 /// Compute ndblk_addrs for the index block given the creation params.
 ///
