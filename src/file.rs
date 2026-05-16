@@ -1654,6 +1654,9 @@ mod integration_tests {
 mod h5py_compat_tests {
     use super::*;
 
+    // Only the deflate-gated h5dump test creates files; without that
+    // feature this helper has no callers.
+    #[cfg(feature = "deflate")]
     fn temp_path(name: &str) -> std::path::PathBuf {
         super::unique_test_path(name)
     }

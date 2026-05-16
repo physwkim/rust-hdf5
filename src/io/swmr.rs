@@ -75,6 +75,35 @@ impl SwmrWriter {
             .create_chunked_dataset(name, datatype, &dims, &max_dims, &chunk_dims)
     }
 
+    /// Create a streaming dataset whose frames are split into fixed-size
+    /// chunk tiles.
+    ///
+    /// `frame_dims` is the per-frame shape (e.g. `[1024, 1024]`);
+    /// `frame_chunk` is the tile shape within a frame (e.g. `[256, 256]`),
+    /// of the same rank. The dataset chunk shape becomes
+    /// `[1, frame_chunk...]`. This is the equivalent of an area-detector
+    /// writer's tiling controls (NDFileHDF5 `nRowChunks` / `nColChunks`):
+    /// it changes the partial-read granularity and compression unit, not
+    /// the stored data.
+    pub fn create_streaming_dataset_tiled(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        frame_dims: &[u64],
+        frame_chunk: &[u64],
+    ) -> IoResult<usize> {
+        validate_frame_chunk(frame_dims, frame_chunk)?;
+        let mut dims = vec![0u64];
+        dims.extend_from_slice(frame_dims);
+        let mut max_dims = vec![u64::MAX];
+        max_dims.extend_from_slice(frame_dims);
+        let mut chunk_dims = vec![1u64];
+        chunk_dims.extend_from_slice(frame_chunk);
+
+        self.writer
+            .create_chunked_dataset(name, datatype, &dims, &max_dims, &chunk_dims)
+    }
+
     /// Create a streaming dataset whose frames are compressed with the given
     /// filter pipeline.
     pub fn create_streaming_dataset_compressed(
@@ -90,6 +119,37 @@ impl SwmrWriter {
         max_dims.extend_from_slice(frame_dims);
         let mut chunk_dims = vec![1u64];
         chunk_dims.extend_from_slice(frame_dims);
+
+        self.writer.create_chunked_dataset_with_pipeline(
+            name,
+            datatype,
+            &dims,
+            &max_dims,
+            &chunk_dims,
+            pipeline,
+        )
+    }
+
+    /// Create a compressed streaming dataset whose frames are split into
+    /// fixed-size chunk tiles. See [`create_streaming_dataset_tiled`] for
+    /// the meaning of `frame_chunk`; each tile is the compression unit.
+    ///
+    /// [`create_streaming_dataset_tiled`]: Self::create_streaming_dataset_tiled
+    pub fn create_streaming_dataset_tiled_compressed(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        frame_dims: &[u64],
+        frame_chunk: &[u64],
+        pipeline: crate::format::messages::filter::FilterPipeline,
+    ) -> IoResult<usize> {
+        validate_frame_chunk(frame_dims, frame_chunk)?;
+        let mut dims = vec![0u64];
+        dims.extend_from_slice(frame_dims);
+        let mut max_dims = vec![u64::MAX];
+        max_dims.extend_from_slice(frame_dims);
+        let mut chunk_dims = vec![1u64];
+        chunk_dims.extend_from_slice(frame_chunk);
 
         self.writer.create_chunked_dataset_with_pipeline(
             name,
@@ -123,15 +183,59 @@ impl SwmrWriter {
     /// Append a frame of data to a streaming dataset.
     ///
     /// This writes the chunk data, updates the extensible array index,
-    /// and extends the dataset dimensions.
+    /// and extends the dataset dimensions. For a tiled streaming dataset
+    /// (created via [`create_streaming_dataset_tiled`]) the frame buffer is
+    /// split into its chunk tiles, each written as a separate chunk; for a
+    /// one-chunk-per-frame dataset the frame is written as a single chunk.
+    ///
+    /// [`create_streaming_dataset_tiled`]: Self::create_streaming_dataset_tiled
     pub fn append_frame(&mut self, ds_index: usize, data: &[u8]) -> IoResult<()> {
-        // Get current frame count (dim 0)
-        let frame_idx = { self.writer.datasets[ds_index].dataspace.dims[0] };
+        // Current frame count (dim 0).
+        let frame_idx = self.writer.datasets[ds_index].dataspace.dims[0];
 
-        // 1. Write chunk data
-        self.writer.write_chunk(ds_index, frame_idx, data)?;
+        let dims = self.writer.dataset_dims(ds_index).to_vec();
+        let chunk_dims = self
+            .writer
+            .dataset_chunk_dims(ds_index)
+            .ok_or_else(|| {
+                crate::io::IoError::InvalidState("append_frame requires a chunked dataset".into())
+            })?
+            .to_vec();
 
-        // 2. Extend dimensions
+        // Number of chunk tiles per frame: the product over the spatial
+        // dimensions of the chunk grid.
+        let mut tiles_per_frame = 1u64;
+        for d in 1..dims.len() {
+            let cd = chunk_dims[d].max(1);
+            tiles_per_frame *= dims[d].div_ceil(cd);
+        }
+
+        // 1. Write the chunk data.
+        if tiles_per_frame <= 1 {
+            // One chunk == one frame.
+            self.writer.write_chunk(ds_index, frame_idx, data)?;
+        } else {
+            // Sub-frame tiling: split the row-major frame buffer into its
+            // chunk tiles and write each as a separate chunk. The linear
+            // chunk index is row-major over the whole chunk grid, so the
+            // tiles of frame `f` occupy `f * tiles_per_frame ..` .
+            let elem_size = self.writer.datasets[ds_index].datatype.element_size() as usize;
+            let frame_elems: u64 = dims[1..].iter().product();
+            let expected = frame_elems as usize * elem_size;
+            if data.len() != expected {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "append_frame: data is {} bytes, expected {expected} for one frame",
+                    data.len()
+                )));
+            }
+            let tiles = split_frame_into_tiles(data, &dims[1..], &chunk_dims[1..], elem_size);
+            let base = frame_idx * tiles_per_frame;
+            for (i, tile) in tiles.iter().enumerate() {
+                self.writer.write_chunk(ds_index, base + i as u64, tile)?;
+            }
+        }
+
+        // 2. Extend dimensions.
         let mut new_dims = self.writer.datasets[ds_index].dataspace.dims.clone();
         new_dims[0] = frame_idx + 1;
         self.writer.extend_dataset(ds_index, &new_dims)?;
@@ -181,4 +285,91 @@ impl SwmrWriter {
     pub fn close(self) -> IoResult<()> {
         self.writer.close()
     }
+}
+
+/// Reject a `frame_chunk` whose rank does not match `frame_dims`, or that
+/// has a zero dimension.
+fn validate_frame_chunk(frame_dims: &[u64], frame_chunk: &[u64]) -> IoResult<()> {
+    if frame_chunk.len() != frame_dims.len() {
+        return Err(crate::io::IoError::InvalidState(format!(
+            "frame_chunk rank {} does not match frame_dims rank {}",
+            frame_chunk.len(),
+            frame_dims.len()
+        )));
+    }
+    if frame_chunk.contains(&0) {
+        return Err(crate::io::IoError::InvalidState(
+            "frame_chunk dimensions must be non-zero".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Row-major linear element offset of `coords` within an array of `dims`.
+fn lin_offset(coords: &[u64], dims: &[u64]) -> u64 {
+    let mut off = 0u64;
+    for d in 0..dims.len() {
+        off = off * dims[d] + coords[d];
+    }
+    off
+}
+
+/// Split a row-major frame buffer into its chunk tiles, in row-major chunk
+/// grid order. A frame dimension that is not a whole multiple of the tile
+/// dimension produces partial edge tiles, which are zero-padded to a full
+/// tile (HDF5 chunks are fixed-size; the dataset extent clips them on read).
+fn split_frame_into_tiles(
+    frame: &[u8],
+    frame_dims: &[u64],
+    tile_dims: &[u64],
+    elem_size: usize,
+) -> Vec<Vec<u8>> {
+    let k = frame_dims.len();
+    let grid: Vec<u64> = (0..k)
+        .map(|d| frame_dims[d].div_ceil(tile_dims[d].max(1)))
+        .collect();
+    let n_tiles: u64 = grid.iter().product();
+    let tile_elems: u64 = tile_dims.iter().product();
+    // Number of "rows" within a tile: every axis but the last.
+    let last = k - 1;
+    let tile_rows: u64 = tile_dims[..last].iter().product();
+    let run = tile_dims[last] as usize; // contiguous run length along the last axis
+
+    let mut tiles = Vec::with_capacity(n_tiles as usize);
+    for t in 0..n_tiles {
+        // Grid coordinates of tile `t`.
+        let mut tg = vec![0u64; k];
+        let mut rem = t;
+        for d in (0..k).rev() {
+            tg[d] = rem % grid[d];
+            rem /= grid[d];
+        }
+        let mut tile = vec![0u8; tile_elems as usize * elem_size];
+        for row in 0..tile_rows {
+            // Within-tile coordinates for axes 0..last.
+            let mut src = vec![0u64; k];
+            let mut r = row;
+            let mut oob = false;
+            for d in (0..last).rev() {
+                let tc = r % tile_dims[d];
+                r /= tile_dims[d];
+                src[d] = tg[d] * tile_dims[d] + tc;
+                if src[d] >= frame_dims[d] {
+                    oob = true;
+                }
+            }
+            let last_base = tg[last] * tile_dims[last];
+            if oob || last_base >= frame_dims[last] {
+                continue;
+            }
+            src[last] = last_base;
+            let copy = run.min((frame_dims[last] - last_base) as usize);
+            let src_off = lin_offset(&src, frame_dims) as usize * elem_size;
+            let dst_off = row as usize * run * elem_size;
+            tile[dst_off..dst_off + copy * elem_size]
+                .copy_from_slice(&frame[src_off..src_off + copy * elem_size]);
+        }
+        tiles.push(tile);
+    }
+    tiles
 }

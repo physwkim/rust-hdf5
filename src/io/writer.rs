@@ -274,6 +274,40 @@ pub struct GroupInfo {
     pub attributes: Vec<AttributeMessage>,
 }
 
+/// The object a [`HardLink`] resolves to.
+#[derive(Clone, Copy)]
+pub enum HardLinkTarget {
+    /// Index into the writer's `datasets` vec.
+    Dataset(usize),
+    /// Index into the writer's `groups` vec.
+    Group(usize),
+}
+
+/// A user-created hard link: an additional name, in some group, for an
+/// object that already exists under its own name.
+///
+/// The HDF5 file format makes every group entry a `name -> object header
+/// address` mapping, so a hard link is just a second such entry pointing at
+/// an already-written object. No data is copied.
+pub struct HardLink {
+    /// Parent group index (`None` = the root group).
+    pub parent: Option<usize>,
+    /// Leaf name of the link within the parent group.
+    pub name: String,
+    /// Object this link resolves to.
+    pub target: HardLinkTarget,
+}
+
+/// Encode an Object Reference Count message (type 0x16) body: a version
+/// byte (`H5O_REFCOUNT_VERSION` = 0) followed by the little-endian u32
+/// count. Emitted on objects reached by more than one hard link.
+fn encode_refcount(refcount: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(5);
+    v.push(0u8);
+    v.extend_from_slice(&refcount.to_le_bytes());
+    v
+}
+
 /// HDF5 file writer.
 ///
 /// Usage:
@@ -287,6 +321,9 @@ pub struct Hdf5Writer {
     ctx: FormatContext,
     pub(crate) datasets: Vec<DatasetInfo>,
     pub(crate) groups: Vec<GroupInfo>,
+    /// User-created hard links (additional names for existing objects),
+    /// resolved and emitted during finalize.
+    pub(crate) hard_links: Vec<HardLink>,
     /// Attributes attached to the root group (file-level attributes).
     pub(crate) root_attributes: Vec<crate::format::messages::attribute::AttributeMessage>,
     closed: bool,
@@ -339,6 +376,7 @@ impl Hdf5Writer {
             ctx,
             datasets: Vec::new(),
             groups: Vec::new(),
+            hard_links: Vec::new(),
             root_attributes: Vec::new(),
             closed: false,
             root_group_addr: None,
@@ -728,6 +766,7 @@ impl Hdf5Writer {
             ctx,
             datasets: existing_datasets,
             groups,
+            hard_links: Vec::new(),
             root_attributes,
             closed: false,
             root_group_addr: None,
@@ -977,6 +1016,153 @@ impl Hdf5Writer {
             })?;
         self.groups[group_idx].child_datasets.push(ds_index);
         Ok(())
+    }
+
+    /// Create a hard link: an additional name for an object that already
+    /// exists in the file.
+    ///
+    /// No data is copied — the link and its target share one object header,
+    /// exactly as `h5py` / libhdf5 hard links do.
+    ///
+    /// * `parent_group_path` — full path of the group that will hold the
+    ///   link (`"/"` for the root group).
+    /// * `link_name` — leaf name of the new link within that group.
+    /// * `target_path` — full path of an existing dataset or group, with or
+    ///   without a leading `/`.
+    pub fn create_hard_link(
+        &mut self,
+        parent_group_path: &str,
+        link_name: &str,
+        target_path: &str,
+    ) -> IoResult<()> {
+        if link_name.is_empty() || link_name.contains('/') {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "hard link name '{link_name}' must be a non-empty leaf name"
+            )));
+        }
+
+        // Resolve the parent group (None == root).
+        let parent = if parent_group_path == "/" {
+            None
+        } else {
+            Some(
+                self.groups
+                    .iter()
+                    .position(|g| g.name == parent_group_path && !g.deleted)
+                    .ok_or_else(|| {
+                        crate::io::IoError::NotFound(format!(
+                            "parent group '{parent_group_path}' not found"
+                        ))
+                    })?,
+            )
+        };
+
+        // Resolve the target. Dataset names are stored without a leading
+        // '/', group names with one — compare on the trimmed form.
+        let target_rel = target_path.trim_start_matches('/');
+        if target_rel.is_empty() {
+            return Err(crate::io::IoError::InvalidState(
+                "cannot hard-link the root group".into(),
+            ));
+        }
+        let target = if let Some(idx) = self
+            .datasets
+            .iter()
+            .position(|d| !d.deleted && d.name.trim_start_matches('/') == target_rel)
+        {
+            HardLinkTarget::Dataset(idx)
+        } else if let Some(idx) = self
+            .groups
+            .iter()
+            .position(|g| !g.deleted && g.name.trim_start_matches('/') == target_rel)
+        {
+            HardLinkTarget::Group(idx)
+        } else {
+            return Err(crate::io::IoError::NotFound(format!(
+                "hard link target '{target_path}' not found"
+            )));
+        };
+
+        // Reject a name already taken in the parent group.
+        let parent_prefix = match parent {
+            None => String::new(),
+            Some(pi) => format!("{}/", self.groups[pi].name.trim_start_matches('/')),
+        };
+        let full = format!("{parent_prefix}{link_name}");
+        let collides = self
+            .datasets
+            .iter()
+            .any(|d| !d.deleted && d.name.trim_start_matches('/') == full)
+            || self
+                .groups
+                .iter()
+                .any(|g| !g.deleted && g.name.trim_start_matches('/') == full)
+            || self
+                .hard_links
+                .iter()
+                .any(|l| l.parent == parent && l.name == link_name);
+        if collides {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "'{full}' already exists in the file"
+            )));
+        }
+
+        self.hard_links.push(HardLink {
+            parent,
+            name: link_name.to_string(),
+            target,
+        });
+        Ok(())
+    }
+
+    /// Whether a hard link will actually be emitted: both its parent group
+    /// and its target object must still be present (not soft-deleted).
+    fn hard_link_emitted(&self, link: &HardLink) -> bool {
+        let parent_ok = match link.parent {
+            None => true,
+            Some(pi) => !self.groups[pi].deleted,
+        };
+        let target_ok = match link.target {
+            HardLinkTarget::Dataset(i) => !self.datasets[i].deleted,
+            HardLinkTarget::Group(i) => !self.groups[i].deleted,
+        };
+        parent_ok && target_ok
+    }
+
+    /// Total number of hard links resolving to an object: its own tree link
+    /// plus every emitted user-created hard link pointing at it.
+    fn object_link_count(&self, target: HardLinkTarget) -> u32 {
+        let same = |a: HardLinkTarget, b: HardLinkTarget| -> bool {
+            matches!(
+                (a, b),
+                (HardLinkTarget::Dataset(x), HardLinkTarget::Dataset(y))
+                    | (HardLinkTarget::Group(x), HardLinkTarget::Group(y))
+                if x == y
+            )
+        };
+        1 + self
+            .hard_links
+            .iter()
+            .filter(|l| self.hard_link_emitted(l) && same(l.target, target))
+            .count() as u32
+    }
+
+    /// Append a `MSG_LINK` message for every user-created hard link whose
+    /// parent group is `parent` (`None` == the root group). Called while
+    /// building group object headers, once every object's header address
+    /// has been assigned.
+    fn emit_hard_links(&self, header: &mut ObjectHeader, parent: Option<usize>) {
+        for link in &self.hard_links {
+            if link.parent != parent || !self.hard_link_emitted(link) {
+                continue;
+            }
+            let addr = match link.target {
+                HardLinkTarget::Dataset(i) => self.datasets[i].obj_header_addr,
+                HardLinkTarget::Group(i) => self.groups[i].obj_header_addr,
+            };
+            let msg = LinkMessage::hard(&link.name, addr);
+            header.add_message(MSG_LINK, 0x00, msg.encode(&self.ctx));
+        }
     }
 
     /// Define a new contiguous dataset. Returns the dataset index (used with
@@ -3050,16 +3236,18 @@ impl Hdf5Writer {
             self.datasets[i].obj_header_encoded_size = encoded_size;
         }
 
-        // 1b. Write group object headers bottom-up.
-        {
-            let order = Self::topological_group_order(&self.groups);
-            for &gi in &order {
-                let grp_header = self.build_group_header(gi);
-                let encoded = grp_header.encode();
-                let addr = self.allocator.allocate(encoded.len() as u64);
-                self.handle.write_at(addr, &encoded)?;
-                self.groups[gi].obj_header_addr = addr;
-            }
+        // 1b. Group object headers. A hard link can point to a group whose
+        // header is written later, so addresses are assigned in a first
+        // pass (a header's encoded size is independent of the address
+        // values it carries) and the content is written in a second.
+        for gi in 0..self.groups.len() {
+            let size = self.build_group_header(gi).encode().len() as u64;
+            self.groups[gi].obj_header_addr = self.allocator.allocate(size);
+        }
+        for gi in 0..self.groups.len() {
+            let encoded = self.build_group_header(gi).encode();
+            self.handle
+                .write_at(self.groups[gi].obj_header_addr, &encoded)?;
         }
 
         // 2. Write root group object header.
@@ -3204,16 +3392,18 @@ impl Hdf5Writer {
             self.datasets[i].obj_header_addr = addr;
         }
 
-        // 1b. Write group object headers bottom-up so child addresses are known.
-        {
-            let order = Self::topological_group_order(&self.groups);
-            for &gi in &order {
-                let grp_header = self.build_group_header(gi);
-                let encoded = grp_header.encode();
-                let addr = self.allocator.allocate(encoded.len() as u64);
-                self.handle.write_at(addr, &encoded)?;
-                self.groups[gi].obj_header_addr = addr;
-            }
+        // 1b. Group object headers. A hard link can point to a group whose
+        // header is written later, so addresses are assigned in a first
+        // pass (a header's encoded size is independent of the address
+        // values it carries) and the content is written in a second.
+        for gi in 0..self.groups.len() {
+            let size = self.build_group_header(gi).encode().len() as u64;
+            self.groups[gi].obj_header_addr = self.allocator.allocate(size);
+        }
+        for gi in 0..self.groups.len() {
+            let encoded = self.build_group_header(gi).encode();
+            self.handle
+                .write_at(self.groups[gi].obj_header_addr, &encoded)?;
         }
 
         // 2. Write root group object header.
@@ -3228,26 +3418,6 @@ impl Hdf5Writer {
 
         self.handle.sync_all()?;
         Ok(())
-    }
-
-    /// Compute a bottom-up ordering of groups so that leaf groups are written
-    /// before their parents. Returns group indices in write order.
-    fn topological_group_order(groups: &[GroupInfo]) -> Vec<usize> {
-        // Compute depth of each group
-        let mut depths: Vec<usize> = vec![0; groups.len()];
-        for (i, grp) in groups.iter().enumerate() {
-            let mut d = 0;
-            let mut cur = grp.parent;
-            while let Some(pidx) = cur {
-                d += 1;
-                cur = groups[pidx].parent;
-            }
-            depths[i] = d;
-        }
-        // Sort by depth descending (deepest first)
-        let mut order: Vec<usize> = (0..groups.len()).collect();
-        order.sort_by(|a, b| depths[*b].cmp(&depths[*a]));
-        order
     }
 
     fn build_dataset_header(&self, index: usize) -> ObjectHeader {
@@ -3327,6 +3497,13 @@ impl Hdf5Writer {
             header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
         }
 
+        // Object Reference Count message (type 0x16): emitted only when
+        // more than one hard link resolves to this dataset.
+        let rc = self.object_link_count(HardLinkTarget::Dataset(index));
+        if rc > 1 {
+            header.add_message(MSG_OBJ_REF_COUNT, 0x00, encode_refcount(rc));
+        }
+
         header
     }
 
@@ -3370,10 +3547,20 @@ impl Hdf5Writer {
             header.add_message(MSG_LINK, 0x00, link_msg);
         }
 
+        // User-created hard links whose parent is this group.
+        self.emit_hard_links(&mut header, Some(group_idx));
+
         // Attribute messages (type 0x0C) -- e.g. NeXus `NX_class`.
         for attr in &grp.attributes {
             let attr_msg = attr.encode(&self.ctx);
             header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
+        }
+
+        // Object Reference Count message: emitted only when this group is
+        // itself a hard-link target reached by more than one link.
+        let rc = self.object_link_count(HardLinkTarget::Group(group_idx));
+        if rc > 1 {
+            header.add_message(MSG_OBJ_REF_COUNT, 0x00, encode_refcount(rc));
         }
 
         header
@@ -3424,6 +3611,9 @@ impl Hdf5Writer {
                 header.add_message(MSG_LINK, 0x00, link_msg);
             }
         }
+
+        // User-created hard links in the root group.
+        self.emit_hard_links(&mut header, None);
 
         // Root-level attributes
         for attr in &self.root_attributes {
@@ -3803,6 +3993,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[cfg(feature = "deflate")]
     #[test]
     fn create_filtered_fixed_array_dataset_roundtrip() {
         // Small compressed fixed-shape chunked dataset: flat filtered FA.
@@ -3857,6 +4048,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[cfg(feature = "deflate")]
     #[test]
     fn create_filtered_fixed_array_paged_dataset_roundtrip() {
         // Large compressed fixed-shape chunked dataset (>1024 chunks): the
@@ -4141,6 +4333,52 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[test]
+    fn swmr_writer_tiled_frames() {
+        use crate::io::swmr::SwmrWriter;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rust_hdf5_swmr_tiled_{}_{}.h5",
+            std::process::id(),
+            n
+        ));
+
+        let mut swmr = SwmrWriter::create(&path).unwrap();
+        // 4x4 frames, tiled into 2x2 chunks -> 4 chunks per frame.
+        let idx = swmr
+            .create_streaming_dataset_tiled("det", DatatypeMessage::u16_type(), &[4, 4], &[2, 2])
+            .unwrap();
+        swmr.start_swmr().unwrap();
+
+        for frame in 0..3u16 {
+            let data: Vec<u16> = (0..16).map(|i| frame * 100 + i).collect();
+            let raw: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            swmr.append_frame(idx, &raw).unwrap();
+        }
+        swmr.flush().unwrap();
+        swmr.close().unwrap();
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        assert_eq!(reader.dataset_shape("det").unwrap(), vec![3, 4, 4]);
+        let raw = reader.read_dataset_raw("det").unwrap();
+        let values: Vec<u16> = raw
+            .chunks(2)
+            .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values.len(), 48);
+        // Every element must survive the frame -> tile split and the
+        // tile -> frame reassembly on read.
+        for frame in 0..3u16 {
+            for i in 0..16usize {
+                assert_eq!(values[frame as usize * 16 + i], frame * 100 + i as u16);
+            }
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "deflate")]
     #[test]
     fn swmr_writer_compressed_frames() {
         use crate::io::swmr::SwmrWriter;

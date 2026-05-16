@@ -1905,7 +1905,7 @@ impl Hdf5Reader {
             let mut scaled = Vec::with_capacity(ndims);
             for d in 0..ndims {
                 let cd = chunk_dims[d];
-                scaled.push(if cd > 0 { offsets[d] / cd } else { 0 });
+                scaled.push(offsets[d].checked_div(cd).unwrap_or(0));
             }
             let data = self.handle.read_at(*addr, *chunk_size as usize)?;
             raw_chunks.push(Some((data, scaled)));

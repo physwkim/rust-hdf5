@@ -92,6 +92,55 @@ impl SwmrFileWriter {
         Ok(idx)
     }
 
+    /// Create a streaming dataset whose frames are split into fixed-size
+    /// chunk tiles.
+    ///
+    /// `frame_dims` is the per-frame shape (e.g. `[1024, 1024]`);
+    /// `frame_chunk` is the tile shape within a frame (e.g. `[256, 256]`),
+    /// of the same rank. The on-disk chunk shape becomes
+    /// `[1, frame_chunk...]`, so each frame is stored as
+    /// `product(frame_dims / frame_chunk)` chunks instead of one. This
+    /// mirrors area-detector tiling controls such as NDFileHDF5's
+    /// `nRowChunks` / `nColChunks`: it changes only the partial-read
+    /// granularity and compression unit, not the stored data.
+    /// [`append_frame`](Self::append_frame) accepts a whole frame and
+    /// splits it into tiles automatically.
+    pub fn create_streaming_dataset_tiled<T: H5Type>(
+        &mut self,
+        name: &str,
+        frame_dims: &[u64],
+        frame_chunk: &[u64],
+    ) -> Result<usize> {
+        let idx = self.inner.create_streaming_dataset_tiled(
+            name,
+            T::hdf5_type(),
+            frame_dims,
+            frame_chunk,
+        )?;
+        Ok(idx)
+    }
+
+    /// Create a compressed streaming dataset whose frames are split into
+    /// fixed-size chunk tiles. See
+    /// [`create_streaming_dataset_tiled`](Self::create_streaming_dataset_tiled)
+    /// for the meaning of `frame_chunk`; each tile is the compression unit.
+    pub fn create_streaming_dataset_tiled_compressed<T: H5Type>(
+        &mut self,
+        name: &str,
+        frame_dims: &[u64],
+        frame_chunk: &[u64],
+        pipeline: crate::format::messages::filter::FilterPipeline,
+    ) -> Result<usize> {
+        let idx = self.inner.create_streaming_dataset_tiled_compressed(
+            name,
+            T::hdf5_type(),
+            frame_dims,
+            frame_chunk,
+            pipeline,
+        )?;
+        Ok(idx)
+    }
+
     /// Signal the start of SWMR mode.
     pub fn start_swmr(&mut self) -> Result<()> {
         self.inner.start_swmr()?;

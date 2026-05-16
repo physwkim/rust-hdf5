@@ -1940,6 +1940,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[cfg(feature = "deflate")]
     #[test]
     fn vlen_append_after_reopen_filtered() {
         // Reopen + append into a partially-written *compressed* vlen chunk
@@ -2038,6 +2039,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[cfg(feature = "deflate")]
     #[test]
     fn vlen_append_after_reopen_filtered_data_block() {
         // The hardest path: compressed + chunk in a data block + partial
@@ -2129,6 +2131,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[cfg(feature = "deflate")]
     #[test]
     fn ea_filtered_super_block_roundtrip() {
         // Compressed chunks across super blocks.

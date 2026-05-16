@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.2.14
+
+### Added
+
+- `H5Group::link(link_name, target_path)` — create a hard link: an
+  additional name for an existing dataset or group. No data is
+  copied; the link and its target share one object header, and an
+  Object Reference Count message records the shared count, exactly
+  as h5py / libhdf5 hard links do. This is the NeXus-style way to
+  expose a dataset at a second canonical location (such as
+  `/entry/data/data`) without duplicating it.
+- `SwmrFileWriter::create_streaming_dataset_tiled` and
+  `create_streaming_dataset_tiled_compressed` — streaming datasets
+  whose frames are split into fixed-size chunk tiles (an on-disk
+  chunk shape of `[1, frame_chunk...]`), the equivalent of an
+  area-detector writer's `nRowChunks` / `nColChunks` controls.
+  `append_frame` accepts a whole frame and splits it into tiles
+  automatically, zero-padding partial edge tiles. The previous
+  streaming API always stored one chunk per frame.
+
+### Fixed
+
+- Gated six `deflate`-dependent tests behind the `deflate` feature
+  so `--no-default-features` builds and test runs pass.
+- Resolved two clippy lints surfaced by newer Rust toolchains:
+  `collapsible_match` in the data-layout decoder and
+  `manual_checked_ops` in the v1 B-tree chunk reader.
+
 ## 0.2.13
 
 ### Added

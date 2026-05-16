@@ -85,6 +85,39 @@ impl H5Group {
         })
     }
 
+    /// Create a hard link in this group: an additional name `link_name`
+    /// for the object that already exists at `target_path`.
+    ///
+    /// No data is copied — the link and its target share one object, just
+    /// as `h5py` / libhdf5 hard links do. `target_path` may be given with
+    /// or without a leading `/` and must name an existing dataset or group.
+    /// This is the NeXus-style way to expose a dataset at a second
+    /// canonical location (e.g. `/entry/data/data`) without duplicating it.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    ///
+    /// let file = H5File::create("nexus.h5").unwrap();
+    /// let inst = file.root_group().create_group("instrument").unwrap();
+    /// inst.new_dataset::<f32>().shape(&[10]).create("data").unwrap();
+    /// let data = file.root_group().create_group("data").unwrap();
+    /// // /data/data is now a hard link to /instrument/data — no copy.
+    /// data.link("data", "/instrument/data").unwrap();
+    /// ```
+    pub fn link(&self, link_name: &str, target_path: &str) -> Result<()> {
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                writer.create_hard_link(&self.name, link_name, target_path)?;
+                Ok(())
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot create hard links in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
     /// Open an existing sub-group by name (read mode).
     pub fn group(&self, name: &str) -> Result<H5Group> {
         let full_name = if self.name == "/" {

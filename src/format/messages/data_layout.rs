@@ -589,23 +589,22 @@ impl DataLayoutMessage {
                         }
                         pos += 6;
                     }
-                    ChunkIndexType::SingleChunk => {
-                        // A single-chunk index whose "single index with
-                        // filter" flag (0x02) is set carries the filtered
-                        // chunk size (sizeof_size bytes) and a 4-byte filter
-                        // mask before the chunk address (H5Olayout.c).
-                        if flags & 0x02 != 0 {
-                            let extra = ctx.sizeof_size as usize + 4;
-                            if buf.len() < pos + extra {
-                                return Err(FormatError::BufferTooShort {
-                                    needed: pos + extra,
-                                    available: buf.len(),
-                                });
-                            }
-                            pos += extra;
+                    // A single-chunk index whose "single index with
+                    // filter" flag (0x02) is set carries the filtered
+                    // chunk size (sizeof_size bytes) and a 4-byte filter
+                    // mask before the chunk address (H5Olayout.c).
+                    ChunkIndexType::SingleChunk if flags & 0x02 != 0 => {
+                        let extra = ctx.sizeof_size as usize + 4;
+                        if buf.len() < pos + extra {
+                            return Err(FormatError::BufferTooShort {
+                                needed: pos + extra,
+                                available: buf.len(),
+                            });
                         }
+                        pos += extra;
                     }
-                    // Implicit: no extra parameters.
+                    // Implicit, and single-chunk without the filter flag:
+                    // no extra parameters.
                     _ => {}
                 }
 
