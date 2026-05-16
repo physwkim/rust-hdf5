@@ -589,7 +589,9 @@ impl Hdf5Reader {
         let heap_data = handle.read_at(heap_hdr.data_addr, heap_hdr.data_size as usize)?;
 
         // Collect all SNOD addresses by walking the B-tree.
-        let snod_addrs = Self::collect_snod_addresses(handle, btree_addr, sa, ss, 0)?;
+        let mut snod_tree_visited = std::collections::HashSet::new();
+        let snod_addrs =
+            Self::collect_snod_addresses(handle, btree_addr, sa, ss, 0, &mut snod_tree_visited)?;
 
         for snod_addr in snod_addrs {
             let snod_buf = handle.read_at_most(snod_addr, 8192)?;
@@ -705,10 +707,13 @@ impl Hdf5Reader {
         sizeof_addr: usize,
         sizeof_size: usize,
         depth: usize,
+        visited: &mut std::collections::HashSet<u64>,
     ) -> IoResult<Vec<u64>> {
         // A well-formed v1 B-tree's level strictly decreases with depth;
         // bound the descent so a corrupt/cyclic tree cannot recurse forever.
-        if depth > 256 {
+        // The `visited` set additionally stops a corrupt tree whose child
+        // points back at an ancestor node from fanning out exponentially.
+        if depth > 256 || !visited.insert(tree_addr) {
             return Ok(Vec::new());
         }
         let buf = handle.read_at_most(tree_addr, 8192)?;
@@ -727,6 +732,7 @@ impl Hdf5Reader {
                     sizeof_addr,
                     sizeof_size,
                     depth + 1,
+                    visited,
                 )?;
                 addrs.extend(child_addrs);
             }
@@ -754,7 +760,14 @@ impl Hdf5Reader {
         /// Bound on the number of continuation blocks followed per header.
         const MAX_CONT_BLOCKS: usize = 4096;
 
-        let buf = handle.read_at_most(addr, 8192)?;
+        // Read to end-of-file: an object header's chunk-0 can hold more
+        // than 8 KiB of inline messages (many/large attributes), and a
+        // truncated buffer makes ObjectHeader::decode_any fail.
+        let avail = handle
+            .file_size()
+            .map(|fs| fs.saturating_sub(addr) as usize)
+            .unwrap_or(8192);
+        let buf = handle.read_at_most(addr, avail)?;
         let (mut header, _) = ObjectHeader::decode_any(&buf)?;
 
         // A v1 header has no "OHDR" signature; detect by it.

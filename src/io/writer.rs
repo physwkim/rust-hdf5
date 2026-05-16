@@ -432,6 +432,7 @@ impl Hdf5Writer {
             "",
             &mut link_entries,
             &mut visited_groups,
+            0,
         )?;
 
         let mut existing_datasets = Vec::new();
@@ -742,7 +743,14 @@ impl Hdf5Writer {
         prefix: &str,
         out: &mut Vec<(String, u64)>,
         visited: &mut std::collections::HashSet<u64>,
+        depth: usize,
     ) -> IoResult<()> {
+        // Bound nesting depth so a pathologically deep group chain cannot
+        // overflow the stack (the `visited` set bounds total work but not
+        // recursion depth).
+        if depth > 256 {
+            return Ok(());
+        }
         use crate::format::messages::link::{LinkMessage, LinkTarget};
         for msg in &header.messages {
             if msg.msg_type == crate::format::messages::MSG_LINK {
@@ -779,6 +787,7 @@ impl Hdf5Writer {
                                         &full_name,
                                         out,
                                         visited,
+                                        depth + 1,
                                     );
                                 }
                             }
