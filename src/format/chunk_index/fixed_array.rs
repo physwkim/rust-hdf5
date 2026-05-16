@@ -182,6 +182,13 @@ impl FixedArrayHeader {
         let client_id = buf[5];
         let element_size = buf[6];
         let max_dblk_page_nelmts_bits = buf[7];
+        // Bound the page-bits field: `1 << bits` is used as the page size,
+        // so a value >= 64 would overflow the shift. libhdf5 only writes 10.
+        if max_dblk_page_nelmts_bits >= 64 {
+            return Err(FormatError::InvalidData(format!(
+                "fixed-array max_dblk_page_nelmts_bits {max_dblk_page_nelmts_bits} is too large"
+            )));
+        }
 
         let mut pos = 8;
         let num_elmts = read_size(&buf[pos..], ss);

@@ -196,6 +196,17 @@ impl FileHandle {
         self.ensure_reader()?;
         match &mut self.mode {
             Mode::Reader(r) | Mode::ReadOnly(r) => {
+                // `offset`/`len` are often file-derived; reject a request
+                // larger than the file before allocating, so a corrupt size
+                // field cannot drive an unbounded allocation.
+                let file_len = r.get_ref().metadata()?.len();
+                let end = offset.checked_add(len as u64);
+                if end.is_none_or(|e| e > file_len) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("read past end: offset={offset} len={len} file_size={file_len}"),
+                    ));
+                }
                 r.seek(SeekFrom::Start(offset))?;
                 let mut buf = vec![0u8; len];
                 r.read_exact(&mut buf)?;
@@ -210,6 +221,10 @@ impl FileHandle {
         self.ensure_reader()?;
         match &mut self.mode {
             Mode::Reader(r) | Mode::ReadOnly(r) => {
+                // Clamp the allocation to what the file can actually hold.
+                let file_len = r.get_ref().metadata()?.len();
+                let avail = file_len.saturating_sub(offset);
+                let max_len = (max_len as u64).min(avail) as usize;
                 r.seek(SeekFrom::Start(offset))?;
                 let mut buf = vec![0u8; max_len];
                 let mut total = 0;
@@ -314,10 +329,14 @@ impl MmapFileHandle {
 
     /// Read exactly `len` bytes at `offset`. Zero-copy: returns a slice.
     pub fn read_at(&self, offset: u64, len: usize) -> std::io::Result<&[u8]> {
-        let start = offset as usize;
-        let end = start + len;
-        if end > self.mmap.len() {
-            return Err(std::io::Error::new(
+        // `offset`/`len` are file-derived; compute the end in u64 and reject
+        // overflow so a hostile value cannot wrap past the bounds check.
+        let end = offset
+            .checked_add(len as u64)
+            .filter(|&e| e <= self.mmap.len() as u64);
+        match end {
+            Some(end) => Ok(&self.mmap[offset as usize..end as usize]),
+            None => Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!(
                     "mmap read past end: offset={} len={} file_size={}",
@@ -325,18 +344,19 @@ impl MmapFileHandle {
                     len,
                     self.mmap.len()
                 ),
-            ));
+            )),
         }
-        Ok(&self.mmap[start..end])
     }
 
     /// Read up to `max_len` bytes at `offset`. Returns a slice.
     pub fn read_at_most(&self, offset: u64, max_len: usize) -> &[u8] {
-        let start = offset as usize;
-        let end = std::cmp::min(start + max_len, self.mmap.len());
-        if start >= self.mmap.len() {
+        if offset >= self.mmap.len() as u64 {
             return &[];
         }
+        let start = offset as usize;
+        let end = (start as u64)
+            .saturating_add(max_len as u64)
+            .min(self.mmap.len() as u64) as usize;
         &self.mmap[start..end]
     }
 }

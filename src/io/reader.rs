@@ -1079,19 +1079,25 @@ impl Hdf5Reader {
                         }
                     }
 
+                    let reverse = |raw: Option<Vec<u8>>| -> IoResult<Option<Vec<u8>>> {
+                        match raw {
+                            Some(r) => Ok(Some(filter::reverse_filters(pl, &r)?)),
+                            None => Ok(None),
+                        }
+                    };
                     #[cfg(feature = "parallel")]
                     let decompressed: Vec<Option<Vec<u8>>> = {
                         use rayon::prelude::*;
                         raw_chunks
                             .into_par_iter()
-                            .map(|raw| raw.and_then(|r| filter::reverse_filters(pl, &r).ok()))
-                            .collect()
+                            .map(reverse)
+                            .collect::<IoResult<Vec<_>>>()?
                     };
                     #[cfg(not(feature = "parallel"))]
                     let decompressed: Vec<Option<Vec<u8>>> = raw_chunks
                         .into_iter()
-                        .map(|raw| raw.and_then(|r| filter::reverse_filters(pl, &r).ok()))
-                        .collect();
+                        .map(reverse)
+                        .collect::<IoResult<Vec<_>>>()?;
 
                     for (i, chunk_data) in decompressed.iter().enumerate() {
                         if let Some(data) = chunk_data {
@@ -1163,6 +1169,16 @@ impl Hdf5Reader {
             return Ok(vec![]);
         }
 
+        // The chunk shape (from the layout message) must match the
+        // dataspace rank; otherwise the chunk-grid indexing panics.
+        if chunk_dims.len() != ndims {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "fixed-array dataset rank {} does not match chunk rank {}",
+                ndims,
+                chunk_dims.len()
+            )));
+        }
+
         let is_filtered = fa_hdr.client_id == FA_CLIENT_FILT_CHUNK;
         let sizeof_addr = self.ctx.sizeof_addr as usize;
         // chunk_size_len = element_size - sizeof_addr - filter_mask(4)
@@ -1177,6 +1193,13 @@ impl Hdf5Reader {
         } else {
             0
         };
+        // The compressed-size field is read into a u64; reject a width that
+        // would overflow the read_size helper.
+        if chunk_size_len > 8 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "fixed array filtered chunk-size width {chunk_size_len} exceeds 8 bytes"
+            )));
+        }
 
         // Compute chunk byte size
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
@@ -1302,32 +1325,30 @@ impl Hdf5Reader {
             }
         }
 
-        // Decompress in parallel if filter pipeline is set
+        // Decompress if a filter pipeline is set. A filter failure is
+        // propagated rather than swallowed into garbage output.
         let decompressed: Vec<(usize, Option<Vec<u8>>)> = if let Some(pl) = pipeline {
+            let reverse =
+                |(idx, raw): (usize, Option<Vec<u8>>)| -> IoResult<(usize, Option<Vec<u8>>)> {
+                    match raw {
+                        Some(r) => Ok((idx, Some(filter::reverse_filters(pl, &r)?))),
+                        None => Ok((idx, None)),
+                    }
+                };
             #[cfg(feature = "parallel")]
             {
                 use rayon::prelude::*;
                 raw_chunks
                     .into_par_iter()
-                    .map(|(idx, raw)| {
-                        (
-                            idx,
-                            raw.map(|r| filter::reverse_filters(pl, &r).unwrap_or(r)),
-                        )
-                    })
-                    .collect()
+                    .map(reverse)
+                    .collect::<IoResult<Vec<_>>>()?
             }
             #[cfg(not(feature = "parallel"))]
             {
                 raw_chunks
                     .into_iter()
-                    .map(|(idx, raw)| {
-                        (
-                            idx,
-                            raw.map(|r| filter::reverse_filters(pl, &r).unwrap_or(r)),
-                        )
-                    })
-                    .collect()
+                    .map(reverse)
+                    .collect::<IoResult<Vec<_>>>()?
             }
         } else {
             raw_chunks
@@ -1446,22 +1467,30 @@ impl Hdf5Reader {
             }
         }
 
-        // Decompress filtered chunks (optionally in parallel).
+        // Decompress filtered chunks (optionally in parallel). A filter
+        // failure is propagated, not swallowed into garbage output.
         let placed: Vec<Option<(Vec<u8>, Vec<u64>)>> = if let Some(pl) = pipeline {
+            let reverse =
+                |c: Option<(Vec<u8>, Vec<u64>)>| -> IoResult<Option<(Vec<u8>, Vec<u64>)>> {
+                    match c {
+                        Some((r, s)) => Ok(Some((filter::reverse_filters(pl, &r)?, s))),
+                        None => Ok(None),
+                    }
+                };
             #[cfg(feature = "parallel")]
             {
                 use rayon::prelude::*;
                 raw_chunks
                     .into_par_iter()
-                    .map(|c| c.map(|(r, s)| (filter::reverse_filters(pl, &r).unwrap_or(r), s)))
-                    .collect()
+                    .map(reverse)
+                    .collect::<IoResult<Vec<_>>>()?
             }
             #[cfg(not(feature = "parallel"))]
             {
                 raw_chunks
                     .into_iter()
-                    .map(|c| c.map(|(r, s)| (filter::reverse_filters(pl, &r).unwrap_or(r), s)))
-                    .collect()
+                    .map(reverse)
+                    .collect::<IoResult<Vec<_>>>()?
             }
         } else {
             raw_chunks
@@ -1548,6 +1577,16 @@ impl Hdf5Reader {
         let fill_value = info.fill_value.clone();
         let ndims = dims.len();
 
+        // The chunk shape must match the dataspace rank or the chunk-grid
+        // indexing below panics.
+        if chunk_dims.len() != ndims {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "B-tree-v1 dataset rank {} does not match chunk rank {}",
+                ndims,
+                chunk_dims.len()
+            )));
+        }
+
         let total_size: u64 = dims.iter().product::<u64>() * element_size;
         let mut output = tiled_fill(total_size as usize, fill_value.as_deref());
 
@@ -1589,22 +1628,30 @@ impl Hdf5Reader {
             raw_chunks.push(Some((data, scaled)));
         }
 
-        // Decompress filtered chunks (optionally in parallel).
+        // Decompress filtered chunks (optionally in parallel). A filter
+        // failure is propagated, not swallowed into garbage output.
         let placed: Vec<Option<(Vec<u8>, Vec<u64>)>> = if let Some(pl) = pipeline {
+            let reverse =
+                |c: Option<(Vec<u8>, Vec<u64>)>| -> IoResult<Option<(Vec<u8>, Vec<u64>)>> {
+                    match c {
+                        Some((r, s)) => Ok(Some((filter::reverse_filters(pl, &r)?, s))),
+                        None => Ok(None),
+                    }
+                };
             #[cfg(feature = "parallel")]
             {
                 use rayon::prelude::*;
                 raw_chunks
                     .into_par_iter()
-                    .map(|c| c.map(|(r, s)| (filter::reverse_filters(pl, &r).unwrap_or(r), s)))
-                    .collect()
+                    .map(reverse)
+                    .collect::<IoResult<Vec<_>>>()?
             }
             #[cfg(not(feature = "parallel"))]
             {
                 raw_chunks
                     .into_iter()
-                    .map(|c| c.map(|(r, s)| (filter::reverse_filters(pl, &r).unwrap_or(r), s)))
-                    .collect()
+                    .map(reverse)
+                    .collect::<IoResult<Vec<_>>>()?
             }
         } else {
             raw_chunks
@@ -1713,9 +1760,12 @@ impl Hdf5Reader {
 
         // For 1D case, direct memcpy
         if ndims == 1 {
-            let start = chunk_coords[0] * chunk_dims[0] * element_size;
-            let actual_elems =
-                std::cmp::min(chunk_dims[0], dims[0] - chunk_coords[0] * chunk_dims[0]);
+            // A corrupt index could place the chunk past the dataset extent;
+            // saturating math keeps that from underflowing, and a zero span
+            // simply copies nothing.
+            let chunk_start = chunk_coords[0].saturating_mul(chunk_dims[0]);
+            let start = chunk_start.saturating_mul(element_size);
+            let actual_elems = std::cmp::min(chunk_dims[0], dims[0].saturating_sub(chunk_start));
             let copy_bytes = (actual_elems * element_size) as usize;
             let start = start as usize;
             if start + copy_bytes <= output.len() && copy_bytes <= chunk_data.len() {

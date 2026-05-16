@@ -482,6 +482,13 @@ impl DataLayoutMessage {
                         "chunked layout encoded dimension size {enc_bytes} is out of range"
                     )));
                 }
+                // Chunked storage carries the chunk rank plus the trailing
+                // element-size dimension, so ndims is at least 2.
+                if ndims < 2 {
+                    return Err(FormatError::InvalidData(format!(
+                        "chunked v4 layout dimensionality {ndims} is too small"
+                    )));
+                }
 
                 // dim sizes
                 let dim_data_len = ndims * enc_bytes;
@@ -493,7 +500,13 @@ impl DataLayoutMessage {
                 }
                 let mut chunk_dims = Vec::with_capacity(ndims);
                 for _ in 0..ndims {
-                    chunk_dims.push(read_size(&buf[pos..], enc_bytes));
+                    let d = read_size(&buf[pos..], enc_bytes);
+                    if d == 0 {
+                        return Err(FormatError::InvalidData(
+                            "chunked v4 layout has a zero chunk dimension".into(),
+                        ));
+                    }
+                    chunk_dims.push(d);
                     pos += enc_bytes;
                 }
 
