@@ -48,7 +48,6 @@ const FILTER_SCALEOFFSET: u16 = 6;
 /// and exercised by `szip` round-trip tests; the remaining gap is the AEC
 /// codec itself, which is tracked as a separate defect.
 #[test]
-#[ignore = "crate AEC codec is not yet libaec/libhdf5 bitstream-compatible"]
 fn szip_libhdf5_chunk() {
     // First chunk (rows 0..20, cols 0..10) of `dset_szip` in libhdf5's own
     // reference file `tools/test/testfiles/h5repack_szip.h5`: int32, RAW

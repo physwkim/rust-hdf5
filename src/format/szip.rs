@@ -29,10 +29,21 @@
 // Based on the CCSDS recommended standard 121.0-B-3.
 
 // ---------------------------------------------------------------------------
-// SZIP option masks (HDF5 filter interface)
+// SZIP option masks (HDF5 filter interface, see H5Zpublic.h / szlib.h)
 // ---------------------------------------------------------------------------
+#[allow(dead_code)]
+const SZ_ALLOW_K13_OPTION_MASK: u32 = 1;
+#[allow(dead_code)]
+const SZ_CHIP_OPTION_MASK: u32 = 2;
+#[allow(dead_code)]
+const SZ_EC_OPTION_MASK: u32 = 4;
+#[allow(dead_code)]
+const SZ_LSB_OPTION_MASK: u32 = 8;
 const SZ_MSB_OPTION_MASK: u32 = 16;
 const SZ_NN_OPTION_MASK: u32 = 32;
+// RAW: libaec's szlib wrapper accepts but does not act on this mask for the
+// interleave decision (see sz_compat.c). Kept for documentation only.
+#[allow(dead_code)]
 const SZ_RAW_OPTION_MASK: u32 = 128;
 
 // ---------------------------------------------------------------------------
@@ -620,7 +631,9 @@ impl Encoder {
                 };
 
                 if split_len < uncomp_len {
-                    if split_len <= se_len {
+                    // libaec's m_select_code_option uses a strict `<` here:
+                    // when splitting and SE produce equal-length CDS, SE wins.
+                    if split_len < se_len {
                         // Splitting (Golomb-Rice)
                         writer.emit(best_k + 1, self.id_len as i32);
                         if has_ref {
@@ -1098,19 +1111,18 @@ pub fn compress(
     let block_size = pixels_per_block;
     let rsi = pixels_per_scanline.div_ceil(pixels_per_block);
 
+    // libaec's SZ_BufftoBuffCompress treats 32- and 64-bit pixels by
+    // byte-interleaving them into 8-bit samples. The RAW option mask does
+    // NOT influence this decision (see sz_compat.c).
     let interleave = bits_per_pixel == 32 || bits_per_pixel == 64;
     let bits_per_sample;
     let input_buf: Vec<u8>;
 
-    if interleave && options_mask & SZ_RAW_OPTION_MASK == 0 {
+    if interleave {
         bits_per_sample = 8;
         input_buf = interleave_buffer(data, (bits_per_pixel / 8) as usize);
     } else {
-        bits_per_sample = if bits_per_pixel == 64 {
-            8
-        } else {
-            bits_per_pixel
-        };
+        bits_per_sample = bits_per_pixel;
         input_buf = data.to_vec();
     }
 
@@ -1124,17 +1136,18 @@ pub fn compress(
     let padding_pixels = padded_line_pixels as usize - pixels_per_scanline as usize;
     let padding_size = padding_pixels * pixel_size;
 
-    let padded_input = if padding_size > 0 {
-        add_padding(
-            &input_buf,
-            line_size_bytes,
-            padding_size,
-            pixel_size,
-            flags & AEC_DATA_PREPROCESS != 0,
-        )
-    } else {
-        input_buf
-    };
+    // libaec's add_padding is always applied: besides filling the
+    // scanline-vs-block gap (padding_size), it also pads a short final
+    // scanline up to a full padded scanline. Skipping it when
+    // padding_size == 0 would under-pad an input whose length is not a
+    // whole multiple of the (padded) scanline size.
+    let padded_input = add_padding(
+        &input_buf,
+        line_size_bytes,
+        padding_size,
+        pixel_size,
+        flags & AEC_DATA_PREPROCESS != 0,
+    );
 
     let encoder = Encoder::new(bits_per_sample, block_size, rsi, flags)?;
     encoder.encode(&padded_input)
@@ -1170,13 +1183,11 @@ pub fn decompress(
     let block_size = pixels_per_block;
     let rsi = pixels_per_scanline.div_ceil(pixels_per_block);
 
-    let deinterleave =
-        (bits_per_pixel == 32 || bits_per_pixel == 64) && options_mask & SZ_RAW_OPTION_MASK == 0;
-    let bits_per_sample = if deinterleave || bits_per_pixel == 64 {
-        8
-    } else {
-        bits_per_pixel
-    };
+    // libaec's SZ_BufftoBuffDecompress byte-deinterleaves 32- and 64-bit
+    // pixels back from 8-bit samples. The RAW option mask does NOT influence
+    // this decision (see sz_compat.c).
+    let deinterleave = bits_per_pixel == 32 || bits_per_pixel == 64;
+    let bits_per_sample = if deinterleave { 8 } else { bits_per_pixel };
     let pixel_size = bits_to_bytes(bits_per_sample) as usize;
 
     let pad_scanline = !pixels_per_scanline.is_multiple_of(pixels_per_block);
