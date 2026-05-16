@@ -733,12 +733,16 @@ impl Hdf5Reader {
                     return Ok(vec![]);
                 }
 
-                let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
-                let chunks_dim0 = if chunk_dims[0] > 0 {
-                    dims[0].div_ceil(chunk_dims[0])
-                } else {
-                    0
-                };
+                // Total chunk count across all dimensions.
+                let chunks_dim0: u64 = (0..dims.len())
+                    .map(|d| {
+                        if chunk_dims[d] > 0 {
+                            dims[d].div_ceil(chunk_dims[d])
+                        } else {
+                            0
+                        }
+                    })
+                    .product();
 
                 let chunk_entries = self.collect_ea_chunk_entries(
                     index_address,
@@ -752,6 +756,30 @@ impl Hdf5Reader {
                 let mut output = tiled_fill(total_size as usize, fill_value.as_deref());
 
                 let n_chunks = std::cmp::min(chunks_dim0 as usize, chunk_entries.len());
+
+                // Chunks are placed N-dimensionally: the linear chunk index
+                // maps (row-major) to chunk-grid coordinates, so sub-frame
+                // chunks (a chunk smaller than a full frame) land correctly.
+                let ndims = dims.len();
+                let chunks_per_dim: Vec<u64> = (0..ndims)
+                    .map(|d| {
+                        if chunk_dims[d] > 0 {
+                            dims[d].div_ceil(chunk_dims[d])
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                let chunk_coords = |mut i: u64| -> Vec<u64> {
+                    let mut c = vec![0u64; ndims];
+                    for d in (0..ndims).rev() {
+                        if chunks_per_dim[d] > 0 {
+                            c[d] = i % chunks_per_dim[d];
+                            i /= chunks_per_dim[d];
+                        }
+                    }
+                    c
+                };
 
                 if let Some(pl) = pipeline {
                     // Read all raw chunks first, then decompress (optionally in parallel)
@@ -785,14 +813,15 @@ impl Hdf5Reader {
 
                     for (i, chunk_data) in decompressed.iter().enumerate() {
                         if let Some(data) = chunk_data {
-                            let offset = i as u64 * chunk_bytes;
-                            let end = std::cmp::min(offset + chunk_bytes, total_size);
-                            let copy_len = (end - offset) as usize;
-                            // Decompressed chunk may be shorter than expected if it
-                            // is the last chunk or decompression returned raw data.
-                            let src_len = copy_len.min(data.len());
-                            output[offset as usize..offset as usize + src_len]
-                                .copy_from_slice(&data[..src_len]);
+                            let coords = chunk_coords(i as u64);
+                            self.copy_chunk_to_output(
+                                data,
+                                &mut output,
+                                &dims,
+                                chunk_dims,
+                                &coords,
+                                element_size,
+                            );
                         }
                     }
                 } else {
@@ -801,12 +830,15 @@ impl Hdf5Reader {
                             continue;
                         }
                         let chunk_data = self.handle.read_at_most(addr, nbytes as usize)?;
-                        let offset = i as u64 * chunk_bytes;
-                        let end = std::cmp::min(offset + chunk_bytes, total_size);
-                        let copy_len = (end - offset) as usize;
-                        let src_len = copy_len.min(chunk_data.len());
-                        output[offset as usize..offset as usize + src_len]
-                            .copy_from_slice(&chunk_data[..src_len]);
+                        let coords = chunk_coords(i as u64);
+                        self.copy_chunk_to_output(
+                            &chunk_data,
+                            &mut output,
+                            &dims,
+                            chunk_dims,
+                            &coords,
+                            element_size,
+                        );
                     }
                 }
 
@@ -1244,11 +1276,17 @@ impl Hdf5Reader {
             return Ok(vec![]);
         }
 
-        let chunks_dim0 = if chunk_dims[0] > 0 {
-            dims[0].div_ceil(chunk_dims[0]) as usize
-        } else {
-            0
-        };
+        // Total chunk count across every dimension (sub-frame chunks make
+        // this larger than the dim-0 chunk count alone).
+        let chunks_dim0: usize = (0..dims.len())
+            .map(|d| {
+                if chunk_dims[d] > 0 {
+                    dims[d].div_ceil(chunk_dims[d]) as usize
+                } else {
+                    0
+                }
+            })
+            .product();
         let geo = EaGeometry::new(
             params.idx_blk_elmts,
             params.data_blk_min_elmts,

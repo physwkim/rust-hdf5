@@ -686,43 +686,70 @@ impl H5Dataset {
     /// ```
     pub fn write_chunk_at(&self, chunk_coords: &[usize], data: &[u8]) -> Result<()> {
         match &self.info {
-            DatasetInfo::Writer { index, btree2, .. } => {
-                if !*btree2 {
+            DatasetInfo::Writer {
+                index,
+                chunked,
+                btree2,
+                ..
+            } => {
+                if !*chunked {
                     return Err(Hdf5Error::InvalidState(
-                        "write_chunk_at is for v2 B-tree (multi-unlimited-dimension) \
-                         datasets; use write_chunk or append"
-                            .into(),
+                        "write_chunk_at is only for chunked datasets".into(),
                     ));
                 }
                 let coords: Vec<u64> = chunk_coords.iter().map(|&c| c as u64).collect();
+                let btree2 = *btree2;
                 let mut inner = borrow_inner_mut(&self.file_inner);
-                match &mut *inner {
-                    H5FileInner::Writer(writer) => {
-                        writer.write_chunk_btree_v2(*index, &coords, data)?;
-                        // Grow the logical dimensions to cover this chunk.
-                        let chunk_dims = writer
-                            .dataset_chunk_dims(*index)
-                            .ok_or_else(|| {
-                                Hdf5Error::InvalidState("dataset has no chunk info".into())
-                            })?
-                            .to_vec();
-                        let dims = writer.dataset_dims(*index).to_vec();
-                        let mut new_dims = dims.clone();
-                        for (d, nd) in new_dims.iter_mut().enumerate() {
-                            let needed = (coords[d] + 1) * chunk_dims[d];
-                            if needed > *nd {
-                                *nd = needed;
-                            }
-                        }
-                        if new_dims != dims {
-                            writer.extend_dataset(*index, &new_dims)?;
-                        }
-                        Ok(())
+                let writer = match &mut *inner {
+                    H5FileInner::Writer(w) => w,
+                    _ => {
+                        return Err(Hdf5Error::InvalidState(
+                            "file is no longer in write mode".into(),
+                        ))
                     }
-                    _ => Err(Hdf5Error::InvalidState(
-                        "file is no longer in write mode".into(),
-                    )),
+                };
+                let chunk_dims = writer
+                    .dataset_chunk_dims(*index)
+                    .ok_or_else(|| Hdf5Error::InvalidState("dataset has no chunk info".into()))?
+                    .to_vec();
+                let dims = writer.dataset_dims(*index).to_vec();
+                if coords.len() != dims.len() {
+                    return Err(Hdf5Error::InvalidState(format!(
+                        "chunk_coords has {} entries but the dataset has {} dimensions",
+                        coords.len(),
+                        dims.len()
+                    )));
                 }
+
+                if btree2 {
+                    writer.write_chunk_btree_v2(*index, &coords, data)?;
+                } else {
+                    // Extensible array: linearize the chunk-grid coordinates
+                    // (row-major) into the array's chunk index.
+                    let mut linear = 0u64;
+                    for d in 0..dims.len() {
+                        let grid = if chunk_dims[d] > 0 {
+                            dims[d].div_ceil(chunk_dims[d])
+                        } else {
+                            1
+                        };
+                        linear = linear * grid + coords[d];
+                    }
+                    writer.write_chunk(*index, linear, data)?;
+                }
+
+                // Grow the logical dimensions to cover the written chunk.
+                let mut new_dims = dims.clone();
+                for (d, nd) in new_dims.iter_mut().enumerate() {
+                    let needed = (coords[d] + 1) * chunk_dims[d];
+                    if needed > *nd {
+                        *nd = needed;
+                    }
+                }
+                if new_dims != dims {
+                    writer.extend_dataset(*index, &new_dims)?;
+                }
+                Ok(())
             }
             DatasetInfo::Reader { .. } => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
@@ -2008,6 +2035,49 @@ mod tests {
             let ds = file.dataset("grid").unwrap();
             assert_eq!(ds.shape(), vec![4, 4]);
             assert_eq!(ds.read_raw::<i32>().unwrap(), (0..16).collect::<Vec<i32>>());
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn subframe_chunking_roundtrip() {
+        // A chunk smaller than a frame: shape [N,8,8], chunk [1,4,4], so each
+        // frame is tiled into a 2x2 grid of 4x4 chunks. write_chunk_at takes
+        // the chunk-grid coordinates.
+        let path = temp_path("subframe");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0, 8, 8])
+                .chunk(&[1, 4, 4])
+                .max_shape(&[None, Some(8), Some(8)])
+                .create("v")
+                .unwrap();
+            for f in 0..3usize {
+                for cr in 0..2usize {
+                    for cc in 0..2usize {
+                        let mut bytes = Vec::new();
+                        for i in 0..4usize {
+                            for j in 0..4usize {
+                                let v = (f * 64 + (cr * 4 + i) * 8 + (cc * 4 + j)) as i32;
+                                bytes.extend_from_slice(&v.to_le_bytes());
+                            }
+                        }
+                        ds.write_chunk_at(&[f, cr, cc], &bytes).unwrap();
+                    }
+                }
+            }
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("v").unwrap();
+            assert_eq!(ds.shape(), vec![3, 8, 8]);
+            assert_eq!(
+                ds.read_raw::<i32>().unwrap(),
+                (0..192).collect::<Vec<i32>>()
+            );
         }
         std::fs::remove_file(&path).ok();
     }
