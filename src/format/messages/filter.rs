@@ -374,29 +374,40 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
             }
         }
         FILTER_SZIP => {
-            // cd_values: [options_mask, bits_per_pixel, pixels_per_block, pixels_per_scanline]
+            // cd_values layout per H5Zpublic.h: index 0 = options_mask,
+            // 1 = pixels_per_block, 2 = bits_per_pixel, 3 = pixels_per_scanline.
+            // libhdf5's H5Zszip.c stores exactly 4 cd_values. On the wire it
+            // prepends a 4-byte little-endian header holding the uncompressed
+            // length (UINT32ENCODE) ahead of the raw AEC bitstream, and reads
+            // it back with UINT32DECODE on decompress.
             let options_mask = filter.cd_values.first().copied().unwrap_or(0);
-            let bits_per_pixel = filter.cd_values.get(1).copied().unwrap_or(8);
-            let pixels_per_block = filter.cd_values.get(2).copied().unwrap_or(32);
+            let pixels_per_block = filter.cd_values.get(1).copied().unwrap_or(32);
+            let bits_per_pixel = filter.cd_values.get(2).copied().unwrap_or(8);
             let pixels_per_scanline = filter.cd_values.get(3).copied().unwrap_or(256);
             if compress {
-                crate::format::szip::compress(
+                let compressed = crate::format::szip::compress(
                     data,
                     bits_per_pixel,
                     pixels_per_block,
                     pixels_per_scanline,
                     options_mask,
                 )
-                .map_err(|e| FormatError::InvalidData(format!("SZIP compress: {}", e)))
+                .map_err(|e| FormatError::InvalidData(format!("SZIP compress: {}", e)))?;
+                // Prepend the 4-byte LE uncompressed-length header.
+                let mut out = Vec::with_capacity(compressed.len() + 4);
+                out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                out.extend_from_slice(&compressed);
+                Ok(out)
             } else {
-                let output_size = filter.cd_values.get(4).copied().unwrap_or(0) as usize;
-                let out_size = if output_size > 0 {
-                    output_size
-                } else {
-                    data.len() * 4
-                };
+                if data.len() < 4 {
+                    return Err(FormatError::InvalidData(
+                        "SZIP: data too short for length header".into(),
+                    ));
+                }
+                // Read the 4-byte LE uncompressed-length header.
+                let out_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
                 crate::format::szip::decompress(
-                    data,
+                    &data[4..],
                     out_size,
                     bits_per_pixel,
                     pixels_per_block,
@@ -404,6 +415,29 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
                     options_mask,
                 )
                 .map_err(|e| FormatError::InvalidData(format!("SZIP decompress: {}", e)))
+            }
+        }
+        // =====================================================================
+        // N-bit (5) — strips unused leading/trailing bits per the datatype's
+        // precision/offset (H5Znbit.c). cd_values is the datatype parameter
+        // tree; both directions are byte-exact with libhdf5.
+        // =====================================================================
+        FILTER_NBIT => {
+            crate::format::nbit_scaleoffset::apply_nbit(data, &filter.cd_values, compress)
+        }
+
+        // =====================================================================
+        // Scale-offset (6) — stores values as small integers relative to a
+        // per-chunk minimum (H5Zscaleoffset.c). Decompress only; compress is
+        // not implemented (the writer never needs it).
+        // =====================================================================
+        FILTER_SCALEOFFSET => {
+            if compress {
+                Err(FormatError::UnsupportedFeature(
+                    "scale-offset filter compression is not implemented".into(),
+                ))
+            } else {
+                crate::format::nbit_scaleoffset::reverse_scaleoffset(data, &filter.cd_values)
             }
         }
         // =====================================================================

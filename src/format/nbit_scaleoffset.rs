@@ -17,6 +17,9 @@ const NBIT_ARRAY: u32 = 2;
 const NBIT_COMPOUND: u32 = 3;
 const NBIT_NOOPTYPE: u32 = 4;
 const NBIT_ORDER_LE: u32 = 0;
+/// Big-endian order code; referenced by name only in tests, but kept here
+/// so the parameter-tree decoding reads as a complete enumeration.
+#[cfg_attr(not(test), allow(dead_code))]
 const NBIT_ORDER_BE: u32 = 1;
 
 /// Parameters describing one atomic element for the nbit packer.
@@ -218,7 +221,7 @@ fn nbit_decompress_one_atomic(
 ) -> FormatResult<()> {
     let datatype_len = p.size * 8;
     if p.order == NBIT_ORDER_LE {
-        let begin_i = if (p.precision + p.offset) % 8 != 0 {
+        let begin_i = if !(p.precision + p.offset).is_multiple_of(8) {
             (p.precision + p.offset) / 8
         } else {
             (p.precision + p.offset) / 8 - 1
@@ -241,7 +244,7 @@ fn nbit_decompress_one_atomic(
         }
     } else {
         let begin_i = (datatype_len - p.precision - p.offset) / 8;
-        let end_i = if p.offset % 8 != 0 {
+        let end_i = if !p.offset.is_multiple_of(8) {
             (datatype_len - p.offset) / 8
         } else {
             (datatype_len - p.offset) / 8 - 1
@@ -273,7 +276,7 @@ fn nbit_compress_one_atomic(
 ) {
     let datatype_len = p.size * 8;
     if p.order == NBIT_ORDER_LE {
-        let begin_i = if (p.precision + p.offset) % 8 != 0 {
+        let begin_i = if !(p.precision + p.offset).is_multiple_of(8) {
             (p.precision + p.offset) / 8
         } else {
             (p.precision + p.offset) / 8 - 1
@@ -296,7 +299,7 @@ fn nbit_compress_one_atomic(
         }
     } else {
         let begin_i = (datatype_len - p.precision - p.offset) / 8;
-        let end_i = if p.offset % 8 != 0 {
+        let end_i = if !p.offset.is_multiple_of(8) {
             (datatype_len - p.offset) / 8
         } else {
             (datatype_len - p.offset) / 8 - 1
@@ -772,6 +775,8 @@ const SO_PARM_SIZE: usize = 4;
 const SO_PARM_SIGN: usize = 5;
 const SO_PARM_ORDER: usize = 6;
 const SO_PARM_FILAVAIL: usize = 7;
+/// First cd_values index holding the (optional) packed fill value.
+const SO_PARM_FILVAL: usize = 8;
 
 const SO_CLS_INTEGER: u32 = 0;
 const SO_CLS_FLOAT: u32 = 1;
@@ -930,13 +935,32 @@ pub fn reverse_scaleoffset(data: &[u8], cd_values: &[u32]) -> FormatResult<Vec<u
             size
         )));
     }
-    if filavail == SO_FILL_DEFINED {
-        // Reconstructing a fill value from cd_values is not implemented;
-        // fail loudly rather than emit wrong data.
-        return Err(FormatError::UnsupportedFeature(
-            "scaleoffset with a defined fill value is not supported".into(),
-        ));
-    }
+    // Reconstruct the packed fill value from cd_values[8..]. libhdf5 stores
+    // it 4 bytes per cd_value, least-significant cd_value first; each cd_value
+    // holds the bytes in the dataset datatype's byte order. We read it as a
+    // raw `size`-byte little-endian-composed value (correct for the common
+    // little-endian-dataset case h5py emits on x86/ARM).
+    let filval: u64 = if filavail == SO_FILL_DEFINED {
+        let mut v: u64 = 0;
+        let n_cd = size.div_ceil(4);
+        if cd_values.len() < SO_PARM_FILVAL + n_cd {
+            return Err(FormatError::InvalidData(
+                "scaleoffset: cd_values missing fill value".into(),
+            ));
+        }
+        for (w, cd) in cd_values[SO_PARM_FILVAL..SO_PARM_FILVAL + n_cd]
+            .iter()
+            .enumerate()
+        {
+            v |= (*cd as u64) << (w * 32);
+        }
+        if size < 8 {
+            v &= (1u64 << (size * 8)) - 1;
+        }
+        v
+    } else {
+        0
+    };
     if dtype_class == SO_CLS_FLOAT && scale_type != SO_FLOAT_DSCALE {
         return Err(FormatError::UnsupportedFeature(
             "scaleoffset E-scaling method is not supported".into(),
@@ -964,8 +988,8 @@ pub fn reverse_scaleoffset(data: &[u8], cd_values: &[u32]) -> FormatResult<Vec<u
         ));
     }
     let mut minbits: u32 = 0;
-    for i in 0..4 {
-        minbits |= (data[i] as u32) << (i * 8);
+    for (i, &b) in data[..4].iter().enumerate() {
+        minbits |= (b as u32) << (i * 8);
     }
     if minbits as usize > size * 8 {
         return Err(FormatError::InvalidData(
@@ -1020,14 +1044,27 @@ pub fn reverse_scaleoffset(data: &[u8], cd_values: &[u32]) -> FormatResult<Vec<u
         order,
         dtype_class,
         dtype_sign,
+        minbits,
         minval,
         scale_factor,
+        filavail == SO_FILL_DEFINED,
+        filval,
     );
 
     Ok(out)
 }
 
-/// Postprocess decompressed scale-offset data (no fill value defined).
+/// Sign-extend the low `size*8` bits of `v` to a full `i64`.
+fn sign_extend(v: u64, size: usize) -> i64 {
+    if size >= 8 {
+        return v as i64;
+    }
+    let bits = size * 8;
+    let shift = 64 - bits;
+    ((v << shift) as i64) >> shift
+}
+
+/// Postprocess decompressed scale-offset data.
 #[allow(clippy::too_many_arguments)]
 fn postdecompress(
     out: &mut [u8],
@@ -1036,42 +1073,67 @@ fn postdecompress(
     order: u32,
     dtype_class: u32,
     dtype_sign: u32,
+    minbits: u32,
     minval: u64,
     scale_factor: i32,
+    fill_defined: bool,
+    filval: u64,
 ) {
+    // Sentinel: a fully decompressed value equal to (1 << minbits) - 1 is
+    // restored to the fill value rather than offset-added.
+    let sentinel: u64 = if (minbits as usize) >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << minbits) - 1
+    };
+    let width_mask: u64 = if size >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (size * 8)) - 1
+    };
+
     if dtype_class == SO_CLS_INTEGER {
-        // buf[i] = buf[i] + minval (wrapping in the datatype width).
-        let width_mask: u64 = if size >= 8 {
-            u64::MAX
-        } else {
-            (1u64 << (size * 8)) - 1
-        };
+        // buf[i] = (buf[i] == sentinel) ? filval : buf[i] + minval.
         for i in 0..d_nelmts {
             let off = i * size;
             let v = read_uint(out, off, size, order);
-            let sum = v.wrapping_add(minval) & width_mask;
-            write_uint(out, off, size, order, sum);
+            let result = if fill_defined && v == sentinel {
+                filval
+            } else {
+                v.wrapping_add(minval) & width_mask
+            };
+            write_uint(out, off, size, order, result);
         }
         let _ = dtype_sign;
     } else {
-        // Float D-scale: value = (decompressed_int) / 10^D + min,
+        // Float D-scale: value = (signed decompressed int) / 10^D + min,
         // where `min` reinterprets `minval`'s low bits as the float type.
         let d_val = scale_factor as f64;
         let divisor = 10f64.powf(d_val);
         if size == 4 {
             let min = f32::from_bits(minval as u32);
+            let filval_f = f32::from_bits(filval as u32);
             for i in 0..d_nelmts {
                 let off = i * size;
-                let raw = read_uint(out, off, size, order) as u32;
-                let val = (raw as f32) / (divisor as f32) + min;
+                let raw = read_uint(out, off, size, order);
+                let val = if fill_defined && raw == sentinel {
+                    filval_f
+                } else {
+                    (sign_extend(raw, size) as f32) / (divisor as f32) + min
+                };
                 write_uint(out, off, size, order, val.to_bits() as u64);
             }
         } else if size == 8 {
             let min = f64::from_bits(minval);
+            let filval_f = f64::from_bits(filval);
             for i in 0..d_nelmts {
                 let off = i * size;
                 let raw = read_uint(out, off, size, order);
-                let val = (raw as f64) / divisor + min;
+                if fill_defined && raw == sentinel {
+                    write_uint(out, off, size, order, filval_f.to_bits());
+                    continue;
+                }
+                let val = (sign_extend(raw, size) as f64) / divisor + min;
                 write_uint(out, off, size, order, val.to_bits());
             }
         }

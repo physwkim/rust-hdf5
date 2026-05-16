@@ -11,6 +11,7 @@ pub mod fractal_heap;
 pub mod global_heap;
 pub mod local_heap;
 pub mod messages;
+pub mod nbit_scaleoffset;
 pub mod object_header;
 pub mod superblock;
 pub mod symbol_table;
