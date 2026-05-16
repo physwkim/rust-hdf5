@@ -271,6 +271,7 @@ pub fn collect_managed_objects<R: BlockReader>(
             header.curr_root_rows as u32,
             &mut objects,
             &mut block_budget,
+            0,
         )?;
     }
 
@@ -279,6 +280,7 @@ pub fn collect_managed_objects<R: BlockReader>(
 
 /// Recursively walk an indirect block, descending into child direct and
 /// indirect blocks.
+#[allow(clippy::too_many_arguments)]
 fn walk_indirect_block<R: BlockReader>(
     header: &FractalHeapHeader,
     ctx: &FormatContext,
@@ -287,7 +289,17 @@ fn walk_indirect_block<R: BlockReader>(
     nrows: u32,
     objects: &mut Vec<Vec<u8>>,
     budget: &mut usize,
+    depth: usize,
 ) -> FormatResult<()> {
+    // The block budget bounds total blocks visited, not recursion depth: a
+    // crafted heap that is a deep linear chain of indirect blocks would
+    // recurse far enough to exhaust the stack before the budget runs out.
+    const MAX_INDIRECT_DEPTH: usize = 256;
+    if depth > MAX_INDIRECT_DEPTH {
+        return Err(FormatError::InvalidData(
+            "fractal heap indirect-block nesting exceeds maximum depth".into(),
+        ));
+    }
     if addr == u64::MAX || nrows == 0 {
         return Ok(());
     }
@@ -389,6 +401,7 @@ fn walk_indirect_block<R: BlockReader>(
                 child_nrows,
                 objects,
                 budget,
+                depth + 1,
             )?;
         }
     }

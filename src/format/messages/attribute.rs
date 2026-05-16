@@ -205,10 +205,18 @@ impl AttributeMessage {
         let num_elements: u64 = if dataspace.dims.is_empty() {
             1 // scalar
         } else {
-            dataspace.dims.iter().product()
+            // dims are file-derived; saturate so a crafted attribute with
+            // absurd dimensions is rejected by the buffer check below
+            // instead of overflowing.
+            dataspace
+                .dims
+                .iter()
+                .fold(1u64, |acc, &d| acc.saturating_mul(d))
         };
-        let data_size = (num_elements * datatype.element_size() as u64) as usize;
-        let needed = pos + data_size;
+        let data_size = num_elements
+            .saturating_mul(datatype.element_size() as u64)
+            .min(usize::MAX as u64) as usize;
+        let needed = pos.saturating_add(data_size);
         if buf.len() < needed {
             return Err(FormatError::BufferTooShort {
                 needed,

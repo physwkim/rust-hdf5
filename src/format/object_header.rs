@@ -249,8 +249,16 @@ impl ObjectHeader {
             crate::format::bytes::read_le_uint(&buf[pos..], chunk0_size_bytes) as usize;
         pos += chunk0_size_bytes;
 
-        // We need chunk0_data_size bytes of messages + 4 bytes of checksum
-        let total_consumed = pos + chunk0_data_size + 4;
+        // We need chunk0_data_size bytes of messages + 4 bytes of checksum.
+        // chunk0_data_size is a file field up to 8 bytes wide; guard the
+        // addition so a crafted absurd value yields a clean error instead of
+        // an overflow panic (debug) or wrap (release).
+        let total_consumed = pos
+            .checked_add(chunk0_data_size)
+            .and_then(|x| x.checked_add(4))
+            .ok_or_else(|| {
+                FormatError::InvalidData("object header chunk-0 size overflows usize".into())
+            })?;
         if buf.len() < total_consumed {
             return Err(FormatError::BufferTooShort {
                 needed: total_consumed,

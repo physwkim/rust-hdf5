@@ -330,8 +330,11 @@ impl DatatypeMessage {
                 16
             }
             Self::Array { dims, base } => {
-                let product: u32 = dims.iter().product();
-                product * base.element_size()
+                // `dims` are file-derived; saturate so a crafted array type
+                // yields a too-large size (rejected by buffer checks)
+                // rather than overflowing.
+                let product = dims.iter().fold(1u32, |acc, &d| acc.saturating_mul(d));
+                product.saturating_mul(base.element_size())
             }
         }
     }
@@ -580,8 +583,8 @@ impl DatatypeMessage {
                 // Array: class 10, version 3
                 let version: u8 = 3;
                 let base_size = base.element_size();
-                let product: u32 = dims.iter().product();
-                let total_size = product * base_size;
+                let product = dims.iter().fold(1u32, |acc, &d| acc.saturating_mul(d));
+                let total_size = product.saturating_mul(base_size);
 
                 let mut buf = vec![
                     // byte 0: class | version<<4
@@ -614,8 +617,22 @@ impl DatatypeMessage {
     }
 
     /// Decode from a byte buffer.  Returns `(message, bytes_consumed)`.
-    #[allow(clippy::only_used_in_recursion)]
     pub fn decode(buf: &[u8], ctx: &FormatContext) -> FormatResult<(Self, usize)> {
+        Self::decode_inner(buf, ctx, 0)
+    }
+
+    /// Recursive worker for [`decode`]. `depth` bounds datatype nesting:
+    /// compound/enum/vlen/array types embed a base datatype recursively, and
+    /// a crafted message can nest these deeply enough to exhaust the stack.
+    /// libhdf5-written types nest only a handful of levels.
+    #[allow(clippy::only_used_in_recursion)]
+    fn decode_inner(buf: &[u8], ctx: &FormatContext, depth: usize) -> FormatResult<(Self, usize)> {
+        const MAX_DATATYPE_DEPTH: usize = 256;
+        if depth > MAX_DATATYPE_DEPTH {
+            return Err(FormatError::InvalidData(
+                "datatype nesting exceeds maximum depth".into(),
+            ));
+        }
         if buf.len() < 8 {
             return Err(FormatError::BufferTooShort {
                 needed: 8,
@@ -795,7 +812,7 @@ impl DatatypeMessage {
                     }
 
                     // Member datatype (recursive)
-                    let (member_dt, dt_consumed) = Self::decode(&buf[pos..], ctx)?;
+                    let (member_dt, dt_consumed) = Self::decode_inner(&buf[pos..], ctx, depth + 1)?;
                     pos += dt_consumed;
 
                     members.push(CompoundMember {
@@ -818,7 +835,7 @@ impl DatatypeMessage {
                 let mut pos = 8;
 
                 // Base datatype
-                let (base_dt, base_consumed) = Self::decode(&buf[pos..], ctx)?;
+                let (base_dt, base_consumed) = Self::decode_inner(&buf[pos..], ctx, depth + 1)?;
                 pos += base_consumed;
 
                 // Member names (null-terminated, padded to 8-byte boundary for v1)
@@ -879,7 +896,7 @@ impl DatatypeMessage {
                 let mut pos = 8;
 
                 // Properties: base datatype
-                let (_base_dt, base_consumed) = Self::decode(&buf[pos..], ctx)?;
+                let (_base_dt, base_consumed) = Self::decode_inner(&buf[pos..], ctx, depth + 1)?;
                 pos += base_consumed;
 
                 if vlen_type == 1 {
@@ -939,7 +956,7 @@ impl DatatypeMessage {
                 }
 
                 // Base datatype
-                let (base_dt, base_consumed) = Self::decode(&buf[pos..], ctx)?;
+                let (base_dt, base_consumed) = Self::decode_inner(&buf[pos..], ctx, depth + 1)?;
                 pos += base_consumed;
 
                 Ok((
@@ -1008,6 +1025,36 @@ mod tests {
             sizeof_addr: 4,
             sizeof_size: 4,
         }
+    }
+
+    // ---- recursion / overflow hardening ----
+
+    #[test]
+    fn decode_rejects_deeply_nested_datatype() {
+        // A crafted chain of vlen-of-vlen-of-... datatypes (8 bytes per
+        // level) must be rejected by the depth guard, not recurse until the
+        // stack overflows. Each level: byte0 = class 9 (vlen) | version 1.
+        let levels = 4096;
+        let mut buf = Vec::new();
+        for _ in 0..levels {
+            buf.extend_from_slice(&[(CLASS_VLEN | (1 << 4)), 1, 0, 0, 0, 0, 0, 0]);
+        }
+        let result = DatatypeMessage::decode(&buf, &ctx());
+        assert!(
+            matches!(result, Err(FormatError::InvalidData(_))),
+            "expected depth-limit error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn array_element_size_saturates_on_absurd_dims() {
+        // A crafted array datatype with huge dims must not overflow when its
+        // element size is computed; it saturates instead.
+        let msg = DatatypeMessage::Array {
+            dims: vec![u32::MAX, u32::MAX, u32::MAX],
+            base: Box::new(DatatypeMessage::u64_type()),
+        };
+        assert_eq!(msg.element_size(), u32::MAX);
     }
 
     // ---- fixed point roundtrips ----

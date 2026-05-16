@@ -225,13 +225,15 @@ impl LinkMessage {
 // ========================================================================= helpers
 
 fn check_len(buf: &[u8], pos: usize, need: usize) -> FormatResult<()> {
-    if buf.len() < pos + need {
-        Err(FormatError::BufferTooShort {
-            needed: pos + need,
+    // `need` can be a file-derived length up to 8 bytes wide; a checked add
+    // ensures `pos + need` cannot wrap to a small value that spuriously
+    // passes the bound check (and then panics a slice in the caller).
+    match pos.checked_add(need) {
+        Some(end) if end <= buf.len() => Ok(()),
+        _ => Err(FormatError::BufferTooShort {
+            needed: pos.saturating_add(need),
             available: buf.len(),
-        })
-    } else {
-        Ok(())
+        }),
     }
 }
 

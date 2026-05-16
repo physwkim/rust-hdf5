@@ -206,14 +206,21 @@ impl GlobalHeapCollection {
                 break;
             }
 
-            if pos + size > collection_size {
-                return Err(FormatError::InvalidData(format!(
-                    "global heap object {} extends past collection boundary",
-                    index,
-                )));
-            }
+            // `size` is a file field up to 8 bytes wide; use a checked add
+            // so a crafted value cannot wrap `pos + size` into a small (or
+            // `< pos`) end offset that bypasses the bound check or panics
+            // the slice below.
+            let obj_end = pos
+                .checked_add(size)
+                .filter(|&end| end <= collection_size)
+                .ok_or_else(|| {
+                    FormatError::InvalidData(format!(
+                        "global heap object {} extends past collection boundary",
+                        index,
+                    ))
+                })?;
 
-            let data = buf[pos..pos + size].to_vec();
+            let data = buf[pos..obj_end].to_vec();
             let padded = pad_to_8(size);
             pos += padded;
 

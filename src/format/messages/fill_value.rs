@@ -262,6 +262,31 @@ pub(crate) fn tiled_fill(total: usize, fill_value: Option<&[u8]>) -> Vec<u8> {
     }
 }
 
+/// Fallible variant of [`tiled_fill`] for reader paths.
+///
+/// `total` on a read path is derived from untrusted file fields (dataspace
+/// dimensions, element size). A crafted file can declare an absurd dataset
+/// size; allocating it with `vec![0u8; total]` aborts the process on
+/// allocation failure. This variant uses `try_reserve_exact`, returning a
+/// `TryReserveError` the caller can surface as a clean error instead.
+pub(crate) fn try_tiled_fill(
+    total: usize,
+    fill_value: Option<&[u8]>,
+) -> Result<Vec<u8>, std::collections::TryReserveError> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(total)?;
+    buf.resize(total, 0);
+    if let Some(fv) = fill_value {
+        if !fv.is_empty() && total > 0 {
+            for slot in buf.chunks_mut(fv.len()) {
+                let n = slot.len().min(fv.len());
+                slot[..n].copy_from_slice(&fv[..n]);
+            }
+        }
+    }
+    Ok(buf)
+}
+
 // ======================================================================= tests
 
 #[cfg(test)]

@@ -19,7 +19,7 @@ use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::data_layout::{self, DataLayoutMessage};
 use crate::format::messages::dataspace::DataspaceMessage;
 use crate::format::messages::datatype::DatatypeMessage;
-use crate::format::messages::fill_value::{tiled_fill, FillValueMessage};
+use crate::format::messages::fill_value::{try_tiled_fill, FillValueMessage};
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::link::LinkMessage;
 use crate::format::messages::link::LinkTarget;
@@ -100,6 +100,18 @@ fn saturating_byte_len(dims: &[u64], element_size: u64) -> u64 {
     dims.iter()
         .fold(1u64, |acc, &d| acc.saturating_mul(d))
         .saturating_mul(element_size)
+}
+
+/// Materialize a `total`-byte fill buffer, mapping allocation failure to a
+/// clean error. `total` on a read path comes from untrusted file fields, so
+/// a crafted file declaring an absurd dataset size would otherwise abort the
+/// process when `vec![0u8; total]` fails to allocate.
+fn alloc_tiled_fill(total: usize, fill_value: Option<&[u8]>) -> IoResult<Vec<u8>> {
+    try_tiled_fill(total, fill_value).map_err(|_| {
+        crate::io::IoError::InvalidState(format!(
+            "cannot allocate {total} bytes for dataset buffer (file may be corrupt)"
+        ))
+    })
 }
 
 impl Hdf5Reader {
@@ -771,14 +783,21 @@ impl Hdf5Reader {
         /// Bound on the number of continuation blocks followed per header.
         const MAX_CONT_BLOCKS: usize = 4096;
 
-        // Read to end-of-file: an object header's chunk-0 can hold more
-        // than 8 KiB of inline messages (many/large attributes), and a
-        // truncated buffer makes ObjectHeader::decode_any fail.
-        let avail = handle
-            .file_size()
-            .map(|fs| fs.saturating_sub(addr) as usize)
-            .unwrap_or(8192);
-        let buf = handle.read_at_most(addr, avail)?;
+        // An object header's chunk-0 can hold more than 8 KiB of inline
+        // messages (many/large attributes), but reading the whole file tail
+        // would allocate gigabytes per object on a large valid file. Probe a
+        // bounded prefix; if the header declares a larger chunk-0,
+        // `decode_any` reports the exact byte count via `BufferTooShort` and
+        // we read precisely that much.
+        const HEADER_PROBE: usize = 8192;
+        let mut buf = handle.read_at_most(addr, HEADER_PROBE)?;
+        if let Err(crate::format::FormatError::BufferTooShort { needed, .. }) =
+            ObjectHeader::decode_any(&buf)
+        {
+            if needed > buf.len() {
+                buf = handle.read_at_most(addr, needed)?;
+            }
+        }
         let (mut header, _) = ObjectHeader::decode_any(&buf)?;
 
         // A v1 header has no "OHDR" signature; detect by it.
@@ -1243,7 +1262,7 @@ impl Hdf5Reader {
                     // fill value (when one is defined); otherwise empty.
                     if let Some(ref fv) = fill_value {
                         if total_size > 0 {
-                            return Ok(tiled_fill(total_size as usize, Some(fv)));
+                            return alloc_tiled_fill(total_size as usize, Some(fv));
                         }
                     }
                     return Ok(vec![]);
@@ -1251,7 +1270,7 @@ impl Hdf5Reader {
                 let data = if let Some(pipeline) = pipeline {
                     let raw = self
                         .handle
-                        .read_at_most(index_address, total_size as usize * 2)?;
+                        .read_at_most(index_address, total_size.saturating_mul(2) as usize)?;
                     filter::reverse_filters(pipeline, &raw)?
                 } else {
                     self.handle.read_at(index_address, total_size as usize)?
@@ -1282,7 +1301,7 @@ impl Hdf5Reader {
                             0
                         }
                     })
-                    .product();
+                    .fold(1u64, |acc, n| acc.saturating_mul(n));
 
                 let chunk_entries = self.collect_ea_chunk_entries(
                     index_address,
@@ -1293,7 +1312,7 @@ impl Hdf5Reader {
                 )?;
 
                 let total_size: u64 = saturating_byte_len(&dims, element_size);
-                let mut output = tiled_fill(total_size as usize, fill_value.as_deref());
+                let mut output = alloc_tiled_fill(total_size as usize, fill_value.as_deref())?;
 
                 let n_chunks = std::cmp::min(chunks_dim0 as usize, chunk_entries.len());
 
@@ -1553,7 +1572,7 @@ impl Hdf5Reader {
 
         // Total output size
         let total_size: u64 = saturating_byte_len(&dims, element_size);
-        let mut output = tiled_fill(total_size as usize, fill_value.as_deref());
+        let mut output = alloc_tiled_fill(total_size as usize, fill_value.as_deref())?;
 
         // Compute number of chunks per dimension. A zero chunk dimension
         // from a malformed layout message would divide by zero.
@@ -1718,7 +1737,7 @@ impl Hdf5Reader {
         };
 
         let total_size: u64 = saturating_byte_len(&dims, element_size);
-        let mut output = tiled_fill(total_size as usize, fill_value.as_deref());
+        let mut output = alloc_tiled_fill(total_size as usize, fill_value.as_deref())?;
 
         // Read each chunk's raw bytes.
         let mut raw_chunks: Vec<Option<(Vec<u8>, Vec<u64>)>> = Vec::with_capacity(entries.len());
@@ -1852,7 +1871,7 @@ impl Hdf5Reader {
         }
 
         let total_size: u64 = saturating_byte_len(&dims, element_size);
-        let mut output = tiled_fill(total_size as usize, fill_value.as_deref());
+        let mut output = alloc_tiled_fill(total_size as usize, fill_value.as_deref())?;
 
         if b_tree_address == UNDEF_ADDR || total_size == 0 {
             return Ok(output);
@@ -2041,7 +2060,9 @@ impl Hdf5Reader {
         // For multi-dimensional: compute row-major layout
         // The chunk occupies a sub-region of the output array.
         // We iterate over all elements in the chunk and compute their position.
-        let chunk_elems: u64 = chunk_dims.iter().product();
+        let chunk_elems: u64 = chunk_dims
+            .iter()
+            .fold(1u64, |acc, &d| acc.saturating_mul(d));
         let mut chunk_coord_iter = vec![0u64; ndims];
 
         for elem_idx in 0..chunk_elems {
@@ -2093,7 +2114,7 @@ impl Hdf5Reader {
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let layout = info.layout.clone();
-        let total_elements: u64 = dims.iter().product();
+        let total_elements: u64 = dims.iter().fold(1u64, |acc, &d| acc.saturating_mul(d));
 
         let raw = match &layout {
             DataLayoutMessage::Contiguous { address, size } => {
@@ -2204,7 +2225,7 @@ impl Hdf5Reader {
                     0
                 }
             })
-            .product();
+            .fold(1usize, |acc, n| acc.saturating_mul(n));
         let geo = EaGeometry::new(
             params.idx_blk_elmts,
             params.data_blk_min_elmts,
@@ -2442,7 +2463,7 @@ impl Hdf5Reader {
         match &layout {
             DataLayoutMessage::Contiguous { address, .. } => {
                 if *address == UNDEF_ADDR {
-                    return Ok(tiled_fill(out_bytes, fill_value.as_deref()));
+                    return alloc_tiled_fill(out_bytes, fill_value.as_deref());
                 }
 
                 let strides = compute_strides(&dims, element_size);
@@ -2583,7 +2604,7 @@ impl Hdf5Reader {
                         real_chunk_dims,
                         element_size,
                     )?;
-                    let mut output = tiled_fill(out_bytes, fill_value.as_deref());
+                    let mut output = alloc_tiled_fill(out_bytes, fill_value.as_deref())?;
                     let out_strides = compute_strides(counts, element_size);
                     let chunk_inner_dims = &real_chunk_dims[1..];
                     let chunk_strides = compute_strides(chunk_inner_dims, element_size);
