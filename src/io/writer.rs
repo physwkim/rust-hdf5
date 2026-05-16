@@ -13,8 +13,8 @@ use crate::format::chunk_index::extensible_array::{
     EA_CLS_CHUNK, EA_CLS_FILT_CHUNK,
 };
 use crate::format::chunk_index::fixed_array::{
-    encode_unfiltered_page, FixedArrayDataBlock, FixedArrayHeader, FixedArrayPagedPrefix,
-    FA_CLIENT_CHUNK,
+    encode_filtered_page, encode_unfiltered_page, FixedArrayDataBlock,
+    FixedArrayFilteredChunkElement, FixedArrayHeader, FixedArrayPagedPrefix, FA_CLIENT_FILT_CHUNK,
 };
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::data_layout::{DataLayoutMessage, EarrayParams, FixedArrayParams};
@@ -34,14 +34,20 @@ use crate::io::allocator::FileAllocator;
 use crate::io::file_handle::FileHandle;
 use crate::io::IoResult;
 
-/// On-disk size in bytes of an *unfiltered* fixed-array data block, for the
-/// layout (paged or flat) implied by `hdr`.
+/// On-disk size in bytes of a fixed-array data block, for the layout (paged or
+/// flat) implied by `hdr`.
 ///
 /// Mirrors `H5FA_DBLOCK_SIZE` (`H5FApkg.h`):
-///   - non-paged: `prefix + nelmts * sizeof_addr + checksum`
-///   - paged: `prefix + page_init_bitmap + nelmts * sizeof_addr
+///   - non-paged: `prefix + nelmts * raw_elmt_size + checksum`
+///   - paged: `prefix + page_init_bitmap + nelmts * raw_elmt_size
 ///     + npages * checksum`, where the prefix checksum covers the bitmap.
+///
+/// `raw_elmt_size` is `sizeof_addr` for an unfiltered array, and
+/// `sizeof_addr + chunk_size_len + 4` (the filtered element: address +
+/// compressed size + filter mask) for a filtered array. libhdf5 carries this
+/// value as `hdr->cparam.raw_elmt_size`, i.e. exactly `hdr.element_size`.
 fn fixed_array_dblk_disk_size(ctx: &FormatContext, hdr: &FixedArrayHeader) -> u64 {
+    let elem_size = hdr.element_size as u64;
     let sa = ctx.sizeof_addr as u64;
     let nelmts = hdr.num_elmts;
     // Common metadata prefix: signature(4) + version(1) + client_id(1) + header_addr(sa).
@@ -50,15 +56,16 @@ fn fixed_array_dblk_disk_size(ctx: &FormatContext, hdr: &FixedArrayHeader) -> u6
         let npages = hdr.npages();
         let bitmap_size = npages.div_ceil(8);
         // prefix (incl. its own 4-byte checksum) + elements + per-page checksums.
-        (meta_prefix + bitmap_size + 4) + nelmts * sa + npages * 4
+        (meta_prefix + bitmap_size + 4) + nelmts * elem_size + npages * 4
     } else {
         // prefix + elements + single 4-byte checksum.
-        meta_prefix + nelmts * sa + 4
+        meta_prefix + nelmts * elem_size + 4
     }
 }
 
-/// Encode an *unfiltered* fixed-array data block for the layout implied by
-/// `hdr`, using the chunk addresses held in `dblk.elements`.
+/// Encode a fixed-array data block for the layout implied by `hdr`, using the
+/// chunk addresses held in `dblk.elements` (unfiltered) or the filtered chunk
+/// entries in `dblk.filtered_elements` (filtered, `client_id == 1`).
 ///
 /// For the paged layout (`hdr.is_paged()`), emits the `FADB` prefix with a
 /// page-init bitmap followed by `npages` checksummed element pages. A page is
@@ -71,29 +78,48 @@ fn encode_fixed_array_dblk(
     hdr: &FixedArrayHeader,
     dblk: &FixedArrayDataBlock,
 ) -> Vec<u8> {
+    let is_filtered = hdr.client_id == FA_CLIENT_FILT_CHUNK;
+    let sa = ctx.sizeof_addr as usize;
+    // chunk_size_len for filtered entries = element_size - sizeof_addr - 4.
+    // libhdf5 carries element_size = sizeof_addr + chunk_size_len + 4.
+    let chunk_size_len = (hdr.element_size as usize).saturating_sub(sa + 4);
+
     if !hdr.is_paged() {
-        return dblk.encode_unfiltered(ctx);
+        return if is_filtered {
+            dblk.encode_filtered(ctx, chunk_size_len)
+        } else {
+            dblk.encode_unfiltered(ctx)
+        };
     }
 
     let npages = hdr.npages() as usize;
     let dblk_page_nelmts = hdr.dblk_page_nelmts() as usize;
-    let elements = &dblk.elements;
 
     // Build the page-init bitmap (MSB-first): a page is initialized iff any of
-    // its elements is a defined address.
+    // its elements points at a defined address.
     let mut bitmap = vec![0u8; npages.div_ceil(8)];
+    let nelmts = if is_filtered {
+        dblk.filtered_elements.len()
+    } else {
+        dblk.elements.len()
+    };
     for p in 0..npages {
         let start = p * dblk_page_nelmts;
-        let end = ((p + 1) * dblk_page_nelmts).min(elements.len());
-        let initialized = elements[start..end].iter().any(|&a| a != UNDEF_ADDR);
+        let end = ((p + 1) * dblk_page_nelmts).min(nelmts);
+        let initialized = if is_filtered {
+            dblk.filtered_elements[start..end]
+                .iter()
+                .any(|e| e.address != UNDEF_ADDR)
+        } else {
+            dblk.elements[start..end].iter().any(|&a| a != UNDEF_ADDR)
+        };
         if initialized {
             bitmap[p / 8] |= 0x80u8 >> (p % 8);
         }
     }
 
-    let sa = ctx.sizeof_addr as usize;
     let prefix = FixedArrayPagedPrefix {
-        client_id: FA_CLIENT_CHUNK,
+        client_id: hdr.client_id,
         header_addr: dblk.header_addr,
         page_init_bitmap: bitmap,
         prefix_size: 4 + 1 + 1 + sa + npages.div_ceil(8) + 4,
@@ -106,8 +132,16 @@ fn encode_fixed_array_dblk(
     // only the last page holds fewer elements (libhdf5 H5FA.c).
     for p in 0..npages {
         let start = p * dblk_page_nelmts;
-        let end = ((p + 1) * dblk_page_nelmts).min(elements.len());
-        buf.extend_from_slice(&encode_unfiltered_page(&elements[start..end], ctx));
+        let end = ((p + 1) * dblk_page_nelmts).min(nelmts);
+        if is_filtered {
+            buf.extend_from_slice(&encode_filtered_page(
+                &dblk.filtered_elements[start..end],
+                ctx,
+                chunk_size_len,
+            ));
+        } else {
+            buf.extend_from_slice(&encode_unfiltered_page(&dblk.elements[start..end], ctx));
+        }
     }
     buf
 }
@@ -2194,6 +2228,106 @@ impl Hdf5Writer {
         Ok(idx)
     }
 
+    /// Define a fixed-shape (no unlimited dimension) compressed chunked dataset
+    /// indexed by a *filtered* Fixed Array.
+    ///
+    /// Like `create_fixed_array_dataset`, but the FA header carries the filtered
+    /// client id and a `chunk_size_len`-wide compressed-size field per chunk
+    /// (`FixedArrayFilteredChunkElement`), and the dataset gets a filter
+    /// pipeline. Chunks written via `write_chunk_fixed_array` are compressed and
+    /// their compressed size + filter mask are recorded in the data block.
+    pub fn create_fixed_array_dataset_with_pipeline(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        dims: &[u64],
+        chunk_dims: &[u64],
+        pipeline: FilterPipeline,
+    ) -> IoResult<usize> {
+        self.ensure_unique_dataset_name(name)?;
+        let ndims = dims.len();
+        if chunk_dims.len() != ndims {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "chunk shape has {} dimensions but the dataspace has {}",
+                chunk_dims.len(),
+                ndims
+            )));
+        }
+        let mut num_chunks: u64 = 1;
+        for d in 0..ndims {
+            if chunk_dims[d] == 0 {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "chunk dimension {d} is zero"
+                )));
+            }
+            num_chunks = num_chunks
+                .checked_mul(dims[d].div_ceil(chunk_dims[d]))
+                .ok_or_else(|| {
+                    crate::io::IoError::InvalidState("chunk count overflows u64".into())
+                })?;
+        }
+
+        // chunk_size_len is sized from the uncompressed chunk byte count, the
+        // same way the filtered Extensible Array path computes it: the
+        // compressed size never exceeds the uncompressed size meaningfully, so
+        // this width always holds the stored value.
+        let element_size = datatype.element_size() as u64;
+        let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
+        let chunk_size_len = compute_chunk_size_len(chunk_bytes);
+
+        // Create the filtered FA header.
+        let mut fa_header =
+            FixedArrayHeader::new_for_filtered_chunks(&self.ctx, num_chunks, chunk_size_len);
+        let hdr_encoded = fa_header.encode(&self.ctx);
+        let fa_header_addr = self.allocator.allocate(hdr_encoded.len() as u64);
+
+        // Create the filtered FA data block; both flat and paged layouts
+        // reserve space for `num_chunks` filtered entries up front.
+        let fa_dblk = FixedArrayDataBlock::new_filtered(fa_header_addr, num_chunks as usize);
+        let dblk_size = fixed_array_dblk_disk_size(&self.ctx, &fa_header);
+        let fa_dblk_addr = self.allocator.allocate(dblk_size);
+
+        fa_header.data_blk_addr = fa_dblk_addr;
+
+        let hdr_encoded = fa_header.encode(&self.ctx);
+        self.handle.write_at(fa_header_addr, &hdr_encoded)?;
+        let dblk_encoded = encode_fixed_array_dblk(&self.ctx, &fa_header, &fa_dblk);
+        debug_assert_eq!(dblk_encoded.len() as u64, dblk_size);
+        self.handle.write_at(fa_dblk_addr, &dblk_encoded)?;
+
+        let dataspace = DataspaceMessage::simple(dims);
+
+        let idx = self.datasets.len();
+        self.datasets.push(DatasetInfo {
+            name: name.to_string(),
+            datatype,
+            dataspace,
+            obj_header_addr: 0,
+            data_addr: UNDEF_ADDR,
+            data_size: 0,
+            chunked: None,
+            btree_v2: None,
+            attributes: Vec::new(),
+            obj_header_written_addr: None,
+            obj_header_encoded_size: 0,
+            filter_pipeline: Some(pipeline),
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
+            deleted: false,
+            fill_value: None,
+            fixed_array: Some(FixedArrayDatasetInfo {
+                chunk_dims: chunk_dims.to_vec(),
+                fa_header_addr,
+                fa_dblk_addr,
+                fa_header,
+                fa_dblk,
+                chunks_written: 0,
+            }),
+        });
+
+        Ok(idx)
+    }
+
     /// Define a chunked dataset indexed by a B-tree v2 (multiple unlimited dimensions).
     ///
     /// Returns the dataset index.
@@ -2476,9 +2610,19 @@ impl Hdf5Writer {
             .ok_or_else(|| crate::io::IoError::InvalidState("not a fixed-array dataset".into()))?;
         let chunk_bytes: u64 = fa.chunk_dims.iter().product::<u64>() * element_size;
 
-        // Possibly compress the data
+        // Possibly compress the data. For a filtered dataset the FA carries
+        // filtered elements (address + compressed size + filter mask); the
+        // uncompressed data must still be exactly one chunk wide on input.
+        let is_filtered = ds.filter_pipeline.is_some();
         let write_data;
         let data_to_write = if let Some(ref pipeline) = ds.filter_pipeline {
+            if data.len() as u64 != chunk_bytes {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "chunk data size mismatch: expected {} bytes, got {}",
+                    chunk_bytes,
+                    data.len()
+                )));
+            }
             write_data = filter::apply_filters(pipeline, data)?;
             &write_data
         } else {
@@ -2515,10 +2659,35 @@ impl Hdf5Writer {
         let chunk_addr = self.allocator.allocate(data_to_write.len() as u64);
         self.handle.write_at(chunk_addr, data_to_write)?;
 
-        // Update the fixed array data block
+        // Update the fixed array data block.
         let fa = self.datasets[index].fixed_array.as_mut().unwrap();
-        if (linear_idx as usize) < fa.fa_dblk.elements.len() {
-            fa.fa_dblk.elements[linear_idx as usize] = chunk_addr;
+        let lidx = linear_idx as usize;
+        if is_filtered {
+            // Filtered FA: store address + compressed size + filter mask. The
+            // mask is 0 because `apply_filters` ran the whole pipeline (no
+            // filter was skipped); a non-zero bit means "filter i skipped".
+            let compressed_size = data_to_write.len();
+            if compressed_size > u32::MAX as usize {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "compressed chunk size {compressed_size} exceeds u32::MAX"
+                )));
+            }
+            if lidx < fa.fa_dblk.filtered_elements.len() {
+                fa.fa_dblk.filtered_elements[lidx] = FixedArrayFilteredChunkElement {
+                    address: chunk_addr,
+                    chunk_size: compressed_size as u32,
+                    filter_mask: 0,
+                };
+                fa.chunks_written += 1;
+            } else {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "chunk index {} out of range (max {})",
+                    linear_idx,
+                    fa.fa_dblk.filtered_elements.len()
+                )));
+            }
+        } else if lidx < fa.fa_dblk.elements.len() {
+            fa.fa_dblk.elements[lidx] = chunk_addr;
             fa.chunks_written += 1;
         } else {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -3559,6 +3728,175 @@ mod tests {
         }
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn create_filtered_fixed_array_dataset_roundtrip() {
+        // Small compressed fixed-shape chunked dataset: flat filtered FA.
+        let path = temp_path("fixed_array_filt");
+
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let idx = writer
+            .create_fixed_array_dataset_with_pipeline(
+                "grid",
+                DatatypeMessage::i32_type(),
+                &[4, 6], // 4x6 grid
+                &[2, 3], // chunk = 2x3 => 2x2 = 4 chunks
+                FilterPipeline::deflate(6),
+            )
+            .unwrap();
+
+        let c00: Vec<u8> = [0i32, 1, 2, 6, 7, 8]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        writer.write_chunk_fixed_array(idx, &[0, 0], &c00).unwrap();
+        let c01: Vec<u8> = [3i32, 4, 5, 9, 10, 11]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        writer.write_chunk_fixed_array(idx, &[0, 1], &c01).unwrap();
+        let c10: Vec<u8> = [12i32, 13, 14, 18, 19, 20]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        writer.write_chunk_fixed_array(idx, &[1, 0], &c10).unwrap();
+        let c11: Vec<u8> = [15i32, 16, 17, 21, 22, 23]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        writer.write_chunk_fixed_array(idx, &[1, 1], &c11).unwrap();
+
+        writer.close().unwrap();
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        assert_eq!(reader.dataset_shape("grid").unwrap(), vec![4, 6]);
+        let raw = reader.read_dataset_raw("grid").unwrap();
+        let values: Vec<i32> = raw
+            .chunks(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values.len(), 24);
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(*v, i as i32, "element {i}");
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn create_filtered_fixed_array_paged_dataset_roundtrip() {
+        // Large compressed fixed-shape chunked dataset (>1024 chunks): the
+        // filtered FA data block must be paged.
+        let path = temp_path("fixed_array_filt_paged");
+
+        let n: usize = 3000;
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let idx = writer
+            .create_fixed_array_dataset_with_pipeline(
+                "paged",
+                DatatypeMessage::i32_type(),
+                &[n as u64],
+                &[1],
+                FilterPipeline::deflate(6),
+            )
+            .unwrap();
+
+        for i in 0..n {
+            let v = (i as i32).to_le_bytes();
+            writer
+                .write_chunk_fixed_array(idx, &[i as u64], &v)
+                .unwrap();
+        }
+        writer.close().unwrap();
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        assert_eq!(reader.dataset_shape("paged").unwrap(), vec![n as u64]);
+        let raw = reader.read_dataset_raw("paged").unwrap();
+        let values: Vec<i32> = raw
+            .chunks(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values.len(), n);
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(*v, i as i32, "element {i}");
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn filtered_fixed_array_dblk_disk_size_and_encode() {
+        // Cross-check filtered FA data-block sizing against the encoded length,
+        // for both flat and paged layouts.
+        let ctx = FormatContext {
+            sizeof_addr: 8,
+            sizeof_size: 8,
+        };
+        let csl = 3u8; // chunk_size_len
+        let elem_size = 8 + csl as usize + 4; // addr + size + filter_mask
+
+        // Flat: 100 chunks. prefix(14) + 100*elem_size + cksum(4).
+        let mut flat = FixedArrayHeader::new_for_filtered_chunks(&ctx, 100, csl);
+        flat.data_blk_addr = 0x4000;
+        assert!(!flat.is_paged());
+        assert_eq!(
+            fixed_array_dblk_disk_size(&ctx, &flat),
+            (14 + 100 * elem_size + 4) as u64
+        );
+        let flat_dblk = FixedArrayDataBlock::new_filtered(0x1000, 100);
+        assert_eq!(
+            encode_fixed_array_dblk(&ctx, &flat, &flat_dblk).len() as u64,
+            fixed_array_dblk_disk_size(&ctx, &flat)
+        );
+
+        // Paged: 2500 chunks => 3 pages. prefix(4+1+1+8+1+4=19)
+        // + 2500*elem_size + 3*cksum(4).
+        let mut paged = FixedArrayHeader::new_for_filtered_chunks(&ctx, 2500, csl);
+        paged.data_blk_addr = 0x9000;
+        assert!(paged.is_paged());
+        assert_eq!(paged.npages(), 3);
+        assert_eq!(
+            fixed_array_dblk_disk_size(&ctx, &paged),
+            (19 + 2500 * elem_size + 12) as u64
+        );
+        let mut paged_dblk = FixedArrayDataBlock::new_filtered(0x1000, 2500);
+        for (i, e) in paged_dblk.filtered_elements.iter_mut().enumerate() {
+            e.address = 0x10000 + (i as u64) * 0x100;
+            e.chunk_size = (i % 200) as u32;
+        }
+        let encoded = encode_fixed_array_dblk(&ctx, &paged, &paged_dblk);
+        assert_eq!(
+            encoded.len() as u64,
+            fixed_array_dblk_disk_size(&ctx, &paged)
+        );
+
+        // Decode the paged prefix + pages as the reader does.
+        let npages = paged.npages() as usize;
+        let prefix = FixedArrayPagedPrefix::decode(&encoded, &ctx, npages as u64).unwrap();
+        for p in 0..npages {
+            assert!(prefix.page_initialized(p), "page {p}");
+        }
+        let dblk_page_nelmts = paged.dblk_page_nelmts() as usize;
+        let page_stride = dblk_page_nelmts * elem_size + 4;
+        let mut recovered = Vec::new();
+        for p in 0..npages {
+            let page_nelmts = if p + 1 == npages {
+                2500 - p * dblk_page_nelmts
+            } else {
+                dblk_page_nelmts
+            };
+            let off = prefix.prefix_size + p * page_stride;
+            let elems = crate::format::chunk_index::fixed_array::decode_filtered_page(
+                &encoded[off..],
+                &ctx,
+                page_nelmts,
+                csl as usize,
+            )
+            .unwrap();
+            recovered.extend(elems);
+        }
+        assert_eq!(recovered, paged_dblk.filtered_elements);
     }
 
     #[test]

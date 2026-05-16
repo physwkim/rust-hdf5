@@ -250,17 +250,31 @@ impl<T: H5Type> DatasetBuilder<T> {
                         } else if is_fixed_array {
                             // A chunked dataset with no unlimited dimension
                             // must use the fixed-array index — libhdf5
-                            // rejects an extensible-array index here.
+                            // rejects an extensible-array index here. A
+                            // compressed fixed-shape dataset uses a *filtered*
+                            // fixed array (FA client id 1).
                             if wants_filter {
-                                return Err(Hdf5Error::InvalidState(
-                                    "a compressed chunked dataset needs at least one \
-                                     resizable dimension; add .max_shape(&[None, ...])"
-                                        .into(),
-                                ));
+                                let pipeline = if let Some(p) = self.custom_pipeline {
+                                    p
+                                } else if let Some(level) = self.shuffle_deflate_level {
+                                    crate::format::messages::filter::FilterPipeline::shuffle_deflate(
+                                        T::element_size() as u32,
+                                        level,
+                                    )
+                                } else {
+                                    // deflate_level (checked by wants_filter).
+                                    crate::format::messages::filter::FilterPipeline::deflate(
+                                        self.deflate_level.unwrap(),
+                                    )
+                                };
+                                writer.create_fixed_array_dataset_with_pipeline(
+                                    &full_name, datatype, &dims_u64, &chunk_u64, pipeline,
+                                )?
+                            } else {
+                                writer.create_fixed_array_dataset(
+                                    &full_name, datatype, &dims_u64, &chunk_u64,
+                                )?
                             }
-                            writer.create_fixed_array_dataset(
-                                &full_name, datatype, &dims_u64, &chunk_u64,
-                            )?
                         } else if let Some(pipeline) = self.custom_pipeline {
                             writer.create_chunked_dataset_with_pipeline(
                                 &full_name, datatype, &dims_u64, &max_u64, &chunk_u64, pipeline,

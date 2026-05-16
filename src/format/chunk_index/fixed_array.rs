@@ -628,7 +628,9 @@ pub fn decode_unfiltered_page(
     nelmts: usize,
 ) -> FormatResult<Vec<u64>> {
     let sa = ctx.sizeof_addr as usize;
-    let page_size = nelmts * sa + 4;
+    // Saturating: `nelmts` is file-derived; an overflowing product must yield
+    // a huge `page_size` (clean BufferTooShort), not wrap.
+    let page_size = nelmts.saturating_mul(sa).saturating_add(4);
     if page_buf.len() < page_size {
         return Err(FormatError::BufferTooShort {
             needed: page_size,
@@ -673,7 +675,9 @@ pub fn decode_filtered_page(
 ) -> FormatResult<Vec<FixedArrayFilteredChunkElement>> {
     let sa = ctx.sizeof_addr as usize;
     let elem_size = sa + chunk_size_len + 4;
-    let page_size = nelmts * elem_size + 4;
+    // Saturating: `nelmts` is file-derived; an overflowing product must yield
+    // a huge `page_size` (clean BufferTooShort), not wrap.
+    let page_size = nelmts.saturating_mul(elem_size).saturating_add(4);
     if page_buf.len() < page_size {
         return Err(FormatError::BufferTooShort {
             needed: page_size,
