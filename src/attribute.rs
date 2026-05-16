@@ -35,18 +35,19 @@ pub struct H5Attribute {
     file_inner: SharedInner,
     ds_index: usize,
     name: String,
-    /// Cached data for read-mode attributes.
-    read_data: Option<Vec<u8>>,
+    /// The decoded attribute message for read-mode handles (carries the
+    /// datatype, needed to resolve variable-length string values).
+    read_attr: Option<AttributeMessage>,
 }
 
 impl H5Attribute {
-    /// Create a read-mode attribute handle with cached data.
-    pub(crate) fn new_reader(file_inner: SharedInner, name: String, data: Vec<u8>) -> Self {
+    /// Create a read-mode attribute handle from a decoded attribute message.
+    pub(crate) fn new_reader(file_inner: SharedInner, attr_msg: AttributeMessage) -> Self {
         Self {
             file_inner,
             ds_index: usize::MAX,
-            name,
-            read_data: Some(data),
+            name: attr_msg.name.clone(),
+            read_attr: Some(attr_msg),
         }
     }
 
@@ -119,8 +120,9 @@ impl H5Attribute {
     /// ```
     pub fn read_numeric<T: crate::types::H5Type>(&self) -> Result<T> {
         let data = self
-            .read_data
+            .read_attr
             .as_ref()
+            .map(|a| &a.data)
             .ok_or_else(|| Hdf5Error::InvalidState("attribute has no read data".into()))?;
         let es = T::element_size();
         if data.len() < es {
@@ -139,22 +141,37 @@ impl H5Attribute {
 
     /// Read the attribute value as a string.
     ///
-    /// Works for fixed-length string attributes (as written by this library)
-    /// and returns the string value with any trailing null bytes stripped.
+    /// Handles both fixed-length string attributes and variable-length
+    /// string attributes (h5py's default), resolving a vlen value through
+    /// the global heap.
     pub fn read_string(&self) -> Result<String> {
-        let data = self.read_data.as_ref().ok_or_else(|| {
+        let attr = self.read_attr.as_ref().ok_or_else(|| {
             Hdf5Error::InvalidState("attribute has no read data (write-mode handle?)".into())
         })?;
-        // Strip trailing null bytes
-        let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-        Ok(String::from_utf8_lossy(&data[..end]).to_string())
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => Ok(reader.attr_string_value(attr)?),
+            _ => {
+                // No reader available — fall back to the raw fixed-length
+                // interpretation.
+                let end = attr
+                    .data
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(attr.data.len());
+                Ok(String::from_utf8_lossy(&attr.data[..end]).to_string())
+            }
+        }
     }
 
     /// Read the raw attribute data bytes.
     pub fn read_raw(&self) -> Result<Vec<u8>> {
-        self.read_data.clone().ok_or_else(|| {
-            Hdf5Error::InvalidState("attribute has no read data (write-mode handle?)".into())
-        })
+        self.read_attr
+            .as_ref()
+            .map(|a| a.data.clone())
+            .ok_or_else(|| {
+                Hdf5Error::InvalidState("attribute has no read data (write-mode handle?)".into())
+            })
     }
 }
 
@@ -195,7 +212,7 @@ impl<'a, T> AttrBuilder<'a, T> {
             file_inner: clone_inner(self.file_inner),
             ds_index: self.ds_index,
             name: name.to_string(),
-            read_data: None,
+            read_attr: None,
         })
     }
 }

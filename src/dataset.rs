@@ -546,11 +546,10 @@ impl H5Dataset {
                 let inner = borrow_inner(&self.file_inner);
                 match &*inner {
                     H5FileInner::Reader(reader) => {
-                        let attr_msg = reader.dataset_attr(name, attr_name)?;
+                        let attr_msg = reader.dataset_attr(name, attr_name)?.clone();
                         Ok(crate::attribute::H5Attribute::new_reader(
                             clone_inner(&self.file_inner),
-                            attr_msg.name.clone(),
-                            attr_msg.data.clone(),
+                            attr_msg,
                         ))
                     }
                     _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
@@ -713,6 +712,12 @@ impl H5Dataset {
                             for d in (0..dims.len()).rev() {
                                 coords[d] = rem % grid[d];
                                 rem /= grid[d];
+                            }
+                            // A leftover means chunk_idx exceeded the grid.
+                            if rem != 0 {
+                                return Err(Hdf5Error::InvalidState(format!(
+                                    "chunk index {chunk_idx} is out of range for this dataset"
+                                )));
                             }
                             writer.write_chunk_fixed_array(*index, &coords, data)?;
                         } else {

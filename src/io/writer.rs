@@ -1967,6 +1967,21 @@ impl Hdf5Writer {
             )));
         }
         ds.fill_value = Some(bytes);
+
+        // For a contiguous dataset the fill-value message declares
+        // fill-on-allocation, but contiguous storage has no per-chunk
+        // fill path — write the tiled fill value across the data block now
+        // so unwritten elements read back as the fill value. (The high-level
+        // builder calls this immediately after create, before any data is
+        // written; a subsequent write_raw/write_slice overwrites its region.)
+        let is_chunked = ds.chunked.is_some() || ds.fixed_array.is_some() || ds.btree_v2.is_some();
+        if !is_chunked && ds.data_addr != UNDEF_ADDR && ds.data_size > 0 {
+            let data_addr = ds.data_addr;
+            let data_size = ds.data_size as usize;
+            let fv = ds.fill_value.as_deref();
+            let filled = crate::format::messages::fill_value::tiled_fill(data_size, fv);
+            self.handle.write_at(data_addr, &filled)?;
+        }
         Ok(())
     }
 
@@ -2651,6 +2666,14 @@ impl Hdf5Writer {
         let mut stride: u64 = 1;
         for d in (0..ndims).rev() {
             let n_chunks_in_dim = dims[d].div_ceil(chunk_dims[d]);
+            // Reject an out-of-grid coordinate: without this an inner
+            // dimension's overflow silently aliases a different chunk slot.
+            if chunk_coords[d] >= n_chunks_in_dim {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "chunk coordinate {} in dimension {} is outside the chunk grid (0..{})",
+                    chunk_coords[d], d, n_chunks_in_dim
+                )));
+            }
             linear_idx += chunk_coords[d] * stride;
             stride *= n_chunks_in_dim;
         }
@@ -2670,6 +2693,17 @@ impl Hdf5Writer {
             if compressed_size > u32::MAX as usize {
                 return Err(crate::io::IoError::InvalidState(format!(
                     "compressed chunk size {compressed_size} exceeds u32::MAX"
+                )));
+            }
+            // The compressed size is encoded in the FA header's
+            // `chunk_size_len`-byte field; libhdf5 errors if it does not fit
+            // (H5D_CHUNK_ENCODE_SIZE_CHECK) rather than truncating silently.
+            let chunk_size_len =
+                fa.fa_header.element_size as usize - self.ctx.sizeof_addr as usize - 4;
+            if chunk_size_len < 8 && compressed_size >= (1usize << (chunk_size_len * 8)) {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "compressed chunk size {compressed_size} does not fit in the \
+                     {chunk_size_len}-byte fixed-array chunk-size field"
                 )));
             }
             if lidx < fa.fa_dblk.filtered_elements.len() {
