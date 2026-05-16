@@ -291,7 +291,15 @@ impl Hdf5Writer {
         }
 
         let mut link_entries: Vec<(String, u64)> = Vec::new();
-        Self::collect_links_recursive(&mut handle, &root_header, &ctx, "", &mut link_entries)?;
+        let mut visited_groups = std::collections::HashSet::new();
+        Self::collect_links_recursive(
+            &mut handle,
+            &root_header,
+            &ctx,
+            "",
+            &mut link_entries,
+            &mut visited_groups,
+        )?;
 
         let mut existing_datasets = Vec::new();
         for (name, obj_addr) in &link_entries {
@@ -600,6 +608,7 @@ impl Hdf5Writer {
         ctx: &FormatContext,
         prefix: &str,
         out: &mut Vec<(String, u64)>,
+        visited: &mut std::collections::HashSet<u64>,
     ) -> IoResult<()> {
         use crate::format::messages::link::{LinkMessage, LinkTarget};
         for msg in &header.messages {
@@ -627,13 +636,16 @@ impl Hdf5Writer {
                                     .messages
                                     .iter()
                                     .any(|m| m.msg_type == crate::format::messages::MSG_LINK);
-                                if has_links {
+                                // Recurse only into a group's header we have
+                                // not entered before — breaks hard-link cycles.
+                                if has_links && visited.insert(*address) {
                                     let _ = Self::collect_links_recursive(
                                         handle,
                                         &child_header,
                                         ctx,
                                         &full_name,
                                         out,
+                                        visited,
                                     );
                                 }
                             }

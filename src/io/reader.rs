@@ -272,8 +272,15 @@ impl Hdf5Reader {
         std::collections::HashMap<String, Vec<AttributeMessage>>,
     )> {
         let mut group_attrs = std::collections::HashMap::new();
-        let datasets =
-            Self::discover_datasets_recursive(handle, root_header, ctx, "", &mut group_attrs)?;
+        let mut visited = std::collections::HashSet::new();
+        let datasets = Self::discover_datasets_recursive(
+            handle,
+            root_header,
+            ctx,
+            "",
+            &mut group_attrs,
+            &mut visited,
+        )?;
         Ok((datasets, group_attrs))
     }
 
@@ -283,6 +290,7 @@ impl Hdf5Reader {
         ctx: &FormatContext,
         prefix: &str,
         group_attrs: &mut std::collections::HashMap<String, Vec<AttributeMessage>>,
+        visited: &mut std::collections::HashSet<u64>,
     ) -> IoResult<Vec<DatasetReadInfo>> {
         // Bound recursion depth on a hostile/corrupt file.
         const MAX_GROUP_DEPTH: usize = 256;
@@ -324,14 +332,24 @@ impl Hdf5Reader {
                     format!("{}/{}", prefix, link.name)
                 };
 
-                // Try to read as a dataset.
-                if let Some(info) =
-                    Self::read_dataset_from_object_header(handle, ctx, *address, &full_name)?
+                // Try to read as a dataset. A target whose object header
+                // fails to decode (e.g. a stale link left by a deletion) is
+                // skipped rather than aborting the whole file open.
+                match Self::read_dataset_from_object_header(handle, ctx, *address, &full_name) {
+                    Ok(Some(info)) => {
+                        datasets.push(info);
+                        continue;
+                    }
+                    Err(_) => continue,
+                    Ok(None) => {}
+                }
+                // Not a dataset — treat as a group. Break hard-link cycles:
+                // only descend into an object-header address once.
+                if !visited.insert(*address) {
+                    continue;
+                }
                 {
-                    datasets.push(info);
-                } else {
-                    // Not a dataset — treat as a group. Read its full object
-                    // header (with continuations) for child links.
+                    // Read its full object header (with continuations).
                     if let Ok(child_header) = Self::read_object_header_full(handle, ctx, *address) {
                         // Capture group attributes (e.g. the NeXus `NX_class`
                         // marker), keyed by path, whether or not it has
@@ -353,6 +371,7 @@ impl Hdf5Reader {
                             ctx,
                             &full_name,
                             group_attrs,
+                            visited,
                         )?;
                         datasets.extend(child_ds);
                     }
@@ -425,6 +444,7 @@ impl Hdf5Reader {
         heap_addr: u64,
     ) -> IoResult<Vec<DatasetReadInfo>> {
         let mut datasets = Vec::new();
+        let mut visited = std::collections::HashSet::new();
         Self::discover_datasets_from_btree_recursive(
             handle,
             ctx,
@@ -433,12 +453,14 @@ impl Hdf5Reader {
             "",
             0,
             &mut datasets,
+            &mut visited,
         )?;
         Ok(datasets)
     }
 
     /// Recursive worker for `discover_datasets_from_btree`. `prefix` is the
     /// path of the group being scanned; `depth` bounds recursion.
+    #[allow(clippy::too_many_arguments)]
     fn discover_datasets_from_btree_recursive(
         handle: &mut FileHandle,
         ctx: &FormatContext,
@@ -447,6 +469,7 @@ impl Hdf5Reader {
         prefix: &str,
         depth: usize,
         datasets: &mut Vec<DatasetReadInfo>,
+        visited: &mut std::collections::HashSet<u64>,
     ) -> IoResult<()> {
         // Bound legacy-group nesting depth on a hostile/corrupt file.
         const MAX_GROUP_DEPTH: usize = 256;
@@ -466,7 +489,7 @@ impl Hdf5Reader {
         let heap_data = handle.read_at(heap_hdr.data_addr, heap_hdr.data_size as usize)?;
 
         // Collect all SNOD addresses by walking the B-tree.
-        let snod_addrs = Self::collect_snod_addresses(handle, btree_addr, sa, ss)?;
+        let snod_addrs = Self::collect_snod_addresses(handle, btree_addr, sa, ss, 0)?;
 
         for snod_addr in snod_addrs {
             let snod_buf = handle.read_at_most(snod_addr, 8192)?;
@@ -484,19 +507,30 @@ impl Hdf5Reader {
                     format!("{}/{}", prefix, name)
                 };
 
-                // Try to read this entry as a dataset.
-                if let Some(info) = Self::read_dataset_from_object_header(
+                // Try to read this entry as a dataset. A target whose
+                // object header fails to decode is skipped, not fatal.
+                match Self::read_dataset_from_object_header(
                     handle,
                     ctx,
                     entry.obj_header_addr,
                     &full_name,
-                )? {
-                    datasets.push(info);
+                ) {
+                    Ok(Some(info)) => {
+                        datasets.push(info);
+                        continue;
+                    }
+                    Err(_) => continue,
+                    Ok(None) => {}
+                }
+
+                // Not a dataset — it is a subgroup. Break cycles: descend
+                // into each group object header at most once.
+                if !visited.insert(entry.obj_header_addr) {
                     continue;
                 }
 
-                // Not a dataset — it is a subgroup. Find its B-tree + local
-                // heap and recurse, prefixing names with the group path.
+                // Find its B-tree + local heap and recurse, prefixing names
+                // with the group path.
                 let (sub_btree, sub_heap) = if entry.cache_type == 1 {
                     // Scratch-pad caches the subgroup's symbol-table info.
                     (entry.btree_addr, entry.heap_addr)
@@ -515,6 +549,7 @@ impl Hdf5Reader {
                         &full_name,
                         depth + 1,
                         datasets,
+                        visited,
                     )?;
                 }
             }
@@ -529,7 +564,13 @@ impl Hdf5Reader {
         tree_addr: u64,
         sizeof_addr: usize,
         sizeof_size: usize,
+        depth: usize,
     ) -> IoResult<Vec<u64>> {
+        // A well-formed v1 B-tree's level strictly decreases with depth;
+        // bound the descent so a corrupt/cyclic tree cannot recurse forever.
+        if depth > 256 {
+            return Ok(Vec::new());
+        }
         let buf = handle.read_at_most(tree_addr, 8192)?;
         let node = BTreeV1Node::decode(&buf, sizeof_addr, sizeof_size)?;
 
@@ -540,8 +581,13 @@ impl Hdf5Reader {
             // Internal level: children are sub-TREE addresses
             let mut addrs = Vec::new();
             for &child_addr in &node.children {
-                let child_addrs =
-                    Self::collect_snod_addresses(handle, child_addr, sizeof_addr, sizeof_size)?;
+                let child_addrs = Self::collect_snod_addresses(
+                    handle,
+                    child_addr,
+                    sizeof_addr,
+                    sizeof_size,
+                    depth + 1,
+                )?;
                 addrs.extend(child_addrs);
             }
             Ok(addrs)
