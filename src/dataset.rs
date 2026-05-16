@@ -1851,6 +1851,41 @@ mod tests {
     }
 
     #[test]
+    fn vlen_append_after_reopen_super_block() {
+        // Reopen + append into a partial chunk whose index falls in an
+        // extensible-array *super block* (chunk index 244 with the default
+        // EA geometry: idx_blk_elmts=4, data_blk_min_elmts=16,
+        // sup_blk_min_data_ptrs=4 -> chunks 0..=243 are reached via the
+        // index block or its direct data blocks, so chunk 244 is reached
+        // via a super block read from disk). Exercises the ViaSblk branch
+        // of read_chunk_if_present.
+        let path = temp_path("vlen_reopen_super");
+        // 489 strings, chunk size 2 -> chunk 244 holds one string only
+        // (partially filled) and is flushed to disk on close.
+        let labels: Vec<String> = (0..489).map(|i| format!("v{i}")).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.create_appendable_vlen_dataset("strs", 2, None)
+                .unwrap();
+            let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+            file.append_vlen_strings("strs", &refs).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open_rw(&path).unwrap();
+            file.append_vlen_strings("strs", &["v489"]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let got = file.dataset("strs").unwrap().read_vlen_strings().unwrap();
+            let want: Vec<String> = (0..490).map(|i| format!("v{i}")).collect();
+            assert_eq!(got, want);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn vlen_append_after_reopen_filtered_data_block() {
         // The hardest path: compressed + chunk in a data block + partial
         // read-modify-write across a reopen.

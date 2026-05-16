@@ -89,19 +89,12 @@ pub struct ChunkedDatasetInfo {
     pub ea_header: ExtensibleArrayHeader,
     /// In-memory copy of the EA index block (for unfiltered datasets).
     pub ea_iblk: ExtensibleArrayIndexBlock,
-    /// Data blocks that have been allocated. Each entry: (file_addr, data_block).
-    pub data_blocks: Vec<(u64, ExtensibleArrayDataBlock)>,
     /// Number of chunks written so far.
     pub chunks_written: u64,
     /// Filtered index block (for compressed datasets).
     pub filt_iblk: Option<FilteredIndexBlock>,
-    /// Filtered data blocks (for compressed datasets).
-    pub filt_data_blocks: Vec<(u64, FilteredDataBlock)>,
     /// chunk_size_len for filtered entries.
     pub chunk_size_len: u8,
-    /// Super blocks that have been allocated. Each entry: (file_addr, super_block).
-    /// Super blocks are filter-agnostic (they hold data-block addresses only).
-    pub super_blocks: Vec<(u64, ExtensibleArraySuperBlock)>,
 }
 
 /// Where a newly-created EA data block's address must be recorded.
@@ -508,12 +501,9 @@ impl Hdf5Writer {
                                 ndblk_addrs,
                                 ea_header,
                                 ea_iblk,
-                                data_blocks: Vec::new(),
                                 chunks_written: 0,
                                 filt_iblk,
-                                filt_data_blocks: Vec::new(),
                                 chunk_size_len,
-                                super_blocks: Vec::new(),
                             });
                         }
                     }
@@ -956,12 +946,9 @@ impl Hdf5Writer {
                 ndblk_addrs,
                 ea_header,
                 ea_iblk,
-                data_blocks: Vec::new(),
                 chunks_written: 0,
                 filt_iblk: None,
-                filt_data_blocks: Vec::new(),
                 chunk_size_len: 0,
-                super_blocks: Vec::new(),
             }),
         });
 
@@ -1028,14 +1015,27 @@ impl Hdf5Writer {
         } else {
             data
         };
-        let is_filtered = ds.filter_pipeline.is_some();
         let compressed_size = write_data.len() as u64;
 
         // Allocate space for the chunk data
         let chunk_addr = self.allocator.allocate(compressed_size);
         self.handle.write_at(chunk_addr, write_data)?;
 
-        // Update the extensible array to record this chunk
+        self.record_ea_chunk(index, chunk_idx, chunk_addr, compressed_size)
+    }
+
+    /// Record a written chunk in the extensible-array index, placing
+    /// its address (and compressed size, for filtered datasets) into
+    /// the index block, a data block, or a super block per the EA
+    /// geometry. Shared by write_chunk and write_compressed_chunk.
+    fn record_ea_chunk(
+        &mut self,
+        index: usize,
+        chunk_idx: u64,
+        chunk_addr: u64,
+        compressed_size: u64,
+    ) -> IoResult<()> {
+        let is_filtered = self.datasets[index].filter_pipeline.is_some();
         let idx_blk_elmts = {
             let c = self.datasets[index].chunked.as_ref().unwrap();
             c.earray_params.idx_blk_elmts as u64
@@ -1260,7 +1260,6 @@ impl Hdf5Writer {
                 c.ea_header.num_elmts_realized += loc.dblk_nelmts;
             }
         }
-
         Ok(())
     }
 
@@ -1567,12 +1566,9 @@ impl Hdf5Writer {
                 ndblk_addrs,
                 ea_header,
                 ea_iblk,
-                data_blocks: Vec::new(),
                 chunks_written: 0,
                 filt_iblk: Some(filt_iblk),
-                filt_data_blocks: Vec::new(),
                 chunk_size_len,
-                super_blocks: Vec::new(),
             }),
         });
 
@@ -1838,10 +1834,7 @@ impl Hdf5Writer {
             return Ok(None);
         };
         let chunk_bytes = chunked.chunk_dims.iter().product::<u64>() * element_size;
-        let idx_blk_elmts = chunked.earray_params.idx_blk_elmts as u64;
-        let min_elmts = chunked.earray_params.data_blk_min_elmts as u64;
         let max_nelmts_bits = chunked.earray_params.max_nelmts_bits;
-        let ndblk_addrs = chunked.ndblk_addrs;
         let chunk_size_len = chunked.chunk_size_len;
         let is_filtered = chunked.filt_iblk.is_some();
 
@@ -1856,49 +1849,77 @@ impl Hdf5Writer {
             },
         }
 
-        let loc = if chunk_idx < idx_blk_elmts {
-            if is_filtered {
-                let e = &chunked.filt_iblk.as_ref().unwrap().elements[chunk_idx as usize];
-                Loc::Direct(e.addr, e.nbytes)
-            } else {
-                Loc::Direct(chunked.ea_iblk.elements[chunk_idx as usize], chunk_bytes)
+        // Resolve the chunk's location with the libhdf5-compatible EA
+        // geometry (super-block-grouped data blocks), matching `record_ea_chunk`.
+        let ea_loc = {
+            let p = &chunked.earray_params;
+            EaGeometry::new(
+                p.idx_blk_elmts,
+                p.data_blk_min_elmts,
+                p.sup_blk_min_data_ptrs,
+                p.max_nelmts_bits,
+                p.max_dblk_page_nelmts_bits,
+            )
+            .locate(chunk_idx)
+        };
+        let loc = match ea_loc {
+            EaLoc::Index { elem } => {
+                if is_filtered {
+                    let e = &chunked.filt_iblk.as_ref().unwrap().elements[elem];
+                    Loc::Direct(e.addr, e.nbytes)
+                } else {
+                    Loc::Direct(chunked.ea_iblk.elements[elem], chunk_bytes)
+                }
             }
-        } else {
-            // Locate the data block covering this chunk. Block sizes follow
-            // min, min, 2*min, 2*min, 4*min, ... (doubling every two).
-            let offset_in_dblks = chunk_idx - idx_blk_elmts;
-            let mut cumulative = 0u64;
-            let mut dblk_idx = 0usize;
-            let mut current_size = min_elmts;
-            let mut pair = 0;
-            loop {
-                if offset_in_dblks < cumulative + current_size {
-                    break;
+            EaLoc::Dblk(l) => {
+                if l.paged {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "chunk index {} lives in a paged extensible-array data \
+                         block, which is not yet supported for read-modify-write",
+                        chunk_idx
+                    )));
                 }
-                cumulative += current_size;
-                dblk_idx += 1;
-                pair += 1;
-                if pair >= 2 {
-                    pair = 0;
-                    current_size *= 2;
-                }
-                if dblk_idx >= ndblk_addrs {
+                let dblk_addr = match l.path {
+                    EaDblkPath::Direct { idx } => {
+                        if is_filtered {
+                            chunked.filt_iblk.as_ref().unwrap().dblk_addrs[idx]
+                        } else {
+                            chunked.ea_iblk.dblk_addrs[idx]
+                        }
+                    }
+                    EaDblkPath::ViaSblk {
+                        sblk_off,
+                        local_dblk,
+                        ndblks_in_sblk,
+                        ..
+                    } => {
+                        let sblk_addr = if is_filtered {
+                            chunked.filt_iblk.as_ref().unwrap().sblk_addrs[sblk_off]
+                        } else {
+                            chunked.ea_iblk.sblk_addrs[sblk_off]
+                        };
+                        if sblk_addr == UNDEF_ADDR {
+                            return Ok(None);
+                        }
+                        let sb_buf = self.handle.read_at_most(sblk_addr, 65536)?;
+                        let sb = ExtensibleArraySuperBlock::decode(
+                            &sb_buf,
+                            &self.ctx,
+                            max_nelmts_bits,
+                            ndblks_in_sblk,
+                            0,
+                        )?;
+                        sb.dblk_addrs[local_dblk]
+                    }
+                };
+                if dblk_addr == UNDEF_ADDR {
                     return Ok(None);
                 }
-            }
-            let offset = (offset_in_dblks - cumulative) as usize;
-            let dblk_addr = if is_filtered {
-                chunked.filt_iblk.as_ref().unwrap().dblk_addrs[dblk_idx]
-            } else {
-                chunked.ea_iblk.dblk_addrs[dblk_idx]
-            };
-            if dblk_addr == UNDEF_ADDR {
-                return Ok(None);
-            }
-            Loc::DataBlock {
-                dblk_addr,
-                offset,
-                nelmts: current_size as usize,
+                Loc::DataBlock {
+                    dblk_addr,
+                    offset: l.offset_in_dblk as usize,
+                    nelmts: l.dblk_nelmts as usize,
+                }
             }
         };
 
@@ -2172,12 +2193,9 @@ impl Hdf5Writer {
                 ndblk_addrs,
                 ea_header,
                 ea_iblk,
-                data_blocks: Vec::new(),
                 chunks_written: 0,
                 filt_iblk: Some(filt_iblk),
-                filt_data_blocks: Vec::new(),
                 chunk_size_len,
-                super_blocks: Vec::new(),
             }),
         });
 
@@ -2270,12 +2288,9 @@ impl Hdf5Writer {
                 ndblk_addrs,
                 ea_header,
                 ea_iblk,
-                data_blocks: Vec::new(),
                 chunks_written: 0,
                 filt_iblk: Some(filt_iblk),
-                filt_data_blocks: Vec::new(),
                 chunk_size_len,
-                super_blocks: Vec::new(),
             }),
         });
         Ok(idx)
@@ -2422,157 +2437,7 @@ impl Hdf5Writer {
         let chunk_addr = self.allocator.allocate(compressed_size);
         self.handle.write_at(chunk_addr, compressed_data)?;
 
-        let is_filtered = self.datasets[index].filter_pipeline.is_some();
-        let idx_blk_elmts = {
-            let c = self.datasets[index]
-                .chunked
-                .as_ref()
-                .ok_or_else(|| crate::io::IoError::InvalidState("not a chunked dataset".into()))?;
-            c.earray_params.idx_blk_elmts as u64
-        };
-
-        if chunk_idx < idx_blk_elmts {
-            let chunked = self.datasets[index].chunked.as_mut().unwrap();
-            if is_filtered {
-                if let Some(ref mut fiblk) = chunked.filt_iblk {
-                    fiblk.elements[chunk_idx as usize] = FilteredChunkEntry {
-                        addr: chunk_addr,
-                        nbytes: compressed_size,
-                        filter_mask: 0,
-                    };
-                }
-            } else {
-                chunked.ea_iblk.elements[chunk_idx as usize] = chunk_addr;
-            }
-            chunked.chunks_written += 1;
-            if chunk_idx + 1 > chunked.ea_header.max_idx_set {
-                chunked.ea_header.max_idx_set = chunk_idx + 1;
-            }
-            if chunked.ea_header.num_elmts_realized < idx_blk_elmts {
-                chunked.ea_header.num_elmts_realized = idx_blk_elmts;
-            }
-        } else {
-            let offset_in_dblks = chunk_idx - idx_blk_elmts;
-            let chunked = self.datasets[index].chunked.as_mut().unwrap();
-            let min_elmts = chunked.earray_params.data_blk_min_elmts as u64;
-
-            let mut cumulative = 0u64;
-            let mut dblk_idx = 0usize;
-            let mut current_size = min_elmts;
-            let mut pair_count = 0;
-            loop {
-                if offset_in_dblks < cumulative + current_size {
-                    break;
-                }
-                cumulative += current_size;
-                dblk_idx += 1;
-                pair_count += 1;
-                if pair_count >= 2 {
-                    pair_count = 0;
-                    current_size *= 2;
-                }
-                if dblk_idx >= chunked.ndblk_addrs {
-                    return Err(crate::io::IoError::InvalidState(
-                        "chunk index exceeds extensible array capacity".into(),
-                    ));
-                }
-            }
-            let offset_in_block = (offset_in_dblks - cumulative) as usize;
-            let block_nelmts = current_size as usize;
-
-            if is_filtered {
-                let filt_iblk = chunked.filt_iblk.as_mut().unwrap();
-                if filt_iblk.dblk_addrs[dblk_idx] == UNDEF_ADDR {
-                    let mut dblk =
-                        FilteredDataBlock::new(chunked.ea_header_addr, cumulative, block_nelmts);
-                    dblk.elements[offset_in_block] = FilteredChunkEntry {
-                        addr: chunk_addr,
-                        nbytes: compressed_size,
-                        filter_mask: 0,
-                    };
-                    let encoded = dblk.encode(
-                        &self.ctx,
-                        chunked.earray_params.max_nelmts_bits,
-                        chunked.chunk_size_len,
-                    );
-                    let dblk_addr = self.allocator.allocate(encoded.len() as u64);
-                    self.handle.write_at(dblk_addr, &encoded)?;
-                    filt_iblk.dblk_addrs[dblk_idx] = dblk_addr;
-                    chunked.filt_data_blocks.push((dblk_addr, dblk));
-                    chunked.ea_header.num_dblks_created += 1;
-                    chunked.ea_header.size_dblks_created += encoded.len() as u64;
-                } else {
-                    let dblk_addr = filt_iblk.dblk_addrs[dblk_idx];
-                    if let Some((_, ref mut dblk)) = chunked
-                        .filt_data_blocks
-                        .iter_mut()
-                        .find(|(a, _)| *a == dblk_addr)
-                    {
-                        dblk.elements[offset_in_block] = FilteredChunkEntry {
-                            addr: chunk_addr,
-                            nbytes: compressed_size,
-                            filter_mask: 0,
-                        };
-                        let encoded = dblk.encode(
-                            &self.ctx,
-                            chunked.earray_params.max_nelmts_bits,
-                            chunked.chunk_size_len,
-                        );
-                        self.handle.write_at(dblk_addr, &encoded)?;
-                    }
-                }
-            } else {
-                if chunked.ea_iblk.dblk_addrs[dblk_idx] == UNDEF_ADDR {
-                    let mut dblk = ExtensibleArrayDataBlock::new(
-                        chunked.ea_header_addr,
-                        cumulative,
-                        block_nelmts,
-                    );
-                    dblk.elements[offset_in_block] = chunk_addr;
-                    let encoded = dblk.encode(&self.ctx, chunked.earray_params.max_nelmts_bits);
-                    let dblk_addr = self.allocator.allocate(encoded.len() as u64);
-                    self.handle.write_at(dblk_addr, &encoded)?;
-                    chunked.ea_iblk.dblk_addrs[dblk_idx] = dblk_addr;
-                    chunked.data_blocks.push((dblk_addr, dblk));
-                    chunked.ea_header.num_dblks_created += 1;
-                    chunked.ea_header.size_dblks_created += encoded.len() as u64;
-                } else {
-                    let dblk_addr = chunked.ea_iblk.dblk_addrs[dblk_idx];
-                    if let Some((_, ref mut dblk)) = chunked
-                        .data_blocks
-                        .iter_mut()
-                        .find(|(a, _)| *a == dblk_addr)
-                    {
-                        dblk.elements[offset_in_block] = chunk_addr;
-                        let encoded = dblk.encode(&self.ctx, chunked.earray_params.max_nelmts_bits);
-                        self.handle.write_at(dblk_addr, &encoded)?;
-                    }
-                }
-            }
-
-            chunked.chunks_written += 1;
-            if chunk_idx + 1 > chunked.ea_header.max_idx_set {
-                chunked.ea_header.max_idx_set = chunk_idx + 1;
-            }
-            let total_realized = if is_filtered {
-                idx_blk_elmts
-                    + chunked
-                        .filt_data_blocks
-                        .iter()
-                        .map(|(_, db)| db.elements.len() as u64)
-                        .sum::<u64>()
-            } else {
-                idx_blk_elmts
-                    + chunked
-                        .data_blocks
-                        .iter()
-                        .map(|(_, db)| db.elements.len() as u64)
-                        .sum::<u64>()
-            };
-            chunked.ea_header.num_elmts_realized = total_realized;
-        }
-
-        Ok(())
+        self.record_ea_chunk(index, chunk_idx, chunk_addr, compressed_size)
     }
 
     /// Extend the dimensions of a chunked dataset.
