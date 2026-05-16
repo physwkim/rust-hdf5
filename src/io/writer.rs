@@ -2028,6 +2028,16 @@ impl Hdf5Writer {
 
         // Create FA header
         let mut fa_header = FixedArrayHeader::new_for_chunks(&self.ctx, num_chunks);
+        // The writer only emits non-paged data blocks. libhdf5 switches to a
+        // paged layout once num_elmts exceeds dblk_page_nelmts, so reject
+        // arrays that would require paging instead of writing a corrupt file.
+        if fa_header.is_paged() {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "fixed array with {} chunks requires a paged data block, \
+                 which the writer does not support",
+                num_chunks
+            )));
+        }
         let hdr_encoded = fa_header.encode(&self.ctx);
         let fa_header_addr = self.allocator.allocate(hdr_encoded.len() as u64);
 
