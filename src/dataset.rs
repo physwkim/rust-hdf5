@@ -222,10 +222,12 @@ impl<T: H5Type> DatasetBuilder<T> {
                 dims_u64.clone()
             };
 
-            // libhdf5 selects the v2 B-tree chunk index when a dataset has
-            // two or more unlimited dimensions; the extensible array is used
-            // for exactly one.
-            let is_btree2 = max_u64.iter().filter(|&&m| m == u64::MAX).count() >= 2;
+            // libhdf5 selects the chunk index from the dataspace: a v2
+            // B-tree for two or more unlimited dimensions, an extensible
+            // array for exactly one, and a fixed array when there are none.
+            let n_unlimited = max_u64.iter().filter(|&&m| m == u64::MAX).count();
+            let is_btree2 = n_unlimited >= 2;
+            let is_fixed_array = n_unlimited == 0;
             let wants_filter = self.custom_pipeline.is_some()
                 || self.shuffle_deflate_level.is_some()
                 || self.deflate_level.is_some();
@@ -244,6 +246,20 @@ impl<T: H5Type> DatasetBuilder<T> {
                             }
                             writer.create_btree_v2_dataset(
                                 &full_name, datatype, &dims_u64, &max_u64, &chunk_u64,
+                            )?
+                        } else if is_fixed_array {
+                            // A chunked dataset with no unlimited dimension
+                            // must use the fixed-array index — libhdf5
+                            // rejects an extensible-array index here.
+                            if wants_filter {
+                                return Err(Hdf5Error::InvalidState(
+                                    "a compressed chunked dataset needs at least one \
+                                     resizable dimension; add .max_shape(&[None, ...])"
+                                        .into(),
+                                ));
+                            }
+                            writer.create_fixed_array_dataset(
+                                &full_name, datatype, &dims_u64, &chunk_u64,
                             )?
                         } else if let Some(pipeline) = self.custom_pipeline {
                             writer.create_chunked_dataset_with_pipeline(
@@ -296,6 +312,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                     element_size,
                     chunked: true,
                     btree2: is_btree2,
+                    fixed_array: is_fixed_array,
                 },
             })
         } else {
@@ -334,6 +351,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                     element_size,
                     chunked: false,
                     btree2: false,
+                    fixed_array: false,
                 },
             })
         }
@@ -358,6 +376,8 @@ enum DatasetInfo {
         chunked: bool,
         /// Whether the chunk index is a v2 B-tree (multiple unlimited dims).
         btree2: bool,
+        /// Whether the chunk index is a Fixed Array (no unlimited dims).
+        fixed_array: bool,
     },
     /// A dataset opened by name in read mode.
     Reader {
@@ -574,6 +594,7 @@ impl H5Dataset {
                 element_size,
                 chunked,
                 btree2: _,
+                fixed_array: _,
             } => {
                 if *chunked {
                     return Err(Hdf5Error::InvalidState(
@@ -636,6 +657,7 @@ impl H5Dataset {
                 index,
                 chunked,
                 btree2,
+                fixed_array,
                 ..
             } => {
                 if !*chunked {
@@ -654,7 +676,34 @@ impl H5Dataset {
                 let mut inner = borrow_inner_mut(&self.file_inner);
                 match &mut *inner {
                     H5FileInner::Writer(writer) => {
-                        writer.write_chunk(*index, chunk_idx as u64, data)?;
+                        if *fixed_array {
+                            // Fixed-array dataset: convert the linear chunk
+                            // index into row-major grid coordinates.
+                            let chunk_dims = writer
+                                .dataset_chunk_dims(*index)
+                                .ok_or_else(|| {
+                                    Hdf5Error::InvalidState("dataset has no chunk info".into())
+                                })?
+                                .to_vec();
+                            let dims = writer.dataset_dims(*index).to_vec();
+                            let mut grid = vec![0u64; dims.len()];
+                            for d in 0..dims.len() {
+                                grid[d] = if chunk_dims[d] > 0 {
+                                    dims[d].div_ceil(chunk_dims[d])
+                                } else {
+                                    1
+                                };
+                            }
+                            let mut rem = chunk_idx as u64;
+                            let mut coords = vec![0u64; dims.len()];
+                            for d in (0..dims.len()).rev() {
+                                coords[d] = rem % grid[d];
+                                rem /= grid[d];
+                            }
+                            writer.write_chunk_fixed_array(*index, &coords, data)?;
+                        } else {
+                            writer.write_chunk(*index, chunk_idx as u64, data)?;
+                        }
                         Ok(())
                     }
                     _ => Err(Hdf5Error::InvalidState(
@@ -694,6 +743,7 @@ impl H5Dataset {
                 index,
                 chunked,
                 btree2,
+                fixed_array,
                 ..
             } => {
                 if !*chunked {
@@ -703,6 +753,7 @@ impl H5Dataset {
                 }
                 let coords: Vec<u64> = chunk_coords.iter().map(|&c| c as u64).collect();
                 let btree2 = *btree2;
+                let fixed_array = *fixed_array;
                 let mut inner = borrow_inner_mut(&self.file_inner);
                 let writer = match &mut *inner {
                     H5FileInner::Writer(w) => w,
@@ -749,6 +800,12 @@ impl H5Dataset {
                     if needed > new_dims[d] {
                         new_dims[d] = needed;
                     }
+                }
+
+                if fixed_array {
+                    // Fixed-array (fixed-shape) dataset: no dimension growth.
+                    writer.write_chunk_fixed_array(*index, &coords, data)?;
+                    return Ok(());
                 }
 
                 if btree2 {
