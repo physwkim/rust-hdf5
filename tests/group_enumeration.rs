@@ -60,7 +60,7 @@ fn group_enumeration_covers_groups_without_datasets() {
         let with_data = root.create_group("with_data").unwrap();
         with_data
             .new_dataset::<f32>()
-            .shape(&[3])
+            .shape([3])
             .create("temperature")
             .unwrap();
 
