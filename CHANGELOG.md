@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.2.13
+
+### Added
+
+- Read chunked datasets stored under every libhdf5 chunk index:
+  Extensible Array (including paged data blocks), Fixed Array
+  (including paged and filtered data blocks), version-1 B-tree
+  (version-3 data layout), and version-2 B-tree of any depth
+  (including filtered records).
+- Read dense group links stored in a fractal heap, with
+  direct-block checksum verification.
+- SZIP / AEC filter: an in-crate codec that is byte-compatible
+  with libaec / libhdf5 for both compression and decompression.
+- N-bit and Scale-offset filters, with element-exact reads and
+  post-filter datatype conversion for chunked datasets.
+- Decode version-1 (as well as version-2) filter pipeline
+  messages.
+- Fill-value API: `set_dataset_fill_value`, with the version-3
+  on-disk fill-value message layout. Unwritten and unallocated
+  regions read back as the declared fill value.
+- Group attributes and a group/root attribute API; read group
+  and root attributes from legacy (version-0/1 superblock)
+  files, including variable-length string attributes.
+- Sub-frame chunking (chunks smaller than one frame).
+- Compressed SWMR streaming datasets.
+- Route multi-unlimited-dimension datasets to the version-2
+  B-tree chunk index; route fixed-shape chunked datasets to the
+  Fixed Array index; write filtered Fixed Array chunk indexes.
+- Enumerate groups from link records rather than dataset path
+  prefixes, so attribute-only and subgroup-only groups are
+  discovered.
+
+### Fixed
+
+- Fletcher-32 filter trailer endianness (`UINT32ENCODE` is
+  little-endian).
+- Extensible Array, Fixed Array, and version-2 B-tree on-disk
+  byte layouts now match libhdf5; paged Extensible Array
+  page-init bitmap indexing corrected.
+- Version-3 fill-value message corrected to the real on-disk
+  layout.
+- Global-heap index exhaustion handled.
+- Group discovery is cycle-safe and tolerant of stale links;
+  `open_append` rejects unsupported version-0/1 superblocks
+  with a clear error.
+
+### Hardening
+
+- Unified the little-endian integer/address decoders behind
+  clamped helpers (`src/format/bytes.rs`) so a short or
+  malformed buffer cannot panic.
+- Bounded every recursive parser against corrupt or adversarial
+  input: v1 B-tree group traversal, group-link recursion,
+  datatype nesting, and fractal-heap indirect-block nesting all
+  carry depth and/or visited-set guards.
+- Dataset and chunk byte-length computation uses saturating
+  arithmetic; buffers sized from untrusted file fields are
+  allocated with `try_reserve` so a crafted file yields a clean
+  error instead of aborting the process.
+- Hardened datatype, global-heap, and link-message parsing,
+  chunk-index readers, Extensible/Fixed Array and v2 B-tree
+  geometry, the Fixed Array writer, and the N-bit decoder
+  against panics on malformed input.
+- Verified against h5py 3.16 / libhdf5 2.0.0.
+
 ## 0.2.12
 
 ### Reliability
