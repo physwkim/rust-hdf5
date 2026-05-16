@@ -441,11 +441,13 @@ impl H5Dataset {
                 let inner = borrow_inner(&self.file_inner);
                 if let H5FileInner::Reader(reader) = &*inner {
                     if let Some(info) = reader.dataset_info(name) {
-                        if let crate::format::messages::data_layout::DataLayoutMessage::ChunkedV4 {
-                            chunk_dims,
-                            ..
-                        } = &info.layout
-                        {
+                        use crate::format::messages::data_layout::DataLayoutMessage;
+                        let chunk_dims = match &info.layout {
+                            DataLayoutMessage::ChunkedV4 { chunk_dims, .. }
+                            | DataLayoutMessage::ChunkedV3 { chunk_dims, .. } => Some(chunk_dims),
+                            _ => None,
+                        };
+                        if let Some(chunk_dims) = chunk_dims {
                             // Strip trailing element-size dimension
                             return Some(
                                 chunk_dims[..chunk_dims.len() - 1]
@@ -471,9 +473,11 @@ impl H5Dataset {
                 match &*inner {
                     H5FileInner::Reader(reader) => {
                         if let Some(info) = reader.dataset_info(name) {
+                            use crate::format::messages::data_layout::DataLayoutMessage;
                             matches!(
                                 info.layout,
-                                crate::format::messages::data_layout::DataLayoutMessage::ChunkedV4 { .. }
+                                DataLayoutMessage::ChunkedV4 { .. }
+                                    | DataLayoutMessage::ChunkedV3 { .. }
                             )
                         } else {
                             false

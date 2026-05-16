@@ -12,6 +12,14 @@
 //!     compact_size: u16 LE
 //!     data:         compact_size bytes
 //!
+//! Binary layout (version 3, chunked):
+//!   Byte 0: version = 3
+//!   Byte 1: layout class = 2 (chunked)
+//!   dimensionality D(1)
+//!   + b_tree_address(sizeof_addr)
+//!   + D 4-byte LE dimension sizes (chunk dims; last is the element size)
+//!   The chunk index is always a version-1 B-tree.
+//!
 //! Binary layout (version 4, chunked only):
 //!   Byte 0: version = 4
 //!   Byte 1: layout class = 2 (chunked)
@@ -110,6 +118,17 @@ pub enum DataLayoutMessage {
         /// The raw data bytes.
         data: Vec<u8>,
     },
+    /// Version 3 chunked storage, indexed by a version-1 B-tree.
+    ///
+    /// This is what libhdf5 / h5py writes for a chunked dataset created
+    /// with the default `libver` bounds.
+    ChunkedV3 {
+        /// Chunk dimension sizes, including the trailing element-size
+        /// dimension (so the chunk rank is `chunk_dims.len() - 1`).
+        chunk_dims: Vec<u64>,
+        /// Address of the version-1 B-tree that indexes the chunks.
+        b_tree_address: u64,
+    },
     /// Version 4 chunked storage.
     ChunkedV4 {
         flags: u8,
@@ -143,6 +162,16 @@ impl DataLayoutMessage {
     /// Compact layout with inline data.
     pub fn compact(data: Vec<u8>) -> Self {
         Self::Compact { data }
+    }
+
+    /// Version 3 chunked layout indexed by a version-1 B-tree.
+    ///
+    /// `chunk_dims` must include the trailing element-size dimension.
+    pub fn chunked_v3_btree_v1(chunk_dims: Vec<u64>, b_tree_address: u64) -> Self {
+        Self::ChunkedV3 {
+            chunk_dims,
+            b_tree_address,
+        }
     }
 
     /// Version 4 chunked layout with extensible array index.
@@ -231,6 +260,23 @@ impl DataLayoutMessage {
                 buf.push(CLASS_COMPACT);
                 buf.extend_from_slice(&(data.len() as u16).to_le_bytes());
                 buf.extend_from_slice(data);
+                buf
+            }
+            Self::ChunkedV3 {
+                chunk_dims,
+                b_tree_address,
+            } => {
+                let sa = ctx.sizeof_addr as usize;
+                let ndims = chunk_dims.len() as u8;
+                let mut buf = Vec::with_capacity(3 + sa + chunk_dims.len() * 4);
+                buf.push(VERSION_3);
+                buf.push(CLASS_CHUNKED);
+                buf.push(ndims);
+                buf.extend_from_slice(&b_tree_address.to_le_bytes()[..sa]);
+                // Dimension sizes are always 4 bytes each (UINT32ENCODE).
+                for &d in chunk_dims {
+                    buf.extend_from_slice(&(d as u32).to_le_bytes());
+                }
                 buf
             }
             Self::ChunkedV4 {
@@ -351,6 +397,66 @@ impl DataLayoutMessage {
                 let data = buf[pos..pos + compact_size].to_vec();
                 pos += compact_size;
                 Ok((Self::Compact { data }, pos))
+            }
+            (VERSION_3, CLASS_CHUNKED) => {
+                // version(1) + class(1) + ndims(1) + b_tree_addr(sa)
+                // + ndims * 4-byte dimension sizes.
+                let sa = ctx.sizeof_addr as usize;
+                let mut pos = 2;
+                if buf.len() < pos + 1 {
+                    return Err(FormatError::BufferTooShort {
+                        needed: pos + 1,
+                        available: buf.len(),
+                    });
+                }
+                let ndims = buf[pos] as usize;
+                pos += 1;
+
+                // libhdf5 (H5Olayout.c) requires 2 <= ndims for chunked
+                // storage: the chunk rank plus the trailing element-size
+                // dimension. A zero or one is malformed.
+                if ndims < 2 {
+                    return Err(FormatError::InvalidData(format!(
+                        "chunked v3 layout dimensionality {ndims} is too small"
+                    )));
+                }
+
+                if buf.len() < pos + sa {
+                    return Err(FormatError::BufferTooShort {
+                        needed: pos + sa,
+                        available: buf.len(),
+                    });
+                }
+                let b_tree_address = read_addr(&buf[pos..], sa);
+                pos += sa;
+
+                let dim_data_len = ndims * 4;
+                if buf.len() < pos + dim_data_len {
+                    return Err(FormatError::BufferTooShort {
+                        needed: pos + dim_data_len,
+                        available: buf.len(),
+                    });
+                }
+                let mut chunk_dims = Vec::with_capacity(ndims);
+                for _ in 0..ndims {
+                    let d = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
+                        as u64;
+                    if d == 0 {
+                        return Err(FormatError::InvalidData(
+                            "chunked v3 layout has a zero chunk dimension".into(),
+                        ));
+                    }
+                    chunk_dims.push(d);
+                    pos += 4;
+                }
+
+                Ok((
+                    Self::ChunkedV3 {
+                        chunk_dims,
+                        b_tree_address,
+                    },
+                    pos,
+                ))
             }
             (VERSION_4 | VERSION_5, CLASS_CHUNKED) => {
                 let sa = ctx.sizeof_addr as usize;
@@ -732,6 +838,73 @@ mod tests {
         // + 3*2 dim bytes + index_type(1) + 5 earray params + 8 addr = 25
         assert_eq!(encoded.len(), 25);
         assert_eq!(encoded[4], 2); // enc_bytes_per_dim = 2
+    }
+
+    #[test]
+    fn roundtrip_chunked_v3_btree_v1() {
+        // 1-D dataset, chunk=(8), element_size=4 -> chunk_dims=[8, 4].
+        let msg = DataLayoutMessage::chunked_v3_btree_v1(vec![8, 4], 0x1234);
+        let encoded = msg.encode(&ctx8());
+        // version(1) + class(1) + ndims(1) + addr(8) + 2*4 dims = 19
+        assert_eq!(encoded.len(), 19);
+        assert_eq!(encoded[0], 3);
+        assert_eq!(encoded[1], 2);
+        assert_eq!(encoded[2], 2); // ndims
+        let (decoded, consumed) = DataLayoutMessage::decode(&encoded, &ctx8()).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn roundtrip_chunked_v3_btree_v1_2d_ctx4() {
+        // 2-D dataset, chunk=(2,3), element_size=8 -> chunk_dims=[2, 3, 8].
+        let msg = DataLayoutMessage::chunked_v3_btree_v1(vec![2, 3, 8], 0x800);
+        let encoded = msg.encode(&ctx4());
+        // version(1) + class(1) + ndims(1) + addr(4) + 3*4 dims = 19
+        assert_eq!(encoded.len(), 19);
+        let (decoded, consumed) = DataLayoutMessage::decode(&encoded, &ctx4()).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn chunked_v3_undef_btree_addr() {
+        let msg = DataLayoutMessage::chunked_v3_btree_v1(vec![16, 4], UNDEF_ADDR);
+        let encoded = msg.encode(&ctx8());
+        let (decoded, _) = DataLayoutMessage::decode(&encoded, &ctx8()).unwrap();
+        match decoded {
+            DataLayoutMessage::ChunkedV3 { b_tree_address, .. } => {
+                assert_eq!(b_tree_address, UNDEF_ADDR);
+            }
+            _ => panic!("expected ChunkedV3"),
+        }
+    }
+
+    #[test]
+    fn chunked_v3_rejects_ndims_too_small() {
+        // ndims = 1 is malformed for chunked storage.
+        let buf = [3u8, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let err = DataLayoutMessage::decode(&buf, &ctx8()).unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)));
+    }
+
+    #[test]
+    fn chunked_v3_rejects_zero_dim() {
+        // ndims=2, addr=0, dims=[0, 4] -> zero chunk dimension.
+        let mut buf = vec![3u8, 2, 2];
+        buf.extend_from_slice(&0u64.to_le_bytes()); // addr
+        buf.extend_from_slice(&0u32.to_le_bytes()); // dim 0 == 0
+        buf.extend_from_slice(&4u32.to_le_bytes()); // dim 1
+        let err = DataLayoutMessage::decode(&buf, &ctx8()).unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)));
+    }
+
+    #[test]
+    fn chunked_v3_truncated() {
+        // version=3, class=2, ndims=2, but no room for addr/dims.
+        let buf = [3u8, 2, 2];
+        let err = DataLayoutMessage::decode(&buf, &ctx8()).unwrap_err();
+        assert!(matches!(err, FormatError::BufferTooShort { .. }));
     }
 
     #[test]

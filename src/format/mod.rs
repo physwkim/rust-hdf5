@@ -7,6 +7,7 @@
 pub mod btree_v1;
 pub mod checksum;
 pub mod chunk_index;
+pub mod fractal_heap;
 pub mod global_heap;
 pub mod local_heap;
 pub mod messages;

@@ -8,7 +8,8 @@
 
 use std::path::Path;
 
-use crate::format::btree_v1::BTreeV1Node;
+use crate::format::btree_v1::{BTreeV1Node, ChunkBTreeV1Node};
+use crate::format::fractal_heap::{self, BlockReader, FractalHeapHeader};
 use crate::format::global_heap::{
     decode_vlen_reference, vlen_reference_size, GlobalHeapCollection,
 };
@@ -21,6 +22,7 @@ use crate::format::messages::fill_value::{tiled_fill, FillValueMessage};
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::link::LinkMessage;
 use crate::format::messages::link::LinkTarget;
+use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
 use crate::format::superblock::{detect_superblock_version, SuperblockV0V1, SuperblockV2V3};
@@ -158,9 +160,9 @@ impl Hdf5Reader {
             sizeof_size: sb.sizeof_lengths,
         };
 
-        // Read root group object header.
-        let root_buf = handle.read_at_most(sb.root_group_object_header_address, 4096)?;
-        let (root_header, _) = ObjectHeader::decode(&root_buf)?;
+        // Read root group object header, following continuation blocks.
+        let root_header =
+            Self::read_object_header_full(&mut handle, &ctx, sb.root_group_object_header_address)?;
 
         // Walk link messages to discover datasets and group attributes.
         let (datasets, group_attributes) =
@@ -282,54 +284,77 @@ impl Hdf5Reader {
         prefix: &str,
         group_attrs: &mut std::collections::HashMap<String, Vec<AttributeMessage>>,
     ) -> IoResult<Vec<DatasetReadInfo>> {
+        // Bound recursion depth on a hostile/corrupt file.
+        const MAX_GROUP_DEPTH: usize = 256;
+        let depth = if prefix.is_empty() {
+            0
+        } else {
+            prefix.matches('/').count() + 1
+        };
+        if depth > MAX_GROUP_DEPTH {
+            return Ok(Vec::new());
+        }
+
         let mut datasets = Vec::new();
+
+        // Collect every link in this group: inline `Link` messages plus, for
+        // groups using dense storage, links held in a fractal heap referenced
+        // by the `Link Info` message.
+        let mut links: Vec<LinkMessage> = Vec::new();
         for msg in &header.messages {
             if msg.msg_type == MSG_LINK {
-                let (link, _) = LinkMessage::decode(&msg.data, ctx)?;
-                if let LinkTarget::Hard { address } = &link.target {
-                    let full_name = if prefix.is_empty() {
-                        link.name.clone()
-                    } else {
-                        format!("{}/{}", prefix, link.name)
-                    };
+                if let Ok((link, _)) = LinkMessage::decode(&msg.data, ctx) {
+                    links.push(link);
+                }
+            } else if msg.msg_type == MSG_LINK_INFO {
+                if let Ok((info, _)) = LinkInfoMessage::decode(&msg.data, ctx) {
+                    if info.fractal_heap_address != UNDEF_ADDR {
+                        let dense = Self::read_dense_links(handle, ctx, info.fractal_heap_address)?;
+                        links.extend(dense);
+                    }
+                }
+            }
+        }
 
-                    // Try to read as a dataset
-                    if let Some(info) =
-                        Self::read_dataset_from_object_header(handle, ctx, *address, &full_name)?
-                    {
-                        datasets.push(info);
-                    } else {
-                        // Not a dataset — might be a group. Try reading its
-                        // object header for link messages.
-                        let child_buf = handle.read_at_most(*address, 8192)?;
-                        if let Ok((child_header, _)) = ObjectHeader::decode_any(&child_buf) {
-                            // Not a dataset — treat as a group. Capture its
-                            // attributes (e.g. the NeXus `NX_class` marker)
-                            // keyed by path, whether or not it has children.
-                            let mut attrs = Vec::new();
-                            for m in &child_header.messages {
-                                if m.msg_type == MSG_ATTRIBUTE {
-                                    if let Ok((a, _)) = AttributeMessage::decode(&m.data, ctx) {
-                                        attrs.push(a);
-                                    }
+        for link in &links {
+            if let LinkTarget::Hard { address } = &link.target {
+                let full_name = if prefix.is_empty() {
+                    link.name.clone()
+                } else {
+                    format!("{}/{}", prefix, link.name)
+                };
+
+                // Try to read as a dataset.
+                if let Some(info) =
+                    Self::read_dataset_from_object_header(handle, ctx, *address, &full_name)?
+                {
+                    datasets.push(info);
+                } else {
+                    // Not a dataset — treat as a group. Read its full object
+                    // header (with continuations) for child links.
+                    if let Ok(child_header) = Self::read_object_header_full(handle, ctx, *address) {
+                        // Capture group attributes (e.g. the NeXus `NX_class`
+                        // marker), keyed by path, whether or not it has
+                        // children.
+                        let mut attrs = Vec::new();
+                        for m in &child_header.messages {
+                            if m.msg_type == MSG_ATTRIBUTE {
+                                if let Ok((a, _)) = AttributeMessage::decode(&m.data, ctx) {
+                                    attrs.push(a);
                                 }
                             }
-                            if !attrs.is_empty() {
-                                group_attrs.insert(full_name.clone(), attrs);
-                            }
-                            let has_links =
-                                child_header.messages.iter().any(|m| m.msg_type == MSG_LINK);
-                            if has_links {
-                                let child_ds = Self::discover_datasets_recursive(
-                                    handle,
-                                    &child_header,
-                                    ctx,
-                                    &full_name,
-                                    group_attrs,
-                                )?;
-                                datasets.extend(child_ds);
-                            }
                         }
+                        if !attrs.is_empty() {
+                            group_attrs.insert(full_name.clone(), attrs);
+                        }
+                        let child_ds = Self::discover_datasets_recursive(
+                            handle,
+                            &child_header,
+                            ctx,
+                            &full_name,
+                            group_attrs,
+                        )?;
+                        datasets.extend(child_ds);
                     }
                 }
             }
@@ -337,55 +362,165 @@ impl Hdf5Reader {
         Ok(datasets)
     }
 
+    /// Read every link stored in a group's dense (fractal-heap) link storage.
+    ///
+    /// The `Link Info` message gives the fractal-heap address; each managed
+    /// object in the heap is an encoded `Link` message. Returns the decoded
+    /// links (hard and soft).
+    fn read_dense_links(
+        handle: &mut FileHandle,
+        ctx: &FormatContext,
+        fractal_heap_addr: u64,
+    ) -> IoResult<Vec<LinkMessage>> {
+        // Read the fractal heap header. Its on-disk size depends only on the
+        // address/length widths, so a generous prefix read covers it.
+        let hdr_buf = handle.read_at_most(fractal_heap_addr, 512)?;
+        let fh_header = match FractalHeapHeader::decode(&hdr_buf, ctx) {
+            Ok(h) => h,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        // Walk the heap's managed blocks; each block hands back a payload
+        // region holding one or more packed encoded `Link` messages.
+        let mut br = HandleBlockReader { handle };
+        let payloads = match fractal_heap::collect_managed_objects(&fh_header, ctx, &mut br) {
+            Ok(p) => p,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut links = Vec::new();
+        for payload in payloads {
+            // Decode packed `Link` messages sequentially. Each decode reports
+            // its consumed length; stop at the first byte that is not a valid
+            // link (trailing free space or an unrelated managed object).
+            let mut pos = 0;
+            while pos < payload.len() {
+                // A v1 link message starts with version byte 1.
+                if payload[pos] != 1 {
+                    break;
+                }
+                match LinkMessage::decode(&payload[pos..], ctx) {
+                    Ok((link, consumed)) if consumed > 0 => {
+                        links.push(link);
+                        pos += consumed;
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        Ok(links)
+    }
+
     /// Discover datasets by walking the B-tree v1 + local heap (legacy format).
+    ///
+    /// Recurses into subgroups: a symbol-table entry whose `cache_type == 1`
+    /// carries scratch-pad `btree_addr`/`heap_addr` for the subgroup; for
+    /// other entries the child object header is read for a symbol-table
+    /// message. Discovered dataset names are prefixed with the group path.
     fn discover_datasets_from_btree(
         handle: &mut FileHandle,
         ctx: &FormatContext,
         btree_addr: u64,
         heap_addr: u64,
     ) -> IoResult<Vec<DatasetReadInfo>> {
+        let mut datasets = Vec::new();
+        Self::discover_datasets_from_btree_recursive(
+            handle,
+            ctx,
+            btree_addr,
+            heap_addr,
+            "",
+            0,
+            &mut datasets,
+        )?;
+        Ok(datasets)
+    }
+
+    /// Recursive worker for `discover_datasets_from_btree`. `prefix` is the
+    /// path of the group being scanned; `depth` bounds recursion.
+    fn discover_datasets_from_btree_recursive(
+        handle: &mut FileHandle,
+        ctx: &FormatContext,
+        btree_addr: u64,
+        heap_addr: u64,
+        prefix: &str,
+        depth: usize,
+        datasets: &mut Vec<DatasetReadInfo>,
+    ) -> IoResult<()> {
+        // Bound legacy-group nesting depth on a hostile/corrupt file.
+        const MAX_GROUP_DEPTH: usize = 256;
+        if depth > MAX_GROUP_DEPTH {
+            return Ok(());
+        }
+        if btree_addr == UNDEF_ADDR || heap_addr == UNDEF_ADDR {
+            return Ok(());
+        }
+
         let sa = ctx.sizeof_addr as usize;
         let ss = ctx.sizeof_size as usize;
 
-        // Read the local heap header
+        // Read the local heap header + data for this group.
         let heap_hdr_buf = handle.read_at_most(heap_addr, 64)?;
         let heap_hdr = LocalHeapHeader::decode(&heap_hdr_buf, sa, ss)?;
-
-        // Read the local heap data
         let heap_data = handle.read_at(heap_hdr.data_addr, heap_hdr.data_size as usize)?;
 
-        // Collect all SNOD addresses by walking the B-tree
+        // Collect all SNOD addresses by walking the B-tree.
         let snod_addrs = Self::collect_snod_addresses(handle, btree_addr, sa, ss)?;
 
-        let mut datasets = Vec::new();
-
         for snod_addr in snod_addrs {
-            // Read SNOD
             let snod_buf = handle.read_at_most(snod_addr, 8192)?;
             let snod = SymbolTableNode::decode(&snod_buf, sa, ss)?;
 
             for entry in &snod.entries {
-                // Get the name from the local heap
                 let name = local_heap_get_string(&heap_data, entry.name_offset)?;
-
-                // Skip empty names (root group self-reference)
+                // Skip empty names (root group self-reference).
                 if name.is_empty() {
                     continue;
                 }
+                let full_name = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{}", prefix, name)
+                };
 
-                // Try to read this as a dataset
+                // Try to read this entry as a dataset.
                 if let Some(info) = Self::read_dataset_from_object_header(
                     handle,
                     ctx,
                     entry.obj_header_addr,
-                    &name,
+                    &full_name,
                 )? {
                     datasets.push(info);
+                    continue;
+                }
+
+                // Not a dataset — it is a subgroup. Find its B-tree + local
+                // heap and recurse, prefixing names with the group path.
+                let (sub_btree, sub_heap) = if entry.cache_type == 1 {
+                    // Scratch-pad caches the subgroup's symbol-table info.
+                    (entry.btree_addr, entry.heap_addr)
+                } else {
+                    // No scratch pad — read the child object header for a
+                    // symbol-table message.
+                    Self::find_stab_in_object_header(handle, ctx, entry.obj_header_addr)?
+                };
+
+                if sub_btree != UNDEF_ADDR && sub_heap != UNDEF_ADDR {
+                    Self::discover_datasets_from_btree_recursive(
+                        handle,
+                        ctx,
+                        sub_btree,
+                        sub_heap,
+                        &full_name,
+                        depth + 1,
+                        datasets,
+                    )?;
                 }
             }
         }
 
-        Ok(datasets)
+        Ok(())
     }
 
     /// Recursively walk a B-tree v1 to collect leaf-level SNOD addresses.
@@ -413,38 +548,115 @@ impl Hdf5Reader {
         }
     }
 
-    /// Read a dataset's object header and extract metadata. Returns None if
-    /// the object is not a dataset (e.g., it's a group).
-    fn read_dataset_from_object_header(
+    /// Read an object header at `addr` and return it with the messages from
+    /// every object-header continuation block flattened in.
+    ///
+    /// Handles both wire formats:
+    /// - v1 headers: continuation blocks are bare v1 messages (type:u16,
+    ///   size:u16, flags:u8, reserved:3, data, padded to 8-byte alignment).
+    /// - v2 headers: continuation blocks are `"OCHK"(4) + messages +
+    ///   checksum(4)` with v2 message headers (type:u8, size:u16, flags:u8,
+    ///   and a 2-byte creation-order field when the header tracks creation
+    ///   order).
+    ///
+    /// Nested continuations are followed; the total block count is bounded.
+    fn read_object_header_full(
         handle: &mut FileHandle,
         ctx: &FormatContext,
         addr: u64,
-        name: &str,
-    ) -> IoResult<Option<DatasetReadInfo>> {
-        // Read the primary object header chunk
-        let buf = handle.read_at_most(addr, 4096)?;
+    ) -> IoResult<ObjectHeader> {
+        /// Bound on the number of continuation blocks followed per header.
+        const MAX_CONT_BLOCKS: usize = 4096;
+
+        let buf = handle.read_at_most(addr, 8192)?;
         let (mut header, _) = ObjectHeader::decode_any(&buf)?;
 
-        // Follow continuation messages (type 0x10) to read additional chunks.
-        // This is essential for v1 headers that span multiple chunks.
+        // A v1 header has no "OHDR" signature; detect by it.
+        let is_v2 = buf.len() >= 4 && buf[0..4] == crate::format::object_header::OHDR_SIGNATURE;
+        // v2 creation-order tracking is recorded in object-header flag bit 2.
+        let track_creation_order = is_v2 && (header.flags & 0x04) != 0;
+
         let sa = ctx.sizeof_addr as usize;
         let ss = ctx.sizeof_size as usize;
-        let mut continuations: Vec<(u64, u64)> = Vec::new();
-        for msg in &header.messages {
-            if msg.msg_type == MSG_OBJ_HEADER_CONTINUATION && msg.data.len() >= sa + ss {
-                let cont_addr = read_uint(&msg.data, sa);
-                let cont_len = read_uint(&msg.data[sa..], ss);
-                continuations.push((cont_addr, cont_len));
-            }
-        }
 
-        // Parse messages from continuation chunks
-        for (cont_addr, cont_len) in continuations {
-            if cont_addr == UNDEF_ADDR || cont_len == 0 {
+        // Collect continuation references from a slice of messages.
+        let collect = |msgs: &[crate::format::object_header::ObjectHeaderMessage],
+                       out: &mut Vec<(u64, u64)>| {
+            for msg in msgs {
+                if msg.msg_type == MSG_OBJ_HEADER_CONTINUATION && msg.data.len() >= sa + ss {
+                    let cont_addr = read_uint(&msg.data, sa);
+                    let cont_len = read_uint(&msg.data[sa..], ss);
+                    out.push((cont_addr, cont_len));
+                }
+            }
+        };
+
+        let mut pending: Vec<(u64, u64)> = Vec::new();
+        collect(&header.messages, &mut pending);
+
+        let mut visited = std::collections::HashSet::new();
+        let mut blocks_read = 0usize;
+
+        while let Some((cont_addr, cont_len)) = pending.pop() {
+            if cont_addr == UNDEF_ADDR || cont_addr == 0 || cont_len == 0 {
                 continue;
             }
+            if !visited.insert(cont_addr) {
+                continue; // already followed — guard against cycles
+            }
+            blocks_read += 1;
+            if blocks_read > MAX_CONT_BLOCKS {
+                break;
+            }
+
             let cont_buf = handle.read_at_most(cont_addr, cont_len as usize)?;
-            // Parse messages from the continuation chunk (v1 format: no header prefix)
+            let mut new_msgs = Vec::new();
+            Self::parse_continuation_block(&cont_buf, is_v2, track_creation_order, &mut new_msgs);
+            collect(&new_msgs, &mut pending);
+            header.messages.extend(new_msgs);
+        }
+
+        Ok(header)
+    }
+
+    /// Parse the messages out of a single object-header continuation block.
+    ///
+    /// For v2 (`is_v2`) the block is `"OCHK"(4) + messages + checksum(4)`;
+    /// for v1 it is bare messages. Null/padding messages (type 0) are skipped.
+    fn parse_continuation_block(
+        cont_buf: &[u8],
+        is_v2: bool,
+        track_creation_order: bool,
+        out: &mut Vec<crate::format::object_header::ObjectHeaderMessage>,
+    ) {
+        if is_v2 {
+            // "OCHK"(4) signature + messages + checksum(4).
+            if cont_buf.len() < 8 || cont_buf[0..4] != *b"OCHK" {
+                return;
+            }
+            let msgs_end = cont_buf.len() - 4; // strip trailing checksum
+            let mut pos = 4; // skip "OCHK" signature
+                             // v2 message header: type(1) + size(2) + flags(1) [+ crt_order(2)]
+            let hdr_size = if track_creation_order { 6 } else { 4 };
+            while pos + hdr_size <= msgs_end {
+                let msg_type = cont_buf[pos];
+                let data_size = u16::from_le_bytes([cont_buf[pos + 1], cont_buf[pos + 2]]) as usize;
+                let msg_flags = cont_buf[pos + 3];
+                pos += hdr_size;
+                if pos + data_size > msgs_end {
+                    break;
+                }
+                if msg_type != 0 {
+                    out.push(crate::format::object_header::ObjectHeaderMessage {
+                        msg_type,
+                        flags: msg_flags,
+                        data: cont_buf[pos..pos + data_size].to_vec(),
+                    });
+                }
+                pos += data_size;
+            }
+        } else {
+            // v1 continuation: bare messages, 8-byte aligned, no prefix.
             let mut pos = 0;
             while pos + 8 <= cont_buf.len() {
                 let msg_type = u16::from_le_bytes([cont_buf[pos], cont_buf[pos + 1]]);
@@ -455,19 +667,28 @@ impl Hdf5Reader {
                     break;
                 }
                 if msg_type != 0 {
-                    header
-                        .messages
-                        .push(crate::format::object_header::ObjectHeaderMessage {
-                            msg_type: msg_type as u8,
-                            flags: msg_flags,
-                            data: cont_buf[pos..pos + data_size].to_vec(),
-                        });
+                    out.push(crate::format::object_header::ObjectHeaderMessage {
+                        msg_type: msg_type as u8,
+                        flags: msg_flags,
+                        data: cont_buf[pos..pos + data_size].to_vec(),
+                    });
                 }
                 pos += data_size;
-                // v1 alignment to 8 bytes
-                pos = (pos + 7) & !7;
+                pos = (pos + 7) & !7; // v1 8-byte alignment
             }
         }
+    }
+
+    /// Read a dataset's object header and extract metadata. Returns None if
+    /// the object is not a dataset (e.g., it's a group).
+    fn read_dataset_from_object_header(
+        handle: &mut FileHandle,
+        ctx: &FormatContext,
+        addr: u64,
+        name: &str,
+    ) -> IoResult<Option<DatasetReadInfo>> {
+        // Read the object header, following continuation blocks (v1 and v2).
+        let header = Self::read_object_header_full(handle, ctx, addr)?;
 
         let mut datatype = None;
         let mut dataspace = None;
@@ -619,6 +840,20 @@ impl Hdf5Reader {
                 Ok(data)
             }
             DataLayoutMessage::Compact { data } => Ok(data.clone()),
+            DataLayoutMessage::ChunkedV3 {
+                chunk_dims,
+                b_tree_address,
+            } => {
+                // The layout's chunk_dims include the element size as
+                // the trailing dimension. Strip it for chunk indexing.
+                let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
+                self.read_chunked_btree_v1(
+                    name,
+                    real_chunk_dims,
+                    *b_tree_address,
+                    pipeline.as_ref(),
+                )
+            }
             DataLayoutMessage::ChunkedV4 {
                 chunk_dims,
                 index_address,
@@ -659,11 +894,12 @@ impl Hdf5Reader {
             sizeof_size: sb.sizeof_lengths,
         };
 
-        // Re-read root group object header.
-        let root_buf = self
-            .handle
-            .read_at_most(sb.root_group_object_header_address, 4096)?;
-        let (root_header, _) = ObjectHeader::decode(&root_buf)?;
+        // Re-read root group object header, following continuation blocks.
+        let root_header = Self::read_object_header_full(
+            &mut self.handle,
+            &ctx,
+            sb.root_group_object_header_address,
+        )?;
 
         // Re-scan datasets and group attributes from link messages.
         let (datasets, group_attributes) =
@@ -1143,6 +1379,173 @@ impl Hdf5Reader {
                     geo,
                     out,
                 )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Read a chunked dataset indexed by a version-1 B-tree (layout
+    /// message version 3, class 2 "chunked").
+    ///
+    /// `chunk_dims` excludes the trailing element-size dimension.
+    fn read_chunked_btree_v1(
+        &mut self,
+        name: &str,
+        chunk_dims: &[u64],
+        b_tree_address: u64,
+        pipeline: Option<&FilterPipeline>,
+    ) -> IoResult<Vec<u8>> {
+        let info = self
+            .dataset_info(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let dims = info.dataspace.dims.clone();
+        let element_size = info.datatype.element_size() as u64;
+        let fill_value = info.fill_value.clone();
+        let ndims = dims.len();
+
+        let total_size: u64 = dims.iter().product::<u64>() * element_size;
+        let mut output = tiled_fill(total_size as usize, fill_value.as_deref());
+
+        if b_tree_address == UNDEF_ADDR || total_size == 0 {
+            return Ok(output);
+        }
+
+        // Walk the B-tree, collecting every leaf entry as
+        // (element_offsets, chunk_address, chunk_size, filter_mask).
+        // `chunk_dims.len()` is the chunk rank; the B-tree keys carry
+        // rank + 1 offsets (the extra one is the element-size dimension).
+        let mut entries: Vec<(Vec<u64>, u64, u32, u32)> = Vec::new();
+        let file_size = self.handle.file_size()?;
+        self.collect_btree_v1_chunks(b_tree_address, ndims, file_size, 0, &mut entries)?;
+
+        // The uncompressed byte size of a full chunk.
+        let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
+
+        // Read every chunk's raw bytes.
+        let mut raw_chunks: Vec<Option<(Vec<u8>, Vec<u64>)>> = Vec::with_capacity(entries.len());
+        for (offsets, addr, chunk_size, _mask) in &entries {
+            if *addr == UNDEF_ADDR
+                || *chunk_size == 0
+                || *addr >= file_size
+                || *chunk_size as u64 > file_size
+            {
+                raw_chunks.push(None);
+                continue;
+            }
+            // Convert element offsets to chunk-grid (scaled) coordinates.
+            // The trailing element-size dimension offset is always 0 and
+            // is dropped here.
+            let mut scaled = Vec::with_capacity(ndims);
+            for d in 0..ndims {
+                let cd = chunk_dims[d];
+                scaled.push(if cd > 0 { offsets[d] / cd } else { 0 });
+            }
+            let data = self.handle.read_at(*addr, *chunk_size as usize)?;
+            raw_chunks.push(Some((data, scaled)));
+        }
+
+        // Decompress filtered chunks (optionally in parallel).
+        let placed: Vec<Option<(Vec<u8>, Vec<u64>)>> = if let Some(pl) = pipeline {
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                raw_chunks
+                    .into_par_iter()
+                    .map(|c| c.map(|(r, s)| (filter::reverse_filters(pl, &r).unwrap_or(r), s)))
+                    .collect()
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                raw_chunks
+                    .into_iter()
+                    .map(|c| c.map(|(r, s)| (filter::reverse_filters(pl, &r).unwrap_or(r), s)))
+                    .collect()
+            }
+        } else {
+            raw_chunks
+        };
+
+        // Place each chunk N-dimensionally by its scaled offsets.
+        for chunk in placed.iter().flatten() {
+            let (data, scaled) = chunk;
+            self.copy_chunk_to_output(data, &mut output, &dims, chunk_dims, scaled, element_size);
+        }
+
+        // libhdf5 stores raw byte sizes; verify the uncompressed chunk
+        // size is consistent for unfiltered datasets so a corrupt index
+        // surfaces instead of silently producing garbage.
+        if pipeline.is_none() {
+            for (_, addr, chunk_size, _) in &entries {
+                if *addr != UNDEF_ADDR && *chunk_size as u64 != chunk_bytes && *chunk_size != 0 {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "chunk B-tree v1: unfiltered chunk size {} != expected {}",
+                        chunk_size, chunk_bytes
+                    )));
+                }
+            }
+        }
+
+        Ok(output)
+    }
+
+    /// Recursively walk a version-1 raw-data-chunk B-tree, collecting every
+    /// leaf entry as `(element_offsets, chunk_address, chunk_size,
+    /// filter_mask)`.
+    ///
+    /// `rank` is the chunk rank excluding the trailing element-size
+    /// dimension. Recursion is bounded by the node level read from disk:
+    /// each recursive step descends to a strictly lower level, and the
+    /// `depth` counter caps the descent at the 1-byte level field's range.
+    fn collect_btree_v1_chunks(
+        &mut self,
+        addr: u64,
+        rank: usize,
+        file_size: u64,
+        depth: u32,
+        out: &mut Vec<(Vec<u64>, u64, u32, u32)>,
+    ) -> IoResult<()> {
+        // A v1 B-tree node level fits in one byte, so the tree can be at
+        // most 256 levels deep; this also stops cyclic/corrupt indices.
+        if depth > 256 {
+            return Err(crate::io::IoError::InvalidState(
+                "chunk B-tree v1 exceeds maximum depth".into(),
+            ));
+        }
+        if addr == UNDEF_ADDR || addr >= file_size {
+            return Ok(());
+        }
+
+        // A node is the header (8 + 2*sizeof_addr) plus interleaved
+        // keys/children. Read a generous slice; ChunkBTreeV1Node::decode
+        // validates the exact length it needs.
+        let sa = self.ctx.sizeof_addr as usize;
+        let key_size = 4 + 4 + (rank + 1) * 8;
+        // u16 entries_used: at most 65535 children.
+        let max_node = 8 + sa * 2 + 65536 * (key_size + sa);
+        let buf = self.handle.read_at_most(addr, max_node)?;
+        let node = ChunkBTreeV1Node::decode(&buf, sa, rank)?;
+
+        if node.level == 0 {
+            // Leaf node: each child points at chunk data.
+            for (i, &child_addr) in node.children.iter().enumerate() {
+                let key = &node.keys[i];
+                out.push((
+                    key.offsets[..rank].to_vec(),
+                    child_addr,
+                    key.chunk_size,
+                    key.filter_mask,
+                ));
+            }
+        } else {
+            // Internal node: each child points at a sub-TREE node one
+            // level below. `node.level` is read from disk and decreases on
+            // every descent, so it also bounds the recursion.
+            let children: Vec<u64> = node.children.clone();
+            for child_addr in children {
+                if child_addr == UNDEF_ADDR || child_addr >= file_size {
+                    continue;
+                }
+                self.collect_btree_v1_chunks(child_addr, rank, file_size, depth + 1, out)?;
             }
         }
         Ok(())
@@ -1640,6 +2043,44 @@ impl Hdf5Reader {
                 }
                 Ok(output)
             }
+            DataLayoutMessage::ChunkedV3 { .. } => {
+                // Read the full dataset via the v1 B-tree path, then
+                // extract the requested slice.
+                let full = self.read_dataset_raw(name)?;
+                let mut output = vec![0u8; out_bytes];
+                let src_strides = compute_strides(&dims, element_size);
+                let row_bytes = (counts[ndims - 1] * element_size) as usize;
+                let n_rows: u64 = if ndims > 1 {
+                    counts[..ndims - 1].iter().product()
+                } else {
+                    1
+                };
+                if ndims == 1 {
+                    let src_off = (starts[0] * element_size) as usize;
+                    output[..row_bytes].copy_from_slice(&full[src_off..src_off + row_bytes]);
+                } else {
+                    let out_strides = compute_strides(counts, element_size);
+                    let mut coords = vec![0u64; ndims - 1];
+                    for _row in 0..n_rows {
+                        let mut src_off = (starts[ndims - 1] * element_size) as usize;
+                        let mut out_off = 0usize;
+                        for d in 0..ndims - 1 {
+                            src_off += ((starts[d] + coords[d]) * src_strides[d]) as usize;
+                            out_off += (coords[d] * out_strides[d]) as usize;
+                        }
+                        output[out_off..out_off + row_bytes]
+                            .copy_from_slice(&full[src_off..src_off + row_bytes]);
+                        for d in (0..ndims - 1).rev() {
+                            coords[d] += 1;
+                            if coords[d] < counts[d] {
+                                break;
+                            }
+                            coords[d] = 0;
+                        }
+                    }
+                }
+                Ok(output)
+            }
             DataLayoutMessage::ChunkedV4 {
                 chunk_dims: layout_chunk_dims,
                 index_address,
@@ -1781,6 +2222,23 @@ fn read_uint(buf: &[u8], n: usize) -> u64 {
     let mut tmp = [0u8; 8];
     tmp[..n].copy_from_slice(&buf[..n]);
     u64::from_le_bytes(tmp)
+}
+
+/// Adapts a `FileHandle` to the `BlockReader` trait used by the fractal-heap
+/// walker, so heap blocks can be fetched from the open file.
+struct HandleBlockReader<'a> {
+    handle: &'a mut FileHandle,
+}
+
+impl BlockReader for HandleBlockReader<'_> {
+    fn read_block(&mut self, offset: u64, len: usize) -> crate::format::FormatResult<Vec<u8>> {
+        self.handle.read_at(offset, len).map_err(|e| {
+            crate::format::FormatError::InvalidData(format!(
+                "fractal heap block read failed at {:#x}: {}",
+                offset, e
+            ))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2276,5 +2734,152 @@ mod h5py_debug_tests {
         // Try full open
         let reader = Hdf5Reader::open(path).unwrap();
         eprintln!("Datasets found: {:?}", reader.dataset_names());
+    }
+
+    // ====================================================================
+    // Group/link discovery: continuation blocks, dense links, v0/v1 groups.
+    //
+    // These tests generate HDF5 fixtures with h5py (HDF5 2.0.0). If the
+    // pinned Python interpreter is not present, the test skips so the suite
+    // still runs in environments without it.
+    // ====================================================================
+
+    const TEST_PYTHON: &str = "/Users/stevek/mamba/envs/bs2026.1/bin/python";
+
+    /// Per-call unique temp path (PID + atomic counter) to avoid collisions
+    /// across concurrent test runs.
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "rust_hdf5_gap_test_{}_{}_{}.h5",
+            name,
+            std::process::id(),
+            n
+        ))
+    }
+
+    /// Run a Python snippet to generate a fixture; returns false if Python
+    /// is unavailable so the caller can skip the test.
+    fn gen_fixture(script: &str) -> bool {
+        if !std::path::Path::new(TEST_PYTHON).exists() {
+            return false;
+        }
+        let status = std::process::Command::new(TEST_PYTHON)
+            .arg("-c")
+            .arg(script)
+            .status();
+        matches!(status, Ok(s) if s.success())
+    }
+
+    #[test]
+    fn gap1_v2_root_continuation_block() {
+        let path = temp_path("gap1_cont");
+        let p = path.display().to_string();
+        // ~6 datasets in a v2 root group forces an object-header
+        // continuation block.
+        let script = format!(
+            "import h5py,numpy as np\n\
+             f=h5py.File(r'{p}','w',libver='latest')\n\
+             [f.create_dataset('ds_%d'%i,data=np.arange(i*10,i*10+10,dtype='int32')) for i in range(6)]\n\
+             f.close()"
+        );
+        if !gen_fixture(&script) {
+            eprintln!("skipping gap1: python unavailable");
+            return;
+        }
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        let mut names = reader.dataset_names();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["ds_0", "ds_1", "ds_2", "ds_3", "ds_4", "ds_5"],
+            "all 6 datasets must be found across the continuation block"
+        );
+        // Element-exact read of one dataset.
+        let raw = reader.read_dataset_raw("ds_3").unwrap();
+        let vals: Vec<i32> = raw
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(vals, (30..40).collect::<Vec<i32>>());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gap2_v2_dense_fractal_heap_links() {
+        let path = temp_path("gap2_dense");
+        let p = path.display().to_string();
+        // 14 datasets in one v2 group forces dense (fractal-heap) link
+        // storage.
+        let script = format!(
+            "import h5py,numpy as np\n\
+             f=h5py.File(r'{p}','w',libver='latest')\n\
+             g=f.create_group('dense')\n\
+             [g.create_dataset('d%02d'%i,data=np.full(4,i,dtype='float64')) for i in range(14)]\n\
+             f.close()"
+        );
+        if !gen_fixture(&script) {
+            eprintln!("skipping gap2: python unavailable");
+            return;
+        }
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        let mut names = reader.dataset_names();
+        names.sort();
+        let expected: Vec<String> = (0..14).map(|i| format!("dense/d{:02}", i)).collect();
+        assert_eq!(
+            names, expected,
+            "all 14 dense-stored links must be recovered from the fractal heap"
+        );
+        // Element-exact read of one dense-stored dataset.
+        let raw = reader.read_dataset_raw("dense/d07").unwrap();
+        let vals: Vec<f64> = raw
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .collect();
+        assert_eq!(vals, vec![7.0; 4]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gap3_v0v1_legacy_subgroups() {
+        let path = temp_path("gap3_legacy");
+        let p = path.display().to_string();
+        // libver='earliest' => v0 superblock, symbol-table groups; datasets
+        // nested inside subgroups.
+        let script = format!(
+            "import h5py,numpy as np\n\
+             f=h5py.File(r'{p}','w',libver='earliest')\n\
+             g1=f.create_group('grp1')\n\
+             g1.create_dataset('a',data=np.arange(5,dtype='int16'))\n\
+             g2=g1.create_group('sub')\n\
+             g2.create_dataset('b',data=np.arange(7,dtype='int64'))\n\
+             f.create_dataset('top',data=np.arange(3,dtype='int32'))\n\
+             f.close()"
+        );
+        if !gen_fixture(&script) {
+            eprintln!("skipping gap3: python unavailable");
+            return;
+        }
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        let mut names = reader.dataset_names();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["grp1/a", "grp1/sub/b", "top"],
+            "datasets nested in legacy symbol-table subgroups must be found"
+        );
+        // Element-exact read of a doubly-nested dataset.
+        let raw = reader.read_dataset_raw("grp1/sub/b").unwrap();
+        let vals: Vec<i64> = raw
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .collect();
+        assert_eq!(vals, (0..7).collect::<Vec<i64>>());
+        let _ = std::fs::remove_file(&path);
     }
 }
