@@ -997,23 +997,35 @@ impl Hdf5Reader {
             return Ok(vec![]);
         }
 
-        // For depth=0, root is a leaf node
-        if bt2_hdr.depth != 0 {
-            return Err(crate::io::IoError::InvalidState(
-                "B-tree v2 depth > 0 not yet supported for reading".into(),
-            ));
-        }
-
-        // Read leaf node
-        let leaf_buf = self.handle.read_at_most(bt2_hdr.root_node_addr, 65536)?;
-        let leaf =
-            Bt2LeafNode::decode(&leaf_buf, bt2_hdr.num_records_in_root, bt2_hdr.record_size)?;
+        // Walk the B-tree to any depth, collecting every record's raw bytes
+        // from the internal nodes and leaves.
+        let geo = Bt2Geometry::new(
+            bt2_hdr.node_size,
+            bt2_hdr.record_size,
+            bt2_hdr.depth,
+            self.ctx.sizeof_addr,
+        );
+        let mut record_bytes: Vec<u8> = Vec::new();
+        self.collect_bt2_records(
+            bt2_hdr.root_node_addr,
+            bt2_hdr.depth,
+            bt2_hdr.num_records_in_root,
+            bt2_hdr.record_size,
+            bt2_hdr.node_size,
+            &geo,
+            &mut record_bytes,
+        )?;
+        let total_records = if bt2_hdr.record_size > 0 {
+            record_bytes.len() / bt2_hdr.record_size as usize
+        } else {
+            0
+        };
 
         // Decode records
         let records = if bt2_hdr.record_type == BT2_TYPE_CHUNK_UNFILT {
             Bt2ChunkIndex::decode_unfiltered_records(
-                &leaf.record_data,
-                bt2_hdr.num_records_in_root as usize,
+                &record_bytes,
+                total_records,
                 ndims,
                 &self.ctx,
             )?
@@ -1088,6 +1100,59 @@ impl Hdf5Reader {
         }
 
         Ok(output)
+    }
+
+    /// Recursively walk a v2 B-tree, appending every node's raw record bytes
+    /// (internal nodes and leaves alike) to `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_bt2_records(
+        &mut self,
+        addr: u64,
+        depth: u16,
+        nrec: u16,
+        record_size: u16,
+        node_size: u32,
+        geo: &crate::format::chunk_index::btree_v2::Bt2Geometry,
+        out: &mut Vec<u8>,
+    ) -> IoResult<()> {
+        use crate::format::chunk_index::btree_v2::{Bt2InternalNode, Bt2LeafNode};
+
+        let buf = self.handle.read_at_most(addr, node_size as usize)?;
+        if depth == 0 {
+            let leaf = Bt2LeafNode::decode(&buf, nrec, record_size)?;
+            out.extend_from_slice(&leaf.record_data);
+        } else {
+            let node = Bt2InternalNode::decode(
+                &buf,
+                &self.ctx,
+                depth,
+                nrec,
+                record_size,
+                geo.max_nrec_size,
+                geo.child_total_size(depth),
+            )?;
+            out.extend_from_slice(&node.record_data);
+            // Collect (addr, nrec) up front so the node borrow is released
+            // before recursing.
+            let children: Vec<(u64, u16)> = node
+                .child_addrs
+                .iter()
+                .zip(node.child_nrecords.iter())
+                .map(|(&a, &n)| (a, n))
+                .collect();
+            for (child_addr, child_nrec) in children {
+                self.collect_bt2_records(
+                    child_addr,
+                    depth - 1,
+                    child_nrec,
+                    record_size,
+                    node_size,
+                    geo,
+                    out,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Copy chunk data into the correct position in a multi-dimensional output buffer.

@@ -376,185 +376,222 @@ impl Bt2InternalNode {
         }
     }
 
-    /// Compute the number of bytes needed for the child_nrecords packed field.
-    fn nrec_bytes(num_children: usize, max_nrec: u32) -> usize {
-        let bits_per_child = std::cmp::max(1, (32 - max_nrec.leading_zeros()) as usize);
-        (num_children * bits_per_child).div_ceil(8)
+    /// Encoded size of an internal node at `depth` with `nrec` records.
+    pub fn encoded_size(
+        ctx: &FormatContext,
+        depth: u16,
+        nrec: u16,
+        rrec_size: u16,
+        max_nrec_size: u8,
+        child_total_size: u8,
+    ) -> usize {
+        let sa = ctx.sizeof_addr as usize;
+        let nchild = nrec as usize + 1;
+        let ptr = sa
+            + max_nrec_size as usize
+            + if depth > 1 {
+                child_total_size as usize
+            } else {
+                0
+            };
+        4 + 1 + 1 + nrec as usize * rrec_size as usize + nchild * ptr + 4
     }
 
-    /// Compute the encoded size.
-    pub fn encoded_size(&self, ctx: &FormatContext, depth: u16, max_nrec_per_node: u32) -> usize {
+    /// Encode an internal node (libhdf5 `H5B2__cache_int_serialize` layout):
+    /// each child pointer is `address + node_nrec + [total_nrec if depth>1]`,
+    /// where the widths come from the B-tree geometry.
+    pub fn encode(
+        &self,
+        ctx: &FormatContext,
+        depth: u16,
+        max_nrec_size: u8,
+        child_total_size: u8,
+    ) -> Vec<u8> {
         let sa = ctx.sizeof_addr as usize;
-        let ss = ctx.sizeof_size as usize;
-        let num_children = self.num_records as usize + 1;
-        let nrec_bytes = Self::nrec_bytes(num_children, max_nrec_per_node);
-
-        let mut size = 4 + 1 + 1; // signature + version + type
-        size += self.record_data.len(); // records
-        size += num_children * sa; // child addrs
-        size += nrec_bytes; // child nrecords
-        if depth > 1 {
-            size += num_children * ss; // child total nrecords
-        }
-        size += 4; // checksum
-        size
-    }
-
-    pub fn encode(&self, ctx: &FormatContext, depth: u16, max_nrec_per_node: u32) -> Vec<u8> {
-        let sa = ctx.sizeof_addr as usize;
-        let ss = ctx.sizeof_size as usize;
-        let num_children = self.num_records as usize + 1;
-        let size = self.encoded_size(ctx, depth, max_nrec_per_node);
+        let nchild = self.num_records as usize + 1;
+        let size = Self::encoded_size(
+            ctx,
+            depth,
+            self.num_records,
+            self.record_size,
+            max_nrec_size,
+            child_total_size,
+        );
         let mut buf = Vec::with_capacity(size);
-
         buf.extend_from_slice(&BTIN_SIGNATURE);
         buf.push(BT2_VERSION);
         buf.push(self.record_type);
         buf.extend_from_slice(&self.record_data);
-
-        // Child addresses
-        for &addr in &self.child_addrs {
-            buf.extend_from_slice(&addr.to_le_bytes()[..sa]);
-        }
-
-        // Child nrecords - packed bits
-        let bits_per_child = std::cmp::max(1, (32 - max_nrec_per_node.leading_zeros()) as usize);
-        let nrec_bytes = Self::nrec_bytes(num_children, max_nrec_per_node);
-        let mut packed = vec![0u8; nrec_bytes];
-        for (i, &nrec) in self.child_nrecords.iter().enumerate() {
-            let bit_offset = i * bits_per_child;
-            let byte_offset = bit_offset / 8;
-            let bit_shift = bit_offset % 8;
-            let value = nrec as u32;
-            // Write the value across potentially multiple bytes
-            let combined = (value as u64) << bit_shift;
-            let bytes = combined.to_le_bytes();
-            let bytes_needed = (bits_per_child + bit_shift).div_ceil(8);
-            for j in 0..bytes_needed {
-                if byte_offset + j < nrec_bytes {
-                    packed[byte_offset + j] |= bytes[j];
-                }
+        for i in 0..nchild {
+            buf.extend_from_slice(&self.child_addrs[i].to_le_bytes()[..sa]);
+            buf.extend_from_slice(
+                &(self.child_nrecords[i] as u64).to_le_bytes()[..max_nrec_size as usize],
+            );
+            if depth > 1 {
+                buf.extend_from_slice(
+                    &self.child_total_nrecords[i].to_le_bytes()[..child_total_size as usize],
+                );
             }
         }
-        buf.extend_from_slice(&packed);
-
-        // Child total nrecords (only if depth > 1)
-        if depth > 1 {
-            for &total in &self.child_total_nrecords {
-                buf.extend_from_slice(&total.to_le_bytes()[..ss]);
-            }
-        }
-
         let cksum = checksum_metadata(&buf);
         buf.extend_from_slice(&cksum.to_le_bytes());
-
         debug_assert_eq!(buf.len(), size);
         buf
     }
 
+    /// Decode an internal node. `depth` is this node's depth (children are at
+    /// `depth - 1`); `nrec` its record count; the size widths come from the
+    /// B-tree geometry.
     pub fn decode(
         buf: &[u8],
         ctx: &FormatContext,
-        num_records: u16,
-        record_size: u16,
         depth: u16,
-        max_nrec_per_node: u32,
+        nrec: u16,
+        rrec_size: u16,
+        max_nrec_size: u8,
+        child_total_size: u8,
     ) -> FormatResult<Self> {
         let sa = ctx.sizeof_addr as usize;
-        let ss = ctx.sizeof_size as usize;
-        let num_children = num_records as usize + 1;
-        let records_len = num_records as usize * record_size as usize;
-        let bits_per_child = std::cmp::max(1, (32 - max_nrec_per_node.leading_zeros()) as usize);
-        let nrec_bytes = Self::nrec_bytes(num_children, max_nrec_per_node);
-
-        let mut min_size = 4 + 1 + 1 + records_len + num_children * sa + nrec_bytes;
-        if depth > 1 {
-            min_size += num_children * ss;
-        }
-        min_size += 4; // checksum
-
+        let nchild = nrec as usize + 1;
+        let records_len = nrec as usize * rrec_size as usize;
+        let ptr = sa
+            + max_nrec_size as usize
+            + if depth > 1 {
+                child_total_size as usize
+            } else {
+                0
+            };
+        let min_size = 4 + 1 + 1 + records_len + nchild * ptr + 4;
         if buf.len() < min_size {
             return Err(FormatError::BufferTooShort {
                 needed: min_size,
                 available: buf.len(),
             });
         }
-
         if buf[0..4] != BTIN_SIGNATURE {
             return Err(FormatError::InvalidSignature);
         }
-
-        let version = buf[4];
-        if version != BT2_VERSION {
-            return Err(FormatError::InvalidVersion(version));
+        if buf[4] != BT2_VERSION {
+            return Err(FormatError::InvalidVersion(buf[4]));
         }
-
-        // Verify checksum
         let data_end = min_size - 4;
-        let stored_cksum = u32::from_le_bytes([
+        let stored = u32::from_le_bytes([
             buf[data_end],
             buf[data_end + 1],
             buf[data_end + 2],
             buf[data_end + 3],
         ]);
-        let computed_cksum = checksum_metadata(&buf[..data_end]);
-        if stored_cksum != computed_cksum {
+        let computed = checksum_metadata(&buf[..data_end]);
+        if stored != computed {
             return Err(FormatError::ChecksumMismatch {
-                expected: stored_cksum,
-                computed: computed_cksum,
+                expected: stored,
+                computed,
             });
         }
-
         let record_type = buf[5];
         let mut pos = 6;
-
         let record_data = buf[pos..pos + records_len].to_vec();
         pos += records_len;
-
-        let mut child_addrs = Vec::with_capacity(num_children);
-        for _ in 0..num_children {
+        let mut child_addrs = Vec::with_capacity(nchild);
+        let mut child_nrecords = Vec::with_capacity(nchild);
+        let mut child_total_nrecords = Vec::with_capacity(nchild);
+        for _ in 0..nchild {
             child_addrs.push(read_addr(&buf[pos..], sa));
             pos += sa;
-        }
-
-        // Decode packed child nrecords
-        let packed = &buf[pos..pos + nrec_bytes];
-        pos += nrec_bytes;
-        let mask = (1u32 << bits_per_child) - 1;
-        let mut child_nrecords = Vec::with_capacity(num_children);
-        for i in 0..num_children {
-            let bit_offset = i * bits_per_child;
-            let byte_offset = bit_offset / 8;
-            let bit_shift = bit_offset % 8;
-            // Read up to 8 bytes starting at byte_offset
-            let mut tmp = [0u8; 8];
-            let avail = std::cmp::min(8, nrec_bytes - byte_offset);
-            tmp[..avail].copy_from_slice(&packed[byte_offset..byte_offset + avail]);
-            let value = u64::from_le_bytes(tmp);
-            let nrec = ((value >> bit_shift) as u32 & mask) as u16;
-            child_nrecords.push(nrec);
-        }
-
-        let child_total_nrecords = if depth > 1 {
-            let mut totals = Vec::with_capacity(num_children);
-            for _ in 0..num_children {
-                totals.push(read_size(&buf[pos..], ss));
-                pos += ss;
+            child_nrecords.push(read_size(&buf[pos..], max_nrec_size as usize) as u16);
+            pos += max_nrec_size as usize;
+            if depth > 1 {
+                child_total_nrecords.push(read_size(&buf[pos..], child_total_size as usize));
+                pos += child_total_size as usize;
             }
-            totals
-        } else {
-            Vec::new()
-        };
-
+        }
         Ok(Self {
             record_type,
             record_data,
-            num_records,
-            record_size,
+            num_records: nrec,
+            record_size: rrec_size,
             child_addrs,
             child_nrecords,
             child_total_nrecords,
         })
+    }
+}
+
+/// Per-depth v2 B-tree node geometry (`H5B2_node_info_t`).
+#[derive(Debug, Clone, Copy)]
+pub struct Bt2NodeInfo {
+    /// Maximum records a node at this depth holds.
+    pub max_nrec: u64,
+    /// Maximum records in this node and all nodes below it.
+    pub cum_max_nrec: u64,
+    /// Bytes needed to encode `cum_max_nrec`.
+    pub cum_max_nrec_size: u8,
+}
+
+/// v2 B-tree node geometry derived from the header parameters, matching
+/// libhdf5 `H5B2__hdr_init`.
+#[derive(Debug, Clone)]
+pub struct Bt2Geometry {
+    /// Bytes used to encode a child node's record count.
+    pub max_nrec_size: u8,
+    /// Node info indexed by depth (`0..=depth`).
+    pub node_info: Vec<Bt2NodeInfo>,
+}
+
+/// libhdf5 `H5VM_limit_enc_size`: bytes to encode values in `0..=limit`.
+fn limit_enc_size(limit: u64) -> u8 {
+    let log2 = if limit == 0 {
+        0
+    } else {
+        63 - limit.leading_zeros()
+    };
+    (log2 / 8 + 1) as u8
+}
+
+impl Bt2Geometry {
+    /// v2 B-tree prefix size (`H5B2_METADATA_PREFIX_SIZE`): magic + version
+    /// + type + checksum.
+    const PREFIX: u64 = 10;
+
+    pub fn new(node_size: u32, rrec_size: u16, depth: u16, sizeof_addr: u8) -> Self {
+        let rrec = rrec_size.max(1) as u64;
+        let leaf_max = (node_size as u64 - Self::PREFIX) / rrec;
+        let max_nrec_size = limit_enc_size(leaf_max);
+        let mut node_info = vec![Bt2NodeInfo {
+            max_nrec: leaf_max,
+            cum_max_nrec: leaf_max,
+            cum_max_nrec_size: 0,
+        }];
+        for d in 1..=depth as usize {
+            let ptr = sizeof_addr as u64
+                + max_nrec_size as u64
+                + node_info[d - 1].cum_max_nrec_size as u64;
+            let max_nrec = if (node_size as u64) > Self::PREFIX + ptr {
+                (node_size as u64 - Self::PREFIX - ptr) / (rrec + ptr)
+            } else {
+                0
+            };
+            let cum = (max_nrec + 1) * node_info[d - 1].cum_max_nrec + max_nrec;
+            node_info.push(Bt2NodeInfo {
+                max_nrec,
+                cum_max_nrec: cum,
+                cum_max_nrec_size: limit_enc_size(cum),
+            });
+        }
+        Self {
+            max_nrec_size,
+            node_info,
+        }
+    }
+
+    /// Width of a child's "total records" field for a node at `depth`
+    /// (0 unless `depth > 1`).
+    pub fn child_total_size(&self, depth: u16) -> u8 {
+        if depth > 1 {
+            self.node_info[depth as usize - 1].cum_max_nrec_size
+        } else {
+            0
+        }
     }
 }
 
@@ -1010,11 +1047,11 @@ mod tests {
         node.child_addrs = vec![0x1000, 0x2000]; // 2 children
         node.child_nrecords = vec![3, 5];
 
-        let max_nrec = 10u32;
-        let encoded = node.encode(&ctx8(), 1, max_nrec);
+        // depth 1: children are leaves, no total-nrec field.
+        let encoded = node.encode(&ctx8(), 1, 1, 0);
         assert_eq!(&encoded[..4], b"BTIN");
 
-        let decoded = Bt2InternalNode::decode(&encoded, &ctx8(), 1, rec_size, 1, max_nrec).unwrap();
+        let decoded = Bt2InternalNode::decode(&encoded, &ctx8(), 1, 1, rec_size, 1, 0).unwrap();
         assert_eq!(decoded.record_data, node.record_data);
         assert_eq!(decoded.child_addrs, node.child_addrs);
         assert_eq!(decoded.child_nrecords, node.child_nrecords);
@@ -1030,12 +1067,20 @@ mod tests {
         node.child_nrecords = vec![4, 6, 2];
         node.child_total_nrecords = vec![100, 200, 50];
 
-        let max_nrec = 16u32;
-        let encoded = node.encode(&ctx8(), 2, max_nrec);
-
-        let decoded = Bt2InternalNode::decode(&encoded, &ctx8(), 2, rec_size, 2, max_nrec).unwrap();
+        // depth 2: children carry a 2-byte total-nrec field.
+        let encoded = node.encode(&ctx8(), 2, 1, 2);
+        let decoded = Bt2InternalNode::decode(&encoded, &ctx8(), 2, 2, rec_size, 1, 2).unwrap();
         assert_eq!(decoded.child_total_nrecords, vec![100, 200, 50]);
         assert_eq!(decoded.child_nrecords, vec![4, 6, 2]);
+    }
+
+    #[test]
+    fn bt2_geometry_matches_libhdf5() {
+        // node_size 2048, record_size 24, depth 1: leaf holds (2048-10)/24 = 84.
+        let g = Bt2Geometry::new(2048, 24, 1, 8);
+        assert_eq!(g.node_info[0].max_nrec, 84);
+        assert_eq!(g.max_nrec_size, 1);
+        assert_eq!(g.child_total_size(1), 0);
     }
 
     // ---- In-memory index tests ----
