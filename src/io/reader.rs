@@ -1442,7 +1442,6 @@ impl Hdf5Reader {
                 }
             };
 
-            let pis = geo.dblk_page_init_size(u);
             let npages = geo.npages(u) as usize;
             let page_size = geo.dblk_page_size(raw_elmt_size);
             let prefix = geo.dblk_prefix_size(self.ctx.sizeof_addr, max_nelmts_bits);
@@ -1453,11 +1452,13 @@ impl Hdf5Reader {
                 } else if paged {
                     // Paged data block: only a prefix lives at `dblk_addr`;
                     // the elements live in `npages` page structures that
-                    // follow it on disk.
-                    let bitmap = &page_init[d * pis..(d + 1) * pis];
+                    // follow it on disk. The super block's page-init bitmap
+                    // is one flat MSB-first bitmap (H5VM bit ops) indexed by
+                    // `dblk_idx * npages + page_idx` (H5EA.c), not a series
+                    // of per-data-block sub-bitmaps.
                     for p in 0..npages {
-                        // libhdf5 page-init bitmaps are MSB-first (H5VM bit ops).
-                        let initialized = bitmap[p / 8] & (0x80u8 >> (p % 8)) != 0;
+                        let bit = d * npages + p;
+                        let initialized = page_init[bit / 8] & (0x80u8 >> (bit % 8)) != 0;
                         if !initialized {
                             entries.extend(std::iter::repeat_n(
                                 (UNDEF_ADDR, 0),
