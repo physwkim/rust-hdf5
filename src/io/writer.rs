@@ -379,6 +379,24 @@ impl Hdf5Writer {
         let file_size = handle.file_size()?;
 
         let sb_buf = handle.read_at_most(0, 256)?;
+        // open_append reconstructs writer state from the file's link/chunk
+        // structures, which this crate only writes in the version-2/3
+        // (v18+) format. A classic v0/v1-superblock file (e.g. h5py's
+        // default `libver`) uses symbol-table groups and v1-B-tree chunk
+        // indexes that the append path cannot rebuild — reject it with a
+        // clear message rather than the cryptic version error, and without
+        // touching the file.
+        if matches!(
+            crate::format::superblock::detect_superblock_version(&sb_buf),
+            Ok(0) | Ok(1)
+        ) {
+            return Err(crate::io::IoError::InvalidState(
+                "cannot open this file for appending: it uses the classic \
+                 (version-0/1 superblock) HDF5 format; re-create it with a \
+                 newer library-version bound to append to it"
+                    .into(),
+            ));
+        }
         let sb = SuperblockV2V3::decode(&sb_buf)?;
         let ctx = FormatContext {
             sizeof_addr: sb.sizeof_offsets,

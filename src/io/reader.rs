@@ -265,7 +265,13 @@ impl Hdf5Reader {
                     .unwrap_or((UNDEF_ADDR, UNDEF_ADDR))
             };
             if btree_addr != UNDEF_ADDR && heap_addr != UNDEF_ADDR {
-                Self::discover_datasets_from_btree(&mut handle, &ctx, btree_addr, heap_addr)?
+                Self::discover_datasets_from_btree(
+                    &mut handle,
+                    &ctx,
+                    btree_addr,
+                    heap_addr,
+                    root_obj_addr,
+                )?
             } else {
                 (
                     Vec::new(),
@@ -522,6 +528,7 @@ impl Hdf5Reader {
         ctx: &FormatContext,
         btree_addr: u64,
         heap_addr: u64,
+        root_obj_addr: u64,
     ) -> IoResult<(
         Vec<DatasetReadInfo>,
         std::collections::HashMap<String, Vec<AttributeMessage>>,
@@ -529,6 +536,9 @@ impl Hdf5Reader {
     )> {
         let mut datasets = Vec::new();
         let mut visited = std::collections::HashSet::new();
+        // Seed the root object header so a hard link cycling back to the
+        // root group is not descended into a second time.
+        visited.insert(root_obj_addr);
         let mut group_attrs = std::collections::HashMap::new();
         let mut group_paths = std::collections::BTreeSet::new();
         Self::discover_datasets_from_btree_recursive(
