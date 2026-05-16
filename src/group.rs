@@ -93,19 +93,14 @@ impl H5Group {
             format!("{}/{}", self.name, name)
         };
 
-        // Verify the group exists by checking if any datasets have this prefix
+        // Verify the group exists by consulting the reader's actual group
+        // set (derived from link records), not inferred dataset prefixes.
+        // This opens empty groups, attribute-only groups, and
+        // subgroup-only groups, which have no datasets beneath them.
         let inner = borrow_inner(&self.file_inner);
         if let H5FileInner::Reader(reader) = &*inner {
-            let prefix = if full_name == "/" {
-                String::new()
-            } else {
-                format!("{}/", full_name.trim_start_matches('/'))
-            };
-            let has_children = reader
-                .dataset_names()
-                .iter()
-                .any(|n| n.starts_with(&prefix));
-            if !has_children {
+            let group_path = full_name.trim_start_matches('/');
+            if !reader.has_group(group_path) {
                 return Err(Hdf5Error::NotFound(full_name));
             }
         }
@@ -273,21 +268,6 @@ impl H5Group {
 
     /// List sub-group names that are direct children of this group.
     pub fn group_names(&self) -> Result<Vec<String>> {
-        let inner = borrow_inner(&self.file_inner);
-        let all_names = match &*inner {
-            H5FileInner::Reader(reader) => reader
-                .dataset_names()
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>(),
-            H5FileInner::Writer(writer) => writer
-                .dataset_names()
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>(),
-            H5FileInner::Closed => return Ok(vec![]),
-        };
-
         let prefix = if self.name == "/" {
             String::new()
         } else {
@@ -295,18 +275,47 @@ impl H5Group {
         };
 
         let mut groups = std::collections::BTreeSet::new();
-        for name in &all_names {
-            let stripped = if prefix.is_empty() {
-                name.as_str()
-            } else if let Some(rest) = name.strip_prefix(&prefix) {
-                rest
-            } else {
-                continue;
-            };
-            // If there's a '/', the first part is a group name
-            if let Some(pos) = stripped.find('/') {
-                groups.insert(stripped[..pos].to_string());
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            // Read mode: list immediate child groups from the reader's
+            // actual group set (link records), so empty / attribute-only /
+            // subgroup-only child groups are included.
+            H5FileInner::Reader(reader) => {
+                for path in reader.group_paths() {
+                    let stripped = if prefix.is_empty() {
+                        path.as_str()
+                    } else if let Some(rest) = path.strip_prefix(&prefix) {
+                        rest
+                    } else {
+                        continue;
+                    };
+                    if stripped.is_empty() {
+                        continue;
+                    }
+                    // Immediate child only: take the first path component.
+                    let child = match stripped.find('/') {
+                        Some(pos) => &stripped[..pos],
+                        None => stripped,
+                    };
+                    groups.insert(child.to_string());
+                }
             }
+            // Write mode: no link-record store; infer from dataset paths.
+            H5FileInner::Writer(writer) => {
+                for name in writer.dataset_names() {
+                    let stripped = if prefix.is_empty() {
+                        name
+                    } else if let Some(rest) = name.strip_prefix(&prefix) {
+                        rest
+                    } else {
+                        continue;
+                    };
+                    if let Some(pos) = stripped.find('/') {
+                        groups.insert(stripped[..pos].to_string());
+                    }
+                }
+            }
+            H5FileInner::Closed => return Ok(vec![]),
         }
         Ok(groups.into_iter().collect())
     }

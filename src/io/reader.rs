@@ -84,6 +84,11 @@ pub struct Hdf5Reader {
     root_attributes: Vec<AttributeMessage>,
     /// Attributes on non-root groups, keyed by group path (no leading `/`).
     group_attributes: std::collections::HashMap<String, Vec<AttributeMessage>>,
+    /// Every non-root group path the discovery walk traversed into (no
+    /// leading `/`), regardless of whether the group has datasets or
+    /// attributes. Built from actual link records, so empty groups,
+    /// attribute-only groups, and subgroup-only groups are all included.
+    group_paths: std::collections::BTreeSet<String>,
 }
 
 impl Hdf5Reader {
@@ -165,8 +170,9 @@ impl Hdf5Reader {
         let root_header =
             Self::read_object_header_full(&mut handle, &ctx, sb.root_group_object_header_address)?;
 
-        // Walk link messages to discover datasets and group attributes.
-        let (datasets, group_attributes) =
+        // Walk link messages to discover datasets, group attributes, and
+        // every group path that exists.
+        let (datasets, group_attributes, group_paths) =
             Self::discover_datasets_from_links(&mut handle, &root_header, &ctx)?;
 
         // Collect root group attributes
@@ -189,6 +195,7 @@ impl Hdf5Reader {
             datasets,
             root_attributes,
             group_attributes,
+            group_paths,
         })
     }
 
@@ -216,11 +223,16 @@ impl Hdf5Reader {
             Self::find_stab_in_object_header(&mut handle, &ctx, ste.obj_header_addr)?
         };
 
-        let (datasets, group_attributes) = if btree_addr != UNDEF_ADDR && heap_addr != UNDEF_ADDR {
-            Self::discover_datasets_from_btree(&mut handle, &ctx, btree_addr, heap_addr)?
-        } else {
-            (Vec::new(), std::collections::HashMap::new())
-        };
+        let (datasets, group_attributes, group_paths) =
+            if btree_addr != UNDEF_ADDR && heap_addr != UNDEF_ADDR {
+                Self::discover_datasets_from_btree(&mut handle, &ctx, btree_addr, heap_addr)?
+            } else {
+                (
+                    Vec::new(),
+                    std::collections::HashMap::new(),
+                    std::collections::BTreeSet::new(),
+                )
+            };
 
         // Collect the root group's own attributes from its object header.
         let mut root_attributes = Vec::new();
@@ -247,6 +259,7 @@ impl Hdf5Reader {
             datasets,
             root_attributes,
             group_attributes,
+            group_paths,
         })
     }
 
@@ -284,8 +297,10 @@ impl Hdf5Reader {
     ) -> IoResult<(
         Vec<DatasetReadInfo>,
         std::collections::HashMap<String, Vec<AttributeMessage>>,
+        std::collections::BTreeSet<String>,
     )> {
         let mut group_attrs = std::collections::HashMap::new();
+        let mut group_paths = std::collections::BTreeSet::new();
         let mut visited = std::collections::HashSet::new();
         let datasets = Self::discover_datasets_recursive(
             handle,
@@ -293,17 +308,20 @@ impl Hdf5Reader {
             ctx,
             "",
             &mut group_attrs,
+            &mut group_paths,
             &mut visited,
         )?;
-        Ok((datasets, group_attrs))
+        Ok((datasets, group_attrs, group_paths))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn discover_datasets_recursive(
         handle: &mut FileHandle,
         header: &ObjectHeader,
         ctx: &FormatContext,
         prefix: &str,
         group_attrs: &mut std::collections::HashMap<String, Vec<AttributeMessage>>,
+        group_paths: &mut std::collections::BTreeSet<String>,
         visited: &mut std::collections::HashSet<u64>,
     ) -> IoResult<Vec<DatasetReadInfo>> {
         // Bound recursion depth on a hostile/corrupt file.
@@ -363,6 +381,10 @@ impl Hdf5Reader {
                     continue;
                 }
                 {
+                    // Record this group's path from the actual link record,
+                    // whether or not it ends up containing datasets or
+                    // attributes.
+                    group_paths.insert(full_name.clone());
                     // Read its full object header (with continuations).
                     if let Ok(child_header) = Self::read_object_header_full(handle, ctx, *address) {
                         // Capture group attributes (e.g. the NeXus `NX_class`
@@ -385,6 +407,7 @@ impl Hdf5Reader {
                             ctx,
                             &full_name,
                             group_attrs,
+                            group_paths,
                             visited,
                         )?;
                         datasets.extend(child_ds);
@@ -460,10 +483,12 @@ impl Hdf5Reader {
     ) -> IoResult<(
         Vec<DatasetReadInfo>,
         std::collections::HashMap<String, Vec<AttributeMessage>>,
+        std::collections::BTreeSet<String>,
     )> {
         let mut datasets = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut group_attrs = std::collections::HashMap::new();
+        let mut group_paths = std::collections::BTreeSet::new();
         Self::discover_datasets_from_btree_recursive(
             handle,
             ctx,
@@ -474,8 +499,9 @@ impl Hdf5Reader {
             &mut datasets,
             &mut visited,
             &mut group_attrs,
+            &mut group_paths,
         )?;
-        Ok((datasets, group_attrs))
+        Ok((datasets, group_attrs, group_paths))
     }
 
     /// Recursive worker for `discover_datasets_from_btree`. `prefix` is the
@@ -491,6 +517,7 @@ impl Hdf5Reader {
         datasets: &mut Vec<DatasetReadInfo>,
         visited: &mut std::collections::HashSet<u64>,
         group_attrs: &mut std::collections::HashMap<String, Vec<AttributeMessage>>,
+        group_paths: &mut std::collections::BTreeSet<String>,
     ) -> IoResult<()> {
         // Bound legacy-group nesting depth on a hostile/corrupt file.
         const MAX_GROUP_DEPTH: usize = 256;
@@ -544,8 +571,13 @@ impl Hdf5Reader {
                     Ok(None) => {}
                 }
 
-                // Not a dataset — it is a subgroup. Break cycles: descend
-                // into each group object header at most once.
+                // Not a dataset — it is a subgroup. Record its path from
+                // the actual symbol-table entry, whether or not it has
+                // datasets or attributes.
+                group_paths.insert(full_name.clone());
+
+                // Break cycles: descend into each group object header at
+                // most once.
                 if !visited.insert(entry.obj_header_addr) {
                     continue;
                 }
@@ -587,6 +619,7 @@ impl Hdf5Reader {
                         datasets,
                         visited,
                         group_attrs,
+                        group_paths,
                     )?;
                 }
             }
@@ -894,6 +927,19 @@ impl Hdf5Reader {
             .find(|a| a.name == name)
     }
 
+    /// Return every non-root group path the discovery walk traversed into
+    /// (no leading `/`). Built from actual link records, so empty groups,
+    /// attribute-only groups, and subgroup-only groups are all included.
+    pub fn group_paths(&self) -> &std::collections::BTreeSet<String> {
+        &self.group_paths
+    }
+
+    /// Report whether a group exists at `group_path` (no leading `/`).
+    /// The empty string denotes the root group, which always exists.
+    pub fn has_group(&self, group_path: &str) -> bool {
+        group_path.is_empty() || self.group_paths.contains(group_path)
+    }
+
     /// Decode an attribute's value as a string, resolving a variable-length
     /// string attribute through the global heap (h5py writes string
     /// attributes as variable-length by default).
@@ -1059,14 +1105,16 @@ impl Hdf5Reader {
             sb.root_group_object_header_address,
         )?;
 
-        // Re-scan datasets and group attributes from link messages.
-        let (datasets, group_attributes) =
+        // Re-scan datasets, group attributes, and group paths from link
+        // messages.
+        let (datasets, group_attributes, group_paths) =
             Self::discover_datasets_from_links(&mut self.handle, &root_header, &ctx)?;
 
         self._eof = sb.end_of_file_address;
         self.ctx = ctx;
         self.datasets = datasets;
         self.group_attributes = group_attributes;
+        self.group_paths = group_paths;
 
         Ok(())
     }
