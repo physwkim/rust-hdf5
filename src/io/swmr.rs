@@ -202,31 +202,32 @@ impl SwmrWriter {
             })?
             .to_vec();
 
-        // Number of chunk tiles per frame: the product over the spatial
-        // dimensions of the chunk grid.
-        let mut tiles_per_frame = 1u64;
-        for d in 1..dims.len() {
-            let cd = chunk_dims[d].max(1);
-            tiles_per_frame *= dims[d].div_ceil(cd);
+        // `data` must hold exactly one frame.
+        let elem_size = self.writer.datasets[ds_index].datatype.element_size() as usize;
+        let frame_elems: u64 = dims[1..].iter().product();
+        let expected = frame_elems as usize * elem_size;
+        if data.len() != expected {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "append_frame: data is {} bytes, expected {expected} for one frame",
+                data.len()
+            )));
         }
 
-        // 1. Write the chunk data.
-        if tiles_per_frame <= 1 {
-            // One chunk == one frame.
+        // 1. Write the chunk data. The fast path (one chunk == one whole
+        // frame) is taken only when the chunk shape exactly equals the
+        // frame shape; otherwise the frame is split into chunk tiles,
+        // including the case of a chunk larger than the frame, which still
+        // produces one zero-padded tile of the full chunk size.
+        if chunk_dims[1..] == dims[1..] {
             self.writer.write_chunk(ds_index, frame_idx, data)?;
         } else {
             // Sub-frame tiling: split the row-major frame buffer into its
             // chunk tiles and write each as a separate chunk. The linear
             // chunk index is row-major over the whole chunk grid, so the
             // tiles of frame `f` occupy `f * tiles_per_frame ..` .
-            let elem_size = self.writer.datasets[ds_index].datatype.element_size() as usize;
-            let frame_elems: u64 = dims[1..].iter().product();
-            let expected = frame_elems as usize * elem_size;
-            if data.len() != expected {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "append_frame: data is {} bytes, expected {expected} for one frame",
-                    data.len()
-                )));
+            let mut tiles_per_frame = 1u64;
+            for d in 1..dims.len() {
+                tiles_per_frame *= dims[d].div_ceil(chunk_dims[d].max(1));
             }
             let tiles = split_frame_into_tiles(data, &dims[1..], &chunk_dims[1..], elem_size);
             let base = frame_idx * tiles_per_frame;
@@ -300,6 +301,11 @@ fn validate_frame_chunk(frame_dims: &[u64], frame_chunk: &[u64]) -> IoResult<()>
     if frame_chunk.contains(&0) {
         return Err(crate::io::IoError::InvalidState(
             "frame_chunk dimensions must be non-zero".into(),
+        ));
+    }
+    if frame_dims.contains(&0) {
+        return Err(crate::io::IoError::InvalidState(
+            "frame_dims dimensions must be non-zero".into(),
         ));
     }
     Ok(())

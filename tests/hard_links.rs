@@ -147,3 +147,69 @@ fn hard_link_rejects_duplicate_name() {
     drop(file);
     cleanup(&path);
 }
+
+/// Creating a dataset whose name a hard link already occupies is rejected
+/// (the reverse order of `hard_link_rejects_duplicate_name`): otherwise the
+/// parent group would carry two link records with the same name.
+#[test]
+fn dataset_rejects_name_taken_by_hard_link() {
+    let path = unique_tmp("hl_reverse");
+    let file = H5File::create(&path).unwrap();
+    let root = file.root_group();
+    let inst = root.create_group("instrument").unwrap();
+    inst.new_dataset::<f32>()
+        .shape([4])
+        .create("detector")
+        .unwrap();
+
+    let data = root.create_group("data").unwrap();
+    data.link("detector", "/instrument/detector").unwrap();
+
+    // /data/detector is already a hard link; a dataset there must fail.
+    let ds_result = data.new_dataset::<f32>().shape([4]).create("detector");
+    let err = ds_result
+        .err()
+        .expect("dataset creation should be rejected");
+    let msg = format!("{err}");
+    assert!(msg.contains("already exists"), "unexpected error: {msg}");
+
+    // ...and so must a group of the same name.
+    let grp_result = data.create_group("detector");
+    let err = grp_result.err().expect("group creation should be rejected");
+    let msg = format!("{err}");
+    assert!(msg.contains("already exists"), "unexpected error: {msg}");
+
+    drop(file);
+    cleanup(&path);
+}
+
+/// A target path given with a trailing slash still resolves.
+#[test]
+fn hard_link_tolerates_trailing_slash() {
+    let path = unique_tmp("hl_trailing");
+    let data: Vec<i32> = vec![3, 1, 4, 1, 5];
+
+    {
+        let file = H5File::create(&path).unwrap();
+        let root = file.root_group();
+        let inst = root.create_group("instrument").unwrap();
+        let ds = inst
+            .new_dataset::<i32>()
+            .shape([5])
+            .create("counts")
+            .unwrap();
+        ds.write_raw(&data).unwrap();
+
+        // Leading and trailing slashes both tolerated.
+        root.link("alias", "/instrument/counts/").unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let file = H5File::open(&path).unwrap();
+        let aliased = file.dataset("alias").unwrap().read_raw::<i32>().unwrap();
+        assert_eq!(aliased, data);
+    }
+
+    cleanup(&path);
+}

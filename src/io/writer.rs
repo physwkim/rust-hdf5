@@ -863,6 +863,15 @@ impl Hdf5Writer {
                 "a dataset named '{name}' already exists"
             )));
         }
+        if self
+            .hard_links
+            .iter()
+            .any(|l| self.hard_link_emitted(l) && self.hard_link_full_path(l) == name)
+        {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "a hard link named '{name}' already exists"
+            )));
+        }
         Ok(())
     }
 
@@ -965,6 +974,17 @@ impl Hdf5Writer {
                 full_name
             )));
         }
+        // A hard link must not already occupy this name in its parent.
+        let full_rel = full_name.trim_start_matches('/');
+        if self
+            .hard_links
+            .iter()
+            .any(|l| self.hard_link_emitted(l) && self.hard_link_full_path(l) == full_rel)
+        {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "a hard link named '{full_name}' already exists"
+            )));
+        }
 
         // Find parent group index (None means it's a root-level group)
         let parent_idx = if parent_path == "/" {
@@ -1058,8 +1078,9 @@ impl Hdf5Writer {
         };
 
         // Resolve the target. Dataset names are stored without a leading
-        // '/', group names with one — compare on the trimmed form.
-        let target_rel = target_path.trim_start_matches('/');
+        // '/', group names with one — compare on the trimmed form. A
+        // trailing '/' is tolerated too.
+        let target_rel = target_path.trim_matches('/');
         if target_rel.is_empty() {
             return Err(crate::io::IoError::InvalidState(
                 "cannot hard-link the root group".into(),
@@ -1127,6 +1148,19 @@ impl Hdf5Writer {
             HardLinkTarget::Group(i) => !self.groups[i].deleted,
         };
         parent_ok && target_ok
+    }
+
+    /// The full path a hard link occupies, with no leading `/` — the same
+    /// form dataset names are stored in. Used for name-collision checks.
+    fn hard_link_full_path(&self, link: &HardLink) -> String {
+        match link.parent {
+            None => link.name.clone(),
+            Some(pi) => format!(
+                "{}/{}",
+                self.groups[pi].name.trim_start_matches('/'),
+                link.name
+            ),
+        }
     }
 
     /// Total number of hard links resolving to an object: its own tree link
@@ -4373,6 +4407,49 @@ mod tests {
         for frame in 0..3u16 {
             for i in 0..16usize {
                 assert_eq!(values[frame as usize * 16 + i], frame * 100 + i as u16);
+            }
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn swmr_writer_tiled_chunk_larger_than_frame() {
+        use crate::io::swmr::SwmrWriter;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rust_hdf5_swmr_bigchunk_{}_{}.h5",
+            std::process::id(),
+            n
+        ));
+
+        // Chunk tile larger than the frame: a 1x1 chunk grid, but the frame
+        // must still be zero-padded up to the full chunk size.
+        let mut swmr = SwmrWriter::create(&path).unwrap();
+        let idx = swmr
+            .create_streaming_dataset_tiled("det", DatatypeMessage::u16_type(), &[3, 3], &[8, 8])
+            .unwrap();
+        swmr.start_swmr().unwrap();
+        for frame in 0..2u16 {
+            let data: Vec<u16> = (0..9).map(|i| frame * 10 + i).collect();
+            let raw: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            swmr.append_frame(idx, &raw).unwrap();
+        }
+        swmr.flush().unwrap();
+        swmr.close().unwrap();
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        assert_eq!(reader.dataset_shape("det").unwrap(), vec![2, 3, 3]);
+        let raw = reader.read_dataset_raw("det").unwrap();
+        let values: Vec<u16> = raw
+            .chunks(2)
+            .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values.len(), 18);
+        for frame in 0..2u16 {
+            for i in 0..9usize {
+                assert_eq!(values[frame as usize * 9 + i], frame * 10 + i as u16);
             }
         }
         std::fs::remove_file(&path).ok();
