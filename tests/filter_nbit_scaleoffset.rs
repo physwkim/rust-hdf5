@@ -11,6 +11,9 @@
 //! dataset reader) isolates the filter codec from the unrelated chunked-
 //! dataset discovery path.
 
+// Test vectors embed values close to mathematical constants by coincidence.
+#![allow(clippy::approx_constant)]
+
 use rust_hdf5::format::messages::filter::{apply_filters, reverse_filters, Filter, FilterPipeline};
 
 fn pipeline(id: u16, cd_values: Vec<u32>) -> FilterPipeline {
@@ -25,7 +28,7 @@ fn pipeline(id: u16, cd_values: Vec<u32>) -> FilterPipeline {
 
 fn hex(s: &str) -> Vec<u8> {
     let clean: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(clean.len() % 2 == 0, "hex string has odd length");
+    assert!(clean.len().is_multiple_of(2), "hex string has odd length");
     (0..clean.len() / 2)
         .map(|i| u8::from_str_radix(&clean[2 * i..2 * i + 2], 16).unwrap())
         .collect()
@@ -135,9 +138,7 @@ fn nbit_i32_precision20() {
 #[test]
 fn nbit_u16_big_endian() {
     // 16-bit storage, 10-bit precision, big-endian unsigned int.
-    let chunk = hex(concat!(
-        "000351a89f351094f9736a1dd84a479f2b1b9b1bd4385eebef09059238c300"
-    ));
+    let chunk = hex("000351a89f351094f9736a1dd84a479f2b1b9b1bd4385eebef09059238c300");
     let pl = pipeline(FILTER_NBIT, vec![8, 0, 24, 1, 2, 1, 10, 0]);
     let out = reverse_filters(&pl, &chunk).expect("nbit u16be reverse");
     let expected: Vec<u8> = (0..24u16)

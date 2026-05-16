@@ -912,8 +912,8 @@ mod tests {
         assert_eq!(prefix.prefix_size, buf.len());
         // signature(4)+version(1)+client(1)+addr(8)+bitmap(2)+cksum(4) = 20
         assert_eq!(prefix.prefix_size, 20);
-        for p in 0..11 {
-            assert_eq!(prefix.page_initialized(p), init[p], "page {p}");
+        for (p, &expected) in init.iter().enumerate() {
+            assert_eq!(prefix.page_initialized(p), expected, "page {p}");
         }
     }
 

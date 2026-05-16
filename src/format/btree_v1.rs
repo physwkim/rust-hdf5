@@ -22,9 +22,9 @@
 //! - Each child is sizeof_addr bytes (address of SNOD or sub-TREE)
 //!
 //! For type-1 (raw data chunk) B-trees:
-//! - Each key is `4 + 4 + (rank+1)*8` bytes:
-//!     chunk_size(4) + filter_mask(4) + (rank+1) 8-byte element offsets.
-//!   The last offset is the element-size dimension and is always 0.
+//! - Each key is `4 + 4 + (rank+1)*8` bytes: chunk_size(4), filter_mask(4),
+//!   then (rank+1) 8-byte element offsets. The last offset is the
+//!   element-size dimension and is always 0.
 //! - Each child is sizeof_addr bytes: a chunk-data address at a leaf
 //!   node (level 0), or a sub-TREE address at an internal node.
 

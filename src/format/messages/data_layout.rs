@@ -15,9 +15,8 @@
 //! Binary layout (version 3, chunked):
 //!   Byte 0: version = 3
 //!   Byte 1: layout class = 2 (chunked)
-//!   dimensionality D(1)
-//!   + b_tree_address(sizeof_addr)
-//!   + D 4-byte LE dimension sizes (chunk dims; last is the element size)
+//!   dimensionality D(1), b_tree_address(sizeof_addr),
+//!   D 4-byte LE dimension sizes (chunk dims; last is the element size).
 //!   The chunk index is always a version-1 B-tree.
 //!
 //! Binary layout (version 4, chunked only):
