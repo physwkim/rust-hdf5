@@ -298,7 +298,9 @@ impl FixedArrayDataBlock {
         num_elmts: usize,
     ) -> FormatResult<Self> {
         let sa = ctx.sizeof_addr as usize;
-        let min_size = 4 + 1 + 1 + sa + num_elmts * sa + 4;
+        // Saturating: `num_elmts` is file-derived; an overflowing product
+        // must yield a huge `min_size` (clean BufferTooShort), not wrap.
+        let min_size = num_elmts.saturating_mul(sa).saturating_add(10 + sa);
 
         if buf.len() < min_size {
             return Err(FormatError::BufferTooShort {
@@ -360,7 +362,7 @@ impl FixedArrayDataBlock {
     ) -> FormatResult<Self> {
         let sa = ctx.sizeof_addr as usize;
         let elem_size = sa + chunk_size_len + 4;
-        let min_size = 4 + 1 + 1 + sa + num_elmts * elem_size + 4;
+        let min_size = num_elmts.saturating_mul(elem_size).saturating_add(10 + sa);
 
         if buf.len() < min_size {
             return Err(FormatError::BufferTooShort {

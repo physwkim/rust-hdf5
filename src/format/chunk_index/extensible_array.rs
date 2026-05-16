@@ -512,7 +512,9 @@ impl FilteredDataBlock {
         let sa = ctx.sizeof_addr as usize;
         let bo_size = ExtensibleArrayDataBlock::block_offset_size(max_nelmts_bits);
         let elmt_size = FilteredChunkEntry::raw_size(ctx.sizeof_addr, chunk_size_len) as usize;
-        let min_size = 4 + 1 + 1 + sa + bo_size + nelmts * elmt_size + 4;
+        let min_size = nelmts
+            .saturating_mul(elmt_size)
+            .saturating_add(10 + sa + bo_size);
 
         if buf.len() < min_size {
             return Err(FormatError::BufferTooShort {
@@ -784,7 +786,7 @@ impl ExtensibleArrayDataBlock {
     ) -> FormatResult<Self> {
         let sa = ctx.sizeof_addr as usize;
         let bo_size = Self::block_offset_size(max_nelmts_bits);
-        let min_size = 4 + 1 + 1 + sa + bo_size + nelmts * sa + 4;
+        let min_size = nelmts.saturating_mul(sa).saturating_add(10 + sa + bo_size);
 
         if buf.len() < min_size {
             return Err(FormatError::BufferTooShort {
@@ -1199,7 +1201,9 @@ impl ExtensibleArraySuperBlock {
     ) -> FormatResult<Self> {
         let sa = ctx.sizeof_addr as usize;
         let bo = ExtensibleArrayDataBlock::block_offset_size(max_nelmts_bits);
-        let min_size = 4 + 1 + 1 + sa + bo + page_init_total + ndblks * sa + 4;
+        let min_size = ndblks
+            .saturating_mul(sa)
+            .saturating_add((10 + sa + bo).saturating_add(page_init_total));
         if buf.len() < min_size {
             return Err(FormatError::BufferTooShort {
                 needed: min_size,

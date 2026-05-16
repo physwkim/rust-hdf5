@@ -728,6 +728,25 @@ impl H5Dataset {
                     )));
                 }
 
+                // Validate coordinates and compute the grown dimensions
+                // up-front, before any chunk is written, so an overflowing
+                // coordinate cannot leave an orphaned chunk in the file.
+                let mut new_dims = dims.clone();
+                for d in 0..dims.len() {
+                    let needed = coords[d]
+                        .checked_add(1)
+                        .and_then(|c| c.checked_mul(chunk_dims[d]))
+                        .ok_or_else(|| {
+                            Hdf5Error::InvalidState(format!(
+                                "chunk coordinate {} in dimension {} is too large",
+                                coords[d], d
+                            ))
+                        })?;
+                    if needed > new_dims[d] {
+                        new_dims[d] = needed;
+                    }
+                }
+
                 if btree2 {
                     writer.write_chunk_btree_v2(*index, &coords, data)?;
                 } else {
@@ -740,19 +759,18 @@ impl H5Dataset {
                         } else {
                             1
                         };
-                        linear = linear * grid + coords[d];
+                        linear = linear
+                            .checked_mul(grid)
+                            .and_then(|l| l.checked_add(coords[d]))
+                            .ok_or_else(|| {
+                                Hdf5Error::InvalidState(
+                                    "chunk coordinates overflow the array index".into(),
+                                )
+                            })?;
                     }
                     writer.write_chunk(*index, linear, data)?;
                 }
 
-                // Grow the logical dimensions to cover the written chunk.
-                let mut new_dims = dims.clone();
-                for (d, nd) in new_dims.iter_mut().enumerate() {
-                    let needed = (coords[d] + 1) * chunk_dims[d];
-                    if needed > *nd {
-                        *nd = needed;
-                    }
-                }
                 if new_dims != dims {
                     writer.extend_dataset(*index, &new_dims)?;
                 }
@@ -1494,6 +1512,47 @@ mod tests {
             );
         }
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn write_slice_out_of_bounds_rejected() {
+        let path = temp_path("write_slice_oob");
+        let file = H5File::create(&path).unwrap();
+        let ds = file.new_dataset::<i32>().shape([4]).create("d").unwrap();
+        ds.write_raw(&[0i32; 4]).unwrap();
+        // start 2 + count 6 = 8 > extent 4 -> must error, not corrupt.
+        assert!(ds.write_slice(&[2], &[6], &[9i32; 6]).is_err());
+        // An in-bounds slice still works.
+        assert!(ds.write_slice(&[1], &[2], &[7i32, 8]).is_ok());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn duplicate_dataset_name_rejected() {
+        let path = temp_path("dup_name");
+        let file = H5File::create(&path).unwrap();
+        let _ = file.new_dataset::<i32>().shape([2]).create("d").unwrap();
+        assert!(file.new_dataset::<i32>().shape([2]).create("d").is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn extend_cannot_shrink() {
+        let path = temp_path("extend_shrink");
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([0])
+            .chunk(&[2])
+            .max_shape(&[None])
+            .create("d")
+            .unwrap();
+        ds.append(&[1i32, 2, 3, 4]).unwrap();
+        // Shrinking below the written extent must be rejected.
+        assert!(ds.extend(&[2]).is_err());
+        // Growing is fine.
+        assert!(ds.extend(&[6]).is_ok());
         std::fs::remove_file(&path).ok();
     }
 

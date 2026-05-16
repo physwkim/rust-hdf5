@@ -127,6 +127,7 @@ impl SuperblockV2V3 {
         let sizeof_offsets = buf[9];
         let sizeof_lengths = buf[10];
         let file_consistency_flags = buf[11];
+        validate_sizeof(sizeof_offsets, sizeof_lengths)?;
 
         let o = sizeof_offsets as usize;
         let total_size = 12 + 4 * o + 4;
@@ -177,6 +178,25 @@ impl SuperblockV2V3 {
 fn encode_offset(buf: &mut Vec<u8>, value: u64, size: usize) {
     let bytes = value.to_le_bytes();
     buf.extend_from_slice(&bytes[..size]);
+}
+
+/// Reject `sizeof_offsets` / `sizeof_lengths` values this crate cannot
+/// represent. libhdf5 permits 2, 4, 8, 16 and 32; this crate decodes
+/// addresses into a `u64`, so it supports only 2, 4 and 8. Validating here
+/// keeps every downstream `read_addr` / `read_size` helper (which copies
+/// `n` bytes into an 8-byte buffer) from panicking on a hostile file.
+fn validate_sizeof(sizeof_offsets: u8, sizeof_lengths: u8) -> FormatResult<()> {
+    for (name, v) in [
+        ("sizeof_offsets", sizeof_offsets),
+        ("sizeof_lengths", sizeof_lengths),
+    ] {
+        if !matches!(v, 2 | 4 | 8) {
+            return Err(FormatError::InvalidData(format!(
+                "unsupported superblock {name} = {v} (only 2, 4, 8 are supported)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Decode a little-endian address of `size` bytes from `buf` at `*pos`,
@@ -429,6 +449,7 @@ impl SuperblockV0V1 {
         let sizeof_offsets = buf[13];
         let sizeof_lengths = buf[14];
         // buf[15] = reserved
+        validate_sizeof(sizeof_offsets, sizeof_lengths)?;
 
         let o = sizeof_offsets as usize;
         let mut pos = 16;

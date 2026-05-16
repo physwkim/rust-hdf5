@@ -78,6 +78,13 @@
 //! assert_eq!(region.len(), 12);
 //! ```
 
+// The crate reads and writes numeric values by transmuting host-native
+// bytes (`H5Type` raw read/write paths) while always declaring a
+// little-endian datatype on disk. That is correct only on a little-endian
+// host; fail the build loudly on big-endian rather than corrupt data.
+#[cfg(target_endian = "big")]
+compile_error!("rust-hdf5 currently supports little-endian hosts only");
+
 pub mod format;
 pub(crate) mod io;
 

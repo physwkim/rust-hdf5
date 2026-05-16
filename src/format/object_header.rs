@@ -285,9 +285,10 @@ impl ObjectHeader {
             // Each message: type(1) + size(2) + flags(1) [+ creation_order(2)]
             let msg_header_size = if has_creation_order { 6 } else { 4 };
             if pos + msg_header_size > messages_end {
-                return Err(FormatError::InvalidData(
-                    "truncated message header in object header".into(),
-                ));
+                // libhdf5 (H5O__chunk_deserialize) permits a gap smaller than
+                // one message header at the end of a v2 chunk; treat the
+                // remaining bytes as such a gap rather than an error.
+                break;
             }
 
             let msg_type = buf[pos];

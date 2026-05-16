@@ -315,8 +315,8 @@ impl Bt2LeafNode {
     }
 
     pub fn decode(buf: &[u8], num_records: u16, record_size: u16) -> FormatResult<Self> {
-        let records_len = num_records as usize * record_size as usize;
-        let min_size = 4 + 1 + 1 + records_len + 4;
+        let records_len = (num_records as usize).saturating_mul(record_size as usize);
+        let min_size = records_len.saturating_add(10);
 
         if buf.len() < min_size {
             return Err(FormatError::BufferTooShort {
@@ -445,6 +445,9 @@ impl Bt2InternalNode {
             max_nrec_size,
             child_total_size,
         );
+        debug_assert_eq!(self.child_addrs.len(), nchild);
+        debug_assert_eq!(self.child_nrecords.len(), nchild);
+        debug_assert!(depth <= 1 || self.child_total_nrecords.len() == nchild);
         let mut buf = Vec::with_capacity(size);
         buf.extend_from_slice(&BTIN_SIGNATURE);
         buf.push(BT2_VERSION);
@@ -481,7 +484,7 @@ impl Bt2InternalNode {
     ) -> FormatResult<Self> {
         let sa = ctx.sizeof_addr as usize;
         let nchild = nrec as usize + 1;
-        let records_len = nrec as usize * rrec_size as usize;
+        let records_len = (nrec as usize).saturating_mul(rrec_size as usize);
         let ptr = sa
             + max_nrec_size as usize
             + if depth > 1 {
@@ -489,7 +492,9 @@ impl Bt2InternalNode {
             } else {
                 0
             };
-        let min_size = 4 + 1 + 1 + records_len + nchild * ptr + 4;
+        let min_size = records_len
+            .saturating_add(nchild.saturating_mul(ptr))
+            .saturating_add(10);
         if buf.len() < min_size {
             return Err(FormatError::BufferTooShort {
                 needed: min_size,

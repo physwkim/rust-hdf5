@@ -1543,6 +1543,11 @@ impl Hdf5Reader {
                 "starts/counts length must match dataset rank".into(),
             ));
         }
+        if ndims == 0 {
+            return Err(crate::io::IoError::InvalidState(
+                "read_slice does not support scalar datasets; use read_dataset_raw".into(),
+            ));
+        }
         for d in 0..ndims {
             if starts[d] + counts[d] > dims[d] {
                 return Err(crate::io::IoError::InvalidState(format!(

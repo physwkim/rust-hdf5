@@ -651,6 +651,18 @@ impl Hdf5Writer {
             .position(|d| d.name == name && !d.deleted)
     }
 
+    /// Reject a dataset name already used by a live dataset. Dataset names
+    /// here are full paths, so they must be unique across the file (HDF5
+    /// requires link names to be unique within their group).
+    fn ensure_unique_dataset_name(&self, name: &str) -> IoResult<()> {
+        if self.datasets.iter().any(|d| !d.deleted && d.name == name) {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "a dataset named '{name}' already exists"
+            )));
+        }
+        Ok(())
+    }
+
     /// Soft-delete a dataset by name. The dataset is excluded from the file
     /// on close. File space is not reclaimed.
     pub fn delete_dataset(&mut self, name: &str) -> IoResult<()> {
@@ -814,6 +826,7 @@ impl Hdf5Writer {
         datatype: DatatypeMessage,
         dims: &[u64],
     ) -> IoResult<usize> {
+        self.ensure_unique_dataset_name(name)?;
         let total_elements: u64 = if dims.is_empty() {
             1
         } else {
@@ -872,6 +885,7 @@ impl Hdf5Writer {
         max_dims: &[u64],
         chunk_dims: &[u64],
     ) -> IoResult<usize> {
+        self.ensure_unique_dataset_name(name)?;
         let earray_params = EarrayParams::default_params();
         let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs)?;
         let nsblk_addrs = compute_nsblk_addrs(
@@ -1294,6 +1308,25 @@ impl Hdf5Writer {
             return Err(crate::io::IoError::InvalidState(
                 "starts/counts length must match dataset rank".into(),
             ));
+        }
+        if ndims == 0 {
+            return Err(crate::io::IoError::InvalidState(
+                "write_slice does not support scalar datasets; use write_dataset_raw".into(),
+            ));
+        }
+
+        // Every hyperslab edge must stay inside the dataset; without this an
+        // out-of-bounds selection writes raw bytes over neighbouring data.
+        for d in 0..ndims {
+            let end = starts[d]
+                .checked_add(counts[d])
+                .ok_or_else(|| crate::io::IoError::InvalidState("slice extent overflow".into()))?;
+            if end > dims[d] {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "slice out of bounds in dimension {}: start {} + count {} exceeds extent {}",
+                    d, starts[d], counts[d], dims[d]
+                )));
+            }
         }
 
         let out_elems: u64 = counts.iter().product();
@@ -1975,6 +2008,7 @@ impl Hdf5Writer {
         dims: &[u64],
         chunk_dims: &[u64],
     ) -> IoResult<usize> {
+        self.ensure_unique_dataset_name(name)?;
         // Compute total number of chunks
         let ndims = dims.len();
         let mut num_chunks: u64 = 1;
@@ -2044,6 +2078,7 @@ impl Hdf5Writer {
         max_dims: &[u64],
         chunk_dims: &[u64],
     ) -> IoResult<usize> {
+        self.ensure_unique_dataset_name(name)?;
         let ndims = dims.len();
         let bt2_index = Bt2ChunkIndex::new_unfiltered(ndims);
 
@@ -2212,6 +2247,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: FilterPipeline,
     ) -> IoResult<usize> {
+        self.ensure_unique_dataset_name(name)?;
         let element_size = datatype.element_size() as u64;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
         let chunk_size_len = compute_chunk_size_len(chunk_bytes);
@@ -2447,6 +2483,30 @@ impl Hdf5Writer {
             return Err(crate::io::IoError::InvalidState(
                 "can only extend chunked datasets".into(),
             ));
+        }
+        if new_dims.len() != ds.dataspace.dims.len() {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "extend_dataset rank mismatch: dataset has {} dimensions, got {}",
+                ds.dataspace.dims.len(),
+                new_dims.len()
+            )));
+        }
+        // The chunk index and append buffers assume the logical size only
+        // grows; shrinking below already-written data desynchronizes them.
+        for (d, (&new, &cur)) in new_dims.iter().zip(&ds.dataspace.dims).enumerate() {
+            if new < cur {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "extend_dataset cannot shrink dimension {d} from {cur} to {new}"
+                )));
+            }
+            if let Some(ref max) = ds.dataspace.max_dims {
+                if new > max[d] {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "extend_dataset dimension {d} ({new}) exceeds the maximum {}",
+                        max[d]
+                    )));
+                }
+            }
         }
         ds.dataspace.dims = new_dims.to_vec();
         Ok(())

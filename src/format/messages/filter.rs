@@ -959,9 +959,20 @@ fn bitshuffle_decompress(data: &[u8], elem_size: usize, comp_type: u32) -> Forma
         data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
     ]) as usize;
     let block_bytes = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
-    let block_elems = block_bytes.checked_div(elem_size).unwrap_or(0);
-
-    let mut output = Vec::with_capacity(orig_size);
+    if elem_size == 0 {
+        return Err(FormatError::InvalidData(
+            "bitshuffle: element size is zero".into(),
+        ));
+    }
+    let block_elems = block_bytes / elem_size;
+    if block_elems == 0 {
+        return Err(FormatError::InvalidData(
+            "bitshuffle: block size is smaller than one element".into(),
+        ));
+    }
+    // `orig_size` is file-derived; cap the pre-allocation so a hostile
+    // header cannot drive an unbounded allocation.
+    let mut output = Vec::with_capacity(orig_size.min(64 * 1024 * 1024));
     let mut rpos = 12;
 
     let n_elems = orig_size / elem_size;
