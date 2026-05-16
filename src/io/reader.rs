@@ -326,10 +326,11 @@ impl Hdf5Reader {
     )> {
         let mut group_attrs = std::collections::HashMap::new();
         let mut group_paths = std::collections::BTreeSet::new();
-        let mut visited = std::collections::HashSet::new();
-        // Seed the root object header so a hard link cycling back to the
-        // root is not descended into a second time.
-        visited.insert(root_addr);
+        // The ancestor set starts with the root object header so a hard
+        // link cycling back to the root is recognised as a cycle.
+        let mut ancestors = std::collections::HashSet::new();
+        ancestors.insert(root_addr);
+        let mut budget: usize = 1 << 20;
         let datasets = Self::discover_datasets_recursive(
             handle,
             root_header,
@@ -337,7 +338,8 @@ impl Hdf5Reader {
             "",
             &mut group_attrs,
             &mut group_paths,
-            &mut visited,
+            &mut ancestors,
+            &mut budget,
         )?;
         Ok((datasets, group_attrs, group_paths))
     }
@@ -350,7 +352,15 @@ impl Hdf5Reader {
         prefix: &str,
         group_attrs: &mut std::collections::HashMap<String, Vec<AttributeMessage>>,
         group_paths: &mut std::collections::BTreeSet<String>,
-        visited: &mut std::collections::HashSet<u64>,
+        // `ancestors` holds the object-header addresses on the current
+        // root-to-here path: a link whose target is an ancestor is a true
+        // cycle. A target that is merely *already seen on another branch*
+        // (a group hard-linked under two names) is NOT a cycle and is
+        // descended again so its contents appear under every name.
+        ancestors: &mut std::collections::HashSet<u64>,
+        // Total remaining group descents — bounds the walk so a file with
+        // many aliased groups cannot blow up.
+        budget: &mut usize,
     ) -> IoResult<Vec<DatasetReadInfo>> {
         // Bound recursion depth on a hostile/corrupt file.
         const MAX_GROUP_DEPTH: usize = 256;
@@ -427,39 +437,42 @@ impl Hdf5Reader {
                 }
                 {
                     // It is a group. Record its path from the actual link
-                    // record — before the cycle check, so a hard-link alias
-                    // of an already-visited group still appears — whether or
-                    // not it contains datasets or attributes.
+                    // record, whether or not it has datasets or attributes.
                     group_paths.insert(full_name.clone());
-                    {
-                        // Capture group attributes (e.g. the NeXus `NX_class`
-                        // marker), keyed by path.
-                        let mut attrs = Vec::new();
-                        for m in &child_header.messages {
-                            if m.msg_type == MSG_ATTRIBUTE {
-                                if let Ok((a, _)) = AttributeMessage::decode(&m.data, ctx) {
-                                    attrs.push(a);
-                                }
+                    // Capture group attributes (e.g. the NeXus `NX_class`
+                    // marker), keyed by path.
+                    let mut attrs = Vec::new();
+                    for m in &child_header.messages {
+                        if m.msg_type == MSG_ATTRIBUTE {
+                            if let Ok((a, _)) = AttributeMessage::decode(&m.data, ctx) {
+                                attrs.push(a);
                             }
                         }
-                        if !attrs.is_empty() {
-                            group_attrs.insert(full_name.clone(), attrs);
-                        }
-                        // Descend at most once per object header (cycle guard).
-                        if !visited.insert(*address) {
-                            continue;
-                        }
-                        let child_ds = Self::discover_datasets_recursive(
-                            handle,
-                            &child_header,
-                            ctx,
-                            &full_name,
-                            group_attrs,
-                            group_paths,
-                            visited,
-                        )?;
-                        datasets.extend(child_ds);
                     }
+                    if !attrs.is_empty() {
+                        group_attrs.insert(full_name.clone(), attrs);
+                    }
+                    // Descend unless this is a true cycle (target on the
+                    // current path) or the descent budget is exhausted. A
+                    // group reached by a second, non-ancestor link is
+                    // descended again so its contents appear under that name.
+                    if ancestors.contains(address) || *budget == 0 {
+                        continue;
+                    }
+                    *budget -= 1;
+                    ancestors.insert(*address);
+                    let child_ds = Self::discover_datasets_recursive(
+                        handle,
+                        &child_header,
+                        ctx,
+                        &full_name,
+                        group_attrs,
+                        group_paths,
+                        ancestors,
+                        budget,
+                    )?;
+                    ancestors.remove(address);
+                    datasets.extend(child_ds);
                 }
             }
         }
@@ -535,10 +548,10 @@ impl Hdf5Reader {
         std::collections::BTreeSet<String>,
     )> {
         let mut datasets = Vec::new();
-        let mut visited = std::collections::HashSet::new();
-        // Seed the root object header so a hard link cycling back to the
-        // root group is not descended into a second time.
-        visited.insert(root_obj_addr);
+        // Ancestor set for true-cycle detection, seeded with the root.
+        let mut ancestors = std::collections::HashSet::new();
+        ancestors.insert(root_obj_addr);
+        let mut budget: usize = 1 << 20;
         let mut group_attrs = std::collections::HashMap::new();
         let mut group_paths = std::collections::BTreeSet::new();
         Self::discover_datasets_from_btree_recursive(
@@ -549,7 +562,8 @@ impl Hdf5Reader {
             "",
             0,
             &mut datasets,
-            &mut visited,
+            &mut ancestors,
+            &mut budget,
             &mut group_attrs,
             &mut group_paths,
         )?;
@@ -567,7 +581,11 @@ impl Hdf5Reader {
         prefix: &str,
         depth: usize,
         datasets: &mut Vec<DatasetReadInfo>,
-        visited: &mut std::collections::HashSet<u64>,
+        // Object-header addresses on the current root-to-here path (true
+        // cycle detection); a non-ancestor revisit is a hard-link alias and
+        // is walked again. `budget` bounds total descents.
+        ancestors: &mut std::collections::HashSet<u64>,
+        budget: &mut usize,
         group_attrs: &mut std::collections::HashMap<String, Vec<AttributeMessage>>,
         group_paths: &mut std::collections::BTreeSet<String>,
     ) -> IoResult<()> {
@@ -646,12 +664,6 @@ impl Hdf5Reader {
                 // attributes.
                 group_paths.insert(full_name.clone());
 
-                // Break cycles: descend into each group object header at
-                // most once.
-                if !visited.insert(entry.obj_header_addr) {
-                    continue;
-                }
-
                 // Collect this subgroup's attributes (e.g. NeXus NX_class).
                 {
                     let mut attrs = Vec::new();
@@ -667,6 +679,12 @@ impl Hdf5Reader {
                     }
                 }
 
+                // Descend unless this is a true cycle (the target is on the
+                // current path) or the descent budget is exhausted.
+                if ancestors.contains(&entry.obj_header_addr) || *budget == 0 {
+                    continue;
+                }
+
                 // Find its B-tree + local heap and recurse, prefixing names
                 // with the group path.
                 let (sub_btree, sub_heap) = if entry.cache_type == 1 {
@@ -679,6 +697,8 @@ impl Hdf5Reader {
                 };
 
                 if sub_btree != UNDEF_ADDR && sub_heap != UNDEF_ADDR {
+                    *budget -= 1;
+                    ancestors.insert(entry.obj_header_addr);
                     Self::discover_datasets_from_btree_recursive(
                         handle,
                         ctx,
@@ -687,10 +707,12 @@ impl Hdf5Reader {
                         &full_name,
                         depth + 1,
                         datasets,
-                        visited,
+                        ancestors,
+                        budget,
                         group_attrs,
                         group_paths,
                     )?;
+                    ancestors.remove(&entry.obj_header_addr);
                 }
             }
         }
