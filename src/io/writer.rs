@@ -12,7 +12,10 @@ use crate::format::chunk_index::extensible_array::{
     ExtensibleArraySuperBlock, FilteredChunkEntry, FilteredDataBlock, FilteredIndexBlock,
     EA_CLS_CHUNK, EA_CLS_FILT_CHUNK,
 };
-use crate::format::chunk_index::fixed_array::{FixedArrayDataBlock, FixedArrayHeader};
+use crate::format::chunk_index::fixed_array::{
+    encode_unfiltered_page, FixedArrayDataBlock, FixedArrayHeader, FixedArrayPagedPrefix,
+    FA_CLIENT_CHUNK,
+};
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::data_layout::{DataLayoutMessage, EarrayParams, FixedArrayParams};
 use crate::format::messages::dataspace::DataspaceMessage;
@@ -30,6 +33,84 @@ use crate::format::{FormatContext, UNDEF_ADDR};
 use crate::io::allocator::FileAllocator;
 use crate::io::file_handle::FileHandle;
 use crate::io::IoResult;
+
+/// On-disk size in bytes of an *unfiltered* fixed-array data block, for the
+/// layout (paged or flat) implied by `hdr`.
+///
+/// Mirrors `H5FA_DBLOCK_SIZE` (`H5FApkg.h`):
+///   - non-paged: `prefix + nelmts * sizeof_addr + checksum`
+///   - paged: `prefix + page_init_bitmap + nelmts * sizeof_addr
+///     + npages * checksum`, where the prefix checksum covers the bitmap.
+fn fixed_array_dblk_disk_size(ctx: &FormatContext, hdr: &FixedArrayHeader) -> u64 {
+    let sa = ctx.sizeof_addr as u64;
+    let nelmts = hdr.num_elmts;
+    // Common metadata prefix: signature(4) + version(1) + client_id(1) + header_addr(sa).
+    let meta_prefix = 4 + 1 + 1 + sa;
+    if hdr.is_paged() {
+        let npages = hdr.npages();
+        let bitmap_size = npages.div_ceil(8);
+        // prefix (incl. its own 4-byte checksum) + elements + per-page checksums.
+        (meta_prefix + bitmap_size + 4) + nelmts * sa + npages * 4
+    } else {
+        // prefix + elements + single 4-byte checksum.
+        meta_prefix + nelmts * sa + 4
+    }
+}
+
+/// Encode an *unfiltered* fixed-array data block for the layout implied by
+/// `hdr`, using the chunk addresses held in `dblk.elements`.
+///
+/// For the paged layout (`hdr.is_paged()`), emits the `FADB` prefix with a
+/// page-init bitmap followed by `npages` checksummed element pages. A page is
+/// marked initialized iff at least one of its chunk addresses is defined,
+/// mirroring libhdf5's lazy `H5FA__dblk_page_create`. Uninitialized pages are
+/// still written (all `UNDEF_ADDR`, valid checksum) so the file contains no
+/// uninitialized bytes; the reader skips them via the bitmap.
+fn encode_fixed_array_dblk(
+    ctx: &FormatContext,
+    hdr: &FixedArrayHeader,
+    dblk: &FixedArrayDataBlock,
+) -> Vec<u8> {
+    if !hdr.is_paged() {
+        return dblk.encode_unfiltered(ctx);
+    }
+
+    let npages = hdr.npages() as usize;
+    let dblk_page_nelmts = hdr.dblk_page_nelmts() as usize;
+    let elements = &dblk.elements;
+
+    // Build the page-init bitmap (MSB-first): a page is initialized iff any of
+    // its elements is a defined address.
+    let mut bitmap = vec![0u8; npages.div_ceil(8)];
+    for p in 0..npages {
+        let start = p * dblk_page_nelmts;
+        let end = ((p + 1) * dblk_page_nelmts).min(elements.len());
+        let initialized = elements[start..end].iter().any(|&a| a != UNDEF_ADDR);
+        if initialized {
+            bitmap[p / 8] |= 0x80u8 >> (p % 8);
+        }
+    }
+
+    let sa = ctx.sizeof_addr as usize;
+    let prefix = FixedArrayPagedPrefix {
+        client_id: FA_CLIENT_CHUNK,
+        header_addr: dblk.header_addr,
+        page_init_bitmap: bitmap,
+        prefix_size: 4 + 1 + 1 + sa + npages.div_ceil(8) + 4,
+    };
+
+    let mut buf = prefix.encode(ctx);
+    debug_assert_eq!(buf.len(), prefix.prefix_size);
+
+    // Append each page: all pages use the full `dblk_page_nelmts` stride;
+    // only the last page holds fewer elements (libhdf5 H5FA.c).
+    for p in 0..npages {
+        let start = p * dblk_page_nelmts;
+        let end = ((p + 1) * dblk_page_nelmts).min(elements.len());
+        buf.extend_from_slice(&encode_unfiltered_page(&elements[start..end], ctx));
+    }
+    buf
+}
 
 /// Metadata for a dataset being written.
 pub struct DatasetInfo {
@@ -2040,30 +2121,27 @@ impl Hdf5Writer {
 
         // Create FA header
         let mut fa_header = FixedArrayHeader::new_for_chunks(&self.ctx, num_chunks);
-        // The writer only emits non-paged data blocks. libhdf5 switches to a
-        // paged layout once num_elmts exceeds dblk_page_nelmts, so reject
-        // arrays that would require paging instead of writing a corrupt file.
-        if fa_header.is_paged() {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "fixed array with {} chunks requires a paged data block, \
-                 which the writer does not support",
-                num_chunks
-            )));
-        }
         let hdr_encoded = fa_header.encode(&self.ctx);
         let fa_header_addr = self.allocator.allocate(hdr_encoded.len() as u64);
 
-        // Create FA data block
+        // Create FA data block. libhdf5 switches to a paged layout once
+        // num_elmts exceeds dblk_page_nelmts; both layouts allocate space
+        // for `num_chunks` chunk addresses up front, but the paged layout
+        // also reserves the page-init bitmap and a per-page checksum.
         let fa_dblk = FixedArrayDataBlock::new_unfiltered(fa_header_addr, num_chunks as usize);
-        let dblk_encoded = fa_dblk.encode_unfiltered(&self.ctx);
-        let fa_dblk_addr = self.allocator.allocate(dblk_encoded.len() as u64);
+        let dblk_size = fixed_array_dblk_disk_size(&self.ctx, &fa_header);
+        let fa_dblk_addr = self.allocator.allocate(dblk_size);
 
         // Update header with data block address
         fa_header.data_blk_addr = fa_dblk_addr;
 
-        // Write both
+        // Write both. The data block content is finalized in `flush_dataset`
+        // once all chunk addresses are known; here we just reserve space and
+        // write the header so the file is structurally consistent.
         let hdr_encoded = fa_header.encode(&self.ctx);
         self.handle.write_at(fa_header_addr, &hdr_encoded)?;
+        let dblk_encoded = encode_fixed_array_dblk(&self.ctx, &fa_header, &fa_dblk);
+        debug_assert_eq!(dblk_encoded.len() as u64, dblk_size);
         self.handle.write_at(fa_dblk_addr, &dblk_encoded)?;
 
         let dataspace = DataspaceMessage::simple(dims);
@@ -2567,7 +2645,7 @@ impl Hdf5Writer {
 
         // Fixed-array-indexed dataset
         if let Some(ref fa) = ds.fixed_array {
-            let dblk_encoded = fa.fa_dblk.encode_unfiltered(&self.ctx);
+            let dblk_encoded = encode_fixed_array_dblk(&self.ctx, &fa.fa_header, &fa.fa_dblk);
             self.handle.write_at(fa.fa_dblk_addr, &dblk_encoded)?;
             let hdr_encoded = fa.fa_header.encode(&self.ctx);
             self.handle.write_at(fa.fa_header_addr, &hdr_encoded)?;
@@ -3352,6 +3430,108 @@ mod tests {
         assert_eq!(values.len(), 24);
         for (i, val) in values.iter().enumerate() {
             assert_eq!(*val, i as i32);
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn fixed_array_paged_dblk_disk_size() {
+        let ctx = FormatContext {
+            sizeof_addr: 8,
+            sizeof_size: 8,
+        };
+        // 1024 elements per page (bits=10). 3000 chunks => 3 pages.
+        let hdr = FixedArrayHeader::new_for_chunks(&ctx, 3000);
+        assert!(hdr.is_paged());
+        assert_eq!(hdr.npages(), 3);
+        // prefix: 4+1+1+8 + bitmap(1) + cksum(4) = 19
+        // elements: 3000 * 8 = 24000 ; per-page cksum: 3 * 4 = 12
+        assert_eq!(fixed_array_dblk_disk_size(&ctx, &hdr), 19 + 24000 + 12);
+
+        // Non-paged: 1000 elements. prefix(14) + 1000*8 + cksum(4).
+        let small = FixedArrayHeader::new_for_chunks(&ctx, 1000);
+        assert!(!small.is_paged());
+        assert_eq!(fixed_array_dblk_disk_size(&ctx, &small), 14 + 8000 + 4);
+    }
+
+    #[test]
+    fn fixed_array_paged_encode_matches_reader_layout() {
+        let ctx = FormatContext {
+            sizeof_addr: 8,
+            sizeof_size: 8,
+        };
+        let mut hdr = FixedArrayHeader::new_for_chunks(&ctx, 2500);
+        hdr.data_blk_addr = 0x9000;
+        let npages = hdr.npages() as usize; // ceil(2500/1024) = 3
+
+        let mut dblk = FixedArrayDataBlock::new_unfiltered(0x1000, 2500);
+        for (i, e) in dblk.elements.iter_mut().enumerate() {
+            *e = 0x10000 + (i as u64) * 0x100;
+        }
+
+        let encoded = encode_fixed_array_dblk(&ctx, &hdr, &dblk);
+        assert_eq!(encoded.len() as u64, fixed_array_dblk_disk_size(&ctx, &hdr));
+
+        // Decode the prefix and pages exactly as the reader does.
+        let prefix = FixedArrayPagedPrefix::decode(&encoded, &ctx, npages as u64).unwrap();
+        assert_eq!(prefix.header_addr, 0x1000);
+        for p in 0..npages {
+            assert!(prefix.page_initialized(p), "page {p} should be initialized");
+        }
+
+        let dblk_page_nelmts = hdr.dblk_page_nelmts() as usize;
+        let page_stride = dblk_page_nelmts * 8 + 4;
+        let mut recovered = Vec::new();
+        for p in 0..npages {
+            let page_nelmts = if p + 1 == npages {
+                2500 - p * dblk_page_nelmts
+            } else {
+                dblk_page_nelmts
+            };
+            let off = prefix.prefix_size + p * page_stride;
+            let page_buf = &encoded[off..];
+            let addrs = crate::format::chunk_index::fixed_array::decode_unfiltered_page(
+                page_buf,
+                &ctx,
+                page_nelmts,
+            )
+            .unwrap();
+            recovered.extend(addrs);
+        }
+        assert_eq!(recovered, dblk.elements);
+    }
+
+    #[test]
+    fn create_fixed_array_paged_dataset_roundtrip() {
+        let path = temp_path("fixed_array_paged");
+
+        // 1D dataset of 3000 elements, chunk size 1 => 3000 chunks.
+        // 3000 > 1024 (one page) => the FA data block must be paged.
+        let n: usize = 3000;
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let idx = writer
+            .create_fixed_array_dataset("paged", DatatypeMessage::i32_type(), &[n as u64], &[1])
+            .unwrap();
+
+        for i in 0..n {
+            let v = (i as i32).to_le_bytes();
+            writer
+                .write_chunk_fixed_array(idx, &[i as u64], &v)
+                .unwrap();
+        }
+        writer.close().unwrap();
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        assert_eq!(reader.dataset_shape("paged").unwrap(), vec![n as u64]);
+        let raw = reader.read_dataset_raw("paged").unwrap();
+        let values: Vec<i32> = raw
+            .chunks(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values.len(), n);
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(*v, i as i32, "element {i}");
         }
 
         std::fs::remove_file(&path).ok();

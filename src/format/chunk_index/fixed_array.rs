@@ -558,6 +558,62 @@ impl FixedArrayPagedPrefix {
         }
         (self.page_init_bitmap[byte] & (0x80u8 >> (p % 8))) != 0
     }
+
+    /// Encode the prefix of a paged data block (matches `decode`).
+    ///
+    /// On-disk layout: `"FADB"(4) + version(1) + client_id(1)
+    /// + header_addr(sizeof_addr) + page_init_bitmap(ceil(npages/8)) + checksum(4)`.
+    /// The returned buffer is exactly `prefix_size` bytes.
+    pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
+        let sa = ctx.sizeof_addr as usize;
+        let mut buf = Vec::with_capacity(4 + 1 + 1 + sa + self.page_init_bitmap.len() + 4);
+        buf.extend_from_slice(&FADB_SIGNATURE);
+        buf.push(FA_VERSION);
+        buf.push(self.client_id);
+        buf.extend_from_slice(&self.header_addr.to_le_bytes()[..sa]);
+        buf.extend_from_slice(&self.page_init_bitmap);
+        let cksum = checksum_metadata(&buf);
+        buf.extend_from_slice(&cksum.to_le_bytes());
+        buf
+    }
+}
+
+/// Encode a single *unfiltered* data block page.
+///
+/// Layout: `addrs.len()` chunk addresses (`sizeof_addr` bytes each, MSB-padded
+/// little-endian) followed by a 4-byte Jenkins checksum over the elements.
+/// Mirrors `H5FA__cache_dblk_page_serialize` (`H5FAcache.c`).
+pub fn encode_unfiltered_page(addrs: &[u64], ctx: &FormatContext) -> Vec<u8> {
+    let sa = ctx.sizeof_addr as usize;
+    let mut buf = Vec::with_capacity(addrs.len() * sa + 4);
+    for &addr in addrs {
+        buf.extend_from_slice(&addr.to_le_bytes()[..sa]);
+    }
+    let cksum = checksum_metadata(&buf);
+    buf.extend_from_slice(&cksum.to_le_bytes());
+    buf
+}
+
+/// Encode a single *filtered* data block page.
+///
+/// Layout: per element `address(sizeof_addr) + chunk_size(chunk_size_len)
+/// + filter_mask(4)`, followed by a 4-byte Jenkins checksum over the elements.
+pub fn encode_filtered_page(
+    elems: &[FixedArrayFilteredChunkElement],
+    ctx: &FormatContext,
+    chunk_size_len: usize,
+) -> Vec<u8> {
+    let sa = ctx.sizeof_addr as usize;
+    let elem_size = sa + chunk_size_len + 4;
+    let mut buf = Vec::with_capacity(elems.len() * elem_size + 4);
+    for e in elems {
+        buf.extend_from_slice(&e.address.to_le_bytes()[..sa]);
+        buf.extend_from_slice(&(e.chunk_size as u64).to_le_bytes()[..chunk_size_len]);
+        buf.extend_from_slice(&e.filter_mask.to_le_bytes());
+    }
+    let cksum = checksum_metadata(&buf);
+    buf.extend_from_slice(&cksum.to_le_bytes());
+    buf
 }
 
 /// Decode the unfiltered chunk addresses contained in a single data block page.
@@ -979,5 +1035,92 @@ mod tests {
         // Ask for more elements than the buffer holds.
         let err = decode_unfiltered_page(&page, &ctx, 4).unwrap_err();
         assert!(matches!(err, FormatError::BufferTooShort { .. }));
+    }
+
+    #[test]
+    fn paged_prefix_encode_decode_roundtrip() {
+        let ctx = ctx8();
+        // 17 pages => 3-byte bitmap. Initialize pages 0, 8, 15, 16.
+        let npages = 17usize;
+        let mut bitmap = vec![0u8; npages.div_ceil(8)];
+        for &p in &[0usize, 8, 15, 16] {
+            bitmap[p / 8] |= 0x80u8 >> (p % 8);
+        }
+        let prefix = FixedArrayPagedPrefix {
+            client_id: FA_CLIENT_CHUNK,
+            header_addr: 0xDEAD_BEEF,
+            page_init_bitmap: bitmap.clone(),
+            prefix_size: 4 + 1 + 1 + 8 + bitmap.len() + 4,
+        };
+        let encoded = prefix.encode(&ctx);
+        assert_eq!(encoded.len(), prefix.prefix_size);
+        assert_eq!(&encoded[..4], b"FADB");
+
+        let decoded = FixedArrayPagedPrefix::decode(&encoded, &ctx, npages as u64).unwrap();
+        assert_eq!(decoded.client_id, FA_CLIENT_CHUNK);
+        assert_eq!(decoded.header_addr, 0xDEAD_BEEF);
+        assert_eq!(decoded.page_init_bitmap, bitmap);
+        assert_eq!(decoded.prefix_size, prefix.prefix_size);
+        for p in 0..npages {
+            let expected = [0usize, 8, 15, 16].contains(&p);
+            assert_eq!(decoded.page_initialized(p), expected, "page {p}");
+        }
+    }
+
+    #[test]
+    fn unfiltered_page_encode_decode_roundtrip() {
+        let ctx = ctx8();
+        let addrs = [0x1000u64, 0x2000, UNDEF_ADDR, 0x4000];
+        let encoded = encode_unfiltered_page(&addrs, &ctx);
+        assert_eq!(encoded.len(), addrs.len() * 8 + 4);
+        let decoded = decode_unfiltered_page(&encoded, &ctx, addrs.len()).unwrap();
+        assert_eq!(decoded, addrs);
+    }
+
+    #[test]
+    fn filtered_page_encode_decode_roundtrip() {
+        let ctx = ctx8();
+        let csl = 4;
+        let elems = vec![
+            FixedArrayFilteredChunkElement {
+                address: 0x5000,
+                chunk_size: 123,
+                filter_mask: 0,
+            },
+            FixedArrayFilteredChunkElement {
+                address: 0x6000,
+                chunk_size: 456,
+                filter_mask: 1,
+            },
+        ];
+        let encoded = encode_filtered_page(&elems, &ctx, csl);
+        assert_eq!(encoded.len(), elems.len() * (8 + csl + 4) + 4);
+        let decoded = decode_filtered_page(&encoded, &ctx, elems.len(), csl).unwrap();
+        assert_eq!(decoded, elems);
+    }
+
+    #[test]
+    fn paged_prefix_encode_matches_test_builder() {
+        let ctx = ctx8();
+        let npages = 11usize;
+        let mut init = vec![false; npages];
+        for &p in &[0usize, 7, 8, 10] {
+            init[p] = true;
+        }
+        let from_builder = build_paged_prefix(&ctx, FA_CLIENT_CHUNK, 0xABCD, npages, &init);
+
+        let mut bitmap = vec![0u8; npages.div_ceil(8)];
+        for (p, &on) in init.iter().enumerate() {
+            if on {
+                bitmap[p / 8] |= 0x80u8 >> (p % 8);
+            }
+        }
+        let prefix = FixedArrayPagedPrefix {
+            client_id: FA_CLIENT_CHUNK,
+            header_addr: 0xABCD,
+            page_init_bitmap: bitmap.clone(),
+            prefix_size: 4 + 1 + 1 + 8 + bitmap.len() + 4,
+        };
+        assert_eq!(prefix.encode(&ctx), from_builder);
     }
 }
