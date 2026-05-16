@@ -867,6 +867,22 @@ impl Hdf5Reader {
 
     /// Read the raw bytes of a dataset.
     pub fn read_dataset_raw(&mut self, name: &str) -> IoResult<Vec<u8>> {
+        let datatype = self
+            .dataset_info(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?
+            .datatype
+            .clone();
+        let mut data = self.read_dataset_raw_unconverted(name)?;
+        Self::apply_post_filter_conversion(&mut data, &datatype)?;
+        Ok(data)
+    }
+
+    /// Read a full dataset producing the raw filter-pipeline output, before
+    /// the post-filter datatype conversion. `read_dataset_raw` wraps this
+    /// and applies the conversion exactly once; internal callers that go on
+    /// to convert themselves (e.g. the `read_slice` fallback) must use this
+    /// to avoid converting twice.
+    fn read_dataset_raw_unconverted(&mut self, name: &str) -> IoResult<Vec<u8>> {
         let info = self
             .dataset_info(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
@@ -877,15 +893,14 @@ impl Hdf5Reader {
         // Clone filter pipeline to avoid borrow conflict.
         let pipeline = info.filter_pipeline.clone();
 
-        match &layout {
+        let data = match &layout {
             DataLayoutMessage::Contiguous { address, size } => {
                 if *address == UNDEF_ADDR {
                     return Ok(vec![]);
                 }
-                let data = self.handle.read_at(*address, *size as usize)?;
-                Ok(data)
+                self.handle.read_at(*address, *size as usize)?
             }
-            DataLayoutMessage::Compact { data } => Ok(data.clone()),
+            DataLayoutMessage::Compact { data } => data.clone(),
             DataLayoutMessage::ChunkedV3 {
                 chunk_dims,
                 b_tree_address,
@@ -898,7 +913,7 @@ impl Hdf5Reader {
                     real_chunk_dims,
                     *b_tree_address,
                     pipeline.as_ref(),
-                )
+                )?
             }
             DataLayoutMessage::ChunkedV4 {
                 chunk_dims,
@@ -917,9 +932,30 @@ impl Hdf5Reader {
                     *index_type,
                     earray_params.as_ref(),
                     pipeline.as_ref(),
-                )
+                )?
             }
+        };
+
+        Ok(data)
+    }
+
+    /// Apply the post-filter datatype conversion (libhdf5's `H5T_convert`
+    /// step) to a fully-decoded output buffer.
+    ///
+    /// For N-bit / reduced-precision `FixedPoint` datatypes the filter
+    /// pipeline leaves the significant value occupying `bit_precision` bits
+    /// at `bit_offset` within each element, zero-filled and not
+    /// sign-extended. This rewrites every element so the value occupies the
+    /// whole element at bit offset 0, sign-extended when signed. It is a
+    /// no-op for ordinary full-width datatypes.
+    fn apply_post_filter_conversion(buffer: &mut [u8], datatype: &DatatypeMessage) -> IoResult<()> {
+        use crate::format::nbit_scaleoffset::{
+            apply_datatype_conversion, datatype_needs_bit_conversion,
+        };
+        if datatype_needs_bit_conversion(datatype) {
+            apply_datatype_conversion(buffer, datatype)?;
         }
+        Ok(())
     }
 
     /// Re-read the superblock and dataset metadata for SWMR.
@@ -2126,6 +2162,25 @@ impl Hdf5Reader {
     /// starts[d] is the first index along dim d, counts[d] is how many.
     /// Returns the selected data in row-major order.
     pub fn read_slice(&mut self, name: &str, starts: &[u64], counts: &[u64]) -> IoResult<Vec<u8>> {
+        let datatype = self
+            .dataset_info(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?
+            .datatype
+            .clone();
+        let mut data = self.read_slice_inner(name, starts, counts)?;
+        Self::apply_post_filter_conversion(&mut data, &datatype)?;
+        Ok(data)
+    }
+
+    /// Slice read producing the raw filter-pipeline output, before the
+    /// post-filter datatype conversion. `read_slice` wraps this and applies
+    /// the conversion.
+    fn read_slice_inner(
+        &mut self,
+        name: &str,
+        starts: &[u64],
+        counts: &[u64],
+    ) -> IoResult<Vec<u8>> {
         let info = self
             .dataset_info(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
@@ -2240,8 +2295,10 @@ impl Hdf5Reader {
             }
             DataLayoutMessage::ChunkedV3 { .. } => {
                 // Read the full dataset via the v1 B-tree path, then
-                // extract the requested slice.
-                let full = self.read_dataset_raw(name)?;
+                // extract the requested slice. Use the unconverted read so
+                // the post-filter datatype conversion runs exactly once, in
+                // the `read_slice` wrapper.
+                let full = self.read_dataset_raw_unconverted(name)?;
                 let mut output = vec![0u8; out_bytes];
                 let src_strides = compute_strides(&dims, element_size);
                 let row_bytes = (counts[ndims - 1] * element_size) as usize;
@@ -2357,8 +2414,10 @@ impl Hdf5Reader {
                     }
                     Ok(output)
                 } else {
-                    // Fallback: read full dataset and extract slice
-                    let full = self.read_dataset_raw(name)?;
+                    // Fallback: read full dataset and extract slice. Use the
+                    // unconverted read so the post-filter datatype conversion
+                    // is applied exactly once, by the `read_slice` wrapper.
+                    let full = self.read_dataset_raw_unconverted(name)?;
                     let mut output = vec![0u8; out_bytes];
                     let src_strides = compute_strides(&dims, element_size);
                     let row_bytes = (counts[ndims - 1] * element_size) as usize;
@@ -3075,6 +3134,112 @@ mod h5py_debug_tests {
             .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
             .collect();
         assert_eq!(vals, (0..7).collect::<Vec<i64>>());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// N-bit chunked datasets with non-zero bit offset and signed types with
+    /// negative values must read back element-exact through the crate's
+    /// chunked readers. The post-filter datatype conversion shifts/masks/
+    /// sign-extends each element after the filter pipeline.
+    #[test]
+    fn nbit_chunked_post_filter_conversion() {
+        let path = temp_path("nbit_conv");
+        let p = path.display().to_string();
+        // Build N-bit datasets with reduced precision + non-zero offset via
+        // h5py's low-level filter API (h5py has no high-level N-bit knob).
+        let script = format!(
+            "import h5py,numpy as np\n\
+             from h5py import h5t,h5p,h5s,h5d,h5f,h5z\n\
+             fid=h5f.create(r'{p}'.encode())\n\
+             def mk(name,bt,prec,off,npd,vals,chunk):\n\
+            \x20dt=bt.copy();dt.set_precision(prec);dt.set_offset(off)\n\
+            \x20arr=np.ascontiguousarray(np.asarray(vals,dtype=npd))\n\
+            \x20sp=h5s.create_simple(arr.shape)\n\
+            \x20dc=h5p.create(h5p.DATASET_CREATE);dc.set_chunk(chunk)\n\
+            \x20dc.set_filter(h5z.FILTER_NBIT,h5z.FLAG_OPTIONAL,())\n\
+            \x20ds=h5d.create(fid,name.encode(),dt,sp,dc)\n\
+            \x20ds.write(h5s.ALL,h5s.ALL,arr);ds.close()\n\
+             mk('u4_p17_o3',h5t.STD_U32LE,17,3,'u4',[0,1,1000,65535,131071,70000,42,99999],(4,))\n\
+             mk('i4_p13_o5',h5t.STD_I32LE,13,5,'i4',[-5,-1,0,1,7,-4096,4095,-77,42,100,-100,3],(4,))\n\
+             mk('i2_p9_o4',h5t.STD_I16LE,9,4,'i2',[-256,-1,0,1,255,-7,7,-200],(3,))\n\
+             mk('i4_2d_p11_o6',h5t.STD_I32LE,11,6,'i4',np.array([[-1024,-1,0,5],[1023,-77,88,-3]],dtype='i4'),(1,4))\n\
+             fid.close()"
+        );
+        if !gen_fixture(&script) {
+            eprintln!("skipping nbit_chunked_post_filter_conversion: python unavailable");
+            return;
+        }
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+
+        // Unsigned u4, precision 17, bit offset 3.
+        let raw = reader.read_dataset_raw("u4_p17_o3").unwrap();
+        let got: Vec<u32> = raw
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(
+            got,
+            vec![0u32, 1, 1000, 65535, 131071, 70000, 42, 99999],
+            "u4 N-bit dataset must decode to exact unsigned values"
+        );
+
+        // Signed i4 with negatives, precision 13, bit offset 5.
+        let raw = reader.read_dataset_raw("i4_p13_o5").unwrap();
+        let got: Vec<i32> = raw
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(
+            got,
+            vec![-5i32, -1, 0, 1, 7, -4096, 4095, -77, 42, 100, -100, 3],
+            "i4 N-bit dataset must sign-extend negative values"
+        );
+
+        // Signed i2 with negatives, precision 9, bit offset 4.
+        let raw = reader.read_dataset_raw("i2_p9_o4").unwrap();
+        let got: Vec<i16> = raw
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(
+            got,
+            vec![-256i16, -1, 0, 1, 255, -7, 7, -200],
+            "i2 N-bit dataset must sign-extend negative values"
+        );
+
+        // 2D signed i4, precision 11, bit offset 6 (1-row chunks).
+        let raw = reader.read_dataset_raw("i4_2d_p11_o6").unwrap();
+        let got: Vec<i32> = raw
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(
+            got,
+            vec![-1024i32, -1, 0, 5, 1023, -77, 88, -3],
+            "2D i4 N-bit dataset must decode element-exact"
+        );
+
+        // read_slice path must also apply the conversion exactly once.
+        let raw = reader.read_slice("i4_p13_o5", &[4], &[3]).unwrap();
+        let got: Vec<i32> = raw
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(got, vec![7i32, -4096, 4095], "read_slice must convert too");
+
+        // 2D slice: second row, all columns.
+        let raw = reader.read_slice("i4_2d_p11_o6", &[1, 0], &[1, 4]).unwrap();
+        let got: Vec<i32> = raw
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(
+            got,
+            vec![1023i32, -77, 88, -3],
+            "2D read_slice must convert"
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 }

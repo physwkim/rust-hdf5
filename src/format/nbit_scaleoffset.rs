@@ -1141,6 +1141,193 @@ fn postdecompress(
 }
 
 // ===========================================================================
+//  Post-filter datatype conversion (H5T_convert equivalent)
+// ===========================================================================
+
+use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+
+/// True if `dt` is a standard IEEE-754 binary32/binary64 layout (the only
+/// floating-point layouts the crate can faithfully reinterpret in place).
+fn is_standard_ieee_float(dt: &DatatypeMessage) -> bool {
+    match dt {
+        DatatypeMessage::FloatingPoint {
+            size,
+            sign_location,
+            bit_offset,
+            bit_precision,
+            exponent_location,
+            exponent_size,
+            mantissa_location,
+            mantissa_size,
+            exponent_bias,
+            ..
+        } => {
+            let bits = *size * 8;
+            let is_ieee32 = bits == 32
+                && *bit_offset == 0
+                && *bit_precision == 32
+                && *sign_location == 31
+                && *exponent_location == 23
+                && *exponent_size == 8
+                && *mantissa_location == 0
+                && *mantissa_size == 23
+                && *exponent_bias == 127;
+            let is_ieee64 = bits == 64
+                && *bit_offset == 0
+                && *bit_precision == 64
+                && *sign_location == 63
+                && *exponent_location == 52
+                && *exponent_size == 11
+                && *mantissa_location == 0
+                && *mantissa_size == 52
+                && *exponent_bias == 1023;
+            is_ieee32 || is_ieee64
+        }
+        _ => false,
+    }
+}
+
+/// True if the filter-pipeline / on-disk output for `dt` needs a post-filter
+/// datatype conversion before the element values are usable.
+///
+/// For a `FixedPoint` datatype the filter pipeline output (or contiguous
+/// on-disk bytes) carries the significant value in `bit_precision` bits
+/// starting at `bit_offset`, with the rest zero-filled and the sign bit NOT
+/// extended. libhdf5 fixes this up with a datatype conversion
+/// (`H5T_convert`) after the filter pipeline; this returns true for any
+/// such non-trivial layout.
+///
+/// It also returns true for a non-standard `FloatingPoint` layout, so the
+/// caller routes it through [`apply_datatype_conversion`], which then
+/// returns a clear error rather than silently yielding wrong data.
+pub fn datatype_needs_bit_conversion(dt: &DatatypeMessage) -> bool {
+    match dt {
+        DatatypeMessage::FixedPoint {
+            size,
+            bit_offset,
+            bit_precision,
+            ..
+        } => *bit_offset != 0 || (*bit_precision as u32) < *size * 8,
+        DatatypeMessage::FloatingPoint { .. } => !is_standard_ieee_float(dt),
+        _ => false,
+    }
+}
+
+/// Apply the post-filter datatype conversion in place to a fully-decoded
+/// output buffer.
+///
+/// This mirrors libhdf5's `H5T_convert` step that runs AFTER the filter
+/// pipeline. For a `FixedPoint` datatype with `bit_offset != 0` or
+/// `bit_precision < size*8`, each `size`-byte element is rewritten so the
+/// significant value occupies the whole element with bit offset 0:
+///
+///   1. interpret the element as an unsigned integer (respecting byte order),
+///   2. shift right by `bit_offset`,
+///   3. mask to `bit_precision` low bits,
+///   4. sign-extend from bit `bit_precision-1` if the type is signed,
+///   5. write the result back in the same byte order.
+///
+/// It is a strict no-op for ordinary full-width datatypes (and for any
+/// non-`FixedPoint` class).
+///
+/// For `FloatingPoint` types with a non-standard bit layout that cannot be
+/// faithfully reinterpreted, an error is returned rather than wrong data.
+pub fn apply_datatype_conversion(buffer: &mut [u8], dt: &DatatypeMessage) -> FormatResult<()> {
+    match dt {
+        DatatypeMessage::FixedPoint {
+            size,
+            byte_order,
+            signed,
+            bit_offset,
+            bit_precision,
+        } => {
+            let size = *size as usize;
+            let precision = *bit_precision as usize;
+            let offset = *bit_offset as usize;
+
+            // Full-width plain integer: nothing to do.
+            if offset == 0 && precision == size * 8 {
+                return Ok(());
+            }
+            if size == 0 || size > 8 {
+                return Err(FormatError::InvalidData(format!(
+                    "datatype conversion: unsupported FixedPoint size {size}"
+                )));
+            }
+            if precision == 0 || offset + precision > size * 8 {
+                return Err(FormatError::InvalidData(format!(
+                    "datatype conversion: invalid bit layout (offset {offset}, \
+                     precision {precision}, size {size})"
+                )));
+            }
+            if !buffer.len().is_multiple_of(size) {
+                return Err(FormatError::InvalidData(format!(
+                    "datatype conversion: buffer length {} not a multiple of \
+                     element size {size}",
+                    buffer.len()
+                )));
+            }
+
+            let big_endian = matches!(byte_order, ByteOrder::BigEndian);
+            let precision_mask: u64 = if precision == 64 {
+                u64::MAX
+            } else {
+                (1u64 << precision) - 1
+            };
+            let sign_bit: u64 = 1u64 << (precision - 1);
+
+            for elem in buffer.chunks_exact_mut(size) {
+                // Load element as a u64 in native value space.
+                let mut raw: u64 = 0;
+                if big_endian {
+                    for &b in elem.iter() {
+                        raw = (raw << 8) | b as u64;
+                    }
+                } else {
+                    for (i, &b) in elem.iter().enumerate() {
+                        raw |= (b as u64) << (8 * i);
+                    }
+                }
+
+                // Extract the significant bits.
+                let mut value = (raw >> offset) & precision_mask;
+
+                // Sign-extend from bit `precision-1` when signed.
+                if *signed && (value & sign_bit) != 0 {
+                    value |= !precision_mask;
+                }
+
+                // Store back in the same byte order, full element width.
+                if big_endian {
+                    for i in 0..size {
+                        elem[size - 1 - i] = (value >> (8 * i)) as u8;
+                    }
+                } else {
+                    for (i, b) in elem.iter_mut().enumerate() {
+                        *b = (value >> (8 * i)) as u8;
+                    }
+                }
+            }
+            Ok(())
+        }
+        DatatypeMessage::FloatingPoint { .. } => {
+            // Standard IEEE-754 layouts need no conversion. Anything else
+            // cannot be faithfully reinterpreted here.
+            if is_standard_ieee_float(dt) {
+                Ok(())
+            } else {
+                Err(FormatError::InvalidData(
+                    "datatype conversion: non-standard floating-point bit \
+                     layout cannot be converted"
+                        .into(),
+                ))
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+// ===========================================================================
 //  Tests
 // ===========================================================================
 #[cfg(test)]
@@ -1218,5 +1405,150 @@ mod tests {
         let packed = apply_nbit(&raw, &cd, true).unwrap();
         let unpacked = apply_nbit(&packed, &cd, false).unwrap();
         assert_eq!(unpacked, raw);
+    }
+
+    // ---------------------------------------------------------------
+    //  Post-filter datatype conversion
+    // ---------------------------------------------------------------
+
+    fn fixed(size: u32, signed: bool, offset: u16, precision: u16) -> DatatypeMessage {
+        DatatypeMessage::FixedPoint {
+            size,
+            byte_order: ByteOrder::LittleEndian,
+            signed,
+            bit_offset: offset,
+            bit_precision: precision,
+        }
+    }
+
+    #[test]
+    fn conversion_noop_for_full_width_types() {
+        // 32-bit unsigned, offset 0, precision 32 -> plain integer, no-op.
+        let dt = fixed(4, false, 0, 32);
+        assert!(!datatype_needs_bit_conversion(&dt));
+        let mut buf = vec![0x78, 0x56, 0x34, 0x12, 0xFF, 0xFF, 0xFF, 0xFF];
+        let before = buf.clone();
+        apply_datatype_conversion(&mut buf, &dt).unwrap();
+        assert_eq!(buf, before);
+    }
+
+    #[test]
+    fn conversion_noop_for_non_numeric_types() {
+        let dt = DatatypeMessage::fixed_string(8);
+        assert!(!datatype_needs_bit_conversion(&dt));
+        let mut buf = b"hello!!\0".to_vec();
+        let before = buf.clone();
+        apply_datatype_conversion(&mut buf, &dt).unwrap();
+        assert_eq!(buf, before);
+    }
+
+    #[test]
+    fn conversion_unsigned_offset_shifts_right() {
+        // u16, bit_offset 3, precision 10. The value lives in bits [3,13).
+        // Raw element layout (LE u16): value 0x2A5 placed at offset 3 ->
+        // 0x2A5 << 3 = 0x1528.
+        let dt = fixed(2, false, 3, 10);
+        assert!(datatype_needs_bit_conversion(&dt));
+        let mut buf = (0x1528u16).to_le_bytes().to_vec();
+        apply_datatype_conversion(&mut buf, &dt).unwrap();
+        assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0x2A5);
+    }
+
+    #[test]
+    fn conversion_signed_negative_sign_extends() {
+        // i16, bit_offset 4, precision 8. Store -3 (8-bit two's complement
+        // = 0xFD) at offset 4: 0xFD << 4 = 0xFD0.
+        let dt = fixed(2, true, 4, 8);
+        let mut buf = (0x0FD0u16).to_le_bytes().to_vec();
+        apply_datatype_conversion(&mut buf, &dt).unwrap();
+        assert_eq!(i16::from_le_bytes([buf[0], buf[1]]), -3);
+    }
+
+    #[test]
+    fn conversion_signed_positive_stays_positive() {
+        // i16, bit_offset 4, precision 8. Store +5 at offset 4 -> 0x050.
+        let dt = fixed(2, true, 4, 8);
+        let mut buf = (0x0050u16).to_le_bytes().to_vec();
+        apply_datatype_conversion(&mut buf, &dt).unwrap();
+        assert_eq!(i16::from_le_bytes([buf[0], buf[1]]), 5);
+    }
+
+    #[test]
+    fn conversion_reduced_precision_offset_zero() {
+        // i32, bit_offset 0, precision 20 -> still non-trivial (precision <
+        // size*8). Store -1 in 20 bits = 0xFFFFF.
+        let dt = fixed(4, true, 0, 20);
+        assert!(datatype_needs_bit_conversion(&dt));
+        let mut buf = (0x000FFFFFu32).to_le_bytes().to_vec();
+        apply_datatype_conversion(&mut buf, &dt).unwrap();
+        assert_eq!(i32::from_le_bytes(buf.clone().try_into().unwrap()), -1);
+    }
+
+    #[test]
+    fn conversion_big_endian_signed() {
+        // i16, BE, bit_offset 4, precision 8, value -3.
+        let dt = DatatypeMessage::FixedPoint {
+            size: 2,
+            byte_order: ByteOrder::BigEndian,
+            signed: true,
+            bit_offset: 4,
+            bit_precision: 8,
+        };
+        let mut buf = (0x0FD0u16).to_be_bytes().to_vec();
+        apply_datatype_conversion(&mut buf, &dt).unwrap();
+        assert_eq!(i16::from_be_bytes([buf[0], buf[1]]), -3);
+    }
+
+    #[test]
+    fn conversion_multiple_elements() {
+        // u32, bit_offset 5, precision 16. Three elements.
+        let dt = fixed(4, false, 5, 16);
+        let vals: [u32; 3] = [0x1234, 0xABCD, 0x0001];
+        let mut buf = Vec::new();
+        for v in vals {
+            buf.extend_from_slice(&((v << 5) as u32).to_le_bytes());
+        }
+        apply_datatype_conversion(&mut buf, &dt).unwrap();
+        for (i, v) in vals.iter().enumerate() {
+            let e = u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+            assert_eq!(e, *v);
+        }
+    }
+
+    #[test]
+    fn conversion_rejects_non_standard_float() {
+        // A float with a non-IEEE bit layout must error, not corrupt data.
+        let dt = DatatypeMessage::FloatingPoint {
+            size: 4,
+            byte_order: ByteOrder::LittleEndian,
+            sign_location: 30,
+            bit_offset: 1,
+            bit_precision: 31,
+            exponent_location: 22,
+            exponent_size: 8,
+            mantissa_location: 0,
+            mantissa_size: 22,
+            exponent_bias: 127,
+        };
+        assert!(datatype_needs_bit_conversion(&dt));
+        let mut buf = vec![0u8; 4];
+        assert!(apply_datatype_conversion(&mut buf, &dt).is_err());
+    }
+
+    #[test]
+    fn conversion_standard_float_is_noop() {
+        let dt = DatatypeMessage::f64_type();
+        assert!(!datatype_needs_bit_conversion(&dt));
+        let mut buf = 3.14159f64.to_le_bytes().to_vec();
+        let before = buf.clone();
+        apply_datatype_conversion(&mut buf, &dt).unwrap();
+        assert_eq!(buf, before);
+    }
+
+    #[test]
+    fn conversion_rejects_bad_buffer_length() {
+        let dt = fixed(4, false, 3, 16);
+        let mut buf = vec![0u8; 5]; // not a multiple of 4
+        assert!(apply_datatype_conversion(&mut buf, &dt).is_err());
     }
 }
