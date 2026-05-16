@@ -132,6 +132,29 @@ impl FillValueMessage {
     }
 }
 
+// ================================================================ tiling helper
+
+/// Build a `total`-byte buffer whose contents are `fill_value` tiled one
+/// element wide, or all zeros when `fill_value` is `None` or empty.
+///
+/// This is the single source of truth for materializing fill values:
+/// chunked reads use it to initialize output buffers, and the writer uses
+/// it to pad partial chunks so that unwritten elements read back as the
+/// fill value rather than zero.
+pub(crate) fn tiled_fill(total: usize, fill_value: Option<&[u8]>) -> Vec<u8> {
+    match fill_value {
+        Some(fv) if !fv.is_empty() && total > 0 => {
+            let mut buf = vec![0u8; total];
+            for slot in buf.chunks_mut(fv.len()) {
+                let n = slot.len().min(fv.len());
+                slot[..n].copy_from_slice(&fv[..n]);
+            }
+            buf
+        }
+        _ => vec![0u8; total],
+    }
+}
+
 // ======================================================================= tests
 
 #[cfg(test)]
@@ -238,5 +261,18 @@ mod tests {
     fn version_byte() {
         let encoded = FillValueMessage::default().encode();
         assert_eq!(encoded[0], 3);
+    }
+
+    #[test]
+    fn tiled_fill_repeats_pattern() {
+        assert_eq!(tiled_fill(0, Some(&[1, 2])), Vec::<u8>::new());
+        assert_eq!(tiled_fill(6, None), vec![0u8; 6]);
+        assert_eq!(tiled_fill(6, Some(&[])), vec![0u8; 6]);
+        assert_eq!(
+            tiled_fill(6, Some(&[0xAB, 0xCD])),
+            vec![0xAB, 0xCD, 0xAB, 0xCD, 0xAB, 0xCD]
+        );
+        // Partial tail when total is not a multiple of the pattern width.
+        assert_eq!(tiled_fill(5, Some(&[1, 2])), vec![1, 2, 1, 2, 1]);
     }
 }

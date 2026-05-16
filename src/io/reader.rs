@@ -17,6 +17,7 @@ use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::data_layout::{self, DataLayoutMessage};
 use crate::format::messages::dataspace::DataspaceMessage;
 use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::messages::fill_value::{tiled_fill, FillValueMessage};
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::link::LinkMessage;
 use crate::format::messages::link::LinkTarget;
@@ -45,6 +46,10 @@ pub struct DatasetReadInfo {
     pub filter_pipeline: Option<FilterPipeline>,
     /// Attributes attached to this dataset.
     pub attributes: Vec<AttributeMessage>,
+    /// User-defined fill value bytes (one element wide), decoded from the
+    /// fill-value message when `fill_defined == 2`. `None` => default
+    /// zero-fill. Applied to unallocated chunks and unwritten regions.
+    pub fill_value: Option<Vec<u8>>,
 }
 
 /// Internal enum to represent what we know about the root group from the
@@ -74,6 +79,8 @@ pub struct Hdf5Reader {
     datasets: Vec<DatasetReadInfo>,
     /// Attributes on the root group (file-level attributes).
     root_attributes: Vec<AttributeMessage>,
+    /// Attributes on non-root groups, keyed by group path (no leading `/`).
+    group_attributes: std::collections::HashMap<String, Vec<AttributeMessage>>,
 }
 
 impl Hdf5Reader {
@@ -155,8 +162,9 @@ impl Hdf5Reader {
         let root_buf = handle.read_at_most(sb.root_group_object_header_address, 4096)?;
         let (root_header, _) = ObjectHeader::decode(&root_buf)?;
 
-        // Walk link messages to discover datasets.
-        let datasets = Self::discover_datasets_from_links(&mut handle, &root_header, &ctx)?;
+        // Walk link messages to discover datasets and group attributes.
+        let (datasets, group_attributes) =
+            Self::discover_datasets_from_links(&mut handle, &root_header, &ctx)?;
 
         // Collect root group attributes
         let mut root_attributes = Vec::new();
@@ -177,6 +185,7 @@ impl Hdf5Reader {
             },
             datasets,
             root_attributes,
+            group_attributes,
         })
     }
 
@@ -221,6 +230,7 @@ impl Hdf5Reader {
             },
             datasets,
             root_attributes: Vec::new(),
+            group_attributes: std::collections::HashMap::new(),
         })
     }
 
@@ -250,12 +260,19 @@ impl Hdf5Reader {
 
     /// Discover datasets by walking link messages in a v2 object header.
     /// Recursively descends into groups, prefixing dataset names with the group path.
+    #[allow(clippy::type_complexity)]
     fn discover_datasets_from_links(
         handle: &mut FileHandle,
         root_header: &ObjectHeader,
         ctx: &FormatContext,
-    ) -> IoResult<Vec<DatasetReadInfo>> {
-        Self::discover_datasets_recursive(handle, root_header, ctx, "")
+    ) -> IoResult<(
+        Vec<DatasetReadInfo>,
+        std::collections::HashMap<String, Vec<AttributeMessage>>,
+    )> {
+        let mut group_attrs = std::collections::HashMap::new();
+        let datasets =
+            Self::discover_datasets_recursive(handle, root_header, ctx, "", &mut group_attrs)?;
+        Ok((datasets, group_attrs))
     }
 
     fn discover_datasets_recursive(
@@ -263,6 +280,7 @@ impl Hdf5Reader {
         header: &ObjectHeader,
         ctx: &FormatContext,
         prefix: &str,
+        group_attrs: &mut std::collections::HashMap<String, Vec<AttributeMessage>>,
     ) -> IoResult<Vec<DatasetReadInfo>> {
         let mut datasets = Vec::new();
         for msg in &header.messages {
@@ -285,6 +303,20 @@ impl Hdf5Reader {
                         // object header for link messages.
                         let child_buf = handle.read_at_most(*address, 8192)?;
                         if let Ok((child_header, _)) = ObjectHeader::decode_any(&child_buf) {
+                            // Not a dataset — treat as a group. Capture its
+                            // attributes (e.g. the NeXus `NX_class` marker)
+                            // keyed by path, whether or not it has children.
+                            let mut attrs = Vec::new();
+                            for m in &child_header.messages {
+                                if m.msg_type == MSG_ATTRIBUTE {
+                                    if let Ok((a, _)) = AttributeMessage::decode(&m.data, ctx) {
+                                        attrs.push(a);
+                                    }
+                                }
+                            }
+                            if !attrs.is_empty() {
+                                group_attrs.insert(full_name.clone(), attrs);
+                            }
                             let has_links =
                                 child_header.messages.iter().any(|m| m.msg_type == MSG_LINK);
                             if has_links {
@@ -293,6 +325,7 @@ impl Hdf5Reader {
                                     &child_header,
                                     ctx,
                                     &full_name,
+                                    group_attrs,
                                 )?;
                                 datasets.extend(child_ds);
                             }
@@ -440,6 +473,7 @@ impl Hdf5Reader {
         let mut dataspace = None;
         let mut layout = None;
         let mut filter_pipeline = None;
+        let mut fill_value = None;
         let mut attributes = Vec::new();
 
         for msg in &header.messages {
@@ -466,6 +500,13 @@ impl Hdf5Reader {
                         }
                     }
                 }
+                MSG_FILL_VALUE => {
+                    if let Ok((fv, _)) = FillValueMessage::decode(&msg.data) {
+                        if fv.fill_defined == 2 {
+                            fill_value = fv.fill_value;
+                        }
+                    }
+                }
                 MSG_ATTRIBUTE => {
                     if let Ok((attr, _)) = AttributeMessage::decode(&msg.data, ctx) {
                         attributes.push(attr);
@@ -483,6 +524,7 @@ impl Hdf5Reader {
                 layout: dl,
                 filter_pipeline,
                 attributes,
+                fill_value,
             }))
         } else {
             Ok(None)
@@ -529,6 +571,23 @@ impl Hdf5Reader {
     /// Return a root-level attribute by name.
     pub fn root_attr(&self, name: &str) -> Option<&AttributeMessage> {
         self.root_attributes.iter().find(|a| a.name == name)
+    }
+
+    /// Return the attribute names of a non-root group (path without a
+    /// leading `/`, e.g. `"detector"` or `"entry/instrument"`).
+    pub fn group_attr_names(&self, group_path: &str) -> Vec<String> {
+        self.group_attributes
+            .get(group_path)
+            .map(|v| v.iter().map(|a| a.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Return a non-root group's attribute by name.
+    pub fn group_attr(&self, group_path: &str, name: &str) -> Option<&AttributeMessage> {
+        self.group_attributes
+            .get(group_path)?
+            .iter()
+            .find(|a| a.name == name)
     }
 
     /// Return the dimensions of a dataset.
@@ -606,12 +665,14 @@ impl Hdf5Reader {
             .read_at_most(sb.root_group_object_header_address, 4096)?;
         let (root_header, _) = ObjectHeader::decode(&root_buf)?;
 
-        // Re-scan datasets from link messages.
-        let datasets = Self::discover_datasets_from_links(&mut self.handle, &root_header, &ctx)?;
+        // Re-scan datasets and group attributes from link messages.
+        let (datasets, group_attributes) =
+            Self::discover_datasets_from_links(&mut self.handle, &root_header, &ctx)?;
 
         self._eof = sb.end_of_file_address;
         self.ctx = ctx;
         self.datasets = datasets;
+        self.group_attributes = group_attributes;
 
         Ok(())
     }
@@ -633,12 +694,20 @@ impl Hdf5Reader {
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
+        let fill_value = info.fill_value.clone();
 
         match index_type {
             data_layout::ChunkIndexType::SingleChunk => {
                 // Single chunk: the index_address IS the chunk address
                 let total_size: u64 = dims.iter().product::<u64>() * element_size;
                 if index_address == UNDEF_ADDR || total_size == 0 {
+                    // An unallocated single chunk reads back entirely as the
+                    // fill value (when one is defined); otherwise empty.
+                    if let Some(ref fv) = fill_value {
+                        if total_size > 0 {
+                            return Ok(tiled_fill(total_size as usize, Some(fv)));
+                        }
+                    }
                     return Ok(vec![]);
                 }
                 let data = if let Some(pipeline) = pipeline {
@@ -782,7 +851,7 @@ impl Hdf5Reader {
                 }
 
                 let total_size: u64 = dims.iter().product::<u64>() * element_size;
-                let mut output = vec![0u8; total_size as usize];
+                let mut output = tiled_fill(total_size as usize, fill_value.as_deref());
 
                 let n_chunks = std::cmp::min(chunks_dim0 as usize, chunk_entries.len());
 
@@ -867,6 +936,7 @@ impl Hdf5Reader {
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
+        let fill_value = info.fill_value.clone();
         let ndims = dims.len();
 
         if index_address == UNDEF_ADDR {
@@ -894,7 +964,7 @@ impl Hdf5Reader {
 
         // Total output size
         let total_size: u64 = dims.iter().product::<u64>() * element_size;
-        let mut output = vec![0u8; total_size as usize];
+        let mut output = tiled_fill(total_size as usize, fill_value.as_deref());
 
         // Compute number of chunks per dimension
         let chunks_per_dim: Vec<u64> = (0..ndims)
@@ -982,6 +1052,7 @@ impl Hdf5Reader {
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
+        let fill_value = info.fill_value.clone();
         let ndims = dims.len();
 
         if index_address == UNDEF_ADDR {
@@ -1027,7 +1098,7 @@ impl Hdf5Reader {
 
         // Total output size
         let total_size: u64 = dims.iter().product::<u64>() * element_size;
-        let mut output = vec![0u8; total_size as usize];
+        let mut output = tiled_fill(total_size as usize, fill_value.as_deref());
 
         // Read all chunk raw data sequentially
         let mut raw_chunks: Vec<(usize, Option<Vec<u8>>)> = Vec::with_capacity(records.len());
@@ -1389,6 +1460,7 @@ impl Hdf5Reader {
         let element_size = info.datatype.element_size() as u64;
         let layout = info.layout.clone();
         let pipeline = info.filter_pipeline.clone();
+        let fill_value = info.fill_value.clone();
         let ndims = dims.len();
 
         if starts.len() != ndims || counts.len() != ndims {
@@ -1411,7 +1483,7 @@ impl Hdf5Reader {
         match &layout {
             DataLayoutMessage::Contiguous { address, .. } => {
                 if *address == UNDEF_ADDR {
-                    return Ok(vec![0u8; out_bytes]);
+                    return Ok(tiled_fill(out_bytes, fill_value.as_deref()));
                 }
 
                 let strides = compute_strides(&dims, element_size);
@@ -1512,7 +1584,7 @@ impl Hdf5Reader {
                         real_chunk_dims,
                         element_size,
                     )?;
-                    let mut output = vec![0u8; out_bytes];
+                    let mut output = tiled_fill(out_bytes, fill_value.as_deref());
                     let out_strides = compute_strides(counts, element_size);
                     let chunk_inner_dims = &real_chunk_dims[1..];
                     let chunk_strides = compute_strides(chunk_inner_dims, element_size);

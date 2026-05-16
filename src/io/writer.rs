@@ -64,6 +64,10 @@ pub struct DatasetInfo {
     pub append_buffered_frames: u64,
     /// Soft-deleted: excluded from finalize output.
     pub deleted: bool,
+    /// User-defined fill value bytes (exactly one element wide). `None`
+    /// means default zero-fill; `Some` is emitted as a `fill_defined = 2`
+    /// fill-value message in the dataset object header.
+    pub fill_value: Option<Vec<u8>>,
 }
 
 /// Runtime metadata for a chunked dataset.
@@ -142,6 +146,8 @@ pub struct GroupInfo {
     pub obj_header_addr: u64,
     /// Soft-deleted: excluded from finalize output.
     pub deleted: bool,
+    /// Attributes attached to this group (e.g. NeXus `NX_class`).
+    pub attributes: Vec<AttributeMessage>,
 }
 
 /// HDF5 file writer.
@@ -288,6 +294,7 @@ impl Hdf5Writer {
             let mut dataspace = None;
             let mut layout = None;
             let mut fp = None;
+            let mut fill_value = None;
             let mut attrs = Vec::new();
 
             for msg in &ds_header.messages {
@@ -311,6 +318,13 @@ impl Hdf5Writer {
                         if let Ok((p, _)) = FilterPipeline::decode(&msg.data) {
                             if !p.filters.is_empty() {
                                 fp = Some(p);
+                            }
+                        }
+                    }
+                    crate::format::messages::MSG_FILL_VALUE => {
+                        if let Ok((fv, _)) = FillValueMessage::decode(&msg.data) {
+                            if fv.fill_defined == 2 {
+                                fill_value = fv.fill_value;
                             }
                         }
                     }
@@ -345,6 +359,7 @@ impl Hdf5Writer {
                 append_buffer: Vec::new(),
                 append_buffered_frames: 0,
                 deleted: false,
+                fill_value,
             };
 
             // Reconstruct storage-specific metadata
@@ -393,32 +408,73 @@ impl Hdf5Writer {
                                 0
                             };
 
-                            // Read EA index block
+                            // Read the EA index block. Filtered datasets
+                            // store a `FilteredIndexBlock`; unfiltered ones a
+                            // plain `ExtensibleArrayIndexBlock`. Both must be
+                            // reconstructed so a reopened dataset can append
+                            // (write_chunk consults whichever applies).
                             let ea_iblk_addr = ea_header.idx_blk_addr;
-                            let ea_iblk = if ea_iblk_addr != UNDEF_ADDR {
-                                let iblk_buf = handle.read_at_most(ea_iblk_addr, 65536)?;
-                                ExtensibleArrayIndexBlock::decode(
-                                    &iblk_buf,
-                                    &ctx,
-                                    ep.idx_blk_elmts as usize,
+                            let (ea_iblk, filt_iblk) = if is_filtered {
+                                let placeholder = ExtensibleArrayIndexBlock::new(
+                                    *index_address,
+                                    ep.idx_blk_elmts,
                                     ndblk_addrs,
                                     nsblk_addrs,
-                                )
-                                .unwrap_or_else(|_| {
+                                );
+                                let fib = if ea_iblk_addr != UNDEF_ADDR {
+                                    let iblk_buf = handle.read_at_most(ea_iblk_addr, 65536)?;
+                                    FilteredIndexBlock::decode(
+                                        &iblk_buf,
+                                        &ctx,
+                                        ep.idx_blk_elmts as usize,
+                                        ndblk_addrs,
+                                        nsblk_addrs,
+                                        chunk_size_len,
+                                    )
+                                    .unwrap_or_else(|_| {
+                                        FilteredIndexBlock::new(
+                                            *index_address,
+                                            ep.idx_blk_elmts,
+                                            ndblk_addrs,
+                                            nsblk_addrs,
+                                        )
+                                    })
+                                } else {
+                                    FilteredIndexBlock::new(
+                                        *index_address,
+                                        ep.idx_blk_elmts,
+                                        ndblk_addrs,
+                                        nsblk_addrs,
+                                    )
+                                };
+                                (placeholder, Some(fib))
+                            } else {
+                                let eib = if ea_iblk_addr != UNDEF_ADDR {
+                                    let iblk_buf = handle.read_at_most(ea_iblk_addr, 65536)?;
+                                    ExtensibleArrayIndexBlock::decode(
+                                        &iblk_buf,
+                                        &ctx,
+                                        ep.idx_blk_elmts as usize,
+                                        ndblk_addrs,
+                                        nsblk_addrs,
+                                    )
+                                    .unwrap_or_else(|_| {
+                                        ExtensibleArrayIndexBlock::new(
+                                            *index_address,
+                                            ep.idx_blk_elmts,
+                                            ndblk_addrs,
+                                            nsblk_addrs,
+                                        )
+                                    })
+                                } else {
                                     ExtensibleArrayIndexBlock::new(
                                         *index_address,
                                         ep.idx_blk_elmts,
                                         ndblk_addrs,
                                         nsblk_addrs,
                                     )
-                                })
-                            } else {
-                                ExtensibleArrayIndexBlock::new(
-                                    *index_address,
-                                    ep.idx_blk_elmts,
-                                    ndblk_addrs,
-                                    nsblk_addrs,
-                                )
+                                };
+                                (eib, None)
                             };
 
                             let max_dims = info
@@ -438,7 +494,7 @@ impl Hdf5Writer {
                                 ea_iblk,
                                 data_blocks: Vec::new(),
                                 chunks_written: 0,
-                                filt_iblk: None,
+                                filt_iblk,
                                 filt_data_blocks: Vec::new(),
                                 chunk_size_len,
                             });
@@ -492,6 +548,7 @@ impl Hdf5Writer {
                     child_groups: Vec::new(),
                     obj_header_addr: 0,
                     deleted: false,
+                    attributes: Vec::new(),
                 });
                 if let Some(pidx) = parent {
                     groups[pidx].child_groups.push(gidx);
@@ -712,6 +769,7 @@ impl Hdf5Writer {
             child_groups: Vec::new(),
             obj_header_addr: 0,
             deleted: false,
+            attributes: Vec::new(),
         });
 
         // Register this group as a child of its parent
@@ -788,6 +846,7 @@ impl Hdf5Writer {
             append_buffer: Vec::new(),
             append_buffered_frames: 0,
             deleted: false,
+            fill_value: None,
         });
 
         Ok(idx)
@@ -868,6 +927,7 @@ impl Hdf5Writer {
             append_buffer: Vec::new(),
             append_buffered_frames: 0,
             deleted: false,
+            fill_value: None,
             fixed_array: None,
             btree_v2: None,
             chunked: Some(ChunkedDatasetInfo {
@@ -1054,6 +1114,30 @@ impl Hdf5Writer {
                             chunked.chunk_size_len,
                         );
                         self.handle.write_at(dblk_addr, &dblk_encoded)?;
+                    } else {
+                        // Filtered data block exists on disk but not in
+                        // memory (append mode). Read it, update, write back.
+                        let dblk_buf = self.handle.read_at_most(dblk_addr, 65536)?;
+                        if let Ok(mut dblk) = FilteredDataBlock::decode(
+                            &dblk_buf,
+                            &self.ctx,
+                            chunked.earray_params.max_nelmts_bits,
+                            block_nelmts,
+                            chunked.chunk_size_len,
+                        ) {
+                            dblk.elements[offset_in_block] = FilteredChunkEntry {
+                                addr: chunk_addr,
+                                nbytes: compressed_size,
+                                filter_mask: 0,
+                            };
+                            let dblk_encoded = dblk.encode(
+                                &self.ctx,
+                                chunked.earray_params.max_nelmts_bits,
+                                chunked.chunk_size_len,
+                            );
+                            self.handle.write_at(dblk_addr, &dblk_encoded)?;
+                            chunked.filt_data_blocks.push((dblk_addr, dblk));
+                        }
                     }
                 }
             } else {
@@ -1297,6 +1381,7 @@ impl Hdf5Writer {
             append_buffer: Vec::new(),
             append_buffered_frames: 0,
             deleted: false,
+            fill_value: None,
         });
 
         Ok(idx)
@@ -1419,6 +1504,7 @@ impl Hdf5Writer {
             append_buffer: Vec::new(),
             append_buffered_frames: 0,
             deleted: false,
+            fill_value: None,
             fixed_array: None,
             btree_v2: None,
             chunked: Some(ChunkedDatasetInfo {
@@ -1445,8 +1531,9 @@ impl Hdf5Writer {
             let start = chunk_i * chunk_byte_size;
             let end = (start + chunk_byte_size).min(raw_data.len());
             let chunk_data = if end - start < chunk_byte_size {
-                // Pad last chunk to full size
-                let mut padded = vec![0u8; chunk_byte_size];
+                // Pad last chunk to full size (vlen datasets carry no user
+                // fill value, so this resolves to zero = null vlen reference).
+                let mut padded = self.new_chunk_buffer(idx, chunk_byte_size);
                 padded[..end - start].copy_from_slice(&raw_data[start..end]);
                 padded
             } else {
@@ -1532,7 +1619,6 @@ impl Hdf5Writer {
         let n_new_frames = strings.len();
         let current_dim0 = dims[0] as usize;
         let chunk_dim0 = chunk_dims[0] as usize;
-        let chunk_bytes = chunk_dim0 * ref_size;
         let frame_bytes = ref_size;
 
         // Merge buffered data with new data
@@ -1559,8 +1645,23 @@ impl Hdf5Writer {
                 if frames_to_fill == chunk_dim0 {
                     self.write_chunk(ds_index, chunk_idx as u64, &combined[byte_pos..end])?;
                 } else {
-                    let mut chunk_buf = vec![0u8; chunk_bytes];
+                    // Partial-chunk write: this branch only runs with
+                    // offset_in_chunk > 0, meaning the chunk already holds
+                    // earlier frames on disk. Read-modify-write so those
+                    // frames survive — a fresh fill buffer would erase them.
                     let offset_in_chunk = (abs_frame % chunk_dim0) * frame_bytes;
+                    let mut chunk_buf =
+                        match self.read_chunk_if_present(ds_index, chunk_idx as u64)? {
+                            Some(existing) => existing,
+                            None => {
+                                return Err(crate::io::IoError::InvalidState(format!(
+                                    "cannot append into partially-written chunk {}: its \
+                                     existing content was not found in the chunk index \
+                                     (the file may be inconsistent)",
+                                    chunk_idx
+                                )));
+                            }
+                        };
                     chunk_buf[offset_in_chunk..offset_in_chunk + frames_to_fill * frame_bytes]
                         .copy_from_slice(&combined[byte_pos..end]);
                     self.write_chunk(ds_index, chunk_idx as u64, &chunk_buf)?;
@@ -1602,6 +1703,192 @@ impl Hdf5Writer {
         }
         self.datasets[ds_index].attributes.push(attr);
         Ok(())
+    }
+
+    /// Add (or replace) an attribute on a group identified by its full path.
+    ///
+    /// The attribute is written into the group's object header when the
+    /// file is finalized. An existing attribute with the same name is
+    /// replaced, matching [`add_root_attribute`](Self::add_root_attribute).
+    pub fn add_group_attribute(
+        &mut self,
+        group_path: &str,
+        attr: AttributeMessage,
+    ) -> IoResult<()> {
+        let gi = self
+            .groups
+            .iter()
+            .position(|g| g.name == group_path && !g.deleted)
+            .ok_or_else(|| {
+                crate::io::IoError::NotFound(format!("group '{}' not found", group_path))
+            })?;
+        let attrs = &mut self.groups[gi].attributes;
+        if let Some(pos) = attrs.iter().position(|a| a.name == attr.name) {
+            attrs[pos] = attr;
+        } else {
+            attrs.push(attr);
+        }
+        Ok(())
+    }
+
+    /// Set a user-defined fill value for a dataset.
+    ///
+    /// `bytes` must be exactly one element wide (matching the dataset's
+    /// datatype). The value is emitted as a `fill_defined = 2` fill-value
+    /// message in the dataset object header when the file is finalized.
+    pub fn set_dataset_fill_value(&mut self, ds_index: usize, bytes: Vec<u8>) -> IoResult<()> {
+        let ds = self.datasets.get_mut(ds_index).ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!("dataset index {} out of range", ds_index))
+        })?;
+        let es = ds.datatype.element_size() as usize;
+        if bytes.len() != es {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "fill value is {} bytes but dataset element size is {}",
+                bytes.len(),
+                es
+            )));
+        }
+        ds.fill_value = Some(bytes);
+        Ok(())
+    }
+
+    /// Allocate a `chunk_bytes`-sized buffer pre-filled with dataset
+    /// `ds_index`'s fill value (tiled one element wide), or zeros when no
+    /// user-defined fill value exists.
+    ///
+    /// Every partial chunk the writer emits must be built on top of a
+    /// buffer from this method, so that the unwritten element region of an
+    /// allocated chunk reads back as the fill value rather than zero.
+    pub(crate) fn new_chunk_buffer(&self, ds_index: usize, chunk_bytes: usize) -> Vec<u8> {
+        let fv = self.datasets[ds_index].fill_value.as_deref();
+        crate::format::messages::fill_value::tiled_fill(chunk_bytes, fv)
+    }
+
+    /// Read an already-written chunk's *decompressed* bytes when the chunk
+    /// is allocated and resolvable from the in-memory extensible-array
+    /// index. Handles index-block and data-block chunks, filtered and
+    /// unfiltered.
+    ///
+    /// Returns `Ok(None)` only when the chunk has never been written
+    /// (address `UNDEF`) or the index genuinely does not reach it. A
+    /// caller doing a read-modify-write of a partial chunk treats `None`
+    /// as an error rather than silently overwriting the chunk.
+    pub(crate) fn read_chunk_if_present(
+        &mut self,
+        ds_index: usize,
+        chunk_idx: u64,
+    ) -> IoResult<Option<Vec<u8>>> {
+        // Phase 1: resolve the chunk's location from the in-memory index.
+        let ds = &self.datasets[ds_index];
+        let element_size = ds.datatype.element_size() as u64;
+        let pipeline = ds.filter_pipeline.clone();
+        let Some(chunked) = ds.chunked.as_ref() else {
+            return Ok(None);
+        };
+        let chunk_bytes = chunked.chunk_dims.iter().product::<u64>() * element_size;
+        let idx_blk_elmts = chunked.earray_params.idx_blk_elmts as u64;
+        let min_elmts = chunked.earray_params.data_blk_min_elmts as u64;
+        let max_nelmts_bits = chunked.earray_params.max_nelmts_bits;
+        let ndblk_addrs = chunked.ndblk_addrs;
+        let chunk_size_len = chunked.chunk_size_len;
+        let is_filtered = chunked.filt_iblk.is_some();
+
+        // The chunk entry is either read straight from an index block, or
+        // located via a data block that must itself be read from disk.
+        enum Loc {
+            Direct(u64, u64),
+            DataBlock {
+                dblk_addr: u64,
+                offset: usize,
+                nelmts: usize,
+            },
+        }
+
+        let loc = if chunk_idx < idx_blk_elmts {
+            if is_filtered {
+                let e = &chunked.filt_iblk.as_ref().unwrap().elements[chunk_idx as usize];
+                Loc::Direct(e.addr, e.nbytes)
+            } else {
+                Loc::Direct(chunked.ea_iblk.elements[chunk_idx as usize], chunk_bytes)
+            }
+        } else {
+            // Locate the data block covering this chunk. Block sizes follow
+            // min, min, 2*min, 2*min, 4*min, ... (doubling every two).
+            let offset_in_dblks = chunk_idx - idx_blk_elmts;
+            let mut cumulative = 0u64;
+            let mut dblk_idx = 0usize;
+            let mut current_size = min_elmts;
+            let mut pair = 0;
+            loop {
+                if offset_in_dblks < cumulative + current_size {
+                    break;
+                }
+                cumulative += current_size;
+                dblk_idx += 1;
+                pair += 1;
+                if pair >= 2 {
+                    pair = 0;
+                    current_size *= 2;
+                }
+                if dblk_idx >= ndblk_addrs {
+                    return Ok(None);
+                }
+            }
+            let offset = (offset_in_dblks - cumulative) as usize;
+            let dblk_addr = if is_filtered {
+                chunked.filt_iblk.as_ref().unwrap().dblk_addrs[dblk_idx]
+            } else {
+                chunked.ea_iblk.dblk_addrs[dblk_idx]
+            };
+            if dblk_addr == UNDEF_ADDR {
+                return Ok(None);
+            }
+            Loc::DataBlock {
+                dblk_addr,
+                offset,
+                nelmts: current_size as usize,
+            }
+        };
+
+        // Phase 2: resolve through the data block (if needed) and read.
+        let (addr, nbytes) = match loc {
+            Loc::Direct(a, n) => (a, n),
+            Loc::DataBlock {
+                dblk_addr,
+                offset,
+                nelmts,
+            } => {
+                let buf = self.handle.read_at_most(dblk_addr, 65536)?;
+                if is_filtered {
+                    let dblk = FilteredDataBlock::decode(
+                        &buf,
+                        &self.ctx,
+                        max_nelmts_bits,
+                        nelmts,
+                        chunk_size_len,
+                    )?;
+                    let e = &dblk.elements[offset];
+                    (e.addr, e.nbytes)
+                } else {
+                    let dblk =
+                        ExtensibleArrayDataBlock::decode(&buf, &self.ctx, max_nelmts_bits, nelmts)?;
+                    (dblk.elements[offset], chunk_bytes)
+                }
+            }
+        };
+        if addr == UNDEF_ADDR || nbytes == 0 {
+            return Ok(None);
+        }
+
+        let raw = self.handle.read_at(addr, nbytes as usize)?;
+        if is_filtered {
+            let Some(pl) = pipeline.as_ref() else {
+                return Ok(None);
+            };
+            Ok(Some(filter::reverse_filters(pl, &raw)?))
+        } else {
+            Ok(Some(raw))
+        }
     }
 
     /// Define a chunked dataset indexed by a fixed array (no unlimited dimensions).
@@ -1659,6 +1946,7 @@ impl Hdf5Writer {
             append_buffer: Vec::new(),
             append_buffered_frames: 0,
             deleted: false,
+            fill_value: None,
             fixed_array: Some(FixedArrayDatasetInfo {
                 chunk_dims: chunk_dims.to_vec(),
                 fa_header_addr,
@@ -1724,6 +2012,7 @@ impl Hdf5Writer {
             append_buffer: Vec::new(),
             append_buffered_frames: 0,
             deleted: false,
+            fill_value: None,
             btree_v2: Some(Bt2DatasetInfo {
                 chunk_dims: chunk_dims.to_vec(),
                 max_dims: max_dims.to_vec(),
@@ -1819,6 +2108,7 @@ impl Hdf5Writer {
             append_buffer: Vec::new(),
             append_buffered_frames: 0,
             deleted: false,
+            fill_value: None,
             fixed_array: None,
             btree_v2: None,
             chunked: Some(ChunkedDatasetInfo {
@@ -1915,6 +2205,7 @@ impl Hdf5Writer {
             append_buffer: Vec::new(),
             append_buffered_frames: 0,
             deleted: false,
+            fill_value: None,
             fixed_array: None,
             btree_v2: None,
             chunked: Some(ChunkedDatasetInfo {
@@ -2436,7 +2727,8 @@ impl Hdf5Writer {
     // Internal helpers
     // ------------------------------------------------------------------
 
-    /// Flush any partial append buffers as zero-padded chunks.
+    /// Flush any partial append buffers, padding each chunk's unwritten
+    /// tail with the dataset's fill value (zeros when none is defined).
     fn flush_append_buffers(&mut self) -> IoResult<()> {
         for i in 0..self.datasets.len() {
             if self.datasets[i].append_buffer.is_empty() {
@@ -2462,7 +2754,7 @@ impl Hdf5Writer {
             let buf = std::mem::take(&mut self.datasets[i].append_buffer);
             self.datasets[i].append_buffered_frames = 0;
 
-            let mut chunk_buf = vec![0u8; chunk_bytes];
+            let mut chunk_buf = self.new_chunk_buffer(i, chunk_bytes);
             let frame_bytes = if self.datasets[i].dataspace.dims.len() > 1 {
                 self.datasets[i].dataspace.dims[1..]
                     .iter()
@@ -2617,7 +2909,16 @@ impl Hdf5Writer {
 
         // Fill Value message (type 0x05)
         let is_chunked = ds.chunked.is_some() || ds.fixed_array.is_some() || ds.btree_v2.is_some();
-        let fv = if is_chunked {
+        let alloc_time = if is_chunked { 3 } else { 2 }; // 3 = incremental, 2 = late
+        let fv = if let Some(ref bytes) = ds.fill_value {
+            // User-defined fill value (fill_defined = 2).
+            FillValueMessage {
+                alloc_time,
+                fill_write_time: 0, // on alloc
+                fill_defined: 2,
+                fill_value: Some(bytes.clone()),
+            }
+        } else if is_chunked {
             FillValueMessage {
                 alloc_time: 3,      // incremental
                 fill_write_time: 0, // on alloc
@@ -2712,6 +3013,12 @@ impl Hdf5Writer {
             let link = LinkMessage::hard(leaf_name, child_grp.obj_header_addr);
             let link_msg = link.encode(&self.ctx);
             header.add_message(MSG_LINK, 0x00, link_msg);
+        }
+
+        // Attribute messages (type 0x0C) -- e.g. NeXus `NX_class`.
+        for attr in &grp.attributes {
+            let attr_msg = attr.encode(&self.ctx);
+            header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
         }
 
         header

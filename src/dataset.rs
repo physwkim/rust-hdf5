@@ -34,6 +34,7 @@ pub struct DatasetBuilder<T: H5Type> {
     shuffle_deflate_level: Option<u32>,
     custom_pipeline: Option<crate::format::messages::filter::FilterPipeline>,
     group_path: Option<String>,
+    fill_value: Option<Vec<u8>>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -48,6 +49,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             shuffle_deflate_level: None,
             custom_pipeline: None,
             group_path: None,
+            fill_value: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -62,6 +64,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             shuffle_deflate_level: None,
             custom_pipeline: None,
             group_path: Some(group_path),
+            fill_value: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -153,6 +156,33 @@ impl<T: H5Type> DatasetBuilder<T> {
         self
     }
 
+    /// Set a user-defined fill value for unwritten elements.
+    ///
+    /// Without this, datasets use the HDF5 default zero-fill. When set,
+    /// the value is written into the dataset's fill-value message
+    /// (`fill_defined = 2`), so HDF5 readers treat unallocated chunks and
+    /// unwritten regions as this value rather than zero.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("fv.h5").unwrap();
+    /// let ds = file.new_dataset::<f32>()
+    ///     .shape(&[100])
+    ///     .fill_value(f32::NAN)
+    ///     .create("data")
+    ///     .unwrap();
+    /// ```
+    #[must_use]
+    pub fn fill_value(mut self, value: T) -> Self {
+        let es = T::element_size();
+        // Safety: `T: H5Type` is a `Copy` numeric primitive with a
+        // well-defined byte representation; `element_size()` matches
+        // `size_of::<T>()`. The slice borrows `value` only for this call.
+        let raw = unsafe { std::slice::from_raw_parts(&value as *const T as *const u8, es) };
+        self.fill_value = Some(raw.to_vec());
+        self
+    }
+
     /// Finalize and create the dataset with the given `name`.
     ///
     /// The name is the link name within the root group (e.g. `"data"` or
@@ -174,6 +204,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             name.to_string()
         };
         let group_path = self.group_path.clone();
+        let fill_value = self.fill_value.clone();
 
         let dims_u64: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
         let datatype = T::hdf5_type();
@@ -222,6 +253,9 @@ impl<T: H5Type> DatasetBuilder<T> {
                                 writer.assign_dataset_to_group(gp, idx)?;
                             }
                         }
+                        if let Some(ref fv) = fill_value {
+                            writer.set_dataset_fill_value(idx, fv.clone())?;
+                        }
                         idx
                     }
                     H5FileInner::Reader(_) => {
@@ -255,6 +289,9 @@ impl<T: H5Type> DatasetBuilder<T> {
                             if gp != "/" {
                                 writer.assign_dataset_to_group(gp, idx)?;
                             }
+                        }
+                        if let Some(ref fv) = fill_value {
+                            writer.set_dataset_fill_value(idx, fv.clone())?;
                         }
                         idx
                     }
@@ -710,8 +747,6 @@ impl H5Dataset {
 
                 // Chunk size along first dimension
                 let chunk_dim0 = chunk_dims[0] as usize;
-                // Bytes per chunk = product of all chunk_dims * element_size
-                let chunk_bytes = chunk_dims.iter().map(|&d| d as usize).product::<usize>() * es;
                 let frame_bytes = frame_elems * es;
 
                 let raw = unsafe {
@@ -749,9 +784,24 @@ impl H5Dataset {
                                 &combined[byte_pos..end],
                             )?;
                         } else {
-                            // Partial start but fills to chunk boundary
-                            let mut chunk_buf = vec![0u8; chunk_bytes];
+                            // Partial-chunk write: this branch only runs with
+                            // offset_in_chunk > 0, meaning the chunk already
+                            // holds earlier frames on disk. Read-modify-write
+                            // so those frames survive — a fresh fill buffer
+                            // would erase them.
                             let offset_in_chunk = (abs_frame % chunk_dim0) * frame_bytes;
+                            let mut chunk_buf =
+                                match writer.read_chunk_if_present(ds_index, chunk_idx as u64)? {
+                                    Some(existing) => existing,
+                                    None => {
+                                        return Err(Hdf5Error::InvalidState(format!(
+                                            "cannot append into partially-written chunk {}: \
+                                         its existing content was not found in the chunk \
+                                         index (the file may be inconsistent)",
+                                            chunk_idx
+                                        )));
+                                    }
+                                };
                             chunk_buf
                                 [offset_in_chunk..offset_in_chunk + frames_to_fill * frame_bytes]
                                 .copy_from_slice(&combined[byte_pos..end]);
@@ -1602,6 +1652,308 @@ mod tests {
             assert_eq!(all, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
         }
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn vlen_append_after_reopen_filtered() {
+        // Reopen + append into a partially-written *compressed* vlen chunk
+        // (index-block chunk). Exercises filtered-index-block reconstruction
+        // in open_append plus filtered read-modify-write.
+        let path = temp_path("vlen_reopen_filtered");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.create_appendable_vlen_dataset(
+                "strs",
+                4,
+                Some(crate::format::messages::filter::FilterPipeline::deflate(6)),
+            )
+            .unwrap();
+            file.append_vlen_strings("strs", &["alpha", "beta", "gamma"])
+                .unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open_rw(&path).unwrap();
+            file.append_vlen_strings("strs", &["delta"]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let got = file.dataset("strs").unwrap().read_vlen_strings().unwrap();
+            assert_eq!(
+                got.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                vec!["alpha", "beta", "gamma", "delta"]
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn vlen_append_after_reopen_data_block() {
+        // Reopen + append into a partial chunk that lives in an extensible-
+        // array *data block* (chunk index >= idx_blk_elmts). Exercises
+        // data-block resolution in read_chunk_if_present and write_chunk.
+        let path = temp_path("vlen_reopen_datablk");
+        let labels: Vec<String> = (0..9).map(|i| format!("s{i}")).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.create_appendable_vlen_dataset("strs", 2, None)
+                .unwrap();
+            let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+            file.append_vlen_strings("strs", &refs).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open_rw(&path).unwrap();
+            file.append_vlen_strings("strs", &["s9"]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let got = file.dataset("strs").unwrap().read_vlen_strings().unwrap();
+            let want: Vec<String> = (0..10).map(|i| format!("s{i}")).collect();
+            assert_eq!(got, want);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn vlen_append_after_reopen_filtered_data_block() {
+        // The hardest path: compressed + chunk in a data block + partial
+        // read-modify-write across a reopen.
+        let path = temp_path("vlen_reopen_filt_datablk");
+        let labels: Vec<String> = (0..9).map(|i| format!("item{i:02}")).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.create_appendable_vlen_dataset(
+                "strs",
+                2,
+                Some(crate::format::messages::filter::FilterPipeline::deflate(6)),
+            )
+            .unwrap();
+            let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+            file.append_vlen_strings("strs", &refs).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open_rw(&path).unwrap();
+            file.append_vlen_strings("strs", &["item09"]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let got = file.dataset("strs").unwrap().read_vlen_strings().unwrap();
+            let want: Vec<String> = (0..10).map(|i| format!("item{i:02}")).collect();
+            assert_eq!(got, want);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn group_nx_class_attribute_roundtrip() {
+        // Non-root groups carry attributes (NeXus `NX_class`) in their
+        // own object header, and the reader reads them back by path.
+        let path = temp_path("group_nx_class");
+        {
+            let file = H5File::create(&path).unwrap();
+            let entry = file.create_group("entry").unwrap();
+            entry.set_attr_string("NX_class", "NXentry").unwrap();
+            let det = entry.create_group("detector").unwrap();
+            det.set_attr_string("NX_class", "NXdetector").unwrap();
+            det.set_attr_numeric("frame_count", &7i32).unwrap();
+            det.new_dataset::<f32>()
+                .shape([4])
+                .create("data")
+                .unwrap()
+                .write_raw(&[1.0f32; 4])
+                .unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let entry = file.root_group().group("entry").unwrap();
+            assert_eq!(entry.attr_string("NX_class").unwrap(), "NXentry");
+            let det = entry.group("detector").unwrap();
+            assert_eq!(det.attr_string("NX_class").unwrap(), "NXdetector");
+            let names = det.attr_names().unwrap();
+            assert!(names.contains(&"NX_class".to_string()));
+            assert!(names.contains(&"frame_count".to_string()));
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn fill_value_contiguous_roundtrip() {
+        let path = temp_path("fill_value_contig");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<f32>()
+                .shape([4])
+                .fill_value(2.5f32)
+                .create("data")
+                .unwrap();
+            ds.write_raw(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+            file.close().unwrap();
+        }
+        // open_append decodes the fill-value message back from the header.
+        {
+            let writer = crate::io::writer::Hdf5Writer::open_append(&path).unwrap();
+            let idx = writer.dataset_index("data").unwrap();
+            assert_eq!(
+                writer.datasets[idx].fill_value,
+                Some(2.5f32.to_le_bytes().to_vec())
+            );
+        }
+        // Data still reads back correctly.
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("data").unwrap();
+            assert_eq!(ds.read_raw::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn fill_value_chunked_roundtrip() {
+        let path = temp_path("fill_value_chunked");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0])
+                .chunk(&[4])
+                .max_shape(&[None])
+                .fill_value(-7i32)
+                .create("vals")
+                .unwrap();
+            ds.append(&[1i32, 2, 3, 4]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let writer = crate::io::writer::Hdf5Writer::open_append(&path).unwrap();
+            let idx = writer.dataset_index("vals").unwrap();
+            assert_eq!(
+                writer.datasets[idx].fill_value,
+                Some((-7i32).to_le_bytes().to_vec())
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn fill_value_read_missing_chunks() {
+        // A chunked dataset with chunk 1 left unwritten must read that
+        // gap back as the user-defined fill value, not zero.
+        fn i32_bytes(vals: &[i32]) -> Vec<u8> {
+            vals.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+        let path = temp_path("fill_value_read_missing");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0])
+                .chunk(&[2])
+                .max_shape(&[None])
+                .fill_value(-1i32)
+                .create("vals")
+                .unwrap();
+            // chunk 0 = [10,20]; chunk 1 unwritten; chunk 2 = [50,60].
+            ds.write_chunk(0, &i32_bytes(&[10, 20])).unwrap();
+            ds.write_chunk(2, &i32_bytes(&[50, 60])).unwrap();
+            ds.extend(&[6]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("vals").unwrap();
+            let all = ds.read_raw::<i32>().unwrap();
+            assert_eq!(all, vec![10, 20, -1, -1, 50, 60]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn fill_value_partial_chunk_padded_with_fill() {
+        // A partial trailing chunk flushed at close must pad its unwritten
+        // tail with the fill value. That pad sits beyond the logical shape,
+        // so it is verified by scanning the on-disk chunk bytes directly.
+        let path = temp_path("fill_value_partial_pad");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0])
+                .chunk(&[4])
+                .max_shape(&[None])
+                .fill_value(-9i32)
+                .create("vals")
+                .unwrap();
+            // 3 of 4 frames -> flushed as a partial chunk on close.
+            ds.append(&[1i32, 2, 3]).unwrap();
+            file.close().unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        // Locate the chunk: i32 LE of [1, 2, 3] written contiguously.
+        let needle: Vec<u8> = [1i32, 2, 3].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let pos = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("chunk data [1,2,3] not found in file");
+        let pad = &bytes[pos + needle.len()..pos + needle.len() + 4];
+        assert_eq!(
+            pad,
+            &(-9i32).to_le_bytes(),
+            "partial chunk tail must be padded with fill value -9, got {:?}",
+            pad
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn vlen_append_after_reopen_preserves_existing() {
+        // Reopening and appending into a partially-written vlen chunk must
+        // read-modify-write: the strings already on disk must survive.
+        let path = temp_path("vlen_append_reopen");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.create_appendable_vlen_dataset("strs", 4, None)
+                .unwrap();
+            // 3 of 4 frames -> flushed as a partial chunk on close.
+            file.append_vlen_strings("strs", &["a", "b", "c"]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            // Append a 4th string -> partial-chunk write into chunk 0.
+            let file = H5File::open_rw(&path).unwrap();
+            file.append_vlen_strings("strs", &["d"]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("strs").unwrap();
+            let got = ds.read_vlen_strings().unwrap();
+            assert_eq!(
+                got.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                vec!["a", "b", "c", "d"]
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn fill_value_size_mismatch_errors() {
+        let path = temp_path("fill_value_mismatch");
+        let mut writer = crate::io::writer::Hdf5Writer::create(&path).unwrap();
+        let dt = <f64 as crate::types::H5Type>::hdf5_type();
+        let idx = writer.create_dataset("d", dt, &[4u64]).unwrap();
+        // f64 element size is 8; a 4-byte fill value must be rejected.
+        assert!(writer.set_dataset_fill_value(idx, vec![0u8; 4]).is_err());
+        // The correct width succeeds.
+        writer.set_dataset_fill_value(idx, vec![0u8; 8]).unwrap();
+        writer.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
 }

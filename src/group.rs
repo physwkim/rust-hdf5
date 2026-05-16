@@ -20,6 +20,7 @@
 use crate::dataset::DatasetBuilder;
 use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
+use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::filter::FilterPipeline;
 use crate::types::H5Type;
 
@@ -308,5 +309,87 @@ impl H5Group {
             }
         }
         Ok(groups.into_iter().collect())
+    }
+
+    /// Add (or replace) a string attribute on this group.
+    ///
+    /// This is the standard way to mark a NeXus class, e.g.
+    /// `grp.set_attr_string("NX_class", "NXdetector")`.
+    pub fn set_attr_string(&self, name: &str, value: &str) -> Result<()> {
+        self.add_attr(AttributeMessage::scalar_string(name, value))
+    }
+
+    /// Add (or replace) a numeric scalar attribute on this group.
+    pub fn set_attr_numeric<T: H5Type>(&self, name: &str, value: &T) -> Result<()> {
+        let es = T::element_size();
+        // Safety: `T: H5Type` is a `Copy` numeric primitive whose byte
+        // representation is exactly `element_size()` wide.
+        let raw = unsafe { std::slice::from_raw_parts(value as *const T as *const u8, es) };
+        self.add_attr(AttributeMessage::scalar_numeric(
+            name,
+            T::hdf5_type(),
+            raw.to_vec(),
+        ))
+    }
+
+    /// Route an attribute to the writer: the root group goes to the
+    /// file-level attribute list, any other group to its own header.
+    fn add_attr(&self, attr: AttributeMessage) -> Result<()> {
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                if self.name == "/" {
+                    writer.add_root_attribute(attr);
+                } else {
+                    writer.add_group_attribute(&self.name, attr)?;
+                }
+                Ok(())
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot write attributes in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
+    /// List this group's attribute names (read mode).
+    pub fn attr_names(&self) -> Result<Vec<String>> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => {
+                if self.name == "/" {
+                    Ok(reader.root_attr_names())
+                } else {
+                    Ok(reader.group_attr_names(self.name.trim_start_matches('/')))
+                }
+            }
+            _ => Err(Hdf5Error::InvalidState(
+                "attr_names is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Read one of this group's attributes as a string (read mode).
+    pub fn attr_string(&self, name: &str) -> Result<String> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => {
+                let attr = if self.name == "/" {
+                    reader.root_attr(name)
+                } else {
+                    reader.group_attr(self.name.trim_start_matches('/'), name)
+                }
+                .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?;
+                let end = attr
+                    .data
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(attr.data.len());
+                Ok(String::from_utf8_lossy(&attr.data[..end]).to_string())
+            }
+            _ => Err(Hdf5Error::InvalidState(
+                "attr_string is only available in read mode".into(),
+            )),
+        }
     }
 }
