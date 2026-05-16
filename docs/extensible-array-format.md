@@ -74,7 +74,8 @@ With the default parameters (`data_blk_min_elmts = 16`):
 | 6   | 8        | 128           | 1008        | 14           |
 | …   | …        | …             | …           | …            |
 | 11  | 32       | 1024          | 32752       | —            |
-| 12  | 64       | 2048 (paged)  | 65520       | —            |
+| 12  | 64       | 1024          | 65520       | —            |
+| 13  | 64       | 2048 (paged)  | 131056      | —            |
 
 Data-block sizes in file order are therefore `16, 32, 32, 64, 64, 128, …`.
 
@@ -153,7 +154,7 @@ checksum(4)
 
 rust-hdf5 already matches this.
 
-### EA super block — magic `EASB` (not yet implemented in rust-hdf5)
+### EA super block — magic `EASB`
 
 ```
 "EASB"(4) version(1) client_id(1)
@@ -200,13 +201,14 @@ the value; this is libhdf5's actual behaviour, confirmed against
 
 ## Paging
 
-When `dblk_nelmts(u) > dblk_page_nelmts` (i.e. `u >= 12` for the default
-parameters), data blocks in super block `u` are split into pages of
-`dblk_page_nelmts` elements. The data block then stores only its prefix; the
-elements live in `EA data block page` structures appended after the prefix,
-and the owning super block carries a page-init bitmap. With default parameters
-this only matters past chunk index `~65,520`; non-paged super blocks cover
-everything below that.
+When `dblk_nelmts(u) > dblk_page_nelmts` (i.e. `u >= 13` for the default
+parameters — `dblk_nelmts(12) = 1024` equals the page size and is *not*
+paged, `dblk_nelmts(13) = 2048` is), data blocks in super block `u` are
+split into pages of `dblk_page_nelmts` elements. The data block then stores
+only its prefix; the elements live in `EA data block page` structures
+appended after the prefix, and the owning super block carries a page-init
+bitmap. With default parameters this only matters at chunk index `131,060`
+and beyond; non-paged super blocks cover everything below that.
 
 ## Worked example — `/tmp/ea_ref.h5`
 
@@ -250,9 +252,16 @@ Done:
 6. Layout message version 5 is accepted (it is structurally identical to
    version 4; libhdf5 emits v5 for filtered datasets).
 
-Verified round-trip with h5py 3.16 / libhdf5 2.0.0 in both directions,
-filtered and unfiltered, across super blocks (1500–2000 chunks).
+7. `reader.rs::collect_ea_chunk_entries` reads paged data blocks: when a
+   super block's data blocks exceed the page size, it walks the per-super-
+   block page-init bitmap (one flat MSB-first bitmap indexed by
+   `dblk_idx * npages + page_idx`) and reads the element pages.
 
-Not done — paged data blocks (chunk index `> ~65,520` with default
-parameters): the writer errors clearly rather than emitting an unpaged block
-where libhdf5 expects pages.
+Verified round-trip with h5py 3.16 / libhdf5 2.0.0 in both directions,
+filtered and unfiltered, across super blocks (1500–2000 chunks) and across
+paged data blocks (140,000 chunks).
+
+Not done — *writing* paged data blocks (chunk index `>= 131,060` with
+default parameters): the writer errors clearly rather than emitting an
+unpaged block where libhdf5 expects pages. The reader handles paged data
+blocks (item 7).
