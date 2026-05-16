@@ -30,6 +30,10 @@ pub const BT2_TYPE_CHUNK_UNFILT: u8 = 10;
 /// Record type: filtered chunks (filtered chunked datasets).
 pub const BT2_TYPE_CHUNK_FILT: u8 = 11;
 
+/// Bytes used to encode a filtered chunk's compressed size in a v2 B-tree
+/// record (libhdf5 layout version 5 uses `sizeof_size`).
+pub const BT2_FILT_CHUNK_SIZE_LEN: usize = 8;
+
 /// A chunk record for BT2 type 10 (unfiltered).
 ///
 /// Contains the scaled chunk coordinates and the file address.
@@ -714,10 +718,14 @@ impl Bt2ChunkIndex {
     }
 
     /// Compute the record size in bytes.
+    ///
+    /// Filtered records encode the compressed size in a fixed
+    /// [`BT2_FILT_CHUNK_SIZE_LEN`]-byte field, matching libhdf5's layout
+    /// version 5.
     pub fn record_size(&self, ctx: &FormatContext) -> u16 {
         let sa = ctx.sizeof_addr as usize;
         if self.filtered {
-            (self.ndims * 8 + sa + 4 + 4) as u16
+            (sa + BT2_FILT_CHUNK_SIZE_LEN + 4 + self.ndims * 8) as u16
         } else {
             (self.ndims * 8 + sa) as u16
         }
@@ -732,12 +740,16 @@ impl Bt2ChunkIndex {
 
         if self.filtered {
             for rec in &self.filtered_records {
+                // libhdf5 H5D__bt2_filt_encode: address, chunk size,
+                // filter mask, then the scaled offsets.
+                buf.extend_from_slice(&rec.chunk_address.to_le_bytes()[..sa]);
+                buf.extend_from_slice(
+                    &(rec.chunk_size as u64).to_le_bytes()[..BT2_FILT_CHUNK_SIZE_LEN],
+                );
+                buf.extend_from_slice(&rec.filter_mask.to_le_bytes());
                 for &offset in &rec.scaled_offsets {
                     buf.extend_from_slice(&offset.to_le_bytes());
                 }
-                buf.extend_from_slice(&rec.chunk_address.to_le_bytes()[..sa]);
-                buf.extend_from_slice(&rec.chunk_size.to_le_bytes());
-                buf.extend_from_slice(&rec.filter_mask.to_le_bytes());
             }
         } else {
             for rec in &self.records {
@@ -841,15 +853,27 @@ impl Bt2ChunkIndex {
         Ok(records)
     }
 
-    /// Decode filtered records from a leaf node's raw record data.
+    /// Decode filtered records from a node's raw record data.
+    ///
+    /// `record_size` is the on-disk record width from the B-tree header; the
+    /// compressed-size field width is derived from it (libhdf5 encodes the
+    /// chunk size in `record_size - sizeof_addr - 4 - ndims*8` bytes).
     pub fn decode_filtered_records(
         record_data: &[u8],
         num_records: usize,
         ndims: usize,
+        record_size: u16,
         ctx: &FormatContext,
     ) -> FormatResult<Vec<Bt2FilteredChunkRecord>> {
         let sa = ctx.sizeof_addr as usize;
-        let rec_size = ndims * 8 + sa + 4 + 4;
+        let rec_size = record_size as usize;
+        // chunk-size field width = record - address - filter_mask - offsets.
+        let chunk_size_len = rec_size.checked_sub(sa + 4 + ndims * 8).ok_or_else(|| {
+            FormatError::InvalidData(format!(
+                "filtered v2 B-tree record size {} too small",
+                rec_size
+            ))
+        })?;
         if record_data.len() < num_records * rec_size {
             return Err(FormatError::BufferTooShort {
                 needed: num_records * rec_size,
@@ -860,30 +884,12 @@ impl Bt2ChunkIndex {
         let mut records = Vec::with_capacity(num_records);
         let mut pos = 0;
         for _ in 0..num_records {
-            let mut scaled_offsets = Vec::with_capacity(ndims);
-            for _ in 0..ndims {
-                let offset = u64::from_le_bytes([
-                    record_data[pos],
-                    record_data[pos + 1],
-                    record_data[pos + 2],
-                    record_data[pos + 3],
-                    record_data[pos + 4],
-                    record_data[pos + 5],
-                    record_data[pos + 6],
-                    record_data[pos + 7],
-                ]);
-                scaled_offsets.push(offset);
-                pos += 8;
-            }
+            // libhdf5 H5D__bt2_filt_encode: address, chunk size, filter
+            // mask, then the scaled offsets.
             let chunk_address = read_addr(&record_data[pos..], sa);
             pos += sa;
-            let chunk_size = u32::from_le_bytes([
-                record_data[pos],
-                record_data[pos + 1],
-                record_data[pos + 2],
-                record_data[pos + 3],
-            ]);
-            pos += 4;
+            let chunk_size = read_size(&record_data[pos..], chunk_size_len) as u32;
+            pos += chunk_size_len;
             let filter_mask = u32::from_le_bytes([
                 record_data[pos],
                 record_data[pos + 1],
@@ -891,6 +897,11 @@ impl Bt2ChunkIndex {
                 record_data[pos + 3],
             ]);
             pos += 4;
+            let mut scaled_offsets = Vec::with_capacity(ndims);
+            for _ in 0..ndims {
+                scaled_offsets.push(read_size(&record_data[pos..], 8));
+                pos += 8;
+            }
             records.push(Bt2FilteredChunkRecord {
                 scaled_offsets,
                 chunk_address,
@@ -1178,12 +1189,14 @@ mod tests {
         let hdr = Bt2Header::decode(&hdr_bytes, &ctx).unwrap();
         assert_eq!(hdr.record_type, BT2_TYPE_CHUNK_FILT);
         assert_eq!(hdr.total_num_records, 2);
-        // record_size = 2*8 + 8 + 4 + 4 = 32
-        assert_eq!(hdr.record_size, 32);
+        // record_size = sizeof_addr(8) + chunk_size_len(8) + filter_mask(4)
+        //             + ndims*8(16) = 36
+        assert_eq!(hdr.record_size, 36);
 
         let leaf = Bt2LeafNode::decode(&leaf_bytes, 2, hdr.record_size).unwrap();
         let records =
-            Bt2ChunkIndex::decode_filtered_records(&leaf.record_data, 2, 2, &ctx).unwrap();
+            Bt2ChunkIndex::decode_filtered_records(&leaf.record_data, 2, 2, hdr.record_size, &ctx)
+                .unwrap();
 
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].chunk_address, 0x1000);

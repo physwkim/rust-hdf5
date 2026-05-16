@@ -1022,81 +1022,74 @@ impl Hdf5Reader {
         };
 
         // Decode records
-        let records = if bt2_hdr.record_type == BT2_TYPE_CHUNK_UNFILT {
+        // Compute chunk byte size
+        let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
+
+        // Unify filtered and unfiltered records into (address, read_size,
+        // scaled offsets). read_size is the compressed size for filtered
+        // chunks, the full chunk size otherwise.
+        let entries: Vec<(u64, usize, Vec<u64>)> = if bt2_hdr.record_type == BT2_TYPE_CHUNK_UNFILT {
             Bt2ChunkIndex::decode_unfiltered_records(
                 &record_bytes,
                 total_records,
                 ndims,
                 &self.ctx,
             )?
+            .into_iter()
+            .map(|r| (r.chunk_address, chunk_bytes as usize, r.scaled_offsets))
+            .collect()
         } else {
-            return Err(crate::io::IoError::InvalidState(
-                "filtered B-tree v2 chunk reading not yet supported".into(),
-            ));
+            Bt2ChunkIndex::decode_filtered_records(
+                &record_bytes,
+                total_records,
+                ndims,
+                bt2_hdr.record_size,
+                &self.ctx,
+            )?
+            .into_iter()
+            .map(|r| (r.chunk_address, r.chunk_size as usize, r.scaled_offsets))
+            .collect()
         };
 
-        // Compute chunk byte size
-        let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
-
-        // Total output size
         let total_size: u64 = dims.iter().product::<u64>() * element_size;
         let mut output = tiled_fill(total_size as usize, fill_value.as_deref());
 
-        // Read all chunk raw data sequentially
-        let mut raw_chunks: Vec<(usize, Option<Vec<u8>>)> = Vec::with_capacity(records.len());
-        for (i, rec) in records.iter().enumerate() {
-            if rec.chunk_address == UNDEF_ADDR {
-                raw_chunks.push((i, None));
-            } else if pipeline.is_some() {
-                raw_chunks.push((
-                    i,
-                    Some(
-                        self.handle
-                            .read_at_most(rec.chunk_address, chunk_bytes as usize * 2)?,
-                    ),
-                ));
+        // Read each chunk's raw bytes.
+        let mut raw_chunks: Vec<Option<(Vec<u8>, Vec<u64>)>> = Vec::with_capacity(entries.len());
+        for (addr, read_size, scaled) in &entries {
+            if *addr == UNDEF_ADDR || *read_size == 0 {
+                raw_chunks.push(None);
             } else {
-                raw_chunks.push((
-                    i,
-                    Some(
-                        self.handle
-                            .read_at(rec.chunk_address, chunk_bytes as usize)?,
-                    ),
-                ));
+                let data = self.handle.read_at(*addr, *read_size)?;
+                raw_chunks.push(Some((data, scaled.clone())));
             }
         }
 
-        // Decompress in parallel
-        let decompressed: Vec<(usize, Option<Vec<u8>>)> = if let Some(pl) = pipeline {
+        // Decompress filtered chunks (optionally in parallel).
+        let placed: Vec<Option<(Vec<u8>, Vec<u64>)>> = if let Some(pl) = pipeline {
             #[cfg(feature = "parallel")]
             {
                 use rayon::prelude::*;
                 raw_chunks
                     .into_par_iter()
-                    .map(|(i, raw)| (i, raw.map(|r| filter::reverse_filters(pl, &r).unwrap_or(r))))
+                    .map(|c| c.map(|(r, s)| (filter::reverse_filters(pl, &r).unwrap_or(r), s)))
                     .collect()
             }
             #[cfg(not(feature = "parallel"))]
             {
                 raw_chunks
                     .into_iter()
-                    .map(|(i, raw)| (i, raw.map(|r| filter::reverse_filters(pl, &r).unwrap_or(r))))
+                    .map(|c| c.map(|(r, s)| (filter::reverse_filters(pl, &r).unwrap_or(r), s)))
                     .collect()
             }
         } else {
             raw_chunks
         };
 
-        for (i, chunk_data) in &decompressed {
-            let Some(data) = chunk_data else { continue };
-            self.copy_chunk_to_output(
-                data,
-                &mut output,
-                &dims,
-                chunk_dims,
-                &records[*i].scaled_offsets,
-                element_size,
-            );
+        // Place each chunk N-dimensionally by its scaled (chunk-grid) offsets.
+        for chunk in placed.iter().flatten() {
+            let (data, scaled) = chunk;
+            self.copy_chunk_to_output(data, &mut output, &dims, chunk_dims, scaled, element_size);
         }
 
         Ok(output)
