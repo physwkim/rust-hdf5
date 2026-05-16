@@ -222,11 +222,30 @@ impl<T: H5Type> DatasetBuilder<T> {
                 dims_u64.clone()
             };
 
+            // libhdf5 selects the v2 B-tree chunk index when a dataset has
+            // two or more unlimited dimensions; the extensible array is used
+            // for exactly one.
+            let is_btree2 = max_u64.iter().filter(|&&m| m == u64::MAX).count() >= 2;
+            let wants_filter = self.custom_pipeline.is_some()
+                || self.shuffle_deflate_level.is_some()
+                || self.deflate_level.is_some();
+
             let index = {
                 let mut inner = borrow_inner_mut(&self.file_inner);
                 match &mut *inner {
                     H5FileInner::Writer(writer) => {
-                        let idx = if let Some(pipeline) = self.custom_pipeline {
+                        let idx = if is_btree2 {
+                            if wants_filter {
+                                return Err(Hdf5Error::InvalidState(
+                                    "compression of v2 B-tree (multi-unlimited-dimension) \
+                                     datasets is not yet supported"
+                                        .into(),
+                                ));
+                            }
+                            writer.create_btree_v2_dataset(
+                                &full_name, datatype, &dims_u64, &max_u64, &chunk_u64,
+                            )?
+                        } else if let Some(pipeline) = self.custom_pipeline {
                             writer.create_chunked_dataset_with_pipeline(
                                 &full_name, datatype, &dims_u64, &max_u64, &chunk_u64, pipeline,
                             )?
@@ -276,6 +295,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                     shape,
                     element_size,
                     chunked: true,
+                    btree2: is_btree2,
                 },
             })
         } else {
@@ -313,6 +333,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                     shape,
                     element_size,
                     chunked: false,
+                    btree2: false,
                 },
             })
         }
@@ -335,6 +356,8 @@ enum DatasetInfo {
         element_size: usize,
         /// Whether this is a chunked dataset.
         chunked: bool,
+        /// Whether the chunk index is a v2 B-tree (multiple unlimited dims).
+        btree2: bool,
     },
     /// A dataset opened by name in read mode.
     Reader {
@@ -546,6 +569,7 @@ impl H5Dataset {
                 shape,
                 element_size,
                 chunked,
+                btree2: _,
             } => {
                 if *chunked {
                     return Err(Hdf5Error::InvalidState(
@@ -599,12 +623,27 @@ impl H5Dataset {
     ///
     /// `chunk_idx` is the linear chunk index (typically the frame number for
     /// streaming datasets). `data` is the raw byte data for one chunk.
+    ///
+    /// For datasets with two or more unlimited dimensions (v2 B-tree index),
+    /// use [`write_chunk_at`](Self::write_chunk_at) instead.
     pub fn write_chunk(&self, chunk_idx: usize, data: &[u8]) -> Result<()> {
         match &self.info {
-            DatasetInfo::Writer { index, chunked, .. } => {
+            DatasetInfo::Writer {
+                index,
+                chunked,
+                btree2,
+                ..
+            } => {
                 if !*chunked {
                     return Err(Hdf5Error::InvalidState(
                         "write_chunk is only for chunked datasets".into(),
+                    ));
+                }
+                if *btree2 {
+                    return Err(Hdf5Error::InvalidState(
+                        "this dataset uses a v2 B-tree chunk index; use write_chunk_at \
+                         with the chunk's grid coordinates"
+                            .into(),
                     ));
                 }
 
@@ -612,6 +651,72 @@ impl H5Dataset {
                 match &mut *inner {
                     H5FileInner::Writer(writer) => {
                         writer.write_chunk(*index, chunk_idx as u64, data)?;
+                        Ok(())
+                    }
+                    _ => Err(Hdf5Error::InvalidState(
+                        "file is no longer in write mode".into(),
+                    )),
+                }
+            }
+            DatasetInfo::Reader { .. } => {
+                Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
+            }
+        }
+    }
+
+    /// Write a single chunk to a v2-B-tree-indexed dataset, addressed by its
+    /// chunk-grid coordinates (one per dimension).
+    ///
+    /// This is the entry point for datasets with two or more unlimited
+    /// dimensions. The dataset's logical dimensions are extended to cover
+    /// the written chunk. `data` is the raw bytes of one full chunk.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("bt2.h5").unwrap();
+    /// let ds = file.new_dataset::<i32>()
+    ///     .shape(&[0, 0])
+    ///     .chunk(&[2, 2])
+    ///     .max_shape(&[None, None])
+    ///     .create("grid")
+    ///     .unwrap();
+    /// let chunk = [0i32, 1, 2, 3];
+    /// let bytes: Vec<u8> = chunk.iter().flat_map(|v| v.to_le_bytes()).collect();
+    /// ds.write_chunk_at(&[0, 0], &bytes).unwrap();
+    /// ```
+    pub fn write_chunk_at(&self, chunk_coords: &[usize], data: &[u8]) -> Result<()> {
+        match &self.info {
+            DatasetInfo::Writer { index, btree2, .. } => {
+                if !*btree2 {
+                    return Err(Hdf5Error::InvalidState(
+                        "write_chunk_at is for v2 B-tree (multi-unlimited-dimension) \
+                         datasets; use write_chunk or append"
+                            .into(),
+                    ));
+                }
+                let coords: Vec<u64> = chunk_coords.iter().map(|&c| c as u64).collect();
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Writer(writer) => {
+                        writer.write_chunk_btree_v2(*index, &coords, data)?;
+                        // Grow the logical dimensions to cover this chunk.
+                        let chunk_dims = writer
+                            .dataset_chunk_dims(*index)
+                            .ok_or_else(|| {
+                                Hdf5Error::InvalidState("dataset has no chunk info".into())
+                            })?
+                            .to_vec();
+                        let dims = writer.dataset_dims(*index).to_vec();
+                        let mut new_dims = dims.clone();
+                        for (d, nd) in new_dims.iter_mut().enumerate() {
+                            let needed = (coords[d] + 1) * chunk_dims[d];
+                            if needed > *nd {
+                                *nd = needed;
+                            }
+                        }
+                        if new_dims != dims {
+                            writer.extend_dataset(*index, &new_dims)?;
+                        }
                         Ok(())
                     }
                     _ => Err(Hdf5Error::InvalidState(
@@ -1864,6 +1969,45 @@ mod tests {
             let v = file.dataset("v").unwrap().read_raw::<i32>().unwrap();
             assert_eq!(v.len(), 900);
             assert!(v.iter().enumerate().all(|(i, &x)| x == i as i32));
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn btree_v2_multi_unlimited_roundtrip() {
+        // A dataset with two unlimited dimensions uses the v2 B-tree chunk
+        // index; chunks are written by grid coordinates with write_chunk_at.
+        let path = temp_path("bt2_multi");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0, 0])
+                .chunk(&[2, 2])
+                .max_shape(&[None, None])
+                .create("grid")
+                .unwrap();
+            assert!(ds.is_chunked());
+            // 4x4 logical grid, value[r][c] = r*4 + c, in 2x2 chunks.
+            for cr in 0..2usize {
+                for cc in 0..2usize {
+                    let mut bytes = Vec::new();
+                    for i in 0..2usize {
+                        for j in 0..2usize {
+                            let v = ((cr * 2 + i) * 4 + (cc * 2 + j)) as i32;
+                            bytes.extend_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                    ds.write_chunk_at(&[cr, cc], &bytes).unwrap();
+                }
+            }
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("grid").unwrap();
+            assert_eq!(ds.shape(), vec![4, 4]);
+            assert_eq!(ds.read_raw::<i32>().unwrap(), (0..16).collect::<Vec<i32>>());
         }
         std::fs::remove_file(&path).ok();
     }
