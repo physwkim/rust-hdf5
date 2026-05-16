@@ -1334,7 +1334,13 @@ impl Hdf5Reader {
         let total_size: u64 = dims.iter().product::<u64>() * element_size;
         let mut output = tiled_fill(total_size as usize, fill_value.as_deref());
 
-        // Compute number of chunks per dimension
+        // Compute number of chunks per dimension. A zero chunk dimension
+        // from a malformed layout message would divide by zero.
+        if chunk_dims.contains(&0) {
+            return Err(crate::io::IoError::InvalidState(
+                "fixed-array layout has a zero chunk dimension".into(),
+            ));
+        }
         let chunks_per_dim: Vec<u64> = (0..ndims)
             .map(|d| dims[d].div_ceil(chunk_dims[d]))
             .collect();

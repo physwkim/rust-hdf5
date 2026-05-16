@@ -38,15 +38,9 @@ const FILTER_SZIP: u16 = 4;
 const FILTER_NBIT: u16 = 5;
 const FILTER_SCALEOFFSET: u16 = 6;
 
-/// SZIP cross-decode against libhdf5's own reference file.
-///
-/// IGNORED: the crate's `szip.rs` AEC codec is internally self-consistent
-/// (crate-compress -> crate-decompress round-trips) but its bitstream is
-/// NOT byte-compatible with libaec/libhdf5 — encoding the same input yields
-/// a different compressed stream, so it cannot decode libhdf5-written SZIP
-/// chunks. The 4-byte length-header framing fixed in this change is correct
-/// and exercised by `szip` round-trip tests; the remaining gap is the AEC
-/// codec itself, which is tracked as a separate defect.
+/// SZIP cross-decode against libhdf5's own reference file: the crate's AEC
+/// codec is byte-compatible with libaec/libhdf5, so it decodes a real
+/// libhdf5-written SZIP chunk exactly.
 #[test]
 fn szip_libhdf5_chunk() {
     // First chunk (rows 0..20, cols 0..10) of `dset_szip` in libhdf5's own

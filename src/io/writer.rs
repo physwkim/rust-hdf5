@@ -2112,11 +2112,28 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
     ) -> IoResult<usize> {
         self.ensure_unique_dataset_name(name)?;
-        // Compute total number of chunks
+        // Compute total number of chunks. `chunk_dims` is caller-supplied;
+        // validate it before any indexing or division.
         let ndims = dims.len();
+        if chunk_dims.len() != ndims {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "chunk shape has {} dimensions but the dataspace has {}",
+                chunk_dims.len(),
+                ndims
+            )));
+        }
         let mut num_chunks: u64 = 1;
         for d in 0..ndims {
-            num_chunks *= dims[d].div_ceil(chunk_dims[d]);
+            if chunk_dims[d] == 0 {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "chunk dimension {d} is zero"
+                )));
+            }
+            num_chunks = num_chunks
+                .checked_mul(dims[d].div_ceil(chunk_dims[d]))
+                .ok_or_else(|| {
+                    crate::io::IoError::InvalidState("chunk count overflows u64".into())
+                })?;
         }
 
         // Create FA header
@@ -2479,6 +2496,13 @@ impl Hdf5Writer {
         let dims = &ds.dataspace.dims;
         let chunk_dims = &fa.chunk_dims;
         let ndims = dims.len();
+        if chunk_coords.len() != ndims {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "chunk_coords has {} entries but the dataset has {} dimensions",
+                chunk_coords.len(),
+                ndims
+            )));
+        }
         let mut linear_idx: u64 = 0;
         let mut stride: u64 = 1;
         for d in (0..ndims).rev() {

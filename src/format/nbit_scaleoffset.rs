@@ -335,6 +335,20 @@ fn read_atomic(parms: &[u32], idx: &mut usize) -> FormatResult<NbitAtomic> {
         offset: parms[*idx + 3],
     };
     *idx += 4;
+    // Validate every atomic (top-level, array member, compound member) so
+    // the bit math below cannot overflow or panic on a crafted file.
+    let bits = p.size.checked_mul(8);
+    let span = p.precision.checked_add(p.offset);
+    match (bits, span) {
+        (Some(bits), Some(span))
+            if p.size > 0 && p.precision > 0 && p.precision <= bits && span <= bits => {}
+        _ => {
+            return Err(FormatError::InvalidData(format!(
+                "nbit: invalid atomic datatype (size={}, precision={}, offset={})",
+                p.size, p.precision, p.offset
+            )));
+        }
+    }
     Ok(p)
 }
 

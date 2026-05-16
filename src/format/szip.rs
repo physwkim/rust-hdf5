@@ -970,8 +970,16 @@ impl Decoder {
                             zero_blocks -= 1;
                         }
 
-                        let zero_samples = zero_blocks as usize * self.block_size as usize
-                            - if has_ref { 1 } else { 0 };
+                        // `fs` (hence `zero_blocks`) is bitstream-derived; a
+                        // corrupt run of zero bits could ask for a huge
+                        // expansion. Clamp to what remains in the RSI so a
+                        // bad stream cannot drive an unbounded allocation.
+                        let zero_samples = (zero_blocks as usize * self.block_size as usize)
+                            .saturating_sub(if has_ref { 1 } else { 0 })
+                            .min(
+                                (self.rsi as usize * self.block_size as usize)
+                                    .saturating_sub(rsi_buf.len()),
+                            );
                         rsi_buf.extend(std::iter::repeat_n(0, zero_samples));
                     }
                 } else if id == (1u32 << self.id_len) - 1 {
