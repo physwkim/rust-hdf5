@@ -6,6 +6,7 @@
 //! 3. Update dataset object header (new dataspace dims) -> fsync
 //! 4. Update superblock (new EOF) -> fsync
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::format::messages::datatype::DatatypeMessage;
@@ -14,6 +15,22 @@ use crate::format::superblock::{FLAG_SWMR_WRITE, FLAG_WRITE_ACCESS};
 use crate::io::writer::Hdf5Writer;
 use crate::io::IoResult;
 
+/// Per-dataset accumulation state for a streaming dataset whose chunks span
+/// more than one frame (`chunk[0] > 1`, i.e. NDFileHDF5 `nFramesChunks`).
+/// `append_frame` buffers whole frames here until a chunk band is full.
+struct BandBuffer {
+    /// Frames per chunk along the frame axis, `chunk[0]`.
+    frames_per_chunk: u64,
+    /// Per-frame (spatial) dimensions.
+    frame_dims: Vec<u64>,
+    /// Per-frame tile dimensions, `chunk[1..]`.
+    tile_dims: Vec<u64>,
+    /// Element size in bytes.
+    elem_size: usize,
+    /// Whole frames accumulated for the current (not-yet-full) band.
+    frames: Vec<Vec<u8>>,
+}
+
 /// SWMR writer wrapping an Hdf5Writer.
 ///
 /// After calling `start_swmr()`, each `append_frame()` writes a chunk and
@@ -21,6 +38,9 @@ use crate::io::IoResult;
 pub struct SwmrWriter {
     writer: Hdf5Writer,
     swmr_active: bool,
+    /// Band buffers keyed by dataset index, for streaming datasets created
+    /// with `chunk[0] > 1`.
+    band_buffers: HashMap<usize, BandBuffer>,
 }
 
 impl SwmrWriter {
@@ -31,6 +51,7 @@ impl SwmrWriter {
         Ok(Self {
             writer,
             swmr_active: false,
+            band_buffers: HashMap::new(),
         })
     }
 
@@ -46,6 +67,7 @@ impl SwmrWriter {
         Ok(Self {
             writer,
             swmr_active: false,
+            band_buffers: HashMap::new(),
         })
     }
 
@@ -161,6 +183,90 @@ impl SwmrWriter {
         )
     }
 
+    /// Create a streaming dataset with full control over the chunk shape,
+    /// including the frame axis.
+    ///
+    /// `chunk` is the complete per-chunk shape, of rank
+    /// `frame_dims.len() + 1`: `chunk[0]` is the number of frames per chunk
+    /// (the NDFileHDF5 `nFramesChunks` control) and `chunk[1..]` is the
+    /// per-frame tile shape (`nRowChunks` / `nColChunks`). When
+    /// `chunk[0] > 1`, [`append_frame`](Self::append_frame) buffers whole
+    /// frames until a chunk band fills; the final partial band is written
+    /// (zero-padded) at [`close`](Self::close). The dataset's logical frame
+    /// count always tracks the exact number of frames appended, so a
+    /// partial last chunk does not over-extend it.
+    pub fn create_streaming_dataset_chunked(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        frame_dims: &[u64],
+        chunk: &[u64],
+    ) -> IoResult<usize> {
+        self.create_streaming_dataset_chunked_inner(name, datatype, frame_dims, chunk, None)
+    }
+
+    /// Compressed variant of [`create_streaming_dataset_chunked`]; each
+    /// chunk is filtered independently through `pipeline`.
+    ///
+    /// [`create_streaming_dataset_chunked`]: Self::create_streaming_dataset_chunked
+    pub fn create_streaming_dataset_chunked_compressed(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        frame_dims: &[u64],
+        chunk: &[u64],
+        pipeline: crate::format::messages::filter::FilterPipeline,
+    ) -> IoResult<usize> {
+        self.create_streaming_dataset_chunked_inner(
+            name,
+            datatype,
+            frame_dims,
+            chunk,
+            Some(pipeline),
+        )
+    }
+
+    fn create_streaming_dataset_chunked_inner(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        frame_dims: &[u64],
+        chunk: &[u64],
+        pipeline: Option<crate::format::messages::filter::FilterPipeline>,
+    ) -> IoResult<usize> {
+        validate_streaming_chunk(frame_dims, chunk)?;
+        let elem_size = datatype.element_size() as usize;
+        let mut dims = vec![0u64];
+        dims.extend_from_slice(frame_dims);
+        let mut max_dims = vec![u64::MAX];
+        max_dims.extend_from_slice(frame_dims);
+
+        let idx = match pipeline {
+            Some(p) => self
+                .writer
+                .create_chunked_dataset_with_pipeline(name, datatype, &dims, &max_dims, chunk, p)?,
+            None => self
+                .writer
+                .create_chunked_dataset(name, datatype, &dims, &max_dims, chunk)?,
+        };
+
+        // A chunk that spans more than one frame needs frame buffering in
+        // `append_frame`; a single-frame chunk is written immediately.
+        if chunk[0] > 1 {
+            self.band_buffers.insert(
+                idx,
+                BandBuffer {
+                    frames_per_chunk: chunk[0],
+                    frame_dims: frame_dims.to_vec(),
+                    tile_dims: chunk[1..].to_vec(),
+                    elem_size,
+                    frames: Vec::new(),
+                },
+            );
+        }
+        Ok(idx)
+    }
+
     /// Set the SWMR flag in the superblock.
     ///
     /// This performs a full finalize: writes all dataset object headers, the
@@ -187,9 +293,18 @@ impl SwmrWriter {
     /// (created via [`create_streaming_dataset_tiled`]) the frame buffer is
     /// split into its chunk tiles, each written as a separate chunk; for a
     /// one-chunk-per-frame dataset the frame is written as a single chunk.
+    /// For a dataset created with `chunk[0] > 1` (via
+    /// [`create_streaming_dataset_chunked`]) the frame is buffered until a
+    /// chunk band fills.
     ///
     /// [`create_streaming_dataset_tiled`]: Self::create_streaming_dataset_tiled
+    /// [`create_streaming_dataset_chunked`]: Self::create_streaming_dataset_chunked
     pub fn append_frame(&mut self, ds_index: usize, data: &[u8]) -> IoResult<()> {
+        // Multi-frame-chunk datasets buffer whole frames per chunk band.
+        if self.band_buffers.contains_key(&ds_index) {
+            return self.append_frame_banded(ds_index, data);
+        }
+
         // Current frame count (dim 0).
         let frame_idx = self.writer.datasets[ds_index].dataspace.dims[0];
 
@@ -244,6 +359,104 @@ impl SwmrWriter {
         Ok(())
     }
 
+    /// `append_frame` for a dataset whose chunk spans `chunk[0] > 1` frames:
+    /// buffer the frame, grow the logical extent by exactly one, and write
+    /// the band's chunks once `frames_per_chunk` frames have accumulated.
+    fn append_frame_banded(&mut self, ds_index: usize, data: &[u8]) -> IoResult<()> {
+        let (frame_bytes, frames_per_chunk) = {
+            let bb = &self.band_buffers[&ds_index];
+            let elems: u64 = bb.frame_dims.iter().product();
+            (elems as usize * bb.elem_size, bb.frames_per_chunk)
+        };
+        if data.len() != frame_bytes {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "append_frame: data is {} bytes, expected {frame_bytes} for one frame",
+                data.len()
+            )));
+        }
+
+        self.band_buffers
+            .get_mut(&ds_index)
+            .expect("band buffer present")
+            .frames
+            .push(data.to_vec());
+
+        // The logical frame count tracks the exact number appended.
+        let frame_idx = self.writer.datasets[ds_index].dataspace.dims[0];
+        let mut new_dims = self.writer.datasets[ds_index].dataspace.dims.clone();
+        new_dims[0] = frame_idx + 1;
+        self.writer.extend_dataset(ds_index, &new_dims)?;
+
+        // A full band is written immediately.
+        if self.band_buffers[&ds_index].frames.len() as u64 == frames_per_chunk {
+            self.write_band(ds_index)?;
+        }
+        Ok(())
+    }
+
+    /// Assemble and write every chunk of the currently buffered band of a
+    /// multi-frame-chunk dataset, then clear the buffer. A band shorter than
+    /// `frames_per_chunk` (the final band at close) yields zero-padded
+    /// chunks; the dataset's logical extent is not changed.
+    fn write_band(&mut self, ds_index: usize) -> IoResult<()> {
+        let (frames, n, frame_dims, tile_dims, elem_size) = {
+            let bb = self
+                .band_buffers
+                .get_mut(&ds_index)
+                .expect("band buffer present");
+            if bb.frames.is_empty() {
+                return Ok(());
+            }
+            (
+                std::mem::take(&mut bb.frames),
+                bb.frames_per_chunk,
+                bb.frame_dims.clone(),
+                bb.tile_dims.clone(),
+                bb.elem_size,
+            )
+        };
+
+        let count = frames.len() as u64;
+        // Band index: the logical extent already counts every appended
+        // frame, so the band starts at `dim0 - count`.
+        let dim0 = self.writer.datasets[ds_index].dataspace.dims[0];
+        let band = (dim0 - count) / n;
+
+        let k = frame_dims.len();
+        let grid: Vec<u64> = (0..k)
+            .map(|d| frame_dims[d].div_ceil(tile_dims[d]))
+            .collect();
+        let cells: u64 = grid.iter().product();
+        let tile_bytes = tile_dims.iter().product::<u64>() as usize * elem_size;
+
+        // Split each frame into its tiles once (row-major cell order).
+        let per_frame_tiles: Vec<Vec<Vec<u8>>> = frames
+            .iter()
+            .map(|f| split_frame_into_tiles(f, &frame_dims, &tile_dims, elem_size))
+            .collect();
+
+        // For each tile-grid cell, assemble the [n, tile...] chunk: frame
+        // `s` occupies frame-slot `s`; slots `count..n` stay zero-padded.
+        for cell in 0..cells as usize {
+            let mut chunk = vec![0u8; n as usize * tile_bytes];
+            for (s, frame_tiles) in per_frame_tiles.iter().enumerate() {
+                chunk[s * tile_bytes..(s + 1) * tile_bytes].copy_from_slice(&frame_tiles[cell]);
+            }
+            let linear = band * cells + cell as u64;
+            self.writer.write_chunk(ds_index, linear, &chunk)?;
+        }
+        Ok(())
+    }
+
+    /// Write the final partial band of every multi-frame-chunk dataset.
+    fn flush_band_buffers(&mut self) -> IoResult<()> {
+        let indices: Vec<usize> = self.band_buffers.keys().copied().collect();
+        for ds_index in indices {
+            self.write_band(ds_index)?;
+        }
+        Ok(())
+    }
+
     /// Flush with ordered semantics for SWMR safety.
     ///
     /// Performs ordered fsyncs:
@@ -283,9 +496,36 @@ impl SwmrWriter {
     }
 
     /// Close and finalize the file.
-    pub fn close(self) -> IoResult<()> {
+    ///
+    /// Any partially filled multi-frame chunk band is written (zero-padded)
+    /// before the file is finalized.
+    pub fn close(mut self) -> IoResult<()> {
+        self.flush_band_buffers()?;
         self.writer.close()
     }
+}
+
+/// Reject a streaming chunk shape that does not have rank
+/// `frame_dims.len() + 1`, or that (with `frame_dims`) has a zero dimension.
+fn validate_streaming_chunk(frame_dims: &[u64], chunk: &[u64]) -> IoResult<()> {
+    if chunk.len() != frame_dims.len() + 1 {
+        return Err(crate::io::IoError::InvalidState(format!(
+            "chunk rank {} must be the frame rank + 1 ({})",
+            chunk.len(),
+            frame_dims.len() + 1
+        )));
+    }
+    if chunk.contains(&0) {
+        return Err(crate::io::IoError::InvalidState(
+            "chunk dimensions must be non-zero".into(),
+        ));
+    }
+    if frame_dims.contains(&0) {
+        return Err(crate::io::IoError::InvalidState(
+            "frame_dims dimensions must be non-zero".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Reject a `frame_chunk` whose rank does not match `frame_dims`, or that

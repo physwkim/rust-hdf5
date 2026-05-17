@@ -1104,6 +1104,37 @@ impl H5Dataset {
         }
     }
 
+    /// Set the logical extent of a chunked dataset, growing **or
+    /// shrinking** any dimension.
+    ///
+    /// Unlike [`extend`](Self::extend), which only grows, this can reduce a
+    /// dimension — for example to correct an over-extended frame count
+    /// after writing a partial multi-frame chunk. Shrinking changes the
+    /// logical dataspace only: data in chunks beyond the new extent stays
+    /// in the file but is no longer visible on read, exactly as libhdf5's
+    /// `H5Dset_extent` behaves. The new extent must not exceed the
+    /// dataset's maximum dimensions.
+    pub fn set_extent(&self, new_dims: &[usize]) -> Result<()> {
+        match &self.info {
+            DatasetInfo::Writer { index, .. } => {
+                let dims_u64: Vec<u64> = new_dims.iter().map(|&d| d as u64).collect();
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Writer(writer) => {
+                        writer.set_dataset_extent(*index, &dims_u64)?;
+                        Ok(())
+                    }
+                    _ => Err(Hdf5Error::InvalidState(
+                        "file is no longer in write mode".into(),
+                    )),
+                }
+            }
+            DatasetInfo::Reader { .. } => Err(Hdf5Error::InvalidState(
+                "cannot set extent in read mode".into(),
+            )),
+        }
+    }
+
     /// Flush a chunked dataset's index structures to disk.
     pub fn flush(&self) -> Result<()> {
         match &self.info {

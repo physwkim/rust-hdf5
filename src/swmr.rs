@@ -141,6 +141,49 @@ impl SwmrFileWriter {
         Ok(idx)
     }
 
+    /// Create a streaming dataset with full control over the chunk shape,
+    /// including the frame axis.
+    ///
+    /// `chunk` is the complete per-chunk shape, of rank
+    /// `frame_dims.len() + 1`: `chunk[0]` frames per chunk (the NDFileHDF5
+    /// `nFramesChunks` control) and `chunk[1..]` the per-frame tile shape
+    /// (`nRowChunks` / `nColChunks`). When `chunk[0] > 1`,
+    /// [`append_frame`](Self::append_frame) buffers whole frames until a
+    /// chunk band fills; the final partial band is written (zero-padded) at
+    /// [`close`](Self::close), and the dataset's logical frame count always
+    /// equals the exact number of frames appended.
+    pub fn create_streaming_dataset_chunked<T: H5Type>(
+        &mut self,
+        name: &str,
+        frame_dims: &[u64],
+        chunk: &[u64],
+    ) -> Result<usize> {
+        let idx =
+            self.inner
+                .create_streaming_dataset_chunked(name, T::hdf5_type(), frame_dims, chunk)?;
+        Ok(idx)
+    }
+
+    /// Compressed variant of
+    /// [`create_streaming_dataset_chunked`](Self::create_streaming_dataset_chunked);
+    /// each chunk is filtered independently through `pipeline`.
+    pub fn create_streaming_dataset_chunked_compressed<T: H5Type>(
+        &mut self,
+        name: &str,
+        frame_dims: &[u64],
+        chunk: &[u64],
+        pipeline: crate::format::messages::filter::FilterPipeline,
+    ) -> Result<usize> {
+        let idx = self.inner.create_streaming_dataset_chunked_compressed(
+            name,
+            T::hdf5_type(),
+            frame_dims,
+            chunk,
+            pipeline,
+        )?;
+        Ok(idx)
+    }
+
     /// Signal the start of SWMR mode.
     pub fn start_swmr(&mut self) -> Result<()> {
         self.inner.start_swmr()?;

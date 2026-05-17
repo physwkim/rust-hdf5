@@ -3108,6 +3108,52 @@ impl Hdf5Writer {
         Ok(())
     }
 
+    /// Set the logical extent of a chunked dataset, growing **or shrinking**
+    /// any dimension (unlike [`extend_dataset`](Self::extend_dataset), which
+    /// only grows).
+    ///
+    /// Shrinking sets the logical dataspace only: chunks (or parts of
+    /// chunks) beyond the new extent stay in the file but are no longer
+    /// visible on read, exactly as libhdf5's `H5Dset_extent` behaves. This
+    /// is how a partial multi-frame chunk's over-extended frame count is
+    /// corrected back to the true number of frames written.
+    pub fn set_dataset_extent(&mut self, index: usize, new_dims: &[u64]) -> IoResult<()> {
+        let ds = &mut self.datasets[index];
+        if ds.chunked.is_none() && ds.fixed_array.is_none() && ds.btree_v2.is_none() {
+            return Err(crate::io::IoError::InvalidState(
+                "can only set the extent of chunked datasets".into(),
+            ));
+        }
+        if new_dims.len() != ds.dataspace.dims.len() {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "set_extent rank mismatch: dataset has {} dimensions, got {}",
+                ds.dataspace.dims.len(),
+                new_dims.len()
+            )));
+        }
+        // A pending append buffer is positioned relative to the current
+        // logical size; changing the extent underneath it would make
+        // `flush_append_buffers` write the chunk at the wrong index.
+        if ds.append_buffered_frames > 0 {
+            return Err(crate::io::IoError::InvalidState(
+                "set_extent cannot run while the dataset has buffered appends; \
+                 flush them first"
+                    .into(),
+            ));
+        }
+        if let Some(ref max) = ds.dataspace.max_dims {
+            for (d, (&new, &m)) in new_dims.iter().zip(max).enumerate() {
+                if new > m {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "set_extent dimension {d} ({new}) exceeds the maximum {m}"
+                    )));
+                }
+            }
+        }
+        ds.dataspace.dims = new_dims.to_vec();
+        Ok(())
+    }
+
     /// Flush a chunked dataset's index structures to disk.
     pub fn flush_dataset(&mut self, index: usize) -> IoResult<()> {
         let ds = &self.datasets[index];
@@ -4450,6 +4496,103 @@ mod tests {
         for frame in 0..2u16 {
             for i in 0..9usize {
                 assert_eq!(values[frame as usize * 9 + i], frame * 10 + i as u16);
+            }
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn swmr_writer_multi_frame_chunks() {
+        use crate::io::swmr::SwmrWriter;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rust_hdf5_swmr_mfc_{}_{}.h5",
+            std::process::id(),
+            n
+        ));
+
+        // 3x3 frames, chunk = 4 frames x full frame. 10 frames -> 3 bands
+        // of 4, 4, 2 (the last band partial).
+        let mut swmr = SwmrWriter::create(&path).unwrap();
+        let idx = swmr
+            .create_streaming_dataset_chunked(
+                "det",
+                DatatypeMessage::u16_type(),
+                &[3, 3],
+                &[4, 3, 3],
+            )
+            .unwrap();
+        swmr.start_swmr().unwrap();
+        for frame in 0..10u16 {
+            let data: Vec<u16> = (0..9).map(|i| frame * 100 + i).collect();
+            let raw: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            swmr.append_frame(idx, &raw).unwrap();
+        }
+        swmr.flush().unwrap();
+        swmr.close().unwrap();
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        // The partial last band must not over-extend the frame count.
+        assert_eq!(reader.dataset_shape("det").unwrap(), vec![10, 3, 3]);
+        let raw = reader.read_dataset_raw("det").unwrap();
+        let values: Vec<u16> = raw
+            .chunks(2)
+            .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values.len(), 90);
+        for frame in 0..10u16 {
+            for i in 0..9usize {
+                assert_eq!(values[frame as usize * 9 + i], frame * 100 + i as u16);
+            }
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn swmr_writer_multi_frame_tiled_chunks() {
+        use crate::io::swmr::SwmrWriter;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rust_hdf5_swmr_mftc_{}_{}.h5",
+            std::process::id(),
+            n
+        ));
+
+        // 4x4 frames, chunk = 2 frames x 2x2 tiles. 5 frames -> bands of
+        // 2, 2, 1; every frame is also split into a 2x2 tile grid.
+        let mut swmr = SwmrWriter::create(&path).unwrap();
+        let idx = swmr
+            .create_streaming_dataset_chunked(
+                "det",
+                DatatypeMessage::u16_type(),
+                &[4, 4],
+                &[2, 2, 2],
+            )
+            .unwrap();
+        swmr.start_swmr().unwrap();
+        for frame in 0..5u16 {
+            let data: Vec<u16> = (0..16).map(|i| frame * 100 + i).collect();
+            let raw: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            swmr.append_frame(idx, &raw).unwrap();
+        }
+        swmr.flush().unwrap();
+        swmr.close().unwrap();
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        assert_eq!(reader.dataset_shape("det").unwrap(), vec![5, 4, 4]);
+        let raw = reader.read_dataset_raw("det").unwrap();
+        let values: Vec<u16> = raw
+            .chunks(2)
+            .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values.len(), 80);
+        for frame in 0..5u16 {
+            for i in 0..16usize {
+                assert_eq!(values[frame as usize * 16 + i], frame * 100 + i as u16);
             }
         }
         std::fs::remove_file(&path).ok();

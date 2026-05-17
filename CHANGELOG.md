@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.15
+
+### Added
+
+- `H5Dataset::set_extent(&[dims])` — set the logical extent of a chunked
+  dataset, growing **or shrinking** any dimension. Unlike `extend`
+  (grow-only), this can reduce a dimension — for example to correct an
+  over-extended frame count after a partial multi-frame chunk. Shrinking
+  changes the logical dataspace only: data in chunks beyond the new
+  extent stays in the file but is no longer visible on read, as with
+  libhdf5's `H5Dset_extent`.
+- `SwmrFileWriter::create_streaming_dataset_chunked` and
+  `create_streaming_dataset_chunked_compressed` — streaming datasets
+  with full control over the chunk shape, including the frame axis.
+  `chunk[0]` sets the number of frames per chunk (the NDFileHDF5
+  `nFramesChunks` control); `chunk[1..]` sets the per-frame tile shape
+  (`nRowChunks` / `nColChunks`). `append_frame` buffers whole frames
+  until a chunk band fills and writes the final partial band
+  zero-padded at `close`; the dataset's logical frame count always
+  equals the exact number of frames appended, so a partial last chunk
+  never over-extends it.
+
 ## 0.2.14
 
 ### Added
