@@ -184,6 +184,38 @@ impl SwmrFileWriter {
         Ok(idx)
     }
 
+    /// Create a hard link: an additional name for a dataset or group that
+    /// already exists in the file.
+    ///
+    /// No data is copied — the link and its target share one object header,
+    /// exactly as `h5py` / libhdf5 hard links do. This is the NeXus-style way
+    /// to expose a streaming dataset at an aliased path.
+    ///
+    /// * `parent_group_path` — full path of the group that will hold the
+    ///   link (`"/"` for the root group).
+    /// * `link_name` — leaf name of the new link within that group.
+    /// * `target_path` — full path of an existing dataset or group.
+    ///
+    /// # Visibility relative to SWMR mode
+    ///
+    /// A link created **before** [`start_swmr`](Self::start_swmr) is committed
+    /// by `start_swmr` and is visible to SWMR readers for the whole streaming
+    /// window. A link created **after** `start_swmr` is committed only by
+    /// [`close`](Self::close); it does not appear to readers that attach
+    /// during the live SWMR window. Create layout links before `start_swmr`
+    /// when readers must resolve them while streaming.
+    pub fn create_hard_link(
+        &mut self,
+        parent_group_path: &str,
+        link_name: &str,
+        target_path: &str,
+    ) -> Result<()> {
+        self.inner
+            .writer_mut()
+            .create_hard_link(parent_group_path, link_name, target_path)?;
+        Ok(())
+    }
+
     /// Signal the start of SWMR mode.
     pub fn start_swmr(&mut self) -> Result<()> {
         self.inner.start_swmr()?;

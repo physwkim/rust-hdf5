@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.16
+
+### Added
+
+- `SwmrFileWriter::create_hard_link(parent_group_path, link_name,
+  target_path)` — create a hard link in a SWMR file through the public
+  API. A link created **before** `start_swmr` is committed by
+  `start_swmr` and is visible to SWMR readers for the whole streaming
+  window; a link created **after** `start_swmr` is committed by `close`
+  and is not visible during the live SWMR window.
+
+### Fixed
+
+- Closing a SWMR file now commits structural changes made after
+  `start_swmr` (such as a hard link) via a full re-finalize of all
+  object headers. Previously the SWMR close path only rewrote dataset
+  headers in place: creating a hard link after `start_swmr` grew its
+  target's object header past the in-place slot, so `close` failed with
+  `dataset header grew ... cannot rewrite in place` and left the file
+  marked SWMR-dirty (the clean-close superblock was never written).
+
 ## 0.2.15
 
 ### Added

@@ -183,6 +183,36 @@ fn dataset_rejects_name_taken_by_hard_link() {
     cleanup(&path);
 }
 
+/// A hard link can be created through the public SWMR writer API. Created
+/// before `start_swmr`, it is committed with the streaming layout and
+/// resolves to the target's data after close.
+#[test]
+fn swmr_writer_creates_hard_link() {
+    use rust_hdf5::swmr::{SwmrFileReader, SwmrFileWriter};
+
+    let path = unique_tmp("hl_swmr");
+    {
+        let mut w = SwmrFileWriter::create(&path).unwrap();
+        let ds = w.create_streaming_dataset::<u8>("frames", &[2, 2]).unwrap();
+        // Layout alias created before start_swmr -> visible for the whole run.
+        w.create_hard_link("/", "alias", "frames").unwrap();
+        w.start_swmr().unwrap();
+        w.append_frame(ds, &[1u8, 2, 3, 4]).unwrap();
+        w.close().unwrap();
+    }
+
+    let mut r = SwmrFileReader::open(&path).unwrap();
+    let names = r.dataset_names();
+    assert!(
+        names.iter().any(|n| n == "alias"),
+        "hard link 'alias' missing: {names:?}"
+    );
+    assert_eq!(r.read_dataset_raw("frames").unwrap(), vec![1u8, 2, 3, 4]);
+    assert_eq!(r.read_dataset_raw("alias").unwrap(), vec![1u8, 2, 3, 4]);
+
+    cleanup(&path);
+}
+
 /// A target path given with a trailing slash still resolves.
 #[test]
 fn hard_link_tolerates_trailing_slash() {

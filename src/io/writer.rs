@@ -3398,36 +3398,19 @@ impl Hdf5Writer {
         // Flush any partial append buffers before finalizing
         self.flush_append_buffers()?;
 
-        // If SWMR finalize was already done, re-write headers in place and
-        // update the superblock with clean-close flags.
-        if self.root_group_addr.is_some() {
-            // Flush index structures for modified chunked datasets.
-            for i in 0..self.datasets.len() {
-                let modified = self.datasets[i]
-                    .chunked
-                    .as_ref()
-                    .is_some_and(|c| c.chunks_written > 0);
-                if !modified {
-                    continue;
-                }
-                if self.datasets[i].chunked.is_some()
-                    || self.datasets[i].fixed_array.is_some()
-                    || self.datasets[i].btree_v2.is_some()
-                {
-                    self.flush_dataset(i)?;
-                }
-            }
-            // Re-write dataset headers in place with final dims.
-            for i in 0..self.datasets.len() {
-                if self.datasets[i].obj_header_written_addr.is_some() {
-                    self.write_dataset_header_inplace(i)?;
-                }
-            }
-            // Write superblock with clean-close flags (no SWMR).
-            self.write_superblock(0)?;
-            self.handle.sync_all()?;
-            return Ok(());
-        }
+        // A SWMR session (`finalize_for_swmr` already ran, so
+        // `root_group_addr` is `Some`) is closed by the same full finalize as
+        // a fresh write: every object header is rebuilt at a fresh address and
+        // the superblock is written with clean-close flags. A full rebuild —
+        // rather than the in-place header rewrite used by the live
+        // `SwmrWriter::flush` path — is required so any structural change made
+        // after `start_swmr` is committed to the final file. A hard link, in
+        // particular, both grows its target's header with an object
+        // reference-count message and adds a `MSG_LINK` record to a group
+        // header; an in-place rewrite cannot accommodate the grown header and
+        // never re-emits group/root headers. The fall-through below already
+        // handles datasets whose header was written by `finalize_for_swmr`
+        // (`obj_header_written_addr.is_some()`).
 
         // 0. Flush chunked dataset index structures (only modified datasets).
         for i in 0..self.datasets.len() {

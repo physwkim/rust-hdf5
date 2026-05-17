@@ -619,3 +619,150 @@ fn split_frame_into_tiles(
     }
     tiles
 }
+
+#[cfg(test)]
+mod swmr_hardlink_tests {
+    use super::*;
+    use crate::format::messages::datatype::DatatypeMessage;
+    use crate::io::reader::Hdf5Reader;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Unique temp directory, removed on drop, so parallel runs cannot collide.
+    struct TmpDir(std::path::PathBuf);
+
+    impl TmpDir {
+        fn new(label: &str) -> Self {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "rh5_swmr_hl_{}_{}_{}",
+                label,
+                std::process::id(),
+                n
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            TmpDir(dir)
+        }
+
+        fn file(&self) -> std::path::PathBuf {
+            self.0.join("stream.h5")
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A hard link created BEFORE `start_swmr` is committed by `start_swmr`
+    /// and is visible to readers for the whole SWMR window and after close.
+    #[test]
+    fn hardlink_before_start_swmr_visible() {
+        let dir = TmpDir::new("before");
+        let path = dir.file();
+        {
+            let mut w = SwmrWriter::create(&path).unwrap();
+            let idx = w
+                .create_streaming_dataset("frames", DatatypeMessage::u8_type(), &[2, 2])
+                .unwrap();
+            w.writer_mut()
+                .create_hard_link("/", "alias", "frames")
+                .unwrap();
+            w.start_swmr().unwrap();
+            w.append_frame(idx, &[1u8, 2, 3, 4]).unwrap();
+            w.close().unwrap();
+        }
+        let mut r = Hdf5Reader::open(&path).unwrap();
+        let names: Vec<String> = r.dataset_names().iter().map(|s| s.to_string()).collect();
+        assert!(
+            names.iter().any(|n| n == "alias"),
+            "hard link 'alias' missing from final file: {names:?}"
+        );
+        assert_eq!(r.read_dataset_raw("frames").unwrap(), vec![1u8, 2, 3, 4]);
+        assert_eq!(r.read_dataset_raw("alias").unwrap(), vec![1u8, 2, 3, 4]);
+    }
+
+    /// Regression: a hard link created AFTER `start_swmr` is a structural
+    /// change made during the SWMR window. `close` must commit it via a full
+    /// re-finalize (rebuilding group/root headers and the grown target
+    /// header), not reject it with an in-place-rewrite error.
+    #[test]
+    fn hardlink_after_start_swmr_committed_at_close() {
+        let dir = TmpDir::new("after");
+        let path = dir.file();
+        {
+            let mut w = SwmrWriter::create(&path).unwrap();
+            let idx = w
+                .create_streaming_dataset("frames", DatatypeMessage::u8_type(), &[2, 2])
+                .unwrap();
+            w.start_swmr().unwrap();
+            w.append_frame(idx, &[1u8, 2, 3, 4]).unwrap();
+            w.append_frame(idx, &[5u8, 6, 7, 8]).unwrap();
+            // Structural change during the SWMR window.
+            w.writer_mut()
+                .create_hard_link("/", "alias", "frames")
+                .unwrap();
+            // Before the fix this returned Err("dataset header grew ...
+            // cannot rewrite in place") and left the file SWMR-dirty.
+            w.close().unwrap();
+        }
+        let mut r = Hdf5Reader::open(&path).unwrap();
+        let names: Vec<String> = r.dataset_names().iter().map(|s| s.to_string()).collect();
+        assert!(
+            names.iter().any(|n| n == "alias"),
+            "hard link created after start_swmr missing from final file: {names:?}"
+        );
+        // The streaming data must survive the full re-finalize intact.
+        let expect = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(r.read_dataset_raw("frames").unwrap(), expect);
+        assert_eq!(r.read_dataset_raw("alias").unwrap(), expect);
+        assert_eq!(r.dataset_shape("frames").unwrap(), vec![2, 2, 2]);
+    }
+
+    /// A reader attached during the SWMR window must still resolve the file
+    /// after `close`, even though the full re-finalize relocates every object
+    /// header. `refresh` re-reads the superblock and follows the new root
+    /// address, so the relocation is transparent.
+    #[test]
+    fn reader_refresh_after_close_follows_relocated_headers() {
+        use crate::io::locking::FileLocking;
+
+        let dir = TmpDir::new("refresh");
+        let path = dir.file();
+
+        let mut w = SwmrWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+        let idx = w
+            .create_streaming_dataset("frames", DatatypeMessage::u8_type(), &[2, 2])
+            .unwrap();
+        w.start_swmr().unwrap();
+        w.append_frame(idx, &[1u8, 2, 3, 4]).unwrap();
+        w.flush().unwrap();
+
+        // Reader attaches mid-stream and sees the first frame.
+        let mut r = Hdf5Reader::open_swmr_with_locking(&path, FileLocking::Disabled).unwrap();
+        assert_eq!(r.dataset_shape("frames").unwrap(), vec![1, 2, 2]);
+
+        // A second frame plus a structural change, then close: the full
+        // re-finalize writes every header at a fresh address.
+        w.append_frame(idx, &[5u8, 6, 7, 8]).unwrap();
+        w.writer_mut()
+            .create_hard_link("/", "alias", "frames")
+            .unwrap();
+        w.close().unwrap();
+
+        // The already-attached reader follows the relocated headers via the
+        // superblock and sees the final state, including the new hard link.
+        r.refresh().unwrap();
+        assert_eq!(r.dataset_shape("frames").unwrap(), vec![2, 2, 2]);
+        assert_eq!(
+            r.read_dataset_raw("frames").unwrap(),
+            vec![1u8, 2, 3, 4, 5, 6, 7, 8]
+        );
+        let names: Vec<String> = r.dataset_names().iter().map(|s| s.to_string()).collect();
+        assert!(
+            names.iter().any(|n| n == "alias"),
+            "refreshed reader missing hard link: {names:?}"
+        );
+    }
+}
