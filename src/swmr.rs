@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use crate::format::messages::attribute::AttributeMessage;
 use crate::io::locking::FileLocking;
 use crate::io::Hdf5Reader;
 use crate::io::SwmrWriter as IoSwmrWriter;
@@ -51,6 +52,34 @@ impl SwmrFileWriter {
     pub fn create_with_locking<P: AsRef<Path>>(path: P, locking: FileLocking) -> Result<Self> {
         let inner = IoSwmrWriter::create_with_locking(path.as_ref(), locking)?;
         Ok(Self { inner })
+    }
+
+    /// Reopen a cleanly-closed HDF5 file to resume SWMR streaming.
+    ///
+    /// Existing datasets are reconstructed; locate them with
+    /// [`dataset_index`](Self::dataset_index), call [`start_swmr`](Self::start_swmr)
+    /// to re-enter SWMR mode, then continue with [`append_frame`](Self::append_frame).
+    /// Appending to a multi-frame-chunk dataset (`chunk[0] > 1`) after reopen
+    /// is rejected — its final partial band was zero-padded at the original
+    /// close. Recovering a crashed (never cleanly closed) file is not supported.
+    pub fn open_append<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let inner = IoSwmrWriter::open_append(path.as_ref())?;
+        Ok(Self { inner })
+    }
+
+    /// Reopen a cleanly-closed HDF5 file to resume SWMR streaming with an
+    /// explicit locking policy. See [`Self::open_append`].
+    pub fn open_append_with_locking<P: AsRef<Path>>(path: P, locking: FileLocking) -> Result<Self> {
+        let inner = IoSwmrWriter::open_append_with_locking(path.as_ref(), locking)?;
+        Ok(Self { inner })
+    }
+
+    /// Return the index of a dataset by name, or `None` if absent.
+    ///
+    /// Mainly used after [`open_append`](Self::open_append) to recover the
+    /// index of a reconstructed dataset for [`append_frame`](Self::append_frame).
+    pub fn dataset_index(&self, name: &str) -> Option<usize> {
+        self.inner.dataset_index(name)
     }
 
     /// Create a streaming dataset.
@@ -216,6 +245,180 @@ impl SwmrFileWriter {
         Ok(())
     }
 
+    /// Create a group in the file hierarchy.
+    ///
+    /// * `parent_group_path` — full path of the parent group (`"/"` for the
+    ///   root group).
+    /// * `name` — leaf name of the new group.
+    ///
+    /// A nested NeXus layout is built one level at a time, parent first:
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::swmr::SwmrFileWriter;
+    /// # let mut writer = SwmrFileWriter::create("stream.h5").unwrap();
+    /// writer.create_group("/", "entry").unwrap();
+    /// writer.create_group("/entry", "data").unwrap();
+    /// ```
+    ///
+    /// Like [`create_hard_link`](Self::create_hard_link), a group created
+    /// before [`start_swmr`](Self::start_swmr) is visible to SWMR readers for
+    /// the whole streaming window; one created after is committed only by
+    /// [`close`](Self::close).
+    pub fn create_group(&mut self, parent_group_path: &str, name: &str) -> Result<()> {
+        self.inner
+            .writer_mut()
+            .create_group(parent_group_path, name)?;
+        Ok(())
+    }
+
+    /// Set a string attribute on a group, or on the root group when
+    /// `group_path` is `"/"`.
+    ///
+    /// This is the NeXus way to tag a group with its class — for example
+    /// `set_group_attr_string("/entry", "NX_class", "NXentry")`. An existing
+    /// attribute of the same name is replaced.
+    ///
+    /// The same SWMR visibility rule as [`create_group`](Self::create_group)
+    /// applies: set before [`start_swmr`](Self::start_swmr) for the attribute
+    /// to be visible to readers during streaming.
+    pub fn set_group_attr_string(
+        &mut self,
+        group_path: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<()> {
+        let attr = AttributeMessage::scalar_string(name, value);
+        if group_path == "/" {
+            self.inner.writer_mut().add_root_attribute(attr);
+        } else {
+            self.inner
+                .writer_mut()
+                .add_group_attribute(group_path, attr)?;
+        }
+        Ok(())
+    }
+
+    /// Set a numeric scalar attribute on a group, or on the root group when
+    /// `group_path` is `"/"`. An existing attribute of the same name is
+    /// replaced. See [`set_group_attr_string`](Self::set_group_attr_string)
+    /// for the SWMR visibility rule.
+    pub fn set_group_attr_numeric<T: H5Type>(
+        &mut self,
+        group_path: &str,
+        name: &str,
+        value: &T,
+    ) -> Result<()> {
+        let attr = AttributeMessage::scalar_numeric(name, T::hdf5_type(), scalar_to_bytes(value));
+        if group_path == "/" {
+            self.inner.writer_mut().add_root_attribute(attr);
+        } else {
+            self.inner
+                .writer_mut()
+                .add_group_attribute(group_path, attr)?;
+        }
+        Ok(())
+    }
+
+    /// Create a fixed-shape (non-streaming) dataset and write all its data in
+    /// one call. Returns the dataset index.
+    ///
+    /// This is for the NeXus metadata that surrounds the image stream —
+    /// coordinate axes, detector geometry, and (with `dims = &[]`) scalar
+    /// values such as `/entry/instrument/detector/distance`. Unlike a
+    /// streaming dataset, it is written once and not appended to.
+    pub fn write_dataset<T: H5Type>(
+        &mut self,
+        name: &str,
+        dims: &[u64],
+        data: &[T],
+    ) -> Result<usize> {
+        let expected: u64 = if dims.is_empty() {
+            1
+        } else {
+            dims.iter().product()
+        };
+        if data.len() as u64 != expected {
+            return Err(crate::error::Hdf5Error::InvalidState(format!(
+                "write_dataset: data has {} elements but shape {dims:?} needs {expected}",
+                data.len()
+            )));
+        }
+        let idx = self
+            .inner
+            .writer_mut()
+            .create_dataset(name, T::hdf5_type(), dims)?;
+        self.inner
+            .writer_mut()
+            .write_dataset_raw(idx, slice_to_bytes(data))?;
+        Ok(idx)
+    }
+
+    /// Create a variable-length string dataset (one element per string).
+    /// Returns the dataset index. Useful for NeXus metadata such as
+    /// `/entry/start_time` or per-frame timestamp arrays.
+    pub fn write_string_dataset(&mut self, name: &str, strings: &[&str]) -> Result<usize> {
+        let idx = self
+            .inner
+            .writer_mut()
+            .create_vlen_string_dataset(name, strings)?;
+        Ok(idx)
+    }
+
+    /// Set a string attribute on a dataset, addressed by its index. The
+    /// NeXus way to record `units`, `long_name`, `signal`, etc. An existing
+    /// attribute of the same name is replaced.
+    pub fn set_dataset_attr_string(
+        &mut self,
+        ds_index: usize,
+        name: &str,
+        value: &str,
+    ) -> Result<()> {
+        self.inner
+            .writer_mut()
+            .add_dataset_attribute(ds_index, AttributeMessage::scalar_string(name, value))?;
+        Ok(())
+    }
+
+    /// Set a numeric scalar attribute on a dataset, addressed by its index.
+    /// An existing attribute of the same name is replaced.
+    pub fn set_dataset_attr_numeric<T: H5Type>(
+        &mut self,
+        ds_index: usize,
+        name: &str,
+        value: &T,
+    ) -> Result<()> {
+        let attr = AttributeMessage::scalar_numeric(name, T::hdf5_type(), scalar_to_bytes(value));
+        self.inner
+            .writer_mut()
+            .add_dataset_attribute(ds_index, attr)?;
+        Ok(())
+    }
+
+    /// Set the fill value of a streaming dataset, addressed by its index.
+    ///
+    /// Call this before the first [`append_frame`](Self::append_frame): it
+    /// determines the value of chunk regions that are never written (a
+    /// partial final band, or unwritten tiles).
+    pub fn set_dataset_fill_value<T: H5Type>(&mut self, ds_index: usize, value: &T) -> Result<()> {
+        self.inner
+            .writer_mut()
+            .set_dataset_fill_value(ds_index, scalar_to_bytes(value))?;
+        Ok(())
+    }
+
+    /// Place an existing dataset inside a group.
+    ///
+    /// By default a dataset created through this writer lives at the root
+    /// level; this moves its link record into `group_path` (which must
+    /// already exist). The group must be created before `start_swmr` for the
+    /// placement to be visible to readers during streaming.
+    pub fn assign_dataset_to_group(&mut self, group_path: &str, ds_index: usize) -> Result<()> {
+        self.inner
+            .writer_mut()
+            .assign_dataset_to_group(group_path, ds_index)?;
+        Ok(())
+    }
+
     /// Signal the start of SWMR mode.
     pub fn start_swmr(&mut self) -> Result<()> {
         self.inner.start_swmr()?;
@@ -317,20 +520,127 @@ impl SwmrFileReader {
 
     /// Read a dataset as a typed vector.
     pub fn read_dataset<T: H5Type>(&mut self, name: &str) -> Result<Vec<T>> {
-        let raw = self.reader.read_dataset_raw(name)?;
-        if raw.len() % T::element_size() != 0 {
-            return Err(crate::error::Hdf5Error::TypeMismatch(format!(
-                "raw data size {} is not a multiple of element size {}",
-                raw.len(),
-                T::element_size(),
-            )));
-        }
-        let count = raw.len() / T::element_size();
-        let mut result = Vec::<T>::with_capacity(count);
-        unsafe {
-            std::ptr::copy_nonoverlapping(raw.as_ptr(), result.as_mut_ptr() as *mut u8, raw.len());
-            result.set_len(count);
-        }
-        Ok(result)
+        bytes_to_typed(self.reader.read_dataset_raw(name)?)
     }
+
+    /// Read a slice (hyperslab) of a dataset as raw bytes.
+    ///
+    /// `starts[d]` is the first index along dimension `d`, `counts[d]` is how
+    /// many. For a streaming dataset this reads only the chunks the slice
+    /// overlaps — the efficient way for a live viewer to fetch the latest
+    /// frame without re-reading the whole stream.
+    pub fn read_slice_raw(
+        &mut self,
+        name: &str,
+        starts: &[u64],
+        counts: &[u64],
+    ) -> Result<Vec<u8>> {
+        Ok(self.reader.read_slice(name, starts, counts)?)
+    }
+
+    /// Read a slice (hyperslab) of a dataset as a typed vector.
+    /// See [`read_slice_raw`](Self::read_slice_raw).
+    pub fn read_slice<T: H5Type>(
+        &mut self,
+        name: &str,
+        starts: &[u64],
+        counts: &[u64],
+    ) -> Result<Vec<T>> {
+        bytes_to_typed(self.reader.read_slice(name, starts, counts)?)
+    }
+
+    /// Read a variable-length string dataset.
+    pub fn read_vlen_strings(&mut self, name: &str) -> Result<Vec<String>> {
+        Ok(self.reader.read_vlen_strings(name)?)
+    }
+
+    /// Element size of a dataset's datatype, in bytes — enough to size a
+    /// read buffer without knowing the concrete element type at compile time.
+    pub fn dataset_element_size(&self, name: &str) -> Result<usize> {
+        self.reader
+            .dataset_info(name)
+            .map(|i| i.datatype.element_size() as usize)
+            .ok_or_else(|| crate::error::Hdf5Error::NotFound(name.to_string()))
+    }
+
+    /// All group paths in the file.
+    pub fn group_paths(&self) -> Vec<String> {
+        self.reader.group_paths().iter().cloned().collect()
+    }
+
+    /// Whether a group exists. A leading `/` is tolerated.
+    pub fn has_group(&self, group_path: &str) -> bool {
+        self.reader.has_group(group_path.trim_start_matches('/'))
+    }
+
+    /// Names of the attributes on a dataset.
+    pub fn dataset_attr_names(&self, name: &str) -> Result<Vec<String>> {
+        Ok(self.reader.dataset_attr_names(name)?)
+    }
+
+    /// Read a dataset's attribute as a string (e.g. `units`, `NX_class`).
+    pub fn dataset_attr_string(&mut self, dataset: &str, attr: &str) -> Result<String> {
+        let a = self.reader.dataset_attr(dataset, attr)?.clone();
+        Ok(self.reader.attr_string_value(&a)?)
+    }
+
+    /// Names of the attributes on a group, or on the root group when
+    /// `group_path` is `"/"`. A leading `/` is tolerated.
+    pub fn group_attr_names(&self, group_path: &str) -> Vec<String> {
+        if group_path == "/" {
+            self.reader.root_attr_names()
+        } else {
+            self.reader
+                .group_attr_names(group_path.trim_start_matches('/'))
+        }
+    }
+
+    /// Read a group's attribute as a string (the NeXus `NX_class` etc.), or
+    /// a root attribute when `group_path` is `"/"`. A leading `/` is tolerated.
+    pub fn group_attr_string(&mut self, group_path: &str, attr: &str) -> Result<String> {
+        let a = if group_path == "/" {
+            self.reader.root_attr(attr)
+        } else {
+            self.reader
+                .group_attr(group_path.trim_start_matches('/'), attr)
+        }
+        .ok_or_else(|| crate::error::Hdf5Error::NotFound(attr.to_string()))?
+        .clone();
+        Ok(self.reader.attr_string_value(&a)?)
+    }
+}
+
+/// Reinterpret a raw byte buffer as a typed vector. The buffer length must
+/// be a whole multiple of `T`'s element size.
+fn bytes_to_typed<T: H5Type>(raw: Vec<u8>) -> Result<Vec<T>> {
+    let es = T::element_size();
+    if es == 0 || !raw.len().is_multiple_of(es) {
+        return Err(crate::error::Hdf5Error::TypeMismatch(format!(
+            "raw data size {} is not a multiple of element size {es}",
+            raw.len()
+        )));
+    }
+    let count = raw.len() / es;
+    let mut result = Vec::<T>::with_capacity(count);
+    // Safety: `T: H5Type` is a `Copy` POD primitive exactly `element_size()`
+    // bytes wide, so the byte buffer is a valid array of `count` `T`s.
+    unsafe {
+        std::ptr::copy_nonoverlapping(raw.as_ptr(), result.as_mut_ptr() as *mut u8, raw.len());
+        result.set_len(count);
+    }
+    Ok(result)
+}
+
+/// Raw bytes of one `H5Type` scalar.
+fn scalar_to_bytes<T: H5Type>(value: &T) -> Vec<u8> {
+    let es = T::element_size();
+    // Safety: `T: H5Type` is a `Copy` POD primitive exactly `element_size()`
+    // bytes wide.
+    unsafe { std::slice::from_raw_parts(value as *const T as *const u8, es) }.to_vec()
+}
+
+/// Raw bytes of an `H5Type` slice, in element order.
+fn slice_to_bytes<T: H5Type>(data: &[T]) -> &[u8] {
+    // Safety: as `scalar_to_bytes`; the slice is a contiguous POD array.
+    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
 }

@@ -1,0 +1,235 @@
+//! Integration tests for the extended SWMR public API: NeXus-layout
+//! metadata (fixed/scalar/string datasets, dataset & group attributes),
+//! hyperslab reads, dataset placement in groups, and stream resumption
+//! via `open_append`.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use rust_hdf5::swmr::{SwmrFileReader, SwmrFileWriter};
+use rust_hdf5::FileLocking;
+
+/// Per-test unique temp path so parallel cargo runs cannot collide.
+fn unique_tmp(label: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "rust_hdf5_swmr_api_{}_{}_{}",
+        label,
+        std::process::id(),
+        n
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join(format!("{label}.h5"))
+}
+
+fn cleanup(path: &Path) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+const NO_LOCK: FileLocking = FileLocking::Disabled;
+
+/// Fixed/scalar/string datasets and dataset/group/root attributes written
+/// through the SWMR API round-trip through `SwmrFileReader`.
+#[test]
+fn metadata_datasets_and_attributes_round_trip() {
+    let path = unique_tmp("metadata");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+
+        // Scalar, 1-D numeric, and vlen-string metadata datasets.
+        w.write_dataset::<f64>("distance", &[], &[0.55]).unwrap();
+        let axis = w.write_dataset::<i32>("axis", &[3], &[10, 20, 30]).unwrap();
+        w.write_string_dataset("start_time", &["2026-05-18T10:00:00"])
+            .unwrap();
+
+        // Dataset attributes (string + numeric).
+        w.set_dataset_attr_string(axis, "units", "mm").unwrap();
+        w.set_dataset_attr_numeric::<i32>(axis, "count", &3)
+            .unwrap();
+
+        // Group + group/root attributes.
+        w.create_group("/", "entry").unwrap();
+        w.set_group_attr_string("/entry", "NX_class", "NXentry")
+            .unwrap();
+        w.set_group_attr_numeric::<f64>("/entry", "version", &2.0)
+            .unwrap();
+        w.set_group_attr_string("/", "file_name", "metadata.h5")
+            .unwrap();
+
+        let frames = w.create_streaming_dataset::<u8>("frames", &[2, 2]).unwrap();
+        w.start_swmr().unwrap();
+        w.append_frame(frames, &[1u8, 2, 3, 4]).unwrap();
+        w.close().unwrap();
+    }
+
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+
+    assert_eq!(r.read_dataset::<f64>("distance").unwrap(), vec![0.55]);
+    assert_eq!(r.read_dataset::<i32>("axis").unwrap(), vec![10, 20, 30]);
+    assert_eq!(
+        r.read_vlen_strings("start_time").unwrap(),
+        vec!["2026-05-18T10:00:00".to_string()]
+    );
+    assert_eq!(r.dataset_element_size("axis").unwrap(), 4);
+    assert_eq!(r.dataset_element_size("frames").unwrap(), 1);
+
+    let attr_names = r.dataset_attr_names("axis").unwrap();
+    assert!(attr_names.iter().any(|n| n == "units"), "{attr_names:?}");
+    assert!(attr_names.iter().any(|n| n == "count"), "{attr_names:?}");
+    assert_eq!(r.dataset_attr_string("axis", "units").unwrap(), "mm");
+
+    assert_eq!(
+        r.group_attr_string("/entry", "NX_class").unwrap(),
+        "NXentry"
+    );
+    assert!(r.group_attr_names("/entry").iter().any(|n| n == "version"));
+    assert_eq!(
+        r.group_attr_string("/", "file_name").unwrap(),
+        "metadata.h5"
+    );
+
+    cleanup(&path);
+}
+
+/// `read_slice` fetches one frame of a streaming dataset without reading
+/// the whole stream.
+#[test]
+fn read_slice_reads_a_single_frame() {
+    let path = unique_tmp("slice");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        let ds = w.create_streaming_dataset::<u8>("frames", &[2, 2]).unwrap();
+        w.start_swmr().unwrap();
+        w.append_frame(ds, &[1u8, 2, 3, 4]).unwrap();
+        w.append_frame(ds, &[5u8, 6, 7, 8]).unwrap();
+        w.append_frame(ds, &[9u8, 10, 11, 12]).unwrap();
+        w.close().unwrap();
+    }
+
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.dataset_shape("frames").unwrap(), vec![3, 2, 2]);
+
+    // Middle frame only.
+    let frame1 = r
+        .read_slice::<u8>("frames", &[1, 0, 0], &[1, 2, 2])
+        .unwrap();
+    assert_eq!(frame1, vec![5, 6, 7, 8]);
+
+    // Last frame, raw bytes.
+    let frame2 = r.read_slice_raw("frames", &[2, 0, 0], &[1, 2, 2]).unwrap();
+    assert_eq!(frame2, vec![9, 10, 11, 12]);
+
+    cleanup(&path);
+}
+
+/// A streaming dataset can be placed inside a group; the reader then sees
+/// it at the nested path and the group tree is enumerable.
+#[test]
+fn assign_dataset_to_group_places_the_stream() {
+    let path = unique_tmp("assign");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        w.create_group("/", "entry").unwrap();
+        w.create_group("/entry", "data").unwrap();
+        let ds = w.create_streaming_dataset::<u8>("frames", &[2, 2]).unwrap();
+        w.assign_dataset_to_group("/entry/data", ds).unwrap();
+        w.start_swmr().unwrap();
+        w.append_frame(ds, &[1u8, 2, 3, 4]).unwrap();
+        w.close().unwrap();
+    }
+
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert!(r.has_group("/entry"));
+    assert!(r.has_group("/entry/data"));
+    let groups = r.group_paths();
+    assert!(
+        groups
+            .iter()
+            .any(|g| g.trim_start_matches('/') == "entry/data"),
+        "group paths: {groups:?}"
+    );
+
+    let names = r.dataset_names();
+    assert!(
+        names.iter().any(|n| n == "entry/data/frames"),
+        "dataset names: {names:?}"
+    );
+    assert_eq!(
+        r.read_dataset_raw("entry/data/frames").unwrap(),
+        vec![1, 2, 3, 4]
+    );
+
+    cleanup(&path);
+}
+
+/// A cleanly-closed SWMR file can be reopened and its streaming dataset
+/// extended with further frames.
+#[test]
+fn open_append_resumes_streaming() {
+    let path = unique_tmp("resume");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        let ds = w.create_streaming_dataset::<u8>("frames", &[2, 2]).unwrap();
+        w.start_swmr().unwrap();
+        w.append_frame(ds, &[1u8, 2, 3, 4]).unwrap();
+        w.append_frame(ds, &[5u8, 6, 7, 8]).unwrap();
+        w.close().unwrap();
+    }
+
+    {
+        let mut w = SwmrFileWriter::open_append_with_locking(&path, NO_LOCK).unwrap();
+        let ds = w
+            .dataset_index("frames")
+            .expect("reopened dataset 'frames'");
+        w.start_swmr().unwrap();
+        w.append_frame(ds, &[9u8, 10, 11, 12]).unwrap();
+        w.append_frame(ds, &[13u8, 14, 15, 16]).unwrap();
+        w.close().unwrap();
+    }
+
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.dataset_shape("frames").unwrap(), vec![4, 2, 2]);
+    assert_eq!(
+        r.read_dataset::<u8>("frames").unwrap(),
+        (1u8..=16).collect::<Vec<_>>()
+    );
+
+    cleanup(&path);
+}
+
+/// Resuming a multi-frame-chunk dataset (`chunk[0] > 1`) after `open_append`
+/// is rejected with a clear error rather than corrupting the chunk grid.
+#[test]
+fn open_append_rejects_multi_frame_chunk_resume() {
+    let path = unique_tmp("resume_mfc");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        // chunk[0] = 3 frames per chunk.
+        let ds = w
+            .create_streaming_dataset_chunked::<u8>("frames", &[2, 2], &[3, 2, 2])
+            .unwrap();
+        w.start_swmr().unwrap();
+        for f in 0..3u8 {
+            w.append_frame(ds, &[f, f, f, f]).unwrap();
+        }
+        w.close().unwrap();
+    }
+
+    let mut w = SwmrFileWriter::open_append_with_locking(&path, NO_LOCK).unwrap();
+    let ds = w.dataset_index("frames").expect("reopened 'frames'");
+    w.start_swmr().unwrap();
+    let err = w
+        .append_frame(ds, &[9u8, 9, 9, 9])
+        .expect_err("multi-frame-chunk resume must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("multi-frame chunks"),
+        "unexpected error: {msg}"
+    );
+    drop(w);
+
+    cleanup(&path);
+}

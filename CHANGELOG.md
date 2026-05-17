@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.2.17
+
+### Added
+
+- `SwmrFileWriter::create_group`, `set_group_attr_string`, and
+  `set_group_attr_numeric` — build a nested group layout (e.g. the
+  NeXus `/entry` → `/entry/data` tree) and tag groups, or the root
+  group, with attributes such as `NX_class`. A group created before
+  `start_swmr` is visible to readers for the whole streaming window;
+  one created after is committed at `close`.
+- `SwmrFileWriter::write_dataset` and `write_string_dataset` — write
+  fixed-shape, scalar (`dims = &[]`), and variable-length-string
+  datasets for the metadata that surrounds an image stream.
+- `SwmrFileWriter::set_dataset_attr_string`, `set_dataset_attr_numeric`,
+  `set_dataset_fill_value`, and `assign_dataset_to_group` — dataset
+  attributes (`units`, `signal`, …), streaming fill values, and
+  placement of a dataset inside a group.
+- `SwmrFileWriter::open_append` / `open_append_with_locking` and
+  `dataset_index` — reopen a cleanly-closed SWMR file and resume
+  streaming into its existing datasets. Appending to a multi-frame-chunk
+  dataset (`chunk[0] > 1`) after reopen is rejected with a clear error,
+  because its final partial band was zero-padded at the original close.
+- `SwmrFileReader::read_slice` and `read_slice_raw` — hyperslab reads.
+  For a streaming dataset only the chunks the slice overlaps are read,
+  so a live viewer can fetch the latest frame without re-reading the
+  whole stream.
+- `SwmrFileReader::read_vlen_strings`, `dataset_element_size`,
+  `group_paths`, `has_group`, `dataset_attr_names`,
+  `dataset_attr_string`, `group_attr_names`, and `group_attr_string` —
+  inspect groups, datasets, and string attributes through a SWMR reader.
+
 ## 0.2.16
 
 ### Added

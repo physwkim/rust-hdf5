@@ -71,6 +71,43 @@ impl SwmrWriter {
         })
     }
 
+    /// Reopen a cleanly-closed HDF5 file to resume SWMR streaming.
+    ///
+    /// Existing datasets are reconstructed so `append_frame` can continue
+    /// extending them after a fresh `start_swmr`. Multi-frame-chunk datasets
+    /// (`chunk[0] > 1`) are reopened read-as-is; appending to one is rejected
+    /// because its final partial band was already zero-padded at the original
+    /// close.
+    pub fn open_append(path: &Path) -> IoResult<Self> {
+        let writer = Hdf5Writer::open_append(path)?;
+        Ok(Self {
+            writer,
+            swmr_active: false,
+            band_buffers: HashMap::new(),
+        })
+    }
+
+    /// Reopen a cleanly-closed HDF5 file to resume SWMR streaming with an
+    /// explicit locking policy. See [`Self::open_append`].
+    pub fn open_append_with_locking(
+        path: &Path,
+        locking: crate::io::locking::FileLocking,
+    ) -> IoResult<Self> {
+        let writer = Hdf5Writer::open_append_with_locking(path, locking)?;
+        Ok(Self {
+            writer,
+            swmr_active: false,
+            band_buffers: HashMap::new(),
+        })
+    }
+
+    /// Return the index of a dataset by name, or `None` if absent. Used to
+    /// locate datasets reconstructed by [`Self::open_append`] for
+    /// [`append_frame`](Self::append_frame).
+    pub fn dataset_index(&self, name: &str) -> Option<usize> {
+        self.writer.dataset_index(name)
+    }
+
     /// Create a streaming dataset (chunked, unlimited first dim).
     ///
     /// `frame_dims` are the spatial dimensions per frame (e.g., [H, W]).
@@ -316,6 +353,20 @@ impl SwmrWriter {
                 crate::io::IoError::InvalidState("append_frame requires a chunked dataset".into())
             })?
             .to_vec();
+
+        // A multi-frame chunk (`chunk[0] > 1`) not tracked in `band_buffers`
+        // can only be a dataset reopened via `open_append`: its final partial
+        // band was already zero-padded and written at the original close, so
+        // frame-aligned appending cannot resume. (Datasets created in this
+        // session with `chunk[0] > 1` are routed through `band_buffers` above
+        // and never reach here.)
+        if chunk_dims[0] > 1 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset {ds_index} uses multi-frame chunks (chunk[0] = {}); \
+                 appending to it after open_append is not supported",
+                chunk_dims[0]
+            )));
+        }
 
         // `data` must hold exactly one frame.
         let elem_size = self.writer.datasets[ds_index].datatype.element_size() as usize;
@@ -763,6 +814,31 @@ mod swmr_hardlink_tests {
         assert!(
             names.iter().any(|n| n == "alias"),
             "refreshed reader missing hard link: {names:?}"
+        );
+    }
+
+    /// A group created after `start_swmr` is a structural change; the full
+    /// re-finalize at close rebuilds every group/root header, so the group
+    /// reaches the final file.
+    #[test]
+    fn group_created_after_start_swmr_committed_at_close() {
+        let dir = TmpDir::new("group_after");
+        let path = dir.file();
+        {
+            let mut w = SwmrWriter::create(&path).unwrap();
+            let idx = w
+                .create_streaming_dataset("frames", DatatypeMessage::u8_type(), &[2, 2])
+                .unwrap();
+            w.start_swmr().unwrap();
+            w.append_frame(idx, &[1u8, 2, 3, 4]).unwrap();
+            w.writer_mut().create_group("/", "entry").unwrap();
+            w.close().unwrap();
+        }
+        let r = Hdf5Reader::open(&path).unwrap();
+        assert!(
+            r.has_group("entry"),
+            "group created after start_swmr missing: {:?}",
+            r.group_paths()
         );
     }
 }

@@ -213,6 +213,56 @@ fn swmr_writer_creates_hard_link() {
     cleanup(&path);
 }
 
+/// The public SWMR writer API can build a nested NeXus-style layout: groups
+/// tagged with `NX_class` attributes plus a hard link aliasing a streaming
+/// dataset into that layout. All structure is created before `start_swmr`.
+#[test]
+fn swmr_writer_builds_nexus_layout() {
+    use rust_hdf5::swmr::SwmrFileWriter;
+
+    let path = unique_tmp("swmr_nexus");
+    {
+        let mut w = SwmrFileWriter::create(&path).unwrap();
+        let ds = w
+            .create_streaming_dataset::<u16>("frames", &[2, 2])
+            .unwrap();
+
+        // NeXus group tree: /entry (NXentry) -> /entry/data (NXdata).
+        w.create_group("/", "entry").unwrap();
+        w.create_group("/entry", "data").unwrap();
+        w.set_group_attr_string("/entry", "NX_class", "NXentry")
+            .unwrap();
+        w.set_group_attr_string("/entry/data", "NX_class", "NXdata")
+            .unwrap();
+        // Alias the streaming dataset at the NeXus canonical location.
+        w.create_hard_link("/entry/data", "data", "frames").unwrap();
+
+        w.start_swmr().unwrap();
+        // One frame of 4 u16 values, little-endian: 1, 2, 3, 4.
+        w.append_frame(ds, &[1u8, 0, 2, 0, 3, 0, 4, 0]).unwrap();
+        w.close().unwrap();
+    }
+
+    let file = H5File::open(&path).unwrap();
+    let root = file.root_group();
+
+    let entry = root.group("entry").unwrap();
+    assert_eq!(entry.attr_string("NX_class").unwrap(), "NXentry");
+
+    let data = entry.group("data").unwrap();
+    assert_eq!(data.attr_string("NX_class").unwrap(), "NXdata");
+
+    // The hard link resolves to the streaming dataset's data.
+    let aliased = file
+        .dataset("entry/data/data")
+        .unwrap()
+        .read_raw::<u16>()
+        .unwrap();
+    assert_eq!(aliased, vec![1u16, 2, 3, 4]);
+
+    cleanup(&path);
+}
+
 /// A target path given with a trailing slash still resolves.
 #[test]
 fn hard_link_tolerates_trailing_slash() {
