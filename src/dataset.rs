@@ -7,6 +7,7 @@
 use crate::attribute::AttrBuilder;
 use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
+use crate::format::messages::datatype::DatatypeMessage;
 use crate::types::H5Type;
 
 // ---------------------------------------------------------------------------
@@ -465,6 +466,54 @@ impl H5Dataset {
         match &self.info {
             DatasetInfo::Writer { element_size, .. } => *element_size,
             DatasetInfo::Reader { element_size, .. } => *element_size,
+        }
+    }
+
+    /// Return the element datatype as parsed from the file (read mode only).
+    ///
+    /// Unlike [`element_size`](Self::element_size), which reports only the
+    /// byte width, this exposes the full datatype: its class (integer vs
+    /// floating-point vs string vs compound …), signedness, byte order and
+    /// bit precision. Callers that must reconstruct the exact stored type —
+    /// for example to map it to a NumPy / Arrow dtype — should use this
+    /// instead of inferring a type from the byte width, which cannot
+    /// distinguish `u8` from `i8` (both 1 byte) or `i32` from `f32` (both 4
+    /// bytes).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is in write mode, or if the dataset can
+    /// no longer be found in the reader's metadata.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::{H5File, DatatypeMessage};
+    /// let file = H5File::open("data.h5").unwrap();
+    /// let ds = file.dataset("image").unwrap();
+    /// match ds.datatype().unwrap() {
+    ///     DatatypeMessage::FixedPoint { size, signed, .. } => {
+    ///         println!("integer: {} bytes, signed={}", size, signed);
+    ///     }
+    ///     DatatypeMessage::FloatingPoint { size, .. } => {
+    ///         println!("float: {} bytes", size);
+    ///     }
+    ///     other => println!("other type: {other}"),
+    /// }
+    /// ```
+    pub fn datatype(&self) -> Result<DatatypeMessage> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Reader(reader) => reader
+                        .dataset_info(name)
+                        .map(|info| info.datatype.clone())
+                        .ok_or_else(|| Hdf5Error::NotFound(name.clone())),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "datatype() is only available in read mode".into(),
+            )),
         }
     }
 
@@ -2475,6 +2524,72 @@ mod tests {
         // The correct width succeeds.
         writer.set_dataset_fill_value(idx, vec![0u8; 8]).unwrap();
         writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn datatype_exposes_class_sign_and_byteorder() {
+        // The byte width alone cannot tell u8 from i8 (both 1 byte) or i32
+        // from f32 (both 4 bytes). datatype() must report the real class and
+        // signedness so a reader does not have to guess from element_size.
+        use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+
+        let path = temp_path("datatype_accessor");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<u8>().shape([3]).create("u8d").unwrap();
+            file.new_dataset::<i8>().shape([3]).create("i8d").unwrap();
+            file.new_dataset::<i32>().shape([3]).create("i32d").unwrap();
+            file.new_dataset::<f32>().shape([3]).create("f32d").unwrap();
+            file.close().unwrap();
+        }
+
+        let file = H5File::open(&path).unwrap();
+
+        match file.dataset("u8d").unwrap().datatype().unwrap() {
+            DatatypeMessage::FixedPoint {
+                size,
+                signed,
+                byte_order,
+                ..
+            } => {
+                assert_eq!(size, 1);
+                assert!(!signed, "u8 must be unsigned");
+                assert_eq!(byte_order, ByteOrder::LittleEndian);
+            }
+            other => panic!("expected FixedPoint for u8, got {other:?}"),
+        }
+
+        match file.dataset("i8d").unwrap().datatype().unwrap() {
+            DatatypeMessage::FixedPoint { size, signed, .. } => {
+                assert_eq!(size, 1);
+                assert!(signed, "i8 must be signed");
+            }
+            other => panic!("expected FixedPoint for i8, got {other:?}"),
+        }
+
+        match file.dataset("i32d").unwrap().datatype().unwrap() {
+            DatatypeMessage::FixedPoint { size, signed, .. } => {
+                assert_eq!(size, 4);
+                assert!(signed, "i32 must be signed");
+            }
+            other => panic!("expected FixedPoint for i32, got {other:?}"),
+        }
+
+        match file.dataset("f32d").unwrap().datatype().unwrap() {
+            DatatypeMessage::FloatingPoint { size, .. } => assert_eq!(size, 4),
+            other => panic!("expected FloatingPoint for f32, got {other:?}"),
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn datatype_in_write_mode_errors() {
+        let path = temp_path("datatype_write_mode");
+        let file = H5File::create(&path).unwrap();
+        let ds = file.new_dataset::<f32>().shape([4]).create("d").unwrap();
+        assert!(ds.datatype().is_err());
         std::fs::remove_file(&path).ok();
     }
 }

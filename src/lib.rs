@@ -100,6 +100,7 @@ pub use attribute::H5Attribute;
 pub use dataset::H5Dataset;
 pub use error::{Hdf5Error, Result};
 pub use file::{H5File, H5FileOptions};
+pub use format::messages::datatype::{ByteOrder, DatatypeMessage};
 pub use format::messages::filter::FilterPipeline;
 pub use group::H5Group;
 pub use io::locking::{FileLocking, LockMode};

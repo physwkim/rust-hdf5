@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.18
+
+### Added
+
+- `H5Dataset::datatype()` — return the element type a dataset was
+  written with, as the parsed `DatatypeMessage` (class, signedness,
+  byte order, and bit precision), in read mode. Callers that must
+  reconstruct the exact stored type — for example to map it to a NumPy
+  or Arrow dtype — no longer have to infer it from `element_size`,
+  which cannot tell `u8` from `i8` (both 1 byte) or `i32` from `f32`
+  (both 4 bytes).
+- `DatatypeMessage` and `ByteOrder` are now re-exported at the crate
+  root, alongside the existing `FilterPipeline` re-export.
+
 ## 0.2.17
 
 ### Added
