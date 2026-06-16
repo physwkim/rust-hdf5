@@ -36,6 +36,9 @@ pub struct H5Attribute {
     file_inner: SharedInner,
     ds_index: usize,
     name: String,
+    /// Dimensions for write-mode array attributes (empty = scalar). Set from
+    /// [`AttrBuilder::shape`] and consumed by [`write_array`](Self::write_array).
+    write_dims: Vec<usize>,
     /// The decoded attribute message for read-mode handles (carries the
     /// datatype, needed to resolve variable-length string values).
     read_attr: Option<AttributeMessage>,
@@ -48,6 +51,7 @@ impl H5Attribute {
             file_inner,
             ds_index: usize::MAX,
             name: attr_msg.name.clone(),
+            write_dims: Vec::new(),
             read_attr: Some(attr_msg),
         }
     }
@@ -96,6 +100,59 @@ impl H5Attribute {
         let es = T::element_size();
         let raw = unsafe { std::slice::from_raw_parts(value as *const T as *const u8, es) };
         let attr_msg = AttributeMessage::scalar_numeric(&self.name, T::hdf5_type(), raw.to_vec());
+
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                writer.add_dataset_attribute(self.ds_index, attr_msg)?;
+                Ok(())
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot write attributes in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
+    /// Write a numeric array attribute.
+    ///
+    /// The number of `values` must equal the product of the dimensions set
+    /// via [`AttrBuilder::shape`]; if no shape was set the attribute is a
+    /// scalar and exactly one value is required. The on-disk datatype is
+    /// `T::hdf5_type()` and the dataspace is the simple dataspace described by
+    /// the shape — matching the 1-D `int32` array attributes AreaDetector
+    /// writes (e.g. `NDArrayDimOffset`, `Binning`, `Reverse`).
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("arr_attr.h5").unwrap();
+    /// let ds = file.new_dataset::<f32>().shape(&[10]).create("data").unwrap();
+    /// ds.write_raw(&[0.0f32; 10]).unwrap();
+    /// let attr = ds.new_attr::<i32>().shape([3]).create("dim_offset").unwrap();
+    /// attr.write_array(&[0i32, 4, 8]).unwrap();
+    /// ```
+    pub fn write_array<T: crate::types::H5Type>(&self, values: &[T]) -> Result<()> {
+        // Product of an empty shape is 1 (a scalar holds one element).
+        let expected: usize = self.write_dims.iter().product();
+        if values.len() != expected {
+            return Err(Hdf5Error::InvalidState(format!(
+                "attribute '{}' shape {:?} needs {} elements, got {}",
+                self.name,
+                self.write_dims,
+                expected,
+                values.len()
+            )));
+        }
+
+        let es = T::element_size();
+        // Safety: `T: H5Type` is a `Copy` numeric primitive with a defined
+        // byte representation; `element_size()` matches `size_of::<T>()`. The
+        // slice borrows `values` only for this call.
+        let raw =
+            unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * es) };
+        let dims_u64: Vec<u64> = self.write_dims.iter().map(|&d| d as u64).collect();
+        let attr_msg =
+            AttributeMessage::array_numeric(&self.name, T::hdf5_type(), &dims_u64, raw.to_vec());
 
         let mut inner = borrow_inner_mut(&self.file_inner);
         match &mut *inner {
@@ -209,13 +266,53 @@ impl H5Attribute {
     }
 }
 
+/// Shapes accepted by [`AttrBuilder::shape`].
+///
+/// `()` selects a scalar attribute (rank 0). A slice, array, or `Vec` of
+/// `usize` selects a simple dataspace with those dimension sizes — e.g.
+/// `[3]` for a 1-D array attribute of length 3.
+pub trait AttrShape {
+    /// Dimension sizes for the attribute; empty for a scalar.
+    fn attr_dims(&self) -> Vec<usize>;
+}
+
+impl AttrShape for () {
+    fn attr_dims(&self) -> Vec<usize> {
+        Vec::new()
+    }
+}
+
+impl AttrShape for &[usize] {
+    fn attr_dims(&self) -> Vec<usize> {
+        self.to_vec()
+    }
+}
+
+impl<const N: usize> AttrShape for [usize; N] {
+    fn attr_dims(&self) -> Vec<usize> {
+        self.to_vec()
+    }
+}
+
+impl<const N: usize> AttrShape for &[usize; N] {
+    fn attr_dims(&self) -> Vec<usize> {
+        self.to_vec()
+    }
+}
+
+impl AttrShape for Vec<usize> {
+    fn attr_dims(&self) -> Vec<usize> {
+        self.clone()
+    }
+}
+
 /// A fluent builder for creating attributes on datasets.
 ///
 /// Obtained from [`H5Dataset::new_attr::<T>()`](crate::dataset::H5Dataset::new_attr).
 pub struct AttrBuilder<'a, T> {
     file_inner: &'a SharedInner,
     ds_index: usize,
-    _shape_set: bool,
+    dims: Vec<usize>,
     _marker: PhantomData<T>,
 }
 
@@ -224,28 +321,35 @@ impl<'a, T> AttrBuilder<'a, T> {
         Self {
             file_inner,
             ds_index,
-            _shape_set: false,
+            dims: Vec::new(),
             _marker: PhantomData,
         }
     }
 
-    /// Set the attribute shape. Use `()` for a scalar attribute.
+    /// Set the attribute shape.
+    ///
+    /// Use `()` for a scalar attribute, or an array/slice of dimension sizes
+    /// for an array attribute (e.g. `[3]` for a 1-D array of length 3). The
+    /// shape is consumed by [`H5Attribute::write_array`]; the scalar writers
+    /// ([`write_scalar`](H5Attribute::write_scalar),
+    /// [`write_numeric`](H5Attribute::write_numeric)) ignore it.
     #[must_use]
-    pub fn shape<S>(mut self, _shape: S) -> Self {
-        // For now we only support scalar attributes.
-        self._shape_set = true;
+    pub fn shape<S: AttrShape>(mut self, shape: S) -> Self {
+        self.dims = shape.attr_dims();
         self
     }
 
     /// Create the attribute with the given name.
     ///
     /// The attribute is created but does not yet have a value.
-    /// Call [`H5Attribute::write_scalar`] to set the value.
+    /// Call [`H5Attribute::write_scalar`] or
+    /// [`H5Attribute::write_array`] to set the value.
     pub fn create(self, name: &str) -> Result<H5Attribute> {
         Ok(H5Attribute {
             file_inner: clone_inner(self.file_inner),
             ds_index: self.ds_index,
             name: name.to_string(),
+            write_dims: self.dims,
             read_attr: None,
         })
     }

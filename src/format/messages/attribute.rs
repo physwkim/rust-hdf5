@@ -65,6 +65,32 @@ impl AttributeMessage {
         }
     }
 
+    /// Create a numeric array attribute with a simple dataspace.
+    ///
+    /// `dims` are the dimension sizes (e.g. `&[3]` for the 1-D array
+    /// attributes AreaDetector writes). `data` is the row-major raw bytes and
+    /// must hold `product(dims) * datatype.element_size()` bytes — the caller
+    /// owns that invariant. An empty `dims` yields a scalar dataspace; prefer
+    /// [`Self::scalar_numeric`] for that case.
+    pub fn array_numeric(
+        name: &str,
+        datatype: DatatypeMessage,
+        dims: &[u64],
+        data: Vec<u8>,
+    ) -> Self {
+        debug_assert_eq!(
+            data.len() as u64,
+            dims.iter().product::<u64>() * datatype.element_size() as u64,
+            "array_numeric data length must equal product(dims) * element_size"
+        );
+        Self {
+            name: name.to_string(),
+            datatype,
+            dataspace: DataspaceMessage::simple(dims),
+            data,
+        }
+    }
+
     /// Encode the attribute message into a byte vector.
     ///
     /// The result is the raw payload for an object header message of type
@@ -298,6 +324,31 @@ mod tests {
             FormatError::InvalidVersion(0) => {}
             other => panic!("unexpected error: {:?}", other),
         }
+    }
+
+    #[test]
+    fn array_numeric_1d_roundtrip() {
+        use crate::format::messages::datatype::DatatypeMessage;
+        // Three int32 values, 1-D array attribute (NDArrayDimOffset-style).
+        let vals: [i32; 3] = [10, -20, 30];
+        let mut data = Vec::new();
+        for v in vals {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let msg = AttributeMessage::array_numeric(
+            "dim_offset",
+            DatatypeMessage::i32_type(),
+            &[3],
+            data.clone(),
+        );
+        assert_eq!(msg.dataspace.dims, vec![3]);
+        let encoded = msg.encode(&ctx());
+        let (decoded, consumed) = AttributeMessage::decode(&encoded, &ctx()).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.name, "dim_offset");
+        assert_eq!(decoded.dataspace.dims, vec![3]);
+        assert_eq!(decoded.data, data);
+        assert_eq!(decoded, msg);
     }
 
     #[test]

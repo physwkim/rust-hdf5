@@ -96,7 +96,7 @@ pub mod group;
 pub mod swmr;
 pub mod types;
 
-pub use attribute::H5Attribute;
+pub use attribute::{AttrShape, H5Attribute};
 pub use dataset::H5Dataset;
 pub use error::{Hdf5Error, Result};
 pub use file::{H5File, H5FileOptions};

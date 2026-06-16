@@ -1724,6 +1724,44 @@ mod tests {
     }
 
     #[test]
+    fn array_attr_roundtrip() {
+        let path = temp_path("array_attr");
+        let offsets = [10i32, -20, 30];
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file.new_dataset::<f32>().shape([4]).create("data").unwrap();
+            ds.write_raw(&[1.0f32; 4]).unwrap();
+
+            // 1-D int32 array attribute (NDArrayDimOffset-style).
+            let a = ds
+                .new_attr::<i32>()
+                .shape([3])
+                .create("dim_offset")
+                .unwrap();
+            a.write_array(&offsets).unwrap();
+
+            // Wrong element count is rejected.
+            let bad = ds.new_attr::<i32>().shape([3]).create("bad").unwrap();
+            assert!(bad.write_array(&[1i32, 2]).is_err());
+
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("data").unwrap();
+            let a = ds.attr("dim_offset").unwrap();
+            let raw = a.read_raw().unwrap();
+            assert_eq!(raw.len(), 3 * 4);
+            let got: Vec<i32> = raw
+                .chunks_exact(4)
+                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            assert_eq!(got, offsets);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn attr_datatype_exposes_class_and_sign() {
         // H5Attribute::datatype() must report the stored datatype class and
         // signedness so a generic attr->metadata mapper need not infer it from
