@@ -213,6 +213,30 @@ impl SwmrFileWriter {
         Ok(idx)
     }
 
+    /// Create a fixed-shape multi-dimensional grid dataset that fills at
+    /// explicit positions as frames arrive.
+    ///
+    /// Unlike [`create_streaming_dataset`](Self::create_streaming_dataset),
+    /// which appends frames along a single unlimited leading axis, this
+    /// creates a dataset of the full bounded shape `dims` (no unlimited axis)
+    /// and lets you place each frame at an arbitrary chunk position with
+    /// [`write_chunk_at`](Self::write_chunk_at). This mirrors AreaDetector's
+    /// "extra dimensions" layout, where a scan of known size (e.g.
+    /// `[Na, Nb, H, W]`) is filled in odometer order. `chunk` is the per-chunk
+    /// shape of the same rank (typically `[1, …, 1, H, W]`). Returns the
+    /// dataset index.
+    pub fn create_grid_dataset<T: H5Type>(
+        &mut self,
+        name: &str,
+        dims: &[u64],
+        chunk: &[u64],
+    ) -> Result<usize> {
+        let idx = self
+            .inner
+            .create_grid_dataset(name, T::hdf5_type(), dims, chunk)?;
+        Ok(idx)
+    }
+
     /// Create a hard link: an additional name for a dataset or group that
     /// already exists in the file.
     ///
@@ -470,6 +494,26 @@ impl SwmrFileWriter {
     /// The data size must match one frame (product of frame_dims * element_size).
     pub fn append_frame(&mut self, ds_index: usize, data: &[u8]) -> Result<()> {
         self.inner.append_frame(ds_index, data)?;
+        Ok(())
+    }
+
+    /// Write one frame at an explicit chunk position of a grid dataset
+    /// created with [`create_grid_dataset`](Self::create_grid_dataset).
+    ///
+    /// `chunk_coords` are in units of chunks (row-major over the chunk grid)
+    /// and `data` must be exactly one full chunk (`product(chunk) *
+    /// element_size` bytes; edge chunks are zero-padded by the caller). The
+    /// logical extent is fixed, so positions may be written in any order and
+    /// unwritten positions read back as fill. As with the streaming path,
+    /// call [`flush`](Self::flush) to make writes visible to SWMR readers and
+    /// set dataset attributes before [`start_swmr`](Self::start_swmr).
+    pub fn write_chunk_at(
+        &mut self,
+        ds_index: usize,
+        chunk_coords: &[u64],
+        data: &[u8],
+    ) -> Result<()> {
+        self.inner.write_chunk_at(ds_index, chunk_coords, data)?;
         Ok(())
     }
 

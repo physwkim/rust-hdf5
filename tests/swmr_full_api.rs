@@ -286,3 +286,117 @@ fn dataset_array_attribute_round_trips() {
 
     cleanup(&path);
 }
+
+/// A fixed-shape multi-dimensional grid dataset (AreaDetector "extra
+/// dimensions" layout) filled at explicit chunk positions out of order
+/// round-trips: written positions recover their data, unwritten positions
+/// read back as fill, and the SWMR reader sees the full bounded shape.
+#[test]
+fn grid_dataset_positioned_writes_round_trip() {
+    use rust_hdf5::H5File;
+
+    // Grid [Na=2, Nb=3, H=4, W=4], chunk [1,1,H,W]: one chunk == one frame.
+    const NA: u64 = 2;
+    const NB: u64 = 3;
+    const H: u64 = 4;
+    const W: u64 = 4;
+    let fpp = (H * W) as usize; // elements per frame
+
+    // Distinct, position-dependent pixel values.
+    let frame = |a: u64, b: u64| -> Vec<u16> {
+        (0..fpp as u16)
+            .map(|p| (1000 * a + 100 * b) as u16 + p)
+            .collect()
+    };
+    let bytes = |d: &[u16]| -> Vec<u8> { d.iter().flat_map(|v| v.to_le_bytes()).collect() };
+
+    let path = unique_tmp("grid");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        let ds = w
+            .create_grid_dataset::<u16>("grid", &[NA, NB, H, W], &[1, 1, H, W])
+            .unwrap();
+        w.start_swmr().unwrap();
+
+        // Deliberately non-sequential placement; leave (a=1, b=2) unwritten.
+        let order = [(0u64, 2u64), (1, 0), (0, 0), (1, 1), (0, 1)];
+        for &(a, b) in &order {
+            w.write_chunk_at(ds, &[a, b, 0, 0], &bytes(&frame(a, b)))
+                .unwrap();
+            w.flush().unwrap();
+        }
+        w.close().unwrap();
+    }
+
+    // SWMR reader sees the full bounded shape.
+    {
+        let r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+        assert_eq!(r.dataset_shape("grid").unwrap(), vec![NA, NB, H, W]);
+    }
+
+    // Full read path: each written position matches, (1,2) is fill (zero).
+    {
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("grid").unwrap();
+        assert_eq!(
+            ds.shape(),
+            vec![NA as usize, NB as usize, H as usize, W as usize]
+        );
+        let flat = ds.read_raw::<u16>().unwrap();
+        let idx = |a: u64, b: u64| ((a * NB + b) as usize) * fpp;
+        for a in 0..NA {
+            for b in 0..NB {
+                let got = &flat[idx(a, b)..idx(a, b) + fpp];
+                if a == 1 && b == 2 {
+                    assert!(
+                        got.iter().all(|&v| v == 0),
+                        "unwritten position (1,2) is not fill: {got:?}"
+                    );
+                } else {
+                    assert_eq!(got, &frame(a, b)[..], "mismatch at ({a},{b})");
+                }
+            }
+        }
+    }
+
+    cleanup(&path);
+}
+
+/// `write_chunk_at` rejects misuse: wrong-rank coordinates, out-of-grid
+/// coordinates, and a non-grid (streaming) dataset.
+#[test]
+fn grid_dataset_positioned_write_rejects_misuse() {
+    const H: u64 = 4;
+    const W: u64 = 4;
+    let chunk_bytes = vec![0u8; (H * W) as usize * 2]; // u16 full chunk
+
+    let path = unique_tmp("grid_misuse");
+    let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+    let grid = w
+        .create_grid_dataset::<u16>("grid", &[2, 3, H, W], &[1, 1, H, W])
+        .unwrap();
+    // A streaming (extensible-array) dataset is not a grid.
+    let stream = w
+        .create_streaming_dataset::<u16>("stream", &[H, W])
+        .unwrap();
+    w.start_swmr().unwrap();
+
+    // Wrong-rank coordinates (2 vs 4) are rejected.
+    assert!(
+        w.write_chunk_at(grid, &[0, 0], &chunk_bytes).is_err(),
+        "wrong-rank coords accepted"
+    );
+    // Out-of-grid coordinate (a=2 with Na=2) is rejected.
+    assert!(
+        w.write_chunk_at(grid, &[2, 0, 0, 0], &chunk_bytes).is_err(),
+        "out-of-grid coord accepted"
+    );
+    // Positioned write to a non-grid dataset is rejected.
+    assert!(
+        w.write_chunk_at(stream, &[0, 0], &chunk_bytes).is_err(),
+        "positioned write to streaming dataset accepted"
+    );
+
+    w.close().unwrap();
+    cleanup(&path);
+}

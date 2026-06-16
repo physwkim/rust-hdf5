@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.23
+
+### Added
+
+- `SwmrFileWriter::create_grid_dataset(name, dims, chunk)` — create a
+  fixed-shape multi-dimensional grid dataset whose chunks are filled at
+  explicit positions, rather than appended along a single unlimited axis
+  (`create_streaming_dataset`). This is the AreaDetector "extra dimensions"
+  layout: a scan of known size (e.g. `[Na, Nb, H, W]`) filled in odometer
+  order. Because the dataspace is fully bounded, it uses the fixed-array
+  chunk index — the index libhdf5 requires when there is no unlimited
+  dimension; an extensible array would make the file unreadable
+  ("didn't find unlimited dimension"). Verified readable by h5py.
+- `SwmrFileWriter::write_chunk_at(ds_index, chunk_coords, data)` — write one
+  full chunk at explicit chunk-grid coordinates of a grid dataset. Positions
+  may be written in any order; unwritten positions read back as fill. Call
+  `flush()` to make writes visible to SWMR readers. Rejects wrong-rank or
+  out-of-grid coordinates and non-grid (streaming) datasets.
+
 ## 0.2.22
 
 ### Added

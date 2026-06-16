@@ -304,6 +304,41 @@ impl SwmrWriter {
         Ok(idx)
     }
 
+    /// Create a fixed-shape multi-dimensional grid dataset addressed by
+    /// chunk coordinates.
+    ///
+    /// Unlike [`create_streaming_dataset`](Self::create_streaming_dataset),
+    /// which grows a single unlimited leading axis via `append_frame`, this
+    /// creates a dataset of the full bounded shape `dims` (no unlimited axis)
+    /// whose chunks are placed at explicit positions with
+    /// [`write_chunk_at`](Self::write_chunk_at). `chunk` is the per-chunk
+    /// shape of the same rank. A fully bounded dataspace uses the fixed-array
+    /// chunk index — the index libhdf5 requires for a dataset with no
+    /// unlimited dimension; an extensible array would make the file
+    /// unreadable ("didn't find unlimited dimension"). Returns the dataset
+    /// index.
+    pub fn create_grid_dataset(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        dims: &[u64],
+        chunk: &[u64],
+    ) -> IoResult<usize> {
+        if dims.is_empty() {
+            return Err(crate::io::IoError::InvalidState(
+                "create_grid_dataset requires at least one dimension".into(),
+            ));
+        }
+        if dims.contains(&0) {
+            return Err(crate::io::IoError::InvalidState(
+                "grid dataset dims must be non-zero".into(),
+            ));
+        }
+        // Fixed array index (rank/chunk validation happens inside).
+        self.writer
+            .create_fixed_array_dataset(name, datatype, dims, chunk)
+    }
+
     /// Set the SWMR flag in the superblock.
     ///
     /// This performs a full finalize: writes all dataset object headers, the
@@ -408,6 +443,29 @@ impl SwmrWriter {
         self.writer.extend_dataset(ds_index, &new_dims)?;
 
         Ok(())
+    }
+
+    /// Write one chunk at explicit chunk-grid coordinates of a fixed grid
+    /// dataset (see [`create_grid_dataset`](Self::create_grid_dataset)).
+    ///
+    /// `chunk_coords` are in units of chunks; `data` must be exactly one full
+    /// chunk (`product(chunk) * element_size` bytes — edge chunks are
+    /// zero-padded by the caller). The logical extent is fixed, so positions
+    /// may be written in any order and unwritten positions read back as fill.
+    /// Make writes visible to SWMR readers with [`flush`](Self::flush).
+    pub fn write_chunk_at(
+        &mut self,
+        ds_index: usize,
+        chunk_coords: &[u64],
+        data: &[u8],
+    ) -> IoResult<()> {
+        if self.writer.datasets[ds_index].fixed_array.is_none() {
+            return Err(crate::io::IoError::InvalidState(
+                "write_chunk_at requires a fixed grid dataset (create_grid_dataset)".into(),
+            ));
+        }
+        self.writer
+            .write_chunk_fixed_array(ds_index, chunk_coords, data)
     }
 
     /// `append_frame` for a dataset whose chunk spans `chunk[0] > 1` frames:
@@ -515,9 +573,14 @@ impl SwmrWriter {
     /// 2. Re-write dataset object headers in place (updated dataspace) -> fsync
     /// 3. Re-write superblock (updated EOF) -> fsync
     pub fn flush(&mut self) -> IoResult<()> {
-        // Step 1: Flush EA index structures for all chunked datasets.
+        // Step 1: Flush chunk index structures for all chunked datasets —
+        // extensible array (streaming), fixed array (fixed grid), and v2
+        // B-tree alike, matching finalize_for_swmr.
         for i in 0..self.writer.datasets.len() {
-            if self.writer.datasets[i].chunked.is_some() {
+            if self.writer.datasets[i].chunked.is_some()
+                || self.writer.datasets[i].fixed_array.is_some()
+                || self.writer.datasets[i].btree_v2.is_some()
+            {
                 self.writer.flush_dataset(i)?;
             }
         }
