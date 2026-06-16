@@ -12,15 +12,12 @@ use crate::format::{FormatError, FormatResult};
 // ===========================================================================
 
 // Datatype class codes used in the nbit parameter tree.
-const NBIT_ATOMIC: u32 = 1;
+pub(crate) const NBIT_ATOMIC: u32 = 1;
 const NBIT_ARRAY: u32 = 2;
 const NBIT_COMPOUND: u32 = 3;
 const NBIT_NOOPTYPE: u32 = 4;
-const NBIT_ORDER_LE: u32 = 0;
-/// Big-endian order code; referenced by name only in tests, but kept here
-/// so the parameter-tree decoding reads as a complete enumeration.
-#[cfg_attr(not(test), allow(dead_code))]
-const NBIT_ORDER_BE: u32 = 1;
+pub(crate) const NBIT_ORDER_LE: u32 = 0;
+pub(crate) const NBIT_ORDER_BE: u32 = 1;
 
 /// Parameters describing one atomic element for the nbit packer.
 #[derive(Clone, Copy)]

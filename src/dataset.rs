@@ -36,6 +36,7 @@ pub struct DatasetBuilder<T: H5Type> {
     custom_pipeline: Option<crate::format::messages::filter::FilterPipeline>,
     group_path: Option<String>,
     fill_value: Option<Vec<u8>>,
+    datatype_override: Option<crate::format::messages::datatype::DatatypeMessage>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -51,6 +52,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             custom_pipeline: None,
             group_path: None,
             fill_value: None,
+            datatype_override: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -66,6 +68,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             custom_pipeline: None,
             group_path: Some(group_path),
             fill_value: None,
+            datatype_override: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -157,6 +160,24 @@ impl<T: H5Type> DatasetBuilder<T> {
         self
     }
 
+    /// Override the stored element datatype.
+    ///
+    /// By default the dataset is created with the datatype derived from the
+    /// Rust type parameter `T` ([`H5Type::hdf5_type`]). Use this to store a
+    /// different on-disk datatype than the in-memory element type — for
+    /// example a reduced-precision fixed-point type that matches an N-bit
+    /// filter (see [`FilterPipeline::nbit`]). The element *byte* size of the
+    /// override must equal `T::element_size()`; the N-bit filter packs the
+    /// significant bits within that fixed footprint.
+    ///
+    /// [`H5Type::hdf5_type`]: crate::H5Type::hdf5_type
+    /// [`FilterPipeline::nbit`]: crate::FilterPipeline::nbit
+    #[must_use]
+    pub fn datatype(mut self, dt: crate::format::messages::datatype::DatatypeMessage) -> Self {
+        self.datatype_override = Some(dt);
+        self
+    }
+
     /// Set a user-defined fill value for unwritten elements.
     ///
     /// Without this, datasets use the HDF5 default zero-fill. When set,
@@ -208,7 +229,7 @@ impl<T: H5Type> DatasetBuilder<T> {
         let fill_value = self.fill_value.clone();
 
         let dims_u64: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
-        let datatype = T::hdf5_type();
+        let datatype = self.datatype_override.clone().unwrap_or_else(T::hdf5_type);
         let element_size = T::element_size();
 
         if let Some(ref chunk_dims) = self.chunk_dims {

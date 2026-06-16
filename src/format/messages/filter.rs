@@ -169,6 +169,77 @@ impl FilterPipeline {
         }
     }
 
+    /// Create a pipeline with a single N-bit filter (`H5Z_FILTER_NBIT`, id 5)
+    /// for an atomic numeric datatype.
+    ///
+    /// `dt` is the element datatype to pack (typically a reduced-precision
+    /// fixed-point type) and `d_nelmts` is the number of elements per chunk.
+    /// The `cd_values` tree mirrors libhdf5's `H5Z__set_local_nbit` for a
+    /// single atomic datatype:
+    /// `[nparms, need_not_compress, d_nelmts, NBIT_ATOMIC, size, order,
+    /// precision, offset]`. Pair this with
+    /// [`DatasetBuilder::datatype`](crate::dataset::DatasetBuilder::datatype) so the
+    /// stored datatype matches the filter parameters.
+    ///
+    /// Non-atomic datatypes are emitted with `need_not_compress = 1` (a
+    /// pass-through), matching libhdf5's handling of types it does not pack.
+    pub fn nbit(dt: &crate::format::messages::datatype::DatatypeMessage, d_nelmts: usize) -> Self {
+        use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+        use crate::format::nbit_scaleoffset::{NBIT_ATOMIC, NBIT_ORDER_BE, NBIT_ORDER_LE};
+
+        let (size, order, precision, offset) = match dt {
+            DatatypeMessage::FixedPoint {
+                size,
+                byte_order,
+                bit_offset,
+                bit_precision,
+                ..
+            }
+            | DatatypeMessage::FloatingPoint {
+                size,
+                byte_order,
+                bit_offset,
+                bit_precision,
+                ..
+            } => {
+                let order = match byte_order {
+                    ByteOrder::LittleEndian => NBIT_ORDER_LE,
+                    ByteOrder::BigEndian => NBIT_ORDER_BE,
+                };
+                (*size, order, *bit_precision as u32, *bit_offset as u32)
+            }
+            // Non-atomic: full footprint, no packing.
+            other => {
+                let size = other.element_size();
+                (size, NBIT_ORDER_LE, size * 8, 0)
+            }
+        };
+
+        // A full-precision atomic (offset 0, precision == size*8) carries no
+        // savings, so libhdf5 flags it pass-through; reduced precision sets
+        // need_not_compress = 0 so the bit packing actually runs.
+        let need_not_compress = u32::from(offset == 0 && precision == size * 8);
+
+        Self {
+            filters: vec![Filter {
+                id: FILTER_NBIT,
+                flags: 0,
+                // [nparms, need_not_compress, d_nelmts, class, size, order,
+                //  precision, offset] — total 8 (3 base + 5 atomic).
+                cd_values: vec![
+                    8,
+                    need_not_compress,
+                    d_nelmts as u32,
+                    NBIT_ATOMIC,
+                    size,
+                    order,
+                    precision,
+                    offset,
+                ],
+            }],
+        }
+    }
+
     /// Create an empty pipeline (no filters).
     pub fn none() -> Self {
         Self {
@@ -2657,6 +2728,77 @@ mod tests {
                 "lz4 framing roundtrip failed for es={elem_size} block={block} n={n_elems}"
             );
         }
+    }
+
+    // --- N-bit filter constructor tests ---
+    #[test]
+    fn nbit_atomic_cd_values_layout() {
+        use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+        // 12-bit unsigned packed into a 2-byte fixed-point footprint.
+        let dt = DatatypeMessage::FixedPoint {
+            size: 2,
+            byte_order: ByteOrder::LittleEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 12,
+        };
+        let pipeline = FilterPipeline::nbit(&dt, 100);
+        assert_eq!(pipeline.filters.len(), 1);
+        let f = &pipeline.filters[0];
+        assert_eq!(f.id, FILTER_NBIT);
+        // [nparms, need_not_compress, d_nelmts, NBIT_ATOMIC, size, order,
+        //  precision, offset]
+        assert_eq!(f.cd_values, vec![8, 0, 100, 1, 2, 0, 12, 0]);
+
+        // A full-precision atomic flags need_not_compress = 1 (pass-through).
+        let full = DatatypeMessage::FixedPoint {
+            size: 2,
+            byte_order: ByteOrder::LittleEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 16,
+        };
+        assert_eq!(FilterPipeline::nbit(&full, 100).filters[0].cd_values[1], 1);
+
+        // Big-endian maps to order code 1.
+        let be = DatatypeMessage::FixedPoint {
+            size: 2,
+            byte_order: ByteOrder::BigEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 12,
+        };
+        assert_eq!(FilterPipeline::nbit(&be, 100).filters[0].cd_values[5], 1);
+    }
+
+    #[test]
+    fn nbit_atomic_roundtrip_packs_12bit() {
+        use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+        let n = 64usize;
+        let dt = DatatypeMessage::FixedPoint {
+            size: 2,
+            byte_order: ByteOrder::LittleEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 12,
+        };
+        let pipeline = FilterPipeline::nbit(&dt, n);
+        // Values within 12-bit range, stored little-endian as u16.
+        let mut data = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let v = ((i * 53 + 1) % 4096) as u16;
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let packed = apply_filters(&pipeline, &data).unwrap();
+        // 12 of every 16 bits are kept, so the packed stream is shorter.
+        assert!(
+            packed.len() < data.len(),
+            "nbit did not pack: {} >= {}",
+            packed.len(),
+            data.len()
+        );
+        let back = reverse_filters(&pipeline, &packed).unwrap();
+        assert_eq!(back, data, "nbit 12-bit roundtrip mismatch");
     }
 
     // --- BitGroom golden test ---
