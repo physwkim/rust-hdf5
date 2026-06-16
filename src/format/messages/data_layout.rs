@@ -106,6 +106,23 @@ impl FixedArrayParams {
     }
 }
 
+/// Filtered single-chunk index parameters.
+///
+/// When a version-4 chunked layout uses the Single Chunk index AND the
+/// layout's "single index with filter" flag (`flags & 0x02`) is set,
+/// libhdf5 stores the chunk's on-disk (post-filter) size and its per-chunk
+/// filter mask inline in the layout message rather than in a separate index
+/// structure (H5Olayout.c). The mask must be honored on read: a set bit
+/// means the corresponding filter was *not* applied to this chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SingleChunkFilter {
+    /// On-disk (filtered) size of the single chunk, in bytes.
+    pub nbytes: u64,
+    /// Per-chunk filter mask: bit `i` set ⟹ filter `i` (forward pipeline
+    /// order) was skipped for this chunk and must not be reversed on read.
+    pub filter_mask: u32,
+}
+
 /// Data layout message payload.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DataLayoutMessage {
@@ -143,6 +160,9 @@ pub enum DataLayoutMessage {
         earray_params: Option<EarrayParams>,
         /// Fixed array parameters (present when index_type == FixedArray).
         farray_params: Option<FixedArrayParams>,
+        /// Filtered single-chunk parameters (present when index_type ==
+        /// SingleChunk and the layout's filtered flag `0x02` is set).
+        single_chunk_filter: Option<SingleChunkFilter>,
         /// Address of the chunk index structure.
         index_address: u64,
     },
@@ -193,6 +213,7 @@ impl DataLayoutMessage {
             index_type: ChunkIndexType::ExtensibleArray,
             earray_params: Some(earray_params),
             farray_params: None,
+            single_chunk_filter: None,
             index_address,
         }
     }
@@ -211,6 +232,7 @@ impl DataLayoutMessage {
             index_type: ChunkIndexType::FixedArray,
             earray_params: None,
             farray_params: Some(farray_params),
+            single_chunk_filter: None,
             index_address,
         }
     }
@@ -225,6 +247,7 @@ impl DataLayoutMessage {
             index_type: ChunkIndexType::BTreeV2,
             earray_params: None,
             farray_params: None,
+            single_chunk_filter: None,
             index_address,
         }
     }
@@ -239,6 +262,7 @@ impl DataLayoutMessage {
             index_type: ChunkIndexType::SingleChunk,
             earray_params: None,
             farray_params: None,
+            single_chunk_filter: None,
             index_address,
         }
     }
@@ -288,6 +312,7 @@ impl DataLayoutMessage {
                 index_type,
                 earray_params,
                 farray_params,
+                single_chunk_filter,
                 index_address,
             } => {
                 let sa = ctx.sizeof_addr as usize;
@@ -338,7 +363,21 @@ impl DataLayoutMessage {
                         buf.push(100);
                         buf.push(40);
                     }
-                    // SingleChunk, Implicit: no extra parameters.
+                    ChunkIndexType::SingleChunk => {
+                        // A filtered single chunk carries its on-disk size
+                        // (sizeof_size bytes) and 4-byte filter mask inline,
+                        // before the chunk address (H5Olayout.c). Only emit
+                        // them when the filtered flag is set; otherwise the
+                        // layout has no per-index parameters.
+                        if *flags & 0x02 != 0 {
+                            if let Some(scf) = single_chunk_filter {
+                                let ss = ctx.sizeof_size as usize;
+                                buf.extend_from_slice(&scf.nbytes.to_le_bytes()[..ss]);
+                                buf.extend_from_slice(&scf.filter_mask.to_le_bytes());
+                            }
+                        }
+                    }
+                    // Implicit: no extra parameters.
                     _ => {}
                 }
 
@@ -530,6 +569,7 @@ impl DataLayoutMessage {
                 // Index-type-specific parameters
                 let mut earray_params = None;
                 let mut farray_params = None;
+                let mut single_chunk_filter = None;
 
                 match index_type {
                     ChunkIndexType::ExtensibleArray => {
@@ -592,16 +632,31 @@ impl DataLayoutMessage {
                     // A single-chunk index whose "single index with
                     // filter" flag (0x02) is set carries the filtered
                     // chunk size (sizeof_size bytes) and a 4-byte filter
-                    // mask before the chunk address (H5Olayout.c).
+                    // mask before the chunk address (H5Olayout.c). Retain
+                    // both: the reader needs the exact on-disk size and must
+                    // honor the per-chunk mask when reversing filters.
                     ChunkIndexType::SingleChunk if flags & 0x02 != 0 => {
-                        let extra = ctx.sizeof_size as usize + 4;
+                        let ss = ctx.sizeof_size as usize;
+                        let extra = ss + 4;
                         if buf.len() < pos + extra {
                             return Err(FormatError::BufferTooShort {
                                 needed: pos + extra,
                                 available: buf.len(),
                             });
                         }
-                        pos += extra;
+                        let nbytes = read_size(&buf[pos..], ss);
+                        pos += ss;
+                        let filter_mask = u32::from_le_bytes([
+                            buf[pos],
+                            buf[pos + 1],
+                            buf[pos + 2],
+                            buf[pos + 3],
+                        ]);
+                        pos += 4;
+                        single_chunk_filter = Some(SingleChunkFilter {
+                            nbytes,
+                            filter_mask,
+                        });
                     }
                     // Implicit, and single-chunk without the filter flag:
                     // no extra parameters.
@@ -625,6 +680,7 @@ impl DataLayoutMessage {
                         index_type,
                         earray_params,
                         farray_params,
+                        single_chunk_filter,
                         index_address,
                     },
                     pos,
@@ -823,6 +879,43 @@ mod tests {
         let (decoded, consumed) = DataLayoutMessage::decode(&encoded, &ctx8()).unwrap();
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded, msg);
+    }
+
+    /// A filtered single-chunk layout (flag `0x02`) carries the chunk's
+    /// on-disk size and per-chunk filter mask inline. Decode must retain both
+    /// (not discard them), and encode↔decode must round-trip — including the
+    /// nonzero mask the reader needs to skip a filter.
+    #[test]
+    fn roundtrip_chunked_v4_single_filtered() {
+        for ctx in [ctx8(), ctx4()] {
+            let msg = DataLayoutMessage::ChunkedV4 {
+                flags: 0x02,
+                chunk_dims: vec![100, 200, 4],
+                index_type: ChunkIndexType::SingleChunk,
+                earray_params: None,
+                farray_params: None,
+                single_chunk_filter: Some(SingleChunkFilter {
+                    nbytes: 12345,
+                    filter_mask: 0b101,
+                }),
+                index_address: 0x3000,
+            };
+            let encoded = msg.encode(&ctx);
+            let (decoded, consumed) = DataLayoutMessage::decode(&encoded, &ctx).unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(decoded, msg);
+            // The decoded layout exposes the retained size and mask.
+            match decoded {
+                DataLayoutMessage::ChunkedV4 {
+                    single_chunk_filter: Some(scf),
+                    ..
+                } => {
+                    assert_eq!(scf.nbytes, 12345);
+                    assert_eq!(scf.filter_mask, 0b101);
+                }
+                other => panic!("expected filtered single-chunk layout, got {other:?}"),
+            }
+        }
     }
 
     #[test]

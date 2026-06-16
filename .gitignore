@@ -1,6 +1,11 @@
 /target
 Cargo.lock
 *.h5
+# Committed test fixtures are an explicit exception to the blanket *.h5
+# ignore above (which is for scratch / generated data files). These are
+# libhdf5/h5py-produced inputs that `tests/single_chunk_filtered.rs`
+# embeds via include_bytes!, so they must ship in the published package.
+!tests/fixtures/*.h5
 /.claude/
 .DS_Store
 /kodex-out/

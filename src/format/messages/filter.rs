@@ -325,15 +325,35 @@ pub fn apply_filters(pipeline: &FilterPipeline, data: &[u8]) -> FormatResult<Vec
     Ok(buf)
 }
 
-/// Reverse filter pipeline to decompress raw chunk data.
+/// Reverse the filter pipeline, skipping any filter whose bit is set in
+/// `filter_mask`.
 ///
-/// Filters are applied in reverse order. Returns the decompressed data.
-pub fn reverse_filters(pipeline: &FilterPipeline, data: &[u8]) -> FormatResult<Vec<u8>> {
+/// Filters run in reverse pipeline order. A set bit *i* means filter *i*
+/// (counted in forward pipeline order) was **not** applied to this chunk on
+/// write — e.g. an HDF5 direct chunk write (`H5Dwrite_chunk`) that handed in
+/// already-filtered bytes, or an incompressible chunk libhdf5 chose to store
+/// raw — so its reverse must be skipped here too. The mask addresses only the
+/// first 32 filters (the HDF5 limit); a position beyond that cannot be marked
+/// skipped and is always applied.
+pub fn reverse_filters_masked(
+    pipeline: &FilterPipeline,
+    data: &[u8],
+    filter_mask: u32,
+) -> FormatResult<Vec<u8>> {
     let mut buf = data.to_vec();
-    for filter in pipeline.filters.iter().rev() {
+    for (i, filter) in pipeline.filters.iter().enumerate().rev() {
+        if i < 32 && filter_mask & (1u32 << i) != 0 {
+            continue;
+        }
         buf = apply_single_filter(filter, &buf, false)?;
     }
     Ok(buf)
+}
+
+/// Reverse filter pipeline to decompress raw chunk data (the full pipeline,
+/// no per-chunk mask). Equivalent to [`reverse_filters_masked`] with mask 0.
+pub fn reverse_filters(pipeline: &FilterPipeline, data: &[u8]) -> FormatResult<Vec<u8>> {
+    reverse_filters_masked(pipeline, data, 0)
 }
 
 /// Apply the shuffle filter (byte transposition).
@@ -2014,6 +2034,32 @@ mod tests {
 
         let decompressed = reverse_filters(&pipeline, &compressed).unwrap();
         assert_eq!(decompressed, original);
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn reverse_filters_masked_skips_masked_filter() {
+        let pipeline = FilterPipeline::deflate(6);
+        let original = vec![42u8; 1024];
+        let compressed = apply_filters(&pipeline, &original).unwrap();
+
+        // mask 0: the full pipeline reverses (inflate) compressed -> original.
+        assert_eq!(
+            reverse_filters_masked(&pipeline, &compressed, 0).unwrap(),
+            original
+        );
+        // mask 1: filter 0 (deflate) is marked skipped, so the bytes are taken
+        // verbatim — a chunk stored uncompressed by a direct chunk write.
+        assert_eq!(
+            reverse_filters_masked(&pipeline, &original, 1).unwrap(),
+            original
+        );
+        // Out-of-range bits (>= 32) cannot mark a real filter; the single
+        // deflate filter still runs, recovering the original.
+        assert_eq!(
+            reverse_filters_masked(&pipeline, &compressed, 1u32 << 31).unwrap(),
+            original
+        );
     }
 
     #[cfg(feature = "deflate")]

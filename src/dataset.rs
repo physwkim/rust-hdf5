@@ -792,6 +792,120 @@ impl H5Dataset {
         }
     }
 
+    /// Write an already-filtered (pre-compressed) chunk **verbatim**, recording
+    /// the caller-supplied `filter_mask`. The bytes are stored as-is without
+    /// running the dataset's filter pipeline — the HDF5 "direct chunk write"
+    /// (`H5Dwrite_chunk`, formerly `H5DOwrite_chunk`) operation.
+    ///
+    /// `chunk_idx` is the linear chunk index (the frame number for streaming
+    /// datasets), exactly as for [`write_chunk`](Self::write_chunk). `data` is
+    /// the already-filtered bytes of one chunk — its length is the *stored*
+    /// (compressed) size, not the uncompressed chunk size.
+    ///
+    /// `filter_mask` is a bitfield: bit *i* set means filter *i* of the
+    /// dataset's pipeline was **not** applied to this chunk and must be skipped
+    /// on read. Pass 0 when the full pipeline was already applied upstream (the
+    /// common case: a codec plugin handed you compressed frames).
+    ///
+    /// The dataset must be chunked **and** filtered; an unfiltered chunk index
+    /// has no slot to record a stored size or mask. For a v2-B-tree-indexed
+    /// dataset (two or more unlimited dimensions) direct chunk writes are not
+    /// supported.
+    ///
+    /// # Reading back
+    ///
+    /// Both this crate's reader and libhdf5/h5py honor the per-chunk
+    /// `filter_mask`: a chunk written with any mask round-trips correctly, with
+    /// the reader skipping exactly the filters the mask marks as not applied.
+    pub fn write_chunk_raw(&self, chunk_idx: usize, data: &[u8], filter_mask: u32) -> Result<()> {
+        match &self.info {
+            DatasetInfo::Writer {
+                index,
+                chunked,
+                btree2,
+                fixed_array,
+                ..
+            } => {
+                if !*chunked {
+                    return Err(Hdf5Error::InvalidState(
+                        "write_chunk_raw is only for chunked datasets".into(),
+                    ));
+                }
+                if *btree2 {
+                    return Err(Hdf5Error::InvalidState(
+                        "direct chunk writes are not supported for v2-B-tree-indexed \
+                         datasets (two or more unlimited dimensions)"
+                            .into(),
+                    ));
+                }
+
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Writer(writer) => {
+                        if *fixed_array {
+                            // Fixed-array dataset: convert the linear chunk
+                            // index into row-major grid coordinates.
+                            let chunk_dims = writer
+                                .dataset_chunk_dims(*index)
+                                .ok_or_else(|| {
+                                    Hdf5Error::InvalidState("dataset has no chunk info".into())
+                                })?
+                                .to_vec();
+                            let dims = writer.dataset_dims(*index).to_vec();
+                            let mut grid = vec![0u64; dims.len()];
+                            for d in 0..dims.len() {
+                                grid[d] = if chunk_dims[d] > 0 {
+                                    dims[d].div_ceil(chunk_dims[d])
+                                } else {
+                                    1
+                                };
+                            }
+                            // A zero-extent dimension yields a grid of 0
+                            // chunks — there is no chunk to write.
+                            if grid.contains(&0) {
+                                return Err(Hdf5Error::InvalidState(
+                                    "dataset has a zero-extent dimension and no chunks".into(),
+                                ));
+                            }
+                            let mut rem = chunk_idx as u64;
+                            let mut coords = vec![0u64; dims.len()];
+                            for d in (0..dims.len()).rev() {
+                                coords[d] = rem % grid[d];
+                                rem /= grid[d];
+                            }
+                            // A leftover means chunk_idx exceeded the grid.
+                            if rem != 0 {
+                                return Err(Hdf5Error::InvalidState(format!(
+                                    "chunk index {chunk_idx} is out of range for this dataset"
+                                )));
+                            }
+                            writer.write_compressed_chunk_fixed_array(
+                                *index,
+                                &coords,
+                                data,
+                                filter_mask,
+                            )?;
+                        } else {
+                            writer.write_compressed_chunk(
+                                *index,
+                                chunk_idx as u64,
+                                data,
+                                filter_mask,
+                            )?;
+                        }
+                        Ok(())
+                    }
+                    _ => Err(Hdf5Error::InvalidState(
+                        "file is no longer in write mode".into(),
+                    )),
+                }
+            }
+            DatasetInfo::Reader { .. } => {
+                Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
+            }
+        }
+    }
+
     /// Write a single chunk to a v2-B-tree-indexed dataset, addressed by its
     /// chunk-grid coordinates (one per dimension).
     ///
@@ -2590,6 +2704,285 @@ mod tests {
         let file = H5File::create(&path).unwrap();
         let ds = file.new_dataset::<f32>().shape([4]).create("d").unwrap();
         assert!(ds.datatype().is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    // --- write_chunk_raw (HDF5 direct chunk write) ---------------------------
+
+    /// Extensible-array path: pre-compress with the dataset's pipeline, write
+    /// the bytes verbatim via write_chunk_raw (filter_mask = 0), and confirm
+    /// the data round-trips through the reader unchanged.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn write_chunk_raw_ea_roundtrip_mask0() {
+        use crate::format::messages::filter::{apply_filters, FilterPipeline};
+        let path = temp_path("wcr_ea_mask0");
+        let original: Vec<i32> = (0..12).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0])
+                .chunk(&[4])
+                .max_shape(&[None])
+                .deflate(4)
+                .create("v")
+                .unwrap();
+            assert!(ds.is_chunked());
+            let pipeline = FilterPipeline::deflate(4);
+            for c in 0..3usize {
+                let raw: Vec<u8> = original[c * 4..c * 4 + 4]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                let compressed = apply_filters(&pipeline, &raw).unwrap();
+                ds.write_chunk_raw(c, &compressed, 0).unwrap();
+            }
+            ds.set_extent(&[12]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let v = file.dataset("v").unwrap().read_raw::<i32>().unwrap();
+            assert_eq!(v, original);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Fixed-array path (all dimensions bounded): same verbatim write through
+    /// the linear-index dispatch, round-tripped through the reader.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn write_chunk_raw_fixed_array_roundtrip_mask0() {
+        use crate::format::messages::filter::{apply_filters, FilterPipeline};
+        let path = temp_path("wcr_fa_mask0");
+        let original: Vec<i32> = (0..12).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([12])
+                .chunk(&[4])
+                .deflate(4)
+                .create("v")
+                .unwrap();
+            assert!(ds.is_chunked());
+            let pipeline = FilterPipeline::deflate(4);
+            for c in 0..3usize {
+                let raw: Vec<u8> = original[c * 4..c * 4 + 4]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                let compressed = apply_filters(&pipeline, &raw).unwrap();
+                ds.write_chunk_raw(c, &compressed, 0).unwrap();
+            }
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let v = file.dataset("v").unwrap().read_raw::<i32>().unwrap();
+            assert_eq!(v, original);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The caller-supplied filter_mask must reach the on-disk filtered index
+    /// entry (not be hardcoded to 0). Store one chunk uncompressed in a
+    /// filtered dataset with mask = 1 (deflate skipped), then reopen and decode
+    /// the extensible-array filtered entry to read the mask back at the format
+    /// level (independent of the data reader's mask handling).
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn write_chunk_raw_records_filter_mask() {
+        let path = temp_path("wcr_records_mask");
+        let raw: Vec<u8> = [10i32, 20, 30, 40]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(raw.len(), 16);
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0])
+                .chunk(&[4])
+                .max_shape(&[None])
+                .deflate(4)
+                .create("v")
+                .unwrap();
+            // mask = 1: bit 0 set => filter 0 (deflate) was skipped, so the
+            // chunk is stored uncompressed (its raw bytes).
+            ds.write_chunk_raw(0, &raw, 1).unwrap();
+            ds.set_extent(&[4]).unwrap();
+            file.close().unwrap();
+        }
+        // Reopen the writer; open_append decodes the filtered index block from
+        // disk, so the entry reflects exactly what was committed.
+        {
+            let w = crate::io::writer::Hdf5Writer::open_append(&path).unwrap();
+            let idx = w.dataset_index("v").unwrap();
+            let entry = &w.datasets[idx]
+                .chunked
+                .as_ref()
+                .unwrap()
+                .filt_iblk
+                .as_ref()
+                .unwrap()
+                .elements[0];
+            assert_eq!(entry.filter_mask, 1, "filter_mask must round-trip to disk");
+            assert_eq!(entry.nbytes, 16, "uncompressed chunk stored verbatim");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Reader honors a per-chunk filter_mask (EA): one chunk is stored
+    /// compressed (mask 0), the next stored raw with deflate skipped (mask 1),
+    /// in the same dataset. A correct reader skips deflate for chunk 1 only;
+    /// ignoring the mask would feed raw bytes through inflate and corrupt them.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn write_chunk_raw_ea_per_chunk_mask_roundtrip() {
+        use crate::format::messages::filter::{apply_filters, FilterPipeline};
+        let path = temp_path("wcr_ea_per_chunk_mask");
+        let original: Vec<i32> = (0..8).collect();
+        let pipeline = FilterPipeline::deflate(4);
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0])
+                .chunk(&[4])
+                .max_shape(&[None])
+                .deflate(4)
+                .create("v")
+                .unwrap();
+            let raw0: Vec<u8> = original[0..4]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            // chunk 0: compressed through the pipeline, mask 0.
+            ds.write_chunk_raw(0, &apply_filters(&pipeline, &raw0).unwrap(), 0)
+                .unwrap();
+            let raw1: Vec<u8> = original[4..8]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            // chunk 1: stored uncompressed, mask 1 (deflate skipped).
+            ds.write_chunk_raw(1, &raw1, 1).unwrap();
+            ds.set_extent(&[8]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let v = file.dataset("v").unwrap().read_raw::<i32>().unwrap();
+            assert_eq!(v, original);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Reader honors a per-chunk filter_mask (fixed array): same mixed
+    /// compressed/raw chunks as the EA case, through the fixed-array index.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn write_chunk_raw_fixed_array_per_chunk_mask_roundtrip() {
+        use crate::format::messages::filter::{apply_filters, FilterPipeline};
+        let path = temp_path("wcr_fa_per_chunk_mask");
+        let original: Vec<i32> = (0..8).collect();
+        let pipeline = FilterPipeline::deflate(4);
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([8])
+                .chunk(&[4])
+                .deflate(4)
+                .create("v")
+                .unwrap();
+            let raw0: Vec<u8> = original[0..4]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            ds.write_chunk_raw(0, &apply_filters(&pipeline, &raw0).unwrap(), 0)
+                .unwrap();
+            let raw1: Vec<u8> = original[4..8]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            ds.write_chunk_raw(1, &raw1, 1).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let v = file.dataset("v").unwrap().read_raw::<i32>().unwrap();
+            assert_eq!(v, original);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An unfiltered chunk index has no slot for a stored size or mask, so a
+    /// direct chunk write must be rejected rather than silently dropping them.
+    #[test]
+    fn write_chunk_raw_rejects_unfiltered() {
+        let path = temp_path("wcr_unfiltered");
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([0])
+            .chunk(&[4])
+            .max_shape(&[None])
+            .create("v")
+            .unwrap();
+        let err = ds.write_chunk_raw(0, &[0u8; 16], 0).unwrap_err();
+        assert!(
+            err.to_string().contains("filtered dataset"),
+            "expected a filtered-dataset error, got: {err}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// v2-B-tree-indexed datasets (two or more unlimited dimensions) do not
+    /// support direct chunk writes.
+    #[test]
+    fn write_chunk_raw_rejects_btree_v2() {
+        let path = temp_path("wcr_btree2");
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([0, 0])
+            .chunk(&[2, 2])
+            .max_shape(&[None, None])
+            .create("grid")
+            .unwrap();
+        let err = ds.write_chunk_raw(0, &[0u8; 16], 0).unwrap_err();
+        assert!(
+            err.to_string().contains("v2-B-tree"),
+            "expected a v2-B-tree rejection, got: {err}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A stored size that does not fit the index's chunk-size field must error
+    /// (libhdf5 H5D_CHUNK_ENCODE_SIZE_CHECK) instead of truncating silently.
+    /// A 4-byte chunk (chunk[1] of i32) has chunk_size_len = 2 (max 65535), so
+    /// a 70000-byte stored chunk overflows it.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn write_chunk_raw_rejects_oversized_chunk() {
+        let path = temp_path("wcr_oversized");
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([0])
+            .chunk(&[1])
+            .max_shape(&[None])
+            .deflate(4)
+            .create("v")
+            .unwrap();
+        let err = ds.write_chunk_raw(0, &vec![0u8; 70000], 0).unwrap_err();
+        assert!(
+            err.to_string().contains("does not fit"),
+            "expected a chunk-size-field overflow error, got: {err}"
+        );
         std::fs::remove_file(&path).ok();
     }
 }

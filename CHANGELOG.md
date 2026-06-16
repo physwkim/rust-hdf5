@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.2.19
+
+### Added
+
+- `H5Dataset::write_chunk_raw(chunk_idx, data, filter_mask)` — the HDF5
+  "direct chunk write" (`H5Dwrite_chunk` / `H5DOwrite_chunk`): store an
+  already-filtered chunk verbatim without re-running the dataset's filter
+  pipeline, recording a per-chunk `filter_mask`. Bit *i* set means filter
+  *i* was not applied to this chunk and must be skipped on read. Unblocks
+  handing already-compressed frames (e.g. from a codec plugin) straight to
+  disk. Supported for extensible-array (one unlimited dimension) and
+  fixed-array (all dimensions bounded) indexes; rejected for unfiltered and
+  v2-B-tree datasets, which have no slot for a stored size or mask.
+- `filter::reverse_filters_masked(pipeline, data, filter_mask)` and
+  `DataLayoutMessage`'s new `SingleChunkFilter` — public format-layer
+  building blocks for per-chunk masking.
+
+### Fixed
+
+- The reader now honors the per-chunk `filter_mask` on every chunked index
+  path — extensible array, fixed array, version-1 and version-2 B-trees,
+  and the single-chunk index — so a chunk written with a filter skipped
+  round-trips through this crate's own reader, not only libhdf5/h5py. A
+  single-chunk filtered layout's inline on-disk size and mask are now
+  decoded (previously discarded), so such a chunk is read at its exact
+  stored size instead of an over-read-and-inflate guess.
+- A filtered chunk whose stored size does not fit the chunk-index size
+  field now errors (matching libhdf5's `H5D_CHUNK_ENCODE_SIZE_CHECK`)
+  instead of silently truncating the recorded size.
+
 ## 0.2.18
 
 ### Added

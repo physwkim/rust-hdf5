@@ -1419,7 +1419,9 @@ impl Hdf5Writer {
         let chunk_addr = self.allocator.allocate(compressed_size);
         self.handle.write_at(chunk_addr, write_data)?;
 
-        self.record_ea_chunk(index, chunk_idx, chunk_addr, compressed_size)
+        // filter_mask = 0: this path runs the whole pipeline, so no filter is
+        // skipped for the chunk.
+        self.record_ea_chunk(index, chunk_idx, chunk_addr, compressed_size, 0)
     }
 
     /// Record a written chunk in the extensible-array index, placing
@@ -1432,8 +1434,30 @@ impl Hdf5Writer {
         chunk_idx: u64,
         chunk_addr: u64,
         compressed_size: u64,
+        filter_mask: u32,
     ) -> IoResult<()> {
         let is_filtered = self.datasets[index].filter_pipeline.is_some();
+        // For a filtered dataset the chunk's stored size is encoded in the
+        // `chunk_size_len`-byte field of each filtered EA entry
+        // (`FilteredChunkEntry::encode` writes `nbytes[..chunk_size_len]`,
+        // which truncates silently). Reject a size that would not fit, the way
+        // libhdf5's H5D_CHUNK_ENCODE_SIZE_CHECK does, instead of corrupting the
+        // index. The compress path never exceeds this (chunk_size_len holds the
+        // uncompressed chunk size); a direct/raw write with caller-supplied
+        // bytes can.
+        if is_filtered {
+            let chunk_size_len = self.datasets[index]
+                .chunked
+                .as_ref()
+                .unwrap()
+                .chunk_size_len as usize;
+            if chunk_size_len < 8 && compressed_size >= (1u64 << (chunk_size_len * 8)) {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "filtered chunk size {compressed_size} does not fit in the \
+                     {chunk_size_len}-byte extensible-array chunk-size field"
+                )));
+            }
+        }
         let idx_blk_elmts = {
             let c = self.datasets[index].chunked.as_ref().unwrap();
             c.earray_params.idx_blk_elmts as u64
@@ -1446,7 +1470,7 @@ impl Hdf5Writer {
                     fiblk.elements[chunk_idx as usize] = FilteredChunkEntry {
                         addr: chunk_addr,
                         nbytes: compressed_size,
-                        filter_mask: 0,
+                        filter_mask,
                     };
                 }
             } else {
@@ -1568,7 +1592,7 @@ impl Hdf5Writer {
                 let entry = FilteredChunkEntry {
                     addr: chunk_addr,
                     nbytes: compressed_size,
-                    filter_mask: 0,
+                    filter_mask,
                 };
                 let mut dblk = if created {
                     FilteredDataBlock::new(ea_header_addr, loc.dblk_block_offset, dblk_nelmts)
@@ -2279,7 +2303,7 @@ impl Hdf5Writer {
         // The chunk entry is either read straight from an index block, or
         // located via a data block that must itself be read from disk.
         enum Loc {
-            Direct(u64, u64),
+            Direct(u64, u64, u32),
             DataBlock {
                 dblk_addr: u64,
                 offset: usize,
@@ -2304,9 +2328,9 @@ impl Hdf5Writer {
             EaLoc::Index { elem } => {
                 if is_filtered {
                     let e = &chunked.filt_iblk.as_ref().unwrap().elements[elem];
-                    Loc::Direct(e.addr, e.nbytes)
+                    Loc::Direct(e.addr, e.nbytes, e.filter_mask)
                 } else {
-                    Loc::Direct(chunked.ea_iblk.elements[elem], chunk_bytes)
+                    Loc::Direct(chunked.ea_iblk.elements[elem], chunk_bytes, 0)
                 }
             }
             EaLoc::Dblk(l) => {
@@ -2361,9 +2385,12 @@ impl Hdf5Writer {
             }
         };
 
-        // Phase 2: resolve through the data block (if needed) and read.
-        let (addr, nbytes) = match loc {
-            Loc::Direct(a, n) => (a, n),
+        // Phase 2: resolve through the data block (if needed) and read. The
+        // mask is the chunk's filter mask (0 for unfiltered), so a chunk
+        // written via a direct chunk write with a skipped filter is reversed
+        // correctly during read-modify-write.
+        let (addr, nbytes, mask) = match loc {
+            Loc::Direct(a, n, m) => (a, n, m),
             Loc::DataBlock {
                 dblk_addr,
                 offset,
@@ -2379,11 +2406,11 @@ impl Hdf5Writer {
                         chunk_size_len,
                     )?;
                     let e = &dblk.elements[offset];
-                    (e.addr, e.nbytes)
+                    (e.addr, e.nbytes, e.filter_mask)
                 } else {
                     let dblk =
                         ExtensibleArrayDataBlock::decode(&buf, &self.ctx, max_nelmts_bits, nelmts)?;
-                    (dblk.elements[offset], chunk_bytes)
+                    (dblk.elements[offset], chunk_bytes, 0)
                 }
             }
         };
@@ -2396,7 +2423,7 @@ impl Hdf5Writer {
             let Some(pl) = pipeline.as_ref() else {
                 return Ok(None);
             };
-            Ok(Some(filter::reverse_filters(pl, &raw)?))
+            Ok(Some(filter::reverse_filters_masked(pl, &raw, mask)?))
         } else {
             Ok(Some(raw))
         }
@@ -2864,6 +2891,8 @@ impl Hdf5Writer {
     /// Write a chunk to a fixed-array-indexed dataset.
     ///
     /// `chunk_coords` is the multidimensional chunk index (e.g., [row_chunk, col_chunk]).
+    /// The uncompressed `data` must be exactly one chunk wide; the filter
+    /// pipeline (if any) runs here before the bytes reach the index.
     pub fn write_chunk_fixed_array(
         &mut self,
         index: usize,
@@ -2878,33 +2907,75 @@ impl Hdf5Writer {
             .ok_or_else(|| crate::io::IoError::InvalidState("not a fixed-array dataset".into()))?;
         let chunk_bytes: u64 = fa.chunk_dims.iter().product::<u64>() * element_size;
 
-        // Possibly compress the data. For a filtered dataset the FA carries
-        // filtered elements (address + compressed size + filter mask); the
-        // uncompressed data must still be exactly one chunk wide on input.
-        let is_filtered = ds.filter_pipeline.is_some();
+        if data.len() as u64 != chunk_bytes {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "chunk data size mismatch: expected {} bytes, got {}",
+                chunk_bytes,
+                data.len()
+            )));
+        }
         let write_data;
         let data_to_write = if let Some(ref pipeline) = ds.filter_pipeline {
-            if data.len() as u64 != chunk_bytes {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "chunk data size mismatch: expected {} bytes, got {}",
-                    chunk_bytes,
-                    data.len()
-                )));
-            }
             write_data = filter::apply_filters(pipeline, data)?;
-            &write_data
+            &write_data[..]
         } else {
-            if data.len() as u64 != chunk_bytes {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "chunk data size mismatch: expected {} bytes, got {}",
-                    chunk_bytes,
-                    data.len()
-                )));
-            }
             data
         };
+        // filter_mask = 0: the whole pipeline ran (or the dataset is
+        // unfiltered), so no filter is skipped for this chunk.
+        self.record_fixed_array_chunk(index, chunk_coords, data_to_write, 0)
+    }
 
-        // Compute linear chunk index from multidimensional coordinates
+    /// Write a pre-filtered chunk verbatim to a fixed-array dataset, recording
+    /// the caller-supplied `filter_mask`.
+    ///
+    /// The bytes are stored exactly as given (no filter pipeline is run); this
+    /// is the fixed-array half of the HDF5 "direct chunk write"
+    /// (`H5Dwrite_chunk`) operation. `filter_mask` is a bitfield: bit *i* set
+    /// means filter *i* of the pipeline was **not** applied to this chunk and
+    /// must be skipped on read; pass 0 when the full pipeline was applied
+    /// upstream.
+    ///
+    /// Requires a filtered dataset — only the filtered FA element carries the
+    /// size+mask slot.
+    pub fn write_compressed_chunk_fixed_array(
+        &mut self,
+        index: usize,
+        chunk_coords: &[u64],
+        data: &[u8],
+        filter_mask: u32,
+    ) -> IoResult<()> {
+        if self.datasets[index].filter_pipeline.is_none() {
+            return Err(crate::io::IoError::InvalidState(
+                "write_compressed_chunk_fixed_array requires a filtered dataset \
+                 (no slot for a compressed size or filter mask on an unfiltered \
+                 chunk index)"
+                    .into(),
+            ));
+        }
+        self.record_fixed_array_chunk(index, chunk_coords, data, filter_mask)
+    }
+
+    /// Place an already-final chunk (`final_bytes` is whatever goes to disk —
+    /// filtered if the dataset is filtered, raw otherwise) into a fixed-array
+    /// dataset's data block, recording the caller-supplied `filter_mask`.
+    /// Shared by [`write_chunk_fixed_array`](Self::write_chunk_fixed_array)
+    /// and [`write_compressed_chunk_fixed_array`](Self::write_compressed_chunk_fixed_array).
+    fn record_fixed_array_chunk(
+        &mut self,
+        index: usize,
+        chunk_coords: &[u64],
+        final_bytes: &[u8],
+        filter_mask: u32,
+    ) -> IoResult<()> {
+        let ds = &self.datasets[index];
+        let is_filtered = ds.filter_pipeline.is_some();
+        let fa = ds
+            .fixed_array
+            .as_ref()
+            .ok_or_else(|| crate::io::IoError::InvalidState("not a fixed-array dataset".into()))?;
+
+        // Compute linear chunk index from multidimensional coordinates.
         let dims = &ds.dataspace.dims;
         let chunk_dims = &fa.chunk_dims;
         let ndims = dims.len();
@@ -2932,26 +3003,25 @@ impl Hdf5Writer {
         }
 
         // Allocate space for the chunk data
-        let chunk_addr = self.allocator.allocate(data_to_write.len() as u64);
-        self.handle.write_at(chunk_addr, data_to_write)?;
+        let chunk_addr = self.allocator.allocate(final_bytes.len() as u64);
+        self.handle.write_at(chunk_addr, final_bytes)?;
 
         // Update the fixed array data block.
         let fa = self.datasets[index].fixed_array.as_mut().unwrap();
         let lidx = linear_idx as usize;
         if is_filtered {
-            // Filtered FA: store address + compressed size + filter mask. The
-            // mask is 0 because `apply_filters` ran the whole pipeline (no
-            // filter was skipped); a non-zero bit means "filter i skipped".
-            let compressed_size = data_to_write.len();
-            if compressed_size > u32::MAX as usize {
+            // Filtered FA: store address + stored size + filter mask. A
+            // non-zero mask bit means "filter i was skipped for this chunk".
+            let stored_size = final_bytes.len();
+            if stored_size > u32::MAX as usize {
                 return Err(crate::io::IoError::InvalidState(format!(
-                    "compressed chunk size {compressed_size} exceeds u32::MAX"
+                    "compressed chunk size {stored_size} exceeds u32::MAX"
                 )));
             }
-            // The compressed size is encoded in the FA header's
-            // `chunk_size_len`-byte field; libhdf5 errors if it does not fit
-            // (H5D_CHUNK_ENCODE_SIZE_CHECK) rather than truncating silently.
-            // element_size = sizeof_addr + chunk_size_len + 4 by construction.
+            // The stored size is encoded in the FA header's `chunk_size_len`-byte
+            // field; libhdf5 errors if it does not fit (H5D_CHUNK_ENCODE_SIZE_CHECK)
+            // rather than truncating silently. element_size = sizeof_addr +
+            // chunk_size_len + 4 by construction.
             let chunk_size_len = (fa.fa_header.element_size as usize)
                 .checked_sub(self.ctx.sizeof_addr as usize + 4)
                 .ok_or_else(|| {
@@ -2959,17 +3029,17 @@ impl Hdf5Writer {
                         "filtered fixed-array element size is too small".into(),
                     )
                 })?;
-            if chunk_size_len < 8 && compressed_size >= (1usize << (chunk_size_len * 8)) {
+            if chunk_size_len < 8 && stored_size >= (1usize << (chunk_size_len * 8)) {
                 return Err(crate::io::IoError::InvalidState(format!(
-                    "compressed chunk size {compressed_size} does not fit in the \
+                    "compressed chunk size {stored_size} does not fit in the \
                      {chunk_size_len}-byte fixed-array chunk-size field"
                 )));
             }
             if lidx < fa.fa_dblk.filtered_elements.len() {
                 fa.fa_dblk.filtered_elements[lidx] = FixedArrayFilteredChunkElement {
                     address: chunk_addr,
-                    chunk_size: compressed_size as u32,
-                    filter_mask: 0,
+                    chunk_size: stored_size as u32,
+                    filter_mask,
                 };
                 fa.chunks_written += 1;
             } else {
@@ -2979,15 +3049,24 @@ impl Hdf5Writer {
                     fa.fa_dblk.filtered_elements.len()
                 )));
             }
-        } else if lidx < fa.fa_dblk.elements.len() {
-            fa.fa_dblk.elements[lidx] = chunk_addr;
-            fa.chunks_written += 1;
         } else {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "chunk index {} out of range (max {})",
-                linear_idx,
-                fa.fa_dblk.elements.len()
-            )));
+            // An unfiltered fixed array stores only addresses — there is no
+            // slot for a filter mask, so a non-zero mask cannot be honored.
+            if filter_mask != 0 {
+                return Err(crate::io::IoError::InvalidState(
+                    "filter_mask is non-zero but the dataset is unfiltered".into(),
+                ));
+            }
+            if lidx < fa.fa_dblk.elements.len() {
+                fa.fa_dblk.elements[lidx] = chunk_addr;
+                fa.chunks_written += 1;
+            } else {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "chunk index {} out of range (max {})",
+                    linear_idx,
+                    fa.fa_dblk.elements.len()
+                )));
+            }
         }
 
         Ok(())
@@ -3041,7 +3120,9 @@ impl Hdf5Writer {
                 let chunk_data: Vec<Vec<u8>> = chunks.iter().map(|(_, d)| d.to_vec()).collect();
                 let compressed = filter::apply_filters_parallel(pipeline, &chunk_data);
                 for ((idx, _), compressed_data) in chunks.iter().zip(compressed.iter()) {
-                    self.write_compressed_chunk(ds_index, *idx, compressed_data)?;
+                    // filter_mask = 0: the parallel compressor ran the whole
+                    // pipeline, so no filter is skipped for these chunks.
+                    self.write_compressed_chunk(ds_index, *idx, compressed_data, 0)?;
                 }
                 return Ok(());
             }
@@ -3053,23 +3134,37 @@ impl Hdf5Writer {
         Ok(())
     }
 
-    /// Write a pre-compressed chunk to a chunked dataset.
+    /// Write a pre-filtered chunk verbatim to an EA-indexed dataset, recording
+    /// the caller-supplied `filter_mask`.
     ///
-    /// The chunk data is already compressed; this method writes it and updates
-    /// the chunk index using the proper filtered EA entries (addr + size + mask).
-    /// For datasets with a filter pipeline, this stores the compressed size
-    /// in the filtered EA. For unfiltered datasets, it stores only the address.
+    /// The bytes are stored exactly as given (no filter pipeline is run); this
+    /// is the extensible-array half of the HDF5 "direct chunk write"
+    /// (`H5Dwrite_chunk`) operation. `filter_mask` is a bitfield: bit *i* set
+    /// means filter *i* of the pipeline was **not** applied to this chunk and
+    /// must be skipped on read; pass 0 when the full pipeline was applied
+    /// upstream.
+    ///
+    /// Requires a filtered dataset — only the filtered EA entry carries the
+    /// size+mask slot. An unfiltered dataset has nowhere to record either.
     pub fn write_compressed_chunk(
         &mut self,
         index: usize,
         chunk_idx: u64,
         compressed_data: &[u8],
+        filter_mask: u32,
     ) -> IoResult<()> {
+        if self.datasets[index].filter_pipeline.is_none() {
+            return Err(crate::io::IoError::InvalidState(
+                "write_compressed_chunk requires a filtered dataset (no slot for \
+                 a compressed size or filter mask on an unfiltered chunk index)"
+                    .into(),
+            ));
+        }
         let compressed_size = compressed_data.len() as u64;
         let chunk_addr = self.allocator.allocate(compressed_size);
         self.handle.write_at(chunk_addr, compressed_data)?;
 
-        self.record_ea_chunk(index, chunk_idx, chunk_addr, compressed_size)
+        self.record_ea_chunk(index, chunk_idx, chunk_addr, compressed_size, filter_mask)
     }
 
     /// Extend the dimensions of a chunked dataset.

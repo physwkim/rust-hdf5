@@ -35,6 +35,30 @@ use crate::io::file_handle::FileHandle;
 use crate::io::file_handle::MmapFileHandle;
 use crate::io::IoResult;
 
+/// A chunk read from a B-tree-indexed dataset before decompression: its raw
+/// on-disk bytes, its scaled (chunk-grid) offsets, and its per-chunk filter
+/// mask (0 when unfiltered, or a bitfield marking filters skipped for the
+/// chunk).
+type RawChunkWithMask = (Vec<u8>, Vec<u64>, u32);
+
+/// The version-4 chunk-index descriptor pulled from a data-layout message:
+/// the index kind, its address, and the per-kind parameters the reader needs
+/// to walk it. Bundled so the chunked read entry point takes one descriptor
+/// instead of a long parameter list.
+struct ChunkIndexDesc<'a> {
+    /// The kind of chunk index (single chunk, fixed/extensible array, …).
+    index_type: data_layout::ChunkIndexType,
+    /// Address of the chunk index structure (or the chunk itself, for a
+    /// single chunk). `UNDEF_ADDR` when unallocated.
+    index_address: u64,
+    /// Extensible-array parameters (present iff `index_type == ExtensibleArray`).
+    earray_params: Option<&'a data_layout::EarrayParams>,
+    /// Filtered single-chunk parameters (present iff `index_type ==
+    /// SingleChunk` and the layout's filtered flag is set): the chunk's exact
+    /// on-disk size and per-chunk filter mask.
+    single_chunk_filter: Option<data_layout::SingleChunkFilter>,
+}
+
 /// Read-side metadata for a single dataset.
 pub struct DatasetReadInfo {
     /// Dataset name (the link name in the root group).
@@ -1155,6 +1179,7 @@ impl Hdf5Reader {
                 index_address,
                 index_type,
                 earray_params,
+                single_chunk_filter,
                 ..
             } => {
                 // The layout's chunk_dims include the element size as
@@ -1163,9 +1188,12 @@ impl Hdf5Reader {
                 self.read_chunked_v4(
                     name,
                     real_chunk_dims,
-                    *index_address,
-                    *index_type,
-                    earray_params.as_ref(),
+                    ChunkIndexDesc {
+                        index_type: *index_type,
+                        index_address: *index_address,
+                        earray_params: earray_params.as_ref(),
+                        single_chunk_filter: *single_chunk_filter,
+                    },
                     pipeline.as_ref(),
                 )?
             }
@@ -1237,15 +1265,23 @@ impl Hdf5Reader {
     }
 
     /// Read chunked dataset data by walking the chunk index.
+    ///
+    /// `desc` bundles the version-4 chunk-index descriptor extracted from the
+    /// data-layout message (kind, address, and per-kind parameters), so this
+    /// entry point takes one descriptor rather than a long parameter list.
     fn read_chunked_v4(
         &mut self,
         name: &str,
         chunk_dims: &[u64],
-        index_address: u64,
-        index_type: data_layout::ChunkIndexType,
-        earray_params: Option<&data_layout::EarrayParams>,
+        desc: ChunkIndexDesc<'_>,
         pipeline: Option<&FilterPipeline>,
     ) -> IoResult<Vec<u8>> {
+        let ChunkIndexDesc {
+            index_type,
+            index_address,
+            earray_params,
+            single_chunk_filter,
+        } = desc;
         let info = self
             .dataset_info(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
@@ -1268,10 +1304,26 @@ impl Hdf5Reader {
                     return Ok(vec![]);
                 }
                 let data = if let Some(pipeline) = pipeline {
-                    let raw = self
-                        .handle
-                        .read_at_most(index_address, total_size.saturating_mul(2) as usize)?;
-                    filter::reverse_filters(pipeline, &raw)?
+                    // A filtered single chunk records its exact on-disk size
+                    // and per-chunk filter mask in the layout message. Use
+                    // them to read precisely the stored bytes and to skip the
+                    // filters the mask marks as not applied. Without those
+                    // params (older/edge layouts) fall back to the
+                    // read-extra-and-inflate heuristic with the full pipeline.
+                    let (raw, mask) = match single_chunk_filter {
+                        Some(scf) => (
+                            self.handle.read_at(index_address, scf.nbytes as usize)?,
+                            scf.filter_mask,
+                        ),
+                        None => (
+                            self.handle.read_at_most(
+                                index_address,
+                                total_size.saturating_mul(2) as usize,
+                            )?,
+                            0,
+                        ),
+                    };
+                    filter::reverse_filters_masked(pipeline, &raw, mask)?
                 } else {
                     self.handle.read_at(index_address, total_size as usize)?
                 };
@@ -1343,8 +1395,8 @@ impl Hdf5Reader {
                 if let Some(pl) = pipeline {
                     // Read all raw chunks first, then decompress (optionally in parallel)
                     let file_size = self.handle.file_size()?;
-                    let mut raw_chunks: Vec<Option<Vec<u8>>> = Vec::with_capacity(n_chunks);
-                    for &(addr, nbytes) in &chunk_entries[..n_chunks] {
+                    let mut raw_chunks: Vec<Option<(Vec<u8>, u32)>> = Vec::with_capacity(n_chunks);
+                    for &(addr, nbytes, mask) in &chunk_entries[..n_chunks] {
                         if addr == UNDEF_ADDR
                             || nbytes == 0
                             || addr >= file_size
@@ -1352,13 +1404,16 @@ impl Hdf5Reader {
                         {
                             raw_chunks.push(None);
                         } else {
-                            raw_chunks.push(Some(self.handle.read_at(addr, nbytes as usize)?));
+                            raw_chunks
+                                .push(Some((self.handle.read_at(addr, nbytes as usize)?, mask)));
                         }
                     }
 
-                    let reverse = |raw: Option<Vec<u8>>| -> IoResult<Option<Vec<u8>>> {
+                    let reverse = |raw: Option<(Vec<u8>, u32)>| -> IoResult<Option<Vec<u8>>> {
                         match raw {
-                            Some(r) => Ok(Some(filter::reverse_filters(pl, &r)?)),
+                            Some((r, mask)) => {
+                                Ok(Some(filter::reverse_filters_masked(pl, &r, mask)?))
+                            }
                             None => Ok(None),
                         }
                     };
@@ -1390,7 +1445,8 @@ impl Hdf5Reader {
                         }
                     }
                 } else {
-                    for (i, &(addr, nbytes)) in chunk_entries[..n_chunks].iter().enumerate() {
+                    // Unfiltered branch: the mask field is always 0 here.
+                    for (i, &(addr, nbytes, _)) in chunk_entries[..n_chunks].iter().enumerate() {
                         if addr == UNDEF_ADDR {
                             continue;
                         }
@@ -1485,7 +1541,9 @@ impl Hdf5Reader {
         // exact on-disk byte count for filtered chunks, or chunk_bytes when
         // unfiltered.
         let num_elmts = fa_hdr.num_elmts as usize;
-        let mut chunk_entries: Vec<(u64, u64)> = Vec::with_capacity(num_elmts);
+        // (chunk address, on-disk byte count, filter mask). The mask is the
+        // per-chunk filter mask for filtered chunks, 0 when unfiltered.
+        let mut chunk_entries: Vec<(u64, u64, u32)> = Vec::with_capacity(num_elmts);
 
         if fa_hdr.is_paged() {
             // Paged data block: prefix (with page-init bitmap) followed by pages.
@@ -1520,7 +1578,8 @@ impl Hdf5Reader {
 
                 if !prefix.page_initialized(p) {
                     // Uninitialized page: all chunk entries are undefined.
-                    chunk_entries.extend(std::iter::repeat_n((UNDEF_ADDR, 0u64), page_nelmts));
+                    chunk_entries
+                        .extend(std::iter::repeat_n((UNDEF_ADDR, 0u64, 0u32), page_nelmts));
                     continue;
                 }
 
@@ -1532,12 +1591,12 @@ impl Hdf5Reader {
                     let elems =
                         decode_filtered_page(&page_buf, &self.ctx, page_nelmts, chunk_size_len)?;
                     for e in elems {
-                        chunk_entries.push((e.address, e.chunk_size as u64));
+                        chunk_entries.push((e.address, e.chunk_size as u64, e.filter_mask));
                     }
                 } else {
                     let addrs = decode_unfiltered_page(&page_buf, &self.ctx, page_nelmts)?;
                     for addr in addrs {
-                        chunk_entries.push((addr, chunk_bytes));
+                        chunk_entries.push((addr, chunk_bytes, 0));
                     }
                 }
             }
@@ -1559,13 +1618,13 @@ impl Hdf5Reader {
                     chunk_size_len,
                 )?;
                 for e in &fa_dblk.filtered_elements {
-                    chunk_entries.push((e.address, e.chunk_size as u64));
+                    chunk_entries.push((e.address, e.chunk_size as u64, e.filter_mask));
                 }
             } else {
                 let fa_dblk =
                     FixedArrayDataBlock::decode_unfiltered(&dblk_buf, &self.ctx, num_elmts)?;
                 for &addr in &fa_dblk.elements {
-                    chunk_entries.push((addr, chunk_bytes));
+                    chunk_entries.push((addr, chunk_bytes, 0));
                 }
             }
         }
@@ -1587,10 +1646,10 @@ impl Hdf5Reader {
 
         // Read all chunk raw data sequentially (I/O must be serial)
         let n_chunks = chunk_entries.len();
-        let mut raw_chunks: Vec<(usize, Option<Vec<u8>>)> = Vec::with_capacity(n_chunks);
-        for (linear_idx, &(addr, comp_size)) in chunk_entries.iter().enumerate() {
+        let mut raw_chunks: Vec<(usize, Option<Vec<u8>>, u32)> = Vec::with_capacity(n_chunks);
+        for (linear_idx, &(addr, comp_size, mask)) in chunk_entries.iter().enumerate() {
             if addr == UNDEF_ADDR {
-                raw_chunks.push((linear_idx, None));
+                raw_chunks.push((linear_idx, None, 0));
             } else if pipeline.is_some() {
                 // For filtered chunks the entry carries the exact compressed
                 // size; fall back to a generous estimate otherwise.
@@ -1599,11 +1658,16 @@ impl Hdf5Reader {
                 } else {
                     chunk_bytes as usize * 2
                 };
-                raw_chunks.push((linear_idx, Some(self.handle.read_at_most(addr, read_len)?)));
+                raw_chunks.push((
+                    linear_idx,
+                    Some(self.handle.read_at_most(addr, read_len)?),
+                    mask,
+                ));
             } else {
                 raw_chunks.push((
                     linear_idx,
                     Some(self.handle.read_at(addr, chunk_bytes as usize)?),
+                    mask,
                 ));
             }
         }
@@ -1611,13 +1675,15 @@ impl Hdf5Reader {
         // Decompress if a filter pipeline is set. A filter failure is
         // propagated rather than swallowed into garbage output.
         let decompressed: Vec<(usize, Option<Vec<u8>>)> = if let Some(pl) = pipeline {
-            let reverse =
-                |(idx, raw): (usize, Option<Vec<u8>>)| -> IoResult<(usize, Option<Vec<u8>>)> {
-                    match raw {
-                        Some(r) => Ok((idx, Some(filter::reverse_filters(pl, &r)?))),
-                        None => Ok((idx, None)),
-                    }
-                };
+            let reverse = |(idx, raw, mask): (usize, Option<Vec<u8>>, u32)| -> IoResult<(
+                usize,
+                Option<Vec<u8>>,
+            )> {
+                match raw {
+                    Some(r) => Ok((idx, Some(filter::reverse_filters_masked(pl, &r, mask)?))),
+                    None => Ok((idx, None)),
+                }
+            };
             #[cfg(feature = "parallel")]
             {
                 use rayon::prelude::*;
@@ -1634,7 +1700,9 @@ impl Hdf5Reader {
                     .collect::<IoResult<Vec<_>>>()?
             }
         } else {
-            raw_chunks
+            // No pipeline: drop the (always-zero) mask field to match the
+            // decompressed tuple shape.
+            raw_chunks.into_iter().map(|(i, r, _)| (i, r)).collect()
         };
 
         // Place chunks into output
@@ -1711,55 +1779,65 @@ impl Hdf5Reader {
         let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
 
         // Unify filtered and unfiltered records into (address, read_size,
-        // scaled offsets). read_size is the compressed size for filtered
-        // chunks, the full chunk size otherwise.
-        let entries: Vec<(u64, usize, Vec<u64>)> = if bt2_hdr.record_type == BT2_TYPE_CHUNK_UNFILT {
-            Bt2ChunkIndex::decode_unfiltered_records(
-                &record_bytes,
-                total_records,
-                ndims,
-                &self.ctx,
-            )?
-            .into_iter()
-            .map(|r| (r.chunk_address, chunk_bytes as usize, r.scaled_offsets))
-            .collect()
-        } else {
-            Bt2ChunkIndex::decode_filtered_records(
-                &record_bytes,
-                total_records,
-                ndims,
-                bt2_hdr.record_size,
-                &self.ctx,
-            )?
-            .into_iter()
-            .map(|r| (r.chunk_address, r.chunk_size as usize, r.scaled_offsets))
-            .collect()
-        };
+        // scaled offsets, filter mask). read_size is the compressed size for
+        // filtered chunks, the full chunk size otherwise; the mask is 0 for
+        // unfiltered records.
+        let entries: Vec<(u64, usize, Vec<u64>, u32)> =
+            if bt2_hdr.record_type == BT2_TYPE_CHUNK_UNFILT {
+                Bt2ChunkIndex::decode_unfiltered_records(
+                    &record_bytes,
+                    total_records,
+                    ndims,
+                    &self.ctx,
+                )?
+                .into_iter()
+                .map(|r| (r.chunk_address, chunk_bytes as usize, r.scaled_offsets, 0))
+                .collect()
+            } else {
+                Bt2ChunkIndex::decode_filtered_records(
+                    &record_bytes,
+                    total_records,
+                    ndims,
+                    bt2_hdr.record_size,
+                    &self.ctx,
+                )?
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.chunk_address,
+                        r.chunk_size as usize,
+                        r.scaled_offsets,
+                        r.filter_mask,
+                    )
+                })
+                .collect()
+            };
 
         let total_size: u64 = saturating_byte_len(&dims, element_size);
         let mut output = alloc_tiled_fill(total_size as usize, fill_value.as_deref())?;
 
-        // Read each chunk's raw bytes.
-        let mut raw_chunks: Vec<Option<(Vec<u8>, Vec<u64>)>> = Vec::with_capacity(entries.len());
-        for (addr, read_size, scaled) in &entries {
+        // Read each chunk's raw bytes (carrying the per-chunk filter mask).
+        let mut raw_chunks: Vec<Option<RawChunkWithMask>> = Vec::with_capacity(entries.len());
+        for (addr, read_size, scaled, mask) in &entries {
             if *addr == UNDEF_ADDR || *read_size == 0 {
                 raw_chunks.push(None);
             } else {
                 let data = self.handle.read_at(*addr, *read_size)?;
-                raw_chunks.push(Some((data, scaled.clone())));
+                raw_chunks.push(Some((data, scaled.clone(), *mask)));
             }
         }
 
         // Decompress filtered chunks (optionally in parallel). A filter
         // failure is propagated, not swallowed into garbage output.
         let placed: Vec<Option<(Vec<u8>, Vec<u64>)>> = if let Some(pl) = pipeline {
-            let reverse =
-                |c: Option<(Vec<u8>, Vec<u64>)>| -> IoResult<Option<(Vec<u8>, Vec<u64>)>> {
-                    match c {
-                        Some((r, s)) => Ok(Some((filter::reverse_filters(pl, &r)?, s))),
-                        None => Ok(None),
+            let reverse = |c: Option<RawChunkWithMask>| -> IoResult<Option<(Vec<u8>, Vec<u64>)>> {
+                match c {
+                    Some((r, s, mask)) => {
+                        Ok(Some((filter::reverse_filters_masked(pl, &r, mask)?, s)))
                     }
-                };
+                    None => Ok(None),
+                }
+            };
             #[cfg(feature = "parallel")]
             {
                 use rayon::prelude::*;
@@ -1776,7 +1854,11 @@ impl Hdf5Reader {
                     .collect::<IoResult<Vec<_>>>()?
             }
         } else {
+            // No pipeline: drop the (always-zero) mask field.
             raw_chunks
+                .into_iter()
+                .map(|o| o.map(|(r, s, _)| (r, s)))
+                .collect()
         };
 
         // Place each chunk N-dimensionally by its scaled (chunk-grid) offsets.
@@ -1888,9 +1970,10 @@ impl Hdf5Reader {
         // The uncompressed byte size of a full chunk.
         let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
 
-        // Read every chunk's raw bytes.
-        let mut raw_chunks: Vec<Option<(Vec<u8>, Vec<u64>)>> = Vec::with_capacity(entries.len());
-        for (offsets, addr, chunk_size, _mask) in &entries {
+        // Read every chunk's raw bytes (carrying the per-chunk filter mask
+        // already decoded from the B-tree keys).
+        let mut raw_chunks: Vec<Option<RawChunkWithMask>> = Vec::with_capacity(entries.len());
+        for (offsets, addr, chunk_size, mask) in &entries {
             if *addr == UNDEF_ADDR
                 || *chunk_size == 0
                 || *addr >= file_size
@@ -1908,19 +1991,20 @@ impl Hdf5Reader {
                 scaled.push(offsets[d].checked_div(cd).unwrap_or(0));
             }
             let data = self.handle.read_at(*addr, *chunk_size as usize)?;
-            raw_chunks.push(Some((data, scaled)));
+            raw_chunks.push(Some((data, scaled, *mask)));
         }
 
         // Decompress filtered chunks (optionally in parallel). A filter
         // failure is propagated, not swallowed into garbage output.
         let placed: Vec<Option<(Vec<u8>, Vec<u64>)>> = if let Some(pl) = pipeline {
-            let reverse =
-                |c: Option<(Vec<u8>, Vec<u64>)>| -> IoResult<Option<(Vec<u8>, Vec<u64>)>> {
-                    match c {
-                        Some((r, s)) => Ok(Some((filter::reverse_filters(pl, &r)?, s))),
-                        None => Ok(None),
+            let reverse = |c: Option<RawChunkWithMask>| -> IoResult<Option<(Vec<u8>, Vec<u64>)>> {
+                match c {
+                    Some((r, s, mask)) => {
+                        Ok(Some((filter::reverse_filters_masked(pl, &r, mask)?, s)))
                     }
-                };
+                    None => Ok(None),
+                }
+            };
             #[cfg(feature = "parallel")]
             {
                 use rayon::prelude::*;
@@ -1937,7 +2021,11 @@ impl Hdf5Reader {
                     .collect::<IoResult<Vec<_>>>()?
             }
         } else {
+            // No pipeline: drop the (always-zero) mask field.
             raw_chunks
+                .into_iter()
+                .map(|o| o.map(|(r, s, _)| (r, s)))
+                .collect()
         };
 
         // Place each chunk N-dimensionally by its scaled offsets.
@@ -2203,7 +2291,7 @@ impl Hdf5Reader {
         dims: &[u64],
         chunk_dims: &[u64],
         element_size: u64,
-    ) -> IoResult<Vec<(u64, u64)>> {
+    ) -> IoResult<Vec<(u64, u64, u32)>> {
         use crate::format::chunk_index::extensible_array::{self as ea, *};
 
         if index_address == UNDEF_ADDR {
@@ -2241,7 +2329,10 @@ impl Hdf5Reader {
             0
         };
         let max_nelmts_bits = params.max_nelmts_bits;
-        let mut entries: Vec<(u64, u64)> = Vec::new();
+        // Each entry is (chunk address, on-disk byte count, filter mask). The
+        // mask is the per-chunk filter mask for filtered datasets (0 for an
+        // unfiltered index, where it is meaningless).
+        let mut entries: Vec<(u64, u64, u32)> = Vec::new();
 
         // Read the index block: direct elements + the data-block / super-block
         // address arrays (the address arrays are filter-agnostic).
@@ -2256,7 +2347,7 @@ impl Hdf5Reader {
                 chunk_size_len,
             )?;
             for e in &fiblk.elements {
-                entries.push((e.addr, e.nbytes));
+                entries.push((e.addr, e.nbytes, e.filter_mask));
             }
             (fiblk.dblk_addrs, fiblk.sblk_addrs)
         } else {
@@ -2269,7 +2360,7 @@ impl Hdf5Reader {
                 geo.nsblk_addrs,
             )?;
             for &addr in &iblk.elements {
-                entries.push((addr, chunk_bytes));
+                entries.push((addr, chunk_bytes, 0));
             }
             (iblk.dblk_addrs, iblk.sblk_addrs)
         };
@@ -2335,7 +2426,7 @@ impl Hdf5Reader {
 
             for (d, &dblk_addr) in this_dblk_addrs.iter().enumerate() {
                 if dblk_addr == UNDEF_ADDR {
-                    entries.extend(std::iter::repeat_n((UNDEF_ADDR, 0), dblk_nelmts));
+                    entries.extend(std::iter::repeat_n((UNDEF_ADDR, 0, 0), dblk_nelmts));
                 } else if paged {
                     // Paged data block: only a prefix lives at `dblk_addr`;
                     // the elements live in `npages` page structures that
@@ -2348,7 +2439,7 @@ impl Hdf5Reader {
                         let initialized = page_init[bit / 8] & (0x80u8 >> (bit % 8)) != 0;
                         if !initialized {
                             entries.extend(std::iter::repeat_n(
-                                (UNDEF_ADDR, 0),
+                                (UNDEF_ADDR, 0, 0),
                                 geo.dblk_page_nelmts as usize,
                             ));
                             continue;
@@ -2363,9 +2454,9 @@ impl Hdf5Reader {
                                     sa,
                                     chunk_size_len as usize,
                                 );
-                                entries.push((e.addr, e.nbytes));
+                                entries.push((e.addr, e.nbytes, e.filter_mask));
                             } else {
-                                entries.push((read_addr(&page[off..], sa), chunk_bytes));
+                                entries.push((read_addr(&page[off..], sa), chunk_bytes, 0));
                             }
                         }
                     }
@@ -2380,7 +2471,7 @@ impl Hdf5Reader {
                         chunk_size_len,
                     )?;
                     for e in &dblk.elements {
-                        entries.push((e.addr, e.nbytes));
+                        entries.push((e.addr, e.nbytes, e.filter_mask));
                     }
                 } else {
                     let dblk_size = prefix + dblk_nelmts * raw_elmt_size;
@@ -2392,7 +2483,7 @@ impl Hdf5Reader {
                         dblk_nelmts,
                     )?;
                     for &addr in &dblk.elements {
-                        entries.push((addr, chunk_bytes));
+                        entries.push((addr, chunk_bytes, 0));
                     }
                 }
                 if entries.len() >= chunks_dim0 {
@@ -2623,14 +2714,14 @@ impl Hdf5Reader {
                         if (gi as usize) >= all_entries.len() {
                             break;
                         }
-                        let (addr, nbytes) = all_entries[gi as usize];
+                        let (addr, nbytes, mask) = all_entries[gi as usize];
                         if addr == UNDEF_ADDR {
                             continue;
                         }
 
                         let chunk_data = if let Some(ref pl) = fp {
                             let raw = self.handle.read_at(addr, nbytes as usize)?;
-                            filter::reverse_filters(pl, &raw)?
+                            filter::reverse_filters_masked(pl, &raw, mask)?
                         } else {
                             self.handle.read_at(addr, nbytes as usize)?
                         };
