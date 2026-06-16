@@ -363,18 +363,16 @@ impl DataLayoutMessage {
                         buf.push(100);
                         buf.push(40);
                     }
-                    ChunkIndexType::SingleChunk => {
-                        // A filtered single chunk carries its on-disk size
-                        // (sizeof_size bytes) and 4-byte filter mask inline,
-                        // before the chunk address (H5Olayout.c). Only emit
-                        // them when the filtered flag is set; otherwise the
-                        // layout has no per-index parameters.
-                        if *flags & 0x02 != 0 {
-                            if let Some(scf) = single_chunk_filter {
-                                let ss = ctx.sizeof_size as usize;
-                                buf.extend_from_slice(&scf.nbytes.to_le_bytes()[..ss]);
-                                buf.extend_from_slice(&scf.filter_mask.to_le_bytes());
-                            }
+                    // A filtered single chunk carries its on-disk size
+                    // (sizeof_size bytes) and 4-byte filter mask inline, before
+                    // the chunk address (H5Olayout.c). Only emit them when the
+                    // filtered flag (0x02) is set; an unfiltered single chunk
+                    // falls through to the no-extra-parameters arm below.
+                    ChunkIndexType::SingleChunk if *flags & 0x02 != 0 => {
+                        if let Some(scf) = single_chunk_filter {
+                            let ss = ctx.sizeof_size as usize;
+                            buf.extend_from_slice(&scf.nbytes.to_le_bytes()[..ss]);
+                            buf.extend_from_slice(&scf.filter_mask.to_le_bytes());
                         }
                     }
                     // Implicit: no extra parameters.
