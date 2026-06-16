@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.2.22
+
+### Added
+
+- `DatasetBuilder::datatype(dt)` — override the stored on-disk element
+  datatype independently of the in-memory type parameter `T`. Combined with
+  the new N-bit constructor, this lets a dataset store a reduced-precision
+  fixed-point type while writing from a wider Rust integer.
+- `FilterPipeline::nbit(&dt, d_nelmts)` — construct the N-bit filter
+  (`H5Z_FILTER_NBIT`, id 5) for an atomic numeric datatype. The `cd_values`
+  tree (`[nparms, need_not_compress, d_nelmts, NBIT_ATOMIC, size, order,
+  precision, offset]`) mirrors libhdf5's `H5Z__set_local_nbit`, so packed
+  datasets are readable by h5py / libhdf5. Verified byte-compatible with
+  h5py for 10- and 12-bit `u16` data, single- and multi-chunk.
+- 1-D (and N-D) array attributes. `AttrBuilder::shape` now records the
+  attribute dimensions instead of discarding them, accepting either `()`
+  (scalar) or an array/slice/`Vec` of dimension sizes via the new
+  `AttrShape` trait (re-exported at the crate root). `H5Attribute::write_array`
+  writes the values (length must equal the product of the shape), and
+  `AttributeMessage::array_numeric` builds the underlying simple-dataspace
+  attribute. The scalar writers (`write_scalar`, `write_numeric`) are
+  unchanged. Verified against h5py: a written `int32` array attribute reads
+  back with the correct shape, dtype, and values.
+- `H5File::dataset_writer(name)` — reopen an existing dataset by name in
+  write mode (the write-mode counterpart of `dataset()`), reconstructing the
+  same handle `new_dataset().create()` returns so attributes can be attached
+  or chunks appended without keeping the original handle. Returns
+  `Hdf5Error::NotFound` for an unknown name.
+- `SwmrFileWriter::set_dataset_attr_array(ds_index, name, dims, values)` —
+  set a numeric array attribute on a dataset (the SWMR counterpart of
+  `H5Attribute::write_array`). As with the other SWMR dataset attributes, it
+  must be called before `start_swmr`; resolve a dataset path to its index via
+  `dataset_index(name)`.
+
 ## 0.2.21
 
 ### Fixed
