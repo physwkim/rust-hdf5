@@ -233,3 +233,56 @@ fn open_append_rejects_multi_frame_chunk_resume() {
 
     cleanup(&path);
 }
+
+/// A 1-D int32 array dataset attribute set before `start_swmr` (the
+/// AreaDetector NDArrayDimOffset/Binning/Reverse shape) round-trips: the
+/// SWMR reader sees its name and the full read path recovers shape + values.
+#[test]
+fn dataset_array_attribute_round_trips() {
+    use rust_hdf5::H5File;
+
+    let path = unique_tmp("array_attr");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        let axis = w.write_dataset::<i32>("axis", &[3], &[10, 20, 30]).unwrap();
+        // Open-time 1-D int32 array dataset attribute.
+        w.set_dataset_attr_array::<i32>(axis, "NDArrayDimOffset", &[3], &[0, 4, 8])
+            .unwrap();
+        // Wrong element count is rejected.
+        assert!(w
+            .set_dataset_attr_array::<i32>(axis, "bad", &[3], &[1, 2])
+            .is_err());
+
+        let frames = w.create_streaming_dataset::<u8>("frames", &[2, 2]).unwrap();
+        w.start_swmr().unwrap();
+        w.append_frame(frames, &[1u8, 2, 3, 4]).unwrap();
+        w.close().unwrap();
+    }
+
+    // SWMR reader sees the attribute name.
+    {
+        let r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+        assert!(
+            r.dataset_attr_names("axis")
+                .unwrap()
+                .iter()
+                .any(|n| n == "NDArrayDimOffset"),
+            "array attribute name not visible to SWMR reader"
+        );
+    }
+
+    // Full read path verifies shape + values.
+    {
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("axis").unwrap();
+        let raw = ds.attr("NDArrayDimOffset").unwrap().read_raw().unwrap();
+        assert_eq!(raw.len(), 3 * 4);
+        let got: Vec<i32> = raw
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert_eq!(got, vec![0, 4, 8]);
+    }
+
+    cleanup(&path);
+}

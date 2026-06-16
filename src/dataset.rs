@@ -458,6 +458,33 @@ impl H5Dataset {
         }
     }
 
+    /// Create a writer-mode dataset handle for an already-created dataset
+    /// (called internally by [`H5File::dataset_writer`](crate::file::H5File::dataset_writer)).
+    ///
+    /// Reconstructs the same handle `new_dataset().create()` returns, so the
+    /// reopened dataset supports attribute writes and chunk appends.
+    pub(crate) fn new_writer(
+        file_inner: SharedInner,
+        index: usize,
+        shape: Vec<usize>,
+        element_size: usize,
+        chunked: bool,
+        btree2: bool,
+        fixed_array: bool,
+    ) -> Self {
+        Self {
+            file_inner,
+            info: DatasetInfo::Writer {
+                index,
+                shape,
+                element_size,
+                chunked,
+                btree2,
+                fixed_array,
+            },
+        }
+    }
+
     /// Return the dataset dimensions.
     pub fn shape(&self) -> Vec<usize> {
         match &self.info {

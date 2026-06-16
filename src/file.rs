@@ -415,6 +415,49 @@ impl H5File {
         }
     }
 
+    /// Reopen an existing dataset by name in write mode.
+    ///
+    /// [`dataset`](Self::dataset) only works in read mode; in write mode a
+    /// dataset is normally created via [`new_dataset`](Self::new_dataset).
+    /// This returns a write-mode handle to a dataset created earlier in the
+    /// same session, so you can attach attributes or append chunks to it
+    /// without keeping the original handle around — e.g. to flush cached
+    /// first/last values onto a dataset at file-close time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Hdf5Error::NotFound`] if no live dataset with that name
+    /// exists, and an error in read mode (use [`dataset`](Self::dataset)).
+    pub fn dataset_writer(&self, name: &str) -> Result<H5Dataset> {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => {
+                let index = writer
+                    .dataset_index(name)
+                    .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?;
+                let ds = &writer.datasets[index];
+                let shape: Vec<usize> = ds.dataspace.dims.iter().map(|&d| d as usize).collect();
+                let element_size = ds.datatype.element_size() as usize;
+                let fixed_array = ds.fixed_array.is_some();
+                let btree2 = ds.btree_v2.is_some();
+                let chunked = ds.chunked.is_some() || fixed_array || btree2;
+                Ok(H5Dataset::new_writer(
+                    clone_inner(&self.inner),
+                    index,
+                    shape,
+                    element_size,
+                    chunked,
+                    btree2,
+                    fixed_array,
+                ))
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot open a dataset_writer in read mode; use dataset() instead".to_string(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".to_string())),
+        }
+    }
+
     /// Return the names of all datasets in the root group.
     ///
     /// Works in both read and write mode: in write mode, returns the names of
@@ -857,6 +900,63 @@ mod integration_tests {
         file.close().unwrap();
 
         assert!(path.exists());
+    }
+
+    #[test]
+    fn dataset_writer_reopens_for_attributes() {
+        // Reopen a dataset by name in write mode (the original handle is gone)
+        // and attach attributes to it — the close-time flush pattern.
+        let path = temp_path("dataset_writer");
+        {
+            let file = H5File::create(&path).unwrap();
+            {
+                let ds = file
+                    .new_dataset::<u16>()
+                    .shape([8])
+                    .create("image")
+                    .unwrap();
+                ds.write_raw(&[0u16; 8]).unwrap();
+                // original handle dropped here
+            }
+
+            // Reopen by name; dataset() would error in write mode.
+            assert!(file.dataset("image").is_err());
+            let ds = file.dataset_writer("image").unwrap();
+            assert_eq!(ds.shape(), vec![8]);
+            ds.new_attr::<i32>()
+                .shape([3])
+                .create("NDArrayDimOffset")
+                .unwrap()
+                .write_array(&[0i32, 4, 8])
+                .unwrap();
+            ds.new_attr::<i32>()
+                .shape(())
+                .create("NDUniqueId")
+                .unwrap()
+                .write_numeric(&42i32)
+                .unwrap();
+
+            // Missing dataset is reported.
+            assert!(matches!(
+                file.dataset_writer("nope"),
+                Err(crate::error::Hdf5Error::NotFound(_))
+            ));
+
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("image").unwrap();
+            let off = ds.attr("NDArrayDimOffset").unwrap().read_raw().unwrap();
+            let got: Vec<i32> = off
+                .chunks_exact(4)
+                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            assert_eq!(got, vec![0, 4, 8]);
+            let uid: i32 = ds.attr("NDUniqueId").unwrap().read_numeric().unwrap();
+            assert_eq!(uid, 42);
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

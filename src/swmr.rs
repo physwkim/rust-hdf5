@@ -394,6 +394,46 @@ impl SwmrFileWriter {
         Ok(())
     }
 
+    /// Set a numeric array attribute on a dataset, addressed by its index.
+    ///
+    /// `dims` are the dimension sizes (e.g. `&[3]` for a 1-D array) and the
+    /// number of `values` must equal their product. This is the SWMR
+    /// counterpart of [`H5Attribute::write_array`](crate::H5Attribute::write_array),
+    /// for the length-ndims `int32` array attributes AreaDetector writes
+    /// (`NDArrayDimOffset`, `NDArrayDimBinning`, `NDArrayDimReverse`). An
+    /// existing attribute of the same name is replaced.
+    ///
+    /// In SWMR mode, attributes can only be added before
+    /// [`start_swmr`](Self::start_swmr); HDF5 forbids adding dataset
+    /// attributes once the file is in SWMR write mode. Resolve a dataset path
+    /// to its index with [`dataset_index`](Self::dataset_index).
+    pub fn set_dataset_attr_array<T: H5Type>(
+        &mut self,
+        ds_index: usize,
+        name: &str,
+        dims: &[u64],
+        values: &[T],
+    ) -> Result<()> {
+        // Product of an empty shape is 1 (a scalar holds one element).
+        let expected: u64 = dims.iter().product();
+        if values.len() as u64 != expected {
+            return Err(crate::error::Hdf5Error::InvalidState(format!(
+                "set_dataset_attr_array: {} values but shape {dims:?} needs {expected}",
+                values.len()
+            )));
+        }
+        let attr = AttributeMessage::array_numeric(
+            name,
+            T::hdf5_type(),
+            dims,
+            slice_to_bytes(values).to_vec(),
+        );
+        self.inner
+            .writer_mut()
+            .add_dataset_attribute(ds_index, attr)?;
+        Ok(())
+    }
+
     /// Set the fill value of a streaming dataset, addressed by its index.
     ///
     /// Call this before the first [`append_frame`](Self::append_frame): it
