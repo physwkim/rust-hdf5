@@ -1703,6 +1703,61 @@ mod tests {
     }
 
     #[test]
+    fn attr_datatype_exposes_class_and_sign() {
+        // H5Attribute::datatype() must report the stored datatype class and
+        // signedness so a generic attr->metadata mapper need not infer it from
+        // the byte width (the HDF5-L1 adapter blocker this accessor unblocks).
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let path = temp_path("attr_datatype");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file.new_dataset::<f32>().shape([4]).create("data").unwrap();
+            ds.new_attr::<f64>()
+                .shape(())
+                .create("scale")
+                .unwrap()
+                .write_numeric(&1.5f64)
+                .unwrap();
+            ds.new_attr::<i32>()
+                .shape(())
+                .create("count")
+                .unwrap()
+                .write_numeric(&7i32)
+                .unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("data").unwrap();
+
+            match ds.attr("scale").unwrap().datatype().unwrap() {
+                DatatypeMessage::FloatingPoint { size, .. } => assert_eq!(size, 8),
+                other => panic!("expected FloatingPoint for f64 attr, got {other:?}"),
+            }
+
+            match ds.attr("count").unwrap().datatype().unwrap() {
+                DatatypeMessage::FixedPoint { size, signed, .. } => {
+                    assert_eq!(size, 4);
+                    assert!(signed, "i32 attr must be signed");
+                }
+                other => panic!("expected FixedPoint for i32 attr, got {other:?}"),
+            }
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn attr_datatype_in_write_mode_errors() {
+        let path = temp_path("attr_datatype_write_mode");
+        let file = H5File::create(&path).unwrap();
+        let ds = file.new_dataset::<f32>().shape([4]).create("data").unwrap();
+        let attr = ds.new_attr::<f64>().shape(()).create("scale").unwrap();
+        assert!(attr.datatype().is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn cannot_create_dataset_in_read_mode() {
         let path = temp_path("no_create_read");
 

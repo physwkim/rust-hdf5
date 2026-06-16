@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.20
+
+### Added
+
+- `H5Attribute::datatype()` — return the parsed `DatatypeMessage` (class,
+  signedness, byte order, bit precision) of a read-mode attribute, mirroring
+  `H5Dataset::datatype()` from 0.2.18. A generic attribute→metadata mapper can
+  now recover the exact stored type instead of guessing from the byte width
+  (which cannot tell `u8` from `i8`, or `i32` from `f32`). Errors for a
+  write-mode handle, which carries no decoded attribute message.
+
 ## 0.2.19
 
 ### Added

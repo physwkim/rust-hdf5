@@ -19,6 +19,7 @@
 use std::marker::PhantomData;
 
 use crate::format::messages::attribute::AttributeMessage;
+use crate::format::messages::datatype::DatatypeMessage;
 
 use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
@@ -162,6 +163,39 @@ impl H5Attribute {
                 Ok(String::from_utf8_lossy(&attr.data[..end]).to_string())
             }
         }
+    }
+
+    /// Return the attribute datatype as parsed from the file (read mode only).
+    ///
+    /// Mirrors [`H5Dataset::datatype`](crate::dataset::H5Dataset::datatype):
+    /// it exposes the full datatype — class (integer vs floating-point vs
+    /// string vs compound …), signedness, byte order and bit precision — so
+    /// callers mapping an attribute to a NumPy / Arrow dtype need not infer a
+    /// type from the byte width, which cannot distinguish `u8` from `i8` (both
+    /// 1 byte) or `i32` from `f32` (both 4 bytes).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a write-mode handle, which carries no decoded
+    /// attribute message.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::{H5File, DatatypeMessage};
+    /// let file = H5File::open("data.h5").unwrap();
+    /// let ds = file.dataset("image").unwrap();
+    /// let attr = ds.attr("scale").unwrap();
+    /// match attr.datatype().unwrap() {
+    ///     DatatypeMessage::FloatingPoint { size, .. } => println!("float: {size} bytes"),
+    ///     other => println!("other type: {other}"),
+    /// }
+    /// ```
+    pub fn datatype(&self) -> Result<DatatypeMessage> {
+        self.read_attr
+            .as_ref()
+            .map(|a| a.datatype.clone())
+            .ok_or_else(|| {
+                Hdf5Error::InvalidState("attribute has no read data (write-mode handle?)".into())
+            })
     }
 
     /// Read the raw attribute data bytes.
