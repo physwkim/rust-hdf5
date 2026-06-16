@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.21
+
+### Fixed
+
+- The bitshuffle filter (32008, including the LZ4 "BSLZ4" mode) is now
+  byte-for-byte compatible with the canonical bitshuffle HDF5 filter
+  (kiyo-masui/bitshuffle), so files written by this crate are readable by
+  h5py / libhdf5 and vice versa. Two divergences were corrected:
+  - **Bit order.** The bit transpose used an MSB-first convention; the
+    canonical filter is LSB-first in both dimensions. Files written before
+    this fix were unreadable by h5py/libhdf5, and canonical files could not
+    be read back by this crate.
+  - **Block framing.** The trailing elements of a chunk are now split into a
+    final transposed block rounded down to a multiple of 8 elements plus a
+    raw `n_elems % 8` leftover, matching `bshuf_blocked_wrap_fun`. The
+    previous code copied the entire `n_elems % block_size` tail verbatim, so
+    any chunk whose element count was not a multiple of the block size (the
+    common case) was framed incompatibly. The non-canonical per-block
+    "store uncompressed" fallback was removed (every block is LZ4; only the
+    `n_elems % 8` leftover is raw), and no-compression decoding now honors
+    the block size carried in `cd_values[3]` instead of always recomputing
+    the default.
+
+  Validated byte-for-byte against the upstream C reference and end-to-end
+  with h5py + hdf5plugin in both directions.
+
+### Added
+
+- `FilterPipeline::bshuf(element_size)` and
+  `FilterPipeline::bshuf_lz4(element_size)` — construct a bitshuffle filter
+  pipeline (bit transpose only, or bit transpose + LZ4), mirroring the
+  existing `lz4()` / `zstd()` constructors.
+
 ## 0.2.20
 
 ### Added

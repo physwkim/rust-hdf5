@@ -46,6 +46,9 @@ pub const FILTER_LZF: u16 = 32000;
 pub const FILTER_BLOSC: u16 = 32001;
 pub const FILTER_LZ4: u16 = 32004;
 pub const FILTER_BSHUF: u16 = 32008;
+/// Bitshuffle compression sub-option (cd_values[4]): apply LZ4 after the
+/// bit transpose. Matches `BSHUF_H5_COMPRESS_LZ4` in the canonical filter.
+pub const BSHUF_COMPRESS_LZ4: u32 = 2;
 pub const FILTER_ZFP: u16 = 32013;
 pub const FILTER_ZSTD: u16 = 32015;
 pub const FILTER_JPEG: u16 = 32019;
@@ -128,6 +131,40 @@ impl FilterPipeline {
                 id: FILTER_ZSTD,
                 flags: 0,
                 cd_values: vec![level],
+            }],
+        }
+    }
+
+    /// Create a pipeline with a single bitshuffle filter (registered filter
+    /// 32008), bit transpose only (no secondary compression).
+    ///
+    /// `element_size` is the size of each data element in bytes. The block
+    /// size is left at the canonical default (`cd_values[3] = 0`). Output is
+    /// byte-for-byte compatible with the canonical bitshuffle HDF5 filter, so
+    /// files written this way are readable by h5py / libhdf5.
+    pub fn bshuf(element_size: u32) -> Self {
+        Self {
+            filters: vec![Filter {
+                id: FILTER_BSHUF,
+                flags: 0,
+                // [major, minor, elem_size, block_size, compression]
+                cd_values: vec![0, 0, element_size, 0, 0],
+            }],
+        }
+    }
+
+    /// Create a pipeline with a single bitshuffle filter that applies LZ4
+    /// after the bit transpose (the "BSLZ4" encoding).
+    ///
+    /// `element_size` is the size of each data element in bytes. The block
+    /// size is left at the canonical default. Output is byte-for-byte
+    /// framing-compatible with the canonical bitshuffle HDF5 filter.
+    pub fn bshuf_lz4(element_size: u32) -> Self {
+        Self {
+            filters: vec![Filter {
+                id: FILTER_BSHUF,
+                flags: 0,
+                cd_values: vec![0, 0, element_size, 0, BSHUF_COMPRESS_LZ4],
             }],
         }
     }
@@ -705,7 +742,7 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
             if compress {
                 bitshuffle_compress(data, elem_size, block_size, comp_type, filter)
             } else {
-                bitshuffle_decompress(data, elem_size, comp_type)
+                bitshuffle_decompress(data, elem_size, block_size, comp_type)
             }
         }
 
@@ -966,7 +1003,63 @@ fn lzf_decompress(input: &[u8], max_output: usize) -> FormatResult<Vec<u8>> {
 
 // =========================================================================
 // Bitshuffle — bit-level transpose
+//
+// Byte-for-byte compatible with the canonical bitshuffle HDF5 filter
+// (32008, kiyo-masui/bitshuffle, as vendored in libhdf5 plugins and
+// c-blosc). Two conventions are load-bearing for interop with h5py / C:
+//
+//   * Bit order is LSB-first in BOTH dimensions. Bit-plane `q` of an
+//     element is `byte_within_elem * 8 + bit_within_byte` (LSB = bit 0),
+//     and within an output plane the element bits are packed LSB-first.
+//     (The earlier implementation used MSB-first, which produced files
+//     libhdf5/h5py could not read and could not read theirs back.)
+//   * The block transpose operates on whole blocks of `block_size`
+//     elements (a multiple of 8). The trailing elements are split into a
+//     final transposed block rounded down to a multiple of 8, plus a raw
+//     `size % 8` leftover that is copied verbatim — see
+//     `bshuf_block_plan` and the (de)compress framing below.
 // =========================================================================
+
+/// Canonical default block size in elements for `elem_size`-byte elements.
+/// Mirrors `bshuf_default_block_size`: target 8 KiB, rounded down to a
+/// multiple of 8, floored at 128.
+fn bshuf_default_block_size(elem_size: usize) -> usize {
+    let block = (8192 / elem_size / 8) * 8;
+    std::cmp::max(block, 128)
+}
+
+/// Resolve the effective block size in elements: the user/header value
+/// (0 => canonical default), rounded down to a multiple of 8 (block sizes
+/// must be a multiple of 8), floored at 8.
+fn bshuf_resolve_block_elems(block_size: usize, elem_size: usize) -> usize {
+    let mut block = if block_size == 0 {
+        bshuf_default_block_size(elem_size)
+    } else {
+        block_size
+    };
+    block = (block / 8) * 8;
+    if block < 8 {
+        block = 8;
+    }
+    block
+}
+
+/// Canonical block layout for `n_elems` elements split into `block_elems`
+/// blocks: a sequence of bit-transposed block element-counts (full blocks
+/// followed by an optional final block rounded down to a multiple of 8).
+/// The elements not covered (`n_elems - sum`, always `n_elems % 8`) form
+/// the raw leftover the caller copies verbatim. Mirrors
+/// `bshuf_blocked_wrap_fun`.
+fn bshuf_block_plan(n_elems: usize, block_elems: usize) -> Vec<usize> {
+    let n_full = n_elems / block_elems;
+    let mut blocks = vec![block_elems; n_full];
+    let tail = n_elems % block_elems;
+    let last_block = tail - tail % 8;
+    if last_block > 0 {
+        blocks.push(last_block);
+    }
+    blocks
+}
 
 fn bitshuffle_block(input: &[u8], elem_size: usize) -> Vec<u8> {
     let n_elems = input.len() / elem_size;
@@ -975,13 +1068,13 @@ fn bitshuffle_block(input: &[u8], elem_size: usize) -> Vec<u8> {
 
     for bit in 0..nbits {
         let byte_idx = bit / 8;
-        let bit_idx = 7 - (bit % 8);
+        let bit_idx = bit % 8; // LSB-first within the source byte
         for elem in 0..n_elems {
             let src_byte = input[elem * elem_size + byte_idx];
             let src_bit = (src_byte >> bit_idx) & 1;
             let dst_bit_pos = bit * n_elems + elem;
             let dst_byte_idx = dst_bit_pos / 8;
-            let dst_bit_idx = 7 - (dst_bit_pos % 8);
+            let dst_bit_idx = dst_bit_pos % 8; // LSB-first within the output byte
             out[dst_byte_idx] |= src_bit << dst_bit_idx;
         }
     }
@@ -995,11 +1088,11 @@ fn bitunshuffle_block(input: &[u8], elem_size: usize) -> Vec<u8> {
 
     for bit in 0..nbits {
         let byte_idx = bit / 8;
-        let bit_idx = 7 - (bit % 8);
+        let bit_idx = bit % 8; // LSB-first within the destination byte
         for elem in 0..n_elems {
             let src_bit_pos = bit * n_elems + elem;
             let src_byte_idx = src_bit_pos / 8;
-            let src_bit_idx = 7 - (src_bit_pos % 8);
+            let src_bit_idx = src_bit_pos % 8; // LSB-first within the source byte
             let src_bit = (input[src_byte_idx] >> src_bit_idx) & 1;
             out[elem * elem_size + byte_idx] |= src_bit << bit_idx;
         }
@@ -1010,7 +1103,7 @@ fn bitunshuffle_block(input: &[u8], elem_size: usize) -> Vec<u8> {
 fn bitshuffle_compress(
     data: &[u8],
     elem_size: usize,
-    mut block_size: usize,
+    block_size: usize,
     comp_type: u32,
     _filter: &Filter,
 ) -> FormatResult<Vec<u8>> {
@@ -1018,153 +1111,170 @@ fn bitshuffle_compress(
         return Ok(data.to_vec());
     }
     let n_elems = data.len() / elem_size;
-    if block_size == 0 {
-        block_size = std::cmp::max(128, 8192 / elem_size);
-    }
-    block_size = (block_size / 8) * 8; // round down to multiple of 8
-    if block_size < 8 {
-        block_size = 8;
-    }
+    let block_elems = bshuf_resolve_block_elems(block_size, elem_size);
+    let blocks = bshuf_block_plan(n_elems, block_elems);
 
     if comp_type == 0 {
-        // Bitshuffle only, no compression, no header
-        let usable = (n_elems / block_size) * block_size;
+        // Bitshuffle only, no compression, no header. Each planned block is
+        // bit-transposed; the trailing `n_elems % 8` elements are copied raw.
         let mut out = Vec::with_capacity(data.len());
-        let mut pos = 0;
-        while pos < usable * elem_size {
-            let end = std::cmp::min(pos + block_size * elem_size, usable * elem_size);
-            out.extend_from_slice(&bitshuffle_block(&data[pos..end], elem_size));
-            pos = end;
+        let mut elem_pos = 0;
+        for &block in &blocks {
+            let start = elem_pos * elem_size;
+            let end = start + block * elem_size;
+            out.extend_from_slice(&bitshuffle_block(&data[start..end], elem_size));
+            elem_pos += block;
         }
-        out.extend_from_slice(&data[usable * elem_size..]);
+        out.extend_from_slice(&data[elem_pos * elem_size..]);
         return Ok(out);
     }
 
-    // With compression: write 12-byte header
-    let mut out = Vec::with_capacity(12 + data.len());
-    out.extend_from_slice(&(data.len() as u64).to_be_bytes());
-    out.extend_from_slice(&((block_size * elem_size) as u32).to_be_bytes());
+    if comp_type != BSHUF_COMPRESS_LZ4 {
+        return Err(FormatError::UnsupportedFeature(format!(
+            "bitshuffle: unsupported compression type {comp_type}"
+        )));
+    }
 
-    let usable = (n_elems / block_size) * block_size;
-    let mut pos = 0;
-    while pos < usable * elem_size {
-        let end = std::cmp::min(pos + block_size * elem_size, usable * elem_size);
-        let shuffled = bitshuffle_block(&data[pos..end], elem_size);
+    #[cfg(not(feature = "lz4"))]
+    {
+        Err(FormatError::UnsupportedFeature(
+            "bitshuffle+LZ4 requires the 'lz4' feature".into(),
+        ))
+    }
 
-        #[cfg(feature = "lz4")]
-        if comp_type == 2 {
+    #[cfg(feature = "lz4")]
+    {
+        // 12-byte header: BE u64 total uncompressed bytes, BE u32 block bytes.
+        let mut out = Vec::with_capacity(12 + data.len());
+        out.extend_from_slice(&(data.len() as u64).to_be_bytes());
+        out.extend_from_slice(&((block_elems * elem_size) as u32).to_be_bytes());
+
+        // Each planned block: BE u32 LZ4-compressed size, then the raw LZ4
+        // block of the bit-transposed data. Trailing `n_elems % 8` elements
+        // are copied raw with no length prefix.
+        let mut elem_pos = 0;
+        for &block in &blocks {
+            let start = elem_pos * elem_size;
+            let end = start + block * elem_size;
+            let shuffled = bitshuffle_block(&data[start..end], elem_size);
             let compressed = lz4_flex::compress(&shuffled);
             out.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
             out.extend_from_slice(&compressed);
-            pos = end;
-            continue;
+            elem_pos += block;
         }
-
-        // Fallback: store uncompressed
-        out.extend_from_slice(&(shuffled.len() as u32).to_be_bytes());
-        out.extend_from_slice(&shuffled);
-        pos = end;
+        out.extend_from_slice(&data[elem_pos * elem_size..]);
+        Ok(out)
     }
-    // Leftover
-    if usable * elem_size < data.len() {
-        out.extend_from_slice(&data[usable * elem_size..]);
-    }
-    Ok(out)
 }
 
-fn bitshuffle_decompress(data: &[u8], elem_size: usize, comp_type: u32) -> FormatResult<Vec<u8>> {
+fn bitshuffle_decompress(
+    data: &[u8],
+    elem_size: usize,
+    block_size: usize,
+    comp_type: u32,
+) -> FormatResult<Vec<u8>> {
     if comp_type == 0 {
-        // No compression header — bitunshuffle block-by-block (matching compress)
+        // No compression and no header: the stream is the same length as the
+        // original, so reconstruct the canonical block plan from its length
+        // and the filter's block size, then bitunshuffle each block. The
+        // trailing `n_elems % 8` elements are raw.
         if elem_size == 0 {
             return Ok(data.to_vec());
         }
         let n_elems = data.len() / elem_size;
-        let mut block_size = std::cmp::max(128, 8192 / elem_size);
-        block_size = (block_size / 8) * 8;
-        if block_size < 8 {
-            block_size = 8;
-        }
-        let usable = (n_elems / block_size) * block_size;
+        let block_elems = bshuf_resolve_block_elems(block_size, elem_size);
+        let blocks = bshuf_block_plan(n_elems, block_elems);
         let mut out = Vec::with_capacity(data.len());
-        let mut pos = 0;
-        while pos < usable * elem_size {
-            let end = std::cmp::min(pos + block_size * elem_size, usable * elem_size);
-            out.extend_from_slice(&bitunshuffle_block(&data[pos..end], elem_size));
-            pos = end;
+        let mut elem_pos = 0;
+        for &block in &blocks {
+            let start = elem_pos * elem_size;
+            let end = start + block * elem_size;
+            out.extend_from_slice(&bitunshuffle_block(&data[start..end], elem_size));
+            elem_pos += block;
         }
-        out.extend_from_slice(&data[usable * elem_size..]);
+        out.extend_from_slice(&data[elem_pos * elem_size..]);
         return Ok(out);
     }
 
-    if data.len() < 12 {
-        return Err(FormatError::InvalidData(
-            "bitshuffle: header too short".into(),
-        ));
+    if comp_type != BSHUF_COMPRESS_LZ4 {
+        return Err(FormatError::UnsupportedFeature(format!(
+            "bitshuffle: unsupported compression type {comp_type}"
+        )));
     }
-    let orig_size = u64::from_be_bytes([
-        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-    ]) as usize;
-    let block_bytes = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
-    if elem_size == 0 {
-        return Err(FormatError::InvalidData(
-            "bitshuffle: element size is zero".into(),
-        ));
-    }
-    let block_elems = block_bytes / elem_size;
-    if block_elems == 0 {
-        return Err(FormatError::InvalidData(
-            "bitshuffle: block size is smaller than one element".into(),
-        ));
-    }
-    // `orig_size` is file-derived; cap the pre-allocation so a hostile
-    // header cannot drive an unbounded allocation.
-    let mut output = Vec::with_capacity(orig_size.min(64 * 1024 * 1024));
-    let mut rpos = 12;
 
-    let n_elems = orig_size / elem_size;
-    let usable = (n_elems / block_elems) * block_elems;
-    let mut elems_done = 0;
+    #[cfg(not(feature = "lz4"))]
+    {
+        Err(FormatError::UnsupportedFeature(
+            "bitshuffle+LZ4 requires the 'lz4' feature".into(),
+        ))
+    }
 
-    while elems_done < usable {
-        if rpos + 4 > data.len() {
-            break;
+    #[cfg(feature = "lz4")]
+    {
+        if data.len() < 12 {
+            return Err(FormatError::InvalidData(
+                "bitshuffle: header too short".into(),
+            ));
         }
-        let comp_size =
-            u32::from_be_bytes([data[rpos], data[rpos + 1], data[rpos + 2], data[rpos + 3]])
-                as usize;
-        rpos += 4;
-        if rpos + comp_size > data.len() {
-            break;
+        let orig_size = u64::from_be_bytes([
+            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+        ]) as usize;
+        // Block size is read from the header, overriding the filter value
+        // (matching the canonical filter), and must be a multiple of 8.
+        let block_bytes = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        if elem_size == 0 {
+            return Err(FormatError::InvalidData(
+                "bitshuffle: element size is zero".into(),
+            ));
         }
+        let block_elems = block_bytes / elem_size;
+        if block_elems == 0 || !block_elems.is_multiple_of(8) {
+            return Err(FormatError::InvalidData(
+                "bitshuffle: invalid block size in header".into(),
+            ));
+        }
+        // `orig_size` is file-derived; cap the pre-allocation so a hostile
+        // header cannot drive an unbounded allocation.
+        let mut output = Vec::with_capacity(orig_size.min(64 * 1024 * 1024));
+        let mut rpos = 12;
 
-        let cur_elems = std::cmp::min(block_elems, usable - elems_done);
-        let _exp_size = cur_elems * elem_size;
-
-        #[cfg(feature = "lz4")]
-        if comp_size < _exp_size {
-            let decompressed = lz4_flex::decompress(&data[rpos..rpos + comp_size], _exp_size)
+        let n_elems = orig_size / elem_size;
+        // Every block (full or final) is a length-prefixed LZ4 block; only the
+        // `n_elems % 8` trailing elements are stored raw.
+        for &block in &bshuf_block_plan(n_elems, block_elems) {
+            if rpos + 4 > data.len() {
+                return Err(FormatError::InvalidData(
+                    "bitshuffle: truncated block header".into(),
+                ));
+            }
+            let comp_size =
+                u32::from_be_bytes([data[rpos], data[rpos + 1], data[rpos + 2], data[rpos + 3]])
+                    as usize;
+            rpos += 4;
+            if rpos + comp_size > data.len() {
+                return Err(FormatError::InvalidData(
+                    "bitshuffle: truncated block data".into(),
+                ));
+            }
+            let exp_size = block * elem_size;
+            let decompressed = lz4_flex::decompress(&data[rpos..rpos + comp_size], exp_size)
                 .map_err(|e| FormatError::InvalidData(format!("bshuf LZ4: {}", e)))?;
             output.extend_from_slice(&bitunshuffle_block(&decompressed, elem_size));
             rpos += comp_size;
-            elems_done += cur_elems;
-            continue;
         }
 
-        // Uncompressed or no LZ4 available
-        output.extend_from_slice(&bitunshuffle_block(
-            &data[rpos..rpos + comp_size],
-            elem_size,
-        ));
-        rpos += comp_size;
-        elems_done += cur_elems;
+        // Trailing raw leftover: `orig_size - output.len()` bytes.
+        if output.len() < orig_size {
+            let remaining = orig_size - output.len();
+            if rpos + remaining > data.len() {
+                return Err(FormatError::InvalidData(
+                    "bitshuffle: truncated leftover bytes".into(),
+                ));
+            }
+            output.extend_from_slice(&data[rpos..rpos + remaining]);
+        }
+        Ok(output)
     }
-
-    // Leftover raw bytes
-    if rpos < data.len() && output.len() < orig_size {
-        let remaining = std::cmp::min(data.len() - rpos, orig_size - output.len());
-        output.extend_from_slice(&data[rpos..rpos + remaining]);
-    }
-    Ok(output)
 }
 
 // =========================================================================
@@ -2279,6 +2389,274 @@ mod tests {
         // Bitshuffle+LZ4 produces valid output (may not always be smaller)
         let decompressed = reverse_filters(&pipeline, &compressed).unwrap();
         assert_eq!(decompressed, data);
+    }
+
+    fn bshuf_dummy_filter() -> Filter {
+        Filter {
+            id: FILTER_BSHUF,
+            flags: 0,
+            cd_values: vec![0, 0, 0, 0, 0],
+        }
+    }
+
+    /// Byte-for-byte parity of the no-compression bit transpose against the
+    /// canonical bitshuffle filter (kiyo-masui/bitshuffle, HDF5 plugin
+    /// `bshuf_bitshuffle`). Vectors generated from that C reference; each
+    /// tuple is (elem_size, block_size_elems, input, canonical_shuffled).
+    /// Covers full blocks, a final block rounded to a multiple of 8, and the
+    /// raw `n_elems % 8` leftover. Guards against the historical MSB-first
+    /// (non-canonical) bit order and the old raw-tail framing.
+    #[test]
+    fn bitshuffle_canonical_nocomp_vectors() {
+        let cases: &[(usize, usize, &[u8], &[u8])] = &[
+            (
+                1,
+                8,
+                &[
+                    7, 138, 13, 144, 19, 150, 25, 156, 31, 162, 37, 168, 43, 174, 49, 180, 55, 186,
+                    61, 192, 67, 198, 73, 204,
+                ],
+                &[
+                    85, 51, 165, 198, 248, 0, 0, 170, 85, 51, 165, 57, 193, 254, 0, 170, 85, 51,
+                    165, 198, 7, 7, 248, 170,
+                ],
+            ),
+            (
+                1,
+                8,
+                &[
+                    7, 138, 13, 144, 19, 150, 25, 156, 31, 162, 37, 168, 43, 174, 49, 180, 55, 186,
+                    61, 192,
+                ],
+                &[
+                    85, 51, 165, 198, 248, 0, 0, 170, 85, 51, 165, 57, 193, 254, 0, 170, 55, 186,
+                    61, 192,
+                ],
+            ),
+            (
+                1,
+                16,
+                &[
+                    7, 138, 13, 144, 19, 150, 25, 156, 31, 162, 37, 168, 43, 174, 49, 180, 55, 186,
+                    61, 192, 67, 198, 73, 204, 79, 210, 85, 216,
+                ],
+                &[
+                    85, 85, 51, 51, 165, 165, 198, 57, 248, 193, 0, 254, 0, 0, 170, 170, 85, 51,
+                    165, 198, 7, 7, 248, 170, 79, 210, 85, 216,
+                ],
+            ),
+            (
+                2,
+                8,
+                &[
+                    7, 138, 13, 144, 19, 150, 25, 156, 31, 162, 37, 168, 43, 174, 49, 180, 55, 186,
+                    61, 192, 67, 198, 73, 204, 79, 210, 85, 216, 91, 222, 97, 228, 103, 234, 109,
+                    240, 115, 246, 121, 252,
+                ],
+                &[
+                    255, 85, 51, 90, 156, 224, 0, 0, 0, 85, 204, 105, 142, 240, 0, 255, 255, 85,
+                    51, 90, 99, 131, 252, 0, 0, 85, 204, 105, 113, 129, 254, 255, 103, 234, 109,
+                    240, 115, 246, 121, 252,
+                ],
+            ),
+            (
+                2,
+                16,
+                &[
+                    7, 138, 13, 144, 19, 150, 25, 156, 31, 162, 37, 168, 43, 174, 49, 180, 55, 186,
+                    61, 192, 67, 198, 73, 204, 79, 210, 85, 216, 91, 222, 97, 228, 103, 234, 109,
+                    240, 115, 246, 121, 252, 127, 2, 133, 8, 139, 14, 145, 20, 151, 26, 157, 32,
+                    163, 38, 169, 44,
+                ],
+                &[
+                    255, 255, 85, 85, 51, 51, 90, 90, 156, 99, 224, 131, 0, 252, 0, 0, 0, 0, 85,
+                    85, 204, 204, 105, 105, 142, 113, 240, 129, 0, 254, 255, 255, 255, 85, 51, 90,
+                    156, 31, 31, 224, 0, 85, 204, 105, 142, 15, 15, 15, 151, 26, 157, 32, 163, 38,
+                    169, 44,
+                ],
+            ),
+            (
+                4,
+                8,
+                &[
+                    7, 138, 13, 144, 19, 150, 25, 156, 31, 162, 37, 168, 43, 174, 49, 180, 55, 186,
+                    61, 192, 67, 198, 73, 204, 79, 210, 85, 216, 91, 222, 97, 228, 103, 234, 109,
+                    240, 115, 246, 121, 252, 127, 2, 133, 8, 139, 14, 145, 20, 151, 26, 157, 32,
+                ],
+                &[
+                    255, 255, 85, 204, 150, 24, 224, 0, 0, 255, 170, 153, 210, 28, 224, 255, 255,
+                    0, 85, 51, 90, 156, 224, 0, 0, 0, 170, 102, 75, 140, 240, 255, 103, 234, 109,
+                    240, 115, 246, 121, 252, 127, 2, 133, 8, 139, 14, 145, 20, 151, 26, 157, 32,
+                ],
+            ),
+            (
+                4,
+                0,
+                &[
+                    7, 138, 13, 144, 19, 150, 25, 156, 31, 162, 37, 168, 43, 174, 49, 180, 55, 186,
+                    61, 192, 67, 198, 73, 204, 79, 210, 85, 216, 91, 222, 97, 228, 103, 234, 109,
+                    240, 115, 246, 121, 252, 127, 2, 133, 8, 139, 14, 145, 20, 151, 26, 157, 32,
+                    163, 38, 169, 44, 175, 50, 181, 56, 187, 62, 193, 68, 199, 74, 205, 80, 211,
+                    86, 217, 92, 223, 98, 229, 104, 235, 110, 241, 116, 247, 122, 253, 128, 3, 134,
+                    9, 140, 15, 146, 21, 152, 27, 158, 33, 164,
+                ],
+                &[
+                    255, 255, 255, 255, 255, 255, 85, 85, 85, 204, 204, 204, 150, 150, 150, 24,
+                    231, 24, 224, 7, 31, 0, 248, 31, 0, 0, 0, 255, 255, 255, 170, 170, 170, 153,
+                    153, 153, 210, 210, 210, 28, 227, 28, 224, 3, 31, 255, 3, 224, 255, 255, 255,
+                    0, 0, 0, 85, 85, 85, 51, 51, 51, 90, 90, 90, 156, 99, 156, 224, 131, 31, 0,
+                    252, 31, 0, 0, 0, 0, 0, 0, 170, 170, 170, 102, 102, 102, 75, 75, 75, 140, 115,
+                    140, 240, 131, 15, 255, 3, 240,
+                ],
+            ),
+            (
+                1,
+                0,
+                &[
+                    7, 138, 13, 144, 19, 150, 25, 156, 31, 162, 37, 168, 43, 174, 49, 180, 55, 186,
+                    61, 192, 67, 198, 73, 204, 79, 210, 85, 216, 91, 222, 97, 228, 103, 234, 109,
+                    240, 115, 246, 121, 252,
+                ],
+                &[
+                    85, 85, 85, 85, 85, 51, 51, 51, 51, 51, 165, 165, 165, 165, 165, 198, 57, 198,
+                    57, 198, 248, 193, 7, 62, 248, 0, 254, 7, 192, 255, 0, 0, 248, 255, 255, 170,
+                    170, 170, 170, 170,
+                ],
+            ),
+        ];
+        let filter = bshuf_dummy_filter();
+        for (i, &(elem_size, block, input, expected)) in cases.iter().enumerate() {
+            let got = bitshuffle_compress(input, elem_size, block, 0, &filter).unwrap();
+            assert_eq!(
+                got, expected,
+                "shuffle mismatch in case {i} (es={elem_size}, block={block})"
+            );
+            let back = bitshuffle_decompress(&got, elem_size, block, 0).unwrap();
+            assert_eq!(back, input, "roundtrip mismatch in case {i}");
+        }
+    }
+
+    /// rust-hdf5 must decode BSLZ4 streams produced by the canonical C filter.
+    /// Vectors are the full HDF5 filter bytes (12-byte header + body) from
+    /// `bshuf_compress_lz4`; each tuple is (elem_size, block_arg, input,
+    /// filter_bytes). The block size is read from the header, so block_arg is
+    /// passed only to mirror how the dataset would advertise it.
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn bitshuffle_canonical_lz4_decode_vectors() {
+        let cases: &[(usize, usize, &[u8], &[u8])] = &[
+            (
+                1,
+                16,
+                &[
+                    7, 138, 13, 144, 19, 150, 25, 156, 31, 162, 37, 168, 43, 174, 49, 180, 55, 186,
+                    61, 192, 67, 198, 73, 204, 79, 210, 85, 216,
+                ],
+                &[
+                    0, 0, 0, 0, 0, 0, 0, 28, 0, 0, 0, 16, 0, 0, 0, 18, 240, 1, 85, 85, 51, 51, 165,
+                    165, 198, 57, 248, 193, 0, 254, 0, 0, 170, 170, 0, 0, 0, 9, 128, 85, 51, 165,
+                    198, 7, 7, 248, 170, 79, 210, 85, 216,
+                ],
+            ),
+            (
+                2,
+                16,
+                &[
+                    7, 138, 13, 144, 19, 150, 25, 156, 31, 162, 37, 168, 43, 174, 49, 180, 55, 186,
+                    61, 192, 67, 198, 73, 204, 79, 210, 85, 216, 91, 222, 97, 228, 103, 234, 109,
+                    240, 115, 246, 121, 252, 127, 2, 133, 8, 139, 14, 145, 20, 151, 26, 157, 32,
+                    163, 38, 169, 44,
+                ],
+                &[
+                    0, 0, 0, 0, 0, 0, 0, 56, 0, 0, 0, 32, 0, 0, 0, 34, 240, 17, 255, 255, 85, 85,
+                    51, 51, 90, 90, 156, 99, 224, 131, 0, 252, 0, 0, 0, 0, 85, 85, 204, 204, 105,
+                    105, 142, 113, 240, 129, 0, 254, 255, 255, 0, 0, 0, 18, 240, 1, 255, 85, 51,
+                    90, 156, 31, 31, 224, 0, 85, 204, 105, 142, 15, 15, 15, 151, 26, 157, 32, 163,
+                    38, 169, 44,
+                ],
+            ),
+            (
+                4,
+                8,
+                &[
+                    7, 138, 13, 144, 19, 150, 25, 156, 31, 162, 37, 168, 43, 174, 49, 180, 55, 186,
+                    61, 192, 67, 198, 73, 204, 79, 210, 85, 216, 91, 222, 97, 228, 103, 234, 109,
+                    240, 115, 246, 121, 252, 127, 2, 133, 8, 139, 14, 145, 20, 151, 26, 157, 32,
+                    163, 38, 169, 44, 175, 50, 181, 56, 187, 62, 193, 68, 199, 74, 205, 80, 211,
+                    86, 217, 92, 223, 98, 229, 104, 235, 110, 241, 116, 247, 122, 253, 128, 3, 134,
+                    9, 140, 15, 146, 21, 152, 27, 158, 33, 164, 39, 170, 45, 176, 51, 182, 57, 188,
+                    63, 194, 69, 200, 75, 206, 81, 212, 87, 218, 93, 224, 99, 230, 105, 236, 111,
+                    242, 117, 248, 123, 254, 129, 4, 135, 10, 141, 16, 147, 22, 153, 28, 159, 34,
+                    165, 40, 171, 46, 177, 52, 183, 58, 189, 64, 195, 70, 201, 76, 207, 82, 213,
+                    88, 219, 94, 225, 100,
+                ],
+                &[
+                    0, 0, 0, 0, 0, 0, 0, 160, 0, 0, 0, 32, 0, 0, 0, 34, 240, 17, 255, 255, 85, 204,
+                    150, 24, 224, 0, 0, 255, 170, 153, 210, 28, 224, 255, 255, 0, 85, 51, 90, 156,
+                    224, 0, 0, 0, 170, 102, 75, 140, 240, 255, 0, 0, 0, 34, 240, 17, 255, 255, 85,
+                    204, 150, 231, 7, 248, 0, 255, 170, 153, 210, 227, 3, 3, 255, 0, 85, 51, 90,
+                    99, 131, 252, 0, 0, 170, 102, 75, 115, 131, 3, 0, 0, 0, 34, 240, 17, 255, 255,
+                    85, 204, 150, 24, 31, 31, 0, 255, 170, 153, 210, 28, 31, 224, 255, 0, 85, 51,
+                    90, 156, 31, 31, 0, 0, 170, 102, 75, 140, 15, 240, 0, 0, 0, 34, 240, 17, 255,
+                    255, 85, 204, 150, 231, 248, 0, 0, 255, 170, 153, 210, 227, 252, 255, 255, 0,
+                    85, 51, 90, 99, 124, 128, 0, 0, 170, 102, 75, 115, 124, 127, 0, 0, 0, 34, 240,
+                    17, 255, 255, 85, 204, 150, 24, 224, 255, 0, 255, 170, 153, 210, 28, 224, 0,
+                    255, 0, 85, 51, 90, 156, 224, 255, 0, 0, 170, 102, 75, 140, 240, 0,
+                ],
+            ),
+            (
+                4,
+                0,
+                &[
+                    7, 138, 13, 144, 19, 150, 25, 156, 31, 162, 37, 168, 43, 174, 49, 180, 55, 186,
+                    61, 192, 67, 198, 73, 204, 79, 210, 85, 216, 91, 222, 97, 228, 103, 234, 109,
+                    240, 115, 246, 121, 252, 127, 2, 133, 8, 139, 14, 145, 20, 151, 26, 157, 32,
+                    163, 38, 169, 44, 175, 50, 181, 56, 187, 62, 193, 68, 199, 74, 205, 80, 211,
+                    86, 217, 92, 223, 98, 229, 104, 235, 110, 241, 116, 247, 122, 253, 128, 3, 134,
+                    9, 140, 15, 146, 21, 152, 27, 158, 33, 164,
+                ],
+                &[
+                    0, 0, 0, 0, 0, 0, 0, 96, 0, 0, 32, 0, 0, 0, 0, 96, 17, 255, 1, 0, 240, 50, 85,
+                    85, 85, 204, 204, 204, 150, 150, 150, 24, 231, 24, 224, 7, 31, 0, 248, 31, 0,
+                    0, 0, 255, 255, 255, 170, 170, 170, 153, 153, 153, 210, 210, 210, 28, 227, 28,
+                    224, 3, 31, 255, 3, 224, 255, 255, 255, 0, 0, 0, 85, 85, 85, 51, 51, 51, 90,
+                    90, 90, 156, 99, 156, 224, 131, 31, 0, 252, 48, 0, 240, 6, 0, 0, 0, 170, 170,
+                    170, 102, 102, 102, 75, 75, 75, 140, 115, 140, 240, 131, 15, 255, 3, 240,
+                ],
+            ),
+        ];
+        for (i, &(elem_size, block, input, filter_bytes)) in cases.iter().enumerate() {
+            let back =
+                bitshuffle_decompress(filter_bytes, elem_size, block, BSHUF_COMPRESS_LZ4).unwrap();
+            assert_eq!(back, input, "canonical BSLZ4 decode mismatch in case {i}");
+        }
+    }
+
+    /// The LZ4 framing (header + per-block length-prefixed blocks + raw
+    /// `n_elems % 8` leftover) must round-trip for inputs that exercise full
+    /// blocks, a rounded final block, and a raw leftover simultaneously.
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn bitshuffle_lz4_framing_roundtrip() {
+        let filter = bshuf_dummy_filter();
+        // (elem_size, block_size_elems, n_elems): each yields full + last + leftover.
+        for &(elem_size, block, n_elems) in &[
+            (1usize, 16usize, 28usize),
+            (2, 16, 28),
+            (4, 8, 45),
+            (2, 8, 100),
+        ] {
+            let data: Vec<u8> = (0..n_elems * elem_size)
+                .map(|i| (i * 131 + 7) as u8)
+                .collect();
+            let comp =
+                bitshuffle_compress(&data, elem_size, block, BSHUF_COMPRESS_LZ4, &filter).unwrap();
+            let back = bitshuffle_decompress(&comp, elem_size, block, BSHUF_COMPRESS_LZ4).unwrap();
+            assert_eq!(
+                back, data,
+                "lz4 framing roundtrip failed for es={elem_size} block={block} n={n_elems}"
+            );
+        }
     }
 
     // --- BitGroom golden test ---
