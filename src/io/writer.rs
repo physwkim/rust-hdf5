@@ -147,6 +147,60 @@ fn encode_fixed_array_dblk(
     buf
 }
 
+/// Interior-mutability cell for per-dataset write state, selected by feature.
+///
+/// This is the §5-B "cfg-selected interior types" from
+/// `docs/threadsafe-fine-grained-locking.md`: the single-threaded build uses a
+/// `RefCell` (zero overhead, no atomics), while the `threadsafe` build uses a
+/// `Mutex` so two threads can write *different* datasets concurrently while the
+/// same dataset's writes serialize. Call sites are identical across both via
+/// [`Slot::lock`].
+#[cfg(not(feature = "threadsafe"))]
+pub(crate) struct Slot<T>(std::cell::RefCell<T>);
+
+#[cfg(not(feature = "threadsafe"))]
+impl<T> Slot<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Slot(std::cell::RefCell::new(value))
+    }
+    /// Borrow the contents mutably (an uncontended `RefCell` borrow).
+    pub(crate) fn lock(&self) -> std::cell::RefMut<'_, T> {
+        self.0.borrow_mut()
+    }
+}
+
+#[cfg(feature = "threadsafe")]
+pub(crate) struct Slot<T>(std::sync::Mutex<T>);
+
+#[cfg(feature = "threadsafe")]
+impl<T> Slot<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Slot(std::sync::Mutex::new(value))
+    }
+    /// Lock the contents. Different datasets hold different slots, so this
+    /// only contends when two threads write the *same* dataset.
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, T> {
+        self.0.lock().unwrap()
+    }
+}
+
+/// Per-dataset state mutated by the streaming write path (chunk writes and
+/// append buffering), held behind a [`Slot`] so concurrent writes to
+/// different datasets don't contend. The immutable-after-create dataset
+/// parameters stay directly on [`DatasetInfo`].
+pub struct DatasetMut {
+    /// Chunked storage info (None for contiguous).
+    pub chunked: Option<ChunkedDatasetInfo>,
+    /// Fixed array chunked storage info.
+    pub fixed_array: Option<FixedArrayDatasetInfo>,
+    /// B-tree v2 chunked storage info.
+    pub btree_v2: Option<Bt2DatasetInfo>,
+    /// Buffer for partially filled chunks during append.
+    pub append_buffer: Vec<u8>,
+    /// Number of frames accumulated in `append_buffer`.
+    pub append_buffered_frames: u64,
+}
+
 /// Metadata for a dataset being written.
 pub struct DatasetInfo {
     /// Link name within the root group.
@@ -161,12 +215,10 @@ pub struct DatasetInfo {
     pub data_addr: u64,
     /// Size of the raw data in bytes (contiguous only).
     pub data_size: u64,
-    /// Chunked storage info (None for contiguous).
-    pub chunked: Option<ChunkedDatasetInfo>,
-    /// Fixed array chunked storage info.
-    pub fixed_array: Option<FixedArrayDatasetInfo>,
-    /// B-tree v2 chunked storage info.
-    pub btree_v2: Option<Bt2DatasetInfo>,
+    /// Per-dataset state mutated by the streaming write path
+    /// (chunked/fixed-array/btree-v2 index + append buffer), behind a
+    /// [`Slot`] so concurrent writes to different datasets don't contend.
+    pub mut_state: Slot<DatasetMut>,
     /// Attributes attached to this dataset.
     pub attributes: Vec<AttributeMessage>,
     /// File offset where the dataset object header was written (for SWMR in-place rewrites).
@@ -175,10 +227,6 @@ pub struct DatasetInfo {
     pub obj_header_encoded_size: usize,
     /// Filter pipeline for compressed chunks.
     pub filter_pipeline: Option<FilterPipeline>,
-    /// Buffer for partially filled chunks during append.
-    pub append_buffer: Vec<u8>,
-    /// Number of frames accumulated in `append_buffer`.
-    pub append_buffered_frames: u64,
     /// Soft-deleted: excluded from finalize output.
     pub deleted: bool,
     /// User-defined fill value bytes (exactly one element wide). `None`
@@ -544,15 +592,17 @@ impl Hdf5Writer {
                 obj_header_addr: *obj_addr,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
-                chunked: None,
-                fixed_array: None,
-                btree_v2: None,
+                mut_state: Slot::new(DatasetMut {
+                    chunked: None,
+                    fixed_array: None,
+                    btree_v2: None,
+                    append_buffer: Vec::new(),
+                    append_buffered_frames: 0,
+                }),
                 attributes: attrs,
                 obj_header_written_addr: Some(*obj_addr),
                 obj_header_encoded_size: 0,
                 filter_pipeline: fp,
-                append_buffer: Vec::new(),
-                append_buffered_frames: 0,
                 deleted: false,
                 fill_value,
             };
@@ -678,7 +728,7 @@ impl Hdf5Writer {
                                 .clone()
                                 .unwrap_or_else(|| info.dataspace.dims.clone());
 
-                            info.chunked = Some(ChunkedDatasetInfo {
+                            info.mut_state.lock().chunked = Some(ChunkedDatasetInfo {
                                 chunk_dims: real_chunk_dims,
                                 max_dims,
                                 earray_params: ep,
@@ -866,9 +916,15 @@ impl Hdf5Writer {
         let ds = &self.datasets[index];
         let shape: Vec<usize> = ds.dataspace.dims.iter().map(|&d| d as usize).collect();
         let element_size = ds.datatype.element_size() as usize;
-        let fixed_array = ds.fixed_array.is_some();
-        let btree2 = ds.btree_v2.is_some();
-        let chunked = ds.chunked.is_some() || fixed_array || btree2;
+        let (fixed_array, btree2, has_chunked) = {
+            let m = ds.mut_state.lock();
+            (
+                m.fixed_array.is_some(),
+                m.btree_v2.is_some(),
+                m.chunked.is_some(),
+            )
+        };
+        let chunked = has_chunked || fixed_array || btree2;
         (shape, element_size, chunked, btree2, fixed_array)
     }
 
@@ -945,16 +1001,17 @@ impl Hdf5Writer {
     }
 
     /// Return the chunk dimensions for a dataset, if chunked.
-    pub fn dataset_chunk_dims(&self, index: usize) -> Option<&[u64]> {
-        let ds = &self.datasets[index];
-        if let Some(ref c) = ds.chunked {
-            Some(&c.chunk_dims)
-        } else if let Some(ref f) = ds.fixed_array {
-            Some(&f.chunk_dims)
-        } else if let Some(ref b) = ds.btree_v2 {
-            Some(&b.chunk_dims)
+    ///
+    /// Returns an owned `Vec` because the chunk geometry now lives behind the
+    /// per-dataset [`Slot`]; it cannot be borrowed past the guard.
+    pub fn dataset_chunk_dims(&self, index: usize) -> Option<Vec<u64>> {
+        let m = self.datasets[index].mut_state.lock();
+        if let Some(ref c) = m.chunked {
+            Some(c.chunk_dims.clone())
+        } else if let Some(ref f) = m.fixed_array {
+            Some(f.chunk_dims.clone())
         } else {
-            None
+            m.btree_v2.as_ref().map(|b| b.chunk_dims.clone())
         }
     }
 
@@ -1258,15 +1315,17 @@ impl Hdf5Writer {
             obj_header_addr: 0, // set during finalize
             data_addr,
             data_size,
-            chunked: None,
-            fixed_array: None,
-            btree_v2: None,
+            mut_state: Slot::new(DatasetMut {
+                chunked: None,
+                fixed_array: None,
+                btree_v2: None,
+                append_buffer: Vec::new(),
+                append_buffered_frames: 0,
+            }),
             attributes: Vec::new(),
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
             filter_pipeline: None,
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
             deleted: false,
             fill_value: None,
         });
@@ -1347,24 +1406,26 @@ impl Hdf5Writer {
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
             filter_pipeline: None,
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
             deleted: false,
             fill_value: None,
-            fixed_array: None,
-            btree_v2: None,
-            chunked: Some(ChunkedDatasetInfo {
-                chunk_dims: chunk_dims.to_vec(),
-                max_dims: max_dims.to_vec(),
-                earray_params,
-                ea_header_addr,
-                ea_iblk_addr,
-                ndblk_addrs,
-                ea_header,
-                ea_iblk,
-                chunks_written: 0,
-                filt_iblk: None,
-                chunk_size_len: 0,
+            mut_state: Slot::new(DatasetMut {
+                fixed_array: None,
+                btree_v2: None,
+                chunked: Some(ChunkedDatasetInfo {
+                    chunk_dims: chunk_dims.to_vec(),
+                    max_dims: max_dims.to_vec(),
+                    earray_params,
+                    ea_header_addr,
+                    ea_iblk_addr,
+                    ndblk_addrs,
+                    ea_header,
+                    ea_iblk,
+                    chunks_written: 0,
+                    filt_iblk: None,
+                    chunk_size_len: 0,
+                }),
+                append_buffer: Vec::new(),
+                append_buffered_frames: 0,
             }),
         });
 
@@ -1378,7 +1439,7 @@ impl Hdf5Writer {
     /// creation time.
     pub fn write_dataset_raw(&mut self, index: usize, data: &[u8]) -> IoResult<()> {
         let ds = &self.datasets[index];
-        if ds.chunked.is_some() {
+        if ds.mut_state.lock().chunked.is_some() {
             return Err(crate::io::IoError::InvalidState(
                 "use write_chunk for chunked datasets".into(),
             ));
@@ -1409,11 +1470,16 @@ impl Hdf5Writer {
     pub fn write_chunk(&mut self, index: usize, chunk_idx: u64, data: &[u8]) -> IoResult<()> {
         let ds = &self.datasets[index];
         let element_size = ds.datatype.element_size() as u64;
-        let chunked = ds
-            .chunked
-            .as_ref()
-            .ok_or_else(|| crate::io::IoError::InvalidState("not a chunked dataset".into()))?;
-        let chunk_bytes: u64 = chunked.chunk_dims.iter().product::<u64>() * element_size;
+        // Scope the slot guard: `record_ea_chunk` re-locks the same slot, so
+        // it must be dropped before that call.
+        let chunk_bytes: u64 = {
+            let m = ds.mut_state.lock();
+            let chunked = m
+                .chunked
+                .as_ref()
+                .ok_or_else(|| crate::io::IoError::InvalidState("not a chunked dataset".into()))?;
+            chunked.chunk_dims.iter().product::<u64>() * element_size
+        };
 
         if data.len() as u64 != chunk_bytes {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -1455,6 +1521,10 @@ impl Hdf5Writer {
         filter_mask: u32,
     ) -> IoResult<()> {
         let is_filtered = self.datasets[index].filter_pipeline.is_some();
+        // Hold one slot guard for the whole method: every chunked-state access
+        // below goes through `m`, while `self.handle`/`self.allocator`/`self.ctx`
+        // are disjoint fields safe to touch with the guard held.
+        let mut m = self.datasets[index].mut_state.lock();
         // For a filtered dataset the chunk's stored size is encoded in the
         // `chunk_size_len`-byte field of each filtered EA entry
         // (`FilteredChunkEntry::encode` writes `nbytes[..chunk_size_len]`,
@@ -1464,11 +1534,7 @@ impl Hdf5Writer {
         // uncompressed chunk size); a direct/raw write with caller-supplied
         // bytes can.
         if is_filtered {
-            let chunk_size_len = self.datasets[index]
-                .chunked
-                .as_ref()
-                .unwrap()
-                .chunk_size_len as usize;
+            let chunk_size_len = m.chunked.as_ref().unwrap().chunk_size_len as usize;
             if chunk_size_len < 8 && compressed_size >= (1u64 << (chunk_size_len * 8)) {
                 return Err(crate::io::IoError::InvalidState(format!(
                     "filtered chunk size {compressed_size} does not fit in the \
@@ -1477,12 +1543,12 @@ impl Hdf5Writer {
             }
         }
         let idx_blk_elmts = {
-            let c = self.datasets[index].chunked.as_ref().unwrap();
+            let c = m.chunked.as_ref().unwrap();
             c.earray_params.idx_blk_elmts as u64
         };
 
         if chunk_idx < idx_blk_elmts {
-            let chunked = self.datasets[index].chunked.as_mut().unwrap();
+            let chunked = m.chunked.as_mut().unwrap();
             if is_filtered {
                 if let Some(ref mut fiblk) = chunked.filt_iblk {
                     fiblk.elements[chunk_idx as usize] = FilteredChunkEntry {
@@ -1505,7 +1571,7 @@ impl Hdf5Writer {
             // chunk_idx >= idx_blk_elmts: place the chunk through the EA
             // data-block / super-block hierarchy (libhdf5-compatible geometry).
             let (geo, max_nelmts_bits, chunk_size_len, ea_header_addr) = {
-                let c = self.datasets[index].chunked.as_ref().unwrap();
+                let c = m.chunked.as_ref().unwrap();
                 let p = &c.earray_params;
                 (
                     EaGeometry::new(
@@ -1544,7 +1610,7 @@ impl Hdf5Writer {
             let mut dblk_addr: u64;
             match loc.path {
                 EaDblkPath::Direct { idx: di } => {
-                    let c = self.datasets[index].chunked.as_ref().unwrap();
+                    let c = m.chunked.as_ref().unwrap();
                     dblk_addr = if is_filtered {
                         c.filt_iblk.as_ref().unwrap().dblk_addrs[di]
                     } else {
@@ -1559,7 +1625,7 @@ impl Hdf5Writer {
                     sblk_block_offset,
                 } => {
                     let mut sblk_addr = {
-                        let c = self.datasets[index].chunked.as_ref().unwrap();
+                        let c = m.chunked.as_ref().unwrap();
                         if is_filtered {
                             c.filt_iblk.as_ref().unwrap().sblk_addrs[sblk_off]
                         } else {
@@ -1576,7 +1642,7 @@ impl Hdf5Writer {
                         let enc = sb.encode(&self.ctx, max_nelmts_bits);
                         sblk_addr = self.allocator.allocate(enc.len() as u64);
                         self.handle.write_at(sblk_addr, &enc)?;
-                        let c = self.datasets[index].chunked.as_mut().unwrap();
+                        let c = m.chunked.as_mut().unwrap();
                         if is_filtered {
                             c.filt_iblk.as_mut().unwrap().sblk_addrs[sblk_off] = sblk_addr;
                         } else {
@@ -1631,7 +1697,7 @@ impl Hdf5Writer {
                 }
                 self.handle.write_at(dblk_addr, &enc)?;
                 if created {
-                    let c = self.datasets[index].chunked.as_mut().unwrap();
+                    let c = m.chunked.as_mut().unwrap();
                     c.ea_header.num_dblks_created += 1;
                     c.ea_header.size_dblks_created += enc.len() as u64;
                 }
@@ -1653,7 +1719,7 @@ impl Hdf5Writer {
                 }
                 self.handle.write_at(dblk_addr, &enc)?;
                 if created {
-                    let c = self.datasets[index].chunked.as_mut().unwrap();
+                    let c = m.chunked.as_mut().unwrap();
                     c.ea_header.num_dblks_created += 1;
                     c.ea_header.size_dblks_created += enc.len() as u64;
                 }
@@ -1663,7 +1729,7 @@ impl Hdf5Writer {
             if created {
                 match parent {
                     DblkParent::IndexBlock(di) => {
-                        let c = self.datasets[index].chunked.as_mut().unwrap();
+                        let c = m.chunked.as_mut().unwrap();
                         if is_filtered {
                             c.filt_iblk.as_mut().unwrap().dblk_addrs[di] = dblk_addr;
                         } else {
@@ -1691,7 +1757,7 @@ impl Hdf5Writer {
             }
 
             // Statistics.
-            let c = self.datasets[index].chunked.as_mut().unwrap();
+            let c = m.chunked.as_mut().unwrap();
             c.chunks_written += 1;
             if chunk_idx + 1 > c.ea_header.max_idx_set {
                 c.ea_header.max_idx_set = chunk_idx + 1;
@@ -1715,10 +1781,13 @@ impl Hdf5Writer {
         data: &[u8],
     ) -> IoResult<()> {
         let ds = &self.datasets[index];
-        if ds.chunked.is_some() || ds.fixed_array.is_some() || ds.btree_v2.is_some() {
-            return Err(crate::io::IoError::InvalidState(
-                "write_slice is only for contiguous datasets".into(),
-            ));
+        {
+            let m = ds.mut_state.lock();
+            if m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some() {
+                return Err(crate::io::IoError::InvalidState(
+                    "write_slice is only for contiguous datasets".into(),
+                ));
+            }
         }
         if ds.data_addr == UNDEF_ADDR {
             return Err(crate::io::IoError::InvalidState(
@@ -1859,17 +1928,19 @@ impl Hdf5Writer {
             obj_header_addr: 0,
             data_addr,
             data_size: data_size as u64,
-            chunked: None,
-            fixed_array: None,
-            btree_v2: None,
             attributes: Vec::new(),
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
             filter_pipeline: None,
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
             deleted: false,
             fill_value: None,
+            mut_state: Slot::new(DatasetMut {
+                chunked: None,
+                fixed_array: None,
+                btree_v2: None,
+                append_buffer: Vec::new(),
+                append_buffered_frames: 0,
+            }),
         });
 
         Ok(idx)
@@ -1933,17 +2004,19 @@ impl Hdf5Writer {
             obj_header_addr: 0,
             data_addr,
             data_size: data_size as u64,
-            chunked: None,
-            fixed_array: None,
-            btree_v2: None,
             attributes: Vec::new(),
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
             filter_pipeline: None,
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
             deleted: false,
             fill_value: None,
+            mut_state: Slot::new(DatasetMut {
+                chunked: None,
+                fixed_array: None,
+                btree_v2: None,
+                append_buffer: Vec::new(),
+                append_buffered_frames: 0,
+            }),
         });
 
         Ok(idx)
@@ -2063,24 +2136,26 @@ impl Hdf5Writer {
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
             filter_pipeline: Some(pipeline),
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
             deleted: false,
             fill_value: None,
-            fixed_array: None,
-            btree_v2: None,
-            chunked: Some(ChunkedDatasetInfo {
-                chunk_dims: chunk_dims.clone(),
-                max_dims: max_dims.clone(),
-                earray_params,
-                ea_header_addr,
-                ea_iblk_addr,
-                ndblk_addrs,
-                ea_header,
-                ea_iblk,
-                chunks_written: 0,
-                filt_iblk: Some(filt_iblk),
-                chunk_size_len,
+            mut_state: Slot::new(DatasetMut {
+                fixed_array: None,
+                btree_v2: None,
+                chunked: Some(ChunkedDatasetInfo {
+                    chunk_dims: chunk_dims.clone(),
+                    max_dims: max_dims.clone(),
+                    earray_params,
+                    ea_header_addr,
+                    ea_iblk_addr,
+                    ndblk_addrs,
+                    ea_header,
+                    ea_iblk,
+                    chunks_written: 0,
+                    filt_iblk: Some(filt_iblk),
+                    chunk_size_len,
+                }),
+                append_buffer: Vec::new(),
+                append_buffered_frames: 0,
             }),
         });
 
@@ -2181,12 +2256,16 @@ impl Hdf5Writer {
         let chunk_dim0 = chunk_dims[0] as usize;
         let frame_bytes = ref_size;
 
-        // Merge buffered data with new data
-        let ds = &mut self.datasets[ds_index];
-        let buffered_frames = ds.append_buffered_frames as usize;
-        let mut combined = std::mem::take(&mut ds.append_buffer);
+        // Merge buffered data with new data. Scope the slot guard: the loop
+        // below calls `write_chunk`, which re-locks the same slot.
+        let (buffered_frames, mut combined) = {
+            let mut m = self.datasets[ds_index].mut_state.lock();
+            let buffered_frames = m.append_buffered_frames as usize;
+            let combined = std::mem::take(&mut m.append_buffer);
+            m.append_buffered_frames = 0;
+            (buffered_frames, combined)
+        };
         combined.extend_from_slice(&raw);
-        ds.append_buffered_frames = 0;
 
         let total_frames = buffered_frames + n_new_frames;
         let total_bytes = combined.len();
@@ -2229,9 +2308,9 @@ impl Hdf5Writer {
                 byte_pos = end;
                 frame_pos += frames_to_fill;
             } else {
-                let ds = &mut self.datasets[ds_index];
-                ds.append_buffer = combined[byte_pos..total_bytes].to_vec();
-                ds.append_buffered_frames = remaining_frames as u64;
+                let mut m = self.datasets[ds_index].mut_state.lock();
+                m.append_buffer = combined[byte_pos..total_bytes].to_vec();
+                m.append_buffered_frames = remaining_frames as u64;
                 frame_pos = total_frames;
             }
         }
@@ -2360,7 +2439,10 @@ impl Hdf5Writer {
         // so unwritten elements read back as the fill value. (The high-level
         // builder calls this immediately after create, before any data is
         // written; a subsequent write_raw/write_slice overwrites its region.)
-        let is_chunked = ds.chunked.is_some() || ds.fixed_array.is_some() || ds.btree_v2.is_some();
+        let is_chunked = {
+            let m = ds.mut_state.lock();
+            m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some()
+        };
         if !is_chunked && ds.data_addr != UNDEF_ADDR && ds.data_size > 0 {
             let data_addr = ds.data_addr;
             let data_size = ds.data_size as usize;
@@ -2401,7 +2483,10 @@ impl Hdf5Writer {
         let ds = &self.datasets[ds_index];
         let element_size = ds.datatype.element_size() as u64;
         let pipeline = ds.filter_pipeline.clone();
-        let Some(chunked) = ds.chunked.as_ref() else {
+        // Hold the slot guard through Phase 1: `chunked` borrows it, while the
+        // `self.handle`/`self.ctx` reads below touch disjoint fields.
+        let m = ds.mut_state.lock();
+        let Some(chunked) = m.chunked.as_ref() else {
             return Ok(None);
         };
         let chunk_bytes = chunked.chunk_dims.iter().product::<u64>() * element_size;
@@ -2609,23 +2694,25 @@ impl Hdf5Writer {
             obj_header_addr: 0,
             data_addr: UNDEF_ADDR,
             data_size: 0,
-            chunked: None,
-            btree_v2: None,
             attributes: Vec::new(),
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
             filter_pipeline: None,
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
             deleted: false,
             fill_value: None,
-            fixed_array: Some(FixedArrayDatasetInfo {
-                chunk_dims: chunk_dims.to_vec(),
-                fa_header_addr,
-                fa_dblk_addr,
-                fa_header,
-                fa_dblk,
-                chunks_written: 0,
+            mut_state: Slot::new(DatasetMut {
+                chunked: None,
+                btree_v2: None,
+                fixed_array: Some(FixedArrayDatasetInfo {
+                    chunk_dims: chunk_dims.to_vec(),
+                    fa_header_addr,
+                    fa_dblk_addr,
+                    fa_header,
+                    fa_dblk,
+                    chunks_written: 0,
+                }),
+                append_buffer: Vec::new(),
+                append_buffered_frames: 0,
             }),
         });
 
@@ -2709,23 +2796,25 @@ impl Hdf5Writer {
             obj_header_addr: 0,
             data_addr: UNDEF_ADDR,
             data_size: 0,
-            chunked: None,
-            btree_v2: None,
             attributes: Vec::new(),
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
             filter_pipeline: Some(pipeline),
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
             deleted: false,
             fill_value: None,
-            fixed_array: Some(FixedArrayDatasetInfo {
-                chunk_dims: chunk_dims.to_vec(),
-                fa_header_addr,
-                fa_dblk_addr,
-                fa_header,
-                fa_dblk,
-                chunks_written: 0,
+            mut_state: Slot::new(DatasetMut {
+                chunked: None,
+                btree_v2: None,
+                fixed_array: Some(FixedArrayDatasetInfo {
+                    chunk_dims: chunk_dims.to_vec(),
+                    fa_header_addr,
+                    fa_dblk_addr,
+                    fa_header,
+                    fa_dblk,
+                    chunks_written: 0,
+                }),
+                append_buffer: Vec::new(),
+                append_buffered_frames: 0,
             }),
         });
 
@@ -2776,23 +2865,25 @@ impl Hdf5Writer {
             obj_header_addr: 0,
             data_addr: UNDEF_ADDR,
             data_size: 0,
-            chunked: None,
-            fixed_array: None,
             attributes: Vec::new(),
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
             filter_pipeline: None,
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
             deleted: false,
             fill_value: None,
-            btree_v2: Some(Bt2DatasetInfo {
-                chunk_dims: chunk_dims.to_vec(),
-                max_dims: max_dims.to_vec(),
-                bt2_header_addr,
-                bt2_leaf_addr,
-                index: bt2_index,
-                chunks_written: 0,
+            mut_state: Slot::new(DatasetMut {
+                chunked: None,
+                fixed_array: None,
+                btree_v2: Some(Bt2DatasetInfo {
+                    chunk_dims: chunk_dims.to_vec(),
+                    max_dims: max_dims.to_vec(),
+                    bt2_header_addr,
+                    bt2_leaf_addr,
+                    index: bt2_index,
+                    chunks_written: 0,
+                }),
+                append_buffer: Vec::new(),
+                append_buffered_frames: 0,
             }),
         });
 
@@ -2878,24 +2969,26 @@ impl Hdf5Writer {
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
             filter_pipeline: Some(FilterPipeline::deflate(compression_level)),
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
             deleted: false,
             fill_value: None,
-            fixed_array: None,
-            btree_v2: None,
-            chunked: Some(ChunkedDatasetInfo {
-                chunk_dims: chunk_dims.to_vec(),
-                max_dims: max_dims.to_vec(),
-                earray_params,
-                ea_header_addr,
-                ea_iblk_addr,
-                ndblk_addrs,
-                ea_header,
-                ea_iblk,
-                chunks_written: 0,
-                filt_iblk: Some(filt_iblk),
-                chunk_size_len,
+            mut_state: Slot::new(DatasetMut {
+                fixed_array: None,
+                btree_v2: None,
+                chunked: Some(ChunkedDatasetInfo {
+                    chunk_dims: chunk_dims.to_vec(),
+                    max_dims: max_dims.to_vec(),
+                    earray_params,
+                    ea_header_addr,
+                    ea_iblk_addr,
+                    ndblk_addrs,
+                    ea_header,
+                    ea_iblk,
+                    chunks_written: 0,
+                    filt_iblk: Some(filt_iblk),
+                    chunk_size_len,
+                }),
+                append_buffer: Vec::new(),
+                append_buffered_frames: 0,
             }),
         });
 
@@ -2974,24 +3067,26 @@ impl Hdf5Writer {
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
             filter_pipeline: Some(pipeline),
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
             deleted: false,
             fill_value: None,
-            fixed_array: None,
-            btree_v2: None,
-            chunked: Some(ChunkedDatasetInfo {
-                chunk_dims: chunk_dims.to_vec(),
-                max_dims: max_dims.to_vec(),
-                earray_params,
-                ea_header_addr,
-                ea_iblk_addr,
-                ndblk_addrs,
-                ea_header,
-                ea_iblk,
-                chunks_written: 0,
-                filt_iblk: Some(filt_iblk),
-                chunk_size_len,
+            mut_state: Slot::new(DatasetMut {
+                fixed_array: None,
+                btree_v2: None,
+                chunked: Some(ChunkedDatasetInfo {
+                    chunk_dims: chunk_dims.to_vec(),
+                    max_dims: max_dims.to_vec(),
+                    earray_params,
+                    ea_header_addr,
+                    ea_iblk_addr,
+                    ndblk_addrs,
+                    ea_header,
+                    ea_iblk,
+                    chunks_written: 0,
+                    filt_iblk: Some(filt_iblk),
+                    chunk_size_len,
+                }),
+                append_buffer: Vec::new(),
+                append_buffered_frames: 0,
             }),
         });
         Ok(idx)
@@ -3010,11 +3105,14 @@ impl Hdf5Writer {
     ) -> IoResult<()> {
         let ds = &self.datasets[index];
         let element_size = ds.datatype.element_size() as u64;
-        let fa = ds
-            .fixed_array
-            .as_ref()
-            .ok_or_else(|| crate::io::IoError::InvalidState("not a fixed-array dataset".into()))?;
-        let chunk_bytes: u64 = fa.chunk_dims.iter().product::<u64>() * element_size;
+        // Scope the slot guard: `record_fixed_array_chunk` re-locks the same slot.
+        let chunk_bytes: u64 = {
+            let m = ds.mut_state.lock();
+            let fa = m.fixed_array.as_ref().ok_or_else(|| {
+                crate::io::IoError::InvalidState("not a fixed-array dataset".into())
+            })?;
+            fa.chunk_dims.iter().product::<u64>() * element_size
+        };
 
         if data.len() as u64 != chunk_bytes {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -3079,7 +3177,10 @@ impl Hdf5Writer {
     ) -> IoResult<()> {
         let ds = &self.datasets[index];
         let is_filtered = ds.filter_pipeline.is_some();
-        let fa = ds
+        // Hold one slot guard for the whole method; `self.allocator`/`self.handle`/
+        // `self.ctx` below touch disjoint fields safe to use with the guard held.
+        let mut m = ds.mut_state.lock();
+        let fa = m
             .fixed_array
             .as_ref()
             .ok_or_else(|| crate::io::IoError::InvalidState("not a fixed-array dataset".into()))?;
@@ -3116,7 +3217,7 @@ impl Hdf5Writer {
         self.handle.write_at(chunk_addr, final_bytes)?;
 
         // Update the fixed array data block.
-        let fa = self.datasets[index].fixed_array.as_mut().unwrap();
+        let fa = m.fixed_array.as_mut().unwrap();
         let lidx = linear_idx as usize;
         if is_filtered {
             // Filtered FA: store address + stored size + filter mask. A
@@ -3192,7 +3293,10 @@ impl Hdf5Writer {
     ) -> IoResult<()> {
         let ds = &self.datasets[index];
         let element_size = ds.datatype.element_size() as u64;
-        let bt2 = ds
+        // Hold one slot guard for the whole method; `self.allocator`/`self.handle`
+        // below touch disjoint fields safe to use with the guard held.
+        let mut m = ds.mut_state.lock();
+        let bt2 = m
             .btree_v2
             .as_ref()
             .ok_or_else(|| crate::io::IoError::InvalidState("not a B-tree v2 dataset".into()))?;
@@ -3211,7 +3315,7 @@ impl Hdf5Writer {
         self.handle.write_at(chunk_addr, data)?;
 
         // Insert into the in-memory BT2 index
-        let bt2 = self.datasets[index].btree_v2.as_mut().unwrap();
+        let bt2 = m.btree_v2.as_mut().unwrap();
         bt2.index.insert(chunk_coords.to_vec(), chunk_addr);
         bt2.chunks_written += 1;
 
@@ -3279,7 +3383,11 @@ impl Hdf5Writer {
     /// Extend the dimensions of a chunked dataset.
     pub fn extend_dataset(&mut self, index: usize, new_dims: &[u64]) -> IoResult<()> {
         let ds = &mut self.datasets[index];
-        if ds.chunked.is_none() && ds.fixed_array.is_none() && ds.btree_v2.is_none() {
+        let is_unindexed = {
+            let m = ds.mut_state.lock();
+            m.chunked.is_none() && m.fixed_array.is_none() && m.btree_v2.is_none()
+        };
+        if is_unindexed {
             return Err(crate::io::IoError::InvalidState(
                 "can only extend chunked datasets".into(),
             ));
@@ -3323,7 +3431,11 @@ impl Hdf5Writer {
     /// corrected back to the true number of frames written.
     pub fn set_dataset_extent(&mut self, index: usize, new_dims: &[u64]) -> IoResult<()> {
         let ds = &mut self.datasets[index];
-        if ds.chunked.is_none() && ds.fixed_array.is_none() && ds.btree_v2.is_none() {
+        let is_unindexed = {
+            let m = ds.mut_state.lock();
+            m.chunked.is_none() && m.fixed_array.is_none() && m.btree_v2.is_none()
+        };
+        if is_unindexed {
             return Err(crate::io::IoError::InvalidState(
                 "can only set the extent of chunked datasets".into(),
             ));
@@ -3338,7 +3450,7 @@ impl Hdf5Writer {
         // A pending append buffer is positioned relative to the current
         // logical size; changing the extent underneath it would make
         // `flush_append_buffers` write the chunk at the wrong index.
-        if ds.append_buffered_frames > 0 {
+        if ds.mut_state.lock().append_buffered_frames > 0 {
             return Err(crate::io::IoError::InvalidState(
                 "set_extent cannot run while the dataset has buffered appends; \
                  flush them first"
@@ -3361,9 +3473,12 @@ impl Hdf5Writer {
     /// Flush a chunked dataset's index structures to disk.
     pub fn flush_dataset(&mut self, index: usize) -> IoResult<()> {
         let ds = &self.datasets[index];
+        // Hold one slot guard for the whole method; `self.handle`/`self.ctx`/
+        // `self.allocator` below touch disjoint fields.
+        let mut m = ds.mut_state.lock();
 
         // EA-indexed dataset
-        if let Some(ref chunked) = ds.chunked {
+        if let Some(ref chunked) = m.chunked {
             if let Some(ref fiblk) = chunked.filt_iblk {
                 // Filtered EA
                 let iblk_encoded = fiblk.encode(&self.ctx, chunked.chunk_size_len);
@@ -3380,7 +3495,7 @@ impl Hdf5Writer {
         }
 
         // Fixed-array-indexed dataset
-        if let Some(ref fa) = ds.fixed_array {
+        if let Some(ref fa) = m.fixed_array {
             let dblk_encoded = encode_fixed_array_dblk(&self.ctx, &fa.fa_header, &fa.fa_dblk);
             self.handle.write_at(fa.fa_dblk_addr, &dblk_encoded)?;
             let hdr_encoded = fa.fa_header.encode(&self.ctx);
@@ -3390,7 +3505,7 @@ impl Hdf5Writer {
         }
 
         // BT2-indexed dataset
-        if let Some(ref bt2) = ds.btree_v2 {
+        if let Some(ref bt2) = m.btree_v2 {
             // Re-encode the leaf node and header
             let (hdr_bytes, leaf_bytes) = bt2.index.encode(&self.ctx);
 
@@ -3406,7 +3521,7 @@ impl Hdf5Writer {
             self.handle.write_at(bt2.bt2_header_addr, &hdr_encoded)?;
 
             // Update our in-memory copy's leaf addr
-            let bt2_mut = self.datasets[index].btree_v2.as_mut().unwrap();
+            let bt2_mut = m.btree_v2.as_mut().unwrap();
             bt2_mut.bt2_leaf_addr = leaf_addr;
 
             self.handle.sync_data()?;
@@ -3500,10 +3615,11 @@ impl Hdf5Writer {
     pub fn finalize_for_swmr(&mut self) -> IoResult<()> {
         // 0. Flush all chunked dataset index structures.
         for i in 0..self.datasets.len() {
-            if self.datasets[i].chunked.is_some()
-                || self.datasets[i].fixed_array.is_some()
-                || self.datasets[i].btree_v2.is_some()
-            {
+            let is_indexed = {
+                let m = self.datasets[i].mut_state.lock();
+                m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some()
+            };
+            if is_indexed {
                 self.flush_dataset(i)?;
             }
         }
@@ -3558,28 +3674,35 @@ impl Hdf5Writer {
     /// tail with the dataset's fill value (zeros when none is defined).
     fn flush_append_buffers(&mut self) -> IoResult<()> {
         for i in 0..self.datasets.len() {
-            if self.datasets[i].append_buffer.is_empty() {
+            if self.datasets[i].mut_state.lock().append_buffer.is_empty() {
                 continue;
             }
-            let chunk_dims = if let Some(ref c) = self.datasets[i].chunked {
-                c.chunk_dims.clone()
-            } else if let Some(ref f) = self.datasets[i].fixed_array {
-                f.chunk_dims.clone()
-            } else if let Some(ref b) = self.datasets[i].btree_v2 {
-                b.chunk_dims.clone()
-            } else {
-                continue;
+            let chunk_dims = {
+                let m = self.datasets[i].mut_state.lock();
+                if let Some(ref c) = m.chunked {
+                    c.chunk_dims.clone()
+                } else if let Some(ref f) = m.fixed_array {
+                    f.chunk_dims.clone()
+                } else if let Some(ref b) = m.btree_v2 {
+                    b.chunk_dims.clone()
+                } else {
+                    continue;
+                }
             };
             let es = self.datasets[i].datatype.element_size() as usize;
             let chunk_bytes: usize = chunk_dims.iter().map(|&d| d as usize).product::<usize>() * es;
             let chunk_dim0 = chunk_dims[0] as usize;
-            let buffered_frames = self.datasets[i].append_buffered_frames as usize;
+            let buffered_frames = self.datasets[i].mut_state.lock().append_buffered_frames as usize;
             let current_dim0 = self.datasets[i].dataspace.dims[0] as usize;
             let base_frame = current_dim0 - buffered_frames;
             let chunk_idx = base_frame / chunk_dim0;
 
-            let buf = std::mem::take(&mut self.datasets[i].append_buffer);
-            self.datasets[i].append_buffered_frames = 0;
+            let buf = {
+                let mut m = self.datasets[i].mut_state.lock();
+                let buf = std::mem::take(&mut m.append_buffer);
+                m.append_buffered_frames = 0;
+                buf
+            };
 
             let mut chunk_buf = self.new_chunk_buffer(i, chunk_bytes);
             let frame_bytes = if self.datasets[i].dataspace.dims.len() > 1 {
@@ -3620,6 +3743,8 @@ impl Hdf5Writer {
         for i in 0..self.datasets.len() {
             if self.datasets[i].obj_header_written_addr.is_some() {
                 let modified = self.datasets[i]
+                    .mut_state
+                    .lock()
                     .chunked
                     .as_ref()
                     .is_some_and(|c| c.chunks_written > 0);
@@ -3627,10 +3752,11 @@ impl Hdf5Writer {
                     continue;
                 }
             }
-            if self.datasets[i].chunked.is_some()
-                || self.datasets[i].fixed_array.is_some()
-                || self.datasets[i].btree_v2.is_some()
-            {
+            let is_indexed = {
+                let m = self.datasets[i].mut_state.lock();
+                m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some()
+            };
+            if is_indexed {
                 self.flush_dataset(i)?;
             }
         }
@@ -3642,6 +3768,8 @@ impl Hdf5Writer {
                 // If it has chunked info with chunks_written > 0, it was modified
                 // and needs a new object header.
                 let modified = self.datasets[i]
+                    .mut_state
+                    .lock()
                     .chunked
                     .as_ref()
                     .is_some_and(|c| c.chunks_written > 0);
@@ -3689,6 +3817,9 @@ impl Hdf5Writer {
 
     fn build_dataset_header(&self, index: usize) -> ObjectHeader {
         let ds = &self.datasets[index];
+        // Hold one slot guard for the index-kind reads (is_chunked + layout);
+        // every other field touched here is disjoint from `mut_state`.
+        let m = ds.mut_state.lock();
         let mut header = ObjectHeader::new();
 
         // Dataspace message (type 0x01)
@@ -3700,7 +3831,7 @@ impl Hdf5Writer {
         header.add_message(MSG_DATATYPE, 0x01, dt_msg);
 
         // Fill Value message (type 0x05)
-        let is_chunked = ds.chunked.is_some() || ds.fixed_array.is_some() || ds.btree_v2.is_some();
+        let is_chunked = m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
         let alloc_time = if is_chunked { 3 } else { 2 }; // 3 = incremental, 2 = late
         let fv = if let Some(ref bytes) = ds.fill_value {
             // User-defined fill value (fill_defined = 2).
@@ -3724,7 +3855,7 @@ impl Hdf5Writer {
         header.add_message(MSG_FILL_VALUE, 0x00, fv_msg);
 
         // Data Layout message (type 0x08)
-        let layout = if let Some(ref chunked) = ds.chunked {
+        let layout = if let Some(ref chunked) = m.chunked {
             let mut layout_dims = chunked.chunk_dims.clone();
             layout_dims.push(ds.datatype.element_size() as u64);
             DataLayoutMessage::chunked_v4_earray(
@@ -3732,7 +3863,7 @@ impl Hdf5Writer {
                 chunked.earray_params.clone(),
                 chunked.ea_header_addr,
             )
-        } else if let Some(ref fa) = ds.fixed_array {
+        } else if let Some(ref fa) = m.fixed_array {
             let mut layout_dims = fa.chunk_dims.clone();
             layout_dims.push(ds.datatype.element_size() as u64);
             DataLayoutMessage::chunked_v4_farray(
@@ -3740,7 +3871,7 @@ impl Hdf5Writer {
                 FixedArrayParams::default_params(),
                 fa.fa_header_addr,
             )
-        } else if let Some(ref bt2) = ds.btree_v2 {
+        } else if let Some(ref bt2) = m.btree_v2 {
             let mut layout_dims = bt2.chunk_dims.clone();
             layout_dims.push(ds.datatype.element_size() as u64);
             DataLayoutMessage::chunked_v4_btree_v2(layout_dims, bt2.bt2_header_addr)

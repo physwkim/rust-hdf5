@@ -1456,12 +1456,16 @@ impl H5Dataset {
                     std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * es)
                 };
 
-                // Merge buffered data with new data
-                let ds = &mut writer.datasets[ds_index];
-                let buffered_frames = ds.append_buffered_frames as usize;
-                let mut combined = std::mem::take(&mut ds.append_buffer);
+                // Merge buffered data with new data. Scope the slot guard: the
+                // loop below calls `write_chunk`, which re-locks the same slot.
+                let (buffered_frames, mut combined) = {
+                    let mut m = writer.datasets[ds_index].mut_state.lock();
+                    let buffered_frames = m.append_buffered_frames as usize;
+                    let combined = std::mem::take(&mut m.append_buffer);
+                    m.append_buffered_frames = 0;
+                    (buffered_frames, combined)
+                };
                 combined.extend_from_slice(raw);
-                ds.append_buffered_frames = 0;
 
                 let total_frames = buffered_frames + n_new_frames;
                 let total_bytes = combined.len();
@@ -1514,9 +1518,9 @@ impl H5Dataset {
                         frame_pos += frames_to_fill;
                     } else {
                         // Partial chunk — buffer for next append
-                        let ds = &mut writer.datasets[ds_index];
-                        ds.append_buffer = combined[byte_pos..total_bytes].to_vec();
-                        ds.append_buffered_frames = remaining_frames as u64;
+                        let mut m = writer.datasets[ds_index].mut_state.lock();
+                        m.append_buffer = combined[byte_pos..total_bytes].to_vec();
+                        m.append_buffered_frames = remaining_frames as u64;
                         frame_pos = total_frames;
                     }
                 }
@@ -3407,7 +3411,8 @@ mod tests {
         {
             let w = crate::io::writer::Hdf5Writer::open_append(&path).unwrap();
             let idx = w.dataset_index("v").unwrap();
-            let entry = &w.datasets[idx]
+            let m = w.datasets[idx].mut_state.lock();
+            let entry = &m
                 .chunked
                 .as_ref()
                 .unwrap()

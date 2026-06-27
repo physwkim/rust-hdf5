@@ -459,7 +459,12 @@ impl SwmrWriter {
         chunk_coords: &[u64],
         data: &[u8],
     ) -> IoResult<()> {
-        if self.writer.datasets[ds_index].fixed_array.is_none() {
+        if self.writer.datasets[ds_index]
+            .mut_state
+            .lock()
+            .fixed_array
+            .is_none()
+        {
             return Err(crate::io::IoError::InvalidState(
                 "write_chunk_at requires a fixed grid dataset (create_grid_dataset)".into(),
             ));
@@ -577,10 +582,11 @@ impl SwmrWriter {
         // extensible array (streaming), fixed array (fixed grid), and v2
         // B-tree alike, matching finalize_for_swmr.
         for i in 0..self.writer.datasets.len() {
-            if self.writer.datasets[i].chunked.is_some()
-                || self.writer.datasets[i].fixed_array.is_some()
-                || self.writer.datasets[i].btree_v2.is_some()
-            {
+            let is_indexed = {
+                let m = self.writer.datasets[i].mut_state.lock();
+                m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some()
+            };
+            if is_indexed {
                 self.writer.flush_dataset(i)?;
             }
         }
