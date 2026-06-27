@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::io::locking::{self, FileLocking, LockMode};
@@ -7,12 +7,19 @@ use crate::io::locking::{self, FileLocking, LockMode};
 /// Default buffer size for buffered I/O (64 KiB).
 const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 
-/// Wraps `std::fs::File` with buffered, positioned I/O convenience methods.
+/// Wraps `std::fs::File` with positioned I/O convenience methods.
 ///
-/// Write operations go through a `BufWriter` to merge small writes.
-/// Read operations go through a `BufReader` to reduce syscall overhead.
-/// The buffers are flushed automatically when switching between
-/// read and write operations.
+/// Writes use positioned writes (`pwrite`) directly on the `File`: each
+/// `write_at` lands at its offset without a shared write cursor, so the
+/// mechanism is safe to issue concurrently at non-overlapping offsets (the
+/// foundation for the `threadsafe` fine-grained writer — see
+/// `docs/threadsafe-fine-grained-locking.md`). The previous `BufWriter`
+/// merged nothing here anyway, because every `write_at` seeked first, which
+/// flushes a `BufWriter`.
+///
+/// Read operations go through a `BufReader` to reduce syscall overhead on
+/// the many small structural reads the reader makes; the reader buffer is
+/// reset when switching between read and write operations.
 pub struct FileHandle {
     file: Option<File>,
     mode: Mode,
@@ -24,8 +31,8 @@ pub struct FileHandle {
 }
 
 enum Mode {
-    /// Read/write capable, currently buffering writes.
-    Writer(BufWriter<File>),
+    /// Read/write capable; writes go straight to the file via `pwrite`.
+    Writer(File),
     /// Read/write capable, currently buffering reads.
     Reader(BufReader<File>),
     /// Read-only file.
@@ -59,7 +66,7 @@ impl FileHandle {
         file.set_len(0)?;
         Ok(Self {
             file: None,
-            mode: Mode::Writer(BufWriter::with_capacity(DEFAULT_BUF_SIZE, file)),
+            mode: Mode::Writer(file),
             lock_policy: policy,
             lock_held,
         })
@@ -97,7 +104,7 @@ impl FileHandle {
         let lock_held = locking::try_acquire(&file, LockMode::Exclusive, policy)?;
         Ok(Self {
             file: None,
-            mode: Mode::Writer(BufWriter::with_capacity(DEFAULT_BUF_SIZE, file)),
+            mode: Mode::Writer(file),
             lock_policy: policy,
             lock_held,
         })
@@ -137,11 +144,11 @@ impl FileHandle {
         Ok(())
     }
 
-    /// Extract the raw `File` from the current mode, flushing if needed.
+    /// Extract the raw `File` from the current mode.
     fn take_file(&mut self) -> std::io::Result<File> {
         let old = std::mem::replace(&mut self.mode, Mode::Transitioning);
         match old {
-            Mode::Writer(w) => w.into_inner().map_err(|e| e.into_error()),
+            Mode::Writer(f) => Ok(f),
             Mode::Reader(r) => Ok(r.into_inner()),
             Mode::ReadOnly(r) => Ok(r.into_inner()),
             Mode::Transitioning => {
@@ -166,7 +173,7 @@ impl FileHandle {
             _ => {}
         }
         let file = self.take_file()?;
-        self.mode = Mode::Writer(BufWriter::with_capacity(DEFAULT_BUF_SIZE, file));
+        self.mode = Mode::Writer(file);
         Ok(())
     }
 
@@ -182,11 +189,14 @@ impl FileHandle {
     }
 
     /// Write `data` at the given byte offset.
+    ///
+    /// Uses a positioned write (`pwrite`) that neither moves nor depends on
+    /// the file's seek cursor, so distinct, non-overlapping offsets are safe
+    /// to write concurrently against a shared `&File`.
     pub fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
         self.ensure_writer()?;
-        if let Mode::Writer(w) = &mut self.mode {
-            w.seek(SeekFrom::Start(offset))?;
-            w.write_all(data)?;
+        if let Mode::Writer(f) = &self.mode {
+            pwrite_all(f, offset, data)?;
         }
         Ok(())
     }
@@ -293,21 +303,73 @@ impl FileHandle {
     }
 
     /// Flush any pending buffered writes.
+    ///
+    /// Writes go straight to the file via `pwrite` (there is no
+    /// application-level write buffer), so there is nothing to flush. Kept as
+    /// a hook so the durability call sites (`sync_data`, `sync_all`,
+    /// `release_lock`) read uniformly and stay correct if buffering is ever
+    /// reintroduced.
     fn flush_buffers(&mut self) -> std::io::Result<()> {
-        if let Mode::Writer(w) = &mut self.mode {
-            w.flush()?;
-        }
         Ok(())
     }
 
     /// Get a reference to the underlying File for sync operations.
     fn get_file_ref(&self) -> &File {
         match &self.mode {
-            Mode::Writer(w) => w.get_ref(),
+            Mode::Writer(f) => f,
             Mode::Reader(r) | Mode::ReadOnly(r) => r.get_ref(),
             Mode::Transitioning => unreachable!("sync during transition"),
         }
     }
+}
+
+/// Write all of `data` to `file` starting at `offset` using a positioned
+/// write.
+///
+/// A positioned write neither consults nor moves the file's seek cursor, so
+/// concurrent calls at distinct, non-overlapping offsets against a shared
+/// `&File` do not race — the property the `threadsafe` fine-grained writer
+/// relies on to write chunk data without holding a global lock (see
+/// `docs/threadsafe-fine-grained-locking.md`).
+#[cfg(unix)]
+fn pwrite_all(file: &File, offset: u64, data: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(data, offset)
+}
+
+#[cfg(windows)]
+fn pwrite_all(file: &File, mut offset: u64, mut data: &[u8]) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    // `seek_write` is positioned but may write fewer bytes than requested, so
+    // loop until the whole buffer lands.
+    while !data.is_empty() {
+        match file.seek_write(data, offset) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            Ok(n) => {
+                data = &data[n..];
+                offset += n as u64;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pwrite_all(file: &File, offset: u64, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    // No positioned-write API on this platform; fall back to seek+write on a
+    // shared `&File`. This moves the shared cursor and is therefore NOT
+    // concurrency-safe — on such a platform the writer must stay serialized.
+    let mut f = file;
+    f.seek(SeekFrom::Start(offset))?;
+    f.write_all(data)
 }
 
 /// A memory-mapped read-only file handle for zero-copy reads.
