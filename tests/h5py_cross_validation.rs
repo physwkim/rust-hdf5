@@ -98,15 +98,18 @@ fn f1_vlen_dataset_with_attrs_readable_by_h5py() {
     read_back_with_h5py(
         py,
         &path,
-        // rust-hdf5 stores small string attributes as fixed-length strings, so
-        // h5py may hand them back as bytes; decode before comparing. The point
-        // is that the dataset and its attributes are h5py-readable at all.
+        // String attributes are stored as variable-length UTF-8 strings, so
+        // h5py hands them back as Python `str` (not bytes). The dataset
+        // elements of a vlen-string dataset still come back as bytes, so the
+        // `dec` helper is kept only for those.
         "dec = lambda v: v.decode() if isinstance(v, bytes) else v\n\
          ds = f['ch/labels']\n\
          vals = [dec(x) for x in ds[...]]\n\
          assert vals == ['a', 'bb', 'ccc'], vals\n\
-         assert dec(ds.attrs['unit']) == 'volt', ds.attrs['unit']\n\
-         assert dec(ds.attrs['desc']) == 'channel labels', ds.attrs['desc']\n",
+         assert isinstance(ds.attrs['unit'], str), type(ds.attrs['unit'])\n\
+         assert ds.attrs['unit'] == 'volt', ds.attrs['unit']\n\
+         assert isinstance(ds.attrs['desc'], str), type(ds.attrs['desc'])\n\
+         assert ds.attrs['desc'] == 'channel labels', ds.attrs['desc']\n",
     );
     std::fs::remove_file(&path).ok();
 }
@@ -202,6 +205,47 @@ fn f3_vlen_bytes_written_by_h5py_read_by_rust() {
     let expected: Vec<Vec<u8>> = vec![vec![1, 2, 3], vec![], vec![255, 254]];
     assert_eq!(got, expected);
     drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+/// C: string attributes written via the public setters are variable-length
+/// UTF-8 strings. h5py must read them back as Python `str` (vlen dtype),
+/// on a dataset, a group, and the root group.
+#[test]
+fn c_vlen_string_attrs_readable_as_str_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("c_vlen_attrs");
+    {
+        let file = H5File::create(&path).unwrap();
+        // Root attribute via H5File::set_attr_string.
+        file.set_attr_string("title", "experiment").unwrap();
+        // Group attribute via Group::set_attr_string.
+        let grp = file.root_group().create_group("entry").unwrap();
+        grp.set_attr_string("NX_class", "NXentry").unwrap();
+        // Dataset attribute via new_attr::<VarLenUnicode>().write_string.
+        let ds = file.new_dataset::<i32>().shape([3]).create("data").unwrap();
+        ds.write_raw(&[1, 2, 3]).unwrap();
+        ds.new_attr::<VarLenUnicode>()
+            .shape(())
+            .create("units")
+            .unwrap()
+            .write_string("volt")
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "assert isinstance(f.attrs['title'], str), type(f.attrs['title'])\n\
+         assert f.attrs['title'] == 'experiment', f.attrs['title']\n\
+         g = f['entry']\n\
+         assert isinstance(g.attrs['NX_class'], str), type(g.attrs['NX_class'])\n\
+         assert g.attrs['NX_class'] == 'NXentry', g.attrs['NX_class']\n\
+         ds = f['data']\n\
+         assert isinstance(ds.attrs['units'], str), type(ds.attrs['units'])\n\
+         assert ds.attrs['units'] == 'volt', ds.attrs['units']\n\
+         assert h5py.check_string_dtype(ds.attrs.get_id('units').dtype), 'units not vlen string'\n",
+    );
     std::fs::remove_file(&path).ok();
 }
 

@@ -477,9 +477,26 @@ impl H5Group {
     /// Add (or replace) a string attribute on this group.
     ///
     /// This is the standard way to mark a NeXus class, e.g.
-    /// `grp.set_attr_string("NX_class", "NXdetector")`.
+    /// `grp.set_attr_string("NX_class", "NXdetector")`. The value is stored as
+    /// a variable-length UTF-8 string (read back as a Python `str` by h5py),
+    /// not a fixed-length string.
     pub fn set_attr_string(&self, name: &str, value: &str) -> Result<()> {
-        self.add_attr(AttributeMessage::scalar_string(name, value))
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                let attr = writer.vlen_string_attribute(name, value)?;
+                if self.name == "/" {
+                    writer.add_root_attribute(attr);
+                } else {
+                    writer.add_group_attribute(&self.name, attr)?;
+                }
+                Ok(())
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot write attributes in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
     }
 
     /// Add (or replace) a numeric scalar attribute on this group.

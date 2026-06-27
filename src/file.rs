@@ -190,12 +190,14 @@ impl H5File {
     }
 
     /// Add a string attribute to the file (root group).
+    ///
+    /// The value is stored as a variable-length UTF-8 string (read back as a
+    /// Python `str` by h5py), not a fixed-length string.
     pub fn set_attr_string(&self, name: &str, value: &str) -> Result<()> {
-        use crate::format::messages::attribute::AttributeMessage;
-        let attr = AttributeMessage::scalar_string(name, value);
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
+                let attr = writer.vlen_string_attribute(name, value)?;
                 writer.add_root_attribute(attr);
                 Ok(())
             }

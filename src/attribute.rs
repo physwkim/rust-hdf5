@@ -63,14 +63,14 @@ impl H5Attribute {
 
     /// Write a scalar value to the attribute.
     ///
-    /// For `VarLenUnicode`, this writes a fixed-length string attribute
-    /// whose size is determined by the string value.
+    /// For `VarLenUnicode`, this writes a variable-length UTF-8 string
+    /// attribute — the string is stored in a global heap and h5py reads it
+    /// back as a Python `str` (matching the `VarLenUnicode` type name).
     pub fn write_scalar(&self, value: &VarLenUnicode) -> Result<()> {
-        let attr_msg = AttributeMessage::scalar_string(&self.name, &value.0);
-
         let mut inner = borrow_inner_mut(&self.file_inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
+                let attr_msg = writer.vlen_string_attribute(&self.name, &value.0)?;
                 writer.add_dataset_attribute(self.ds_index, attr_msg)?;
                 Ok(())
             }

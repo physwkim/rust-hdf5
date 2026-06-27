@@ -311,7 +311,7 @@ impl SwmrFileWriter {
         name: &str,
         value: &str,
     ) -> Result<()> {
-        let attr = AttributeMessage::scalar_string(name, value);
+        let attr = self.inner.writer_mut().vlen_string_attribute(name, value)?;
         if group_path == "/" {
             self.inner.writer_mut().add_root_attribute(attr);
         } else {
@@ -397,9 +397,10 @@ impl SwmrFileWriter {
         name: &str,
         value: &str,
     ) -> Result<()> {
+        let attr = self.inner.writer_mut().vlen_string_attribute(name, value)?;
         self.inner
             .writer_mut()
-            .add_dataset_attribute(ds_index, AttributeMessage::scalar_string(name, value))?;
+            .add_dataset_attribute(ds_index, attr)?;
         Ok(())
     }
 

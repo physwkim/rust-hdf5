@@ -2291,6 +2291,44 @@ impl Hdf5Writer {
         Ok(())
     }
 
+    /// Build a variable-length UTF-8 string attribute message.
+    ///
+    /// The string is stored as one object in a global heap collection and the
+    /// returned [`AttributeMessage`] carries the vlen reference as its data,
+    /// with a vlen-string datatype and scalar dataspace. h5py reads the value
+    /// back as a Python `str` (not `bytes`).
+    ///
+    /// This is the single owner of vlen-string-attribute construction: every
+    /// public string-attribute setter (dataset, group, root, and the SWMR
+    /// equivalents) routes through it, so a `VarLenUnicode` /
+    /// `set_attr_string` value is always stored as a true variable-length
+    /// string rather than the fixed-length string it used to be.
+    ///
+    /// One global heap collection is allocated per attribute, matching the
+    /// per-call collection of [`create_vlen_string_dataset`](Self::create_vlen_string_dataset).
+    /// A single shared attribute heap would avoid the per-attribute padding
+    /// (`H5HG_MINALLOC` = 4096 bytes) but is a heap-management change that
+    /// would also need to cover the dataset path.
+    pub fn vlen_string_attribute(&mut self, name: &str, value: &str) -> IoResult<AttributeMessage> {
+        use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+        use crate::format::messages::dataspace::DataspaceMessage;
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let mut gcol = GlobalHeapCollection::new();
+        let obj_idx = gcol.add_object(value.as_bytes().to_vec())?;
+        let gcol_encoded = gcol.encode(&self.ctx);
+        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
+        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+
+        let data = encode_vlen_reference(value.len() as u32, gcol_addr, obj_idx as u32, &self.ctx);
+        Ok(AttributeMessage {
+            name: name.to_string(),
+            datatype: DatatypeMessage::vlen_string_utf8(),
+            dataspace: DataspaceMessage::scalar(),
+            data,
+        })
+    }
+
     /// Set a user-defined fill value for a dataset.
     ///
     /// `bytes` must be exactly one element wide (matching the dataset's

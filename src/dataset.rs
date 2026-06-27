@@ -2511,11 +2511,24 @@ mod tests {
 
         // Verify the file is still valid and readable
         {
+            use crate::format::messages::datatype::DatatypeMessage;
             let file = H5File::open(&path).unwrap();
             let ds = file.dataset("data").unwrap();
             assert_eq!(ds.shape(), vec![4]);
             let readback = ds.read_raw::<u8>().unwrap();
             assert_eq!(readback, vec![1u8, 2, 3, 4]);
+
+            // The string attribute is stored as a true variable-length string
+            // (not fixed-length) and round-trips its value.
+            let attr = ds.attr("name").unwrap();
+            assert!(
+                matches!(
+                    attr.datatype().unwrap(),
+                    DatatypeMessage::VarLenString { .. }
+                ),
+                "string attribute should have a variable-length string datatype"
+            );
+            assert_eq!(attr.read_string().unwrap(), "test_value");
         }
 
         std::fs::remove_file(&path).ok();
