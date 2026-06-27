@@ -3895,8 +3895,19 @@ impl Hdf5Writer {
 impl Drop for Hdf5Writer {
     fn drop(&mut self) {
         if !self.closed {
-            // Best-effort finalize on drop.
-            let _ = self.finalize();
+            // Best-effort finalize on drop. Drop cannot return a Result, so a
+            // failure here is otherwise invisible: it would leave a truncated
+            // or unflushed file on disk while the caller believes the write
+            // succeeded. Surface it on stderr instead of swallowing it.
+            // Callers that need to handle the error must call
+            // `H5File::close()` explicitly, which returns the Result.
+            if let Err(e) = self.finalize() {
+                eprintln!(
+                    "rust-hdf5: failed to finalize HDF5 file on drop: {e}. \
+                     The file may be incomplete or corrupt; call \
+                     H5File::close() to handle this error explicitly."
+                );
+            }
         }
     }
 }
