@@ -253,7 +253,7 @@ impl H5File {
     ///
     /// This is a convenience method for writing h5py-compatible vlen string
     /// datasets using global heap storage.
-    pub fn write_vlen_strings(&self, name: &str, strings: &[&str]) -> Result<()> {
+    pub fn write_vlen_strings(&self, name: &str, strings: &[&str]) -> Result<H5Dataset> {
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
@@ -268,7 +268,17 @@ impl H5File {
                     };
                     writer.assign_dataset_to_group(&abs_group_path, idx)?;
                 }
-                Ok(())
+                let (shape, element_size, chunked, btree2, fixed_array) =
+                    writer.dataset_handle_parts(idx);
+                Ok(H5Dataset::new_writer(
+                    clone_inner(&self.inner),
+                    idx,
+                    shape,
+                    element_size,
+                    chunked,
+                    btree2,
+                    fixed_array,
+                ))
             }
             H5FileInner::Reader(_) => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
@@ -289,7 +299,7 @@ impl H5File {
         strings: &[&str],
         chunk_size: usize,
         pipeline: FilterPipeline,
-    ) -> Result<()> {
+    ) -> Result<H5Dataset> {
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
@@ -304,7 +314,17 @@ impl H5File {
                     };
                     writer.assign_dataset_to_group(&abs_group_path, idx)?;
                 }
-                Ok(())
+                let (shape, element_size, chunked, btree2, fixed_array) =
+                    writer.dataset_handle_parts(idx);
+                Ok(H5Dataset::new_writer(
+                    clone_inner(&self.inner),
+                    idx,
+                    shape,
+                    element_size,
+                    chunked,
+                    btree2,
+                    fixed_array,
+                ))
             }
             H5FileInner::Reader(_) => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
@@ -322,7 +342,7 @@ impl H5File {
         name: &str,
         chunk_size: usize,
         pipeline: Option<FilterPipeline>,
-    ) -> Result<()> {
+    ) -> Result<H5Dataset> {
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
@@ -337,7 +357,17 @@ impl H5File {
                     };
                     writer.assign_dataset_to_group(&abs_group_path, idx)?;
                 }
-                Ok(())
+                let (shape, element_size, chunked, btree2, fixed_array) =
+                    writer.dataset_handle_parts(idx);
+                Ok(H5Dataset::new_writer(
+                    clone_inner(&self.inner),
+                    idx,
+                    shape,
+                    element_size,
+                    chunked,
+                    btree2,
+                    fixed_array,
+                ))
             }
             H5FileInner::Reader(_) => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
@@ -435,12 +465,8 @@ impl H5File {
                 let index = writer
                     .dataset_index(name)
                     .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?;
-                let ds = &writer.datasets[index];
-                let shape: Vec<usize> = ds.dataspace.dims.iter().map(|&d| d as usize).collect();
-                let element_size = ds.datatype.element_size() as usize;
-                let fixed_array = ds.fixed_array.is_some();
-                let btree2 = ds.btree_v2.is_some();
-                let chunked = ds.chunked.is_some() || fixed_array || btree2;
+                let (shape, element_size, chunked, btree2, fixed_array) =
+                    writer.dataset_handle_parts(index);
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.inner),
                     index,
@@ -1425,6 +1451,47 @@ mod integration_tests {
             let ds = file.dataset("names").unwrap();
             let strings = ds.read_vlen_strings().unwrap();
             assert_eq!(strings, vec!["alice", "bob", "charlie"]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn vlen_dataset_returns_handle_for_attributes() {
+        use crate::types::VarLenUnicode;
+        let path = temp_path("vlen_attr");
+        {
+            let file = H5File::create(&path).unwrap();
+            let grp = file.root_group().create_group("ch").unwrap();
+            // The vlen helper now returns the dataset handle, so attributes can
+            // be attached directly — the issue the mdfr reporter hit.
+            let ds = grp
+                .write_vlen_strings("labels", &["a", "bb", "ccc"])
+                .unwrap();
+            ds.new_attr::<VarLenUnicode>()
+                .shape(())
+                .create("unit")
+                .unwrap()
+                .write_string("volt")
+                .unwrap();
+            // The same dataset can also be reopened by name within the group.
+            let ds2 = grp.dataset_writer("labels").unwrap();
+            ds2.new_attr::<VarLenUnicode>()
+                .shape(())
+                .create("desc")
+                .unwrap()
+                .write_string("channel labels")
+                .unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("ch/labels").unwrap();
+            assert_eq!(ds.read_vlen_strings().unwrap(), vec!["a", "bb", "ccc"]);
+            assert_eq!(ds.attr("unit").unwrap().read_string().unwrap(), "volt");
+            assert_eq!(
+                ds.attr("desc").unwrap().read_string().unwrap(),
+                "channel labels"
+            );
         }
         std::fs::remove_file(&path).ok();
     }

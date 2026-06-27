@@ -855,6 +855,23 @@ impl Hdf5Writer {
             .position(|d| d.name == name && !d.deleted)
     }
 
+    /// Reconstruct the fields a writer-mode `H5Dataset` handle needs for the
+    /// dataset at `index`: `(shape, element_size, chunked, btree2,
+    /// fixed_array)`. Single owner of this mapping so `H5File::dataset_writer`,
+    /// `H5Group::dataset_writer`, and the vlen-string helpers all agree.
+    pub(crate) fn dataset_handle_parts(
+        &self,
+        index: usize,
+    ) -> (Vec<usize>, usize, bool, bool, bool) {
+        let ds = &self.datasets[index];
+        let shape: Vec<usize> = ds.dataspace.dims.iter().map(|&d| d as usize).collect();
+        let element_size = ds.datatype.element_size() as usize;
+        let fixed_array = ds.fixed_array.is_some();
+        let btree2 = ds.btree_v2.is_some();
+        let chunked = ds.chunked.is_some() || fixed_array || btree2;
+        (shape, element_size, chunked, btree2, fixed_array)
+    }
+
     /// Reject a dataset name already used by a live dataset. Dataset names
     /// here are full paths, so they must be unique across the file (HDF5
     /// requires link names to be unique within their group).

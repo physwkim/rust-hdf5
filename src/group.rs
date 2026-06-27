@@ -17,7 +17,7 @@
 //!     .unwrap();
 //! ```
 
-use crate::dataset::DatasetBuilder;
+use crate::dataset::{DatasetBuilder, H5Dataset};
 use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
 use crate::format::messages::attribute::AttributeMessage;
@@ -186,7 +186,11 @@ impl H5Group {
     }
 
     /// Create a variable-length string dataset and write data within this group.
-    pub fn write_vlen_strings(&self, name: &str, strings: &[&str]) -> Result<()> {
+    ///
+    /// Returns a writer-mode handle to the created dataset so attributes can be
+    /// attached to it (e.g. units, descriptions) just like a dataset created
+    /// via [`new_dataset`](Self::new_dataset).
+    pub fn write_vlen_strings(&self, name: &str, strings: &[&str]) -> Result<H5Dataset> {
         let full_name = if self.name == "/" {
             name.to_string()
         } else {
@@ -201,7 +205,17 @@ impl H5Group {
                 if self.name != "/" {
                     writer.assign_dataset_to_group(&self.name, idx)?;
                 }
-                Ok(())
+                let (shape, element_size, chunked, btree2, fixed_array) =
+                    writer.dataset_handle_parts(idx);
+                Ok(H5Dataset::new_writer(
+                    clone_inner(&self.file_inner),
+                    idx,
+                    shape,
+                    element_size,
+                    chunked,
+                    btree2,
+                    fixed_array,
+                ))
             }
             H5FileInner::Reader(_) => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
@@ -211,13 +225,16 @@ impl H5Group {
     }
 
     /// Create a chunked, compressed variable-length string dataset within this group.
+    ///
+    /// Returns a writer-mode handle to the created dataset so attributes can be
+    /// attached to it, like [`write_vlen_strings`](Self::write_vlen_strings).
     pub fn write_vlen_strings_compressed(
         &self,
         name: &str,
         strings: &[&str],
         chunk_size: usize,
         pipeline: FilterPipeline,
-    ) -> Result<()> {
+    ) -> Result<H5Dataset> {
         let full_name = if self.name == "/" {
             name.to_string()
         } else {
@@ -234,7 +251,17 @@ impl H5Group {
                 if self.name != "/" {
                     writer.assign_dataset_to_group(&self.name, idx)?;
                 }
-                Ok(())
+                let (shape, element_size, chunked, btree2, fixed_array) =
+                    writer.dataset_handle_parts(idx);
+                Ok(H5Dataset::new_writer(
+                    clone_inner(&self.file_inner),
+                    idx,
+                    shape,
+                    element_size,
+                    chunked,
+                    btree2,
+                    fixed_array,
+                ))
             }
             H5FileInner::Reader(_) => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
@@ -244,12 +271,16 @@ impl H5Group {
     }
 
     /// Create an empty chunked vlen string dataset ready for incremental appends.
+    ///
+    /// Returns a writer-mode handle to the created dataset so attributes can be
+    /// attached before or between [`append_vlen_strings`](Self::append_vlen_strings)
+    /// calls.
     pub fn create_appendable_vlen_dataset(
         &self,
         name: &str,
         chunk_size: usize,
         pipeline: Option<FilterPipeline>,
-    ) -> Result<()> {
+    ) -> Result<H5Dataset> {
         let full_name = if self.name == "/" {
             name.to_string()
         } else {
@@ -265,7 +296,17 @@ impl H5Group {
                 if self.name != "/" {
                     writer.assign_dataset_to_group(&self.name, idx)?;
                 }
-                Ok(())
+                let (shape, element_size, chunked, btree2, fixed_array) =
+                    writer.dataset_handle_parts(idx);
+                Ok(H5Dataset::new_writer(
+                    clone_inner(&self.file_inner),
+                    idx,
+                    shape,
+                    element_size,
+                    chunked,
+                    btree2,
+                    fixed_array,
+                ))
             }
             H5FileInner::Reader(_) => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
@@ -295,6 +336,45 @@ impl H5Group {
             H5FileInner::Reader(_) => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
             }
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
+    /// Reopen a writer-mode handle to a dataset in this group by name.
+    ///
+    /// Mirrors [`H5File::dataset_writer`](crate::file::H5File::dataset_writer)
+    /// but resolves `name` relative to this group, so a dataset created here
+    /// (including via the vlen-string helpers) can be reopened to attach
+    /// attributes or append chunks. `name` is the link name within this group.
+    pub fn dataset_writer(&self, name: &str) -> Result<H5Dataset> {
+        let full_name = if self.name == "/" {
+            name.to_string()
+        } else {
+            let trimmed = self.name.trim_start_matches('/');
+            format!("{}/{}", trimmed, name)
+        };
+
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => {
+                let index = writer
+                    .dataset_index(&full_name)
+                    .ok_or_else(|| Hdf5Error::NotFound(full_name.clone()))?;
+                let (shape, element_size, chunked, btree2, fixed_array) =
+                    writer.dataset_handle_parts(index);
+                Ok(H5Dataset::new_writer(
+                    clone_inner(&self.file_inner),
+                    index,
+                    shape,
+                    element_size,
+                    chunked,
+                    btree2,
+                    fixed_array,
+                ))
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot open a dataset_writer in read mode; use dataset() instead".into(),
+            )),
             H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
         }
     }
