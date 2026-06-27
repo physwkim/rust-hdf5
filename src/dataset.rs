@@ -230,7 +230,13 @@ impl<T: H5Type> DatasetBuilder<T> {
 
         let dims_u64: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
         let datatype = self.datatype_override.clone().unwrap_or_else(T::hdf5_type);
-        let element_size = T::element_size();
+        // Size one element from the on-disk datatype, not the carrier `T`. For
+        // the default path this equals `T::element_size()`; when a `datatype()`
+        // override is set (N-bit, or a runtime `CompoundType`), the stored type
+        // — not `T` — defines the element width, so the dataspace, the raw
+        // allocation, and the `write_raw` length check all agree with the bytes
+        // libhdf5/h5py will read.
+        let element_size = datatype.element_size() as usize;
 
         if let Some(ref chunk_dims) = self.chunk_dims {
             // Chunked dataset
@@ -741,6 +747,81 @@ impl H5Dataset {
                 match &mut *inner {
                     H5FileInner::Writer(writer) => {
                         writer.write_dataset_raw(*index, raw)?;
+                        Ok(())
+                    }
+                    _ => Err(Hdf5Error::InvalidState(
+                        "file is no longer in write mode".into(),
+                    )),
+                }
+            }
+            DatasetInfo::Reader { .. } => Err(Hdf5Error::InvalidState(
+                "cannot write to a dataset opened in read mode".into(),
+            )),
+        }
+    }
+
+    /// Write the raw byte image of a contiguous dataset directly.
+    ///
+    /// Unlike [`write_raw`](Self::write_raw), this is not generic over an
+    /// `H5Type` carrier, so it works for element types that have no matching
+    /// Rust primitive — in particular a runtime
+    /// [`CompoundType`](crate::types::CompoundType) of arbitrary size set via
+    /// [`DatasetBuilder::datatype`]. `bytes.len()` must equal
+    /// `product(shape) * element_size`, where `element_size` is taken from the
+    /// dataset's on-disk datatype.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// # use rust_hdf5::types::{CompoundType, H5Type};
+    /// let file = H5File::create("c.h5").unwrap();
+    /// let ct = CompoundType {
+    ///     members: vec![
+    ///         ("id".to_string(), i32::hdf5_type(), 0),
+    ///         ("val".to_string(), f64::hdf5_type(), 4),
+    ///     ],
+    ///     total_size: 12,
+    /// };
+    /// let ds = file
+    ///     .new_dataset::<u8>()
+    ///     .datatype(ct.to_datatype())
+    ///     .shape(&[2])
+    ///     .create("records")
+    ///     .unwrap();
+    /// let mut bytes = Vec::new();
+    /// bytes.extend_from_slice(&1i32.to_le_bytes());
+    /// bytes.extend_from_slice(&2.5f64.to_le_bytes());
+    /// bytes.extend_from_slice(&2i32.to_le_bytes());
+    /// bytes.extend_from_slice(&3.5f64.to_le_bytes());
+    /// ds.write_raw_bytes(&bytes).unwrap();
+    /// ```
+    pub fn write_raw_bytes(&self, bytes: &[u8]) -> Result<()> {
+        match &self.info {
+            DatasetInfo::Writer {
+                index,
+                shape,
+                element_size,
+                chunked,
+                ..
+            } => {
+                if *chunked {
+                    return Err(Hdf5Error::InvalidState(
+                        "use write_chunk for chunked datasets".into(),
+                    ));
+                }
+                let expected: usize = shape.iter().product::<usize>() * *element_size;
+                if bytes.len() != expected {
+                    return Err(Hdf5Error::InvalidState(format!(
+                        "raw byte length {} does not match dataset size {} \
+                         (product(shape) * element_size {})",
+                        bytes.len(),
+                        expected,
+                        element_size,
+                    )));
+                }
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Writer(writer) => {
+                        writer.write_dataset_raw(*index, bytes)?;
                         Ok(())
                     }
                     _ => Err(Hdf5Error::InvalidState(
@@ -1568,6 +1649,27 @@ impl H5Dataset {
             )),
         }
     }
+
+    /// Read the raw byte image of a dataset without an `H5Type` carrier.
+    ///
+    /// The counterpart to [`write_raw_bytes`](Self::write_raw_bytes): returns
+    /// the element bytes verbatim regardless of the on-disk element type, so a
+    /// runtime [`CompoundType`](crate::types::CompoundType) whose records have
+    /// no matching Rust primitive can be read back and decoded by the caller.
+    pub fn read_raw_bytes(&self) -> Result<Vec<u8>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => Ok(reader.read_dataset_raw(name)?),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read from a dataset in write mode".into(),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1588,6 +1690,61 @@ mod tests {
             std::process::id(),
             n
         ))
+    }
+
+    #[test]
+    fn runtime_compound_via_datatype_override_and_raw_bytes() {
+        use crate::format::messages::datatype::DatatypeMessage;
+        use crate::types::{CompoundType, H5Type};
+
+        let path = temp_path("compound_raw");
+        // A 12-byte packed compound with NO matching Rust primitive carrier,
+        // so it can only be written through the datatype() override +
+        // write_raw_bytes path (the runtime-CompoundType use case).
+        let ct = CompoundType {
+            members: vec![
+                ("id".to_string(), i32::hdf5_type(), 0),
+                ("val".to_string(), f64::hdf5_type(), 4),
+            ],
+            total_size: 12,
+        };
+        let recs: [(i32, f64); 3] = [(1, 2.5), (2, 3.5), (3, -4.0)];
+        let mut bytes = Vec::new();
+        for (id, val) in recs {
+            bytes.extend_from_slice(&id.to_le_bytes());
+            bytes.extend_from_slice(&val.to_le_bytes());
+        }
+
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<u8>()
+                .datatype(ct.to_datatype())
+                .shape([recs.len()])
+                .create("records")
+                .unwrap();
+            ds.write_raw_bytes(&bytes).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("records").unwrap();
+            // The on-disk element type is the compound we specified (size 12),
+            // not the u8 carrier.
+            match ds.datatype().unwrap() {
+                DatatypeMessage::Compound { size, members } => {
+                    assert_eq!(size, 12);
+                    assert_eq!(members.len(), 2);
+                    assert_eq!(members[0].name, "id");
+                    assert_eq!(members[0].offset, 0);
+                    assert_eq!(members[1].name, "val");
+                    assert_eq!(members[1].offset, 4);
+                }
+                other => panic!("expected compound datatype, got {other:?}"),
+            }
+            assert_eq!(ds.read_raw_bytes().unwrap(), bytes);
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

@@ -93,3 +93,50 @@ fn f1_vlen_dataset_with_attrs_readable_by_h5py() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// F2: a runtime `CompoundType` of arbitrary size, written via the
+/// `datatype()` override + `write_raw_bytes`, is read by h5py as a structured
+/// array with the right field names and dtypes.
+#[test]
+fn f2_runtime_compound_readable_by_h5py() {
+    use rust_hdf5::types::{CompoundType, H5Type};
+    let Some(py) = python() else { return };
+    let path = tmp("f2_compound");
+    // 12-byte packed compound: {id: i32 @0, val: f64 @4}. No matching Rust
+    // primitive carrier exists, so this exercises the carrier-agnostic path.
+    let ct = CompoundType {
+        members: vec![
+            ("id".to_string(), i32::hdf5_type(), 0),
+            ("val".to_string(), f64::hdf5_type(), 4),
+        ],
+        total_size: 12,
+    };
+    let recs: [(i32, f64); 3] = [(1, 2.5), (2, 3.5), (3, -4.0)];
+    let mut bytes = Vec::new();
+    for (id, val) in recs {
+        bytes.extend_from_slice(&id.to_le_bytes());
+        bytes.extend_from_slice(&val.to_le_bytes());
+    }
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<u8>()
+            .datatype(ct.to_datatype())
+            .shape([recs.len()])
+            .create("records")
+            .unwrap();
+        ds.write_raw_bytes(&bytes).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['records']\n\
+         assert ds.dtype.names == ('id', 'val'), ds.dtype\n\
+         assert ds.dtype['id'] == np.dtype('<i4'), ds.dtype['id']\n\
+         assert ds.dtype['val'] == np.dtype('<f8'), ds.dtype['val']\n\
+         assert list(ds['id']) == [1, 2, 3], ds['id']\n\
+         assert list(ds['val']) == [2.5, 3.5, -4.0], ds['val']\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
