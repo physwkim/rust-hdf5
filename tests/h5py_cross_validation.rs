@@ -204,3 +204,66 @@ fn f3_vlen_bytes_written_by_h5py_read_by_rust() {
     drop(file);
     std::fs::remove_file(&path).ok();
 }
+
+/// A: a filter requested without explicit chunk dimensions auto-chunks (whole
+/// dataset = one chunk) and `write_raw` populates it. h5py must see a gzip-
+/// compressed, chunked dataset with the right values — proving the filter is
+/// honored, not silently dropped on a contiguous layout.
+#[test]
+fn a_autochunk_deflate_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("a_autochunk");
+    let data: Vec<i32> = (0..8).collect();
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .deflate(6)
+            .shape([8])
+            .create("seq")
+            .unwrap();
+        ds.write_raw(&data).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['seq']\n\
+         assert ds.compression == 'gzip', ds.compression\n\
+         assert ds.chunks == (8,), ds.chunks\n\
+         assert list(ds[...]) == list(range(8)), ds[...]\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// B: `write_raw` on an explicitly chunked + compressed 2-D dataset scatters
+/// the full row-major image across a multi-chunk grid with edge chunks
+/// (7/3 and 5/2). h5py must reassemble the exact array and see gzip+chunks.
+#[test]
+fn b_multichunk_deflate_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("b_multichunk");
+    let data: Vec<i32> = (0..35).collect(); // 7 x 5 row-major
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([7, 5])
+            .chunk(&[3, 2])
+            .deflate(4)
+            .create("grid")
+            .unwrap();
+        ds.write_raw(&data).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['grid']\n\
+         assert ds.compression == 'gzip', ds.compression\n\
+         assert ds.chunks == (3, 2), ds.chunks\n\
+         assert ds.shape == (7, 5), ds.shape\n\
+         assert np.array_equal(ds[...], np.arange(35).reshape(7, 5)), ds[...]\n",
+    );
+    std::fs::remove_file(&path).ok();
+}

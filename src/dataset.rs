@@ -238,7 +238,21 @@ impl<T: H5Type> DatasetBuilder<T> {
         // libhdf5/h5py will read.
         let element_size = datatype.element_size() as usize;
 
-        if let Some(ref chunk_dims) = self.chunk_dims {
+        // A filter pipeline requires chunked storage. When a filter is
+        // requested without explicit chunk dimensions, store the whole
+        // dataset as a single chunk (matching h5py's auto-chunking) instead
+        // of silently dropping the filter on the contiguous path.
+        let wants_filter = self.custom_pipeline.is_some()
+            || self.shuffle_deflate_level.is_some()
+            || self.deflate_level.is_some();
+        let auto_chunk: Option<Vec<usize>> =
+            if self.chunk_dims.is_none() && wants_filter && !shape.is_empty() {
+                Some(shape.iter().map(|&d| d.max(1)).collect())
+            } else {
+                None
+            };
+
+        if let Some(chunk_dims) = self.chunk_dims.as_ref().or(auto_chunk.as_ref()) {
             // Chunked dataset
             let chunk_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
             let max_u64: Vec<u64> = if let Some(ref max) = self.max_shape {
@@ -256,9 +270,6 @@ impl<T: H5Type> DatasetBuilder<T> {
             let n_unlimited = max_u64.iter().filter(|&&m| m == u64::MAX).count();
             let is_btree2 = n_unlimited >= 2;
             let is_fixed_array = n_unlimited == 0;
-            let wants_filter = self.custom_pipeline.is_some()
-                || self.shuffle_deflate_level.is_some()
-                || self.deflate_level.is_some();
 
             let index = {
                 let mut inner = borrow_inner_mut(&self.file_inner);
@@ -709,15 +720,9 @@ impl H5Dataset {
                 shape,
                 element_size,
                 chunked,
-                btree2: _,
-                fixed_array: _,
+                btree2,
+                fixed_array,
             } => {
-                if *chunked {
-                    return Err(Hdf5Error::InvalidState(
-                        "use write_chunk for chunked datasets".into(),
-                    ));
-                }
-
                 let total_elements: usize = shape.iter().product();
                 if data.len() != total_elements {
                     return Err(Hdf5Error::InvalidState(format!(
@@ -742,6 +747,19 @@ impl H5Dataset {
                 let byte_len = data.len() * T::element_size();
                 let raw =
                     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
+
+                if *chunked {
+                    // A chunked dataset has no contiguous data block; scatter
+                    // the full row-major image into its chunk grid and write
+                    // each chunk through the dataset's filter pipeline.
+                    return self.write_full_image_chunked(
+                        *index,
+                        *btree2,
+                        *fixed_array,
+                        raw,
+                        *element_size,
+                    );
+                }
 
                 let mut inner = borrow_inner_mut(&self.file_inner);
                 match &mut *inner {
@@ -801,13 +819,9 @@ impl H5Dataset {
                 shape,
                 element_size,
                 chunked,
-                ..
+                btree2,
+                fixed_array,
             } => {
-                if *chunked {
-                    return Err(Hdf5Error::InvalidState(
-                        "use write_chunk for chunked datasets".into(),
-                    ));
-                }
                 let expected: usize = shape.iter().product::<usize>() * *element_size;
                 if bytes.len() != expected {
                     return Err(Hdf5Error::InvalidState(format!(
@@ -817,6 +831,17 @@ impl H5Dataset {
                         expected,
                         element_size,
                     )));
+                }
+                if *chunked {
+                    // Scatter the full row-major image into the chunk grid
+                    // (same path as write_raw, carrier-agnostic bytes).
+                    return self.write_full_image_chunked(
+                        *index,
+                        *btree2,
+                        *fixed_array,
+                        bytes,
+                        *element_size,
+                    );
                 }
                 let mut inner = borrow_inner_mut(&self.file_inner);
                 match &mut *inner {
@@ -833,6 +858,148 @@ impl H5Dataset {
                 "cannot write to a dataset opened in read mode".into(),
             )),
         }
+    }
+
+    /// Scatter a full row-major dataset image into its chunk grid, writing
+    /// every chunk through the dataset's filter pipeline.
+    ///
+    /// This is the chunked counterpart of a single contiguous `write_dataset_raw`
+    /// — it is how [`write_raw`](Self::write_raw) and
+    /// [`write_raw_bytes`](Self::write_raw_bytes) populate a chunked dataset
+    /// (including the single auto-chunk created when a filter is set without
+    /// explicit chunk dimensions). Edge chunks are zero-padded to the full
+    /// chunk footprint, exactly as libhdf5 stores them.
+    fn write_full_image_chunked(
+        &self,
+        index: usize,
+        btree2: bool,
+        fixed_array: bool,
+        bytes: &[u8],
+        element_size: usize,
+    ) -> Result<()> {
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        let writer = match &mut *inner {
+            H5FileInner::Writer(w) => w,
+            _ => {
+                return Err(Hdf5Error::InvalidState(
+                    "file is no longer in write mode".into(),
+                ))
+            }
+        };
+        let chunk_dims = writer
+            .dataset_chunk_dims(index)
+            .ok_or_else(|| Hdf5Error::InvalidState("dataset has no chunk info".into()))?
+            .to_vec();
+        let dims = writer.dataset_dims(index).to_vec();
+        let rank = dims.len();
+
+        // Chunk grid: number of chunks along each dimension (row-major).
+        let mut grid = vec![0u64; rank];
+        for d in 0..rank {
+            grid[d] = if chunk_dims[d] > 0 {
+                dims[d].div_ceil(chunk_dims[d])
+            } else {
+                0
+            };
+        }
+        let total_chunks: u64 = grid.iter().product();
+
+        for linear in 0..total_chunks {
+            // Decode the linear chunk index into row-major grid coordinates.
+            let mut rem = linear;
+            let mut coords = vec![0u64; rank];
+            for d in (0..rank).rev() {
+                coords[d] = rem % grid[d];
+                rem /= grid[d];
+            }
+            let chunk_buf = Self::gather_chunk(bytes, &dims, &chunk_dims, &coords, element_size);
+            if fixed_array {
+                writer.write_chunk_fixed_array(index, &coords, &chunk_buf)?;
+            } else if btree2 {
+                writer.write_chunk_btree_v2(index, &coords, &chunk_buf)?;
+            } else {
+                // Extensible array (single unlimited dimension): the linear
+                // index over the grid is the array's chunk index.
+                writer.write_chunk(index, linear, &chunk_buf)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Gather one chunk's bytes from a row-major full-dataset image.
+    ///
+    /// `coords` are the chunk's grid coordinates. The returned buffer is
+    /// exactly `product(chunk_dims) * element_size` bytes, zero-padded where
+    /// the chunk extends past the dataset edge.
+    fn gather_chunk(
+        source: &[u8],
+        dims: &[u64],
+        chunk_dims: &[u64],
+        coords: &[u64],
+        element_size: usize,
+    ) -> Vec<u8> {
+        let rank = dims.len();
+        let chunk_elems: u64 = chunk_dims.iter().product();
+        let mut out = vec![0u8; chunk_elems as usize * element_size];
+        if rank == 0 {
+            // Scalar dataset: a single element, no chunking dimension.
+            if source.len() >= element_size {
+                out[..element_size].copy_from_slice(&source[..element_size]);
+            }
+            return out;
+        }
+
+        // Actual extent of this chunk along each dimension (edge chunks are
+        // smaller than the nominal chunk shape).
+        let mut extent = vec![0u64; rank];
+        for d in 0..rank {
+            let start = coords[d] * chunk_dims[d];
+            let end = ((coords[d] + 1) * chunk_dims[d]).min(dims[d]);
+            extent[d] = end.saturating_sub(start);
+        }
+        if extent.contains(&0) {
+            return out; // nothing of the dataset falls in this chunk
+        }
+
+        // Row-major strides (in elements) for the source (over `dims`) and the
+        // destination chunk buffer (over `chunk_dims`).
+        let mut src_stride = vec![1u64; rank];
+        let mut dst_stride = vec![1u64; rank];
+        for d in (0..rank - 1).rev() {
+            src_stride[d] = src_stride[d + 1] * dims[d + 1];
+            dst_stride[d] = dst_stride[d + 1] * chunk_dims[d + 1];
+        }
+
+        // Copy one contiguous run along the last axis per outer multi-index.
+        let last = rank - 1;
+        let run = extent[last] as usize * element_size;
+        let outer: u64 = extent[..last].iter().product::<u64>().max(1);
+        let mut idx = vec![0u64; rank]; // local indices within the chunk extent
+        for _ in 0..outer {
+            let mut src_off = 0u64;
+            let mut dst_off = 0u64;
+            for d in 0..rank {
+                let global = coords[d] * chunk_dims[d] + idx[d];
+                src_off += global * src_stride[d];
+                dst_off += idx[d] * dst_stride[d];
+            }
+            let s = src_off as usize * element_size;
+            let dpos = dst_off as usize * element_size;
+            out[dpos..dpos + run].copy_from_slice(&source[s..s + run]);
+
+            // Advance the multi-index over axes [0..last); the last axis is the
+            // contiguous run handled above.
+            let mut d = last;
+            while d > 0 {
+                d -= 1;
+                idx[d] += 1;
+                if idx[d] < extent[d] {
+                    break;
+                }
+                idx[d] = 0;
+            }
+        }
+        out
     }
 
     /// Write a single chunk to a chunked dataset.
@@ -1785,6 +1952,93 @@ mod tests {
         // Provide 3 elements instead of 4
         let result = ds.write_raw(&[1u8, 2, 3]);
         assert!(result.is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    // A: a filter set without explicit chunk dimensions must auto-chunk (whole
+    // dataset = one chunk) rather than silently drop the filter on the
+    // contiguous path. write_raw then populates that single chunk.
+    #[test]
+    fn filter_without_chunk_autochunks_and_roundtrips() {
+        let path = temp_path("autochunk_filter");
+        let data: Vec<i32> = (0..8).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .deflate(6)
+                .shape([8])
+                .create("seq")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("seq").unwrap();
+            // The filter forced chunked storage: a single whole-dataset chunk.
+            assert!(
+                ds.is_chunked(),
+                "auto-chunk did not produce chunked storage"
+            );
+            assert_eq!(ds.chunk_dims(), Some(vec![8]));
+            assert_eq!(ds.read_raw::<i32>().unwrap(), data);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    // B: write_raw on an explicitly chunked + compressed dataset scatters the
+    // full row-major image across a multi-chunk grid, including edge chunks
+    // (7/3 -> 3,3,1 along dim0; 5/2 -> 2,2,1 along dim1).
+    #[test]
+    fn write_raw_multichunk_edge_roundtrips() {
+        let path = temp_path("multichunk_edge");
+        let data: Vec<i32> = (0..35).collect(); // 7 x 5 row-major
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([7, 5])
+                .chunk(&[3, 2])
+                .deflate(4)
+                .create("grid")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("grid").unwrap();
+            assert_eq!(ds.shape(), vec![7, 5]);
+            assert_eq!(ds.chunk_dims(), Some(vec![3, 2]));
+            assert_eq!(ds.read_raw::<i32>().unwrap(), data);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    // B: write_raw on an unfiltered chunked dataset (previously rejected with
+    // "use write_chunk for chunked datasets") now gathers and round-trips.
+    #[test]
+    fn write_raw_unfiltered_chunked_roundtrips() {
+        let path = temp_path("chunked_unfiltered");
+        let data: Vec<f64> = (0..12).map(|i| i as f64 * 1.5).collect(); // 4 x 3
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<f64>()
+                .shape([4, 3])
+                .chunk(&[2, 2])
+                .create("m")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("m").unwrap();
+            assert_eq!(ds.chunk_dims(), Some(vec![2, 2]));
+            assert_eq!(ds.read_raw::<f64>().unwrap(), data);
+        }
         std::fs::remove_file(&path).ok();
     }
 
