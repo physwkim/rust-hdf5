@@ -512,6 +512,50 @@ impl H5Group {
         ))
     }
 
+    /// Add (or replace) a numeric (or bool) **array** attribute on this group.
+    ///
+    /// The values are written as a 1-D HDF5 array attribute (simple dataspace
+    /// `[values.len()]`), read back by h5py as a numpy array — the array
+    /// counterpart of [`set_attr_numeric`](Self::set_attr_numeric).
+    pub fn set_attr_array_numeric<T: H5Type>(&self, name: &str, values: &[T]) -> Result<()> {
+        let es = T::element_size();
+        // Safety: `T: H5Type` is a `Copy` POD numeric whose byte width is `es`.
+        let raw =
+            unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * es) };
+        let dims = [values.len() as u64];
+        self.add_attr(AttributeMessage::array_numeric(
+            name,
+            T::hdf5_type(),
+            &dims,
+            raw.to_vec(),
+        ))
+    }
+
+    /// Add (or replace) a variable-length UTF-8 string **array** attribute on
+    /// this group, read back by h5py as a 1-D array of `str` — the array
+    /// counterpart of [`set_attr_string`](Self::set_attr_string).
+    pub fn set_attr_string_array(&self, name: &str, values: &[&str]) -> Result<()> {
+        // The vlen array message needs `&mut writer` (global-heap allocation),
+        // so we route it the same way `set_attr_string` does rather than through
+        // `add_attr` (which re-borrows the writer).
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                let attr = writer.vlen_string_array_attribute(name, values)?;
+                if self.name == "/" {
+                    writer.add_root_attribute(attr);
+                } else {
+                    writer.add_group_attribute(&self.name, attr)?;
+                }
+                Ok(())
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot write attributes in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
     /// Route an attribute to the writer: the root group goes to the
     /// file-level attribute list, any other group to its own header.
     fn add_attr(&self, attr: AttributeMessage) -> Result<()> {

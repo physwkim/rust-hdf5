@@ -2545,6 +2545,55 @@ impl Hdf5Writer {
         })
     }
 
+    /// Build a variable-length UTF-8 string **array** attribute message.
+    ///
+    /// The 1-D counterpart of [`vlen_string_attribute`](Self::vlen_string_attribute):
+    /// every element string is stored as one object in a single global heap
+    /// collection, and the attribute data is the concatenation of one vlen
+    /// reference per element. The datatype is the same vlen-string datatype; the
+    /// dataspace is a simple dataspace of shape `[values.len()]`. h5py reads the
+    /// value back as a 1-D array of Python `str`.
+    ///
+    /// One global heap collection is allocated for the whole array (all elements
+    /// share it), matching the per-attribute collection of the scalar path.
+    pub fn vlen_string_array_attribute(
+        &mut self,
+        name: &str,
+        values: &[&str],
+    ) -> IoResult<AttributeMessage> {
+        use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+        use crate::format::messages::dataspace::DataspaceMessage;
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let mut gcol = GlobalHeapCollection::new();
+        // (byte length, heap object index) per element, in order.
+        let mut entries: Vec<(u32, u16)> = Vec::with_capacity(values.len());
+        for v in values {
+            let obj_idx = gcol.add_object(v.as_bytes().to_vec())?;
+            entries.push((v.len() as u32, obj_idx));
+        }
+        let gcol_encoded = gcol.encode(&self.ctx);
+        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
+        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+
+        let mut data = Vec::with_capacity(values.len() * 16);
+        for (len, obj_idx) in &entries {
+            data.extend_from_slice(&encode_vlen_reference(
+                *len,
+                gcol_addr,
+                *obj_idx as u32,
+                &self.ctx,
+            ));
+        }
+        let dims = [values.len() as u64];
+        Ok(AttributeMessage {
+            name: name.to_string(),
+            datatype: DatatypeMessage::vlen_string_utf8(),
+            dataspace: DataspaceMessage::simple(&dims),
+            data,
+        })
+    }
+
     /// Set a user-defined fill value for a dataset.
     ///
     /// `bytes` must be exactly one element wide (matching the dataset's

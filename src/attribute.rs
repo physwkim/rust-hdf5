@@ -86,6 +86,45 @@ impl H5Attribute {
         self.write_scalar(&VarLenUnicode(value.to_string()))
     }
 
+    /// Write a variable-length UTF-8 string **array** attribute.
+    ///
+    /// The attribute must have been given a 1-D shape via
+    /// [`AttrBuilder::shape`] whose single dimension equals `values.len()`.
+    /// Every element is stored in one shared global heap collection; h5py reads
+    /// the attribute back as a 1-D array of Python `str`. The string-array
+    /// counterpart of [`write_string`](Self::write_string) /
+    /// [`write_array`](Self::write_array).
+    pub fn write_string_array(&self, values: &[&str]) -> Result<()> {
+        if self.write_dims.len() > 1 {
+            return Err(Hdf5Error::InvalidState(format!(
+                "attribute '{}' string arrays support only a 1-D shape, got {:?}",
+                self.name, self.write_dims
+            )));
+        }
+        let expected: usize = self.write_dims.iter().product();
+        if values.len() != expected {
+            return Err(Hdf5Error::InvalidState(format!(
+                "attribute '{}' shape {:?} needs {} elements, got {}",
+                self.name,
+                self.write_dims,
+                expected,
+                values.len()
+            )));
+        }
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                let attr_msg = writer.vlen_string_array_attribute(&self.name, values)?;
+                writer.add_dataset_attribute(self.ds_index, attr_msg)?;
+                Ok(())
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot write attributes in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
     /// Write a numeric scalar attribute.
     ///
     /// ```no_run

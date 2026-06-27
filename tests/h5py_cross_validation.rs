@@ -249,6 +249,61 @@ fn c_vlen_string_attrs_readable_as_str_by_h5py() {
     std::fs::remove_file(&path).ok();
 }
 
+/// Array attributes: variable-length string arrays and numeric arrays written
+/// via the public setters must come back through h5py as 1-D arrays — `str`
+/// elements for the vlen-string arrays and a numpy int array for the numeric
+/// ones — on the root group, a sub-group, and a dataset.
+#[test]
+fn arr_string_and_numeric_array_attrs_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("arr_array_attrs");
+    {
+        let file = H5File::create(&path).unwrap();
+        // Root: vlen-string array + numeric array.
+        file.set_attr_string_array("names", &["alpha", "beta", "gamma"])
+            .unwrap();
+        file.set_attr_array_numeric("ids", &[10i32, 20, 30])
+            .unwrap();
+        // Group: vlen-string array + numeric array.
+        let grp = file.root_group().create_group("grp").unwrap();
+        grp.set_attr_string_array("labels", &["p", "qq"]).unwrap();
+        grp.set_attr_array_numeric("counts", &[1i32, 2, 3, 4])
+            .unwrap();
+        // Dataset: vlen-string array attribute via the builder + shape([n]).
+        let ds = file.new_dataset::<i32>().shape([3]).create("data").unwrap();
+        ds.write_raw(&[1, 2, 3]).unwrap();
+        ds.new_attr::<VarLenUnicode>()
+            .shape([2])
+            .create("tags")
+            .unwrap()
+            .write_string_array(&["x", "y"])
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "names = f.attrs['names']\n\
+         assert names.shape == (3,), names.shape\n\
+         assert list(names) == ['alpha', 'beta', 'gamma'], list(names)\n\
+         assert all(isinstance(x, str) for x in names), [type(x) for x in names]\n\
+         assert h5py.check_string_dtype(f.attrs.get_id('names').dtype), 'names not vlen string'\n\
+         ids = f.attrs['ids']\n\
+         assert ids.dtype == np.dtype('<i4'), ids.dtype\n\
+         assert ids.shape == (3,), ids.shape\n\
+         assert list(ids) == [10, 20, 30], list(ids)\n\
+         g = f['grp']\n\
+         assert list(g.attrs['labels']) == ['p', 'qq'], list(g.attrs['labels'])\n\
+         assert all(isinstance(x, str) for x in g.attrs['labels'])\n\
+         assert g.attrs['counts'].dtype == np.dtype('<i4'), g.attrs['counts'].dtype\n\
+         assert list(g.attrs['counts']) == [1, 2, 3, 4], list(g.attrs['counts'])\n\
+         ds = f['data']\n\
+         assert list(ds.attrs['tags']) == ['x', 'y'], list(ds.attrs['tags'])\n\
+         assert all(isinstance(x, str) for x in ds.attrs['tags'])\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// A: a filter requested without explicit chunk dimensions auto-chunks (whole
 /// dataset = one chunk) and `write_raw` populates it. h5py must see a gzip-
 /// compressed, chunked dataset with the right values — proving the filter is

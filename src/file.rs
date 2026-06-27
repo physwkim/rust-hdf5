@@ -230,6 +230,48 @@ impl H5File {
         }
     }
 
+    /// Add a numeric (or bool) **array** attribute to the file (root group).
+    ///
+    /// The values are written as a 1-D HDF5 array attribute (simple dataspace
+    /// `[values.len()]`, on-disk type `T::hdf5_type()`), read back by h5py as a
+    /// numpy array — the array counterpart of [`set_attr_numeric`](Self::set_attr_numeric).
+    pub fn set_attr_array_numeric<T: crate::types::H5Type>(
+        &self,
+        name: &str,
+        values: &[T],
+    ) -> Result<()> {
+        use crate::format::messages::attribute::AttributeMessage;
+        let es = T::element_size();
+        // Safety: `T: H5Type` is a `Copy` POD numeric whose byte width is `es`.
+        let raw =
+            unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * es) };
+        let dims = [values.len() as u64];
+        let attr = AttributeMessage::array_numeric(name, T::hdf5_type(), &dims, raw.to_vec());
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                writer.add_root_attribute(attr);
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
+        }
+    }
+
+    /// Add a variable-length UTF-8 string **array** attribute to the file (root
+    /// group), read back by h5py as a 1-D array of `str` — the array counterpart
+    /// of [`set_attr_string`](Self::set_attr_string).
+    pub fn set_attr_string_array(&self, name: &str, values: &[&str]) -> Result<()> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                let attr = writer.vlen_string_array_attribute(name, values)?;
+                writer.add_root_attribute(attr);
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
+        }
+    }
+
     /// Return the names of file-level (root group) attributes.
     pub fn attr_names(&self) -> Result<Vec<String>> {
         let inner = borrow_inner(&self.inner);
