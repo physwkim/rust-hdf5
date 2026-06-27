@@ -251,7 +251,7 @@ impl Hdf5Reader {
         path: &Path,
         locking: crate::io::locking::FileLocking,
     ) -> IoResult<Self> {
-        let mut handle = FileHandle::open_read_with_locking(path, locking)?;
+        let handle = FileHandle::open_read_with_locking(path, locking)?;
 
         // Read enough bytes to detect the superblock version and parse it.
         let sb_buf = handle.read_at_most(0, 1024)?;
@@ -3465,7 +3465,7 @@ mod h5py_debug_tests {
             return;
         }
 
-        let mut handle = FileHandle::open_read(path).unwrap();
+        let handle = FileHandle::open_read(path).unwrap();
         let sb_buf = handle.read_at_most(0, 1024).unwrap();
         let version = detect_superblock_version(&sb_buf).unwrap();
         eprintln!("Superblock version: {}", version);
