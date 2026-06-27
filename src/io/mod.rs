@@ -6,6 +6,7 @@
 
 pub mod allocator;
 pub mod file_handle;
+pub(crate) mod hyperslab;
 pub mod locking;
 pub mod reader;
 pub mod swmr;

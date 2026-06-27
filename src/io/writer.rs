@@ -32,6 +32,7 @@ use crate::format::{FormatContext, UNDEF_ADDR};
 
 use crate::io::allocator::FileAllocator;
 use crate::io::file_handle::FileHandle;
+use crate::io::hyperslab::for_each_contiguous_run;
 use crate::io::IoResult;
 
 /// On-disk size in bytes of a fixed-array data block, for the layout (paged or
@@ -1746,47 +1747,26 @@ impl Hdf5Writer {
             )));
         }
 
-        let mut strides = vec![0u64; ndims];
-        strides[ndims - 1] = element_size;
-        for d in (0..ndims - 1).rev() {
-            strides[d] = strides[d + 1] * dims[d + 1];
-        }
-
         let base_addr = ds.data_addr;
+        // `dims` borrows self.datasets; collect what the run iterator needs so
+        // the closure can borrow self.handle (a disjoint field) for the write.
+        let dims = dims.clone();
 
-        // Write row-by-row along the last dimension
-        let row_bytes = (counts[ndims - 1] * element_size) as usize;
-        let n_rows: u64 = if ndims > 1 {
-            counts[..ndims - 1].iter().product()
-        } else {
-            1
-        };
-
-        if ndims == 1 {
-            let offset = base_addr + starts[0] * element_size;
-            self.handle.write_at(offset, data)?;
-            return Ok(());
-        }
-
-        let mut coords = vec![0u64; ndims - 1];
-        for row in 0..n_rows {
-            let mut file_offset = base_addr + starts[ndims - 1] * element_size;
-            for d in 0..ndims - 1 {
-                file_offset += (starts[d] + coords[d]) * strides[d];
-            }
-
-            let src_offset = row as usize * row_bytes;
-            self.handle
-                .write_at(file_offset, &data[src_offset..src_offset + row_bytes])?;
-
-            for d in (0..ndims - 1).rev() {
-                coords[d] += 1;
-                if coords[d] < counts[d] {
-                    break;
-                }
-                coords[d] = 0;
-            }
-        }
+        // Write each maximal contiguous run in one `write_at`. Trailing
+        // full-selected dimensions coalesce, mirroring the read path: a slice
+        // with a full last axis becomes one write per outer index instead of
+        // one write per last-axis row.
+        for_each_contiguous_run(
+            &dims,
+            starts,
+            counts,
+            element_size,
+            |dst_off, src_off, len| {
+                self.handle
+                    .write_at(base_addr + dst_off, &data[src_off..src_off + len])
+                    .map_err(Into::into)
+            },
+        )?;
 
         Ok(())
     }

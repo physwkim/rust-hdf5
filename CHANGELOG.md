@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.24
+
+### Fixed
+
+- Hyperslab slice reads and writes no longer issue one I/O per last-axis
+  row. `read_slice`/`write_slice` now coalesce trailing fully-selected
+  dimensions into a single contiguous transfer: a `[:, r0:r1, :]` read of a
+  `[nproj, nz, nx]` contiguous dataset becomes `nproj` reads instead of
+  `nproj * (r1 - r0)` per-row reads, and `[r0:r1, :, :]` becomes a single
+  read. The contiguous, compact, and all chunked layouts share one
+  contiguous-run primitive (`io::hyperslab::for_each_contiguous_run`), so the
+  read and write paths stay symmetric.
+- Chunked `read_slice` now reads only the chunks that overlap the selection
+  instead of materializing the whole dataset and extracting the sub-region.
+  Each chunk∩selection is copied as contiguous last-axis runs, and this
+  applies uniformly to single-chunk, fixed-array, extensible-array, and
+  v1/v2 B-tree chunk indices (the previous extensible-array-only fast path is
+  removed, subsumed by the general path).
+- Contiguous slice reads no longer perform a per-call `fstat`; bytes are read
+  straight into the caller's pre-sized output buffer.
+
 ## 0.2.23
 
 ### Added

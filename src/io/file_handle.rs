@@ -216,6 +216,31 @@ impl FileHandle {
         }
     }
 
+    /// Read exactly `buf.len()` bytes at `offset` directly into `buf`.
+    ///
+    /// Like [`read_at`](Self::read_at) but writes into a caller-owned buffer,
+    /// so a coalesced block read can land straight in the output without an
+    /// intermediate `Vec` allocation per block.
+    ///
+    /// Unlike `read_at`, this does not `fstat` the file first: `read_at`'s
+    /// up-front length check exists to bound an allocation sized from a
+    /// possibly-corrupt on-disk length field, but here the buffer is owned by
+    /// the caller and already sized from the validated selection, so there is
+    /// no allocation to bound. A read past EOF still fails — `read_exact`
+    /// returns `UnexpectedEof` when it cannot fill `buf` — but without paying
+    /// a per-call `fstat` on the hot coalesced-read path.
+    pub fn read_exact_at_into(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.ensure_reader()?;
+        match &mut self.mode {
+            Mode::Reader(r) | Mode::ReadOnly(r) => {
+                r.seek(SeekFrom::Start(offset))?;
+                r.read_exact(buf)?;
+                Ok(())
+            }
+            _ => unreachable!(),
+        }
+    }
+
     /// Read up to `max_len` bytes starting at the given byte offset.
     pub fn read_at_most(&mut self, offset: u64, max_len: usize) -> std::io::Result<Vec<u8>> {
         self.ensure_reader()?;

@@ -33,6 +33,7 @@ use crate::format::{FormatContext, UNDEF_ADDR};
 use crate::io::file_handle::FileHandle;
 #[cfg(feature = "mmap")]
 use crate::io::file_handle::MmapFileHandle;
+use crate::io::hyperslab::{compute_strides, for_each_contiguous_run};
 use crate::io::IoResult;
 
 /// A chunk read from a B-tree-indexed dataset before decompression: its raw
@@ -57,6 +58,49 @@ struct ChunkIndexDesc<'a> {
     /// SingleChunk` and the layout's filtered flag is set): the chunk's exact
     /// on-disk size and per-chunk filter mask.
     single_chunk_filter: Option<data_layout::SingleChunkFilter>,
+}
+
+/// What a chunked read should produce: the whole dataset, or one hyperslab.
+///
+/// Threaded through every chunked reader so the index walk, raw read, and
+/// filter pipeline are shared between full reads and slice reads. For a
+/// `Slice`, the reader allocates a `counts`-shaped buffer, skips reading any
+/// chunk that does not overlap the selection (the I/O win), and scatters only
+/// the chunk∩selection intersection. `Full` reads and places every chunk.
+#[derive(Clone, Copy)]
+enum ChunkTarget<'a> {
+    Full,
+    Slice {
+        starts: &'a [u64],
+        counts: &'a [u64],
+    },
+}
+
+impl<'a> ChunkTarget<'a> {
+    /// Dimensions of the produced output buffer: the dataset dims for `Full`,
+    /// the selection extent for `Slice`.
+    fn out_dims(&self, dims: &'a [u64]) -> &'a [u64] {
+        match self {
+            ChunkTarget::Full => dims,
+            ChunkTarget::Slice { counts, .. } => counts,
+        }
+    }
+
+    /// Whether a chunk at chunk-grid `coords` (extent `chunk_dims`) intersects
+    /// the target. `Full` always intersects; a `Slice` intersects iff every
+    /// dimension's chunk span `[origin, origin+chunk_dims)` overlaps the
+    /// selection span `[start, start+count)`.
+    fn overlaps(&self, coords: &[u64], chunk_dims: &[u64]) -> bool {
+        match self {
+            ChunkTarget::Full => true,
+            ChunkTarget::Slice { starts, counts } => coords.iter().enumerate().all(|(d, &c)| {
+                let origin = c.saturating_mul(chunk_dims[d]);
+                let chunk_end = origin.saturating_add(chunk_dims[d]);
+                let sel_end = starts[d].saturating_add(counts[d]);
+                origin < sel_end && starts[d] < chunk_end
+            }),
+        }
+    }
 }
 
 /// Read-side metadata for a single dataset.
@@ -136,6 +180,24 @@ fn alloc_tiled_fill(total: usize, fill_value: Option<&[u8]>) -> IoResult<Vec<u8>
             "cannot allocate {total} bytes for dataset buffer (file may be corrupt)"
         ))
     })
+}
+
+/// Output for an array/tree-indexed chunked dataset whose index is entirely
+/// unallocated. Preserves the historical full-read contract — an empty vec,
+/// since the caller treats that as "no data" — while a slice must still return
+/// exactly `counts` bytes, so it yields a fill/zero buffer.
+fn unallocated_chunk_output(
+    target: ChunkTarget,
+    element_size: u64,
+    fill_value: Option<&[u8]>,
+) -> IoResult<Vec<u8>> {
+    match target {
+        ChunkTarget::Full => Ok(vec![]),
+        ChunkTarget::Slice { counts, .. } => {
+            let out_size = saturating_byte_len(counts, element_size) as usize;
+            alloc_tiled_fill(out_size, fill_value)
+        }
+    }
 }
 
 impl Hdf5Reader {
@@ -1172,6 +1234,7 @@ impl Hdf5Reader {
                     real_chunk_dims,
                     *b_tree_address,
                     pipeline.as_ref(),
+                    ChunkTarget::Full,
                 )?
             }
             DataLayoutMessage::ChunkedV4 {
@@ -1195,6 +1258,7 @@ impl Hdf5Reader {
                         single_chunk_filter: *single_chunk_filter,
                     },
                     pipeline.as_ref(),
+                    ChunkTarget::Full,
                 )?
             }
         };
@@ -1275,6 +1339,7 @@ impl Hdf5Reader {
         chunk_dims: &[u64],
         desc: ChunkIndexDesc<'_>,
         pipeline: Option<&FilterPipeline>,
+        target: ChunkTarget,
     ) -> IoResult<Vec<u8>> {
         let ChunkIndexDesc {
             index_type,
@@ -1295,13 +1360,23 @@ impl Hdf5Reader {
                 let total_size: u64 = saturating_byte_len(&dims, element_size);
                 if index_address == UNDEF_ADDR || total_size == 0 {
                     // An unallocated single chunk reads back entirely as the
-                    // fill value (when one is defined); otherwise empty.
-                    if let Some(ref fv) = fill_value {
-                        if total_size > 0 {
-                            return alloc_tiled_fill(total_size as usize, Some(fv));
+                    // fill value (when one is defined). A full read returns the
+                    // whole-dataset fill buffer (or empty without a fill); a
+                    // slice returns a correctly-sized fill/zero buffer.
+                    match target {
+                        ChunkTarget::Full => {
+                            if let Some(ref fv) = fill_value {
+                                if total_size > 0 {
+                                    return alloc_tiled_fill(total_size as usize, Some(fv));
+                                }
+                            }
+                            return Ok(vec![]);
+                        }
+                        ChunkTarget::Slice { counts, .. } => {
+                            let out_size = saturating_byte_len(counts, element_size);
+                            return alloc_tiled_fill(out_size as usize, fill_value.as_deref());
                         }
                     }
-                    return Ok(vec![]);
                 }
                 let data = if let Some(pipeline) = pipeline {
                     // A filtered single chunk records its exact on-disk size
@@ -1327,13 +1402,34 @@ impl Hdf5Reader {
                 } else {
                     self.handle.read_at(index_address, total_size as usize)?
                 };
-                Ok(data)
+                match target {
+                    // The lone chunk spans the whole dataset, so a full read
+                    // returns it verbatim.
+                    ChunkTarget::Full => Ok(data),
+                    ChunkTarget::Slice { starts, counts } => {
+                        let out_size = saturating_byte_len(counts, element_size);
+                        let mut output =
+                            alloc_tiled_fill(out_size as usize, fill_value.as_deref())?;
+                        let coords = vec![0u64; dims.len()];
+                        self.copy_chunk_to_slice(
+                            &data,
+                            &mut output,
+                            &dims,
+                            chunk_dims,
+                            &coords,
+                            element_size,
+                            starts,
+                            counts,
+                        );
+                        Ok(output)
+                    }
+                }
             }
             data_layout::ChunkIndexType::FixedArray => {
-                self.read_chunked_fixed_array(name, chunk_dims, index_address, pipeline)
+                self.read_chunked_fixed_array(name, chunk_dims, index_address, pipeline, target)
             }
             data_layout::ChunkIndexType::BTreeV2 => {
-                self.read_chunked_btree_v2(name, chunk_dims, index_address, pipeline)
+                self.read_chunked_btree_v2(name, chunk_dims, index_address, pipeline, target)
             }
             data_layout::ChunkIndexType::ExtensibleArray => {
                 let params = earray_params.ok_or_else(|| {
@@ -1341,7 +1437,7 @@ impl Hdf5Reader {
                 })?;
 
                 if index_address == UNDEF_ADDR {
-                    return Ok(vec![]);
+                    return unallocated_chunk_output(target, element_size, fill_value.as_deref());
                 }
 
                 // Total chunk count across all dimensions.
@@ -1363,8 +1459,8 @@ impl Hdf5Reader {
                     element_size,
                 )?;
 
-                let total_size: u64 = saturating_byte_len(&dims, element_size);
-                let mut output = alloc_tiled_fill(total_size as usize, fill_value.as_deref())?;
+                let out_size: u64 = saturating_byte_len(target.out_dims(&dims), element_size);
+                let mut output = alloc_tiled_fill(out_size as usize, fill_value.as_deref())?;
 
                 let n_chunks = std::cmp::min(chunks_dim0 as usize, chunk_entries.len());
 
@@ -1393,14 +1489,16 @@ impl Hdf5Reader {
                 };
 
                 if let Some(pl) = pipeline {
-                    // Read all raw chunks first, then decompress (optionally in parallel)
+                    // Read all raw chunks first, then decompress (optionally in parallel).
+                    // For a slice, chunks outside the selection are never read.
                     let file_size = self.handle.file_size()?;
                     let mut raw_chunks: Vec<Option<(Vec<u8>, u32)>> = Vec::with_capacity(n_chunks);
-                    for &(addr, nbytes, mask) in &chunk_entries[..n_chunks] {
+                    for (i, &(addr, nbytes, mask)) in chunk_entries[..n_chunks].iter().enumerate() {
                         if addr == UNDEF_ADDR
                             || nbytes == 0
                             || addr >= file_size
                             || nbytes > file_size
+                            || !target.overlaps(&chunk_coords(i as u64), chunk_dims)
                         {
                             raw_chunks.push(None);
                         } else {
@@ -1434,7 +1532,8 @@ impl Hdf5Reader {
                     for (i, chunk_data) in decompressed.iter().enumerate() {
                         if let Some(data) = chunk_data {
                             let coords = chunk_coords(i as u64);
-                            self.copy_chunk_to_output(
+                            self.scatter_chunk(
+                                target,
                                 data,
                                 &mut output,
                                 &dims,
@@ -1447,12 +1546,13 @@ impl Hdf5Reader {
                 } else {
                     // Unfiltered branch: the mask field is always 0 here.
                     for (i, &(addr, nbytes, _)) in chunk_entries[..n_chunks].iter().enumerate() {
-                        if addr == UNDEF_ADDR {
+                        let coords = chunk_coords(i as u64);
+                        if addr == UNDEF_ADDR || !target.overlaps(&coords, chunk_dims) {
                             continue;
                         }
                         let chunk_data = self.handle.read_at_most(addr, nbytes as usize)?;
-                        let coords = chunk_coords(i as u64);
-                        self.copy_chunk_to_output(
+                        self.scatter_chunk(
+                            target,
                             &chunk_data,
                             &mut output,
                             &dims,
@@ -1479,6 +1579,7 @@ impl Hdf5Reader {
         chunk_dims: &[u64],
         index_address: u64,
         pipeline: Option<&FilterPipeline>,
+        target: ChunkTarget,
     ) -> IoResult<Vec<u8>> {
         use crate::format::chunk_index::fixed_array::*;
 
@@ -1491,7 +1592,7 @@ impl Hdf5Reader {
         let ndims = dims.len();
 
         if index_address == UNDEF_ADDR {
-            return Ok(vec![]);
+            return unallocated_chunk_output(target, element_size, fill_value.as_deref());
         }
 
         // Read FA header
@@ -1499,7 +1600,7 @@ impl Hdf5Reader {
         let fa_hdr = FixedArrayHeader::decode(&hdr_buf, &self.ctx)?;
 
         if fa_hdr.data_blk_addr == UNDEF_ADDR {
-            return Ok(vec![]);
+            return unallocated_chunk_output(target, element_size, fill_value.as_deref());
         }
 
         // The chunk shape (from the layout message) must match the
@@ -1629,9 +1730,9 @@ impl Hdf5Reader {
             }
         }
 
-        // Total output size
-        let total_size: u64 = saturating_byte_len(&dims, element_size);
-        let mut output = alloc_tiled_fill(total_size as usize, fill_value.as_deref())?;
+        // Output size: whole dataset, or the slice extent.
+        let out_size: u64 = saturating_byte_len(target.out_dims(&dims), element_size);
+        let mut output = alloc_tiled_fill(out_size as usize, fill_value.as_deref())?;
 
         // Compute number of chunks per dimension. A zero chunk dimension
         // from a malformed layout message would divide by zero.
@@ -1643,12 +1744,23 @@ impl Hdf5Reader {
         let chunks_per_dim: Vec<u64> = (0..ndims)
             .map(|d| dims[d].div_ceil(chunk_dims[d]))
             .collect();
+        // Linear chunk index -> chunk-grid coordinates (row-major).
+        let chunk_coords = |mut i: u64| -> Vec<u64> {
+            let mut c = vec![0u64; ndims];
+            for d in (0..ndims).rev() {
+                c[d] = i % chunks_per_dim[d];
+                i /= chunks_per_dim[d];
+            }
+            c
+        };
 
-        // Read all chunk raw data sequentially (I/O must be serial)
+        // Read all chunk raw data sequentially (I/O must be serial). For a
+        // slice, chunks outside the selection are never read.
         let n_chunks = chunk_entries.len();
         let mut raw_chunks: Vec<(usize, Option<Vec<u8>>, u32)> = Vec::with_capacity(n_chunks);
         for (linear_idx, &(addr, comp_size, mask)) in chunk_entries.iter().enumerate() {
-            if addr == UNDEF_ADDR {
+            if addr == UNDEF_ADDR || !target.overlaps(&chunk_coords(linear_idx as u64), chunk_dims)
+            {
                 raw_chunks.push((linear_idx, None, 0));
             } else if pipeline.is_some() {
                 // For filtered chunks the entry carries the exact compressed
@@ -1708,13 +1820,16 @@ impl Hdf5Reader {
         // Place chunks into output
         for (linear_idx, chunk_data) in &decompressed {
             let Some(data) = chunk_data else { continue };
-            let mut remaining = *linear_idx as u64;
-            let mut coords = vec![0u64; ndims];
-            for d in (0..ndims).rev() {
-                coords[d] = remaining % chunks_per_dim[d];
-                remaining /= chunks_per_dim[d];
-            }
-            self.copy_chunk_to_output(data, &mut output, &dims, chunk_dims, &coords, element_size);
+            let coords = chunk_coords(*linear_idx as u64);
+            self.scatter_chunk(
+                target,
+                data,
+                &mut output,
+                &dims,
+                chunk_dims,
+                &coords,
+                element_size,
+            );
         }
 
         Ok(output)
@@ -1727,6 +1842,7 @@ impl Hdf5Reader {
         chunk_dims: &[u64],
         index_address: u64,
         pipeline: Option<&FilterPipeline>,
+        target: ChunkTarget,
     ) -> IoResult<Vec<u8>> {
         use crate::format::chunk_index::btree_v2::*;
 
@@ -1739,7 +1855,7 @@ impl Hdf5Reader {
         let ndims = dims.len();
 
         if index_address == UNDEF_ADDR {
-            return Ok(vec![]);
+            return unallocated_chunk_output(target, element_size, fill_value.as_deref());
         }
 
         // Read BT2 header
@@ -1747,7 +1863,7 @@ impl Hdf5Reader {
         let bt2_hdr = Bt2Header::decode(&hdr_buf, &self.ctx)?;
 
         if bt2_hdr.root_node_addr == UNDEF_ADDR || bt2_hdr.total_num_records == 0 {
-            return Ok(vec![]);
+            return unallocated_chunk_output(target, element_size, fill_value.as_deref());
         }
 
         // Walk the B-tree to any depth, collecting every record's raw bytes
@@ -1813,13 +1929,14 @@ impl Hdf5Reader {
                 .collect()
             };
 
-        let total_size: u64 = saturating_byte_len(&dims, element_size);
-        let mut output = alloc_tiled_fill(total_size as usize, fill_value.as_deref())?;
+        let out_size: u64 = saturating_byte_len(target.out_dims(&dims), element_size);
+        let mut output = alloc_tiled_fill(out_size as usize, fill_value.as_deref())?;
 
         // Read each chunk's raw bytes (carrying the per-chunk filter mask).
+        // For a slice, chunks outside the selection are never read.
         let mut raw_chunks: Vec<Option<RawChunkWithMask>> = Vec::with_capacity(entries.len());
         for (addr, read_size, scaled, mask) in &entries {
-            if *addr == UNDEF_ADDR || *read_size == 0 {
+            if *addr == UNDEF_ADDR || *read_size == 0 || !target.overlaps(scaled, chunk_dims) {
                 raw_chunks.push(None);
             } else {
                 let data = self.handle.read_at(*addr, *read_size)?;
@@ -1864,7 +1981,15 @@ impl Hdf5Reader {
         // Place each chunk N-dimensionally by its scaled (chunk-grid) offsets.
         for chunk in placed.iter().flatten() {
             let (data, scaled) = chunk;
-            self.copy_chunk_to_output(data, &mut output, &dims, chunk_dims, scaled, element_size);
+            self.scatter_chunk(
+                target,
+                data,
+                &mut output,
+                &dims,
+                chunk_dims,
+                scaled,
+                element_size,
+            );
         }
 
         Ok(output)
@@ -1933,6 +2058,7 @@ impl Hdf5Reader {
         chunk_dims: &[u64],
         b_tree_address: u64,
         pipeline: Option<&FilterPipeline>,
+        target: ChunkTarget,
     ) -> IoResult<Vec<u8>> {
         let info = self
             .dataset_info(name)
@@ -1953,7 +2079,8 @@ impl Hdf5Reader {
         }
 
         let total_size: u64 = saturating_byte_len(&dims, element_size);
-        let mut output = alloc_tiled_fill(total_size as usize, fill_value.as_deref())?;
+        let out_size: u64 = saturating_byte_len(target.out_dims(&dims), element_size);
+        let mut output = alloc_tiled_fill(out_size as usize, fill_value.as_deref())?;
 
         if b_tree_address == UNDEF_ADDR || total_size == 0 {
             return Ok(output);
@@ -1974,14 +2101,6 @@ impl Hdf5Reader {
         // already decoded from the B-tree keys).
         let mut raw_chunks: Vec<Option<RawChunkWithMask>> = Vec::with_capacity(entries.len());
         for (offsets, addr, chunk_size, mask) in &entries {
-            if *addr == UNDEF_ADDR
-                || *chunk_size == 0
-                || *addr >= file_size
-                || *chunk_size as u64 > file_size
-            {
-                raw_chunks.push(None);
-                continue;
-            }
             // Convert element offsets to chunk-grid (scaled) coordinates.
             // The trailing element-size dimension offset is always 0 and
             // is dropped here.
@@ -1989,6 +2108,15 @@ impl Hdf5Reader {
             for d in 0..ndims {
                 let cd = chunk_dims[d];
                 scaled.push(offsets[d].checked_div(cd).unwrap_or(0));
+            }
+            if *addr == UNDEF_ADDR
+                || *chunk_size == 0
+                || *addr >= file_size
+                || *chunk_size as u64 > file_size
+                || !target.overlaps(&scaled, chunk_dims)
+            {
+                raw_chunks.push(None);
+                continue;
             }
             let data = self.handle.read_at(*addr, *chunk_size as usize)?;
             raw_chunks.push(Some((data, scaled, *mask)));
@@ -2031,7 +2159,15 @@ impl Hdf5Reader {
         // Place each chunk N-dimensionally by its scaled offsets.
         for chunk in placed.iter().flatten() {
             let (data, scaled) = chunk;
-            self.copy_chunk_to_output(data, &mut output, &dims, chunk_dims, scaled, element_size);
+            self.scatter_chunk(
+                target,
+                data,
+                &mut output,
+                &dims,
+                chunk_dims,
+                scaled,
+                element_size,
+            );
         }
 
         // libhdf5 stores raw byte sizes; verify the uncompressed chunk
@@ -2186,6 +2322,115 @@ impl Hdf5Reader {
                 output[dst_offset..dst_offset + es]
                     .copy_from_slice(&chunk_data[src_offset..src_offset + es]);
             }
+        }
+    }
+
+    /// Copy the intersection of one chunk with a hyperslab selection into a
+    /// `counts`-shaped slice output buffer.
+    ///
+    /// `chunk_coords` is the chunk-grid position (global origin =
+    /// `chunk_coords[d] * chunk_dims[d]`); `output` is row-major over `counts`.
+    /// The global intersection box is `[max(origin, start), min(origin +
+    /// chunk_dims, start + count, dims))` per dimension. Because the last axis
+    /// is innermost in both the chunk and the output, each fixed setting of the
+    /// outer box dimensions copies one contiguous run of
+    /// `(hi[last]-lo[last])` elements — no per-element loop.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_chunk_to_slice(
+        &self,
+        chunk_data: &[u8],
+        output: &mut [u8],
+        dims: &[u64],
+        chunk_dims: &[u64],
+        chunk_coords: &[u64],
+        element_size: u64,
+        starts: &[u64],
+        counts: &[u64],
+    ) {
+        let ndims = dims.len();
+        if ndims == 0 {
+            return;
+        }
+        // Global intersection box [lo, hi) of chunk ∩ selection ∩ dataset.
+        let mut lo = vec![0u64; ndims];
+        let mut hi = vec![0u64; ndims];
+        for d in 0..ndims {
+            let origin = chunk_coords[d].saturating_mul(chunk_dims[d]);
+            let chunk_end = origin.saturating_add(chunk_dims[d]).min(dims[d]);
+            let sel_end = starts[d].saturating_add(counts[d]);
+            lo[d] = origin.max(starts[d]);
+            hi[d] = chunk_end.min(sel_end);
+            if lo[d] >= hi[d] {
+                return; // no overlap in this dimension
+            }
+        }
+
+        let chunk_strides = compute_strides(chunk_dims, element_size);
+        let out_strides = compute_strides(counts, element_size);
+        let last = ndims - 1;
+        let run_bytes = ((hi[last] - lo[last]) * element_size) as usize;
+
+        // Iterate the outer box dimensions [0, last); each position copies one
+        // contiguous last-axis run.
+        let outer_extent: Vec<u64> = (0..last).map(|d| hi[d] - lo[d]).collect();
+        let n_outer: u64 = outer_extent.iter().product(); // empty product == 1
+        let mut oc = vec![0u64; last];
+        for _ in 0..n_outer {
+            let mut src_off = 0u64;
+            let mut dst_off = 0u64;
+            for d in 0..ndims {
+                let g = if d < last { lo[d] + oc[d] } else { lo[last] };
+                let origin = chunk_coords[d].saturating_mul(chunk_dims[d]);
+                src_off += (g - origin) * chunk_strides[d];
+                dst_off += (g - starts[d]) * out_strides[d];
+            }
+            let s = src_off as usize;
+            let dst = dst_off as usize;
+            if s + run_bytes <= chunk_data.len() && dst + run_bytes <= output.len() {
+                output[dst..dst + run_bytes].copy_from_slice(&chunk_data[s..s + run_bytes]);
+            }
+            for d in (0..last).rev() {
+                oc[d] += 1;
+                if oc[d] < outer_extent[d] {
+                    break;
+                }
+                oc[d] = 0;
+            }
+        }
+    }
+
+    /// Scatter one decoded chunk into the output for the given target: the
+    /// whole dataset (`Full`) or a hyperslab (`Slice`).
+    #[allow(clippy::too_many_arguments)]
+    fn scatter_chunk(
+        &self,
+        target: ChunkTarget,
+        chunk_data: &[u8],
+        output: &mut [u8],
+        dims: &[u64],
+        chunk_dims: &[u64],
+        chunk_coords: &[u64],
+        element_size: u64,
+    ) {
+        match target {
+            ChunkTarget::Full => self.copy_chunk_to_output(
+                chunk_data,
+                output,
+                dims,
+                chunk_dims,
+                chunk_coords,
+                element_size,
+            ),
+            ChunkTarget::Slice { starts, counts } => self.copy_chunk_to_slice(
+                chunk_data,
+                output,
+                dims,
+                chunk_dims,
+                chunk_coords,
+                element_size,
+                starts,
+                counts,
+            ),
         }
     }
 
@@ -2557,256 +2802,88 @@ impl Hdf5Reader {
                     return alloc_tiled_fill(out_bytes, fill_value.as_deref());
                 }
 
-                let strides = compute_strides(&dims, element_size);
-
-                // For 1D, simple contiguous read
-                if ndims == 1 {
-                    let offset = *address + starts[0] * element_size;
-                    return self
-                        .handle
-                        .read_at(offset, (counts[0] * element_size) as usize)
-                        .map_err(Into::into);
-                }
-
-                // Multi-dimensional: read row by row along the last dimension
+                // Read each maximal contiguous run straight into the output.
+                // Trailing full-selected dimensions coalesce, so a slice like
+                // `[:, r0:r1, :]` of `[nproj, nz, nx]` becomes `nproj` reads of
+                // `(r1-r0)*nx` elements instead of `nproj*(r1-r0)` per-`nx`-row
+                // reads. The 1-D case folds to a single run.
+                let base = *address;
                 let mut output = vec![0u8; out_bytes];
-                let row_bytes = (counts[ndims - 1] * element_size) as usize;
-
-                // Iterate over all rows in the slice
-                let mut coords = vec![0u64; ndims - 1];
-                let n_rows: u64 = counts[..ndims - 1].iter().product();
-
-                for row in 0..n_rows {
-                    // Compute file offset
-                    let mut file_offset = *address + starts[ndims - 1] * element_size;
-                    for d in 0..ndims - 1 {
-                        file_offset += (starts[d] + coords[d]) * strides[d];
-                    }
-
-                    let out_offset = row as usize * row_bytes;
-                    let data = self.handle.read_at(file_offset, row_bytes)?;
-                    output[out_offset..out_offset + row_bytes].copy_from_slice(&data);
-
-                    // Increment coords (carry)
-                    for d in (0..ndims - 1).rev() {
-                        coords[d] += 1;
-                        if coords[d] < counts[d] {
-                            break;
-                        }
-                        coords[d] = 0;
-                    }
-                }
-
+                for_each_contiguous_run(
+                    &dims,
+                    starts,
+                    counts,
+                    element_size,
+                    |src_off, out_off, len| {
+                        self.handle
+                            .read_exact_at_into(base + src_off, &mut output[out_off..out_off + len])
+                            .map_err(Into::into)
+                    },
+                )?;
                 Ok(output)
             }
             DataLayoutMessage::Compact { data } => {
-                // Same logic but from in-memory data
-                let strides = compute_strides(&dims, element_size);
-
+                // Same coalesced geometry, copying from the in-memory full
+                // dataset instead of reading from the file.
                 let mut output = vec![0u8; out_bytes];
-                let row_bytes = (counts[ndims - 1] * element_size) as usize;
-                let n_rows: u64 = if ndims > 1 {
-                    counts[..ndims - 1].iter().product()
-                } else {
-                    1
-                };
-
-                let mut coords = vec![0u64; ndims.saturating_sub(1)];
-                for row in 0..n_rows {
-                    let mut src_offset = (starts[ndims - 1] * element_size) as usize;
-                    for d in 0..ndims.saturating_sub(1) {
-                        src_offset += ((starts[d] + coords[d]) * strides[d]) as usize;
-                    }
-                    let out_offset = row as usize * row_bytes;
-                    output[out_offset..out_offset + row_bytes]
-                        .copy_from_slice(&data[src_offset..src_offset + row_bytes]);
-
-                    for d in (0..ndims.saturating_sub(1)).rev() {
-                        coords[d] += 1;
-                        if coords[d] < counts[d] {
-                            break;
-                        }
-                        coords[d] = 0;
-                    }
-                }
+                for_each_contiguous_run(
+                    &dims,
+                    starts,
+                    counts,
+                    element_size,
+                    |src_off, out_off, len| {
+                        let src = src_off as usize;
+                        output[out_off..out_off + len].copy_from_slice(&data[src..src + len]);
+                        Ok(())
+                    },
+                )?;
                 Ok(output)
             }
-            DataLayoutMessage::ChunkedV3 { .. } => {
-                // Read the full dataset via the v1 B-tree path, then
-                // extract the requested slice. Use the unconverted read so
-                // the post-filter datatype conversion runs exactly once, in
-                // the `read_slice` wrapper.
-                let full = self.read_dataset_raw_unconverted(name)?;
-                let mut output = vec![0u8; out_bytes];
-                let src_strides = compute_strides(&dims, element_size);
-                let row_bytes = (counts[ndims - 1] * element_size) as usize;
-                let n_rows: u64 = if ndims > 1 {
-                    counts[..ndims - 1].iter().product()
-                } else {
-                    1
-                };
-                if ndims == 1 {
-                    let src_off = (starts[0] * element_size) as usize;
-                    output[..row_bytes].copy_from_slice(&full[src_off..src_off + row_bytes]);
-                } else {
-                    let out_strides = compute_strides(counts, element_size);
-                    let mut coords = vec![0u64; ndims - 1];
-                    for _row in 0..n_rows {
-                        let mut src_off = (starts[ndims - 1] * element_size) as usize;
-                        let mut out_off = 0usize;
-                        for d in 0..ndims - 1 {
-                            src_off += ((starts[d] + coords[d]) * src_strides[d]) as usize;
-                            out_off += (coords[d] * out_strides[d]) as usize;
-                        }
-                        output[out_off..out_off + row_bytes]
-                            .copy_from_slice(&full[src_off..src_off + row_bytes]);
-                        for d in (0..ndims - 1).rev() {
-                            coords[d] += 1;
-                            if coords[d] < counts[d] {
-                                break;
-                            }
-                            coords[d] = 0;
-                        }
-                    }
-                }
-                Ok(output)
+            DataLayoutMessage::ChunkedV3 {
+                chunk_dims,
+                b_tree_address,
+            } => {
+                // Walk the v1 B-tree index reading only chunks that overlap the
+                // selection, scattering each chunk∩selection into a slice-shaped
+                // buffer. The unconverted read keeps the post-filter datatype
+                // conversion to exactly once, in the `read_slice` wrapper.
+                let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
+                self.read_chunked_btree_v1(
+                    name,
+                    real_chunk_dims,
+                    *b_tree_address,
+                    pipeline.as_ref(),
+                    ChunkTarget::Slice { starts, counts },
+                )
             }
             DataLayoutMessage::ChunkedV4 {
-                chunk_dims: layout_chunk_dims,
+                chunk_dims,
                 index_address,
                 index_type,
                 earray_params,
+                single_chunk_filter,
                 ..
             } => {
-                let real_chunk_dims = &layout_chunk_dims[..layout_chunk_dims.len() - 1];
-                let fp = pipeline.clone();
-
-                // Optimized path for 1D-chunked streaming (chunk_dim0 == 1, EA index):
-                // Read only the chunks that overlap [starts[0]..starts[0]+counts[0]).
-                let can_optimize = ndims >= 2
-                    && real_chunk_dims[0] == 1
-                    && *index_type == data_layout::ChunkIndexType::ExtensibleArray;
-
-                if can_optimize {
-                    let all_entries = self.collect_ea_chunk_entries(
-                        *index_address,
-                        earray_params.as_ref().unwrap(),
-                        &dims,
-                        real_chunk_dims,
-                        element_size,
-                    )?;
-                    let mut output = alloc_tiled_fill(out_bytes, fill_value.as_deref())?;
-                    let out_strides = compute_strides(counts, element_size);
-                    let chunk_inner_dims = &real_chunk_dims[1..];
-                    let chunk_strides = compute_strides(chunk_inner_dims, element_size);
-                    let inner_starts = &starts[1..];
-                    let inner_counts = &counts[1..];
-                    let inner_ndims = inner_starts.len();
-                    let row_bytes = (inner_counts[inner_ndims - 1] * element_size) as usize;
-                    let n_inner_rows: u64 = if inner_ndims > 1 {
-                        inner_counts[..inner_ndims - 1].iter().product()
-                    } else {
-                        1
-                    };
-
-                    for fi in 0..counts[0] {
-                        let gi = starts[0] + fi;
-                        if (gi as usize) >= all_entries.len() {
-                            break;
-                        }
-                        let (addr, nbytes, mask) = all_entries[gi as usize];
-                        if addr == UNDEF_ADDR {
-                            continue;
-                        }
-
-                        let chunk_data = if let Some(ref pl) = fp {
-                            let raw = self.handle.read_at(addr, nbytes as usize)?;
-                            filter::reverse_filters_masked(pl, &raw, mask)?
-                        } else {
-                            self.handle.read_at(addr, nbytes as usize)?
-                        };
-
-                        let mut ic = vec![0u64; inner_ndims.saturating_sub(1)];
-                        for _irow in 0..n_inner_rows {
-                            let mut src_off =
-                                (inner_starts[inner_ndims - 1] * element_size) as usize;
-                            let mut dst_off = (fi * out_strides[0]) as usize;
-                            for d in 0..inner_ndims.saturating_sub(1) {
-                                src_off += ((inner_starts[d] + ic[d]) * chunk_strides[d]) as usize;
-                                dst_off += (ic[d] * out_strides[d + 1]) as usize;
-                            }
-                            if src_off + row_bytes <= chunk_data.len()
-                                && dst_off + row_bytes <= output.len()
-                            {
-                                output[dst_off..dst_off + row_bytes]
-                                    .copy_from_slice(&chunk_data[src_off..src_off + row_bytes]);
-                            }
-                            for d in (0..inner_ndims.saturating_sub(1)).rev() {
-                                ic[d] += 1;
-                                if ic[d] < inner_counts[d] {
-                                    break;
-                                }
-                                ic[d] = 0;
-                            }
-                        }
-                    }
-                    Ok(output)
-                } else {
-                    // Fallback: read full dataset and extract slice. Use the
-                    // unconverted read so the post-filter datatype conversion
-                    // is applied exactly once, by the `read_slice` wrapper.
-                    let full = self.read_dataset_raw_unconverted(name)?;
-                    let mut output = vec![0u8; out_bytes];
-                    let src_strides = compute_strides(&dims, element_size);
-                    let row_bytes = (counts[ndims - 1] * element_size) as usize;
-                    let n_rows: u64 = if ndims > 1 {
-                        counts[..ndims - 1].iter().product()
-                    } else {
-                        1
-                    };
-                    if ndims == 1 {
-                        let src_off = (starts[0] * element_size) as usize;
-                        output[..row_bytes].copy_from_slice(&full[src_off..src_off + row_bytes]);
-                    } else {
-                        let out_strides = compute_strides(counts, element_size);
-                        let mut coords = vec![0u64; ndims - 1];
-                        for _row in 0..n_rows {
-                            let mut src_off = (starts[ndims - 1] * element_size) as usize;
-                            let mut out_off = 0usize;
-                            for d in 0..ndims - 1 {
-                                src_off += ((starts[d] + coords[d]) * src_strides[d]) as usize;
-                                out_off += (coords[d] * out_strides[d]) as usize;
-                            }
-                            output[out_off..out_off + row_bytes]
-                                .copy_from_slice(&full[src_off..src_off + row_bytes]);
-                            for d in (0..ndims - 1).rev() {
-                                coords[d] += 1;
-                                if coords[d] < counts[d] {
-                                    break;
-                                }
-                                coords[d] = 0;
-                            }
-                        }
-                    }
-                    Ok(output)
-                }
+                // Same selection-aware chunk read for every v4 index kind
+                // (single chunk, fixed/extensible array, B-tree v2): only
+                // overlapping chunks are read and only their intersection with
+                // the selection is scattered into the slice output.
+                let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
+                self.read_chunked_v4(
+                    name,
+                    real_chunk_dims,
+                    ChunkIndexDesc {
+                        index_type: *index_type,
+                        index_address: *index_address,
+                        earray_params: earray_params.as_ref(),
+                        single_chunk_filter: *single_chunk_filter,
+                    },
+                    pipeline.as_ref(),
+                    ChunkTarget::Slice { starts, counts },
+                )
             }
         }
     }
-}
-
-/// Compute row-major strides for an N-dimensional array.
-fn compute_strides(dims: &[u64], element_size: u64) -> Vec<u64> {
-    let ndims = dims.len();
-    if ndims == 0 {
-        return vec![];
-    }
-    let mut strides = vec![0u64; ndims];
-    strides[ndims - 1] = element_size;
-    for d in (0..ndims - 1).rev() {
-        strides[d] = strides[d + 1] * dims[d + 1];
-    }
-    strides
 }
 
 /// Adapts a `FileHandle` to the `BlockReader` trait used by the fractal-heap
@@ -3223,6 +3300,134 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
     }
+
+    /// Collect the (src_off, out_off, len) runs the coalescer emits.
+    fn collect_runs(
+        dims: &[u64],
+        starts: &[u64],
+        counts: &[u64],
+        es: u64,
+    ) -> Vec<(u64, usize, usize)> {
+        let mut v = Vec::new();
+        for_each_contiguous_run(dims, starts, counts, es, |s, o, l| {
+            v.push((s, o, l));
+            Ok(())
+        })
+        .unwrap();
+        v
+    }
+
+    #[test]
+    fn coalesce_1d_is_single_run() {
+        // 1-D selection is always one contiguous run.
+        assert_eq!(collect_runs(&[10], &[2], &[3], 1), vec![(2, 0, 3)]);
+        // element_size scales offsets and length.
+        assert_eq!(collect_runs(&[10], &[2], &[3], 4), vec![(8, 0, 12)]);
+    }
+
+    #[test]
+    fn coalesce_full_last_dim_merges_into_one_run() {
+        // 2-D, full last dim => the whole [r0:r1, :] block is one run.
+        // dims=[4,5], select rows 1..3, all 5 columns.
+        assert_eq!(collect_runs(&[4, 5], &[1, 0], &[2, 5], 1), vec![(5, 0, 10)]);
+    }
+
+    #[test]
+    fn coalesce_partial_last_dim_keeps_one_run_per_row() {
+        // 2-D, partial last dim => no merge; one run per selected row.
+        // dims=[4,5] strides=[5,1]; select rows 1..3, cols 1..4.
+        assert_eq!(
+            collect_runs(&[4, 5], &[1, 1], &[2, 3], 1),
+            vec![(6, 0, 3), (11, 3, 3)]
+        );
+        // Same shape, element_size=4: strides=[20,4], inner_base=4.
+        assert_eq!(
+            collect_runs(&[4, 5], &[1, 1], &[2, 3], 4),
+            vec![(24, 0, 12), (44, 12, 12)]
+        );
+    }
+
+    #[test]
+    fn coalesce_3d_reported_case_one_run_per_outer_index() {
+        // The reported workload: [:, r0:r1, :] of [nproj, nz, nx].
+        // dims=[3,4,5] strides=[20,5,1]; select all of dim0, rows 1..3 of
+        // dim1, all of dim2. Last dim full => merge dim1+dim2; dim1 partial
+        // => one run per dim0 index (3 runs, not 3*2=6 rows).
+        assert_eq!(
+            collect_runs(&[3, 4, 5], &[0, 1, 0], &[3, 2, 5], 1),
+            vec![(5, 0, 10), (25, 10, 10), (45, 20, 10)]
+        );
+    }
+
+    #[test]
+    fn coalesce_3d_full_inner_dims_is_single_run() {
+        // [r0:r1, :, :] => both inner dims full => one contiguous run.
+        // dims=[3,4,5] strides=[20,5,1]; select rows 1..3 of dim0.
+        assert_eq!(
+            collect_runs(&[3, 4, 5], &[1, 0, 0], &[2, 4, 5], 1),
+            vec![(20, 0, 40)]
+        );
+    }
+
+    /// Build a contiguous i32 dataset and verify `read_slice` returns the
+    /// correct bytes for both coalesced and non-coalesced selections.
+    #[test]
+    fn read_slice_contiguous_3d_matches_naive_extraction() {
+        let dims = [3u64, 4, 5];
+        let total: usize = (dims[0] * dims[1] * dims[2]) as usize;
+        let values: Vec<i32> = (0..total as i32).collect();
+        let raw_data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let file_bytes = build_v0_file("vol", &dims, &raw_data);
+
+        let path = temp_path("slice_3d_contig");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&file_bytes).unwrap();
+            f.sync_all().unwrap();
+        }
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+
+        // Naive row-major extraction for an arbitrary [starts, counts).
+        let expect = |starts: [u64; 3], counts: [u64; 3]| -> Vec<i32> {
+            let mut out = Vec::new();
+            for i in 0..counts[0] {
+                for j in 0..counts[1] {
+                    for k in 0..counts[2] {
+                        let gi = starts[0] + i;
+                        let gj = starts[1] + j;
+                        let gk = starts[2] + k;
+                        out.push(values[(gi * dims[1] * dims[2] + gj * dims[2] + gk) as usize]);
+                    }
+                }
+            }
+            out
+        };
+        let decode = |raw: Vec<u8>| -> Vec<i32> {
+            raw.chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+
+        // Mix of coalesced and non-coalesced selections.
+        let cases: &[([u64; 3], [u64; 3])] = &[
+            ([0, 1, 0], [3, 2, 5]), // [:, 1:3, :]  -> coalesced (3 runs)
+            ([1, 0, 0], [2, 4, 5]), // [1:3, :, :]  -> single run
+            ([0, 0, 1], [3, 4, 3]), // [:, :, 1:4]  -> partial last dim, no merge
+            ([1, 2, 1], [2, 2, 4]), // interior block, partial all dims
+            ([0, 0, 0], [3, 4, 5]), // whole dataset -> single run
+            ([2, 3, 4], [1, 1, 1]), // single element
+        ];
+        for &(starts, counts) in cases {
+            let got = decode(reader.read_slice("vol", &starts, &counts).unwrap());
+            assert_eq!(
+                got,
+                expect(starts, counts),
+                "slice starts={starts:?} counts={counts:?}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]
@@ -3572,5 +3777,102 @@ mod h5py_debug_tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Partial-slice reads of chunked datasets must skip non-overlapping
+    /// chunks yet return exactly the selected region, for every chunk index
+    /// type: v1 B-tree (libver=earliest), single chunk, fixed array,
+    /// extensible array (one unlimited dim), and v2 B-tree (>1 unlimited dim).
+    ///
+    /// The dataset is a 5×4×6 int32 `arange`, chunked 2×2×2 so the chunk grid
+    /// is ragged (edge chunks) and most selections touch a strict subset of
+    /// chunks. Each slice is checked against the row-major `arange` value so a
+    /// dropped/misplaced chunk or a mis-sized output buffer is caught.
+    #[test]
+    fn read_slice_chunked_all_index_types() {
+        let latest = temp_path("slice_chunk_latest");
+        let earliest = temp_path("slice_chunk_earliest");
+        let pl = latest.display().to_string();
+        let pe = earliest.display().to_string();
+        // libver=latest selects modern indices by maxshape: fixed -> Fixed
+        // Array, one unlimited dim -> Extensible Array, >1 unlimited -> v2
+        // B-tree, single chunk -> Single Chunk index. libver=earliest always
+        // uses the v1 B-tree chunk index.
+        let script = format!(
+            "import h5py,numpy as np\n\
+             a=np.arange(5*4*6,dtype='int32').reshape(5,4,6)\n\
+             f=h5py.File(r'{pl}','w',libver='latest')\n\
+             f.create_dataset('single',data=a,chunks=(5,4,6))\n\
+             f.create_dataset('fa',data=a,chunks=(2,2,2))\n\
+             f.create_dataset('ea',data=a,chunks=(2,2,2),maxshape=(None,4,6))\n\
+             f.create_dataset('btv2',data=a,chunks=(2,2,2),maxshape=(None,None,6))\n\
+             f.close()\n\
+             g=h5py.File(r'{pe}','w',libver='earliest')\n\
+             g.create_dataset('btv1',data=a,chunks=(2,2,2))\n\
+             g.close()"
+        );
+        if !gen_fixture(&script) {
+            eprintln!("skipping read_slice_chunked_all_index_types: python unavailable");
+            return;
+        }
+
+        let dims = [5u64, 4, 6];
+        // Row-major value of element (i,j,k) in the arange dataset.
+        let val = |i: u64, j: u64, k: u64| (i * dims[1] * dims[2] + j * dims[2] + k) as i32;
+        let expect = |starts: [u64; 3], counts: [u64; 3]| -> Vec<i32> {
+            let mut out = Vec::new();
+            for i in 0..counts[0] {
+                for j in 0..counts[1] {
+                    for k in 0..counts[2] {
+                        out.push(val(starts[0] + i, starts[1] + j, starts[2] + k));
+                    }
+                }
+            }
+            out
+        };
+        let decode = |raw: Vec<u8>| -> Vec<i32> {
+            raw.chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let cases: &[([u64; 3], [u64; 3])] = &[
+            ([0, 1, 0], [5, 2, 6]), // full last dim, partial mid -> coalesced runs
+            ([1, 0, 0], [3, 4, 6]), // partial dim0, inner dims full -> one run
+            ([0, 0, 2], [5, 4, 3]), // partial last dim -> one run per (i,j) row
+            ([2, 1, 3], [1, 2, 2]), // interior block spanning few chunks
+            ([0, 0, 0], [5, 4, 6]), // whole dataset via read_slice
+            ([4, 3, 5], [1, 1, 1]), // single element at the far edge chunk
+            ([1, 1, 1], [3, 3, 4]), // straddles chunk boundaries on all axes
+        ];
+
+        let mut reader_l = Hdf5Reader::open(&latest).unwrap();
+        for name in ["single", "fa", "ea", "btv2"] {
+            // Full read sanity first, then every slice.
+            let full = decode(reader_l.read_dataset_raw(name).unwrap());
+            assert_eq!(full, expect([0, 0, 0], [5, 4, 6]), "{name} full read");
+            for &(starts, counts) in cases {
+                let got = decode(reader_l.read_slice(name, &starts, &counts).unwrap());
+                assert_eq!(
+                    got,
+                    expect(starts, counts),
+                    "{name} slice starts={starts:?} counts={counts:?}"
+                );
+            }
+        }
+
+        let mut reader_e = Hdf5Reader::open(&earliest).unwrap();
+        let full = decode(reader_e.read_dataset_raw("btv1").unwrap());
+        assert_eq!(full, expect([0, 0, 0], [5, 4, 6]), "btv1 full read");
+        for &(starts, counts) in cases {
+            let got = decode(reader_e.read_slice("btv1", &starts, &counts).unwrap());
+            assert_eq!(
+                got,
+                expect(starts, counts),
+                "btv1 slice starts={starts:?} counts={counts:?}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&latest);
+        let _ = std::fs::remove_file(&earliest);
     }
 }
