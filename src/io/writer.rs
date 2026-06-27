@@ -1875,6 +1875,80 @@ impl Hdf5Writer {
         Ok(idx)
     }
 
+    /// Create a 1-D variable-length byte-array dataset.
+    ///
+    /// Each item's bytes are stored as a global-heap object and the dataset
+    /// holds one vlen reference per item (same on-disk shape as a vlen string
+    /// dataset). The datatype is a vlen sequence of `u8`, so h5py reads it back
+    /// as an array of variable-length `uint8` arrays. `seq_len` is the number
+    /// of base (`u8`) elements, i.e. the byte length; no null terminator is
+    /// appended.
+    pub fn create_vlen_bytes_dataset(&mut self, name: &str, items: &[&[u8]]) -> IoResult<usize> {
+        use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let num_items = items.len() as u64;
+
+        // Build a global heap collection with all byte arrays.
+        let mut gcol = GlobalHeapCollection::new();
+        let mut obj_indices = Vec::with_capacity(items.len());
+        for item in items {
+            let idx = gcol.add_object(item.to_vec())?;
+            obj_indices.push(idx);
+        }
+
+        // Encode and write the global heap collection.
+        let gcol_encoded = gcol.encode(&self.ctx);
+        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
+        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+
+        // Build raw data: one vlen reference per item.
+        let ref_size = crate::format::global_heap::vlen_reference_size(&self.ctx);
+        let data_size = (num_items as usize) * ref_size;
+        let mut raw_data = Vec::with_capacity(data_size);
+        for (i, &obj_idx) in obj_indices.iter().enumerate() {
+            // base is u8, so element count == byte count.
+            let seq_len = items[i].len() as u32;
+            raw_data.extend_from_slice(&encode_vlen_reference(
+                seq_len,
+                gcol_addr,
+                obj_idx as u32,
+                &self.ctx,
+            ));
+        }
+
+        // Allocate and write raw data.
+        let data_addr = self.allocator.allocate(data_size as u64);
+        self.handle.write_at(data_addr, &raw_data)?;
+
+        // Create the dataset with a vlen byte-array datatype.
+        let datatype = DatatypeMessage::vlen_bytes();
+        let dataspace = crate::format::messages::dataspace::DataspaceMessage::simple(&[num_items]);
+
+        let idx = self.datasets.len();
+        self.datasets.push(DatasetInfo {
+            name: name.to_string(),
+            datatype,
+            dataspace,
+            obj_header_addr: 0,
+            data_addr,
+            data_size: data_size as u64,
+            chunked: None,
+            fixed_array: None,
+            btree_v2: None,
+            attributes: Vec::new(),
+            obj_header_written_addr: None,
+            obj_header_encoded_size: 0,
+            filter_pipeline: None,
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
+            deleted: false,
+            fill_value: None,
+        });
+
+        Ok(idx)
+    }
+
     /// Create a chunked, compressed variable-length string dataset.
     ///
     /// Strings are stored in the global heap (same as `create_vlen_string_dataset`),

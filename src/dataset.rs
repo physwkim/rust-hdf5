@@ -1582,6 +1582,27 @@ impl H5Dataset {
         }
     }
 
+    /// Read variable-length byte arrays from a dataset.
+    ///
+    /// This handles vlen byte-array datasets (a vlen sequence of `u8`, e.g.
+    /// those written by [`write_vlen_bytes`](crate::H5File::write_vlen_bytes))
+    /// that store each element as a global heap reference. Returns one
+    /// `Vec<u8>` per element.
+    pub fn read_vlen_bytes(&self) -> Result<Vec<Vec<u8>>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => Ok(reader.read_vlen_bytes(name)?),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read vlen bytes from a dataset in write mode".into(),
+            )),
+        }
+    }
+
     /// Read the entire dataset as a typed vector.
     ///
     /// The raw bytes are read from the file and reinterpreted as `T`. The

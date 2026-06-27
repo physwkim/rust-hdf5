@@ -2442,6 +2442,31 @@ impl Hdf5Reader {
     ///
     /// Returns a Vec<String> with one entry per element.
     pub fn read_vlen_strings(&mut self, name: &str) -> IoResult<Vec<String>> {
+        // A vlen string is a vlen sequence of `u8` reinterpreted as UTF-8.
+        // The global-heap walk is identical; decode the raw object bytes.
+        Ok(self
+            .read_vlen_objects(name)?
+            .into_iter()
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+            .collect())
+    }
+
+    /// Read a 1-D variable-length byte-array dataset (vlen sequence of `u8`).
+    ///
+    /// Returns a `Vec<Vec<u8>>` with one byte array per element. Missing or
+    /// undefined references yield an empty `Vec`.
+    pub fn read_vlen_bytes(&mut self, name: &str) -> IoResult<Vec<Vec<u8>>> {
+        self.read_vlen_objects(name)
+    }
+
+    /// Shared owner of the global-heap walk for variable-length datasets.
+    ///
+    /// Each element of the raw data is a vlen reference (collection address +
+    /// object index) into a global heap collection. Returns the raw object
+    /// bytes for each element, with an empty `Vec` for undefined/missing
+    /// references. Both `read_vlen_strings` (UTF-8 view) and `read_vlen_bytes`
+    /// (raw view) layer on top of this.
+    fn read_vlen_objects(&mut self, name: &str) -> IoResult<Vec<Vec<u8>>> {
         let info = self
             .dataset_info(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
@@ -2464,7 +2489,7 @@ impl Hdf5Reader {
         };
 
         let ref_size = vlen_reference_size(&self.ctx);
-        let mut strings = Vec::with_capacity(total_elements as usize);
+        let mut items: Vec<Vec<u8>> = Vec::with_capacity(total_elements as usize);
 
         // Cache global heap collections to avoid re-reading.
         // Store as (collection, index→offset lookup) for O(1) object access.
@@ -2483,7 +2508,7 @@ impl Hdf5Reader {
                 decode_vlen_reference(&raw[offset..], &self.ctx)?;
 
             if collection_addr == UNDEF_ADDR || collection_addr == 0 {
-                strings.push(String::new());
+                items.push(Vec::new());
                 continue;
             }
 
@@ -2494,13 +2519,13 @@ impl Hdf5Reader {
                 let header_len = 4 + 1 + 3 + ss;
                 let header_buf = self.handle.read_at_most(collection_addr, header_len)?;
                 if header_buf.len() < header_len || &header_buf[0..4] != b"GCOL" {
-                    strings.push(String::new());
+                    items.push(Vec::new());
                     continue;
                 }
                 let collection_size = read_uint(&header_buf[8..], ss) as usize;
 
                 if collection_size == 0 || collection_size > 64 * 1024 * 1024 {
-                    strings.push(String::new());
+                    items.push(Vec::new());
                     continue;
                 }
 
@@ -2517,14 +2542,13 @@ impl Hdf5Reader {
 
             let (coll, lookup) = &heap_cache[&collection_addr];
             if let Some(&idx) = lookup.get(&(obj_index as u16)) {
-                let s = String::from_utf8_lossy(&coll.objects[idx].data).to_string();
-                strings.push(s);
+                items.push(coll.objects[idx].data.clone());
             } else {
-                strings.push(String::new());
+                items.push(Vec::new());
             }
         }
 
-        Ok(strings)
+        Ok(items)
     }
 
     /// Collect chunk (address, size) entries from an EA index.

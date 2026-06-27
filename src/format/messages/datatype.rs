@@ -110,10 +110,21 @@ pub enum DatatypeMessage {
         /// Enumeration members (name + value pairs).
         members: Vec<EnumMember>,
     },
-    /// Variable-length datatype (class 9) -- currently only vlen strings.
+    /// Variable-length string datatype (class 9, vlen type 1).
     VarLenString {
         /// Character set: 0 = ASCII, 1 = UTF-8.
         charset: u8,
+    },
+    /// Variable-length sequence datatype (class 9, vlen type 0): each item is a
+    /// variable number of `base` elements stored in the global heap. With
+    /// `base` = `u8` this is a variable-length byte array.
+    ///
+    /// Mirrors libhdf5 `H5T_VLEN`/`H5T_VLEN_SEQUENCE` (see `H5Odtype.c`): the
+    /// bit field's low nibble is the vlen type (0 = sequence), and the parent
+    /// (base) datatype message is embedded in the properties.
+    VarLenSequence {
+        /// Element type of each item's sequence.
+        base: Box<DatatypeMessage>,
     },
     /// Array datatype (class 10).
     Array {
@@ -287,6 +298,16 @@ impl DatatypeMessage {
         Self::VarLenString { charset: 0 }
     }
 
+    /// Variable-length byte-array type: a vlen sequence of `u8`.
+    ///
+    /// Note: like `VarLenString`, `element_size()` for this type requires a
+    /// `FormatContext`. Use `element_size_ctx()` or `vlen_ref_size()`.
+    pub fn vlen_bytes() -> Self {
+        Self::VarLenSequence {
+            base: Box::new(Self::u8_type()),
+        }
+    }
+
     /// Compound datatype.
     pub fn compound(size: u32, members: Vec<CompoundMember>) -> Self {
         Self::Compound { size, members }
@@ -324,7 +345,7 @@ impl DatatypeMessage {
             Self::FixedString { size, .. } => *size,
             Self::Compound { size, .. } => *size,
             Self::Enum { base, .. } => base.element_size(),
-            Self::VarLenString { .. } => {
+            Self::VarLenString { .. } | Self::VarLenSequence { .. } => {
                 // Default assumption: sizeof_addr = 8
                 // vlen ref = 4 (seq_len) + sizeof_addr + 4 (index) = 16
                 16
@@ -345,7 +366,7 @@ impl DatatypeMessage {
     /// `sizeof_addr`.
     pub fn element_size_ctx(&self, ctx: &FormatContext) -> u32 {
         match self {
-            Self::VarLenString { .. } => ctx.sizeof_addr as u32 + 8,
+            Self::VarLenString { .. } | Self::VarLenSequence { .. } => ctx.sizeof_addr as u32 + 8,
             _ => self.element_size(),
         }
     }
@@ -575,6 +596,35 @@ impl DatatypeMessage {
                     charset: *charset,
                 };
                 let base_encoded = base_type.encode(ctx);
+                buf.extend_from_slice(&base_encoded);
+
+                buf
+            }
+            Self::VarLenSequence { base } => {
+                // Variable-length sequence: class 9, version 1.
+                //
+                // On-disk element size = sizeof_addr + 4 (the vlen reference),
+                // identical to a vlen string. The bit field's low nibble is the
+                // vlen type (0 = sequence); unlike a vlen string there are no
+                // pad/charset bits. The properties embed the parent (base)
+                // datatype message recursively (libhdf5 `H5Odtype.c`).
+                let vlen_size = Self::vlen_ref_size(ctx);
+
+                let mut buf = vec![
+                    // byte 0: class 9 | version<<4
+                    CLASS_VLEN | (DT_VERSION << 4),
+                    // byte 1 bits 0-3: type = 0 (sequence)
+                    0x00,
+                    // bytes 2-3: reserved (no charset/pad for sequences)
+                    0,
+                    0,
+                ];
+
+                // bytes 4-7: element size
+                buf.extend_from_slice(&vlen_size.to_le_bytes());
+
+                // Properties: base (parent) datatype message, recursive.
+                let base_encoded = base.encode(ctx);
                 buf.extend_from_slice(&base_encoded);
 
                 buf
@@ -895,19 +945,21 @@ impl DatatypeMessage {
 
                 let mut pos = 8;
 
-                // Properties: base datatype
-                let (_base_dt, base_consumed) = Self::decode_inner(&buf[pos..], ctx, depth + 1)?;
+                // Properties: base (parent) datatype
+                let (base_dt, base_consumed) = Self::decode_inner(&buf[pos..], ctx, depth + 1)?;
                 pos += base_consumed;
 
                 if vlen_type == 1 {
                     // String type
                     Ok((Self::VarLenString { charset }, pos))
                 } else {
-                    // Sequence type -- treat as unsupported for now
-                    Err(FormatError::UnsupportedFeature(format!(
-                        "vlen sequence type {}",
-                        vlen_type
-                    )))
+                    // Sequence type: variable-length array of `base_dt`.
+                    Ok((
+                        Self::VarLenSequence {
+                            base: Box::new(base_dt),
+                        },
+                        pos,
+                    ))
                 }
             }
             CLASS_ARRAY => {
@@ -998,6 +1050,9 @@ impl std::fmt::Display for DatatypeMessage {
             Self::VarLenString { charset } => {
                 let cs = if *charset == 1 { "UTF-8" } else { "ASCII" };
                 write!(f, "vlen_string({})", cs)
+            }
+            Self::VarLenSequence { base } => {
+                write!(f, "vlen_sequence<{}>", base)
             }
             Self::Array { dims, base } => {
                 let dim_str: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
@@ -1304,6 +1359,53 @@ mod tests {
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded, msg);
         // Size field in the encoded bytes should be 4+4+4=12
+        let sz = u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]);
+        assert_eq!(sz, 12);
+    }
+
+    // ---- vlen sequence (byte array) roundtrips ----
+
+    #[test]
+    fn roundtrip_vlen_bytes() {
+        let msg = DatatypeMessage::vlen_bytes();
+        let encoded = msg.encode(&ctx());
+        let (decoded, consumed) = DatatypeMessage::decode(&encoded, &ctx()).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, msg);
+        // Base type is a u8 fixed-point.
+        match decoded {
+            DatatypeMessage::VarLenSequence { base } => {
+                assert_eq!(*base, DatatypeMessage::u8_type());
+            }
+            other => panic!("expected VarLenSequence, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn vlen_bytes_class_encoding() {
+        let encoded = DatatypeMessage::vlen_bytes().encode(&ctx());
+        assert_eq!(encoded[0] & 0x0F, CLASS_VLEN); // class = 9
+        assert_eq!(encoded[0] >> 4, DT_VERSION); // version = 1
+        assert_eq!(encoded[1] & 0x0F, 0); // type = sequence (0)
+    }
+
+    #[test]
+    fn vlen_bytes_element_size() {
+        let msg = DatatypeMessage::vlen_bytes();
+        // Same on-disk vlen reference size as a vlen string.
+        assert_eq!(msg.element_size(), 16);
+        assert_eq!(msg.element_size_ctx(&ctx()), 16);
+        assert_eq!(msg.element_size_ctx(&ctx4()), 12);
+    }
+
+    #[test]
+    fn vlen_bytes_4byte_ctx() {
+        let c = ctx4();
+        let msg = DatatypeMessage::vlen_bytes();
+        let encoded = msg.encode(&c);
+        let (decoded, consumed) = DatatypeMessage::decode(&encoded, &c).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, msg);
         let sz = u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]);
         assert_eq!(sz, 12);
     }

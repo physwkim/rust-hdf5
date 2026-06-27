@@ -224,6 +224,47 @@ impl H5Group {
         }
     }
 
+    /// Create a variable-length byte-array dataset and write data within this
+    /// group.
+    ///
+    /// Each `&[u8]` becomes one element of variable length, stored as a vlen
+    /// sequence of `u8`. h5py reads it back as an array of `uint8` arrays.
+    /// Returns a writer-mode handle so attributes can be attached, like
+    /// [`write_vlen_strings`](Self::write_vlen_strings).
+    pub fn write_vlen_bytes(&self, name: &str, items: &[&[u8]]) -> Result<H5Dataset> {
+        let full_name = if self.name == "/" {
+            name.to_string()
+        } else {
+            let trimmed = self.name.trim_start_matches('/');
+            format!("{}/{}", trimmed, name)
+        };
+
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                let idx = writer.create_vlen_bytes_dataset(&full_name, items)?;
+                if self.name != "/" {
+                    writer.assign_dataset_to_group(&self.name, idx)?;
+                }
+                let (shape, element_size, chunked, btree2, fixed_array) =
+                    writer.dataset_handle_parts(idx);
+                Ok(H5Dataset::new_writer(
+                    clone_inner(&self.file_inner),
+                    idx,
+                    shape,
+                    element_size,
+                    chunked,
+                    btree2,
+                    fixed_array,
+                ))
+            }
+            H5FileInner::Reader(_) => {
+                Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
+            }
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
     /// Create a chunked, compressed variable-length string dataset within this group.
     ///
     /// Returns a writer-mode handle to the created dataset so attributes can be

@@ -51,6 +51,23 @@ fn read_back_with_h5py(py: &str, path: &std::path::Path, body: &str) {
     );
 }
 
+/// Run `body` (top-level python statements) with a fresh file opened as `f` in
+/// write mode. The body should populate `f` and is followed by `f.close()`. A
+/// non-zero exit fails the test.
+fn write_with_h5py(py: &str, path: &std::path::Path, body: &str) {
+    let script = format!(
+        "import h5py, numpy as np, sys\nf = h5py.File(r'{}', 'w')\n{}\nf.close()\n",
+        path.display(),
+        body
+    );
+    let status = std::process::Command::new(py)
+        .arg("-c")
+        .arg(&script)
+        .status()
+        .expect("failed to spawn python");
+    assert!(status.success(), "h5py write failed for {}", path.display());
+}
+
 /// F1: a vlen-string dataset created via the group helper returns a handle, so
 /// attributes attach to it; the dataset and its attributes are h5py-readable.
 #[test]
@@ -138,5 +155,52 @@ fn f2_runtime_compound_readable_by_h5py() {
          assert list(ds['id']) == [1, 2, 3], ds['id']\n\
          assert list(ds['val']) == [2.5, 3.5, -4.0], ds['val']\n",
     );
+    std::fs::remove_file(&path).ok();
+}
+
+/// F3 (rust → h5py): a vlen byte-array dataset written by rust-hdf5 is read by
+/// h5py as a vlen `uint8` dataset, element for element.
+#[test]
+fn f3_vlen_bytes_written_by_rust_read_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("f3_bytes_rw");
+    let items: [&[u8]; 4] = [b"abc", b"", &[0u8, 1, 2, 255], b"hi"];
+    {
+        let file = H5File::create(&path).unwrap();
+        file.write_vlen_bytes("blobs", &items).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['blobs']\n\
+         assert h5py.check_vlen_dtype(ds.dtype) == np.uint8, ds.dtype\n\
+         got = [list(int(b) for b in x) for x in ds[...]]\n\
+         assert got == [[97, 98, 99], [], [0, 1, 2, 255], [104, 105]], got\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// F3 (h5py → rust): a vlen `uint8` dataset written by h5py is read back by
+/// rust-hdf5's `read_vlen_bytes`, element for element.
+#[test]
+fn f3_vlen_bytes_written_by_h5py_read_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("f3_bytes_wr");
+    write_with_h5py(
+        py,
+        &path,
+        "dt = h5py.vlen_dtype(np.uint8)\n\
+         ds = f.create_dataset('blobs', (3,), dtype=dt)\n\
+         ds[0] = np.array([1, 2, 3], dtype=np.uint8)\n\
+         ds[1] = np.array([], dtype=np.uint8)\n\
+         ds[2] = np.array([255, 254], dtype=np.uint8)\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("blobs").unwrap();
+    let got = ds.read_vlen_bytes().unwrap();
+    let expected: Vec<Vec<u8>> = vec![vec![1, 2, 3], vec![], vec![255, 254]];
+    assert_eq!(got, expected);
+    drop(file);
     std::fs::remove_file(&path).ok();
 }

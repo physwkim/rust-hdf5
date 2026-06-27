@@ -287,6 +287,46 @@ impl H5File {
         }
     }
 
+    /// Create a variable-length byte-array dataset and write data.
+    ///
+    /// Each `&[u8]` becomes one element of variable length, stored as a vlen
+    /// sequence of `u8` in global heap storage. h5py reads it back as an array
+    /// of `uint8` arrays. Returns a writer-mode handle so attributes can be
+    /// attached, like [`write_vlen_strings`](Self::write_vlen_strings).
+    pub fn write_vlen_bytes(&self, name: &str, items: &[&[u8]]) -> Result<H5Dataset> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                let idx = writer.create_vlen_bytes_dataset(name, items)?;
+                // If the name contains '/', assign the dataset to its parent group
+                if let Some(slash_pos) = name.rfind('/') {
+                    let group_path = &name[..slash_pos];
+                    let abs_group_path = if group_path.starts_with('/') {
+                        group_path.to_string()
+                    } else {
+                        format!("/{}", group_path)
+                    };
+                    writer.assign_dataset_to_group(&abs_group_path, idx)?;
+                }
+                let (shape, element_size, chunked, btree2, fixed_array) =
+                    writer.dataset_handle_parts(idx);
+                Ok(H5Dataset::new_writer(
+                    clone_inner(&self.inner),
+                    idx,
+                    shape,
+                    element_size,
+                    chunked,
+                    btree2,
+                    fixed_array,
+                ))
+            }
+            H5FileInner::Reader(_) => {
+                Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
+            }
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
     /// Create a chunked, compressed variable-length string dataset.
     ///
     /// Like `write_vlen_strings`, but stores the vlen references in chunked
@@ -1451,6 +1491,52 @@ mod integration_tests {
             let ds = file.dataset("names").unwrap();
             let strings = ds.read_vlen_strings().unwrap();
             assert_eq!(strings, vec!["alice", "bob", "charlie"]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn vlen_bytes_write_read() {
+        let path = temp_path("vlen_bytes_wr");
+        let items: [&[u8]; 4] = [b"abc", b"", &[0u8, 1, 2, 255], b"hi"];
+        {
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_bytes("blobs", &items).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("blobs").unwrap();
+            let got = ds.read_vlen_bytes().unwrap();
+            let expected: Vec<Vec<u8>> = items.iter().map(|s| s.to_vec()).collect();
+            assert_eq!(got, expected);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn vlen_bytes_in_group_with_attribute() {
+        use crate::types::VarLenUnicode;
+        let path = temp_path("vlen_bytes_grp");
+        let items: [&[u8]; 2] = [&[1u8, 2, 3], &[9u8, 8, 7, 6]];
+        {
+            let file = H5File::create(&path).unwrap();
+            let grp = file.root_group().create_group("payloads").unwrap();
+            let ds = grp.write_vlen_bytes("frames", &items).unwrap();
+            ds.new_attr::<VarLenUnicode>()
+                .shape(())
+                .create("codec")
+                .unwrap()
+                .write_string("raw")
+                .unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("payloads/frames").unwrap();
+            let got = ds.read_vlen_bytes().unwrap();
+            let expected: Vec<Vec<u8>> = items.iter().map(|s| s.to_vec()).collect();
+            assert_eq!(got, expected);
         }
         std::fs::remove_file(&path).ok();
     }
