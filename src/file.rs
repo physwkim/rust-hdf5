@@ -235,17 +235,43 @@ impl H5File {
     /// The values are written as a 1-D HDF5 array attribute (simple dataspace
     /// `[values.len()]`, on-disk type `T::hdf5_type()`), read back by h5py as a
     /// numpy array — the array counterpart of [`set_attr_numeric`](Self::set_attr_numeric).
+    /// For a multi-dimensional shape use
+    /// [`set_attr_array_numeric_nd`](Self::set_attr_array_numeric_nd).
     pub fn set_attr_array_numeric<T: crate::types::H5Type>(
         &self,
         name: &str,
         values: &[T],
     ) -> Result<()> {
+        self.set_attr_array_numeric_nd(name, values, &[values.len()])
+    }
+
+    /// Add a numeric (or bool) **N-dimensional array** attribute to the file
+    /// (root group).
+    ///
+    /// `shape` gives the dataspace dimensions; `values` is the row-major data
+    /// and its length must equal the product of `shape` (an empty `shape` is a
+    /// scalar, requiring exactly one value). Read back by h5py as a numpy array
+    /// of that shape. [`set_attr_array_numeric`](Self::set_attr_array_numeric)
+    /// is the 1-D convenience form.
+    pub fn set_attr_array_numeric_nd<T: crate::types::H5Type>(
+        &self,
+        name: &str,
+        values: &[T],
+        shape: &[usize],
+    ) -> Result<()> {
         use crate::format::messages::attribute::AttributeMessage;
+        let n: usize = shape.iter().product();
+        if values.len() != n {
+            return Err(Hdf5Error::InvalidState(format!(
+                "attribute '{name}' shape {shape:?} needs {n} elements, got {}",
+                values.len()
+            )));
+        }
         let es = T::element_size();
         // Safety: `T: H5Type` is a `Copy` POD numeric whose byte width is `es`.
         let raw =
             unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * es) };
-        let dims = [values.len() as u64];
+        let dims: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
         let attr = AttributeMessage::array_numeric(name, T::hdf5_type(), &dims, raw.to_vec());
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {

@@ -304,6 +304,47 @@ fn arr_string_and_numeric_array_attrs_readable_by_h5py() {
     std::fs::remove_file(&path).ok();
 }
 
+/// N-D numeric array attributes (`set_attr_array_numeric_nd`): a 2x3 attribute
+/// on the root and a 2x2x2 attribute on a group must come back from h5py as
+/// numpy arrays with the exact multi-dimensional shape and row-major values.
+#[test]
+fn nd_numeric_array_attrs_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("nd_array_attrs");
+    {
+        let file = H5File::create(&path).unwrap();
+        // Root: 2x3 row-major i32.
+        file.set_attr_array_numeric_nd("mat", &[1i32, 2, 3, 4, 5, 6], &[2, 3])
+            .unwrap();
+        // Group: 2x2x2 row-major f64.
+        let grp = file.root_group().create_group("grp").unwrap();
+        grp.set_attr_array_numeric_nd(
+            "cube",
+            &[0.0f64, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+            &[2, 2, 2],
+        )
+        .unwrap();
+        // Length/shape mismatch must error, not silently truncate.
+        assert!(file
+            .set_attr_array_numeric_nd("bad", &[1i32, 2, 3], &[2, 2])
+            .is_err());
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "mat = f.attrs['mat']\n\
+         assert mat.dtype == np.dtype('<i4'), mat.dtype\n\
+         assert mat.shape == (2, 3), mat.shape\n\
+         assert mat.tolist() == [[1, 2, 3], [4, 5, 6]], mat.tolist()\n\
+         cube = f['grp'].attrs['cube']\n\
+         assert cube.dtype == np.dtype('<f8'), cube.dtype\n\
+         assert cube.shape == (2, 2, 2), cube.shape\n\
+         assert cube.tolist() == [[[0.0, 1.0], [2.0, 3.0]], [[4.0, 5.0], [6.0, 7.0]]], cube.tolist()\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// A: a filter requested without explicit chunk dimensions auto-chunks (whole
 /// dataset = one chunk) and `write_raw` populates it. h5py must see a gzip-
 /// compressed, chunked dataset with the right values — proving the filter is
