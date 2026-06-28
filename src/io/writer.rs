@@ -4815,7 +4815,7 @@ mod tests {
     fn parallel_batch_write_roundtrip() {
         let path = temp_path("parallel_batch");
 
-        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let writer = Hdf5Writer::create(&path).unwrap();
         let idx = writer
             .create_chunked_dataset(
                 "data",
