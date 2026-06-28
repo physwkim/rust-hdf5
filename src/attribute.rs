@@ -22,7 +22,7 @@ use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::datatype::DatatypeMessage;
 
 use crate::error::{Hdf5Error, Result};
-use crate::file::{borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
+use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
 use crate::types::VarLenUnicode;
 
 /// A handle to an HDF5 attribute.
@@ -67,8 +67,8 @@ impl H5Attribute {
     /// attribute — the string is stored in a global heap and h5py reads it
     /// back as a Python `str` (matching the `VarLenUnicode` type name).
     pub fn write_scalar(&self, value: &VarLenUnicode) -> Result<()> {
-        let mut inner = borrow_inner_mut(&self.file_inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 let attr_msg = writer.vlen_string_attribute(&self.name, &value.0)?;
                 writer.add_dataset_attribute(self.ds_index, attr_msg)?;
@@ -101,8 +101,8 @@ impl H5Attribute {
         let raw = unsafe { std::slice::from_raw_parts(value as *const T as *const u8, es) };
         let attr_msg = AttributeMessage::scalar_numeric(&self.name, T::hdf5_type(), raw.to_vec());
 
-        let mut inner = borrow_inner_mut(&self.file_inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 writer.add_dataset_attribute(self.ds_index, attr_msg)?;
                 Ok(())
@@ -154,8 +154,8 @@ impl H5Attribute {
         let attr_msg =
             AttributeMessage::array_numeric(&self.name, T::hdf5_type(), &dims_u64, raw.to_vec());
 
-        let mut inner = borrow_inner_mut(&self.file_inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 writer.add_dataset_attribute(self.ds_index, attr_msg)?;
                 Ok(())

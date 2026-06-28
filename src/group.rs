@@ -63,8 +63,8 @@ impl H5Group {
             format!("{}/{}", self.name, name)
         };
 
-        let mut inner = borrow_inner_mut(&self.file_inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 writer.create_group(&self.name, name)?;
             }
@@ -105,8 +105,8 @@ impl H5Group {
     /// data.link("data", "/instrument/data").unwrap();
     /// ```
     pub fn link(&self, link_name: &str, target_path: &str) -> Result<()> {
-        let mut inner = borrow_inner_mut(&self.file_inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 writer.create_hard_link(&self.name, link_name, target_path)?;
                 Ok(())
@@ -198,8 +198,8 @@ impl H5Group {
             format!("{}/{}", trimmed, name)
         };
 
-        let mut inner = borrow_inner_mut(&self.file_inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_string_dataset(&full_name, strings)?;
                 if self.name != "/" {
@@ -239,8 +239,8 @@ impl H5Group {
             format!("{}/{}", trimmed, name)
         };
 
-        let mut inner = borrow_inner_mut(&self.file_inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_bytes_dataset(&full_name, items)?;
                 if self.name != "/" {
@@ -283,8 +283,8 @@ impl H5Group {
             format!("{}/{}", trimmed, name)
         };
 
-        let mut inner = borrow_inner_mut(&self.file_inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_string_dataset_compressed(
                     &full_name, strings, chunk_size, pipeline,
@@ -329,8 +329,8 @@ impl H5Group {
             format!("{}/{}", trimmed, name)
         };
 
-        let mut inner = borrow_inner_mut(&self.file_inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer
                     .create_appendable_vlen_string_dataset(&full_name, chunk_size, pipeline)?;
@@ -365,8 +365,8 @@ impl H5Group {
             format!("{}/{}", trimmed, name)
         };
 
-        let mut inner = borrow_inner_mut(&self.file_inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 let ds_index = writer
                     .dataset_index(&full_name)
@@ -481,8 +481,8 @@ impl H5Group {
     /// a variable-length UTF-8 string (read back as a Python `str` by h5py),
     /// not a fixed-length string.
     pub fn set_attr_string(&self, name: &str, value: &str) -> Result<()> {
-        let mut inner = borrow_inner_mut(&self.file_inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 let attr = writer.vlen_string_attribute(name, value)?;
                 if self.name == "/" {
@@ -515,8 +515,8 @@ impl H5Group {
     /// Route an attribute to the writer: the root group goes to the
     /// file-level attribute list, any other group to its own header.
     fn add_attr(&self, attr: AttributeMessage) -> Result<()> {
-        let mut inner = borrow_inner_mut(&self.file_inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 if self.name == "/" {
                     writer.add_root_attribute(attr);

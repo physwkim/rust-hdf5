@@ -272,8 +272,8 @@ impl<T: H5Type> DatasetBuilder<T> {
             let is_fixed_array = n_unlimited == 0;
 
             let index = {
-                let mut inner = borrow_inner_mut(&self.file_inner);
-                match &mut *inner {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
                     H5FileInner::Writer(writer) => {
                         let idx = if is_btree2 {
                             if wants_filter {
@@ -371,8 +371,8 @@ impl<T: H5Type> DatasetBuilder<T> {
         } else {
             // Contiguous dataset (original path)
             let index = {
-                let mut inner = borrow_inner_mut(&self.file_inner);
-                match &mut *inner {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
                     H5FileInner::Writer(writer) => {
                         let idx = writer.create_dataset(&full_name, datatype, &dims_u64)?;
                         if let Some(ref gp) = group_path {
@@ -1239,8 +1239,8 @@ impl H5Dataset {
                 let coords: Vec<u64> = chunk_coords.iter().map(|&c| c as u64).collect();
                 let btree2 = *btree2;
                 let fixed_array = *fixed_array;
-                let mut inner = borrow_inner_mut(&self.file_inner);
-                let writer = match &mut *inner {
+                let inner = borrow_inner(&self.file_inner);
+                let writer = match &*inner {
                     H5FileInner::Writer(w) => w,
                     _ => {
                         return Err(Hdf5Error::InvalidState(
@@ -1408,8 +1408,8 @@ impl H5Dataset {
                 let ds_index = *index;
                 let es = *element_size;
 
-                let mut inner = borrow_inner_mut(&self.file_inner);
-                let writer = match &mut *inner {
+                let inner = borrow_inner(&self.file_inner);
+                let writer = match &*inner {
                     H5FileInner::Writer(w) => w,
                     _ => {
                         return Err(Hdf5Error::InvalidState(
@@ -1552,8 +1552,8 @@ impl H5Dataset {
                 }
 
                 let dims_u64: Vec<u64> = new_dims.iter().map(|&d| d as u64).collect();
-                let mut inner = borrow_inner_mut(&self.file_inner);
-                match &mut *inner {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
                     H5FileInner::Writer(writer) => {
                         writer.extend_dataset(*index, &dims_u64)?;
                         Ok(())
@@ -1583,8 +1583,8 @@ impl H5Dataset {
         match &self.info {
             DatasetInfo::Writer { index, .. } => {
                 let dims_u64: Vec<u64> = new_dims.iter().map(|&d| d as u64).collect();
-                let mut inner = borrow_inner_mut(&self.file_inner);
-                match &mut *inner {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
                     H5FileInner::Writer(writer) => {
                         writer.set_dataset_extent(*index, &dims_u64)?;
                         Ok(())
@@ -1604,8 +1604,8 @@ impl H5Dataset {
     pub fn flush(&self) -> Result<()> {
         match &self.info {
             DatasetInfo::Writer { index, .. } => {
-                let mut inner = borrow_inner_mut(&self.file_inner);
-                match &mut *inner {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
                     H5FileInner::Writer(writer) => {
                         writer.flush_dataset(*index)?;
                         Ok(())
@@ -1719,8 +1719,8 @@ impl H5Dataset {
                 let raw =
                     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
 
-                let mut inner = borrow_inner_mut(&self.file_inner);
-                match &mut *inner {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
                     H5FileInner::Writer(writer) => {
                         writer.write_slice(*index, &starts_u64, &counts_u64, raw)?;
                         Ok(())

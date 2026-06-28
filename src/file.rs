@@ -203,8 +203,8 @@ impl H5File {
     /// The value is stored as a variable-length UTF-8 string (read back as a
     /// Python `str` by h5py), not a fixed-length string.
     pub fn set_attr_string(&self, name: &str, value: &str) -> Result<()> {
-        let mut inner = borrow_inner_mut(&self.inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 let attr = writer.vlen_string_attribute(name, value)?;
                 writer.add_root_attribute(attr);
@@ -220,8 +220,8 @@ impl H5File {
         let es = T::element_size();
         let raw = unsafe { std::slice::from_raw_parts(value as *const T as *const u8, es) };
         let attr = AttributeMessage::scalar_numeric(name, T::hdf5_type(), raw.to_vec());
-        let mut inner = borrow_inner_mut(&self.inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 writer.add_root_attribute(attr);
                 Ok(())
@@ -265,8 +265,8 @@ impl H5File {
     /// This is a convenience method for writing h5py-compatible vlen string
     /// datasets using global heap storage.
     pub fn write_vlen_strings(&self, name: &str, strings: &[&str]) -> Result<H5Dataset> {
-        let mut inner = borrow_inner_mut(&self.inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_string_dataset(name, strings)?;
                 // If the name contains '/', assign the dataset to its parent group
@@ -305,8 +305,8 @@ impl H5File {
     /// of `uint8` arrays. Returns a writer-mode handle so attributes can be
     /// attached, like [`write_vlen_strings`](Self::write_vlen_strings).
     pub fn write_vlen_bytes(&self, name: &str, items: &[&[u8]]) -> Result<H5Dataset> {
-        let mut inner = borrow_inner_mut(&self.inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_bytes_dataset(name, items)?;
                 // If the name contains '/', assign the dataset to its parent group
@@ -351,8 +351,8 @@ impl H5File {
         chunk_size: usize,
         pipeline: FilterPipeline,
     ) -> Result<H5Dataset> {
-        let mut inner = borrow_inner_mut(&self.inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer
                     .create_vlen_string_dataset_compressed(name, strings, chunk_size, pipeline)?;
@@ -394,8 +394,8 @@ impl H5File {
         chunk_size: usize,
         pipeline: Option<FilterPipeline>,
     ) -> Result<H5Dataset> {
-        let mut inner = borrow_inner_mut(&self.inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx =
                     writer.create_appendable_vlen_string_dataset(name, chunk_size, pipeline)?;
@@ -429,8 +429,8 @@ impl H5File {
 
     /// Append variable-length strings to an existing chunked vlen string dataset.
     pub fn append_vlen_strings(&self, name: &str, strings: &[&str]) -> Result<()> {
-        let mut inner = borrow_inner_mut(&self.inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 let ds_index = writer
                     .dataset_index(name)
@@ -448,8 +448,8 @@ impl H5File {
     /// Delete a dataset by name. The dataset is unlinked on close;
     /// file space is not reclaimed.
     pub fn delete_dataset(&self, name: &str) -> Result<()> {
-        let mut inner = borrow_inner_mut(&self.inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 writer.delete_dataset(name)?;
                 Ok(())
@@ -461,8 +461,8 @@ impl H5File {
     /// Delete a group and all its child datasets/sub-groups.
     /// File space is not reclaimed.
     pub fn delete_group(&self, name: &str) -> Result<()> {
-        let mut inner = borrow_inner_mut(&self.inner);
-        match &mut *inner {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
             H5FileInner::Writer(writer) => {
                 writer.delete_group(name)?;
                 Ok(())
