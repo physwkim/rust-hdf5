@@ -240,8 +240,10 @@ impl<T: H5Type> DatasetBuilder<T> {
 
         // A filter pipeline requires chunked storage. When a filter is
         // requested without explicit chunk dimensions, store the whole
-        // dataset as a single chunk (matching h5py's auto-chunking) instead
-        // of silently dropping the filter on the contiguous path.
+        // dataset as a single chunk instead of silently dropping the filter
+        // on the contiguous path. (This is one whole-dataset chunk, not
+        // h5py's ~1 MiB chunk-size heuristic; pass explicit chunk dimensions
+        // for large datasets.)
         let wants_filter = self.custom_pipeline.is_some()
             || self.shuffle_deflate_level.is_some()
             || self.deflate_level.is_some();
