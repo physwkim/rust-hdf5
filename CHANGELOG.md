@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.2.25
+
+### Added
+
+- The `threadsafe` feature now provides real write concurrency. Built with
+  `--features threadsafe`, `H5File` is `Send + Sync` and writer operations —
+  create, append, extend, chunk write, and metadata — run concurrently across
+  *distinct* datasets on a shared `&H5File` (e.g. a Rayon `par_iter` writing
+  one dataset per task). The single-threaded default build keeps its
+  `Rc`/`RefCell` zero-overhead path unchanged. Internally this is a lock-free
+  `AtomicU64` file-space allocator, positioned `pread`/`pwrite` with no shared
+  cursor, a per-dataset-`Mutex` registry behind a read-mostly `RwLock`, and
+  compression run outside the per-dataset lock. Verified with loom interleaving
+  models and multi-threaded create/append/metadata stress tests plus h5py
+  read-back. Concurrent writes to a *single* dataset remain unsupported;
+  serialize those externally.
+- Runtime compound (record) datatypes: `DatasetBuilder::datatype(...)` overrides
+  the element type and `H5Dataset::write_raw_bytes`/`read_raw_bytes` move raw
+  element bytes, so a `{id: i32, val: f64}` record round-trips and reads back as
+  a structured array in h5py.
+- Variable-length byte arrays — a vlen sequence of `u8` — via the
+  `VarLenSequence` datatype, with create/append and `read_vlen_bytes`.
+- `Group::dataset_writer(...)`, and the vlen-string dataset helpers now return an
+  `H5Dataset` so attributes can be attached to those datasets.
+
+### Changed
+
+- Compression is now usable through the natural builder API. Requesting a filter
+  (deflate/zstd/`filter_pipeline`) without explicit chunk dimensions auto-chunks
+  the dataset as one whole-dataset chunk instead of silently dropping to the
+  contiguous path and discarding the filter, and `write_raw`/`write_raw_bytes`
+  now accept chunked datasets, scattering the row-major image across the chunk
+  grid (edge chunks zero-padded).
+- String attributes are written as variable-length UTF-8 (read back as Python
+  `str` by h5py) instead of fixed-length strings (which h5py returned as
+  `bytes`).
+
+### Fixed
+
+- `H5File::close()` (and `SwmrFileWriter::close()`) finalize exactly once: a
+  finalize failure is now reported through the returned `Result` and is no
+  longer re-attempted by the writer's `Drop`.
+- Concurrent creation of two objects with the same name (under `threadsafe`) now
+  reliably fails for all but one creator instead of racing past the
+  duplicate-name check and writing an invalid file with two same-named links.
+- The writer no longer silently swallows a finalize error on drop; it is now
+  reported on stderr (use `close()` to handle it as a `Result`).
+- The `threadsafe` feature no longer builds on targets that lack positioned file
+  I/O (neither Unix nor Windows), where the seek-based fallback would race the
+  shared file cursor; it now fails to compile there with an explanatory message.
+
 ## 0.2.24
 
 ### Fixed
