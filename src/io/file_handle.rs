@@ -3,6 +3,22 @@ use std::path::Path;
 
 use crate::io::locking::{self, FileLocking, LockMode};
 
+// The `threadsafe` writer's safety rests on positioned I/O: concurrent
+// pread/pwrite at distinct offsets on a shared `&File` never race because they
+// neither consult nor move a file cursor. On a target that is neither Unix nor
+// Windows there is no positioned API, so the pwrite_all/pread fallbacks below
+// fall back to seek+read/write on the shared cursor — which IS a data race
+// when the writer methods run concurrently through the shared read guard. The
+// in-fallback comment assumes "the writer must stay serialized," but under
+// `threadsafe` it is not. Rather than let that silent-corruption path be
+// reachable, refuse to build the feature where its premise does not hold.
+#[cfg(all(feature = "threadsafe", not(any(unix, windows))))]
+compile_error!(
+    "the `threadsafe` feature requires positioned file I/O (pread/pwrite), \
+     which is only available on Unix and Windows targets; on this target the \
+     seek-based fallback would race the shared file cursor across threads"
+);
+
 /// Wraps `std::fs::File` with positioned (pread / pwrite) I/O convenience
 /// methods.
 ///
