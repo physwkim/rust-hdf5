@@ -1966,6 +1966,7 @@ mod tests {
     // A: a filter set without explicit chunk dimensions must auto-chunk (whole
     // dataset = one chunk) rather than silently drop the filter on the
     // contiguous path. write_raw then populates that single chunk.
+    #[cfg(feature = "deflate")]
     #[test]
     fn filter_without_chunk_autochunks_and_roundtrips() {
         let path = temp_path("autochunk_filter");
@@ -1998,6 +1999,7 @@ mod tests {
     // B: write_raw on an explicitly chunked + compressed dataset scatters the
     // full row-major image across a multi-chunk grid, including edge chunks
     // (7/3 -> 3,3,1 along dim0; 5/2 -> 2,2,1 along dim1).
+    #[cfg(feature = "deflate")]
     #[test]
     fn write_raw_multichunk_edge_roundtrips() {
         let path = temp_path("multichunk_edge");

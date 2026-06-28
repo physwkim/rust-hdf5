@@ -253,6 +253,7 @@ fn c_vlen_string_attrs_readable_as_str_by_h5py() {
 /// dataset = one chunk) and `write_raw` populates it. h5py must see a gzip-
 /// compressed, chunked dataset with the right values — proving the filter is
 /// honored, not silently dropped on a contiguous layout.
+#[cfg(feature = "deflate")]
 #[test]
 fn a_autochunk_deflate_readable_by_h5py() {
     let Some(py) = python() else { return };
@@ -283,6 +284,7 @@ fn a_autochunk_deflate_readable_by_h5py() {
 /// B: `write_raw` on an explicitly chunked + compressed 2-D dataset scatters
 /// the full row-major image across a multi-chunk grid with edge chunks
 /// (7/3 and 5/2). h5py must reassemble the exact array and see gzip+chunks.
+#[cfg(feature = "deflate")]
 #[test]
 fn b_multichunk_deflate_readable_by_h5py() {
     let Some(py) = python() else { return };
