@@ -378,7 +378,7 @@ impl SwmrWriter {
         }
 
         // Current frame count (dim 0).
-        let frame_idx = self.writer.datasets[ds_index].dataspace.dims[0];
+        let frame_idx = self.writer.ds(ds_index).lock().dataspace.dims[0];
 
         let dims = self.writer.dataset_dims(ds_index).to_vec();
         let chunk_dims = self
@@ -404,7 +404,7 @@ impl SwmrWriter {
         }
 
         // `data` must hold exactly one frame.
-        let elem_size = self.writer.datasets[ds_index].datatype.element_size() as usize;
+        let elem_size = self.writer.ds(ds_index).lock().datatype.element_size() as usize;
         let frame_elems: u64 = dims[1..].iter().product();
         let expected = frame_elems as usize * elem_size;
         if data.len() != expected {
@@ -438,7 +438,7 @@ impl SwmrWriter {
         }
 
         // 2. Extend dimensions.
-        let mut new_dims = self.writer.datasets[ds_index].dataspace.dims.clone();
+        let mut new_dims = self.writer.ds(ds_index).lock().dataspace.dims.clone();
         new_dims[0] = frame_idx + 1;
         self.writer.extend_dataset(ds_index, &new_dims)?;
 
@@ -459,12 +459,7 @@ impl SwmrWriter {
         chunk_coords: &[u64],
         data: &[u8],
     ) -> IoResult<()> {
-        if self.writer.datasets[ds_index]
-            .mut_state
-            .lock()
-            .fixed_array
-            .is_none()
-        {
+        if self.writer.ds(ds_index).lock().fixed_array.is_none() {
             return Err(crate::io::IoError::InvalidState(
                 "write_chunk_at requires a fixed grid dataset (create_grid_dataset)".into(),
             ));
@@ -496,8 +491,8 @@ impl SwmrWriter {
             .push(data.to_vec());
 
         // The logical frame count tracks the exact number appended.
-        let frame_idx = self.writer.datasets[ds_index].dataspace.dims[0];
-        let mut new_dims = self.writer.datasets[ds_index].dataspace.dims.clone();
+        let mut new_dims = self.writer.ds(ds_index).lock().dataspace.dims.clone();
+        let frame_idx = new_dims[0];
         new_dims[0] = frame_idx + 1;
         self.writer.extend_dataset(ds_index, &new_dims)?;
 
@@ -533,7 +528,7 @@ impl SwmrWriter {
         let count = frames.len() as u64;
         // Band index: the logical extent already counts every appended
         // frame, so the band starts at `dim0 - count`.
-        let dim0 = self.writer.datasets[ds_index].dataspace.dims[0];
+        let dim0 = self.writer.ds(ds_index).lock().dataspace.dims[0];
         let band = (dim0 - count) / n;
 
         let k = frame_dims.len();
@@ -581,9 +576,10 @@ impl SwmrWriter {
         // Step 1: Flush chunk index structures for all chunked datasets —
         // extensible array (streaming), fixed array (fixed grid), and v2
         // B-tree alike, matching finalize_for_swmr.
-        for i in 0..self.writer.datasets.len() {
+        for i in 0..self.writer.dataset_count() {
             let is_indexed = {
-                let m = self.writer.datasets[i].mut_state.lock();
+                let ds = self.writer.ds(i);
+                let m = ds.lock();
                 m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some()
             };
             if is_indexed {
@@ -594,8 +590,8 @@ impl SwmrWriter {
 
         if self.swmr_active {
             // Step 2: Re-write dataset object headers in place with updated dims.
-            for i in 0..self.writer.datasets.len() {
-                if self.writer.datasets[i].obj_header_written_addr.is_some() {
+            for i in 0..self.writer.dataset_count() {
+                if self.writer.ds(i).lock().obj_header_written_addr.is_some() {
                     self.writer.write_dataset_header_inplace(i)?;
                 }
             }

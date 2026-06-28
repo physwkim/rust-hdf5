@@ -458,7 +458,7 @@ impl H5Group {
             H5FileInner::Writer(writer) => {
                 for name in writer.dataset_names() {
                     let stripped = if prefix.is_empty() {
-                        name
+                        name.as_str()
                     } else if let Some(rest) = name.strip_prefix(&prefix) {
                         rest
                     } else {

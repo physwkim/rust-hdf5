@@ -1459,7 +1459,8 @@ impl H5Dataset {
                 // Merge buffered data with new data. Scope the slot guard: the
                 // loop below calls `write_chunk`, which re-locks the same slot.
                 let (buffered_frames, mut combined) = {
-                    let mut m = writer.datasets[ds_index].mut_state.lock();
+                    let ds = writer.ds(ds_index);
+                    let mut m = ds.lock();
                     let buffered_frames = m.append_buffered_frames as usize;
                     let combined = std::mem::take(&mut m.append_buffer);
                     m.append_buffered_frames = 0;
@@ -1518,7 +1519,8 @@ impl H5Dataset {
                         frame_pos += frames_to_fill;
                     } else {
                         // Partial chunk — buffer for next append
-                        let mut m = writer.datasets[ds_index].mut_state.lock();
+                        let ds = writer.ds(ds_index);
+                        let mut m = ds.lock();
                         m.append_buffer = combined[byte_pos..total_bytes].to_vec();
                         m.append_buffered_frames = remaining_frames as u64;
                         frame_pos = total_frames;
@@ -2958,7 +2960,7 @@ mod tests {
             file.close().unwrap();
         }
         {
-            let mut w = crate::io::writer::Hdf5Writer::open_append(&path).unwrap();
+            let w = crate::io::writer::Hdf5Writer::open_append(&path).unwrap();
             let idx = w.dataset_index("v").unwrap();
             for c in 300..900u64 {
                 w.write_chunk(idx, c, &(c as i32).to_le_bytes()).unwrap();
@@ -3076,7 +3078,7 @@ mod tests {
             let writer = crate::io::writer::Hdf5Writer::open_append(&path).unwrap();
             let idx = writer.dataset_index("data").unwrap();
             assert_eq!(
-                writer.datasets[idx].fill_value,
+                writer.ds(idx).lock().fill_value,
                 Some(2.5f32.to_le_bytes().to_vec())
             );
         }
@@ -3109,7 +3111,7 @@ mod tests {
             let writer = crate::io::writer::Hdf5Writer::open_append(&path).unwrap();
             let idx = writer.dataset_index("vals").unwrap();
             assert_eq!(
-                writer.datasets[idx].fill_value,
+                writer.ds(idx).lock().fill_value,
                 Some((-7i32).to_le_bytes().to_vec())
             );
         }
@@ -3220,7 +3222,7 @@ mod tests {
     #[test]
     fn fill_value_size_mismatch_errors() {
         let path = temp_path("fill_value_mismatch");
-        let mut writer = crate::io::writer::Hdf5Writer::create(&path).unwrap();
+        let writer = crate::io::writer::Hdf5Writer::create(&path).unwrap();
         let dt = <f64 as crate::types::H5Type>::hdf5_type();
         let idx = writer.create_dataset("d", dt, &[4u64]).unwrap();
         // f64 element size is 8; a 4-byte fill value must be rejected.
@@ -3411,7 +3413,8 @@ mod tests {
         {
             let w = crate::io::writer::Hdf5Writer::open_append(&path).unwrap();
             let idx = w.dataset_index("v").unwrap();
-            let m = w.datasets[idx].mut_state.lock();
+            let ds = w.ds(idx);
+            let m = ds.lock();
             let entry = &m
                 .chunked
                 .as_ref()

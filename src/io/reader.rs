@@ -3301,7 +3301,7 @@ mod tests {
         let path = temp_path("detect_v3");
         {
             use crate::io::writer::Hdf5Writer;
-            let mut writer = Hdf5Writer::create(&path).unwrap();
+            let writer = Hdf5Writer::create(&path).unwrap();
             let datatype = crate::format::messages::datatype::DatatypeMessage::i32_type();
             let idx = writer.create_dataset("test", datatype, &[4]).unwrap();
             let data = [1i32, 2, 3, 4];

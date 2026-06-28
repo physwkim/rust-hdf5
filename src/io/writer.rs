@@ -184,24 +184,36 @@ impl<T> Slot<T> {
     }
 }
 
-/// Per-dataset state mutated by the streaming write path (chunk writes and
-/// append buffering), held behind a [`Slot`] so concurrent writes to
-/// different datasets don't contend. The immutable-after-create dataset
-/// parameters stay directly on [`DatasetInfo`].
-pub struct DatasetMut {
-    /// Chunked storage info (None for contiguous).
-    pub chunked: Option<ChunkedDatasetInfo>,
-    /// Fixed array chunked storage info.
-    pub fixed_array: Option<FixedArrayDatasetInfo>,
-    /// B-tree v2 chunked storage info.
-    pub btree_v2: Option<Bt2DatasetInfo>,
-    /// Buffer for partially filled chunks during append.
-    pub append_buffer: Vec<u8>,
-    /// Number of frames accumulated in `append_buffer`.
-    pub append_buffered_frames: u64,
-}
+/// Reference-counted shared pointer, feature-selected. The single-thread
+/// build uses `Rc` (no atomics); the `threadsafe` build uses `Arc` so a
+/// dataset/group slot can be cloned out of the registry and locked on its
+/// own — letting writes to *different* datasets proceed concurrently without
+/// holding the registry lock. See `docs/threadsafe-fine-grained-locking.md`
+/// (Stage 3).
+#[cfg(not(feature = "threadsafe"))]
+pub(crate) type Shared<T> = std::rc::Rc<T>;
+#[cfg(feature = "threadsafe")]
+pub(crate) type Shared<T> = std::sync::Arc<T>;
+
+/// A single dataset's metadata behind its own [`Slot`], reference-counted so
+/// a writer can clone it out of the registry (releasing the registry lock)
+/// and then lock just this one dataset. Two threads writing different
+/// datasets take different `DatasetRef` locks and never contend; the same
+/// dataset's writes serialize, which is required because one chunk index is
+/// not concurrently mutable.
+pub(crate) type DatasetRef = Shared<Slot<DatasetInfo>>;
+
+/// A single group's metadata behind its own [`Slot`], reference-counted like
+/// [`DatasetRef`].
+pub(crate) type GroupRef = Shared<Slot<GroupInfo>>;
 
 /// Metadata for a dataset being written.
+///
+/// The whole struct lives behind a per-dataset [`Slot`] (via [`DatasetRef`]).
+/// The streaming write path locks it only briefly — compression runs *outside*
+/// the lock — so writes to different datasets do not contend, and a structural
+/// op (create/delete) that scans names only momentarily touches a sibling
+/// slot.
 pub struct DatasetInfo {
     /// Link name within the root group.
     pub name: String,
@@ -215,10 +227,16 @@ pub struct DatasetInfo {
     pub data_addr: u64,
     /// Size of the raw data in bytes (contiguous only).
     pub data_size: u64,
-    /// Per-dataset state mutated by the streaming write path
-    /// (chunked/fixed-array/btree-v2 index + append buffer), behind a
-    /// [`Slot`] so concurrent writes to different datasets don't contend.
-    pub mut_state: Slot<DatasetMut>,
+    /// Chunked storage info (None for contiguous).
+    pub chunked: Option<ChunkedDatasetInfo>,
+    /// Fixed array chunked storage info.
+    pub fixed_array: Option<FixedArrayDatasetInfo>,
+    /// B-tree v2 chunked storage info.
+    pub btree_v2: Option<Bt2DatasetInfo>,
+    /// Buffer for partially filled chunks during append.
+    pub append_buffer: Vec<u8>,
+    /// Number of frames accumulated in `append_buffer`.
+    pub append_buffered_frames: u64,
     /// Attributes attached to this dataset.
     pub attributes: Vec<AttributeMessage>,
     /// File offset where the dataset object header was written (for SWMR in-place rewrites).
@@ -338,6 +356,7 @@ pub enum HardLinkTarget {
 /// The HDF5 file format makes every group entry a `name -> object header
 /// address` mapping, so a hard link is just a second such entry pointing at
 /// an already-written object. No data is copied.
+#[derive(Clone)]
 pub struct HardLink {
     /// Parent group index (`None` = the root group).
     pub parent: Option<usize>,
@@ -368,13 +387,19 @@ pub struct Hdf5Writer {
     handle: FileHandle,
     allocator: FileAllocator,
     ctx: FormatContext,
-    pub(crate) datasets: Vec<DatasetInfo>,
-    pub(crate) groups: Vec<GroupInfo>,
+    /// Dataset registry. The outer [`Slot`] guards the spine (push on create,
+    /// index/clone on access) and is held only briefly; each [`DatasetRef`]
+    /// carries one dataset's metadata behind its own lock. A writer clones
+    /// the `DatasetRef` out (releasing this lock) before doing the long
+    /// per-dataset work, so a create never blocks an in-flight write.
+    pub(crate) datasets: Slot<Vec<DatasetRef>>,
+    /// Group registry, same shape as [`Self::datasets`].
+    pub(crate) groups: Slot<Vec<GroupRef>>,
     /// User-created hard links (additional names for existing objects),
     /// resolved and emitted during finalize.
-    pub(crate) hard_links: Vec<HardLink>,
+    pub(crate) hard_links: Slot<Vec<HardLink>>,
     /// Attributes attached to the root group (file-level attributes).
-    pub(crate) root_attributes: Vec<crate::format::messages::attribute::AttributeMessage>,
+    pub(crate) root_attributes: Slot<Vec<crate::format::messages::attribute::AttributeMessage>>,
     closed: bool,
     /// Address of the root group object header (set after first finalize).
     root_group_addr: Option<u64>,
@@ -423,10 +448,10 @@ impl Hdf5Writer {
             handle,
             allocator,
             ctx,
-            datasets: Vec::new(),
-            groups: Vec::new(),
-            hard_links: Vec::new(),
-            root_attributes: Vec::new(),
+            datasets: Slot::new(Vec::new()),
+            groups: Slot::new(Vec::new()),
+            hard_links: Slot::new(Vec::new()),
+            root_attributes: Slot::new(Vec::new()),
             closed: false,
             root_group_addr: None,
             root_group_encoded_size: 0,
@@ -436,6 +461,72 @@ impl Hdf5Writer {
     /// Provide public access to the format context.
     pub fn ctx(&self) -> &FormatContext {
         &self.ctx
+    }
+
+    /// Number of dataset slots in the registry (including soft-deleted ones).
+    pub(crate) fn dataset_count(&self) -> usize {
+        self.datasets.lock().len()
+    }
+
+    /// Clone out the [`DatasetRef`] for `index`, releasing the registry lock
+    /// immediately. Lock the returned ref to read or mutate that one dataset.
+    ///
+    /// Panics on an out-of-range index, exactly like the `Vec` indexing it
+    /// replaces; bounds-checking callers consult [`Self::dataset_count`] first.
+    ///
+    /// MUST NOT be called while the registry [`Slot`] is already locked (it
+    /// would deadlock the `threadsafe` mutex / panic the single-thread
+    /// `RefCell`): collect the refs you need, drop the registry guard, then work.
+    pub(crate) fn ds(&self, index: usize) -> DatasetRef {
+        Shared::clone(&self.datasets.lock()[index])
+    }
+
+    /// Number of group slots in the registry (including soft-deleted ones).
+    pub(crate) fn group_count(&self) -> usize {
+        self.groups.lock().len()
+    }
+
+    /// Clone out the [`GroupRef`] for `index`. Same contract as [`Self::ds`].
+    pub(crate) fn grp(&self, index: usize) -> GroupRef {
+        Shared::clone(&self.groups.lock()[index])
+    }
+
+    /// Push a freshly-built dataset into the registry and return its index.
+    /// Takes the registry lock only for the push, so it does not block an
+    /// in-flight write that already cloned its own [`DatasetRef`] out.
+    pub(crate) fn push_dataset(&self, info: DatasetInfo) -> usize {
+        let mut reg = self.datasets.lock();
+        let idx = reg.len();
+        reg.push(Shared::new(Slot::new(info)));
+        idx
+    }
+
+    /// Push a freshly-built group into the registry and return its index.
+    pub(crate) fn push_group(&self, info: GroupInfo) -> usize {
+        let mut reg = self.groups.lock();
+        let idx = reg.len();
+        reg.push(Shared::new(Slot::new(info)));
+        idx
+    }
+
+    /// Snapshot every [`DatasetRef`] (spine lock held only for the clone).
+    /// Iterate the snapshot to lock each dataset one at a time — this keeps
+    /// the lock order *spine → slot* and never reacquires the spine while a
+    /// slot is held, which is what makes the registry deadlock-free.
+    pub(crate) fn dataset_refs(&self) -> Vec<DatasetRef> {
+        self.datasets.lock().iter().map(Shared::clone).collect()
+    }
+
+    /// Snapshot every [`GroupRef`]; see [`Self::dataset_refs`].
+    pub(crate) fn group_refs(&self) -> Vec<GroupRef> {
+        self.groups.lock().iter().map(Shared::clone).collect()
+    }
+
+    /// Snapshot the hard-link list (the lock is held only for the clone), so
+    /// callers can resolve each link's target/parent — which locks dataset and
+    /// group slots — without holding the hard-link lock.
+    pub(crate) fn hard_links_vec(&self) -> Vec<HardLink> {
+        self.hard_links.lock().clone()
     }
 
     /// Open an existing HDF5 file for appending new datasets, using the
@@ -592,13 +683,11 @@ impl Hdf5Writer {
                 obj_header_addr: *obj_addr,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
-                mut_state: Slot::new(DatasetMut {
-                    chunked: None,
-                    fixed_array: None,
-                    btree_v2: None,
-                    append_buffer: Vec::new(),
-                    append_buffered_frames: 0,
-                }),
+                chunked: None,
+                fixed_array: None,
+                btree_v2: None,
+                append_buffer: Vec::new(),
+                append_buffered_frames: 0,
                 attributes: attrs,
                 obj_header_written_addr: Some(*obj_addr),
                 obj_header_encoded_size: 0,
@@ -728,7 +817,7 @@ impl Hdf5Writer {
                                 .clone()
                                 .unwrap_or_else(|| info.dataspace.dims.clone());
 
-                            info.mut_state.lock().chunked = Some(ChunkedDatasetInfo {
+                            info.chunked = Some(ChunkedDatasetInfo {
                                 chunk_dims: real_chunk_dims,
                                 max_dims,
                                 earray_params: ep,
@@ -811,14 +900,26 @@ impl Hdf5Writer {
 
         let allocator = FileAllocator::new(file_size);
 
+        // Wrap the reconstructed plain vecs into the per-slot registry. The
+        // reconstruction logic above runs single-threaded on local `Vec`s;
+        // only the final hand-off needs the `Shared<Slot<_>>` shape.
+        let datasets = existing_datasets
+            .into_iter()
+            .map(|i| Shared::new(Slot::new(i)))
+            .collect();
+        let groups = groups
+            .into_iter()
+            .map(|g| Shared::new(Slot::new(g)))
+            .collect();
+
         Ok(Self {
             handle,
             allocator,
             ctx,
-            datasets: existing_datasets,
-            groups,
-            hard_links: Vec::new(),
-            root_attributes,
+            datasets: Slot::new(datasets),
+            groups: Slot::new(groups),
+            hard_links: Slot::new(Vec::new()),
+            root_attributes: Slot::new(root_attributes),
             closed: false,
             root_group_addr: None,
             root_group_encoded_size: 0,
@@ -890,19 +991,22 @@ impl Hdf5Writer {
     }
 
     /// Return the names of all datasets created so far.
-    pub fn dataset_names(&self) -> Vec<&str> {
-        self.datasets
+    pub fn dataset_names(&self) -> Vec<String> {
+        self.dataset_refs()
             .iter()
-            .filter(|d| !d.deleted)
-            .map(|d| d.name.as_str())
+            .filter_map(|d| {
+                let g = d.lock();
+                (!g.deleted).then(|| g.name.clone())
+            })
             .collect()
     }
 
     /// Find a dataset index by name.
     pub fn dataset_index(&self, name: &str) -> Option<usize> {
-        self.datasets
-            .iter()
-            .position(|d| d.name == name && !d.deleted)
+        self.dataset_refs().iter().position(|d| {
+            let g = d.lock();
+            g.name == name && !g.deleted
+        })
     }
 
     /// Reconstruct the fields a writer-mode `H5Dataset` handle needs for the
@@ -913,17 +1017,15 @@ impl Hdf5Writer {
         &self,
         index: usize,
     ) -> (Vec<usize>, usize, bool, bool, bool) {
-        let ds = &self.datasets[index];
-        let shape: Vec<usize> = ds.dataspace.dims.iter().map(|&d| d as usize).collect();
-        let element_size = ds.datatype.element_size() as usize;
-        let (fixed_array, btree2, has_chunked) = {
-            let m = ds.mut_state.lock();
-            (
-                m.fixed_array.is_some(),
-                m.btree_v2.is_some(),
-                m.chunked.is_some(),
-            )
-        };
+        let ds = self.ds(index);
+        let g = ds.lock();
+        let shape: Vec<usize> = g.dataspace.dims.iter().map(|&d| d as usize).collect();
+        let element_size = g.datatype.element_size() as usize;
+        let (fixed_array, btree2, has_chunked) = (
+            g.fixed_array.is_some(),
+            g.btree_v2.is_some(),
+            g.chunked.is_some(),
+        );
         let chunked = has_chunked || fixed_array || btree2;
         (shape, element_size, chunked, btree2, fixed_array)
     }
@@ -932,13 +1034,17 @@ impl Hdf5Writer {
     /// here are full paths, so they must be unique across the file (HDF5
     /// requires link names to be unique within their group).
     fn ensure_unique_dataset_name(&self, name: &str) -> IoResult<()> {
-        if self.datasets.iter().any(|d| !d.deleted && d.name == name) {
+        let exists = self.dataset_refs().iter().any(|d| {
+            let g = d.lock();
+            !g.deleted && g.name == name
+        });
+        if exists {
             return Err(crate::io::IoError::InvalidState(format!(
                 "a dataset named '{name}' already exists"
             )));
         }
         if self
-            .hard_links
+            .hard_links_vec()
             .iter()
             .any(|l| self.hard_link_emitted(l) && self.hard_link_full_path(l) == name)
         {
@@ -951,50 +1057,60 @@ impl Hdf5Writer {
 
     /// Soft-delete a dataset by name. The dataset is excluded from the file
     /// on close. File space is not reclaimed.
-    pub fn delete_dataset(&mut self, name: &str) -> IoResult<()> {
-        let idx = self
-            .datasets
+    pub fn delete_dataset(&self, name: &str) -> IoResult<()> {
+        let refs = self.dataset_refs();
+        let idx = refs
             .iter()
-            .position(|d| d.name == name && !d.deleted)
+            .position(|d| {
+                let g = d.lock();
+                g.name == name && !g.deleted
+            })
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
-        self.datasets[idx].deleted = true;
+        refs[idx].lock().deleted = true;
         // Remove from parent group's child_datasets
-        for grp in &mut self.groups {
-            grp.child_datasets.retain(|&di| di != idx);
+        for grp in self.group_refs() {
+            grp.lock().child_datasets.retain(|&di| di != idx);
         }
         Ok(())
     }
 
     /// Soft-delete a group and all its child datasets and sub-groups.
     /// File space is not reclaimed.
-    pub fn delete_group(&mut self, name: &str) -> IoResult<()> {
+    pub fn delete_group(&self, name: &str) -> IoResult<()> {
         let name = if name.starts_with('/') {
             name.to_string()
         } else {
             format!("/{}", name)
         };
-        let gidx = self
-            .groups
+        let groups = self.group_refs();
+        let gidx = groups
             .iter()
-            .position(|g| g.name == name && !g.deleted)
+            .position(|g| {
+                let gg = g.lock();
+                gg.name == name && !gg.deleted
+            })
             .ok_or_else(|| crate::io::IoError::NotFound(name.clone()))?;
         self.delete_group_recursive(gidx);
         // Remove from parent's child_groups
-        if let Some(pidx) = self.groups[gidx].parent {
-            self.groups[pidx].child_groups.retain(|&gi| gi != gidx);
+        let parent = groups[gidx].lock().parent;
+        if let Some(pidx) = parent {
+            groups[pidx].lock().child_groups.retain(|&gi| gi != gidx);
         }
         Ok(())
     }
 
-    fn delete_group_recursive(&mut self, gidx: usize) {
-        self.groups[gidx].deleted = true;
-        // Delete child datasets
-        let child_ds: Vec<usize> = self.groups[gidx].child_datasets.clone();
+    fn delete_group_recursive(&self, gidx: usize) {
+        // Mark deleted and snapshot the child lists, releasing the group lock
+        // before locking any dataset/child-group slot (spine → slot order).
+        let (child_ds, child_gs) = {
+            let grp = self.grp(gidx);
+            let mut g = grp.lock();
+            g.deleted = true;
+            (g.child_datasets.clone(), g.child_groups.clone())
+        };
         for di in child_ds {
-            self.datasets[di].deleted = true;
+            self.ds(di).lock().deleted = true;
         }
-        // Recurse into child groups
-        let child_gs: Vec<usize> = self.groups[gidx].child_groups.clone();
         for gi in child_gs {
             self.delete_group_recursive(gi);
         }
@@ -1005,7 +1121,8 @@ impl Hdf5Writer {
     /// Returns an owned `Vec` because the chunk geometry now lives behind the
     /// per-dataset [`Slot`]; it cannot be borrowed past the guard.
     pub fn dataset_chunk_dims(&self, index: usize) -> Option<Vec<u64>> {
-        let m = self.datasets[index].mut_state.lock();
+        let ds = self.ds(index);
+        let m = ds.lock();
         if let Some(ref c) = m.chunked {
             Some(c.chunk_dims.clone())
         } else if let Some(ref f) = m.fixed_array {
@@ -1016,13 +1133,19 @@ impl Hdf5Writer {
     }
 
     /// Return the current dimensions of a dataset.
-    pub fn dataset_dims(&self, index: usize) -> &[u64] {
-        &self.datasets[index].dataspace.dims
+    ///
+    /// Returns an owned `Vec` because the dataspace now lives behind the
+    /// per-dataset [`Slot`]; it cannot be borrowed past the guard.
+    pub fn dataset_dims(&self, index: usize) -> Vec<u64> {
+        self.ds(index).lock().dataspace.dims.clone()
     }
 
     /// Return the names of all groups created so far.
-    pub fn group_names(&self) -> Vec<&str> {
-        self.groups.iter().map(|g| g.name.as_str()).collect()
+    pub fn group_names(&self) -> Vec<String> {
+        self.group_refs()
+            .iter()
+            .map(|g| g.lock().name.clone())
+            .collect()
     }
 
     /// Create a group in the file hierarchy.
@@ -1031,19 +1154,20 @@ impl Hdf5Writer {
     /// `name` is the name of the new group (e.g., "detector").
     ///
     /// Returns the group index in the writer's group list.
-    pub fn create_group(&mut self, parent_path: &str, name: &str) -> IoResult<usize> {
+    pub fn create_group(&self, parent_path: &str, name: &str) -> IoResult<usize> {
         let full_name = if parent_path == "/" {
             format!("/{}", name)
         } else {
             format!("{}/{}", parent_path, name)
         };
 
+        let groups = self.group_refs();
         // Check for duplicates (ignore deleted groups)
-        if self
-            .groups
-            .iter()
-            .any(|g| g.name == full_name && !g.deleted)
-        {
+        let dup = groups.iter().any(|g| {
+            let gg = g.lock();
+            gg.name == full_name && !gg.deleted
+        });
+        if dup {
             return Err(crate::io::IoError::InvalidState(format!(
                 "group '{}' already exists",
                 full_name
@@ -1052,7 +1176,7 @@ impl Hdf5Writer {
         // A hard link must not already occupy this name in its parent.
         let full_rel = full_name.trim_start_matches('/');
         if self
-            .hard_links
+            .hard_links_vec()
             .iter()
             .any(|l| self.hard_link_emitted(l) && self.hard_link_full_path(l) == full_rel)
         {
@@ -1061,14 +1185,15 @@ impl Hdf5Writer {
             )));
         }
 
-        // Find parent group index (None means it's a root-level group)
+        // Find parent group index (None means it's a root-level group). Indices
+        // are append-only, so a parent found in the snapshot stays valid even
+        // if another thread pushes a new group concurrently.
         let parent_idx = if parent_path == "/" {
             None
         } else {
-            let idx = self
-                .groups
+            let idx = groups
                 .iter()
-                .position(|g| g.name == parent_path)
+                .position(|g| g.lock().name == parent_path)
                 .ok_or_else(|| {
                     crate::io::IoError::NotFound(format!(
                         "parent group '{}' not found",
@@ -1078,8 +1203,7 @@ impl Hdf5Writer {
             Some(idx)
         };
 
-        let group_idx = self.groups.len();
-        self.groups.push(GroupInfo {
+        let group_idx = self.push_group(GroupInfo {
             name: full_name,
             parent: parent_idx,
             child_datasets: Vec::new(),
@@ -1091,7 +1215,7 @@ impl Hdf5Writer {
 
         // Register this group as a child of its parent
         if let Some(pidx) = parent_idx {
-            self.groups[pidx].child_groups.push(group_idx);
+            self.grp(pidx).lock().child_groups.push(group_idx);
         }
 
         Ok(group_idx)
@@ -1101,15 +1225,15 @@ impl Hdf5Writer {
     ///
     /// `group_path` is the full path of the group (e.g., "/detector").
     /// `ds_index` is the dataset index returned by `create_dataset`.
-    pub fn assign_dataset_to_group(&mut self, group_path: &str, ds_index: usize) -> IoResult<()> {
-        let group_idx = self
-            .groups
+    pub fn assign_dataset_to_group(&self, group_path: &str, ds_index: usize) -> IoResult<()> {
+        let groups = self.group_refs();
+        let group_idx = groups
             .iter()
-            .position(|g| g.name == group_path)
+            .position(|g| g.lock().name == group_path)
             .ok_or_else(|| {
                 crate::io::IoError::NotFound(format!("group '{}' not found", group_path))
             })?;
-        self.groups[group_idx].child_datasets.push(ds_index);
+        groups[group_idx].lock().child_datasets.push(ds_index);
         Ok(())
     }
 
@@ -1125,7 +1249,7 @@ impl Hdf5Writer {
     /// * `target_path` — full path of an existing dataset or group, with or
     ///   without a leading `/`.
     pub fn create_hard_link(
-        &mut self,
+        &self,
         parent_group_path: &str,
         link_name: &str,
         target_path: &str,
@@ -1136,14 +1260,20 @@ impl Hdf5Writer {
             )));
         }
 
+        let datasets = self.dataset_refs();
+        let groups = self.group_refs();
+
         // Resolve the parent group (None == root).
         let parent = if parent_group_path == "/" {
             None
         } else {
             Some(
-                self.groups
+                groups
                     .iter()
-                    .position(|g| g.name == parent_group_path && !g.deleted)
+                    .position(|g| {
+                        let gg = g.lock();
+                        gg.name == parent_group_path && !gg.deleted
+                    })
                     .ok_or_else(|| {
                         crate::io::IoError::NotFound(format!(
                             "parent group '{parent_group_path}' not found"
@@ -1161,17 +1291,15 @@ impl Hdf5Writer {
                 "cannot hard-link the root group".into(),
             ));
         }
-        let target = if let Some(idx) = self
-            .datasets
-            .iter()
-            .position(|d| !d.deleted && d.name.trim_start_matches('/') == target_rel)
-        {
+        let target = if let Some(idx) = datasets.iter().position(|d| {
+            let g = d.lock();
+            !g.deleted && g.name.trim_start_matches('/') == target_rel
+        }) {
             HardLinkTarget::Dataset(idx)
-        } else if let Some(idx) = self
-            .groups
-            .iter()
-            .position(|g| !g.deleted && g.name.trim_start_matches('/') == target_rel)
-        {
+        } else if let Some(idx) = groups.iter().position(|g| {
+            let gg = g.lock();
+            !gg.deleted && gg.name.trim_start_matches('/') == target_rel
+        }) {
             HardLinkTarget::Group(idx)
         } else {
             return Err(crate::io::IoError::NotFound(format!(
@@ -1182,28 +1310,26 @@ impl Hdf5Writer {
         // Reject a name already taken in the parent group.
         let parent_prefix = match parent {
             None => String::new(),
-            Some(pi) => format!("{}/", self.groups[pi].name.trim_start_matches('/')),
+            Some(pi) => format!("{}/", groups[pi].lock().name.trim_start_matches('/')),
         };
         let full = format!("{parent_prefix}{link_name}");
-        let collides = self
-            .datasets
+        let collides = datasets.iter().any(|d| {
+            let g = d.lock();
+            !g.deleted && g.name.trim_start_matches('/') == full
+        }) || groups.iter().any(|g| {
+            let gg = g.lock();
+            !gg.deleted && gg.name.trim_start_matches('/') == full
+        }) || self
+            .hard_links_vec()
             .iter()
-            .any(|d| !d.deleted && d.name.trim_start_matches('/') == full)
-            || self
-                .groups
-                .iter()
-                .any(|g| !g.deleted && g.name.trim_start_matches('/') == full)
-            || self
-                .hard_links
-                .iter()
-                .any(|l| l.parent == parent && l.name == link_name);
+            .any(|l| l.parent == parent && l.name == link_name);
         if collides {
             return Err(crate::io::IoError::InvalidState(format!(
                 "'{full}' already exists in the file"
             )));
         }
 
-        self.hard_links.push(HardLink {
+        self.hard_links.lock().push(HardLink {
             parent,
             name: link_name.to_string(),
             target,
@@ -1216,11 +1342,11 @@ impl Hdf5Writer {
     fn hard_link_emitted(&self, link: &HardLink) -> bool {
         let parent_ok = match link.parent {
             None => true,
-            Some(pi) => !self.groups[pi].deleted,
+            Some(pi) => !self.grp(pi).lock().deleted,
         };
         let target_ok = match link.target {
-            HardLinkTarget::Dataset(i) => !self.datasets[i].deleted,
-            HardLinkTarget::Group(i) => !self.groups[i].deleted,
+            HardLinkTarget::Dataset(i) => !self.ds(i).lock().deleted,
+            HardLinkTarget::Group(i) => !self.grp(i).lock().deleted,
         };
         parent_ok && target_ok
     }
@@ -1232,7 +1358,7 @@ impl Hdf5Writer {
             None => link.name.clone(),
             Some(pi) => format!(
                 "{}/{}",
-                self.groups[pi].name.trim_start_matches('/'),
+                self.grp(pi).lock().name.trim_start_matches('/'),
                 link.name
             ),
         }
@@ -1250,7 +1376,7 @@ impl Hdf5Writer {
             )
         };
         1 + self
-            .hard_links
+            .hard_links_vec()
             .iter()
             .filter(|l| self.hard_link_emitted(l) && same(l.target, target))
             .count() as u32
@@ -1261,13 +1387,13 @@ impl Hdf5Writer {
     /// building group object headers, once every object's header address
     /// has been assigned.
     fn emit_hard_links(&self, header: &mut ObjectHeader, parent: Option<usize>) {
-        for link in &self.hard_links {
-            if link.parent != parent || !self.hard_link_emitted(link) {
+        for link in self.hard_links_vec() {
+            if link.parent != parent || !self.hard_link_emitted(&link) {
                 continue;
             }
             let addr = match link.target {
-                HardLinkTarget::Dataset(i) => self.datasets[i].obj_header_addr,
-                HardLinkTarget::Group(i) => self.groups[i].obj_header_addr,
+                HardLinkTarget::Dataset(i) => self.ds(i).lock().obj_header_addr,
+                HardLinkTarget::Group(i) => self.grp(i).lock().obj_header_addr,
             };
             let msg = LinkMessage::hard(&link.name, addr);
             header.add_message(MSG_LINK, 0x00, msg.encode(&self.ctx));
@@ -1280,7 +1406,7 @@ impl Hdf5Writer {
     /// The raw-data region is allocated immediately so that
     /// `write_dataset_raw` can be called at any time before `close()`.
     pub fn create_dataset(
-        &mut self,
+        &self,
         name: &str,
         datatype: DatatypeMessage,
         dims: &[u64],
@@ -1307,21 +1433,18 @@ impl Hdf5Writer {
             DataspaceMessage::simple(dims)
         };
 
-        let idx = self.datasets.len();
-        self.datasets.push(DatasetInfo {
+        let idx = self.push_dataset(DatasetInfo {
             name: name.to_string(),
             datatype,
             dataspace,
             obj_header_addr: 0, // set during finalize
             data_addr,
             data_size,
-            mut_state: Slot::new(DatasetMut {
-                chunked: None,
-                fixed_array: None,
-                btree_v2: None,
-                append_buffer: Vec::new(),
-                append_buffered_frames: 0,
-            }),
+            chunked: None,
+            fixed_array: None,
+            btree_v2: None,
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
             attributes: Vec::new(),
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
@@ -1339,7 +1462,7 @@ impl Hdf5Writer {
     /// the first dimension is unlimited). Use `write_chunk` and
     /// `extend_dataset` to add data.
     pub fn create_chunked_dataset(
-        &mut self,
+        &self,
         name: &str,
         datatype: DatatypeMessage,
         dims: &[u64],
@@ -1394,8 +1517,7 @@ impl Hdf5Writer {
             max_dims: Some(max_dims.to_vec()),
         };
 
-        let idx = self.datasets.len();
-        self.datasets.push(DatasetInfo {
+        let idx = self.push_dataset(DatasetInfo {
             name: name.to_string(),
             datatype,
             dataspace,
@@ -1408,25 +1530,23 @@ impl Hdf5Writer {
             filter_pipeline: None,
             deleted: false,
             fill_value: None,
-            mut_state: Slot::new(DatasetMut {
-                fixed_array: None,
-                btree_v2: None,
-                chunked: Some(ChunkedDatasetInfo {
-                    chunk_dims: chunk_dims.to_vec(),
-                    max_dims: max_dims.to_vec(),
-                    earray_params,
-                    ea_header_addr,
-                    ea_iblk_addr,
-                    ndblk_addrs,
-                    ea_header,
-                    ea_iblk,
-                    chunks_written: 0,
-                    filt_iblk: None,
-                    chunk_size_len: 0,
-                }),
-                append_buffer: Vec::new(),
-                append_buffered_frames: 0,
+            fixed_array: None,
+            btree_v2: None,
+            chunked: Some(ChunkedDatasetInfo {
+                chunk_dims: chunk_dims.to_vec(),
+                max_dims: max_dims.to_vec(),
+                earray_params,
+                ea_header_addr,
+                ea_iblk_addr,
+                ndblk_addrs,
+                ea_header,
+                ea_iblk,
+                chunks_written: 0,
+                filt_iblk: None,
+                chunk_size_len: 0,
             }),
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
         });
 
         Ok(idx)
@@ -1438,25 +1558,29 @@ impl Hdf5Writer {
     /// and layout. The length must match the total data size declared at
     /// creation time.
     pub fn write_dataset_raw(&self, index: usize, data: &[u8]) -> IoResult<()> {
-        let ds = &self.datasets[index];
-        if ds.mut_state.lock().chunked.is_some() {
-            return Err(crate::io::IoError::InvalidState(
-                "use write_chunk for chunked datasets".into(),
-            ));
-        }
-        if ds.data_addr == UNDEF_ADDR {
-            return Err(crate::io::IoError::InvalidState(
-                "dataset has no data allocated".into(),
-            ));
-        }
-        if data.len() as u64 != ds.data_size {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "data size mismatch: expected {} bytes, got {}",
-                ds.data_size,
-                data.len()
-            )));
-        }
-        self.handle.write_at(ds.data_addr, data)?;
+        let ds = self.ds(index);
+        let data_addr = {
+            let g = ds.lock();
+            if g.chunked.is_some() {
+                return Err(crate::io::IoError::InvalidState(
+                    "use write_chunk for chunked datasets".into(),
+                ));
+            }
+            if g.data_addr == UNDEF_ADDR {
+                return Err(crate::io::IoError::InvalidState(
+                    "dataset has no data allocated".into(),
+                ));
+            }
+            if data.len() as u64 != g.data_size {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "data size mismatch: expected {} bytes, got {}",
+                    g.data_size,
+                    data.len()
+                )));
+            }
+            g.data_addr
+        };
+        self.handle.write_at(data_addr, data)?;
         Ok(())
     }
 
@@ -1468,17 +1592,22 @@ impl Hdf5Writer {
     ///
     /// `data` must be exactly chunk_size bytes (product of chunk_dims * element_size).
     pub fn write_chunk(&self, index: usize, chunk_idx: u64, data: &[u8]) -> IoResult<()> {
-        let ds = &self.datasets[index];
-        let element_size = ds.datatype.element_size() as u64;
-        // Scope the slot guard: `record_ea_chunk` re-locks the same slot, so
-        // it must be dropped before that call.
-        let chunk_bytes: u64 = {
-            let m = ds.mut_state.lock();
-            let chunked = m
+        let ds = self.ds(index);
+        // Read the chunk geometry and filter pipeline under one brief lock,
+        // then drop it: compression runs *outside* the lock, and
+        // `record_ea_chunk` re-locks the same slot, so the guard must not be
+        // held across either.
+        let (chunk_bytes, pipeline) = {
+            let g = ds.lock();
+            let element_size = g.datatype.element_size() as u64;
+            let chunked = g
                 .chunked
                 .as_ref()
                 .ok_or_else(|| crate::io::IoError::InvalidState("not a chunked dataset".into()))?;
-            chunked.chunk_dims.iter().product::<u64>() * element_size
+            (
+                chunked.chunk_dims.iter().product::<u64>() * element_size,
+                g.filter_pipeline.clone(),
+            )
         };
 
         if data.len() as u64 != chunk_bytes {
@@ -1491,7 +1620,7 @@ impl Hdf5Writer {
 
         // Apply compression if filter pipeline is set
         let compressed;
-        let write_data = if let Some(ref pipeline) = ds.filter_pipeline {
+        let write_data = if let Some(ref pipeline) = pipeline {
             compressed = filter::apply_filters(pipeline, data)?;
             &compressed
         } else {
@@ -1520,11 +1649,12 @@ impl Hdf5Writer {
         compressed_size: u64,
         filter_mask: u32,
     ) -> IoResult<()> {
-        let is_filtered = self.datasets[index].filter_pipeline.is_some();
-        // Hold one slot guard for the whole method: every chunked-state access
+        let ds = self.ds(index);
+        // Hold one slot guard for the whole method: every dataset-state access
         // below goes through `m`, while `self.handle`/`self.allocator`/`self.ctx`
         // are disjoint fields safe to touch with the guard held.
-        let mut m = self.datasets[index].mut_state.lock();
+        let mut m = ds.lock();
+        let is_filtered = m.filter_pipeline.is_some();
         // For a filtered dataset the chunk's stored size is encoded in the
         // `chunk_size_len`-byte field of each filtered EA entry
         // (`FilteredChunkEntry::encode` writes `nbytes[..chunk_size_len]`,
@@ -1774,20 +1904,18 @@ impl Hdf5Writer {
     /// `starts` and `counts` define the N-dimensional selection.
     /// `data` must be exactly `product(counts) * element_size` bytes.
     pub fn write_slice(
-        &mut self,
+        &self,
         index: usize,
         starts: &[u64],
         counts: &[u64],
         data: &[u8],
     ) -> IoResult<()> {
-        let ds = &self.datasets[index];
-        {
-            let m = ds.mut_state.lock();
-            if m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some() {
-                return Err(crate::io::IoError::InvalidState(
-                    "write_slice is only for contiguous datasets".into(),
-                ));
-            }
+        let ds_ref = self.ds(index);
+        let ds = ds_ref.lock();
+        if ds.chunked.is_some() || ds.fixed_array.is_some() || ds.btree_v2.is_some() {
+            return Err(crate::io::IoError::InvalidState(
+                "write_slice is only for contiguous datasets".into(),
+            ));
         }
         if ds.data_addr == UNDEF_ADDR {
             return Err(crate::io::IoError::InvalidState(
@@ -1858,19 +1986,13 @@ impl Hdf5Writer {
     }
 
     /// Add an attribute to the root group (file-level attribute).
-    pub fn add_root_attribute(
-        &mut self,
-        attr: crate::format::messages::attribute::AttributeMessage,
-    ) {
+    pub fn add_root_attribute(&self, attr: crate::format::messages::attribute::AttributeMessage) {
         // Replace existing attribute with the same name, or append new one.
-        if let Some(pos) = self
-            .root_attributes
-            .iter()
-            .position(|a| a.name == attr.name)
-        {
-            self.root_attributes[pos] = attr;
+        let mut attrs = self.root_attributes.lock();
+        if let Some(pos) = attrs.iter().position(|a| a.name == attr.name) {
+            attrs[pos] = attr;
         } else {
-            self.root_attributes.push(attr);
+            attrs.push(attr);
         }
     }
 
@@ -1878,7 +2000,7 @@ impl Hdf5Writer {
     ///
     /// Stores strings in a global heap collection. The dataset raw data
     /// consists of vlen references (collection_addr + object_index pairs).
-    pub fn create_vlen_string_dataset(&mut self, name: &str, strings: &[&str]) -> IoResult<usize> {
+    pub fn create_vlen_string_dataset(&self, name: &str, strings: &[&str]) -> IoResult<usize> {
         use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
         use crate::format::messages::datatype::DatatypeMessage;
 
@@ -1920,8 +2042,7 @@ impl Hdf5Writer {
         let dataspace =
             crate::format::messages::dataspace::DataspaceMessage::simple(&[num_strings]);
 
-        let idx = self.datasets.len();
-        self.datasets.push(DatasetInfo {
+        let idx = self.push_dataset(DatasetInfo {
             name: name.to_string(),
             datatype,
             dataspace,
@@ -1934,13 +2055,11 @@ impl Hdf5Writer {
             filter_pipeline: None,
             deleted: false,
             fill_value: None,
-            mut_state: Slot::new(DatasetMut {
-                chunked: None,
-                fixed_array: None,
-                btree_v2: None,
-                append_buffer: Vec::new(),
-                append_buffered_frames: 0,
-            }),
+            chunked: None,
+            fixed_array: None,
+            btree_v2: None,
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
         });
 
         Ok(idx)
@@ -1954,7 +2073,7 @@ impl Hdf5Writer {
     /// as an array of variable-length `uint8` arrays. `seq_len` is the number
     /// of base (`u8`) elements, i.e. the byte length; no null terminator is
     /// appended.
-    pub fn create_vlen_bytes_dataset(&mut self, name: &str, items: &[&[u8]]) -> IoResult<usize> {
+    pub fn create_vlen_bytes_dataset(&self, name: &str, items: &[&[u8]]) -> IoResult<usize> {
         use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
         use crate::format::messages::datatype::DatatypeMessage;
 
@@ -1996,8 +2115,7 @@ impl Hdf5Writer {
         let datatype = DatatypeMessage::vlen_bytes();
         let dataspace = crate::format::messages::dataspace::DataspaceMessage::simple(&[num_items]);
 
-        let idx = self.datasets.len();
-        self.datasets.push(DatasetInfo {
+        let idx = self.push_dataset(DatasetInfo {
             name: name.to_string(),
             datatype,
             dataspace,
@@ -2010,13 +2128,11 @@ impl Hdf5Writer {
             filter_pipeline: None,
             deleted: false,
             fill_value: None,
-            mut_state: Slot::new(DatasetMut {
-                chunked: None,
-                fixed_array: None,
-                btree_v2: None,
-                append_buffer: Vec::new(),
-                append_buffered_frames: 0,
-            }),
+            chunked: None,
+            fixed_array: None,
+            btree_v2: None,
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
         });
 
         Ok(idx)
@@ -2028,7 +2144,7 @@ impl Hdf5Writer {
     /// but the vlen references are stored in chunked layout with the given filter
     /// pipeline (e.g., deflate, zstd). `chunk_size` is the number of strings per chunk.
     pub fn create_vlen_string_dataset_compressed(
-        &mut self,
+        &self,
         name: &str,
         strings: &[&str],
         chunk_size: usize,
@@ -2124,8 +2240,7 @@ impl Hdf5Writer {
             nsblk_addrs,
         );
 
-        let idx = self.datasets.len();
-        self.datasets.push(DatasetInfo {
+        let idx = self.push_dataset(DatasetInfo {
             name: name.to_string(),
             datatype,
             dataspace,
@@ -2138,25 +2253,23 @@ impl Hdf5Writer {
             filter_pipeline: Some(pipeline),
             deleted: false,
             fill_value: None,
-            mut_state: Slot::new(DatasetMut {
-                fixed_array: None,
-                btree_v2: None,
-                chunked: Some(ChunkedDatasetInfo {
-                    chunk_dims: chunk_dims.clone(),
-                    max_dims: max_dims.clone(),
-                    earray_params,
-                    ea_header_addr,
-                    ea_iblk_addr,
-                    ndblk_addrs,
-                    ea_header,
-                    ea_iblk,
-                    chunks_written: 0,
-                    filt_iblk: Some(filt_iblk),
-                    chunk_size_len,
-                }),
-                append_buffer: Vec::new(),
-                append_buffered_frames: 0,
+            fixed_array: None,
+            btree_v2: None,
+            chunked: Some(ChunkedDatasetInfo {
+                chunk_dims: chunk_dims.clone(),
+                max_dims: max_dims.clone(),
+                earray_params,
+                ea_header_addr,
+                ea_iblk_addr,
+                ndblk_addrs,
+                ea_header,
+                ea_iblk,
+                chunks_written: 0,
+                filt_iblk: Some(filt_iblk),
+                chunk_size_len,
             }),
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
         });
 
         // Write chunks of vlen references with compression
@@ -2185,7 +2298,7 @@ impl Hdf5Writer {
     /// The dataset starts with `dims = [0]` and `max_dims = [unlimited]`.
     /// Use `append_vlen_strings` to add data.
     pub fn create_appendable_vlen_string_dataset(
-        &mut self,
+        &self,
         name: &str,
         chunk_size: usize,
         pipeline: Option<FilterPipeline>,
@@ -2213,7 +2326,7 @@ impl Hdf5Writer {
     ///
     /// Creates a new global heap collection for the strings, builds vlen
     /// references, and appends them as new chunks to the dataset.
-    pub fn append_vlen_strings(&mut self, ds_index: usize, strings: &[&str]) -> IoResult<()> {
+    pub fn append_vlen_strings(&self, ds_index: usize, strings: &[&str]) -> IoResult<()> {
         use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
 
         if strings.is_empty() {
@@ -2259,7 +2372,8 @@ impl Hdf5Writer {
         // Merge buffered data with new data. Scope the slot guard: the loop
         // below calls `write_chunk`, which re-locks the same slot.
         let (buffered_frames, mut combined) = {
-            let mut m = self.datasets[ds_index].mut_state.lock();
+            let ds = self.ds(ds_index);
+            let mut m = ds.lock();
             let buffered_frames = m.append_buffered_frames as usize;
             let combined = std::mem::take(&mut m.append_buffer);
             m.append_buffered_frames = 0;
@@ -2308,7 +2422,8 @@ impl Hdf5Writer {
                 byte_pos = end;
                 frame_pos += frames_to_fill;
             } else {
-                let mut m = self.datasets[ds_index].mut_state.lock();
+                let ds = self.ds(ds_index);
+                let mut m = ds.lock();
                 m.append_buffer = combined[byte_pos..total_bytes].to_vec();
                 m.append_buffered_frames = remaining_frames as u64;
                 frame_pos = total_frames;
@@ -2328,19 +2443,15 @@ impl Hdf5Writer {
     ///
     /// The attribute will be written as a message in the dataset's object
     /// header when the file is finalized.
-    pub fn add_dataset_attribute(
-        &mut self,
-        ds_index: usize,
-        attr: AttributeMessage,
-    ) -> IoResult<()> {
-        if ds_index >= self.datasets.len() {
+    pub fn add_dataset_attribute(&self, ds_index: usize, attr: AttributeMessage) -> IoResult<()> {
+        let count = self.dataset_count();
+        if ds_index >= count {
             return Err(crate::io::IoError::InvalidState(format!(
                 "dataset index {} out of range (have {})",
-                ds_index,
-                self.datasets.len()
+                ds_index, count
             )));
         }
-        self.datasets[ds_index].attributes.push(attr);
+        self.ds(ds_index).lock().attributes.push(attr);
         Ok(())
     }
 
@@ -2349,25 +2460,23 @@ impl Hdf5Writer {
     /// The attribute is written into the group's object header when the
     /// file is finalized. An existing attribute with the same name is
     /// replaced, matching [`add_root_attribute`](Self::add_root_attribute).
-    pub fn add_group_attribute(
-        &mut self,
-        group_path: &str,
-        attr: AttributeMessage,
-    ) -> IoResult<()> {
-        let gi = self
-            .groups
-            .iter()
-            .position(|g| g.name == group_path && !g.deleted)
-            .ok_or_else(|| {
-                crate::io::IoError::NotFound(format!("group '{}' not found", group_path))
-            })?;
-        let attrs = &mut self.groups[gi].attributes;
-        if let Some(pos) = attrs.iter().position(|a| a.name == attr.name) {
-            attrs[pos] = attr;
-        } else {
-            attrs.push(attr);
+    pub fn add_group_attribute(&self, group_path: &str, attr: AttributeMessage) -> IoResult<()> {
+        for grp in self.group_refs() {
+            let mut g = grp.lock();
+            if g.name == group_path && !g.deleted {
+                let attrs = &mut g.attributes;
+                if let Some(pos) = attrs.iter().position(|a| a.name == attr.name) {
+                    attrs[pos] = attr;
+                } else {
+                    attrs.push(attr);
+                }
+                return Ok(());
+            }
         }
-        Ok(())
+        Err(crate::io::IoError::NotFound(format!(
+            "group '{}' not found",
+            group_path
+        )))
     }
 
     /// Build a variable-length UTF-8 string attribute message.
@@ -2388,7 +2497,7 @@ impl Hdf5Writer {
     /// A single shared attribute heap would avoid the per-attribute padding
     /// (`H5HG_MINALLOC` = 4096 bytes) but is a heap-management change that
     /// would also need to cover the dataset path.
-    pub fn vlen_string_attribute(&mut self, name: &str, value: &str) -> IoResult<AttributeMessage> {
+    pub fn vlen_string_attribute(&self, name: &str, value: &str) -> IoResult<AttributeMessage> {
         use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
         use crate::format::messages::dataspace::DataspaceMessage;
         use crate::format::messages::datatype::DatatypeMessage;
@@ -2419,10 +2528,16 @@ impl Hdf5Writer {
     /// called BEFORE any `write_dataset_raw` / `write_slice` — otherwise the
     /// fill write clobbers data already written. (The high-level builder
     /// always calls this right after creating the dataset.)
-    pub fn set_dataset_fill_value(&mut self, ds_index: usize, bytes: Vec<u8>) -> IoResult<()> {
-        let ds = self.datasets.get_mut(ds_index).ok_or_else(|| {
-            crate::io::IoError::InvalidState(format!("dataset index {} out of range", ds_index))
-        })?;
+    pub fn set_dataset_fill_value(&self, ds_index: usize, bytes: Vec<u8>) -> IoResult<()> {
+        let count = self.dataset_count();
+        if ds_index >= count {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset index {} out of range",
+                ds_index
+            )));
+        }
+        let ds_ref = self.ds(ds_index);
+        let mut ds = ds_ref.lock();
         let es = ds.datatype.element_size() as usize;
         if bytes.len() != es {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -2439,10 +2554,7 @@ impl Hdf5Writer {
         // so unwritten elements read back as the fill value. (The high-level
         // builder calls this immediately after create, before any data is
         // written; a subsequent write_raw/write_slice overwrites its region.)
-        let is_chunked = {
-            let m = ds.mut_state.lock();
-            m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some()
-        };
+        let is_chunked = ds.chunked.is_some() || ds.fixed_array.is_some() || ds.btree_v2.is_some();
         if !is_chunked && ds.data_addr != UNDEF_ADDR && ds.data_size > 0 {
             let data_addr = ds.data_addr;
             let data_size = ds.data_size as usize;
@@ -2461,7 +2573,9 @@ impl Hdf5Writer {
     /// buffer from this method, so that the unwritten element region of an
     /// allocated chunk reads back as the fill value rather than zero.
     pub(crate) fn new_chunk_buffer(&self, ds_index: usize, chunk_bytes: usize) -> Vec<u8> {
-        let fv = self.datasets[ds_index].fill_value.as_deref();
+        let ds = self.ds(ds_index);
+        let m = ds.lock();
+        let fv = m.fill_value.as_deref();
         crate::format::messages::fill_value::tiled_fill(chunk_bytes, fv)
     }
 
@@ -2480,12 +2594,12 @@ impl Hdf5Writer {
         chunk_idx: u64,
     ) -> IoResult<Option<Vec<u8>>> {
         // Phase 1: resolve the chunk's location from the in-memory index.
-        let ds = &self.datasets[ds_index];
-        let element_size = ds.datatype.element_size() as u64;
-        let pipeline = ds.filter_pipeline.clone();
         // Hold the slot guard through Phase 1: `chunked` borrows it, while the
         // `self.handle`/`self.ctx` reads below touch disjoint fields.
-        let m = ds.mut_state.lock();
+        let ds = self.ds(ds_index);
+        let m = ds.lock();
+        let element_size = m.datatype.element_size() as u64;
+        let pipeline = m.filter_pipeline.clone();
         let Some(chunked) = m.chunked.as_ref() else {
             return Ok(None);
         };
@@ -2628,7 +2742,7 @@ impl Hdf5Writer {
     /// `dims` and `max_dims` should be the same (all fixed). `chunk_dims` defines the
     /// chunk shape. Returns the dataset index.
     pub fn create_fixed_array_dataset(
-        &mut self,
+        &self,
         name: &str,
         datatype: DatatypeMessage,
         dims: &[u64],
@@ -2686,8 +2800,7 @@ impl Hdf5Writer {
 
         let dataspace = DataspaceMessage::simple(dims);
 
-        let idx = self.datasets.len();
-        self.datasets.push(DatasetInfo {
+        let idx = self.push_dataset(DatasetInfo {
             name: name.to_string(),
             datatype,
             dataspace,
@@ -2700,20 +2813,18 @@ impl Hdf5Writer {
             filter_pipeline: None,
             deleted: false,
             fill_value: None,
-            mut_state: Slot::new(DatasetMut {
-                chunked: None,
-                btree_v2: None,
-                fixed_array: Some(FixedArrayDatasetInfo {
-                    chunk_dims: chunk_dims.to_vec(),
-                    fa_header_addr,
-                    fa_dblk_addr,
-                    fa_header,
-                    fa_dblk,
-                    chunks_written: 0,
-                }),
-                append_buffer: Vec::new(),
-                append_buffered_frames: 0,
+            chunked: None,
+            btree_v2: None,
+            fixed_array: Some(FixedArrayDatasetInfo {
+                chunk_dims: chunk_dims.to_vec(),
+                fa_header_addr,
+                fa_dblk_addr,
+                fa_header,
+                fa_dblk,
+                chunks_written: 0,
             }),
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
         });
 
         Ok(idx)
@@ -2728,7 +2839,7 @@ impl Hdf5Writer {
     /// pipeline. Chunks written via `write_chunk_fixed_array` are compressed and
     /// their compressed size + filter mask are recorded in the data block.
     pub fn create_fixed_array_dataset_with_pipeline(
-        &mut self,
+        &self,
         name: &str,
         datatype: DatatypeMessage,
         dims: &[u64],
@@ -2788,8 +2899,7 @@ impl Hdf5Writer {
 
         let dataspace = DataspaceMessage::simple(dims);
 
-        let idx = self.datasets.len();
-        self.datasets.push(DatasetInfo {
+        let idx = self.push_dataset(DatasetInfo {
             name: name.to_string(),
             datatype,
             dataspace,
@@ -2802,20 +2912,18 @@ impl Hdf5Writer {
             filter_pipeline: Some(pipeline),
             deleted: false,
             fill_value: None,
-            mut_state: Slot::new(DatasetMut {
-                chunked: None,
-                btree_v2: None,
-                fixed_array: Some(FixedArrayDatasetInfo {
-                    chunk_dims: chunk_dims.to_vec(),
-                    fa_header_addr,
-                    fa_dblk_addr,
-                    fa_header,
-                    fa_dblk,
-                    chunks_written: 0,
-                }),
-                append_buffer: Vec::new(),
-                append_buffered_frames: 0,
+            chunked: None,
+            btree_v2: None,
+            fixed_array: Some(FixedArrayDatasetInfo {
+                chunk_dims: chunk_dims.to_vec(),
+                fa_header_addr,
+                fa_dblk_addr,
+                fa_header,
+                fa_dblk,
+                chunks_written: 0,
             }),
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
         });
 
         Ok(idx)
@@ -2825,7 +2933,7 @@ impl Hdf5Writer {
     ///
     /// Returns the dataset index.
     pub fn create_btree_v2_dataset(
-        &mut self,
+        &self,
         name: &str,
         datatype: DatatypeMessage,
         dims: &[u64],
@@ -2857,8 +2965,7 @@ impl Hdf5Writer {
             max_dims: Some(max_dims.to_vec()),
         };
 
-        let idx = self.datasets.len();
-        self.datasets.push(DatasetInfo {
+        let idx = self.push_dataset(DatasetInfo {
             name: name.to_string(),
             datatype,
             dataspace,
@@ -2871,20 +2978,18 @@ impl Hdf5Writer {
             filter_pipeline: None,
             deleted: false,
             fill_value: None,
-            mut_state: Slot::new(DatasetMut {
-                chunked: None,
-                fixed_array: None,
-                btree_v2: Some(Bt2DatasetInfo {
-                    chunk_dims: chunk_dims.to_vec(),
-                    max_dims: max_dims.to_vec(),
-                    bt2_header_addr,
-                    bt2_leaf_addr,
-                    index: bt2_index,
-                    chunks_written: 0,
-                }),
-                append_buffer: Vec::new(),
-                append_buffered_frames: 0,
+            chunked: None,
+            fixed_array: None,
+            btree_v2: Some(Bt2DatasetInfo {
+                chunk_dims: chunk_dims.to_vec(),
+                max_dims: max_dims.to_vec(),
+                bt2_header_addr,
+                bt2_leaf_addr,
+                index: bt2_index,
+                chunks_written: 0,
             }),
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
         });
 
         Ok(idx)
@@ -2895,7 +3000,7 @@ impl Hdf5Writer {
     /// This is similar to `create_chunked_dataset` but attaches a filter pipeline
     /// (e.g., deflate compression). The pipeline is applied when writing chunks.
     pub fn create_chunked_dataset_compressed(
-        &mut self,
+        &self,
         name: &str,
         datatype: DatatypeMessage,
         dims: &[u64],
@@ -2957,8 +3062,7 @@ impl Hdf5Writer {
             nsblk_addrs,
         );
 
-        let idx = self.datasets.len();
-        self.datasets.push(DatasetInfo {
+        let idx = self.push_dataset(DatasetInfo {
             name: name.to_string(),
             datatype,
             dataspace,
@@ -2971,25 +3075,23 @@ impl Hdf5Writer {
             filter_pipeline: Some(FilterPipeline::deflate(compression_level)),
             deleted: false,
             fill_value: None,
-            mut_state: Slot::new(DatasetMut {
-                fixed_array: None,
-                btree_v2: None,
-                chunked: Some(ChunkedDatasetInfo {
-                    chunk_dims: chunk_dims.to_vec(),
-                    max_dims: max_dims.to_vec(),
-                    earray_params,
-                    ea_header_addr,
-                    ea_iblk_addr,
-                    ndblk_addrs,
-                    ea_header,
-                    ea_iblk,
-                    chunks_written: 0,
-                    filt_iblk: Some(filt_iblk),
-                    chunk_size_len,
-                }),
-                append_buffer: Vec::new(),
-                append_buffered_frames: 0,
+            fixed_array: None,
+            btree_v2: None,
+            chunked: Some(ChunkedDatasetInfo {
+                chunk_dims: chunk_dims.to_vec(),
+                max_dims: max_dims.to_vec(),
+                earray_params,
+                ea_header_addr,
+                ea_iblk_addr,
+                ndblk_addrs,
+                ea_header,
+                ea_iblk,
+                chunks_written: 0,
+                filt_iblk: Some(filt_iblk),
+                chunk_size_len,
             }),
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
         });
 
         Ok(idx)
@@ -2997,7 +3099,7 @@ impl Hdf5Writer {
 
     /// Create a chunked dataset with a custom filter pipeline.
     pub fn create_chunked_dataset_with_pipeline(
-        &mut self,
+        &self,
         name: &str,
         datatype: DatatypeMessage,
         dims: &[u64],
@@ -3055,8 +3157,7 @@ impl Hdf5Writer {
             nsblk_addrs,
         );
 
-        let idx = self.datasets.len();
-        self.datasets.push(DatasetInfo {
+        let idx = self.push_dataset(DatasetInfo {
             name: name.to_string(),
             datatype,
             dataspace,
@@ -3069,25 +3170,23 @@ impl Hdf5Writer {
             filter_pipeline: Some(pipeline),
             deleted: false,
             fill_value: None,
-            mut_state: Slot::new(DatasetMut {
-                fixed_array: None,
-                btree_v2: None,
-                chunked: Some(ChunkedDatasetInfo {
-                    chunk_dims: chunk_dims.to_vec(),
-                    max_dims: max_dims.to_vec(),
-                    earray_params,
-                    ea_header_addr,
-                    ea_iblk_addr,
-                    ndblk_addrs,
-                    ea_header,
-                    ea_iblk,
-                    chunks_written: 0,
-                    filt_iblk: Some(filt_iblk),
-                    chunk_size_len,
-                }),
-                append_buffer: Vec::new(),
-                append_buffered_frames: 0,
+            fixed_array: None,
+            btree_v2: None,
+            chunked: Some(ChunkedDatasetInfo {
+                chunk_dims: chunk_dims.to_vec(),
+                max_dims: max_dims.to_vec(),
+                earray_params,
+                ea_header_addr,
+                ea_iblk_addr,
+                ndblk_addrs,
+                ea_header,
+                ea_iblk,
+                chunks_written: 0,
+                filt_iblk: Some(filt_iblk),
+                chunk_size_len,
             }),
+            append_buffer: Vec::new(),
+            append_buffered_frames: 0,
         });
         Ok(idx)
     }
@@ -3103,15 +3202,20 @@ impl Hdf5Writer {
         chunk_coords: &[u64],
         data: &[u8],
     ) -> IoResult<()> {
-        let ds = &self.datasets[index];
-        let element_size = ds.datatype.element_size() as u64;
-        // Scope the slot guard: `record_fixed_array_chunk` re-locks the same slot.
-        let chunk_bytes: u64 = {
-            let m = ds.mut_state.lock();
+        // Read what we need under one brief slot guard, then compress
+        // OUTSIDE the lock: `record_fixed_array_chunk` re-locks the same slot,
+        // so the guard must be dropped before it (and before apply_filters).
+        let ds = self.ds(index);
+        let (chunk_bytes, pipeline) = {
+            let m = ds.lock();
+            let element_size = m.datatype.element_size() as u64;
             let fa = m.fixed_array.as_ref().ok_or_else(|| {
                 crate::io::IoError::InvalidState("not a fixed-array dataset".into())
             })?;
-            fa.chunk_dims.iter().product::<u64>() * element_size
+            (
+                fa.chunk_dims.iter().product::<u64>() * element_size,
+                m.filter_pipeline.clone(),
+            )
         };
 
         if data.len() as u64 != chunk_bytes {
@@ -3122,7 +3226,7 @@ impl Hdf5Writer {
             )));
         }
         let write_data;
-        let data_to_write = if let Some(ref pipeline) = ds.filter_pipeline {
+        let data_to_write = if let Some(ref pipeline) = pipeline {
             write_data = filter::apply_filters(pipeline, data)?;
             &write_data[..]
         } else {
@@ -3152,7 +3256,7 @@ impl Hdf5Writer {
         data: &[u8],
         filter_mask: u32,
     ) -> IoResult<()> {
-        if self.datasets[index].filter_pipeline.is_none() {
+        if self.ds(index).lock().filter_pipeline.is_none() {
             return Err(crate::io::IoError::InvalidState(
                 "write_compressed_chunk_fixed_array requires a filtered dataset \
                  (no slot for a compressed size or filter mask on an unfiltered \
@@ -3175,18 +3279,18 @@ impl Hdf5Writer {
         final_bytes: &[u8],
         filter_mask: u32,
     ) -> IoResult<()> {
-        let ds = &self.datasets[index];
-        let is_filtered = ds.filter_pipeline.is_some();
         // Hold one slot guard for the whole method; `self.allocator`/`self.handle`/
         // `self.ctx` below touch disjoint fields safe to use with the guard held.
-        let mut m = ds.mut_state.lock();
+        let ds = self.ds(index);
+        let mut m = ds.lock();
+        let is_filtered = m.filter_pipeline.is_some();
         let fa = m
             .fixed_array
             .as_ref()
             .ok_or_else(|| crate::io::IoError::InvalidState("not a fixed-array dataset".into()))?;
 
         // Compute linear chunk index from multidimensional coordinates.
-        let dims = &ds.dataspace.dims;
+        let dims = &m.dataspace.dims;
         let chunk_dims = &fa.chunk_dims;
         let ndims = dims.len();
         if chunk_coords.len() != ndims {
@@ -3291,11 +3395,11 @@ impl Hdf5Writer {
         chunk_coords: &[u64],
         data: &[u8],
     ) -> IoResult<()> {
-        let ds = &self.datasets[index];
-        let element_size = ds.datatype.element_size() as u64;
         // Hold one slot guard for the whole method; `self.allocator`/`self.handle`
         // below touch disjoint fields safe to use with the guard held.
-        let mut m = ds.mut_state.lock();
+        let ds = self.ds(index);
+        let mut m = ds.lock();
+        let element_size = m.datatype.element_size() as u64;
         let bt2 = m
             .btree_v2
             .as_ref()
@@ -3328,8 +3432,11 @@ impl Hdf5Writer {
     pub fn write_chunks_batch(&self, ds_index: usize, chunks: &[(u64, &[u8])]) -> IoResult<()> {
         #[cfg(feature = "parallel")]
         {
-            // If filter pipeline is set, compress all chunks in parallel
-            if let Some(ref pipeline) = self.datasets[ds_index].filter_pipeline {
+            // If filter pipeline is set, compress all chunks in parallel.
+            // Clone the pipeline out under a brief slot guard so the parallel
+            // compression below runs off the lock.
+            let pipeline = self.ds(ds_index).lock().filter_pipeline.clone();
+            if let Some(ref pipeline) = pipeline {
                 let chunk_data: Vec<Vec<u8>> = chunks.iter().map(|(_, d)| d.to_vec()).collect();
                 let compressed = filter::apply_filters_parallel(pipeline, &chunk_data);
                 for ((idx, _), compressed_data) in chunks.iter().zip(compressed.iter()) {
@@ -3366,7 +3473,7 @@ impl Hdf5Writer {
         compressed_data: &[u8],
         filter_mask: u32,
     ) -> IoResult<()> {
-        if self.datasets[index].filter_pipeline.is_none() {
+        if self.ds(index).lock().filter_pipeline.is_none() {
             return Err(crate::io::IoError::InvalidState(
                 "write_compressed_chunk requires a filtered dataset (no slot for \
                  a compressed size or filter mask on an unfiltered chunk index)"
@@ -3381,33 +3488,31 @@ impl Hdf5Writer {
     }
 
     /// Extend the dimensions of a chunked dataset.
-    pub fn extend_dataset(&mut self, index: usize, new_dims: &[u64]) -> IoResult<()> {
-        let ds = &mut self.datasets[index];
-        let is_unindexed = {
-            let m = ds.mut_state.lock();
-            m.chunked.is_none() && m.fixed_array.is_none() && m.btree_v2.is_none()
-        };
+    pub fn extend_dataset(&self, index: usize, new_dims: &[u64]) -> IoResult<()> {
+        let ds = self.ds(index);
+        let mut m = ds.lock();
+        let is_unindexed = m.chunked.is_none() && m.fixed_array.is_none() && m.btree_v2.is_none();
         if is_unindexed {
             return Err(crate::io::IoError::InvalidState(
                 "can only extend chunked datasets".into(),
             ));
         }
-        if new_dims.len() != ds.dataspace.dims.len() {
+        if new_dims.len() != m.dataspace.dims.len() {
             return Err(crate::io::IoError::InvalidState(format!(
                 "extend_dataset rank mismatch: dataset has {} dimensions, got {}",
-                ds.dataspace.dims.len(),
+                m.dataspace.dims.len(),
                 new_dims.len()
             )));
         }
         // The chunk index and append buffers assume the logical size only
         // grows; shrinking below already-written data desynchronizes them.
-        for (d, (&new, &cur)) in new_dims.iter().zip(&ds.dataspace.dims).enumerate() {
+        for (d, (&new, &cur)) in new_dims.iter().zip(&m.dataspace.dims).enumerate() {
             if new < cur {
                 return Err(crate::io::IoError::InvalidState(format!(
                     "extend_dataset cannot shrink dimension {d} from {cur} to {new}"
                 )));
             }
-            if let Some(ref max) = ds.dataspace.max_dims {
+            if let Some(ref max) = m.dataspace.max_dims {
                 if new > max[d] {
                     return Err(crate::io::IoError::InvalidState(format!(
                         "extend_dataset dimension {d} ({new}) exceeds the maximum {}",
@@ -3416,7 +3521,7 @@ impl Hdf5Writer {
                 }
             }
         }
-        ds.dataspace.dims = new_dims.to_vec();
+        m.dataspace.dims = new_dims.to_vec();
         Ok(())
     }
 
@@ -3429,53 +3534,51 @@ impl Hdf5Writer {
     /// visible on read, exactly as libhdf5's `H5Dset_extent` behaves. This
     /// is how a partial multi-frame chunk's over-extended frame count is
     /// corrected back to the true number of frames written.
-    pub fn set_dataset_extent(&mut self, index: usize, new_dims: &[u64]) -> IoResult<()> {
-        let ds = &mut self.datasets[index];
-        let is_unindexed = {
-            let m = ds.mut_state.lock();
-            m.chunked.is_none() && m.fixed_array.is_none() && m.btree_v2.is_none()
-        };
+    pub fn set_dataset_extent(&self, index: usize, new_dims: &[u64]) -> IoResult<()> {
+        let ds = self.ds(index);
+        let mut m = ds.lock();
+        let is_unindexed = m.chunked.is_none() && m.fixed_array.is_none() && m.btree_v2.is_none();
         if is_unindexed {
             return Err(crate::io::IoError::InvalidState(
                 "can only set the extent of chunked datasets".into(),
             ));
         }
-        if new_dims.len() != ds.dataspace.dims.len() {
+        if new_dims.len() != m.dataspace.dims.len() {
             return Err(crate::io::IoError::InvalidState(format!(
                 "set_extent rank mismatch: dataset has {} dimensions, got {}",
-                ds.dataspace.dims.len(),
+                m.dataspace.dims.len(),
                 new_dims.len()
             )));
         }
         // A pending append buffer is positioned relative to the current
         // logical size; changing the extent underneath it would make
         // `flush_append_buffers` write the chunk at the wrong index.
-        if ds.mut_state.lock().append_buffered_frames > 0 {
+        if m.append_buffered_frames > 0 {
             return Err(crate::io::IoError::InvalidState(
                 "set_extent cannot run while the dataset has buffered appends; \
                  flush them first"
                     .into(),
             ));
         }
-        if let Some(ref max) = ds.dataspace.max_dims {
-            for (d, (&new, &m)) in new_dims.iter().zip(max).enumerate() {
-                if new > m {
+        if let Some(ref max) = m.dataspace.max_dims {
+            for (d, (&new, &mx)) in new_dims.iter().zip(max).enumerate() {
+                if new > mx {
                     return Err(crate::io::IoError::InvalidState(format!(
-                        "set_extent dimension {d} ({new}) exceeds the maximum {m}"
+                        "set_extent dimension {d} ({new}) exceeds the maximum {mx}"
                     )));
                 }
             }
         }
-        ds.dataspace.dims = new_dims.to_vec();
+        m.dataspace.dims = new_dims.to_vec();
         Ok(())
     }
 
     /// Flush a chunked dataset's index structures to disk.
-    pub fn flush_dataset(&mut self, index: usize) -> IoResult<()> {
-        let ds = &self.datasets[index];
+    pub fn flush_dataset(&self, index: usize) -> IoResult<()> {
         // Hold one slot guard for the whole method; `self.handle`/`self.ctx`/
         // `self.allocator` below touch disjoint fields.
-        let mut m = ds.mut_state.lock();
+        let ds = self.ds(index);
+        let mut m = ds.lock();
 
         // EA-indexed dataset
         if let Some(ref chunked) = m.chunked {
@@ -3580,12 +3683,15 @@ impl Hdf5Writer {
     /// Only the dataspace dimensions change; the encoded size must not exceed
     /// the originally allocated space.
     pub fn write_dataset_header_inplace(&mut self, index: usize) -> IoResult<()> {
-        let addr = self.datasets[index]
-            .obj_header_written_addr
-            .ok_or_else(|| {
+        // Scope the slot guard: `build_dataset_header` re-locks the same slot.
+        let (addr, original_size) = {
+            let ds = self.ds(index);
+            let m = ds.lock();
+            let addr = m.obj_header_written_addr.ok_or_else(|| {
                 crate::io::IoError::InvalidState("dataset header not yet written".into())
             })?;
-        let original_size = self.datasets[index].obj_header_encoded_size;
+            (addr, m.obj_header_encoded_size)
+        };
 
         let header = self.build_dataset_header(index);
         let encoded = header.encode();
@@ -3614,9 +3720,10 @@ impl Hdf5Writer {
     /// SWMR readers. Subsequent writes use in-place updates.
     pub fn finalize_for_swmr(&mut self) -> IoResult<()> {
         // 0. Flush all chunked dataset index structures.
-        for i in 0..self.datasets.len() {
+        for i in 0..self.dataset_count() {
             let is_indexed = {
-                let m = self.datasets[i].mut_state.lock();
+                let ds = self.ds(i);
+                let m = ds.lock();
                 m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some()
             };
             if is_indexed {
@@ -3625,29 +3732,31 @@ impl Hdf5Writer {
         }
 
         // 1. Write each dataset's object header.
-        for i in 0..self.datasets.len() {
+        for i in 0..self.dataset_count() {
             let ds_header = self.build_dataset_header(i);
             let encoded = ds_header.encode();
             let encoded_size = encoded.len();
             let addr = self.allocator.allocate(encoded_size as u64);
             self.handle.write_at(addr, &encoded)?;
-            self.datasets[i].obj_header_addr = addr;
-            self.datasets[i].obj_header_written_addr = Some(addr);
-            self.datasets[i].obj_header_encoded_size = encoded_size;
+            let ds = self.ds(i);
+            let mut m = ds.lock();
+            m.obj_header_addr = addr;
+            m.obj_header_written_addr = Some(addr);
+            m.obj_header_encoded_size = encoded_size;
         }
 
         // 1b. Group object headers. A hard link can point to a group whose
         // header is written later, so addresses are assigned in a first
         // pass (a header's encoded size is independent of the address
         // values it carries) and the content is written in a second.
-        for gi in 0..self.groups.len() {
+        for gi in 0..self.group_count() {
             let size = self.build_group_header(gi).encode().len() as u64;
-            self.groups[gi].obj_header_addr = self.allocator.allocate(size);
+            self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
         }
-        for gi in 0..self.groups.len() {
+        for gi in 0..self.group_count() {
             let encoded = self.build_group_header(gi).encode();
-            self.handle
-                .write_at(self.groups[gi].obj_header_addr, &encoded)?;
+            let addr = self.grp(gi).lock().obj_header_addr;
+            self.handle.write_at(addr, &encoded)?;
         }
 
         // 2. Write root group object header.
@@ -3673,13 +3782,16 @@ impl Hdf5Writer {
     /// Flush any partial append buffers, padding each chunk's unwritten
     /// tail with the dataset's fill value (zeros when none is defined).
     fn flush_append_buffers(&mut self) -> IoResult<()> {
-        for i in 0..self.datasets.len() {
-            if self.datasets[i].mut_state.lock().append_buffer.is_empty() {
-                continue;
-            }
-            let chunk_dims = {
-                let m = self.datasets[i].mut_state.lock();
-                if let Some(ref c) = m.chunked {
+        for i in 0..self.dataset_count() {
+            // Snapshot everything needed under one brief slot guard, then drop
+            // it: `new_chunk_buffer` and `write_chunk` below re-lock the slot.
+            let (buf, buffered_frames, chunk_dims, es, dims) = {
+                let ds = self.ds(i);
+                let mut m = ds.lock();
+                if m.append_buffer.is_empty() {
+                    continue;
+                }
+                let chunk_dims = if let Some(ref c) = m.chunked {
                     c.chunk_dims.clone()
                 } else if let Some(ref f) = m.fixed_array {
                     f.chunk_dims.clone()
@@ -3687,30 +3799,24 @@ impl Hdf5Writer {
                     b.chunk_dims.clone()
                 } else {
                     continue;
-                }
+                };
+                let es = m.datatype.element_size() as usize;
+                let buffered_frames = m.append_buffered_frames as usize;
+                let dims = m.dataspace.dims.clone();
+                let buf = std::mem::take(&mut m.append_buffer);
+                m.append_buffered_frames = 0;
+                (buf, buffered_frames, chunk_dims, es, dims)
             };
-            let es = self.datasets[i].datatype.element_size() as usize;
+
             let chunk_bytes: usize = chunk_dims.iter().map(|&d| d as usize).product::<usize>() * es;
             let chunk_dim0 = chunk_dims[0] as usize;
-            let buffered_frames = self.datasets[i].mut_state.lock().append_buffered_frames as usize;
-            let current_dim0 = self.datasets[i].dataspace.dims[0] as usize;
+            let current_dim0 = dims[0] as usize;
             let base_frame = current_dim0 - buffered_frames;
             let chunk_idx = base_frame / chunk_dim0;
 
-            let buf = {
-                let mut m = self.datasets[i].mut_state.lock();
-                let buf = std::mem::take(&mut m.append_buffer);
-                m.append_buffered_frames = 0;
-                buf
-            };
-
             let mut chunk_buf = self.new_chunk_buffer(i, chunk_bytes);
-            let frame_bytes = if self.datasets[i].dataspace.dims.len() > 1 {
-                self.datasets[i].dataspace.dims[1..]
-                    .iter()
-                    .map(|&d| d as usize)
-                    .product::<usize>()
-                    * es
+            let frame_bytes = if dims.len() > 1 {
+                dims[1..].iter().map(|&d| d as usize).product::<usize>() * es
             } else {
                 es
             };
@@ -3740,65 +3846,61 @@ impl Hdf5Writer {
         // (`obj_header_written_addr.is_some()`).
 
         // 0. Flush chunked dataset index structures (only modified datasets).
-        for i in 0..self.datasets.len() {
-            if self.datasets[i].obj_header_written_addr.is_some() {
-                let modified = self.datasets[i]
-                    .mut_state
-                    .lock()
-                    .chunked
-                    .as_ref()
-                    .is_some_and(|c| c.chunks_written > 0);
-                if !modified {
+        for i in 0..self.dataset_count() {
+            let ds = self.ds(i);
+            {
+                let m = ds.lock();
+                if m.obj_header_written_addr.is_some() {
+                    let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0);
+                    if !modified {
+                        continue;
+                    }
+                }
+                let is_indexed =
+                    m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
+                if !is_indexed {
                     continue;
                 }
             }
-            let is_indexed = {
-                let m = self.datasets[i].mut_state.lock();
-                m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some()
-            };
-            if is_indexed {
-                self.flush_dataset(i)?;
-            }
+            self.flush_dataset(i)?;
         }
 
         // 1. Write each dataset's object header.
-        for i in 0..self.datasets.len() {
-            if self.datasets[i].obj_header_written_addr.is_some() {
-                // Existing dataset from append mode.
-                // If it has chunked info with chunks_written > 0, it was modified
-                // and needs a new object header.
-                let modified = self.datasets[i]
-                    .mut_state
-                    .lock()
-                    .chunked
-                    .as_ref()
-                    .is_some_and(|c| c.chunks_written > 0);
-                if !modified {
-                    // Keep the original object header address for the root group link.
-                    self.datasets[i].obj_header_addr =
-                        self.datasets[i].obj_header_written_addr.unwrap();
-                    continue;
+        for i in 0..self.dataset_count() {
+            let ds = self.ds(i);
+            {
+                let mut m = ds.lock();
+                if m.obj_header_written_addr.is_some() {
+                    // Existing dataset from append mode.
+                    // If it has chunked info with chunks_written > 0, it was modified
+                    // and needs a new object header.
+                    let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0);
+                    if !modified {
+                        // Keep the original object header address for the root group link.
+                        m.obj_header_addr = m.obj_header_written_addr.unwrap();
+                        continue;
+                    }
                 }
             }
             let ds_header = self.build_dataset_header(i);
             let encoded = ds_header.encode();
             let addr = self.allocator.allocate(encoded.len() as u64);
             self.handle.write_at(addr, &encoded)?;
-            self.datasets[i].obj_header_addr = addr;
+            ds.lock().obj_header_addr = addr;
         }
 
         // 1b. Group object headers. A hard link can point to a group whose
         // header is written later, so addresses are assigned in a first
         // pass (a header's encoded size is independent of the address
         // values it carries) and the content is written in a second.
-        for gi in 0..self.groups.len() {
+        for gi in 0..self.group_count() {
             let size = self.build_group_header(gi).encode().len() as u64;
-            self.groups[gi].obj_header_addr = self.allocator.allocate(size);
+            self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
         }
-        for gi in 0..self.groups.len() {
+        for gi in 0..self.group_count() {
             let encoded = self.build_group_header(gi).encode();
-            self.handle
-                .write_at(self.groups[gi].obj_header_addr, &encoded)?;
+            let addr = self.grp(gi).lock().obj_header_addr;
+            self.handle.write_at(addr, &encoded)?;
         }
 
         // 2. Write root group object header.
@@ -3816,24 +3918,28 @@ impl Hdf5Writer {
     }
 
     fn build_dataset_header(&self, index: usize) -> ObjectHeader {
-        let ds = &self.datasets[index];
-        // Hold one slot guard for the index-kind reads (is_chunked + layout);
-        // every other field touched here is disjoint from `mut_state`.
-        let m = ds.mut_state.lock();
+        // Compute the link count first: object_link_count re-locks dataset and
+        // group slots (including this one), so it must run before we take this
+        // dataset's slot guard — otherwise it would deadlock on the same slot.
+        let rc = self.object_link_count(HardLinkTarget::Dataset(index));
+
+        // Hold one slot guard for the whole header build.
+        let ds = self.ds(index);
+        let m = ds.lock();
         let mut header = ObjectHeader::new();
 
         // Dataspace message (type 0x01)
-        let ds_msg = ds.dataspace.encode(&self.ctx);
+        let ds_msg = m.dataspace.encode(&self.ctx);
         header.add_message(MSG_DATASPACE, 0x00, ds_msg);
 
         // Datatype message (type 0x03), flag 0x01 = constant
-        let dt_msg = ds.datatype.encode(&self.ctx);
+        let dt_msg = m.datatype.encode(&self.ctx);
         header.add_message(MSG_DATATYPE, 0x01, dt_msg);
 
         // Fill Value message (type 0x05)
         let is_chunked = m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
         let alloc_time = if is_chunked { 3 } else { 2 }; // 3 = incremental, 2 = late
-        let fv = if let Some(ref bytes) = ds.fill_value {
+        let fv = if let Some(ref bytes) = m.fill_value {
             // User-defined fill value (fill_defined = 2).
             FillValueMessage {
                 alloc_time,
@@ -3857,7 +3963,7 @@ impl Hdf5Writer {
         // Data Layout message (type 0x08)
         let layout = if let Some(ref chunked) = m.chunked {
             let mut layout_dims = chunked.chunk_dims.clone();
-            layout_dims.push(ds.datatype.element_size() as u64);
+            layout_dims.push(m.datatype.element_size() as u64);
             DataLayoutMessage::chunked_v4_earray(
                 layout_dims,
                 chunked.earray_params.clone(),
@@ -3865,7 +3971,7 @@ impl Hdf5Writer {
             )
         } else if let Some(ref fa) = m.fixed_array {
             let mut layout_dims = fa.chunk_dims.clone();
-            layout_dims.push(ds.datatype.element_size() as u64);
+            layout_dims.push(m.datatype.element_size() as u64);
             DataLayoutMessage::chunked_v4_farray(
                 layout_dims,
                 FixedArrayParams::default_params(),
@@ -3873,16 +3979,16 @@ impl Hdf5Writer {
             )
         } else if let Some(ref bt2) = m.btree_v2 {
             let mut layout_dims = bt2.chunk_dims.clone();
-            layout_dims.push(ds.datatype.element_size() as u64);
+            layout_dims.push(m.datatype.element_size() as u64);
             DataLayoutMessage::chunked_v4_btree_v2(layout_dims, bt2.bt2_header_addr)
         } else {
-            DataLayoutMessage::contiguous(ds.data_addr, ds.data_size)
+            DataLayoutMessage::contiguous(m.data_addr, m.data_size)
         };
         let layout_msg = layout.encode(&self.ctx);
         header.add_message(MSG_DATA_LAYOUT, 0x00, layout_msg);
 
         // Filter Pipeline message (type 0x0B) -- only if filters are configured
-        if let Some(ref pipeline) = ds.filter_pipeline {
+        if let Some(ref pipeline) = m.filter_pipeline {
             if !pipeline.filters.is_empty() {
                 let filter_msg = pipeline.encode();
                 header.add_message(MSG_FILTER_PIPELINE, 0x00, filter_msg);
@@ -3890,14 +3996,13 @@ impl Hdf5Writer {
         }
 
         // Attribute messages (type 0x0C)
-        for attr in &ds.attributes {
+        for attr in &m.attributes {
             let attr_msg = attr.encode(&self.ctx);
             header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
         }
 
         // Object Reference Count message (type 0x16): emitted only when
-        // more than one hard link resolves to this dataset.
-        let rc = self.object_link_count(HardLinkTarget::Dataset(index));
+        // more than one hard link resolves to this dataset (computed above).
         if rc > 1 {
             header.add_message(MSG_OBJ_REF_COUNT, 0x00, encode_refcount(rc));
         }
@@ -3919,28 +4024,41 @@ impl Hdf5Writer {
         let gi_msg = group_info.encode();
         header.add_message(MSG_GROUP_INFO, 0x00, gi_msg);
 
-        let grp = &self.groups[group_idx];
+        // Snapshot the group's child lists and attributes, then drop the slot
+        // guard: the per-child reads and emit_hard_links/object_link_count
+        // below re-lock dataset and group slots (including this one).
+        let (child_datasets, child_groups, attributes) = {
+            let grp = self.grp(group_idx);
+            let g = grp.lock();
+            (
+                g.child_datasets.clone(),
+                g.child_groups.clone(),
+                g.attributes.clone(),
+            )
+        };
 
         // Link messages for child datasets (skip deleted)
-        for &ds_idx in &grp.child_datasets {
-            let ds = &self.datasets[ds_idx];
-            if ds.deleted {
+        for ds_idx in child_datasets {
+            let ds = self.ds(ds_idx);
+            let m = ds.lock();
+            if m.deleted {
                 continue;
             }
-            let leaf_name = ds.name.rsplit('/').next().unwrap_or(&ds.name);
-            let link = LinkMessage::hard(leaf_name, ds.obj_header_addr);
+            let leaf_name = m.name.rsplit('/').next().unwrap_or(&m.name);
+            let link = LinkMessage::hard(leaf_name, m.obj_header_addr);
             let link_msg = link.encode(&self.ctx);
             header.add_message(MSG_LINK, 0x00, link_msg);
         }
 
         // Link messages for child groups (skip deleted)
-        for &child_idx in &grp.child_groups {
-            let child_grp = &self.groups[child_idx];
-            if child_grp.deleted {
+        for child_idx in child_groups {
+            let child_grp = self.grp(child_idx);
+            let g = child_grp.lock();
+            if g.deleted {
                 continue;
             }
-            let leaf_name = child_grp.name.rsplit('/').next().unwrap_or(&child_grp.name);
-            let link = LinkMessage::hard(leaf_name, child_grp.obj_header_addr);
+            let leaf_name = g.name.rsplit('/').next().unwrap_or(&g.name);
+            let link = LinkMessage::hard(leaf_name, g.obj_header_addr);
             let link_msg = link.encode(&self.ctx);
             header.add_message(MSG_LINK, 0x00, link_msg);
         }
@@ -3949,7 +4067,7 @@ impl Hdf5Writer {
         self.emit_hard_links(&mut header, Some(group_idx));
 
         // Attribute messages (type 0x0C) -- e.g. NeXus `NX_class`.
-        for attr in &grp.attributes {
+        for attr in &attributes {
             let attr_msg = attr.encode(&self.ctx);
             header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
         }
@@ -3977,34 +4095,41 @@ impl Hdf5Writer {
         let gi_msg = group_info.encode();
         header.add_message(MSG_GROUP_INFO, 0x00, gi_msg);
 
-        // Collect dataset indices that belong to the root group (not assigned to any subgroup)
-        let datasets_in_subgroups: std::collections::HashSet<usize> = self
-            .groups
-            .iter()
-            .filter(|g| !g.deleted)
-            .flat_map(|g| g.child_datasets.iter().copied())
-            .collect();
+        // Collect dataset indices that belong to a subgroup (not the root
+        // group). Each group slot is locked one at a time, then released.
+        let mut datasets_in_subgroups: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        for grp in self.group_refs() {
+            let g = grp.lock();
+            if g.deleted {
+                continue;
+            }
+            datasets_in_subgroups.extend(g.child_datasets.iter().copied());
+        }
 
-        // Link messages for root-level datasets
-        for (i, ds) in self.datasets.iter().enumerate() {
-            if ds.deleted {
+        // Link messages for root-level datasets. `dataset_refs` preserves
+        // registry order, so `enumerate` yields each dataset's true index.
+        for (i, ds) in self.dataset_refs().into_iter().enumerate() {
+            let m = ds.lock();
+            if m.deleted {
                 continue;
             }
             if !datasets_in_subgroups.contains(&i) {
-                let link = LinkMessage::hard(&ds.name, ds.obj_header_addr);
+                let link = LinkMessage::hard(&m.name, m.obj_header_addr);
                 let link_msg = link.encode(&self.ctx);
                 header.add_message(MSG_LINK, 0x00, link_msg);
             }
         }
 
         // Link messages for root-level groups (those with no parent)
-        for grp in &self.groups {
-            if grp.deleted {
+        for grp in self.group_refs() {
+            let g = grp.lock();
+            if g.deleted {
                 continue;
             }
-            if grp.parent.is_none() {
-                let leaf_name = grp.name.rsplit('/').next().unwrap_or(&grp.name);
-                let link = LinkMessage::hard(leaf_name, grp.obj_header_addr);
+            if g.parent.is_none() {
+                let leaf_name = g.name.rsplit('/').next().unwrap_or(&g.name);
+                let link = LinkMessage::hard(leaf_name, g.obj_header_addr);
                 let link_msg = link.encode(&self.ctx);
                 header.add_message(MSG_LINK, 0x00, link_msg);
             }
@@ -4014,7 +4139,7 @@ impl Hdf5Writer {
         self.emit_hard_links(&mut header, None);
 
         // Root-level attributes
-        for attr in &self.root_attributes {
+        for attr in self.root_attributes.lock().iter() {
             let attr_msg = attr.encode(&self.ctx);
             header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
         }
@@ -4079,7 +4204,7 @@ mod tests {
     fn create_single_dataset() {
         let path = temp_path("single");
 
-        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let writer = Hdf5Writer::create(&path).unwrap();
         let idx = writer
             .create_dataset("data", DatatypeMessage::f64_type(), &[4])
             .unwrap();
@@ -4102,7 +4227,7 @@ mod tests {
     fn create_multiple_datasets() {
         let path = temp_path("multi");
 
-        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let writer = Hdf5Writer::create(&path).unwrap();
 
         let idx0 = writer
             .create_dataset("ints", DatatypeMessage::i32_type(), &[3])
@@ -4140,7 +4265,7 @@ mod tests {
     fn data_size_mismatch() {
         let path = temp_path("mismatch");
 
-        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let writer = Hdf5Writer::create(&path).unwrap();
         let idx = writer
             .create_dataset("x", DatatypeMessage::u8_type(), &[4])
             .unwrap();
@@ -4154,7 +4279,7 @@ mod tests {
     fn create_chunked_dataset_simple() {
         let path = temp_path("chunked_simple");
 
-        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let writer = Hdf5Writer::create(&path).unwrap();
         let idx = writer
             .create_chunked_dataset(
                 "data",
@@ -4199,7 +4324,7 @@ mod tests {
     fn chunked_dataset_many_frames() {
         let path = temp_path("chunked_many");
 
-        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let writer = Hdf5Writer::create(&path).unwrap();
         let idx = writer
             .create_chunked_dataset(
                 "frames",
@@ -4241,7 +4366,7 @@ mod tests {
     fn create_fixed_array_dataset_roundtrip() {
         let path = temp_path("fixed_array");
 
-        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let writer = Hdf5Writer::create(&path).unwrap();
         let idx = writer
             .create_fixed_array_dataset(
                 "grid",
@@ -4374,7 +4499,7 @@ mod tests {
         // 1D dataset of 3000 elements, chunk size 1 => 3000 chunks.
         // 3000 > 1024 (one page) => the FA data block must be paged.
         let n: usize = 3000;
-        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let writer = Hdf5Writer::create(&path).unwrap();
         let idx = writer
             .create_fixed_array_dataset("paged", DatatypeMessage::i32_type(), &[n as u64], &[1])
             .unwrap();
@@ -4408,7 +4533,7 @@ mod tests {
         // Small compressed fixed-shape chunked dataset: flat filtered FA.
         let path = temp_path("fixed_array_filt");
 
-        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let writer = Hdf5Writer::create(&path).unwrap();
         let idx = writer
             .create_fixed_array_dataset_with_pipeline(
                 "grid",
@@ -4465,7 +4590,7 @@ mod tests {
         let path = temp_path("fixed_array_filt_paged");
 
         let n: usize = 3000;
-        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let writer = Hdf5Writer::create(&path).unwrap();
         let idx = writer
             .create_fixed_array_dataset_with_pipeline(
                 "paged",
@@ -4577,7 +4702,7 @@ mod tests {
     fn create_btree_v2_dataset_roundtrip() {
         let path = temp_path("btree_v2");
 
-        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let writer = Hdf5Writer::create(&path).unwrap();
         let idx = writer
             .create_btree_v2_dataset(
                 "data",
@@ -4978,7 +5103,7 @@ mod tests {
     fn group_hierarchy_writer_reader() {
         let path = temp_path("group_hierarchy");
 
-        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let writer = Hdf5Writer::create(&path).unwrap();
 
         // Create groups
         let g0 = writer.create_group("/", "group1").unwrap();
