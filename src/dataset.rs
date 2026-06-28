@@ -761,8 +761,8 @@ impl H5Dataset {
                     );
                 }
 
-                let mut inner = borrow_inner_mut(&self.file_inner);
-                match &mut *inner {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
                     H5FileInner::Writer(writer) => {
                         writer.write_dataset_raw(*index, raw)?;
                         Ok(())
@@ -843,8 +843,8 @@ impl H5Dataset {
                         *element_size,
                     );
                 }
-                let mut inner = borrow_inner_mut(&self.file_inner);
-                match &mut *inner {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
                     H5FileInner::Writer(writer) => {
                         writer.write_dataset_raw(*index, bytes)?;
                         Ok(())
@@ -877,8 +877,8 @@ impl H5Dataset {
         bytes: &[u8],
         element_size: usize,
     ) -> Result<()> {
-        let mut inner = borrow_inner_mut(&self.file_inner);
-        let writer = match &mut *inner {
+        let inner = borrow_inner(&self.file_inner);
+        let writer = match &*inner {
             H5FileInner::Writer(w) => w,
             _ => {
                 return Err(Hdf5Error::InvalidState(
@@ -1031,8 +1031,8 @@ impl H5Dataset {
                     ));
                 }
 
-                let mut inner = borrow_inner_mut(&self.file_inner);
-                match &mut *inner {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
                     H5FileInner::Writer(writer) => {
                         if *fixed_array {
                             // Fixed-array dataset: convert the linear chunk
@@ -1135,8 +1135,8 @@ impl H5Dataset {
                     ));
                 }
 
-                let mut inner = borrow_inner_mut(&self.file_inner);
-                match &mut *inner {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
                     H5FileInner::Writer(writer) => {
                         if *fixed_array {
                             // Fixed-array dataset: convert the linear chunk
@@ -1345,8 +1345,8 @@ impl H5Dataset {
                     .iter()
                     .map(|(idx, data)| (*idx as u64, *data))
                     .collect();
-                let mut inner = borrow_inner_mut(&self.file_inner);
-                match &mut *inner {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
                     H5FileInner::Writer(writer) => {
                         writer.write_chunks_batch(*index, &pairs)?;
                         Ok(())

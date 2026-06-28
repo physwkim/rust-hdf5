@@ -36,7 +36,7 @@ use crate::types::H5Type;
 pub(crate) type SharedInner = std::rc::Rc<std::cell::RefCell<H5FileInner>>;
 
 #[cfg(feature = "threadsafe")]
-pub(crate) type SharedInner = std::sync::Arc<std::sync::Mutex<H5FileInner>>;
+pub(crate) type SharedInner = std::sync::Arc<std::sync::RwLock<H5FileInner>>;
 
 /// Helper to borrow/lock the inner state immutably.
 #[cfg(not(feature = "threadsafe"))]
@@ -62,14 +62,23 @@ pub(crate) fn new_shared(inner: H5FileInner) -> SharedInner {
     std::rc::Rc::new(std::cell::RefCell::new(inner))
 }
 
+/// Acquire a shared (read) lock on the inner state. The fine-grained writer
+/// (atomic allocator, positioned handle, per-dataset `Slot` mutexes) is safe to
+/// drive through `&H5FileInner`, so the non-extending chunk-write path takes
+/// this read guard and lets writes to different datasets proceed concurrently.
 #[cfg(feature = "threadsafe")]
-pub(crate) fn borrow_inner(inner: &SharedInner) -> std::sync::MutexGuard<'_, H5FileInner> {
-    inner.lock().unwrap()
+pub(crate) fn borrow_inner(inner: &SharedInner) -> std::sync::RwLockReadGuard<'_, H5FileInner> {
+    inner.read().unwrap()
 }
 
+/// Acquire an exclusive (write) lock on the inner state. Required by paths that
+/// mutate shared writer state directly — create, extend/`set_extent`, append,
+/// metadata, finalize/close.
 #[cfg(feature = "threadsafe")]
-pub(crate) fn borrow_inner_mut(inner: &SharedInner) -> std::sync::MutexGuard<'_, H5FileInner> {
-    inner.lock().unwrap()
+pub(crate) fn borrow_inner_mut(
+    inner: &SharedInner,
+) -> std::sync::RwLockWriteGuard<'_, H5FileInner> {
+    inner.write().unwrap()
 }
 
 #[cfg(feature = "threadsafe")]
@@ -79,7 +88,7 @@ pub(crate) fn clone_inner(inner: &SharedInner) -> SharedInner {
 
 #[cfg(feature = "threadsafe")]
 pub(crate) fn new_shared(inner: H5FileInner) -> SharedInner {
-    std::sync::Arc::new(std::sync::Mutex::new(inner))
+    std::sync::Arc::new(std::sync::RwLock::new(inner))
 }
 
 /// The inner state of an HDF5 file, shared with datasets via reference counting.
