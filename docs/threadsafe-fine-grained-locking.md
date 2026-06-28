@@ -138,8 +138,19 @@ interior mutability:
 The streaming write path (`write_chunk*`, `append`, `write_raw` on a
 chunked dataset) becomes: lock the *one* target `DatasetSlot`, do the
 short allocate+write+record, unlock. Different datasets run fully in
-parallel; same-dataset writes serialize (correct — a single chunk index
-is not concurrently mutable).
+parallel.
+
+Scope of the same-dataset guarantee: a *single* slot operation — one
+`write_chunk` / `record_*` — serializes on that slot's `Mutex`, so it
+cannot tear the chunk index. It does **not** make a multi-step sequence
+atomic. `append` deliberately drops the slot between phases (read dims →
+take `append_buffer` → compress + write each chunk → `extend_dataset`) so
+compression and disk I/O run unlocked; two threads appending to the *same*
+dataset can therefore interleave those phases and corrupt the
+buffer/dimension accounting. The supported concurrency is across
+**distinct** datasets (one writer per dataset, e.g. a rayon `par_iter`
+over datasets). Concurrent writes to a *single* dataset are unsupported;
+callers must serialize them externally.
 
 ### 4.4 `SharedInner` — drop the outer `Mutex`
 

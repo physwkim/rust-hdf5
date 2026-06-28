@@ -93,11 +93,18 @@ fn concurrent_allocate_three_threads_disjoint() {
 /// Models the writer's registry lock order: a writer reaches a dataset slot
 /// by cloning its `Arc` out of the spine *under the spine lock*, releasing the
 /// spine lock, then locking only that one slot — while a concurrent creator
-/// pushes a brand-new slot under the spine lock. The invariant is spine →
-/// slot, and the spine lock is never re-taken while a slot guard is held, so
-/// no interleaving can deadlock. The cloned `Arc` keeps slot 0 alive across
-/// the creator's `Vec` push (which may reallocate the spine's backing store),
-/// so the write lands and the new slot is independent.
+/// pushes a brand-new slot under the spine lock.
+///
+/// What this proves: under that production acquisition order (spine → slot,
+/// spine released before the slot is locked), no interleaving deadlocks, and
+/// the cloned `Arc` keeps slot 0 alive across the creator's `Vec` push (which
+/// may reallocate the spine's backing store), so the write lands and the new
+/// slot is independent. What it does NOT prove: that *arbitrary* code is
+/// deadlock-free. It never holds a slot guard while taking the spine, so it
+/// cannot catch a future slot → spine inversion (e.g. someone making a header
+/// builder call `object_link_count` while holding the slot). That the
+/// production code never inverts the order is enforced by the `ds`/`grp`
+/// accessor contract (writer.rs) and the review audit, not by this model.
 #[test]
 fn spine_then_slot_no_deadlock_and_disjoint() {
     loom::model(|| {
