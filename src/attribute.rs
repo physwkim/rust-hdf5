@@ -88,19 +88,14 @@ impl H5Attribute {
 
     /// Write a variable-length UTF-8 string **array** attribute.
     ///
-    /// The attribute must have been given a 1-D shape via
-    /// [`AttrBuilder::shape`] whose single dimension equals `values.len()`.
-    /// Every element is stored in one shared global heap collection; h5py reads
-    /// the attribute back as a 1-D array of Python `str`. The string-array
-    /// counterpart of [`write_string`](Self::write_string) /
-    /// [`write_array`](Self::write_array).
+    /// The attribute is given its shape via [`AttrBuilder::shape`] (any rank;
+    /// empty = scalar) and `values` must hold exactly the product of those
+    /// dimensions, supplied in row-major order. Every element is stored in one
+    /// shared global heap collection; h5py reads the attribute back as a numpy
+    /// array of Python `str` with that shape. The string-array counterpart of
+    /// [`write_string`](Self::write_string) / [`write_array`](Self::write_array).
     pub fn write_string_array(&self, values: &[&str]) -> Result<()> {
-        if self.write_dims.len() > 1 {
-            return Err(Hdf5Error::InvalidState(format!(
-                "attribute '{}' string arrays support only a 1-D shape, got {:?}",
-                self.name, self.write_dims
-            )));
-        }
+        // Product of an empty shape is 1 (a scalar holds one element).
         let expected: usize = self.write_dims.iter().product();
         if values.len() != expected {
             return Err(Hdf5Error::InvalidState(format!(
@@ -111,10 +106,11 @@ impl H5Attribute {
                 values.len()
             )));
         }
+        let dims_u64: Vec<u64> = self.write_dims.iter().map(|&d| d as u64).collect();
         let mut inner = borrow_inner_mut(&self.file_inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
-                let attr_msg = writer.vlen_string_array_attribute(&self.name, values)?;
+                let attr_msg = writer.vlen_string_array_attribute(&self.name, values, &dims_u64)?;
                 writer.add_dataset_attribute(self.ds_index, attr_msg)?;
                 Ok(())
             }

@@ -559,15 +559,43 @@ impl H5Group {
 
     /// Add (or replace) a variable-length UTF-8 string **array** attribute on
     /// this group, read back by h5py as a 1-D array of `str` — the array
-    /// counterpart of [`set_attr_string`](Self::set_attr_string).
+    /// counterpart of [`set_attr_string`](Self::set_attr_string). For a
+    /// multi-dimensional shape use
+    /// [`set_attr_string_array_nd`](Self::set_attr_string_array_nd).
     pub fn set_attr_string_array(&self, name: &str, values: &[&str]) -> Result<()> {
+        self.set_attr_string_array_nd(name, values, &[values.len()])
+    }
+
+    /// Add (or replace) a variable-length UTF-8 string **N-dimensional array**
+    /// attribute on this group.
+    ///
+    /// `shape` gives the dataspace dimensions; `values` is the row-major data
+    /// and its length must equal the product of `shape` (an empty `shape` is a
+    /// scalar, requiring exactly one value). Read back by h5py as a numpy array
+    /// of Python `str` with that shape.
+    /// [`set_attr_string_array`](Self::set_attr_string_array) is the 1-D
+    /// convenience form.
+    pub fn set_attr_string_array_nd(
+        &self,
+        name: &str,
+        values: &[&str],
+        shape: &[usize],
+    ) -> Result<()> {
+        let n: usize = shape.iter().product();
+        if values.len() != n {
+            return Err(Hdf5Error::InvalidState(format!(
+                "attribute '{name}' shape {shape:?} needs {n} elements, got {}",
+                values.len()
+            )));
+        }
+        let dims: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
         // The vlen array message needs `&mut writer` (global-heap allocation),
         // so we route it the same way `set_attr_string` does rather than through
         // `add_attr` (which re-borrows the writer).
         let mut inner = borrow_inner_mut(&self.file_inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
-                let attr = writer.vlen_string_array_attribute(name, values)?;
+                let attr = writer.vlen_string_array_attribute(name, values, &dims)?;
                 if self.name == "/" {
                     writer.add_root_attribute(attr);
                 } else {

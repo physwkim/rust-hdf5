@@ -2547,23 +2547,34 @@ impl Hdf5Writer {
 
     /// Build a variable-length UTF-8 string **array** attribute message.
     ///
-    /// The 1-D counterpart of [`vlen_string_attribute`](Self::vlen_string_attribute):
-    /// every element string is stored as one object in a single global heap
-    /// collection, and the attribute data is the concatenation of one vlen
-    /// reference per element. The datatype is the same vlen-string datatype; the
-    /// dataspace is a simple dataspace of shape `[values.len()]`. h5py reads the
-    /// value back as a 1-D array of Python `str`.
+    /// The N-dimensional counterpart of
+    /// [`vlen_string_attribute`](Self::vlen_string_attribute): every element
+    /// string is stored as one object in a single global heap collection, and
+    /// the attribute data is the row-major concatenation of one vlen reference
+    /// per element. The datatype is the same vlen-string datatype; the dataspace
+    /// is the simple dataspace described by `shape` (an empty `shape` is a
+    /// scalar). h5py reads the value back as a numpy array of Python `str` with
+    /// that shape.
     ///
-    /// One global heap collection is allocated for the whole array (all elements
-    /// share it), matching the per-attribute collection of the scalar path.
+    /// The caller owns the invariant that `values.len()` equals the product of
+    /// `shape` (the public setters validate it before calling). One global heap
+    /// collection is allocated for the whole array (all elements share it),
+    /// matching the per-attribute collection of the scalar path.
     pub fn vlen_string_array_attribute(
         &mut self,
         name: &str,
         values: &[&str],
+        shape: &[u64],
     ) -> IoResult<AttributeMessage> {
         use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
         use crate::format::messages::dataspace::DataspaceMessage;
         use crate::format::messages::datatype::DatatypeMessage;
+
+        debug_assert_eq!(
+            values.len() as u64,
+            shape.iter().product::<u64>(),
+            "vlen_string_array_attribute values.len() must equal product(shape)"
+        );
 
         let mut gcol = GlobalHeapCollection::new();
         // (byte length, heap object index) per element, in order.
@@ -2585,11 +2596,10 @@ impl Hdf5Writer {
                 &self.ctx,
             ));
         }
-        let dims = [values.len() as u64];
         Ok(AttributeMessage {
             name: name.to_string(),
             datatype: DatatypeMessage::vlen_string_utf8(),
-            dataspace: DataspaceMessage::simple(&dims),
+            dataspace: DataspaceMessage::simple(shape),
             data,
         })
     }

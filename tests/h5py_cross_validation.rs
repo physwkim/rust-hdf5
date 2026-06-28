@@ -345,6 +345,57 @@ fn nd_numeric_array_attrs_readable_by_h5py() {
     std::fs::remove_file(&path).ok();
 }
 
+/// N-D variable-length string array attributes (`set_attr_string_array_nd` and
+/// the `AttrBuilder::shape` + `write_string_array` path): a 2x3 attribute on the
+/// root, a 2x2 attribute on a group, and a 2x2 attribute on a dataset must come
+/// back from h5py as vlen-string numpy arrays with the exact multi-dimensional
+/// shape, row-major `str` values, and a vlen-string dtype.
+#[test]
+fn nd_string_array_attrs_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("nd_string_array_attrs");
+    {
+        let file = H5File::create(&path).unwrap();
+        // Root: 2x3 row-major vlen strings.
+        file.set_attr_string_array_nd("grid", &["a", "b", "c", "d", "e", "f"], &[2, 3])
+            .unwrap();
+        // Group: 2x2 row-major vlen strings.
+        let grp = file.root_group().create_group("grp").unwrap();
+        grp.set_attr_string_array_nd("cell", &["p", "qq", "rrr", "s"], &[2, 2])
+            .unwrap();
+        // Dataset: 2x2 vlen-string attribute via the builder + shape([2, 2]).
+        let ds = file.new_dataset::<i32>().shape([2]).create("data").unwrap();
+        ds.write_raw(&[1, 2]).unwrap();
+        ds.new_attr::<VarLenUnicode>()
+            .shape([2, 2])
+            .create("tags")
+            .unwrap()
+            .write_string_array(&["w", "xx", "yyy", "z"])
+            .unwrap();
+        // Length/shape mismatch must error, not silently truncate.
+        assert!(file
+            .set_attr_string_array_nd("bad", &["a", "b", "c"], &[2, 2])
+            .is_err());
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "grid = f.attrs['grid']\n\
+         assert grid.shape == (2, 3), grid.shape\n\
+         assert grid.tolist() == [['a', 'b', 'c'], ['d', 'e', 'f']], grid.tolist()\n\
+         assert h5py.check_string_dtype(f.attrs.get_id('grid').dtype), 'grid not vlen string'\n\
+         cell = f['grp'].attrs['cell']\n\
+         assert cell.shape == (2, 2), cell.shape\n\
+         assert cell.tolist() == [['p', 'qq'], ['rrr', 's']], cell.tolist()\n\
+         tags = f['data'].attrs['tags']\n\
+         assert tags.shape == (2, 2), tags.shape\n\
+         assert tags.tolist() == [['w', 'xx'], ['yyy', 'z']], tags.tolist()\n\
+         assert h5py.check_string_dtype(f['data'].attrs.get_id('tags').dtype), 'tags not vlen string'\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// A: a filter requested without explicit chunk dimensions auto-chunks (whole
 /// dataset = one chunk) and `write_raw` populates it. h5py must see a gzip-
 /// compressed, chunked dataset with the right values — proving the filter is
