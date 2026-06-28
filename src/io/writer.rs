@@ -1437,7 +1437,7 @@ impl Hdf5Writer {
     /// The caller is responsible for providing data in the correct byte order
     /// and layout. The length must match the total data size declared at
     /// creation time.
-    pub fn write_dataset_raw(&mut self, index: usize, data: &[u8]) -> IoResult<()> {
+    pub fn write_dataset_raw(&self, index: usize, data: &[u8]) -> IoResult<()> {
         let ds = &self.datasets[index];
         if ds.mut_state.lock().chunked.is_some() {
             return Err(crate::io::IoError::InvalidState(
@@ -1467,7 +1467,7 @@ impl Hdf5Writer {
     /// Only the first (unlimited) dimension index is used for EA indexing.
     ///
     /// `data` must be exactly chunk_size bytes (product of chunk_dims * element_size).
-    pub fn write_chunk(&mut self, index: usize, chunk_idx: u64, data: &[u8]) -> IoResult<()> {
+    pub fn write_chunk(&self, index: usize, chunk_idx: u64, data: &[u8]) -> IoResult<()> {
         let ds = &self.datasets[index];
         let element_size = ds.datatype.element_size() as u64;
         // Scope the slot guard: `record_ea_chunk` re-locks the same slot, so
@@ -1513,7 +1513,7 @@ impl Hdf5Writer {
     /// the index block, a data block, or a super block per the EA
     /// geometry. Shared by write_chunk and write_compressed_chunk.
     fn record_ea_chunk(
-        &mut self,
+        &self,
         index: usize,
         chunk_idx: u64,
         chunk_addr: u64,
@@ -2475,7 +2475,7 @@ impl Hdf5Writer {
     /// caller doing a read-modify-write of a partial chunk treats `None`
     /// as an error rather than silently overwriting the chunk.
     pub(crate) fn read_chunk_if_present(
-        &mut self,
+        &self,
         ds_index: usize,
         chunk_idx: u64,
     ) -> IoResult<Option<Vec<u8>>> {
@@ -3098,7 +3098,7 @@ impl Hdf5Writer {
     /// The uncompressed `data` must be exactly one chunk wide; the filter
     /// pipeline (if any) runs here before the bytes reach the index.
     pub fn write_chunk_fixed_array(
-        &mut self,
+        &self,
         index: usize,
         chunk_coords: &[u64],
         data: &[u8],
@@ -3146,7 +3146,7 @@ impl Hdf5Writer {
     /// Requires a filtered dataset — only the filtered FA element carries the
     /// size+mask slot.
     pub fn write_compressed_chunk_fixed_array(
-        &mut self,
+        &self,
         index: usize,
         chunk_coords: &[u64],
         data: &[u8],
@@ -3169,7 +3169,7 @@ impl Hdf5Writer {
     /// Shared by [`write_chunk_fixed_array`](Self::write_chunk_fixed_array)
     /// and [`write_compressed_chunk_fixed_array`](Self::write_compressed_chunk_fixed_array).
     fn record_fixed_array_chunk(
-        &mut self,
+        &self,
         index: usize,
         chunk_coords: &[u64],
         final_bytes: &[u8],
@@ -3286,7 +3286,7 @@ impl Hdf5Writer {
     ///
     /// `chunk_coords` is the scaled chunk coordinates (one per dimension).
     pub fn write_chunk_btree_v2(
-        &mut self,
+        &self,
         index: usize,
         chunk_coords: &[u64],
         data: &[u8],
@@ -3325,7 +3325,7 @@ impl Hdf5Writer {
     /// Write multiple chunks in a batch, optionally compressing in parallel.
     ///
     /// `chunks` is a list of (chunk_idx, data) pairs for an EA-indexed dataset.
-    pub fn write_chunks_batch(&mut self, ds_index: usize, chunks: &[(u64, &[u8])]) -> IoResult<()> {
+    pub fn write_chunks_batch(&self, ds_index: usize, chunks: &[(u64, &[u8])]) -> IoResult<()> {
         #[cfg(feature = "parallel")]
         {
             // If filter pipeline is set, compress all chunks in parallel
@@ -3360,7 +3360,7 @@ impl Hdf5Writer {
     /// Requires a filtered dataset — only the filtered EA entry carries the
     /// size+mask slot. An unfiltered dataset has nowhere to record either.
     pub fn write_compressed_chunk(
-        &mut self,
+        &self,
         index: usize,
         chunk_idx: u64,
         compressed_data: &[u8],
