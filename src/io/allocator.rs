@@ -48,11 +48,6 @@ impl FileAllocator {
     pub fn eof(&self) -> u64 {
         self.eof.load(Ordering::Acquire)
     }
-
-    /// Manually set the end-of-file offset.
-    pub fn set_eof(&self, eof: u64) {
-        self.eof.store(eof, Ordering::Release);
-    }
 }
 
 #[cfg(test)]
