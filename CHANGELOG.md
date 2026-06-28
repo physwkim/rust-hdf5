@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.27
+
+### Added
+
+- N-dimensional array attributes, generalizing the 1-D array setters added in
+  0.2.26 to an arbitrary shape for both numeric and variable-length string
+  attributes:
+  - `H5File::set_attr_array_numeric_nd` / `set_attr_string_array_nd` (root group)
+  - `H5Group::set_attr_array_numeric_nd` / `set_attr_string_array_nd`
+  - `H5Attribute::write_string_array` now honors the full `AttrBuilder::shape`
+    of any rank (the previous 1-D-only restriction is removed), matching the
+    already-N-D `write_array` for numeric attributes.
+
+  `shape` gives the dataspace dimensions and `values` is the row-major data,
+  whose length must equal the product of `shape` (an empty `shape` is a scalar);
+  a mismatch returns an error instead of truncating. The 1-D
+  `set_attr_array_numeric` / `set_attr_string_array` setters are now thin
+  wrappers over the N-D forms with `shape = [values.len()]`, so existing callers
+  are unaffected. Verified by h5py cross-validation: a 2x3 `i32` and 2x2x2 `f64`
+  numeric attribute, and 2x3 / 2x2 / dataset-builder vlen-string attributes, all
+  read back with the exact multi-dimensional shape and row-major values.
+
 ## 0.2.26
 
 ### Added
