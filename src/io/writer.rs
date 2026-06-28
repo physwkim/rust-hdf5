@@ -3639,9 +3639,16 @@ impl Hdf5Writer {
     /// Writes the dataset object headers, root group object header, and
     /// superblock. After this call the file is a valid HDF5 file.
     pub fn close(mut self) -> IoResult<()> {
-        self.finalize()?;
+        // Mark closed BEFORE finalizing: finalize writes external truth
+        // (object headers + superblock) and must run exactly once. If we
+        // finalized first and it failed, the `?` would return with `closed`
+        // still false, and dropping `self` would re-run `finalize` a second
+        // time over a half-written file (and print the "call close()" notice
+        // the caller already heeded). Committing to the close path first makes
+        // `Drop` (the only other finalize site) a no-op regardless of outcome,
+        // so the error is reported exactly once via this `Result`.
         self.closed = true;
-        Ok(())
+        self.finalize()
     }
 
     /// Provide mutable access to the underlying file handle.
