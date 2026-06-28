@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.26
+
+### Added
+
+- 1-D array attributes for files, groups, and the attribute builder, extending
+  the scalar attribute setters:
+  - `H5File::set_attr_string_array` / `set_attr_array_numeric` (root group)
+  - `H5Group::set_attr_string_array` / `set_attr_array_numeric`
+  - `H5Attribute::write_string_array` (builder path; requires a 1-D `shape([n])`
+    and validates `values.len() == n`)
+
+  String arrays are stored as a `[n]` dataspace of variable-length UTF-8 string
+  references backed by one shared global-heap collection, so h5py reads them back
+  as a 1-D array of Python `str`; numeric arrays use a `[n]` dataspace of
+  little-endian elements and read back as a NumPy array. Verified by h5py
+  cross-validation (root + group string/numeric arrays, dataset-builder string
+  array).
+
 ## 0.2.25
 
 ### Added
