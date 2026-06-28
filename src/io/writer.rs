@@ -400,6 +400,19 @@ pub struct Hdf5Writer {
     pub(crate) hard_links: Slot<Vec<HardLink>>,
     /// Attributes attached to the root group (file-level attributes).
     pub(crate) root_attributes: Slot<Vec<crate::format::messages::attribute::AttributeMessage>>,
+    /// Serializes object creation so name-uniqueness check and registry insert
+    /// happen atomically.
+    ///
+    /// INVARIANT: no two emitted links share a full-path name. Under
+    /// `threadsafe`, create methods run on the shared read guard, so without
+    /// this gate two threads could both pass the duplicate-name check (which
+    /// snapshots a registry and drops its lock) and both push, writing an
+    /// invalid HDF5 file with two same-named links. A create holds this lock
+    /// across its check *and* its push; the streaming write path never takes
+    /// it, so writes to existing datasets stay fully concurrent. It is the
+    /// outermost lock a create acquires (create_lock → spine → slot), and no
+    /// write path takes it, so it cannot deadlock with the registry locks.
+    pub(crate) create_lock: Slot<()>,
     closed: bool,
     /// Address of the root group object header (set after first finalize).
     root_group_addr: Option<u64>,
@@ -452,6 +465,7 @@ impl Hdf5Writer {
             groups: Slot::new(Vec::new()),
             hard_links: Slot::new(Vec::new()),
             root_attributes: Slot::new(Vec::new()),
+            create_lock: Slot::new(()),
             closed: false,
             root_group_addr: None,
             root_group_encoded_size: 0,
@@ -920,6 +934,7 @@ impl Hdf5Writer {
             groups: Slot::new(groups),
             hard_links: Slot::new(Vec::new()),
             root_attributes: Slot::new(root_attributes),
+            create_lock: Slot::new(()),
             closed: false,
             root_group_addr: None,
             root_group_encoded_size: 0,
@@ -1155,6 +1170,9 @@ impl Hdf5Writer {
     ///
     /// Returns the group index in the writer's group list.
     pub fn create_group(&self, parent_path: &str, name: &str) -> IoResult<usize> {
+        // Hold the create gate across the uniqueness check and the registry
+        // push so the two are atomic (see `create_lock`).
+        let _create = self.create_lock.lock();
         let full_name = if parent_path == "/" {
             format!("/{}", name)
         } else {
@@ -1259,6 +1277,10 @@ impl Hdf5Writer {
                 "hard link name '{link_name}' must be a non-empty leaf name"
             )));
         }
+
+        // Hold the create gate across the collision check and the hard-link
+        // push so the two are atomic (see `create_lock`).
+        let _create = self.create_lock.lock();
 
         let datasets = self.dataset_refs();
         let groups = self.group_refs();
@@ -1411,6 +1433,9 @@ impl Hdf5Writer {
         datatype: DatatypeMessage,
         dims: &[u64],
     ) -> IoResult<usize> {
+        // Hold the create gate across the uniqueness check and the registry
+        // push so the two are atomic (see `create_lock`).
+        let _create = self.create_lock.lock();
         self.ensure_unique_dataset_name(name)?;
         let total_elements: u64 = if dims.is_empty() {
             1
@@ -1469,6 +1494,9 @@ impl Hdf5Writer {
         max_dims: &[u64],
         chunk_dims: &[u64],
     ) -> IoResult<usize> {
+        // Hold the create gate across the uniqueness check and the registry
+        // push so the two are atomic (see `create_lock`).
+        let _create = self.create_lock.lock();
         self.ensure_unique_dataset_name(name)?;
         let earray_params = EarrayParams::default_params();
         let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs)?;
@@ -2748,6 +2776,9 @@ impl Hdf5Writer {
         dims: &[u64],
         chunk_dims: &[u64],
     ) -> IoResult<usize> {
+        // Hold the create gate across the uniqueness check and the registry
+        // push so the two are atomic (see `create_lock`).
+        let _create = self.create_lock.lock();
         self.ensure_unique_dataset_name(name)?;
         // Compute total number of chunks. `chunk_dims` is caller-supplied;
         // validate it before any indexing or division.
@@ -2846,6 +2877,9 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: FilterPipeline,
     ) -> IoResult<usize> {
+        // Hold the create gate across the uniqueness check and the registry
+        // push so the two are atomic (see `create_lock`).
+        let _create = self.create_lock.lock();
         self.ensure_unique_dataset_name(name)?;
         let ndims = dims.len();
         if chunk_dims.len() != ndims {
@@ -2940,6 +2974,9 @@ impl Hdf5Writer {
         max_dims: &[u64],
         chunk_dims: &[u64],
     ) -> IoResult<usize> {
+        // Hold the create gate across the uniqueness check and the registry
+        // push so the two are atomic (see `create_lock`).
+        let _create = self.create_lock.lock();
         self.ensure_unique_dataset_name(name)?;
         let ndims = dims.len();
         let bt2_index = Bt2ChunkIndex::new_unfiltered(ndims);
@@ -3107,6 +3144,9 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: FilterPipeline,
     ) -> IoResult<usize> {
+        // Hold the create gate across the uniqueness check and the registry
+        // push so the two are atomic (see `create_lock`).
+        let _create = self.create_lock.lock();
         self.ensure_unique_dataset_name(name)?;
         let element_size = datatype.element_size() as u64;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;

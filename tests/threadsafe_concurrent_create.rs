@@ -163,3 +163,78 @@ fn concurrent_create_append_metadata_distinct_datasets() {
         std::fs::remove_file(&path).ok();
     }
 }
+
+/// Concurrent creation of the *same* dataset name must produce exactly one
+/// dataset, not a file with two same-named links.
+///
+/// Stage 3c lets every thread create on a shared `&H5File`. The name-uniqueness
+/// check and the registry insert must be atomic (the `create_lock` gate);
+/// otherwise two threads could both pass the duplicate-name check against a
+/// snapshot and both push, writing an invalid HDF5 file. Here `N` threads race
+/// to create the one name "dup": exactly one must win, the rest must get the
+/// "already exists" error, and the reopened file must contain a single readable
+/// "dup" dataset holding the winner's data. Repeated to hammer the race window.
+#[test]
+fn concurrent_create_same_name_yields_one_dataset() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const N: usize = 8; // threads racing for one name
+    const ITERS: usize = 64; // repeat to shake out the check/insert race
+    const PATTERN: [i32; 4] = [10, 20, 30, 40];
+
+    for iter in 0..ITERS {
+        let path = tmp(&format!("dup{iter}"));
+        let successes = AtomicUsize::new(0);
+
+        {
+            let file = H5File::create(&path).unwrap();
+            std::thread::scope(|s| {
+                for _ in 0..N {
+                    let file = &file;
+                    let successes = &successes;
+                    s.spawn(move || {
+                        // All threads race to create the single name "dup"
+                        // through a gated create path (chunked unlimited). The
+                        // winner appends a known pattern; losers are rejected
+                        // with an error (the `Err` arm), never silently
+                        // duplicated.
+                        if let Ok(ds) = file
+                            .new_dataset::<i32>()
+                            .shape([0])
+                            .chunk(&[4])
+                            .max_shape(&[None])
+                            .create("dup")
+                        {
+                            successes.fetch_add(1, Ordering::Relaxed);
+                            ds.append(&PATTERN).expect("winner append");
+                        }
+                    });
+                }
+            });
+            file.close().unwrap();
+        }
+
+        let n_ok = successes.load(Ordering::Relaxed);
+        assert_eq!(
+            n_ok, 1,
+            "exactly one create must win on iter {iter}, got {n_ok}"
+        );
+
+        // Reopen: exactly one "dup" link, and it holds the winner's data.
+        let file = H5File::open(&path).unwrap();
+        let dup_links = file
+            .dataset_names()
+            .into_iter()
+            .filter(|n| n.trim_start_matches('/') == "dup")
+            .count();
+        assert_eq!(
+            dup_links, 1,
+            "file must contain exactly one 'dup' link on iter {iter}, got {dup_links}"
+        );
+        let got = file.dataset("dup").unwrap().read_raw::<i32>().unwrap();
+        assert_eq!(got, PATTERN.to_vec(), "winner's data on iter {iter}");
+        drop(file);
+
+        std::fs::remove_file(&path).ok();
+    }
+}
