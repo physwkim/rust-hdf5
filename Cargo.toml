@@ -8,6 +8,12 @@ license = "MIT"
 authors = ["Sang Woo Kim"]
 repository = "https://github.com/physwkim/rust-hdf5"
 
+[lints.rust]
+# `loom` is a custom cfg set only via `RUSTFLAGS="--cfg loom"` to run the
+# concurrency models in tests/loom_concurrency.rs. Declare it so the
+# `unexpected_cfgs` lint does not fire on `#[cfg(loom)]` in normal builds.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [dependencies]
 flate2 = { version = "1", optional = true }
 lz4_flex = { version = "0.11", optional = true }
@@ -31,6 +37,12 @@ threadsafe = []
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+
+# loom is only pulled in when building with `--cfg loom`, so it never enters
+# the normal build, the published crate, or `cargo install`. Run the models
+# with: RUSTFLAGS="--cfg loom" cargo test --test loom_concurrency
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
 
 [[bench]]
 name = "io_bench"
