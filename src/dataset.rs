@@ -1866,6 +1866,117 @@ impl H5Dataset {
             )),
         }
     }
+
+    /// Read the whole dataset into a caller-provided buffer, with no allocation.
+    ///
+    /// `out` must have exactly `product(dims)` elements (the dataset's element
+    /// count) and `T::element_size()` must match the dataset's on-disk element
+    /// size, otherwise an error is returned and `out` is left unspecified. The
+    /// zero-copy counterpart of [`read_raw`](Self::read_raw): the bytes are read
+    /// straight into `out` rather than into a fresh `Vec`, so a pinned /
+    /// page-locked host buffer can be filled in one pass and DMA'd to a GPU
+    /// without the extra staging copy a `read_raw` + copy-into-pinned would
+    /// incur. Works for every layout (contiguous, compact, and chunked under
+    /// any index); for chunked data each decoded chunk is scattered directly
+    /// into `out`.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open("data.h5").unwrap();
+    /// let ds = file.dataset("frames").unwrap();
+    /// let n: usize = ds.shape().iter().product();
+    /// let mut buf = vec![0u16; n];           // or a pinned host allocation
+    /// ds.read_raw_into(&mut buf).unwrap();
+    /// ```
+    pub fn read_raw_into<T: H5Type>(&self, out: &mut [T]) -> Result<()> {
+        match &self.info {
+            DatasetInfo::Reader {
+                name, element_size, ..
+            } => {
+                if T::element_size() != *element_size {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "read type has element size {} but dataset has element size {}",
+                        T::element_size(),
+                        element_size,
+                    )));
+                }
+                // Safety: `T: H5Type` is a `Copy` POD numeric with a defined
+                // byte representation; every bit pattern the read writes is a
+                // valid `T`. The byte view borrows `out` exclusively for this
+                // call, and `out.len() * element_size` cannot overflow because
+                // it is the byte length of an existing slice (<= isize::MAX).
+                let byte_len = out.len() * T::element_size();
+                let bytes = unsafe {
+                    std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, byte_len)
+                };
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => Ok(reader.read_dataset_raw_into(name, bytes)?),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read from a dataset in write mode".into(),
+            )),
+        }
+    }
+
+    /// Read a hyperslab into a caller-provided buffer, with no allocation.
+    ///
+    /// `out` must have exactly `product(counts)` elements and
+    /// `T::element_size()` must match the dataset's element size. The zero-copy
+    /// counterpart of [`read_slice`](Self::read_slice) and the slice analogue of
+    /// [`read_raw_into`](Self::read_raw_into): only chunks overlapping the
+    /// selection are read, and the selected bytes land directly in `out` — the
+    /// entry point for reading one frame / block straight into a pinned host
+    /// buffer for an H2D transfer.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open("vol.h5").unwrap();
+    /// let ds = file.dataset("vol").unwrap();   // shape [nz, ny, nx]
+    /// let (ny, nx) = (ds.shape()[1], ds.shape()[2]);
+    /// let mut frame = vec![0f32; ny * nx];     // or a pinned host allocation
+    /// ds.read_slice_into(&mut frame, &[5, 0, 0], &[1, ny, nx]).unwrap();
+    /// ```
+    pub fn read_slice_into<T: H5Type>(
+        &self,
+        out: &mut [T],
+        starts: &[usize],
+        counts: &[usize],
+    ) -> Result<()> {
+        match &self.info {
+            DatasetInfo::Reader {
+                name, element_size, ..
+            } => {
+                if T::element_size() != *element_size {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "read type has element size {} but dataset has element size {}",
+                        T::element_size(),
+                        element_size,
+                    )));
+                }
+                let starts_u64: Vec<u64> = starts.iter().map(|&s| s as u64).collect();
+                let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
+                // Safety: see `read_raw_into` — `T: H5Type` POD, exclusive
+                // borrow of `out`, byte length within bounds.
+                let byte_len = out.len() * T::element_size();
+                let bytes = unsafe {
+                    std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, byte_len)
+                };
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => {
+                        Ok(reader.read_slice_into(name, &starts_u64, &counts_u64, bytes)?)
+                    }
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read from a dataset in write mode".into(),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2343,6 +2454,197 @@ mod tests {
             assert_eq!(slice, vec![7, 8, 12, 13]);
         }
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    // H2D zero-alloc reads. `read_raw_into` / `read_slice_into` fill a
+    // caller-provided buffer and MUST produce byte-for-byte the same data as
+    // their Vec-returning counterparts (`read_raw` / `read_slice`) on every
+    // creatable layout, since both now share one buffer-filling core.
+    fn assert_into_matches<T>(ds: &super::H5Dataset, starts: &[usize], counts: &[usize])
+    where
+        T: crate::types::H5Type + Copy + std::fmt::Debug + PartialEq + Default,
+    {
+        let n: usize = ds.shape().iter().product();
+        let want_full = ds.read_raw::<T>().unwrap();
+        let mut got_full = vec![T::default(); n];
+        ds.read_raw_into::<T>(&mut got_full).unwrap();
+        assert_eq!(got_full, want_full, "read_raw_into != read_raw");
+
+        let want_slice = ds.read_slice::<T>(starts, counts).unwrap();
+        let sn: usize = counts.iter().product();
+        let mut got_slice = vec![T::default(); sn];
+        ds.read_slice_into::<T>(&mut got_slice, starts, counts)
+            .unwrap();
+        assert_eq!(got_slice, want_slice, "read_slice_into != read_slice");
+    }
+
+    #[test]
+    fn read_into_matches_vec_contiguous() {
+        let path = temp_path("into_contig");
+        let data: Vec<i32> = (0..20).collect(); // 4 x 5 contiguous
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([4, 5])
+                .create("mat")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("mat").unwrap();
+            assert_eq!(ds.chunk_dims(), None);
+            assert_into_matches::<i32>(&ds, &[1, 2], &[2, 2]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_into_matches_vec_chunked_unfiltered() {
+        let path = temp_path("into_chunk");
+        let data: Vec<f64> = (0..35).map(|i| i as f64 * 1.5).collect(); // 7 x 5
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<f64>()
+                .shape([7, 5])
+                .chunk(&[3, 2]) // multi-chunk grid with edge chunks
+                .create("grid")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("grid").unwrap();
+            assert_eq!(ds.chunk_dims(), Some(vec![3, 2]));
+            // Slice spans multiple chunks (rows 2..5, cols 1..4).
+            assert_into_matches::<f64>(&ds, &[2, 1], &[3, 3]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_into_matches_vec_single_chunk() {
+        let path = temp_path("into_single_chunk");
+        let data: Vec<i32> = (0..12).collect(); // 3 x 4, one chunk covers all
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([3, 4])
+                .chunk(&[3, 4]) // chunk == shape -> SingleChunk index
+                .create("g")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("g").unwrap();
+            assert_eq!(ds.chunk_dims(), Some(vec![3, 4]));
+            assert_into_matches::<i32>(&ds, &[1, 1], &[2, 2]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn read_into_matches_vec_chunked_deflate() {
+        let path = temp_path("into_chunk_deflate");
+        let data: Vec<i32> = (0..35).collect(); // 7 x 5
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([7, 5])
+                .chunk(&[3, 2])
+                .deflate(4)
+                .create("grid")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("grid").unwrap();
+            assert_eq!(ds.chunk_dims(), Some(vec![3, 2]));
+            assert_into_matches::<i32>(&ds, &[2, 1], &[3, 3]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_into_wrong_buffer_size_rejected() {
+        let path = temp_path("into_badlen");
+        let data: Vec<i32> = (0..20).collect(); // 4 x 5
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([4, 5])
+                .create("mat")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("mat").unwrap();
+
+            // Too small / too large full-read buffers are both rejected.
+            let mut small = vec![0i32; 19];
+            assert!(ds.read_raw_into::<i32>(&mut small).is_err());
+            let mut large = vec![0i32; 21];
+            assert!(ds.read_raw_into::<i32>(&mut large).is_err());
+
+            // Slice buffer must be exactly product(counts) = 4.
+            let mut bad_slice = vec![0i32; 3];
+            assert!(ds
+                .read_slice_into::<i32>(&mut bad_slice, &[1, 2], &[2, 2])
+                .is_err());
+            // The correctly sized slice buffer succeeds.
+            let mut ok_slice = vec![0i32; 4];
+            assert!(ds
+                .read_slice_into::<i32>(&mut ok_slice, &[1, 2], &[2, 2])
+                .is_ok());
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_into_wrong_element_size_rejected() {
+        let path = temp_path("into_badtype");
+        let data: Vec<i32> = (0..20).collect(); // element size 4
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([4, 5])
+                .create("mat")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("mat").unwrap();
+            // u8 (size 1) and i64 (size 8) mismatch the dataset's 4-byte
+            // element size -> TypeMismatch, even with a "correctly sized" Vec.
+            let mut as_u8 = vec![0u8; 20];
+            assert!(matches!(
+                ds.read_raw_into::<u8>(&mut as_u8),
+                Err(crate::Hdf5Error::TypeMismatch(_))
+            ));
+            let mut as_i64 = vec![0i64; 20];
+            assert!(matches!(
+                ds.read_slice_into::<i64>(&mut as_i64, &[0, 0], &[4, 5]),
+                Err(crate::Hdf5Error::TypeMismatch(_))
+            ));
+        }
         std::fs::remove_file(&path).ok();
     }
 

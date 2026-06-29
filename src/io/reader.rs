@@ -182,20 +182,21 @@ fn alloc_tiled_fill(total: usize, fill_value: Option<&[u8]>) -> IoResult<Vec<u8>
     })
 }
 
-/// Output for an array/tree-indexed chunked dataset whose index is entirely
-/// unallocated. Preserves the historical full-read contract — an empty vec,
-/// since the caller treats that as "no data" — while a slice must still return
-/// exactly `counts` bytes, so it yields a fill/zero buffer.
-fn unallocated_chunk_output(
-    target: ChunkTarget,
-    element_size: u64,
-    fill_value: Option<&[u8]>,
-) -> IoResult<Vec<u8>> {
-    match target {
-        ChunkTarget::Full => Ok(vec![]),
-        ChunkTarget::Slice { counts, .. } => {
-            let out_size = saturating_byte_len(counts, element_size) as usize;
-            alloc_tiled_fill(out_size, fill_value)
+/// Fill an existing buffer in place with the dataset's tiled fill value (or
+/// zero when no fill value is set), matching [`try_tiled_fill`]'s tiling.
+///
+/// Used to initialize a read destination — both an internally-allocated `Vec`
+/// and a caller-provided read-into buffer (whose prior contents are arbitrary)
+/// — so any region a chunked read leaves untouched reads back as the fill
+/// value rather than stale bytes.
+fn fill_tiled_into(out: &mut [u8], fill_value: Option<&[u8]>) {
+    out.fill(0);
+    if let Some(fv) = fill_value {
+        if !fv.is_empty() && !out.is_empty() {
+            for slot in out.chunks_mut(fv.len()) {
+                let n = slot.len().min(fv.len());
+                slot[..n].copy_from_slice(&fv[..n]);
+            }
         }
     }
 }
@@ -1186,48 +1187,91 @@ impl Hdf5Reader {
         Ok(info.dataspace.dims.clone())
     }
 
+    /// Logical byte size of a dataset's full image (`product(dims) *
+    /// element_size`), with the datatype needed for the post-filter conversion.
+    fn raw_size_and_datatype(&self, name: &str) -> IoResult<(DatatypeMessage, u64)> {
+        let info = self
+            .dataset_info(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let total = saturating_byte_len(&info.dataspace.dims, info.datatype.element_size() as u64);
+        Ok((info.datatype.clone(), total))
+    }
+
     /// Read the raw bytes of a dataset.
     pub fn read_dataset_raw(&mut self, name: &str) -> IoResult<Vec<u8>> {
-        let datatype = self
-            .dataset_info(name)
-            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?
-            .datatype
-            .clone();
-        let mut data = self.read_dataset_raw_unconverted(name)?;
+        let (datatype, total) = self.raw_size_and_datatype(name)?;
+        let mut data = alloc_tiled_fill(total as usize, None)?;
+        self.read_dataset_raw_into_unconverted(name, &mut data)?;
         Self::apply_post_filter_conversion(&mut data, &datatype)?;
         Ok(data)
     }
 
-    /// Read a full dataset producing the raw filter-pipeline output, before
-    /// the post-filter datatype conversion. `read_dataset_raw` wraps this
-    /// and applies the conversion exactly once; internal callers that go on
-    /// to convert themselves (e.g. the `read_slice` fallback) must use this
-    /// to avoid converting twice.
-    fn read_dataset_raw_unconverted(&mut self, name: &str) -> IoResult<Vec<u8>> {
+    /// Read the full raw dataset image into a caller-provided buffer.
+    ///
+    /// `out.len()` must equal the dataset's logical byte size
+    /// (`product(dims) * element_size`); otherwise an error is returned. This
+    /// is the no-allocation counterpart of [`read_dataset_raw`](Self::read_dataset_raw):
+    /// the bytes are read straight into `out`, making it the zero-copy entry
+    /// point for reading directly into a pinned/registered host buffer for an
+    /// H2D transfer.
+    pub fn read_dataset_raw_into(&mut self, name: &str, out: &mut [u8]) -> IoResult<()> {
+        let (datatype, total) = self.raw_size_and_datatype(name)?;
+        if out.len() as u64 != total {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "read_dataset_raw_into: buffer is {} bytes but dataset needs {}",
+                out.len(),
+                total
+            )));
+        }
+        self.read_dataset_raw_into_unconverted(name, out)?;
+        Self::apply_post_filter_conversion(out, &datatype)?;
+        Ok(())
+    }
+
+    /// Fill `out` with the full raw dataset image, before the post-filter
+    /// datatype conversion. The single owner of read-destination semantics for
+    /// full reads: it fully defines every byte of `out` (reading allocated data
+    /// straight in, pre-filling chunked or never-written regions with the tiled
+    /// fill value), so callers supply only a correctly-sized buffer. Both the
+    /// allocating `read_dataset_raw` and the zero-copy `read_dataset_raw_into`
+    /// wrap it and apply the conversion exactly once.
+    ///
+    /// `out.len()` must equal `product(dims) * element_size`.
+    fn read_dataset_raw_into_unconverted(&mut self, name: &str, out: &mut [u8]) -> IoResult<()> {
         let info = self
             .dataset_info(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
 
-        // Clone layout to avoid borrow conflict with &mut self in read methods.
+        // Clone to avoid borrow conflict with &mut self in read methods.
         let layout = info.layout.clone();
-
-        // Clone filter pipeline to avoid borrow conflict.
         let pipeline = info.filter_pipeline.clone();
+        let fill_value = info.fill_value.clone();
 
-        let data = match &layout {
-            DataLayoutMessage::Contiguous { address, size } => {
+        match &layout {
+            DataLayoutMessage::Contiguous { address, .. } => {
                 if *address == UNDEF_ADDR {
-                    return Ok(vec![]);
+                    // Never-written contiguous data reads back as the fill value.
+                    fill_tiled_into(out, fill_value.as_deref());
+                } else {
+                    // Read exactly the logical image straight into `out`.
+                    self.handle.read_exact_at_into(*address, out)?;
                 }
-                self.handle.read_at(*address, *size as usize)?
             }
-            DataLayoutMessage::Compact { data } => data.clone(),
+            DataLayoutMessage::Compact { data } => {
+                let n = out.len().min(data.len());
+                out[..n].copy_from_slice(&data[..n]);
+                if n < out.len() {
+                    fill_tiled_into(&mut out[n..], fill_value.as_deref());
+                }
+            }
             DataLayoutMessage::ChunkedV3 {
                 chunk_dims,
                 b_tree_address,
             } => {
-                // The layout's chunk_dims include the element size as
-                // the trailing dimension. Strip it for chunk indexing.
+                // Pre-fill so any chunk gap reads back as fill, then scatter.
+                fill_tiled_into(out, fill_value.as_deref());
+                // The layout's chunk_dims include the element size as the
+                // trailing dimension. Strip it for chunk indexing.
                 let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
                 self.read_chunked_btree_v1(
                     name,
@@ -1235,7 +1279,8 @@ impl Hdf5Reader {
                     *b_tree_address,
                     pipeline.as_ref(),
                     ChunkTarget::Full,
-                )?
+                    out,
+                )?;
             }
             DataLayoutMessage::ChunkedV4 {
                 chunk_dims,
@@ -1245,8 +1290,7 @@ impl Hdf5Reader {
                 single_chunk_filter,
                 ..
             } => {
-                // The layout's chunk_dims include the element size as
-                // the trailing dimension. Strip it for chunk indexing.
+                fill_tiled_into(out, fill_value.as_deref());
                 let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
                 self.read_chunked_v4(
                     name,
@@ -1259,11 +1303,11 @@ impl Hdf5Reader {
                     },
                     pipeline.as_ref(),
                     ChunkTarget::Full,
-                )?
+                    out,
+                )?;
             }
-        };
-
-        Ok(data)
+        }
+        Ok(())
     }
 
     /// Apply the post-filter datatype conversion (libhdf5's `H5T_convert`
@@ -1333,6 +1377,10 @@ impl Hdf5Reader {
     /// `desc` bundles the version-4 chunk-index descriptor extracted from the
     /// data-layout message (kind, address, and per-kind parameters), so this
     /// entry point takes one descriptor rather than a long parameter list.
+    ///
+    /// Scatters only; `output` must already be sized to the target extent and
+    /// pre-filled with the tiled fill value by the caller (so unallocated or
+    /// non-overlapping regions read back as fill).
     fn read_chunked_v4(
         &mut self,
         name: &str,
@@ -1340,7 +1388,8 @@ impl Hdf5Reader {
         desc: ChunkIndexDesc<'_>,
         pipeline: Option<&FilterPipeline>,
         target: ChunkTarget,
-    ) -> IoResult<Vec<u8>> {
+        output: &mut [u8],
+    ) -> IoResult<()> {
         let ChunkIndexDesc {
             index_type,
             index_address,
@@ -1352,31 +1401,16 @@ impl Hdf5Reader {
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
-        let fill_value = info.fill_value.clone();
 
         match index_type {
             data_layout::ChunkIndexType::SingleChunk => {
                 // Single chunk: the index_address IS the chunk address
                 let total_size: u64 = saturating_byte_len(&dims, element_size);
                 if index_address == UNDEF_ADDR || total_size == 0 {
-                    // An unallocated single chunk reads back entirely as the
-                    // fill value (when one is defined). A full read returns the
-                    // whole-dataset fill buffer (or empty without a fill); a
-                    // slice returns a correctly-sized fill/zero buffer.
-                    match target {
-                        ChunkTarget::Full => {
-                            if let Some(ref fv) = fill_value {
-                                if total_size > 0 {
-                                    return alloc_tiled_fill(total_size as usize, Some(fv));
-                                }
-                            }
-                            return Ok(vec![]);
-                        }
-                        ChunkTarget::Slice { counts, .. } => {
-                            let out_size = saturating_byte_len(counts, element_size);
-                            return alloc_tiled_fill(out_size as usize, fill_value.as_deref());
-                        }
-                    }
+                    // Unallocated single chunk: `output` is already the
+                    // pre-filled fill/zero buffer, so there is nothing to read
+                    // or scatter.
+                    return Ok(());
                 }
                 let data = if let Some(pipeline) = pipeline {
                     // A filtered single chunk records its exact on-disk size
@@ -1402,42 +1436,56 @@ impl Hdf5Reader {
                 } else {
                     self.handle.read_at(index_address, total_size as usize)?
                 };
+                // The lone chunk spans the whole dataset; place it respecting
+                // the dataset extent (Full) or the selection (Slice) into the
+                // caller's pre-filled buffer.
+                let coords = vec![0u64; dims.len()];
                 match target {
-                    // The lone chunk spans the whole dataset, so a full read
-                    // returns it verbatim.
-                    ChunkTarget::Full => Ok(data),
-                    ChunkTarget::Slice { starts, counts } => {
-                        let out_size = saturating_byte_len(counts, element_size);
-                        let mut output =
-                            alloc_tiled_fill(out_size as usize, fill_value.as_deref())?;
-                        let coords = vec![0u64; dims.len()];
-                        self.copy_chunk_to_slice(
-                            &data,
-                            &mut output,
-                            &dims,
-                            chunk_dims,
-                            &coords,
-                            element_size,
-                            starts,
-                            counts,
-                        );
-                        Ok(output)
-                    }
+                    ChunkTarget::Full => self.copy_chunk_to_output(
+                        &data,
+                        output,
+                        &dims,
+                        chunk_dims,
+                        &coords,
+                        element_size,
+                    ),
+                    ChunkTarget::Slice { starts, counts } => self.copy_chunk_to_slice(
+                        &data,
+                        output,
+                        &dims,
+                        chunk_dims,
+                        &coords,
+                        element_size,
+                        starts,
+                        counts,
+                    ),
                 }
+                Ok(())
             }
-            data_layout::ChunkIndexType::FixedArray => {
-                self.read_chunked_fixed_array(name, chunk_dims, index_address, pipeline, target)
-            }
-            data_layout::ChunkIndexType::BTreeV2 => {
-                self.read_chunked_btree_v2(name, chunk_dims, index_address, pipeline, target)
-            }
+            data_layout::ChunkIndexType::FixedArray => self.read_chunked_fixed_array(
+                name,
+                chunk_dims,
+                index_address,
+                pipeline,
+                target,
+                output,
+            ),
+            data_layout::ChunkIndexType::BTreeV2 => self.read_chunked_btree_v2(
+                name,
+                chunk_dims,
+                index_address,
+                pipeline,
+                target,
+                output,
+            ),
             data_layout::ChunkIndexType::ExtensibleArray => {
                 let params = earray_params.ok_or_else(|| {
                     crate::io::IoError::InvalidState("missing earray params".into())
                 })?;
 
                 if index_address == UNDEF_ADDR {
-                    return unallocated_chunk_output(target, element_size, fill_value.as_deref());
+                    // Unallocated: `output` is already the pre-filled buffer.
+                    return Ok(());
                 }
 
                 // Total chunk count across all dimensions.
@@ -1458,9 +1506,6 @@ impl Hdf5Reader {
                     chunk_dims,
                     element_size,
                 )?;
-
-                let out_size: u64 = saturating_byte_len(target.out_dims(&dims), element_size);
-                let mut output = alloc_tiled_fill(out_size as usize, fill_value.as_deref())?;
 
                 let n_chunks = std::cmp::min(chunks_dim0 as usize, chunk_entries.len());
 
@@ -1535,7 +1580,7 @@ impl Hdf5Reader {
                             self.scatter_chunk(
                                 target,
                                 data,
-                                &mut output,
+                                output,
                                 &dims,
                                 chunk_dims,
                                 &coords,
@@ -1554,7 +1599,7 @@ impl Hdf5Reader {
                         self.scatter_chunk(
                             target,
                             &chunk_data,
-                            &mut output,
+                            output,
                             &dims,
                             chunk_dims,
                             &coords,
@@ -1563,7 +1608,7 @@ impl Hdf5Reader {
                     }
                 }
 
-                Ok(output)
+                Ok(())
             }
             _ => Err(crate::io::IoError::InvalidState(format!(
                 "unsupported chunk index type: {:?}",
@@ -1573,6 +1618,9 @@ impl Hdf5Reader {
     }
 
     /// Read a dataset indexed by a fixed array.
+    ///
+    /// Scatters only; `output` must already be sized to the target extent and
+    /// pre-filled with the tiled fill value by the caller.
     fn read_chunked_fixed_array(
         &mut self,
         name: &str,
@@ -1580,7 +1628,8 @@ impl Hdf5Reader {
         index_address: u64,
         pipeline: Option<&FilterPipeline>,
         target: ChunkTarget,
-    ) -> IoResult<Vec<u8>> {
+        output: &mut [u8],
+    ) -> IoResult<()> {
         use crate::format::chunk_index::fixed_array::*;
 
         let info = self
@@ -1588,11 +1637,11 @@ impl Hdf5Reader {
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
-        let fill_value = info.fill_value.clone();
         let ndims = dims.len();
 
         if index_address == UNDEF_ADDR {
-            return unallocated_chunk_output(target, element_size, fill_value.as_deref());
+            // Unallocated: `output` is already the pre-filled buffer.
+            return Ok(());
         }
 
         // Read FA header
@@ -1600,7 +1649,8 @@ impl Hdf5Reader {
         let fa_hdr = FixedArrayHeader::decode(&hdr_buf, &self.ctx)?;
 
         if fa_hdr.data_blk_addr == UNDEF_ADDR {
-            return unallocated_chunk_output(target, element_size, fill_value.as_deref());
+            // Unallocated data block: `output` is already pre-filled.
+            return Ok(());
         }
 
         // The chunk shape (from the layout message) must match the
@@ -1730,10 +1780,6 @@ impl Hdf5Reader {
             }
         }
 
-        // Output size: whole dataset, or the slice extent.
-        let out_size: u64 = saturating_byte_len(target.out_dims(&dims), element_size);
-        let mut output = alloc_tiled_fill(out_size as usize, fill_value.as_deref())?;
-
         // Compute number of chunks per dimension. A zero chunk dimension
         // from a malformed layout message would divide by zero.
         if chunk_dims.contains(&0) {
@@ -1824,7 +1870,7 @@ impl Hdf5Reader {
             self.scatter_chunk(
                 target,
                 data,
-                &mut output,
+                output,
                 &dims,
                 chunk_dims,
                 &coords,
@@ -1832,10 +1878,13 @@ impl Hdf5Reader {
             );
         }
 
-        Ok(output)
+        Ok(())
     }
 
     /// Read a dataset indexed by a B-tree v2.
+    ///
+    /// Scatters only; `output` must already be sized to the target extent and
+    /// pre-filled with the tiled fill value by the caller.
     fn read_chunked_btree_v2(
         &mut self,
         name: &str,
@@ -1843,7 +1892,8 @@ impl Hdf5Reader {
         index_address: u64,
         pipeline: Option<&FilterPipeline>,
         target: ChunkTarget,
-    ) -> IoResult<Vec<u8>> {
+        output: &mut [u8],
+    ) -> IoResult<()> {
         use crate::format::chunk_index::btree_v2::*;
 
         let info = self
@@ -1851,11 +1901,11 @@ impl Hdf5Reader {
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
-        let fill_value = info.fill_value.clone();
         let ndims = dims.len();
 
         if index_address == UNDEF_ADDR {
-            return unallocated_chunk_output(target, element_size, fill_value.as_deref());
+            // Unallocated: `output` is already the pre-filled buffer.
+            return Ok(());
         }
 
         // Read BT2 header
@@ -1863,7 +1913,8 @@ impl Hdf5Reader {
         let bt2_hdr = Bt2Header::decode(&hdr_buf, &self.ctx)?;
 
         if bt2_hdr.root_node_addr == UNDEF_ADDR || bt2_hdr.total_num_records == 0 {
-            return unallocated_chunk_output(target, element_size, fill_value.as_deref());
+            // No records: `output` is already pre-filled.
+            return Ok(());
         }
 
         // Walk the B-tree to any depth, collecting every record's raw bytes
@@ -1929,9 +1980,6 @@ impl Hdf5Reader {
                 .collect()
             };
 
-        let out_size: u64 = saturating_byte_len(target.out_dims(&dims), element_size);
-        let mut output = alloc_tiled_fill(out_size as usize, fill_value.as_deref())?;
-
         // Read each chunk's raw bytes (carrying the per-chunk filter mask).
         // For a slice, chunks outside the selection are never read.
         let mut raw_chunks: Vec<Option<RawChunkWithMask>> = Vec::with_capacity(entries.len());
@@ -1984,7 +2032,7 @@ impl Hdf5Reader {
             self.scatter_chunk(
                 target,
                 data,
-                &mut output,
+                output,
                 &dims,
                 chunk_dims,
                 scaled,
@@ -1992,7 +2040,7 @@ impl Hdf5Reader {
             );
         }
 
-        Ok(output)
+        Ok(())
     }
 
     /// Recursively walk a v2 B-tree, appending every node's raw record bytes
@@ -2052,6 +2100,9 @@ impl Hdf5Reader {
     /// message version 3, class 2 "chunked").
     ///
     /// `chunk_dims` excludes the trailing element-size dimension.
+    ///
+    /// Scatters only; `output` must already be sized to the target extent and
+    /// pre-filled with the tiled fill value by the caller.
     fn read_chunked_btree_v1(
         &mut self,
         name: &str,
@@ -2059,13 +2110,13 @@ impl Hdf5Reader {
         b_tree_address: u64,
         pipeline: Option<&FilterPipeline>,
         target: ChunkTarget,
-    ) -> IoResult<Vec<u8>> {
+        output: &mut [u8],
+    ) -> IoResult<()> {
         let info = self
             .dataset_info(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
-        let fill_value = info.fill_value.clone();
         let ndims = dims.len();
 
         // The chunk shape must match the dataspace rank or the chunk-grid
@@ -2079,11 +2130,9 @@ impl Hdf5Reader {
         }
 
         let total_size: u64 = saturating_byte_len(&dims, element_size);
-        let out_size: u64 = saturating_byte_len(target.out_dims(&dims), element_size);
-        let mut output = alloc_tiled_fill(out_size as usize, fill_value.as_deref())?;
-
         if b_tree_address == UNDEF_ADDR || total_size == 0 {
-            return Ok(output);
+            // Unallocated: `output` is already the pre-filled buffer.
+            return Ok(());
         }
 
         // Walk the B-tree, collecting every leaf entry as
@@ -2162,7 +2211,7 @@ impl Hdf5Reader {
             self.scatter_chunk(
                 target,
                 data,
-                &mut output,
+                output,
                 &dims,
                 chunk_dims,
                 scaled,
@@ -2184,7 +2233,7 @@ impl Hdf5Reader {
             }
         }
 
-        Ok(output)
+        Ok(())
     }
 
     /// Recursively walk a version-1 raw-data-chunk B-tree, collecting every
@@ -2769,25 +2818,71 @@ impl Hdf5Reader {
     /// starts[d] is the first index along dim d, counts[d] is how many.
     /// Returns the selected data in row-major order.
     pub fn read_slice(&mut self, name: &str, starts: &[u64], counts: &[u64]) -> IoResult<Vec<u8>> {
-        let datatype = self
-            .dataset_info(name)
-            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?
-            .datatype
-            .clone();
-        let mut data = self.read_slice_inner(name, starts, counts)?;
+        let (datatype, out_bytes) = self.slice_size_and_datatype(name, counts)?;
+        let mut data = alloc_tiled_fill(out_bytes as usize, None)?;
+        self.read_slice_into_unconverted(name, starts, counts, &mut data)?;
         Self::apply_post_filter_conversion(&mut data, &datatype)?;
         Ok(data)
     }
 
-    /// Slice read producing the raw filter-pipeline output, before the
-    /// post-filter datatype conversion. `read_slice` wraps this and applies
-    /// the conversion.
-    fn read_slice_inner(
+    /// Read a hyperslab straight into a caller-provided buffer (no allocation).
+    ///
+    /// `out.len()` must equal `product(counts) * element_size`; otherwise an
+    /// error is returned. The no-allocation counterpart of
+    /// [`read_slice`](Self::read_slice) and the zero-copy entry point for
+    /// reading a selection directly into a pinned/registered host buffer for an
+    /// H2D transfer.
+    pub fn read_slice_into(
         &mut self,
         name: &str,
         starts: &[u64],
         counts: &[u64],
-    ) -> IoResult<Vec<u8>> {
+        out: &mut [u8],
+    ) -> IoResult<()> {
+        let (datatype, out_bytes) = self.slice_size_and_datatype(name, counts)?;
+        if out.len() as u64 != out_bytes {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "read_slice_into: buffer is {} bytes but selection needs {}",
+                out.len(),
+                out_bytes
+            )));
+        }
+        self.read_slice_into_unconverted(name, starts, counts, out)?;
+        Self::apply_post_filter_conversion(out, &datatype)?;
+        Ok(())
+    }
+
+    /// Logical byte size of a hyperslab (`product(counts) * element_size`) with
+    /// the datatype needed for the post-filter conversion.
+    fn slice_size_and_datatype(
+        &self,
+        name: &str,
+        counts: &[u64],
+    ) -> IoResult<(DatatypeMessage, u64)> {
+        let info = self
+            .dataset_info(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let out_bytes = saturating_byte_len(counts, info.datatype.element_size() as u64);
+        Ok((info.datatype.clone(), out_bytes))
+    }
+
+    /// Fill `out` with a hyperslab selection, before the post-filter datatype
+    /// conversion. The single owner of read-destination semantics for slice
+    /// reads (mirrors [`read_dataset_raw_into_unconverted`](Self::read_dataset_raw_into_unconverted)):
+    /// it validates the selection, then fully defines every byte of `out`
+    /// (contiguous/compact runs cover the whole selection; chunked layouts
+    /// pre-fill with the tiled fill value and scatter only overlapping chunks).
+    /// Both [`read_slice`](Self::read_slice) and [`read_slice_into`](Self::read_slice_into)
+    /// wrap it and apply the conversion exactly once.
+    ///
+    /// `out.len()` must equal `product(counts) * element_size`.
+    fn read_slice_into_unconverted(
+        &mut self,
+        name: &str,
+        starts: &[u64],
+        counts: &[u64],
+        out: &mut [u8],
+    ) -> IoResult<()> {
         let info = self
             .dataset_info(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
@@ -2817,39 +2912,39 @@ impl Hdf5Reader {
             }
         }
 
-        let out_elems: u64 = counts.iter().product();
-        let out_bytes = (out_elems * element_size) as usize;
-
         match &layout {
             DataLayoutMessage::Contiguous { address, .. } => {
                 if *address == UNDEF_ADDR {
-                    return alloc_tiled_fill(out_bytes, fill_value.as_deref());
+                    // Never-written: the selection reads back as the fill value.
+                    fill_tiled_into(out, fill_value.as_deref());
+                } else {
+                    // Read each maximal contiguous run straight into `out`.
+                    // Trailing full-selected dimensions coalesce, so a slice
+                    // like `[:, r0:r1, :]` of `[nproj, nz, nx]` becomes `nproj`
+                    // reads of `(r1-r0)*nx` elements instead of `nproj*(r1-r0)`
+                    // per-`nx`-row reads. The 1-D case folds to a single run.
+                    // The runs cover the whole selection, so every byte of `out`
+                    // is written.
+                    let base = *address;
+                    for_each_contiguous_run(
+                        &dims,
+                        starts,
+                        counts,
+                        element_size,
+                        |src_off, out_off, len| {
+                            self.handle
+                                .read_exact_at_into(
+                                    base + src_off,
+                                    &mut out[out_off..out_off + len],
+                                )
+                                .map_err(Into::into)
+                        },
+                    )?;
                 }
-
-                // Read each maximal contiguous run straight into the output.
-                // Trailing full-selected dimensions coalesce, so a slice like
-                // `[:, r0:r1, :]` of `[nproj, nz, nx]` becomes `nproj` reads of
-                // `(r1-r0)*nx` elements instead of `nproj*(r1-r0)` per-`nx`-row
-                // reads. The 1-D case folds to a single run.
-                let base = *address;
-                let mut output = vec![0u8; out_bytes];
-                for_each_contiguous_run(
-                    &dims,
-                    starts,
-                    counts,
-                    element_size,
-                    |src_off, out_off, len| {
-                        self.handle
-                            .read_exact_at_into(base + src_off, &mut output[out_off..out_off + len])
-                            .map_err(Into::into)
-                    },
-                )?;
-                Ok(output)
             }
             DataLayoutMessage::Compact { data } => {
                 // Same coalesced geometry, copying from the in-memory full
                 // dataset instead of reading from the file.
-                let mut output = vec![0u8; out_bytes];
                 for_each_contiguous_run(
                     &dims,
                     starts,
@@ -2857,20 +2952,21 @@ impl Hdf5Reader {
                     element_size,
                     |src_off, out_off, len| {
                         let src = src_off as usize;
-                        output[out_off..out_off + len].copy_from_slice(&data[src..src + len]);
+                        out[out_off..out_off + len].copy_from_slice(&data[src..src + len]);
                         Ok(())
                     },
                 )?;
-                Ok(output)
             }
             DataLayoutMessage::ChunkedV3 {
                 chunk_dims,
                 b_tree_address,
             } => {
                 // Walk the v1 B-tree index reading only chunks that overlap the
-                // selection, scattering each chunk∩selection into a slice-shaped
-                // buffer. The unconverted read keeps the post-filter datatype
-                // conversion to exactly once, in the `read_slice` wrapper.
+                // selection, scattering each chunk∩selection into the slice
+                // buffer. Pre-fill so any unwritten gap reads back as fill. The
+                // unconverted read keeps the post-filter conversion to exactly
+                // once, in the wrappers.
+                fill_tiled_into(out, fill_value.as_deref());
                 let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
                 self.read_chunked_btree_v1(
                     name,
@@ -2878,7 +2974,8 @@ impl Hdf5Reader {
                     *b_tree_address,
                     pipeline.as_ref(),
                     ChunkTarget::Slice { starts, counts },
-                )
+                    out,
+                )?;
             }
             DataLayoutMessage::ChunkedV4 {
                 chunk_dims,
@@ -2892,6 +2989,7 @@ impl Hdf5Reader {
                 // (single chunk, fixed/extensible array, B-tree v2): only
                 // overlapping chunks are read and only their intersection with
                 // the selection is scattered into the slice output.
+                fill_tiled_into(out, fill_value.as_deref());
                 let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
                 self.read_chunked_v4(
                     name,
@@ -2904,9 +3002,11 @@ impl Hdf5Reader {
                     },
                     pipeline.as_ref(),
                     ChunkTarget::Slice { starts, counts },
-                )
+                    out,
+                )?;
             }
         }
+        Ok(())
     }
 }
 
