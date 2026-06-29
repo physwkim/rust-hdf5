@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.28
+
+### Added
+
+- Zero-allocation reads into a caller-provided buffer, the Rust analogue of
+  HDF5 C `H5Dread(..., buf)` and h5py `Dataset.read_direct`:
+  - `H5Dataset::read_raw_into::<T>(out: &mut [T])` — read the whole dataset
+    image into `out`.
+  - `H5Dataset::read_slice_into::<T>(out: &mut [T], starts, counts)` — read a
+    hyperslab into `out`.
+
+  The data is decoded straight into `out` with no intermediate `Vec`, so a
+  pinned / page-locked host buffer can be filled in one pass and DMA'd to a GPU
+  without the staging copy a `read_raw` + copy-into-pinned would incur. Both
+  validate that `T::element_size()` matches the dataset's on-disk element size
+  (`TypeMismatch` otherwise) and that the buffer length is exactly the read
+  size. They are the zero-copy counterparts of `read_raw` / `read_slice` and
+  share the same buffer-filling core, so every layout and chunk index type
+  (contiguous, compact, btree-v1, single-chunk, fixed-array, extensible-array,
+  btree-v2) is handled identically. Verified against the allocating readers on
+  contiguous, multi-chunk, single-chunk, and deflate-compressed layouts.
+
 ## 0.2.27
 
 ### Added
