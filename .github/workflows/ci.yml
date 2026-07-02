@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
     branches: [main]
 
@@ -33,6 +33,10 @@ jobs:
         run: cargo test --no-default-features
       - name: All features
         run: cargo test --all-features
+      - name: Parallel
+        run: cargo test --features parallel
+      - name: All filters + parallel
+        run: cargo test --features all_filters,parallel
       - name: Threadsafe
         run: cargo test --features threadsafe
 
@@ -46,6 +50,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   fmt:
     name: Rustfmt
