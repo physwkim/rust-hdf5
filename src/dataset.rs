@@ -2204,6 +2204,7 @@ mod tests {
     // drives write_full_image_chunked's EA branch, which gathers chunks and
     // compresses them through the windowed batch path. Round-trips the full
     // image, including a partial edge chunk along the unlimited dimension.
+    #[cfg(feature = "deflate")]
     #[test]
     fn write_raw_ea_compressed_roundtrips() {
         let path = temp_path("write_raw_ea_deflate");
@@ -2234,6 +2235,7 @@ mod tests {
     // drives copy_chunk_to_output's multi-dim run-memcpy path with two outer
     // dimensions, exercising the nested outer-coordinate carry and the
     // last-axis edge clamp (chunks hang off the high edge in all three axes).
+    #[cfg(feature = "deflate")]
     #[test]
     fn read_full_3d_chunked_edge_roundtrips() {
         let path = temp_path("full_3d_chunked_edge");
