@@ -36,12 +36,6 @@ use crate::io::file_handle::MmapFileHandle;
 use crate::io::hyperslab::{compute_strides, for_each_contiguous_run};
 use crate::io::IoResult;
 
-/// A chunk read from a B-tree-indexed dataset before decompression: its raw
-/// on-disk bytes, its scaled (chunk-grid) offsets, and its per-chunk filter
-/// mask (0 when unfiltered, or a bitfield marking filters skipped for the
-/// chunk).
-type RawChunkWithMask = (Vec<u8>, Vec<u64>, u32);
-
 /// The version-4 chunk-index descriptor pulled from a data-layout message:
 /// the index kind, its address, and the per-kind parameters the reader needs
 /// to walk it. Bundled so the chunked read entry point takes one descriptor
@@ -198,6 +192,108 @@ fn fill_tiled_into(out: &mut [u8], fill_value: Option<&[u8]>) {
                 slot[..n].copy_from_slice(&fv[..n]);
             }
         }
+    }
+}
+
+/// One chunk's on-disk read request, built by a read path before any I/O.
+struct ChunkReadJob {
+    /// Byte offset of the chunk's stored bytes.
+    addr: u64,
+    /// Number of bytes to read.
+    len: usize,
+    /// `true` → [`FileHandle::read_at_most`] (short reads near EOF are fine);
+    /// `false` → [`FileHandle::read_at`] (exact, errors on a short read).
+    at_most: bool,
+    /// Per-chunk filter mask (ignored when the pipeline is `None`).
+    mask: u32,
+}
+
+/// Read one chunk's raw bytes according to its job.
+fn read_chunk_raw(handle: &FileHandle, j: &ChunkReadJob) -> IoResult<Vec<u8>> {
+    if j.at_most {
+        Ok(handle.read_at_most(j.addr, j.len)?)
+    } else {
+        Ok(handle.read_at(j.addr, j.len)?)
+    }
+}
+
+/// Run the reverse filter pipeline (if any) over one chunk's raw bytes.
+fn decompress_chunk(
+    pipeline: Option<&FilterPipeline>,
+    raw: Vec<u8>,
+    mask: u32,
+) -> IoResult<Vec<u8>> {
+    match pipeline {
+        Some(pl) => Ok(filter::reverse_filters_masked(pl, &raw, mask)?),
+        None => Ok(raw),
+    }
+}
+
+/// Read and decompress a batch of chunk jobs, preserving job order.
+///
+/// `jobs[i] == None` yields `Ok(None)` — a chunk skipped as out-of-selection
+/// or unallocated. Otherwise the chunk's raw bytes are read and, when
+/// `pipeline` is `Some`, run through the reverse filter pipeline with the
+/// job's mask. This is the single owner of the read-then-decompress step for
+/// every chunk index type; each read path only builds the jobs and scatters
+/// the results.
+///
+/// On Unix and Windows, positioned reads at distinct offsets on a shared
+/// `&File` neither consult nor move a file cursor, so read + decompress run
+/// fused in one parallel pass — overlapping chunk I/O across cores, which the
+/// C library's default (non-MPI) path does not do. On targets with neither
+/// positioned API the seek-based fallback shares the file cursor, so reads
+/// stay serial there while decompression still parallelizes.
+fn read_and_decompress_chunks(
+    handle: &FileHandle,
+    pipeline: Option<&FilterPipeline>,
+    jobs: Vec<Option<ChunkReadJob>>,
+) -> IoResult<Vec<Option<Vec<u8>>>> {
+    #[cfg(all(feature = "parallel", any(unix, windows)))]
+    {
+        use rayon::prelude::*;
+        jobs.into_par_iter()
+            .map(|job| match job {
+                Some(j) => Ok(Some(decompress_chunk(
+                    pipeline,
+                    read_chunk_raw(handle, &j)?,
+                    j.mask,
+                )?)),
+                None => Ok(None),
+            })
+            .collect()
+    }
+    #[cfg(all(feature = "parallel", not(any(unix, windows))))]
+    {
+        use rayon::prelude::*;
+        // No positioned read API here: concurrent reads would race the shared
+        // file cursor, so read serially, then parallelize decompression.
+        let raws: Vec<Option<(Vec<u8>, u32)>> = jobs
+            .into_iter()
+            .map(|job| match job {
+                Some(j) => Ok(Some((read_chunk_raw(handle, &j)?, j.mask))),
+                None => Ok(None),
+            })
+            .collect::<IoResult<Vec<_>>>()?;
+        raws.into_par_iter()
+            .map(|r| match r {
+                Some((raw, mask)) => Ok(Some(decompress_chunk(pipeline, raw, mask)?)),
+                None => Ok(None),
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        jobs.into_iter()
+            .map(|job| match job {
+                Some(j) => Ok(Some(decompress_chunk(
+                    pipeline,
+                    read_chunk_raw(handle, &j)?,
+                    j.mask,
+                )?)),
+                None => Ok(None),
+            })
+            .collect()
     }
 }
 
@@ -1533,72 +1629,65 @@ impl Hdf5Reader {
                     c
                 };
 
-                if let Some(pl) = pipeline {
-                    // Read all raw chunks first, then decompress (optionally in parallel).
-                    // For a slice, chunks outside the selection are never read.
+                // Build one read job per chunk (no I/O yet), then read +
+                // decompress them together (in parallel where positioned reads
+                // are race-free), then scatter serially. Filtered chunks record
+                // their exact on-disk size, so read exactly that; unfiltered
+                // chunks read at-most since the entry size can exceed the file
+                // tail. Skip conditions differ between the two, so build jobs
+                // per branch.
+                let jobs: Vec<Option<ChunkReadJob>> = if pipeline.is_some() {
                     let file_size = self.handle.file_size()?;
-                    let mut raw_chunks: Vec<Option<(Vec<u8>, u32)>> = Vec::with_capacity(n_chunks);
-                    for (i, &(addr, nbytes, mask)) in chunk_entries[..n_chunks].iter().enumerate() {
-                        if addr == UNDEF_ADDR
-                            || nbytes == 0
-                            || addr >= file_size
-                            || nbytes > file_size
-                            || !target.overlaps(&chunk_coords(i as u64), chunk_dims)
-                        {
-                            raw_chunks.push(None);
-                        } else {
-                            raw_chunks
-                                .push(Some((self.handle.read_at(addr, nbytes as usize)?, mask)));
-                        }
-                    }
-
-                    let reverse = |raw: Option<(Vec<u8>, u32)>| -> IoResult<Option<Vec<u8>>> {
-                        match raw {
-                            Some((r, mask)) => {
-                                Ok(Some(filter::reverse_filters_masked(pl, &r, mask)?))
+                    chunk_entries[..n_chunks]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &(addr, nbytes, mask))| {
+                            if addr == UNDEF_ADDR
+                                || nbytes == 0
+                                || addr >= file_size
+                                || nbytes > file_size
+                                || !target.overlaps(&chunk_coords(i as u64), chunk_dims)
+                            {
+                                None
+                            } else {
+                                Some(ChunkReadJob {
+                                    addr,
+                                    len: nbytes as usize,
+                                    at_most: false,
+                                    mask,
+                                })
                             }
-                            None => Ok(None),
-                        }
-                    };
-                    #[cfg(feature = "parallel")]
-                    let decompressed: Vec<Option<Vec<u8>>> = {
-                        use rayon::prelude::*;
-                        raw_chunks
-                            .into_par_iter()
-                            .map(reverse)
-                            .collect::<IoResult<Vec<_>>>()?
-                    };
-                    #[cfg(not(feature = "parallel"))]
-                    let decompressed: Vec<Option<Vec<u8>>> = raw_chunks
-                        .into_iter()
-                        .map(reverse)
-                        .collect::<IoResult<Vec<_>>>()?;
-
-                    for (i, chunk_data) in decompressed.iter().enumerate() {
-                        if let Some(data) = chunk_data {
-                            let coords = chunk_coords(i as u64);
-                            self.scatter_chunk(
-                                target,
-                                data,
-                                output,
-                                &dims,
-                                chunk_dims,
-                                &coords,
-                                element_size,
-                            );
-                        }
-                    }
+                        })
+                        .collect()
                 } else {
-                    // Unfiltered branch: the mask field is always 0 here.
-                    for (i, &(addr, nbytes, _)) in chunk_entries[..n_chunks].iter().enumerate() {
+                    chunk_entries[..n_chunks]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &(addr, nbytes, _))| {
+                            if addr == UNDEF_ADDR
+                                || !target.overlaps(&chunk_coords(i as u64), chunk_dims)
+                            {
+                                None
+                            } else {
+                                Some(ChunkReadJob {
+                                    addr,
+                                    len: nbytes as usize,
+                                    at_most: true,
+                                    mask: 0,
+                                })
+                            }
+                        })
+                        .collect()
+                };
+
+                let decompressed = read_and_decompress_chunks(&self.handle, pipeline, jobs)?;
+
+                for (i, chunk_data) in decompressed.iter().enumerate() {
+                    if let Some(data) = chunk_data {
                         let coords = chunk_coords(i as u64);
-                        if addr == UNDEF_ADDR || !target.overlaps(&coords, chunk_dims) {
-                            continue;
-                        }
-                        let chunk_data = self.handle.read_at_most(addr, nbytes as usize)?;
                         self.scatter_chunk(
                             target,
-                            &chunk_data,
+                            data,
                             output,
                             &dims,
                             chunk_dims,
@@ -1800,73 +1889,48 @@ impl Hdf5Reader {
             c
         };
 
-        // Read all chunk raw data sequentially (I/O must be serial). For a
-        // slice, chunks outside the selection are never read.
-        let n_chunks = chunk_entries.len();
-        let mut raw_chunks: Vec<(usize, Option<Vec<u8>>, u32)> = Vec::with_capacity(n_chunks);
-        for (linear_idx, &(addr, comp_size, mask)) in chunk_entries.iter().enumerate() {
-            if addr == UNDEF_ADDR || !target.overlaps(&chunk_coords(linear_idx as u64), chunk_dims)
-            {
-                raw_chunks.push((linear_idx, None, 0));
-            } else if pipeline.is_some() {
-                // For filtered chunks the entry carries the exact compressed
-                // size; fall back to a generous estimate otherwise.
-                let read_len = if comp_size > 0 {
-                    comp_size as usize
+        // Build one read job per chunk (no I/O yet). Filtered chunks carry
+        // their exact compressed size (read at-most, since a zero size means
+        // "unknown" and falls back to a generous estimate); unfiltered chunks
+        // read the exact chunk byte count. For a slice, chunks outside the
+        // selection become None and are never read.
+        let jobs: Vec<Option<ChunkReadJob>> = chunk_entries
+            .iter()
+            .enumerate()
+            .map(|(linear_idx, &(addr, comp_size, mask))| {
+                if addr == UNDEF_ADDR
+                    || !target.overlaps(&chunk_coords(linear_idx as u64), chunk_dims)
+                {
+                    None
+                } else if pipeline.is_some() {
+                    let read_len = if comp_size > 0 {
+                        comp_size as usize
+                    } else {
+                        chunk_bytes as usize * 2
+                    };
+                    Some(ChunkReadJob {
+                        addr,
+                        len: read_len,
+                        at_most: true,
+                        mask,
+                    })
                 } else {
-                    chunk_bytes as usize * 2
-                };
-                raw_chunks.push((
-                    linear_idx,
-                    Some(self.handle.read_at_most(addr, read_len)?),
-                    mask,
-                ));
-            } else {
-                raw_chunks.push((
-                    linear_idx,
-                    Some(self.handle.read_at(addr, chunk_bytes as usize)?),
-                    mask,
-                ));
-            }
-        }
-
-        // Decompress if a filter pipeline is set. A filter failure is
-        // propagated rather than swallowed into garbage output.
-        let decompressed: Vec<(usize, Option<Vec<u8>>)> = if let Some(pl) = pipeline {
-            let reverse = |(idx, raw, mask): (usize, Option<Vec<u8>>, u32)| -> IoResult<(
-                usize,
-                Option<Vec<u8>>,
-            )> {
-                match raw {
-                    Some(r) => Ok((idx, Some(filter::reverse_filters_masked(pl, &r, mask)?))),
-                    None => Ok((idx, None)),
+                    Some(ChunkReadJob {
+                        addr,
+                        len: chunk_bytes as usize,
+                        at_most: false,
+                        mask,
+                    })
                 }
-            };
-            #[cfg(feature = "parallel")]
-            {
-                use rayon::prelude::*;
-                raw_chunks
-                    .into_par_iter()
-                    .map(reverse)
-                    .collect::<IoResult<Vec<_>>>()?
-            }
-            #[cfg(not(feature = "parallel"))]
-            {
-                raw_chunks
-                    .into_iter()
-                    .map(reverse)
-                    .collect::<IoResult<Vec<_>>>()?
-            }
-        } else {
-            // No pipeline: drop the (always-zero) mask field to match the
-            // decompressed tuple shape.
-            raw_chunks.into_iter().map(|(i, r, _)| (i, r)).collect()
-        };
+            })
+            .collect();
 
-        // Place chunks into output
-        for (linear_idx, chunk_data) in &decompressed {
+        // Read + decompress (in parallel where positioned reads are race-free),
+        // then place each chunk into output.
+        let decompressed = read_and_decompress_chunks(&self.handle, pipeline, jobs)?;
+        for (linear_idx, chunk_data) in decompressed.iter().enumerate() {
             let Some(data) = chunk_data else { continue };
-            let coords = chunk_coords(*linear_idx as u64);
+            let coords = chunk_coords(linear_idx as u64);
             self.scatter_chunk(
                 target,
                 data,
@@ -1980,64 +2044,39 @@ impl Hdf5Reader {
                 .collect()
             };
 
-        // Read each chunk's raw bytes (carrying the per-chunk filter mask).
-        // For a slice, chunks outside the selection are never read.
-        let mut raw_chunks: Vec<Option<RawChunkWithMask>> = Vec::with_capacity(entries.len());
+        // Build one read job per chunk (no I/O yet), keeping each chunk's
+        // scaled (chunk-grid) offsets alongside for the scatter. For a slice,
+        // chunks outside the selection become None and are never read.
+        let mut jobs: Vec<Option<ChunkReadJob>> = Vec::with_capacity(entries.len());
+        let coords: Vec<&Vec<u64>> = entries.iter().map(|(_, _, scaled, _)| scaled).collect();
         for (addr, read_size, scaled, mask) in &entries {
             if *addr == UNDEF_ADDR || *read_size == 0 || !target.overlaps(scaled, chunk_dims) {
-                raw_chunks.push(None);
+                jobs.push(None);
             } else {
-                let data = self.handle.read_at(*addr, *read_size)?;
-                raw_chunks.push(Some((data, scaled.clone(), *mask)));
+                jobs.push(Some(ChunkReadJob {
+                    addr: *addr,
+                    len: *read_size,
+                    at_most: false,
+                    mask: *mask,
+                }));
             }
         }
 
-        // Decompress filtered chunks (optionally in parallel). A filter
-        // failure is propagated, not swallowed into garbage output.
-        let placed: Vec<Option<(Vec<u8>, Vec<u64>)>> = if let Some(pl) = pipeline {
-            let reverse = |c: Option<RawChunkWithMask>| -> IoResult<Option<(Vec<u8>, Vec<u64>)>> {
-                match c {
-                    Some((r, s, mask)) => {
-                        Ok(Some((filter::reverse_filters_masked(pl, &r, mask)?, s)))
-                    }
-                    None => Ok(None),
-                }
-            };
-            #[cfg(feature = "parallel")]
-            {
-                use rayon::prelude::*;
-                raw_chunks
-                    .into_par_iter()
-                    .map(reverse)
-                    .collect::<IoResult<Vec<_>>>()?
+        // Read + decompress (in parallel where positioned reads are race-free),
+        // then place each chunk N-dimensionally by its scaled offsets.
+        let placed = read_and_decompress_chunks(&self.handle, pipeline, jobs)?;
+        for (i, chunk_data) in placed.iter().enumerate() {
+            if let Some(data) = chunk_data {
+                self.scatter_chunk(
+                    target,
+                    data,
+                    output,
+                    &dims,
+                    chunk_dims,
+                    coords[i],
+                    element_size,
+                );
             }
-            #[cfg(not(feature = "parallel"))]
-            {
-                raw_chunks
-                    .into_iter()
-                    .map(reverse)
-                    .collect::<IoResult<Vec<_>>>()?
-            }
-        } else {
-            // No pipeline: drop the (always-zero) mask field.
-            raw_chunks
-                .into_iter()
-                .map(|o| o.map(|(r, s, _)| (r, s)))
-                .collect()
-        };
-
-        // Place each chunk N-dimensionally by its scaled (chunk-grid) offsets.
-        for chunk in placed.iter().flatten() {
-            let (data, scaled) = chunk;
-            self.scatter_chunk(
-                target,
-                data,
-                output,
-                &dims,
-                chunk_dims,
-                scaled,
-                element_size,
-            );
         }
 
         Ok(())
@@ -2146,77 +2185,50 @@ impl Hdf5Reader {
         // The uncompressed byte size of a full chunk.
         let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
 
-        // Read every chunk's raw bytes (carrying the per-chunk filter mask
-        // already decoded from the B-tree keys).
-        let mut raw_chunks: Vec<Option<RawChunkWithMask>> = Vec::with_capacity(entries.len());
+        // Build one read job per chunk (no I/O yet), keeping each chunk's
+        // scaled (chunk-grid) coordinates alongside for the scatter. The
+        // trailing element-size dimension offset is always 0 and is dropped.
+        let mut jobs: Vec<Option<ChunkReadJob>> = Vec::with_capacity(entries.len());
+        let mut coords: Vec<Vec<u64>> = Vec::with_capacity(entries.len());
         for (offsets, addr, chunk_size, mask) in &entries {
-            // Convert element offsets to chunk-grid (scaled) coordinates.
-            // The trailing element-size dimension offset is always 0 and
-            // is dropped here.
             let mut scaled = Vec::with_capacity(ndims);
             for d in 0..ndims {
                 let cd = chunk_dims[d];
                 scaled.push(offsets[d].checked_div(cd).unwrap_or(0));
             }
-            if *addr == UNDEF_ADDR
+            let skip = *addr == UNDEF_ADDR
                 || *chunk_size == 0
                 || *addr >= file_size
                 || *chunk_size as u64 > file_size
-                || !target.overlaps(&scaled, chunk_dims)
-            {
-                raw_chunks.push(None);
-                continue;
-            }
-            let data = self.handle.read_at(*addr, *chunk_size as usize)?;
-            raw_chunks.push(Some((data, scaled, *mask)));
+                || !target.overlaps(&scaled, chunk_dims);
+            jobs.push(if skip {
+                None
+            } else {
+                Some(ChunkReadJob {
+                    addr: *addr,
+                    len: *chunk_size as usize,
+                    at_most: false,
+                    mask: *mask,
+                })
+            });
+            coords.push(scaled);
         }
 
-        // Decompress filtered chunks (optionally in parallel). A filter
-        // failure is propagated, not swallowed into garbage output.
-        let placed: Vec<Option<(Vec<u8>, Vec<u64>)>> = if let Some(pl) = pipeline {
-            let reverse = |c: Option<RawChunkWithMask>| -> IoResult<Option<(Vec<u8>, Vec<u64>)>> {
-                match c {
-                    Some((r, s, mask)) => {
-                        Ok(Some((filter::reverse_filters_masked(pl, &r, mask)?, s)))
-                    }
-                    None => Ok(None),
-                }
-            };
-            #[cfg(feature = "parallel")]
-            {
-                use rayon::prelude::*;
-                raw_chunks
-                    .into_par_iter()
-                    .map(reverse)
-                    .collect::<IoResult<Vec<_>>>()?
+        // Read + decompress (in parallel where positioned reads are race-free),
+        // then place each chunk N-dimensionally by its scaled offsets.
+        let placed = read_and_decompress_chunks(&self.handle, pipeline, jobs)?;
+        for (i, chunk_data) in placed.iter().enumerate() {
+            if let Some(data) = chunk_data {
+                self.scatter_chunk(
+                    target,
+                    data,
+                    output,
+                    &dims,
+                    chunk_dims,
+                    &coords[i],
+                    element_size,
+                );
             }
-            #[cfg(not(feature = "parallel"))]
-            {
-                raw_chunks
-                    .into_iter()
-                    .map(reverse)
-                    .collect::<IoResult<Vec<_>>>()?
-            }
-        } else {
-            // No pipeline: drop the (always-zero) mask field.
-            raw_chunks
-                .into_iter()
-                .map(|o| o.map(|(r, s, _)| (r, s)))
-                .collect()
-        };
-
-        // Place each chunk N-dimensionally by its scaled offsets.
-        for chunk in placed.iter().flatten() {
-            let (data, scaled) = chunk;
-            self.scatter_chunk(
-                target,
-                data,
-                output,
-                &dims,
-                chunk_dims,
-                scaled,
-                element_size,
-            );
         }
 
         // libhdf5 stores raw byte sizes; verify the uncompressed chunk
