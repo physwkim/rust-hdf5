@@ -906,23 +906,56 @@ impl H5Dataset {
         }
         let total_chunks: u64 = grid.iter().product();
 
-        for linear in 0..total_chunks {
-            // Decode the linear chunk index into row-major grid coordinates.
+        // Decode a linear chunk index into row-major grid coordinates.
+        let coords_of = |linear: u64| -> Vec<u64> {
             let mut rem = linear;
             let mut coords = vec![0u64; rank];
             for d in (0..rank).rev() {
                 coords[d] = rem % grid[d];
                 rem /= grid[d];
             }
-            let chunk_buf = Self::gather_chunk(bytes, &dims, &chunk_dims, &coords, element_size);
-            if fixed_array {
-                writer.write_chunk_fixed_array(index, &coords, &chunk_buf)?;
-            } else if btree2 {
-                writer.write_chunk_btree_v2(index, &coords, &chunk_buf)?;
-            } else {
-                // Extensible array (single unlimited dimension): the linear
-                // index over the grid is the array's chunk index.
-                writer.write_chunk(index, linear, &chunk_buf)?;
+            coords
+        };
+
+        if fixed_array || btree2 {
+            // Bounded-grid indexes: fixed-array compresses each chunk itself
+            // and B-tree v2 stores chunks verbatim; neither has a parallel
+            // batch write path, so write one chunk at a time.
+            for linear in 0..total_chunks {
+                let coords = coords_of(linear);
+                let chunk_buf =
+                    Self::gather_chunk(bytes, &dims, &chunk_dims, &coords, element_size);
+                if fixed_array {
+                    writer.write_chunk_fixed_array(index, &coords, &chunk_buf)?;
+                } else {
+                    writer.write_chunk_btree_v2(index, &coords, &chunk_buf)?;
+                }
+            }
+        } else {
+            // Extensible array (single unlimited dimension): the linear index
+            // over the grid is the array's chunk index. Gather chunks and write
+            // them through write_chunks_batch so a filter pipeline compresses
+            // them in parallel (with the `parallel` feature). A fixed-size
+            // window bounds peak memory instead of materializing every chunk at
+            // once; 256 keeps every rayon worker fed while capping the transient
+            // buffers to window * chunk bytes.
+            const BATCH_WINDOW: u64 = 256;
+            let mut start = 0u64;
+            while start < total_chunks {
+                let end = (start + BATCH_WINDOW).min(total_chunks);
+                let bufs: Vec<(u64, Vec<u8>)> = (start..end)
+                    .map(|linear| {
+                        let coords = coords_of(linear);
+                        (
+                            linear,
+                            Self::gather_chunk(bytes, &dims, &chunk_dims, &coords, element_size),
+                        )
+                    })
+                    .collect();
+                let pairs: Vec<(u64, &[u8])> =
+                    bufs.iter().map(|(i, d)| (*i, d.as_slice())).collect();
+                writer.write_chunks_batch(index, &pairs)?;
+                start = end;
             }
         }
         Ok(())
@@ -2159,6 +2192,36 @@ mod tests {
             let ds = file.dataset("m").unwrap();
             assert_eq!(ds.chunk_dims(), Some(vec![2, 2]));
             assert_eq!(ds.read_raw::<f64>().unwrap(), data);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    // write_raw on an extensible-array (unlimited first dim) compressed dataset
+    // drives write_full_image_chunked's EA branch, which gathers chunks and
+    // compresses them through the windowed batch path. Round-trips the full
+    // image, including a partial edge chunk along the unlimited dimension.
+    #[test]
+    fn write_raw_ea_compressed_roundtrips() {
+        let path = temp_path("write_raw_ea_deflate");
+        let data: Vec<i32> = (0..20).collect(); // 5 x 4 row-major
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([5, 4])
+                .chunk(&[2, 4])
+                .max_shape(&[None, Some(4)]) // unlimited dim 0 -> extensible array
+                .deflate(5)
+                .create("stream")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("stream").unwrap();
+            assert_eq!(ds.shape(), vec![5, 4]);
+            assert_eq!(ds.read_raw::<i32>().unwrap(), data);
         }
         std::fs::remove_file(&path).ok();
     }

@@ -166,6 +166,41 @@ fn bench_compressed_read(c: &mut Criterion) {
     group.finish();
 }
 
+// write_raw a whole many-chunk deflate-compressed extensible-array dataset.
+// This drives write_full_image_chunked's windowed batch path, where the filter
+// pipeline compresses chunks in parallel under `--features parallel`.
+fn bench_compressed_write_raw(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compressed_write_raw");
+    for &nframes in &[100usize, 1000] {
+        let ncols = 1000usize;
+        let total_bytes = nframes * ncols * 8;
+        let data: Vec<f64> = (0..nframes * ncols).map(|i| i as f64).collect();
+        group.throughput(Throughput::Bytes(total_bytes as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(nframes),
+            &nframes,
+            |b, &nframes| {
+                b.iter(|| {
+                    let path = std::env::temp_dir().join("bench_compressed_write_raw.h5");
+                    let file = H5File::create(&path).unwrap();
+                    let ds = file
+                        .new_dataset::<f64>()
+                        .shape([nframes, ncols])
+                        .chunk(&[1, ncols])
+                        .max_shape(&[None, Some(ncols)])
+                        .deflate(6)
+                        .create("stream")
+                        .unwrap();
+                    ds.write_raw(&data).unwrap();
+                    file.close().unwrap();
+                    std::fs::remove_file(&path).ok();
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_contiguous_write,
@@ -173,5 +208,6 @@ criterion_group!(
     bench_chunked_write,
     bench_compressed_write,
     bench_compressed_read,
+    bench_compressed_write_raw,
 );
 criterion_main!(benches);
