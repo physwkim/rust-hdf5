@@ -88,6 +88,11 @@ compile_error!("rust-hdf5 currently supports little-endian hosts only");
 pub mod format;
 pub(crate) mod io;
 
+/// Private rayon thread pool (half the cores by default) for all internal
+/// parallelism; only present under the `parallel` feature.
+#[cfg(feature = "parallel")]
+pub(crate) mod parallel;
+
 pub mod attribute;
 pub mod dataset;
 pub mod error;

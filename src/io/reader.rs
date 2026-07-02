@@ -252,22 +252,26 @@ fn read_and_decompress_chunks(
     #[cfg(all(feature = "parallel", any(unix, windows)))]
     {
         use rayon::prelude::*;
-        jobs.into_par_iter()
-            .map(|job| match job {
-                Some(j) => Ok(Some(decompress_chunk(
-                    pipeline,
-                    read_chunk_raw(handle, &j)?,
-                    j.mask,
-                )?)),
-                None => Ok(None),
-            })
-            .collect()
+        // Run on rust-hdf5's private half-cores pool, not rayon's global pool.
+        crate::parallel::io_pool().install(|| {
+            jobs.into_par_iter()
+                .map(|job| match job {
+                    Some(j) => Ok(Some(decompress_chunk(
+                        pipeline,
+                        read_chunk_raw(handle, &j)?,
+                        j.mask,
+                    )?)),
+                    None => Ok(None),
+                })
+                .collect()
+        })
     }
     #[cfg(all(feature = "parallel", not(any(unix, windows))))]
     {
         use rayon::prelude::*;
         // No positioned read API here: concurrent reads would race the shared
-        // file cursor, so read serially, then parallelize decompression.
+        // file cursor, so read serially, then parallelize decompression on
+        // rust-hdf5's private half-cores pool (not rayon's global pool).
         let raws: Vec<Option<(Vec<u8>, u32)>> = jobs
             .into_iter()
             .map(|job| match job {
@@ -275,12 +279,14 @@ fn read_and_decompress_chunks(
                 None => Ok(None),
             })
             .collect::<IoResult<Vec<_>>>()?;
-        raws.into_par_iter()
-            .map(|r| match r {
-                Some((raw, mask)) => Ok(Some(decompress_chunk(pipeline, raw, mask)?)),
-                None => Ok(None),
-            })
-            .collect()
+        crate::parallel::io_pool().install(|| {
+            raws.into_par_iter()
+                .map(|r| match r {
+                    Some((raw, mask)) => Ok(Some(decompress_chunk(pipeline, raw, mask)?)),
+                    None => Ok(None),
+                })
+                .collect()
+        })
     }
     #[cfg(not(feature = "parallel"))]
     {
