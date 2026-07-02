@@ -3537,10 +3537,12 @@ impl Hdf5Writer {
             let pipeline = self.ds(ds_index).lock().filter_pipeline.clone();
             if let Some(ref pipeline) = pipeline {
                 let chunk_data: Vec<Vec<u8>> = chunks.iter().map(|(_, d)| d.to_vec()).collect();
-                let compressed = filter::apply_filters_parallel(pipeline, &chunk_data);
+                // Propagate a filter error rather than storing raw bytes under a
+                // filter_mask that claims the pipeline ran (see
+                // apply_filters_parallel). Ok reaching here means every chunk
+                // compressed fully, so filter_mask = 0 is truthful.
+                let compressed = filter::apply_filters_parallel(pipeline, &chunk_data)?;
                 for ((idx, _), compressed_data) in chunks.iter().zip(compressed.iter()) {
-                    // filter_mask = 0: the parallel compressor ran the whole
-                    // pipeline, so no filter is skipped for these chunks.
                     self.write_compressed_chunk(ds_index, *idx, compressed_data, 0)?;
                 }
                 return Ok(());
@@ -3573,17 +3575,13 @@ impl Hdf5Writer {
             // compression below runs off the lock.
             let pipeline = self.ds(ds_index).lock().filter_pipeline.clone();
             if let Some(ref pipeline) = pipeline {
-                use rayon::prelude::*;
-                // Compress every chunk in parallel, propagating a filter error
-                // exactly as the serial write_chunk_fixed_array path does with
-                // `?` — never store raw bytes under a filter_mask that claims
-                // the pipeline ran.
-                let compressed: Vec<Vec<u8>> = chunks
-                    .par_iter()
-                    .map(|(_, d)| filter::apply_filters(pipeline, d))
-                    .collect::<crate::format::FormatResult<Vec<_>>>()?;
+                let chunk_data: Vec<Vec<u8>> = chunks.iter().map(|(_, d)| d.to_vec()).collect();
+                // Same single owner as the EA batch: apply_filters_parallel
+                // propagates a filter error instead of storing raw bytes under a
+                // filter_mask that claims the pipeline ran. Ok here means every
+                // chunk compressed fully, so filter_mask = 0 is truthful.
+                let compressed = filter::apply_filters_parallel(pipeline, &chunk_data)?;
                 for ((coords, _), compressed_data) in chunks.iter().zip(compressed.iter()) {
-                    // filter_mask = 0: the whole pipeline ran on every chunk.
                     self.record_fixed_array_chunk(ds_index, coords, compressed_data, 0)?;
                 }
                 return Ok(());

@@ -907,27 +907,39 @@ fn fletcher32(data: &[u8]) -> u32 {
 
 /// Compress multiple chunks in parallel using rayon.
 ///
-/// Each chunk is independently compressed through the filter pipeline.
-/// If compression of a chunk fails, the original (uncompressed) data is used.
+/// Each chunk is independently compressed through the filter pipeline. A
+/// compression failure on any chunk is propagated (the whole call returns
+/// `Err`), never silently substituted with the raw bytes: a caller that then
+/// records the chunk under `filter_mask = 0` would claim the pipeline ran when
+/// it did not, so the reader would try to reverse-filter raw data and corrupt
+/// it. Serial writes (`apply_filters`) propagate the same way.
 #[cfg(feature = "parallel")]
-pub fn apply_filters_parallel(pipeline: &FilterPipeline, chunks: &[Vec<u8>]) -> Vec<Vec<u8>> {
+pub fn apply_filters_parallel(
+    pipeline: &FilterPipeline,
+    chunks: &[Vec<u8>],
+) -> FormatResult<Vec<Vec<u8>>> {
     use rayon::prelude::*;
     chunks
         .par_iter()
-        .map(|chunk| apply_filters(pipeline, chunk).unwrap_or_else(|_| chunk.clone()))
+        .map(|chunk| apply_filters(pipeline, chunk))
         .collect()
 }
 
 /// Decompress multiple chunks in parallel using rayon.
 ///
-/// Each chunk is independently decompressed through the reversed filter pipeline.
-/// If decompression of a chunk fails, the original data is used.
+/// Each chunk is independently decompressed through the reversed filter
+/// pipeline. A decompression failure on any chunk is propagated (the whole
+/// call returns `Err`), never silently substituted with the still-compressed
+/// bytes. Serial reads (`reverse_filters`) propagate the same way.
 #[cfg(feature = "parallel")]
-pub fn reverse_filters_parallel(pipeline: &FilterPipeline, chunks: &[Vec<u8>]) -> Vec<Vec<u8>> {
+pub fn reverse_filters_parallel(
+    pipeline: &FilterPipeline,
+    chunks: &[Vec<u8>],
+) -> FormatResult<Vec<Vec<u8>>> {
     use rayon::prelude::*;
     chunks
         .par_iter()
-        .map(|chunk| reverse_filters(pipeline, chunk).unwrap_or_else(|_| chunk.clone()))
+        .map(|chunk| reverse_filters(pipeline, chunk))
         .collect()
 }
 
@@ -2360,18 +2372,41 @@ mod tests {
             .map(|i| vec![(i as u8).wrapping_mul(42); 1024])
             .collect();
 
-        let compressed = apply_filters_parallel(&pipeline, &chunks);
+        let compressed = apply_filters_parallel(&pipeline, &chunks).unwrap();
         assert_eq!(compressed.len(), 8);
         // Each compressed chunk should be smaller (repeated data compresses well)
         for c in &compressed {
             assert!(c.len() < 1024);
         }
 
-        let decompressed = reverse_filters_parallel(&pipeline, &compressed);
+        let decompressed = reverse_filters_parallel(&pipeline, &compressed).unwrap();
         assert_eq!(decompressed.len(), 8);
         for (original, decoded) in chunks.iter().zip(decompressed.iter()) {
             assert_eq!(original, decoded);
         }
+    }
+
+    /// A compress failure on any chunk must propagate out of the parallel
+    /// helpers, never be swallowed into raw bytes. If it were swallowed, a
+    /// caller recording the chunk under filter_mask=0 would claim the pipeline
+    /// ran, and the reader would try to reverse-filter raw data and corrupt it.
+    /// Scale-offset compression is unimplemented, so apply_single_filter errors
+    /// deterministically (no feature flag needed).
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_compress_propagates_filter_error() {
+        let pipeline = FilterPipeline {
+            filters: vec![Filter {
+                id: FILTER_SCALEOFFSET,
+                flags: 0,
+                cd_values: vec![],
+            }],
+        };
+        let chunks: Vec<Vec<u8>> = vec![vec![1u8; 64], vec![2u8; 64]];
+        assert!(
+            apply_filters_parallel(&pipeline, &chunks).is_err(),
+            "scale-offset compress error must propagate, not be swallowed"
+        );
     }
 
     // =================================================================
