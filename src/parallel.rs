@@ -7,7 +7,9 @@
 //! **half** the logical cores by default. This keeps a single HDF5 read or
 //! write from saturating the machine and starving co-running processes, and it
 //! never calls [`rayon::ThreadPoolBuilder::build_global`], so it never fights
-//! the application for configuration of the global pool.
+//! the application for configuration of the global pool. If the pool cannot be
+//! built (the OS refuses to spawn its worker threads), each parallel section
+//! falls back to serial execution rather than panicking.
 //!
 //! The thread count can be overridden with the `RUST_HDF5_IO_THREADS`
 //! environment variable (a positive integer). An unset, zero, or unparseable
@@ -33,18 +35,25 @@ fn thread_count() -> usize {
         .max(1)
 }
 
-/// The shared, lazily-built I/O thread pool. Every rust-hdf5 rayon section runs
-/// inside `io_pool().install(...)`, so all of the crate's parallelism is capped
-/// at [`thread_count`] threads regardless of the global rayon pool.
-pub(crate) fn io_pool() -> &'static ThreadPool {
-    static POOL: OnceLock<ThreadPool> = OnceLock::new();
+/// The shared, lazily-built I/O thread pool, or `None` if the OS refused to
+/// spawn its worker threads (e.g. `RLIMIT_NPROC` exhaustion, a very large
+/// `RUST_HDF5_IO_THREADS`). Every rust-hdf5 rayon section runs inside
+/// `io_pool().install(...)` when the pool is present, capping the crate's
+/// parallelism at [`thread_count`] threads regardless of the global rayon pool;
+/// when it is `None` the caller falls back to serial execution, so a pool-build
+/// failure degrades performance instead of panicking across the library
+/// boundary. The `None` decision is cached — the build is not retried, and the
+/// crate runs serially for the rest of the process.
+pub(crate) fn io_pool() -> Option<&'static ThreadPool> {
+    static POOL: OnceLock<Option<ThreadPool>> = OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(thread_count())
             .thread_name(|i| format!("hdf5-io-{i}"))
             .build()
-            .expect("failed to build rust-hdf5 I/O thread pool")
+            .ok()
     })
+    .as_ref()
 }
 
 #[cfg(test)]
@@ -65,10 +74,14 @@ mod tests {
                 "default pool must be <= half the cores"
             );
         }
-        // The pool is a single shared instance across calls.
-        let a = io_pool() as *const ThreadPool;
-        let b = io_pool() as *const ThreadPool;
-        assert_eq!(a, b, "io_pool must return the same shared pool");
-        assert_eq!(io_pool().current_num_threads(), n);
+        // The pool is a single shared instance across calls (when it builds;
+        // build only fails if the OS refuses threads, in which case callers run
+        // serially and there is nothing to assert here).
+        if let Some(pool) = io_pool() {
+            let a = io_pool().unwrap() as *const ThreadPool;
+            let b = io_pool().unwrap() as *const ThreadPool;
+            assert_eq!(a, b, "io_pool must return the same shared pool");
+            assert_eq!(pool.current_num_threads(), n);
+        }
     }
 }

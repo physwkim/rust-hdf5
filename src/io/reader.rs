@@ -254,19 +254,27 @@ fn read_and_decompress_chunks(
     #[cfg(all(feature = "parallel", any(unix, windows)))]
     {
         use rayon::prelude::*;
-        // Run on rust-hdf5's private half-cores pool, not rayon's global pool.
-        crate::parallel::io_pool().install(|| {
-            jobs.into_par_iter()
-                .map(|job| match job {
-                    Some(j) => Ok(Some(decompress_chunk(
-                        pipeline,
-                        read_chunk_raw(handle, &j)?,
-                        j.mask,
-                    )?)),
-                    None => Ok(None),
-                })
-                .collect()
-        })
+        // Fused read + decompress for one job.
+        let decode = |job: Option<ChunkReadJob>| -> IoResult<Option<Vec<u8>>> {
+            match job {
+                Some(j) => Ok(Some(decompress_chunk(
+                    pipeline,
+                    read_chunk_raw(handle, &j)?,
+                    j.mask,
+                )?)),
+                None => Ok(None),
+            }
+        };
+        // Run on rust-hdf5's private half-cores pool, not rayon's global pool;
+        // fall back to serial if the pool could not be built.
+        match crate::parallel::io_pool() {
+            Some(pool) => pool.install(|| {
+                jobs.into_par_iter()
+                    .map(&decode)
+                    .collect::<IoResult<Vec<_>>>()
+            }),
+            None => jobs.into_iter().map(decode).collect::<IoResult<Vec<_>>>(),
+        }
     }
     #[cfg(all(feature = "parallel", not(any(unix, windows))))]
     {
@@ -281,14 +289,21 @@ fn read_and_decompress_chunks(
                 None => Ok(None),
             })
             .collect::<IoResult<Vec<_>>>()?;
-        crate::parallel::io_pool().install(|| {
-            raws.into_par_iter()
-                .map(|r| match r {
-                    Some((raw, mask)) => Ok(Some(decompress_chunk(pipeline, raw, mask)?)),
-                    None => Ok(None),
-                })
-                .collect()
-        })
+        let decode = |r: Option<(Vec<u8>, u32)>| -> IoResult<Option<Vec<u8>>> {
+            match r {
+                Some((raw, mask)) => Ok(Some(decompress_chunk(pipeline, raw, mask)?)),
+                None => Ok(None),
+            }
+        };
+        // Fall back to serial if the private pool could not be built.
+        match crate::parallel::io_pool() {
+            Some(pool) => pool.install(|| {
+                raws.into_par_iter()
+                    .map(&decode)
+                    .collect::<IoResult<Vec<_>>>()
+            }),
+            None => raws.into_iter().map(decode).collect::<IoResult<Vec<_>>>(),
+        }
     }
     #[cfg(not(feature = "parallel"))]
     {

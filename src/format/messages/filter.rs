@@ -919,13 +919,20 @@ pub fn apply_filters_parallel(
     chunks: &[Vec<u8>],
 ) -> FormatResult<Vec<Vec<u8>>> {
     use rayon::prelude::*;
-    // Run on rust-hdf5's private half-cores pool, not rayon's global pool.
-    crate::parallel::io_pool().install(|| {
-        chunks
-            .par_iter()
+    // Run on rust-hdf5's private half-cores pool, not rayon's global pool; fall
+    // back to serial if the pool could not be built.
+    match crate::parallel::io_pool() {
+        Some(pool) => pool.install(|| {
+            chunks
+                .par_iter()
+                .map(|chunk| apply_filters(pipeline, chunk))
+                .collect()
+        }),
+        None => chunks
+            .iter()
             .map(|chunk| apply_filters(pipeline, chunk))
-            .collect()
-    })
+            .collect(),
+    }
 }
 
 /// Decompress multiple chunks in parallel using rayon.
@@ -940,13 +947,20 @@ pub fn reverse_filters_parallel(
     chunks: &[Vec<u8>],
 ) -> FormatResult<Vec<Vec<u8>>> {
     use rayon::prelude::*;
-    // Run on rust-hdf5's private half-cores pool, not rayon's global pool.
-    crate::parallel::io_pool().install(|| {
-        chunks
-            .par_iter()
+    // Run on rust-hdf5's private half-cores pool, not rayon's global pool; fall
+    // back to serial if the pool could not be built.
+    match crate::parallel::io_pool() {
+        Some(pool) => pool.install(|| {
+            chunks
+                .par_iter()
+                .map(|chunk| reverse_filters(pipeline, chunk))
+                .collect()
+        }),
+        None => chunks
+            .iter()
             .map(|chunk| reverse_filters(pipeline, chunk))
-            .collect()
-    })
+            .collect(),
+    }
 }
 
 // =========================================================================
