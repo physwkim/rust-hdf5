@@ -239,8 +239,10 @@ fn decompress_chunk(
 /// the results.
 ///
 /// On Unix and Windows, positioned reads at distinct offsets on a shared
-/// `&File` neither consult nor move a file cursor, so read + decompress run
-/// fused in one parallel pass — overlapping chunk I/O across cores, which the
+/// `&File` each carry their own explicit offset and never consult a shared file
+/// cursor (on Windows the cursor may move as a side effect, but nothing reads
+/// it), so read + decompress run fused in one parallel pass — overlapping chunk
+/// I/O across cores, which the
 /// C library's default (non-MPI) path does not do. On targets with neither
 /// positioned API the seek-based fallback shares the file cursor, so reads
 /// stay serial there while decompression still parallelizes.

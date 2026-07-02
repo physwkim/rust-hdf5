@@ -4,8 +4,11 @@ use std::path::Path;
 use crate::io::locking::{self, FileLocking, LockMode};
 
 // The `threadsafe` writer's safety rests on positioned I/O: concurrent
-// pread/pwrite at distinct offsets on a shared `&File` never race because they
-// neither consult nor move a file cursor. On a target that is neither Unix nor
+// pread/pwrite at distinct offsets on a shared `&File` never race because each
+// call carries its own explicit offset and never consults a shared file cursor.
+// (On Windows, `seek_read`/`seek_write` may update the file position as a side
+// effect, but since no concurrent positioned op reads that position, distinct
+// offsets still cannot race.) On a target that is neither Unix nor
 // Windows there is no positioned API, so the pwrite_all/pread fallbacks below
 // fall back to seek+read/write on the shared cursor — which IS a data race
 // when the writer methods run concurrently through the shared read guard. The
@@ -22,9 +25,10 @@ compile_error!(
 /// Wraps `std::fs::File` with positioned (pread / pwrite) I/O convenience
 /// methods.
 ///
-/// Every read and write takes an explicit byte offset and neither consults nor
-/// moves a shared file cursor. Positioned operations at distinct offsets on a
-/// shared `&File` are safe to issue concurrently, which is what lets the
+/// Every read and write takes an explicit byte offset and never consults a
+/// shared file cursor. Positioned operations at distinct offsets on a
+/// shared `&File` are safe to issue concurrently — on Windows the cursor may
+/// move as a side effect, but nothing consults it — which is what lets the
 /// `threadsafe` fine-grained writer read and write chunk data from `&self`
 /// without holding a global lock (see
 /// `docs/threadsafe-fine-grained-locking.md`).
