@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.3.0
+
+Parallel chunk I/O under the `parallel` feature, a private thread pool that
+bounds the CPU footprint, and a correctness fix in the parallel filter path.
+
+### Added
+
+- Parallel chunk I/O when the crate is built with the `parallel` feature
+  (rayon), doing intra-process chunk-level work that libhdf5's default
+  (non-MPI) path does not:
+  - **Reads.** A single owner, `read_and_decompress_chunks`, drives every
+    chunk index type (extensible-array, fixed-array, B-tree v1, B-tree v2).
+    On Unix and Windows — where positioned reads carry their own offset and
+    never consult a shared file cursor — the per-chunk disk read and its
+    decompression run fused in one parallel pass, overlapping I/O across
+    cores. On targets without a positioned-read API, reads stay serial and
+    only decompression parallelizes.
+  - **Writes.** Full-image chunked writes (`write_raw` on a filtered dataset)
+    compress their chunks in parallel for both the extensible-array and
+    fixed-array layouts, in bounded windows. B-tree v2 datasets are always
+    stored unfiltered, so they remain serial.
+  - **Bounded CPU footprint.** All of the crate's rayon work runs on a private
+    thread pool sized to **half** the logical cores by default, rather than
+    rayon's global pool (which defaults to every core). This keeps a single
+    HDF5 read or write from saturating the machine and starving co-running
+    processes. Override the thread count with the `RUST_HDF5_IO_THREADS`
+    environment variable. The pool never calls `build_global()`, so it does
+    not fight the host application for the global pool, and if it cannot be
+    built (the OS refuses worker threads) each parallel section falls back to
+    serial execution instead of panicking.
+
+### Changed
+
+- **Breaking (`parallel` feature).** `apply_filters_parallel` and
+  `reverse_filters_parallel` in `format::messages::filter` now return
+  `FormatResult<Vec<Vec<u8>>>` instead of `Vec<Vec<u8>>`. They propagate a
+  per-chunk filter error instead of silently substituting the raw bytes, so
+  callers must handle the `Result`. This is the only public API change and is
+  the reason for the minor version bump.
+
+### Fixed
+
+- Parallel chunk compression no longer swallows a filter error into raw bytes
+  recorded under `filter_mask = 0`. Previously a compression failure (an
+  szip/bzip2/unknown/scale-offset filter, or a codec whose feature was not
+  compiled in) stored the uncompressed bytes while marking the chunk as fully
+  filtered, so the reader would try to reverse-filter unfiltered data and
+  corrupt the chunk. Both the extensible-array and fixed-array batch writers
+  now route through one error-propagating compressor. deflate never triggered
+  the bug, so no existing deflate file is affected.
+
+### Performance
+
+- Multi-dimensional whole-image reads scatter each chunk into the output by
+  contiguous last-axis run (`copy_from_slice`) instead of element by element,
+  matching the write path.
+- Measured on a 12-core machine (throughput, `--features parallel` vs serial),
+  1000-chunk datasets:
+  - compressed read: +264% at half cores (617 MiB/s -> 2.18 GiB/s), ~5x at
+    full cores;
+  - compressed `write_raw`, extensible array: +297% at half cores
+    (31 -> 121 MiB/s);
+  - compressed `write_raw`, fixed array: +340% at half cores
+    (32 -> 141 MiB/s).
+
 ## 0.2.28
 
 ### Added
