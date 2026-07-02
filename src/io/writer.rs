@@ -3553,6 +3553,49 @@ impl Hdf5Writer {
         Ok(())
     }
 
+    /// Write multiple fixed-array chunks in a batch, compressing them in
+    /// parallel when a filter pipeline is set and the `parallel` feature is on.
+    ///
+    /// The fixed-array analogue of [`write_chunks_batch`](Self::write_chunks_batch):
+    /// chunks are addressed by grid coordinates rather than a linear index.
+    /// `record_fixed_array_chunk` writes already-compressed bytes verbatim, so
+    /// the parallel compressor is the only place a filter runs. Falls back to
+    /// per-chunk [`write_chunk_fixed_array`](Self::write_chunk_fixed_array) when
+    /// unfiltered or when `parallel` is off.
+    pub fn write_chunks_fixed_array_batch(
+        &self,
+        ds_index: usize,
+        chunks: &[(&[u64], &[u8])],
+    ) -> IoResult<()> {
+        #[cfg(feature = "parallel")]
+        {
+            // Clone the pipeline out under a brief slot guard so the parallel
+            // compression below runs off the lock.
+            let pipeline = self.ds(ds_index).lock().filter_pipeline.clone();
+            if let Some(ref pipeline) = pipeline {
+                use rayon::prelude::*;
+                // Compress every chunk in parallel, propagating a filter error
+                // exactly as the serial write_chunk_fixed_array path does with
+                // `?` — never store raw bytes under a filter_mask that claims
+                // the pipeline ran.
+                let compressed: Vec<Vec<u8>> = chunks
+                    .par_iter()
+                    .map(|(_, d)| filter::apply_filters(pipeline, d))
+                    .collect::<crate::format::FormatResult<Vec<_>>>()?;
+                for ((coords, _), compressed_data) in chunks.iter().zip(compressed.iter()) {
+                    // filter_mask = 0: the whole pipeline ran on every chunk.
+                    self.record_fixed_array_chunk(ds_index, coords, compressed_data, 0)?;
+                }
+                return Ok(());
+            }
+        }
+        // Fallback: sequential (write_chunk_fixed_array compresses per chunk).
+        for (coords, data) in chunks {
+            self.write_chunk_fixed_array(ds_index, coords, data)?;
+        }
+        Ok(())
+    }
+
     /// Write a pre-filtered chunk verbatim to an EA-indexed dataset, recording
     /// the caller-supplied `filter_mask`.
     ///

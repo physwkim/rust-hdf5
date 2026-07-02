@@ -917,44 +917,48 @@ impl H5Dataset {
             coords
         };
 
-        if fixed_array || btree2 {
-            // Bounded-grid indexes: fixed-array compresses each chunk itself
-            // and B-tree v2 stores chunks verbatim; neither has a parallel
-            // batch write path, so write one chunk at a time.
+        if btree2 {
+            // B-tree v2 stores chunks verbatim (unfiltered only in this
+            // codebase), so there is no compression to parallelize; write one
+            // chunk at a time.
             for linear in 0..total_chunks {
                 let coords = coords_of(linear);
                 let chunk_buf =
                     Self::gather_chunk(bytes, &dims, &chunk_dims, &coords, element_size);
-                if fixed_array {
-                    writer.write_chunk_fixed_array(index, &coords, &chunk_buf)?;
-                } else {
-                    writer.write_chunk_btree_v2(index, &coords, &chunk_buf)?;
-                }
+                writer.write_chunk_btree_v2(index, &coords, &chunk_buf)?;
             }
         } else {
-            // Extensible array (single unlimited dimension): the linear index
-            // over the grid is the array's chunk index. Gather chunks and write
-            // them through write_chunks_batch so a filter pipeline compresses
-            // them in parallel (with the `parallel` feature). A fixed-size
-            // window bounds peak memory instead of materializing every chunk at
-            // once; 256 keeps every rayon worker fed while capping the transient
-            // buffers to window * chunk bytes.
+            // Extensible array and fixed array both compress each chunk through
+            // the filter pipeline. Gather chunks and write them through the
+            // per-index batch path so the pipeline compresses them in parallel
+            // (with the `parallel` feature). A fixed-size window bounds peak
+            // memory instead of materializing every chunk at once; 256 keeps
+            // every rayon worker fed while capping the transient buffers to
+            // window * chunk bytes. The two indexes differ only in how a chunk
+            // is addressed: EA by its linear grid index, FA by grid coordinates.
             const BATCH_WINDOW: u64 = 256;
             let mut start = 0u64;
             while start < total_chunks {
                 let end = (start + BATCH_WINDOW).min(total_chunks);
-                let bufs: Vec<(u64, Vec<u8>)> = (start..end)
+                let items: Vec<(u64, Vec<u64>, Vec<u8>)> = (start..end)
                     .map(|linear| {
                         let coords = coords_of(linear);
-                        (
-                            linear,
-                            Self::gather_chunk(bytes, &dims, &chunk_dims, &coords, element_size),
-                        )
+                        let buf =
+                            Self::gather_chunk(bytes, &dims, &chunk_dims, &coords, element_size);
+                        (linear, coords, buf)
                     })
                     .collect();
-                let pairs: Vec<(u64, &[u8])> =
-                    bufs.iter().map(|(i, d)| (*i, d.as_slice())).collect();
-                writer.write_chunks_batch(index, &pairs)?;
+                if fixed_array {
+                    let pairs: Vec<(&[u64], &[u8])> = items
+                        .iter()
+                        .map(|(_, c, d)| (c.as_slice(), d.as_slice()))
+                        .collect();
+                    writer.write_chunks_fixed_array_batch(index, &pairs)?;
+                } else {
+                    let pairs: Vec<(u64, &[u8])> =
+                        items.iter().map(|(l, _, d)| (*l, d.as_slice())).collect();
+                    writer.write_chunks_batch(index, &pairs)?;
+                }
                 start = end;
             }
         }
