@@ -2163,6 +2163,39 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    // 3D chunked Full read with partial-edge chunks in every dimension. This
+    // drives copy_chunk_to_output's multi-dim run-memcpy path with two outer
+    // dimensions, exercising the nested outer-coordinate carry and the
+    // last-axis edge clamp (chunks hang off the high edge in all three axes).
+    #[test]
+    fn read_full_3d_chunked_edge_roundtrips() {
+        let path = temp_path("full_3d_chunked_edge");
+        // shape 5x4x3, chunk 2x3x2 -> ceil gives 3x2x2 chunks; the last chunk
+        // along each axis is partial (1, 1, and 1 element respectively).
+        let total: usize = 5 * 4 * 3;
+        let data: Vec<i32> = (0..total as i32).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([5, 4, 3])
+                .chunk(&[2, 3, 2])
+                .deflate(4)
+                .create("vol")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("vol").unwrap();
+            assert_eq!(ds.shape(), vec![5, 4, 3]);
+            assert_eq!(ds.chunk_dims(), Some(vec![2, 3, 2]));
+            assert_eq!(ds.read_raw::<i32>().unwrap(), data);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn roundtrip_u8_1d() {
         let path = temp_path("rt_u8_1d");

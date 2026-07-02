@@ -2342,46 +2342,52 @@ impl Hdf5Reader {
             return;
         }
 
-        // For multi-dimensional: compute row-major layout
-        // The chunk occupies a sub-region of the output array.
-        // We iterate over all elements in the chunk and compute their position.
-        let chunk_elems: u64 = chunk_dims
-            .iter()
-            .fold(1u64, |acc, &d| acc.saturating_mul(d));
-        let mut chunk_coord_iter = vec![0u64; ndims];
+        // Multi-dimensional: the last axis is innermost in both the chunk and
+        // the output, so each fixed setting of the outer dimensions copies one
+        // contiguous last-axis run — no per-element loop. This mirrors
+        // copy_chunk_to_slice, but writes into the full dataset extent.
+        let last = ndims - 1;
 
-        for elem_idx in 0..chunk_elems {
-            // Compute multi-dimensional index within the chunk
-            let mut remaining = elem_idx;
-            for d in (0..ndims).rev() {
-                chunk_coord_iter[d] = remaining % chunk_dims[d];
-                remaining /= chunk_dims[d];
+        // Per dimension: the chunk's global origin and the valid extent within
+        // the dataset (a chunk may hang off the high edge, so clamp).
+        let mut origin = vec![0u64; ndims];
+        let mut extent = vec![0u64; ndims];
+        for d in 0..ndims {
+            origin[d] = chunk_coords[d].saturating_mul(chunk_dims[d]);
+            if origin[d] >= dims[d] {
+                return; // chunk lies entirely past the extent
             }
+            extent[d] = chunk_dims[d].min(dims[d] - origin[d]);
+        }
 
-            // Compute global position
-            let mut valid = true;
-            let mut global_linear = 0u64;
-            let mut stride = 1u64;
-            for d in (0..ndims).rev() {
-                let global_d = chunk_coords[d] * chunk_dims[d] + chunk_coord_iter[d];
-                if global_d >= dims[d] {
-                    valid = false;
+        let chunk_strides = compute_strides(chunk_dims, element_size);
+        let out_strides = compute_strides(dims, element_size);
+        let run_bytes = (extent[last] * element_size) as usize;
+
+        // Iterate the outer box [0, last); each position copies one contiguous
+        // last-axis run. The last-axis source starts at the chunk row origin.
+        let outer_extent: Vec<u64> = (0..last).map(|d| extent[d]).collect();
+        let n_outer: u64 = outer_extent.iter().product(); // empty product == 1
+        let mut oc = vec![0u64; last];
+        for _ in 0..n_outer {
+            let mut src_off = 0u64;
+            let mut dst_off = 0u64;
+            for d in 0..ndims {
+                let local = if d < last { oc[d] } else { 0 };
+                src_off += local * chunk_strides[d];
+                dst_off += (origin[d] + local) * out_strides[d];
+            }
+            let s = src_off as usize;
+            let dst = dst_off as usize;
+            if s + run_bytes <= chunk_data.len() && dst + run_bytes <= output.len() {
+                output[dst..dst + run_bytes].copy_from_slice(&chunk_data[s..s + run_bytes]);
+            }
+            for d in (0..last).rev() {
+                oc[d] += 1;
+                if oc[d] < outer_extent[d] {
                     break;
                 }
-                global_linear += global_d * stride;
-                stride *= dims[d];
-            }
-
-            if !valid {
-                continue;
-            }
-
-            let src_offset = (elem_idx * element_size) as usize;
-            let dst_offset = (global_linear * element_size) as usize;
-            let es = element_size as usize;
-            if src_offset + es <= chunk_data.len() && dst_offset + es <= output.len() {
-                output[dst_offset..dst_offset + es]
-                    .copy_from_slice(&chunk_data[src_offset..src_offset + es]);
+                oc[d] = 0;
             }
         }
     }
