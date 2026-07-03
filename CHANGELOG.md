@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.1
+
+### Added
+
+- `H5File::close_no_sync` (and the underlying `Hdf5Writer::close_no_sync`) —
+  a close that finalizes the file (writes all object headers and the
+  superblock, so on return it is a complete, valid HDF5 file readable by any
+  process) but skips every `fsync` in the finalize path. The bytes are handed
+  to the OS but are not guaranteed durable against power loss or an OS crash
+  until the OS flushes its page cache. This trades durability for speed for
+  bulk output that can be regenerated; the `fsync`s otherwise dominate close
+  latency. `close` remains durable, and dropping a file without calling either
+  finalizes durably.
+
+  The finalize path has two durability points — the final `sync_all` and the
+  per-indexed-dataset `sync_data` inside `flush_dataset` — and both are skipped
+  by `close_no_sync`, so a file with many chunked datasets sees no `fsync` at
+  all. The public `flush_dataset`, SWMR finalize/flush paths, and
+  `H5Dataset::flush` are unchanged and still sync.
+
 ## 0.3.0
 
 Parallel chunk I/O under the `parallel` feature, a private thread pool that
