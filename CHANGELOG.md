@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.2
+
+### Fixed
+
+- File creation no longer issues an `ftruncate`-to-0 on a brand-new empty
+  file. On ext4 (with the default `auto_da_alloc`), that truncate arms
+  replace-via-truncate protection on the inode, which turns the final
+  `close(2)` into an implicit writeback of everything written since (~330 ms
+  for a 512³ f32 dataset) — silently defeating `close_no_sync`, whose skipped
+  `fsync`s were then paid inside `close(2)` anyway. The truncate now runs only
+  when the file already has content, which is the only case it exists for
+  (destroying prior contents after the create lock is validated). The
+  lock-before-truncate ordering is unchanged, and creating over an existing
+  non-empty file still truncates it. Verified on ext4: `close(2)` after a
+  `close_no_sync` write went from ~326 ms to ~0 ms.
+
 ## 0.3.1
 
 ### Added
