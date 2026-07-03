@@ -3713,8 +3713,21 @@ impl Hdf5Writer {
         Ok(())
     }
 
-    /// Flush a chunked dataset's index structures to disk.
+    /// Flush a chunked dataset's index structures to disk (durable).
+    ///
+    /// Writes the index blocks and issues an `fdatasync` so the data is
+    /// durable — the guarantee SWMR readers and standalone callers rely on.
     pub fn flush_dataset(&self, index: usize) -> IoResult<()> {
+        self.flush_dataset_synced(index, true)
+    }
+
+    /// Flush a chunked dataset's index structures, syncing only if `sync`.
+    ///
+    /// `finalize` threads its own durability choice here so that a
+    /// [`close_no_sync`](Self::close_no_sync) skips this per-dataset
+    /// `sync_data` too — otherwise gating only the final `sync_all` would
+    /// leave one `fdatasync` per indexed dataset and defeat the fast close.
+    fn flush_dataset_synced(&self, index: usize, sync: bool) -> IoResult<()> {
         // Hold one slot guard for the whole method; `self.handle`/`self.ctx`/
         // `self.allocator` below touch disjoint fields.
         let ds = self.ds(index);
@@ -3733,7 +3746,9 @@ impl Hdf5Writer {
             }
             let hdr_encoded = chunked.ea_header.encode(&self.ctx);
             self.handle.write_at(chunked.ea_header_addr, &hdr_encoded)?;
-            self.handle.sync_data()?;
+            if sync {
+                self.handle.sync_data()?;
+            }
             return Ok(());
         }
 
@@ -3743,7 +3758,9 @@ impl Hdf5Writer {
             self.handle.write_at(fa.fa_dblk_addr, &dblk_encoded)?;
             let hdr_encoded = fa.fa_header.encode(&self.ctx);
             self.handle.write_at(fa.fa_header_addr, &hdr_encoded)?;
-            self.handle.sync_data()?;
+            if sync {
+                self.handle.sync_data()?;
+            }
             return Ok(());
         }
 
@@ -3767,7 +3784,9 @@ impl Hdf5Writer {
             let bt2_mut = m.btree_v2.as_mut().unwrap();
             bt2_mut.bt2_leaf_addr = leaf_addr;
 
-            self.handle.sync_data()?;
+            if sync {
+                self.handle.sync_data()?;
+            }
             return Ok(());
         }
 
@@ -3788,7 +3807,29 @@ impl Hdf5Writer {
         // `Drop` (the only other finalize site) a no-op regardless of outcome,
         // so the error is reported exactly once via this `Result`.
         self.closed = true;
-        self.finalize()
+        self.finalize(true)
+    }
+
+    /// Finalize and close the file without a final `fsync`.
+    ///
+    /// Identical to [`close`](Self::close) — the same object headers and
+    /// superblock are written, so on return the file is a complete, valid HDF5
+    /// file readable by any process — except that the trailing `sync_all`
+    /// (fsync) is skipped. The bytes are handed to the OS but are not
+    /// guaranteed durable against power loss or an OS crash until the OS
+    /// flushes its page cache; a normal process exit or a same-machine reader
+    /// sees the full file regardless.
+    ///
+    /// This trades durability for speed: `sync_all` typically dominates close
+    /// latency, so bulk writers that do not need crash durability (the file can
+    /// be regenerated) can use this to avoid that cost. Use [`close`](Self::close)
+    /// when durability matters. `Drop` always finalizes durably, so a writer
+    /// finalized this way must reach `close_no_sync` explicitly.
+    pub fn close_no_sync(mut self) -> IoResult<()> {
+        // Same close-once discipline as `close`: commit to the close path
+        // before finalizing so `Drop` cannot re-run `finalize` on failure.
+        self.closed = true;
+        self.finalize(false)
     }
 
     /// Provide mutable access to the underlying file handle.
@@ -3974,7 +4015,16 @@ impl Hdf5Writer {
         Ok(())
     }
 
-    fn finalize(&mut self) -> IoResult<()> {
+    /// Write all object headers and the superblock, producing a complete,
+    /// valid HDF5 file.
+    ///
+    /// `sync == true` issues a final `sync_all` (fsync) so the bytes are
+    /// durable against power loss / OS crash before returning. `sync == false`
+    /// skips that fsync: the file is still fully written to the OS and readable
+    /// by any process, but durability is left to the OS page-cache flush. This
+    /// is the only difference between [`close`](Self::close) (durable) and
+    /// [`close_no_sync`](Self::close_no_sync) (fast).
+    fn finalize(&mut self, sync: bool) -> IoResult<()> {
         // Flush any partial append buffers before finalizing
         self.flush_append_buffers()?;
 
@@ -4009,7 +4059,7 @@ impl Hdf5Writer {
                     continue;
                 }
             }
-            self.flush_dataset(i)?;
+            self.flush_dataset_synced(i, sync)?;
         }
 
         // 1. Write each dataset's object header.
@@ -4060,7 +4110,12 @@ impl Hdf5Writer {
         // 3. Write superblock at offset 0.
         self.write_superblock(0)?;
 
-        self.handle.sync_all()?;
+        // Durability is opt-in per call: `close` passes `true`, `close_no_sync`
+        // passes `false`, and `Drop` passes `true` so an un-`close`d writer is
+        // still finalized durably by default.
+        if sync {
+            self.handle.sync_all()?;
+        }
         Ok(())
     }
 
@@ -4304,7 +4359,7 @@ impl Drop for Hdf5Writer {
             // succeeded. Surface it on stderr instead of swallowing it.
             // Callers that need to handle the error must call
             // `H5File::close()` explicitly, which returns the Result.
-            if let Err(e) = self.finalize() {
+            if let Err(e) = self.finalize(true) {
                 eprintln!(
                     "rust-hdf5: failed to finalize HDF5 file on drop: {e}. \
                      The file may be incomplete or corrupt; call \

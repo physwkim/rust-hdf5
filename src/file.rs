@@ -672,6 +672,36 @@ impl H5File {
         }
     }
 
+    /// Close the file without a final `fsync` (write mode only).
+    ///
+    /// Like [`close`](Self::close), this finalizes the file — object headers
+    /// and superblock are written, so on return it is a complete, valid HDF5
+    /// file readable by any process — but the trailing `sync_all` (fsync) is
+    /// skipped. The bytes are handed to the OS but are not guaranteed durable
+    /// against power loss or an OS crash until the OS flushes its page cache.
+    ///
+    /// This trades durability for speed (the fsync typically dominates close
+    /// latency); use it for bulk output that can be regenerated. Prefer
+    /// [`close`](Self::close) when durability matters. Dropping the file
+    /// without calling either finalizes durably.
+    ///
+    /// For a reader or an already-closed file this is a no-op, matching
+    /// [`close`](Self::close).
+    pub fn close_no_sync(self) -> Result<()> {
+        let old = {
+            let mut inner = borrow_inner_mut(&self.inner);
+            std::mem::replace(&mut *inner, H5FileInner::Closed)
+        };
+        match old {
+            H5FileInner::Writer(writer) => {
+                writer.close_no_sync()?;
+                Ok(())
+            }
+            H5FileInner::Reader(_) => Ok(()),
+            H5FileInner::Closed => Ok(()),
+        }
+    }
+
     /// Flush the file to disk. Only meaningful in write mode.
     pub fn flush(&self) -> Result<()> {
         // The underlying writer does not expose a standalone flush; data is
@@ -839,6 +869,79 @@ mod tests {
             let data = ds.read_raw::<u8>().unwrap();
             assert_eq!(data.len(), 16);
             assert!(data.iter().all(|&b| b == 0));
+            file.close().unwrap();
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn close_no_sync_produces_valid_readable_file() {
+        let path = temp_path("close_no_sync_rt");
+        let payload: Vec<u8> = (0u8..16).collect();
+
+        // Write and finalize WITHOUT the trailing fsync.
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<u8>()
+                .shape([4, 4])
+                .create("data")
+                .unwrap();
+            ds.write_raw(&payload).unwrap();
+            // The only difference from `write_and_read_roundtrip`: no fsync.
+            // The file must still be a complete, valid, readable HDF5 file.
+            file.close_no_sync().unwrap();
+        }
+
+        // Reopen and verify the full content survived (same-machine reader sees
+        // the OS page cache regardless of whether fsync ran).
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("data").unwrap();
+            assert_eq!(ds.shape(), vec![4, 4]);
+            let data = ds.read_raw::<u8>().unwrap();
+            assert_eq!(data, payload);
+            file.close().unwrap();
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn close_no_sync_chunked_dataset_valid() {
+        // Exercises flush_dataset_synced(sync=false): a chunked (EA-indexed)
+        // dataset closed with close_no_sync must skip the per-dataset
+        // sync_data yet still write valid index structures, so the reopened
+        // file reconstructs every frame.
+        let path = temp_path("close_no_sync_chunked");
+
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0usize, 3])
+                .chunk(&[1, 3])
+                .max_shape(&[None, Some(3)])
+                .create("data")
+                .unwrap();
+            // 10 frames exceeds idx_blk_elmts=4, so data blocks are exercised.
+            for frame in 0..10u64 {
+                let vals: Vec<i32> = (0..3).map(|i| (frame * 3 + i) as i32).collect();
+                let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                ds.write_chunk(frame as usize, &raw).unwrap();
+            }
+            ds.extend(&[10, 3]).unwrap();
+            file.close_no_sync().unwrap();
+        }
+
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("data").unwrap();
+            assert_eq!(ds.shape(), vec![10, 3]);
+            let data = ds.read_raw::<i32>().unwrap();
+            let expected: Vec<i32> = (0..30).collect();
+            assert_eq!(data, expected);
             file.close().unwrap();
         }
 
