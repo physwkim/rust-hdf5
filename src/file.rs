@@ -909,6 +909,41 @@ mod tests {
     }
 
     #[test]
+    fn create_over_existing_file_truncates() {
+        // The create path skips the ftruncate on a brand-new empty file (it
+        // arms ext4's auto_da_alloc and turns close(2) into an implicit
+        // writeback, defeating close_no_sync). This pins the other side of
+        // that guard: creating over an existing non-empty file must still
+        // truncate it, so no stale content survives.
+        let path = temp_path("create_truncates");
+
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<u8>()
+                .shape([4, 4])
+                .create("old_data")
+                .unwrap();
+            ds.write_raw(&[7u8; 16]).unwrap();
+            file.close().unwrap();
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+
+        // Re-create over the non-empty file, write nothing.
+        {
+            let file = H5File::create(&path).unwrap();
+            file.close().unwrap();
+        }
+
+        // The old dataset must be gone.
+        let file = H5File::open(&path).unwrap();
+        assert!(file.dataset("old_data").is_err());
+        file.close().unwrap();
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn close_no_sync_chunked_dataset_valid() {
         // Exercises flush_dataset_synced(sync=false): a chunked (EA-indexed)
         // dataset closed with close_no_sync must skip the per-dataset

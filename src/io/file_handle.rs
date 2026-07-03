@@ -72,8 +72,15 @@ impl FileHandle {
             .truncate(false)
             .open(path)?;
         let lock_held = locking::try_acquire(&file, LockMode::Exclusive, policy)?;
-        // Now that the lock is held (or skipped per policy), truncate.
-        file.set_len(0)?;
+        // Now that the lock is held (or skipped per policy), truncate — but
+        // only when there is something to truncate. An ftruncate-to-0, even on
+        // a brand-new empty file, arms ext4's auto_da_alloc
+        // (replace-via-truncate protection), which turns the final close(2)
+        // into an implicit writeback of everything written since (~330 ms for
+        // a 512^3 f32 dataset) and silently defeats `close_no_sync`.
+        if file.metadata()?.len() > 0 {
+            file.set_len(0)?;
+        }
         Ok(Self {
             file,
             writable: true,
