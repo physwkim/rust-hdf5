@@ -22,7 +22,7 @@ Read and write HDF5 files with contiguous, chunked, and compressed datasets, hie
 - **Attributes** — string and numeric attributes on datasets and root
 - **SWMR** — Single Writer / Multiple Reader streaming protocol
 - **File locking** — OS-level advisory locks (`flock` / `LockFileEx`) honoring `HDF5_USE_FILE_LOCKING`
-- **Hyperslab I/O** — `read_slice` / `write_slice` for partial N-dimensional access
+- **Hyperslab I/O** — `read_slice` / `write_slice` for partial N-dimensional access, on contiguous and chunked (including compressed) datasets
 - **Buffered I/O** — BufWriter/BufReader with automatic mode switching
 - **Memory-mapped I/O** — optional zero-copy read-only access via `mmap` feature
 - **Thread safety** — optional `threadsafe` feature (`Arc<Mutex>` instead of `Rc<RefCell>`)
@@ -149,6 +149,13 @@ let ds = file.dataset("grid")?;
 let region = ds.read_slice::<i32>(&[2, 3], &[2, 3])?;
 assert_eq!(region, vec![1, 2, 3, 4, 5, 6]);
 ```
+
+`write_slice` also works on chunked datasets, including compressed ones: it
+touches only the chunks the selection intersects, reading and rewriting a
+chunk in place when the selection covers it only partially. Updating one row
+of a large chunked dataset therefore costs one chunk's worth of I/O, not the
+whole dataset's. Chunk regions no write has reached read back as the fill
+value.
 
 ### Attributes
 
