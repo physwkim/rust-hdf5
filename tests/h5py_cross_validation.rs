@@ -632,6 +632,61 @@ fn bt2_2_compressed_multi_unlimited_readable_by_h5py() {
     std::fs::remove_file(&path).ok();
 }
 
+/// BT2-5: a direct chunk write on a v2 B-tree — bytes stored verbatim with a
+/// per-chunk filter mask. libhdf5 must skip exactly the filters the mask marks
+/// as not applied, so one chunk arrives deflated (mask 0) and its neighbour
+/// uncompressed (mask 1) and both must read back as the same values.
+#[cfg(feature = "deflate")]
+#[test]
+fn bt2_5_direct_chunk_write_mask_honored_by_h5py() {
+    use flate2::{write::ZlibEncoder, Compression};
+    use std::io::Write;
+
+    let Some(py) = python() else { return };
+    let path = tmp("bt2_direct");
+    let bytes = |vals: [i32; 4]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let deflate = |raw: &[u8]| -> Vec<u8> {
+        let mut e = ZlibEncoder::new(Vec::new(), Compression::new(6));
+        e.write_all(raw).unwrap();
+        e.finish().unwrap()
+    };
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([0, 0])
+            .chunk(&[2, 2])
+            .max_shape(&[None, None])
+            .deflate(6)
+            .create("grid")
+            .unwrap();
+        ds.write_chunk_raw_at(&[0, 0], &deflate(&bytes([0, 1, 4, 5])), 0)
+            .unwrap();
+        // Same values, handed over uncompressed with filter 0 marked skipped.
+        ds.write_chunk_raw_at(&[0, 1], &bytes([2, 3, 6, 7]), 1)
+            .unwrap();
+        ds.write_chunk_raw_at(&[1, 0], &deflate(&bytes([8, 9, 12, 13])), 0)
+            .unwrap();
+        ds.write_chunk_raw_at(&[1, 1], &bytes([10, 11, 14, 15]), 1)
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['grid']\n\
+         assert ds.compression == 'gzip', ds.compression\n\
+         assert ds.chunks == (2, 2), ds.chunks\n\
+         assert np.array_equal(ds[...], np.arange(16).reshape(4, 4)), ds[...]\n\
+         # The mask-1 chunks are stored raw (16 B); the mask-0 ones went through\n\
+         # deflate, so their filter_mask differs.\n\
+         masks = sorted(ds.id.get_chunk_info(i).filter_mask\n\
+                        for i in range(ds.id.get_num_chunks()))\n\
+         assert masks == [0, 0, 1, 1], masks\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// BT2-3: more chunks than a 2048-byte node holds, so the index must be a real
 /// tree — a root of separator records over several leaves — not one oversized
 /// node. libhdf5 sizes every node from the header's `node_size` and descends

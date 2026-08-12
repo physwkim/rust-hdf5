@@ -4020,10 +4020,74 @@ impl Hdf5Writer {
             }
             None => data,
         };
-        let stored_len = stored.len() as u64;
 
+        // filter_mask = 0: the whole pipeline ran (or the dataset is
+        // unfiltered), so no filter is skipped.
+        self.record_btree_v2_chunk(index, chunk_coords, stored, 0)
+    }
+
+    /// Write a pre-filtered chunk verbatim to a BT2-indexed dataset, recording
+    /// the caller-supplied `filter_mask`.
+    ///
+    /// The v2-B-tree half of the HDF5 "direct chunk write" (`H5Dwrite_chunk`).
+    /// The bytes are stored exactly as given; `filter_mask` bit *i* set means
+    /// filter *i* of the pipeline was **not** applied and must be skipped on
+    /// read. Requires a filtered dataset — only a type-11 record has a slot for
+    /// a stored size and mask.
+    pub fn write_compressed_chunk_btree_v2(
+        &self,
+        index: usize,
+        chunk_coords: &[u64],
+        data: &[u8],
+        filter_mask: u32,
+    ) -> IoResult<()> {
+        if self.ds(index).lock().filter_pipeline.is_none() {
+            return Err(crate::io::IoError::InvalidState(
+                "write_compressed_chunk_btree_v2 requires a filtered dataset (no \
+                 slot for a compressed size or filter mask on an unfiltered chunk \
+                 index)"
+                    .into(),
+            ));
+        }
+        self.record_btree_v2_chunk(index, chunk_coords, data, filter_mask)
+    }
+
+    /// Place a chunk's already-final bytes (filtered if the dataset is
+    /// filtered, raw otherwise) in the file and record them in the v2 B-tree,
+    /// under the caller-supplied `filter_mask`.
+    ///
+    /// Shared by [`write_chunk_btree_v2`](Self::write_chunk_btree_v2) and
+    /// [`write_compressed_chunk_btree_v2`](Self::write_compressed_chunk_btree_v2),
+    /// so both reach the index through one placement rule.
+    fn record_btree_v2_chunk(
+        &self,
+        index: usize,
+        chunk_coords: &[u64],
+        final_bytes: &[u8],
+        filter_mask: u32,
+    ) -> IoResult<()> {
+        let stored_len = final_bytes.len() as u64;
+        let ds = self.ds(index);
         let mut m = ds.lock();
-        let bt2 = m.btree_v2.as_ref().unwrap();
+        let element_size = m.datatype.element_size() as u64;
+        let bt2 = m
+            .btree_v2
+            .as_ref()
+            .ok_or_else(|| crate::io::IoError::InvalidState("not a B-tree v2 dataset".into()))?;
+        let chunk_bytes = bt2.chunk_dims.iter().product::<u64>() * element_size;
+        // A filtered record encodes the stored size in a `chunk_size_len`-byte
+        // field that truncates silently. Reject a size that would not fit, as
+        // the extensible-array path does — the compress path never exceeds it,
+        // but a direct write with caller-supplied bytes can.
+        if bt2.index.filtered {
+            let chunk_size_len = bt2.index.chunk_size_len as usize;
+            if chunk_size_len < 8 && stored_len >= (1u64 << (chunk_size_len * 8)) {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "filtered chunk size {stored_len} does not fit in the \
+                     {chunk_size_len}-byte v2 B-tree chunk-size field"
+                )));
+            }
+        }
         // Place the bytes: a rewrite whose stored size is unchanged stays
         // where it is (always so when unfiltered — the size is fixed by the
         // chunk shape), and one that no longer fits moves, releasing its old
@@ -4038,14 +4102,16 @@ impl Hdf5Writer {
                 .map(|r| (r.chunk_address, chunk_bytes))
         };
         let chunk_addr = self.place_chunk(old, stored_len);
-        self.handle.write_at(chunk_addr, stored)?;
+        self.handle.write_at(chunk_addr, final_bytes)?;
 
-        // Insert into the in-memory BT2 index. filter_mask = 0: the whole
-        // pipeline ran (or the dataset is unfiltered), so no filter is skipped.
         let bt2 = m.btree_v2.as_mut().unwrap();
         if bt2.index.filtered {
-            bt2.index
-                .insert_filtered(chunk_coords.to_vec(), chunk_addr, stored_len as u32, 0);
+            bt2.index.insert_filtered(
+                chunk_coords.to_vec(),
+                chunk_addr,
+                stored_len as u32,
+                filter_mask,
+            );
         } else {
             bt2.index.insert(chunk_coords.to_vec(), chunk_addr);
         }
