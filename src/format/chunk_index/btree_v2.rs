@@ -861,8 +861,12 @@ impl Bt2Tree {
                     )
                 };
                 debug_assert!(image.len() <= self.node_size as usize);
-                // A reader reads the whole block, so the padding has to be
-                // there even though only the prefix is checksummed.
+                // Only the used prefix is checksummed, but the image is padded
+                // to the whole block so the block exists in the file rather
+                // than only in the allocator's ledger: a reader asking for
+                // `node_size` bytes past end-of-file gets zeros instead
+                // (libhdf5 `H5FD__sec2_read`, "end of file but not end of
+                // format address space"), which is not the node it allocated.
                 image.resize(self.node_size as usize, 0);
                 image
             })

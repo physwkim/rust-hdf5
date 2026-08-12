@@ -412,10 +412,15 @@ pub struct Bt2DatasetInfo {
     /// Pool of `BT2_NODE_SIZE`-byte blocks holding the tree's nodes, in the
     /// order [`Bt2Tree::encode`] emits them.
     ///
-    /// Append-only and the single owner of the tree's node addresses: a flush
-    /// re-serializes the whole tree over these blocks and allocates only the
-    /// shortfall, so no flush can orphan a block it replaced. Every node is the
-    /// same size, so a block stays usable however the tree reshapes.
+    /// The single owner of the tree's node addresses: a flush re-serializes the
+    /// whole tree over these blocks and allocates only the shortfall, so no
+    /// flush can orphan a block it replaced. Every node is the same size, so a
+    /// block stays usable however the tree reshapes.
+    ///
+    /// The pool grows and never shrinks, because the node count cannot fall:
+    /// [`Bt2ChunkIndex`] has no record-removal path, only insert-or-replace.
+    /// A future removal would have to release the surplus blocks here — the
+    /// `debug_assert` in `flush_dataset_synced` marks the spot.
     pub node_addrs: Vec<u64>,
     /// In-memory chunk index.
     pub index: Bt2ChunkIndex,
@@ -4365,6 +4370,10 @@ impl Hdf5Writer {
             // holds stay valid, which is also what SWMR needs.
             let tree = bt2.index.build_tree(&self.ctx);
             let mut node_addrs = bt2.node_addrs.clone();
+            // Records are only ever inserted or replaced, so the node count
+            // cannot fall. If that ever changes, the surplus blocks have to be
+            // released here rather than left recorded and unused.
+            debug_assert!(node_addrs.len() <= tree.nodes.len());
             while node_addrs.len() < tree.nodes.len() {
                 node_addrs.push(self.allocator.allocate(tree.node_size as u64));
             }
@@ -5565,6 +5574,111 @@ mod tests {
             assert_eq!(*val, i as f64);
         }
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Bytes one chunk of [`btree_v2_flush_probe`]'s dataset occupies — an
+    /// f64 element, so the allocator's alignment neither pads nor merges it and
+    /// the file's growth is exactly the bytes asked for.
+    const BT2_PROBE_CHUNK: u64 = 8;
+
+    /// Write chunks of a 1x1-chunked 2-D BT2 dataset, flushing at each batch
+    /// boundary, and report `(node addresses, file length)` after every flush.
+    /// Chunks are addressed down column 0 so the record count — and hence the
+    /// tree's shape — grows one record at a time.
+    fn btree_v2_flush_probe(path: &std::path::Path, batches: &[u64]) -> Vec<(Vec<u64>, u64)> {
+        let writer = Hdf5Writer::create(path).unwrap();
+        let idx = writer
+            .create_btree_v2_dataset(
+                "data",
+                DatatypeMessage::f64_type(),
+                &[0, 0],
+                &[u64::MAX, u64::MAX],
+                &[1, 1],
+            )
+            .unwrap();
+        let mut written = 0u64;
+        let mut out = Vec::new();
+        for &upto in batches {
+            while written < upto {
+                writer
+                    .write_chunk_btree_v2(idx, &[written, 0], &(written as f64).to_le_bytes())
+                    .unwrap();
+                written += 1;
+            }
+            writer.flush_dataset(idx).unwrap();
+            let addrs = writer
+                .ds(idx)
+                .lock()
+                .btree_v2
+                .as_ref()
+                .unwrap()
+                .node_addrs
+                .clone();
+            out.push((addrs, std::fs::metadata(path).unwrap().len()));
+        }
+        writer.extend_dataset(idx, &[written.max(1), 1]).unwrap();
+        writer.close().unwrap();
+        out
+    }
+
+    /// A node block is only usable if the bytes are actually in the file. A
+    /// reader asked for `BT2_NODE_SIZE` bytes at a node address gets zeros past
+    /// end-of-file rather than the block it allocated, so the writer pads each
+    /// node image to the full block. Checking straight after a flush is what
+    /// makes this bite: the node blocks are the newest allocations, so nothing
+    /// else has extended the file past them.
+    #[test]
+    fn every_btree_v2_node_block_is_fully_written_to_the_file() {
+        use crate::format::chunk_index::btree_v2::BT2_NODE_SIZE;
+
+        let path = temp_path("bt2_node_blocks");
+        // 90 records crosses the 84 one leaf holds, so this covers a leaf, an
+        // internal node and a root.
+        for (addrs, file_len) in btree_v2_flush_probe(&path, &[1, 84, 90]) {
+            assert!(!addrs.is_empty());
+            for addr in addrs {
+                assert!(
+                    file_len >= addr + BT2_NODE_SIZE as u64,
+                    "node block at {addr:#x} runs past end-of-file ({file_len})"
+                );
+            }
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The node pool is the single owner of the tree's block addresses: a flush
+    /// reuses every block already in it and allocates only the shortfall. So
+    /// re-flushing an unchanged index must cost nothing, and a flush that grows
+    /// the tree must cost exactly the blocks it added — anything more means a
+    /// block was stranded.
+    #[test]
+    fn a_btree_v2_flush_allocates_only_the_node_blocks_it_adds() {
+        use crate::format::chunk_index::btree_v2::BT2_NODE_SIZE;
+
+        let path = temp_path("bt2_pool_growth");
+        // Re-flush at 84 (still one leaf), then cross into a three-node depth-1
+        // tree, then keep growing.
+        let batches = [84u64, 84, 85, 200, 200];
+        let probe = btree_v2_flush_probe(&path, &batches);
+        for i in 1..probe.len() {
+            let (prev_addrs, prev_len) = &probe[i - 1];
+            let (addrs, len) = &probe[i];
+            assert!(
+                addrs.starts_with(prev_addrs),
+                "flush {i} moved a node block instead of reusing it"
+            );
+            let new_blocks = (addrs.len() - prev_addrs.len()) as u64 * BT2_NODE_SIZE as u64;
+            let new_chunks = (batches[i] - batches[i - 1]) * BT2_PROBE_CHUNK;
+            assert_eq!(
+                len - prev_len,
+                new_blocks + new_chunks,
+                "flush {i} grew the file by more than the blocks it added"
+            );
+        }
+        // The unchanged re-flushes must be free.
+        assert_eq!(probe[1].1, probe[0].1);
+        assert_eq!(probe[4].1, probe[3].1);
         std::fs::remove_file(&path).ok();
     }
 
