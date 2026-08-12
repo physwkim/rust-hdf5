@@ -68,7 +68,8 @@
   subtree totals libhdf5 descends. Because every node is the same size, a
   flush overwrites the blocks already on disk and allocates only the
   shortfall, so no block is orphaned and the addresses a reader holds stay
-  valid.
+  valid. A tree that loses nodes releases the surplus blocks to the allocator,
+  except under SWMR where a reader may still hold a header naming them.
 
 - Rewriting a chunk no longer leaks its old file block. Every chunk write
   previously allocated fresh space and left the previous block stranded, so
