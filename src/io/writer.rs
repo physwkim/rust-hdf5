@@ -32,7 +32,7 @@ use crate::format::{FormatContext, UNDEF_ADDR};
 
 use crate::io::allocator::FileAllocator;
 use crate::io::file_handle::FileHandle;
-use crate::io::hyperslab::for_each_contiguous_run;
+use crate::io::hyperslab::{for_each_contiguous_run, for_each_dual_run};
 use crate::io::IoResult;
 
 /// On-disk size in bytes of a fixed-array data block, for the layout (paged or
@@ -289,6 +289,100 @@ enum DblkParent {
         ndblks_in_sblk: usize,
         local_dblk: usize,
     },
+}
+
+/// Which chunk index a dataset uses. libhdf5 picks it from the dataspace: a
+/// v2 B-tree for two or more unlimited dimensions, an extensible array for
+/// exactly one, a fixed array for none.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChunkIndexKind {
+    ExtensibleArray,
+    FixedArray,
+    BtreeV2,
+}
+
+/// A chunked dataset's grid geometry, snapshotted out of its slot.
+///
+/// The single owner of chunk-grid arithmetic: how many chunks span each
+/// dimension, where a coordinate sits in the row-major order the array
+/// indices record, and how many bytes one chunk holds.
+struct ChunkGeometry {
+    kind: ChunkIndexKind,
+    dims: Vec<u64>,
+    max_dims: Option<Vec<u64>>,
+    chunk_dims: Vec<u64>,
+    element_size: u64,
+}
+
+impl ChunkGeometry {
+    /// Unfiltered byte size of one whole chunk.
+    fn chunk_bytes(&self) -> u64 {
+        self.chunk_dims.iter().product::<u64>() * self.element_size
+    }
+
+    /// Number of chunks spanning each dimension at the current extent.
+    fn grid(&self) -> Vec<u64> {
+        self.dims
+            .iter()
+            .zip(&self.chunk_dims)
+            .map(|(&d, &c)| if c > 0 { d.div_ceil(c) } else { 0 })
+            .collect()
+    }
+
+    /// Row-major position of `coords` in the chunk grid — the linear index an
+    /// extensible or fixed array records the chunk under.
+    ///
+    /// The grid extents multiplied here come from the *current* dims, which is
+    /// how every chunk written so far was indexed. The bound a coordinate is
+    /// checked against comes from `max_dims`, so an unlimited dimension — the
+    /// one an extensible array exists to grow — is unbounded, while a fixed
+    /// dimension still rejects an out-of-grid coordinate that would otherwise
+    /// silently alias another chunk's slot.
+    fn linear_index(&self, coords: &[u64]) -> IoResult<u64> {
+        let ndims = self.dims.len();
+        if coords.len() != ndims {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "chunk_coords has {} entries but the dataset has {} dimensions",
+                coords.len(),
+                ndims
+            )));
+        }
+        if self.chunk_dims.len() != ndims {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset chunk shape has {} dimensions but the dataspace has {}",
+                self.chunk_dims.len(),
+                ndims
+            )));
+        }
+        let grid = self.grid();
+        let mut linear = 0u64;
+        for d in 0..ndims {
+            if self.chunk_dims[d] == 0 {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "chunk dimension {d} is zero"
+                )));
+            }
+            let extent = self.max_dims.as_ref().map_or(self.dims[d], |m| m[d]);
+            if extent != u64::MAX {
+                let bound = extent.div_ceil(self.chunk_dims[d]);
+                if coords[d] >= bound {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "chunk coordinate {} in dimension {} is outside the chunk grid (0..{})",
+                        coords[d], d, bound
+                    )));
+                }
+            }
+            linear = linear
+                .checked_mul(grid[d])
+                .and_then(|l| l.checked_add(coords[d]))
+                .ok_or_else(|| {
+                    crate::io::IoError::InvalidState(
+                        "chunk coordinates overflow the array index".into(),
+                    )
+                })?;
+        }
+        Ok(linear)
+    }
 }
 
 /// Runtime metadata for a fixed-array-indexed chunked dataset.
@@ -1986,10 +2080,14 @@ impl Hdf5Writer {
         Ok(())
     }
 
-    /// Write a slice (hyperslab) of data to a contiguous dataset.
+    /// Write a slice (hyperslab) of data to a dataset, contiguous or chunked.
     ///
     /// `starts` and `counts` define the N-dimensional selection.
     /// `data` must be exactly `product(counts) * element_size` bytes.
+    ///
+    /// The selection is validated once here and then handed to the layout's
+    /// own writer, so a caller never has to know which storage the dataset
+    /// uses.
     pub fn write_slice(
         &self,
         index: usize,
@@ -1999,16 +2097,7 @@ impl Hdf5Writer {
     ) -> IoResult<()> {
         let ds_ref = self.ds(index);
         let ds = ds_ref.lock();
-        if ds.chunked.is_some() || ds.fixed_array.is_some() || ds.btree_v2.is_some() {
-            return Err(crate::io::IoError::InvalidState(
-                "write_slice is only for contiguous datasets".into(),
-            ));
-        }
-        if ds.data_addr == UNDEF_ADDR {
-            return Err(crate::io::IoError::InvalidState(
-                "dataset has no data allocated".into(),
-            ));
-        }
+        let is_chunked = ds.chunked.is_some() || ds.fixed_array.is_some() || ds.btree_v2.is_some();
 
         let dims = &ds.dataspace.dims;
         let element_size = ds.datatype.element_size() as u64;
@@ -2048,10 +2137,20 @@ impl Hdf5Writer {
             )));
         }
 
-        let base_addr = ds.data_addr;
-        // `dims` borrows self.datasets; collect what the run iterator needs so
-        // the closure can borrow self.handle (a disjoint field) for the write.
+        // `dims` borrows the dataset slot; collect what the writers below need
+        // so the guard can be dropped before they re-lock it.
         let dims = dims.clone();
+        let base_addr = ds.data_addr;
+        drop(ds);
+
+        if is_chunked {
+            return self.write_slice_chunked(index, starts, counts, data);
+        }
+        if base_addr == UNDEF_ADDR {
+            return Err(crate::io::IoError::InvalidState(
+                "dataset has no data allocated".into(),
+            ));
+        }
 
         // Write each maximal contiguous run in one `write_at`. Trailing
         // full-selected dimensions coalesce, mirroring the read path: a slice
@@ -2070,6 +2169,125 @@ impl Hdf5Writer {
         )?;
 
         Ok(())
+    }
+
+    /// Write a hyperslab into a chunked dataset, one chunk at a time.
+    ///
+    /// The selection is already validated by [`write_slice`](Self::write_slice).
+    /// For each chunk the selection touches, the chunk's share of `data` is
+    /// scattered into a whole-chunk buffer and the chunk is rewritten:
+    ///
+    /// - a chunk the selection covers completely is built from `data` alone —
+    ///   nothing needs reading back (libhdf5 takes the same shortcut with the
+    ///   `relax` flag of `H5D__chunk_lock`);
+    /// - a chunk covered only in part starts from what is already stored, or
+    ///   from a fill-value buffer when the chunk has never been written, so
+    ///   neighbouring elements survive and untouched ones read as fill.
+    ///
+    /// An edge chunk that hangs past the dataset extent is always the partial
+    /// case, so the region beyond the extent keeps its fill value.
+    fn write_slice_chunked(
+        &self,
+        index: usize,
+        starts: &[u64],
+        counts: &[u64],
+        data: &[u8],
+    ) -> IoResult<()> {
+        if counts.contains(&0) {
+            return Ok(());
+        }
+        let geo = self.chunk_geometry(index)?;
+        let ndims = geo.dims.len();
+        if geo.chunk_dims.len() != ndims {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset chunk shape has {} dimensions but the dataspace has {}",
+                geo.chunk_dims.len(),
+                ndims
+            )));
+        }
+        if geo.chunk_dims.contains(&0) {
+            return Err(crate::io::IoError::InvalidState(
+                "chunk shape has a zero-length dimension".into(),
+            ));
+        }
+        let chunk_bytes = geo.chunk_bytes() as usize;
+
+        // Grid range the selection touches, inclusive on both ends.
+        let first: Vec<u64> = (0..ndims).map(|d| starts[d] / geo.chunk_dims[d]).collect();
+        let last: Vec<u64> = (0..ndims)
+            .map(|d| (starts[d] + counts[d] - 1) / geo.chunk_dims[d])
+            .collect();
+
+        let mut coords = first.clone();
+        loop {
+            // Intersect the selection with this chunk. `in_chunk` is the
+            // region's origin inside the chunk, `in_data` its origin inside
+            // the caller's counts-shaped buffer, `extent` its size.
+            let mut in_chunk = vec![0u64; ndims];
+            let mut in_data = vec![0u64; ndims];
+            let mut extent = vec![0u64; ndims];
+            let mut covers_whole_chunk = true;
+            for d in 0..ndims {
+                let chunk_origin = coords[d] * geo.chunk_dims[d];
+                let lo = starts[d].max(chunk_origin);
+                let hi = (starts[d] + counts[d]).min(chunk_origin + geo.chunk_dims[d]);
+                in_chunk[d] = lo - chunk_origin;
+                in_data[d] = lo - starts[d];
+                extent[d] = hi - lo;
+                if in_chunk[d] != 0 || extent[d] != geo.chunk_dims[d] {
+                    covers_whole_chunk = false;
+                }
+            }
+
+            let mut buf = if covers_whole_chunk {
+                // Every byte is overwritten below.
+                vec![0u8; chunk_bytes]
+            } else {
+                match self.read_chunk_at_coords(index, &coords)? {
+                    Some(existing) => {
+                        if existing.len() != chunk_bytes {
+                            return Err(crate::io::IoError::InvalidState(format!(
+                                "stored chunk at {coords:?} is {} bytes but the chunk shape \
+                                 needs {chunk_bytes}",
+                                existing.len()
+                            )));
+                        }
+                        existing
+                    }
+                    None => self.new_chunk_buffer(index, chunk_bytes),
+                }
+            };
+
+            for_each_dual_run(
+                &geo.chunk_dims,
+                &in_chunk,
+                counts,
+                &in_data,
+                &extent,
+                geo.element_size,
+                |dst_off, src_off, len| {
+                    let dst = dst_off as usize;
+                    let src = src_off as usize;
+                    buf[dst..dst + len].copy_from_slice(&data[src..src + len]);
+                    Ok(())
+                },
+            )?;
+            self.write_chunk_at_coords(index, &coords, &buf)?;
+
+            // Odometer over the touched grid range.
+            let mut d = ndims;
+            loop {
+                if d == 0 {
+                    return Ok(());
+                }
+                d -= 1;
+                if coords[d] < last[d] {
+                    coords[d] += 1;
+                    break;
+                }
+                coords[d] = first[d];
+            }
+        }
     }
 
     /// Add an attribute to the root group (file-level attribute).
@@ -2868,19 +3086,147 @@ impl Hdf5Writer {
                 }
             }
         };
+        self.read_chunk_block(pipeline.as_ref(), addr, nbytes, mask)
+    }
+
+    /// Read one stored chunk block and undo its filters.
+    ///
+    /// `nbytes` is the *stored* length and `mask` the chunk's filter mask, so
+    /// a chunk written by a direct chunk write with a skipped filter is
+    /// reversed correctly. `Ok(None)` means the chunk has no block yet — the
+    /// single place that judgement is made, shared by every chunk index.
+    fn read_chunk_block(
+        &self,
+        pipeline: Option<&FilterPipeline>,
+        addr: u64,
+        nbytes: u64,
+        mask: u32,
+    ) -> IoResult<Option<Vec<u8>>> {
         if addr == UNDEF_ADDR || nbytes == 0 {
             return Ok(None);
         }
-
         let raw = self.handle.read_at(addr, nbytes as usize)?;
-        if is_filtered {
-            let Some(pl) = pipeline.as_ref() else {
-                return Ok(None);
-            };
-            Ok(Some(filter::reverse_filters_masked(pl, &raw, mask)?))
-        } else {
-            Ok(Some(raw))
+        match pipeline {
+            Some(pl) => Ok(Some(filter::reverse_filters_masked(pl, &raw, mask)?)),
+            None => Ok(Some(raw)),
         }
+    }
+
+    /// Read the *decompressed* bytes of the chunk at `chunk_coords`, whichever
+    /// chunk index the dataset uses, or `Ok(None)` when that chunk has never
+    /// been written.
+    ///
+    /// This is the read half of a partial-chunk read-modify-write: a hyperslab
+    /// write that covers only part of a chunk must start from what is already
+    /// there. Keeping one entry point for all three index types is what lets
+    /// [`write_slice`](Self::write_slice) stay index-agnostic.
+    pub(crate) fn read_chunk_at_coords(
+        &self,
+        ds_index: usize,
+        chunk_coords: &[u64],
+    ) -> IoResult<Option<Vec<u8>>> {
+        let geo = self.chunk_geometry(ds_index)?;
+        let linear = geo.linear_index(chunk_coords)?;
+        match geo.kind {
+            ChunkIndexKind::ExtensibleArray => self.read_chunk_if_present(ds_index, linear),
+            ChunkIndexKind::FixedArray => {
+                let ds = self.ds(ds_index);
+                let m = ds.lock();
+                let pipeline = m.filter_pipeline.clone();
+                let fa = m.fixed_array.as_ref().unwrap();
+                let lidx = linear as usize;
+                let (addr, nbytes, mask) = if pipeline.is_some() {
+                    match fa.fa_dblk.filtered_elements.get(lidx) {
+                        Some(e) => (e.address, e.chunk_size as u64, e.filter_mask),
+                        None => return Ok(None),
+                    }
+                } else {
+                    match fa.fa_dblk.elements.get(lidx) {
+                        Some(&a) => (a, geo.chunk_bytes(), 0),
+                        None => return Ok(None),
+                    }
+                };
+                drop(m);
+                self.read_chunk_block(pipeline.as_ref(), addr, nbytes, mask)
+            }
+            ChunkIndexKind::BtreeV2 => {
+                let ds = self.ds(ds_index);
+                let m = ds.lock();
+                let pipeline = m.filter_pipeline.clone();
+                let bt2 = m.btree_v2.as_ref().unwrap();
+                let found = if bt2.index.filtered {
+                    bt2.index
+                        .lookup_filtered(chunk_coords)
+                        .map(|r| (r.chunk_address, r.chunk_size as u64, r.filter_mask))
+                } else {
+                    bt2.index
+                        .lookup(chunk_coords)
+                        .map(|r| (r.chunk_address, geo.chunk_bytes(), 0))
+                };
+                drop(m);
+                match found {
+                    Some((addr, nbytes, mask)) => {
+                        self.read_chunk_block(pipeline.as_ref(), addr, nbytes, mask)
+                    }
+                    None => Ok(None),
+                }
+            }
+        }
+    }
+
+    /// Write one whole chunk addressed by its grid coordinates, whichever
+    /// chunk index the dataset uses. `data` is the chunk's unfiltered bytes;
+    /// the dataset's filter pipeline (if any) runs here.
+    ///
+    /// The write half of the pair with
+    /// [`read_chunk_at_coords`](Self::read_chunk_at_coords). Unlike the
+    /// dataset-level `write_chunk_at`, this never grows the dataspace — a
+    /// hyperslab write is bounded by the current extent by definition.
+    pub(crate) fn write_chunk_at_coords(
+        &self,
+        ds_index: usize,
+        chunk_coords: &[u64],
+        data: &[u8],
+    ) -> IoResult<()> {
+        let geo = self.chunk_geometry(ds_index)?;
+        match geo.kind {
+            ChunkIndexKind::ExtensibleArray => {
+                let linear = geo.linear_index(chunk_coords)?;
+                self.write_chunk(ds_index, linear, data)
+            }
+            ChunkIndexKind::FixedArray => {
+                self.write_chunk_fixed_array(ds_index, chunk_coords, data)
+            }
+            ChunkIndexKind::BtreeV2 => self.write_chunk_btree_v2(ds_index, chunk_coords, data),
+        }
+    }
+
+    /// Snapshot the geometry needed to address a chunked dataset's grid.
+    ///
+    /// Taken under one brief slot guard so the callers below — which re-lock
+    /// the slot through `write_chunk`/`read_chunk_*` — never hold it across
+    /// compression or I/O.
+    fn chunk_geometry(&self, ds_index: usize) -> IoResult<ChunkGeometry> {
+        let ds = self.ds(ds_index);
+        let m = ds.lock();
+        let (kind, chunk_dims) = if let Some(ref c) = m.chunked {
+            (ChunkIndexKind::ExtensibleArray, c.chunk_dims.clone())
+        } else if let Some(ref f) = m.fixed_array {
+            (ChunkIndexKind::FixedArray, f.chunk_dims.clone())
+        } else if let Some(ref b) = m.btree_v2 {
+            (ChunkIndexKind::BtreeV2, b.chunk_dims.clone())
+        } else {
+            return Err(crate::io::IoError::InvalidState(
+                "not a chunked dataset".into(),
+            ));
+        };
+        Ok(ChunkGeometry {
+            kind,
+            dims: m.dataspace.dims.clone(),
+            max_dims: m.dataspace.max_dims.clone(),
+            chunk_dims,
+            element_size: m.datatype.element_size() as u64,
+        })
     }
 
     /// Define a chunked dataset indexed by a fixed array (no unlimited dimensions).

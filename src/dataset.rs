@@ -1713,9 +1713,18 @@ impl H5Dataset {
         }
     }
 
-    /// Write a typed slice to a sub-region of a contiguous dataset.
+    /// Write a typed slice to a sub-region of the dataset.
     ///
-    /// `starts` and `counts` define the N-dimensional selection.
+    /// `starts` and `counts` define the N-dimensional selection, which must lie
+    /// inside the dataset's current extent.
+    ///
+    /// Works for both contiguous and chunked datasets. For a chunked dataset
+    /// only the chunks the selection touches are rewritten — a partially
+    /// covered chunk is read back, patched, and written again, so updating one
+    /// row of an appendable dataset costs the chunks that row crosses rather
+    /// than the whole dataset. Elements of a touched chunk that the selection
+    /// does not cover keep their stored value, or the dataset's fill value if
+    /// the chunk did not exist yet.
     pub fn write_slice<T: H5Type>(
         &self,
         starts: &[usize],
@@ -1726,14 +1735,8 @@ impl H5Dataset {
             DatasetInfo::Writer {
                 index,
                 element_size,
-                chunked,
                 ..
             } => {
-                if *chunked {
-                    return Err(Hdf5Error::InvalidState(
-                        "write_slice is only for contiguous datasets".into(),
-                    ));
-                }
                 if T::element_size() != *element_size {
                     return Err(Hdf5Error::TypeMismatch(format!(
                         "write type has element size {} but dataset expects {}",

@@ -460,3 +460,90 @@ fn b_multichunk_deflate_readable_by_h5py() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// CS1: a hyperslab written into a chunked dataset must be readable by
+/// libhdf5 — including the chunks the selection only partially covers and the
+/// chunks it never touches, which must come back as the fill value.
+#[test]
+fn cs1_chunked_write_slice_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("cs1_chunk_slice");
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([6, 8])
+            .chunk(&[2, 3])
+            .fill_value(-5)
+            .create("grid")
+            .unwrap();
+        // Rows 1..4 x cols 2..7: crosses both chunk-row boundaries and all
+        // three chunk columns, partial in every chunk it touches.
+        let patch: Vec<i32> = (100..115).collect();
+        ds.write_slice(&[1, 2], &[3, 5], &patch).unwrap();
+        // One element in the far corner chunk, which nothing else touches.
+        ds.write_slice(&[5, 7], &[1, 1], &[777i32]).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['grid']\n\
+         assert ds.chunks == (2, 3), ds.chunks\n\
+         assert ds.shape == (6, 8), ds.shape\n\
+         want = np.full((6, 8), -5, dtype='i4')\n\
+         want[1:4, 2:7] = np.arange(100, 115).reshape(3, 5)\n\
+         want[5, 7] = 777\n\
+         assert np.array_equal(ds[...], want), ds[...]\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// CS2: patching part of a *filtered* chunk means decompressing it, editing
+/// it, and recompressing. The rewritten chunk is deliberately made harder to
+/// compress than the original, so it no longer fits its old file block and
+/// has to be relocated — libhdf5 must still find and decode it.
+#[cfg(feature = "deflate")]
+#[test]
+fn cs2_filtered_chunked_write_slice_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("cs2_filtered_slice");
+    // Incompressible patch: a scrambled sequence, not a run of small ints.
+    let noise: Vec<i32> = (0..4u32)
+        .map(|i| (i.wrapping_mul(0x9e37_79b9) ^ 0x5bd1_e995) as i32)
+        .collect();
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([4, 6])
+            .chunk(&[2, 3])
+            .deflate(6)
+            .create("grid")
+            .unwrap();
+        // Highly compressible seed: every chunk is a short deflate stream.
+        ds.write_slice(&[0, 0], &[4, 6], &[7i32; 24]).unwrap();
+        // 2x2 patch straddling the column boundary at 3, so both chunks of
+        // the top chunk-row are read, modified and recompressed.
+        ds.write_slice(&[0, 2], &[2, 2], &noise).unwrap();
+        file.close().unwrap();
+    }
+    let noise_py = noise
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    read_back_with_h5py(
+        py,
+        &path,
+        &format!(
+            "ds = f['grid']\n\
+             assert ds.compression == 'gzip', ds.compression\n\
+             assert ds.chunks == (2, 3), ds.chunks\n\
+             want = np.full((4, 6), 7, dtype='i4')\n\
+             want[0:2, 2:4] = np.array([{noise_py}], dtype='i4').reshape(2, 2)\n\
+             assert np.array_equal(ds[...], want), ds[...]\n"
+        ),
+    );
+    std::fs::remove_file(&path).ok();
+}
