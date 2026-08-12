@@ -547,3 +547,43 @@ fn cs2_filtered_chunked_write_slice_readable_by_h5py() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// BT2-1: a v2-B-tree index is searched by bisection, so its leaf records must
+/// be ordered by scaled offsets. Write the chunk grid in reverse order — the
+/// order a caller is free to use — and require libhdf5 to still find every
+/// chunk. With records left in insertion order, h5py reads back mostly fill.
+#[test]
+fn bt2_1_out_of_order_chunk_writes_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("bt2_order");
+    let chunk = |vals: [i32; 6]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([4, 6])
+            .chunk(&[2, 3])
+            .max_shape(&[None, None])
+            .create("grid")
+            .unwrap();
+        // Reverse grid order: (1,1), (1,0), (0,1), (0,0).
+        ds.write_chunk_at(&[1, 1], &chunk([15, 16, 17, 21, 22, 23]))
+            .unwrap();
+        ds.write_chunk_at(&[1, 0], &chunk([12, 13, 14, 18, 19, 20]))
+            .unwrap();
+        ds.write_chunk_at(&[0, 1], &chunk([3, 4, 5, 9, 10, 11]))
+            .unwrap();
+        ds.write_chunk_at(&[0, 0], &chunk([0, 1, 2, 6, 7, 8]))
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['grid']\n\
+         assert ds.maxshape == (None, None), ds.maxshape\n\
+         assert ds.chunks == (2, 3), ds.chunks\n\
+         assert np.array_equal(ds[...], np.arange(24).reshape(4, 6)), ds[...]\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
