@@ -2712,30 +2712,13 @@ impl Hdf5Writer {
 
             if remaining_frames >= frames_to_fill {
                 let end = byte_pos + frames_to_fill * frame_bytes;
-                if frames_to_fill == chunk_dim0 {
-                    self.write_chunk(ds_index, chunk_idx as u64, &combined[byte_pos..end])?;
-                } else {
-                    // Partial-chunk write: this branch only runs with
-                    // offset_in_chunk > 0, meaning the chunk already holds
-                    // earlier frames on disk. Read-modify-write so those
-                    // frames survive — a fresh fill buffer would erase them.
-                    let offset_in_chunk = (abs_frame % chunk_dim0) * frame_bytes;
-                    let mut chunk_buf =
-                        match self.read_chunk_if_present(ds_index, chunk_idx as u64)? {
-                            Some(existing) => existing,
-                            None => {
-                                return Err(crate::io::IoError::InvalidState(format!(
-                                    "cannot append into partially-written chunk {}: its \
-                                     existing content was not found in the chunk index \
-                                     (the file may be inconsistent)",
-                                    chunk_idx
-                                )));
-                            }
-                        };
-                    chunk_buf[offset_in_chunk..offset_in_chunk + frames_to_fill * frame_bytes]
-                        .copy_from_slice(&combined[byte_pos..end]);
-                    self.write_chunk(ds_index, chunk_idx as u64, &chunk_buf)?;
-                }
+                let offset_in_chunk = (abs_frame % chunk_dim0) * frame_bytes;
+                self.append_frames_into_chunk(
+                    ds_index,
+                    chunk_idx as u64,
+                    offset_in_chunk,
+                    &combined[byte_pos..end],
+                )?;
                 byte_pos = end;
                 frame_pos += frames_to_fill;
             } else {
@@ -2955,15 +2938,66 @@ impl Hdf5Writer {
         crate::format::messages::fill_value::tiled_fill(chunk_bytes, fv)
     }
 
+    /// Place `frames` in chunk `chunk_idx`, `offset_in_chunk` bytes from its
+    /// start, keeping every byte outside that span.
+    ///
+    /// The single owner of an append's chunk write. A span covering the whole
+    /// chunk is written straight through; a narrower one is read-modify-write,
+    /// because the bytes around it belong to frames appended earlier. Building
+    /// a fresh fill-value buffer for a chunk that already holds frames is what
+    /// erased them. A chunk the index does not reach has had no write land in
+    /// it, so the fill value *is* its content — the rule
+    /// [`write_slice`](Self::write_slice) already applies to a partially
+    /// covered chunk.
+    pub(crate) fn append_frames_into_chunk(
+        &self,
+        ds_index: usize,
+        chunk_idx: u64,
+        offset_in_chunk: usize,
+        frames: &[u8],
+    ) -> IoResult<()> {
+        let chunk_bytes = {
+            let ds = self.ds(ds_index);
+            let m = ds.lock();
+            let chunked = m
+                .chunked
+                .as_ref()
+                .ok_or_else(|| crate::io::IoError::InvalidState("not a chunked dataset".into()))?;
+            chunked.chunk_dims.iter().product::<u64>() as usize * m.datatype.element_size() as usize
+        };
+        if offset_in_chunk + frames.len() > chunk_bytes {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "{} bytes at offset {offset_in_chunk} do not fit chunk {chunk_idx}, \
+                 which is {chunk_bytes} bytes",
+                frames.len()
+            )));
+        }
+        if offset_in_chunk == 0 && frames.len() == chunk_bytes {
+            return self.write_chunk(ds_index, chunk_idx, frames);
+        }
+        let mut chunk_buf = match self.read_chunk_if_present(ds_index, chunk_idx)? {
+            Some(existing) if existing.len() == chunk_bytes => existing,
+            Some(existing) => {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "stored chunk {chunk_idx} is {} bytes but the chunk shape needs \
+                     {chunk_bytes}",
+                    existing.len()
+                )))
+            }
+            None => self.new_chunk_buffer(ds_index, chunk_bytes),
+        };
+        chunk_buf[offset_in_chunk..offset_in_chunk + frames.len()].copy_from_slice(frames);
+        self.write_chunk(ds_index, chunk_idx, &chunk_buf)
+    }
+
     /// Read an already-written chunk's *decompressed* bytes when the chunk
     /// is allocated and resolvable from the in-memory extensible-array
     /// index. Handles index-block and data-block chunks, filtered and
     /// unfiltered.
     ///
     /// Returns `Ok(None)` only when the chunk has never been written
-    /// (address `UNDEF`) or the index genuinely does not reach it. A
-    /// caller doing a read-modify-write of a partial chunk treats `None`
-    /// as an error rather than silently overwriting the chunk.
+    /// (address `UNDEF`) or the index genuinely does not reach it, which for
+    /// a read-modify-write means the chunk's content is the fill value.
     pub(crate) fn read_chunk_if_present(
         &self,
         ds_index: usize,
@@ -4587,8 +4621,10 @@ impl Hdf5Writer {
     // Internal helpers
     // ------------------------------------------------------------------
 
-    /// Flush any partial append buffers, padding each chunk's unwritten
-    /// tail with the dataset's fill value (zeros when none is defined).
+    /// Flush any partial append buffers into the chunks they belong to,
+    /// through [`append_frames_into_chunk`](Self::append_frames_into_chunk):
+    /// frames already in the chunk survive, and the rest of it reads back as
+    /// the dataset's fill value (zeros when none is defined).
     fn flush_append_buffers(&mut self) -> IoResult<()> {
         for i in 0..self.dataset_count() {
             // Snapshot everything needed under one brief slot guard, then drop
@@ -4616,21 +4652,18 @@ impl Hdf5Writer {
                 (buf, buffered_frames, chunk_dims, es, dims)
             };
 
-            let chunk_bytes: usize = chunk_dims.iter().map(|&d| d as usize).product::<usize>() * es;
             let chunk_dim0 = chunk_dims[0] as usize;
             let current_dim0 = dims[0] as usize;
             let base_frame = current_dim0 - buffered_frames;
             let chunk_idx = base_frame / chunk_dim0;
 
-            let mut chunk_buf = self.new_chunk_buffer(i, chunk_bytes);
             let frame_bytes = if dims.len() > 1 {
                 dims[1..].iter().map(|&d| d as usize).product::<usize>() * es
             } else {
                 es
             };
             let offset_in_chunk = (base_frame % chunk_dim0) * frame_bytes;
-            chunk_buf[offset_in_chunk..offset_in_chunk + buf.len()].copy_from_slice(&buf);
-            self.write_chunk(i, chunk_idx as u64, &chunk_buf)?;
+            self.append_frames_into_chunk(i, chunk_idx as u64, offset_in_chunk, &buf)?;
         }
         Ok(())
     }

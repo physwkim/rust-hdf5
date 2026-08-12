@@ -40,6 +40,16 @@
 
 ### Fixed
 
+- Appending after reopening a file no longer erases the rows already in the
+  chunk the new frame lands in (issue #3). An append that leaves its chunk
+  partial is buffered until close, and the flush built a fresh fill-value
+  chunk around the buffered frame instead of reading what the chunk already
+  held — so `append(&[1, 2, 3])`, close, reopen, `append(&[4, 5, 6])` read
+  back as `[0, 0, 0, 4, 5, 6]`. The same file written in one session was
+  correct, because the in-session append path did read-modify-write it.
+  All three append entry points now place their frames through one owner
+  that preserves everything outside the span it writes.
+
 - A v2 B-tree chunk index is now written with its records ordered by scaled
   offsets. libhdf5 searches a B-tree node by bisection (`H5D__bt2_compare`
   orders records with `H5VM_vector_cmp_u`), and records were appended in
