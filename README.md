@@ -271,6 +271,10 @@ for ensuring no second writer attaches during streaming.
 rust-hdf5 = { version = "0.2", features = ["lz4", "zstd"] }
 ```
 
+Filters apply to every chunked layout, whichever chunk index the dataspace
+selects: a fixed array (no unlimited dimension), an extensible array (exactly
+one), or a v2 B-tree (two or more).
+
 ## Feature flags
 
 | Feature | Description |
