@@ -409,8 +409,14 @@ pub struct Bt2DatasetInfo {
     pub max_dims: Vec<u64>,
     /// File offset of the BT2 header.
     pub bt2_header_addr: u64,
-    /// File offset of the BT2 leaf node.
-    pub bt2_leaf_addr: u64,
+    /// Pool of `BT2_NODE_SIZE`-byte blocks holding the tree's nodes, in the
+    /// order [`Bt2Tree::encode`] emits them.
+    ///
+    /// Append-only and the single owner of the tree's node addresses: a flush
+    /// re-serializes the whole tree over these blocks and allocates only the
+    /// shortfall, so no flush can orphan a block it replaced. Every node is the
+    /// same size, so a block stays usable however the tree reshapes.
+    pub node_addrs: Vec<u64>,
     /// In-memory chunk index.
     pub index: Bt2ChunkIndex,
     /// Number of chunks written so far.
@@ -3481,8 +3487,7 @@ impl Hdf5Writer {
         pipeline: Option<FilterPipeline>,
     ) -> IoResult<usize> {
         use crate::format::chunk_index::btree_v2::{
-            compute_chunk_size_len, Bt2Header, Bt2LeafNode, BT2_TYPE_CHUNK_FILT,
-            BT2_TYPE_CHUNK_UNFILT,
+            compute_chunk_size_len, Bt2Header, BT2_NODE_SIZE,
         };
 
         // Hold the create gate across the uniqueness check and the registry
@@ -3501,18 +3506,31 @@ impl Hdf5Writer {
         // The filtered record's size field is as wide as libhdf5 will
         // recompute it from the uncompressed chunk size, exactly as the
         // extensible- and fixed-array filtered paths size theirs.
-        let (bt2_index, record_type) = match pipeline {
+        let bt2_index = match pipeline {
             Some(_) => {
                 let chunk_bytes: u64 =
                     chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
                 let len = compute_chunk_size_len(chunk_bytes);
-                (Bt2ChunkIndex::new_filtered(ndims, len), BT2_TYPE_CHUNK_FILT)
+                Bt2ChunkIndex::new_filtered(ndims, len)
             }
-            None => (Bt2ChunkIndex::new_unfiltered(ndims), BT2_TYPE_CHUNK_UNFILT),
+            None => Bt2ChunkIndex::new_unfiltered(ndims),
         };
 
-        // We'll allocate space for header and leaf node; they'll be rewritten
-        // from the in-memory index during flush_dataset.
+        // The bulk loader spreads a level's records evenly over its nodes, one
+        // separator between adjacent siblings, which needs room for a few
+        // records per node. HDF5's rank limit of 32 leaves room for seven; a
+        // wider rank than that has no valid geometry, so reject it here rather
+        // than emit a tree no reader can walk.
+        let record_size = bt2_index.record_size(&self.ctx) as usize;
+        if (BT2_NODE_SIZE as usize) < 10 + 3 * record_size {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "a {ndims}-dimension v2 B-tree record is {record_size} bytes, too wide \
+                 for a {BT2_NODE_SIZE}-byte node"
+            )));
+        }
+
+        // Only the header gets a home now: it names an empty tree, whose root
+        // is undefined until the first flush bulk-loads the index into nodes.
         let hdr = if bt2_index.filtered {
             Bt2Header::new_for_filtered_chunks(&self.ctx, ndims, bt2_index.chunk_size_len)
         } else {
@@ -3521,12 +3539,6 @@ impl Hdf5Writer {
         let hdr_encoded = hdr.encode(&self.ctx);
         let bt2_header_addr = self.allocator.allocate(hdr_encoded.len() as u64);
         self.handle.write_at(bt2_header_addr, &hdr_encoded)?;
-
-        // Allocate a placeholder leaf node (empty for now)
-        let leaf = Bt2LeafNode::new(record_type, bt2_index.record_size(&self.ctx));
-        let leaf_encoded = leaf.encode();
-        let bt2_leaf_addr = self.allocator.allocate(leaf_encoded.len() as u64);
-        self.handle.write_at(bt2_leaf_addr, &leaf_encoded)?;
 
         let dataspace = DataspaceMessage {
             dims: dims.to_vec(),
@@ -3552,7 +3564,7 @@ impl Hdf5Writer {
                 chunk_dims: chunk_dims.to_vec(),
                 max_dims: max_dims.to_vec(),
                 bt2_header_addr,
-                bt2_leaf_addr,
+                node_addrs: Vec::new(),
                 index: bt2_index,
                 chunks_written: 0,
             }),
@@ -4279,23 +4291,31 @@ impl Hdf5Writer {
 
         // BT2-indexed dataset
         if let Some(ref bt2) = m.btree_v2 {
-            // Re-encode the leaf node and header
-            let (hdr_bytes, leaf_bytes) = bt2.index.encode(&self.ctx);
+            // Bulk-load the index into fixed-size nodes and lay them over the
+            // dataset's block pool. Because every node is the same size, the
+            // blocks already on disk are reused in place and only the shortfall
+            // is allocated — the pool is the single owner of these addresses,
+            // so no flush leaves a block behind. The addresses a reader already
+            // holds stay valid, which is also what SWMR needs.
+            let tree = bt2.index.build_tree(&self.ctx);
+            let mut node_addrs = bt2.node_addrs.clone();
+            while node_addrs.len() < tree.nodes.len() {
+                node_addrs.push(self.allocator.allocate(tree.node_size as u64));
+            }
 
-            // The leaf may have grown -- reallocate if needed
-            let leaf_addr = self.allocator.allocate(leaf_bytes.len() as u64);
-            self.handle.write_at(leaf_addr, &leaf_bytes)?;
+            for (image, &addr) in tree.encode(&self.ctx, &node_addrs).iter().zip(&node_addrs) {
+                self.handle.write_at(addr, image)?;
+            }
 
-            // Update header with new root node address
-            let mut hdr =
-                crate::format::chunk_index::btree_v2::Bt2Header::decode(&hdr_bytes, &self.ctx)?;
-            hdr.root_node_addr = leaf_addr;
-            let hdr_encoded = hdr.encode(&self.ctx);
+            // The root is the last node the bulk load emits.
+            let root_addr = match tree.nodes.len() {
+                0 => UNDEF_ADDR,
+                n => node_addrs[n - 1],
+            };
+            let hdr_encoded = tree.header(root_addr).encode(&self.ctx);
             self.handle.write_at(bt2.bt2_header_addr, &hdr_encoded)?;
 
-            // Update our in-memory copy's leaf addr
-            let bt2_mut = m.btree_v2.as_mut().unwrap();
-            bt2_mut.bt2_leaf_addr = leaf_addr;
+            m.btree_v2.as_mut().unwrap().node_addrs = node_addrs;
 
             if sync {
                 self.handle.sync_data()?;

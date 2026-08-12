@@ -631,3 +631,89 @@ fn bt2_2_compressed_multi_unlimited_readable_by_h5py() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// BT2-3: more chunks than a 2048-byte node holds, so the index must be a real
+/// tree — a root of separator records over several leaves — not one oversized
+/// node. libhdf5 sizes every node from the header's `node_size` and descends
+/// through the child pointers, so a flat index would either read past a node or
+/// lose every record beyond the first.
+#[test]
+fn bt2_3_multi_node_tree_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("bt2_multinode");
+    // 24-byte records, so a leaf holds (2048 - 10) / 24 = 84. A 20x20 extent in
+    // 2x2 chunks is 100 of them.
+    let data: Vec<i32> = (0..400).collect();
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([20, 20])
+            .chunk(&[2, 2])
+            .max_shape(&[None, None])
+            .create("grid")
+            .unwrap();
+        ds.write_slice(&[0, 0], &[20, 20], &data).unwrap();
+        file.close().unwrap();
+    }
+    // Our own reader must agree before h5py is consulted.
+    {
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("grid").unwrap();
+        assert_eq!(ds.read_raw::<i32>().unwrap(), data);
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['grid']\n\
+         assert ds.chunks == (2, 2), ds.chunks\n\
+         assert ds.id.get_num_chunks() == 100, ds.id.get_num_chunks()\n\
+         assert np.array_equal(ds[...], np.arange(400).reshape(20, 20)), ds[...]\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// BT2-4: past 5269 records a depth-1 tree is full too, so the root becomes an
+/// internal node over internal nodes. Depth 2 is the first shape where a child
+/// pointer carries a subtree total (`child_total_nrecords`), whose width comes
+/// from the geometry rather than the record — get it wrong and libhdf5
+/// misparses every pointer after the first.
+#[test]
+fn bt2_4_depth_two_tree_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("bt2_depth2");
+    // 1x1 chunks: 73 * 73 = 5329 records, past the 61 + 62 * 84 = 5269 a
+    // depth-1 tree holds.
+    let n = 73usize;
+    let data: Vec<i32> = (0..(n * n) as i32).collect();
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([n, n])
+            .chunk(&[1, 1])
+            .max_shape(&[None, None])
+            .create("grid")
+            .unwrap();
+        ds.write_slice(&[0, 0], &[n, n], &data).unwrap();
+        file.close().unwrap();
+    }
+    {
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("grid").unwrap();
+        assert_eq!(ds.read_raw::<i32>().unwrap(), data);
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        &format!(
+            "ds = f['grid']\n\
+             assert ds.chunks == (1, 1), ds.chunks\n\
+             assert ds.id.get_num_chunks() == {}, ds.id.get_num_chunks()\n\
+             assert np.array_equal(ds[...], np.arange({}).reshape({n}, {n})), ds[...]\n",
+            n * n,
+            n * n
+        ),
+    );
+    std::fs::remove_file(&path).ok();
+}

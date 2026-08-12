@@ -26,6 +26,23 @@ pub const BTLF_SIGNATURE: [u8; 4] = *b"BTLF";
 /// B-tree v2 version.
 pub const BT2_VERSION: u8 = 0;
 
+/// Node size for a chunk-index v2 B-tree, matching libhdf5's
+/// `H5D_BT2_NODE_SIZE` (`H5Dpkg.h`).
+///
+/// Every node — leaf or internal — occupies exactly this many bytes on disk.
+/// That is what makes a node block reusable: re-serializing a tree overwrites
+/// its nodes in place rather than relocating them, so a flush cannot orphan the
+/// block it replaced. libhdf5 reads a whole node-size block and checksums only
+/// the used prefix, so the tail is padding that must nevertheless exist in the
+/// file.
+pub const BT2_NODE_SIZE: u32 = 2048;
+
+/// Percentage full a node must be before it splits (`H5D_BT2_SPLIT_PERC`).
+pub const BT2_SPLIT_PERCENT: u8 = 100;
+
+/// Percentage below which a node is merged (`H5D_BT2_MERGE_PERC`).
+pub const BT2_MERGE_PERCENT: u8 = 40;
+
 /// Record type: unfiltered chunks (non-filtered chunked datasets).
 pub const BT2_TYPE_CHUNK_UNFILT: u8 = 10;
 /// Record type: filtered chunks (filtered chunked datasets).
@@ -114,11 +131,11 @@ impl Bt2Header {
         let record_size = (ndims * 8 + ctx.sizeof_addr as usize) as u16;
         Self {
             record_type: BT2_TYPE_CHUNK_UNFILT,
-            node_size: 4096,
+            node_size: BT2_NODE_SIZE,
             record_size,
             depth: 0,
-            split_percent: 100,
-            merge_percent: 40,
+            split_percent: BT2_SPLIT_PERCENT,
+            merge_percent: BT2_MERGE_PERCENT,
             root_node_addr: UNDEF_ADDR,
             num_records_in_root: 0,
             total_num_records: 0,
@@ -135,11 +152,11 @@ impl Bt2Header {
             (ctx.sizeof_addr as usize + chunk_size_len as usize + 4 + ndims * 8) as u16;
         Self {
             record_type: BT2_TYPE_CHUNK_FILT,
-            node_size: 4096,
+            node_size: BT2_NODE_SIZE,
             record_size,
             depth: 0,
-            split_percent: 100,
-            merge_percent: 40,
+            split_percent: BT2_SPLIT_PERCENT,
+            merge_percent: BT2_MERGE_PERCENT,
             root_node_addr: UNDEF_ADDR,
             num_records_in_root: 0,
             total_num_records: 0,
@@ -649,14 +666,240 @@ impl Bt2Geometry {
 }
 
 // ==========================================================================
+// Bulk-loaded tree
+// ==========================================================================
+
+/// One node of a bulk-loaded v2 B-tree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bt2TreeNode {
+    /// Height above the leaves; 0 for a leaf.
+    pub depth: u16,
+    /// The records this node holds directly, already encoded.
+    pub record_data: Vec<u8>,
+    /// How many records that is.
+    pub num_records: u16,
+    /// Indices into [`Bt2Tree::nodes`] of this node's children. A node holding
+    /// *m* records has *m + 1* children; a leaf has none.
+    pub children: Vec<usize>,
+    /// Records in this node and every node beneath it.
+    pub total_records: u64,
+}
+
+/// A v2 B-tree bulk-loaded from an ordered record list.
+///
+/// Nodes are laid out children-before-parents, so [`nodes`](Self::nodes)'s last
+/// entry is the root and every node's children have smaller indices — which is
+/// what lets [`encode`](Self::encode) resolve child addresses in one pass.
+///
+/// Every node is exactly [`node_size`](Self::node_size) bytes, so re-loading a
+/// grown index overwrites the nodes already on disk and only ever *appends*
+/// blocks. Sizing the root to its contents instead (one leaf that grows with
+/// the record count) would force a relocation on every flush, orphaning the
+/// block it replaced, and would cap the index at the 65535 records a node's
+/// record count can express.
+#[derive(Debug, Clone)]
+pub struct Bt2Tree {
+    /// Every node, children before parents; the last entry is the root.
+    pub nodes: Vec<Bt2TreeNode>,
+    /// Record type (10 = unfiltered chunks, 11 = filtered chunks).
+    pub record_type: u8,
+    /// Size of one record in bytes.
+    pub record_size: u16,
+    /// Size of every node in bytes.
+    pub node_size: u32,
+    /// Node geometry for depths `0..=depth()`.
+    pub geometry: Bt2Geometry,
+}
+
+impl Bt2Tree {
+    /// Bulk-load a tree from `records` — the encoded records in key order.
+    ///
+    /// Each level's records are spread evenly across that level's nodes, with
+    /// one record promoted to the parent between adjacent siblings. That is the
+    /// shape libhdf5 searches: `H5B2__locate_record` bisects a node's records
+    /// and, on a miss, descends into the child the record would fall between.
+    ///
+    /// Node capacities come from [`Bt2Geometry`], so no node exceeds what a
+    /// reader computing the same geometry will deserialize.
+    pub fn build(
+        record_type: u8,
+        record_size: u16,
+        node_size: u32,
+        sizeof_addr: u8,
+        records: &[u8],
+    ) -> Self {
+        let rec = record_size.max(1) as usize;
+        let total = records.len() / rec;
+        let mut nodes: Vec<Bt2TreeNode> = Vec::new();
+        // Records still to be placed at the current level: the chunk records
+        // at depth 0, and the separators promoted from below at each depth
+        // above it.
+        let mut pending: Vec<u8> = records[..total * rec].to_vec();
+        // Nodes of the level below, in key order.
+        let mut children: Vec<usize> = Vec::new();
+        let mut depth: u16 = 0;
+
+        // An empty index has no nodes at all: the header's root address stays
+        // undefined, the state libhdf5 leaves a freshly created B-tree in.
+        if total > 0 {
+            loop {
+                let geo = Bt2Geometry::new(node_size, record_size, depth, sizeof_addr);
+                let cap = geo.node_info[depth as usize].max_nrec.max(1) as usize;
+                let n = pending.len() / rec;
+                // Fewest nodes that hold n records with one separator between
+                // each adjacent pair: k * cap + (k - 1) >= n.
+                let k = (n + 1).div_ceil(cap + 1);
+                let own = n - (k - 1);
+                let (base, extra) = (own / k, own % k);
+                debug_assert!(base >= 1, "a bulk-loaded node must hold a record");
+                debug_assert!(base + usize::from(extra > 0) <= cap);
+
+                let mut next_pending: Vec<u8> = Vec::new();
+                let mut next_children: Vec<usize> = Vec::with_capacity(k);
+                let (mut r, mut c) = (0usize, 0usize);
+                for i in 0..k {
+                    let m = base + usize::from(i < extra);
+                    let record_data = pending[r * rec..(r + m) * rec].to_vec();
+                    r += m;
+                    let kids: Vec<usize> = if depth == 0 {
+                        Vec::new()
+                    } else {
+                        let kids = children[c..c + m + 1].to_vec();
+                        c += m + 1;
+                        kids
+                    };
+                    let total_records =
+                        m as u64 + kids.iter().map(|&j| nodes[j].total_records).sum::<u64>();
+                    nodes.push(Bt2TreeNode {
+                        depth,
+                        record_data,
+                        num_records: m as u16,
+                        children: kids,
+                        total_records,
+                    });
+                    next_children.push(nodes.len() - 1);
+                    // The record between this node and the next is the
+                    // separator their parent holds.
+                    if i + 1 < k {
+                        next_pending.extend_from_slice(&pending[r * rec..(r + 1) * rec]);
+                        r += 1;
+                    }
+                }
+                if k == 1 {
+                    break;
+                }
+                pending = next_pending;
+                children = next_children;
+                depth += 1;
+            }
+        }
+
+        Self {
+            geometry: Bt2Geometry::new(node_size, record_size, depth, sizeof_addr),
+            nodes,
+            record_type,
+            record_size,
+            node_size,
+        }
+    }
+
+    /// Depth of the root (0 = the root is a leaf).
+    pub fn depth(&self) -> u16 {
+        self.nodes.last().map_or(0, |n| n.depth)
+    }
+
+    /// Records held directly by the root.
+    pub fn root_num_records(&self) -> u16 {
+        self.nodes.last().map_or(0, |n| n.num_records)
+    }
+
+    /// Records in the whole tree.
+    pub fn total_records(&self) -> u64 {
+        self.nodes.last().map_or(0, |n| n.total_records)
+    }
+
+    /// Serialize every node to a [`node_size`](Self::node_size)-byte image, in
+    /// [`nodes`](Self::nodes) order.
+    ///
+    /// `addrs[i]` is the file address assigned to `nodes[i]`; entries past the
+    /// node count are ignored, so a caller may pass a longer block pool.
+    pub fn encode(&self, ctx: &FormatContext, addrs: &[u64]) -> Vec<Vec<u8>> {
+        self.nodes
+            .iter()
+            .map(|n| {
+                let mut image = if n.depth == 0 {
+                    Bt2LeafNode {
+                        record_type: self.record_type,
+                        record_data: n.record_data.clone(),
+                        num_records: n.num_records,
+                        record_size: self.record_size,
+                    }
+                    .encode()
+                } else {
+                    Bt2InternalNode {
+                        record_type: self.record_type,
+                        record_data: n.record_data.clone(),
+                        num_records: n.num_records,
+                        record_size: self.record_size,
+                        child_addrs: n.children.iter().map(|&c| addrs[c]).collect(),
+                        child_nrecords: n
+                            .children
+                            .iter()
+                            .map(|&c| self.nodes[c].num_records)
+                            .collect(),
+                        child_total_nrecords: n
+                            .children
+                            .iter()
+                            .map(|&c| self.nodes[c].total_records)
+                            .collect(),
+                    }
+                    .encode(
+                        ctx,
+                        n.depth,
+                        self.geometry.max_nrec_size,
+                        self.geometry.child_total_size(n.depth),
+                    )
+                };
+                debug_assert!(image.len() <= self.node_size as usize);
+                // A reader reads the whole block, so the padding has to be
+                // there even though only the prefix is checksummed.
+                image.resize(self.node_size as usize, 0);
+                image
+            })
+            .collect()
+    }
+
+    /// The header describing this tree. `root_addr` is the address given to the
+    /// last node, and is ignored for an empty tree (whose root is undefined,
+    /// the state libhdf5 leaves a freshly created B-tree in).
+    pub fn header(&self, root_addr: u64) -> Bt2Header {
+        Bt2Header {
+            record_type: self.record_type,
+            node_size: self.node_size,
+            record_size: self.record_size,
+            depth: self.depth(),
+            split_percent: BT2_SPLIT_PERCENT,
+            merge_percent: BT2_MERGE_PERCENT,
+            root_node_addr: if self.nodes.is_empty() {
+                UNDEF_ADDR
+            } else {
+                root_addr
+            },
+            num_records_in_root: self.root_num_records(),
+            total_num_records: self.total_records(),
+        }
+    }
+}
+
+// ==========================================================================
 // In-memory BT2 chunk index (flat approach)
 // ==========================================================================
 
 /// In-memory B-tree v2 chunk index.
 ///
-/// Keeps all records in memory. Serializes as a header + leaf node(s) for
-/// small trees. For larger trees, internal nodes would be needed but we use
-/// the flat approach for simplicity.
+/// Keeps every record in memory as one ordered list and bulk-loads it into a
+/// tree of fixed-size nodes on demand — see [`build_tree`](Self::build_tree)
+/// and [`Bt2Tree`].
 ///
 /// Records are held sorted by scaled offsets and are inserted in place, so the
 /// encoded leaf is always ordered. A B-tree node is searched by bisection —
@@ -837,47 +1080,28 @@ impl Bt2ChunkIndex {
         buf
     }
 
-    /// Encode the B-tree as a header + leaf node.
+    /// The record type these records serialize as.
+    pub fn record_type(&self) -> u8 {
+        if self.filtered {
+            BT2_TYPE_CHUNK_FILT
+        } else {
+            BT2_TYPE_CHUNK_UNFILT
+        }
+    }
+
+    /// Bulk-load these records into a v2 B-tree of [`BT2_NODE_SIZE`]-byte
+    /// nodes.
     ///
-    /// Returns `(header_bytes, leaf_bytes)`.
-    pub fn encode(&self, ctx: &FormatContext) -> (Vec<u8>, Vec<u8>) {
-        let rec_size = self.record_size(ctx);
-        let num = self.num_records() as u16;
-
-        let record_data = self.encode_records(ctx);
-
-        let leaf = Bt2LeafNode {
-            record_type: if self.filtered {
-                BT2_TYPE_CHUNK_FILT
-            } else {
-                BT2_TYPE_CHUNK_UNFILT
-            },
-            record_data,
-            num_records: num,
-            record_size: rec_size,
-        };
-        let leaf_encoded = leaf.encode();
-
-        // We'll set root_node_addr to UNDEF_ADDR; the caller sets it to the
-        // actual leaf address after allocating.
-        let header = Bt2Header {
-            record_type: if self.filtered {
-                BT2_TYPE_CHUNK_FILT
-            } else {
-                BT2_TYPE_CHUNK_UNFILT
-            },
-            node_size: leaf_encoded.len() as u32,
-            record_size: rec_size,
-            depth: 0,
-            split_percent: 100,
-            merge_percent: 40,
-            root_node_addr: UNDEF_ADDR,
-            num_records_in_root: num,
-            total_num_records: num as u64,
-        };
-        let header_encoded = header.encode(ctx);
-
-        (header_encoded, leaf_encoded)
+    /// The records are already in key order (see the type docs), which is
+    /// exactly what [`Bt2Tree::build`] needs.
+    pub fn build_tree(&self, ctx: &FormatContext) -> Bt2Tree {
+        Bt2Tree::build(
+            self.record_type(),
+            self.record_size(ctx),
+            BT2_NODE_SIZE,
+            ctx.sizeof_addr,
+            &self.encode_records(ctx),
+        )
     }
 
     /// Decode unfiltered records from a leaf node's raw record data.
@@ -1296,10 +1520,7 @@ mod tests {
         idx.insert(vec![0, 1], 0x2000);
         idx.insert(vec![1, 0], 0x3000);
 
-        let (hdr_bytes, leaf_bytes) = idx.encode(&ctx);
-
-        // Decode header
-        let hdr = Bt2Header::decode(&hdr_bytes, &ctx).unwrap();
+        let (hdr, record_bytes) = serialize_and_walk(&idx, &ctx);
         assert_eq!(hdr.record_type, BT2_TYPE_CHUNK_UNFILT);
         assert_eq!(hdr.depth, 0);
         assert_eq!(hdr.total_num_records, 3);
@@ -1307,10 +1528,7 @@ mod tests {
         // record_size = 2*8 + 8 = 24
         assert_eq!(hdr.record_size, 24);
 
-        // Decode leaf
-        let leaf = Bt2LeafNode::decode(&leaf_bytes, 3, hdr.record_size).unwrap();
-        let records =
-            Bt2ChunkIndex::decode_unfiltered_records(&leaf.record_data, 3, 2, &ctx).unwrap();
+        let records = Bt2ChunkIndex::decode_unfiltered_records(&record_bytes, 3, 2, &ctx).unwrap();
 
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].scaled_offsets, vec![0, 0]);
@@ -1342,18 +1560,15 @@ mod tests {
         idx.insert_filtered(vec![0, 0], 0x1000, 512, 0);
         idx.insert_filtered(vec![1, 0], 0x2000, 300, 1);
 
-        let (hdr_bytes, leaf_bytes) = idx.encode(&ctx);
-
-        let hdr = Bt2Header::decode(&hdr_bytes, &ctx).unwrap();
+        let (hdr, record_bytes) = serialize_and_walk(&idx, &ctx);
         assert_eq!(hdr.record_type, BT2_TYPE_CHUNK_FILT);
         assert_eq!(hdr.total_num_records, 2);
         // record_size = sizeof_addr(8) + chunk_size_len(8) + filter_mask(4)
         //             + ndims*8(16) = 36
         assert_eq!(hdr.record_size, 36);
 
-        let leaf = Bt2LeafNode::decode(&leaf_bytes, 2, hdr.record_size).unwrap();
         let records =
-            Bt2ChunkIndex::decode_filtered_records(&leaf.record_data, 2, 2, hdr.record_size, &ctx)
+            Bt2ChunkIndex::decode_filtered_records(&record_bytes, 2, 2, hdr.record_size, &ctx)
                 .unwrap();
 
         assert_eq!(records.len(), 2);
@@ -1372,14 +1587,11 @@ mod tests {
         idx.insert(vec![0], 0x100);
         idx.insert(vec![1], 0x200);
 
-        let (hdr_bytes, leaf_bytes) = idx.encode(&ctx);
-        let hdr = Bt2Header::decode(&hdr_bytes, &ctx).unwrap();
+        let (hdr, record_bytes) = serialize_and_walk(&idx, &ctx);
         // record_size = 1*8 + 4 = 12
         assert_eq!(hdr.record_size, 12);
 
-        let leaf = Bt2LeafNode::decode(&leaf_bytes, 2, hdr.record_size).unwrap();
-        let records =
-            Bt2ChunkIndex::decode_unfiltered_records(&leaf.record_data, 2, 1, &ctx).unwrap();
+        let records = Bt2ChunkIndex::decode_unfiltered_records(&record_bytes, 2, 1, &ctx).unwrap();
         assert_eq!(records[0].chunk_address, 0x100);
         assert_eq!(records[1].chunk_address, 0x200);
     }
@@ -1390,11 +1602,240 @@ mod tests {
         let idx = Bt2ChunkIndex::new_unfiltered(3);
         assert_eq!(idx.num_records(), 0);
 
-        let (hdr_bytes, leaf_bytes) = idx.encode(&ctx);
-        let hdr = Bt2Header::decode(&hdr_bytes, &ctx).unwrap();
+        // No records means no nodes at all: the header names an undefined root,
+        // the state libhdf5 leaves a freshly created B-tree in.
+        let tree = idx.build_tree(&ctx);
+        assert!(tree.nodes.is_empty());
+        let (hdr, record_bytes) = serialize_and_walk(&idx, &ctx);
         assert_eq!(hdr.total_num_records, 0);
+        assert_eq!(hdr.root_node_addr, UNDEF_ADDR);
+        assert!(record_bytes.is_empty());
+    }
 
-        let leaf = Bt2LeafNode::decode(&leaf_bytes, 0, hdr.record_size).unwrap();
-        assert!(leaf.record_data.is_empty());
+    // ---- Bulk-loaded tree tests ----
+
+    /// Serialize an index the way the writer's flush does — a distinct block
+    /// per node — then walk the result the way a reader does, in key order:
+    /// child 0, record 0, child 1, record 1, ..., child m. Returns the header
+    /// and the records the walk recovered, so a caller can compare them
+    /// against the flat ordered list the index holds.
+    fn serialize_and_walk(idx: &Bt2ChunkIndex, ctx: &FormatContext) -> (Bt2Header, Vec<u8>) {
+        let tree = idx.build_tree(ctx);
+        let addrs: Vec<u64> = (0..tree.nodes.len())
+            .map(|i| 0x1000 + i as u64 * tree.node_size as u64)
+            .collect();
+        let blocks: Vec<(u64, Vec<u8>)> = addrs
+            .iter()
+            .copied()
+            .zip(tree.encode(ctx, &addrs))
+            .collect();
+        for (_, image) in &blocks {
+            assert_eq!(
+                image.len(),
+                tree.node_size as usize,
+                "every node occupies a full block"
+            );
+        }
+        let hdr = tree.header(addrs.last().copied().unwrap_or(UNDEF_ADDR));
+
+        let mut out = Vec::new();
+        if hdr.root_node_addr != UNDEF_ADDR {
+            let geo = Bt2Geometry::new(hdr.node_size, hdr.record_size, hdr.depth, ctx.sizeof_addr);
+            walk_node(
+                &blocks,
+                hdr.root_node_addr,
+                hdr.depth,
+                hdr.num_records_in_root,
+                &hdr,
+                &geo,
+                ctx,
+                &mut out,
+            );
+        }
+        (hdr, out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_node(
+        blocks: &[(u64, Vec<u8>)],
+        addr: u64,
+        depth: u16,
+        nrec: u16,
+        hdr: &Bt2Header,
+        geo: &Bt2Geometry,
+        ctx: &FormatContext,
+        out: &mut Vec<u8>,
+    ) {
+        let buf = &blocks
+            .iter()
+            .find(|(a, _)| *a == addr)
+            .unwrap_or_else(|| panic!("no node at {addr:#x}"))
+            .1;
+        let rec = hdr.record_size as usize;
+        assert!(
+            10 + nrec as usize * rec <= hdr.node_size as usize,
+            "node at depth {depth} holds {nrec} records, more than its block fits"
+        );
+        if depth == 0 {
+            let leaf = Bt2LeafNode::decode(buf, nrec, hdr.record_size).unwrap();
+            out.extend_from_slice(&leaf.record_data);
+            return;
+        }
+        let node = Bt2InternalNode::decode(
+            buf,
+            ctx,
+            depth,
+            nrec,
+            hdr.record_size,
+            geo.max_nrec_size,
+            geo.child_total_size(depth),
+        )
+        .unwrap();
+        for i in 0..=nrec as usize {
+            walk_node(
+                blocks,
+                node.child_addrs[i],
+                depth - 1,
+                node.child_nrecords[i],
+                hdr,
+                geo,
+                ctx,
+                out,
+            );
+            if i < nrec as usize {
+                out.extend_from_slice(&node.record_data[i * rec..(i + 1) * rec]);
+            }
+        }
+    }
+
+    /// Build an unfiltered 2-D index with `n` records at (i, 0).
+    fn index_with(n: u64) -> Bt2ChunkIndex {
+        let mut idx = Bt2ChunkIndex::new_unfiltered(2);
+        for i in 0..n {
+            idx.insert(vec![i, 0], 0x10_000 + i * 0x100);
+        }
+        idx
+    }
+
+    #[test]
+    fn a_tree_that_fits_one_node_stays_a_single_leaf() {
+        let ctx = ctx8();
+        // record_size 24, node 2048: a leaf holds (2048 - 10) / 24 = 84.
+        let idx = index_with(84);
+        let tree = idx.build_tree(&ctx);
+        assert_eq!(tree.nodes.len(), 1);
+        assert_eq!(tree.depth(), 0);
+        assert_eq!(tree.total_records(), 84);
+
+        let (hdr, walked) = serialize_and_walk(&idx, &ctx);
+        assert_eq!(hdr.depth, 0);
+        assert_eq!(walked, idx.encode_records(&ctx));
+    }
+
+    #[test]
+    fn one_record_past_a_leaf_grows_the_tree_a_level() {
+        let ctx = ctx8();
+        let idx = index_with(85);
+        let tree = idx.build_tree(&ctx);
+        assert_eq!(tree.depth(), 1, "85 records no longer fit one leaf");
+        assert_eq!(tree.total_records(), 85);
+        // Root separator plus two leaves.
+        assert_eq!(tree.nodes.len(), 3);
+
+        let (hdr, walked) = serialize_and_walk(&idx, &ctx);
+        assert_eq!(hdr.depth, 1);
+        assert_eq!(hdr.total_num_records, 85);
+        assert_eq!(
+            walked,
+            idx.encode_records(&ctx),
+            "an in-order walk must recover every record in key order"
+        );
+    }
+
+    #[test]
+    fn a_tree_grows_a_second_level() {
+        let ctx = ctx8();
+        // Depth 1 tops out at 61 root records over 62 leaves of 84:
+        // 61 + 62 * 84 = 5269.
+        let idx = index_with(5270);
+        let tree = idx.build_tree(&ctx);
+        assert_eq!(tree.depth(), 2);
+        assert_eq!(tree.total_records(), 5270);
+
+        let (hdr, walked) = serialize_and_walk(&idx, &ctx);
+        assert_eq!(hdr.depth, 2);
+        assert_eq!(hdr.total_num_records, 5270);
+        assert_eq!(walked, idx.encode_records(&ctx));
+    }
+
+    /// The record count a node reports is a u16; a tree that kept every record
+    /// in one node would silently truncate past 65535. Splitting keeps every
+    /// node small, so the only count that has to be wide is the header's
+    /// `total_num_records`.
+    #[test]
+    fn a_tree_far_past_the_node_record_count_limit_stays_intact() {
+        let ctx = ctx8();
+        let idx = index_with(70_000);
+        let tree = idx.build_tree(&ctx);
+        assert_eq!(tree.total_records(), 70_000);
+        assert!(tree.depth() >= 2);
+        for node in &tree.nodes {
+            let cap = tree.geometry.node_info[node.depth as usize].max_nrec;
+            assert!(
+                u64::from(node.num_records) <= cap && node.num_records > 0,
+                "node at depth {} holds {} records (cap {cap})",
+                node.depth,
+                node.num_records
+            );
+            assert_eq!(
+                node.children.len(),
+                if node.depth == 0 {
+                    0
+                } else {
+                    node.num_records as usize + 1
+                }
+            );
+        }
+        let (hdr, walked) = serialize_and_walk(&idx, &ctx);
+        assert_eq!(hdr.total_num_records, 70_000);
+        assert_eq!(walked, idx.encode_records(&ctx));
+    }
+
+    #[test]
+    fn filtered_records_survive_a_split_tree() {
+        let ctx = ctx8();
+        // record_size = 8 + 2 + 4 + 16 = 30, so a leaf holds (2048-10)/30 = 67.
+        let mut idx = Bt2ChunkIndex::new_filtered(2, 2);
+        for i in 0..500u64 {
+            idx.insert_filtered(vec![i, 0], 0x10_000 + i * 0x100, (i % 400) as u32 + 1, 0);
+        }
+        let tree = idx.build_tree(&ctx);
+        assert!(tree.depth() >= 1);
+
+        let (hdr, walked) = serialize_and_walk(&idx, &ctx);
+        assert_eq!(hdr.record_size, 30);
+        assert_eq!(hdr.total_num_records, 500);
+        let records =
+            Bt2ChunkIndex::decode_filtered_records(&walked, 500, 2, hdr.record_size, &ctx).unwrap();
+        for (i, r) in records.iter().enumerate() {
+            assert_eq!(r.scaled_offsets, vec![i as u64, 0]);
+            assert_eq!(r.chunk_address, 0x10_000 + i as u64 * 0x100);
+            assert_eq!(r.chunk_size, (i as u32 % 400) + 1);
+        }
+    }
+
+    /// Growing the index must not change the addresses already handed out —
+    /// that is what lets the writer overwrite node blocks instead of
+    /// relocating (and orphaning) them.
+    #[test]
+    fn every_node_occupies_the_same_size_block_at_any_depth() {
+        let ctx = ctx8();
+        for n in [1u64, 84, 85, 1000, 5270] {
+            let tree = index_with(n).build_tree(&ctx);
+            let addrs: Vec<u64> = (0..tree.nodes.len() as u64).collect();
+            for image in tree.encode(&ctx, &addrs) {
+                assert_eq!(image.len(), BT2_NODE_SIZE as usize, "n = {n}");
+            }
+        }
     }
 }
