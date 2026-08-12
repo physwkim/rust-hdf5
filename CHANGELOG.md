@@ -27,6 +27,17 @@
   stored size and filter mask, so a partial `write_slice` can decompress,
   patch and recompress a chunk and relocate it when its size changes.
 
+- `write_chunk_raw_at` — the coordinate-addressed direct chunk write
+  (`H5Dwrite_chunk`), storing already-filtered bytes verbatim under a
+  caller-supplied per-chunk filter mask. This is the form a v2-B-tree-indexed
+  dataset needs: with two or more unlimited dimensions there is no fixed chunk
+  grid for the linear `write_chunk_raw` index to mean anything against, so
+  that entry point now points here instead of rejecting the dataset outright.
+  It works on the extensible- and fixed-array indexes too. Direct writes now
+  also range-check the stored size against the index's chunk-size field on all
+  three indexes (libhdf5 `H5D_CHUNK_ENCODE_SIZE_CHECK`) rather than truncating
+  it silently.
+
 ### Fixed
 
 - A v2 B-tree chunk index is now written with its records ordered by scaled
@@ -44,6 +55,20 @@
   version-4 layout message (`H5D_BT2_COMPUTE_CHUNK_SIZE_LEN`). The header
   constructor and the index previously disagreed about it (a 32- versus
   36-byte record); both now take it from one value.
+
+- A v2 B-tree chunk index is now a real tree of fixed-size nodes, and flushing
+  it no longer leaks. Node size was previously derived from the record count
+  and everything lived in one depth-0 leaf, which caused two failures: the
+  leaf grew with every chunk, so each flush allocated a larger block and
+  stranded the previous one; and one node had to hold every record, but a
+  node's record count is a `u16`, so a dataset past 65535 chunks truncated it
+  silently. Nodes are now 2048 bytes (libhdf5's `H5D_BT2_NODE_SIZE`, which the
+  layout message already declared) and the records are bulk-loaded into as
+  many levels as they need, with internal nodes carrying the separators and
+  subtree totals libhdf5 descends. Because every node is the same size, a
+  flush overwrites the blocks already on disk and allocates only the
+  shortfall, so no block is orphaned and the addresses a reader holds stay
+  valid.
 
 - Rewriting a chunk no longer leaks its old file block. Every chunk write
   previously allocated fresh space and left the previous block stranded, so

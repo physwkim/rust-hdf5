@@ -273,7 +273,10 @@ rust-hdf5 = { version = "0.2", features = ["lz4", "zstd"] }
 
 Filters apply to every chunked layout, whichever chunk index the dataspace
 selects: a fixed array (no unlimited dimension), an extensible array (exactly
-one), or a v2 B-tree (two or more).
+one), or a v2 B-tree (two or more). Already-filtered bytes can be handed over
+verbatim with a per-chunk filter mask — HDF5's direct chunk write — via
+`write_chunk_raw` (linear index) or `write_chunk_raw_at` (grid coordinates,
+and the form a v2-B-tree dataset uses).
 
 ## Feature flags
 
