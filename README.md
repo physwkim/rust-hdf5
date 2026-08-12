@@ -34,7 +34,7 @@ Read and write HDF5 files with contiguous, chunked, and compressed datasets, hie
 
 ```toml
 [dependencies]
-rust-hdf5 = "0.2"
+rust-hdf5 = "0.4"
 ```
 
 > Requires Rust 1.89+ (uses `std::fs::File::lock` for cross-platform
@@ -268,7 +268,7 @@ for ensuring no second writer attaches during streaming.
 ```toml
 # Enable LZ4 + Zstandard
 [dependencies]
-rust-hdf5 = { version = "0.2", features = ["lz4", "zstd"] }
+rust-hdf5 = { version = "0.4", features = ["lz4", "zstd"] }
 ```
 
 Filters apply to every chunked layout, whichever chunk index the dataspace

@@ -1,6 +1,23 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
+
+### Changed
+
+Breaking, all in `format::chunk_index::btree_v2`, from giving the v2 B-tree a
+real multi-node shape and a derived filtered size-field width:
+
+- `Bt2ChunkIndex::encode` is gone. It returned one header image and one leaf
+  image, which cannot describe a tree deeper than a single node. Build the
+  tree with `Bt2ChunkIndex::build_tree`, then `Bt2Tree::encode` for the node
+  images and `Bt2Tree::header` for the header.
+- `Bt2ChunkIndex::new_filtered` and `Bt2Header::new_for_filtered_chunks` take
+  the chunk-size field width as a third argument. It is derived from the chunk
+  size (`compute_chunk_size_len`) because that is what libhdf5 recomputes when
+  it reads a version-4 layout message; a fixed width produced records libhdf5
+  misparsed.
+- `BT2_FILT_CHUNK_SIZE_LEN` is gone for the same reason — the width is derived
+  per dataset, never a constant.
 
 ### Added
 
