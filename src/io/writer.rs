@@ -5622,28 +5622,44 @@ mod tests {
         out
     }
 
-    /// A node block is only usable if the bytes are actually in the file. A
-    /// reader asked for `BT2_NODE_SIZE` bytes at a node address gets zeros past
-    /// end-of-file rather than the block it allocated, so the writer pads each
-    /// node image to the full block. Checking straight after a flush is what
-    /// makes this bite: the node blocks are the newest allocations, so nothing
-    /// else has extended the file past them.
+    /// A node's record count falls as well as rises: the tree's first leaf goes
+    /// from a full 84 records to 42 when 85 records force it to split. The node
+    /// image is padded to the whole block so re-serializing overwrites the
+    /// block, not a prefix of it — otherwise that leaf keeps the tail of its
+    /// 84-record self, stale records sitting in a live node block.
     #[test]
-    fn every_btree_v2_node_block_is_fully_written_to_the_file() {
-        use crate::format::chunk_index::btree_v2::BT2_NODE_SIZE;
+    fn a_shrinking_btree_v2_node_leaves_no_stale_records_behind() {
+        use crate::format::chunk_index::btree_v2::{Bt2ChunkIndex, BT2_NODE_SIZE};
 
         let path = temp_path("bt2_node_blocks");
-        // 90 records crosses the 84 one leaf holds, so this covers a leaf, an
-        // internal node and a root.
-        for (addrs, file_len) in btree_v2_flush_probe(&path, &[1, 84, 90]) {
-            assert!(!addrs.is_empty());
-            for addr in addrs {
-                assert!(
-                    file_len >= addr + BT2_NODE_SIZE as u64,
-                    "node block at {addr:#x} runs past end-of-file ({file_len})"
-                );
-            }
+        let probe = btree_v2_flush_probe(&path, &[84, 85]);
+        let node0 = probe.last().unwrap().0[0];
+
+        // What the first leaf holds once the tree has split.
+        let ctx = FormatContext {
+            sizeof_addr: 8,
+            sizeof_size: 8,
+        };
+        let mut index = Bt2ChunkIndex::new_unfiltered(2);
+        for i in 0..85u64 {
+            index.insert(vec![i, 0], 0);
         }
+        let tree = index.build_tree(&ctx);
+        assert!(
+            tree.nodes[0].num_records < 84,
+            "this test needs the first leaf to shrink, got {}",
+            tree.nodes[0].num_records
+        );
+        // signature(4) + version(1) + type(1) + records + checksum(4)
+        let used = 10 + tree.nodes[0].num_records as usize * tree.record_size as usize;
+
+        let bytes = std::fs::read(&path).unwrap();
+        let block = &bytes[node0 as usize..node0 as usize + BT2_NODE_SIZE as usize];
+        assert!(
+            block[used..].iter().all(|&b| b == 0),
+            "leaf block at {node0:#x} still holds {} bytes of its previous, larger image",
+            block[used..].iter().rposition(|&b| b != 0).unwrap_or(0) + 1
+        );
         std::fs::remove_file(&path).ok();
     }
 
