@@ -1,6 +1,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
-/// Simple append-only file space allocator.
+/// One released, reusable region of the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FreeBlock {
+    addr: u64,
+    len: u64,
+}
+
+/// File space allocator: bump-the-end-of-file, with reuse of released blocks.
 ///
 /// Hands out file offsets by bumping an end-of-file pointer. Every
 /// allocation is aligned to the configured boundary (default 8 bytes).
@@ -9,10 +17,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// and is safe to call concurrently: two threads allocating at once each get
 /// a distinct, non-overlapping, aligned offset. This is the lock-free
 /// foundation that lets the `threadsafe` writer hand out chunk space without
-/// a global lock (see `docs/threadsafe-fine-grained-locking.md`).
+/// a global lock (see `docs/threadsafe-fine-grained-locking.md`). A writer
+/// that never calls [`free`](Self::free) never touches the free list, and
+/// [`allocate`](Self::allocate) skips its lock entirely while the list is
+/// empty, so the streaming path keeps that lock-free fast path.
+///
+/// [`free`](Self::free) returns a block for reuse — the counterpart of
+/// libhdf5's `H5MF_xfree`, called when a rewritten chunk no longer fits its
+/// old location. Like libhdf5's default (non-persistent) free-space strategy,
+/// the list lives only for the session: a block released but not reused
+/// before `close` stays as slack in the file rather than being recorded in an
+/// on-disk free-space manager.
 pub struct FileAllocator {
     eof: AtomicU64,
     alignment: u64,
+    /// Released blocks, sorted by address with adjacent blocks merged.
+    ///
+    /// A plain `Mutex` regardless of the `threadsafe` feature: the allocator
+    /// is shared across threads in both builds (see
+    /// `concurrent_allocations_are_disjoint`), and this lock is only ever
+    /// taken on the rare free/reuse path.
+    free_list: Mutex<Vec<FreeBlock>>,
+    /// `free_list.len()`, readable without taking the lock so the common
+    /// never-freed case costs one relaxed load.
+    free_count: AtomicU64,
 }
 
 impl FileAllocator {
@@ -21,15 +49,27 @@ impl FileAllocator {
         Self {
             eof: AtomicU64::new(initial_eof),
             alignment: 8,
+            free_list: Mutex::new(Vec::new()),
+            free_count: AtomicU64::new(0),
         }
+    }
+
+    /// Round `size` up to the allocator's alignment.
+    fn align_up(&self, size: u64) -> u64 {
+        (size + self.alignment - 1) & !(self.alignment - 1)
     }
 
     /// Allocate `size` bytes, returning the aligned starting offset.
     ///
-    /// Lock-free: the aligned bump is published with a compare-and-swap loop,
-    /// so concurrent callers never overlap (alignment makes a plain
-    /// `fetch_add` insufficient, hence the CAS).
+    /// A released block large enough to hold `size` is reused before the file
+    /// grows; otherwise the end-of-file pointer is bumped. The bump is
+    /// lock-free: it is published with a compare-and-swap loop, so concurrent
+    /// callers never overlap (alignment makes a plain `fetch_add`
+    /// insufficient, hence the CAS).
     pub fn allocate(&self, size: u64) -> u64 {
+        if let Some(addr) = self.take_free(size) {
+            return addr;
+        }
         let mut cur = self.eof.load(Ordering::Acquire);
         loop {
             let aligned = (cur + self.alignment - 1) & !(self.alignment - 1);
@@ -42,6 +82,63 @@ impl FileAllocator {
                 Err(actual) => cur = actual,
             }
         }
+    }
+
+    /// Release `len` bytes at `addr` for reuse by later allocations.
+    ///
+    /// The caller must have already dropped every reference to the block (for
+    /// a chunk: the index entry must be about to point elsewhere). Adjacent
+    /// blocks merge, so a repeatedly grown-and-shrunk chunk does not shred the
+    /// list into unusable fragments.
+    pub fn free(&self, addr: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let mut list = self.free_list.lock().unwrap();
+        let pos = list.partition_point(|b| b.addr < addr);
+        list.insert(pos, FreeBlock { addr, len });
+        // Merge with the following block, then with the preceding one, so a
+        // block that fills the gap between two free blocks yields one block.
+        if pos + 1 < list.len() && list[pos].addr + list[pos].len == list[pos + 1].addr {
+            list[pos].len += list[pos + 1].len;
+            list.remove(pos + 1);
+        }
+        if pos > 0 && list[pos - 1].addr + list[pos - 1].len == list[pos].addr {
+            list[pos - 1].len += list[pos].len;
+            list.remove(pos);
+        }
+        self.free_count.store(list.len() as u64, Ordering::Release);
+    }
+
+    /// Take the smallest released block that fits `size`, splitting off the
+    /// remainder. Returns `None` when nothing fits (or nothing was freed).
+    fn take_free(&self, size: u64) -> Option<u64> {
+        if size == 0 || self.free_count.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let mut list = self.free_list.lock().unwrap();
+        // Best fit: the smallest sufficient block, so a large released region
+        // stays available for a large chunk.
+        let pos = list
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.len >= size)
+            .min_by_key(|(_, b)| b.len)
+            .map(|(i, _)| i)?;
+        let block = list[pos];
+        // `block.addr` is aligned (every allocation is) and `used` is a
+        // multiple of the alignment, so the remainder stays aligned too.
+        let used = self.align_up(size);
+        if block.len > used {
+            list[pos] = FreeBlock {
+                addr: block.addr + used,
+                len: block.len - used,
+            };
+        } else {
+            list.remove(pos);
+        }
+        self.free_count.store(list.len() as u64, Ordering::Release);
+        Some(block.addr)
     }
 
     /// Return the current end-of-file offset.
@@ -133,5 +230,115 @@ mod tests {
         // No duplicates.
         let unique = all.iter().collect::<std::collections::HashSet<_>>().len();
         assert_eq!(unique, all.len(), "duplicate offsets handed out");
+    }
+
+    /// Snapshot of the free list for assertions.
+    fn free_blocks(alloc: &FileAllocator) -> Vec<(u64, u64)> {
+        alloc
+            .free_list
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| (b.addr, b.len))
+            .collect()
+    }
+
+    #[test]
+    fn freed_block_is_reused_before_the_file_grows() {
+        let alloc = FileAllocator::new(0);
+        let a = alloc.allocate(64);
+        alloc.allocate(64);
+        let eof_before = alloc.eof();
+
+        alloc.free(a, 64);
+        assert_eq!(alloc.allocate(64), a, "exact-fit reuse");
+        assert_eq!(alloc.eof(), eof_before, "file must not grow on reuse");
+        assert!(free_blocks(&alloc).is_empty());
+    }
+
+    #[test]
+    fn reusing_part_of_a_block_leaves_an_aligned_remainder() {
+        let alloc = FileAllocator::new(0);
+        let a = alloc.allocate(64);
+        alloc.allocate(8);
+        let eof_before = alloc.eof();
+
+        alloc.free(a, 64);
+        // 10 bytes round up to 16, so 48 bytes remain at a + 16.
+        assert_eq!(alloc.allocate(10), a);
+        assert_eq!(free_blocks(&alloc), vec![(a + 16, 48)]);
+        assert_eq!(alloc.allocate(48), a + 16);
+        assert_eq!(alloc.eof(), eof_before);
+    }
+
+    #[test]
+    fn a_request_larger_than_every_free_block_grows_the_file() {
+        let alloc = FileAllocator::new(0);
+        let a = alloc.allocate(32);
+        alloc.allocate(32);
+        let eof_before = alloc.eof();
+
+        alloc.free(a, 32);
+        let big = alloc.allocate(33);
+        assert_eq!(big, eof_before, "must come from the end of the file");
+        assert_eq!(
+            free_blocks(&alloc),
+            vec![(a, 32)],
+            "the block that did not fit stays available"
+        );
+    }
+
+    #[test]
+    fn best_fit_picks_the_smallest_sufficient_block() {
+        let alloc = FileAllocator::new(0);
+        // Separators keep the three blocks apart, so freeing them cannot
+        // merge them into one and the choice between them is a real one.
+        let small = alloc.allocate(16);
+        alloc.allocate(8);
+        let mid = alloc.allocate(32);
+        alloc.allocate(8);
+        let big = alloc.allocate(64);
+        alloc.allocate(8);
+        alloc.free(big, 64);
+        alloc.free(small, 16);
+        alloc.free(mid, 32);
+
+        assert_eq!(alloc.allocate(20), mid, "20 fits 32 more tightly than 64");
+        assert_eq!(alloc.allocate(16), small);
+        assert_eq!(alloc.allocate(64), big);
+    }
+
+    #[test]
+    fn adjacent_freed_blocks_merge() {
+        let alloc = FileAllocator::new(0);
+        let a = alloc.allocate(32);
+        let b = alloc.allocate(32);
+        let c = alloc.allocate(32);
+        alloc.allocate(8);
+
+        // Free the outer two first: they are not adjacent, so they stay apart.
+        alloc.free(a, 32);
+        alloc.free(c, 32);
+        assert_eq!(free_blocks(&alloc), vec![(a, 32), (c, 32)]);
+
+        // Filling the hole between them collapses all three into one block,
+        // which is then large enough for a 96-byte request.
+        alloc.free(b, 32);
+        assert_eq!(free_blocks(&alloc), vec![(a, 96)]);
+        let eof_before = alloc.eof();
+        assert_eq!(alloc.allocate(96), a);
+        assert_eq!(alloc.eof(), eof_before);
+    }
+
+    #[test]
+    fn freeing_nothing_is_a_no_op() {
+        let alloc = FileAllocator::new(0);
+        let a = alloc.allocate(16);
+        alloc.free(a, 0);
+        assert!(free_blocks(&alloc).is_empty());
+        // A zero-size request never consumes a free block either.
+        alloc.free(a, 16);
+        assert_eq!(alloc.allocate(0), alloc.eof());
+        assert_eq!(free_blocks(&alloc), vec![(a, 16)]);
     }
 }
