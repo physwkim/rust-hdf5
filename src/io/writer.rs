@@ -3152,22 +3152,21 @@ impl Hdf5Writer {
             ChunkIndexKind::BtreeV2 => {
                 let ds = self.ds(ds_index);
                 let m = ds.lock();
-                let pipeline = m.filter_pipeline.clone();
                 let bt2 = m.btree_v2.as_ref().unwrap();
-                let found = if bt2.index.filtered {
-                    bt2.index
-                        .lookup_filtered(chunk_coords)
-                        .map(|r| (r.chunk_address, r.chunk_size as u64, r.filter_mask))
-                } else {
-                    bt2.index
-                        .lookup(chunk_coords)
-                        .map(|r| (r.chunk_address, geo.chunk_bytes(), 0))
-                };
+                // The write half (`write_chunk_btree_v2`) stores raw bytes and
+                // records a type-10 record, and the builder refuses a filter on
+                // a v2-B-tree dataset, so this index is unfiltered by
+                // construction. Read it back the same way — no pipeline —
+                // rather than carrying a filtered branch no writer can produce.
+                if bt2.index.filtered {
+                    return Err(crate::io::IoError::InvalidState(
+                        "filtered v2 B-tree chunk index is not supported".into(),
+                    ));
+                }
+                let found = bt2.index.lookup(chunk_coords).map(|r| r.chunk_address);
                 drop(m);
                 match found {
-                    Some((addr, nbytes, mask)) => {
-                        self.read_chunk_block(pipeline.as_ref(), addr, nbytes, mask)
-                    }
+                    Some(addr) => self.read_chunk_block(None, addr, geo.chunk_bytes(), 0),
                     None => Ok(None),
                 }
             }
