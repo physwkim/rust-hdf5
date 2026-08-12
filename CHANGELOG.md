@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `write_slice` now works on chunked datasets, including compressed ones
+  (issue #2). It was previously rejected with "write_slice is only for
+  contiguous datasets", so updating one row of an appendable dataset meant
+  rebuilding and rewriting the whole thing — O(dataset) memory and I/O for an
+  O(row) change.
+
+  The selection is decomposed onto the chunk grid and only the intersecting
+  chunks are touched. A chunk the selection covers entirely is written
+  straight from the caller's buffer; a partially covered chunk is read,
+  patched and written back (libhdf5 makes the same distinction in
+  `H5D__chunk_lock`'s `relax` flag). Regions of a chunk that no write has
+  reached hold the dataset's fill value. All three chunk index types
+  (extensible array, fixed array, v2 B-tree) are supported.
+
+### Fixed
+
+- Rewriting a chunk no longer leaks its old file block. Every chunk write
+  previously allocated fresh space and left the previous block stranded, so
+  repeatedly rewriting the same chunk grew the file without bound — including
+  through `append`. A chunk is now placed by consulting its index entry first:
+  an unfiltered chunk (whose size never changes) is rewritten in place, and a
+  filtered chunk that no longer fits its old block is relocated with the old
+  block released to the allocator for reuse. This mirrors libhdf5's
+  `H5D__chunk_file_alloc` / `H5MF_xfree`. Under SWMR the release is suppressed,
+  since a reader may still be following the old address.
+
+- `FileAllocator` gained a free list, so released blocks are reused before the
+  file grows. Best fit with merging of adjacent blocks; like libhdf5's default
+  strategy the list is not persisted to disk, so a block released but unused at
+  close remains slack in the file.
+
 ## 0.3.2
 
 ### Fixed
