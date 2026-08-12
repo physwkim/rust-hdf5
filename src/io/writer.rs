@@ -417,10 +417,11 @@ pub struct Bt2DatasetInfo {
     /// flush can orphan a block it replaced. Every node is the same size, so a
     /// block stays usable however the tree reshapes.
     ///
-    /// The pool grows and never shrinks, because the node count cannot fall:
-    /// [`Bt2ChunkIndex`] has no record-removal path, only insert-or-replace.
-    /// A future removal would have to release the surplus blocks here — the
-    /// `debug_assert` in `flush_dataset_synced` marks the spot.
+    /// The pool holds exactly one block per node after every flush, in both
+    /// directions: a taller tree allocates the shortfall, a smaller one frees
+    /// the surplus. Nothing here depends on the record count only ever rising,
+    /// so a record-removal path can be added to [`Bt2ChunkIndex`] without the
+    /// blocks it drops going unreachable.
     pub node_addrs: Vec<u64>,
     /// In-memory chunk index.
     pub index: Bt2ChunkIndex,
@@ -4370,12 +4371,19 @@ impl Hdf5Writer {
             // holds stay valid, which is also what SWMR needs.
             let tree = bt2.index.build_tree(&self.ctx);
             let mut node_addrs = bt2.node_addrs.clone();
-            // Records are only ever inserted or replaced, so the node count
-            // cannot fall. If that ever changes, the surplus blocks have to be
-            // released here rather than left recorded and unused.
-            debug_assert!(node_addrs.len() <= tree.nodes.len());
             while node_addrs.len() < tree.nodes.len() {
                 node_addrs.push(self.allocator.allocate(tree.node_size as u64));
+            }
+            // A tree with fewer nodes than last flush releases the surplus
+            // rather than leaving it recorded and unreachable, so the pool is
+            // exactly one block per node whichever way the count moved. Under
+            // SWMR a reader may still hold a header naming those blocks, so
+            // keep them out of the free list — the same rule `place_chunk`
+            // applies to a relocated chunk.
+            for addr in node_addrs.split_off(tree.nodes.len()) {
+                if !self.swmr_active {
+                    self.allocator.free(addr, tree.node_size as u64);
+                }
             }
 
             for (image, &addr) in tree.encode(&self.ctx, &node_addrs).iter().zip(&node_addrs) {
@@ -5620,6 +5628,84 @@ mod tests {
         writer.extend_dataset(idx, &[written.max(1), 1]).unwrap();
         writer.close().unwrap();
         out
+    }
+
+    /// The node pool tracks the tree in both directions. Dropping records is
+    /// what a removal path would do — [`Bt2ChunkIndex`] has none today, so the
+    /// test drops them itself — and the flush that follows must hand the blocks
+    /// its smaller tree no longer needs back to the allocator instead of
+    /// leaving them recorded and unreachable.
+    #[test]
+    fn a_btree_v2_flush_frees_the_node_blocks_its_tree_gave_up() {
+        use crate::format::chunk_index::btree_v2::BT2_NODE_SIZE;
+
+        let path = temp_path("bt2_node_shrink");
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let idx = writer
+            .create_btree_v2_dataset(
+                "data",
+                DatatypeMessage::f64_type(),
+                &[0, 0],
+                &[u64::MAX, u64::MAX],
+                &[1, 1],
+            )
+            .unwrap();
+        // 85 records is one past a leaf, so the tree is two leaves and a root.
+        for i in 0..85u64 {
+            writer
+                .write_chunk_btree_v2(idx, &[i, 0], &(i as f64).to_le_bytes())
+                .unwrap();
+        }
+        writer.flush_dataset(idx).unwrap();
+        let grown = writer
+            .ds(idx)
+            .lock()
+            .btree_v2
+            .as_ref()
+            .unwrap()
+            .node_addrs
+            .clone();
+        assert_eq!(grown.len(), 3, "expected two leaves and a root");
+
+        // Back to 84 records: one leaf, so two of the three blocks are surplus.
+        writer
+            .ds(idx)
+            .lock()
+            .btree_v2
+            .as_mut()
+            .unwrap()
+            .index
+            .records
+            .truncate(84);
+        writer.flush_dataset(idx).unwrap();
+        let shrunk = writer
+            .ds(idx)
+            .lock()
+            .btree_v2
+            .as_ref()
+            .unwrap()
+            .node_addrs
+            .clone();
+        assert_eq!(
+            shrunk,
+            grown[..1],
+            "the pool still records the surplus blocks"
+        );
+
+        // The surplus went back to the allocator, not on the floor: the next
+        // node-sized allocation lands inside the region the two blocks covered.
+        let reused = writer.allocator.allocate(BT2_NODE_SIZE as u64);
+        assert!(
+            (grown[1]..grown[1] + 2 * BT2_NODE_SIZE as u64).contains(&reused),
+            "a node block allocated at {reused:#x}, outside the freed \
+             [{:#x}, {:#x}) the flush gave up",
+            grown[1],
+            grown[1] + 2 * BT2_NODE_SIZE as u64
+        );
+
+        writer.extend_dataset(idx, &[85, 1]).unwrap();
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
     }
 
     /// A node's record count falls as well as rises: the tree's first leaf goes
