@@ -1626,38 +1626,15 @@ impl H5Dataset {
                     let frames_to_fill = chunk_dim0 - (abs_frame % chunk_dim0);
 
                     if remaining_frames >= frames_to_fill {
-                        // Full chunk — write
+                        // These frames complete the chunk's remaining span.
                         let end = byte_pos + frames_to_fill * frame_bytes;
-                        if frames_to_fill == chunk_dim0 {
-                            writer.write_chunk(
-                                ds_index,
-                                chunk_idx as u64,
-                                &combined[byte_pos..end],
-                            )?;
-                        } else {
-                            // Partial-chunk write: this branch only runs with
-                            // offset_in_chunk > 0, meaning the chunk already
-                            // holds earlier frames on disk. Read-modify-write
-                            // so those frames survive — a fresh fill buffer
-                            // would erase them.
-                            let offset_in_chunk = (abs_frame % chunk_dim0) * frame_bytes;
-                            let mut chunk_buf =
-                                match writer.read_chunk_if_present(ds_index, chunk_idx as u64)? {
-                                    Some(existing) => existing,
-                                    None => {
-                                        return Err(Hdf5Error::InvalidState(format!(
-                                            "cannot append into partially-written chunk {}: \
-                                         its existing content was not found in the chunk \
-                                         index (the file may be inconsistent)",
-                                            chunk_idx
-                                        )));
-                                    }
-                                };
-                            chunk_buf
-                                [offset_in_chunk..offset_in_chunk + frames_to_fill * frame_bytes]
-                                .copy_from_slice(&combined[byte_pos..end]);
-                            writer.write_chunk(ds_index, chunk_idx as u64, &chunk_buf)?;
-                        }
+                        let offset_in_chunk = (abs_frame % chunk_dim0) * frame_bytes;
+                        writer.append_frames_into_chunk(
+                            ds_index,
+                            chunk_idx as u64,
+                            offset_in_chunk,
+                            &combined[byte_pos..end],
+                        )?;
                         byte_pos = end;
                         frame_pos += frames_to_fill;
                     } else {
@@ -3415,6 +3392,52 @@ mod tests {
             assert_eq!(all, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
         }
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An append that leaves its chunk partial is buffered until close, and
+    /// the flush has to keep the frames that chunk already holds. It built a
+    /// fresh fill-value chunk around the buffered frame instead, so reopening
+    /// a file and appending one row erased every earlier row of that chunk
+    /// (issue #3). Four sessions: the second lands beside an existing row, the
+    /// third closes chunk 0 and opens chunk 1, the fourth lands beside the row
+    /// the third left in chunk 1.
+    #[test]
+    fn append_after_reopen_keeps_the_partial_chunk_it_lands_in() {
+        let path = temp_path("append_reopen_partial");
+
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0, 3])
+                .chunk(&[4, 3])
+                .max_shape(&[None, Some(3)])
+                .create("values")
+                .unwrap();
+            ds.append(&[1, 2, 3]).unwrap();
+            file.close().unwrap();
+        }
+        for rows in [
+            vec![4, 5, 6],
+            vec![7, 8, 9, 10, 11, 12, 13, 14, 15],
+            vec![16, 17, 18],
+        ] {
+            let file = H5File::open_rw(&path).unwrap();
+            file.dataset_writer("values")
+                .unwrap()
+                .append(&rows)
+                .unwrap();
+            file.close().unwrap();
+        }
+
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("values").unwrap();
+        assert_eq!(ds.shape(), vec![6, 3]);
+        assert_eq!(
+            ds.read_raw::<i32>().unwrap(),
+            (1..=18).collect::<Vec<i32>>()
+        );
         std::fs::remove_file(&path).ok();
     }
 
