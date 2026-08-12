@@ -862,11 +862,15 @@ impl Bt2Tree {
                 };
                 debug_assert!(image.len() <= self.node_size as usize);
                 // Only the used prefix is checksummed, but the image is padded
-                // to the whole block so the block exists in the file rather
-                // than only in the allocator's ledger: a reader asking for
-                // `node_size` bytes past end-of-file gets zeros instead
-                // (libhdf5 `H5FD__sec2_read`, "end of file but not end of
-                // format address space"), which is not the node it allocated.
+                // to the whole block so re-serializing overwrites the block
+                // rather than a prefix of it. A node's record count falls as
+                // well as rises — a full 84-record leaf becomes two 42-record
+                // leaves when the tree splits — so a short write would leave
+                // the tail of the previous, larger image behind. A conforming
+                // reader stops at the record count its parent gives it and
+                // never sees those bytes, but they are stale records in a live
+                // node block, and anything scanning the file raw reads them as
+                // real.
                 image.resize(self.node_size as usize, 0);
                 image
             })
