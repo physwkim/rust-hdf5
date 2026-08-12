@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `H5Dataset::read_strings` and `read_strings_lossy` decode a whole string
+  dataset in one call, at whatever width the file declares (issue #5). Reading
+  a fixed-string column previously meant `read_raw_bytes` plus hand-written
+  slicing, and the width is a per-dataset property, so the caller had to
+  hard-code one and get it wrong on the next file. Both string datatypes go
+  through the same call, the padding rule decides where each value ends, and
+  the character set is enforced — `read_strings` fails on bytes that do not
+  decode, `read_strings_lossy` substitutes U+FFFD for producers that mislabel
+  the character set.
+
 ## 0.4.0
 
 ### Changed

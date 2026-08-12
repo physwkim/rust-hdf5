@@ -490,6 +490,57 @@ enum ChunkBytes<'a> {
     Prefiltered { data: &'a [u8], filter_mask: u32 },
 }
 
+/// Strip a fixed-string element's padding, leaving the bytes that carry the
+/// value.
+///
+/// The three padding rules are the HDF5 datatype message's: null-terminated
+/// stops at the first NUL and says nothing about the bytes after it,
+/// null-padded and space-padded fill the tail with that byte. `index` names
+/// the element in the error a reserved padding rule produces.
+fn trim_fixed_string(elem: &[u8], padding: u8, index: usize) -> Result<&[u8]> {
+    let end = match padding {
+        // Null-terminated.
+        0 => elem.iter().position(|&b| b == 0).unwrap_or(elem.len()),
+        // Null-padded / space-padded: the tail of that byte is padding.
+        1 => elem.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1),
+        2 => elem.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1),
+        other => {
+            return Err(Hdf5Error::InvalidState(format!(
+                "string {index} uses padding rule {other}, which the format reserves"
+            )))
+        }
+    };
+    Ok(&elem[..end])
+}
+
+/// Decode one string element's bytes under the datatype's character set.
+///
+/// `lossy` replaces what it cannot decode with U+FFFD instead of failing;
+/// `index` names the element in the error otherwise.
+fn decode_string(bytes: &[u8], charset: u8, lossy: bool, index: usize) -> Result<String> {
+    if lossy {
+        return Ok(String::from_utf8_lossy(bytes).into_owned());
+    }
+    match charset {
+        // ASCII. Bytes are 7-bit, which makes them UTF-8 as well.
+        0 => match bytes.iter().position(|&b| b >= 0x80) {
+            None => Ok(String::from_utf8_lossy(bytes).into_owned()),
+            Some(at) => Err(Hdf5Error::InvalidState(format!(
+                "string {index} declares the ASCII character set but byte {at} is {:#04x}",
+                bytes[at]
+            ))),
+        },
+        1 => String::from_utf8(bytes.to_vec()).map_err(|e| {
+            Hdf5Error::InvalidState(format!(
+                "string {index} declares UTF-8 but is not valid UTF-8: {e}"
+            ))
+        }),
+        other => Err(Hdf5Error::InvalidState(format!(
+            "string {index} uses character set {other}, which the format reserves"
+        ))),
+    }
+}
+
 impl H5Dataset {
     /// Create a reader-mode dataset handle (called internally by `H5File::dataset`).
     pub(crate) fn new_reader(
@@ -1896,6 +1947,81 @@ impl H5Dataset {
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "cannot read vlen bytes from a dataset in write mode".into(),
             )),
+        }
+    }
+
+    /// Read a string dataset, fixed-width or variable-length, as one `String`
+    /// per element.
+    ///
+    /// The width of a `FixedString` dataset is whatever the file says, so a
+    /// 24-byte label column and a 100-byte one are read by the same call. The
+    /// padding rule the datatype declares decides where each element ends —
+    /// null-terminated (0), null-padded (1) or space-padded (2) — and its
+    /// character set decides how the remaining bytes are decoded: ASCII (0)
+    /// requires 7-bit bytes, UTF-8 (1) requires valid UTF-8. An element that
+    /// violates either is an error naming the element, not a silent
+    /// substitution; [`read_strings_lossy`](Self::read_strings_lossy) is the
+    /// call that accepts such a file, replacing what it cannot decode.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open("labels.h5").unwrap();
+    /// let labels = file.dataset("names").unwrap().read_strings().unwrap();
+    /// ```
+    pub fn read_strings(&self) -> Result<Vec<String>> {
+        self.read_strings_inner(false)
+    }
+
+    /// [`read_strings`](Self::read_strings), but bytes that do not decode
+    /// under the dataset's character set become U+FFFD instead of an error.
+    ///
+    /// Producers do mislabel the character set — a file that declares ASCII
+    /// while storing Latin-1 or UTF-8 bytes reads here and not there.
+    pub fn read_strings_lossy(&self) -> Result<Vec<String>> {
+        self.read_strings_inner(true)
+    }
+
+    /// The single owner of string decoding for both string datatypes: the
+    /// element bytes are found differently, the padding and character-set
+    /// rules that turn them into a `String` are the same.
+    fn read_strings_inner(&self, lossy: bool) -> Result<Vec<String>> {
+        if matches!(self.info, DatasetInfo::Writer { .. }) {
+            return Err(Hdf5Error::InvalidState(
+                "cannot read strings from a dataset in write mode".into(),
+            ));
+        }
+        match self.datatype()? {
+            DatatypeMessage::VarLenString { charset } => self
+                .read_vlen_bytes()?
+                .iter()
+                .enumerate()
+                .map(|(i, bytes)| decode_string(bytes, charset, lossy, i))
+                .collect(),
+            DatatypeMessage::FixedString {
+                size,
+                padding,
+                charset,
+            } => {
+                let width = size as usize;
+                if width == 0 {
+                    // A corrupt file can declare it; `chunks_exact(0)` panics.
+                    return Err(Hdf5Error::InvalidState(
+                        "fixed-string datatype has zero width".into(),
+                    ));
+                }
+                // `read_raw_bytes` returns `product(dims) * width` bytes, so
+                // `chunks_exact` leaves no remainder.
+                let raw = self.read_raw_bytes()?;
+                raw.chunks_exact(width)
+                    .enumerate()
+                    .map(|(i, elem)| {
+                        decode_string(trim_fixed_string(elem, padding, i)?, charset, lossy, i)
+                    })
+                    .collect()
+            }
+            other => Err(Hdf5Error::InvalidState(format!(
+                "read_strings is only for string datasets, this one is {other:?}"
+            ))),
         }
     }
 
@@ -4456,6 +4582,311 @@ mod tests {
             err.to_string().contains("does not fit"),
             "expected a chunk-size-field overflow error, got: {err}"
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- issue #5: runtime-width fixed-string reading ----------------------
+
+    use crate::format::messages::datatype::DatatypeMessage;
+
+    /// Build a 1-D fixed-string dataset of `width` bytes per element from raw
+    /// element images, optionally chunked and deflated.
+    fn write_fixed_string_dataset(
+        path: &std::path::Path,
+        dt: DatatypeMessage,
+        width: usize,
+        elems: &[&[u8]],
+        compressed: bool,
+    ) {
+        let mut raw = Vec::with_capacity(elems.len() * width);
+        for e in elems {
+            assert!(e.len() <= width);
+            raw.extend_from_slice(e);
+            raw.resize(raw.len() + (width - e.len()), 0);
+        }
+        let file = H5File::create(path).unwrap();
+        let mut b = file.new_dataset::<u8>().datatype(dt).shape([elems.len()]);
+        if compressed {
+            b = b.chunk(&[2]).deflate(6);
+        }
+        let ds = b.create("labels").unwrap();
+        ds.write_raw_bytes(&raw).unwrap();
+        file.close().unwrap();
+    }
+
+    /// The width is whatever the file says, so one call reads a 24-byte label
+    /// column and a 100-byte one. Producers like VASP pick it per dataset.
+    #[test]
+    fn read_strings_handles_any_fixed_width() {
+        for width in [4usize, 24, 100] {
+            let path = temp_path(&format!("fixed_str_{width}"));
+            write_fixed_string_dataset(
+                &path,
+                DatatypeMessage::fixed_string(width as u32),
+                width,
+                &[b"ab", b"cde", b""],
+                false,
+            );
+            let file = H5File::open(&path).unwrap();
+            let got = file.dataset("labels").unwrap().read_strings().unwrap();
+            assert_eq!(got, vec!["ab", "cde", ""], "width {width}");
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// Each padding rule decides where the value ends. Null-terminated stops at
+    /// the first NUL and ignores the bytes after it; the two pad rules strip a
+    /// tail of that byte and keep everything before it.
+    #[test]
+    fn read_strings_honors_every_padding_rule() {
+        // "ab" then a NUL then trailing junk a null-terminated read must drop
+        // and a null-padded read must keep.
+        let elem: &[u8] = b"ab\0X\0\0";
+        for (padding, want) in [(0u8, "ab"), (1, "ab\0X")] {
+            let path = temp_path(&format!("fixed_pad_{padding}"));
+            write_fixed_string_dataset(
+                &path,
+                DatatypeMessage::FixedString {
+                    size: 6,
+                    padding,
+                    charset: 0,
+                },
+                6,
+                &[elem],
+                false,
+            );
+            let file = H5File::open(&path).unwrap();
+            let got = file.dataset("labels").unwrap().read_strings().unwrap();
+            assert_eq!(got, vec![want.to_string()], "padding {padding}");
+            std::fs::remove_file(&path).ok();
+        }
+        // Space-padded keeps interior spaces and strips only the tail.
+        let path = temp_path("fixed_pad_2");
+        write_fixed_string_dataset(
+            &path,
+            DatatypeMessage::FixedString {
+                size: 8,
+                padding: 2,
+                charset: 0,
+            },
+            8,
+            &[b"a b     "],
+            false,
+        );
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("labels").unwrap().read_strings().unwrap(),
+            vec!["a b".to_string()]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A reserved padding or character-set code is an error naming the element,
+    /// not a guess.
+    #[test]
+    fn read_strings_rejects_reserved_datatype_codes() {
+        for (padding, charset, want) in [(3u8, 0u8, "padding rule 3"), (0, 7, "character set 7")] {
+            let path = temp_path(&format!("fixed_reserved_{padding}_{charset}"));
+            write_fixed_string_dataset(
+                &path,
+                DatatypeMessage::FixedString {
+                    size: 4,
+                    padding,
+                    charset,
+                },
+                4,
+                &[b"ab"],
+                false,
+            );
+            let file = H5File::open(&path).unwrap();
+            let err = file
+                .dataset("labels")
+                .unwrap()
+                .read_strings()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(want), "got: {err}");
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// The declared character set is enforced: a byte that cannot be decoded is
+    /// an error naming the element, and the lossy call is what accepts the file
+    /// instead of a silent substitution here.
+    #[test]
+    fn read_strings_enforces_the_character_set_and_lossy_does_not() {
+        // Latin-1 "é" (0xE9) in a dataset that declares ASCII, and a lone 0xFF
+        // in one that declares UTF-8.
+        for (charset, bytes, want) in [
+            (0u8, b"caf\xe9".as_slice(), "ASCII character set"),
+            (1, b"a\xff".as_slice(), "not valid UTF-8"),
+        ] {
+            let path = temp_path(&format!("fixed_charset_{charset}"));
+            write_fixed_string_dataset(
+                &path,
+                DatatypeMessage::FixedString {
+                    size: 6,
+                    padding: 1,
+                    charset,
+                },
+                6,
+                &[b"ok", bytes],
+                false,
+            );
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("labels").unwrap();
+            let err = ds.read_strings().unwrap_err().to_string();
+            assert!(err.contains(want) && err.contains("string 1"), "got: {err}");
+            let lossy = ds.read_strings_lossy().unwrap();
+            assert_eq!(lossy[0], "ok");
+            assert_eq!(
+                lossy[1].chars().next().unwrap(),
+                if charset == 0 { 'c' } else { 'a' }
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// Valid multi-byte UTF-8 survives, and the trailing NUL padding does not
+    /// split a character.
+    #[test]
+    fn read_strings_reads_utf8_fixed_strings() {
+        let path = temp_path("fixed_utf8");
+        write_fixed_string_dataset(
+            &path,
+            DatatypeMessage::fixed_string_utf8(12),
+            12,
+            &["héllo".as_bytes(), "안녕".as_bytes()],
+            false,
+        );
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("labels").unwrap().read_strings().unwrap(),
+            vec!["héllo".to_string(), "안녕".to_string()]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The decode sits on the decoded raw-data path, so a chunked and deflated
+    /// dataset reads the same as a contiguous one.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn read_strings_reads_a_compressed_fixed_string_dataset() {
+        let path = temp_path("fixed_str_deflate");
+        write_fixed_string_dataset(
+            &path,
+            DatatypeMessage::fixed_string(16),
+            16,
+            &[b"alpha", b"beta", b"gamma", b"delta", b"epsilon"],
+            true,
+        );
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("labels").unwrap().read_strings().unwrap(),
+            vec!["alpha", "beta", "gamma", "delta", "epsilon"]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// One call covers both string datatypes, so a caller need not branch on
+    /// which one the file used.
+    #[test]
+    fn read_strings_also_reads_variable_length_strings() {
+        let path = temp_path("read_strings_vlen");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_strings("names", &["alpha", "", "안녕"])
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("names").unwrap().read_strings().unwrap(),
+            vec!["alpha".to_string(), String::new(), "안녕".to_string()]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A file declaring a zero-width fixed string is an error, not the panic
+    /// `chunks_exact(0)` would raise. Nothing in this crate writes one, so the
+    /// test patches the width in the encoded datatype message down to zero and
+    /// re-stamps the object header's checksum over the result.
+    #[test]
+    fn read_strings_rejects_a_zero_width_fixed_string_dataset() {
+        use crate::format::checksum::checksum_metadata;
+        use crate::format::object_header::OHDR_SIGNATURE;
+
+        let path = temp_path("fixed_str_zero_width");
+        write_fixed_string_dataset(
+            &path,
+            DatatypeMessage::fixed_string(37),
+            37,
+            &[b"ab", b"cd"],
+            false,
+        );
+
+        // Version 1 string datatype: class|version, padding|charset, two
+        // reserved bytes, then the width as a little-endian u32. The width is
+        // 37 so the eight bytes occur once in the file.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let needle = [0x13u8, 0, 0, 0, 37, 0, 0, 0];
+        let at = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("encoded fixed-string datatype message");
+        assert!(
+            !bytes[at + 1..].windows(needle.len()).any(|w| w == needle),
+            "the datatype message pattern is not unique in the file"
+        );
+
+        // The enclosing v2 object header ends in a checksum over everything
+        // from its signature onwards; find the offset where the stored value
+        // still agrees, so the patched header can be re-stamped there.
+        let ohdr = bytes[..at]
+            .windows(4)
+            .rposition(|w| w == OHDR_SIGNATURE)
+            .expect("enclosing object header");
+        let cksum_at = (at + needle.len()..bytes.len() - 4)
+            .find(|&e| {
+                u32::from_le_bytes(bytes[e..e + 4].try_into().unwrap())
+                    == checksum_metadata(&bytes[ohdr..e])
+            })
+            .expect("object header checksum");
+
+        bytes[at + 4..at + 8].copy_from_slice(&0u32.to_le_bytes());
+        let fixed = checksum_metadata(&bytes[ohdr..cksum_at]);
+        bytes[cksum_at..cksum_at + 4].copy_from_slice(&fixed.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let file = H5File::open(&path).unwrap();
+        let err = file
+            .dataset("labels")
+            .unwrap()
+            .read_strings()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("zero width"), "got: {err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A non-string dataset is an error, not an attempt to reinterpret bytes.
+    #[test]
+    fn read_strings_rejects_a_non_string_dataset() {
+        let path = temp_path("read_strings_numeric");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file.new_dataset::<i32>().shape([3]).create("nums").unwrap();
+            ds.write_raw(&[1i32, 2, 3]).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let err = file
+            .dataset("nums")
+            .unwrap()
+            .read_strings()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only for string datasets"), "got: {err}");
         std::fs::remove_file(&path).ok();
     }
 }
