@@ -355,13 +355,14 @@ impl DataLayoutMessage {
                         }
                     }
                     ChunkIndexType::BTreeV2 => {
-                        // node_size(4) + split_percent(1) + merge_percent(1).
-                        // The v2 B-tree header carries the authoritative
-                        // copies; readers consult those, so a valid default
-                        // here suffices.
-                        buf.extend_from_slice(&2048u32.to_le_bytes());
-                        buf.push(100);
-                        buf.push(40);
+                        // node_size(4) + split_percent(1) + merge_percent(1),
+                        // the same geometry the B-tree header carries.
+                        use crate::format::chunk_index::btree_v2::{
+                            BT2_MERGE_PERCENT, BT2_NODE_SIZE, BT2_SPLIT_PERCENT,
+                        };
+                        buf.extend_from_slice(&BT2_NODE_SIZE.to_le_bytes());
+                        buf.push(BT2_SPLIT_PERCENT);
+                        buf.push(BT2_MERGE_PERCENT);
                     }
                     // A filtered single chunk carries its on-disk size
                     // (sizeof_size bytes) and 4-byte filter mask inline, before

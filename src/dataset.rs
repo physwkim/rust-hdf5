@@ -2892,6 +2892,47 @@ mod tests {
         assert_eq!(last, 8);
     }
 
+    // A flush re-serializes the whole v2 B-tree over the dataset's node-block
+    // pool. Every node is the same size, so the blocks already on disk are
+    // reused and repeated flushes cost nothing; sizing the root to its record
+    // count instead would relocate it each time and orphan the block it left.
+    #[test]
+    fn repeated_flushes_do_not_grow_a_btree_v2_index() {
+        let flush_n = |label: &str, flushes: usize| -> u64 {
+            let path = temp_path(label);
+            {
+                let file = H5File::create(&path).unwrap();
+                let ds = file
+                    .new_dataset::<i32>()
+                    .shape([2, 4])
+                    .chunk(&[2, 4])
+                    .max_shape(&[None, None])
+                    .create("d")
+                    .unwrap();
+                let bytes: Vec<u8> = (0..8i32).flat_map(|v| v.to_le_bytes()).collect();
+                ds.write_chunk_at(&[0, 0], &bytes).unwrap();
+                for _ in 0..flushes {
+                    ds.flush().unwrap();
+                }
+                file.close().unwrap();
+            }
+            let size = std::fs::metadata(&path).unwrap().len();
+            // The data must survive every rewrite of the index.
+            {
+                let file = H5File::open(&path).unwrap();
+                let ds = file.dataset("d").unwrap();
+                assert_eq!(ds.read_raw::<i32>().unwrap(), (0..8).collect::<Vec<i32>>());
+            }
+            std::fs::remove_file(&path).ok();
+            size
+        };
+        assert_eq!(
+            flush_n("bt2_flush_8", 8),
+            flush_n("bt2_flush_1", 1),
+            "8 index flushes grew the file past a single one"
+        );
+    }
+
     // A filtered chunk whose compressed size changes cannot stay put, so it
     // moves and releases its old block (libhdf5 H5D__chunk_file_alloc calls
     // H5MF_xfree). Alternating between two payloads of different compressed
