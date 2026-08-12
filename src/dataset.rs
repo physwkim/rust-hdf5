@@ -704,11 +704,14 @@ impl H5Dataset {
         AttrBuilder::new(&self.file_inner, ds_index)
     }
 
-    /// Write a typed slice to the dataset (contiguous datasets only).
+    /// Write a typed slice holding the dataset's whole image.
     ///
     /// The slice length must match the total number of elements declared by
     /// the dataset shape. The data is reinterpreted as raw bytes and written
-    /// to the file.
+    /// to the file: to the contiguous data block, or — for a chunked dataset —
+    /// scattered across its chunk grid, through the filter pipeline if one is
+    /// set. To write only part of a dataset, use
+    /// [`write_slice`](Self::write_slice).
     ///
     /// # Errors
     ///
@@ -780,7 +783,10 @@ impl H5Dataset {
         }
     }
 
-    /// Write the raw byte image of a contiguous dataset directly.
+    /// Write the raw byte image of the whole dataset directly.
+    ///
+    /// Takes the same layouts as [`write_raw`](Self::write_raw): a contiguous
+    /// data block, or a chunk grid the image is scattered across.
     ///
     /// Unlike [`write_raw`](Self::write_raw), this is not generic over an
     /// `H5Type` carrier, so it works for element types that have no matching
