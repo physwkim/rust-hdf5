@@ -1910,6 +1910,47 @@ impl H5Dataset {
         }
     }
 
+    /// Replace elements `start .. start + strings.len()` of a 1-D
+    /// variable-length string dataset.
+    ///
+    /// The extent and every element outside the range are left alone, and the
+    /// cost is the new strings plus the chunks holding their references — not
+    /// the column. The dataset's character set is enforced: a non-ASCII
+    /// replacement in a dataset that declares ASCII is rejected rather than
+    /// stored under a datatype that misdescribes it.
+    ///
+    /// The objects the replaced references pointed at stay in their global
+    /// heap collections, unreachable. Nothing in this library frees global
+    /// heap space, so a column updated many times grows the file; rewriting
+    /// the dataset is what reclaims it.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open_rw("meta.h5").unwrap();
+    /// let ds = file.dataset_writer("notes").unwrap();
+    /// ds.write_vlen_strings_slice(42, &["replacement"]).unwrap();
+    /// file.close().unwrap();
+    /// ```
+    pub fn write_vlen_strings_slice(&self, start: usize, strings: &[&str]) -> Result<()> {
+        match &self.info {
+            DatasetInfo::Writer { index, .. } => {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Writer(writer) => {
+                        writer.write_vlen_strings_slice(*index, start as u64, strings)?;
+                        Ok(())
+                    }
+                    _ => Err(Hdf5Error::InvalidState(
+                        "file is no longer in write mode".into(),
+                    )),
+                }
+            }
+            DatasetInfo::Reader { .. } => {
+                Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
+            }
+        }
+    }
+
     /// Read variable-length strings from a dataset.
     ///
     /// This handles h5py-style vlen string datasets that store strings
@@ -4887,6 +4928,204 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("only for string datasets"), "got: {err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- issue #6: random updates to vlen string datasets ------------------
+
+    /// One element changes; the extent and every other element stay as they
+    /// were, on a contiguous vlen dataset.
+    #[test]
+    fn write_vlen_strings_slice_replaces_one_element() {
+        let path = temp_path("vlen_slice_contig");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_strings("notes", &["a", "b", "c", "d"])
+                .unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open_rw(&path).unwrap();
+            file.dataset_writer("notes")
+                .unwrap()
+                .write_vlen_strings_slice(1, &["replacement"])
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("notes").unwrap();
+        assert_eq!(ds.shape(), vec![4]);
+        assert_eq!(
+            ds.read_vlen_strings().unwrap(),
+            vec!["a", "replacement", "c", "d"]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The same on an appendable chunked dataset, across a reopen, over a range
+    /// that spans a chunk boundary.
+    #[test]
+    fn write_vlen_strings_slice_spans_chunks_after_reopen() {
+        let path = temp_path("vlen_slice_chunked");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.create_appendable_vlen_dataset("notes", 2, None)
+                .unwrap();
+            let all: Vec<String> = (0..6).map(|i| format!("v{i}")).collect();
+            let refs: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+            file.append_vlen_strings("notes", &refs).unwrap();
+            file.close().unwrap();
+        }
+        {
+            // Elements 1..4 cross the 2-element chunk boundary twice.
+            let file = H5File::open_rw(&path).unwrap();
+            file.dataset_writer("notes")
+                .unwrap()
+                .write_vlen_strings_slice(1, &["x", "y", "z"])
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("notes").unwrap();
+        assert_eq!(ds.shape(), vec![6]);
+        assert_eq!(
+            ds.read_vlen_strings().unwrap(),
+            vec!["v0", "x", "y", "z", "v4", "v5"]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Elements the append buffer still holds are not on disk yet, so the
+    /// update has to land in the buffer or the flush at close would write the
+    /// pre-update reference over it.
+    #[test]
+    fn write_vlen_strings_slice_reaches_the_append_buffer() {
+        let path = temp_path("vlen_slice_buffered");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.create_appendable_vlen_dataset("notes", 4, None)
+                .unwrap();
+            // 3 of a 4-element chunk: all three stay in the append buffer.
+            file.append_vlen_strings("notes", &["a", "b", "c"]).unwrap();
+            file.dataset_writer("notes")
+                .unwrap()
+                .write_vlen_strings_slice(1, &["patched"])
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("notes").unwrap().read_vlen_strings().unwrap(),
+            vec!["a", "patched", "c"]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A range past the end is rejected before anything is written, and an
+    /// empty batch costs the file nothing — without the early return it would
+    /// still allocate and write an empty global-heap collection.
+    #[test]
+    fn write_vlen_strings_slice_checks_its_range() {
+        let build = |name: &str, empty_call: bool| {
+            let path = temp_path(name);
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_strings("notes", &["a", "b"]).unwrap();
+            let ds = file.dataset_writer("notes").unwrap();
+            let err = ds
+                .write_vlen_strings_slice(1, &["x", "y"])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("outside the dataset's 2 elements"),
+                "got: {err}"
+            );
+            if empty_call {
+                ds.write_vlen_strings_slice(0, &[]).unwrap();
+            }
+            file.close().unwrap();
+            path
+        };
+
+        let with_empty = build("vlen_slice_range", true);
+        let control = build("vlen_slice_range_control", false);
+        assert_eq!(
+            std::fs::metadata(&with_empty).unwrap().len(),
+            std::fs::metadata(&control).unwrap().len(),
+            "the rejected and empty calls must leave the file untouched"
+        );
+
+        let file = H5File::open(&with_empty).unwrap();
+        assert_eq!(
+            file.dataset("notes").unwrap().read_vlen_strings().unwrap(),
+            vec!["a", "b"]
+        );
+        std::fs::remove_file(&with_empty).ok();
+        std::fs::remove_file(&control).ok();
+    }
+
+    /// The element offset is one-dimensional, so a multi-dimensional dataset is
+    /// rejected rather than silently indexed along the first axis.
+    #[test]
+    fn write_vlen_strings_slice_rejects_a_multidimensional_dataset() {
+        let path = temp_path("vlen_slice_2d");
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<u8>()
+            .datatype(DatatypeMessage::vlen_string_utf8())
+            .shape([2, 3])
+            .create("grid")
+            .unwrap();
+        let err = ds
+            .write_vlen_strings_slice(0, &["x"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1-dimension datasets"), "got: {err}");
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A `&str` is UTF-8, so writing a non-ASCII one into a dataset that
+    /// declares the ASCII character set would mislabel the bytes.
+    #[test]
+    fn write_vlen_strings_slice_enforces_the_ascii_character_set() {
+        let path = temp_path("vlen_slice_ascii");
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<u8>()
+            .datatype(DatatypeMessage::vlen_string_ascii())
+            .shape([3])
+            .create("notes")
+            .unwrap();
+        let err = ds
+            .write_vlen_strings_slice(0, &["ok", "안녕"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("string 1") && err.contains("is not ASCII"),
+            "got: {err}"
+        );
+        ds.write_vlen_strings_slice(0, &["ok", "fine"]).unwrap();
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A numeric dataset is rejected: its elements are not vlen references and
+    /// writing one would corrupt the column.
+    #[test]
+    fn write_vlen_strings_slice_rejects_a_non_vlen_dataset() {
+        let path = temp_path("vlen_slice_numeric");
+        let file = H5File::create(&path).unwrap();
+        let ds = file.new_dataset::<i32>().shape([3]).create("nums").unwrap();
+        ds.write_raw(&[1i32, 2, 3]).unwrap();
+        let err = ds
+            .write_vlen_strings_slice(0, &["x"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("only for variable-length string datasets"),
+            "got: {err}"
+        );
+        file.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
 }

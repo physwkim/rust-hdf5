@@ -14,6 +14,15 @@
   decode, `read_strings_lossy` substitutes U+FFFD for producers that mislabel
   the character set.
 
+- `H5Dataset::write_vlen_strings_slice` replaces variable-length strings at an
+  arbitrary offset (issue #6). Vlen datasets could only be created whole or
+  appended to, so correcting one entry meant rewriting the dataset. The new
+  strings go into one global-heap collection and their references are written
+  over the range; elements still held in the append buffer are patched there,
+  so the flush at close does not write the pre-update reference back over
+  them. The heap objects the replaced references pointed at stay in the file
+  as unreachable bytes — libhdf5 does not reclaim them either.
+
 ## 0.4.0
 
 ### Changed

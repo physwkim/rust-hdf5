@@ -2739,6 +2739,135 @@ impl Hdf5Writer {
         Ok(())
     }
 
+    /// Replace elements `start .. start + strings.len()` of a 1-D
+    /// variable-length string dataset, leaving its extent and every other
+    /// element alone.
+    ///
+    /// The replacements go into a fresh global heap collection and only the
+    /// vlen references of the named elements are rewritten, so the cost is the
+    /// new strings plus the chunks those references live in — not the column.
+    /// The objects the old references pointed at stay in their collections,
+    /// unreachable: the global heap has no free path here, the same as for a
+    /// chunk a rewrite relocates under SWMR.
+    ///
+    /// Elements the append buffer still holds are patched in the buffer rather
+    /// than on disk, because that buffer — not the file — is their current
+    /// content until it is flushed.
+    pub fn write_vlen_strings_slice(
+        &self,
+        ds_index: usize,
+        start: u64,
+        strings: &[&str],
+    ) -> IoResult<()> {
+        use crate::format::global_heap::{
+            encode_vlen_reference, vlen_reference_size, GlobalHeapCollection,
+        };
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        // An empty batch must not reach the heap write below: an empty
+        // collection still encodes to the 4096-byte `H5HG_MINALLOC` minimum,
+        // so the file would grow by a block nothing references.
+        if strings.is_empty() {
+            return Ok(());
+        }
+
+        // Snapshot what the write needs, then drop the guard: `write_slice`
+        // below re-locks the same slot.
+        let (charset, dims, buffered_frames) = {
+            let ds = self.ds(ds_index);
+            let m = ds.lock();
+            let charset = match m.datatype {
+                DatatypeMessage::VarLenString { charset } => charset,
+                _ => {
+                    return Err(crate::io::IoError::InvalidState(
+                        "write_vlen_strings_slice is only for variable-length string datasets"
+                            .into(),
+                    ))
+                }
+            };
+            (
+                charset,
+                m.dataspace.dims.clone(),
+                m.append_buffered_frames as usize,
+            )
+        };
+
+        if dims.len() != 1 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "write_vlen_strings_slice is only for 1-dimension datasets, this one has {}",
+                dims.len()
+            )));
+        }
+        let end = start + strings.len() as u64;
+        if end > dims[0] {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "elements {start}..{end} are outside the dataset's {} elements",
+                dims[0]
+            )));
+        }
+        // charset 0 is ASCII. A Rust `&str` is UTF-8, so anything non-ASCII
+        // would be stored as UTF-8 under a datatype that declares otherwise.
+        if charset == 0 {
+            if let Some((i, s)) = strings.iter().enumerate().find(|(_, s)| !s.is_ascii()) {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "string {i} ({s:?}) is not ASCII, but the dataset's character set is"
+                )));
+            }
+        }
+
+        // One collection for the batch, as `append_vlen_strings` does.
+        let mut gcol = GlobalHeapCollection::new();
+        let mut obj_indices = Vec::with_capacity(strings.len());
+        for s in strings {
+            obj_indices.push(gcol.add_object(s.as_bytes().to_vec())?);
+        }
+        let gcol_encoded = gcol.encode(&self.ctx);
+        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
+        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+
+        let ref_size = vlen_reference_size(&self.ctx);
+        let mut refs = Vec::with_capacity(strings.len() * ref_size);
+        for (i, &obj_idx) in obj_indices.iter().enumerate() {
+            refs.extend_from_slice(&encode_vlen_reference(
+                strings[i].len() as u32,
+                gcol_addr,
+                obj_idx as u32,
+                &self.ctx,
+            ));
+        }
+
+        // The append buffer holds the tail of the dataset, so the range splits
+        // into an on-disk prefix and a buffered suffix.
+        let buffer_base = dims[0] - buffered_frames as u64;
+        let split = end.min(buffer_base).max(start);
+
+        if split > start {
+            let n = (split - start) as usize;
+            self.write_slice(ds_index, &[start], &[n as u64], &refs[..n * ref_size])?;
+        }
+        if end > split {
+            let ds = self.ds(ds_index);
+            let mut m = ds.lock();
+            let off = ((split - buffer_base) as usize) * ref_size;
+            let tail = &refs[(split - start) as usize * ref_size..];
+            // `append_buffer.len() == append_buffered_frames * ref_size` holds
+            // for a 1-D vlen dataset, so the range is in bounds for the
+            // snapshot taken above. It can still be stale under the
+            // `thread-safe` feature, where another thread may have flushed the
+            // buffer between the two lock acquisitions; report that rather than
+            // panicking on the slice.
+            if off + tail.len() > m.append_buffer.len() {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "buffered elements {split}..{end} run past the {}-byte append buffer",
+                    m.append_buffer.len()
+                )));
+            }
+            m.append_buffer[off..off + tail.len()].copy_from_slice(tail);
+        }
+
+        Ok(())
+    }
+
     /// Add an attribute to a dataset.
     ///
     /// The attribute will be written as a message in the dataset's object
