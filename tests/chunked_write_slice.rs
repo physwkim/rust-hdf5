@@ -82,6 +82,20 @@ fn deflated(file: &H5File) -> H5Dataset {
         .unwrap()
 }
 
+/// Compressed *and* v2-B-tree indexed: the filtered records carry each chunk's
+/// stored size, so a partial write that recompresses to a different size has
+/// to update the index, not just the bytes.
+#[cfg(feature = "deflate")]
+fn deflated_btree_v2(file: &H5File) -> H5Dataset {
+    file.new_dataset::<i32>()
+        .shape([4, 6])
+        .chunk(&[2, 3])
+        .max_shape(&[None, None])
+        .deflate(6)
+        .create("d")
+        .unwrap()
+}
+
 /// A storage layout to run a case against: a label for assertion messages and
 /// the constructor that produces a dataset with that layout.
 type Layout = (&'static str, fn(&H5File) -> H5Dataset);
@@ -95,18 +109,18 @@ fn layouts() -> Vec<Layout> {
         ("ea", extensible_array),
         ("bt2", btree_v2),
     ];
-    cases.extend(filtered_layout());
+    cases.extend(filtered_layouts());
     cases
 }
 
 #[cfg(feature = "deflate")]
-fn filtered_layout() -> Option<Layout> {
-    Some(("deflate", deflated))
+fn filtered_layouts() -> Vec<Layout> {
+    vec![("deflate", deflated), ("deflate-bt2", deflated_btree_v2)]
 }
 
 #[cfg(not(feature = "deflate"))]
-fn filtered_layout() -> Option<Layout> {
-    None
+fn filtered_layouts() -> Vec<Layout> {
+    Vec::new()
 }
 
 /// Expected contents of the seeded 4x6 grid after writing `values` into the

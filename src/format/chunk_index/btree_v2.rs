@@ -32,8 +32,19 @@ pub const BT2_TYPE_CHUNK_UNFILT: u8 = 10;
 pub const BT2_TYPE_CHUNK_FILT: u8 = 11;
 
 /// Bytes used to encode a filtered chunk's compressed size in a v2 B-tree
-/// record (libhdf5 layout version 5 uses `sizeof_size`).
-pub const BT2_FILT_CHUNK_SIZE_LEN: usize = 8;
+/// record.
+///
+/// libhdf5 does not read this width off the record; it recomputes it
+/// (`H5D_BT2_COMPUTE_CHUNK_SIZE_LEN`, `H5Dbtree2.c`) from the layout message
+/// version: `sizeof_size` for version 5, and otherwise the same
+/// magnitude-derived width the extensible and fixed arrays use. Our writer
+/// emits version-4 layout messages, so a file it writes must use the latter —
+/// hence [`compute_chunk_size_len`], shared with those two indexes.
+///
+/// Decoding stays width-agnostic: [`Bt2ChunkIndex::decode_filtered_records`]
+/// derives the width from the header's `record_size`, so a version-5 file
+/// written by libhdf5 reads back just as well.
+pub use super::extensible_array::compute_chunk_size_len;
 
 /// A chunk record for BT2 type 10 (unfiltered).
 ///
@@ -116,10 +127,12 @@ impl Bt2Header {
 
     /// Create a new B-tree v2 header for filtered chunk indexing.
     ///
-    /// `ndims` is the number of dataset dimensions.
-    pub fn new_for_filtered_chunks(ctx: &FormatContext, ndims: usize) -> Self {
-        // record_size = ndims * 8 + sizeof_addr + 4 (chunk_size) + 4 (filter_mask)
-        let record_size = (ndims * 8 + ctx.sizeof_addr as usize + 4 + 4) as u16;
+    /// `ndims` is the number of dataset dimensions and `chunk_size_len` the
+    /// width of the compressed-size field (see [`compute_chunk_size_len`]).
+    pub fn new_for_filtered_chunks(ctx: &FormatContext, ndims: usize, chunk_size_len: u8) -> Self {
+        // record_size = address + chunk_size + filter_mask(4) + scaled offsets
+        let record_size =
+            (ctx.sizeof_addr as usize + chunk_size_len as usize + 4 + ndims * 8) as u16;
         Self {
             record_type: BT2_TYPE_CHUNK_FILT,
             node_size: 4096,
@@ -664,6 +677,9 @@ pub struct Bt2ChunkIndex {
     /// Filtered chunk records (used when filtered == true), sorted by scaled
     /// offsets.
     pub filtered_records: Vec<Bt2FilteredChunkRecord>,
+    /// Width in bytes of a filtered record's compressed-size field. Meaningful
+    /// only when `filtered`; see [`compute_chunk_size_len`].
+    pub chunk_size_len: u8,
 }
 
 impl Bt2ChunkIndex {
@@ -674,16 +690,21 @@ impl Bt2ChunkIndex {
             filtered: false,
             records: Vec::new(),
             filtered_records: Vec::new(),
+            chunk_size_len: 0,
         }
     }
 
     /// Create a new empty B-tree v2 chunk index for filtered chunks.
-    pub fn new_filtered(ndims: usize) -> Self {
+    ///
+    /// `chunk_size_len` must be the width libhdf5 will recompute for this
+    /// dataset — [`compute_chunk_size_len`] of the uncompressed chunk size.
+    pub fn new_filtered(ndims: usize, chunk_size_len: u8) -> Self {
         Self {
             ndims,
             filtered: true,
             records: Vec::new(),
             filtered_records: Vec::new(),
+            chunk_size_len,
         }
     }
 
@@ -771,13 +792,13 @@ impl Bt2ChunkIndex {
 
     /// Compute the record size in bytes.
     ///
-    /// Filtered records encode the compressed size in a fixed
-    /// [`BT2_FILT_CHUNK_SIZE_LEN`]-byte field, matching libhdf5's layout
-    /// version 5.
+    /// A filtered record adds the compressed size — in the
+    /// [`chunk_size_len`](Self::chunk_size_len)-byte field libhdf5 will
+    /// recompute — and a 4-byte filter mask.
     pub fn record_size(&self, ctx: &FormatContext) -> u16 {
         let sa = ctx.sizeof_addr as usize;
         if self.filtered {
-            (sa + BT2_FILT_CHUNK_SIZE_LEN + 4 + self.ndims * 8) as u16
+            (sa + self.chunk_size_len as usize + 4 + self.ndims * 8) as u16
         } else {
             (self.ndims * 8 + sa) as u16
         }
@@ -796,7 +817,7 @@ impl Bt2ChunkIndex {
                 // filter mask, then the scaled offsets.
                 buf.extend_from_slice(&rec.chunk_address.to_le_bytes()[..sa]);
                 buf.extend_from_slice(
-                    &(rec.chunk_size as u64).to_le_bytes()[..BT2_FILT_CHUNK_SIZE_LEN],
+                    &(rec.chunk_size as u64).to_le_bytes()[..self.chunk_size_len as usize],
                 );
                 buf.extend_from_slice(&rec.filter_mask.to_le_bytes());
                 for &offset in &rec.scaled_offsets {
@@ -1072,10 +1093,21 @@ mod tests {
 
     #[test]
     fn header_filtered_roundtrip() {
-        let hdr = Bt2Header::new_for_filtered_chunks(&ctx8(), 2);
+        let hdr = Bt2Header::new_for_filtered_chunks(&ctx8(), 2, 8);
         assert_eq!(hdr.record_type, BT2_TYPE_CHUNK_FILT);
-        // record_size = 2*8 + 8 + 4 + 4 = 32
-        assert_eq!(hdr.record_size, 32);
+        // address(8) + chunk_size(8) + filter_mask(4) + 2 offsets(16) = 36,
+        // the same rule Bt2ChunkIndex::record_size applies.
+        assert_eq!(hdr.record_size, 36);
+        assert_eq!(
+            hdr.record_size,
+            Bt2ChunkIndex::new_filtered(2, 8).record_size(&ctx8()),
+            "header and index must agree on the record size"
+        );
+        // A narrower size field shrinks the record by exactly that much.
+        assert_eq!(
+            Bt2Header::new_for_filtered_chunks(&ctx8(), 2, 2).record_size,
+            30
+        );
 
         let encoded = hdr.encode(&ctx8());
         let decoded = Bt2Header::decode(&encoded, &ctx8()).unwrap();
@@ -1225,7 +1257,7 @@ mod tests {
 
     #[test]
     fn filtered_records_are_ordered_however_they_are_inserted() {
-        let mut idx = Bt2ChunkIndex::new_filtered(2);
+        let mut idx = Bt2ChunkIndex::new_filtered(2, 8);
         for (i, coords) in [[2, 0], [0, 1], [1, 3], [0, 0]].iter().enumerate() {
             idx.insert_filtered(coords.to_vec(), 0x1000 + i as u64, 7, 0);
         }
@@ -1306,7 +1338,7 @@ mod tests {
     #[test]
     fn filtered_chunk_index_encode_decode_roundtrip() {
         let ctx = ctx8();
-        let mut idx = Bt2ChunkIndex::new_filtered(2);
+        let mut idx = Bt2ChunkIndex::new_filtered(2, 8);
         idx.insert_filtered(vec![0, 0], 0x1000, 512, 0);
         idx.insert_filtered(vec![1, 0], 0x2000, 300, 1);
 

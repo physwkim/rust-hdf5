@@ -277,17 +277,43 @@ impl<T: H5Type> DatasetBuilder<T> {
                 let inner = borrow_inner(&self.file_inner);
                 match &*inner {
                     H5FileInner::Writer(writer) => {
-                        let idx = if is_btree2 {
-                            if wants_filter {
-                                return Err(Hdf5Error::InvalidState(
-                                    "compression of v2 B-tree (multi-unlimited-dimension) \
-                                     datasets is not yet supported"
-                                        .into(),
-                                ));
+                        // The requested filter pipeline, if any. Both index
+                        // types that take one explicitly (fixed array and v2
+                        // B-tree) build it the same way, so resolve it once.
+                        let explicit_pipeline = || {
+                            if let Some(p) = self.custom_pipeline.clone() {
+                                p
+                            } else if let Some(level) = self.shuffle_deflate_level {
+                                crate::format::messages::filter::FilterPipeline::shuffle_deflate(
+                                    T::element_size() as u32,
+                                    level,
+                                )
+                            } else {
+                                // deflate_level (checked by wants_filter).
+                                crate::format::messages::filter::FilterPipeline::deflate(
+                                    self.deflate_level.unwrap(),
+                                )
                             }
-                            writer.create_btree_v2_dataset(
-                                &full_name, datatype, &dims_u64, &max_u64, &chunk_u64,
-                            )?
+                        };
+                        let idx = if is_btree2 {
+                            // Two or more unlimited dimensions: a v2 B-tree,
+                            // whose records carry the stored size and filter
+                            // mask when the dataset is compressed (libhdf5
+                            // H5D_BT2_FILT).
+                            if wants_filter {
+                                writer.create_btree_v2_dataset_with_pipeline(
+                                    &full_name,
+                                    datatype,
+                                    &dims_u64,
+                                    &max_u64,
+                                    &chunk_u64,
+                                    explicit_pipeline(),
+                                )?
+                            } else {
+                                writer.create_btree_v2_dataset(
+                                    &full_name, datatype, &dims_u64, &max_u64, &chunk_u64,
+                                )?
+                            }
                         } else if is_fixed_array {
                             // A chunked dataset with no unlimited dimension
                             // must use the fixed-array index — libhdf5
@@ -295,21 +321,12 @@ impl<T: H5Type> DatasetBuilder<T> {
                             // compressed fixed-shape dataset uses a *filtered*
                             // fixed array (FA client id 1).
                             if wants_filter {
-                                let pipeline = if let Some(p) = self.custom_pipeline {
-                                    p
-                                } else if let Some(level) = self.shuffle_deflate_level {
-                                    crate::format::messages::filter::FilterPipeline::shuffle_deflate(
-                                        T::element_size() as u32,
-                                        level,
-                                    )
-                                } else {
-                                    // deflate_level (checked by wants_filter).
-                                    crate::format::messages::filter::FilterPipeline::deflate(
-                                        self.deflate_level.unwrap(),
-                                    )
-                                };
                                 writer.create_fixed_array_dataset_with_pipeline(
-                                    &full_name, datatype, &dims_u64, &chunk_u64, pipeline,
+                                    &full_name,
+                                    datatype,
+                                    &dims_u64,
+                                    &chunk_u64,
+                                    explicit_pipeline(),
                                 )?
                             } else {
                                 writer.create_fixed_array_dataset(
@@ -3530,28 +3547,41 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    // A v2-B-tree index carries filtered chunks in type-11 records, but this
-    // writer never produces one: the builder refuses the combination up
-    // front. The read and write paths for that index rely on it, so pin the
-    // rejection rather than leaving it to the reader of the code.
+    // Two or more unlimited dimensions select the v2 B-tree index; with a
+    // filter its records become type 11, carrying each chunk's stored size and
+    // mask. The payload is highly compressible, so the chunks really are
+    // stored smaller than the extent — the file would be at least
+    // 6*8*4 = 192 bytes of raw chunk data otherwise.
     #[cfg(feature = "deflate")]
     #[test]
-    fn compression_of_a_multi_unlimited_dataset_is_rejected() {
-        let path = temp_path("bt2_filtered_reject");
-        let file = H5File::create(&path).unwrap();
-        let result = file
-            .new_dataset::<i32>()
-            .shape([4, 4])
-            .chunk(&[2, 2])
-            .max_shape(&[None, None])
-            .deflate(6)
-            .create("d");
-        match result {
-            Ok(_) => panic!("a compressed multi-unlimited dataset must not be creatable"),
-            Err(e) => assert!(
-                e.to_string().contains("not yet supported"),
-                "unexpected error: {e}"
-            ),
+    fn compressed_multi_unlimited_dataset_roundtrips() {
+        let path = temp_path("bt2_filtered");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([6, 8])
+                .chunk(&[2, 4])
+                .max_shape(&[None, None])
+                .deflate(6)
+                .create("d")
+                .unwrap();
+            ds.write_slice(&[0, 0], &[6, 8], &[7i32; 48]).unwrap();
+            // A partial write forces a decompress-patch-recompress of one
+            // chunk, whose new compressed size may not fit its old block.
+            ds.write_slice(&[1, 1], &[2, 2], &[1i32, 2, 3, 4]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("d").unwrap();
+            assert_eq!(ds.shape(), vec![6, 8]);
+            let mut want = vec![7i32; 48];
+            want[9] = 1;
+            want[10] = 2;
+            want[17] = 3;
+            want[18] = 4;
+            assert_eq!(ds.read_raw::<i32>().unwrap(), want);
         }
         std::fs::remove_file(&path).ok();
     }

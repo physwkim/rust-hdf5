@@ -587,3 +587,47 @@ fn bt2_1_out_of_order_chunk_writes_readable_by_h5py() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// BT2-2: a compressed dataset with two unlimited dimensions — a v2 B-tree
+/// index whose records are type 11, carrying each chunk's stored size and
+/// filter mask. libhdf5 recomputes that size field's width from the layout
+/// version rather than reading it off the record, so this also pins that our
+/// version-4 layout and our record width agree with what it expects.
+#[cfg(feature = "deflate")]
+#[test]
+fn bt2_2_compressed_multi_unlimited_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("bt2_filtered");
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([6, 8])
+            .chunk(&[2, 4])
+            .max_shape(&[None, None])
+            .deflate(6)
+            .create("grid")
+            .unwrap();
+        ds.write_slice(&[0, 0], &[6, 8], &[7i32; 48]).unwrap();
+        // Patching part of one chunk recompresses it to a different size, so
+        // the chunk moves and the index must record the new size and address.
+        ds.write_slice(&[1, 1], &[2, 2], &[1i32, 2, 3, 4]).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['grid']\n\
+         assert ds.compression == 'gzip', ds.compression\n\
+         assert ds.maxshape == (None, None), ds.maxshape\n\
+         assert ds.chunks == (2, 4), ds.chunks\n\
+         want = np.full((6, 8), 7, dtype='i4')\n\
+         want[1, 1] = 1; want[1, 2] = 2; want[2, 1] = 3; want[2, 2] = 4\n\
+         assert np.array_equal(ds[...], want), ds[...]\n\
+         # Every chunk must be stored compressed, i.e. smaller than 2*4*4 = 32 B.\n\
+         sizes = [ds.id.get_chunk_info(i).size for i in range(ds.id.get_num_chunks())]\n\
+         assert len(sizes) == 6, sizes\n\
+         assert all(s < 32 for s in sizes), sizes\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
