@@ -400,3 +400,56 @@ fn grid_dataset_positioned_write_rejects_misuse() {
     w.close().unwrap();
     cleanup(&path);
 }
+
+/// Under SWMR a relocated chunk's old block must stay intact for readers still
+/// holding the previous index, so the allocator cannot recycle it. An
+/// unfiltered chunk therefore has only one way not to grow the file on
+/// rewrite: overwrite the block it already occupies (libhdf5 does the same —
+/// `H5D__chunk_flush_entry` leaves `must_alloc` false when the address is
+/// already defined and no filter changes the stored size).
+#[test]
+fn swmr_chunk_rewrite_does_not_grow_the_file() {
+    const H: u64 = 4;
+    const W: u64 = 4;
+    let chunk = |v: u16| -> Vec<u8> {
+        (0..(H * W) as u16)
+            .flat_map(|p| (v + p).to_le_bytes())
+            .collect()
+    };
+
+    // Same file, written once vs rewritten eight times over.
+    let write = |label: &str, rewrites: u16| -> (PathBuf, u64) {
+        let path = unique_tmp(label);
+        {
+            let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+            let ds = w
+                .create_grid_dataset::<u16>("grid", &[1, 1, H, W], &[1, 1, H, W])
+                .unwrap();
+            w.start_swmr().unwrap();
+            for v in 1..=rewrites {
+                w.write_chunk_at(ds, &[0, 0, 0, 0], &chunk(v * 100))
+                    .unwrap();
+                w.flush().unwrap();
+            }
+            w.close().unwrap();
+        }
+        let size = std::fs::metadata(&path).unwrap().len();
+        (path, size)
+    };
+
+    let (once_path, once) = write("swmr_rewrite_1", 1);
+    let (many_path, many) = write("swmr_rewrite_8", 8);
+    assert_eq!(
+        many, once,
+        "8 SWMR rewrites of one chunk grew the file past a single write"
+    );
+
+    // The last write is the one that survives.
+    let mut r = SwmrFileReader::open_with_locking(&many_path, NO_LOCK).unwrap();
+    let data: Vec<u16> = r.read_dataset("grid").unwrap();
+    assert_eq!(data[0], 800);
+    drop(r);
+
+    cleanup(&once_path);
+    cleanup(&many_path);
+}
