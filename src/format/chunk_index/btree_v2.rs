@@ -644,15 +644,25 @@ impl Bt2Geometry {
 /// Keeps all records in memory. Serializes as a header + leaf node(s) for
 /// small trees. For larger trees, internal nodes would be needed but we use
 /// the flat approach for simplicity.
+///
+/// Records are held sorted by scaled offsets and are inserted in place, so the
+/// encoded leaf is always ordered. A B-tree node is searched by bisection —
+/// libhdf5 compares records with `H5VM_vector_cmp_u` (`H5Dbtree2.c`
+/// `H5D__bt2_compare`), which orders the scaled-offset vectors
+/// lexicographically — so an unordered leaf makes libhdf5 miss chunks that are
+/// present, reading them back as fill. Insertion order is *not* a safe order:
+/// `write_chunk_at` lets a caller address the grid in any sequence.
 #[derive(Debug, Clone)]
 pub struct Bt2ChunkIndex {
     /// Number of dataset dimensions.
     pub ndims: usize,
     /// Whether chunks are filtered.
     pub filtered: bool,
-    /// Unfiltered chunk records (used when filtered == false).
+    /// Unfiltered chunk records (used when filtered == false), sorted by
+    /// scaled offsets.
     pub records: Vec<Bt2ChunkRecord>,
-    /// Filtered chunk records (used when filtered == true).
+    /// Filtered chunk records (used when filtered == true), sorted by scaled
+    /// offsets.
     pub filtered_records: Vec<Bt2FilteredChunkRecord>,
 }
 
@@ -677,24 +687,24 @@ impl Bt2ChunkIndex {
         }
     }
 
-    /// Insert an unfiltered chunk record.
+    /// Insert an unfiltered chunk record, keeping the records sorted.
     pub fn insert(&mut self, scaled_offsets: Vec<u64>, chunk_address: u64) {
-        // Check if a record with the same coordinates already exists
-        if let Some(existing) = self
+        match self
             .records
-            .iter_mut()
-            .find(|r| r.scaled_offsets == scaled_offsets)
+            .binary_search_by(|r| r.scaled_offsets.as_slice().cmp(&scaled_offsets))
         {
-            existing.chunk_address = chunk_address;
-        } else {
-            self.records.push(Bt2ChunkRecord {
-                scaled_offsets,
-                chunk_address,
-            });
+            Ok(i) => self.records[i].chunk_address = chunk_address,
+            Err(i) => self.records.insert(
+                i,
+                Bt2ChunkRecord {
+                    scaled_offsets,
+                    chunk_address,
+                },
+            ),
         }
     }
 
-    /// Insert a filtered chunk record.
+    /// Insert a filtered chunk record, keeping the records sorted.
     pub fn insert_filtered(
         &mut self,
         scaled_offsets: Vec<u64>,
@@ -702,36 +712,42 @@ impl Bt2ChunkIndex {
         chunk_size: u32,
         filter_mask: u32,
     ) {
-        if let Some(existing) = self
+        match self
             .filtered_records
-            .iter_mut()
-            .find(|r| r.scaled_offsets == scaled_offsets)
+            .binary_search_by(|r| r.scaled_offsets.as_slice().cmp(&scaled_offsets))
         {
-            existing.chunk_address = chunk_address;
-            existing.chunk_size = chunk_size;
-            existing.filter_mask = filter_mask;
-        } else {
-            self.filtered_records.push(Bt2FilteredChunkRecord {
-                scaled_offsets,
-                chunk_address,
-                chunk_size,
-                filter_mask,
-            });
+            Ok(i) => {
+                let rec = &mut self.filtered_records[i];
+                rec.chunk_address = chunk_address;
+                rec.chunk_size = chunk_size;
+                rec.filter_mask = filter_mask;
+            }
+            Err(i) => self.filtered_records.insert(
+                i,
+                Bt2FilteredChunkRecord {
+                    scaled_offsets,
+                    chunk_address,
+                    chunk_size,
+                    filter_mask,
+                },
+            ),
         }
     }
 
     /// Look up a chunk by its scaled coordinates. Returns the record if found.
     pub fn lookup(&self, scaled_offsets: &[u64]) -> Option<&Bt2ChunkRecord> {
         self.records
-            .iter()
-            .find(|r| r.scaled_offsets == scaled_offsets)
+            .binary_search_by(|r| r.scaled_offsets.as_slice().cmp(scaled_offsets))
+            .ok()
+            .map(|i| &self.records[i])
     }
 
     /// Look up a filtered chunk by its scaled coordinates.
     pub fn lookup_filtered(&self, scaled_offsets: &[u64]) -> Option<&Bt2FilteredChunkRecord> {
         self.filtered_records
-            .iter()
-            .find(|r| r.scaled_offsets == scaled_offsets)
+            .binary_search_by(|r| r.scaled_offsets.as_slice().cmp(scaled_offsets))
+            .ok()
+            .map(|i| &self.filtered_records[i])
     }
 
     /// Iterate all unfiltered records.
@@ -1186,6 +1202,39 @@ mod tests {
         assert_eq!(r.chunk_address, 0x2000);
 
         assert!(idx.lookup(&[2, 2]).is_none());
+    }
+
+    // libhdf5 bisects a B-tree node, so the encoded leaf must be ordered by
+    // scaled offsets no matter what order the caller writes chunks in.
+    #[test]
+    fn records_are_ordered_however_they_are_inserted() {
+        let mut idx = Bt2ChunkIndex::new_unfiltered(2);
+        for coords in [[1, 1], [0, 2], [1, 0], [0, 0], [0, 1]] {
+            idx.insert(coords.to_vec(), 0x1000);
+        }
+        let order: Vec<Vec<u64>> = idx.iter().map(|r| r.scaled_offsets.clone()).collect();
+        assert_eq!(
+            order,
+            vec![vec![0, 0], vec![0, 1], vec![0, 2], vec![1, 0], vec![1, 1]]
+        );
+        // Every record is still reachable after the reordering.
+        for coords in [[1, 1], [0, 2], [1, 0], [0, 0], [0, 1]] {
+            assert!(idx.lookup(&coords).is_some(), "lost {coords:?}");
+        }
+    }
+
+    #[test]
+    fn filtered_records_are_ordered_however_they_are_inserted() {
+        let mut idx = Bt2ChunkIndex::new_filtered(2);
+        for (i, coords) in [[2, 0], [0, 1], [1, 3], [0, 0]].iter().enumerate() {
+            idx.insert_filtered(coords.to_vec(), 0x1000 + i as u64, 7, 0);
+        }
+        let order: Vec<Vec<u64>> = idx
+            .iter_filtered()
+            .map(|r| r.scaled_offsets.clone())
+            .collect();
+        assert_eq!(order, vec![vec![0, 0], vec![0, 1], vec![1, 3], vec![2, 0]]);
+        assert_eq!(idx.lookup_filtered(&[1, 3]).unwrap().chunk_address, 0x1002);
     }
 
     #[test]
