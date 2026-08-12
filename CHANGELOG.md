@@ -18,7 +18,32 @@
   reached hold the dataset's fill value. All three chunk index types
   (extensible array, fixed array, v2 B-tree) are supported.
 
+- Compression now works on datasets with two or more unlimited dimensions,
+  which use a v2 B-tree chunk index. The combination was previously rejected
+  with "compression of v2 B-tree (multi-unlimited-dimension) datasets is not
+  yet supported", although libhdf5 supports it (`H5D_BT2_FILT` in
+  `H5Dbtree2.c`) and h5py produces one from `maxshape=(None, None)` plus
+  `compression=`. The index now writes type-11 records carrying each chunk's
+  stored size and filter mask, so a partial `write_slice` can decompress,
+  patch and recompress a chunk and relocate it when its size changes.
+
 ### Fixed
+
+- A v2 B-tree chunk index is now written with its records ordered by scaled
+  offsets. libhdf5 searches a B-tree node by bisection (`H5D__bt2_compare`
+  orders records with `H5VM_vector_cmp_u`), and records were appended in
+  insertion order, so a file was only correct when the caller happened to
+  write the chunk grid in ascending order. Writing it in any other order —
+  which `write_chunk_at` permits — produced a file this library read back
+  perfectly while libhdf5 and h5py saw the out-of-order chunks as fill: wrong
+  data, with no error. Records are now inserted in sorted position and
+  lookups bisect.
+
+- The width of a filtered v2-B-tree record's compressed-size field is now
+  derived from the chunk size, matching what libhdf5 recomputes for a
+  version-4 layout message (`H5D_BT2_COMPUTE_CHUNK_SIZE_LEN`). The header
+  constructor and the index previously disagreed about it (a 32- versus
+  36-byte record); both now take it from one value.
 
 - Rewriting a chunk no longer leaks its old file block. Every chunk write
   previously allocated fresh space and left the previous block stranded, so
