@@ -3530,6 +3530,32 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    // A v2-B-tree index carries filtered chunks in type-11 records, but this
+    // writer never produces one: the builder refuses the combination up
+    // front. The read and write paths for that index rely on it, so pin the
+    // rejection rather than leaving it to the reader of the code.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn compression_of_a_multi_unlimited_dataset_is_rejected() {
+        let path = temp_path("bt2_filtered_reject");
+        let file = H5File::create(&path).unwrap();
+        let result = file
+            .new_dataset::<i32>()
+            .shape([4, 4])
+            .chunk(&[2, 2])
+            .max_shape(&[None, None])
+            .deflate(6)
+            .create("d");
+        match result {
+            Ok(_) => panic!("a compressed multi-unlimited dataset must not be creatable"),
+            Err(e) => assert!(
+                e.to_string().contains("not yet supported"),
+                "unexpected error: {e}"
+            ),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn btree_v2_multi_unlimited_roundtrip() {
         // A dataset with two unlimited dimensions uses the v2 B-tree chunk
