@@ -2783,6 +2783,141 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// One 2x4 i32 chunk whose every element is `v`.
+    fn chunk_of(v: i32) -> Vec<u8> {
+        (0..8).flat_map(|_| v.to_le_bytes()).collect()
+    }
+
+    /// Write chunk (0,0) `rewrites` times — each time with a different value,
+    /// so no write can be skipped — and return the closed file's size along
+    /// with what the chunk reads back as.
+    fn rewrite_chunk(
+        tag: &str,
+        rewrites: i32,
+        build: impl Fn(&H5File) -> crate::H5Dataset,
+    ) -> (u64, i32) {
+        let path = temp_path(tag);
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = build(&file);
+            for v in 1..=rewrites {
+                ds.write_chunk_at(&[0, 0], &chunk_of(v)).unwrap();
+            }
+            file.close().unwrap();
+        }
+        let size = std::fs::metadata(&path).unwrap().len();
+        let first = {
+            let file = H5File::open(&path).unwrap();
+            file.dataset("d").unwrap().read_raw::<i32>().unwrap()[0]
+        };
+        std::fs::remove_file(&path).ok();
+        (size, first)
+    }
+
+    // An unfiltered chunk's stored size is fixed by the chunk shape, so
+    // rewriting it must overwrite the block it already occupies rather than
+    // abandoning it and appending a new one (libhdf5 H5D__chunk_flush_entry
+    // leaves must_alloc false for exactly this case). The file must therefore
+    // be byte-identical in size no matter how many times the chunk is written.
+    #[test]
+    fn rewriting_an_unfiltered_extensible_array_chunk_stays_in_place() {
+        let build = |f: &H5File| {
+            f.new_dataset::<i32>()
+                .shape([2, 4])
+                .chunk(&[2, 4])
+                .max_shape(&[None, Some(4)])
+                .create("d")
+                .unwrap()
+        };
+        let (once, _) = rewrite_chunk("rewrite_ea_1", 1, build);
+        let (many, last) = rewrite_chunk("rewrite_ea_8", 8, build);
+        assert_eq!(many, once, "8 rewrites grew the file past a single write");
+        assert_eq!(last, 8, "the last write must be the one that survives");
+    }
+
+    #[test]
+    fn rewriting_an_unfiltered_fixed_array_chunk_stays_in_place() {
+        let build = |f: &H5File| {
+            f.new_dataset::<i32>()
+                .shape([2, 4])
+                .chunk(&[2, 4])
+                .create("d")
+                .unwrap()
+        };
+        let (once, _) = rewrite_chunk("rewrite_fa_1", 1, build);
+        let (many, last) = rewrite_chunk("rewrite_fa_8", 8, build);
+        assert_eq!(many, once, "8 rewrites grew the file past a single write");
+        assert_eq!(last, 8);
+    }
+
+    #[test]
+    fn rewriting_an_unfiltered_btree_v2_chunk_stays_in_place() {
+        let build = |f: &H5File| {
+            f.new_dataset::<i32>()
+                .shape([2, 4])
+                .chunk(&[2, 4])
+                .max_shape(&[None, None])
+                .create("d")
+                .unwrap()
+        };
+        let (once, _) = rewrite_chunk("rewrite_bt2_1", 1, build);
+        let (many, last) = rewrite_chunk("rewrite_bt2_8", 8, build);
+        assert_eq!(many, once, "8 rewrites grew the file past a single write");
+        assert_eq!(last, 8);
+    }
+
+    // A filtered chunk whose compressed size changes cannot stay put, so it
+    // moves and releases its old block (libhdf5 H5D__chunk_file_alloc calls
+    // H5MF_xfree). Alternating between two payloads of different compressed
+    // size must therefore keep reusing the same two blocks instead of
+    // appending a fresh one each time.
+    #[test]
+    fn rewriting_a_filtered_chunk_recycles_the_released_block() {
+        // All-equal elements deflate to far fewer bytes than a varied payload,
+        // so the two writes below land at different stored sizes.
+        let flat: Vec<u8> = (0..8).flat_map(|_| 7i32.to_le_bytes()).collect();
+        let varied: Vec<u8> = (0..8i32)
+            .flat_map(|i| i.wrapping_mul(0x5bd1_e995).to_le_bytes())
+            .collect();
+
+        let sizes: Vec<u64> = [1usize, 8]
+            .iter()
+            .map(|&rounds| {
+                let path = temp_path(&format!("rewrite_filtered_{rounds}"));
+                {
+                    let file = H5File::create(&path).unwrap();
+                    let ds = file
+                        .new_dataset::<i32>()
+                        .shape([2, 4])
+                        .chunk(&[2, 4])
+                        .max_shape(&[None, Some(4)])
+                        .deflate(6)
+                        .create("d")
+                        .unwrap();
+                    for _ in 0..rounds {
+                        ds.write_chunk_at(&[0, 0], &flat).unwrap();
+                        ds.write_chunk_at(&[0, 0], &varied).unwrap();
+                    }
+                    file.close().unwrap();
+                }
+                let size = std::fs::metadata(&path).unwrap().len();
+                {
+                    let file = H5File::open(&path).unwrap();
+                    let got = file.dataset("d").unwrap().read_raw::<i32>().unwrap();
+                    let want: Vec<i32> = (0..8i32).map(|i| i.wrapping_mul(0x5bd1_e995)).collect();
+                    assert_eq!(got, want, "the last write must survive the round trip");
+                }
+                std::fs::remove_file(&path).ok();
+                size
+            })
+            .collect();
+
+        assert_eq!(
+            sizes[1], sizes[0],
+            "8 alternating rewrites grew the file past a single pair"
+        );
+    }
+
     #[test]
     fn write_slice_out_of_bounds_rejected() {
         let path = temp_path("write_slice_oob");

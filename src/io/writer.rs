@@ -414,6 +414,14 @@ pub struct Hdf5Writer {
     /// write path takes it, so it cannot deadlock with the registry locks.
     pub(crate) create_lock: Slot<()>,
     closed: bool,
+    /// Set once `finalize_for_swmr` has published a readable file.
+    ///
+    /// A SWMR reader may hold a chunk index that still points at a block this
+    /// writer has since replaced, so from that point on a relocated chunk's
+    /// old block is kept rather than released for reuse — the same rule as
+    /// libhdf5's `H5D__chunk_file_alloc`, which skips `H5MF_xfree` under
+    /// `H5F_ACC_SWMR_WRITE`.
+    swmr_active: bool,
     /// Address of the root group object header (set after first finalize).
     root_group_addr: Option<u64>,
     /// Size of the encoded root group object header (for in-place rewrites).
@@ -467,6 +475,7 @@ impl Hdf5Writer {
             root_attributes: Slot::new(Vec::new()),
             create_lock: Slot::new(()),
             closed: false,
+            swmr_active: false,
             root_group_addr: None,
             root_group_encoded_size: 0,
         })
@@ -936,6 +945,7 @@ impl Hdf5Writer {
             root_attributes: Slot::new(root_attributes),
             create_lock: Slot::new(()),
             closed: false,
+            swmr_active: false,
             root_group_addr: None,
             root_group_encoded_size: 0,
         })
@@ -1654,29 +1664,57 @@ impl Hdf5Writer {
         } else {
             data
         };
-        let compressed_size = write_data.len() as u64;
-
-        // Allocate space for the chunk data
-        let chunk_addr = self.allocator.allocate(compressed_size);
-        self.handle.write_at(chunk_addr, write_data)?;
-
         // filter_mask = 0: this path runs the whole pipeline, so no filter is
         // skipped for the chunk.
-        self.record_ea_chunk(index, chunk_idx, chunk_addr, compressed_size, 0)
+        self.record_ea_chunk(index, chunk_idx, write_data, 0)
     }
 
-    /// Record a written chunk in the extensible-array index, placing
-    /// its address (and compressed size, for filtered datasets) into
-    /// the index block, a data block, or a super block per the EA
-    /// geometry. Shared by write_chunk and write_compressed_chunk.
+    /// Decide where a chunk's bytes belong and put them there, returning the
+    /// address to record in the index.
+    ///
+    /// `old` is the chunk's current `(address, stored length)` if the index
+    /// already holds an entry for it. This is the single owner of the
+    /// rewrite-placement rule, mirroring libhdf5's `H5D__chunk_file_alloc`
+    /// (`H5Dchunk.c`): a chunk whose stored size is unchanged is overwritten
+    /// where it already lives, and only a chunk that no longer fits moves,
+    /// releasing its old block. Without this every rewrite would abandon the
+    /// old block and grow the file.
+    fn place_chunk(&self, old: Option<(u64, u64)>, new_len: u64) -> u64 {
+        match old {
+            // Same stored size: overwrite in place. This is every unfiltered
+            // rewrite (the stored size is fixed by the chunk shape) and every
+            // filtered rewrite that compressed to the same length.
+            Some((addr, len)) if addr != UNDEF_ADDR && len == new_len => addr,
+            Some((addr, len)) if addr != UNDEF_ADDR => {
+                // The chunk has to move. Under SWMR a reader may still hold an
+                // index that points at the old block, so libhdf5 keeps it
+                // (H5D__chunk_file_alloc skips H5MF_xfree when the file is
+                // open for SWMR writing); do the same.
+                if !self.swmr_active {
+                    self.allocator.free(addr, len);
+                }
+                self.allocator.allocate(new_len)
+            }
+            _ => self.allocator.allocate(new_len),
+        }
+    }
+
+    /// Place a chunk's already-final bytes (filtered if the dataset is
+    /// filtered) in the file and record them in the extensible-array index —
+    /// in the index block, a data block, or a super block per the EA geometry.
+    /// Shared by write_chunk and write_compressed_chunk.
+    ///
+    /// The index lookup happens *before* the bytes are placed, because the
+    /// entry it finds is what tells [`place_chunk`](Self::place_chunk) whether
+    /// this is a rewrite that can stay put.
     fn record_ea_chunk(
         &self,
         index: usize,
         chunk_idx: u64,
-        chunk_addr: u64,
-        compressed_size: u64,
+        final_bytes: &[u8],
         filter_mask: u32,
     ) -> IoResult<()> {
+        let compressed_size = final_bytes.len() as u64;
         let ds = self.ds(index);
         // Hold one slot guard for the whole method: every dataset-state access
         // below goes through `m`, while `self.handle`/`self.allocator`/`self.ctx`
@@ -1709,6 +1747,10 @@ impl Hdf5Writer {
             let chunked = m.chunked.as_mut().unwrap();
             if is_filtered {
                 if let Some(ref mut fiblk) = chunked.filt_iblk {
+                    let old = fiblk.elements[chunk_idx as usize];
+                    let chunk_addr =
+                        self.place_chunk(Some((old.addr, old.nbytes)), compressed_size);
+                    self.handle.write_at(chunk_addr, final_bytes)?;
                     fiblk.elements[chunk_idx as usize] = FilteredChunkEntry {
                         addr: chunk_addr,
                         nbytes: compressed_size,
@@ -1716,6 +1758,11 @@ impl Hdf5Writer {
                     };
                 }
             } else {
+                // An unfiltered chunk's stored size is fixed by the chunk
+                // shape, so a rewrite always fits where it already is.
+                let old = chunked.ea_iblk.elements[chunk_idx as usize];
+                let chunk_addr = self.place_chunk(Some((old, compressed_size)), compressed_size);
+                self.handle.write_at(chunk_addr, final_bytes)?;
                 chunked.ea_iblk.elements[chunk_idx as usize] = chunk_addr;
             }
             chunked.chunks_written += 1;
@@ -1831,11 +1878,6 @@ impl Hdf5Writer {
             // Create or update the data block holding this chunk's entry.
             let created = dblk_addr == UNDEF_ADDR;
             if is_filtered {
-                let entry = FilteredChunkEntry {
-                    addr: chunk_addr,
-                    nbytes: compressed_size,
-                    filter_mask,
-                };
                 let mut dblk = if created {
                     FilteredDataBlock::new(ea_header_addr, loc.dblk_block_offset, dblk_nelmts)
                 } else {
@@ -1847,6 +1889,16 @@ impl Hdf5Writer {
                         dblk_nelmts,
                         chunk_size_len,
                     )?
+                };
+                // A freshly created data block holds only undefined addresses,
+                // so this reads as "no previous chunk" without a special case.
+                let old = dblk.elements[loc.offset_in_dblk as usize];
+                let chunk_addr = self.place_chunk(Some((old.addr, old.nbytes)), compressed_size);
+                self.handle.write_at(chunk_addr, final_bytes)?;
+                let entry = FilteredChunkEntry {
+                    addr: chunk_addr,
+                    nbytes: compressed_size,
+                    filter_mask,
                 };
                 dblk.elements[loc.offset_in_dblk as usize] = entry;
                 let enc = dblk.encode(&self.ctx, max_nelmts_bits, chunk_size_len);
@@ -1870,6 +1922,13 @@ impl Hdf5Writer {
                     let buf = self.handle.read_at_most(dblk_addr, 65536)?;
                     ExtensibleArrayDataBlock::decode(&buf, &self.ctx, max_nelmts_bits, dblk_nelmts)?
                 };
+                // Unfiltered: the stored size is fixed by the chunk shape, so
+                // a rewrite always fits its old block. A freshly created data
+                // block holds undefined addresses and falls through to a new
+                // allocation.
+                let old = dblk.elements[loc.offset_in_dblk as usize];
+                let chunk_addr = self.place_chunk(Some((old, compressed_size)), compressed_size);
+                self.handle.write_at(chunk_addr, final_bytes)?;
                 dblk.elements[loc.offset_in_dblk as usize] = chunk_addr;
                 let enc = dblk.encode(&self.ctx, max_nelmts_bits);
                 if created {
@@ -3415,11 +3474,8 @@ impl Hdf5Writer {
             stride *= n_chunks_in_dim;
         }
 
-        // Allocate space for the chunk data
-        let chunk_addr = self.allocator.allocate(final_bytes.len() as u64);
-        self.handle.write_at(chunk_addr, final_bytes)?;
-
-        // Update the fixed array data block.
+        // Update the fixed array data block. The slot is read before the bytes
+        // are placed so a rewrite can stay where it is (see `place_chunk`).
         let fa = m.fixed_array.as_mut().unwrap();
         let lidx = linear_idx as usize;
         if is_filtered {
@@ -3449,6 +3505,12 @@ impl Hdf5Writer {
                 )));
             }
             if lidx < fa.fa_dblk.filtered_elements.len() {
+                let old = &fa.fa_dblk.filtered_elements[lidx];
+                let chunk_addr = self.place_chunk(
+                    Some((old.address, old.chunk_size as u64)),
+                    stored_size as u64,
+                );
+                self.handle.write_at(chunk_addr, final_bytes)?;
                 fa.fa_dblk.filtered_elements[lidx] = FixedArrayFilteredChunkElement {
                     address: chunk_addr,
                     chunk_size: stored_size as u32,
@@ -3471,6 +3533,12 @@ impl Hdf5Writer {
                 ));
             }
             if lidx < fa.fa_dblk.elements.len() {
+                // Unfiltered: the stored size is fixed by the chunk shape, so
+                // a rewrite always fits its old block.
+                let old = fa.fa_dblk.elements[lidx];
+                let len = final_bytes.len() as u64;
+                let chunk_addr = self.place_chunk(Some((old, len)), len);
+                self.handle.write_at(chunk_addr, final_bytes)?;
                 fa.fa_dblk.elements[lidx] = chunk_addr;
                 fa.chunks_written += 1;
             } else {
@@ -3513,8 +3581,11 @@ impl Hdf5Writer {
             )));
         }
 
-        // Allocate space for the chunk data
-        let chunk_addr = self.allocator.allocate(chunk_bytes);
+        // Place the bytes: a rewrite of an already-recorded chunk stays where
+        // it is, since an unfiltered chunk's stored size is fixed by the chunk
+        // shape (see `place_chunk`).
+        let old = bt2.index.lookup(chunk_coords).map(|r| r.chunk_address);
+        let chunk_addr = self.place_chunk(old.map(|a| (a, chunk_bytes)), chunk_bytes);
         self.handle.write_at(chunk_addr, data)?;
 
         // Insert into the in-memory BT2 index
@@ -3620,11 +3691,7 @@ impl Hdf5Writer {
                     .into(),
             ));
         }
-        let compressed_size = compressed_data.len() as u64;
-        let chunk_addr = self.allocator.allocate(compressed_size);
-        self.handle.write_at(chunk_addr, compressed_data)?;
-
-        self.record_ea_chunk(index, chunk_idx, chunk_addr, compressed_size, filter_mask)
+        self.record_ea_chunk(index, chunk_idx, compressed_data, filter_mask)
     }
 
     /// Extend the dimensions of a chunked dataset.
@@ -3960,6 +4027,10 @@ impl Hdf5Writer {
         self.write_superblock(FLAG_WRITE_ACCESS | FLAG_SWMR_WRITE)?;
 
         self.handle.sync_all()?;
+        // Readers can now be following this file, so a chunk that moves must
+        // leave its old block intact for whoever is still holding the previous
+        // index (see `swmr_active`).
+        self.swmr_active = true;
         Ok(())
     }
 
