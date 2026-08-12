@@ -1919,10 +1919,12 @@ impl H5Dataset {
     /// replacement in a dataset that declares ASCII is rejected rather than
     /// stored under a datatype that misdescribes it.
     ///
-    /// The objects the replaced references pointed at stay in their global
-    /// heap collections, unreachable. Nothing in this library frees global
-    /// heap space, so a column updated many times grows the file; rewriting
-    /// the dataset is what reclaims it.
+    /// The global heap objects the replaced references pointed at are freed —
+    /// the same reclaim libhdf5 performs on an overwrite — so updating one
+    /// element repeatedly reuses space rather than growing the file. A
+    /// collection emptied by the update returns its block to the allocator.
+    /// Under SWMR nothing is freed, because a reader may still be following
+    /// those references.
     ///
     /// ```no_run
     /// # use rust_hdf5::H5File;
@@ -5127,5 +5129,166 @@ mod tests {
         );
         file.close().unwrap();
         std::fs::remove_file(&path).ok();
+    }
+
+    // ---- superseded global heap objects (libhdf5 H5HG_remove parity) -------
+
+    /// Repeatedly replacing the same element must not grow the file per
+    /// update: the collection each update supersedes is freed and the next
+    /// update's collection lands in that block. Without the release every
+    /// update costs another `H5HG_MINALLOC` (4096) bytes.
+    #[test]
+    fn write_vlen_strings_slice_reuses_the_freed_heap_block() {
+        let size_after = |updates: usize| {
+            let path = temp_path(&format!("vlen_slice_heap_reuse_{updates}"));
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_strings("notes", &["a", "b"]).unwrap();
+            let ds = file.dataset_writer("notes").unwrap();
+            for i in 0..updates {
+                ds.write_vlen_strings_slice(0, &[&format!("update {i}")])
+                    .unwrap();
+            }
+            file.close().unwrap();
+            let n = std::fs::metadata(&path).unwrap().len();
+            let read = H5File::open(&path).unwrap();
+            assert_eq!(
+                read.dataset("notes").unwrap().read_vlen_strings().unwrap(),
+                vec![format!("update {}", updates - 1), "b".to_string()]
+            );
+            drop(read);
+            std::fs::remove_file(&path).ok();
+            n
+        };
+
+        // The allocator settles once a freed block is available to reuse, so
+        // every count past that produces the same file.
+        let settled = size_after(3);
+        assert_eq!(size_after(20), settled, "20 updates against 3");
+        assert_eq!(size_after(50), settled, "50 updates against 3");
+    }
+
+    /// The elements the update does not name keep their strings, so freeing
+    /// the superseded objects must not disturb the collection's survivors.
+    #[test]
+    fn write_vlen_strings_slice_keeps_the_untouched_strings_readable() {
+        let path = temp_path("vlen_slice_heap_survivors");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_strings("notes", &["a", "b", "c", "d"])
+                .unwrap();
+            let ds = file.dataset_writer("notes").unwrap();
+            // Two updates inside the one collection the create wrote, so the
+            // second reads a collection the first already rewrote.
+            ds.write_vlen_strings_slice(1, &["B"]).unwrap();
+            ds.write_vlen_strings_slice(3, &["D"]).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("notes").unwrap().read_vlen_strings().unwrap(),
+            vec!["a", "B", "c", "D"]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Replacing every element of a chunked dataset empties the collection the
+    /// append wrote, and the file must still read back correctly after its
+    /// block goes to the allocator.
+    #[test]
+    fn write_vlen_strings_slice_frees_an_emptied_collection() {
+        let path = temp_path("vlen_slice_heap_emptied");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.create_appendable_vlen_dataset("notes", 2, None)
+                .unwrap();
+            file.append_vlen_strings("notes", &["p", "q", "r", "s"])
+                .unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open_rw(&path).unwrap();
+            file.dataset_writer("notes")
+                .unwrap()
+                .write_vlen_strings_slice(0, &["w", "x", "y", "z"])
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("notes").unwrap().read_vlen_strings().unwrap(),
+            vec!["w", "x", "y", "z"]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A collection larger than the 4096-byte minimum must keep its size when
+    /// an object leaves it. Re-encoding at the natural size instead shrinks
+    /// what the header declares, so the block's tail stops being part of the
+    /// collection and the eventual free returns less than was allocated —
+    /// stranding the difference on every cycle.
+    #[test]
+    fn write_vlen_strings_slice_keeps_an_oversized_collections_block_whole() {
+        let big = |tag: char| std::iter::repeat_n(tag, 2000).collect::<String>();
+        let size_after = |cycles: usize| {
+            let path = temp_path(&format!("vlen_slice_heap_big_{cycles}"));
+            let file = H5File::create(&path).unwrap();
+            let seed: Vec<String> = "abcd".chars().map(big).collect();
+            let refs: Vec<&str> = seed.iter().map(|s| s.as_str()).collect();
+            // Four 2000-byte strings do not fit the 4096-byte minimum, so this
+            // is one collection well above it.
+            file.write_vlen_strings("notes", &refs).unwrap();
+            let ds = file.dataset_writer("notes").unwrap();
+            for _ in 0..cycles {
+                // Partially empty the collection, then finish it off: the
+                // block is freed only after it has been rewritten once.
+                let head = big('x');
+                ds.write_vlen_strings_slice(0, &[&head]).unwrap();
+                let tail: Vec<String> = "yzw".chars().map(big).collect();
+                let tail_refs: Vec<&str> = tail.iter().map(|s| s.as_str()).collect();
+                ds.write_vlen_strings_slice(1, &tail_refs).unwrap();
+            }
+            file.close().unwrap();
+            let n = std::fs::metadata(&path).unwrap().len();
+            let read = H5File::open(&path).unwrap();
+            assert_eq!(
+                read.dataset("notes").unwrap().read_vlen_strings().unwrap(),
+                vec![big('x'), big('y'), big('z'), big('w')]
+            );
+            drop(read);
+            std::fs::remove_file(&path).ok();
+            n
+        };
+
+        let settled = size_after(4);
+        assert_eq!(size_after(30), settled, "30 cycles against 4");
+    }
+
+    /// An element still in the append buffer has never been on disk, so its
+    /// superseded object has to be found in the buffer or it is stranded.
+    #[test]
+    fn write_vlen_strings_slice_releases_a_buffered_elements_object() {
+        let path = temp_path("vlen_slice_heap_buffered");
+        let file = H5File::create(&path).unwrap();
+        file.create_appendable_vlen_dataset("notes", 4, None)
+            .unwrap();
+        file.append_vlen_strings("notes", &["a", "b", "c"]).unwrap();
+        let ds = file.dataset_writer("notes").unwrap();
+        for i in 0..20 {
+            ds.write_vlen_strings_slice(1, &[&format!("patch {i}")])
+                .unwrap();
+        }
+        file.close().unwrap();
+
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("notes").unwrap().read_vlen_strings().unwrap(),
+            vec!["a", "patch 19", "c"]
+        );
+        let size = std::fs::metadata(&path).unwrap().len();
+        std::fs::remove_file(&path).ok();
+        assert!(
+            size < 20 * 4096,
+            "20 buffered updates left {size} bytes, one collection per update"
+        );
     }
 }

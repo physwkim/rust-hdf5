@@ -20,8 +20,18 @@
   strings go into one global-heap collection and their references are written
   over the range; elements still held in the append buffer are patched there,
   so the flush at close does not write the pre-update reference back over
-  them. The heap objects the replaced references pointed at stay in the file
-  as unreachable bytes — libhdf5 does not reclaim them either.
+  them.
+
+- Superseded global heap objects are now freed. Overwriting a vlen element
+  reads the reference it replaces first and removes the object it names, as
+  libhdf5 does (`H5T__vlen_disk_write` → `H5T__vlen_disk_delete` →
+  `H5HG_remove`): the collection is rewritten at its existing size with the
+  recovered bytes given to its free-space marker, and one left with no objects
+  returns its block to the allocator. Without this, each update stranded a
+  4096-byte collection (`H5HG_MINALLOC`), so a column updated in a loop grew
+  the file without bound. Under SWMR the release is suppressed, since a reader
+  may still be following those references — the same rule a relocated chunk's
+  old block follows.
 
 ## 0.4.0
 

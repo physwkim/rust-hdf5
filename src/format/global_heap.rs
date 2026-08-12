@@ -83,6 +83,33 @@ impl GlobalHeapCollection {
             .map(|o| o.data.as_slice())
     }
 
+    /// Drop the object with this 1-based index, reporting whether it was
+    /// there.
+    ///
+    /// The surviving objects keep their indices, so the vlen references that
+    /// name them stay valid; only their offsets within the collection move.
+    /// This is what libhdf5's `H5HG_remove` does — it compacts the objects and
+    /// gives the recovered bytes to the free-space marker — and re-encoding at
+    /// the collection's existing size ([`encode_at_size`](Self::encode_at_size))
+    /// reproduces that layout. Removing an index that is already gone is not
+    /// an error: two elements of one dataset may name the same object, so a
+    /// range update can reach it twice (libhdf5 tolerates the same case, see
+    /// its HDFFV-10635 note).
+    pub fn remove_object(&mut self, index: u16) -> bool {
+        match self.objects.iter().position(|o| o.index == index) {
+            Some(at) => {
+                self.objects.remove(at);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// True when the collection holds no objects, so its block is free.
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+
     /// Encode the collection into a byte vector.
     ///
     /// The encoded blob includes the GCOL header and all heap objects,
@@ -90,24 +117,41 @@ impl GlobalHeapCollection {
     /// The total size is padded to at least 4096 bytes (H5HG_MINALLOC)
     /// for compatibility with the HDF5 C library.
     pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
+        // Unwrap: the size asked for is the one `encode_at_size` computes as
+        // the minimum, so it always fits.
+        self.encode_at_size(ctx, self.encoded_size(ctx)).unwrap()
+    }
+
+    /// The smallest collection size that holds these objects — what
+    /// [`encode`](Self::encode) uses.
+    pub fn encoded_size(&self, ctx: &FormatContext) -> usize {
+        let (header_size, objhdr_size, objects_size) = self.layout(ctx);
+        (header_size + objects_size + objhdr_size).max(GCOL_MIN_SIZE)
+    }
+
+    /// Encode the collection into a block of exactly `collection_size` bytes,
+    /// with everything not used by an object given to the free-space marker.
+    ///
+    /// A collection is rewritten in place after [`remove_object`](Self::remove_object),
+    /// and its block does not shrink — libhdf5's `H5HG_remove` keeps the
+    /// collection's size and grows its free space instead, and shortening the
+    /// image would leave the tail of the previous, longer one on disk. Fails
+    /// if the objects do not fit in `collection_size`.
+    pub fn encode_at_size(
+        &self,
+        ctx: &FormatContext,
+        collection_size: usize,
+    ) -> FormatResult<Vec<u8>> {
         let ss = ctx.sizeof_size as usize;
+        let (header_size, objhdr_size, objects_size) = self.layout(ctx);
 
-        // libhdf5 (H5HGpkg.h) 8-byte-aligns both the collection header and
-        // every object header (H5HG_ALIGN). For ss == 8 the raw sizes are
-        // already multiples of 8, so this is a no-op there and only matters
-        // for files with 4-byte lengths.
-        let header_size = pad_to_8(4 + 1 + 3 + ss); // GCOL + version + reserved + collection_size
-        let objhdr_size = pad_to_8(2 + 2 + 4 + ss); // index + ref_count + reserved + size
-        let mut objects_size: usize = 0;
-        for obj in &self.objects {
-            objects_size += objhdr_size + pad_to_8(obj.data.len());
+        // The free-space marker's own header has to fit after the objects.
+        let content_size = header_size + objects_size + objhdr_size;
+        if collection_size < content_size {
+            return Err(FormatError::InvalidData(format!(
+                "global heap collection needs {content_size} bytes but was given {collection_size}"
+            )));
         }
-        // Free-space marker carries the same (aligned) object header.
-        let free_marker_size = objhdr_size;
-        let content_size = header_size + objects_size + free_marker_size;
-
-        // HDF5 C library requires collection_size >= 4096 (H5HG_MINALLOC)
-        let collection_size = content_size.max(GCOL_MIN_SIZE);
         // HDF5 convention: free marker size = collection_size - header - objects
         // (includes the free marker's own header in the "free space")
         let free_space = collection_size - header_size - objects_size;
@@ -143,7 +187,49 @@ impl GlobalHeapCollection {
         buf.resize(collection_size, 0);
 
         debug_assert_eq!(buf.len(), collection_size);
-        buf
+        Ok(buf)
+    }
+
+    /// Aligned header size, aligned object-header size, and the total the
+    /// objects occupy — the three numbers every size calculation here needs.
+    ///
+    /// libhdf5 (H5HGpkg.h) 8-byte-aligns both the collection header and every
+    /// object header (`H5HG_ALIGN`). For `ss == 8` the raw sizes are already
+    /// multiples of 8, so the alignment is a no-op there and only matters for
+    /// files with 4-byte lengths.
+    fn layout(&self, ctx: &FormatContext) -> (usize, usize, usize) {
+        let ss = ctx.sizeof_size as usize;
+        let header_size = pad_to_8(4 + 1 + 3 + ss); // GCOL + version + reserved + collection_size
+        let objhdr_size = pad_to_8(2 + 2 + 4 + ss); // index + ref_count + reserved + size
+        let objects_size = self
+            .objects
+            .iter()
+            .map(|obj| objhdr_size + pad_to_8(obj.data.len()))
+            .sum();
+        (header_size, objhdr_size, objects_size)
+    }
+
+    /// Read just the collection's declared total size from its header.
+    ///
+    /// [`decode`](Self::decode) needs the whole collection in `buf`, and the
+    /// size that says how much to read is in the header — so a caller reading
+    /// from a file asks here first, with only the header in hand.
+    pub fn decode_size(buf: &[u8], ctx: &FormatContext) -> FormatResult<usize> {
+        let ss = ctx.sizeof_size as usize;
+        let header_size = pad_to_8(4 + 1 + 3 + ss);
+        if buf.len() < header_size {
+            return Err(FormatError::BufferTooShort {
+                needed: header_size,
+                available: buf.len(),
+            });
+        }
+        if buf[0..4] != GCOL_SIGNATURE {
+            return Err(FormatError::InvalidSignature);
+        }
+        if buf[4] != GCOL_VERSION {
+            return Err(FormatError::InvalidVersion(buf[4]));
+        }
+        Ok(read_size(&buf[8..], ss) as usize)
     }
 
     /// Decode a global heap collection from a byte buffer.
@@ -458,5 +544,62 @@ mod tests {
         let encoded = coll.encode(&ctx());
         let (decoded, _) = GlobalHeapCollection::decode(&encoded, &ctx()).unwrap();
         assert_eq!(decoded.get_object(1), Some([].as_slice()));
+    }
+
+    /// Removing an object keeps the other indices valid, so the vlen
+    /// references that name them do not have to be rewritten.
+    #[test]
+    fn remove_object_keeps_the_survivors_indices() {
+        let mut coll = GlobalHeapCollection::new();
+        assert_eq!(coll.add_object(b"first".to_vec()).unwrap(), 1);
+        assert_eq!(coll.add_object(b"second".to_vec()).unwrap(), 2);
+        assert_eq!(coll.add_object(b"third".to_vec()).unwrap(), 3);
+
+        assert!(coll.remove_object(2));
+        // Already gone: two elements of one dataset may name the same object.
+        assert!(!coll.remove_object(2));
+
+        let encoded = coll.encode(&ctx());
+        let (decoded, _) = GlobalHeapCollection::decode(&encoded, &ctx()).unwrap();
+        assert_eq!(decoded.get_object(1), Some(b"first".as_slice()));
+        assert_eq!(decoded.get_object(2), None);
+        assert_eq!(decoded.get_object(3), Some(b"third".as_slice()));
+
+        assert!(coll.remove_object(1) && coll.remove_object(3));
+        assert!(coll.is_empty());
+    }
+
+    /// A collection above the 4096-byte minimum keeps its size when an object
+    /// leaves it, the way libhdf5's `H5HG_remove` gives the recovered bytes to
+    /// the free-space marker rather than shortening the collection. Re-encoding
+    /// at the natural size would declare a smaller collection than the block
+    /// the file allocated, so a later free would return less than was taken.
+    #[test]
+    fn encode_at_size_holds_an_oversized_collection_open() {
+        let mut coll = GlobalHeapCollection::new();
+        for _ in 0..4 {
+            coll.add_object(vec![0xab; 2000]).unwrap();
+        }
+        let block = coll.encode(&ctx()).len();
+        assert!(block > GCOL_MIN_SIZE, "{block} is not above the minimum");
+
+        coll.remove_object(2);
+        assert!(
+            coll.encoded_size(&ctx()) < block,
+            "the test needs the natural size to have shrunk"
+        );
+
+        let held = coll.encode_at_size(&ctx(), block).unwrap();
+        assert_eq!(held.len(), block);
+        assert_eq!(
+            GlobalHeapCollection::decode(&held, &ctx()).unwrap().1,
+            block,
+            "the collection must still declare the whole block"
+        );
+        let (decoded, _) = GlobalHeapCollection::decode(&held, &ctx()).unwrap();
+        assert_eq!(decoded.get_object(3), Some(vec![0xab; 2000].as_slice()));
+
+        // Asking for less than the objects need is refused, not truncated.
+        assert!(coll.encode_at_size(&ctx(), 64).is_err());
     }
 }

@@ -2746,9 +2746,10 @@ impl Hdf5Writer {
     /// The replacements go into a fresh global heap collection and only the
     /// vlen references of the named elements are rewritten, so the cost is the
     /// new strings plus the chunks those references live in — not the column.
-    /// The objects the old references pointed at stay in their collections,
-    /// unreachable: the global heap has no free path here, the same as for a
-    /// chunk a rewrite relocates under SWMR.
+    /// The objects the old references pointed at are freed, so repeated
+    /// updates reuse space instead of growing the file. This is what libhdf5
+    /// does: `H5T__vlen_disk_write` deletes the reference it read into the
+    /// conversion background buffer before storing the new one.
     ///
     /// Elements the append buffer still holds are patched in the buffer rather
     /// than on disk, because that buffer — not the file — is their current
@@ -2821,11 +2822,34 @@ impl Hdf5Writer {
         for s in strings {
             obj_indices.push(gcol.add_object(s.as_bytes().to_vec())?);
         }
+        let ref_size = vlen_reference_size(&self.ctx);
+
+        // The append buffer holds the tail of the dataset, so the range splits
+        // into an on-disk prefix and a buffered suffix.
+        let buffer_base = dims[0] - buffered_frames as u64;
+        let split = end.min(buffer_base).max(start);
+
+        // The references about to be overwritten, read before anything moves.
+        // libhdf5 reads the same bytes into the conversion background buffer
+        // (`H5D__scatgath_write` gathers the file's current elements when
+        // `need_bkg` is set) and hands them to `H5T__vlen_disk_write`, which
+        // deletes them before storing the new reference. The buffered suffix
+        // is not on disk yet, so its current references come from the buffer.
+        let mut superseded =
+            self.current_element_bytes(ds_index, start, split - start, ref_size)?;
+        if end > split {
+            let ds = self.ds(ds_index);
+            let m = ds.lock();
+            let off = ((split - buffer_base) as usize) * ref_size;
+            let len = ((end - split) as usize) * ref_size;
+            superseded
+                .extend_from_slice(&m.append_buffer[off..(off + len).min(m.append_buffer.len())]);
+        }
+
         let gcol_encoded = gcol.encode(&self.ctx);
         let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
         self.handle.write_at(gcol_addr, &gcol_encoded)?;
 
-        let ref_size = vlen_reference_size(&self.ctx);
         let mut refs = Vec::with_capacity(strings.len() * ref_size);
         for (i, &obj_idx) in obj_indices.iter().enumerate() {
             refs.extend_from_slice(&encode_vlen_reference(
@@ -2835,11 +2859,6 @@ impl Hdf5Writer {
                 &self.ctx,
             ));
         }
-
-        // The append buffer holds the tail of the dataset, so the range splits
-        // into an on-disk prefix and a buffered suffix.
-        let buffer_base = dims[0] - buffered_frames as u64;
-        let split = end.min(buffer_base).max(start);
 
         if split > start {
             let n = (split - start) as usize;
@@ -2865,6 +2884,134 @@ impl Hdf5Writer {
             m.append_buffer[off..off + tail.len()].copy_from_slice(tail);
         }
 
+        // Only now that the new references are in place: a failure above must
+        // not leave the file naming objects this already freed.
+        self.release_vlen_references(&superseded)?;
+
+        Ok(())
+    }
+
+    /// The bytes elements `start .. start + count` of a 1-D dataset currently
+    /// hold, whichever layout stores them.
+    ///
+    /// Elements no write has reached yet read as zeros — for a vlen dataset
+    /// that is the nil reference, which names no heap object.
+    fn current_element_bytes(
+        &self,
+        ds_index: usize,
+        start: u64,
+        count: u64,
+        element_size: usize,
+    ) -> IoResult<Vec<u8>> {
+        let mut out = vec![0u8; count as usize * element_size];
+        if count == 0 {
+            return Ok(out);
+        }
+
+        let (is_chunked, data_addr) = {
+            let ds = self.ds(ds_index);
+            let m = ds.lock();
+            (
+                m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some(),
+                m.data_addr,
+            )
+        };
+
+        if !is_chunked {
+            if data_addr != UNDEF_ADDR {
+                // `read_at_most`, not `read_at`: a contiguous dataset's block is
+                // reserved when it is created, so the file can still be shorter
+                // than the block until something writes it. What is missing has
+                // never been written, which is the zeros above.
+                let at = data_addr + start * element_size as u64;
+                let got = self.handle.read_at_most(at, out.len())?;
+                out[..got.len()].copy_from_slice(&got);
+            }
+            return Ok(out);
+        }
+
+        let geo = self.chunk_geometry(ds_index)?;
+        let per_chunk = geo.chunk_dims[0];
+        let end = start + count;
+        for c in (start / per_chunk)..=((end - 1) / per_chunk) {
+            let origin = c * per_chunk;
+            let lo = start.max(origin);
+            let hi = end.min(origin + per_chunk);
+            // A chunk with no block yet leaves this span as the zeros above.
+            let Some(chunk) = self.read_chunk_at_coords(ds_index, &[c])? else {
+                continue;
+            };
+            let src = ((lo - origin) as usize) * element_size;
+            let dst = ((lo - start) as usize) * element_size;
+            let len = ((hi - lo) as usize) * element_size;
+            if src + len > chunk.len() {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "chunk {c} is {} bytes, too short for elements {lo}..{hi}",
+                    chunk.len()
+                )));
+            }
+            out[dst..dst + len].copy_from_slice(&chunk[src..src + len]);
+        }
+        Ok(out)
+    }
+
+    /// Free the global heap objects `refs` names, so replacing a vlen element
+    /// does not strand what it used to point at.
+    ///
+    /// This is libhdf5's `H5HG_remove` reached through `H5T__vlen_disk_delete`:
+    /// the object leaves its collection, the collection is rewritten at its
+    /// existing size with the recovered bytes given to the free-space marker,
+    /// and a collection that ends up empty returns its block to the allocator.
+    /// A nil reference (address 0 or `UNDEF_ADDR`) and a zero-length sequence
+    /// name no object, which is the `seq_len > 0` test libhdf5 makes.
+    ///
+    /// Under SWMR nothing is freed and no collection is rewritten: a reader may
+    /// be following those references, the same reason `place_chunk` keeps a
+    /// relocated chunk's old block.
+    fn release_vlen_references(&self, refs: &[u8]) -> IoResult<()> {
+        use crate::format::global_heap::{
+            decode_vlen_reference, vlen_reference_size, GlobalHeapCollection,
+        };
+
+        if self.swmr_active {
+            return Ok(());
+        }
+        let ref_size = vlen_reference_size(&self.ctx);
+        if ref_size == 0 || refs.len() < ref_size {
+            return Ok(());
+        }
+
+        // Group by collection so one holding several replaced objects is read,
+        // rewritten and judged empty exactly once.
+        let mut per_collection: std::collections::BTreeMap<u64, Vec<u16>> = Default::default();
+        for r in refs.chunks_exact(ref_size) {
+            let (seq_len, addr, obj_idx) = decode_vlen_reference(r, &self.ctx)?;
+            if seq_len == 0 || addr == 0 || addr == UNDEF_ADDR {
+                continue;
+            }
+            let Ok(idx) = u16::try_from(obj_idx) else {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "global heap object index {obj_idx} does not fit the 16-bit on-disk field"
+                )));
+            };
+            per_collection.entry(addr).or_default().push(idx);
+        }
+
+        for (addr, indices) in per_collection {
+            let head = self.handle.read_at_most(addr, 64)?;
+            let declared = GlobalHeapCollection::decode_size(&head, &self.ctx)?;
+            let image = self.handle.read_at(addr, declared)?;
+            let (mut gcol, _) = GlobalHeapCollection::decode(&image, &self.ctx)?;
+            for idx in indices {
+                gcol.remove_object(idx);
+            }
+            if gcol.is_empty() {
+                self.allocator.free(addr, declared as u64);
+            } else {
+                let rewritten = gcol.encode_at_size(&self.ctx, declared)?;
+                self.handle.write_at(addr, &rewritten)?;
+            }
+        }
         Ok(())
     }
 
