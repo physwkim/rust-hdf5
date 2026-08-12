@@ -105,7 +105,7 @@ pub struct DatasetReadInfo {
     pub datatype: DatatypeMessage,
     /// Dataspace (dimensionality).
     pub dataspace: DataspaceMessage,
-    /// Data layout (contiguous or compact).
+    /// Data layout (contiguous, compact, or chunked).
     pub layout: DataLayoutMessage,
     /// Filter pipeline for compressed chunks (None = uncompressed).
     pub filter_pipeline: Option<FilterPipeline>,
@@ -2853,7 +2853,11 @@ impl Hdf5Reader {
         Ok(entries)
     }
 
-    /// Read a slice (hyperslab) of a contiguous dataset.
+    /// Read a slice (hyperslab) of a dataset, whatever its layout.
+    ///
+    /// Contiguous and compact datasets are read run by run; a chunked one
+    /// reads only the chunks the selection overlaps, and any gap the writer
+    /// never filled comes back as the fill value.
     ///
     /// `starts` and `counts` define the N-dimensional selection:
     /// starts[d] is the first index along dim d, counts[d] is how many.
