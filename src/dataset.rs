@@ -2871,6 +2871,7 @@ mod tests {
     // H5MF_xfree). Alternating between two payloads of different compressed
     // size must therefore keep reusing the same two blocks instead of
     // appending a fresh one each time.
+    #[cfg(feature = "deflate")]
     #[test]
     fn rewriting_a_filtered_chunk_recycles_the_released_block() {
         // All-equal elements deflate to far fewer bytes than a varied payload,
