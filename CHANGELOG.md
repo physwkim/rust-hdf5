@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Rewriting variable-length string elements frees the superseded global-heap
+  objects *before* allocating the replacement collection, the order
+  libhdf5's `H5T__vlen_disk_write` uses, so the freed space is eligible for
+  immediate reuse and reopen-replace loops no longer grow the file every
+  session. (issue #10)
+
+- On close, the writer frees the object-header blocks it supersedes —
+  root group, groups, and modified datasets are rewritten at fresh
+  addresses each session, and the old blocks were simply abandoned,
+  leaking a few dozen bytes per reopen cycle. Not done under SWMR, where
+  a live reader may still walk the old headers. (issue #10)
+
 ## 0.4.2
 
 ### Added
