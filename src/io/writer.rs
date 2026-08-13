@@ -64,6 +64,66 @@ fn fixed_array_dblk_disk_size(ctx: &FormatContext, hdr: &FixedArrayHeader) -> u6
     }
 }
 
+/// Walk a v2 B-tree from `addr`, collecting every node's raw record bytes
+/// and every node block's address — the reader's record walk plus the
+/// addresses, which `open_append` needs so the reconstructed
+/// [`Bt2DatasetInfo::node_addrs`] pool owns the on-disk nodes (the next
+/// flush re-serializes the tree over them, and a delete frees them).
+#[allow(clippy::too_many_arguments)]
+fn collect_bt2_nodes(
+    handle: &FileHandle,
+    ctx: &FormatContext,
+    addr: u64,
+    depth: u16,
+    nrec: u16,
+    record_size: u16,
+    node_size: u32,
+    geo: &crate::format::chunk_index::btree_v2::Bt2Geometry,
+    records: &mut Vec<u8>,
+    node_addrs: &mut Vec<u64>,
+) -> IoResult<()> {
+    use crate::format::chunk_index::btree_v2::{Bt2InternalNode, Bt2LeafNode};
+
+    node_addrs.push(addr);
+    let buf = handle.read_at_most(addr, node_size as usize)?;
+    if depth == 0 {
+        let leaf = Bt2LeafNode::decode(&buf, nrec, record_size)?;
+        records.extend_from_slice(&leaf.record_data);
+    } else {
+        let node = Bt2InternalNode::decode(
+            &buf,
+            ctx,
+            depth,
+            nrec,
+            record_size,
+            geo.max_nrec_size,
+            geo.child_total_size(depth),
+        )?;
+        records.extend_from_slice(&node.record_data);
+        let children: Vec<(u64, u16)> = node
+            .child_addrs
+            .iter()
+            .zip(node.child_nrecords.iter())
+            .map(|(&a, &n)| (a, n))
+            .collect();
+        for (child_addr, child_nrec) in children {
+            collect_bt2_nodes(
+                handle,
+                ctx,
+                child_addr,
+                depth - 1,
+                child_nrec,
+                record_size,
+                node_size,
+                geo,
+                records,
+                node_addrs,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Encode a fixed-array data block for the layout implied by `hdr`, using the
 /// chunk addresses held in `dblk.elements` (unfiltered) or the filtered chunk
 /// entries in `dblk.filtered_elements` (filtered, `client_id == 1`).
@@ -1311,8 +1371,165 @@ impl Hdf5Writer {
                                 chunk_size_len,
                             });
                         }
+                    } else if *index_type
+                        == crate::format::messages::data_layout::ChunkIndexType::FixedArray
+                    {
+                        // Read the FA header and data block back so a
+                        // reopened dataset is writable and deletable, not
+                        // re-link only — a placeholder made a delete free
+                        // just the header and leak every chunk plus the
+                        // index. A paged data block (foreign files only;
+                        // this writer never creates one) stays placeholder.
+                        let hdr_buf = handle.read_at_most(*index_address, 256)?;
+                        let fa_header = FixedArrayHeader::decode(&hdr_buf, &ctx)?;
+                        let is_filtered = fa_header.client_id == FA_CLIENT_FILT_CHUNK;
+                        let chunk_size_len = if is_filtered {
+                            (fa_header.element_size as usize)
+                                .checked_sub(ctx.sizeof_addr as usize + 4)
+                                .ok_or_else(|| {
+                                    crate::io::IoError::InvalidState(
+                                        "fixed array filtered element_size too small".into(),
+                                    )
+                                })?
+                        } else {
+                            0
+                        };
+                        if !fa_header.is_paged()
+                            && fa_header.data_blk_addr != UNDEF_ADDR
+                            && chunk_size_len <= 8
+                        {
+                            let num_elmts = fa_header.num_elmts as usize;
+                            let dblk_size = fixed_array_dblk_disk_size(&ctx, &fa_header) as usize;
+                            let dblk_buf =
+                                handle.read_at_most(fa_header.data_blk_addr, dblk_size)?;
+                            let fa_dblk = if is_filtered {
+                                FixedArrayDataBlock::decode_filtered(
+                                    &dblk_buf,
+                                    &ctx,
+                                    num_elmts,
+                                    chunk_size_len,
+                                )?
+                            } else {
+                                FixedArrayDataBlock::decode_unfiltered(&dblk_buf, &ctx, num_elmts)?
+                            };
+                            info.fixed_array = Some(FixedArrayDatasetInfo {
+                                chunk_dims: real_chunk_dims,
+                                fa_header_addr: *index_address,
+                                fa_dblk_addr: fa_header.data_blk_addr,
+                                fa_header,
+                                fa_dblk,
+                                // Chunks written this session, matching the
+                                // EA reconstruction above.
+                                chunks_written: 0,
+                            });
+                        }
+                    } else if *index_type
+                        == crate::format::messages::data_layout::ChunkIndexType::BTreeV2
+                    {
+                        use crate::format::chunk_index::btree_v2::{
+                            Bt2Geometry, Bt2Header, BT2_NODE_SIZE, BT2_TYPE_CHUNK_FILT,
+                            BT2_TYPE_CHUNK_UNFILT,
+                        };
+
+                        // Walk the tree back into the in-memory index and
+                        // adopt its node blocks as the flush pool. A node
+                        // size other than this writer's, or a record type
+                        // that is not a chunk record (foreign files only),
+                        // cannot join the fixed-size pool and stays
+                        // re-link only.
+                        let hdr_buf = handle.read_at_most(*index_address, 256)?;
+                        let bt2_hdr = Bt2Header::decode(&hdr_buf, &ctx)?;
+                        let ndims = real_chunk_dims.len();
+                        let is_filt = match bt2_hdr.record_type {
+                            BT2_TYPE_CHUNK_UNFILT => Some(false),
+                            BT2_TYPE_CHUNK_FILT => Some(true),
+                            _ => None,
+                        };
+                        if let (Some(is_filt), true) = (is_filt, bt2_hdr.node_size == BT2_NODE_SIZE)
+                        {
+                            let mut index = if is_filt {
+                                let csl = (bt2_hdr.record_size as usize)
+                                    .checked_sub(ctx.sizeof_addr as usize + 4 + ndims * 8)
+                                    .filter(|&c| c <= 8)
+                                    .ok_or_else(|| {
+                                        crate::io::IoError::InvalidState(
+                                            "v2 B-tree filtered record size does not fit \
+                                             its rank and address width"
+                                                .into(),
+                                        )
+                                    })?;
+                                Bt2ChunkIndex::new_filtered(ndims, csl as u8)
+                            } else {
+                                Bt2ChunkIndex::new_unfiltered(ndims)
+                            };
+                            let mut node_addrs = Vec::new();
+                            if bt2_hdr.root_node_addr != UNDEF_ADDR && bt2_hdr.total_num_records > 0
+                            {
+                                let geo = Bt2Geometry::new(
+                                    bt2_hdr.node_size,
+                                    bt2_hdr.record_size,
+                                    bt2_hdr.depth,
+                                    ctx.sizeof_addr,
+                                );
+                                let mut record_bytes = Vec::new();
+                                collect_bt2_nodes(
+                                    &handle,
+                                    &ctx,
+                                    bt2_hdr.root_node_addr,
+                                    bt2_hdr.depth,
+                                    bt2_hdr.num_records_in_root,
+                                    bt2_hdr.record_size,
+                                    bt2_hdr.node_size,
+                                    &geo,
+                                    &mut record_bytes,
+                                    &mut node_addrs,
+                                )?;
+                                let total = if bt2_hdr.record_size > 0 {
+                                    record_bytes.len() / bt2_hdr.record_size as usize
+                                } else {
+                                    0
+                                };
+                                if is_filt {
+                                    for r in Bt2ChunkIndex::decode_filtered_records(
+                                        &record_bytes,
+                                        total,
+                                        ndims,
+                                        bt2_hdr.record_size,
+                                        &ctx,
+                                    )? {
+                                        index.insert_filtered(
+                                            r.scaled_offsets,
+                                            r.chunk_address,
+                                            r.chunk_size,
+                                            r.filter_mask,
+                                        );
+                                    }
+                                } else {
+                                    for r in Bt2ChunkIndex::decode_unfiltered_records(
+                                        &record_bytes,
+                                        total,
+                                        ndims,
+                                        &ctx,
+                                    )? {
+                                        index.insert(r.scaled_offsets, r.chunk_address);
+                                    }
+                                }
+                            }
+                            let max_dims = info
+                                .dataspace
+                                .max_dims
+                                .clone()
+                                .unwrap_or_else(|| info.dataspace.dims.clone());
+                            info.btree_v2 = Some(Bt2DatasetInfo {
+                                chunk_dims: real_chunk_dims,
+                                max_dims,
+                                bt2_header_addr: *index_address,
+                                node_addrs,
+                                index,
+                                chunks_written: 0,
+                            });
+                        }
                     }
-                    // FA/BT2 datasets remain as placeholder (re-link only)
                 }
                 _ => {}
             }
@@ -6525,8 +6742,10 @@ impl Hdf5Writer {
                     continue;
                 }
                 if m.obj_header_written_addr.is_some() {
-                    let modified =
-                        m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0) || m.extent_dirty;
+                    let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0)
+                        || m.fixed_array.as_ref().is_some_and(|f| f.chunks_written > 0)
+                        || m.btree_v2.as_ref().is_some_and(|b| b.chunks_written > 0)
+                        || m.extent_dirty;
                     if !modified {
                         continue;
                     }
@@ -6561,11 +6780,13 @@ impl Hdf5Writer {
                 }
                 if m.obj_header_written_addr.is_some() {
                     // Existing dataset from append mode.
-                    // If it has chunked info with chunks_written > 0 — or its
+                    // If any chunk index took writes this session — or its
                     // extent changed without a chunk write — it was modified
                     // and needs a new object header.
-                    let modified =
-                        m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0) || m.extent_dirty;
+                    let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0)
+                        || m.fixed_array.as_ref().is_some_and(|f| f.chunks_written > 0)
+                        || m.btree_v2.as_ref().is_some_and(|b| b.chunks_written > 0)
+                        || m.extent_dirty;
                     if !modified {
                         // Keep the original object header address for the root group link.
                         m.obj_header_addr = m.obj_header_written_addr.unwrap();

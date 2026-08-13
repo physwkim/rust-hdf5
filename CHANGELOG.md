@@ -16,6 +16,15 @@
 
 ### Fixed
 
+- Reopening a file for appending now reads fixed-array and v2-B-tree
+  chunk indexes back into the writer, as it already did for extensible
+  arrays. Those datasets used to come back as re-link placeholders:
+  writes to them were refused, and deleting one freed only its
+  attributes and object header while every chunk block and the index
+  structures leaked. A paged fixed array or a v2 B-tree with a foreign
+  node size (neither of which this writer creates) still comes back
+  re-link only.
+
 - Vlen writes now pack their heap objects into existing global-heap
   collections with free space, tracking them the way libhdf5's CWFS
   list (`H5HG_insert`) does, and a batch of more than 65535 strings
