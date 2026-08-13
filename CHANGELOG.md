@@ -16,6 +16,16 @@
 
 ### Fixed
 
+- `H5Attribute::read_numeric::<T>` validates the stored datatype against
+  `T`'s before reinterpreting the value bytes. It used to transmute
+  unconditionally — and its length check was `<`, not `==` — so reading an
+  `f64` attribute as `f32` returned the low half of the double's bit image,
+  and big-endian, differently-classed, or even vlen-string attributes came
+  back as garbage values. A mismatch is now a `TypeMismatch` error; the new
+  `H5Attribute::read_numeric_as::<T>()` is the converting read, with the
+  same checked / widening-only policy as the dataset method, and returns
+  every element of an array attribute.
+
 - Rewriting variable-length string elements frees the superseded global-heap
   objects *before* allocating the replacement collection, the order
   libhdf5's `H5T__vlen_disk_write` uses, so the freed space is eligible for

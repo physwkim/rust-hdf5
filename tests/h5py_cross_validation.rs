@@ -948,3 +948,29 @@ fn numeric_conversion_reads_from_h5py_written_file() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// `H5Attribute::read_numeric` must accept h5py's standard little-endian
+/// numeric attribute datatypes (the strict datatype check cannot be *too*
+/// strict), refuse a big-endian one, and `read_numeric_as` must convert it.
+#[test]
+fn attr_numeric_reads_from_h5py_written_file() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_numeric");
+    write_with_h5py(
+        py,
+        &path,
+        "d = f.create_dataset('d', data=np.zeros(2, dtype='float32'))\n\
+         d.attrs.create('i4', np.int32(-7))\n\
+         d.attrs.create('f8', np.float64(1.5))\n\
+         d.attrs.create('be_i4', np.int32(100000), dtype='>i4')\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("d").unwrap();
+    assert_eq!(ds.attr("i4").unwrap().read_numeric::<i32>().unwrap(), -7);
+    assert_eq!(ds.attr("f8").unwrap().read_numeric::<f64>().unwrap(), 1.5);
+    let be = ds.attr("be_i4").unwrap();
+    assert!(be.read_numeric::<i32>().is_err());
+    assert_eq!(be.read_numeric_as::<i64>().unwrap(), vec![100_000]);
+    std::fs::remove_file(&path).ok();
+}

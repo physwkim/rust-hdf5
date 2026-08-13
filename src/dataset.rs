@@ -2319,8 +2319,9 @@ impl H5Dataset {
 pub trait ReadNumeric: numeric::Sealed {}
 impl<T: numeric::Sealed> ReadNumeric for T {}
 
-mod numeric {
-    //! Per-element decode + checked conversion for `read_numeric_as`.
+pub(crate) mod numeric {
+    //! Per-element decode + checked conversion for `read_numeric_as` (and the
+    //! attribute counterpart `H5Attribute::read_numeric_as`).
 
     use crate::error::{Hdf5Error, Result};
     use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
@@ -6043,6 +6044,106 @@ mod tests {
         let raw = (-2.25f64).to_be_bytes();
         let kind = numeric::classify(&dt).unwrap();
         assert_eq!(numeric::convert::<f64>(kind, &raw).unwrap(), vec![-2.25]);
+    }
+
+    /// `H5Attribute::read_numeric` validates the stored datatype before
+    /// reinterpreting bytes: cross-width, cross-class, and non-numeric
+    /// attributes error instead of returning bit-garbage, while the exact
+    /// type and the HBool / complex-compound paths keep working.
+    #[test]
+    fn attr_read_numeric_validates_datatype() {
+        use crate::types::{Complex64, HBool, VarLenUnicode};
+        let path = temp_path("attr_read_numeric_validate");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file.new_dataset::<f32>().shape([2]).create("d").unwrap();
+            ds.write_raw(&[1.0f32; 2]).unwrap();
+            let a = ds.new_attr::<f64>().shape(()).create("f8").unwrap();
+            a.write_numeric(&1.5f64).unwrap();
+            let a = ds.new_attr::<i32>().shape(()).create("i4").unwrap();
+            a.write_numeric(&-7i32).unwrap();
+            let a = ds.new_attr::<HBool>().shape(()).create("b").unwrap();
+            a.write_numeric(&HBool::from(true)).unwrap();
+            let a = ds.new_attr::<Complex64>().shape(()).create("z").unwrap();
+            a.write_numeric(&Complex64 { re: 1.0, im: -2.0 }).unwrap();
+            let a = ds
+                .new_attr::<VarLenUnicode>()
+                .shape(())
+                .create("s")
+                .unwrap();
+            a.write_scalar(&VarLenUnicode("text".into())).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("d").unwrap();
+
+        let f8 = ds.attr("f8").unwrap();
+        assert_eq!(f8.read_numeric::<f64>().unwrap(), 1.5);
+        // Previously returned the low half of the f64 image as an f32.
+        let err = f8.read_numeric::<f32>().unwrap_err();
+        assert!(
+            err.to_string().contains("read_numeric_as"),
+            "unexpected error: {err}"
+        );
+        assert!(f8.read_numeric::<i64>().is_err());
+
+        let i4 = ds.attr("i4").unwrap();
+        assert_eq!(i4.read_numeric::<i32>().unwrap(), -7);
+        assert!(i4.read_numeric::<u32>().is_err());
+
+        assert!(bool::from(
+            ds.attr("b").unwrap().read_numeric::<HBool>().unwrap()
+        ));
+        let z = ds.attr("z").unwrap().read_numeric::<Complex64>().unwrap();
+        assert_eq!((z.re, z.im), (1.0, -2.0));
+
+        // A vlen string attribute: read_numeric used to transmute the heap
+        // reference bytes into the requested type.
+        let s = ds.attr("s").unwrap();
+        assert!(s.read_numeric::<f64>().is_err());
+        assert!(s.read_numeric_as::<f64>().is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The attribute conversion read applies the dataset rules: checked
+    /// int → int naming index and value on overflow, widening-only floats,
+    /// cross-class rejected; an array attribute converts every element.
+    #[test]
+    fn attr_read_numeric_as_converts() {
+        let path = temp_path("attr_read_numeric_as");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file.new_dataset::<f32>().shape([2]).create("d").unwrap();
+            ds.write_raw(&[1.0f32; 2]).unwrap();
+            let a = ds.new_attr::<i32>().shape(()).create("i4").unwrap();
+            a.write_numeric(&-7i32).unwrap();
+            let a = ds.new_attr::<u64>().shape(()).create("u8max").unwrap();
+            a.write_numeric(&u64::MAX).unwrap();
+            let a = ds.new_attr::<i16>().shape([3]).create("arr").unwrap();
+            a.write_array(&[1i16, -2, 3]).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("d").unwrap();
+        assert_eq!(
+            ds.attr("i4").unwrap().read_numeric_as::<i64>().unwrap(),
+            vec![-7]
+        );
+        let err = ds
+            .attr("u8max")
+            .unwrap()
+            .read_numeric_as::<i64>()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not fit in i64"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            ds.attr("arr").unwrap().read_numeric_as::<i32>().unwrap(),
+            vec![1, -2, 3]
+        );
+        assert!(ds.attr("i4").unwrap().read_numeric_as::<f64>().is_err());
+        std::fs::remove_file(&path).ok();
     }
 
     /// The hyperslab variant applies the same conversion to a sub-selection.
