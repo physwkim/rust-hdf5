@@ -823,6 +823,130 @@ fn fa_growable_max_shape_readable_by_h5py() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A global-heap collection extended in place (CWFS second pass: bigger
+/// declared size, free-space marker moved to the new tail) must stay
+/// standard-readable: h5py reads both the object that fit the original
+/// 4096 bytes and the one that forced the extension.
+#[test]
+fn extended_vlen_collection_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("extended_gcol");
+    let big = "x".repeat(5000);
+    {
+        let file = H5File::create(&path).unwrap();
+        let g = file.root_group().create_group("entry").unwrap();
+        g.set_attr_string("small", "hello").unwrap();
+        g.set_attr_string("big", &big).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "g = f['entry']\n\
+         assert g.attrs['small'] == 'hello', g.attrs['small']\n\
+         assert g.attrs['big'] == 'x' * 5000, len(g.attrs['big'])\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A paged FA index (1200 chunks > 1024 per page) written across two rust
+/// sessions — the second reconstructs the paged data block via
+/// `open_append` — reads back exactly through h5py.
+#[test]
+fn fa_paged_reopened_write_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("fa_paged_reopen");
+    let n = 1200usize;
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([n])
+            .chunk(&[1])
+            .max_shape(&[Some(n)])
+            .create("wide")
+            .unwrap();
+        // Page 0 only; page 1 (elements 1024..1200) stays uninitialized.
+        ds.write_slice(&[0], &[600], &(0..600).collect::<Vec<i32>>())
+            .unwrap();
+        file.close().unwrap();
+    }
+    {
+        let file = H5File::options().no_locking().open_rw(&path).unwrap();
+        let ds = file.dataset_writer("wide").unwrap();
+        ds.write_slice(&[600], &[600], &(600..n as i32).collect::<Vec<i32>>())
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['wide']\n\
+         assert ds.shape == (1200,), ds.shape\n\
+         assert ds.chunks == (1,), ds.chunks\n\
+         assert np.array_equal(ds[...], np.arange(1200, dtype=np.int32)), ds[...]\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// h5py (libver='latest', fixed shape, 1200 unit chunks) writes a paged FA
+/// data block and initializes only page 0; libhdf5 leaves page 1's file
+/// space unwritten. Our reader must honor the page-init bitmap: page-0
+/// values read back, page-1 elements read as fill.
+#[test]
+fn fa_paged_written_by_h5py_readable_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("fa_paged_from_h5py");
+    write_with_h5py(
+        py,
+        &path,
+        "name = f.filename; f.close()\n\
+         f = h5py.File(name, 'w', libver='latest')\n\
+         ds = f.create_dataset('wide', shape=(1200,), chunks=(1,), dtype='<i4')\n\
+         ds[:600] = np.arange(600, dtype=np.int32)",
+    );
+    let file = H5File::open(&path).unwrap();
+    let vals = file.dataset("wide").unwrap().read_raw::<i32>().unwrap();
+    assert_eq!(vals.len(), 1200);
+    for (i, v) in vals.iter().enumerate() {
+        let expect = if i < 600 { i as i32 } else { 0 };
+        assert_eq!(*v, expect, "element {i}");
+    }
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The full parity loop: h5py writes the paged FA (page 1 genuinely
+/// unwritten by libhdf5), rust `open_append` reconstructs it and writes
+/// the remaining chunks, and h5py reads the completed array back.
+#[test]
+fn fa_paged_written_by_h5py_completed_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("fa_paged_complete");
+    write_with_h5py(
+        py,
+        &path,
+        "name = f.filename; f.close()\n\
+         f = h5py.File(name, 'w', libver='latest')\n\
+         ds = f.create_dataset('wide', shape=(1200,), chunks=(1,), dtype='<i4')\n\
+         ds[:600] = np.arange(600, dtype=np.int32)",
+    );
+    {
+        let file = H5File::options().no_locking().open_rw(&path).unwrap();
+        let ds = file.dataset_writer("wide").unwrap();
+        ds.write_slice(&[600], &[600], &(600..1200).collect::<Vec<i32>>())
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['wide']\n\
+         assert np.array_equal(ds[...], np.arange(1200, dtype=np.int32)), ds[...]\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// Issue #8: `set_libver_latest(true)` writes a version-5 data layout message
 /// for filtered chunked datasets. Two identical files differing only in the
 /// knob prove both directions: the default file stays h5py-readable (v4), and
@@ -890,4 +1014,177 @@ fn libver_latest_v5_layout_write_and_hdf5_1x_rejection() {
 
     std::fs::remove_file(&path_v4).ok();
     std::fs::remove_file(&path_v5).ok();
+}
+
+/// Issue #11: datatype-aware conversion reads against an externally-written
+/// file — h5py writes int16, big-endian int32, float32, and uint64 datasets;
+/// rust-hdf5 converts on read, including the checked-overflow error path.
+#[test]
+fn numeric_conversion_reads_from_h5py_written_file() {
+    let Some(py) = python() else { return };
+    let path = tmp("numeric_conv");
+    write_with_h5py(
+        py,
+        &path,
+        "f.create_dataset('i2', data=np.array([-3, -1, 0, 7], dtype='int16'))\n\
+         f.create_dataset('be_i4', data=np.array([-100000, 100000], dtype='>i4'))\n\
+         f.create_dataset('f4', data=np.array([1.5, -2.25], dtype='float32'))\n\
+         f.create_dataset('u8', data=np.array([1, 2**64 - 1], dtype='uint64'))\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("i2")
+            .unwrap()
+            .read_numeric_as::<i64>()
+            .unwrap(),
+        vec![-3, -1, 0, 7]
+    );
+    assert_eq!(
+        file.dataset("be_i4")
+            .unwrap()
+            .read_numeric_as::<i64>()
+            .unwrap(),
+        vec![-100_000, 100_000]
+    );
+    assert_eq!(
+        file.dataset("f4")
+            .unwrap()
+            .read_numeric_as::<f64>()
+            .unwrap(),
+        vec![1.5, -2.25]
+    );
+    assert_eq!(
+        file.dataset("u8")
+            .unwrap()
+            .read_numeric_as::<u128>()
+            .unwrap(),
+        vec![1, u128::from(u64::MAX)]
+    );
+    let err = file
+        .dataset("u8")
+        .unwrap()
+        .read_numeric_as::<i64>()
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("does not fit in i64"),
+        "unexpected error: {err}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// `H5Attribute::read_numeric` must accept h5py's standard little-endian
+/// numeric attribute datatypes (the strict datatype check cannot be *too*
+/// strict), refuse a big-endian one, and `read_numeric_as` must convert it.
+#[test]
+fn attr_numeric_reads_from_h5py_written_file() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_numeric");
+    write_with_h5py(
+        py,
+        &path,
+        "d = f.create_dataset('d', data=np.zeros(2, dtype='float32'))\n\
+         d.attrs.create('i4', np.int32(-7))\n\
+         d.attrs.create('f8', np.float64(1.5))\n\
+         d.attrs.create('be_i4', np.int32(100000), dtype='>i4')\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("d").unwrap();
+    assert_eq!(ds.attr("i4").unwrap().read_numeric::<i32>().unwrap(), -7);
+    assert_eq!(ds.attr("f8").unwrap().read_numeric::<f64>().unwrap(), 1.5);
+    let be = ds.attr("be_i4").unwrap();
+    assert!(be.read_numeric::<i32>().is_err());
+    assert_eq!(be.read_numeric_as::<i64>().unwrap(), vec![100_000]);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A dataset shrunk with `set_extent` (pruning chunks from the index) and
+/// grown back is read by h5py/libhdf5 as retained data plus fill values —
+/// the pruned entries must leave the extensible-array index in a state
+/// libhdf5 accepts.
+#[test]
+fn shrunk_and_regrown_dataset_reads_fill_via_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("shrink_prune");
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([24usize, 4])
+            .chunk(&[2, 4])
+            .max_shape(&[None, Some(4)])
+            .create("data")
+            .unwrap();
+        let vals: Vec<i32> = (0..24 * 4).collect();
+        ds.write_slice(&[0, 0], &[24, 4], &vals).unwrap();
+        ds.set_extent(&[3, 4]).unwrap();
+        ds.set_extent(&[24, 4]).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (24, 4), d.shape\n\
+         v = d[...]\n\
+         exp = np.arange(96, dtype='int32').reshape(24, 4)\n\
+         assert (v[:3] == exp[:3]).all(), v[:3]\n\
+         assert (v[3:] == 0).all(), v[3:]\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A vlen batch past the 65535-object collection index cap spills into a
+/// second collection; libhdf5 must resolve references across both — the
+/// per-element collection address is all it needs.
+#[test]
+fn spilled_vlen_batch_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("vlen_spill");
+    {
+        let file = H5File::create(&path).unwrap();
+        let strings = vec!["x"; 65537];
+        file.write_vlen_strings("bulk", &strings).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "d = f['bulk']\n\
+         assert d.shape == (65537,), d.shape\n\
+         v = d[...]\n\
+         assert v[0] == b'x' and v[65535] == b'x' and v[65536] == b'x', v[:3]\n\
+         assert (v == b'x').all()\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// Small vlen attributes and datasets packed into one shared collection
+/// (the writer's CWFS path) stay readable: h5py resolves each reference
+/// by its own (address, index) pair regardless of who else shares the
+/// block.
+#[test]
+fn packed_shared_collection_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("vlen_packed");
+    {
+        let file = H5File::create(&path).unwrap();
+        let g = file.root_group().create_group("entry").unwrap();
+        g.set_attr_string("NX_class", "NXentry").unwrap();
+        g.set_attr_string("title", "packed heap").unwrap();
+        file.write_vlen_strings("notes", &["alpha", "beta"])
+            .unwrap();
+        file.write_vlen_strings("tags", &["red", "green"]).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "assert f['entry'].attrs['NX_class'] == 'NXentry'\n\
+         assert f['entry'].attrs['title'] == 'packed heap'\n\
+         assert list(f['notes'][...]) == [b'alpha', b'beta']\n\
+         assert list(f['tags'][...]) == [b'red', b'green']\n",
+    );
+    std::fs::remove_file(&path).ok();
 }

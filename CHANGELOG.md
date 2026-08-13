@@ -1,5 +1,235 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `H5Dataset::read_numeric_as::<T>()` and `read_numeric_slice_as::<T>()`:
+  datatype-aware numeric reads. Where `read_raw::<T>` only checks that
+  `T`'s size matches the stored element size (so an `i64` read of a
+  `uint64` dataset reinterprets bits, and a big-endian source is misread),
+  these inspect the datatype message — class, signedness, byte order,
+  width — and convert per element. Integer→integer is checked and errors
+  with the element index and value instead of wrapping; `f32`→`f64`
+  widens exactly; `f64`→`f32`, float→integer and integer→float are
+  rejected. `read_raw` is unchanged. (issue #11)
+
+- Global-heap collections extend in place, completing the CWFS parity:
+  when no listed collection can take a vlen object, the writer now grows
+  one — the file allocation via the allocator's new `try_extend`
+  (end-of-file bump or consuming an adjacent released block, libhdf5's
+  `H5MF_try_extend`) and the collection's declared size plus free-space
+  marker (`H5HG_extend`) — before falling back to a fresh collection.
+  Growth is `max(collection_size, shortfall)` capped at the 64 KiB
+  `H5HG_MAXSIZE`, as upstream computes it. A small-then-big attribute
+  pair used to cost two collections; it now costs one.
+
+### Fixed
+
+- A v2 B-tree chunk index re-serializes at the node size its header
+  declares instead of this writer's compile-time 2048. Reopening a file
+  whose tree uses another node size (libhdf5 built with a different
+  `H5D_BT2_NODE_SIZE`, or any other writer) previously left the dataset
+  a re-link placeholder; it now reconstructs and grows, with node blocks,
+  the rewritten B-tree header, and the object header's layout message all
+  carrying the creator's node size and split/merge percentages — the
+  layout message used to be re-stamped with the defaults on every close.
+
+- Reopening a file for append now reconstructs *paged* fixed-array chunk
+  indexes (any fixed-shape dataset with more than 1024 chunks). The
+  writer has emitted the paged layout since paged-write support landed,
+  but `open_append` still refused it, leaving such a dataset a re-link
+  placeholder: writes to it failed and deleting it leaked every chunk
+  plus the index. Reconstruction honors the page-init bitmap — pages
+  libhdf5 never wrote are skipped, not decoded — so a partially written
+  h5py file can be completed in place. (Cross-validated both directions
+  against h5py, including the uninitialized-page case.)
+
+- `delete_dataset` and `delete_group` now follow libhdf5's `H5Ldelete`
+  semantics against hard links: deleting a name only unlinks it, and an
+  object a hard link still names survives under the link's path —
+  promoted to its primary name, a group bringing its whole subtree —
+  with storage freed only when the last name goes. Deleting a dataset
+  used to destroy the object and leave its hard links silently
+  unemitted. A path naming a hard link itself removes just that link
+  (previously `NotFound`, so links could never be removed). Hard links
+  also survive reopening the file for append — each used to come back
+  as an independent dataset carrying the same storage addresses, so
+  deleting one name freed blocks and the shared object header the other
+  names still referenced. And like `H5Dopen`/`H5Lcreate_hard`, an alias
+  path now resolves for `dataset_writer` and as a link target.
+
+- Paths traverse group hard links, the way HDF5 paths always resolve
+  through links: creating, writing, annotating, reading, and deleting
+  through an alias path (`root.group("inner_alias")`,
+  `file.dataset("inner_alias/ds")`) lands on the link's target group.
+  Writer-side, every path entry point canonicalizes group-link
+  prefixes; reader-side, the discovery walk records the alias of an
+  already-visited group header instead of only skipping it, and
+  lookups resolve through those aliases. Deletion still keeps the
+  *leaf* literal — `H5Ldelete` removes the named link itself, not its
+  target.
+
+- Reopening a file for appending now reads fixed-array and v2-B-tree
+  chunk indexes back into the writer, as it already did for extensible
+  arrays. Those datasets used to come back as re-link placeholders:
+  writes to them were refused, and deleting one freed only its
+  attributes and object header while every chunk block and the index
+  structures leaked. A paged fixed array or a v2 B-tree with a foreign
+  node size (neither of which this writer creates) still comes back
+  re-link only.
+
+- Vlen writes now pack their heap objects into existing global-heap
+  collections with free space, tracking them the way libhdf5's CWFS
+  list (`H5HG_insert`) does, and a batch of more than 65535 strings
+  spills into a further collection instead of failing with "global
+  heap collection is full". Every vlen write call used to allocate its
+  own collection, so each small string attribute or dataset paid the
+  4096-byte `H5HG_MINALLOC` minimum for a block that held one value,
+  and one call could never exceed a single collection's 16-bit object
+  index space. Freed space from replaced or deleted vlen values is
+  re-listed for packing, so replace loops settle inside one collection.
+  Under SWMR active, batches keep getting fresh collections — packing
+  rewrites a block a streaming reader may be walking.
+
+- `delete_dataset` and `delete_group` now free the file space the
+  deleted objects owned, the way libhdf5's `H5O_delete` does: chunk
+  blocks and the chunk-index structures themselves (extensible-array
+  header/index/super/data blocks, fixed-array header and data block,
+  v2-B-tree header and nodes), contiguous data blocks, the global-heap
+  objects of variable-length data and attributes, and — on reopened
+  files — the on-disk object header block. They used to only unlink, so
+  every create/delete cycle grew the file by the object's whole
+  footprint, and finalize even wrote a fresh orphan header for each
+  deleted object. Deletes are refused while SWMR streaming is active
+  (a reader may hold the freed addresses; libhdf5 forbids it too), and
+  name resolution for `create_group` parents and dataset→group
+  assignment no longer matches soft-deleted groups, which could attach
+  a new object to a deleted parent and lose it at close.
+
+- SWMR attribute setters now error after `start_swmr` instead of
+  appearing to succeed, matching libhdf5's ban on attribute changes
+  during SWMR writes. Object headers are frozen once streaming starts,
+  so a post-start change was committed at close only when its header
+  happened to be rebuilt — group attributes always, dataset attributes
+  only if the dataset also received chunk writes — and silently dropped
+  otherwise; replacing a vlen attribute also stranded the superseded
+  value's 4096-byte heap collection forever, since a streaming reader
+  may still hold its references. Behavior change: calls that used to
+  return `Ok` now fail; set attributes before `start_swmr`.
+
+- `set_extent` shrinks now prune stored chunks, matching libhdf5's
+  `H5D__chunk_prune_by_extent`: a chunk entirely beyond the new extent is
+  removed from the chunk index (extensible-array, fixed-array, and v2
+  B-tree) and its storage freed for reuse — it used to stay allocated and
+  indexed forever — and a chunk the new extent cuts through has its
+  out-of-extent region overwritten with the fill value. Behavior change:
+  growing the extent back now reads fill values where it used to resurrect
+  the stale pre-shrink data. Under SWMR the index entries are still
+  cleared but the blocks are kept, the rule libhdf5 applies in
+  `H5Dearray.c`.
+
+- Global-heap objects carry their on-disk reference count through
+  decode and encode. It was hardcoded to 1 on every encode — libhdf5
+  writes 0 on insert (`H5HG_insert`), and rewriting a foreign
+  collection after an object removal reset any count its virtual-dataset
+  layer had raised via `H5HG_link`. New objects now encode 0, matching
+  libhdf5 byte-for-byte; decoded objects keep what the file declares.
+
+- Creating a zero-element vlen dataset (`write_vlen_strings`,
+  `write_vlen_bytes`, `write_vlen_strings_compressed`) or an empty
+  string-array attribute no longer writes a global-heap collection: an
+  empty collection still encodes to the 4096-byte minimum, and with no
+  reference pointing at it the block was orphaned. The empty dataset or
+  attribute itself is still created.
+
+- A rejected vlen write no longer orphans a global-heap collection.
+  `append_vlen_strings` wrote the batch's collection before checking the
+  dataset was chunked, and `write_vlen_strings_slice` wrote it before
+  the slice write could refuse a dataset with no writable storage (a
+  reopened fixed-array/v2-B-tree dataset, which this crate re-links but
+  cannot write) — every failed call grew the file by a 4096-byte block
+  nothing referenced. All deterministic rejections now run before the
+  collection is allocated.
+
+- Variable-length reads no longer return silent empty strings when the
+  global-heap collection cannot be resolved. The reader capped
+  collections at 64 MiB — libhdf5 has no cap, and this crate's writers
+  put a whole write call's strings into one collection, so reading back
+  a large batch blanked every string. The cap is gone, and the failures
+  libhdf5 treats as errors (`H5HG__cache_heap_deserialize`: bad `GCOL`
+  signature, declared size below 4096) are now hard errors here too, as
+  are a reference to an object missing from its collection and an object
+  index that overflows the 16-bit on-disk field. A nil reference
+  (address 0) still reads as the empty value. Applies to both dataset
+  and attribute reads, which now share one collection loader.
+
+- Reopening a file for writing (`open_rw` / `open_append`) now keeps
+  every group and its attributes. The reopen rebuilt its group registry
+  from dataset paths alone, so a bare `open_rw` + `close` deleted any
+  group with no dataset beneath it (empty, subgroup-only, or NeXus
+  attribute-only groups) and stripped the attributes — `NX_class`
+  included — off the groups that survived. Groups are now registered
+  from the file's link records with the attributes their headers carry,
+  which also lets a reopen session set attributes on a dataset-less
+  group.
+
+- A `set_extent` shrink of a variable-length dataset now releases the
+  global-heap objects of the elements it discards — both those in pruned
+  chunks and those a straddling chunk's fill refill overwrites. They used
+  to stay in their collections forever, so every shrink stranded at least
+  one 4096-byte collection; an append/shrink cycle now reuses the freed
+  blocks and the file size settles. This is more than libhdf5 does (its
+  `H5D__chunk_prune_by_extent` strands them too), matching this crate's
+  existing element-replace behavior. No-op under SWMR, like every other
+  heap release.
+
+- An extent change made in a reopen session with no chunk write is now
+  persisted at close. The finalize path inferred "modified" from the
+  session's chunk-write count alone, so `open_rw` + `set_extent` (or
+  `extend`) + `close` kept the old dataset header and silently dropped
+  the new shape.
+
+- `H5Attribute::read_numeric::<T>` validates the stored datatype against
+  `T`'s before reinterpreting the value bytes. It used to transmute
+  unconditionally — and its length check was `<`, not `==` — so reading an
+  `f64` attribute as `f32` returned the low half of the double's bit image,
+  and big-endian, differently-classed, or even vlen-string attributes came
+  back as garbage values. A mismatch is now a `TypeMismatch` error; the new
+  `H5Attribute::read_numeric_as::<T>()` is the converting read, with the
+  same checked / widening-only policy as the dataset method, and returns
+  every element of an array attribute.
+
+- `SwmrFileReader::read_dataset::<T>` and `read_slice::<T>` check `T`
+  against the dataset's stored element width. They only checked that the
+  byte count divided evenly, so reading an `f64` dataset as `i32` silently
+  returned twice as many reinterpreted values; a width mismatch is now a
+  `TypeMismatch` error, the same rule as `H5Dataset::read_raw`.
+
+- Rewriting variable-length string elements frees the superseded global-heap
+  objects *before* allocating the replacement collection, the order
+  libhdf5's `H5T__vlen_disk_write` uses, so the freed space is eligible for
+  immediate reuse and reopen-replace loops no longer grow the file every
+  session. (issue #10)
+
+- Replacing a variable-length string attribute releases the superseded
+  value's global-heap objects, before the replacement's collection is
+  allocated (the same free-before-alloc order as the dataset fix below),
+  so updating a vlen attribute — in one session or across reopen-replace
+  sessions — no longer strands one collection block per update. All three
+  attribute lists (root, group, dataset) route replacement through one
+  owner, which also covers a numeric value replacing a vlen one.
+  **Behavior change:** writing a dataset attribute whose name already
+  exists now replaces it, as root and group attributes (and h5py) always
+  did; previously the dataset header accumulated duplicate same-name
+  attribute messages.
+
+- On close, the writer frees the object-header blocks it supersedes —
+  root group, groups, and modified datasets are rewritten at fresh
+  addresses each session, and the old blocks were simply abandoned,
+  leaking a few dozen bytes per reopen cycle. Not done under SWMR, where
+  a live reader may still walk the old headers. (issue #10)
+
 ## 0.4.2
 
 ### Added

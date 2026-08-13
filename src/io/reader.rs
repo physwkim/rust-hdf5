@@ -151,6 +151,12 @@ pub struct Hdf5Reader {
     /// attributes. Built from actual link records, so empty groups,
     /// attribute-only groups, and subgroup-only groups are all included.
     group_paths: std::collections::BTreeSet<String>,
+    /// Group hard links: alias path → the first-walked path of the same
+    /// group object header (both without a leading `/`). The walk
+    /// descends each header once, so objects under the alias are stored
+    /// under the first path; lookups resolve alias prefixes through this
+    /// map, as HDF5 path traversal does.
+    group_aliases: std::collections::HashMap<String, String>,
 }
 
 /// Total byte length of `dims.product() * element_size`, computed with
@@ -401,12 +407,13 @@ impl Hdf5Reader {
 
         // Walk link messages to discover datasets, group attributes, and
         // every group path that exists.
-        let (datasets, group_attributes, group_paths) = Self::discover_datasets_from_links(
-            &mut handle,
-            &root_header,
-            sb.root_group_object_header_address,
-            &ctx,
-        )?;
+        let (datasets, group_attributes, group_paths, group_aliases) =
+            Self::discover_datasets_from_links(
+                &mut handle,
+                &root_header,
+                sb.root_group_object_header_address,
+                &ctx,
+            )?;
 
         // Collect root group attributes
         let mut root_attributes = Vec::new();
@@ -429,6 +436,7 @@ impl Hdf5Reader {
             root_attributes,
             group_attributes,
             group_paths,
+            group_aliases,
         })
     }
 
@@ -473,7 +481,7 @@ impl Hdf5Reader {
                 .any(|m| m.msg_type == MSG_LINK || m.msg_type == MSG_LINK_INFO)
         });
 
-        let (datasets, group_attributes, group_paths) = if has_links {
+        let (datasets, group_attributes, group_paths, group_aliases) = if has_links {
             Self::discover_datasets_from_links(
                 &mut handle,
                 root_hdr.as_ref().unwrap(),
@@ -506,6 +514,7 @@ impl Hdf5Reader {
                     Vec::new(),
                     std::collections::HashMap::new(),
                     std::collections::BTreeSet::new(),
+                    std::collections::HashMap::new(),
                 )
             }
         };
@@ -523,6 +532,7 @@ impl Hdf5Reader {
             root_attributes,
             group_attributes,
             group_paths,
+            group_aliases,
         })
     }
 
@@ -552,13 +562,19 @@ impl Hdf5Reader {
         Vec<DatasetReadInfo>,
         std::collections::HashMap<String, Vec<AttributeMessage>>,
         std::collections::BTreeSet<String>,
+        std::collections::HashMap<String, String>,
     )> {
         let mut group_attrs = std::collections::HashMap::new();
         let mut group_paths = std::collections::BTreeSet::new();
-        let mut visited = std::collections::HashSet::new();
+        // Object headers already descended into, keyed to the first path
+        // that reached them: a later path to the same header is a group
+        // hard link, recorded in `aliases` so lookups can resolve through
+        // it instead of walking (and cycling) a second time.
+        let mut visited = std::collections::HashMap::new();
+        let mut aliases = std::collections::HashMap::new();
         // Seed the root object header so a hard link cycling back to the
         // root is not descended into a second time.
-        visited.insert(root_addr);
+        visited.insert(root_addr, String::new());
         let datasets = Self::discover_datasets_recursive(
             handle,
             root_header,
@@ -567,8 +583,9 @@ impl Hdf5Reader {
             &mut group_attrs,
             &mut group_paths,
             &mut visited,
+            &mut aliases,
         )?;
-        Ok((datasets, group_attrs, group_paths))
+        Ok((datasets, group_attrs, group_paths, aliases))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -579,7 +596,8 @@ impl Hdf5Reader {
         prefix: &str,
         group_attrs: &mut std::collections::HashMap<String, Vec<AttributeMessage>>,
         group_paths: &mut std::collections::BTreeSet<String>,
-        visited: &mut std::collections::HashSet<u64>,
+        visited: &mut std::collections::HashMap<u64, String>,
+        aliases: &mut std::collections::HashMap<String, String>,
     ) -> IoResult<Vec<DatasetReadInfo>> {
         // Bound recursion depth on a hostile/corrupt file.
         const MAX_GROUP_DEPTH: usize = 256;
@@ -674,10 +692,14 @@ impl Hdf5Reader {
                         if !attrs.is_empty() {
                             group_attrs.insert(full_name.clone(), attrs);
                         }
-                        // Descend at most once per object header (cycle guard).
-                        if !visited.insert(*address) {
+                        // Descend at most once per object header (cycle
+                        // guard); a second path to it is a group hard
+                        // link — record the alias for lookups instead.
+                        if let Some(first) = visited.get(address) {
+                            aliases.insert(full_name.clone(), first.clone());
                             continue;
                         }
+                        visited.insert(*address, full_name.clone());
                         let child_ds = Self::discover_datasets_recursive(
                             handle,
                             &child_header,
@@ -686,6 +708,7 @@ impl Hdf5Reader {
                             group_attrs,
                             group_paths,
                             visited,
+                            aliases,
                         )?;
                         datasets.extend(child_ds);
                     }
@@ -762,12 +785,16 @@ impl Hdf5Reader {
         Vec<DatasetReadInfo>,
         std::collections::HashMap<String, Vec<AttributeMessage>>,
         std::collections::BTreeSet<String>,
+        std::collections::HashMap<String, String>,
     )> {
         let mut datasets = Vec::new();
-        let mut visited = std::collections::HashSet::new();
+        // First path per descended object header + the group-hard-link
+        // aliases met later, as in `discover_datasets_from_links`.
+        let mut visited = std::collections::HashMap::new();
+        let mut aliases = std::collections::HashMap::new();
         // Seed the root object header so a hard link cycling back to the
         // root group is not descended into a second time.
-        visited.insert(root_obj_addr);
+        visited.insert(root_obj_addr, String::new());
         let mut group_attrs = std::collections::HashMap::new();
         let mut group_paths = std::collections::BTreeSet::new();
         Self::discover_datasets_from_btree_recursive(
@@ -779,10 +806,11 @@ impl Hdf5Reader {
             0,
             &mut datasets,
             &mut visited,
+            &mut aliases,
             &mut group_attrs,
             &mut group_paths,
         )?;
-        Ok((datasets, group_attrs, group_paths))
+        Ok((datasets, group_attrs, group_paths, aliases))
     }
 
     /// Recursive worker for `discover_datasets_from_btree`. `prefix` is the
@@ -796,7 +824,8 @@ impl Hdf5Reader {
         prefix: &str,
         depth: usize,
         datasets: &mut Vec<DatasetReadInfo>,
-        visited: &mut std::collections::HashSet<u64>,
+        visited: &mut std::collections::HashMap<u64, String>,
+        aliases: &mut std::collections::HashMap<String, String>,
         group_attrs: &mut std::collections::HashMap<String, Vec<AttributeMessage>>,
         group_paths: &mut std::collections::BTreeSet<String>,
     ) -> IoResult<()> {
@@ -878,10 +907,13 @@ impl Hdf5Reader {
                 group_paths.insert(full_name.clone());
 
                 // Break cycles: descend into each group object header at
-                // most once.
-                if !visited.insert(entry.obj_header_addr) {
+                // most once. A second path to it is a group hard link —
+                // record the alias for lookups instead.
+                if let Some(first) = visited.get(&entry.obj_header_addr) {
+                    aliases.insert(full_name.clone(), first.clone());
                     continue;
                 }
+                visited.insert(entry.obj_header_addr, full_name.clone());
 
                 // Collect this subgroup's attributes (e.g. NeXus NX_class).
                 {
@@ -919,6 +951,7 @@ impl Hdf5Reader {
                         depth + 1,
                         datasets,
                         visited,
+                        aliases,
                         group_attrs,
                         group_paths,
                     )?;
@@ -1192,8 +1225,36 @@ impl Hdf5Reader {
         self.datasets.iter().map(|d| d.name.as_str()).collect()
     }
 
-    /// Return metadata for a dataset by name.
+    /// Rewrite a path (no leading `/`) whose group components pass
+    /// through hard links into the first-walked path of the object it
+    /// reaches — HDF5 traversal over the aliases the discovery walk
+    /// recorded. Bounded like libhdf5's link-traversal limit, so a link
+    /// cycle cannot loop forever; a path with no alias components comes
+    /// back unchanged.
+    fn canonical_path(&self, name: &str) -> String {
+        let mut name = name.to_string();
+        for _ in 0..64 {
+            let mut best: Option<(&str, &str)> = None;
+            for (alias, first) in &self.group_aliases {
+                let covers = name == *alias || name.starts_with(&format!("{alias}/"));
+                if covers && best.is_none_or(|(a, _)| alias.len() > a.len()) {
+                    best = Some((alias, first));
+                }
+            }
+            let Some((alias, first)) = best else { break };
+            // `first` is empty for an alias of the root group; trimming
+            // keeps the no-leading-'/' form either way.
+            name = format!("{first}{}", &name[alias.len()..])
+                .trim_start_matches('/')
+                .to_string();
+        }
+        name
+    }
+
+    /// Return metadata for a dataset by name. Like `H5Dopen`, the name
+    /// may pass through group hard links.
     pub fn dataset_info(&self, name: &str) -> Option<&DatasetReadInfo> {
+        let name = self.canonical_path(name);
         self.datasets.iter().find(|d| d.name == name)
     }
 
@@ -1230,10 +1291,11 @@ impl Hdf5Reader {
     }
 
     /// Return the attribute names of a non-root group (path without a
-    /// leading `/`, e.g. `"detector"` or `"entry/instrument"`).
+    /// leading `/`, e.g. `"detector"` or `"entry/instrument"`; may pass
+    /// through group hard links).
     pub fn group_attr_names(&self, group_path: &str) -> Vec<String> {
         self.group_attributes
-            .get(group_path)
+            .get(&self.canonical_path(group_path))
             .map(|v| v.iter().map(|a| a.name.clone()).collect())
             .unwrap_or_default()
     }
@@ -1241,7 +1303,7 @@ impl Hdf5Reader {
     /// Return a non-root group's attribute by name.
     pub fn group_attr(&self, group_path: &str, name: &str) -> Option<&AttributeMessage> {
         self.group_attributes
-            .get(group_path)?
+            .get(&self.canonical_path(group_path))?
             .iter()
             .find(|a| a.name == name)
     }
@@ -1253,10 +1315,42 @@ impl Hdf5Reader {
         &self.group_paths
     }
 
-    /// Report whether a group exists at `group_path` (no leading `/`).
-    /// The empty string denotes the root group, which always exists.
+    /// Report whether a group exists at `group_path` (no leading `/`;
+    /// may pass through group hard links). The empty string denotes the
+    /// root group, which always exists.
     pub fn has_group(&self, group_path: &str) -> bool {
-        group_path.is_empty() || self.group_paths.contains(group_path)
+        if group_path.is_empty() || self.group_paths.contains(group_path) {
+            return true;
+        }
+        let canon = self.canonical_path(group_path);
+        canon.is_empty() || self.group_paths.contains(&canon)
+    }
+
+    /// Read and decode the global-heap collection at `addr`, applying the
+    /// validation of libhdf5's `H5HG__cache_heap_deserialize`: the `GCOL`
+    /// signature must be present and the declared size at least
+    /// `H5HG_MINSIZE` (4096 bytes). There is no upper size cap — libhdf5
+    /// has none, and this crate's writers put a whole write call's strings
+    /// into one collection, which a cap would turn into silent data loss.
+    fn read_heap_collection(&mut self, addr: u64) -> IoResult<GlobalHeapCollection> {
+        let ss = self.ctx.sizeof_size as usize;
+        let header_len = 4 + 1 + 3 + ss;
+        let header_buf = self.handle.read_at_most(addr, header_len)?;
+        if header_buf.len() < header_len || header_buf[0..4] != *b"GCOL" {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "bad global heap collection signature at address {addr:#x}"
+            )));
+        }
+        let declared = read_uint(&header_buf[8..], ss) as usize;
+        if declared < 4096 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "global heap collection at address {addr:#x} declares size {declared}, \
+                 below the 4096-byte minimum"
+            )));
+        }
+        let heap_buf = self.handle.read_at(addr, declared)?;
+        let (coll, _) = GlobalHeapCollection::decode(&heap_buf, &self.ctx)?;
+        Ok(coll)
     }
 
     /// Decode an attribute's value as a string, resolving a variable-length
@@ -1282,19 +1376,17 @@ impl Hdf5Reader {
         if coll_addr == UNDEF_ADDR || coll_addr == 0 {
             return Ok(String::new());
         }
-        let ss = self.ctx.sizeof_size as usize;
-        let header_len = 4 + 1 + 3 + ss;
-        let header_buf = self.handle.read_at_most(coll_addr, header_len)?;
-        if header_buf.len() < header_len || header_buf[0..4] != *b"GCOL" {
-            return Ok(String::new());
-        }
-        let collection_size = read_uint(&header_buf[8..], ss) as usize;
-        if collection_size == 0 || collection_size > 64 * 1024 * 1024 {
-            return Ok(String::new());
-        }
-        let heap_buf = self.handle.read_at(coll_addr, collection_size)?;
-        let (coll, _) = GlobalHeapCollection::decode(&heap_buf, &self.ctx)?;
-        let obj = coll.get_object(obj_index as u16).unwrap_or(&[]);
+        let coll = self.read_heap_collection(coll_addr)?;
+        let idx = u16::try_from(obj_index).map_err(|_| {
+            crate::io::IoError::InvalidState(format!(
+                "global heap object index {obj_index} does not fit the 16-bit on-disk field"
+            ))
+        })?;
+        let obj = coll.get_object(idx).ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!(
+                "global heap object {idx} not found in the collection at address {coll_addr:#x}"
+            ))
+        })?;
         Ok(String::from_utf8_lossy(obj).to_string())
     }
 
@@ -1475,18 +1567,20 @@ impl Hdf5Reader {
 
         // Re-scan datasets, group attributes, and group paths from link
         // messages.
-        let (datasets, group_attributes, group_paths) = Self::discover_datasets_from_links(
-            &mut self.handle,
-            &root_header,
-            sb.root_group_object_header_address,
-            &ctx,
-        )?;
+        let (datasets, group_attributes, group_paths, group_aliases) =
+            Self::discover_datasets_from_links(
+                &mut self.handle,
+                &root_header,
+                sb.root_group_object_header_address,
+                &ctx,
+            )?;
 
         self._eof = sb.end_of_file_address;
         self.ctx = ctx;
         self.datasets = datasets;
         self.group_attributes = group_attributes;
         self.group_paths = group_paths;
+        self.group_aliases = group_aliases;
 
         Ok(())
     }
@@ -2593,22 +2687,7 @@ impl Hdf5Reader {
             // Read or get cached global heap collection
             #[allow(clippy::map_entry)]
             if !heap_cache.contains_key(&collection_addr) {
-                let ss = self.ctx.sizeof_size as usize;
-                let header_len = 4 + 1 + 3 + ss;
-                let header_buf = self.handle.read_at_most(collection_addr, header_len)?;
-                if header_buf.len() < header_len || &header_buf[0..4] != b"GCOL" {
-                    items.push(Vec::new());
-                    continue;
-                }
-                let collection_size = read_uint(&header_buf[8..], ss) as usize;
-
-                if collection_size == 0 || collection_size > 64 * 1024 * 1024 {
-                    items.push(Vec::new());
-                    continue;
-                }
-
-                let heap_buf = self.handle.read_at(collection_addr, collection_size)?;
-                let (coll, _) = GlobalHeapCollection::decode(&heap_buf, &self.ctx)?;
+                let coll = self.read_heap_collection(collection_addr)?;
                 let lookup: std::collections::HashMap<u16, usize> = coll
                     .objects
                     .iter()
@@ -2618,12 +2697,20 @@ impl Hdf5Reader {
                 heap_cache.insert(collection_addr, (coll, lookup));
             }
 
+            let idx = u16::try_from(obj_index).map_err(|_| {
+                crate::io::IoError::InvalidState(format!(
+                    "global heap object index {obj_index} does not fit the 16-bit on-disk field \
+                     (element {i} of \"{name}\")"
+                ))
+            })?;
             let (coll, lookup) = &heap_cache[&collection_addr];
-            if let Some(&idx) = lookup.get(&(obj_index as u16)) {
-                items.push(coll.objects[idx].data.clone());
-            } else {
-                items.push(Vec::new());
-            }
+            let &oi = lookup.get(&idx).ok_or_else(|| {
+                crate::io::IoError::InvalidState(format!(
+                    "global heap object {idx} not found in the collection at address \
+                     {collection_addr:#x} (element {i} of \"{name}\")"
+                ))
+            })?;
+            items.push(coll.objects[oi].data.clone());
         }
 
         Ok(items)

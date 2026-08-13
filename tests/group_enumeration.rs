@@ -186,3 +186,99 @@ fn group_names_lists_only_immediate_children() {
 
     cleanup(&path);
 }
+
+/// A bare `open_rw` + `close` must not change the group structure. The
+/// reopen used to rebuild the group registry from dataset paths alone, so
+/// a group with no dataset beneath it (empty, subgroup-only, or NeXus
+/// attribute-only) vanished at close — and even surviving groups lost
+/// their attributes, which the reopen had parsed and then discarded.
+#[test]
+fn reopen_session_keeps_groups_and_their_attributes() {
+    let path = unique_tmp("reopen_keeps");
+
+    {
+        let file = H5File::create(&path).unwrap();
+        let root = file.root_group();
+        root.create_group("empty").unwrap();
+        let subgroup_only = root.create_group("subgroup_only").unwrap();
+        subgroup_only.create_group("child").unwrap();
+        let attr_only = root.create_group("attr_only").unwrap();
+        attr_only.set_attr_string("NX_class", "NXdetector").unwrap();
+        let with_data = root.create_group("with_data").unwrap();
+        with_data.set_attr_string("NX_class", "NXentry").unwrap();
+        file.write_vlen_strings("with_data/notes", &["n0"]).unwrap();
+        file.close().unwrap();
+    }
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.close().unwrap();
+    }
+
+    let file = H5File::open(&path).unwrap();
+    let root = file.root_group();
+    let mut names = root.group_names().unwrap();
+    names.sort();
+    assert_eq!(names, ["attr_only", "empty", "subgroup_only", "with_data"]);
+    assert_eq!(
+        root.group("subgroup_only").unwrap().group_names().unwrap(),
+        vec!["child".to_string()]
+    );
+    assert_eq!(
+        root.group("attr_only")
+            .unwrap()
+            .attr_string("NX_class")
+            .unwrap(),
+        "NXdetector"
+    );
+    assert_eq!(
+        root.group("with_data")
+            .unwrap()
+            .attr_string("NX_class")
+            .unwrap(),
+        "NXentry"
+    );
+    assert_eq!(
+        file.dataset("with_data/notes")
+            .unwrap()
+            .read_vlen_strings()
+            .unwrap(),
+        vec!["n0"]
+    );
+    drop(file);
+    cleanup(&path);
+}
+
+/// A reopen session must be able to put an attribute on a group that has
+/// no dataset beneath it — the group has to be in the writer's registry
+/// for `set_attr_string` to find it.
+#[test]
+fn reopen_session_can_attribute_a_datasetless_group() {
+    let path = unique_tmp("reopen_attr_empty");
+
+    {
+        let file = H5File::create(&path).unwrap();
+        file.root_group().create_group("empty").unwrap();
+        file.close().unwrap();
+    }
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.root_group()
+            .group("empty")
+            .unwrap()
+            .set_attr_string("NX_class", "NXcollection")
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(
+        file.root_group()
+            .group("empty")
+            .unwrap()
+            .attr_string("NX_class")
+            .unwrap(),
+        "NXcollection"
+    );
+    drop(file);
+    cleanup(&path);
+}

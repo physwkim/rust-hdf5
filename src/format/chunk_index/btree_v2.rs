@@ -710,6 +710,11 @@ pub struct Bt2Tree {
     pub record_size: u16,
     /// Size of every node in bytes.
     pub node_size: u32,
+    /// Split percentage the header declares (pass-through; see
+    /// [`Bt2ChunkIndex::split_percent`]).
+    pub split_percent: u8,
+    /// Merge percentage the header declares (pass-through).
+    pub merge_percent: u8,
     /// Node geometry for depths `0..=depth()`.
     pub geometry: Bt2Geometry,
 }
@@ -803,6 +808,8 @@ impl Bt2Tree {
             record_type,
             record_size,
             node_size,
+            split_percent: BT2_SPLIT_PERCENT,
+            merge_percent: BT2_MERGE_PERCENT,
         }
     }
 
@@ -889,8 +896,8 @@ impl Bt2Tree {
             node_size: self.node_size,
             record_size: self.record_size,
             depth: self.depth(),
-            split_percent: BT2_SPLIT_PERCENT,
-            merge_percent: BT2_MERGE_PERCENT,
+            split_percent: self.split_percent,
+            merge_percent: self.merge_percent,
             root_node_addr: if self.nodes.is_empty() {
                 UNDEF_ADDR
             } else {
@@ -934,6 +941,17 @@ pub struct Bt2ChunkIndex {
     /// Width in bytes of a filtered record's compressed-size field. Meaningful
     /// only when `filtered`; see [`compute_chunk_size_len`].
     pub chunk_size_len: u8,
+    /// Node size every (re-)serialization of this index uses: [`BT2_NODE_SIZE`]
+    /// for a tree this writer creates, the on-disk header's value for a
+    /// reopened tree. libhdf5 sizes every node from `hdr->node_size`
+    /// (`H5B2leaf.c`, `H5B2internal.c`), never from a compile-time constant.
+    pub node_size: u32,
+    /// Split percentage carried into the header. Advisory for this index —
+    /// the bulk loader rebuilds whole trees instead of splitting nodes — but
+    /// a reopened tree must hand back the value its creator declared.
+    pub split_percent: u8,
+    /// Merge percentage carried into the header (advisory, as above).
+    pub merge_percent: u8,
 }
 
 impl Bt2ChunkIndex {
@@ -945,6 +963,9 @@ impl Bt2ChunkIndex {
             records: Vec::new(),
             filtered_records: Vec::new(),
             chunk_size_len: 0,
+            node_size: BT2_NODE_SIZE,
+            split_percent: BT2_SPLIT_PERCENT,
+            merge_percent: BT2_MERGE_PERCENT,
         }
     }
 
@@ -959,6 +980,9 @@ impl Bt2ChunkIndex {
             records: Vec::new(),
             filtered_records: Vec::new(),
             chunk_size_len,
+            node_size: BT2_NODE_SIZE,
+            split_percent: BT2_SPLIT_PERCENT,
+            merge_percent: BT2_MERGE_PERCENT,
         }
     }
 
@@ -1100,19 +1124,22 @@ impl Bt2ChunkIndex {
         }
     }
 
-    /// Bulk-load these records into a v2 B-tree of [`BT2_NODE_SIZE`]-byte
-    /// nodes.
+    /// Bulk-load these records into a v2 B-tree of
+    /// [`node_size`](Self::node_size)-byte nodes.
     ///
     /// The records are already in key order (see the type docs), which is
     /// exactly what [`Bt2Tree::build`] needs.
     pub fn build_tree(&self, ctx: &FormatContext) -> Bt2Tree {
-        Bt2Tree::build(
+        let mut tree = Bt2Tree::build(
             self.record_type(),
             self.record_size(ctx),
-            BT2_NODE_SIZE,
+            self.node_size,
             ctx.sizeof_addr,
             &self.encode_records(ctx),
-        )
+        );
+        tree.split_percent = self.split_percent;
+        tree.merge_percent = self.merge_percent;
+        tree
     }
 
     /// Decode unfiltered records from a leaf node's raw record data.
@@ -1776,6 +1803,40 @@ mod tests {
         let (hdr, walked) = serialize_and_walk(&idx, &ctx);
         assert_eq!(hdr.depth, 2);
         assert_eq!(hdr.total_num_records, 5270);
+        assert_eq!(walked, idx.encode_records(&ctx));
+    }
+
+    /// The bulk load sizes nodes from the index's `node_size`, not the
+    /// compile-time default — a reopened foreign tree re-serializes at the
+    /// size its header declares, the way libhdf5 allocates every node at
+    /// `hdr->node_size`. Split/merge pass through to the header the same way.
+    #[test]
+    fn bulk_load_honors_a_foreign_node_size() {
+        let ctx = ctx8();
+        // record_size 24, node 512: a leaf holds (512 - 10) / 24 = 20, so
+        // 200 records force at least one internal level.
+        let mut idx = index_with(200);
+        idx.node_size = 512;
+        idx.split_percent = 90;
+        idx.merge_percent = 30;
+
+        let tree = idx.build_tree(&ctx);
+        assert_eq!(tree.node_size, 512);
+        assert!(
+            tree.depth() >= 1,
+            "200 records must not fit one 512-byte leaf"
+        );
+        let addrs: Vec<u64> = (0..tree.nodes.len() as u64)
+            .map(|i| 0x1000 + i * 512)
+            .collect();
+        for image in tree.encode(&ctx, &addrs) {
+            assert_eq!(image.len(), 512, "every node image fills its block");
+        }
+
+        let (hdr, walked) = serialize_and_walk(&idx, &ctx);
+        assert_eq!(hdr.node_size, 512);
+        assert_eq!(hdr.split_percent, 90);
+        assert_eq!(hdr.merge_percent, 30);
         assert_eq!(walked, idx.encode_records(&ctx));
     }
 

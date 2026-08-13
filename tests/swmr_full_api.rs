@@ -453,3 +453,82 @@ fn swmr_chunk_rewrite_does_not_grow_the_file() {
     cleanup(&once_path);
     cleanup(&many_path);
 }
+
+/// Boundary: the typed reads check `T` against the stored element width.
+/// An f64 dataset read as `i32` used to pass the divisibility check and
+/// return twice as many garbage values.
+#[test]
+fn typed_reads_reject_a_mismatched_element_width() {
+    let path = unique_tmp("typed_width");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        w.write_dataset::<f64>("d", &[2], &[1.5, -2.25]).unwrap();
+        w.close().unwrap();
+    }
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.read_dataset::<f64>("d").unwrap(), vec![1.5, -2.25]);
+
+    let err = r.read_dataset::<i32>("d").unwrap_err();
+    assert!(
+        err.to_string().contains("element size"),
+        "unexpected error: {err}"
+    );
+    let err = r.read_slice::<i32>("d", &[0], &[1]).unwrap_err();
+    assert!(
+        err.to_string().contains("element size"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(r.read_slice::<f64>("d", &[1], &[1]).unwrap(), vec![-2.25]);
+    cleanup(&path);
+}
+
+/// Every attribute mutation after `start_swmr` is refused, libhdf5's rule
+/// for SWMR writes. Object headers are frozen once streaming starts, so a
+/// change only reached the file when its header happened to be rebuilt at
+/// close (group attrs always, dataset attrs only alongside chunk writes)
+/// and was silently dropped otherwise — and replacing a vlen value
+/// stranded its old 4096-byte collection forever, since a streaming
+/// reader may still hold the references.
+#[test]
+fn attribute_changes_during_swmr_are_refused() {
+    let path = unique_tmp("swmr_attr_freeze");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        w.create_group("/", "entry").unwrap();
+        w.set_group_attr_string("/entry", "NX_class", "NXentry")
+            .unwrap();
+        let ds = w.create_streaming_dataset::<i32>("frames", &[4]).unwrap();
+        w.set_dataset_attr_string(ds, "units", "mm").unwrap();
+        w.set_dataset_attr_numeric(ds, "scale", &2i32).unwrap();
+        w.start_swmr().unwrap();
+
+        let err = w
+            .set_group_attr_string("/entry", "NX_class", "NXdata")
+            .expect_err("vlen replace under SWMR must be refused");
+        assert!(format!("{err}").contains("SWMR"), "got: {err}");
+        w.set_dataset_attr_string(ds, "units", "cm")
+            .expect_err("vlen replace under SWMR must be refused");
+        w.set_dataset_attr_string(ds, "long_name", "detector x")
+            .expect_err("a new vlen attribute under SWMR must be refused");
+        w.set_dataset_attr_numeric(ds, "scale", &3i32)
+            .expect_err("a numeric replace under SWMR must be refused");
+        w.close().unwrap();
+    }
+
+    // No stranded collection: the refused post-start calls must not have
+    // written a heap block. The two pre-start vlen attrs pack into one
+    // shared collection, so exactly one "GCOL" may appear.
+    let bytes = std::fs::read(&path).unwrap();
+    let gcols = bytes.windows(4).filter(|w| *w == b"GCOL").count();
+    assert_eq!(gcols, 1, "only the shared pre-start collection may exist");
+
+    // The pre-start values are what the file holds.
+    let file = rust_hdf5::H5File::open(&path).unwrap();
+    let entry = file.root_group().group("entry").unwrap();
+    assert_eq!(entry.attr_string("NX_class").unwrap(), "NXentry");
+    let ds = file.dataset("frames").unwrap();
+    assert_eq!(ds.attr("units").unwrap().read_string().unwrap(), "mm");
+    assert_eq!(ds.attr("scale").unwrap().read_numeric::<i32>().unwrap(), 2);
+    drop(file);
+    cleanup(&path);
+}

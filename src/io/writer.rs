@@ -13,8 +13,9 @@ use crate::format::chunk_index::extensible_array::{
     EA_CLS_CHUNK, EA_CLS_FILT_CHUNK,
 };
 use crate::format::chunk_index::fixed_array::{
-    encode_filtered_page, encode_unfiltered_page, FixedArrayDataBlock,
-    FixedArrayFilteredChunkElement, FixedArrayHeader, FixedArrayPagedPrefix, FA_CLIENT_FILT_CHUNK,
+    decode_filtered_page, decode_unfiltered_page, encode_filtered_page, encode_unfiltered_page,
+    FixedArrayDataBlock, FixedArrayFilteredChunkElement, FixedArrayHeader, FixedArrayPagedPrefix,
+    FA_CLIENT_FILT_CHUNK,
 };
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::data_layout::{DataLayoutMessage, EarrayParams, FixedArrayParams};
@@ -62,6 +63,66 @@ fn fixed_array_dblk_disk_size(ctx: &FormatContext, hdr: &FixedArrayHeader) -> u6
         // prefix + elements + single 4-byte checksum.
         meta_prefix + nelmts * elem_size + 4
     }
+}
+
+/// Walk a v2 B-tree from `addr`, collecting every node's raw record bytes
+/// and every node block's address — the reader's record walk plus the
+/// addresses, which `open_append` needs so the reconstructed
+/// [`Bt2DatasetInfo::node_addrs`] pool owns the on-disk nodes (the next
+/// flush re-serializes the tree over them, and a delete frees them).
+#[allow(clippy::too_many_arguments)]
+fn collect_bt2_nodes(
+    handle: &FileHandle,
+    ctx: &FormatContext,
+    addr: u64,
+    depth: u16,
+    nrec: u16,
+    record_size: u16,
+    node_size: u32,
+    geo: &crate::format::chunk_index::btree_v2::Bt2Geometry,
+    records: &mut Vec<u8>,
+    node_addrs: &mut Vec<u64>,
+) -> IoResult<()> {
+    use crate::format::chunk_index::btree_v2::{Bt2InternalNode, Bt2LeafNode};
+
+    node_addrs.push(addr);
+    let buf = handle.read_at_most(addr, node_size as usize)?;
+    if depth == 0 {
+        let leaf = Bt2LeafNode::decode(&buf, nrec, record_size)?;
+        records.extend_from_slice(&leaf.record_data);
+    } else {
+        let node = Bt2InternalNode::decode(
+            &buf,
+            ctx,
+            depth,
+            nrec,
+            record_size,
+            geo.max_nrec_size,
+            geo.child_total_size(depth),
+        )?;
+        records.extend_from_slice(&node.record_data);
+        let children: Vec<(u64, u16)> = node
+            .child_addrs
+            .iter()
+            .zip(node.child_nrecords.iter())
+            .map(|(&a, &n)| (a, n))
+            .collect();
+        for (child_addr, child_nrec) in children {
+            collect_bt2_nodes(
+                handle,
+                ctx,
+                child_addr,
+                depth - 1,
+                child_nrec,
+                record_size,
+                node_size,
+                geo,
+                records,
+                node_addrs,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Encode a fixed-array data block for the layout implied by `hdr`, using the
@@ -147,6 +208,64 @@ fn encode_fixed_array_dblk(
     buf
 }
 
+/// Decode a fixed-array data block for the layout implied by `hdr` — the
+/// inverse of [`encode_fixed_array_dblk`], and the single decode dispatch
+/// over non-paged/paged × unfiltered/filtered.
+///
+/// For the paged layout, pages whose bitmap bit is clear are skipped, not
+/// decoded: libhdf5 never writes an uninitialized page, so its bytes are
+/// arbitrary and carry no valid checksum. Their elements stay at the
+/// undefined-address defaults, which is exactly what the bitmap means.
+fn decode_fixed_array_dblk(
+    ctx: &FormatContext,
+    hdr: &FixedArrayHeader,
+    buf: &[u8],
+    chunk_size_len: usize,
+) -> crate::format::FormatResult<FixedArrayDataBlock> {
+    let is_filtered = hdr.client_id == FA_CLIENT_FILT_CHUNK;
+    let num_elmts = hdr.num_elmts as usize;
+
+    if !hdr.is_paged() {
+        return if is_filtered {
+            FixedArrayDataBlock::decode_filtered(buf, ctx, num_elmts, chunk_size_len)
+        } else {
+            FixedArrayDataBlock::decode_unfiltered(buf, ctx, num_elmts)
+        };
+    }
+
+    let npages = hdr.npages() as usize;
+    let dblk_page_nelmts = hdr.dblk_page_nelmts() as usize;
+    let prefix = FixedArrayPagedPrefix::decode(buf, ctx, npages as u64)?;
+
+    let mut dblk = if is_filtered {
+        FixedArrayDataBlock::new_filtered(prefix.header_addr, num_elmts)
+    } else {
+        FixedArrayDataBlock::new_unfiltered(prefix.header_addr, num_elmts)
+    };
+    dblk.client_id = hdr.client_id;
+
+    // Pages follow the prefix back to back; every page spans the full
+    // `dblk_page_nelmts` stride except the last, which holds the remainder.
+    let mut pos = prefix.prefix_size;
+    for p in 0..npages {
+        let start = p * dblk_page_nelmts;
+        let end = ((p + 1) * dblk_page_nelmts).min(num_elmts);
+        let nelmts = end - start;
+        if prefix.page_initialized(p) {
+            let page_buf = buf.get(pos..).unwrap_or(&[]);
+            if is_filtered {
+                let elems = decode_filtered_page(page_buf, ctx, nelmts, chunk_size_len)?;
+                dblk.filtered_elements[start..end].clone_from_slice(&elems);
+            } else {
+                let addrs = decode_unfiltered_page(page_buf, ctx, nelmts)?;
+                dblk.elements[start..end].copy_from_slice(&addrs);
+            }
+        }
+        pos += nelmts * hdr.element_size as usize + 4;
+    }
+    Ok(dblk)
+}
+
 /// Interior-mutability cell for per-dataset write state, selected by feature.
 ///
 /// This is the §5-B "cfg-selected interior types" from
@@ -187,12 +306,16 @@ impl<T> Slot<T> {
 /// Proof that the create gate (`create_lock`) is held and the new dataset's
 /// name passed the uniqueness check. Only [`Hdf5Writer::begin_create`]
 /// constructs one and [`Hdf5Writer::push_dataset`] demands one, so a creator
-/// cannot reach the dataset registry while skipping either step.
+/// cannot reach the dataset registry while skipping either step. Carries
+/// the canonical (link-resolved) name the creator must store, so the
+/// registry only ever holds tree paths.
 pub(crate) struct CreateGuard<'a> {
     #[cfg(not(feature = "threadsafe"))]
     _gate: std::cell::RefMut<'a, ()>,
     #[cfg(feature = "threadsafe")]
     _gate: std::sync::MutexGuard<'a, ()>,
+    /// The dataset name with every group hard link in it resolved.
+    pub(crate) name: String,
 }
 
 /// Reference-counted shared pointer, feature-selected. The single-thread
@@ -322,6 +445,12 @@ pub struct DatasetInfo {
     pub filter_pipeline: Option<FilterPipeline>,
     /// Soft-deleted: excluded from finalize output.
     pub deleted: bool,
+    /// The dataspace extent changed this session (`extend_dataset` /
+    /// `set_dataset_extent`). On a reopened dataset the finalize gate
+    /// otherwise infers "modified" from `chunks_written` alone, and a
+    /// session that only changed the extent would keep the old on-disk
+    /// header — silently dropping the new shape.
+    pub extent_dirty: bool,
     /// User-defined fill value bytes (exactly one element wide). `None`
     /// means default zero-fill; `Some` is emitted as a `fill_defined = 2`
     /// fill-value message in the dataset object header.
@@ -372,6 +501,18 @@ enum DblkParent {
     },
 }
 
+/// Which attribute list an attribute operation targets: the root group's,
+/// a group's (by full path), or a dataset's (by writer index).
+#[derive(Clone, Copy)]
+pub enum AttrTarget<'a> {
+    /// The root group's (file-level) attributes.
+    Root,
+    /// A group's attributes, by full path.
+    Group(&'a str),
+    /// A dataset's attributes, by writer index.
+    Dataset(usize),
+}
+
 /// Which chunk index a dataset uses. libhdf5 picks it from the dataspace: a
 /// v2 B-tree for two or more unlimited dimensions, an extensible array for
 /// exactly one, a fixed array for none.
@@ -412,6 +553,136 @@ impl ChunkGeometry {
             coords,
         )
     }
+}
+
+/// The refusal every attribute mutation gets while SWMR streaming is
+/// active, from the two owners of attribute-list change
+/// ([`Hdf5Writer::set_attribute`] and `evict_attr`).
+fn swmr_attr_error(name: &str) -> crate::io::IoError {
+    crate::io::IoError::InvalidState(format!(
+        "cannot add or modify attribute '{name}' during SWMR streaming: object \
+         headers are frozen while readers stream, and a superseded variable-length \
+         value's heap storage could never be reclaimed; set attributes before \
+         start_swmr (libhdf5 forbids attribute changes during SWMR writes too)"
+    ))
+}
+
+/// One collection block with free space that a later vlen insert may
+/// fill — an entry in the writer's CWFS list (libhdf5 `f->shared->cwfs`).
+struct CwfsEntry {
+    /// Block address of the collection.
+    addr: u64,
+    /// Declared block size; never changes after allocation.
+    size: usize,
+    /// Bytes its free-space marker owns, per
+    /// [`GlobalHeapCollection::free_space_at`](crate::format::global_heap::GlobalHeapCollection::free_space_at).
+    free: usize,
+}
+
+/// Maximum CWFS entries tracked — libhdf5's `H5HG_NCWFS` (H5HGpkg.h).
+const H5HG_NCWFS: usize = 16;
+
+/// Record a collection with `free` bytes in the CWFS list: update its
+/// entry if present, append while the list is short, and otherwise
+/// replace the entry with the least free space when this one has more —
+/// the retention rule of libhdf5's `H5HG_insert`.
+fn cwfs_note(cwfs: &mut Vec<CwfsEntry>, addr: u64, size: usize, free: usize) {
+    if let Some(p) = cwfs.iter().position(|e| e.addr == addr) {
+        cwfs[p].free = free;
+        return;
+    }
+    if cwfs.len() < H5HG_NCWFS {
+        cwfs.insert(0, CwfsEntry { addr, size, free });
+        return;
+    }
+    if let Some(p) = (0..cwfs.len()).min_by_key(|&p| cwfs[p].free) {
+        if free > cwfs[p].free {
+            cwfs[p] = CwfsEntry { addr, size, free };
+        }
+    }
+}
+
+/// The uniform rejection for `delete_dataset` / `delete_group` while SWMR
+/// streaming is active: deleting frees the object's blocks, and a live
+/// reader may hold any of their addresses.
+fn swmr_delete_error(name: &str) -> crate::io::IoError {
+    crate::io::IoError::InvalidState(format!(
+        "cannot delete '{name}' during SWMR streaming: a reader may hold the \
+         object's header and storage addresses (libhdf5 forbids link deletion \
+         during SWMR writes too)"
+    ))
+}
+
+/// Whether the chunk at grid `coords` lies entirely at or beyond `extent` in
+/// some dimension — no element of it would survive a shrink to that extent.
+fn chunk_outside_extent(coords: &[u64], chunk_dims: &[u64], extent: &[u64]) -> bool {
+    coords
+        .iter()
+        .zip(chunk_dims)
+        .zip(extent)
+        .any(|((&c, &cd), &e)| c.saturating_mul(cd) >= e)
+}
+
+/// Whether the chunk at grid `coords` keeps elements under `extent` but
+/// extends past it in some dimension — a shrink must refill its
+/// out-of-extent region with the fill value.
+fn chunk_straddles_extent(coords: &[u64], chunk_dims: &[u64], extent: &[u64]) -> bool {
+    !chunk_outside_extent(coords, chunk_dims, extent)
+        && coords
+            .iter()
+            .zip(chunk_dims)
+            .zip(extent)
+            .any(|((&c, &cd), &e)| (c + 1).saturating_mul(cd) > e)
+}
+
+/// Overwrite, in `data` (one whole chunk, unfiltered, row-major), every
+/// element at or beyond `extent` with the matching bytes of `fill` — a
+/// same-sized buffer tiled with the fill value. The caller guarantees the
+/// chunk at `coords` straddles `extent`, so every dimension keeps at least
+/// one element. Returns the replaced bytes, so a vlen dataset's dead
+/// heap references can be released rather than stranded.
+fn refill_chunk_beyond_extent(
+    data: &mut [u8],
+    fill: &[u8],
+    coords: &[u64],
+    chunk_dims: &[u64],
+    extent: &[u64],
+    element_size: usize,
+) -> Vec<u8> {
+    let ndims = chunk_dims.len();
+    let keep: Vec<usize> = (0..ndims)
+        .map(|d| {
+            let origin = coords[d] * chunk_dims[d];
+            chunk_dims[d].min(extent[d].saturating_sub(origin)) as usize
+        })
+        .collect();
+    // Row-major walk: for every row (all dimensions but the last),
+    // overwrite the whole row when its prefix is outside the keep box,
+    // else only the row's out-of-extent tail.
+    let row_elems = chunk_dims[ndims - 1] as usize;
+    let keep_last = keep[ndims - 1];
+    let nrows: u64 = chunk_dims[..ndims - 1].iter().product();
+    let mut replaced = Vec::new();
+    for r in 0..nrows {
+        let mut rem = r;
+        let mut in_keep = true;
+        for d in (0..ndims - 1).rev() {
+            let c = rem % chunk_dims[d];
+            rem /= chunk_dims[d];
+            if c as usize >= keep[d] {
+                in_keep = false;
+            }
+        }
+        let start = if in_keep { keep_last } else { 0 };
+        if start == row_elems {
+            continue;
+        }
+        let a = (r as usize * row_elems + start) * element_size;
+        let b = (r as usize + 1) * row_elems * element_size;
+        replaced.extend_from_slice(&data[a..b]);
+        data[a..b].copy_from_slice(&fill[a..b]);
+    }
+    replaced
 }
 
 /// Validate caller-supplied chunk geometry at dataset definition, the rule
@@ -510,8 +781,9 @@ pub struct Bt2DatasetInfo {
     pub max_dims: Vec<u64>,
     /// File offset of the BT2 header.
     pub bt2_header_addr: u64,
-    /// Pool of `BT2_NODE_SIZE`-byte blocks holding the tree's nodes, in the
-    /// order [`Bt2Tree::encode`] emits them.
+    /// Pool of node-size blocks (the index's
+    /// [`node_size`](Bt2ChunkIndex::node_size) bytes each) holding the tree's
+    /// nodes, in the order [`Bt2Tree::encode`] emits them.
     ///
     /// The single owner of the tree's node addresses: a flush re-serializes the
     /// whole tree over these blocks and allocates only the shortfall, so no
@@ -542,6 +814,11 @@ pub struct GroupInfo {
     pub child_groups: Vec<usize>,
     /// File offset of this group's object header (set during finalize).
     pub obj_header_addr: u64,
+    /// File offset of the on-disk header a reopen found for this group, so
+    /// finalize can free the block it supersedes.
+    pub obj_header_written_addr: Option<u64>,
+    /// Encoded size of that on-disk header (first block).
+    pub obj_header_encoded_size: usize,
     /// Soft-deleted: excluded from finalize output.
     pub deleted: bool,
     /// Attributes attached to this group (e.g. NeXus `NX_class`).
@@ -637,10 +914,25 @@ pub struct Hdf5Writer {
     /// libhdf5's `H5D__chunk_file_alloc`, which skips `H5MF_xfree` under
     /// `H5F_ACC_SWMR_WRITE`.
     swmr_active: bool,
+    /// Collections with free space — libhdf5's `f->shared->cwfs` list. A
+    /// vlen insert fills these partially-filled collection blocks before
+    /// creating a new one, so many small writes share 4096-byte blocks
+    /// instead of each taking their own. Entries hold `(addr, block size,
+    /// free bytes)` hints; the block on disk stays the single truth for
+    /// contents, and only the two functions that rewrite collection blocks
+    /// ([`insert_vlen_objects`](Self::insert_vlen_objects) and
+    /// [`release_vlen_references`](Self::release_vlen_references)) may
+    /// update this list. In-memory only, like the allocator's free list:
+    /// a reopened file's free space is rediscovered as releases touch its
+    /// collections. Capped at [`H5HG_NCWFS`] entries.
+    cwfs: Slot<Vec<CwfsEntry>>,
     /// Address of the root group object header (set after first finalize).
     root_group_addr: Option<u64>,
     /// Size of the encoded root group object header (for in-place rewrites).
     root_group_encoded_size: usize,
+    /// The on-disk root header block a reopen found, `(addr, len)`, so
+    /// finalize can free the block its rewrite supersedes.
+    superseded_root_header: Option<(u64, u64)>,
 }
 
 impl Hdf5Writer {
@@ -692,8 +984,10 @@ impl Hdf5Writer {
             libver_latest: false,
             closed: false,
             swmr_active: false,
+            cwfs: Slot::new(Vec::new()),
             root_group_addr: None,
             root_group_encoded_size: 0,
+            superseded_root_header: None,
         })
     }
 
@@ -773,8 +1067,13 @@ impl Hdf5Writer {
     /// (see `create_lock`) at every creator by construction.
     pub(crate) fn begin_create(&self, name: &str) -> IoResult<CreateGuard<'_>> {
         let gate = self.create_lock.lock();
-        self.ensure_unique_dataset_name(name)?;
-        Ok(CreateGuard { _gate: gate })
+        // A creation path through hard links lands in the link's target
+        // group, as HDF5 traversal does. Canonicalizing here — the one
+        // entry every creator passes — keeps alias forms out of the
+        // registry.
+        let name = self.canonical_dataset_path(name);
+        self.ensure_unique_dataset_name(&name)?;
+        Ok(CreateGuard { _gate: gate, name })
     }
 
     /// Push a freshly-built dataset into the registry and return its index.
@@ -875,7 +1174,8 @@ impl Hdf5Writer {
         let root_addr = sb.root_group_object_header_address;
         let root_buf =
             handle.read_at_most(root_addr, file_size.saturating_sub(root_addr) as usize)?;
-        let (root_header, _) = crate::format::object_header::ObjectHeader::decode(&root_buf)?;
+        let (root_header, root_header_size) =
+            crate::format::object_header::ObjectHeader::decode(&root_buf)?;
 
         // Collect existing root-level attributes
         let mut root_attributes = Vec::new();
@@ -901,12 +1201,36 @@ impl Hdf5Writer {
             0,
         )?;
 
+        // Two link entries can share one object header — hard links. Only
+        // the first-walked path becomes the object; the rest are rebuilt
+        // as hard-link registry entries further down. Without this split
+        // every alias came back as its own DatasetInfo carrying the same
+        // storage addresses, so deleting (or finalizing) one freed blocks
+        // the others still referenced.
+        let mut seen_header_addrs = std::collections::HashSet::new();
+        let mut alias_entries: Vec<(String, u64)> = Vec::new();
+        link_entries.retain(|(name, addr)| {
+            if seen_header_addrs.insert(*addr) {
+                true
+            } else {
+                alias_entries.push((name.clone(), *addr));
+                false
+            }
+        });
+
         let mut existing_datasets = Vec::new();
+        // Non-dataset link targets (groups): header block `(addr, len)` by
+        // link path — so finalize can free the block its rewrite supersedes —
+        // plus the attributes the header carries, which the group registry
+        // below must keep or finalize rewrites the group without them.
+        type GroupHeaderInfo = (u64, usize, Vec<AttributeMessage>);
+        let mut group_headers: std::collections::HashMap<String, GroupHeaderInfo> =
+            Default::default();
         for (name, obj_addr) in &link_entries {
             // Read the dataset's full object header (to EOF — see above).
             let ds_buf =
                 handle.read_at_most(*obj_addr, file_size.saturating_sub(*obj_addr) as usize)?;
-            let (ds_header, _) =
+            let (ds_header, ds_header_size) =
                 match crate::format::object_header::ObjectHeader::decode_any(&ds_buf) {
                     Ok(h) => h,
                     Err(_) => continue,
@@ -961,7 +1285,13 @@ impl Hdf5Writer {
 
             let (dt, ds, dl) = match (datatype, dataspace, layout) {
                 (Some(dt), Some(ds), Some(dl)) => (dt, ds, dl),
-                _ => continue, // Not a dataset (probably a group)
+                _ => {
+                    // Not a dataset — a group's header. Remember its block so
+                    // finalize can free what its rewrite supersedes, and its
+                    // attributes so the registry rebuild keeps them.
+                    group_headers.insert(name.clone(), (*obj_addr, ds_header_size, attrs));
+                    continue;
+                }
             };
 
             let mut info = DatasetInfo {
@@ -977,9 +1307,10 @@ impl Hdf5Writer {
                 append: None,
                 attributes: attrs,
                 obj_header_written_addr: Some(*obj_addr),
-                obj_header_encoded_size: 0,
+                obj_header_encoded_size: ds_header_size,
                 filter_pipeline: fp,
                 deleted: false,
+                extent_dirty: false,
                 fill_value,
                 // Preserve the on-disk layout version so finalize re-encodes
                 // what it read: a v5 file reopened and appended to must not be
@@ -1126,8 +1457,170 @@ impl Hdf5Writer {
                                 chunk_size_len,
                             });
                         }
+                    } else if *index_type
+                        == crate::format::messages::data_layout::ChunkIndexType::FixedArray
+                    {
+                        // Read the FA header and data block back so a
+                        // reopened dataset is writable and deletable, not
+                        // re-link only — a placeholder made a delete free
+                        // just the header and leak every chunk plus the
+                        // index. Paged data blocks (any FA with more than
+                        // dblk_page_nelmts chunks, libhdf5 default 1024)
+                        // reconstruct through the same decode owner; only
+                        // pages the bitmap marks initialized are decoded.
+                        let hdr_buf = handle.read_at_most(*index_address, 256)?;
+                        let fa_header = FixedArrayHeader::decode(&hdr_buf, &ctx)?;
+                        let is_filtered = fa_header.client_id == FA_CLIENT_FILT_CHUNK;
+                        let chunk_size_len = if is_filtered {
+                            (fa_header.element_size as usize)
+                                .checked_sub(ctx.sizeof_addr as usize + 4)
+                                .ok_or_else(|| {
+                                    crate::io::IoError::InvalidState(
+                                        "fixed array filtered element_size too small".into(),
+                                    )
+                                })?
+                        } else {
+                            0
+                        };
+                        if fa_header.data_blk_addr != UNDEF_ADDR && chunk_size_len <= 8 {
+                            let dblk_size = fixed_array_dblk_disk_size(&ctx, &fa_header) as usize;
+                            let dblk_buf =
+                                handle.read_at_most(fa_header.data_blk_addr, dblk_size)?;
+                            let fa_dblk = decode_fixed_array_dblk(
+                                &ctx,
+                                &fa_header,
+                                &dblk_buf,
+                                chunk_size_len,
+                            )?;
+                            info.fixed_array = Some(FixedArrayDatasetInfo {
+                                chunk_dims: real_chunk_dims,
+                                fa_header_addr: *index_address,
+                                fa_dblk_addr: fa_header.data_blk_addr,
+                                fa_header,
+                                fa_dblk,
+                                // Chunks written this session, matching the
+                                // EA reconstruction above.
+                                chunks_written: 0,
+                            });
+                        }
+                    } else if *index_type
+                        == crate::format::messages::data_layout::ChunkIndexType::BTreeV2
+                    {
+                        use crate::format::chunk_index::btree_v2::{
+                            Bt2Geometry, Bt2Header, BT2_TYPE_CHUNK_FILT, BT2_TYPE_CHUNK_UNFILT,
+                        };
+
+                        // Walk the tree back into the in-memory index and
+                        // adopt its node blocks as the flush pool. The pool
+                        // re-serializes at the header's node_size, whatever
+                        // it is — libhdf5 sizes every node from
+                        // hdr->node_size (H5B2leaf.c, H5B2internal.c) — so
+                        // a foreign size reopens too. Only a record type
+                        // that is not a chunk record, or a node size below
+                        // the bulk loader's few-records-per-node floor
+                        // (the same bound creation enforces), stays
+                        // re-link only.
+                        let hdr_buf = handle.read_at_most(*index_address, 256)?;
+                        let bt2_hdr = Bt2Header::decode(&hdr_buf, &ctx)?;
+                        let ndims = real_chunk_dims.len();
+                        let is_filt = match bt2_hdr.record_type {
+                            BT2_TYPE_CHUNK_UNFILT => Some(false),
+                            BT2_TYPE_CHUNK_FILT => Some(true),
+                            _ => None,
+                        };
+                        if let (Some(is_filt), true) = (
+                            is_filt,
+                            bt2_hdr.node_size as usize >= 10 + 3 * bt2_hdr.record_size as usize,
+                        ) {
+                            let mut index = if is_filt {
+                                let csl = (bt2_hdr.record_size as usize)
+                                    .checked_sub(ctx.sizeof_addr as usize + 4 + ndims * 8)
+                                    .filter(|&c| c <= 8)
+                                    .ok_or_else(|| {
+                                        crate::io::IoError::InvalidState(
+                                            "v2 B-tree filtered record size does not fit \
+                                             its rank and address width"
+                                                .into(),
+                                        )
+                                    })?;
+                                Bt2ChunkIndex::new_filtered(ndims, csl as u8)
+                            } else {
+                                Bt2ChunkIndex::new_unfiltered(ndims)
+                            };
+                            // Re-serialize with the creator's parameters:
+                            // node blocks keep their size and the rewritten
+                            // header keeps its declared split/merge.
+                            index.node_size = bt2_hdr.node_size;
+                            index.split_percent = bt2_hdr.split_percent;
+                            index.merge_percent = bt2_hdr.merge_percent;
+                            let mut node_addrs = Vec::new();
+                            if bt2_hdr.root_node_addr != UNDEF_ADDR && bt2_hdr.total_num_records > 0
+                            {
+                                let geo = Bt2Geometry::new(
+                                    bt2_hdr.node_size,
+                                    bt2_hdr.record_size,
+                                    bt2_hdr.depth,
+                                    ctx.sizeof_addr,
+                                );
+                                let mut record_bytes = Vec::new();
+                                collect_bt2_nodes(
+                                    &handle,
+                                    &ctx,
+                                    bt2_hdr.root_node_addr,
+                                    bt2_hdr.depth,
+                                    bt2_hdr.num_records_in_root,
+                                    bt2_hdr.record_size,
+                                    bt2_hdr.node_size,
+                                    &geo,
+                                    &mut record_bytes,
+                                    &mut node_addrs,
+                                )?;
+                                let total = if bt2_hdr.record_size > 0 {
+                                    record_bytes.len() / bt2_hdr.record_size as usize
+                                } else {
+                                    0
+                                };
+                                if is_filt {
+                                    for r in Bt2ChunkIndex::decode_filtered_records(
+                                        &record_bytes,
+                                        total,
+                                        ndims,
+                                        bt2_hdr.record_size,
+                                        &ctx,
+                                    )? {
+                                        index.insert_filtered(
+                                            r.scaled_offsets,
+                                            r.chunk_address,
+                                            r.chunk_size,
+                                            r.filter_mask,
+                                        );
+                                    }
+                                } else {
+                                    for r in Bt2ChunkIndex::decode_unfiltered_records(
+                                        &record_bytes,
+                                        total,
+                                        ndims,
+                                        &ctx,
+                                    )? {
+                                        index.insert(r.scaled_offsets, r.chunk_address);
+                                    }
+                                }
+                            }
+                            let max_dims = info
+                                .dataspace
+                                .max_dims
+                                .clone()
+                                .unwrap_or_else(|| info.dataspace.dims.clone());
+                            info.btree_v2 = Some(Bt2DatasetInfo {
+                                chunk_dims: real_chunk_dims,
+                                max_dims,
+                                bt2_header_addr: *index_address,
+                                node_addrs,
+                                index,
+                                chunks_written: 0,
+                            });
+                        }
                     }
-                    // FA/BT2 datasets remain as placeholder (re-link only)
                 }
                 _ => {}
             }
@@ -1135,20 +1628,26 @@ impl Hdf5Writer {
             existing_datasets.push(info);
         }
 
-        // Reconstruct group structure from dataset paths.
-        // e.g. dataset "nodes/id" implies group "/nodes" exists.
+        // Reconstruct the group registry. Every group is a link entry of its
+        // own, whether or not a dataset lives under it, so the registry is
+        // built from the discovered links — rebuilding it from dataset paths
+        // alone made attribute-only and empty groups vanish at close, and
+        // dropped the attributes of the groups that survived.
         let mut groups: Vec<GroupInfo> = Vec::new();
         let mut group_index_map: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
 
-        for (di, ds) in existing_datasets.iter().enumerate() {
-            let parts: Vec<&str> = ds.name.split('/').collect();
-            if parts.len() <= 1 {
-                continue; // root-level dataset, no group
-            }
-            // Build group hierarchy: e.g. "a/b/c" → groups "/a", "/a/b"
+        // Register the chain of groups "/a", "/a/b", … for the link-style
+        // path `link_path` ("a/b"), taking each one's on-disk header block
+        // and attributes out of `group_headers` when the link walk saw it.
+        fn ensure_groups_for(
+            link_path: &str,
+            groups: &mut Vec<GroupInfo>,
+            group_index_map: &mut std::collections::HashMap<String, usize>,
+            group_headers: &mut std::collections::HashMap<String, GroupHeaderInfo>,
+        ) {
             let mut path = String::new();
-            for part in &parts[..parts.len() - 1] {
+            for part in link_path.split('/') {
                 let parent_path = if path.is_empty() {
                     "/".to_string()
                 } else {
@@ -1168,29 +1667,88 @@ impl Hdf5Writer {
                     group_index_map.get(&parent_path).copied()
                 };
                 let gidx = groups.len();
+                let (obj_header_written_addr, obj_header_encoded_size, attributes) = group_headers
+                    .remove(path.trim_start_matches('/'))
+                    .map_or((None, 0, Vec::new()), |(addr, len, attrs)| {
+                        (Some(addr), len, attrs)
+                    });
                 groups.push(GroupInfo {
                     name: path.clone(),
                     parent,
                     child_datasets: Vec::new(),
                     child_groups: Vec::new(),
                     obj_header_addr: 0,
+                    obj_header_written_addr,
+                    obj_header_encoded_size,
                     deleted: false,
-                    attributes: Vec::new(),
+                    attributes,
                 });
                 if let Some(pidx) = parent {
                     groups[pidx].child_groups.push(gidx);
                 }
                 group_index_map.insert(path.clone(), gidx);
             }
-            // Assign dataset to its immediate parent group
-            let parent_path = if parts.len() == 2 {
-                format!("/{}", parts[0])
-            } else {
-                format!("/{}", parts[..parts.len() - 1].join("/"))
-            };
-            if let Some(&gidx) = group_index_map.get(&parent_path) {
-                groups[gidx].child_datasets.push(di);
+        }
+
+        // Every linked group, in link-walk order (parents precede children).
+        for (name, _) in &link_entries {
+            if group_headers.contains_key(name.as_str()) {
+                ensure_groups_for(name, &mut groups, &mut group_index_map, &mut group_headers);
             }
+        }
+
+        // Assign each dataset to its immediate parent group, creating any
+        // group the link walk could not decode (its chain stays placeholder).
+        for (di, ds) in existing_datasets.iter().enumerate() {
+            let parts: Vec<&str> = ds.name.split('/').collect();
+            if parts.len() <= 1 {
+                continue; // root-level dataset, no group
+            }
+            let parent_link_path = parts[..parts.len() - 1].join("/");
+            ensure_groups_for(
+                &parent_link_path,
+                &mut groups,
+                &mut group_index_map,
+                &mut group_headers,
+            );
+            let gidx = group_index_map[&format!("/{}", parent_link_path)];
+            groups[gidx].child_datasets.push(di);
+        }
+
+        // Rebuild the hard-link registry from the alias entries set aside
+        // above, so the H5Ldelete semantics survive a reopen. An alias
+        // whose target header did not decode is dropped with its target
+        // (the primary path was skipped the same way).
+        let mut hard_links: Vec<HardLink> = Vec::new();
+        for (path, addr) in alias_entries {
+            let target = if let Some(di) = existing_datasets
+                .iter()
+                .position(|d| d.obj_header_addr == addr)
+            {
+                HardLinkTarget::Dataset(di)
+            } else if let Some(gi) = groups
+                .iter()
+                .position(|g| g.obj_header_written_addr == Some(addr))
+            {
+                HardLinkTarget::Group(gi)
+            } else {
+                continue;
+            };
+            let (parent, link_name) = match path.rsplit_once('/') {
+                None => (None, path),
+                Some((dir, leaf)) => {
+                    ensure_groups_for(dir, &mut groups, &mut group_index_map, &mut group_headers);
+                    (
+                        group_index_map.get(&format!("/{dir}")).copied(),
+                        leaf.to_string(),
+                    )
+                }
+            };
+            hard_links.push(HardLink {
+                parent,
+                name: link_name,
+                target,
+            });
         }
 
         let allocator = FileAllocator::new(file_size);
@@ -1213,14 +1771,16 @@ impl Hdf5Writer {
             ctx,
             datasets: Slot::new(datasets),
             groups: Slot::new(groups),
-            hard_links: Slot::new(Vec::new()),
+            hard_links: Slot::new(hard_links),
             root_attributes: Slot::new(root_attributes),
             create_lock: Slot::new(()),
             libver_latest: false,
             closed: false,
             swmr_active: false,
+            cwfs: Slot::new(Vec::new()),
             root_group_addr: None,
             root_group_encoded_size: 0,
+            superseded_root_header: Some((root_addr, root_header_size as u64)),
         })
     }
 
@@ -1299,12 +1859,28 @@ impl Hdf5Writer {
             .collect()
     }
 
-    /// Find a dataset index by name.
+    /// Find a dataset index by name. Like `H5Dopen`, the name may be any
+    /// link path to the dataset: a user hard link's path — or a path
+    /// whose group components pass through such links — resolves to its
+    /// target.
     pub fn dataset_index(&self, name: &str) -> Option<usize> {
-        self.dataset_refs().iter().position(|d| {
-            let g = d.lock();
-            g.name == name && !g.deleted
-        })
+        let name = self.canonical_dataset_path(name);
+        self.dataset_refs()
+            .iter()
+            .position(|d| {
+                let g = d.lock();
+                g.name == name && !g.deleted
+            })
+            .or_else(|| {
+                self.hard_links_vec().iter().find_map(|l| match l.target {
+                    HardLinkTarget::Dataset(i)
+                        if self.hard_link_emitted(l) && self.hard_link_full_path(l) == name =>
+                    {
+                        Some(i)
+                    }
+                    _ => None,
+                })
+            })
     }
 
     /// Reconstruct the fields a writer-mode `H5Dataset` handle needs for the
@@ -1353,65 +1929,575 @@ impl Hdf5Writer {
         Ok(())
     }
 
-    /// Soft-delete a dataset by name. The dataset is excluded from the file
-    /// on close. File space is not reclaimed.
+    /// Delete a dataset name, with libhdf5's `H5Ldelete` semantics: a name
+    /// is only a link. If `name` is a user hard link's path, just that
+    /// link is removed and the object is untouched. If it is the tree name
+    /// and a user hard link still names the object, the object survives
+    /// under it — the link becomes the primary name and nothing is freed.
+    /// Only deleting the *last* name soft-deletes the object and frees the
+    /// file space it owned: its chunk blocks and chunk-index structures
+    /// (or contiguous data block), the global-heap objects of its
+    /// variable-length data and attributes, and — on a reopened file — the
+    /// on-disk object header block. The freed space is reused by later
+    /// allocations in this session; the file does not shrink.
+    ///
+    /// Refused while SWMR streaming is active: a live reader may hold any
+    /// of those addresses (libhdf5 forbids link deletion during SWMR
+    /// writes too).
     pub fn delete_dataset(&self, name: &str) -> IoResult<()> {
+        if self.swmr_active {
+            return Err(swmr_delete_error(name));
+        }
+        // The gate keeps the link list and child lists still while this
+        // delete reads and rewrites them (create_lock → op → slot order,
+        // the same as every creator).
+        let _create = self.create_lock.lock();
+        // `H5Ldelete` resolves the path through links only *up to* the
+        // leaf — the leaf is what gets deleted, so a leaf naming a user
+        // link must stay literal and be unlinked, not its target.
+        let name = match name.rsplit_once('/') {
+            None => name.to_string(),
+            Some((dir, leaf)) => format!(
+                "{}/{leaf}",
+                self.canonical_group_path(&format!("/{dir}"))
+                    .trim_start_matches('/')
+            ),
+        };
         let refs = self.dataset_refs();
-        let idx = refs
-            .iter()
-            .position(|d| {
-                let g = d.lock();
-                g.name == name && !g.deleted
-            })
-            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let idx = match refs.iter().position(|d| {
+            let g = d.lock();
+            g.name == name && !g.deleted
+        }) {
+            Some(i) => i,
+            None => {
+                // Not a tree name — the path may name a user hard link,
+                // and deleting a link path unlinks just that link (the
+                // creation collision checks keep the two namespaces
+                // disjoint, so the order of the lookups cannot matter).
+                let link = self.hard_links_vec().iter().position(|l| {
+                    self.hard_link_emitted(l)
+                        && matches!(l.target, HardLinkTarget::Dataset(_))
+                        && self.hard_link_full_path(l) == name
+                });
+                let Some(pos) = link else {
+                    return Err(crate::io::IoError::NotFound(name));
+                };
+                self.hard_links.lock().remove(pos);
+                return Ok(());
+            }
+        };
+        // A surviving hard link keeps the object: promote the first one to
+        // the primary name and delete nothing.
+        let promote = self.hard_links_vec().iter().position(|l| {
+            self.hard_link_emitted(l) && matches!(l.target, HardLinkTarget::Dataset(i) if i == idx)
+        });
+        if let Some(pos) = promote {
+            self.promote_dataset_to_link(idx, pos);
+            return Ok(());
+        }
         refs[idx].lock().deleted = true;
         // Remove from parent group's child_datasets
         for grp in self.group_refs() {
             grp.lock().child_datasets.retain(|&di| di != idx);
         }
-        Ok(())
+        self.purge_dead_hard_links();
+        let ds = self.ds(idx);
+        let _op = ds.op.lock();
+        self.release_dataset_storage(idx)
     }
 
-    /// Soft-delete a group and all its child datasets and sub-groups.
-    /// File space is not reclaimed.
+    /// Soft-delete a group and all its child datasets and sub-groups,
+    /// freeing every deleted object's file space the way
+    /// [`delete_dataset`](Self::delete_dataset) does — with the same
+    /// `H5Ldelete` semantics: a `name` that is a user hard link's path
+    /// unlinks just that link, and hard links from *outside* the subtree
+    /// keep their targets. A dataset or group such a link names survives,
+    /// re-homed under the link (a group brings its whole subtree with
+    /// it); a link naming the deleted group itself turns the call into a
+    /// pure rename and nothing is freed. Refused while SWMR streaming is
+    /// active, same rule as `delete_dataset`.
     pub fn delete_group(&self, name: &str) -> IoResult<()> {
+        if self.swmr_active {
+            return Err(swmr_delete_error(name));
+        }
+        // Same gate as `delete_dataset`: the pre-scan below and the
+        // promotions must see a still link list and child lists.
+        let _create = self.create_lock.lock();
         let name = if name.starts_with('/') {
             name.to_string()
         } else {
             format!("/{}", name)
         };
+        // Leaf stays literal, directory resolves through links — the
+        // same `H5Ldelete` rule as `delete_dataset`.
+        let name = match name.rsplit_once('/') {
+            Some((dir, leaf)) if !dir.is_empty() => {
+                format!("{}/{leaf}", self.canonical_group_path(dir))
+            }
+            _ => name,
+        };
         let groups = self.group_refs();
-        let gidx = groups
-            .iter()
-            .position(|g| {
-                let gg = g.lock();
-                gg.name == name && !gg.deleted
-            })
-            .ok_or_else(|| crate::io::IoError::NotFound(name.clone()))?;
-        self.delete_group_recursive(gidx);
+        let gidx = match groups.iter().position(|g| {
+            let gg = g.lock();
+            gg.name == name && !gg.deleted
+        }) {
+            Some(i) => i,
+            None => {
+                // Same `H5Ldelete` rule as `delete_dataset`: a path naming
+                // a user hard link to a group unlinks just that link.
+                let trimmed = name.trim_start_matches('/');
+                let link = self.hard_links_vec().iter().position(|l| {
+                    self.hard_link_emitted(l)
+                        && matches!(l.target, HardLinkTarget::Group(_))
+                        && self.hard_link_full_path(l) == trimmed
+                });
+                let Some(pos) = link else {
+                    return Err(crate::io::IoError::NotFound(name.clone()));
+                };
+                self.hard_links.lock().remove(pos);
+                return Ok(());
+            }
+        };
+
+        // A link is "outside" when its parent group does not die with the
+        // subtree; only outside links can keep their targets alive.
+        fn outside(parent: Option<usize>, doomed_gs: &[usize]) -> bool {
+            match parent {
+                None => true,
+                Some(pi) => !doomed_gs.contains(&pi),
+            }
+        }
+        // A group an outside link names survives, re-homed with its whole
+        // subtree under the link. Each promotion moves that subtree out of
+        // the doomed set — and can turn a link inside it into an outside
+        // one — so rescan from scratch until no promotable group is left.
+        // Promoting `gidx` itself makes the delete a pure rename: return.
+        let mut doomed_ds = Vec::new();
+        let mut doomed_gs = Vec::new();
+        loop {
+            doomed_ds.clear();
+            doomed_gs.clear();
+            self.collect_live_subtree(gidx, &mut doomed_ds, &mut doomed_gs);
+            let promote = self
+                .hard_links_vec()
+                .iter()
+                .enumerate()
+                .find_map(|(pos, l)| match l.target {
+                    HardLinkTarget::Group(gi)
+                        if self.hard_link_emitted(l)
+                            && outside(l.parent, &doomed_gs)
+                            && doomed_gs.contains(&gi) =>
+                    {
+                        Some((pos, gi))
+                    }
+                    _ => None,
+                });
+            let Some((pos, gi)) = promote else { break };
+            self.promote_group_to_link(gi, pos);
+            if gi == gidx {
+                return Ok(());
+            }
+        }
+        // A dataset an outside link names survives its container: re-home
+        // it under the link now, so the marking pass below never sees it.
+        for di in doomed_ds {
+            let promote = self.hard_links_vec().iter().position(|l| {
+                self.hard_link_emitted(l)
+                    && outside(l.parent, &doomed_gs)
+                    && matches!(l.target, HardLinkTarget::Dataset(i) if i == di)
+            });
+            if let Some(pos) = promote {
+                self.promote_dataset_to_link(di, pos);
+            }
+        }
+
+        let mut ds_deleted = Vec::new();
+        let mut gs_deleted = Vec::new();
+        self.delete_group_recursive(gidx, &mut ds_deleted, &mut gs_deleted);
         // Remove from parent's child_groups
         let parent = groups[gidx].lock().parent;
         if let Some(pidx) = parent {
             groups[pidx].lock().child_groups.retain(|&gi| gi != gidx);
         }
+        self.purge_dead_hard_links();
+        // Free storage only after the whole subtree is marked: the lists
+        // hold each object exactly once (the marking pass skips anything
+        // already deleted), so nothing is freed twice.
+        for di in ds_deleted {
+            let ds = self.ds(di);
+            let _op = ds.op.lock();
+            self.release_dataset_storage(di)?;
+        }
+        for gi in gs_deleted {
+            self.release_group_storage(gi)?;
+        }
         Ok(())
     }
 
-    fn delete_group_recursive(&self, gidx: usize) {
+    /// Collect the live (not soft-deleted) members of `gidx`'s subtree,
+    /// each exactly once, without changing anything — the read-only twin
+    /// of [`delete_group_recursive`](Self::delete_group_recursive), for
+    /// the pre-scan that must run before any marking.
+    fn collect_live_subtree(&self, gidx: usize, ds_out: &mut Vec<usize>, gs_out: &mut Vec<usize>) {
+        if gs_out.contains(&gidx) {
+            return;
+        }
+        let (child_ds, child_gs) = {
+            let grp = self.grp(gidx);
+            let g = grp.lock();
+            if g.deleted {
+                return;
+            }
+            (g.child_datasets.clone(), g.child_groups.clone())
+        };
+        gs_out.push(gidx);
+        for di in child_ds {
+            if !self.ds(di).lock().deleted && !ds_out.contains(&di) {
+                ds_out.push(di);
+            }
+        }
+        for gi in child_gs {
+            self.collect_live_subtree(gi, ds_out, gs_out);
+        }
+    }
+
+    /// Re-home dataset `idx` under the hard link at `pos` in the link
+    /// list — the surviving half of `H5Ldelete`: the link leaves the user
+    /// list and becomes the dataset's primary (tree) name, in the link's
+    /// parent group. Storage is untouched; any further links to the
+    /// dataset stay in the list and keep resolving.
+    fn promote_dataset_to_link(&self, idx: usize, pos: usize) {
+        let link = self.hard_links.lock().remove(pos);
+        let new_name = self.hard_link_full_path(&link);
+        for grp in self.group_refs() {
+            grp.lock().child_datasets.retain(|&di| di != idx);
+        }
+        if let Some(pi) = link.parent {
+            self.grp(pi).lock().child_datasets.push(idx);
+        }
+        self.ds(idx).lock().name = new_name;
+    }
+
+    /// The group counterpart of
+    /// [`promote_dataset_to_link`](Self::promote_dataset_to_link): re-home
+    /// group `gidx` under the hard link at `pos`, bringing its whole
+    /// subtree with it. Names are stored as full paths, so every live
+    /// descendant is renamed by prefix.
+    fn promote_group_to_link(&self, gidx: usize, pos: usize) {
+        let link = self.hard_links.lock().remove(pos);
+        let new_name = format!("/{}", self.hard_link_full_path(&link));
+        let old_name = self.grp(gidx).lock().name.clone();
+        for grp in self.group_refs() {
+            grp.lock().child_groups.retain(|&g| g != gidx);
+        }
+        {
+            let grp = self.grp(gidx);
+            let mut g = grp.lock();
+            g.parent = link.parent;
+            g.name = new_name.clone();
+        }
+        if let Some(pi) = link.parent {
+            self.grp(pi).lock().child_groups.push(gidx);
+        }
+
+        let mut ds_in = Vec::new();
+        let mut gs_in = Vec::new();
+        self.collect_live_subtree(gidx, &mut ds_in, &mut gs_in);
+        // Group names carry a leading '/' ("/a/b"), dataset names none
+        // ("a/b/ds") — two prefix forms of the same rename.
+        let old_grp_prefix = format!("{old_name}/");
+        let new_grp_prefix = format!("{new_name}/");
+        let old_ds_prefix = old_grp_prefix.trim_start_matches('/').to_string();
+        let new_ds_prefix = new_grp_prefix.trim_start_matches('/').to_string();
+        for gi in gs_in {
+            if gi == gidx {
+                continue;
+            }
+            let grp = self.grp(gi);
+            let mut g = grp.lock();
+            let renamed = g
+                .name
+                .strip_prefix(&old_grp_prefix)
+                .map(|rest| format!("{new_grp_prefix}{rest}"));
+            if let Some(n) = renamed {
+                g.name = n;
+            }
+        }
+        for di in ds_in {
+            let ds = self.ds(di);
+            let mut d = ds.lock();
+            let renamed = d
+                .name
+                .strip_prefix(&old_ds_prefix)
+                .map(|rest| format!("{new_ds_prefix}{rest}"));
+            if let Some(n) = renamed {
+                d.name = n;
+            }
+        }
+    }
+
+    /// Drop hard-link entries that can no longer be emitted — their parent
+    /// group or target object was just deleted — so the list mirrors what
+    /// the file will hold instead of carrying suppressed zombies.
+    fn purge_dead_hard_links(&self) {
+        let dead: Vec<usize> = self
+            .hard_links_vec()
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| !self.hard_link_emitted(l))
+            .map(|(p, _)| p)
+            .collect();
+        let mut links = self.hard_links.lock();
+        for p in dead.into_iter().rev() {
+            links.remove(p);
+        }
+    }
+
+    /// Mark `gidx` and its subtree deleted, appending each newly-deleted
+    /// object's index to `ds_out` / `gs_out` exactly once — the caller
+    /// frees their storage, and an object reachable twice (or a subtree
+    /// already deleted) must not be freed twice.
+    fn delete_group_recursive(
+        &self,
+        gidx: usize,
+        ds_out: &mut Vec<usize>,
+        gs_out: &mut Vec<usize>,
+    ) {
         // Mark deleted and snapshot the child lists, releasing the group lock
         // before locking any dataset/child-group slot (spine → slot order).
         let (child_ds, child_gs) = {
             let grp = self.grp(gidx);
             let mut g = grp.lock();
+            if g.deleted {
+                return;
+            }
             g.deleted = true;
             (g.child_datasets.clone(), g.child_groups.clone())
         };
+        gs_out.push(gidx);
         for di in child_ds {
-            self.ds(di).lock().deleted = true;
+            let ds = self.ds(di);
+            let mut d = ds.lock();
+            if !d.deleted {
+                d.deleted = true;
+                ds_out.push(di);
+            }
         }
         for gi in child_gs {
-            self.delete_group_recursive(gi);
+            self.delete_group_recursive(gi, ds_out, gs_out);
         }
+    }
+
+    /// Free everything a soft-deleted dataset owned. The single owner of
+    /// delete-time reclamation, called only from the two delete paths with
+    /// the dataset already marked deleted and its op lock held.
+    ///
+    /// A deleted dataset contributes nothing to finalize (the header,
+    /// index-flush and append-flush loops all skip it), so nothing in the
+    /// finalized file can reference the blocks freed here. Never runs under
+    /// SWMR — the delete entry points refuse first.
+    fn release_dataset_storage(&self, index: usize) -> IoResult<()> {
+        use crate::format::messages::datatype::DatatypeMessage;
+        let (indexed, ndims, contiguous, is_vlen, attrs, header_block) = {
+            let ds = self.ds(index);
+            let mut m = ds.lock();
+            // Buffered rows were never written to a chunk; they die with
+            // the dataset instead of being flushed at close.
+            m.append = None;
+            let indexed = m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
+            let contiguous = (!indexed && m.data_addr != UNDEF_ADDR && m.data_size > 0)
+                .then_some((m.data_addr, m.data_size));
+            m.data_addr = UNDEF_ADDR;
+            m.data_size = 0;
+            let is_vlen = matches!(
+                m.datatype,
+                DatatypeMessage::VarLenString { .. } | DatatypeMessage::VarLenSequence { .. }
+            );
+            let attrs = std::mem::take(&mut m.attributes);
+            let header_block = m
+                .obj_header_written_addr
+                .take()
+                .filter(|_| m.obj_header_encoded_size > 0)
+                .map(|a| (a, m.obj_header_encoded_size as u64));
+            m.obj_header_encoded_size = 0;
+            (
+                indexed,
+                m.dataspace.dims.len(),
+                contiguous,
+                is_vlen,
+                attrs,
+                header_block,
+            )
+        };
+        if indexed {
+            // Prune to a zero extent: every stored chunk is entirely beyond
+            // it, so the walk frees each chunk block and collects the vlen
+            // references its bytes held (released inside).
+            self.prune_chunks_beyond(index, &vec![0; ndims])?;
+            self.free_chunk_index(index)?;
+        } else if let Some((addr, size)) = contiguous {
+            if is_vlen {
+                let data = self.handle.read_at(addr, size as usize)?;
+                self.release_vlen_references(&data)?;
+            }
+            self.allocator.free(addr, size);
+        }
+        for attr in &attrs {
+            self.release_attr_vlen(attr)?;
+        }
+        if let Some((addr, size)) = header_block {
+            self.allocator.free(addr, size);
+        }
+        Ok(())
+    }
+
+    /// Free a deleted group's file space: its attributes' global-heap
+    /// objects and, on a reopened file, the on-disk header block. The
+    /// group counterpart of
+    /// [`release_dataset_storage`](Self::release_dataset_storage).
+    fn release_group_storage(&self, gidx: usize) -> IoResult<()> {
+        let (attrs, header_block) = {
+            let grp = self.grp(gidx);
+            let mut g = grp.lock();
+            let attrs = std::mem::take(&mut g.attributes);
+            let header_block = g
+                .obj_header_written_addr
+                .take()
+                .filter(|_| g.obj_header_encoded_size > 0)
+                .map(|a| (a, g.obj_header_encoded_size as u64));
+            g.obj_header_encoded_size = 0;
+            (attrs, header_block)
+        };
+        for attr in &attrs {
+            self.release_attr_vlen(attr)?;
+        }
+        if let Some((addr, size)) = header_block {
+            self.allocator.free(addr, size);
+        }
+        Ok(())
+    }
+
+    /// Free a deleted dataset's chunk-index structures, after the chunks
+    /// themselves were freed by a zero-extent prune. Takes the index info
+    /// out of the slot, so the dataset no longer claims chunked storage.
+    ///
+    /// Every block's size is recovered the way its allocation computed it:
+    /// re-encoding the in-memory copy (EA header and index block, FA
+    /// header and data block, BT2 header) or sizing a same-shape dummy
+    /// from the array geometry (EA data blocks, whose element counts come
+    /// from [`EaGeometry`]; BT2 nodes are all `node_size`).
+    fn free_chunk_index(&self, index: usize) -> IoResult<()> {
+        let ds = self.ds(index);
+        let mut m = ds.lock();
+        let is_filtered = m.filter_pipeline.is_some();
+        if let Some(c) = m.chunked.take() {
+            let p = &c.earray_params;
+            let bits = p.max_nelmts_bits;
+            let csl = c.chunk_size_len;
+            let geo = EaGeometry::new(
+                p.idx_blk_elmts,
+                p.data_blk_min_elmts,
+                p.sup_blk_min_data_ptrs,
+                bits,
+                p.max_dblk_page_nelmts_bits,
+            )?;
+            let dblk_size = |nelmts: u64| -> u64 {
+                if is_filtered {
+                    FilteredDataBlock::new(c.ea_header_addr, 0, nelmts as usize)
+                        .encode(&self.ctx, bits, csl)
+                        .len() as u64
+                } else {
+                    ExtensibleArrayDataBlock::new(c.ea_header_addr, 0, nelmts as usize)
+                        .encoded_size(&self.ctx, bits) as u64
+                }
+            };
+            let (dblk_addrs, sblk_addrs, iblk_size) = if is_filtered {
+                let f = c.filt_iblk.as_ref().unwrap();
+                (
+                    f.dblk_addrs.clone(),
+                    f.sblk_addrs.clone(),
+                    f.encode(&self.ctx, csl).len() as u64,
+                )
+            } else {
+                (
+                    c.ea_iblk.dblk_addrs.clone(),
+                    c.ea_iblk.sblk_addrs.clone(),
+                    c.ea_iblk.encoded_size(&self.ctx) as u64,
+                )
+            };
+            // Data blocks addressed from the index block belong to the
+            // first `iblock_nsblks` super blocks; each of those defines the
+            // element count (and so the disk size) of its data blocks.
+            let mut g = 0usize;
+            'direct: for s in geo.sblk.iter().take(geo.iblock_nsblks) {
+                for _ in 0..s.ndblks {
+                    let Some(&a) = dblk_addrs.get(g) else {
+                        break 'direct;
+                    };
+                    g += 1;
+                    if a == UNDEF_ADDR {
+                        continue;
+                    }
+                    if s.dblk_nelmts > geo.dblk_page_nelmts {
+                        return Err(crate::io::IoError::InvalidState(
+                            "cannot free a paged extensible-array data block, \
+                             which is not yet supported"
+                                .into(),
+                        ));
+                    }
+                    self.allocator.free(a, dblk_size(s.dblk_nelmts));
+                }
+            }
+            for (off, &sa) in sblk_addrs.iter().enumerate() {
+                if sa == UNDEF_ADDR {
+                    continue;
+                }
+                let s = geo.sblk[geo.iblock_nsblks + off];
+                if s.dblk_nelmts > geo.dblk_page_nelmts {
+                    return Err(crate::io::IoError::InvalidState(
+                        "cannot free a paged extensible-array data block, \
+                         which is not yet supported"
+                            .into(),
+                    ));
+                }
+                let buf = self.handle.read_at_most(sa, 65536)?;
+                let sb =
+                    ExtensibleArraySuperBlock::decode(&buf, &self.ctx, bits, s.ndblks as usize, 0)?;
+                for &da in &sb.dblk_addrs {
+                    if da != UNDEF_ADDR {
+                        self.allocator.free(da, dblk_size(s.dblk_nelmts));
+                    }
+                }
+                self.allocator
+                    .free(sa, sb.encode(&self.ctx, bits).len() as u64);
+            }
+            self.allocator.free(c.ea_iblk_addr, iblk_size);
+            self.allocator
+                .free(c.ea_header_addr, c.ea_header.encoded_size(&self.ctx) as u64);
+            return Ok(());
+        }
+        if let Some(fa) = m.fixed_array.take() {
+            self.allocator.free(
+                fa.fa_dblk_addr,
+                fixed_array_dblk_disk_size(&self.ctx, &fa.fa_header),
+            );
+            self.allocator.free(
+                fa.fa_header_addr,
+                fa.fa_header.encode(&self.ctx).len() as u64,
+            );
+            return Ok(());
+        }
+        if let Some(bt2) = m.btree_v2.take() {
+            let tree = bt2.index.build_tree(&self.ctx);
+            for &a in &bt2.node_addrs {
+                self.allocator.free(a, tree.node_size as u64);
+            }
+            self.allocator.free(
+                bt2.bt2_header_addr,
+                tree.header(UNDEF_ADDR).encode(&self.ctx).len() as u64,
+            );
+        }
+        Ok(())
     }
 
     /// Return the chunk dimensions for a dataset, if chunked.
@@ -1456,6 +2542,10 @@ impl Hdf5Writer {
         // Hold the create gate across the uniqueness check and the registry
         // push so the two are atomic (see `create_lock`).
         let _create = self.create_lock.lock();
+        // A parent path through hard links creates in the link's target,
+        // as HDF5 traversal does.
+        let parent_path = self.canonical_group_path(parent_path);
+        let parent_path = parent_path.as_str();
         let full_name = if parent_path == "/" {
             format!("/{}", name)
         } else {
@@ -1494,7 +2584,10 @@ impl Hdf5Writer {
         } else {
             let idx = groups
                 .iter()
-                .position(|g| g.lock().name == parent_path)
+                .position(|g| {
+                    let gg = g.lock();
+                    gg.name == parent_path && !gg.deleted
+                })
                 .ok_or_else(|| {
                     crate::io::IoError::NotFound(format!(
                         "parent group '{}' not found",
@@ -1510,6 +2603,8 @@ impl Hdf5Writer {
             child_datasets: Vec::new(),
             child_groups: Vec::new(),
             obj_header_addr: 0,
+            obj_header_written_addr: None,
+            obj_header_encoded_size: 0,
             deleted: false,
             attributes: Vec::new(),
         });
@@ -1527,10 +2622,15 @@ impl Hdf5Writer {
     /// `group_path` is the full path of the group (e.g., "/detector").
     /// `ds_index` is the dataset index returned by `create_dataset`.
     pub fn assign_dataset_to_group(&self, group_path: &str, ds_index: usize) -> IoResult<()> {
+        let group_path = self.canonical_group_path(group_path);
+        let group_path = group_path.as_str();
         let groups = self.group_refs();
         let group_idx = groups
             .iter()
-            .position(|g| g.lock().name == group_path)
+            .position(|g| {
+                let gg = g.lock();
+                gg.name == group_path && !gg.deleted
+            })
             .ok_or_else(|| {
                 crate::io::IoError::NotFound(format!("group '{}' not found", group_path))
             })?;
@@ -1564,6 +2664,9 @@ impl Hdf5Writer {
         // Hold the create gate across the collision check and the hard-link
         // push so the two are atomic (see `create_lock`).
         let _create = self.create_lock.lock();
+        // Both paths resolve through hard links, as HDF5 traversal does.
+        let parent_group_path = self.canonical_group_path(parent_group_path);
+        let parent_group_path = parent_group_path.as_str();
 
         let datasets = self.dataset_refs();
         let groups = self.group_refs();
@@ -1590,7 +2693,8 @@ impl Hdf5Writer {
         // Resolve the target. Dataset names are stored without a leading
         // '/', group names with one — compare on the trimmed form. A
         // trailing '/' is tolerated too.
-        let target_rel = target_path.trim_matches('/');
+        let target_rel = self.canonical_dataset_path(target_path.trim_matches('/'));
+        let target_rel = target_rel.as_str();
         if target_rel.is_empty() {
             return Err(crate::io::IoError::InvalidState(
                 "cannot hard-link the root group".into(),
@@ -1606,6 +2710,14 @@ impl Hdf5Writer {
             !gg.deleted && gg.name.trim_start_matches('/') == target_rel
         }) {
             HardLinkTarget::Group(idx)
+        } else if let Some(t) = self.hard_links_vec().iter().find_map(|l| {
+            (self.hard_link_emitted(l) && self.hard_link_full_path(l) == target_rel)
+                .then_some(l.target)
+        }) {
+            // The target path may itself be a hard link: links have no
+            // chain (all point straight at the object header, as in
+            // libhdf5), so the new link copies the existing one's target.
+            t
         } else {
             return Err(crate::io::IoError::NotFound(format!(
                 "hard link target '{target_path}' not found"
@@ -1669,6 +2781,49 @@ impl Hdf5Writer {
         }
     }
 
+    /// Rewrite a group path that passes through hard links into the tree
+    /// path of the group it reaches — HDF5 traversal, where any link in a
+    /// path component resolves to its target. Group-name form (leading
+    /// `/`). Repeats because a substituted target's subtree can hold
+    /// further links; bounded like libhdf5's link-traversal limit, so a
+    /// link cycle cannot loop forever. A path with no link components
+    /// (including one naming nothing at all) comes back unchanged.
+    pub(crate) fn canonical_group_path(&self, path: &str) -> String {
+        let mut path = path.to_string();
+        for _ in 0..64 {
+            // The longest emitted group-link path that is the whole of
+            // `path` or a '/'-boundary prefix of it.
+            let mut best: Option<(usize, usize)> = None; // (prefix len, target)
+            for l in self.hard_links_vec() {
+                let HardLinkTarget::Group(gi) = l.target else {
+                    continue;
+                };
+                if !self.hard_link_emitted(&l) {
+                    continue;
+                }
+                let lp = format!("/{}", self.hard_link_full_path(&l));
+                let covers = path == lp || path.starts_with(&format!("{lp}/"));
+                if covers && best.is_none_or(|(len, _)| lp.len() > len) {
+                    best = Some((lp.len(), gi));
+                }
+            }
+            let Some((len, gi)) = best else { break };
+            let target_name = self.grp(gi).lock().name.clone();
+            path = format!("{}{}", target_name, &path[len..]);
+        }
+        path
+    }
+
+    /// [`canonical_group_path`](Self::canonical_group_path) in the
+    /// dataset-name form (no leading `/`): the leaf is a dataset, so only
+    /// group links can appear as components and the whole path can go
+    /// through the group rewrite unchanged.
+    fn canonical_dataset_path(&self, name: &str) -> String {
+        self.canonical_group_path(&format!("/{name}"))
+            .trim_start_matches('/')
+            .to_string()
+    }
+
     /// Total number of hard links resolving to an object: its own tree link
     /// plus every emitted user-created hard link pointing at it.
     fn object_link_count(&self, target: HardLinkTarget) -> u32 {
@@ -1717,6 +2872,7 @@ impl Hdf5Writer {
         dims: &[u64],
     ) -> IoResult<usize> {
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         let total_elements: u64 = if dims.is_empty() {
             1
         } else {
@@ -1756,6 +2912,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: None,
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version: 4,
             },
@@ -1778,6 +2935,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
     ) -> IoResult<usize> {
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         ensure_unlimited_is_leading(max_dims)?;
         let chunk_bytes = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
@@ -1843,6 +3001,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: None,
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -2505,46 +3664,367 @@ impl Hdf5Writer {
         }
     }
 
-    /// Add an attribute to the root group (file-level attribute).
-    pub fn add_root_attribute(&self, attr: crate::format::messages::attribute::AttributeMessage) {
-        // Replace existing attribute with the same name, or append new one.
-        let mut attrs = self.root_attributes.lock();
-        if let Some(pos) = attrs.iter().position(|a| a.name == attr.name) {
-            attrs[pos] = attr;
-        } else {
-            attrs.push(attr);
+    /// Add an attribute to the root group (file-level attribute), replacing
+    /// a same-name attribute. See [`set_attribute`](Self::set_attribute).
+    pub fn add_root_attribute(&self, attr: AttributeMessage) -> IoResult<()> {
+        self.set_attribute(AttrTarget::Root, attr)
+    }
+
+    /// Insert `attr` into the attribute list `target` names, replacing a
+    /// same-name attribute.
+    ///
+    /// The single owner of attribute-list mutation: an `AttributeMessage`
+    /// that leaves a list here has its vlen global-heap objects released, so
+    /// no replacement — vlen over vlen, numeric over vlen — can strand heap
+    /// space (the attribute counterpart of issue #10's dataset fix).
+    ///
+    /// Under SWMR every attribute mutation is refused, matching libhdf5's
+    /// rule for SWMR writes. Object headers are frozen once streaming
+    /// starts — a change was committed at close only when the header
+    /// happened to be rebuilt (group attrs always, dataset attrs only if
+    /// the dataset also got chunk writes) and silently dropped otherwise —
+    /// and a replacement's superseded vlen value could never be reclaimed,
+    /// since a streaming reader may hold its heap references.
+    pub fn set_attribute(&self, target: AttrTarget<'_>, attr: AttributeMessage) -> IoResult<()> {
+        if self.swmr_active {
+            return Err(swmr_attr_error(&attr.name));
         }
+        let old = self.with_attr_list(target, |attrs| {
+            if let Some(pos) = attrs.iter().position(|a| a.name == attr.name) {
+                Some(std::mem::replace(&mut attrs[pos], attr))
+            } else {
+                attrs.push(attr);
+                None
+            }
+        })?;
+        match old {
+            Some(old) => self.release_attr_vlen(&old),
+            None => Ok(()),
+        }
+    }
+
+    /// Set a variable-length string attribute on `target`, replacing any
+    /// same-name attribute.
+    ///
+    /// Owns the whole replacement sequence: the superseded attribute is
+    /// removed and its heap objects released *before* the new value's
+    /// collection is allocated — the free-before-alloc order (issue #10)
+    /// that lets a reopen-replace loop land in the block it just freed
+    /// instead of growing the file every session. The cost, as on the
+    /// dataset path: a failure between the eviction and the insert below
+    /// loses the attribute rather than leaking its heap space.
+    pub fn set_vlen_string_attribute(
+        &self,
+        target: AttrTarget<'_>,
+        name: &str,
+        value: &str,
+    ) -> IoResult<()> {
+        self.evict_attr(target, name)?;
+        let attr = self.vlen_string_attribute(name, value)?;
+        self.set_attribute(target, attr)
+    }
+
+    /// The array counterpart of
+    /// [`set_vlen_string_attribute`](Self::set_vlen_string_attribute).
+    pub fn set_vlen_string_array_attribute(
+        &self,
+        target: AttrTarget<'_>,
+        name: &str,
+        values: &[&str],
+        dims: &[u64],
+    ) -> IoResult<()> {
+        self.evict_attr(target, name)?;
+        let attr = self.vlen_string_array_attribute(name, values, dims)?;
+        self.set_attribute(target, attr)
+    }
+
+    /// Take the attribute `name` off `target`'s list, releasing its heap
+    /// objects. No-op when absent. Refused under SWMR — see
+    /// [`set_attribute`](Self::set_attribute).
+    fn evict_attr(&self, target: AttrTarget<'_>, name: &str) -> IoResult<()> {
+        if self.swmr_active {
+            return Err(swmr_attr_error(name));
+        }
+        let old = self.with_attr_list(target, |attrs| {
+            attrs
+                .iter()
+                .position(|a| a.name == name)
+                .map(|pos| attrs.remove(pos))
+        })?;
+        match old {
+            Some(old) => self.release_attr_vlen(&old),
+            None => Ok(()),
+        }
+    }
+
+    /// Release the global-heap objects a superseded attribute owned.
+    /// Recognizes top-level vlen datatypes only: a *compound* attribute
+    /// with vlen members — which this crate cannot write, only a foreign
+    /// file can carry — keeps its members' heap objects when replaced or
+    /// deleted, the storage cost the foreign writer accepted. Every other
+    /// class stores its value inline in the message. Per-object removal
+    /// keeps collections shared with other refs (libhdf5-written files)
+    /// intact.
+    fn release_attr_vlen(&self, old: &AttributeMessage) -> IoResult<()> {
+        use crate::format::messages::datatype::DatatypeMessage;
+        if matches!(
+            old.datatype,
+            DatatypeMessage::VarLenString { .. } | DatatypeMessage::VarLenSequence { .. }
+        ) {
+            self.release_vlen_references(&old.data)?;
+        }
+        Ok(())
+    }
+
+    /// Run `f` on the attribute list `target` names — the accessor every
+    /// attribute mutation shares.
+    fn with_attr_list<R>(
+        &self,
+        target: AttrTarget<'_>,
+        f: impl FnOnce(&mut Vec<AttributeMessage>) -> R,
+    ) -> IoResult<R> {
+        match target {
+            AttrTarget::Root => Ok(f(&mut self.root_attributes.lock())),
+            AttrTarget::Group(path) => {
+                let path = self.canonical_group_path(path);
+                for grp in self.group_refs() {
+                    let mut g = grp.lock();
+                    if g.name == path && !g.deleted {
+                        return Ok(f(&mut g.attributes));
+                    }
+                }
+                Err(crate::io::IoError::NotFound(format!(
+                    "group '{path}' not found"
+                )))
+            }
+            AttrTarget::Dataset(index) => {
+                let count = self.dataset_count();
+                if index >= count {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "dataset index {index} out of range (have {count})"
+                    )));
+                }
+                Ok(f(&mut self.ds(index).lock().attributes))
+            }
+        }
+    }
+
+    /// Store each of `items` as a global heap object and return its
+    /// placement `(collection address, object index)`, in input order —
+    /// the writer side of libhdf5's `H5HG_insert`.
+    ///
+    /// Placement follows libhdf5: a collection from the CWFS list takes an
+    /// item when its free space holds the object *and* a residual
+    /// free-space marker header (`encode_at_size` always emits the
+    /// marker); what no listed collection can take goes into a fresh
+    /// collection, spilling into another at the 65535-object index cap.
+    /// One batch may therefore span several collections — invisible to
+    /// readers, which resolve each reference's own collection address. An
+    /// empty batch allocates nothing: an empty collection still encodes
+    /// to the 4096-byte `H5HG_MINALLOC` minimum, a block nothing would
+    /// reference. libhdf5 additionally tries to extend a nearly-full
+    /// collection's block in place (`H5MF_try_extend`); this writer does
+    /// not — an oversized item always starts a fresh collection.
+    ///
+    /// The `cwfs` lock is held across every read-modify-rewrite of a
+    /// listed collection block: it serializes concurrent inserts (two
+    /// datasets' writers can pack the same block) and inserts against
+    /// [`release_vlen_references`](Self::release_vlen_references), which
+    /// rewrites the same blocks when objects are freed.
+    ///
+    /// Under SWMR the CWFS list is neither consulted nor updated and every
+    /// batch gets fresh collections: packing rewrites a block a streaming
+    /// reader may be mid-walk on — the same reason `place_chunk` keeps a
+    /// relocated chunk's old block.
+    fn insert_vlen_objects(&self, items: &[&[u8]]) -> IoResult<Vec<(u64, u16)>> {
+        use crate::format::global_heap::{GlobalHeapCollection, GlobalHeapObject};
+
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let objhdr = GlobalHeapCollection::object_disk_size(&self.ctx, 0);
+        let mut placements = Vec::with_capacity(items.len());
+        let mut i = 0;
+
+        // Pack into listed collections while one can take the next item.
+        if !self.swmr_active {
+            let mut cwfs = self.cwfs.lock();
+            while i < items.len() {
+                let need = GlobalHeapCollection::object_disk_size(&self.ctx, items[i].len());
+                let Some(pos) = cwfs.iter().position(|e| e.free >= need + objhdr) else {
+                    // Second pass of libhdf5's H5F_cwfs_find_free_heap: no
+                    // listed collection has room, so try to grow one in
+                    // place before falling back to a fresh collection.
+                    if self.extend_listed_collection(&mut cwfs, need + objhdr)? {
+                        continue;
+                    }
+                    break;
+                };
+                let (addr, size) = (cwfs[pos].addr, cwfs[pos].size);
+                let image = self.handle.read_at(addr, size)?;
+                let (mut gcol, _) = GlobalHeapCollection::decode(&image[..size], &self.ctx)?;
+                // The disk is the truth for free space; the entry is a hint.
+                let Some(mut free) = gcol.free_space_at(&self.ctx, size) else {
+                    cwfs.remove(pos);
+                    continue;
+                };
+                let mut next_idx = gcol.max_index();
+                let mut took = false;
+                while i < items.len() && next_idx < u16::MAX {
+                    let need = GlobalHeapCollection::object_disk_size(&self.ctx, items[i].len());
+                    if free < need + objhdr {
+                        break;
+                    }
+                    next_idx += 1;
+                    gcol.objects.push(GlobalHeapObject {
+                        index: next_idx,
+                        ref_count: 0,
+                        data: items[i].to_vec(),
+                    });
+                    placements.push((addr, next_idx));
+                    free -= need;
+                    took = true;
+                    i += 1;
+                }
+                if took {
+                    let rewritten = gcol.encode_at_size(&self.ctx, size)?;
+                    self.handle.write_at(addr, &rewritten)?;
+                    // Correct the entry to the measured free space and move
+                    // it to the front — libhdf5 keeps `cwfs` in
+                    // most-recently-used order.
+                    let mut e = cwfs.remove(pos);
+                    e.free = free;
+                    cwfs.insert(0, e);
+                } else if next_idx == u16::MAX {
+                    // At the index cap nothing can be inserted no matter the
+                    // free space; drop the entry or the scan re-picks it
+                    // forever. (A removal can lower the top index again, and
+                    // the release side re-lists the collection then.)
+                    cwfs.remove(pos);
+                } else {
+                    // The hint overstated the block's free space — shrink it
+                    // to the measured value so the scan moves on.
+                    cwfs[pos].free = free;
+                }
+            }
+        }
+
+        // What remains goes into fresh collections.
+        while i < items.len() {
+            let mut gcol = GlobalHeapCollection::new();
+            // Objects are pushed with a running index: `add_object` rescans
+            // for the max index per call, O(n²) across a spill-sized batch.
+            let mut next_idx: u16 = 0;
+            while i < items.len() && next_idx < u16::MAX {
+                next_idx += 1;
+                gcol.objects.push(GlobalHeapObject {
+                    index: next_idx,
+                    ref_count: 0,
+                    data: items[i].to_vec(),
+                });
+                i += 1;
+            }
+            let encoded = gcol.encode(&self.ctx);
+            let addr = self.allocator.allocate(encoded.len() as u64);
+            self.handle.write_at(addr, &encoded)?;
+            for idx in 1..=next_idx {
+                placements.push((addr, idx));
+            }
+            // List the block's leftover free space for later inserts — the
+            // minimum-size padding of a small batch is most of 4096 bytes.
+            // Below two object headers not even an empty object fits.
+            if !self.swmr_active {
+                if let Some(free) = gcol.free_space_at(&self.ctx, encoded.len()) {
+                    if free >= 2 * objhdr {
+                        cwfs_note(&mut self.cwfs.lock(), addr, encoded.len(), free);
+                    }
+                }
+            }
+        }
+        Ok(placements)
+    }
+
+    /// Try to extend one listed collection in place so it can take an
+    /// object needing `want` bytes of free space — the second pass of
+    /// libhdf5's `H5F_cwfs_find_free_heap`: grow the file allocation
+    /// ([`FileAllocator::try_extend`], mirroring `H5MF_try_extend`) and then
+    /// the collection itself (`H5HG_extend`: a larger declared size and a
+    /// free-space marker covering the new tail — here by re-encoding at the
+    /// grown size, which writes exactly those two things).
+    ///
+    /// Extension size is `max(collection_size, shortfall)` — at least a
+    /// doubling — capped so the result stays within [`GCOL_MAX_SIZE`], both
+    /// as upstream computes them. On success the grown entry moves to the
+    /// front of the list and the caller's scan re-picks it; the free-space
+    /// measurement is taken from the block on disk, not the list's hint, so
+    /// the rewrite and the entry agree.
+    ///
+    /// Caller holds the `cwfs` lock (it passes the guarded list), which is
+    /// what serializes this read-modify-rewrite against concurrent inserts
+    /// and releases.
+    fn extend_listed_collection(&self, cwfs: &mut Vec<CwfsEntry>, want: usize) -> IoResult<bool> {
+        use crate::format::global_heap::{GlobalHeapCollection, GCOL_MAX_SIZE};
+
+        let mut pos = 0;
+        while pos < cwfs.len() {
+            let (addr, size) = (cwfs[pos].addr, cwfs[pos].size);
+            let image = self.handle.read_at(addr, size)?;
+            let (gcol, _) = GlobalHeapCollection::decode(&image[..size], &self.ctx)?;
+            // The disk is the truth for free space; the entry is a hint.
+            let Some(free) = gcol.free_space_at(&self.ctx, size) else {
+                cwfs.remove(pos);
+                continue;
+            };
+            // A hint can understate the block (upstream's FREE_SIZE is its
+            // in-memory truth and cannot): if the block already has room,
+            // correct the hint instead of doubling the collection.
+            if free >= want {
+                cwfs[pos].free = free;
+                return Ok(true);
+            }
+            let new_need = size.max(want.saturating_sub(free));
+            if size + new_need > GCOL_MAX_SIZE
+                || !self
+                    .allocator
+                    .try_extend(addr, size as u64, new_need as u64)
+            {
+                pos += 1;
+                continue;
+            }
+            let new_size = size + new_need;
+            let rewritten = gcol.encode_at_size(&self.ctx, new_size)?;
+            self.handle.write_at(addr, &rewritten)?;
+            let mut e = cwfs.remove(pos);
+            e.size = new_size;
+            e.free = free + new_need;
+            cwfs.insert(0, e);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Create a variable-length string dataset and write string data.
     ///
-    /// Stores strings in a global heap collection. The dataset raw data
-    /// consists of vlen references (collection_addr + object_index pairs).
+    /// Stores strings in the global heap. The dataset raw data consists of
+    /// vlen references (collection_addr + object_index pairs).
     pub fn create_vlen_string_dataset(&self, name: &str, strings: &[&str]) -> IoResult<usize> {
-        use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+        use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
 
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         let num_strings = strings.len() as u64;
 
-        // Build a global heap collection with all strings
-        let mut gcol = GlobalHeapCollection::new();
-        let mut obj_indices = Vec::with_capacity(strings.len());
-        for s in strings {
-            let idx = gcol.add_object(s.as_bytes().to_vec())?;
-            obj_indices.push(idx);
-        }
-
-        // Encode and write the global heap collection
-        let gcol_encoded = gcol.encode(&self.ctx);
-        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
-        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+        // Store the strings as heap objects; a batch that fits an earlier
+        // collection's free space shares its block.
+        let items: Vec<&[u8]> = strings.iter().map(|s| s.as_bytes()).collect();
+        let placements = self.insert_vlen_objects(&items)?;
 
         // Build raw data: vlen references
         let ref_size = crate::format::global_heap::vlen_reference_size(&self.ctx);
         let data_size = (num_strings as usize) * ref_size;
         let mut raw_data = Vec::with_capacity(data_size);
-        for (i, &obj_idx) in obj_indices.iter().enumerate() {
+        for (i, &(gcol_addr, obj_idx)) in placements.iter().enumerate() {
             let seq_len = crate::format::global_heap::vlen_seq_len(strings[i].len())?;
             raw_data.extend_from_slice(&encode_vlen_reference(
                 seq_len,
@@ -2577,6 +4057,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: None,
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version: 4,
                 chunked: None,
@@ -2598,30 +4079,22 @@ impl Hdf5Writer {
     /// of base (`u8`) elements, i.e. the byte length; no null terminator is
     /// appended.
     pub fn create_vlen_bytes_dataset(&self, name: &str, items: &[&[u8]]) -> IoResult<usize> {
-        use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+        use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
 
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         let num_items = items.len() as u64;
 
-        // Build a global heap collection with all byte arrays.
-        let mut gcol = GlobalHeapCollection::new();
-        let mut obj_indices = Vec::with_capacity(items.len());
-        for item in items {
-            let idx = gcol.add_object(item.to_vec())?;
-            obj_indices.push(idx);
-        }
-
-        // Encode and write the global heap collection.
-        let gcol_encoded = gcol.encode(&self.ctx);
-        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
-        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+        // Store the byte arrays as heap objects, sharing collection blocks
+        // as `create_vlen_string_dataset` does.
+        let placements = self.insert_vlen_objects(items)?;
 
         // Build raw data: one vlen reference per item.
         let ref_size = crate::format::global_heap::vlen_reference_size(&self.ctx);
         let data_size = (num_items as usize) * ref_size;
         let mut raw_data = Vec::with_capacity(data_size);
-        for (i, &obj_idx) in obj_indices.iter().enumerate() {
+        for (i, &(gcol_addr, obj_idx)) in placements.iter().enumerate() {
             // base is u8, so element count == byte count.
             let seq_len = crate::format::global_heap::vlen_seq_len(items[i].len())?;
             raw_data.extend_from_slice(&encode_vlen_reference(
@@ -2654,6 +4127,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: None,
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version: 4,
                 chunked: None,
@@ -2678,31 +4152,24 @@ impl Hdf5Writer {
         chunk_size: usize,
         pipeline: FilterPipeline,
     ) -> IoResult<usize> {
-        use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+        use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
 
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         let num_strings = strings.len() as u64;
         validate_chunk_geometry(&[num_strings], &[num_strings], &[chunk_size as u64])?;
 
-        // Build a global heap collection with all strings
-        let mut gcol = GlobalHeapCollection::new();
-        let mut obj_indices = Vec::with_capacity(strings.len());
-        for s in strings {
-            let idx = gcol.add_object(s.as_bytes().to_vec())?;
-            obj_indices.push(idx);
-        }
-
-        // Encode and write the global heap collection
-        let gcol_encoded = gcol.encode(&self.ctx);
-        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
-        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+        // Store the strings as heap objects; the geometry validation above
+        // must precede this so a refused call allocates nothing.
+        let items: Vec<&[u8]> = strings.iter().map(|s| s.as_bytes()).collect();
+        let placements = self.insert_vlen_objects(&items)?;
 
         // Build raw data: vlen references
         let ref_size = crate::format::global_heap::vlen_reference_size(&self.ctx);
         let data_size = (num_strings as usize) * ref_size;
         let mut raw_data = Vec::with_capacity(data_size);
-        for (i, &obj_idx) in obj_indices.iter().enumerate() {
+        for (i, &(gcol_addr, obj_idx)) in placements.iter().enumerate() {
             let seq_len = crate::format::global_heap::vlen_seq_len(strings[i].len())?;
             raw_data.extend_from_slice(&encode_vlen_reference(
                 seq_len,
@@ -2785,6 +4252,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: Some(pipeline),
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -2861,7 +4329,7 @@ impl Hdf5Writer {
     /// Creates a new global heap collection for the strings, builds vlen
     /// references, and appends them as new chunks to the dataset.
     pub fn append_vlen_strings(&self, ds_index: usize, strings: &[&str]) -> IoResult<()> {
-        use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+        use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
 
         if strings.is_empty() {
@@ -2890,21 +4358,25 @@ impl Hdf5Writer {
         };
         ensure_vlen_charset(charset, strings)?;
 
-        // Build a new global heap collection for this batch
-        let mut gcol = GlobalHeapCollection::new();
-        let mut obj_indices = Vec::with_capacity(strings.len());
-        for s in strings {
-            let idx = gcol.add_object(s.as_bytes().to_vec())?;
-            obj_indices.push(idx);
-        }
-        let gcol_encoded = gcol.encode(&self.ctx);
-        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
-        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+        // Every deterministic rejection must precede the heap write below:
+        // a collection written for a batch the append then refuses (a
+        // contiguous dataset, or a reopened dataset whose chunk index was
+        // not reconstructed) is a 4096-byte orphan nothing references.
+        let chunk_dims = self
+            .dataset_chunk_dims(ds_index)
+            .ok_or_else(|| crate::io::IoError::InvalidState("not a chunked dataset".into()))?
+            .to_vec();
+        let dims = self.dataset_dims(ds_index).to_vec();
+
+        // Store the batch's strings as heap objects; a batch that fits an
+        // earlier collection's free space shares its block.
+        let items: Vec<&[u8]> = strings.iter().map(|s| s.as_bytes()).collect();
+        let placements = self.insert_vlen_objects(&items)?;
 
         // Build raw vlen reference bytes
         let ref_size = crate::format::global_heap::vlen_reference_size(&self.ctx);
         let mut raw = Vec::with_capacity(strings.len() * ref_size);
-        for (i, &obj_idx) in obj_indices.iter().enumerate() {
+        for (i, &(gcol_addr, obj_idx)) in placements.iter().enumerate() {
             let seq_len = crate::format::global_heap::vlen_seq_len(strings[i].len())?;
             raw.extend_from_slice(&encode_vlen_reference(
                 seq_len,
@@ -2913,13 +4385,6 @@ impl Hdf5Writer {
                 &self.ctx,
             ));
         }
-
-        // Use the same chunked-append logic as append<T>
-        let chunk_dims = self
-            .dataset_chunk_dims(ds_index)
-            .ok_or_else(|| crate::io::IoError::InvalidState("not a chunked dataset".into()))?
-            .to_vec();
-        let dims = self.dataset_dims(ds_index).to_vec();
 
         let n_new_frames = strings.len();
         let current_dim0 = dims[0] as usize;
@@ -2983,11 +4448,14 @@ impl Hdf5Writer {
     /// variable-length string dataset, leaving its extent and every other
     /// element alone.
     ///
-    /// The replacements go into a fresh global heap collection and only the
-    /// vlen references of the named elements are rewritten, so the cost is the
+    /// The replacements go into the global heap and only the vlen
+    /// references of the named elements are rewritten, so the cost is the
     /// new strings plus the chunks those references live in — not the column.
-    /// The objects the old references pointed at are freed, so repeated
-    /// updates reuse space instead of growing the file. This is what libhdf5
+    /// The objects the old references pointed at are freed *before* the
+    /// replacement is allocated, so repeated updates reuse space instead of
+    /// growing the file — including across close/reopen cycles, where the
+    /// in-memory free list starts empty and only this free-first order lets
+    /// the session reuse the block it just released. This is what libhdf5
     /// does: `H5T__vlen_disk_write` deletes the reference it read into the
     /// conversion background buffer before storing the new one.
     ///
@@ -2999,14 +4467,10 @@ impl Hdf5Writer {
         start: u64,
         strings: &[&str],
     ) -> IoResult<()> {
-        use crate::format::global_heap::{
-            encode_vlen_reference, vlen_reference_size, GlobalHeapCollection,
-        };
+        use crate::format::global_heap::{encode_vlen_reference, vlen_reference_size};
         use crate::format::messages::datatype::DatatypeMessage;
 
-        // An empty batch must not reach the heap write below: an empty
-        // collection still encodes to the 4096-byte `H5HG_MINALLOC` minimum,
-        // so the file would grow by a block nothing references.
+        // An empty batch is a no-op: nothing to replace, nothing to free.
         if strings.is_empty() {
             return Ok(());
         }
@@ -3019,7 +4483,7 @@ impl Hdf5Writer {
 
         // Snapshot what the write needs, then drop the guard: `write_slice`
         // below re-locks the same slot.
-        let (charset, dims) = {
+        let (charset, dims, writable) = {
             let ds = self.ds(ds_index);
             let m = ds.lock();
             let charset = match m.datatype {
@@ -3031,8 +4495,22 @@ impl Hdf5Writer {
                     ))
                 }
             };
-            (charset, m.dataspace.dims.clone())
+            let writable = m.chunked.is_some()
+                || m.fixed_array.is_some()
+                || m.btree_v2.is_some()
+                || m.data_addr != UNDEF_ADDR;
+            (charset, m.dataspace.dims.clone(), writable)
         };
+
+        // `write_slice_inner` rejects a dataset with neither chunk machinery
+        // nor allocated data (a reopened dataset whose index was not
+        // reconstructed) — that rejection must come before the heap write
+        // below, or every failed call orphans a 4096-byte collection.
+        if !writable {
+            return Err(crate::io::IoError::InvalidState(
+                "dataset has no data allocated".into(),
+            ));
+        }
 
         if dims.len() != 1 {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -3049,12 +4527,6 @@ impl Hdf5Writer {
         }
         ensure_vlen_charset(charset, strings)?;
 
-        // One collection for the batch, as `append_vlen_strings` does.
-        let mut gcol = GlobalHeapCollection::new();
-        let mut obj_indices = Vec::with_capacity(strings.len());
-        for s in strings {
-            obj_indices.push(gcol.add_object(s.as_bytes().to_vec())?);
-        }
         let ref_size = vlen_reference_size(&self.ctx);
 
         // Elements the append buffer holds are not in the chunks yet: hand
@@ -3069,12 +4541,23 @@ impl Hdf5Writer {
         // which deletes them before storing the new reference.
         let superseded = self.current_element_bytes(ds_index, start, end - start, ref_size)?;
 
-        let gcol_encoded = gcol.encode(&self.ctx);
-        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
-        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+        // Free the superseded objects *before* allocating the replacement,
+        // the order `H5T__vlen_disk_write` uses. The freed block satisfies
+        // the allocation below within this same session, so a reopen-and-
+        // replace loop keeps the file flat — no persisted free-space
+        // information exists to carry it across sessions (issue #10). The
+        // cost, shared with libhdf5: a failure between here and the ref
+        // write below leaves the dataset's old references dangling.
+        self.release_vlen_references(&superseded)?;
+
+        // The insert comes after the release above so the space the release
+        // recovered — a freed block, or in-collection bytes the release just
+        // listed in `cwfs` — can satisfy this batch.
+        let items: Vec<&[u8]> = strings.iter().map(|s| s.as_bytes()).collect();
+        let placements = self.insert_vlen_objects(&items)?;
 
         let mut refs = Vec::with_capacity(strings.len() * ref_size);
-        for (i, &obj_idx) in obj_indices.iter().enumerate() {
+        for (i, &(gcol_addr, obj_idx)) in placements.iter().enumerate() {
             refs.extend_from_slice(&encode_vlen_reference(
                 crate::format::global_heap::vlen_seq_len(strings[i].len())?,
                 gcol_addr,
@@ -3084,10 +4567,6 @@ impl Hdf5Writer {
         }
 
         self.write_slice_inner(ds_index, &[start], &[strings.len() as u64], &refs)?;
-
-        // Only now that the new references are in place: a failure above must
-        // not leave the file naming objects this already freed.
-        self.release_vlen_references(&superseded)?;
 
         Ok(())
     }
@@ -3167,10 +4646,20 @@ impl Hdf5Writer {
     /// Free the global heap objects `refs` names, so replacing a vlen element
     /// does not strand what it used to point at.
     ///
+    /// Callers pass refs only for *top-level* vlen datatypes (the
+    /// `collect_refs` / `is_vlen` decisions at the prune, delete and
+    /// attribute-release sites all match `VarLenString`/`VarLenSequence`).
+    /// A compound datatype with vlen members — writable only by a foreign
+    /// library, never by this crate — keeps its members' heap objects when
+    /// its storage is pruned, deleted or replaced.
+    ///
     /// This is libhdf5's `H5HG_remove` reached through `H5T__vlen_disk_delete`:
     /// the object leaves its collection, the collection is rewritten at its
     /// existing size with the recovered bytes given to the free-space marker,
     /// and a collection that ends up empty returns its block to the allocator.
+    /// A rewritten collection's recovered space is listed in `cwfs` for
+    /// [`insert_vlen_objects`](Self::insert_vlen_objects) to pack into; a
+    /// freed block leaves the list.
     /// A nil reference (address 0 or `UNDEF_ADDR`) names no object. The
     /// address decides, not the sequence length: this crate's writers store
     /// even the empty string as a real heap object, so a zero-length reference
@@ -3220,6 +4709,12 @@ impl Hdf5Writer {
             per_collection.entry(addr).or_default().push(idx);
         }
 
+        // The `cwfs` lock is held across the sweep: it serializes these
+        // collection-block rewrites (and frees) against
+        // `insert_vlen_objects`, which may be packing new objects into the
+        // same blocks.
+        let objhdr = GlobalHeapCollection::object_disk_size(&self.ctx, 0);
+        let mut cwfs = self.cwfs.lock();
         for (addr, indices) in per_collection {
             // A collection is at least 4096 bytes (H5HG_MINALLOC) and most are
             // exactly that, so one read usually covers the whole image; only
@@ -3244,9 +4739,19 @@ impl Hdf5Writer {
             }
             if gcol.is_empty() {
                 self.allocator.free(addr, declared as u64);
+                // The block is gone; a lingering entry would let an insert
+                // pack into space the allocator can hand to anything.
+                cwfs.retain(|e| e.addr != addr);
             } else {
                 let rewritten = gcol.encode_at_size(&self.ctx, declared)?;
                 self.handle.write_at(addr, &rewritten)?;
+                // The recovered bytes are packable now — list them, the way
+                // libhdf5's `H5HG_remove` adds the heap to `cwfs`.
+                if let Some(free) = gcol.free_space_at(&self.ctx, declared) {
+                    if free >= 2 * objhdr {
+                        cwfs_note(&mut cwfs, addr, declared, free);
+                    }
+                }
             }
         }
         Ok(())
@@ -3257,15 +4762,7 @@ impl Hdf5Writer {
     /// The attribute will be written as a message in the dataset's object
     /// header when the file is finalized.
     pub fn add_dataset_attribute(&self, ds_index: usize, attr: AttributeMessage) -> IoResult<()> {
-        let count = self.dataset_count();
-        if ds_index >= count {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "dataset index {} out of range (have {})",
-                ds_index, count
-            )));
-        }
-        self.ds(ds_index).lock().attributes.push(attr);
-        Ok(())
+        self.set_attribute(AttrTarget::Dataset(ds_index), attr)
     }
 
     /// Add (or replace) an attribute on a group identified by its full path.
@@ -3274,22 +4771,7 @@ impl Hdf5Writer {
     /// file is finalized. An existing attribute with the same name is
     /// replaced, matching [`add_root_attribute`](Self::add_root_attribute).
     pub fn add_group_attribute(&self, group_path: &str, attr: AttributeMessage) -> IoResult<()> {
-        for grp in self.group_refs() {
-            let mut g = grp.lock();
-            if g.name == group_path && !g.deleted {
-                let attrs = &mut g.attributes;
-                if let Some(pos) = attrs.iter().position(|a| a.name == attr.name) {
-                    attrs[pos] = attr;
-                } else {
-                    attrs.push(attr);
-                }
-                return Ok(());
-            }
-        }
-        Err(crate::io::IoError::NotFound(format!(
-            "group '{}' not found",
-            group_path
-        )))
+        self.set_attribute(AttrTarget::Group(group_path), attr)
     }
 
     /// Build a variable-length UTF-8 string attribute message.
@@ -3305,22 +4787,16 @@ impl Hdf5Writer {
     /// `set_attr_string` value is always stored as a true variable-length
     /// string rather than the fixed-length string it used to be.
     ///
-    /// One global heap collection is allocated per attribute, matching the
-    /// per-call collection of [`create_vlen_string_dataset`](Self::create_vlen_string_dataset).
-    /// A single shared attribute heap would avoid the per-attribute padding
-    /// (`H5HG_MINALLOC` = 4096 bytes) but is a heap-management change that
-    /// would also need to cover the dataset path.
-    pub fn vlen_string_attribute(&self, name: &str, value: &str) -> IoResult<AttributeMessage> {
-        use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+    /// The string's heap object is placed by
+    /// [`insert_vlen_objects`](Self::insert_vlen_objects), so consecutive
+    /// attributes pack into a shared collection instead of each paying the
+    /// 4096-byte `H5HG_MINALLOC` minimum for a block that holds one string.
+    fn vlen_string_attribute(&self, name: &str, value: &str) -> IoResult<AttributeMessage> {
+        use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::dataspace::DataspaceMessage;
         use crate::format::messages::datatype::DatatypeMessage;
 
-        let mut gcol = GlobalHeapCollection::new();
-        let obj_idx = gcol.add_object(value.as_bytes().to_vec())?;
-        let gcol_encoded = gcol.encode(&self.ctx);
-        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
-        self.handle.write_at(gcol_addr, &gcol_encoded)?;
-
+        let (gcol_addr, obj_idx) = self.insert_vlen_objects(&[value.as_bytes()])?[0];
         let seq_len = crate::format::global_heap::vlen_seq_len(value.len())?;
         let data = encode_vlen_reference(seq_len, gcol_addr, obj_idx as u32, &self.ctx);
         Ok(AttributeMessage {
@@ -3343,16 +4819,18 @@ impl Hdf5Writer {
     /// that shape.
     ///
     /// The caller owns the invariant that `values.len()` equals the product of
-    /// `shape` (the public setters validate it before calling). One global heap
-    /// collection is allocated for the whole array (all elements share it),
-    /// matching the per-attribute collection of the scalar path.
-    pub fn vlen_string_array_attribute(
-        &mut self,
+    /// `shape` (the public setters validate it before calling). The element
+    /// objects are placed by
+    /// [`insert_vlen_objects`](Self::insert_vlen_objects) — a zero-element
+    /// array allocates nothing, and each reference carries its element's
+    /// own collection address.
+    fn vlen_string_array_attribute(
+        &self,
         name: &str,
         values: &[&str],
         shape: &[u64],
     ) -> IoResult<AttributeMessage> {
-        use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+        use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::dataspace::DataspaceMessage;
         use crate::format::messages::datatype::DatatypeMessage;
 
@@ -3362,23 +4840,15 @@ impl Hdf5Writer {
             "vlen_string_array_attribute values.len() must equal product(shape)"
         );
 
-        let mut gcol = GlobalHeapCollection::new();
-        // (byte length, heap object index) per element, in order.
-        let mut entries: Vec<(u32, u16)> = Vec::with_capacity(values.len());
-        for v in values {
-            let obj_idx = gcol.add_object(v.as_bytes().to_vec())?;
-            entries.push((crate::format::global_heap::vlen_seq_len(v.len())?, obj_idx));
-        }
-        let gcol_encoded = gcol.encode(&self.ctx);
-        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
-        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+        let items: Vec<&[u8]> = values.iter().map(|v| v.as_bytes()).collect();
+        let placements = self.insert_vlen_objects(&items)?;
 
         let mut data = Vec::with_capacity(values.len() * 16);
-        for (len, obj_idx) in &entries {
+        for (i, &(gcol_addr, obj_idx)) in placements.iter().enumerate() {
             data.extend_from_slice(&encode_vlen_reference(
-                *len,
+                crate::format::global_heap::vlen_seq_len(values[i].len())?,
                 gcol_addr,
-                *obj_idx as u32,
+                obj_idx as u32,
                 &self.ctx,
             ));
         }
@@ -3910,6 +5380,7 @@ impl Hdf5Writer {
         pipeline: Option<FilterPipeline>,
     ) -> IoResult<usize> {
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         if max_dims.contains(&u64::MAX) {
             return Err(crate::io::IoError::InvalidState(
@@ -3986,6 +5457,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: pipeline,
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version,
                 chunked: None,
@@ -4055,9 +5527,10 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: Option<FilterPipeline>,
     ) -> IoResult<usize> {
-        use crate::format::chunk_index::btree_v2::{Bt2Header, BT2_NODE_SIZE};
+        use crate::format::chunk_index::btree_v2::Bt2Header;
 
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         let ndims = dims.len();
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
@@ -4081,10 +5554,11 @@ impl Hdf5Writer {
         // wider rank than that has no valid geometry, so reject it here rather
         // than emit a tree no reader can walk.
         let record_size = bt2_index.record_size(&self.ctx) as usize;
-        if (BT2_NODE_SIZE as usize) < 10 + 3 * record_size {
+        let node_size = bt2_index.node_size as usize;
+        if node_size < 10 + 3 * record_size {
             return Err(crate::io::IoError::InvalidState(format!(
                 "a {ndims}-dimension v2 B-tree record is {record_size} bytes, too wide \
-                 for a {BT2_NODE_SIZE}-byte node"
+                 for a {node_size}-byte node"
             )));
         }
 
@@ -4118,6 +5592,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: pipeline,
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version,
                 chunked: None,
@@ -4151,6 +5626,7 @@ impl Hdf5Writer {
         compression_level: u32,
     ) -> IoResult<usize> {
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         ensure_unlimited_is_leading(max_dims)?;
         let element_size = datatype.element_size() as u64;
@@ -4222,6 +5698,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: Some(FilterPipeline::deflate(compression_level)),
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -4257,6 +5734,7 @@ impl Hdf5Writer {
         pipeline: FilterPipeline,
     ) -> IoResult<usize> {
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         ensure_unlimited_is_leading(max_dims)?;
         let element_size = datatype.element_size() as u64;
@@ -4323,6 +5801,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: Some(pipeline),
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -4905,7 +6384,10 @@ impl Hdf5Writer {
                 _ => {}
             }
         }
-        m.dataspace.dims = new_dims.to_vec();
+        if m.dataspace.dims != new_dims {
+            m.dataspace.dims = new_dims.to_vec();
+            m.extent_dirty = true;
+        }
         Ok(())
     }
 
@@ -4913,62 +6395,540 @@ impl Hdf5Writer {
     /// any dimension (unlike [`extend_dataset`](Self::extend_dataset), which
     /// only grows).
     ///
-    /// Shrinking sets the logical dataspace only: chunks (or parts of
-    /// chunks) beyond the new extent stay in the file but are no longer
-    /// visible on read, exactly as libhdf5's `H5Dset_extent` behaves. This
-    /// is how a partial multi-frame chunk's over-extended frame count is
-    /// corrected back to the true number of frames written.
+    /// A shrink prunes the stored chunks the way libhdf5's
+    /// `H5D__chunk_prune_by_extent` (H5Dchunk.c) does: a chunk entirely
+    /// beyond the new extent leaves the chunk index and its block is freed
+    /// for reuse (kept under SWMR, where a live reader may still hold its
+    /// address — the rule `H5Dearray.c` applies in `idx_remove`), and a
+    /// chunk the new extent cuts through has its out-of-extent region
+    /// overwritten with the fill value, so growing the extent back exposes
+    /// fill values rather than the stale data.
     pub fn set_dataset_extent(&self, index: usize, new_dims: &[u64]) -> IoResult<()> {
         let ds = self.ds(index);
         let _op = ds.op.lock();
+        let old_dims = {
+            let m = ds.lock();
+            let is_unindexed =
+                m.chunked.is_none() && m.fixed_array.is_none() && m.btree_v2.is_none();
+            if is_unindexed {
+                return Err(crate::io::IoError::InvalidState(
+                    "can only set the extent of chunked datasets".into(),
+                ));
+            }
+            if new_dims.len() != m.dataspace.dims.len() {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "set_extent rank mismatch: dataset has {} dimensions, got {}",
+                    m.dataspace.dims.len(),
+                    new_dims.len()
+                )));
+            }
+            // A shrink can cut into buffered rows, whose recorded base would
+            // then point past the extent; refuse rather than reconcile.
+            if m.append.is_some() {
+                return Err(crate::io::IoError::InvalidState(
+                    "set_extent cannot run while the dataset has buffered appends; \
+                     flush them first"
+                        .into(),
+                ));
+            }
+            // An absent maximum shape means the shape is fixed (libhdf5
+            // defaults maxdims to dims at creation), so growth is bounded by
+            // the extent.
+            match m.dataspace.max_dims {
+                Some(ref max) => {
+                    for (d, (&new, &mx)) in new_dims.iter().zip(max).enumerate() {
+                        if new > mx {
+                            return Err(crate::io::IoError::InvalidState(format!(
+                                "set_extent dimension {d} ({new}) exceeds the maximum {mx}"
+                            )));
+                        }
+                    }
+                }
+                None => {
+                    for (d, (&new, &cur)) in new_dims.iter().zip(&m.dataspace.dims).enumerate() {
+                        if new > cur {
+                            return Err(crate::io::IoError::InvalidState(format!(
+                                "set_extent dimension {d} ({new}) exceeds the maximum {cur}: \
+                                 a dataset without a stored maximum shape is fixed at its extent"
+                            )));
+                        }
+                    }
+                }
+            }
+            m.dataspace.dims.clone()
+        };
+        // A shrink strands chunks; prune them (and refill the straddlers)
+        // *before* the dims update — chunk addressing uses the
+        // maximum-extent grid, which the update does not change, and the
+        // helpers re-lock the slot themselves.
+        if new_dims.iter().zip(&old_dims).any(|(&n, &o)| n < o) {
+            self.prune_chunks_beyond(index, new_dims)?;
+        }
         let mut m = ds.lock();
-        let is_unindexed = m.chunked.is_none() && m.fixed_array.is_none() && m.btree_v2.is_none();
-        if is_unindexed {
-            return Err(crate::io::IoError::InvalidState(
-                "can only set the extent of chunked datasets".into(),
-            ));
+        if m.dataspace.dims != new_dims {
+            m.dataspace.dims = new_dims.to_vec();
+            m.extent_dirty = true;
         }
-        if new_dims.len() != m.dataspace.dims.len() {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "set_extent rank mismatch: dataset has {} dimensions, got {}",
-                m.dataspace.dims.len(),
-                new_dims.len()
-            )));
-        }
-        // A shrink can cut into buffered rows, whose recorded base would
-        // then point past the extent; refuse rather than reconcile.
-        if m.append.is_some() {
-            return Err(crate::io::IoError::InvalidState(
-                "set_extent cannot run while the dataset has buffered appends; \
-                 flush them first"
-                    .into(),
-            ));
-        }
-        // An absent maximum shape means the shape is fixed (libhdf5 defaults
-        // maxdims to dims at creation), so growth is bounded by the extent.
-        match m.dataspace.max_dims {
-            Some(ref max) => {
-                for (d, (&new, &mx)) in new_dims.iter().zip(max).enumerate() {
-                    if new > mx {
-                        return Err(crate::io::IoError::InvalidState(format!(
-                            "set_extent dimension {d} ({new}) exceeds the maximum {mx}"
-                        )));
-                    }
-                }
-            }
-            None => {
-                for (d, (&new, &cur)) in new_dims.iter().zip(&m.dataspace.dims).enumerate() {
-                    if new > cur {
-                        return Err(crate::io::IoError::InvalidState(format!(
-                            "set_extent dimension {d} ({new}) exceeds the maximum {cur}: \
-                             a dataset without a stored maximum shape is fixed at its extent"
-                        )));
-                    }
-                }
-            }
-        }
-        m.dataspace.dims = new_dims.to_vec();
         Ok(())
+    }
+
+    /// Remove and refill the chunks a shrink to `new_dims` strands — the
+    /// libhdf5 `H5D__chunk_prune_by_extent` behavior. A chunk entirely
+    /// beyond the new extent leaves the index and its block is freed (kept
+    /// under SWMR, where a live reader may still hold its address); a chunk
+    /// the extent cuts through gets its out-of-extent region refilled with
+    /// the fill value, so a later regrow reads fill, not stale elements.
+    ///
+    /// Runs *before* the dims update: the index grid chunks are addressed in
+    /// comes from the maximum extent, which a shrink never changes, so every
+    /// stored entry still resolves. The caller holds the dataset's op lock.
+    fn prune_chunks_beyond(&self, index: usize, new_dims: &[u64]) -> IoResult<()> {
+        let geo = self.chunk_geometry(index)?;
+        // A vlen dataset's elements are global-heap IDs: the pruned chunks
+        // still reference live heap objects, so the walkers read each dead
+        // chunk's bytes before freeing its block and the heap objects are
+        // released here — otherwise every shrink strands its strings in the
+        // file. `release_vlen_references` is a SWMR no-op, so the reads are
+        // skipped under SWMR too.
+        let collect_refs = !self.swmr_active && {
+            let ds = self.ds(index);
+            let m = ds.lock();
+            matches!(
+                m.datatype,
+                DatatypeMessage::VarLenString { .. } | DatatypeMessage::VarLenSequence { .. }
+            )
+        };
+        let (straddlers, dead_refs) = match geo.kind {
+            ChunkIndexKind::ExtensibleArray => {
+                self.prune_ea_chunks(index, &geo, new_dims, collect_refs)?
+            }
+            ChunkIndexKind::FixedArray => {
+                self.prune_fa_chunks(index, &geo, new_dims, collect_refs)?
+            }
+            ChunkIndexKind::BtreeV2 => {
+                self.prune_bt2_chunks(index, &geo, new_dims, collect_refs)?
+            }
+        };
+        if !dead_refs.is_empty() {
+            self.release_vlen_references(&dead_refs)?;
+        }
+        // Whole-chunk read-modify-write per straddler: an unfiltered chunk
+        // rewrites in place, a filtered one re-places through `place_chunk`.
+        let chunk_bytes = geo.chunk_bytes() as usize;
+        for coords in straddlers {
+            let Some(mut data) = self.read_chunk_at_coords(index, &coords)? else {
+                continue;
+            };
+            let fill = self.new_chunk_buffer(index, chunk_bytes);
+            let replaced = refill_chunk_beyond_extent(
+                &mut data,
+                &fill,
+                &coords,
+                &geo.chunk_dims,
+                new_dims,
+                geo.element_size as usize,
+            );
+            // Release before the write-back: a filtered straddler re-places
+            // its block, and freed heap space must be visible to that
+            // allocation (free-before-alloc, as everywhere else).
+            if collect_refs && !replaced.is_empty() {
+                self.release_vlen_references(&replaced)?;
+            }
+            self.write_chunk_at_coords(index, &coords, &data)?;
+        }
+        Ok(())
+    }
+
+    /// Extensible-array half of [`prune_chunks_beyond`](Self::prune_chunks_beyond):
+    /// walk every slot the array has ever set, free and clear the entries of
+    /// chunks entirely beyond `new_dims`, and return the grid coordinates of
+    /// the chunks that straddle it, plus — when `collect_refs` — the dead
+    /// chunks' element bytes so the caller can release their heap objects.
+    fn prune_ea_chunks(
+        &self,
+        index: usize,
+        geo: &ChunkGeometry,
+        new_dims: &[u64],
+        collect_refs: bool,
+    ) -> IoResult<(Vec<Vec<u64>>, Vec<u8>)> {
+        let ds = self.ds(index);
+        // One slot guard for the whole walk, the `record_ea_chunk` pattern:
+        // `self.handle`/`self.allocator`/`self.ctx` are disjoint fields.
+        let mut m = ds.lock();
+        let is_filtered = m.filter_pipeline.is_some();
+        let pipeline = m.filter_pipeline.clone();
+        let chunk_bytes = geo.chunk_bytes();
+        let (ea_geo, max_nelmts_bits, chunk_size_len, max_idx) = {
+            let c = m.chunked.as_ref().unwrap();
+            let p = &c.earray_params;
+            (
+                EaGeometry::new(
+                    p.idx_blk_elmts,
+                    p.data_blk_min_elmts,
+                    p.sup_blk_min_data_ptrs,
+                    p.max_nelmts_bits,
+                    p.max_dblk_page_nelmts_bits,
+                )?,
+                p.max_nelmts_bits,
+                c.chunk_size_len,
+                c.ea_header.max_idx_set,
+            )
+        };
+
+        let mut straddlers = Vec::new();
+        let mut dead_refs = Vec::new();
+
+        // The decoded data block the walk is currently inside, written back
+        // when the walk leaves it (or ends) having cleared an entry.
+        enum Dblk {
+            Unfiltered(ExtensibleArrayDataBlock),
+            Filtered(FilteredDataBlock),
+        }
+        let mut cache: Option<(u64, Dblk, bool)> = None;
+        let flush = |cache: &mut Option<(u64, Dblk, bool)>| -> IoResult<()> {
+            if let Some((addr, blk, dirty)) = cache.take() {
+                if dirty {
+                    let enc = match &blk {
+                        Dblk::Unfiltered(d) => d.encode(&self.ctx, max_nelmts_bits),
+                        Dblk::Filtered(d) => d.encode(&self.ctx, max_nelmts_bits, chunk_size_len),
+                    };
+                    self.handle.write_at(addr, &enc)?;
+                }
+            }
+            Ok(())
+        };
+        // Consecutive slots resolve through the same super block, so keep
+        // the last decode. Super blocks are only read here — clearing a
+        // data-block element never moves the block — so it never dirties.
+        let mut sblk_cache: Option<(usize, ExtensibleArraySuperBlock)> = None;
+
+        let mut slot = 0u64;
+        while slot < max_idx {
+            let coords = crate::io::chunk_grid::coords_of(
+                &geo.dims,
+                geo.max_dims.as_deref(),
+                &geo.chunk_dims,
+                slot,
+            )?;
+            if !chunk_outside_extent(&coords, &geo.chunk_dims, new_dims) {
+                if chunk_straddles_extent(&coords, &geo.chunk_dims, new_dims) {
+                    straddlers.push(coords);
+                }
+                slot += 1;
+                continue;
+            }
+            match ea_geo.locate(slot)? {
+                EaLoc::Index { elem } => {
+                    let c = m.chunked.as_mut().unwrap();
+                    if is_filtered {
+                        let fiblk = c.filt_iblk.as_mut().unwrap();
+                        let e = fiblk.elements[elem];
+                        if e.addr != UNDEF_ADDR {
+                            if collect_refs {
+                                if let Some(bytes) = self.read_chunk_block(
+                                    pipeline.as_ref(),
+                                    e.addr,
+                                    e.nbytes,
+                                    e.filter_mask,
+                                )? {
+                                    dead_refs.extend_from_slice(&bytes);
+                                }
+                            }
+                            if !self.swmr_active {
+                                self.allocator.free(e.addr, e.nbytes);
+                            }
+                            fiblk.elements[elem] = FilteredChunkEntry {
+                                addr: UNDEF_ADDR,
+                                nbytes: 0,
+                                filter_mask: 0,
+                            };
+                        }
+                    } else {
+                        let a = c.ea_iblk.elements[elem];
+                        if a != UNDEF_ADDR {
+                            if collect_refs {
+                                if let Some(bytes) =
+                                    self.read_chunk_block(pipeline.as_ref(), a, chunk_bytes, 0)?
+                                {
+                                    dead_refs.extend_from_slice(&bytes);
+                                }
+                            }
+                            if !self.swmr_active {
+                                self.allocator.free(a, chunk_bytes);
+                            }
+                            c.ea_iblk.elements[elem] = UNDEF_ADDR;
+                        }
+                    }
+                    slot += 1;
+                }
+                EaLoc::Dblk(l) => {
+                    if l.paged {
+                        return Err(crate::io::IoError::InvalidState(format!(
+                            "chunk index {slot} lives in a paged extensible-array \
+                             data block, which is not yet supported"
+                        )));
+                    }
+                    let dblk_start = slot - l.offset_in_dblk;
+                    let dblk_end = dblk_start + l.dblk_nelmts;
+                    // Resolve the data block's address; an undefined super or
+                    // data block means nothing in its whole element range was
+                    // ever written, so the walk skips the range.
+                    let dblk_addr = {
+                        let c = m.chunked.as_ref().unwrap();
+                        match l.path {
+                            EaDblkPath::Direct { idx } => {
+                                if is_filtered {
+                                    c.filt_iblk.as_ref().unwrap().dblk_addrs[idx]
+                                } else {
+                                    c.ea_iblk.dblk_addrs[idx]
+                                }
+                            }
+                            EaDblkPath::ViaSblk {
+                                sblk_off,
+                                local_dblk,
+                                ndblks_in_sblk,
+                                ..
+                            } => {
+                                let sblk_addr = if is_filtered {
+                                    c.filt_iblk.as_ref().unwrap().sblk_addrs[sblk_off]
+                                } else {
+                                    c.ea_iblk.sblk_addrs[sblk_off]
+                                };
+                                if sblk_addr == UNDEF_ADDR {
+                                    UNDEF_ADDR
+                                } else {
+                                    if sblk_cache.as_ref().map(|&(o, _)| o) != Some(sblk_off) {
+                                        let buf = self.handle.read_at_most(sblk_addr, 65536)?;
+                                        let sb = ExtensibleArraySuperBlock::decode(
+                                            &buf,
+                                            &self.ctx,
+                                            max_nelmts_bits,
+                                            ndblks_in_sblk,
+                                            0,
+                                        )?;
+                                        sblk_cache = Some((sblk_off, sb));
+                                    }
+                                    sblk_cache.as_ref().unwrap().1.dblk_addrs[local_dblk]
+                                }
+                            }
+                        }
+                    };
+                    if dblk_addr == UNDEF_ADDR {
+                        slot = dblk_end;
+                        continue;
+                    }
+                    if cache.as_ref().map(|&(a, _, _)| a) != Some(dblk_addr) {
+                        flush(&mut cache)?;
+                        let buf = self.handle.read_at_most(dblk_addr, 65536)?;
+                        let blk = if is_filtered {
+                            Dblk::Filtered(FilteredDataBlock::decode(
+                                &buf,
+                                &self.ctx,
+                                max_nelmts_bits,
+                                l.dblk_nelmts as usize,
+                                chunk_size_len,
+                            )?)
+                        } else {
+                            Dblk::Unfiltered(ExtensibleArrayDataBlock::decode(
+                                &buf,
+                                &self.ctx,
+                                max_nelmts_bits,
+                                l.dblk_nelmts as usize,
+                            )?)
+                        };
+                        cache = Some((dblk_addr, blk, false));
+                    }
+                    let (_, blk, dirty) = cache.as_mut().unwrap();
+                    match blk {
+                        Dblk::Filtered(d) => {
+                            let e = d.elements[l.offset_in_dblk as usize];
+                            if e.addr != UNDEF_ADDR {
+                                if collect_refs {
+                                    if let Some(bytes) = self.read_chunk_block(
+                                        pipeline.as_ref(),
+                                        e.addr,
+                                        e.nbytes,
+                                        e.filter_mask,
+                                    )? {
+                                        dead_refs.extend_from_slice(&bytes);
+                                    }
+                                }
+                                if !self.swmr_active {
+                                    self.allocator.free(e.addr, e.nbytes);
+                                }
+                                d.elements[l.offset_in_dblk as usize] = FilteredChunkEntry {
+                                    addr: UNDEF_ADDR,
+                                    nbytes: 0,
+                                    filter_mask: 0,
+                                };
+                                *dirty = true;
+                            }
+                        }
+                        Dblk::Unfiltered(d) => {
+                            let a = d.elements[l.offset_in_dblk as usize];
+                            if a != UNDEF_ADDR {
+                                if collect_refs {
+                                    if let Some(bytes) =
+                                        self.read_chunk_block(pipeline.as_ref(), a, chunk_bytes, 0)?
+                                    {
+                                        dead_refs.extend_from_slice(&bytes);
+                                    }
+                                }
+                                if !self.swmr_active {
+                                    self.allocator.free(a, chunk_bytes);
+                                }
+                                d.elements[l.offset_in_dblk as usize] = UNDEF_ADDR;
+                                *dirty = true;
+                            }
+                        }
+                    }
+                    slot += 1;
+                }
+            }
+        }
+        flush(&mut cache)?;
+        Ok((straddlers, dead_refs))
+    }
+
+    /// Fixed-array half of [`prune_chunks_beyond`](Self::prune_chunks_beyond):
+    /// the whole element array is in memory and flushed at close, so
+    /// clearing an entry is pure bookkeeping.
+    fn prune_fa_chunks(
+        &self,
+        index: usize,
+        geo: &ChunkGeometry,
+        new_dims: &[u64],
+        collect_refs: bool,
+    ) -> IoResult<(Vec<Vec<u64>>, Vec<u8>)> {
+        let ds = self.ds(index);
+        let mut m = ds.lock();
+        let is_filtered = m.filter_pipeline.is_some();
+        let pipeline = m.filter_pipeline.clone();
+        let chunk_bytes = geo.chunk_bytes();
+        let mut straddlers = Vec::new();
+        let mut dead_refs = Vec::new();
+        let fa = m.fixed_array.as_mut().unwrap();
+        let nslots = if is_filtered {
+            fa.fa_dblk.filtered_elements.len()
+        } else {
+            fa.fa_dblk.elements.len()
+        };
+        for lidx in 0..nslots {
+            let (addr, stored, mask) = if is_filtered {
+                let e = &fa.fa_dblk.filtered_elements[lidx];
+                (e.address, e.chunk_size, e.filter_mask)
+            } else {
+                (fa.fa_dblk.elements[lidx], chunk_bytes, 0)
+            };
+            if addr == UNDEF_ADDR {
+                continue;
+            }
+            let coords = crate::io::chunk_grid::coords_of(
+                &geo.dims,
+                geo.max_dims.as_deref(),
+                &geo.chunk_dims,
+                lidx as u64,
+            )?;
+            if chunk_outside_extent(&coords, &geo.chunk_dims, new_dims) {
+                if collect_refs {
+                    if let Some(bytes) =
+                        self.read_chunk_block(pipeline.as_ref(), addr, stored, mask)?
+                    {
+                        dead_refs.extend_from_slice(&bytes);
+                    }
+                }
+                if !self.swmr_active {
+                    self.allocator.free(addr, stored);
+                }
+                if is_filtered {
+                    fa.fa_dblk.filtered_elements[lidx] = FixedArrayFilteredChunkElement {
+                        address: UNDEF_ADDR,
+                        chunk_size: 0,
+                        filter_mask: 0,
+                    };
+                } else {
+                    fa.fa_dblk.elements[lidx] = UNDEF_ADDR;
+                }
+            } else if chunk_straddles_extent(&coords, &geo.chunk_dims, new_dims) {
+                straddlers.push(coords);
+            }
+        }
+        Ok((straddlers, dead_refs))
+    }
+
+    /// V2-B-tree half of [`prune_chunks_beyond`](Self::prune_chunks_beyond):
+    /// drop the records of chunks beyond the extent — the next flush
+    /// re-serializes the smaller tree over the node pool and releases the
+    /// surplus node blocks.
+    fn prune_bt2_chunks(
+        &self,
+        index: usize,
+        geo: &ChunkGeometry,
+        new_dims: &[u64],
+        collect_refs: bool,
+    ) -> IoResult<(Vec<Vec<u64>>, Vec<u8>)> {
+        let ds = self.ds(index);
+        let mut m = ds.lock();
+        let pipeline = m.filter_pipeline.clone();
+        let chunk_bytes = geo.chunk_bytes();
+        let swmr = self.swmr_active;
+        let mut straddlers = Vec::new();
+        let mut dead_refs = Vec::new();
+        let bt2 = m.btree_v2.as_mut().unwrap();
+        if bt2.index.filtered {
+            let records = std::mem::take(&mut bt2.index.filtered_records);
+            let mut kept = Vec::with_capacity(records.len());
+            for r in records {
+                if chunk_outside_extent(&r.scaled_offsets, &geo.chunk_dims, new_dims) {
+                    if collect_refs {
+                        if let Some(bytes) = self.read_chunk_block(
+                            pipeline.as_ref(),
+                            r.chunk_address,
+                            r.chunk_size,
+                            r.filter_mask,
+                        )? {
+                            dead_refs.extend_from_slice(&bytes);
+                        }
+                    }
+                    if !swmr {
+                        self.allocator.free(r.chunk_address, r.chunk_size);
+                    }
+                } else {
+                    if chunk_straddles_extent(&r.scaled_offsets, &geo.chunk_dims, new_dims) {
+                        straddlers.push(r.scaled_offsets.clone());
+                    }
+                    kept.push(r);
+                }
+            }
+            bt2.index.filtered_records = kept;
+        } else {
+            let records = std::mem::take(&mut bt2.index.records);
+            let mut kept = Vec::with_capacity(records.len());
+            for r in records {
+                if chunk_outside_extent(&r.scaled_offsets, &geo.chunk_dims, new_dims) {
+                    if collect_refs {
+                        if let Some(bytes) = self.read_chunk_block(
+                            pipeline.as_ref(),
+                            r.chunk_address,
+                            chunk_bytes,
+                            0,
+                        )? {
+                            dead_refs.extend_from_slice(&bytes);
+                        }
+                    }
+                    if !swmr {
+                        self.allocator.free(r.chunk_address, chunk_bytes);
+                    }
+                } else {
+                    if chunk_straddles_extent(&r.scaled_offsets, &geo.chunk_dims, new_dims) {
+                        straddlers.push(r.scaled_offsets.clone());
+                    }
+                    kept.push(r);
+                }
+            }
+            bt2.index.records = kept;
+        }
+        Ok((straddlers, dead_refs))
     }
 
     /// Flush a chunked dataset's index structures to disk (durable).
@@ -5191,15 +7151,20 @@ impl Hdf5Writer {
             let is_indexed = {
                 let ds = self.ds(i);
                 let m = ds.lock();
-                m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some()
+                !m.deleted
+                    && (m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some())
             };
             if is_indexed {
                 self.flush_dataset(i)?;
             }
         }
 
-        // 1. Write each dataset's object header.
+        // 1. Write each dataset's object header (none for a dataset deleted
+        // before start_swmr — its storage was freed at delete time).
         for i in 0..self.dataset_count() {
+            if self.ds(i).lock().deleted {
+                continue;
+            }
             let ds_header = self.build_dataset_header(i);
             let encoded = ds_header.encode();
             let encoded_size = encoded.len();
@@ -5217,10 +7182,16 @@ impl Hdf5Writer {
         // pass (a header's encoded size is independent of the address
         // values it carries) and the content is written in a second.
         for gi in 0..self.group_count() {
+            if self.grp(gi).lock().deleted {
+                continue;
+            }
             let size = self.build_group_header(gi).encode().len() as u64;
             self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
         }
         for gi in 0..self.group_count() {
+            if self.grp(gi).lock().deleted {
+                continue;
+            }
             let encoded = self.build_group_header(gi).encode();
             let addr = self.grp(gi).lock().obj_header_addr;
             self.handle.write_at(addr, &encoded)?;
@@ -5256,6 +7227,9 @@ impl Hdf5Writer {
     /// dataset's fill value (zeros when none is defined).
     fn flush_append_buffers(&mut self) -> IoResult<()> {
         for i in 0..self.dataset_count() {
+            if self.ds(i).lock().deleted {
+                continue;
+            }
             self.flush_append_buffer(i)?;
         }
         Ok(())
@@ -5293,8 +7267,14 @@ impl Hdf5Writer {
             let ds = self.ds(i);
             {
                 let m = ds.lock();
+                if m.deleted {
+                    continue;
+                }
                 if m.obj_header_written_addr.is_some() {
-                    let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0);
+                    let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0)
+                        || m.fixed_array.as_ref().is_some_and(|f| f.chunks_written > 0)
+                        || m.btree_v2.as_ref().is_some_and(|b| b.chunks_written > 0)
+                        || m.extent_dirty;
                     if !modified {
                         continue;
                     }
@@ -5308,20 +7288,45 @@ impl Hdf5Writer {
             self.flush_dataset_synced(i, sync)?;
         }
 
-        // 1. Write each dataset's object header.
+        // Every header block this finalize supersedes — a reopened root or
+        // group header, a modified dataset's reopened header — is freed
+        // before its replacement is allocated, so the rewrite reuses the
+        // block instead of growing the file on every open/close cycle.
+        // Never under SWMR: a live reader may be walking the old headers,
+        // the same rule `release_vlen_references` and `place_chunk` follow.
+        // Hard links can alias one header under several names; the set keeps
+        // an aliased block from entering the free list twice.
+        let mut freed_headers = std::collections::HashSet::new();
+
+        // 1. Write each dataset's object header (deleted datasets get none —
+        // their storage was already freed at delete time).
         for i in 0..self.dataset_count() {
             let ds = self.ds(i);
             {
                 let mut m = ds.lock();
+                if m.deleted {
+                    continue;
+                }
                 if m.obj_header_written_addr.is_some() {
                     // Existing dataset from append mode.
-                    // If it has chunked info with chunks_written > 0, it was modified
+                    // If any chunk index took writes this session — or its
+                    // extent changed without a chunk write — it was modified
                     // and needs a new object header.
-                    let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0);
+                    let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0)
+                        || m.fixed_array.as_ref().is_some_and(|f| f.chunks_written > 0)
+                        || m.btree_v2.as_ref().is_some_and(|b| b.chunks_written > 0)
+                        || m.extent_dirty;
                     if !modified {
                         // Keep the original object header address for the root group link.
                         m.obj_header_addr = m.obj_header_written_addr.unwrap();
                         continue;
+                    }
+                    if !self.swmr_active && m.obj_header_encoded_size > 0 {
+                        let old = m.obj_header_written_addr.take().unwrap();
+                        if freed_headers.insert(old) {
+                            self.allocator.free(old, m.obj_header_encoded_size as u64);
+                        }
+                        m.obj_header_encoded_size = 0;
                     }
                 }
             }
@@ -5336,17 +7341,44 @@ impl Hdf5Writer {
         // header is written later, so addresses are assigned in a first
         // pass (a header's encoded size is independent of the address
         // values it carries) and the content is written in a second.
+        if !self.swmr_active {
+            for gi in 0..self.group_count() {
+                let grp = self.grp(gi);
+                let mut g = grp.lock();
+                if g.obj_header_encoded_size > 0 {
+                    if let Some(old) = g.obj_header_written_addr.take() {
+                        if freed_headers.insert(old) {
+                            self.allocator.free(old, g.obj_header_encoded_size as u64);
+                        }
+                        g.obj_header_encoded_size = 0;
+                    }
+                }
+            }
+        }
         for gi in 0..self.group_count() {
+            if self.grp(gi).lock().deleted {
+                continue;
+            }
             let size = self.build_group_header(gi).encode().len() as u64;
             self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
         }
         for gi in 0..self.group_count() {
+            if self.grp(gi).lock().deleted {
+                continue;
+            }
             let encoded = self.build_group_header(gi).encode();
             let addr = self.grp(gi).lock().obj_header_addr;
             self.handle.write_at(addr, &encoded)?;
         }
 
         // 2. Write root group object header.
+        if !self.swmr_active {
+            if let Some((addr, len)) = self.superseded_root_header.take() {
+                if freed_headers.insert(addr) {
+                    self.allocator.free(addr, len);
+                }
+            }
+        }
         let root_header = self.build_root_group_header();
         let root_encoded = root_header.encode();
         let root_addr = self.allocator.allocate(root_encoded.len() as u64);
@@ -5433,6 +7465,11 @@ impl Hdf5Writer {
             DataLayoutMessage::chunked_v4_btree_v2(
                 m.layout_version,
                 layout_dims,
+                crate::format::messages::data_layout::Bt2Params {
+                    node_size: bt2.index.node_size,
+                    split_percent: bt2.index.split_percent,
+                    merge_percent: bt2.index.merge_percent,
+                },
                 bt2.bt2_header_addr,
             )
         } else {
@@ -5791,6 +7828,265 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// The CWFS second pass (`H5F_cwfs_find_free_heap`): an object too big
+    /// for the listed collection's remaining free space extends the
+    /// collection in place — the file allocation grows off the end of the
+    /// file (`H5MF_try_extend`) and the collection's declared size and
+    /// free-space marker grow with it (`H5HG_extend`) — instead of opening
+    /// a second collection.
+    #[test]
+    fn an_oversized_vlen_insert_extends_the_listed_collection() {
+        use crate::format::global_heap::GlobalHeapCollection;
+
+        let path = temp_path("cwfs_extend_tail");
+        let writer = Hdf5Writer::create(&path).unwrap();
+        // A small object opens a minimum-size (4096) listed collection —
+        // the file's last allocation, so the extension grows the file end.
+        let p1 = writer.insert_vlen_objects(&[b"hello".as_slice()]).unwrap();
+        let big = vec![0x41u8; 5000]; // more than the ~4 KiB remaining
+        let p2 = writer.insert_vlen_objects(&[big.as_slice()]).unwrap();
+        assert_eq!(
+            p2[0].0, p1[0].0,
+            "the big object opened a second collection"
+        );
+
+        // The block on disk is one grown collection holding both objects.
+        let img = writer.handle.read_at_most(p1[0].0, 65536).unwrap();
+        let (gcol, csize) = GlobalHeapCollection::decode(&img, &writer.ctx).unwrap();
+        assert!(csize > 4096, "declared size did not grow: {csize}");
+        assert_eq!(gcol.objects.len(), 2);
+        assert_eq!(gcol.objects[1].data, big);
+
+        writer.close().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes.windows(4).filter(|w| *w == b"GCOL").count(),
+            1,
+            "a second collection signature is in the file"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The non-tail counterpart: the collection is pinned away from the end
+    /// of the file, but a released block starts right after it, so the
+    /// extension consumes the front of that block (`H5MF_try_extend`'s
+    /// free-section path) and the remainder stays reusable.
+    #[test]
+    fn extension_consumes_a_freed_block_after_the_collection() {
+        use crate::format::global_heap::GlobalHeapCollection;
+
+        let path = temp_path("cwfs_extend_freed");
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let p1 = writer.insert_vlen_objects(&[b"hello".as_slice()]).unwrap();
+        let addr = p1[0].0;
+        // Land a block right after the collection, pin the file end past
+        // it, then release it: extension must use the released space.
+        let spacer = writer.allocator.allocate(8192);
+        assert_eq!(spacer, addr + 4096, "spacer not adjacent; layout changed");
+        writer.allocator.allocate(8);
+        writer.allocator.free(spacer, 8192);
+
+        let big = vec![0x42u8; 5000];
+        let p2 = writer.insert_vlen_objects(&[big.as_slice()]).unwrap();
+        assert_eq!(p2[0].0, addr, "the big object opened a second collection");
+
+        let img = writer.handle.read_at_most(addr, 65536).unwrap();
+        let (gcol, csize) = GlobalHeapCollection::decode(&img, &writer.ctx).unwrap();
+        assert_eq!(csize, 8192, "grew by max(size, shortfall) = 4096");
+        assert_eq!(gcol.objects.len(), 2);
+
+        // The remainder of the released block is still allocatable.
+        assert_eq!(
+            writer.allocator.allocate(4096),
+            addr + 8192,
+            "the freed block's tail was lost"
+        );
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Issue #10: a reopen-and-replace loop on a vlen string must not grow
+    /// the file. The superseded heap objects are freed *before* the
+    /// replacement is allocated, so each session reuses the block it just
+    /// released even though the free list starts empty on reopen. The old
+    /// free-after-alloc order failed this by one collection per session.
+    #[test]
+    fn vlen_replace_across_reopen_keeps_the_file_flat() {
+        let path = temp_path("vlen_reopen_flat");
+        let payload_a = "a".repeat(64 * 1024);
+        let payload_b = "b".repeat(64 * 1024);
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        writer
+            .create_vlen_string_dataset("notes", &["initial"])
+            .unwrap();
+        writer.close().unwrap();
+
+        let mut sizes = Vec::new();
+        for i in 0..8 {
+            let writer = Hdf5Writer::open_append(&path).unwrap();
+            let payload = if i % 2 == 0 { &payload_a } else { &payload_b };
+            writer
+                .write_vlen_strings_slice(0, 0, &[payload.as_str()])
+                .unwrap();
+            writer.close().unwrap();
+            sizes.push(std::fs::metadata(&path).unwrap().len());
+        }
+        // The first replacement grows the file once (the initial collection
+        // cannot hold 64 KiB); every later equal-size replacement must land
+        // in the block its own session just freed.
+        assert_eq!(&sizes[1..], &vec![sizes[0]; 7][..], "sizes: {sizes:?}");
+
+        // The reused blocks still form a valid file holding the last value.
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        assert_eq!(
+            reader.read_vlen_strings("notes").unwrap(),
+            vec![payload_b.clone()]
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Replacing a vlen string attribute must release the superseded
+    /// global-heap collection *before* the replacement's collection is
+    /// allocated, so a reopen-replace loop lands each new value in the block
+    /// it just freed instead of growing the file by one collection per
+    /// session — the attribute counterpart of
+    /// [`vlen_replace_across_reopen_keeps_the_file_flat`].
+    #[test]
+    fn vlen_attr_replace_across_reopen_keeps_the_file_flat() {
+        let path = temp_path("vlen_attr_reopen_flat");
+        let payload_a = "a".repeat(8 * 1024);
+        let payload_b = "b".repeat(8 * 1024);
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        writer
+            .set_vlen_string_attribute(AttrTarget::Root, "note", &payload_a)
+            .unwrap();
+        writer.close().unwrap();
+
+        let mut sizes = Vec::new();
+        for i in 0..8 {
+            let writer = Hdf5Writer::open_append(&path).unwrap();
+            let payload = if i % 2 == 0 { &payload_b } else { &payload_a };
+            writer
+                .set_vlen_string_attribute(AttrTarget::Root, "note", payload)
+                .unwrap();
+            writer.close().unwrap();
+            sizes.push(std::fs::metadata(&path).unwrap().len());
+        }
+        assert_eq!(&sizes[1..], &vec![sizes[0]; 7][..], "sizes: {sizes:?}");
+
+        // The reused blocks still hold the last value.
+        let reader = Hdf5Reader::open(&path).unwrap();
+        let attr = reader.root_attr("note").unwrap().clone();
+        let mut reader = reader;
+        assert_eq!(reader.attr_string_value(&attr).unwrap(), payload_a);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A numeric attribute replacing a vlen one goes through the same list
+    /// owner, so the superseded collection is released even though the new
+    /// value holds no heap reference: a later same-size vlen attribute must
+    /// land in the freed block, making the file exactly as large as one that
+    /// never stored the replaced value.
+    #[test]
+    fn numeric_replacing_a_vlen_attr_releases_its_collection() {
+        let payload = "x".repeat(8 * 1024);
+        let numeric = || {
+            AttributeMessage::scalar_numeric(
+                "x",
+                DatatypeMessage::i32_type(),
+                7i32.to_le_bytes().to_vec(),
+            )
+        };
+
+        let path_a = temp_path("vlen_attr_cross_a");
+        let writer = Hdf5Writer::create(&path_a).unwrap();
+        writer
+            .set_vlen_string_attribute(AttrTarget::Root, "x", &payload)
+            .unwrap();
+        writer.add_root_attribute(numeric()).unwrap();
+        writer
+            .set_vlen_string_attribute(AttrTarget::Root, "y", &payload)
+            .unwrap();
+        writer.close().unwrap();
+
+        // The same end state written without the replaced vlen value.
+        let path_b = temp_path("vlen_attr_cross_b");
+        let writer = Hdf5Writer::create(&path_b).unwrap();
+        writer.add_root_attribute(numeric()).unwrap();
+        writer
+            .set_vlen_string_attribute(AttrTarget::Root, "y", &payload)
+            .unwrap();
+        writer.close().unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path_a).unwrap().len(),
+            std::fs::metadata(&path_b).unwrap().len()
+        );
+
+        let reader = Hdf5Reader::open(&path_a).unwrap();
+        let y = reader.root_attr("y").unwrap().clone();
+        let mut reader = reader;
+        assert_eq!(reader.attr_string_value(&y).unwrap(), payload);
+
+        std::fs::remove_file(&path_a).ok();
+        std::fs::remove_file(&path_b).ok();
+    }
+
+    /// Reopen/write/close cycles must not leak the object-header blocks
+    /// finalize rewrites: the reopened root header, the reopened group
+    /// header, and the modified chunked dataset's header are each freed
+    /// before their replacements are allocated. The chunk rewrite itself is
+    /// in place (unfiltered chunks never move), so a leak of any header
+    /// block shows up as monotonic growth here.
+    #[test]
+    fn reopen_cycles_reuse_superseded_header_blocks() {
+        let path = temp_path("header_reuse");
+        {
+            let writer = Hdf5Writer::create(&path).unwrap();
+            writer.create_group("/", "g").unwrap();
+            let idx = writer
+                .create_chunked_dataset(
+                    "g/data",
+                    DatatypeMessage::i32_type(),
+                    &[4],
+                    &[u64::MAX],
+                    &[4],
+                )
+                .unwrap();
+            let seed: Vec<u8> = [1i32, 2, 3, 4]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            writer.write_chunk(idx, 0, &seed).unwrap();
+            writer.close().unwrap();
+        }
+
+        let mut sizes = Vec::new();
+        for i in 0..6i32 {
+            let writer = Hdf5Writer::open_append(&path).unwrap();
+            let data: Vec<u8> = [i; 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+            writer.write_chunk(0, 0, &data).unwrap();
+            writer.close().unwrap();
+            sizes.push(std::fs::metadata(&path).unwrap().len());
+        }
+        assert_eq!(&sizes[1..], &vec![sizes[0]; 5][..], "sizes: {sizes:?}");
+
+        // The reused header blocks still form a valid file.
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        let raw = reader.read_dataset_raw("g/data").unwrap();
+        let values: Vec<i32> = raw
+            .chunks(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, vec![5, 5, 5, 5]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn create_empty_file() {
         let path = temp_path("empty");
@@ -6095,6 +8391,66 @@ mod tests {
             recovered.extend(addrs);
         }
         assert_eq!(recovered, dblk.elements);
+    }
+
+    #[test]
+    fn fixed_array_paged_decode_roundtrip_with_uninitialized_page() {
+        let ctx = FormatContext {
+            sizeof_addr: 8,
+            sizeof_size: 8,
+        };
+        let hdr = FixedArrayHeader::new_for_chunks(&ctx, 2500);
+        let npages = hdr.npages() as usize; // 3
+        let page = hdr.dblk_page_nelmts() as usize; // 1024
+
+        // Populate pages 0 and 2; leave page 1 entirely undefined so its
+        // bitmap bit stays clear on encode.
+        let mut dblk = FixedArrayDataBlock::new_unfiltered(0x1000, 2500);
+        for i in (0..page).chain(2 * page..2500) {
+            dblk.elements[i] = 0x10000 + (i as u64) * 0x100;
+        }
+
+        let mut encoded = encode_fixed_array_dblk(&ctx, &hdr, &dblk);
+        let prefix = FixedArrayPagedPrefix::decode(&encoded, &ctx, npages as u64).unwrap();
+        assert!(prefix.page_initialized(0));
+        assert!(!prefix.page_initialized(1));
+        assert!(prefix.page_initialized(2));
+
+        // Corrupt the uninitialized page's bytes the way libhdf5 leaves
+        // them: arbitrary, no valid checksum. Decode must not look at it.
+        let page_stride = page * 8 + 4;
+        let p1 = prefix.prefix_size + page_stride;
+        for b in &mut encoded[p1..p1 + page_stride] {
+            *b = 0x5A;
+        }
+
+        let decoded = decode_fixed_array_dblk(&ctx, &hdr, &encoded, 0).unwrap();
+        assert_eq!(decoded.elements, dblk.elements);
+        assert_eq!(decoded.header_addr, 0x1000);
+    }
+
+    #[test]
+    fn fixed_array_paged_decode_filtered_roundtrip() {
+        let ctx = FormatContext {
+            sizeof_addr: 8,
+            sizeof_size: 8,
+        };
+        let chunk_size_len = 4usize;
+        let hdr = FixedArrayHeader::new_for_filtered_chunks(&ctx, 1500, chunk_size_len as u8);
+        assert!(hdr.is_paged());
+
+        let mut dblk = FixedArrayDataBlock::new_filtered(0x2000, 1500);
+        for (i, e) in dblk.filtered_elements.iter_mut().enumerate() {
+            e.address = 0x8000 + (i as u64) * 0x40;
+            e.chunk_size = 100 + i as u64;
+            e.filter_mask = (i % 3) as u32;
+        }
+
+        let encoded = encode_fixed_array_dblk(&ctx, &hdr, &dblk);
+        assert_eq!(encoded.len() as u64, fixed_array_dblk_disk_size(&ctx, &hdr));
+        let decoded = decode_fixed_array_dblk(&ctx, &hdr, &encoded, chunk_size_len).unwrap();
+        assert_eq!(decoded.filtered_elements, dblk.filtered_elements);
+        assert_eq!(decoded.client_id, FA_CLIENT_FILT_CHUNK);
     }
 
     #[test]
@@ -6488,6 +8844,79 @@ mod tests {
 
         writer.extend_dataset(idx, &[85, 1]).unwrap();
         writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A v2 B-tree whose header declares a non-default node size — libhdf5
+    /// built with a different `H5D_BT2_NODE_SIZE`, or any other writer —
+    /// reopens for append: the reconstruction adopts the header's node_size,
+    /// split and merge instead of refusing everything but 2048, and the next
+    /// flush re-serializes at that size (upstream allocates every node at
+    /// `hdr->node_size`, H5B2leaf.c / H5B2internal.c).
+    #[test]
+    fn a_btree_v2_with_a_foreign_node_size_reopens_and_grows() {
+        let path = temp_path("bt2_foreign_node_size");
+        {
+            let writer = Hdf5Writer::create(&path).unwrap();
+            let idx = writer
+                .create_btree_v2_dataset(
+                    "data",
+                    DatatypeMessage::f64_type(),
+                    &[0, 0],
+                    &[u64::MAX, u64::MAX],
+                    &[1, 1],
+                )
+                .unwrap();
+            // Act as a foreign writer: 512-byte nodes, non-default tuning.
+            // record_size 24 => a 512-byte leaf holds 20 records, so 85
+            // records make a depth-1 tree of 512-byte blocks.
+            {
+                let ds = writer.ds(idx);
+                let mut m = ds.lock();
+                let index = &mut m.btree_v2.as_mut().unwrap().index;
+                index.node_size = 512;
+                index.split_percent = 90;
+                index.merge_percent = 30;
+            }
+            for i in 0..85u64 {
+                writer
+                    .write_chunk_btree_v2(idx, &[i, 0], &(i as f64).to_le_bytes())
+                    .unwrap();
+            }
+            writer.extend_dataset(idx, &[85, 1]).unwrap();
+            writer.close().unwrap();
+        }
+        {
+            let writer = Hdf5Writer::open_append(&path).unwrap();
+            let idx = writer.dataset_index("data").unwrap();
+            {
+                let ds = writer.ds(idx);
+                let m = ds.lock();
+                let index = &m.btree_v2.as_ref().unwrap().index;
+                assert_eq!(index.node_size, 512, "header node_size not adopted");
+                assert_eq!(index.split_percent, 90);
+                assert_eq!(index.merge_percent, 30);
+                assert_eq!(index.records.len(), 85, "records not walked back");
+            }
+            for i in 85..115u64 {
+                writer
+                    .write_chunk_btree_v2(idx, &[i, 0], &(i as f64).to_le_bytes())
+                    .unwrap();
+            }
+            writer.extend_dataset(idx, &[115, 1]).unwrap();
+            writer.close().unwrap();
+        }
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        let raw = reader.read_dataset_raw("data").unwrap();
+        let values: Vec<f64> = raw
+            .chunks(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values.len(), 115);
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(*v, i as f64, "element {i}");
+        }
         std::fs::remove_file(&path).ok();
     }
 

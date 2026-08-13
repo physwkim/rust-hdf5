@@ -109,6 +109,34 @@ impl FixedArrayParams {
     }
 }
 
+/// Parameters for the v2 B-tree chunk index (node size, split/merge
+/// percentages — libhdf5's creation `cparam`). The v2 B-tree header carries
+/// authoritative copies; libhdf5 reads these only at creation, but a
+/// rewritten object header must not contradict the header of the tree it
+/// points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bt2Params {
+    pub node_size: u32,
+    pub split_percent: u8,
+    pub merge_percent: u8,
+}
+
+impl Bt2Params {
+    /// This writer's creation defaults, matching libhdf5's
+    /// `H5D_BT2_NODE_SIZE` / `H5D_BT2_SPLIT_PERC` / `H5D_BT2_MERGE_PERC`
+    /// (`H5Dpkg.h`).
+    pub fn default_params() -> Self {
+        use crate::format::chunk_index::btree_v2::{
+            BT2_MERGE_PERCENT, BT2_NODE_SIZE, BT2_SPLIT_PERCENT,
+        };
+        Self {
+            node_size: BT2_NODE_SIZE,
+            split_percent: BT2_SPLIT_PERCENT,
+            merge_percent: BT2_MERGE_PERCENT,
+        }
+    }
+}
+
 /// Filtered single-chunk index parameters.
 ///
 /// When a version-4 chunked layout uses the Single Chunk index AND the
@@ -171,6 +199,8 @@ pub enum DataLayoutMessage {
         earray_params: Option<EarrayParams>,
         /// Fixed array parameters (present when index_type == FixedArray).
         farray_params: Option<FixedArrayParams>,
+        /// v2 B-tree parameters (present when index_type == BTreeV2).
+        bt2_params: Option<Bt2Params>,
         /// Filtered single-chunk parameters (present when index_type ==
         /// SingleChunk and the layout's filtered flag `0x02` is set).
         single_chunk_filter: Option<SingleChunkFilter>,
@@ -226,6 +256,7 @@ impl DataLayoutMessage {
             index_type: ChunkIndexType::ExtensibleArray,
             earray_params: Some(earray_params),
             farray_params: None,
+            bt2_params: None,
             single_chunk_filter: None,
             index_address,
         }
@@ -247,6 +278,7 @@ impl DataLayoutMessage {
             index_type: ChunkIndexType::FixedArray,
             earray_params: None,
             farray_params: Some(farray_params),
+            bt2_params: None,
             single_chunk_filter: None,
             index_address,
         }
@@ -255,7 +287,12 @@ impl DataLayoutMessage {
     /// Version 4 chunked layout with B-tree v2 index.
     ///
     /// `chunk_dims` should include the trailing element-size dimension.
-    pub fn chunked_v4_btree_v2(version: u8, chunk_dims: Vec<u64>, index_address: u64) -> Self {
+    pub fn chunked_v4_btree_v2(
+        version: u8,
+        chunk_dims: Vec<u64>,
+        bt2_params: Bt2Params,
+        index_address: u64,
+    ) -> Self {
         Self::ChunkedV4 {
             version,
             flags: 0,
@@ -263,6 +300,7 @@ impl DataLayoutMessage {
             index_type: ChunkIndexType::BTreeV2,
             earray_params: None,
             farray_params: None,
+            bt2_params: Some(bt2_params),
             single_chunk_filter: None,
             index_address,
         }
@@ -279,6 +317,7 @@ impl DataLayoutMessage {
             index_type: ChunkIndexType::SingleChunk,
             earray_params: None,
             farray_params: None,
+            bt2_params: None,
             single_chunk_filter: None,
             index_address,
         }
@@ -330,6 +369,7 @@ impl DataLayoutMessage {
                 index_type,
                 earray_params,
                 farray_params,
+                bt2_params,
                 single_chunk_filter,
                 index_address,
             } => {
@@ -375,13 +415,15 @@ impl DataLayoutMessage {
                     }
                     ChunkIndexType::BTreeV2 => {
                         // node_size(4) + split_percent(1) + merge_percent(1),
-                        // the same geometry the B-tree header carries.
-                        use crate::format::chunk_index::btree_v2::{
-                            BT2_MERGE_PERCENT, BT2_NODE_SIZE, BT2_SPLIT_PERCENT,
-                        };
-                        buf.extend_from_slice(&BT2_NODE_SIZE.to_le_bytes());
-                        buf.push(BT2_SPLIT_PERCENT);
-                        buf.push(BT2_MERGE_PERCENT);
+                        // the same geometry the B-tree header carries — the
+                        // message must agree with the BTHD it points at, so
+                        // a reopened foreign node size is preserved, not
+                        // stamped over with this writer's default.
+                        if let Some(ref params) = bt2_params {
+                            buf.extend_from_slice(&params.node_size.to_le_bytes());
+                            buf.push(params.split_percent);
+                            buf.push(params.merge_percent);
+                        }
                     }
                     // A filtered single chunk carries its on-disk size
                     // (sizeof_size bytes) and 4-byte filter mask inline, before
@@ -587,6 +629,7 @@ impl DataLayoutMessage {
                 // Index-type-specific parameters
                 let mut earray_params = None;
                 let mut farray_params = None;
+                let mut bt2_params = None;
                 let mut single_chunk_filter = None;
 
                 match index_type {
@@ -637,14 +680,25 @@ impl DataLayoutMessage {
                     }
                     ChunkIndexType::BTreeV2 => {
                         // node_size(4) + split_percent(1) + merge_percent(1).
-                        // The v2 B-tree header carries authoritative copies,
-                        // so the reader only needs to skip these.
+                        // The v2 B-tree header carries authoritative copies;
+                        // retained so a rewritten object header re-emits the
+                        // creator's values, not this writer's defaults.
                         if buf.len() < pos + 6 {
                             return Err(FormatError::BufferTooShort {
                                 needed: pos + 6,
                                 available: buf.len(),
                             });
                         }
+                        bt2_params = Some(Bt2Params {
+                            node_size: u32::from_le_bytes([
+                                buf[pos],
+                                buf[pos + 1],
+                                buf[pos + 2],
+                                buf[pos + 3],
+                            ]),
+                            split_percent: buf[pos + 4],
+                            merge_percent: buf[pos + 5],
+                        });
                         pos += 6;
                     }
                     // A single-chunk index whose "single index with
@@ -699,6 +753,7 @@ impl DataLayoutMessage {
                         index_type,
                         earray_params,
                         farray_params,
+                        bt2_params,
                         single_chunk_filter,
                         index_address,
                     },
@@ -921,6 +976,30 @@ mod tests {
         assert_eq!(decoded, msg);
     }
 
+    /// The BTreeV2 parameters (node size, split/merge) round-trip through
+    /// the message instead of being skipped on decode and re-stamped with
+    /// defaults on encode — a rewritten object header must agree with the
+    /// BTHD it points at.
+    #[test]
+    fn roundtrip_chunked_v4_btree_v2_params() {
+        for ctx in [ctx8(), ctx4()] {
+            let msg = DataLayoutMessage::chunked_v4_btree_v2(
+                4,
+                vec![2, 2, 8],
+                Bt2Params {
+                    node_size: 512,
+                    split_percent: 90,
+                    merge_percent: 30,
+                },
+                0x2000,
+            );
+            let encoded = msg.encode(&ctx);
+            let (decoded, consumed) = DataLayoutMessage::decode(&encoded, &ctx).unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(decoded, msg);
+        }
+    }
+
     /// A filtered single-chunk layout (flag `0x02`) carries the chunk's
     /// on-disk size and per-chunk filter mask inline. Decode must retain both
     /// (not discard them), and encode↔decode must round-trip — including the
@@ -935,6 +1014,7 @@ mod tests {
                 index_type: ChunkIndexType::SingleChunk,
                 earray_params: None,
                 farray_params: None,
+                bt2_params: None,
                 single_chunk_filter: Some(SingleChunkFilter {
                     nbytes: 12345,
                     filter_mask: 0b101,

@@ -141,6 +141,55 @@ impl FileAllocator {
         Some(block.addr)
     }
 
+    /// Try to grow the allocation `[addr, addr + len)` by `extra` bytes in
+    /// place — libhdf5's `H5MF_try_extend`. Returns whether the block now
+    /// extends to `addr + len + extra`.
+    ///
+    /// Two ways it can succeed, tried in `H5MF_try_extend`'s order: the
+    /// block ends at the end of the file, so the end-of-file pointer moves
+    /// (published by compare-and-swap, so a concurrent `allocate` cannot be
+    /// handed the same region); or a released block starts exactly at
+    /// `addr + len` and is large enough, so the front of it is consumed
+    /// (`extra` rounded up to the alignment, keeping the remainder aligned).
+    pub fn try_extend(&self, addr: u64, len: u64, extra: u64) -> bool {
+        if extra == 0 {
+            return true;
+        }
+        let end = addr + len;
+        let mut cur = self.eof.load(Ordering::Acquire);
+        while cur == end {
+            match self.eof.compare_exchange_weak(
+                end,
+                end + extra,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+
+        if self.free_count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let mut list = self.free_list.lock().unwrap();
+        let used = self.align_up(extra);
+        let Some(pos) = list.iter().position(|b| b.addr == end && b.len >= used) else {
+            return false;
+        };
+        let block = list[pos];
+        if block.len > used {
+            list[pos] = FreeBlock {
+                addr: block.addr + used,
+                len: block.len - used,
+            };
+        } else {
+            list.remove(pos);
+        }
+        self.free_count.store(list.len() as u64, Ordering::Release);
+        true
+    }
+
     /// Return the current end-of-file offset.
     pub fn eof(&self) -> u64 {
         self.eof.load(Ordering::Acquire)
@@ -328,6 +377,55 @@ mod tests {
         let eof_before = alloc.eof();
         assert_eq!(alloc.allocate(96), a);
         assert_eq!(alloc.eof(), eof_before);
+    }
+
+    #[test]
+    fn try_extend_grows_the_file_when_the_block_ends_at_eof() {
+        let alloc = FileAllocator::new(0);
+        let a = alloc.allocate(64);
+        assert!(alloc.try_extend(a, 64, 32));
+        assert_eq!(alloc.eof(), 96);
+        // The extension owns [64, 96): the next allocation starts after it.
+        assert_eq!(alloc.allocate(8), 96);
+    }
+
+    #[test]
+    fn try_extend_consumes_the_front_of_an_adjacent_free_block() {
+        let alloc = FileAllocator::new(0);
+        let a = alloc.allocate(64);
+        let b = alloc.allocate(64);
+        alloc.allocate(8); // pin: the freed block is not at EOF
+        alloc.free(b, 64);
+
+        assert!(alloc.try_extend(a, 64, 16));
+        assert_eq!(free_blocks(&alloc), vec![(b + 16, 48)]);
+        // Growing into the whole remainder empties the list.
+        assert!(alloc.try_extend(a, 80, 48));
+        assert!(free_blocks(&alloc).is_empty());
+    }
+
+    #[test]
+    fn try_extend_fails_without_room_past_the_block() {
+        let alloc = FileAllocator::new(0);
+        let a = alloc.allocate(64);
+        alloc.allocate(64); // live block right after `a`
+        let c = alloc.allocate(16);
+        alloc.free(c, 16); // free space exists, but not at a + 64
+
+        assert!(!alloc.try_extend(a, 64, 8));
+        assert_eq!(free_blocks(&alloc), vec![(c, 16)], "nothing consumed");
+    }
+
+    #[test]
+    fn try_extend_fails_when_the_adjacent_block_is_too_small() {
+        let alloc = FileAllocator::new(0);
+        let a = alloc.allocate(64);
+        let b = alloc.allocate(32);
+        alloc.allocate(8);
+        alloc.free(b, 32);
+
+        assert!(!alloc.try_extend(a, 64, 40), "32 free < 40 wanted");
+        assert_eq!(free_blocks(&alloc), vec![(b, 32)], "nothing consumed");
     }
 
     #[test]

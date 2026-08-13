@@ -232,8 +232,11 @@ impl H5File {
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let attr = writer.vlen_string_attribute(name, value)?;
-                writer.add_root_attribute(attr);
+                writer.set_vlen_string_attribute(
+                    crate::io::writer::AttrTarget::Root,
+                    name,
+                    value,
+                )?;
                 Ok(())
             }
             _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
@@ -249,7 +252,7 @@ impl H5File {
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                writer.add_root_attribute(attr);
+                writer.add_root_attribute(attr)?;
                 Ok(())
             }
             _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
@@ -302,7 +305,7 @@ impl H5File {
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
-                writer.add_root_attribute(attr);
+                writer.add_root_attribute(attr)?;
                 Ok(())
             }
             _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
@@ -343,8 +346,12 @@ impl H5File {
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
-                let attr = writer.vlen_string_array_attribute(name, values, &dims)?;
-                writer.add_root_attribute(attr);
+                writer.set_vlen_string_array_attribute(
+                    crate::io::writer::AttrTarget::Root,
+                    name,
+                    values,
+                    &dims,
+                )?;
                 Ok(())
             }
             _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
@@ -566,8 +573,14 @@ impl H5File {
         }
     }
 
-    /// Delete a dataset by name. The dataset is unlinked on close;
-    /// file space is not reclaimed.
+    /// Delete a dataset name, with libhdf5's `H5Ldelete` semantics: a
+    /// path naming a hard link removes just that link, and if a hard link
+    /// still names the object whose tree name is deleted, the dataset
+    /// lives on under the link. Deleting the last name unlinks the
+    /// dataset on close and the file space it owned — data blocks,
+    /// chunk-index structures, and the global-heap objects of
+    /// variable-length values — is freed for reuse by later writes in this
+    /// session (the file itself does not shrink).
     pub fn delete_dataset(&self, name: &str) -> Result<()> {
         let inner = borrow_inner(&self.inner);
         match &*inner {
@@ -579,8 +592,14 @@ impl H5File {
         }
     }
 
-    /// Delete a group and all its child datasets/sub-groups.
-    /// File space is not reclaimed.
+    /// Delete a group and all its child datasets/sub-groups, freeing their
+    /// file space the way [`delete_dataset`](Self::delete_dataset) does.
+    ///
+    /// Hard links reaching in from outside the deleted subtree keep their
+    /// targets alive: a dataset or group named by such a link survives
+    /// under the link's path (a group brings its whole subtree with it),
+    /// and a `name` that is itself a hard link's path removes just that
+    /// link.
     pub fn delete_group(&self, name: &str) -> Result<()> {
         let inner = borrow_inner(&self.inner);
         match &*inner {

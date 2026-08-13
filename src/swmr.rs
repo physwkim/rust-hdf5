@@ -302,30 +302,28 @@ impl SwmrFileWriter {
     /// `set_group_attr_string("/entry", "NX_class", "NXentry")`. An existing
     /// attribute of the same name is replaced.
     ///
-    /// The same SWMR visibility rule as [`create_group`](Self::create_group)
-    /// applies: set before [`start_swmr`](Self::start_swmr) for the attribute
-    /// to be visible to readers during streaming.
+    /// Attributes must be set before [`start_swmr`](Self::start_swmr):
+    /// object headers are frozen while readers stream, so every attribute
+    /// setter is refused once SWMR is active — libhdf5's rule for SWMR
+    /// writes too.
     pub fn set_group_attr_string(
         &mut self,
         group_path: &str,
         name: &str,
         value: &str,
     ) -> Result<()> {
-        let attr = self.inner.writer_mut().vlen_string_attribute(name, value)?;
-        if group_path == "/" {
-            self.inner.writer_mut().add_root_attribute(attr);
-        } else {
-            self.inner
-                .writer_mut()
-                .add_group_attribute(group_path, attr)?;
-        }
+        self.inner.writer_mut().set_vlen_string_attribute(
+            group_attr_target(group_path),
+            name,
+            value,
+        )?;
         Ok(())
     }
 
     /// Set a numeric scalar attribute on a group, or on the root group when
     /// `group_path` is `"/"`. An existing attribute of the same name is
-    /// replaced. See [`set_group_attr_string`](Self::set_group_attr_string)
-    /// for the SWMR visibility rule.
+    /// replaced. Refused after [`start_swmr`](Self::start_swmr) — see
+    /// [`set_group_attr_string`](Self::set_group_attr_string).
     pub fn set_group_attr_numeric<T: H5Type>(
         &mut self,
         group_path: &str,
@@ -333,13 +331,9 @@ impl SwmrFileWriter {
         value: &T,
     ) -> Result<()> {
         let attr = AttributeMessage::scalar_numeric(name, T::hdf5_type(), scalar_to_bytes(value));
-        if group_path == "/" {
-            self.inner.writer_mut().add_root_attribute(attr);
-        } else {
-            self.inner
-                .writer_mut()
-                .add_group_attribute(group_path, attr)?;
-        }
+        self.inner
+            .writer_mut()
+            .set_attribute(group_attr_target(group_path), attr)?;
         Ok(())
     }
 
@@ -390,22 +384,27 @@ impl SwmrFileWriter {
 
     /// Set a string attribute on a dataset, addressed by its index. The
     /// NeXus way to record `units`, `long_name`, `signal`, etc. An existing
-    /// attribute of the same name is replaced.
+    /// attribute of the same name is replaced. Refused after
+    /// [`start_swmr`](Self::start_swmr) — see
+    /// [`set_group_attr_string`](Self::set_group_attr_string).
     pub fn set_dataset_attr_string(
         &mut self,
         ds_index: usize,
         name: &str,
         value: &str,
     ) -> Result<()> {
-        let attr = self.inner.writer_mut().vlen_string_attribute(name, value)?;
-        self.inner
-            .writer_mut()
-            .add_dataset_attribute(ds_index, attr)?;
+        self.inner.writer_mut().set_vlen_string_attribute(
+            crate::io::writer::AttrTarget::Dataset(ds_index),
+            name,
+            value,
+        )?;
         Ok(())
     }
 
     /// Set a numeric scalar attribute on a dataset, addressed by its index.
-    /// An existing attribute of the same name is replaced.
+    /// An existing attribute of the same name is replaced. Refused after
+    /// [`start_swmr`](Self::start_swmr) — see
+    /// [`set_group_attr_string`](Self::set_group_attr_string).
     pub fn set_dataset_attr_numeric<T: H5Type>(
         &mut self,
         ds_index: usize,
@@ -604,7 +603,15 @@ impl SwmrFileReader {
     }
 
     /// Read a dataset as a typed vector.
+    ///
+    /// `T` must have the dataset's exact element width — the same
+    /// width-checked byte reinterpretation as
+    /// [`H5Dataset::read_raw`](crate::dataset::H5Dataset::read_raw), with no
+    /// datatype conversion. Use
+    /// [`dataset_element_size`](Self::dataset_element_size) to size-check a
+    /// type at runtime.
     pub fn read_dataset<T: H5Type>(&mut self, name: &str) -> Result<Vec<T>> {
+        self.check_element_width::<T>(name)?;
         bytes_to_typed(self.reader.read_dataset_raw(name)?)
     }
 
@@ -624,14 +631,31 @@ impl SwmrFileReader {
     }
 
     /// Read a slice (hyperslab) of a dataset as a typed vector.
-    /// See [`read_slice_raw`](Self::read_slice_raw).
+    /// See [`read_slice_raw`](Self::read_slice_raw); `T`'s width is checked
+    /// like [`read_dataset`](Self::read_dataset).
     pub fn read_slice<T: H5Type>(
         &mut self,
         name: &str,
         starts: &[u64],
         counts: &[u64],
     ) -> Result<Vec<T>> {
+        self.check_element_width::<T>(name)?;
         bytes_to_typed(self.reader.read_slice(name, starts, counts)?)
+    }
+
+    /// The width gate for the typed reads: without it, reinterpreting the
+    /// raw bytes splits or merges elements — an f64 dataset read as `i32`
+    /// passed the divisibility check and silently returned twice as many
+    /// garbage values.
+    fn check_element_width<T: H5Type>(&self, name: &str) -> Result<()> {
+        let stored = self.dataset_element_size(name)?;
+        if T::element_size() != stored {
+            return Err(crate::error::Hdf5Error::TypeMismatch(format!(
+                "read type has element size {} but dataset has element size {stored}",
+                T::element_size(),
+            )));
+        }
+        Ok(())
     }
 
     /// Read a variable-length string dataset.
@@ -692,6 +716,16 @@ impl SwmrFileReader {
         .ok_or_else(|| crate::error::Hdf5Error::NotFound(attr.to_string()))?
         .clone();
         Ok(self.reader.attr_string_value(&a)?)
+    }
+}
+
+/// The writer-side attribute list a group path names: `"/"` is the
+/// file-level (root) list, anything else the group's own.
+fn group_attr_target(group_path: &str) -> crate::io::writer::AttrTarget<'_> {
+    if group_path == "/" {
+        crate::io::writer::AttrTarget::Root
+    } else {
+        crate::io::writer::AttrTarget::Group(group_path)
     }
 }
 

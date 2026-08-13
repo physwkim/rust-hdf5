@@ -70,8 +70,11 @@ impl H5Attribute {
         let inner = borrow_inner(&self.file_inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let attr_msg = writer.vlen_string_attribute(&self.name, &value.0)?;
-                writer.add_dataset_attribute(self.ds_index, attr_msg)?;
+                writer.set_vlen_string_attribute(
+                    crate::io::writer::AttrTarget::Dataset(self.ds_index),
+                    &self.name,
+                    &value.0,
+                )?;
                 Ok(())
             }
             H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
@@ -110,8 +113,12 @@ impl H5Attribute {
         let mut inner = borrow_inner_mut(&self.file_inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
-                let attr_msg = writer.vlen_string_array_attribute(&self.name, values, &dims_u64)?;
-                writer.add_dataset_attribute(self.ds_index, attr_msg)?;
+                writer.set_vlen_string_array_attribute(
+                    crate::io::writer::AttrTarget::Dataset(self.ds_index),
+                    &self.name,
+                    values,
+                    &dims_u64,
+                )?;
                 Ok(())
             }
             H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
@@ -212,11 +219,24 @@ impl H5Attribute {
     /// let val: f64 = attr.read_numeric().unwrap();
     /// ```
     pub fn read_numeric<T: crate::types::H5Type>(&self) -> Result<T> {
-        let data = self
+        let attr = self
             .read_attr
             .as_ref()
-            .map(|a| &a.data)
             .ok_or_else(|| Hdf5Error::InvalidState("attribute has no read data".into()))?;
+        // The byte image is reinterpreted as `T` below, so the stored
+        // datatype must be exactly what `T` writes — the same message
+        // `write_numeric` would emit. This is what rejects reading a
+        // big-endian or differently-classed attribute as `T` bit-for-bit
+        // garbage; a converting read is `read_numeric_as`.
+        let expected = T::hdf5_type();
+        if attr.datatype != expected {
+            return Err(Hdf5Error::TypeMismatch(format!(
+                "attribute datatype '{}' is not the requested type's datatype '{}'; \
+                 use read_numeric_as for a converting read or read_raw for the bytes",
+                attr.datatype, expected
+            )));
+        }
+        let data = &attr.data;
         let es = T::element_size();
         if data.len() < es {
             return Err(Hdf5Error::TypeMismatch(format!(
@@ -230,6 +250,25 @@ impl H5Attribute {
             std::ptr::copy_nonoverlapping(data.as_ptr(), val.as_mut_ptr() as *mut u8, es);
             Ok(val.assume_init())
         }
+    }
+
+    /// Read a numeric attribute as `T`, converting each element from the
+    /// stored datatype — the attribute counterpart of
+    /// [`H5Dataset::read_numeric_as`](crate::dataset::H5Dataset::read_numeric_as).
+    ///
+    /// Returns every element (one for a scalar attribute), with the same
+    /// policy: integer → integer is checked and errors with the element index
+    /// and value instead of wrapping, `f32` → `f64` widens exactly, and
+    /// `f64` → `f32`, float ↔ integer, and non-numeric datatypes are
+    /// rejected. Big-endian sources are decoded per the stored byte order,
+    /// which [`read_numeric`](Self::read_numeric) refuses.
+    pub fn read_numeric_as<T: crate::dataset::ReadNumeric>(&self) -> Result<Vec<T>> {
+        let attr = self
+            .read_attr
+            .as_ref()
+            .ok_or_else(|| Hdf5Error::InvalidState("attribute has no read data".into()))?;
+        let kind = crate::dataset::numeric::classify(&attr.datatype)?;
+        crate::dataset::numeric::convert(kind, &attr.data)
     }
 
     /// Read the attribute value as a string.
