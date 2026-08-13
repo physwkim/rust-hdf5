@@ -484,12 +484,7 @@ impl H5Group {
         let inner = borrow_inner(&self.file_inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let attr = writer.vlen_string_attribute(name, value)?;
-                if self.name == "/" {
-                    writer.add_root_attribute(attr);
-                } else {
-                    writer.add_group_attribute(&self.name, attr)?;
-                }
+                writer.set_vlen_string_attribute(self.attr_target(), name, value)?;
                 Ok(())
             }
             H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
@@ -595,12 +590,7 @@ impl H5Group {
         let mut inner = borrow_inner_mut(&self.file_inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
-                let attr = writer.vlen_string_array_attribute(name, values, &dims)?;
-                if self.name == "/" {
-                    writer.add_root_attribute(attr);
-                } else {
-                    writer.add_group_attribute(&self.name, attr)?;
-                }
+                writer.set_vlen_string_array_attribute(self.attr_target(), name, values, &dims)?;
                 Ok(())
             }
             H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
@@ -610,17 +600,23 @@ impl H5Group {
         }
     }
 
+    /// The writer-side attribute list this group's attributes live in: the
+    /// root group's is the file-level list, any other group's is its own.
+    fn attr_target(&self) -> crate::io::writer::AttrTarget<'_> {
+        if self.name == "/" {
+            crate::io::writer::AttrTarget::Root
+        } else {
+            crate::io::writer::AttrTarget::Group(&self.name)
+        }
+    }
+
     /// Route an attribute to the writer: the root group goes to the
     /// file-level attribute list, any other group to its own header.
     fn add_attr(&self, attr: AttributeMessage) -> Result<()> {
         let inner = borrow_inner(&self.file_inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                if self.name == "/" {
-                    writer.add_root_attribute(attr);
-                } else {
-                    writer.add_group_attribute(&self.name, attr)?;
-                }
+                writer.set_attribute(self.attr_target(), attr)?;
                 Ok(())
             }
             H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(

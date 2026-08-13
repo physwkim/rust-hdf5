@@ -232,8 +232,11 @@ impl H5File {
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let attr = writer.vlen_string_attribute(name, value)?;
-                writer.add_root_attribute(attr);
+                writer.set_vlen_string_attribute(
+                    crate::io::writer::AttrTarget::Root,
+                    name,
+                    value,
+                )?;
                 Ok(())
             }
             _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
@@ -249,7 +252,7 @@ impl H5File {
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                writer.add_root_attribute(attr);
+                writer.add_root_attribute(attr)?;
                 Ok(())
             }
             _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
@@ -302,7 +305,7 @@ impl H5File {
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
-                writer.add_root_attribute(attr);
+                writer.add_root_attribute(attr)?;
                 Ok(())
             }
             _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
@@ -343,8 +346,12 @@ impl H5File {
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
-                let attr = writer.vlen_string_array_attribute(name, values, &dims)?;
-                writer.add_root_attribute(attr);
+                writer.set_vlen_string_array_attribute(
+                    crate::io::writer::AttrTarget::Root,
+                    name,
+                    values,
+                    &dims,
+                )?;
                 Ok(())
             }
             _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),

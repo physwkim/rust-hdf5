@@ -311,14 +311,11 @@ impl SwmrFileWriter {
         name: &str,
         value: &str,
     ) -> Result<()> {
-        let attr = self.inner.writer_mut().vlen_string_attribute(name, value)?;
-        if group_path == "/" {
-            self.inner.writer_mut().add_root_attribute(attr);
-        } else {
-            self.inner
-                .writer_mut()
-                .add_group_attribute(group_path, attr)?;
-        }
+        self.inner.writer_mut().set_vlen_string_attribute(
+            group_attr_target(group_path),
+            name,
+            value,
+        )?;
         Ok(())
     }
 
@@ -333,13 +330,9 @@ impl SwmrFileWriter {
         value: &T,
     ) -> Result<()> {
         let attr = AttributeMessage::scalar_numeric(name, T::hdf5_type(), scalar_to_bytes(value));
-        if group_path == "/" {
-            self.inner.writer_mut().add_root_attribute(attr);
-        } else {
-            self.inner
-                .writer_mut()
-                .add_group_attribute(group_path, attr)?;
-        }
+        self.inner
+            .writer_mut()
+            .set_attribute(group_attr_target(group_path), attr)?;
         Ok(())
     }
 
@@ -397,10 +390,11 @@ impl SwmrFileWriter {
         name: &str,
         value: &str,
     ) -> Result<()> {
-        let attr = self.inner.writer_mut().vlen_string_attribute(name, value)?;
-        self.inner
-            .writer_mut()
-            .add_dataset_attribute(ds_index, attr)?;
+        self.inner.writer_mut().set_vlen_string_attribute(
+            crate::io::writer::AttrTarget::Dataset(ds_index),
+            name,
+            value,
+        )?;
         Ok(())
     }
 
@@ -717,6 +711,16 @@ impl SwmrFileReader {
         .ok_or_else(|| crate::error::Hdf5Error::NotFound(attr.to_string()))?
         .clone();
         Ok(self.reader.attr_string_value(&a)?)
+    }
+}
+
+/// The writer-side attribute list a group path names: `"/"` is the
+/// file-level (root) list, anything else the group's own.
+fn group_attr_target(group_path: &str) -> crate::io::writer::AttrTarget<'_> {
+    if group_path == "/" {
+        crate::io::writer::AttrTarget::Root
+    } else {
+        crate::io::writer::AttrTarget::Group(group_path)
     }
 }
 

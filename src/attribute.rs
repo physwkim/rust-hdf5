@@ -70,8 +70,11 @@ impl H5Attribute {
         let inner = borrow_inner(&self.file_inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let attr_msg = writer.vlen_string_attribute(&self.name, &value.0)?;
-                writer.add_dataset_attribute(self.ds_index, attr_msg)?;
+                writer.set_vlen_string_attribute(
+                    crate::io::writer::AttrTarget::Dataset(self.ds_index),
+                    &self.name,
+                    &value.0,
+                )?;
                 Ok(())
             }
             H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
@@ -110,8 +113,12 @@ impl H5Attribute {
         let mut inner = borrow_inner_mut(&self.file_inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
-                let attr_msg = writer.vlen_string_array_attribute(&self.name, values, &dims_u64)?;
-                writer.add_dataset_attribute(self.ds_index, attr_msg)?;
+                writer.set_vlen_string_array_attribute(
+                    crate::io::writer::AttrTarget::Dataset(self.ds_index),
+                    &self.name,
+                    values,
+                    &dims_u64,
+                )?;
                 Ok(())
             }
             H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(

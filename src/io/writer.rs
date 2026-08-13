@@ -372,6 +372,18 @@ enum DblkParent {
     },
 }
 
+/// Which attribute list an attribute operation targets: the root group's,
+/// a group's (by full path), or a dataset's (by writer index).
+#[derive(Clone, Copy)]
+pub enum AttrTarget<'a> {
+    /// The root group's (file-level) attributes.
+    Root,
+    /// A group's attributes, by full path.
+    Group(&'a str),
+    /// A dataset's attributes, by writer index.
+    Dataset(usize),
+}
+
 /// Which chunk index a dataset uses. libhdf5 picks it from the dataspace: a
 /// v2 B-tree for two or more unlimited dimensions, an extensible array for
 /// exactly one, a fixed array for none.
@@ -2531,14 +2543,128 @@ impl Hdf5Writer {
         }
     }
 
-    /// Add an attribute to the root group (file-level attribute).
-    pub fn add_root_attribute(&self, attr: crate::format::messages::attribute::AttributeMessage) {
-        // Replace existing attribute with the same name, or append new one.
-        let mut attrs = self.root_attributes.lock();
-        if let Some(pos) = attrs.iter().position(|a| a.name == attr.name) {
-            attrs[pos] = attr;
-        } else {
-            attrs.push(attr);
+    /// Add an attribute to the root group (file-level attribute), replacing
+    /// a same-name attribute. See [`set_attribute`](Self::set_attribute).
+    pub fn add_root_attribute(&self, attr: AttributeMessage) -> IoResult<()> {
+        self.set_attribute(AttrTarget::Root, attr)
+    }
+
+    /// Insert `attr` into the attribute list `target` names, replacing a
+    /// same-name attribute.
+    ///
+    /// The single owner of attribute-list mutation: an `AttributeMessage`
+    /// that leaves a list here has its vlen global-heap objects released, so
+    /// no replacement — vlen over vlen, numeric over vlen — can strand heap
+    /// space (the attribute counterpart of issue #10's dataset fix).
+    pub fn set_attribute(&self, target: AttrTarget<'_>, attr: AttributeMessage) -> IoResult<()> {
+        let old = self.with_attr_list(target, |attrs| {
+            if let Some(pos) = attrs.iter().position(|a| a.name == attr.name) {
+                Some(std::mem::replace(&mut attrs[pos], attr))
+            } else {
+                attrs.push(attr);
+                None
+            }
+        })?;
+        match old {
+            Some(old) => self.release_attr_vlen(&old),
+            None => Ok(()),
+        }
+    }
+
+    /// Set a variable-length string attribute on `target`, replacing any
+    /// same-name attribute.
+    ///
+    /// Owns the whole replacement sequence: the superseded attribute is
+    /// removed and its heap objects released *before* the new value's
+    /// collection is allocated — the free-before-alloc order (issue #10)
+    /// that lets a reopen-replace loop land in the block it just freed
+    /// instead of growing the file every session. The cost, as on the
+    /// dataset path: a failure between the eviction and the insert below
+    /// loses the attribute rather than leaking its heap space.
+    pub fn set_vlen_string_attribute(
+        &self,
+        target: AttrTarget<'_>,
+        name: &str,
+        value: &str,
+    ) -> IoResult<()> {
+        self.evict_attr(target, name)?;
+        let attr = self.vlen_string_attribute(name, value)?;
+        self.set_attribute(target, attr)
+    }
+
+    /// The array counterpart of
+    /// [`set_vlen_string_attribute`](Self::set_vlen_string_attribute).
+    pub fn set_vlen_string_array_attribute(
+        &self,
+        target: AttrTarget<'_>,
+        name: &str,
+        values: &[&str],
+        dims: &[u64],
+    ) -> IoResult<()> {
+        self.evict_attr(target, name)?;
+        let attr = self.vlen_string_array_attribute(name, values, dims)?;
+        self.set_attribute(target, attr)
+    }
+
+    /// Take the attribute `name` off `target`'s list, releasing its heap
+    /// objects. No-op when absent.
+    fn evict_attr(&self, target: AttrTarget<'_>, name: &str) -> IoResult<()> {
+        let old = self.with_attr_list(target, |attrs| {
+            attrs
+                .iter()
+                .position(|a| a.name == name)
+                .map(|pos| attrs.remove(pos))
+        })?;
+        match old {
+            Some(old) => self.release_attr_vlen(&old),
+            None => Ok(()),
+        }
+    }
+
+    /// Release the global-heap objects a superseded attribute owned. Only
+    /// vlen attributes hold heap references; every other class stores its
+    /// value inline in the message. Per-object removal keeps collections
+    /// shared with other refs (libhdf5-written files) intact.
+    fn release_attr_vlen(&self, old: &AttributeMessage) -> IoResult<()> {
+        use crate::format::messages::datatype::DatatypeMessage;
+        if matches!(
+            old.datatype,
+            DatatypeMessage::VarLenString { .. } | DatatypeMessage::VarLenSequence { .. }
+        ) {
+            self.release_vlen_references(&old.data)?;
+        }
+        Ok(())
+    }
+
+    /// Run `f` on the attribute list `target` names — the accessor every
+    /// attribute mutation shares.
+    fn with_attr_list<R>(
+        &self,
+        target: AttrTarget<'_>,
+        f: impl FnOnce(&mut Vec<AttributeMessage>) -> R,
+    ) -> IoResult<R> {
+        match target {
+            AttrTarget::Root => Ok(f(&mut self.root_attributes.lock())),
+            AttrTarget::Group(path) => {
+                for grp in self.group_refs() {
+                    let mut g = grp.lock();
+                    if g.name == path && !g.deleted {
+                        return Ok(f(&mut g.attributes));
+                    }
+                }
+                Err(crate::io::IoError::NotFound(format!(
+                    "group '{path}' not found"
+                )))
+            }
+            AttrTarget::Dataset(index) => {
+                let count = self.dataset_count();
+                if index >= count {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "dataset index {index} out of range (have {count})"
+                    )));
+                }
+                Ok(f(&mut self.ds(index).lock().attributes))
+            }
         }
     }
 
@@ -3291,15 +3417,7 @@ impl Hdf5Writer {
     /// The attribute will be written as a message in the dataset's object
     /// header when the file is finalized.
     pub fn add_dataset_attribute(&self, ds_index: usize, attr: AttributeMessage) -> IoResult<()> {
-        let count = self.dataset_count();
-        if ds_index >= count {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "dataset index {} out of range (have {})",
-                ds_index, count
-            )));
-        }
-        self.ds(ds_index).lock().attributes.push(attr);
-        Ok(())
+        self.set_attribute(AttrTarget::Dataset(ds_index), attr)
     }
 
     /// Add (or replace) an attribute on a group identified by its full path.
@@ -3308,22 +3426,7 @@ impl Hdf5Writer {
     /// file is finalized. An existing attribute with the same name is
     /// replaced, matching [`add_root_attribute`](Self::add_root_attribute).
     pub fn add_group_attribute(&self, group_path: &str, attr: AttributeMessage) -> IoResult<()> {
-        for grp in self.group_refs() {
-            let mut g = grp.lock();
-            if g.name == group_path && !g.deleted {
-                let attrs = &mut g.attributes;
-                if let Some(pos) = attrs.iter().position(|a| a.name == attr.name) {
-                    attrs[pos] = attr;
-                } else {
-                    attrs.push(attr);
-                }
-                return Ok(());
-            }
-        }
-        Err(crate::io::IoError::NotFound(format!(
-            "group '{}' not found",
-            group_path
-        )))
+        self.set_attribute(AttrTarget::Group(group_path), attr)
     }
 
     /// Build a variable-length UTF-8 string attribute message.
@@ -3344,7 +3447,7 @@ impl Hdf5Writer {
     /// A single shared attribute heap would avoid the per-attribute padding
     /// (`H5HG_MINALLOC` = 4096 bytes) but is a heap-management change that
     /// would also need to cover the dataset path.
-    pub fn vlen_string_attribute(&self, name: &str, value: &str) -> IoResult<AttributeMessage> {
+    fn vlen_string_attribute(&self, name: &str, value: &str) -> IoResult<AttributeMessage> {
         use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
         use crate::format::messages::dataspace::DataspaceMessage;
         use crate::format::messages::datatype::DatatypeMessage;
@@ -3380,8 +3483,8 @@ impl Hdf5Writer {
     /// `shape` (the public setters validate it before calling). One global heap
     /// collection is allocated for the whole array (all elements share it),
     /// matching the per-attribute collection of the scalar path.
-    pub fn vlen_string_array_attribute(
-        &mut self,
+    fn vlen_string_array_attribute(
+        &self,
         name: &str,
         values: &[&str],
         shape: &[u64],
@@ -5903,6 +6006,95 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Replacing a vlen string attribute must release the superseded
+    /// global-heap collection *before* the replacement's collection is
+    /// allocated, so a reopen-replace loop lands each new value in the block
+    /// it just freed instead of growing the file by one collection per
+    /// session — the attribute counterpart of
+    /// [`vlen_replace_across_reopen_keeps_the_file_flat`].
+    #[test]
+    fn vlen_attr_replace_across_reopen_keeps_the_file_flat() {
+        let path = temp_path("vlen_attr_reopen_flat");
+        let payload_a = "a".repeat(8 * 1024);
+        let payload_b = "b".repeat(8 * 1024);
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        writer
+            .set_vlen_string_attribute(AttrTarget::Root, "note", &payload_a)
+            .unwrap();
+        writer.close().unwrap();
+
+        let mut sizes = Vec::new();
+        for i in 0..8 {
+            let writer = Hdf5Writer::open_append(&path).unwrap();
+            let payload = if i % 2 == 0 { &payload_b } else { &payload_a };
+            writer
+                .set_vlen_string_attribute(AttrTarget::Root, "note", payload)
+                .unwrap();
+            writer.close().unwrap();
+            sizes.push(std::fs::metadata(&path).unwrap().len());
+        }
+        assert_eq!(&sizes[1..], &vec![sizes[0]; 7][..], "sizes: {sizes:?}");
+
+        // The reused blocks still hold the last value.
+        let reader = Hdf5Reader::open(&path).unwrap();
+        let attr = reader.root_attr("note").unwrap().clone();
+        let mut reader = reader;
+        assert_eq!(reader.attr_string_value(&attr).unwrap(), payload_a);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A numeric attribute replacing a vlen one goes through the same list
+    /// owner, so the superseded collection is released even though the new
+    /// value holds no heap reference: a later same-size vlen attribute must
+    /// land in the freed block, making the file exactly as large as one that
+    /// never stored the replaced value.
+    #[test]
+    fn numeric_replacing_a_vlen_attr_releases_its_collection() {
+        let payload = "x".repeat(8 * 1024);
+        let numeric = || {
+            AttributeMessage::scalar_numeric(
+                "x",
+                DatatypeMessage::i32_type(),
+                7i32.to_le_bytes().to_vec(),
+            )
+        };
+
+        let path_a = temp_path("vlen_attr_cross_a");
+        let writer = Hdf5Writer::create(&path_a).unwrap();
+        writer
+            .set_vlen_string_attribute(AttrTarget::Root, "x", &payload)
+            .unwrap();
+        writer.add_root_attribute(numeric()).unwrap();
+        writer
+            .set_vlen_string_attribute(AttrTarget::Root, "y", &payload)
+            .unwrap();
+        writer.close().unwrap();
+
+        // The same end state written without the replaced vlen value.
+        let path_b = temp_path("vlen_attr_cross_b");
+        let writer = Hdf5Writer::create(&path_b).unwrap();
+        writer.add_root_attribute(numeric()).unwrap();
+        writer
+            .set_vlen_string_attribute(AttrTarget::Root, "y", &payload)
+            .unwrap();
+        writer.close().unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path_a).unwrap().len(),
+            std::fs::metadata(&path_b).unwrap().len()
+        );
+
+        let reader = Hdf5Reader::open(&path_a).unwrap();
+        let y = reader.root_attr("y").unwrap().clone();
+        let mut reader = reader;
+        assert_eq!(reader.attr_string_value(&y).unwrap(), payload);
+
+        std::fs::remove_file(&path_a).ok();
+        std::fs::remove_file(&path_b).ok();
     }
 
     /// Reopen/write/close cycles must not leak the object-header blocks

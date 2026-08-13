@@ -38,6 +38,18 @@
   immediate reuse and reopen-replace loops no longer grow the file every
   session. (issue #10)
 
+- Replacing a variable-length string attribute releases the superseded
+  value's global-heap objects, before the replacement's collection is
+  allocated (the same free-before-alloc order as the dataset fix below),
+  so updating a vlen attribute — in one session or across reopen-replace
+  sessions — no longer strands one collection block per update. All three
+  attribute lists (root, group, dataset) route replacement through one
+  owner, which also covers a numeric value replacing a vlen one.
+  **Behavior change:** writing a dataset attribute whose name already
+  exists now replaces it, as root and group attributes (and h5py) always
+  did; previously the dataset header accumulated duplicate same-name
+  attribute messages.
+
 - On close, the writer frees the object-header blocks it supersedes —
   root group, groups, and modified datasets are rewritten at fresh
   addresses each session, and the old blocks were simply abandoned,
