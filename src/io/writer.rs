@@ -2825,26 +2825,27 @@ impl Hdf5Writer {
         let ref_size = vlen_reference_size(&self.ctx);
 
         // The append buffer holds the tail of the dataset, so the range splits
-        // into an on-disk prefix and a buffered suffix.
-        let buffer_base = dims[0] - buffered_frames as u64;
+        // into an on-disk prefix and a buffered suffix. An append that is
+        // between publishing its buffered count and extending the dims (two
+        // separate lock acquisitions on its side) can make the count exceed
+        // the extent; report that instead of wrapping.
+        let buffer_base = dims[0].checked_sub(buffered_frames as u64).ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!(
+                "the append buffer holds {buffered_frames} frames but the dataset has {} elements",
+                dims[0]
+            ))
+        })?;
         let split = end.min(buffer_base).max(start);
 
-        // The references about to be overwritten, read before anything moves.
-        // libhdf5 reads the same bytes into the conversion background buffer
-        // (`H5D__scatgath_write` gathers the file's current elements when
-        // `need_bkg` is set) and hands them to `H5T__vlen_disk_write`, which
-        // deletes them before storing the new reference. The buffered suffix
-        // is not on disk yet, so its current references come from the buffer.
+        // The on-disk references about to be overwritten, read before anything
+        // moves. libhdf5 reads the same bytes into the conversion background
+        // buffer (`H5D__scatgath_write` gathers the file's current elements
+        // when `need_bkg` is set) and hands them to `H5T__vlen_disk_write`,
+        // which deletes them before storing the new reference. The buffered
+        // suffix is not on disk yet; its references are read further down,
+        // under the same lock that patches them.
         let mut superseded =
             self.current_element_bytes(ds_index, start, split - start, ref_size)?;
-        if end > split {
-            let ds = self.ds(ds_index);
-            let m = ds.lock();
-            let off = ((split - buffer_base) as usize) * ref_size;
-            let len = ((end - split) as usize) * ref_size;
-            superseded
-                .extend_from_slice(&m.append_buffer[off..(off + len).min(m.append_buffer.len())]);
-        }
 
         let gcol_encoded = gcol.encode(&self.ctx);
         let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
@@ -2865,22 +2866,34 @@ impl Hdf5Writer {
             self.write_slice(ds_index, &[start], &[n as u64], &refs[..n * ref_size])?;
         }
         if end > split {
+            // One lock acquisition owns the buffered suffix: the offset is
+            // derived, the superseded references read and the new ones patched
+            // against the same buffer. The snapshot above can be stale under
+            // the `threadsafe` feature — a concurrent append may have flushed
+            // the buffer and moved its base between the two acquisitions,
+            // putting the suffix on disk where this patch no longer reaches
+            // it — so a moved base is reported, not applied. A base that is
+            // unchanged means nothing flushed (appends only push it up), and
+            // then the buffer can only have grown past our range.
             let ds = self.ds(ds_index);
             let mut m = ds.lock();
+            m.dataspace.dims[0]
+                .checked_sub(m.append_buffered_frames)
+                .filter(|&b| b == buffer_base)
+                .ok_or_else(|| {
+                    crate::io::IoError::InvalidState(format!(
+                        "the append buffer moved while elements {split}..{end} were being replaced"
+                    ))
+                })?;
             let off = ((split - buffer_base) as usize) * ref_size;
             let tail = &refs[(split - start) as usize * ref_size..];
-            // `append_buffer.len() == append_buffered_frames * ref_size` holds
-            // for a 1-D vlen dataset, so the range is in bounds for the
-            // snapshot taken above. It can still be stale under the
-            // `thread-safe` feature, where another thread may have flushed the
-            // buffer between the two lock acquisitions; report that rather than
-            // panicking on the slice.
             if off + tail.len() > m.append_buffer.len() {
                 return Err(crate::io::IoError::InvalidState(format!(
                     "buffered elements {split}..{end} run past the {}-byte append buffer",
                     m.append_buffer.len()
                 )));
             }
+            superseded.extend_from_slice(&m.append_buffer[off..off + tail.len()]);
             m.append_buffer[off..off + tail.len()].copy_from_slice(tail);
         }
 
@@ -5317,6 +5330,27 @@ mod tests {
             tag,
             n
         ))
+    }
+
+    /// A concurrent append publishes its buffered count and extends the dims
+    /// under two different lock acquisitions, so a slice update can observe a
+    /// count that exceeds the extent. That half-published state must come back
+    /// as an error, not wrap `dims[0] - buffered` around zero.
+    #[test]
+    fn vlen_slice_reports_a_half_published_append_count() {
+        let path = temp_path("vlen_slice_half_published");
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let idx = writer.create_vlen_string_dataset("d", &["a", "b"]).unwrap();
+        writer.ds(idx).lock().append_buffered_frames = 3; // dims[0] == 2
+        let err = writer.write_vlen_strings_slice(idx, 0, &["x"]).unwrap_err();
+        assert!(
+            err.to_string().contains("append buffer holds 3 frames"),
+            "unexpected error: {err}"
+        );
+
+        writer.ds(idx).lock().append_buffered_frames = 0;
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
