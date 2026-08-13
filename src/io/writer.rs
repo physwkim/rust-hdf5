@@ -2797,10 +2797,18 @@ impl Hdf5Writer {
             obj_indices.push(idx);
         }
 
-        // Encode and write the global heap collection
-        let gcol_encoded = gcol.encode(&self.ctx);
-        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
-        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+        // An empty batch must not reach the heap write: an empty collection
+        // still encodes to the 4096-byte `H5HG_MINALLOC` minimum — a block
+        // nothing references. The reference loop below is empty then, so
+        // the placeholder address is never used.
+        let gcol_addr = if strings.is_empty() {
+            UNDEF_ADDR
+        } else {
+            let gcol_encoded = gcol.encode(&self.ctx);
+            let addr = self.allocator.allocate(gcol_encoded.len() as u64);
+            self.handle.write_at(addr, &gcol_encoded)?;
+            addr
+        };
 
         // Build raw data: vlen references
         let ref_size = crate::format::global_heap::vlen_reference_size(&self.ctx);
@@ -2875,10 +2883,15 @@ impl Hdf5Writer {
             obj_indices.push(idx);
         }
 
-        // Encode and write the global heap collection.
-        let gcol_encoded = gcol.encode(&self.ctx);
-        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
-        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+        // Empty batch: no heap write, as in `create_vlen_string_dataset`.
+        let gcol_addr = if items.is_empty() {
+            UNDEF_ADDR
+        } else {
+            let gcol_encoded = gcol.encode(&self.ctx);
+            let addr = self.allocator.allocate(gcol_encoded.len() as u64);
+            self.handle.write_at(addr, &gcol_encoded)?;
+            addr
+        };
 
         // Build raw data: one vlen reference per item.
         let ref_size = crate::format::global_heap::vlen_reference_size(&self.ctx);
@@ -2959,8 +2972,14 @@ impl Hdf5Writer {
 
         // Encode and write the global heap collection
         let gcol_encoded = gcol.encode(&self.ctx);
-        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
-        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+        let gcol_addr = if strings.is_empty() {
+            // Empty batch: no heap write, as in `create_vlen_string_dataset`.
+            UNDEF_ADDR
+        } else {
+            let addr = self.allocator.allocate(gcol_encoded.len() as u64);
+            self.handle.write_at(addr, &gcol_encoded)?;
+            addr
+        };
 
         // Build raw data: vlen references
         let ref_size = crate::format::global_heap::vlen_reference_size(&self.ctx);
@@ -3636,9 +3655,17 @@ impl Hdf5Writer {
             let obj_idx = gcol.add_object(v.as_bytes().to_vec())?;
             entries.push((crate::format::global_heap::vlen_seq_len(v.len())?, obj_idx));
         }
-        let gcol_encoded = gcol.encode(&self.ctx);
-        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
-        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+        // A zero-element array attribute must not reach the heap write: an
+        // empty collection still encodes to the 4096-byte `H5HG_MINALLOC`
+        // minimum — a block nothing references.
+        let gcol_addr = if values.is_empty() {
+            UNDEF_ADDR
+        } else {
+            let gcol_encoded = gcol.encode(&self.ctx);
+            let addr = self.allocator.allocate(gcol_encoded.len() as u64);
+            self.handle.write_at(addr, &gcol_encoded)?;
+            addr
+        };
 
         let mut data = Vec::with_capacity(values.len() * 16);
         for (len, obj_idx) in &entries {

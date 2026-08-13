@@ -27,6 +27,13 @@
   cleared but the blocks are kept, the rule libhdf5 applies in
   `H5Dearray.c`.
 
+- Creating a zero-element vlen dataset (`write_vlen_strings`,
+  `write_vlen_bytes`, `write_vlen_strings_compressed`) or an empty
+  string-array attribute no longer writes a global-heap collection: an
+  empty collection still encodes to the 4096-byte minimum, and with no
+  reference pointing at it the block was orphaned. The empty dataset or
+  attribute itself is still created.
+
 - A rejected vlen write no longer orphans a global-heap collection.
   `append_vlen_strings` wrote the batch's collection before checking the
   dataset was chunked, and `write_vlen_strings_slice` wrote it before

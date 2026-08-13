@@ -174,3 +174,64 @@ fn rejected_append_does_not_orphan_a_collection() {
         "20 rejected appends against 1"
     );
 }
+
+/// A zero-element vlen dataset or string-array attribute references no
+/// heap object, so no collection belongs in the file — an empty
+/// collection is still a 4096-byte `H5HG_MINALLOC` block nothing points
+/// to. The file must contain no `GCOL` block at all, and the empty value
+/// must read back.
+#[test]
+fn empty_vlen_creators_write_no_collection() {
+    type WriteEmpty = fn(&H5File);
+    let cases: &[(&str, WriteEmpty)] = &[
+        ("strings", |f| {
+            f.write_vlen_strings("v", &[]).unwrap();
+        }),
+        ("bytes", |f| {
+            let no_items: &[&[u8]] = &[];
+            f.write_vlen_bytes("v", no_items).unwrap();
+        }),
+        ("compressed", |f| {
+            f.write_vlen_strings_compressed("v", &[], 4, rust_hdf5::FilterPipeline::deflate(4))
+                .unwrap();
+        }),
+        ("attr_array", |f| {
+            f.set_attr_string_array("v", &[]).unwrap();
+        }),
+    ];
+
+    for (tag, write) in cases {
+        let path = unique_tmp(&format!("empty_{tag}"));
+        let file = H5File::create(&path).unwrap();
+        write(&file);
+        file.close().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            !bytes.windows(4).any(|w| w == b"GCOL"),
+            "{tag}: empty input must not write a heap collection"
+        );
+
+        let read = H5File::open(&path).unwrap();
+        match *tag {
+            "strings" | "compressed" => {
+                assert_eq!(
+                    read.dataset("v").unwrap().read_vlen_strings().unwrap(),
+                    Vec::<String>::new(),
+                    "{tag}"
+                );
+            }
+            "bytes" => {
+                assert_eq!(
+                    read.dataset("v").unwrap().read_vlen_bytes().unwrap(),
+                    Vec::<Vec<u8>>::new()
+                );
+            }
+            _ => {
+                assert!(read.attr_names().unwrap().contains(&"v".to_string()));
+            }
+        }
+        drop(read);
+        cleanup(&path);
+    }
+}
