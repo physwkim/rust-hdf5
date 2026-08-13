@@ -573,6 +573,174 @@ fn hard_link_to_a_link_path_targets_the_object() {
     cleanup(&path);
 }
 
+/// A reopened file rebuilds hard-link identity: the alias and the tree
+/// name are one object again, so deleting one name keeps the data alive
+/// under the other. Reopen used to give every alias its own
+/// `DatasetInfo` with the same storage addresses — deleting either path
+/// freed blocks the other still referenced.
+#[test]
+fn reopened_file_keeps_hard_link_identity() {
+    let path = unique_tmp("hl_reopen");
+    let data: Vec<i32> = (0..10).collect();
+
+    {
+        let file = H5File::create(&path).unwrap();
+        let root = file.root_group();
+        let inst = root.create_group("instrument").unwrap();
+        let ds = inst
+            .new_dataset::<i32>()
+            .shape([10])
+            .create("detector")
+            .unwrap();
+        ds.write_raw(&data).unwrap();
+        let data_grp = root.create_group("data").unwrap();
+        data_grp.link("detector", "/instrument/detector").unwrap();
+        file.close().unwrap();
+    }
+    {
+        let file = H5File::options().no_locking().open_rw(&path).unwrap();
+        file.delete_dataset("instrument/detector").unwrap();
+        // Anything the delete wrongly freed gets reused here with other
+        // bytes — under the old per-alias DatasetInfo reopen, this filler
+        // landed in the object's storage and the alias read it back.
+        let filler: Vec<i32> = (100..110).collect();
+        let f = file
+            .root_group()
+            .new_dataset::<i32>()
+            .shape([10])
+            .create("filler")
+            .unwrap();
+        f.write_raw(&filler).unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("data/detector")
+                .unwrap()
+                .read_raw::<i32>()
+                .unwrap(),
+            data,
+            "the other name must keep the object across sessions"
+        );
+        assert!(
+            file.dataset("instrument/detector").is_err(),
+            "the deleted name must not resolve"
+        );
+    }
+
+    cleanup(&path);
+}
+
+/// Reopening and closing without changes keeps both names resolving.
+#[test]
+fn reopen_close_preserves_hard_links() {
+    let path = unique_tmp("hl_reopen_noop");
+    let data: Vec<i32> = vec![9, 8, 7];
+
+    {
+        let file = H5File::create(&path).unwrap();
+        let root = file.root_group();
+        let ds = root.new_dataset::<i32>().shape([3]).create("ds").unwrap();
+        ds.write_raw(&data).unwrap();
+        root.link("alias", "ds").unwrap();
+        file.close().unwrap();
+    }
+    {
+        let file = H5File::options().no_locking().open_rw(&path).unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(file.dataset("ds").unwrap().read_raw::<i32>().unwrap(), data);
+        assert_eq!(
+            file.dataset("alias").unwrap().read_raw::<i32>().unwrap(),
+            data
+        );
+    }
+
+    cleanup(&path);
+}
+
+/// Cross-session last-name deletes settle the file size: cycles of
+/// reopen → delete both names → recreate dataset + link do not grow the
+/// file, so the freed storage is really recovered.
+#[test]
+fn reopen_delete_both_names_settles_file_size() {
+    let size_after = |cycles: usize| {
+        let path = unique_tmp(&format!("hl_reopen_free_{cycles}"));
+        let vals: Vec<i32> = (0..256).collect();
+        let create = |file: &H5File| {
+            let root = file.root_group();
+            let ds = root.new_dataset::<i32>().shape([256]).create("ds").unwrap();
+            ds.write_raw(&vals).unwrap();
+            root.link("alias", "ds").unwrap();
+        };
+        {
+            let file = H5File::create(&path).unwrap();
+            create(&file);
+            file.close().unwrap();
+        }
+        for _ in 0..cycles {
+            let file = H5File::options().no_locking().open_rw(&path).unwrap();
+            file.delete_dataset("ds").unwrap();
+            file.delete_dataset("alias").unwrap();
+            create(&file);
+            file.close().unwrap();
+        }
+        let read = H5File::open(&path).unwrap();
+        assert_eq!(
+            read.dataset("alias").unwrap().read_raw::<i32>().unwrap(),
+            vals
+        );
+        drop(read);
+        let n = std::fs::metadata(&path).unwrap().len();
+        cleanup(&path);
+        n
+    };
+
+    assert_eq!(size_after(10), size_after(2), "10 reopen cycles against 2");
+}
+
+/// A hard link to a *group* survives reopen too: it still refuses the
+/// subtree delete, and unlinking it first clears the way.
+#[test]
+fn reopened_group_link_still_refuses_subtree_delete() {
+    let path = unique_tmp("hl_reopen_group");
+
+    {
+        let file = H5File::create(&path).unwrap();
+        let root = file.root_group();
+        let container = root.create_group("container").unwrap();
+        let inner = container.create_group("inner").unwrap();
+        inner.new_dataset::<i32>().shape([2]).create("ds").unwrap();
+        root.link("inner_alias", "/container/inner").unwrap();
+        file.close().unwrap();
+    }
+    {
+        let file = H5File::options().no_locking().open_rw(&path).unwrap();
+        assert!(
+            file.delete_group("container").is_err(),
+            "the reopened group link must still refuse the delete"
+        );
+        file.delete_group("inner_alias").unwrap();
+        file.delete_group("container").unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let file = H5File::open(&path).unwrap();
+        assert!(
+            file.dataset("container/inner/ds").is_err(),
+            "the subtree must be gone after the cleared delete"
+        );
+    }
+
+    cleanup(&path);
+}
+
 /// A target path given with a trailing slash still resolves.
 #[test]
 fn hard_link_tolerates_trailing_slash() {

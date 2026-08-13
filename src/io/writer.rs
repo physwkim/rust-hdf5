@@ -1132,6 +1132,23 @@ impl Hdf5Writer {
             0,
         )?;
 
+        // Two link entries can share one object header — hard links. Only
+        // the first-walked path becomes the object; the rest are rebuilt
+        // as hard-link registry entries further down. Without this split
+        // every alias came back as its own DatasetInfo carrying the same
+        // storage addresses, so deleting (or finalizing) one freed blocks
+        // the others still referenced.
+        let mut seen_header_addrs = std::collections::HashSet::new();
+        let mut alias_entries: Vec<(String, u64)> = Vec::new();
+        link_entries.retain(|(name, addr)| {
+            if seen_header_addrs.insert(*addr) {
+                true
+            } else {
+                alias_entries.push((name.clone(), *addr));
+                false
+            }
+        });
+
         let mut existing_datasets = Vec::new();
         // Non-dataset link targets (groups): header block `(addr, len)` by
         // link path — so finalize can free the block its rewrite supersedes —
@@ -1624,6 +1641,42 @@ impl Hdf5Writer {
             groups[gidx].child_datasets.push(di);
         }
 
+        // Rebuild the hard-link registry from the alias entries set aside
+        // above, so the H5Ldelete semantics survive a reopen. An alias
+        // whose target header did not decode is dropped with its target
+        // (the primary path was skipped the same way).
+        let mut hard_links: Vec<HardLink> = Vec::new();
+        for (path, addr) in alias_entries {
+            let target = if let Some(di) = existing_datasets
+                .iter()
+                .position(|d| d.obj_header_addr == addr)
+            {
+                HardLinkTarget::Dataset(di)
+            } else if let Some(gi) = groups
+                .iter()
+                .position(|g| g.obj_header_written_addr == Some(addr))
+            {
+                HardLinkTarget::Group(gi)
+            } else {
+                continue;
+            };
+            let (parent, link_name) = match path.rsplit_once('/') {
+                None => (None, path),
+                Some((dir, leaf)) => {
+                    ensure_groups_for(dir, &mut groups, &mut group_index_map, &mut group_headers);
+                    (
+                        group_index_map.get(&format!("/{dir}")).copied(),
+                        leaf.to_string(),
+                    )
+                }
+            };
+            hard_links.push(HardLink {
+                parent,
+                name: link_name,
+                target,
+            });
+        }
+
         let allocator = FileAllocator::new(file_size);
 
         // Wrap the reconstructed plain vecs into the per-slot registry. The
@@ -1644,7 +1697,7 @@ impl Hdf5Writer {
             ctx,
             datasets: Slot::new(datasets),
             groups: Slot::new(groups),
-            hard_links: Slot::new(Vec::new()),
+            hard_links: Slot::new(hard_links),
             root_attributes: Slot::new(root_attributes),
             create_lock: Slot::new(()),
             libver_latest: false,
