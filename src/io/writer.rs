@@ -184,6 +184,17 @@ impl<T> Slot<T> {
     }
 }
 
+/// Proof that the create gate (`create_lock`) is held and the new dataset's
+/// name passed the uniqueness check. Only [`Hdf5Writer::begin_create`]
+/// constructs one and [`Hdf5Writer::push_dataset`] demands one, so a creator
+/// cannot reach the dataset registry while skipping either step.
+pub(crate) struct CreateGuard<'a> {
+    #[cfg(not(feature = "threadsafe"))]
+    _gate: std::cell::RefMut<'a, ()>,
+    #[cfg(feature = "threadsafe")]
+    _gate: std::sync::MutexGuard<'a, ()>,
+}
+
 /// Reference-counted shared pointer, feature-selected. The single-thread
 /// build uses `Rc` (no atomics); the `threadsafe` build uses `Arc` so a
 /// dataset/group slot can be cloned out of the registry and locked on its
@@ -688,10 +699,22 @@ impl Hdf5Writer {
         Shared::clone(&self.groups.lock()[index])
     }
 
+    /// Enter the create gate: take `create_lock` and check that `name` is not
+    /// already taken. The returned witness is what [`Self::push_dataset`]
+    /// requires, so the uniqueness check and the registry push are atomic
+    /// (see `create_lock`) at every creator by construction.
+    pub(crate) fn begin_create(&self, name: &str) -> IoResult<CreateGuard<'_>> {
+        let gate = self.create_lock.lock();
+        self.ensure_unique_dataset_name(name)?;
+        Ok(CreateGuard { _gate: gate })
+    }
+
     /// Push a freshly-built dataset into the registry and return its index.
     /// Takes the registry lock only for the push, so it does not block an
     /// in-flight write that already cloned its own [`DatasetRef`] out.
-    pub(crate) fn push_dataset(&self, info: DatasetInfo) -> usize {
+    /// The [`CreateGuard`] proves the caller entered through
+    /// [`Self::begin_create`] and still holds the gate.
+    pub(crate) fn push_dataset(&self, _create: &CreateGuard<'_>, info: DatasetInfo) -> usize {
         let mut reg = self.datasets.lock();
         let idx = reg.len();
         reg.push(Shared::new(Slot::new(info)));
@@ -1616,10 +1639,7 @@ impl Hdf5Writer {
         datatype: DatatypeMessage,
         dims: &[u64],
     ) -> IoResult<usize> {
-        // Hold the create gate across the uniqueness check and the registry
-        // push so the two are atomic (see `create_lock`).
-        let _create = self.create_lock.lock();
-        self.ensure_unique_dataset_name(name)?;
+        let create = self.begin_create(name)?;
         let total_elements: u64 = if dims.is_empty() {
             1
         } else {
@@ -1641,24 +1661,27 @@ impl Hdf5Writer {
             DataspaceMessage::simple(dims)
         };
 
-        let idx = self.push_dataset(DatasetInfo {
-            name: name.to_string(),
-            datatype,
-            dataspace,
-            obj_header_addr: 0, // set during finalize
-            data_addr,
-            data_size,
-            chunked: None,
-            fixed_array: None,
-            btree_v2: None,
-            append: None,
-            attributes: Vec::new(),
-            obj_header_written_addr: None,
-            obj_header_encoded_size: 0,
-            filter_pipeline: None,
-            deleted: false,
-            fill_value: None,
-        });
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                dataspace,
+                obj_header_addr: 0, // set during finalize
+                data_addr,
+                data_size,
+                chunked: None,
+                fixed_array: None,
+                btree_v2: None,
+                append: None,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: None,
+                deleted: false,
+                fill_value: None,
+            },
+        );
 
         Ok(idx)
     }
@@ -1676,10 +1699,7 @@ impl Hdf5Writer {
         max_dims: &[u64],
         chunk_dims: &[u64],
     ) -> IoResult<usize> {
-        // Hold the create gate across the uniqueness check and the registry
-        // push so the two are atomic (see `create_lock`).
-        let _create = self.create_lock.lock();
-        self.ensure_unique_dataset_name(name)?;
+        let create = self.begin_create(name)?;
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         let earray_params = EarrayParams::default_params();
         let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs)?;
@@ -1728,36 +1748,39 @@ impl Hdf5Writer {
             max_dims: Some(max_dims.to_vec()),
         };
 
-        let idx = self.push_dataset(DatasetInfo {
-            name: name.to_string(),
-            datatype,
-            dataspace,
-            obj_header_addr: 0,
-            data_addr: UNDEF_ADDR,
-            data_size: 0,
-            attributes: Vec::new(),
-            obj_header_written_addr: None,
-            obj_header_encoded_size: 0,
-            filter_pipeline: None,
-            deleted: false,
-            fill_value: None,
-            fixed_array: None,
-            btree_v2: None,
-            chunked: Some(ChunkedDatasetInfo {
-                chunk_dims: chunk_dims.to_vec(),
-                max_dims: max_dims.to_vec(),
-                earray_params,
-                ea_header_addr,
-                ea_iblk_addr,
-                ndblk_addrs,
-                ea_header,
-                ea_iblk,
-                chunks_written: 0,
-                filt_iblk: None,
-                chunk_size_len: 0,
-            }),
-            append: None,
-        });
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                dataspace,
+                obj_header_addr: 0,
+                data_addr: UNDEF_ADDR,
+                data_size: 0,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: None,
+                deleted: false,
+                fill_value: None,
+                fixed_array: None,
+                btree_v2: None,
+                chunked: Some(ChunkedDatasetInfo {
+                    chunk_dims: chunk_dims.to_vec(),
+                    max_dims: max_dims.to_vec(),
+                    earray_params,
+                    ea_header_addr,
+                    ea_iblk_addr,
+                    ndblk_addrs,
+                    ea_header,
+                    ea_iblk,
+                    chunks_written: 0,
+                    filt_iblk: None,
+                    chunk_size_len: 0,
+                }),
+                append: None,
+            },
+        );
 
         Ok(idx)
     }
@@ -2391,6 +2414,7 @@ impl Hdf5Writer {
         use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
         use crate::format::messages::datatype::DatatypeMessage;
 
+        let create = self.begin_create(name)?;
         let num_strings = strings.len() as u64;
 
         // Build a global heap collection with all strings
@@ -2429,24 +2453,27 @@ impl Hdf5Writer {
         let dataspace =
             crate::format::messages::dataspace::DataspaceMessage::simple(&[num_strings]);
 
-        let idx = self.push_dataset(DatasetInfo {
-            name: name.to_string(),
-            datatype,
-            dataspace,
-            obj_header_addr: 0,
-            data_addr,
-            data_size: data_size as u64,
-            attributes: Vec::new(),
-            obj_header_written_addr: None,
-            obj_header_encoded_size: 0,
-            filter_pipeline: None,
-            deleted: false,
-            fill_value: None,
-            chunked: None,
-            fixed_array: None,
-            btree_v2: None,
-            append: None,
-        });
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                dataspace,
+                obj_header_addr: 0,
+                data_addr,
+                data_size: data_size as u64,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: None,
+                deleted: false,
+                fill_value: None,
+                chunked: None,
+                fixed_array: None,
+                btree_v2: None,
+                append: None,
+            },
+        );
 
         Ok(idx)
     }
@@ -2463,6 +2490,7 @@ impl Hdf5Writer {
         use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
         use crate::format::messages::datatype::DatatypeMessage;
 
+        let create = self.begin_create(name)?;
         let num_items = items.len() as u64;
 
         // Build a global heap collection with all byte arrays.
@@ -2501,24 +2529,27 @@ impl Hdf5Writer {
         let datatype = DatatypeMessage::vlen_bytes();
         let dataspace = crate::format::messages::dataspace::DataspaceMessage::simple(&[num_items]);
 
-        let idx = self.push_dataset(DatasetInfo {
-            name: name.to_string(),
-            datatype,
-            dataspace,
-            obj_header_addr: 0,
-            data_addr,
-            data_size: data_size as u64,
-            attributes: Vec::new(),
-            obj_header_written_addr: None,
-            obj_header_encoded_size: 0,
-            filter_pipeline: None,
-            deleted: false,
-            fill_value: None,
-            chunked: None,
-            fixed_array: None,
-            btree_v2: None,
-            append: None,
-        });
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                dataspace,
+                obj_header_addr: 0,
+                data_addr,
+                data_size: data_size as u64,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: None,
+                deleted: false,
+                fill_value: None,
+                chunked: None,
+                fixed_array: None,
+                btree_v2: None,
+                append: None,
+            },
+        );
 
         Ok(idx)
     }
@@ -2538,6 +2569,7 @@ impl Hdf5Writer {
         use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
         use crate::format::messages::datatype::DatatypeMessage;
 
+        let create = self.begin_create(name)?;
         let num_strings = strings.len() as u64;
         validate_chunk_geometry(&[num_strings], &[num_strings], &[chunk_size as u64])?;
 
@@ -2626,36 +2658,39 @@ impl Hdf5Writer {
             nsblk_addrs,
         );
 
-        let idx = self.push_dataset(DatasetInfo {
-            name: name.to_string(),
-            datatype,
-            dataspace,
-            obj_header_addr: 0,
-            data_addr: UNDEF_ADDR,
-            data_size: 0,
-            attributes: Vec::new(),
-            obj_header_written_addr: None,
-            obj_header_encoded_size: 0,
-            filter_pipeline: Some(pipeline),
-            deleted: false,
-            fill_value: None,
-            fixed_array: None,
-            btree_v2: None,
-            chunked: Some(ChunkedDatasetInfo {
-                chunk_dims: chunk_dims.clone(),
-                max_dims: max_dims.clone(),
-                earray_params,
-                ea_header_addr,
-                ea_iblk_addr,
-                ndblk_addrs,
-                ea_header,
-                ea_iblk,
-                chunks_written: 0,
-                filt_iblk: Some(filt_iblk),
-                chunk_size_len,
-            }),
-            append: None,
-        });
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                dataspace,
+                obj_header_addr: 0,
+                data_addr: UNDEF_ADDR,
+                data_size: 0,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: Some(pipeline),
+                deleted: false,
+                fill_value: None,
+                fixed_array: None,
+                btree_v2: None,
+                chunked: Some(ChunkedDatasetInfo {
+                    chunk_dims: chunk_dims.clone(),
+                    max_dims: max_dims.clone(),
+                    earray_params,
+                    ea_header_addr,
+                    ea_iblk_addr,
+                    ndblk_addrs,
+                    ea_header,
+                    ea_iblk,
+                    chunks_written: 0,
+                    filt_iblk: Some(filt_iblk),
+                    chunk_size_len,
+                }),
+                append: None,
+            },
+        );
 
         // Write chunks of vlen references with compression
         let chunk_byte_size = chunk_bytes as usize;
@@ -3648,10 +3683,7 @@ impl Hdf5Writer {
         dims: &[u64],
         chunk_dims: &[u64],
     ) -> IoResult<usize> {
-        // Hold the create gate across the uniqueness check and the registry
-        // push so the two are atomic (see `create_lock`).
-        let _create = self.create_lock.lock();
-        self.ensure_unique_dataset_name(name)?;
+        let create = self.begin_create(name)?;
         // A fixed-array index means a fixed shape: max dims are the dims.
         validate_chunk_geometry(dims, dims, chunk_dims)?;
         let ndims = dims.len();
@@ -3691,31 +3723,34 @@ impl Hdf5Writer {
 
         let dataspace = DataspaceMessage::simple(dims);
 
-        let idx = self.push_dataset(DatasetInfo {
-            name: name.to_string(),
-            datatype,
-            dataspace,
-            obj_header_addr: 0,
-            data_addr: UNDEF_ADDR,
-            data_size: 0,
-            attributes: Vec::new(),
-            obj_header_written_addr: None,
-            obj_header_encoded_size: 0,
-            filter_pipeline: None,
-            deleted: false,
-            fill_value: None,
-            chunked: None,
-            btree_v2: None,
-            fixed_array: Some(FixedArrayDatasetInfo {
-                chunk_dims: chunk_dims.to_vec(),
-                fa_header_addr,
-                fa_dblk_addr,
-                fa_header,
-                fa_dblk,
-                chunks_written: 0,
-            }),
-            append: None,
-        });
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                dataspace,
+                obj_header_addr: 0,
+                data_addr: UNDEF_ADDR,
+                data_size: 0,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: None,
+                deleted: false,
+                fill_value: None,
+                chunked: None,
+                btree_v2: None,
+                fixed_array: Some(FixedArrayDatasetInfo {
+                    chunk_dims: chunk_dims.to_vec(),
+                    fa_header_addr,
+                    fa_dblk_addr,
+                    fa_header,
+                    fa_dblk,
+                    chunks_written: 0,
+                }),
+                append: None,
+            },
+        );
 
         Ok(idx)
     }
@@ -3736,10 +3771,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: FilterPipeline,
     ) -> IoResult<usize> {
-        // Hold the create gate across the uniqueness check and the registry
-        // push so the two are atomic (see `create_lock`).
-        let _create = self.create_lock.lock();
-        self.ensure_unique_dataset_name(name)?;
+        let create = self.begin_create(name)?;
         // A fixed-array index means a fixed shape: max dims are the dims.
         validate_chunk_geometry(dims, dims, chunk_dims)?;
         let ndims = dims.len();
@@ -3782,31 +3814,34 @@ impl Hdf5Writer {
 
         let dataspace = DataspaceMessage::simple(dims);
 
-        let idx = self.push_dataset(DatasetInfo {
-            name: name.to_string(),
-            datatype,
-            dataspace,
-            obj_header_addr: 0,
-            data_addr: UNDEF_ADDR,
-            data_size: 0,
-            attributes: Vec::new(),
-            obj_header_written_addr: None,
-            obj_header_encoded_size: 0,
-            filter_pipeline: Some(pipeline),
-            deleted: false,
-            fill_value: None,
-            chunked: None,
-            btree_v2: None,
-            fixed_array: Some(FixedArrayDatasetInfo {
-                chunk_dims: chunk_dims.to_vec(),
-                fa_header_addr,
-                fa_dblk_addr,
-                fa_header,
-                fa_dblk,
-                chunks_written: 0,
-            }),
-            append: None,
-        });
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                dataspace,
+                obj_header_addr: 0,
+                data_addr: UNDEF_ADDR,
+                data_size: 0,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: Some(pipeline),
+                deleted: false,
+                fill_value: None,
+                chunked: None,
+                btree_v2: None,
+                fixed_array: Some(FixedArrayDatasetInfo {
+                    chunk_dims: chunk_dims.to_vec(),
+                    fa_header_addr,
+                    fa_dblk_addr,
+                    fa_header,
+                    fa_dblk,
+                    chunks_written: 0,
+                }),
+                append: None,
+            },
+        );
 
         Ok(idx)
     }
@@ -3865,10 +3900,7 @@ impl Hdf5Writer {
             compute_chunk_size_len, Bt2Header, BT2_NODE_SIZE,
         };
 
-        // Hold the create gate across the uniqueness check and the registry
-        // push so the two are atomic (see `create_lock`).
-        let _create = self.create_lock.lock();
-        self.ensure_unique_dataset_name(name)?;
+        let create = self.begin_create(name)?;
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         let ndims = dims.len();
 
@@ -3914,31 +3946,34 @@ impl Hdf5Writer {
             max_dims: Some(max_dims.to_vec()),
         };
 
-        let idx = self.push_dataset(DatasetInfo {
-            name: name.to_string(),
-            datatype,
-            dataspace,
-            obj_header_addr: 0,
-            data_addr: UNDEF_ADDR,
-            data_size: 0,
-            attributes: Vec::new(),
-            obj_header_written_addr: None,
-            obj_header_encoded_size: 0,
-            filter_pipeline: pipeline,
-            deleted: false,
-            fill_value: None,
-            chunked: None,
-            fixed_array: None,
-            btree_v2: Some(Bt2DatasetInfo {
-                chunk_dims: chunk_dims.to_vec(),
-                max_dims: max_dims.to_vec(),
-                bt2_header_addr,
-                node_addrs: Vec::new(),
-                index: bt2_index,
-                chunks_written: 0,
-            }),
-            append: None,
-        });
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                dataspace,
+                obj_header_addr: 0,
+                data_addr: UNDEF_ADDR,
+                data_size: 0,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: pipeline,
+                deleted: false,
+                fill_value: None,
+                chunked: None,
+                fixed_array: None,
+                btree_v2: Some(Bt2DatasetInfo {
+                    chunk_dims: chunk_dims.to_vec(),
+                    max_dims: max_dims.to_vec(),
+                    bt2_header_addr,
+                    node_addrs: Vec::new(),
+                    index: bt2_index,
+                    chunks_written: 0,
+                }),
+                append: None,
+            },
+        );
 
         Ok(idx)
     }
@@ -3956,6 +3991,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         compression_level: u32,
     ) -> IoResult<usize> {
+        let create = self.begin_create(name)?;
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         let element_size = datatype.element_size() as u64;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
@@ -4011,36 +4047,39 @@ impl Hdf5Writer {
             nsblk_addrs,
         );
 
-        let idx = self.push_dataset(DatasetInfo {
-            name: name.to_string(),
-            datatype,
-            dataspace,
-            obj_header_addr: 0,
-            data_addr: UNDEF_ADDR,
-            data_size: 0,
-            attributes: Vec::new(),
-            obj_header_written_addr: None,
-            obj_header_encoded_size: 0,
-            filter_pipeline: Some(FilterPipeline::deflate(compression_level)),
-            deleted: false,
-            fill_value: None,
-            fixed_array: None,
-            btree_v2: None,
-            chunked: Some(ChunkedDatasetInfo {
-                chunk_dims: chunk_dims.to_vec(),
-                max_dims: max_dims.to_vec(),
-                earray_params,
-                ea_header_addr,
-                ea_iblk_addr,
-                ndblk_addrs,
-                ea_header,
-                ea_iblk,
-                chunks_written: 0,
-                filt_iblk: Some(filt_iblk),
-                chunk_size_len,
-            }),
-            append: None,
-        });
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                dataspace,
+                obj_header_addr: 0,
+                data_addr: UNDEF_ADDR,
+                data_size: 0,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: Some(FilterPipeline::deflate(compression_level)),
+                deleted: false,
+                fill_value: None,
+                fixed_array: None,
+                btree_v2: None,
+                chunked: Some(ChunkedDatasetInfo {
+                    chunk_dims: chunk_dims.to_vec(),
+                    max_dims: max_dims.to_vec(),
+                    earray_params,
+                    ea_header_addr,
+                    ea_iblk_addr,
+                    ndblk_addrs,
+                    ea_header,
+                    ea_iblk,
+                    chunks_written: 0,
+                    filt_iblk: Some(filt_iblk),
+                    chunk_size_len,
+                }),
+                append: None,
+            },
+        );
 
         Ok(idx)
     }
@@ -4055,10 +4094,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: FilterPipeline,
     ) -> IoResult<usize> {
-        // Hold the create gate across the uniqueness check and the registry
-        // push so the two are atomic (see `create_lock`).
-        let _create = self.create_lock.lock();
-        self.ensure_unique_dataset_name(name)?;
+        let create = self.begin_create(name)?;
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         let element_size = datatype.element_size() as u64;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
@@ -4109,36 +4145,39 @@ impl Hdf5Writer {
             nsblk_addrs,
         );
 
-        let idx = self.push_dataset(DatasetInfo {
-            name: name.to_string(),
-            datatype,
-            dataspace,
-            obj_header_addr: 0,
-            data_addr: UNDEF_ADDR,
-            data_size: 0,
-            attributes: Vec::new(),
-            obj_header_written_addr: None,
-            obj_header_encoded_size: 0,
-            filter_pipeline: Some(pipeline),
-            deleted: false,
-            fill_value: None,
-            fixed_array: None,
-            btree_v2: None,
-            chunked: Some(ChunkedDatasetInfo {
-                chunk_dims: chunk_dims.to_vec(),
-                max_dims: max_dims.to_vec(),
-                earray_params,
-                ea_header_addr,
-                ea_iblk_addr,
-                ndblk_addrs,
-                ea_header,
-                ea_iblk,
-                chunks_written: 0,
-                filt_iblk: Some(filt_iblk),
-                chunk_size_len,
-            }),
-            append: None,
-        });
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                dataspace,
+                obj_header_addr: 0,
+                data_addr: UNDEF_ADDR,
+                data_size: 0,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: Some(pipeline),
+                deleted: false,
+                fill_value: None,
+                fixed_array: None,
+                btree_v2: None,
+                chunked: Some(ChunkedDatasetInfo {
+                    chunk_dims: chunk_dims.to_vec(),
+                    max_dims: max_dims.to_vec(),
+                    earray_params,
+                    ea_header_addr,
+                    ea_iblk_addr,
+                    ndblk_addrs,
+                    ea_header,
+                    ea_iblk,
+                    chunks_written: 0,
+                    filt_iblk: Some(filt_iblk),
+                    chunk_size_len,
+                }),
+                append: None,
+            },
+        );
         Ok(idx)
     }
 
@@ -5363,6 +5402,59 @@ mod tests {
                 .contains("only for variable-length string datasets"),
             "unexpected error: {err}"
         );
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Every creator must enter through `begin_create`; the four that used
+    /// to bypass it could push a second dataset under an existing name and
+    /// emit an invalid file with two same-named links.
+    #[test]
+    fn every_creator_rejects_an_existing_dataset_name() {
+        let path = temp_path("create_gate");
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        writer
+            .create_dataset("d", DatatypeMessage::i32_type(), &[2])
+            .unwrap();
+
+        let attempts: [(&str, IoResult<usize>); 4] = [
+            (
+                "vlen_string",
+                writer.create_vlen_string_dataset("d", &["x"]),
+            ),
+            ("vlen_bytes", writer.create_vlen_bytes_dataset("d", &[b"x"])),
+            (
+                "vlen_string_compressed",
+                writer.create_vlen_string_dataset_compressed(
+                    "d",
+                    &["x"],
+                    1,
+                    FilterPipeline::deflate(6),
+                ),
+            ),
+            (
+                "chunked_compressed",
+                writer.create_chunked_dataset_compressed(
+                    "d",
+                    DatatypeMessage::i32_type(),
+                    &[0],
+                    &[u64::MAX],
+                    &[4],
+                    6,
+                ),
+            ),
+        ];
+        for (which, res) in attempts {
+            match res {
+                Ok(_) => panic!("{which} accepted a duplicate name"),
+                Err(e) => assert!(
+                    e.to_string().contains("already exists"),
+                    "{which}: unexpected error: {e}"
+                ),
+            }
+        }
 
         writer.close().unwrap();
         std::fs::remove_file(&path).ok();

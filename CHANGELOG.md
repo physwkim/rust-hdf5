@@ -46,6 +46,13 @@
   appends to reopened 0.4.0 files with a wider-than-row chunk land
   correctly instead of reading back `[1, 2, 0, 0]` for `[1, 2, 3, 4]`.
 
+- Every dataset creator checks the new name is unique before registering
+  the dataset. The vlen creators and `create_chunked_dataset_compressed`
+  skipped the check, so creating two datasets under one name silently
+  emitted an invalid file with two same-named links. The check-then-push
+  pair is now a witness type (`begin_create` → `push_dataset`), so a
+  creator cannot skip it.
+
 ## 0.4.1
 
 ### Added
