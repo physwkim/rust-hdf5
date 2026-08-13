@@ -207,6 +207,22 @@ pub(crate) type DatasetRef = Shared<Slot<DatasetInfo>>;
 /// [`DatasetRef`].
 pub(crate) type GroupRef = Shared<Slot<GroupInfo>>;
 
+/// Appended frames held back until they complete a chunk.
+///
+/// The buffer is the sole authority for rows `base .. base + frames`: the
+/// file's chunks do not hold them yet, and any operation that writes those
+/// rows must go through [`Hdf5Writer::flush_append_buffer`] first. `base` is
+/// recorded when the frames are buffered — never derived from the current
+/// extent, which an `extend_dataset` can move independently.
+pub struct AppendBuffer {
+    /// Absolute row of the first buffered frame.
+    pub base: u64,
+    /// Number of buffered frames.
+    pub frames: u64,
+    /// The frames' bytes, `frames` whole rows, row-major.
+    pub bytes: Vec<u8>,
+}
+
 /// Metadata for a dataset being written.
 ///
 /// The whole struct lives behind a per-dataset [`Slot`] (via [`DatasetRef`]).
@@ -233,10 +249,8 @@ pub struct DatasetInfo {
     pub fixed_array: Option<FixedArrayDatasetInfo>,
     /// B-tree v2 chunked storage info.
     pub btree_v2: Option<Bt2DatasetInfo>,
-    /// Buffer for partially filled chunks during append.
-    pub append_buffer: Vec<u8>,
-    /// Number of frames accumulated in `append_buffer`.
-    pub append_buffered_frames: u64,
+    /// Appended frames not yet written to chunks, `None` when empty.
+    pub append: Option<AppendBuffer>,
     /// Attributes attached to this dataset.
     pub attributes: Vec<AttributeMessage>,
     /// File offset where the dataset object header was written (for SWMR in-place rewrites).
@@ -852,8 +866,7 @@ impl Hdf5Writer {
                 chunked: None,
                 fixed_array: None,
                 btree_v2: None,
-                append_buffer: Vec::new(),
-                append_buffered_frames: 0,
+                append: None,
                 attributes: attrs,
                 obj_header_written_addr: Some(*obj_addr),
                 obj_header_encoded_size: 0,
@@ -1621,8 +1634,7 @@ impl Hdf5Writer {
             chunked: None,
             fixed_array: None,
             btree_v2: None,
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
+            append: None,
             attributes: Vec::new(),
             obj_header_written_addr: None,
             obj_header_encoded_size: 0,
@@ -1727,8 +1739,7 @@ impl Hdf5Writer {
                 filt_iblk: None,
                 chunk_size_len: 0,
             }),
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
+            append: None,
         });
 
         Ok(idx)
@@ -2194,6 +2205,10 @@ impl Hdf5Writer {
         drop(ds);
 
         if is_chunked {
+            // Rows the append buffer holds are not in the chunks yet; writing
+            // them there anyway would be undone when the buffer flushes at
+            // close. Hand them to the chunks first.
+            self.flush_append_buffer_if_intersecting(index, starts[0], starts[0] + counts[0])?;
             return self.write_slice_chunked(index, starts, counts, data);
         }
         if base_addr == UNDEF_ADDR {
@@ -2413,8 +2428,7 @@ impl Hdf5Writer {
             chunked: None,
             fixed_array: None,
             btree_v2: None,
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
+            append: None,
         });
 
         Ok(idx)
@@ -2486,8 +2500,7 @@ impl Hdf5Writer {
             chunked: None,
             fixed_array: None,
             btree_v2: None,
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
+            append: None,
         });
 
         Ok(idx)
@@ -2624,8 +2637,7 @@ impl Hdf5Writer {
                 filt_iblk: Some(filt_iblk),
                 chunk_size_len,
             }),
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
+            append: None,
         });
 
         // Write chunks of vlen references with compression
@@ -2725,25 +2737,23 @@ impl Hdf5Writer {
         let chunk_dim0 = chunk_dims[0] as usize;
         let frame_bytes = ref_size;
 
-        // Merge buffered data with new data. Scope the slot guard: the loop
-        // below calls `write_chunk`, which re-locks the same slot.
-        let (buffered_frames, mut combined) = {
-            let ds = self.ds(ds_index);
-            let mut m = ds.lock();
-            let buffered_frames = m.append_buffered_frames as usize;
-            let combined = std::mem::take(&mut m.append_buffer);
-            m.append_buffered_frames = 0;
-            (buffered_frames, combined)
+        // Merge the buffer with the new frames when it is the dataset's tail;
+        // a buffer left mid-extent (the extent moved past it) keeps its
+        // recorded place — flush it and start fresh at the current end.
+        let taken = { self.ds(ds_index).lock().append.take() };
+        let (base_dim0, buffered_frames, mut combined) = match taken {
+            Some(b) if b.base + b.frames == current_dim0 as u64 => {
+                (b.base as usize, b.frames as usize, b.bytes)
+            }
+            Some(b) => {
+                self.write_append_frames(ds_index, b.base, b.frames, &b.bytes)?;
+                (current_dim0, 0, Vec::new())
+            }
+            None => (current_dim0, 0, Vec::new()),
         };
         combined.extend_from_slice(&raw);
 
         let total_frames = buffered_frames + n_new_frames;
-        let base_dim0 = current_dim0.checked_sub(buffered_frames).ok_or_else(|| {
-            crate::io::IoError::InvalidState(format!(
-                "the append buffer holds {buffered_frames} frames but the dataset \
-                 extent is {current_dim0}"
-            ))
-        })?;
 
         // Rows up to the last chunk boundary are written now; the tail that
         // does not complete a chunk goes back in the buffer for the next
@@ -2764,8 +2774,11 @@ impl Hdf5Writer {
         if tail_frames > 0 {
             let ds = self.ds(ds_index);
             let mut m = ds.lock();
-            m.append_buffer = combined[write_frames * frame_bytes..].to_vec();
-            m.append_buffered_frames = tail_frames as u64;
+            m.append = Some(AppendBuffer {
+                base: (base_dim0 + write_frames) as u64,
+                frames: tail_frames as u64,
+                bytes: combined[write_frames * frame_bytes..].to_vec(),
+            });
         }
 
         // Extend dims
@@ -2789,9 +2802,8 @@ impl Hdf5Writer {
     /// does: `H5T__vlen_disk_write` deletes the reference it read into the
     /// conversion background buffer before storing the new one.
     ///
-    /// Elements the append buffer still holds are patched in the buffer rather
-    /// than on disk, because that buffer — not the file — is their current
-    /// content until it is flushed.
+    /// Elements the append buffer still holds are flushed to their chunks
+    /// first, so the whole range is on disk and one write path covers it.
     pub fn write_vlen_strings_slice(
         &self,
         ds_index: usize,
@@ -2812,7 +2824,7 @@ impl Hdf5Writer {
 
         // Snapshot what the write needs, then drop the guard: `write_slice`
         // below re-locks the same slot.
-        let (charset, dims, buffered_frames) = {
+        let (charset, dims) = {
             let ds = self.ds(ds_index);
             let m = ds.lock();
             let charset = match m.datatype {
@@ -2824,11 +2836,7 @@ impl Hdf5Writer {
                     ))
                 }
             };
-            (
-                charset,
-                m.dataspace.dims.clone(),
-                m.append_buffered_frames as usize,
-            )
+            (charset, m.dataspace.dims.clone())
         };
 
         if dims.len() != 1 {
@@ -2862,28 +2870,17 @@ impl Hdf5Writer {
         }
         let ref_size = vlen_reference_size(&self.ctx);
 
-        // The append buffer holds the tail of the dataset, so the range splits
-        // into an on-disk prefix and a buffered suffix. An append that is
-        // between publishing its buffered count and extending the dims (two
-        // separate lock acquisitions on its side) can make the count exceed
-        // the extent; report that instead of wrapping.
-        let buffer_base = dims[0].checked_sub(buffered_frames as u64).ok_or_else(|| {
-            crate::io::IoError::InvalidState(format!(
-                "the append buffer holds {buffered_frames} frames but the dataset has {} elements",
-                dims[0]
-            ))
-        })?;
-        let split = end.min(buffer_base).max(start);
+        // Elements the append buffer holds are not in the chunks yet: hand
+        // them to the chunks first so the whole range is on disk and the one
+        // write path below covers it.
+        self.flush_append_buffer_if_intersecting(ds_index, start, end)?;
 
         // The on-disk references about to be overwritten, read before anything
         // moves. libhdf5 reads the same bytes into the conversion background
         // buffer (`H5D__scatgath_write` gathers the file's current elements
         // when `need_bkg` is set) and hands them to `H5T__vlen_disk_write`,
-        // which deletes them before storing the new reference. The buffered
-        // suffix is not on disk yet; its references are read further down,
-        // under the same lock that patches them.
-        let mut superseded =
-            self.current_element_bytes(ds_index, start, split - start, ref_size)?;
+        // which deletes them before storing the new reference.
+        let superseded = self.current_element_bytes(ds_index, start, end - start, ref_size)?;
 
         let gcol_encoded = gcol.encode(&self.ctx);
         let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
@@ -2899,41 +2896,7 @@ impl Hdf5Writer {
             ));
         }
 
-        if split > start {
-            let n = (split - start) as usize;
-            self.write_slice(ds_index, &[start], &[n as u64], &refs[..n * ref_size])?;
-        }
-        if end > split {
-            // One lock acquisition owns the buffered suffix: the offset is
-            // derived, the superseded references read and the new ones patched
-            // against the same buffer. The snapshot above can be stale under
-            // the `threadsafe` feature — a concurrent append may have flushed
-            // the buffer and moved its base between the two acquisitions,
-            // putting the suffix on disk where this patch no longer reaches
-            // it — so a moved base is reported, not applied. A base that is
-            // unchanged means nothing flushed (appends only push it up), and
-            // then the buffer can only have grown past our range.
-            let ds = self.ds(ds_index);
-            let mut m = ds.lock();
-            m.dataspace.dims[0]
-                .checked_sub(m.append_buffered_frames)
-                .filter(|&b| b == buffer_base)
-                .ok_or_else(|| {
-                    crate::io::IoError::InvalidState(format!(
-                        "the append buffer moved while elements {split}..{end} were being replaced"
-                    ))
-                })?;
-            let off = ((split - buffer_base) as usize) * ref_size;
-            let tail = &refs[(split - start) as usize * ref_size..];
-            if off + tail.len() > m.append_buffer.len() {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "buffered elements {split}..{end} run past the {}-byte append buffer",
-                    m.append_buffer.len()
-                )));
-            }
-            superseded.extend_from_slice(&m.append_buffer[off..off + tail.len()]);
-            m.append_buffer[off..off + tail.len()].copy_from_slice(tail);
-        }
+        self.write_slice(ds_index, &[start], &[strings.len() as u64], &refs)?;
 
         // Only now that the new references are in place: a failure above must
         // not leave the file naming objects this already freed.
@@ -3324,6 +3287,42 @@ impl Hdf5Writer {
         self.write_slice_chunked(ds_index, &starts, &counts, frames)
     }
 
+    /// Write the dataset's append buffer (if any) into its chunks and clear
+    /// it. The single owner of the buffer-to-chunks transition: the flush at
+    /// close, an append meeting a non-contiguous buffer, and any operation
+    /// about to write rows the buffer holds all come through here.
+    pub(crate) fn flush_append_buffer(&self, ds_index: usize) -> IoResult<()> {
+        let taken = { self.ds(ds_index).lock().append.take() };
+        match taken {
+            Some(b) => self.write_append_frames(ds_index, b.base, b.frames, &b.bytes),
+            None => Ok(()),
+        }
+    }
+
+    /// Flush the append buffer when rows `start_row .. end_row` intersect
+    /// the buffered range — those rows' current content is the buffer, and
+    /// writing them on disk while the buffer still holds them would be
+    /// undone by the flush at close.
+    pub(crate) fn flush_append_buffer_if_intersecting(
+        &self,
+        ds_index: usize,
+        start_row: u64,
+        end_row: u64,
+    ) -> IoResult<()> {
+        let intersects = {
+            let ds = self.ds(ds_index);
+            let m = ds.lock();
+            m.append
+                .as_ref()
+                .is_some_and(|b| start_row < b.base + b.frames && end_row > b.base)
+        };
+        if intersects {
+            self.flush_append_buffer(ds_index)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Read an already-written chunk's *decompressed* bytes when the chunk
     /// is allocated and resolvable from the in-memory extensible-array
     /// index. Handles index-block and data-block chunks, filtered and
@@ -3689,8 +3688,7 @@ impl Hdf5Writer {
                 fa_dblk,
                 chunks_written: 0,
             }),
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
+            append: None,
         });
 
         Ok(idx)
@@ -3781,8 +3779,7 @@ impl Hdf5Writer {
                 fa_dblk,
                 chunks_written: 0,
             }),
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
+            append: None,
         });
 
         Ok(idx)
@@ -3914,8 +3911,7 @@ impl Hdf5Writer {
                 index: bt2_index,
                 chunks_written: 0,
             }),
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
+            append: None,
         });
 
         Ok(idx)
@@ -4017,8 +4013,7 @@ impl Hdf5Writer {
                 filt_iblk: Some(filt_iblk),
                 chunk_size_len,
             }),
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
+            append: None,
         });
 
         Ok(idx)
@@ -4116,8 +4111,7 @@ impl Hdf5Writer {
                 filt_iblk: Some(filt_iblk),
                 chunk_size_len,
             }),
-            append_buffer: Vec::new(),
-            append_buffered_frames: 0,
+            append: None,
         });
         Ok(idx)
     }
@@ -4629,10 +4623,9 @@ impl Hdf5Writer {
                 new_dims.len()
             )));
         }
-        // A pending append buffer is positioned relative to the current
-        // logical size; changing the extent underneath it would make
-        // `flush_append_buffers` write the chunk at the wrong index.
-        if m.append_buffered_frames > 0 {
+        // A shrink can cut into buffered rows, whose recorded base would
+        // then point past the extent; refuse rather than reconcile.
+        if m.append.is_some() {
             return Err(crate::io::IoError::InvalidState(
                 "set_extent cannot run while the dataset has buffered appends; \
                  flush them first"
@@ -4929,38 +4922,13 @@ impl Hdf5Writer {
     // Internal helpers
     // ------------------------------------------------------------------
 
-    /// Flush any partial append buffers into the chunks they belong to,
-    /// through [`write_append_frames`](Self::write_append_frames): frames
+    /// Flush every dataset's append buffer into the chunks it belongs to,
+    /// through [`flush_append_buffer`](Self::flush_append_buffer): frames
     /// already in the chunk survive, and the rest of it reads back as the
     /// dataset's fill value (zeros when none is defined).
     fn flush_append_buffers(&mut self) -> IoResult<()> {
         for i in 0..self.dataset_count() {
-            // Snapshot everything needed under one brief slot guard, then
-            // drop it: `write_append_frames` below re-locks the slot.
-            let (buf, buffered_frames, dims) = {
-                let ds = self.ds(i);
-                let mut m = ds.lock();
-                if m.append_buffer.is_empty() {
-                    continue;
-                }
-                if m.chunked.is_none() && m.fixed_array.is_none() && m.btree_v2.is_none() {
-                    continue;
-                }
-                let buffered_frames = m.append_buffered_frames;
-                let dims = m.dataspace.dims.clone();
-                let buf = std::mem::take(&mut m.append_buffer);
-                m.append_buffered_frames = 0;
-                (buf, buffered_frames, dims)
-            };
-
-            let base_frame = dims[0].checked_sub(buffered_frames).ok_or_else(|| {
-                crate::io::IoError::InvalidState(format!(
-                    "the append buffer holds {buffered_frames} frames but the \
-                     dataset extent is {}",
-                    dims[0]
-                ))
-            })?;
-            self.write_append_frames(i, base_frame, buffered_frames, &buf)?;
+            self.flush_append_buffer(i)?;
         }
         Ok(())
     }
@@ -5336,27 +5304,6 @@ mod tests {
             tag,
             n
         ))
-    }
-
-    /// A concurrent append publishes its buffered count and extends the dims
-    /// under two different lock acquisitions, so a slice update can observe a
-    /// count that exceeds the extent. That half-published state must come back
-    /// as an error, not wrap `dims[0] - buffered` around zero.
-    #[test]
-    fn vlen_slice_reports_a_half_published_append_count() {
-        let path = temp_path("vlen_slice_half_published");
-
-        let writer = Hdf5Writer::create(&path).unwrap();
-        let idx = writer.create_vlen_string_dataset("d", &["a", "b"]).unwrap();
-        writer.ds(idx).lock().append_buffered_frames = 3; // dims[0] == 2
-        let err = writer.write_vlen_strings_slice(idx, 0, &["x"]).unwrap_err();
-        assert!(
-            err.to_string().contains("append buffer holds 3 frames"),
-            "unexpected error: {err}"
-        );
-
-        writer.ds(idx).lock().append_buffered_frames = 0;
-        std::fs::remove_file(&path).ok();
     }
 
     /// A corrupt file can declare a zero-length chunk dimension; the

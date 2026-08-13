@@ -976,6 +976,9 @@ impl H5Dataset {
                 ))
             }
         };
+        // A buffered append tail would flush over the image at close; hand
+        // it to the chunks first, the image below overwrites everything.
+        writer.flush_append_buffer(index)?;
         let chunk_dims = writer
             .dataset_chunk_dims(index)
             .ok_or_else(|| Hdf5Error::InvalidState("dataset has no chunk info".into()))?
@@ -1650,27 +1653,24 @@ impl H5Dataset {
                     std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * es)
                 };
 
-                // Merge buffered data with new data. Scope the slot guard: the
-                // loop below calls `write_chunk`, which re-locks the same slot.
-                let (buffered_frames, mut combined) = {
-                    let ds = writer.ds(ds_index);
-                    let mut m = ds.lock();
-                    let buffered_frames = m.append_buffered_frames as usize;
-                    let combined = std::mem::take(&mut m.append_buffer);
-                    m.append_buffered_frames = 0;
-                    (buffered_frames, combined)
+                // Merge the buffer with the new frames when it is the
+                // dataset's tail; a buffer left mid-extent (the extent moved
+                // past it) keeps its recorded place — flush it and start
+                // fresh at the current end.
+                let taken = { writer.ds(ds_index).lock().append.take() };
+                let (base_dim0, buffered_frames, mut combined) = match taken {
+                    Some(b) if b.base + b.frames == current_dim0 as u64 => {
+                        (b.base as usize, b.frames as usize, b.bytes)
+                    }
+                    Some(b) => {
+                        writer.write_append_frames(ds_index, b.base, b.frames, &b.bytes)?;
+                        (current_dim0, 0, Vec::new())
+                    }
+                    None => (current_dim0, 0, Vec::new()),
                 };
                 combined.extend_from_slice(raw);
 
                 let total_frames = buffered_frames + n_new_frames;
-
-                // First appended row: account for buffered frames.
-                let base_dim0 = current_dim0.checked_sub(buffered_frames).ok_or_else(|| {
-                    Hdf5Error::InvalidState(format!(
-                        "the append buffer holds {buffered_frames} frames but the \
-                         dataset extent is {current_dim0}"
-                    ))
-                })?;
 
                 // Rows up to the last chunk boundary are written now; the
                 // tail that does not complete a chunk goes back in the
@@ -1692,8 +1692,11 @@ impl H5Dataset {
                 if tail_frames > 0 {
                     let ds = writer.ds(ds_index);
                     let mut m = ds.lock();
-                    m.append_buffer = combined[write_frames * frame_bytes..].to_vec();
-                    m.append_buffered_frames = tail_frames as u64;
+                    m.append = Some(crate::io::writer::AppendBuffer {
+                        base: (base_dim0 + write_frames) as u64,
+                        frames: tail_frames as u64,
+                        bytes: combined[write_frames * frame_bytes..].to_vec(),
+                    });
                 }
 
                 // Extend dims to include all frames (buffered + new)
@@ -4995,11 +4998,11 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// Elements the append buffer still holds are not on disk yet, so the
-    /// update has to land in the buffer or the flush at close would write the
-    /// pre-update reference over it.
+    /// Elements the append buffer still holds are not on disk yet; the
+    /// update flushes them to their chunks first, so the flush at close has
+    /// nothing left to write the pre-update reference over.
     #[test]
-    fn write_vlen_strings_slice_reaches_the_append_buffer() {
+    fn write_vlen_strings_slice_updates_buffered_elements() {
         let path = temp_path("vlen_slice_buffered");
         {
             let file = H5File::create(&path).unwrap();
@@ -5318,6 +5321,66 @@ mod tests {
             size < 20 * 4096,
             "20 buffered updates left {size} bytes, one collection per update"
         );
+    }
+
+    /// Regression: a typed `write_slice` into rows the append buffer still
+    /// held wrote the chunks, and the flush at close wrote the stale buffered
+    /// rows back over it — write 99, read 50. The slice now flushes the
+    /// buffer first, making the chunks the single authority for those rows.
+    #[test]
+    fn write_slice_into_the_buffered_tail_survives_close() {
+        let path = temp_path("slice_into_buffered_tail");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0])
+                .chunk(&[4])
+                .max_shape(&[None])
+                .create("d")
+                .unwrap();
+            // 6 rows: 4 land in chunk 0, rows 4 and 5 stay buffered.
+            ds.append(&[10, 11, 12, 13, 50, 51]).unwrap();
+            ds.write_slice(&[4], &[1], &[99]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("d").unwrap();
+            assert_eq!(ds.read_raw::<i32>().unwrap(), vec![10, 11, 12, 13, 99, 51]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Extending a dataset while appends sit in the buffer must not move
+    /// them: the buffer records the absolute row its frames belong to, so
+    /// the flush at close lands them there, and the grown region reads as
+    /// fill.
+    #[test]
+    fn extend_does_not_move_buffered_appends() {
+        let path = temp_path("extend_keeps_buffered_rows");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0])
+                .chunk(&[4])
+                .max_shape(&[None])
+                .create("d")
+                .unwrap();
+            ds.append(&[10, 11, 12, 13, 50, 51]).unwrap(); // rows 4, 5 buffered
+            ds.extend(&[10]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("d").unwrap();
+            assert_eq!(
+                ds.read_raw::<i32>().unwrap(),
+                vec![10, 11, 12, 13, 50, 51, 0, 0, 0, 0]
+            );
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     /// Regression: appends to a v2 B-tree indexed dataset (two unlimited

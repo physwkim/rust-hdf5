@@ -18,6 +18,16 @@
   controls the API mirrors) can produce such a file; previously the frame was
   zero-padded up to the tile.
 
+- The append buffer records the absolute row its frames belong to, and
+  every operation that writes rows the buffer holds flushes it to the
+  chunks first. Before this, the buffer's position was derived from the
+  current extent, and two operations broke the derivation: a typed
+  `write_slice` into the buffered tail was silently overwritten by the
+  flush at close (write 99, read back 50), and an `extend` with buffered
+  appends made the flush land them at the extended end instead of where
+  they were appended. `write_vlen_strings_slice` drops its
+  patch-the-buffer path for the same flush-first rule.
+
 - Appends work on every chunk index and chunk shape. The append paths'
   chunk writes required the extensible-array index, so appending to a
   fixed-array or v2 B-tree dataset buffered fine and then failed at
