@@ -3012,8 +3012,11 @@ impl Hdf5Writer {
     /// The replacements go into a fresh global heap collection and only the
     /// vlen references of the named elements are rewritten, so the cost is the
     /// new strings plus the chunks those references live in — not the column.
-    /// The objects the old references pointed at are freed, so repeated
-    /// updates reuse space instead of growing the file. This is what libhdf5
+    /// The objects the old references pointed at are freed *before* the
+    /// replacement is allocated, so repeated updates reuse space instead of
+    /// growing the file — including across close/reopen cycles, where the
+    /// in-memory free list starts empty and only this free-first order lets
+    /// the session reuse the block it just released. This is what libhdf5
     /// does: `H5T__vlen_disk_write` deletes the reference it read into the
     /// conversion background buffer before storing the new one.
     ///
@@ -3095,6 +3098,15 @@ impl Hdf5Writer {
         // which deletes them before storing the new reference.
         let superseded = self.current_element_bytes(ds_index, start, end - start, ref_size)?;
 
+        // Free the superseded objects *before* allocating the replacement,
+        // the order `H5T__vlen_disk_write` uses. The freed block satisfies
+        // the allocation below within this same session, so a reopen-and-
+        // replace loop keeps the file flat — no persisted free-space
+        // information exists to carry it across sessions (issue #10). The
+        // cost, shared with libhdf5: a failure between here and the ref
+        // write below leaves the dataset's old references dangling.
+        self.release_vlen_references(&superseded)?;
+
         let gcol_encoded = gcol.encode(&self.ctx);
         let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
         self.handle.write_at(gcol_addr, &gcol_encoded)?;
@@ -3110,10 +3122,6 @@ impl Hdf5Writer {
         }
 
         self.write_slice_inner(ds_index, &[start], &[strings.len() as u64], &refs)?;
-
-        // Only now that the new references are in place: a failure above must
-        // not leave the file naming objects this already freed.
-        self.release_vlen_references(&superseded)?;
 
         Ok(())
     }
@@ -5852,6 +5860,48 @@ mod tests {
         assert_eq!(writer.handle.read_at(addr, 40).unwrap(), img);
 
         writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Issue #10: a reopen-and-replace loop on a vlen string must not grow
+    /// the file. The superseded heap objects are freed *before* the
+    /// replacement is allocated, so each session reuses the block it just
+    /// released even though the free list starts empty on reopen. The old
+    /// free-after-alloc order failed this by one collection per session.
+    #[test]
+    fn vlen_replace_across_reopen_keeps_the_file_flat() {
+        let path = temp_path("vlen_reopen_flat");
+        let payload_a = "a".repeat(64 * 1024);
+        let payload_b = "b".repeat(64 * 1024);
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        writer
+            .create_vlen_string_dataset("notes", &["initial"])
+            .unwrap();
+        writer.close().unwrap();
+
+        let mut sizes = Vec::new();
+        for i in 0..8 {
+            let writer = Hdf5Writer::open_append(&path).unwrap();
+            let payload = if i % 2 == 0 { &payload_a } else { &payload_b };
+            writer
+                .write_vlen_strings_slice(0, 0, &[payload.as_str()])
+                .unwrap();
+            writer.close().unwrap();
+            sizes.push(std::fs::metadata(&path).unwrap().len());
+        }
+        // The first replacement grows the file once (the initial collection
+        // cannot hold 64 KiB); every later equal-size replacement must land
+        // in the block its own session just freed.
+        assert_eq!(&sizes[1..], &vec![sizes[0]; 7][..], "sizes: {sizes:?}");
+
+        // The reused blocks still form a valid file holding the last value.
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        assert_eq!(
+            reader.read_vlen_strings("notes").unwrap(),
+            vec![payload_b.clone()]
+        );
+
         std::fs::remove_file(&path).ok();
     }
 
