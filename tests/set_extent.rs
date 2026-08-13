@@ -163,6 +163,7 @@ fn ea_shrink_then_regrow_reads_fill_not_stale() {
 /// The same prune-and-refill through the filtered extensible-array path:
 /// stored chunk sizes vary, so the freed lengths come from the index
 /// entries and the refilled straddler is re-compressed.
+#[cfg(feature = "deflate")]
 #[test]
 fn ea_filtered_shrink_then_regrow_reads_fill() {
     let path = unique_tmp("ea_filt_regrow");
@@ -462,10 +463,11 @@ fn vlen_shrink_releases_the_refilled_straddlers_heap_objects() {
 /// must decompress the pruned chunk before parsing its references).
 #[test]
 fn vlen_shrink_then_regrow_keeps_survivors_and_reads_empty() {
-    for (tag, pipeline) in [
-        ("plain", None),
-        ("deflate", Some(rust_hdf5::FilterPipeline::deflate(4))),
-    ] {
+    let mut variants: Vec<(&str, Option<rust_hdf5::FilterPipeline>)> = vec![("plain", None)];
+    if cfg!(feature = "deflate") {
+        variants.push(("deflate", Some(rust_hdf5::FilterPipeline::deflate(4))));
+    }
+    for (tag, pipeline) in variants {
         let path = unique_tmp(&format!("vlen_regrow_{tag}"));
         {
             let file = H5File::create(&path).unwrap();

@@ -73,10 +73,11 @@ fn deleted_contiguous_vlen_dataset_frees_its_heap_and_data() {
 /// the extensible-array index structures themselves.
 #[test]
 fn deleted_chunked_vlen_dataset_frees_chunks_heap_and_index() {
-    for (tag, pipeline) in [
-        ("plain", None),
-        ("deflate", Some(rust_hdf5::FilterPipeline::deflate(4))),
-    ] {
+    let mut variants: Vec<(&str, Option<rust_hdf5::FilterPipeline>)> = vec![("plain", None)];
+    if cfg!(feature = "deflate") {
+        variants.push(("deflate", Some(rust_hdf5::FilterPipeline::deflate(4))));
+    }
+    for (tag, pipeline) in variants {
         let size_after = |cycles: usize| {
             let path = unique_tmp(&format!("chunked_vlen_{tag}_{cycles}"));
             let file = H5File::create(&path).unwrap();
