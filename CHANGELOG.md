@@ -16,6 +16,21 @@
 
 ### Fixed
 
+- `delete_dataset` and `delete_group` now free the file space the
+  deleted objects owned, the way libhdf5's `H5O_delete` does: chunk
+  blocks and the chunk-index structures themselves (extensible-array
+  header/index/super/data blocks, fixed-array header and data block,
+  v2-B-tree header and nodes), contiguous data blocks, the global-heap
+  objects of variable-length data and attributes, and — on reopened
+  files — the on-disk object header block. They used to only unlink, so
+  every create/delete cycle grew the file by the object's whole
+  footprint, and finalize even wrote a fresh orphan header for each
+  deleted object. Deletes are refused while SWMR streaming is active
+  (a reader may hold the freed addresses; libhdf5 forbids it too), and
+  name resolution for `create_group` parents and dataset→group
+  assignment no longer matches soft-deleted groups, which could attach
+  a new object to a deleted parent and lose it at close.
+
 - SWMR attribute setters now error after `start_swmr` instead of
   appearing to succeed, matching libhdf5's ban on attribute changes
   during SWMR writes. Object headers are frozen once streaming starts,

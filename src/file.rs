@@ -573,8 +573,10 @@ impl H5File {
         }
     }
 
-    /// Delete a dataset by name. The dataset is unlinked on close;
-    /// file space is not reclaimed.
+    /// Delete a dataset by name. The dataset is unlinked on close and the
+    /// file space it owned — data blocks, chunk-index structures, and the
+    /// global-heap objects of variable-length values — is freed for reuse
+    /// by later writes in this session (the file itself does not shrink).
     pub fn delete_dataset(&self, name: &str) -> Result<()> {
         let inner = borrow_inner(&self.inner);
         match &*inner {
@@ -586,8 +588,8 @@ impl H5File {
         }
     }
 
-    /// Delete a group and all its child datasets/sub-groups.
-    /// File space is not reclaimed.
+    /// Delete a group and all its child datasets/sub-groups, freeing their
+    /// file space the way [`delete_dataset`](Self::delete_dataset) does.
     pub fn delete_group(&self, name: &str) -> Result<()> {
         let inner = borrow_inner(&self.inner);
         match &*inner {

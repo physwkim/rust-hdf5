@@ -444,6 +444,17 @@ fn swmr_attr_error(name: &str) -> crate::io::IoError {
     ))
 }
 
+/// The uniform rejection for `delete_dataset` / `delete_group` while SWMR
+/// streaming is active: deleting frees the object's blocks, and a live
+/// reader may hold any of their addresses.
+fn swmr_delete_error(name: &str) -> crate::io::IoError {
+    crate::io::IoError::InvalidState(format!(
+        "cannot delete '{name}' during SWMR streaming: a reader may hold the \
+         object's header and storage addresses (libhdf5 forbids link deletion \
+         during SWMR writes too)"
+    ))
+}
+
 /// Whether the chunk at grid `coords` lies entirely at or beyond `extent` in
 /// some dimension — no element of it would survive a shrink to that extent.
 fn chunk_outside_extent(coords: &[u64], chunk_dims: &[u64], extent: &[u64]) -> bool {
@@ -1509,9 +1520,20 @@ impl Hdf5Writer {
         Ok(())
     }
 
-    /// Soft-delete a dataset by name. The dataset is excluded from the file
-    /// on close. File space is not reclaimed.
+    /// Soft-delete a dataset by name and free the file space it owned:
+    /// its chunk blocks and chunk-index structures (or contiguous data
+    /// block), the global-heap objects of its variable-length data and
+    /// attributes, and — on a reopened file — the on-disk object header
+    /// block. The freed space is reused by later allocations in this
+    /// session; the file does not shrink.
+    ///
+    /// Refused while SWMR streaming is active: a live reader may hold any
+    /// of those addresses (libhdf5 forbids link deletion during SWMR
+    /// writes too).
     pub fn delete_dataset(&self, name: &str) -> IoResult<()> {
+        if self.swmr_active {
+            return Err(swmr_delete_error(name));
+        }
         let refs = self.dataset_refs();
         let idx = refs
             .iter()
@@ -1525,12 +1547,19 @@ impl Hdf5Writer {
         for grp in self.group_refs() {
             grp.lock().child_datasets.retain(|&di| di != idx);
         }
-        Ok(())
+        let ds = self.ds(idx);
+        let _op = ds.op.lock();
+        self.release_dataset_storage(idx)
     }
 
-    /// Soft-delete a group and all its child datasets and sub-groups.
-    /// File space is not reclaimed.
+    /// Soft-delete a group and all its child datasets and sub-groups,
+    /// freeing every deleted object's file space the way
+    /// [`delete_dataset`](Self::delete_dataset) does. Refused while SWMR
+    /// streaming is active, same rule.
     pub fn delete_group(&self, name: &str) -> IoResult<()> {
+        if self.swmr_active {
+            return Err(swmr_delete_error(name));
+        }
         let name = if name.starts_with('/') {
             name.to_string()
         } else {
@@ -1544,30 +1573,273 @@ impl Hdf5Writer {
                 gg.name == name && !gg.deleted
             })
             .ok_or_else(|| crate::io::IoError::NotFound(name.clone()))?;
-        self.delete_group_recursive(gidx);
+        let mut ds_deleted = Vec::new();
+        let mut gs_deleted = Vec::new();
+        self.delete_group_recursive(gidx, &mut ds_deleted, &mut gs_deleted);
         // Remove from parent's child_groups
         let parent = groups[gidx].lock().parent;
         if let Some(pidx) = parent {
             groups[pidx].lock().child_groups.retain(|&gi| gi != gidx);
         }
+        // Free storage only after the whole subtree is marked: the lists
+        // hold each object exactly once (the marking pass skips anything
+        // already deleted), so nothing is freed twice.
+        for di in ds_deleted {
+            let ds = self.ds(di);
+            let _op = ds.op.lock();
+            self.release_dataset_storage(di)?;
+        }
+        for gi in gs_deleted {
+            self.release_group_storage(gi)?;
+        }
         Ok(())
     }
 
-    fn delete_group_recursive(&self, gidx: usize) {
+    /// Mark `gidx` and its subtree deleted, appending each newly-deleted
+    /// object's index to `ds_out` / `gs_out` exactly once — the caller
+    /// frees their storage, and an object reachable twice (or a subtree
+    /// already deleted) must not be freed twice.
+    fn delete_group_recursive(
+        &self,
+        gidx: usize,
+        ds_out: &mut Vec<usize>,
+        gs_out: &mut Vec<usize>,
+    ) {
         // Mark deleted and snapshot the child lists, releasing the group lock
         // before locking any dataset/child-group slot (spine → slot order).
         let (child_ds, child_gs) = {
             let grp = self.grp(gidx);
             let mut g = grp.lock();
+            if g.deleted {
+                return;
+            }
             g.deleted = true;
             (g.child_datasets.clone(), g.child_groups.clone())
         };
+        gs_out.push(gidx);
         for di in child_ds {
-            self.ds(di).lock().deleted = true;
+            let ds = self.ds(di);
+            let mut d = ds.lock();
+            if !d.deleted {
+                d.deleted = true;
+                ds_out.push(di);
+            }
         }
         for gi in child_gs {
-            self.delete_group_recursive(gi);
+            self.delete_group_recursive(gi, ds_out, gs_out);
         }
+    }
+
+    /// Free everything a soft-deleted dataset owned. The single owner of
+    /// delete-time reclamation, called only from the two delete paths with
+    /// the dataset already marked deleted and its op lock held.
+    ///
+    /// A deleted dataset contributes nothing to finalize (the header,
+    /// index-flush and append-flush loops all skip it), so nothing in the
+    /// finalized file can reference the blocks freed here. Never runs under
+    /// SWMR — the delete entry points refuse first.
+    fn release_dataset_storage(&self, index: usize) -> IoResult<()> {
+        use crate::format::messages::datatype::DatatypeMessage;
+        let (indexed, ndims, contiguous, is_vlen, attrs, header_block) = {
+            let ds = self.ds(index);
+            let mut m = ds.lock();
+            // Buffered rows were never written to a chunk; they die with
+            // the dataset instead of being flushed at close.
+            m.append = None;
+            let indexed = m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
+            let contiguous = (!indexed && m.data_addr != UNDEF_ADDR && m.data_size > 0)
+                .then_some((m.data_addr, m.data_size));
+            m.data_addr = UNDEF_ADDR;
+            m.data_size = 0;
+            let is_vlen = matches!(
+                m.datatype,
+                DatatypeMessage::VarLenString { .. } | DatatypeMessage::VarLenSequence { .. }
+            );
+            let attrs = std::mem::take(&mut m.attributes);
+            let header_block = m
+                .obj_header_written_addr
+                .take()
+                .filter(|_| m.obj_header_encoded_size > 0)
+                .map(|a| (a, m.obj_header_encoded_size as u64));
+            m.obj_header_encoded_size = 0;
+            (
+                indexed,
+                m.dataspace.dims.len(),
+                contiguous,
+                is_vlen,
+                attrs,
+                header_block,
+            )
+        };
+        if indexed {
+            // Prune to a zero extent: every stored chunk is entirely beyond
+            // it, so the walk frees each chunk block and collects the vlen
+            // references its bytes held (released inside).
+            self.prune_chunks_beyond(index, &vec![0; ndims])?;
+            self.free_chunk_index(index)?;
+        } else if let Some((addr, size)) = contiguous {
+            if is_vlen {
+                let data = self.handle.read_at(addr, size as usize)?;
+                self.release_vlen_references(&data)?;
+            }
+            self.allocator.free(addr, size);
+        }
+        for attr in &attrs {
+            self.release_attr_vlen(attr)?;
+        }
+        if let Some((addr, size)) = header_block {
+            self.allocator.free(addr, size);
+        }
+        Ok(())
+    }
+
+    /// Free a deleted group's file space: its attributes' global-heap
+    /// objects and, on a reopened file, the on-disk header block. The
+    /// group counterpart of
+    /// [`release_dataset_storage`](Self::release_dataset_storage).
+    fn release_group_storage(&self, gidx: usize) -> IoResult<()> {
+        let (attrs, header_block) = {
+            let grp = self.grp(gidx);
+            let mut g = grp.lock();
+            let attrs = std::mem::take(&mut g.attributes);
+            let header_block = g
+                .obj_header_written_addr
+                .take()
+                .filter(|_| g.obj_header_encoded_size > 0)
+                .map(|a| (a, g.obj_header_encoded_size as u64));
+            g.obj_header_encoded_size = 0;
+            (attrs, header_block)
+        };
+        for attr in &attrs {
+            self.release_attr_vlen(attr)?;
+        }
+        if let Some((addr, size)) = header_block {
+            self.allocator.free(addr, size);
+        }
+        Ok(())
+    }
+
+    /// Free a deleted dataset's chunk-index structures, after the chunks
+    /// themselves were freed by a zero-extent prune. Takes the index info
+    /// out of the slot, so the dataset no longer claims chunked storage.
+    ///
+    /// Every block's size is recovered the way its allocation computed it:
+    /// re-encoding the in-memory copy (EA header and index block, FA
+    /// header and data block, BT2 header) or sizing a same-shape dummy
+    /// from the array geometry (EA data blocks, whose element counts come
+    /// from [`EaGeometry`]; BT2 nodes are all `node_size`).
+    fn free_chunk_index(&self, index: usize) -> IoResult<()> {
+        let ds = self.ds(index);
+        let mut m = ds.lock();
+        let is_filtered = m.filter_pipeline.is_some();
+        if let Some(c) = m.chunked.take() {
+            let p = &c.earray_params;
+            let bits = p.max_nelmts_bits;
+            let csl = c.chunk_size_len;
+            let geo = EaGeometry::new(
+                p.idx_blk_elmts,
+                p.data_blk_min_elmts,
+                p.sup_blk_min_data_ptrs,
+                bits,
+                p.max_dblk_page_nelmts_bits,
+            )?;
+            let dblk_size = |nelmts: u64| -> u64 {
+                if is_filtered {
+                    FilteredDataBlock::new(c.ea_header_addr, 0, nelmts as usize)
+                        .encode(&self.ctx, bits, csl)
+                        .len() as u64
+                } else {
+                    ExtensibleArrayDataBlock::new(c.ea_header_addr, 0, nelmts as usize)
+                        .encoded_size(&self.ctx, bits) as u64
+                }
+            };
+            let (dblk_addrs, sblk_addrs, iblk_size) = if is_filtered {
+                let f = c.filt_iblk.as_ref().unwrap();
+                (
+                    f.dblk_addrs.clone(),
+                    f.sblk_addrs.clone(),
+                    f.encode(&self.ctx, csl).len() as u64,
+                )
+            } else {
+                (
+                    c.ea_iblk.dblk_addrs.clone(),
+                    c.ea_iblk.sblk_addrs.clone(),
+                    c.ea_iblk.encoded_size(&self.ctx) as u64,
+                )
+            };
+            // Data blocks addressed from the index block belong to the
+            // first `iblock_nsblks` super blocks; each of those defines the
+            // element count (and so the disk size) of its data blocks.
+            let mut g = 0usize;
+            'direct: for s in geo.sblk.iter().take(geo.iblock_nsblks) {
+                for _ in 0..s.ndblks {
+                    let Some(&a) = dblk_addrs.get(g) else {
+                        break 'direct;
+                    };
+                    g += 1;
+                    if a == UNDEF_ADDR {
+                        continue;
+                    }
+                    if s.dblk_nelmts > geo.dblk_page_nelmts {
+                        return Err(crate::io::IoError::InvalidState(
+                            "cannot free a paged extensible-array data block, \
+                             which is not yet supported"
+                                .into(),
+                        ));
+                    }
+                    self.allocator.free(a, dblk_size(s.dblk_nelmts));
+                }
+            }
+            for (off, &sa) in sblk_addrs.iter().enumerate() {
+                if sa == UNDEF_ADDR {
+                    continue;
+                }
+                let s = geo.sblk[geo.iblock_nsblks + off];
+                if s.dblk_nelmts > geo.dblk_page_nelmts {
+                    return Err(crate::io::IoError::InvalidState(
+                        "cannot free a paged extensible-array data block, \
+                         which is not yet supported"
+                            .into(),
+                    ));
+                }
+                let buf = self.handle.read_at_most(sa, 65536)?;
+                let sb =
+                    ExtensibleArraySuperBlock::decode(&buf, &self.ctx, bits, s.ndblks as usize, 0)?;
+                for &da in &sb.dblk_addrs {
+                    if da != UNDEF_ADDR {
+                        self.allocator.free(da, dblk_size(s.dblk_nelmts));
+                    }
+                }
+                self.allocator
+                    .free(sa, sb.encode(&self.ctx, bits).len() as u64);
+            }
+            self.allocator.free(c.ea_iblk_addr, iblk_size);
+            self.allocator
+                .free(c.ea_header_addr, c.ea_header.encoded_size(&self.ctx) as u64);
+            return Ok(());
+        }
+        if let Some(fa) = m.fixed_array.take() {
+            self.allocator.free(
+                fa.fa_dblk_addr,
+                fixed_array_dblk_disk_size(&self.ctx, &fa.fa_header),
+            );
+            self.allocator.free(
+                fa.fa_header_addr,
+                fa.fa_header.encode(&self.ctx).len() as u64,
+            );
+            return Ok(());
+        }
+        if let Some(bt2) = m.btree_v2.take() {
+            let tree = bt2.index.build_tree(&self.ctx);
+            for &a in &bt2.node_addrs {
+                self.allocator.free(a, tree.node_size as u64);
+            }
+            self.allocator.free(
+                bt2.bt2_header_addr,
+                tree.header(UNDEF_ADDR).encode(&self.ctx).len() as u64,
+            );
+        }
+        Ok(())
     }
 
     /// Return the chunk dimensions for a dataset, if chunked.
@@ -1650,7 +1922,10 @@ impl Hdf5Writer {
         } else {
             let idx = groups
                 .iter()
-                .position(|g| g.lock().name == parent_path)
+                .position(|g| {
+                    let gg = g.lock();
+                    gg.name == parent_path && !gg.deleted
+                })
                 .ok_or_else(|| {
                     crate::io::IoError::NotFound(format!(
                         "parent group '{}' not found",
@@ -1688,7 +1963,10 @@ impl Hdf5Writer {
         let groups = self.group_refs();
         let group_idx = groups
             .iter()
-            .position(|g| g.lock().name == group_path)
+            .position(|g| {
+                let gg = g.lock();
+                gg.name == group_path && !gg.deleted
+            })
             .ok_or_else(|| {
                 crate::io::IoError::NotFound(format!("group '{}' not found", group_path))
             })?;
@@ -5997,15 +6275,20 @@ impl Hdf5Writer {
             let is_indexed = {
                 let ds = self.ds(i);
                 let m = ds.lock();
-                m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some()
+                !m.deleted
+                    && (m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some())
             };
             if is_indexed {
                 self.flush_dataset(i)?;
             }
         }
 
-        // 1. Write each dataset's object header.
+        // 1. Write each dataset's object header (none for a dataset deleted
+        // before start_swmr — its storage was freed at delete time).
         for i in 0..self.dataset_count() {
+            if self.ds(i).lock().deleted {
+                continue;
+            }
             let ds_header = self.build_dataset_header(i);
             let encoded = ds_header.encode();
             let encoded_size = encoded.len();
@@ -6023,10 +6306,16 @@ impl Hdf5Writer {
         // pass (a header's encoded size is independent of the address
         // values it carries) and the content is written in a second.
         for gi in 0..self.group_count() {
+            if self.grp(gi).lock().deleted {
+                continue;
+            }
             let size = self.build_group_header(gi).encode().len() as u64;
             self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
         }
         for gi in 0..self.group_count() {
+            if self.grp(gi).lock().deleted {
+                continue;
+            }
             let encoded = self.build_group_header(gi).encode();
             let addr = self.grp(gi).lock().obj_header_addr;
             self.handle.write_at(addr, &encoded)?;
@@ -6062,6 +6351,9 @@ impl Hdf5Writer {
     /// dataset's fill value (zeros when none is defined).
     fn flush_append_buffers(&mut self) -> IoResult<()> {
         for i in 0..self.dataset_count() {
+            if self.ds(i).lock().deleted {
+                continue;
+            }
             self.flush_append_buffer(i)?;
         }
         Ok(())
@@ -6099,6 +6391,9 @@ impl Hdf5Writer {
             let ds = self.ds(i);
             {
                 let m = ds.lock();
+                if m.deleted {
+                    continue;
+                }
                 if m.obj_header_written_addr.is_some() {
                     let modified =
                         m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0) || m.extent_dirty;
@@ -6125,11 +6420,15 @@ impl Hdf5Writer {
         // an aliased block from entering the free list twice.
         let mut freed_headers = std::collections::HashSet::new();
 
-        // 1. Write each dataset's object header.
+        // 1. Write each dataset's object header (deleted datasets get none —
+        // their storage was already freed at delete time).
         for i in 0..self.dataset_count() {
             let ds = self.ds(i);
             {
                 let mut m = ds.lock();
+                if m.deleted {
+                    continue;
+                }
                 if m.obj_header_written_addr.is_some() {
                     // Existing dataset from append mode.
                     // If it has chunked info with chunks_written > 0 — or its
@@ -6177,10 +6476,16 @@ impl Hdf5Writer {
             }
         }
         for gi in 0..self.group_count() {
+            if self.grp(gi).lock().deleted {
+                continue;
+            }
             let size = self.build_group_header(gi).encode().len() as u64;
             self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
         }
         for gi in 0..self.group_count() {
+            if self.grp(gi).lock().deleted {
+                continue;
+            }
             let encoded = self.build_group_header(gi).encode();
             let addr = self.grp(gi).lock().obj_header_addr;
             self.handle.write_at(addr, &encoded)?;
