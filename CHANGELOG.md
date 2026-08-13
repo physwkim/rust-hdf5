@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Chunk geometry is validated at every dataset create, the rule libhdf5
+  applies in `H5D__chunk_construct`: the chunk rank must match the dataspace,
+  no chunk dimension may be zero, and a chunk dimension may not exceed a
+  fixed maximum dimension unless that dimension's current size is zero. The
+  extensible-array and compressed-vlen creators previously accepted any
+  geometry, and a chunk wider than a fixed dimension made appends land rows
+  at the chunk stride — `[1, 2, 3, 4]` read back as `[1, 2, 0, 0]`.
+
+  **Behavior change:** `SwmrWriter::create_streaming_dataset_tiled` no longer
+  accepts a chunk tile larger than the frame. libhdf5 refuses to create that
+  geometry, so no libhdf5-based writer (including the NDFileHDF5 tiling
+  controls the API mirrors) can produce such a file; previously the frame was
+  zero-padded up to the tile.
+
 ## 0.4.1
 
 ### Added

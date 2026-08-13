@@ -385,6 +385,43 @@ impl ChunkGeometry {
     }
 }
 
+/// Validate caller-supplied chunk geometry at dataset definition, the rule
+/// libhdf5 applies in `H5D__chunk_construct` (H5Dchunk.c): the chunk rank
+/// must match the dataspace rank, no chunk dimension may be zero, and a
+/// chunk dimension may not exceed a fixed maximum dimension — except in a
+/// dimension whose current size is zero, which libhdf5 exempts.
+fn validate_chunk_geometry(dims: &[u64], max_dims: &[u64], chunk_dims: &[u64]) -> IoResult<()> {
+    let ndims = dims.len();
+    if chunk_dims.len() != ndims {
+        return Err(crate::io::IoError::InvalidState(format!(
+            "chunk shape has {} dimensions but the dataspace has {}",
+            chunk_dims.len(),
+            ndims
+        )));
+    }
+    if max_dims.len() != ndims {
+        return Err(crate::io::IoError::InvalidState(format!(
+            "maximum shape has {} dimensions but the dataspace has {}",
+            max_dims.len(),
+            ndims
+        )));
+    }
+    for d in 0..ndims {
+        if chunk_dims[d] == 0 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "chunk dimension {d} is zero"
+            )));
+        }
+        if dims[d] != 0 && max_dims[d] != u64::MAX && max_dims[d] < chunk_dims[d] {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "chunk dimension {} is {} but the maximum dimension size is {}",
+                d, chunk_dims[d], max_dims[d]
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Runtime metadata for a fixed-array-indexed chunked dataset.
 pub struct FixedArrayDatasetInfo {
     /// Chunk dimension sizes.
@@ -1614,6 +1651,7 @@ impl Hdf5Writer {
         // push so the two are atomic (see `create_lock`).
         let _create = self.create_lock.lock();
         self.ensure_unique_dataset_name(name)?;
+        validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         let earray_params = EarrayParams::default_params();
         let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs)?;
         let nsblk_addrs = compute_nsblk_addrs(
@@ -2471,6 +2509,7 @@ impl Hdf5Writer {
         use crate::format::messages::datatype::DatatypeMessage;
 
         let num_strings = strings.len() as u64;
+        validate_chunk_geometry(&[num_strings], &[num_strings], &[chunk_size as u64])?;
 
         // Build a global heap collection with all strings
         let mut gcol = GlobalHeapCollection::new();
@@ -3602,23 +3641,11 @@ impl Hdf5Writer {
         // push so the two are atomic (see `create_lock`).
         let _create = self.create_lock.lock();
         self.ensure_unique_dataset_name(name)?;
-        // Compute total number of chunks. `chunk_dims` is caller-supplied;
-        // validate it before any indexing or division.
+        // A fixed-array index means a fixed shape: max dims are the dims.
+        validate_chunk_geometry(dims, dims, chunk_dims)?;
         let ndims = dims.len();
-        if chunk_dims.len() != ndims {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "chunk shape has {} dimensions but the dataspace has {}",
-                chunk_dims.len(),
-                ndims
-            )));
-        }
         let mut num_chunks: u64 = 1;
         for d in 0..ndims {
-            if chunk_dims[d] == 0 {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "chunk dimension {d} is zero"
-                )));
-            }
             num_chunks = num_chunks
                 .checked_mul(dims[d].div_ceil(chunk_dims[d]))
                 .ok_or_else(|| {
@@ -3703,21 +3730,11 @@ impl Hdf5Writer {
         // push so the two are atomic (see `create_lock`).
         let _create = self.create_lock.lock();
         self.ensure_unique_dataset_name(name)?;
+        // A fixed-array index means a fixed shape: max dims are the dims.
+        validate_chunk_geometry(dims, dims, chunk_dims)?;
         let ndims = dims.len();
-        if chunk_dims.len() != ndims {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "chunk shape has {} dimensions but the dataspace has {}",
-                chunk_dims.len(),
-                ndims
-            )));
-        }
         let mut num_chunks: u64 = 1;
         for d in 0..ndims {
-            if chunk_dims[d] == 0 {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "chunk dimension {d} is zero"
-                )));
-            }
             num_chunks = num_chunks
                 .checked_mul(dims[d].div_ceil(chunk_dims[d]))
                 .ok_or_else(|| {
@@ -3843,14 +3860,8 @@ impl Hdf5Writer {
         // push so the two are atomic (see `create_lock`).
         let _create = self.create_lock.lock();
         self.ensure_unique_dataset_name(name)?;
+        validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         let ndims = dims.len();
-        if chunk_dims.len() != ndims {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "chunk shape has {} dimensions but the dataspace has {}",
-                chunk_dims.len(),
-                ndims
-            )));
-        }
 
         // The filtered record's size field is as wide as libhdf5 will
         // recompute it from the uncompressed chunk size, exactly as the
@@ -3937,6 +3948,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         compression_level: u32,
     ) -> IoResult<usize> {
+        validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         let element_size = datatype.element_size() as u64;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
         let chunk_size_len = compute_chunk_size_len(chunk_bytes);
@@ -4040,6 +4052,7 @@ impl Hdf5Writer {
         // push so the two are atomic (see `create_lock`).
         let _create = self.create_lock.lock();
         self.ensure_unique_dataset_name(name)?;
+        validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         let element_size = datatype.element_size() as u64;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
         let chunk_size_len = compute_chunk_size_len(chunk_bytes);
@@ -6358,8 +6371,14 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// A chunk tile larger than the frame is geometry libhdf5 refuses to
+    /// create (`H5D__chunk_construct`: chunk must not exceed a fixed maximum
+    /// dimension), so no libhdf5-based writer — including the NDFileHDF5
+    /// tiling controls this API mirrors — can produce such a file. Until
+    /// 0.4.1 we accepted it and zero-padded the frame up to the tile; now
+    /// the create is rejected like every other creator's.
     #[test]
-    fn swmr_writer_tiled_chunk_larger_than_frame() {
+    fn swmr_writer_tiled_chunk_larger_than_frame_is_rejected() {
         use crate::io::swmr::SwmrWriter;
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -6370,34 +6389,15 @@ mod tests {
             n
         ));
 
-        // Chunk tile larger than the frame: a 1x1 chunk grid, but the frame
-        // must still be zero-padded up to the full chunk size.
         let mut swmr = SwmrWriter::create(&path).unwrap();
-        let idx = swmr
+        let err = swmr
             .create_streaming_dataset_tiled("det", DatatypeMessage::u16_type(), &[3, 3], &[8, 8])
-            .unwrap();
-        swmr.start_swmr().unwrap();
-        for frame in 0..2u16 {
-            let data: Vec<u16> = (0..9).map(|i| frame * 10 + i).collect();
-            let raw: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-            swmr.append_frame(idx, &raw).unwrap();
-        }
-        swmr.flush().unwrap();
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("maximum dimension size"),
+            "unexpected error: {err}"
+        );
         swmr.close().unwrap();
-
-        let mut reader = Hdf5Reader::open(&path).unwrap();
-        assert_eq!(reader.dataset_shape("det").unwrap(), vec![2, 3, 3]);
-        let raw = reader.read_dataset_raw("det").unwrap();
-        let values: Vec<u16> = raw
-            .chunks(2)
-            .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        assert_eq!(values.len(), 18);
-        for frame in 0..2u16 {
-            for i in 0..9usize {
-                assert_eq!(values[frame as usize * 9 + i], frame * 10 + i as u16);
-            }
-        }
         std::fs::remove_file(&path).ok();
     }
 
@@ -6608,6 +6608,105 @@ mod tests {
         let raw = reader.read_dataset_raw("group1/sub/values").unwrap();
         assert_eq!(raw, vec![1, 2, 3, 4]);
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// libhdf5 (`H5D__chunk_construct`) rejects a chunk dimension that
+    /// exceeds a fixed maximum dimension. Before this check, such a dataset
+    /// was created and appends landed rows at the chunk stride instead of
+    /// the row stride, reading back [1, 2, 0, 0] for [1, 2, 3, 4].
+    #[test]
+    fn create_rejects_a_chunk_wider_than_a_fixed_max_dimension() {
+        let path = temp_path("chunk_wider_than_max");
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let err = writer
+            .create_chunked_dataset(
+                "data",
+                DatatypeMessage::f64_type(),
+                &[0, 2],
+                &[u64::MAX, 2],
+                &[2, 4],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("maximum dimension size"),
+            "unexpected error: {err}"
+        );
+
+        // The fixed-array creators derive the maximum from the fixed dims.
+        let err = writer
+            .create_fixed_array_dataset("fa", DatatypeMessage::f64_type(), &[3], &[5])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("maximum dimension size"),
+            "unexpected error: {err}"
+        );
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// libhdf5 exempts a dimension whose *current* size is zero from the
+    /// chunk-vs-maximum check (`curr_dims[u] &&` in `H5D__chunk_construct`),
+    /// and rejects a zero chunk dimension on every path.
+    #[test]
+    fn create_mirrors_the_libhdf5_chunk_geometry_exemptions() {
+        let path = temp_path("chunk_geometry_exemptions");
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        // dims[1] == 0: chunk 4 > max 2 is allowed, as libhdf5 allows it.
+        writer
+            .create_chunked_dataset(
+                "exempt",
+                DatatypeMessage::f64_type(),
+                &[0, 0],
+                &[u64::MAX, 2],
+                &[2, 4],
+            )
+            .unwrap();
+
+        let err = writer
+            .create_chunked_dataset("zero", DatatypeMessage::f64_type(), &[0], &[u64::MAX], &[0])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("chunk dimension 0 is zero"),
+            "unexpected error: {err}"
+        );
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The compressed vlen creator sizes its chunked layout from a
+    /// caller-supplied chunk size; it goes through the same geometry
+    /// validation as every other creator (empty inputs are exempt because
+    /// their current size is zero).
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn compressed_vlen_create_validates_its_chunk_size() {
+        use crate::format::messages::filter::FilterPipeline;
+        let path = temp_path("vlen_compressed_chunk");
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let err = writer
+            .create_vlen_string_dataset_compressed(
+                "texts",
+                &["a", "b", "c"],
+                100,
+                FilterPipeline::deflate(6),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("maximum dimension size"),
+            "unexpected error: {err}"
+        );
+
+        writer
+            .create_vlen_string_dataset_compressed("empty", &[], 16, FilterPipeline::deflate(6))
+            .unwrap();
+
+        writer.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
 }

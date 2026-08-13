@@ -5321,4 +5321,30 @@ mod tests {
             "20 buffered updates left {size} bytes, one collection per update"
         );
     }
+
+    /// Regression: a chunk wider than a fixed max dimension used to be
+    /// accepted, and appends then packed rows at the chunk stride — writing
+    /// [1, 2, 3, 4] and reading back [1, 2, 0, 0]. libhdf5 rejects the
+    /// geometry at create (`H5D__chunk_construct`); so do we now.
+    #[test]
+    fn builder_rejects_a_chunk_wider_than_a_fixed_max_dimension() {
+        let path = temp_path("builder_chunk_wider_than_max");
+        let file = H5File::create(&path).unwrap();
+        let err = match file
+            .new_dataset::<i32>()
+            .shape([0, 2])
+            .chunk(&[2, 4])
+            .max_shape(&[None, Some(2)])
+            .create("v5")
+        {
+            Ok(_) => panic!("create accepted a chunk wider than the fixed max dimension"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("maximum dimension size"),
+            "unexpected error: {err}"
+        );
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
 }
