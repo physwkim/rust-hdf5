@@ -432,6 +432,18 @@ impl ChunkGeometry {
     }
 }
 
+/// The refusal every attribute mutation gets while SWMR streaming is
+/// active, from the two owners of attribute-list change
+/// ([`Hdf5Writer::set_attribute`] and `evict_attr`).
+fn swmr_attr_error(name: &str) -> crate::io::IoError {
+    crate::io::IoError::InvalidState(format!(
+        "cannot add or modify attribute '{name}' during SWMR streaming: object \
+         headers are frozen while readers stream, and a superseded variable-length \
+         value's heap storage could never be reclaimed; set attributes before \
+         start_swmr (libhdf5 forbids attribute changes during SWMR writes too)"
+    ))
+}
+
 /// Whether the chunk at grid `coords` lies entirely at or beyond `extent` in
 /// some dimension — no element of it would survive a shrink to that extent.
 fn chunk_outside_extent(coords: &[u64], chunk_dims: &[u64], extent: &[u64]) -> bool {
@@ -2666,7 +2678,18 @@ impl Hdf5Writer {
     /// that leaves a list here has its vlen global-heap objects released, so
     /// no replacement — vlen over vlen, numeric over vlen — can strand heap
     /// space (the attribute counterpart of issue #10's dataset fix).
+    ///
+    /// Under SWMR every attribute mutation is refused, matching libhdf5's
+    /// rule for SWMR writes. Object headers are frozen once streaming
+    /// starts — a change was committed at close only when the header
+    /// happened to be rebuilt (group attrs always, dataset attrs only if
+    /// the dataset also got chunk writes) and silently dropped otherwise —
+    /// and a replacement's superseded vlen value could never be reclaimed,
+    /// since a streaming reader may hold its heap references.
     pub fn set_attribute(&self, target: AttrTarget<'_>, attr: AttributeMessage) -> IoResult<()> {
+        if self.swmr_active {
+            return Err(swmr_attr_error(&attr.name));
+        }
         let old = self.with_attr_list(target, |attrs| {
             if let Some(pos) = attrs.iter().position(|a| a.name == attr.name) {
                 Some(std::mem::replace(&mut attrs[pos], attr))
@@ -2717,8 +2740,12 @@ impl Hdf5Writer {
     }
 
     /// Take the attribute `name` off `target`'s list, releasing its heap
-    /// objects. No-op when absent.
+    /// objects. No-op when absent. Refused under SWMR — see
+    /// [`set_attribute`](Self::set_attribute).
     fn evict_attr(&self, target: AttrTarget<'_>, name: &str) -> IoResult<()> {
+        if self.swmr_active {
+            return Err(swmr_attr_error(name));
+        }
         let old = self.with_attr_list(target, |attrs| {
             attrs
                 .iter()

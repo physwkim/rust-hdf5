@@ -16,6 +16,17 @@
 
 ### Fixed
 
+- SWMR attribute setters now error after `start_swmr` instead of
+  appearing to succeed, matching libhdf5's ban on attribute changes
+  during SWMR writes. Object headers are frozen once streaming starts,
+  so a post-start change was committed at close only when its header
+  happened to be rebuilt — group attributes always, dataset attributes
+  only if the dataset also received chunk writes — and silently dropped
+  otherwise; replacing a vlen attribute also stranded the superseded
+  value's 4096-byte heap collection forever, since a streaming reader
+  may still hold its references. Behavior change: calls that used to
+  return `Ok` now fail; set attributes before `start_swmr`.
+
 - `set_extent` shrinks now prune stored chunks, matching libhdf5's
   `H5D__chunk_prune_by_extent`: a chunk entirely beyond the new extent is
   removed from the chunk index (extensible-array, fixed-array, and v2

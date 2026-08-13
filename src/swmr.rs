@@ -302,9 +302,10 @@ impl SwmrFileWriter {
     /// `set_group_attr_string("/entry", "NX_class", "NXentry")`. An existing
     /// attribute of the same name is replaced.
     ///
-    /// The same SWMR visibility rule as [`create_group`](Self::create_group)
-    /// applies: set before [`start_swmr`](Self::start_swmr) for the attribute
-    /// to be visible to readers during streaming.
+    /// Attributes must be set before [`start_swmr`](Self::start_swmr):
+    /// object headers are frozen while readers stream, so every attribute
+    /// setter is refused once SWMR is active — libhdf5's rule for SWMR
+    /// writes too.
     pub fn set_group_attr_string(
         &mut self,
         group_path: &str,
@@ -321,8 +322,8 @@ impl SwmrFileWriter {
 
     /// Set a numeric scalar attribute on a group, or on the root group when
     /// `group_path` is `"/"`. An existing attribute of the same name is
-    /// replaced. See [`set_group_attr_string`](Self::set_group_attr_string)
-    /// for the SWMR visibility rule.
+    /// replaced. Refused after [`start_swmr`](Self::start_swmr) — see
+    /// [`set_group_attr_string`](Self::set_group_attr_string).
     pub fn set_group_attr_numeric<T: H5Type>(
         &mut self,
         group_path: &str,
@@ -383,7 +384,9 @@ impl SwmrFileWriter {
 
     /// Set a string attribute on a dataset, addressed by its index. The
     /// NeXus way to record `units`, `long_name`, `signal`, etc. An existing
-    /// attribute of the same name is replaced.
+    /// attribute of the same name is replaced. Refused after
+    /// [`start_swmr`](Self::start_swmr) — see
+    /// [`set_group_attr_string`](Self::set_group_attr_string).
     pub fn set_dataset_attr_string(
         &mut self,
         ds_index: usize,
@@ -399,7 +402,9 @@ impl SwmrFileWriter {
     }
 
     /// Set a numeric scalar attribute on a dataset, addressed by its index.
-    /// An existing attribute of the same name is replaced.
+    /// An existing attribute of the same name is replaced. Refused after
+    /// [`start_swmr`](Self::start_swmr) — see
+    /// [`set_group_attr_string`](Self::set_group_attr_string).
     pub fn set_dataset_attr_numeric<T: H5Type>(
         &mut self,
         ds_index: usize,

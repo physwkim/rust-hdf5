@@ -481,3 +481,53 @@ fn typed_reads_reject_a_mismatched_element_width() {
     assert_eq!(r.read_slice::<f64>("d", &[1], &[1]).unwrap(), vec![-2.25]);
     cleanup(&path);
 }
+
+/// Every attribute mutation after `start_swmr` is refused, libhdf5's rule
+/// for SWMR writes. Object headers are frozen once streaming starts, so a
+/// change only reached the file when its header happened to be rebuilt at
+/// close (group attrs always, dataset attrs only alongside chunk writes)
+/// and was silently dropped otherwise — and replacing a vlen value
+/// stranded its old 4096-byte collection forever, since a streaming
+/// reader may still hold the references.
+#[test]
+fn attribute_changes_during_swmr_are_refused() {
+    let path = unique_tmp("swmr_attr_freeze");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        w.create_group("/", "entry").unwrap();
+        w.set_group_attr_string("/entry", "NX_class", "NXentry")
+            .unwrap();
+        let ds = w.create_streaming_dataset::<i32>("frames", &[4]).unwrap();
+        w.set_dataset_attr_string(ds, "units", "mm").unwrap();
+        w.set_dataset_attr_numeric(ds, "scale", &2i32).unwrap();
+        w.start_swmr().unwrap();
+
+        let err = w
+            .set_group_attr_string("/entry", "NX_class", "NXdata")
+            .expect_err("vlen replace under SWMR must be refused");
+        assert!(format!("{err}").contains("SWMR"), "got: {err}");
+        w.set_dataset_attr_string(ds, "units", "cm")
+            .expect_err("vlen replace under SWMR must be refused");
+        w.set_dataset_attr_string(ds, "long_name", "detector x")
+            .expect_err("a new vlen attribute under SWMR must be refused");
+        w.set_dataset_attr_numeric(ds, "scale", &3i32)
+            .expect_err("a numeric replace under SWMR must be refused");
+        w.close().unwrap();
+    }
+
+    // No stranded collection: the refused new-attribute call must not have
+    // written a heap block ("GCOL" appears once per pre-start vlen attr).
+    let bytes = std::fs::read(&path).unwrap();
+    let gcols = bytes.windows(4).filter(|w| *w == b"GCOL").count();
+    assert_eq!(gcols, 2, "only NX_class and units may own a collection");
+
+    // The pre-start values are what the file holds.
+    let file = rust_hdf5::H5File::open(&path).unwrap();
+    let entry = file.root_group().group("entry").unwrap();
+    assert_eq!(entry.attr_string("NX_class").unwrap(), "NXentry");
+    let ds = file.dataset("frames").unwrap();
+    assert_eq!(ds.attr("units").unwrap().read_string().unwrap(), "mm");
+    assert_eq!(ds.attr("scale").unwrap().read_numeric::<i32>().unwrap(), 2);
+    drop(file);
+    cleanup(&path);
+}
