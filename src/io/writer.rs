@@ -206,13 +206,63 @@ pub(crate) type Shared<T> = std::rc::Rc<T>;
 #[cfg(feature = "threadsafe")]
 pub(crate) type Shared<T> = std::sync::Arc<T>;
 
-/// A single dataset's metadata behind its own [`Slot`], reference-counted so
-/// a writer can clone it out of the registry (releasing the registry lock)
-/// and then lock just this one dataset. Two threads writing different
-/// datasets take different `DatasetRef` locks and never contend; the same
-/// dataset's writes serialize, which is required because one chunk index is
-/// not concurrently mutable.
-pub(crate) type DatasetRef = Shared<Slot<DatasetInfo>>;
+/// One dataset's cell in the registry: its metadata slot plus the operation
+/// lock that serializes whole logical operations on it. Both live in one
+/// allocation so they cannot fall out of step — every dataset has its op
+/// lock by construction.
+pub(crate) struct DatasetCell {
+    /// Serializes one *whole* logical operation on this dataset.
+    ///
+    /// The metadata slot below serializes each individual acquisition, but a
+    /// multi-acquisition operation — take the append buffer → write chunks →
+    /// re-buffer the tail → extend, or flush-then-overwrite in a slice write
+    /// — would interleave with a concurrent same-dataset operation *between*
+    /// its acquisitions under `threadsafe`. Public write entries take this
+    /// lock and delegate to `_inner` variants; `_inner` variants and the
+    /// `pub(crate)` write helpers require the caller to hold it (or to hold
+    /// the writer exclusively via `&mut`, as close and the SWMR wrapper do).
+    ///
+    /// Not reentrant: the single-thread build's `RefCell` panics instantly
+    /// on a nested acquisition, so a missed entry/inner split fails loudly
+    /// in every test run rather than deadlocking only under `threadsafe`.
+    ///
+    /// Lock order: `create_lock → op → registry spine → metadata slot`. An
+    /// op lock is never held across another dataset's op lock, and no
+    /// op-lock holder takes `create_lock`, so the order is acyclic.
+    pub(crate) op: Slot<()>,
+    info: Slot<DatasetInfo>,
+}
+
+impl DatasetCell {
+    pub(crate) fn new(info: DatasetInfo) -> Self {
+        DatasetCell {
+            op: Slot::new(()),
+            info: Slot::new(info),
+        }
+    }
+
+    /// Borrow the metadata slot (a single acquisition; see [`Self::op`] for
+    /// whole-operation serialization).
+    #[cfg(not(feature = "threadsafe"))]
+    pub(crate) fn lock(&self) -> std::cell::RefMut<'_, DatasetInfo> {
+        self.info.lock()
+    }
+
+    /// Lock the metadata slot (a single acquisition; see [`Self::op`] for
+    /// whole-operation serialization).
+    #[cfg(feature = "threadsafe")]
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, DatasetInfo> {
+        self.info.lock()
+    }
+}
+
+/// A single dataset's [`DatasetCell`], reference-counted so a writer can
+/// clone it out of the registry (releasing the registry lock) and then lock
+/// just this one dataset. Two threads writing different datasets take
+/// different `DatasetRef` locks and never contend; the same dataset's writes
+/// serialize, which is required because one chunk index is not concurrently
+/// mutable.
+pub(crate) type DatasetRef = Shared<DatasetCell>;
 
 /// A single group's metadata behind its own [`Slot`], reference-counted like
 /// [`DatasetRef`].
@@ -683,7 +733,7 @@ impl Hdf5Writer {
     pub(crate) fn push_dataset(&self, _create: &CreateGuard<'_>, info: DatasetInfo) -> usize {
         let mut reg = self.datasets.lock();
         let idx = reg.len();
-        reg.push(Shared::new(Slot::new(info)));
+        reg.push(Shared::new(DatasetCell::new(info)));
         idx
     }
 
@@ -1090,7 +1140,7 @@ impl Hdf5Writer {
         // only the final hand-off needs the `Shared<Slot<_>>` shape.
         let datasets = existing_datasets
             .into_iter()
-            .map(|i| Shared::new(Slot::new(i)))
+            .map(|i| Shared::new(DatasetCell::new(i)))
             .collect();
         let groups = groups
             .into_iter()
@@ -1759,6 +1809,7 @@ impl Hdf5Writer {
     /// creation time.
     pub fn write_dataset_raw(&self, index: usize, data: &[u8]) -> IoResult<()> {
         let ds = self.ds(index);
+        let _op = ds.op.lock();
         let data_addr = {
             let g = ds.lock();
             if g.chunked.is_some() {
@@ -1792,6 +1843,19 @@ impl Hdf5Writer {
     ///
     /// `data` must be exactly chunk_size bytes (product of chunk_dims * element_size).
     pub fn write_chunk(&self, index: usize, chunk_idx: u64, data: &[u8]) -> IoResult<()> {
+        let ds = self.ds(index);
+        let _op = ds.op.lock();
+        self.write_chunk_inner(index, chunk_idx, data)
+    }
+
+    /// [`Self::write_chunk`] body; the caller holds the dataset's op lock or
+    /// the writer exclusively.
+    pub(crate) fn write_chunk_inner(
+        &self,
+        index: usize,
+        chunk_idx: u64,
+        data: &[u8],
+    ) -> IoResult<()> {
         let ds = self.ds(index);
         // Read the chunk geometry and filter pipeline under one brief lock,
         // then drop it: compression runs *outside* the lock, and
@@ -2157,6 +2221,20 @@ impl Hdf5Writer {
     /// own writer, so a caller never has to know which storage the dataset
     /// uses.
     pub fn write_slice(
+        &self,
+        index: usize,
+        starts: &[u64],
+        counts: &[u64],
+        data: &[u8],
+    ) -> IoResult<()> {
+        let ds = self.ds(index);
+        let _op = ds.op.lock();
+        self.write_slice_inner(index, starts, counts, data)
+    }
+
+    /// [`Self::write_slice`] body; the caller holds the dataset's op lock or
+    /// the writer exclusively.
+    pub(crate) fn write_slice_inner(
         &self,
         index: usize,
         starts: &[u64],
@@ -2721,6 +2799,12 @@ impl Hdf5Writer {
             return Ok(());
         }
 
+        // Whole-operation guard: buffer take, frame writes, re-buffer and
+        // extend below are separate slot acquisitions that a concurrent
+        // same-dataset append must not interleave with.
+        let cell = self.ds(ds_index);
+        let _op = cell.op.lock();
+
         // The elements about to be written are vlen references; any other
         // element type would be overwritten with them as raw bytes.
         let charset = {
@@ -2821,7 +2905,7 @@ impl Hdf5Writer {
         let logical_dim0 = base_dim0 + total_frames;
         let mut new_dims = dims;
         new_dims[0] = logical_dim0 as u64;
-        self.extend_dataset(ds_index, &new_dims)?;
+        self.extend_dataset_inner(ds_index, &new_dims)?;
 
         Ok(())
     }
@@ -2857,6 +2941,12 @@ impl Hdf5Writer {
         if strings.is_empty() {
             return Ok(());
         }
+
+        // Whole-operation guard: the flush, the old-reference reads and the
+        // slice write below must not interleave with a concurrent
+        // same-dataset operation.
+        let cell = self.ds(ds_index);
+        let _op = cell.op.lock();
 
         // Snapshot what the write needs, then drop the guard: `write_slice`
         // below re-locks the same slot.
@@ -2924,7 +3014,7 @@ impl Hdf5Writer {
             ));
         }
 
-        self.write_slice(ds_index, &[start], &[strings.len() as u64], &refs)?;
+        self.write_slice_inner(ds_index, &[start], &[strings.len() as u64], &refs)?;
 
         // Only now that the new references are in place: a failure above must
         // not leave the file naming objects this already freed.
@@ -3307,6 +3397,8 @@ impl Hdf5Writer {
     /// owner required the extensible-array index and packed rows at the
     /// frame stride, so appends to a fixed-array or v2 B-tree dataset
     /// failed at close and lost the buffered rows.
+    ///
+    /// The caller holds the dataset's op lock or the writer exclusively.
     pub(crate) fn write_append_frames(
         &self,
         ds_index: usize,
@@ -3336,6 +3428,9 @@ impl Hdf5Writer {
     /// it. The single owner of the buffer-to-chunks transition: the flush at
     /// close, an append meeting a non-contiguous buffer, and any operation
     /// about to write rows the buffer holds all come through here.
+    ///
+    /// The caller holds the dataset's op lock or the writer exclusively —
+    /// the take and the frame writes are separate acquisitions.
     pub(crate) fn flush_append_buffer(&self, ds_index: usize) -> IoResult<()> {
         let taken = { self.ds(ds_index).lock().append.take() };
         match taken {
@@ -3348,6 +3443,8 @@ impl Hdf5Writer {
     /// the buffered range — those rows' current content is the buffer, and
     /// writing them on disk while the buffer still holds them would be
     /// undone by the flush at close.
+    ///
+    /// The caller holds the dataset's op lock or the writer exclusively.
     pub(crate) fn flush_append_buffer_if_intersecting(
         &self,
         ds_index: usize,
@@ -3615,6 +3712,8 @@ impl Hdf5Writer {
     /// [`read_chunk_at_coords`](Self::read_chunk_at_coords). Unlike the
     /// dataset-level `write_chunk_at`, this never grows the dataspace — a
     /// hyperslab write is bounded by the current extent by definition.
+    ///
+    /// The caller holds the dataset's op lock or the writer exclusively.
     pub(crate) fn write_chunk_at_coords(
         &self,
         ds_index: usize,
@@ -3625,12 +3724,14 @@ impl Hdf5Writer {
         match geo.kind {
             ChunkIndexKind::ExtensibleArray => {
                 let linear = geo.linear_index(chunk_coords)?;
-                self.write_chunk(ds_index, linear, data)
+                self.write_chunk_inner(ds_index, linear, data)
             }
             ChunkIndexKind::FixedArray => {
-                self.write_chunk_fixed_array(ds_index, chunk_coords, data)
+                self.write_chunk_fixed_array_inner(ds_index, chunk_coords, data)
             }
-            ChunkIndexKind::BtreeV2 => self.write_chunk_btree_v2(ds_index, chunk_coords, data),
+            ChunkIndexKind::BtreeV2 => {
+                self.write_chunk_btree_v2_inner(ds_index, chunk_coords, data)
+            }
         }
     }
 
@@ -4182,6 +4283,19 @@ impl Hdf5Writer {
         chunk_coords: &[u64],
         data: &[u8],
     ) -> IoResult<()> {
+        let ds = self.ds(index);
+        let _op = ds.op.lock();
+        self.write_chunk_fixed_array_inner(index, chunk_coords, data)
+    }
+
+    /// [`Self::write_chunk_fixed_array`] body; the caller holds the dataset's
+    /// op lock or the writer exclusively.
+    pub(crate) fn write_chunk_fixed_array_inner(
+        &self,
+        index: usize,
+        chunk_coords: &[u64],
+        data: &[u8],
+    ) -> IoResult<()> {
         // Read what we need under one brief slot guard, then compress
         // OUTSIDE the lock: `record_fixed_array_chunk` re-locks the same slot,
         // so the guard must be dropped before it (and before apply_filters).
@@ -4230,6 +4344,20 @@ impl Hdf5Writer {
     /// Requires a filtered dataset — only the filtered FA element carries the
     /// size+mask slot.
     pub fn write_compressed_chunk_fixed_array(
+        &self,
+        index: usize,
+        chunk_coords: &[u64],
+        data: &[u8],
+        filter_mask: u32,
+    ) -> IoResult<()> {
+        let ds = self.ds(index);
+        let _op = ds.op.lock();
+        self.write_compressed_chunk_fixed_array_inner(index, chunk_coords, data, filter_mask)
+    }
+
+    /// [`Self::write_compressed_chunk_fixed_array`] body; the caller holds
+    /// the dataset's op lock or the writer exclusively.
+    pub(crate) fn write_compressed_chunk_fixed_array_inner(
         &self,
         index: usize,
         chunk_coords: &[u64],
@@ -4368,6 +4496,19 @@ impl Hdf5Writer {
         chunk_coords: &[u64],
         data: &[u8],
     ) -> IoResult<()> {
+        let ds = self.ds(index);
+        let _op = ds.op.lock();
+        self.write_chunk_btree_v2_inner(index, chunk_coords, data)
+    }
+
+    /// [`Self::write_chunk_btree_v2`] body; the caller holds the dataset's op
+    /// lock or the writer exclusively.
+    pub(crate) fn write_chunk_btree_v2_inner(
+        &self,
+        index: usize,
+        chunk_coords: &[u64],
+        data: &[u8],
+    ) -> IoResult<()> {
         // Read what the write needs under a brief guard, then compress OUTSIDE
         // the lock — filtering a chunk must not hold the dataset slot.
         let ds = self.ds(index);
@@ -4414,6 +4555,20 @@ impl Hdf5Writer {
     /// read. Requires a filtered dataset — only a type-11 record has a slot for
     /// a stored size and mask.
     pub fn write_compressed_chunk_btree_v2(
+        &self,
+        index: usize,
+        chunk_coords: &[u64],
+        data: &[u8],
+        filter_mask: u32,
+    ) -> IoResult<()> {
+        let ds = self.ds(index);
+        let _op = ds.op.lock();
+        self.write_compressed_chunk_btree_v2_inner(index, chunk_coords, data, filter_mask)
+    }
+
+    /// [`Self::write_compressed_chunk_btree_v2`] body; the caller holds the
+    /// dataset's op lock or the writer exclusively.
+    pub(crate) fn write_compressed_chunk_btree_v2_inner(
         &self,
         index: usize,
         chunk_coords: &[u64],
@@ -4503,6 +4658,18 @@ impl Hdf5Writer {
     ///
     /// `chunks` is a list of (chunk_idx, data) pairs for an EA-indexed dataset.
     pub fn write_chunks_batch(&self, ds_index: usize, chunks: &[(u64, &[u8])]) -> IoResult<()> {
+        let ds = self.ds(ds_index);
+        let _op = ds.op.lock();
+        self.write_chunks_batch_inner(ds_index, chunks)
+    }
+
+    /// [`Self::write_chunks_batch`] body; the caller holds the dataset's op
+    /// lock or the writer exclusively.
+    pub(crate) fn write_chunks_batch_inner(
+        &self,
+        ds_index: usize,
+        chunks: &[(u64, &[u8])],
+    ) -> IoResult<()> {
         #[cfg(feature = "parallel")]
         {
             // If filter pipeline is set, compress all chunks in parallel.
@@ -4517,14 +4684,14 @@ impl Hdf5Writer {
                 // compressed fully, so filter_mask = 0 is truthful.
                 let compressed = filter::apply_filters_parallel(pipeline, &chunk_data)?;
                 for ((idx, _), compressed_data) in chunks.iter().zip(compressed.iter()) {
-                    self.write_compressed_chunk(ds_index, *idx, compressed_data, 0)?;
+                    self.write_compressed_chunk_inner(ds_index, *idx, compressed_data, 0)?;
                 }
                 return Ok(());
             }
         }
         // Fallback: sequential
         for (idx, data) in chunks {
-            self.write_chunk(ds_index, *idx, data)?;
+            self.write_chunk_inner(ds_index, *idx, data)?;
         }
         Ok(())
     }
@@ -4539,6 +4706,18 @@ impl Hdf5Writer {
     /// per-chunk [`write_chunk_fixed_array`](Self::write_chunk_fixed_array) when
     /// unfiltered or when `parallel` is off.
     pub fn write_chunks_fixed_array_batch(
+        &self,
+        ds_index: usize,
+        chunks: &[(&[u64], &[u8])],
+    ) -> IoResult<()> {
+        let ds = self.ds(ds_index);
+        let _op = ds.op.lock();
+        self.write_chunks_fixed_array_batch_inner(ds_index, chunks)
+    }
+
+    /// [`Self::write_chunks_fixed_array_batch`] body; the caller holds the
+    /// dataset's op lock or the writer exclusively.
+    pub(crate) fn write_chunks_fixed_array_batch_inner(
         &self,
         ds_index: usize,
         chunks: &[(&[u64], &[u8])],
@@ -4561,9 +4740,10 @@ impl Hdf5Writer {
                 return Ok(());
             }
         }
-        // Fallback: sequential (write_chunk_fixed_array compresses per chunk).
+        // Fallback: sequential (write_chunk_fixed_array_inner compresses per
+        // chunk).
         for (coords, data) in chunks {
-            self.write_chunk_fixed_array(ds_index, coords, data)?;
+            self.write_chunk_fixed_array_inner(ds_index, coords, data)?;
         }
         Ok(())
     }
@@ -4587,6 +4767,20 @@ impl Hdf5Writer {
         compressed_data: &[u8],
         filter_mask: u32,
     ) -> IoResult<()> {
+        let ds = self.ds(index);
+        let _op = ds.op.lock();
+        self.write_compressed_chunk_inner(index, chunk_idx, compressed_data, filter_mask)
+    }
+
+    /// [`Self::write_compressed_chunk`] body; the caller holds the dataset's
+    /// op lock or the writer exclusively.
+    pub(crate) fn write_compressed_chunk_inner(
+        &self,
+        index: usize,
+        chunk_idx: u64,
+        compressed_data: &[u8],
+        filter_mask: u32,
+    ) -> IoResult<()> {
         if self.ds(index).lock().filter_pipeline.is_none() {
             return Err(crate::io::IoError::InvalidState(
                 "write_compressed_chunk requires a filtered dataset (no slot for \
@@ -4599,6 +4793,14 @@ impl Hdf5Writer {
 
     /// Extend the dimensions of a chunked dataset.
     pub fn extend_dataset(&self, index: usize, new_dims: &[u64]) -> IoResult<()> {
+        let ds = self.ds(index);
+        let _op = ds.op.lock();
+        self.extend_dataset_inner(index, new_dims)
+    }
+
+    /// [`Self::extend_dataset`] body; the caller holds the dataset's op lock
+    /// or the writer exclusively.
+    pub(crate) fn extend_dataset_inner(&self, index: usize, new_dims: &[u64]) -> IoResult<()> {
         let ds = self.ds(index);
         let mut m = ds.lock();
         let is_unindexed = m.chunked.is_none() && m.fixed_array.is_none() && m.btree_v2.is_none();
@@ -4655,6 +4857,7 @@ impl Hdf5Writer {
     /// corrected back to the true number of frames written.
     pub fn set_dataset_extent(&self, index: usize, new_dims: &[u64]) -> IoResult<()> {
         let ds = self.ds(index);
+        let _op = ds.op.lock();
         let mut m = ds.lock();
         let is_unindexed = m.chunked.is_none() && m.fixed_array.is_none() && m.btree_v2.is_none();
         if is_unindexed {
@@ -4710,6 +4913,8 @@ impl Hdf5Writer {
     /// Writes the index blocks and issues an `fdatasync` so the data is
     /// durable — the guarantee SWMR readers and standalone callers rely on.
     pub fn flush_dataset(&self, index: usize) -> IoResult<()> {
+        let ds = self.ds(index);
+        let _op = ds.op.lock();
         self.flush_dataset_synced(index, true)
     }
 

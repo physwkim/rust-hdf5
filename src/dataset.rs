@@ -969,6 +969,11 @@ impl H5Dataset {
                 ))
             }
         };
+        // Whole-operation guard: the flush, the grid snapshot and the chunk
+        // writes below must not interleave with a concurrent same-dataset
+        // operation.
+        let cell = writer.ds(index);
+        let _op = cell.op.lock();
         // A buffered append tail would flush over the image at close; hand
         // it to the chunks first, the image below overwrites everything.
         writer.flush_append_buffer(index)?;
@@ -1013,7 +1018,7 @@ impl H5Dataset {
                 let coords = coords_of(linear);
                 let chunk_buf =
                     Self::gather_chunk(bytes, &dims, &chunk_dims, &coords, element_size);
-                writer.write_chunk_btree_v2(index, &coords, &chunk_buf)?;
+                writer.write_chunk_btree_v2_inner(index, &coords, &chunk_buf)?;
             }
         } else {
             // Extensible array and fixed array both compress each chunk through
@@ -1041,13 +1046,13 @@ impl H5Dataset {
                         .iter()
                         .map(|(c, d)| (c.as_slice(), d.as_slice()))
                         .collect();
-                    writer.write_chunks_fixed_array_batch(index, &pairs)?;
+                    writer.write_chunks_fixed_array_batch_inner(index, &pairs)?;
                 } else {
                     let mut pairs: Vec<(u64, &[u8])> = Vec::with_capacity(items.len());
                     for (c, d) in &items {
                         pairs.push((writer.chunk_slot(index, c)?, d.as_slice()));
                     }
-                    writer.write_chunks_batch(index, &pairs)?;
+                    writer.write_chunks_batch_inner(index, &pairs)?;
                 }
                 start = end;
             }
@@ -1163,13 +1168,17 @@ impl H5Dataset {
                 let inner = borrow_inner(&self.file_inner);
                 match &*inner {
                     H5FileInner::Writer(writer) => {
+                        // One op: the slot decode and the write see the same
+                        // extents.
+                        let cell = writer.ds(*index);
+                        let _op = cell.op.lock();
                         if *fixed_array {
                             // Fixed-array dataset: decode the index-grid slot
                             // into row-major grid coordinates.
                             let coords = writer.chunk_coords_from_slot(*index, chunk_idx as u64)?;
-                            writer.write_chunk_fixed_array(*index, &coords, data)?;
+                            writer.write_chunk_fixed_array_inner(*index, &coords, data)?;
                         } else {
-                            writer.write_chunk(*index, chunk_idx as u64, data)?;
+                            writer.write_chunk_inner(*index, chunk_idx as u64, data)?;
                         }
                         Ok(())
                     }
@@ -1235,18 +1244,22 @@ impl H5Dataset {
                 let inner = borrow_inner(&self.file_inner);
                 match &*inner {
                     H5FileInner::Writer(writer) => {
+                        // One op: the slot decode and the write see the same
+                        // extents.
+                        let cell = writer.ds(*index);
+                        let _op = cell.op.lock();
                         if *fixed_array {
                             // Fixed-array dataset: decode the index-grid slot
                             // into row-major grid coordinates.
                             let coords = writer.chunk_coords_from_slot(*index, chunk_idx as u64)?;
-                            writer.write_compressed_chunk_fixed_array(
+                            writer.write_compressed_chunk_fixed_array_inner(
                                 *index,
                                 &coords,
                                 data,
                                 filter_mask,
                             )?;
                         } else {
-                            writer.write_compressed_chunk(
+                            writer.write_compressed_chunk_inner(
                                 *index,
                                 chunk_idx as u64,
                                 data,
@@ -1356,6 +1369,11 @@ impl H5Dataset {
                         ))
                     }
                 };
+                // Whole-operation guard: the dims snapshot, the chunk write
+                // and the extend below must not interleave with a concurrent
+                // same-dataset operation.
+                let cell = writer.ds(*index);
+                let _op = cell.op.lock();
                 let chunk_dims = writer
                     .dataset_chunk_dims(*index)
                     .ok_or_else(|| Hdf5Error::InvalidState("dataset has no chunk info".into()))?
@@ -1399,10 +1417,10 @@ impl H5Dataset {
                     // Fixed-array (fixed-shape) dataset: no dimension growth.
                     match bytes {
                         ChunkBytes::Unfiltered(data) => {
-                            writer.write_chunk_fixed_array(*index, &coords, data)?
+                            writer.write_chunk_fixed_array_inner(*index, &coords, data)?
                         }
                         ChunkBytes::Prefiltered { data, filter_mask } => writer
-                            .write_compressed_chunk_fixed_array(
+                            .write_compressed_chunk_fixed_array_inner(
                                 *index,
                                 &coords,
                                 data,
@@ -1415,25 +1433,31 @@ impl H5Dataset {
                 if btree2 {
                     match bytes {
                         ChunkBytes::Unfiltered(data) => {
-                            writer.write_chunk_btree_v2(*index, &coords, data)?
+                            writer.write_chunk_btree_v2_inner(*index, &coords, data)?
                         }
                         ChunkBytes::Prefiltered { data, filter_mask } => writer
-                            .write_compressed_chunk_btree_v2(*index, &coords, data, filter_mask)?,
+                            .write_compressed_chunk_btree_v2_inner(
+                                *index,
+                                &coords,
+                                data,
+                                filter_mask,
+                            )?,
                     }
                 } else {
                     // Extensible array: the chunk's index-grid slot (row-major
                     // against the maximum extent).
                     let linear = writer.chunk_slot(*index, &coords)?;
                     match bytes {
-                        ChunkBytes::Unfiltered(data) => writer.write_chunk(*index, linear, data)?,
-                        ChunkBytes::Prefiltered { data, filter_mask } => {
-                            writer.write_compressed_chunk(*index, linear, data, filter_mask)?
+                        ChunkBytes::Unfiltered(data) => {
+                            writer.write_chunk_inner(*index, linear, data)?
                         }
+                        ChunkBytes::Prefiltered { data, filter_mask } => writer
+                            .write_compressed_chunk_inner(*index, linear, data, filter_mask)?,
                     }
                 }
 
                 if new_dims != dims {
-                    writer.extend_dataset(*index, &new_dims)?;
+                    writer.extend_dataset_inner(*index, &new_dims)?;
                 }
                 Ok(())
             }
@@ -1533,6 +1557,13 @@ impl H5Dataset {
                     }
                 };
 
+                // Whole-operation guard: the buffer take, the frame writes,
+                // the re-buffer and the extend below are separate slot
+                // acquisitions that a concurrent same-dataset append must not
+                // interleave with.
+                let cell = writer.ds(ds_index);
+                let _op = cell.op.lock();
+
                 let chunk_dims = writer
                     .dataset_chunk_dims(ds_index)
                     .ok_or_else(|| Hdf5Error::InvalidState("dataset has no chunk info".into()))?
@@ -1621,7 +1652,7 @@ impl H5Dataset {
                 let logical_dim0 = base_dim0 + total_frames;
                 let mut new_dims: Vec<u64> = dims;
                 new_dims[0] = logical_dim0 as u64;
-                writer.extend_dataset(ds_index, &new_dims)?;
+                writer.extend_dataset_inner(ds_index, &new_dims)?;
 
                 Ok(())
             }

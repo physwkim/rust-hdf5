@@ -4,6 +4,17 @@
 
 ### Fixed
 
+- Concurrent operations on the *same* dataset serialize wholly under the
+  `threadsafe` feature. Each dataset now carries an operation lock beside
+  its metadata slot; every public write entry (`write_chunk*`,
+  `write_slice`, `append*`, `extend`/`set_extent`, `flush`) holds it for
+  the operation's full duration. The per-slot mutex only serialized each
+  individual acquisition, so two threads appending to one dataset could
+  interleave between the buffer take, the chunk writes and the extend —
+  losing or doubling rows. Same-dataset concurrency was previously
+  documented as unsupported; it is now correct, and writes to different
+  datasets still never contend.
+
 - Chunk geometry is validated at every dataset create, the rule libhdf5
   applies in `H5D__chunk_construct`: the chunk rank must match the dataspace,
   no chunk dimension may be zero, and a chunk dimension may not exceed a

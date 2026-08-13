@@ -140,17 +140,28 @@ chunked dataset) becomes: lock the *one* target `DatasetSlot`, do the
 short allocate+write+record, unlock. Different datasets run fully in
 parallel.
 
-Scope of the same-dataset guarantee: a *single* slot operation — one
-`write_chunk` / `record_*` — serializes on that slot's `Mutex`, so it
-cannot tear the chunk index. It does **not** make a multi-step sequence
-atomic. `append` deliberately drops the slot between phases (read dims →
-take `append_buffer` → compress + write each chunk → `extend_dataset`) so
-compression and disk I/O run unlocked; two threads appending to the *same*
-dataset can therefore interleave those phases and corrupt the
-buffer/dimension accounting. The supported concurrency is across
-**distinct** datasets (one writer per dataset, e.g. a rayon `par_iter`
-over datasets). Concurrent writes to a *single* dataset are unsupported;
-callers must serialize them externally.
+Scope of the same-dataset guarantee: the metadata slot's `Mutex`
+serializes a *single* acquisition — one `record_*`, one buffer take — so
+it cannot tear the chunk index, but it does not make a multi-step
+sequence atomic. `append` deliberately drops the slot between phases
+(read dims → take `append_buffer` → compress + write each chunk →
+`extend_dataset`) so compression and disk I/O run unlocked. Whole
+operations are serialized one level up: each `DatasetCell` carries an
+**op lock** beside its metadata slot, every public write entry
+(`write_chunk*`, `write_slice`, `append*`, `extend`/`set_extent`,
+`flush`) takes it for the operation's full duration and delegates to a
+`_inner` variant, and multi-acquisition compositions in `dataset.rs`
+take it around their whole sequence. `_inner` variants and the
+`pub(crate)` helpers (`write_append_frames`, `flush_append_buffer*`,
+`write_chunk_at_coords`) require the caller to hold it — or to hold the
+writer exclusively via `&mut`, as close and the SWMR wrapper do. The op
+lock is not reentrant; the single-thread build's `RefCell` panics on a
+nested acquisition, so a missed entry/inner split fails in every test
+run. Lock order: `create_lock → op → registry spine → metadata slot`,
+never two datasets' op locks at once. Concurrent operations on the
+*same* dataset are therefore supported and serialize wholly
+(`tests/threadsafe_same_dataset_append.rs`); the parallelism win remains
+across distinct datasets, whose op locks never contend.
 
 ### 4.4 `SharedInner` — drop the outer `Mutex`
 
