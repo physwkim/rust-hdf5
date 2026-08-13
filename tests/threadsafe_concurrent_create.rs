@@ -28,12 +28,18 @@ use rust_hdf5::H5File;
 const TEST_PYTHON: &str = "/Users/stevek/mamba/envs/bs2026.1/bin/python";
 
 fn python() -> Option<&'static str> {
-    if std::path::Path::new(TEST_PYTHON).exists() {
-        Some(TEST_PYTHON)
-    } else {
-        eprintln!("skipping h5py cross-check: {TEST_PYTHON} not present");
-        None
-    }
+    static PY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PY.get_or_init(|| {
+        let candidate =
+            std::env::var("RUST_HDF5_TEST_PYTHON").unwrap_or_else(|_| TEST_PYTHON.to_string());
+        if std::path::Path::new(&candidate).exists() {
+            Some(candidate)
+        } else {
+            eprintln!("skipping h5py cross-check: {candidate} not present");
+            None
+        }
+    })
+    .as_deref()
 }
 
 fn tmp(name: &str) -> std::path::PathBuf {
