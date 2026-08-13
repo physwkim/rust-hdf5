@@ -3025,8 +3025,17 @@ impl Hdf5Writer {
             let declared = GlobalHeapCollection::decode_size(&head, &self.ctx)?;
             let image = self.handle.read_at(addr, declared)?;
             let (mut gcol, _) = GlobalHeapCollection::decode(&image, &self.ctx)?;
+            let mut removed_any = false;
             for idx in indices {
-                gcol.remove_object(idx);
+                removed_any |= gcol.remove_object(idx);
+            }
+            // Every index already gone (a stale or duplicate reference):
+            // leave the image alone. Rewriting is not just wasted I/O — a
+            // 100%-full collection written by libhdf5 has no free-space
+            // marker, so re-encoding it at its declared size cannot fit one
+            // and the whole element update would fail.
+            if !removed_any {
+                continue;
             }
             if gcol.is_empty() {
                 self.allocator.free(addr, declared as u64);
@@ -5382,6 +5391,44 @@ mod tests {
         );
 
         writer.ds(idx).lock().chunked.as_mut().unwrap().chunk_dims[0] = 2;
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A libhdf5-written collection can be 100% full — no free-space marker,
+    /// content exactly the declared size. When a stale reference names an
+    /// index that is not there, nothing is removed, and the collection must
+    /// be left alone: re-encoding it at its declared size cannot fit the
+    /// free-space marker and would fail the whole update.
+    #[test]
+    fn release_leaves_a_full_collection_it_removed_nothing_from() {
+        use crate::format::global_heap::encode_vlen_reference;
+
+        let path = temp_path("release_full_gcol");
+        let writer = Hdf5Writer::create(&path).unwrap();
+
+        // Hand-built full collection: 16-byte header + one 16+8-byte object,
+        // declared size exactly 40, no free-space marker.
+        let mut img = Vec::new();
+        img.extend_from_slice(b"GCOL");
+        img.push(1);
+        img.extend_from_slice(&[0u8; 3]);
+        img.extend_from_slice(&40u64.to_le_bytes());
+        img.extend_from_slice(&1u16.to_le_bytes()); // object index 1
+        img.extend_from_slice(&1u16.to_le_bytes()); // ref_count
+        img.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        img.extend_from_slice(&8u64.to_le_bytes()); // data size
+        img.extend_from_slice(b"deadbeef");
+        assert_eq!(img.len(), 40);
+        let addr = writer.allocator.allocate(img.len() as u64);
+        writer.handle.write_at(addr, &img).unwrap();
+
+        // The superseded reference names index 2, which the collection does
+        // not hold — a no-op removal.
+        let refs = encode_vlen_reference(3, addr, 2, &writer.ctx);
+        writer.release_vlen_references(&refs).unwrap();
+        assert_eq!(writer.handle.read_at(addr, 40).unwrap(), img);
+
         writer.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
