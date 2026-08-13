@@ -1259,6 +1259,33 @@ impl Hdf5Reader {
         group_path.is_empty() || self.group_paths.contains(group_path)
     }
 
+    /// Read and decode the global-heap collection at `addr`, applying the
+    /// validation of libhdf5's `H5HG__cache_heap_deserialize`: the `GCOL`
+    /// signature must be present and the declared size at least
+    /// `H5HG_MINSIZE` (4096 bytes). There is no upper size cap — libhdf5
+    /// has none, and this crate's writers put a whole write call's strings
+    /// into one collection, which a cap would turn into silent data loss.
+    fn read_heap_collection(&mut self, addr: u64) -> IoResult<GlobalHeapCollection> {
+        let ss = self.ctx.sizeof_size as usize;
+        let header_len = 4 + 1 + 3 + ss;
+        let header_buf = self.handle.read_at_most(addr, header_len)?;
+        if header_buf.len() < header_len || header_buf[0..4] != *b"GCOL" {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "bad global heap collection signature at address {addr:#x}"
+            )));
+        }
+        let declared = read_uint(&header_buf[8..], ss) as usize;
+        if declared < 4096 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "global heap collection at address {addr:#x} declares size {declared}, \
+                 below the 4096-byte minimum"
+            )));
+        }
+        let heap_buf = self.handle.read_at(addr, declared)?;
+        let (coll, _) = GlobalHeapCollection::decode(&heap_buf, &self.ctx)?;
+        Ok(coll)
+    }
+
     /// Decode an attribute's value as a string, resolving a variable-length
     /// string attribute through the global heap (h5py writes string
     /// attributes as variable-length by default).
@@ -1282,19 +1309,17 @@ impl Hdf5Reader {
         if coll_addr == UNDEF_ADDR || coll_addr == 0 {
             return Ok(String::new());
         }
-        let ss = self.ctx.sizeof_size as usize;
-        let header_len = 4 + 1 + 3 + ss;
-        let header_buf = self.handle.read_at_most(coll_addr, header_len)?;
-        if header_buf.len() < header_len || header_buf[0..4] != *b"GCOL" {
-            return Ok(String::new());
-        }
-        let collection_size = read_uint(&header_buf[8..], ss) as usize;
-        if collection_size == 0 || collection_size > 64 * 1024 * 1024 {
-            return Ok(String::new());
-        }
-        let heap_buf = self.handle.read_at(coll_addr, collection_size)?;
-        let (coll, _) = GlobalHeapCollection::decode(&heap_buf, &self.ctx)?;
-        let obj = coll.get_object(obj_index as u16).unwrap_or(&[]);
+        let coll = self.read_heap_collection(coll_addr)?;
+        let idx = u16::try_from(obj_index).map_err(|_| {
+            crate::io::IoError::InvalidState(format!(
+                "global heap object index {obj_index} does not fit the 16-bit on-disk field"
+            ))
+        })?;
+        let obj = coll.get_object(idx).ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!(
+                "global heap object {idx} not found in the collection at address {coll_addr:#x}"
+            ))
+        })?;
         Ok(String::from_utf8_lossy(obj).to_string())
     }
 
@@ -2593,22 +2618,7 @@ impl Hdf5Reader {
             // Read or get cached global heap collection
             #[allow(clippy::map_entry)]
             if !heap_cache.contains_key(&collection_addr) {
-                let ss = self.ctx.sizeof_size as usize;
-                let header_len = 4 + 1 + 3 + ss;
-                let header_buf = self.handle.read_at_most(collection_addr, header_len)?;
-                if header_buf.len() < header_len || &header_buf[0..4] != b"GCOL" {
-                    items.push(Vec::new());
-                    continue;
-                }
-                let collection_size = read_uint(&header_buf[8..], ss) as usize;
-
-                if collection_size == 0 || collection_size > 64 * 1024 * 1024 {
-                    items.push(Vec::new());
-                    continue;
-                }
-
-                let heap_buf = self.handle.read_at(collection_addr, collection_size)?;
-                let (coll, _) = GlobalHeapCollection::decode(&heap_buf, &self.ctx)?;
+                let coll = self.read_heap_collection(collection_addr)?;
                 let lookup: std::collections::HashMap<u16, usize> = coll
                     .objects
                     .iter()
@@ -2618,12 +2628,20 @@ impl Hdf5Reader {
                 heap_cache.insert(collection_addr, (coll, lookup));
             }
 
+            let idx = u16::try_from(obj_index).map_err(|_| {
+                crate::io::IoError::InvalidState(format!(
+                    "global heap object index {obj_index} does not fit the 16-bit on-disk field \
+                     (element {i} of \"{name}\")"
+                ))
+            })?;
             let (coll, lookup) = &heap_cache[&collection_addr];
-            if let Some(&idx) = lookup.get(&(obj_index as u16)) {
-                items.push(coll.objects[idx].data.clone());
-            } else {
-                items.push(Vec::new());
-            }
+            let &oi = lookup.get(&idx).ok_or_else(|| {
+                crate::io::IoError::InvalidState(format!(
+                    "global heap object {idx} not found in the collection at address \
+                     {collection_addr:#x} (element {i} of \"{name}\")"
+                ))
+            })?;
+            items.push(coll.objects[oi].data.clone());
         }
 
         Ok(items)

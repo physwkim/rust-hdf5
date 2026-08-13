@@ -27,6 +27,18 @@
   cleared but the blocks are kept, the rule libhdf5 applies in
   `H5Dearray.c`.
 
+- Variable-length reads no longer return silent empty strings when the
+  global-heap collection cannot be resolved. The reader capped
+  collections at 64 MiB — libhdf5 has no cap, and this crate's writers
+  put a whole write call's strings into one collection, so reading back
+  a large batch blanked every string. The cap is gone, and the failures
+  libhdf5 treats as errors (`H5HG__cache_heap_deserialize`: bad `GCOL`
+  signature, declared size below 4096) are now hard errors here too, as
+  are a reference to an object missing from its collection and an object
+  index that overflows the 16-bit on-disk field. A nil reference
+  (address 0) still reads as the empty value. Applies to both dataset
+  and attribute reads, which now share one collection loader.
+
 - Reopening a file for writing (`open_rw` / `open_append`) now keeps
   every group and its attributes. The reopen rebuilt its group registry
   from dataset paths alone, so a bare `open_rw` + `close` deleted any
