@@ -3036,10 +3036,14 @@ impl Hdf5Writer {
         }
     }
 
-    /// Release the global-heap objects a superseded attribute owned. Only
-    /// vlen attributes hold heap references; every other class stores its
-    /// value inline in the message. Per-object removal keeps collections
-    /// shared with other refs (libhdf5-written files) intact.
+    /// Release the global-heap objects a superseded attribute owned.
+    /// Recognizes top-level vlen datatypes only: a *compound* attribute
+    /// with vlen members — which this crate cannot write, only a foreign
+    /// file can carry — keeps its members' heap objects when replaced or
+    /// deleted, the storage cost the foreign writer accepted. Every other
+    /// class stores its value inline in the message. Per-object removal
+    /// keeps collections shared with other refs (libhdf5-written files)
+    /// intact.
     fn release_attr_vlen(&self, old: &AttributeMessage) -> IoResult<()> {
         use crate::format::messages::datatype::DatatypeMessage;
         if matches!(
@@ -3780,6 +3784,13 @@ impl Hdf5Writer {
 
     /// Free the global heap objects `refs` names, so replacing a vlen element
     /// does not strand what it used to point at.
+    ///
+    /// Callers pass refs only for *top-level* vlen datatypes (the
+    /// `collect_refs` / `is_vlen` decisions at the prune, delete and
+    /// attribute-release sites all match `VarLenString`/`VarLenSequence`).
+    /// A compound datatype with vlen members — writable only by a foreign
+    /// library, never by this crate — keeps its members' heap objects when
+    /// its storage is pruned, deleted or replaced.
     ///
     /// This is libhdf5's `H5HG_remove` reached through `H5T__vlen_disk_delete`:
     /// the object leaves its collection, the collection is rewritten at its
