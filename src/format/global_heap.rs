@@ -369,6 +369,20 @@ pub fn vlen_reference_size(ctx: &FormatContext) -> usize {
     4 + ctx.sizeof_addr as usize + 4
 }
 
+/// The `u32` sequence length a vlen reference stores, or an error when the
+/// data is longer than the on-disk field can say.
+///
+/// The single owner of this conversion: a bare `as u32` at a write site
+/// silently wraps a 4 GiB sequence to its low 32 bits — the heap object
+/// keeps every byte, but each read returns the wrapped length.
+pub fn vlen_seq_len(data_len: usize) -> FormatResult<u32> {
+    u32::try_from(data_len).map_err(|_| {
+        FormatError::InvalidData(format!(
+            "a {data_len}-byte vlen sequence does not fit the 32-bit length field"
+        ))
+    })
+}
+
 /// Round `n` up to the next multiple of 8.
 fn pad_to_8(n: usize) -> usize {
     (n + 7) & !7
@@ -472,6 +486,14 @@ mod tests {
         assert_eq!(seq_len, 10);
         assert_eq!(addr, 0x1234_5678);
         assert_eq!(idx, 7);
+    }
+
+    #[test]
+    fn vlen_seq_len_bounds() {
+        assert_eq!(vlen_seq_len(0).unwrap(), 0);
+        assert_eq!(vlen_seq_len(u32::MAX as usize).unwrap(), u32::MAX);
+        #[cfg(target_pointer_width = "64")]
+        assert!(vlen_seq_len(u32::MAX as usize + 1).is_err());
     }
 
     #[test]

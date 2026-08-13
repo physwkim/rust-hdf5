@@ -2341,7 +2341,7 @@ impl Hdf5Writer {
         let data_size = (num_strings as usize) * ref_size;
         let mut raw_data = Vec::with_capacity(data_size);
         for (i, &obj_idx) in obj_indices.iter().enumerate() {
-            let seq_len = strings[i].len() as u32;
+            let seq_len = crate::format::global_heap::vlen_seq_len(strings[i].len())?;
             raw_data.extend_from_slice(&encode_vlen_reference(
                 seq_len,
                 gcol_addr,
@@ -2415,7 +2415,7 @@ impl Hdf5Writer {
         let mut raw_data = Vec::with_capacity(data_size);
         for (i, &obj_idx) in obj_indices.iter().enumerate() {
             // base is u8, so element count == byte count.
-            let seq_len = items[i].len() as u32;
+            let seq_len = crate::format::global_heap::vlen_seq_len(items[i].len())?;
             raw_data.extend_from_slice(&encode_vlen_reference(
                 seq_len,
                 gcol_addr,
@@ -2490,7 +2490,7 @@ impl Hdf5Writer {
         let data_size = (num_strings as usize) * ref_size;
         let mut raw_data = Vec::with_capacity(data_size);
         for (i, &obj_idx) in obj_indices.iter().enumerate() {
-            let seq_len = strings[i].len() as u32;
+            let seq_len = crate::format::global_heap::vlen_seq_len(strings[i].len())?;
             raw_data.extend_from_slice(&encode_vlen_reference(
                 seq_len,
                 gcol_addr,
@@ -2665,7 +2665,7 @@ impl Hdf5Writer {
         let ref_size = crate::format::global_heap::vlen_reference_size(&self.ctx);
         let mut raw = Vec::with_capacity(strings.len() * ref_size);
         for (i, &obj_idx) in obj_indices.iter().enumerate() {
-            let seq_len = strings[i].len() as u32;
+            let seq_len = crate::format::global_heap::vlen_seq_len(strings[i].len())?;
             raw.extend_from_slice(&encode_vlen_reference(
                 seq_len,
                 gcol_addr,
@@ -2854,7 +2854,7 @@ impl Hdf5Writer {
         let mut refs = Vec::with_capacity(strings.len() * ref_size);
         for (i, &obj_idx) in obj_indices.iter().enumerate() {
             refs.extend_from_slice(&encode_vlen_reference(
-                strings[i].len() as u32,
+                crate::format::global_heap::vlen_seq_len(strings[i].len())?,
                 gcol_addr,
                 obj_idx as u32,
                 &self.ctx,
@@ -3107,7 +3107,8 @@ impl Hdf5Writer {
         let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
         self.handle.write_at(gcol_addr, &gcol_encoded)?;
 
-        let data = encode_vlen_reference(value.len() as u32, gcol_addr, obj_idx as u32, &self.ctx);
+        let seq_len = crate::format::global_heap::vlen_seq_len(value.len())?;
+        let data = encode_vlen_reference(seq_len, gcol_addr, obj_idx as u32, &self.ctx);
         Ok(AttributeMessage {
             name: name.to_string(),
             datatype: DatatypeMessage::vlen_string_utf8(),
@@ -3152,7 +3153,7 @@ impl Hdf5Writer {
         let mut entries: Vec<(u32, u16)> = Vec::with_capacity(values.len());
         for v in values {
             let obj_idx = gcol.add_object(v.as_bytes().to_vec())?;
-            entries.push((v.len() as u32, obj_idx));
+            entries.push((crate::format::global_heap::vlen_seq_len(v.len())?, obj_idx));
         }
         let gcol_encoded = gcol.encode(&self.ctx);
         let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
