@@ -3083,10 +3083,15 @@ impl Hdf5Writer {
         }
 
         for (addr, indices) in per_collection {
-            let head = self.handle.read_at_most(addr, 64)?;
-            let declared = GlobalHeapCollection::decode_size(&head, &self.ctx)?;
-            let image = self.handle.read_at(addr, declared)?;
-            let (mut gcol, _) = GlobalHeapCollection::decode(&image, &self.ctx)?;
+            // A collection is at least 4096 bytes (H5HG_MINALLOC) and most are
+            // exactly that, so one read usually covers the whole image; only
+            // an oversized collection needs a second read at its declared size.
+            let mut image = self.handle.read_at_most(addr, 4096)?;
+            let declared = GlobalHeapCollection::decode_size(&image, &self.ctx)?;
+            if declared > image.len() {
+                image = self.handle.read_at(addr, declared)?;
+            }
+            let (mut gcol, _) = GlobalHeapCollection::decode(&image[..declared], &self.ctx)?;
             let mut removed_any = false;
             for idx in indices {
                 removed_any |= gcol.remove_object(idx);
