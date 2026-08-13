@@ -16,6 +16,17 @@
 
 ### Fixed
 
+- `set_extent` shrinks now prune stored chunks, matching libhdf5's
+  `H5D__chunk_prune_by_extent`: a chunk entirely beyond the new extent is
+  removed from the chunk index (extensible-array, fixed-array, and v2
+  B-tree) and its storage freed for reuse — it used to stay allocated and
+  indexed forever — and a chunk the new extent cuts through has its
+  out-of-extent region overwritten with the fill value. Behavior change:
+  growing the extent back now reads fill values where it used to resurrect
+  the stale pre-shrink data. Under SWMR the index entries are still
+  cleared but the blocks are kept, the rule libhdf5 applies in
+  `H5Dearray.c`.
+
 - An extent change made in a reopen session with no chunk write is now
   persisted at close. The finalize path inferred "modified" from the
   session's chunk-write count alone, so `open_rw` + `set_extent` (or

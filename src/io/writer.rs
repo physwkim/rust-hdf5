@@ -432,6 +432,74 @@ impl ChunkGeometry {
     }
 }
 
+/// Whether the chunk at grid `coords` lies entirely at or beyond `extent` in
+/// some dimension — no element of it would survive a shrink to that extent.
+fn chunk_outside_extent(coords: &[u64], chunk_dims: &[u64], extent: &[u64]) -> bool {
+    coords
+        .iter()
+        .zip(chunk_dims)
+        .zip(extent)
+        .any(|((&c, &cd), &e)| c.saturating_mul(cd) >= e)
+}
+
+/// Whether the chunk at grid `coords` keeps elements under `extent` but
+/// extends past it in some dimension — a shrink must refill its
+/// out-of-extent region with the fill value.
+fn chunk_straddles_extent(coords: &[u64], chunk_dims: &[u64], extent: &[u64]) -> bool {
+    !chunk_outside_extent(coords, chunk_dims, extent)
+        && coords
+            .iter()
+            .zip(chunk_dims)
+            .zip(extent)
+            .any(|((&c, &cd), &e)| (c + 1).saturating_mul(cd) > e)
+}
+
+/// Overwrite, in `data` (one whole chunk, unfiltered, row-major), every
+/// element at or beyond `extent` with the matching bytes of `fill` — a
+/// same-sized buffer tiled with the fill value. The caller guarantees the
+/// chunk at `coords` straddles `extent`, so every dimension keeps at least
+/// one element.
+fn refill_chunk_beyond_extent(
+    data: &mut [u8],
+    fill: &[u8],
+    coords: &[u64],
+    chunk_dims: &[u64],
+    extent: &[u64],
+    element_size: usize,
+) {
+    let ndims = chunk_dims.len();
+    let keep: Vec<usize> = (0..ndims)
+        .map(|d| {
+            let origin = coords[d] * chunk_dims[d];
+            chunk_dims[d].min(extent[d].saturating_sub(origin)) as usize
+        })
+        .collect();
+    // Row-major walk: for every row (all dimensions but the last),
+    // overwrite the whole row when its prefix is outside the keep box,
+    // else only the row's out-of-extent tail.
+    let row_elems = chunk_dims[ndims - 1] as usize;
+    let keep_last = keep[ndims - 1];
+    let nrows: u64 = chunk_dims[..ndims - 1].iter().product();
+    for r in 0..nrows {
+        let mut rem = r;
+        let mut in_keep = true;
+        for d in (0..ndims - 1).rev() {
+            let c = rem % chunk_dims[d];
+            rem /= chunk_dims[d];
+            if c as usize >= keep[d] {
+                in_keep = false;
+            }
+        }
+        let start = if in_keep { keep_last } else { 0 };
+        if start == row_elems {
+            continue;
+        }
+        let a = (r as usize * row_elems + start) * element_size;
+        let b = (r as usize + 1) * row_elems * element_size;
+        data[a..b].copy_from_slice(&fill[a..b]);
+    }
+}
+
 /// Validate caller-supplied chunk geometry at dataset definition, the rule
 /// libhdf5 applies in `H5D__chunk_construct` (H5Dchunk.c): the chunk rank
 /// must match the dataspace rank, no chunk dimension may be zero, and a
@@ -5069,65 +5137,436 @@ impl Hdf5Writer {
     /// any dimension (unlike [`extend_dataset`](Self::extend_dataset), which
     /// only grows).
     ///
-    /// Shrinking sets the logical dataspace only: chunks (or parts of
-    /// chunks) beyond the new extent stay in the file but are no longer
-    /// visible on read, exactly as libhdf5's `H5Dset_extent` behaves. This
-    /// is how a partial multi-frame chunk's over-extended frame count is
-    /// corrected back to the true number of frames written.
+    /// A shrink prunes the stored chunks the way libhdf5's
+    /// `H5D__chunk_prune_by_extent` (H5Dchunk.c) does: a chunk entirely
+    /// beyond the new extent leaves the chunk index and its block is freed
+    /// for reuse (kept under SWMR, where a live reader may still hold its
+    /// address — the rule `H5Dearray.c` applies in `idx_remove`), and a
+    /// chunk the new extent cuts through has its out-of-extent region
+    /// overwritten with the fill value, so growing the extent back exposes
+    /// fill values rather than the stale data.
     pub fn set_dataset_extent(&self, index: usize, new_dims: &[u64]) -> IoResult<()> {
         let ds = self.ds(index);
         let _op = ds.op.lock();
+        let old_dims = {
+            let m = ds.lock();
+            let is_unindexed =
+                m.chunked.is_none() && m.fixed_array.is_none() && m.btree_v2.is_none();
+            if is_unindexed {
+                return Err(crate::io::IoError::InvalidState(
+                    "can only set the extent of chunked datasets".into(),
+                ));
+            }
+            if new_dims.len() != m.dataspace.dims.len() {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "set_extent rank mismatch: dataset has {} dimensions, got {}",
+                    m.dataspace.dims.len(),
+                    new_dims.len()
+                )));
+            }
+            // A shrink can cut into buffered rows, whose recorded base would
+            // then point past the extent; refuse rather than reconcile.
+            if m.append.is_some() {
+                return Err(crate::io::IoError::InvalidState(
+                    "set_extent cannot run while the dataset has buffered appends; \
+                     flush them first"
+                        .into(),
+                ));
+            }
+            // An absent maximum shape means the shape is fixed (libhdf5
+            // defaults maxdims to dims at creation), so growth is bounded by
+            // the extent.
+            match m.dataspace.max_dims {
+                Some(ref max) => {
+                    for (d, (&new, &mx)) in new_dims.iter().zip(max).enumerate() {
+                        if new > mx {
+                            return Err(crate::io::IoError::InvalidState(format!(
+                                "set_extent dimension {d} ({new}) exceeds the maximum {mx}"
+                            )));
+                        }
+                    }
+                }
+                None => {
+                    for (d, (&new, &cur)) in new_dims.iter().zip(&m.dataspace.dims).enumerate() {
+                        if new > cur {
+                            return Err(crate::io::IoError::InvalidState(format!(
+                                "set_extent dimension {d} ({new}) exceeds the maximum {cur}: \
+                                 a dataset without a stored maximum shape is fixed at its extent"
+                            )));
+                        }
+                    }
+                }
+            }
+            m.dataspace.dims.clone()
+        };
+        // A shrink strands chunks; prune them (and refill the straddlers)
+        // *before* the dims update — chunk addressing uses the
+        // maximum-extent grid, which the update does not change, and the
+        // helpers re-lock the slot themselves.
+        if new_dims.iter().zip(&old_dims).any(|(&n, &o)| n < o) {
+            self.prune_chunks_beyond(index, new_dims)?;
+        }
         let mut m = ds.lock();
-        let is_unindexed = m.chunked.is_none() && m.fixed_array.is_none() && m.btree_v2.is_none();
-        if is_unindexed {
-            return Err(crate::io::IoError::InvalidState(
-                "can only set the extent of chunked datasets".into(),
-            ));
-        }
-        if new_dims.len() != m.dataspace.dims.len() {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "set_extent rank mismatch: dataset has {} dimensions, got {}",
-                m.dataspace.dims.len(),
-                new_dims.len()
-            )));
-        }
-        // A shrink can cut into buffered rows, whose recorded base would
-        // then point past the extent; refuse rather than reconcile.
-        if m.append.is_some() {
-            return Err(crate::io::IoError::InvalidState(
-                "set_extent cannot run while the dataset has buffered appends; \
-                 flush them first"
-                    .into(),
-            ));
-        }
-        // An absent maximum shape means the shape is fixed (libhdf5 defaults
-        // maxdims to dims at creation), so growth is bounded by the extent.
-        match m.dataspace.max_dims {
-            Some(ref max) => {
-                for (d, (&new, &mx)) in new_dims.iter().zip(max).enumerate() {
-                    if new > mx {
-                        return Err(crate::io::IoError::InvalidState(format!(
-                            "set_extent dimension {d} ({new}) exceeds the maximum {mx}"
-                        )));
-                    }
-                }
-            }
-            None => {
-                for (d, (&new, &cur)) in new_dims.iter().zip(&m.dataspace.dims).enumerate() {
-                    if new > cur {
-                        return Err(crate::io::IoError::InvalidState(format!(
-                            "set_extent dimension {d} ({new}) exceeds the maximum {cur}: \
-                             a dataset without a stored maximum shape is fixed at its extent"
-                        )));
-                    }
-                }
-            }
-        }
         if m.dataspace.dims != new_dims {
             m.dataspace.dims = new_dims.to_vec();
             m.extent_dirty = true;
         }
         Ok(())
+    }
+
+    /// Remove and refill the chunks a shrink to `new_dims` strands — the
+    /// libhdf5 `H5D__chunk_prune_by_extent` behavior. A chunk entirely
+    /// beyond the new extent leaves the index and its block is freed (kept
+    /// under SWMR, where a live reader may still hold its address); a chunk
+    /// the extent cuts through gets its out-of-extent region refilled with
+    /// the fill value, so a later regrow reads fill, not stale elements.
+    ///
+    /// Runs *before* the dims update: the index grid chunks are addressed in
+    /// comes from the maximum extent, which a shrink never changes, so every
+    /// stored entry still resolves. The caller holds the dataset's op lock.
+    fn prune_chunks_beyond(&self, index: usize, new_dims: &[u64]) -> IoResult<()> {
+        let geo = self.chunk_geometry(index)?;
+        let straddlers = match geo.kind {
+            ChunkIndexKind::ExtensibleArray => self.prune_ea_chunks(index, &geo, new_dims)?,
+            ChunkIndexKind::FixedArray => self.prune_fa_chunks(index, &geo, new_dims)?,
+            ChunkIndexKind::BtreeV2 => self.prune_bt2_chunks(index, &geo, new_dims)?,
+        };
+        // Whole-chunk read-modify-write per straddler: an unfiltered chunk
+        // rewrites in place, a filtered one re-places through `place_chunk`.
+        let chunk_bytes = geo.chunk_bytes() as usize;
+        for coords in straddlers {
+            let Some(mut data) = self.read_chunk_at_coords(index, &coords)? else {
+                continue;
+            };
+            let fill = self.new_chunk_buffer(index, chunk_bytes);
+            refill_chunk_beyond_extent(
+                &mut data,
+                &fill,
+                &coords,
+                &geo.chunk_dims,
+                new_dims,
+                geo.element_size as usize,
+            );
+            self.write_chunk_at_coords(index, &coords, &data)?;
+        }
+        Ok(())
+    }
+
+    /// Extensible-array half of [`prune_chunks_beyond`](Self::prune_chunks_beyond):
+    /// walk every slot the array has ever set, free and clear the entries of
+    /// chunks entirely beyond `new_dims`, and return the grid coordinates of
+    /// the chunks that straddle it.
+    fn prune_ea_chunks(
+        &self,
+        index: usize,
+        geo: &ChunkGeometry,
+        new_dims: &[u64],
+    ) -> IoResult<Vec<Vec<u64>>> {
+        let ds = self.ds(index);
+        // One slot guard for the whole walk, the `record_ea_chunk` pattern:
+        // `self.handle`/`self.allocator`/`self.ctx` are disjoint fields.
+        let mut m = ds.lock();
+        let is_filtered = m.filter_pipeline.is_some();
+        let chunk_bytes = geo.chunk_bytes();
+        let (ea_geo, max_nelmts_bits, chunk_size_len, max_idx) = {
+            let c = m.chunked.as_ref().unwrap();
+            let p = &c.earray_params;
+            (
+                EaGeometry::new(
+                    p.idx_blk_elmts,
+                    p.data_blk_min_elmts,
+                    p.sup_blk_min_data_ptrs,
+                    p.max_nelmts_bits,
+                    p.max_dblk_page_nelmts_bits,
+                )?,
+                p.max_nelmts_bits,
+                c.chunk_size_len,
+                c.ea_header.max_idx_set,
+            )
+        };
+
+        let mut straddlers = Vec::new();
+
+        // The decoded data block the walk is currently inside, written back
+        // when the walk leaves it (or ends) having cleared an entry.
+        enum Dblk {
+            Unfiltered(ExtensibleArrayDataBlock),
+            Filtered(FilteredDataBlock),
+        }
+        let mut cache: Option<(u64, Dblk, bool)> = None;
+        let flush = |cache: &mut Option<(u64, Dblk, bool)>| -> IoResult<()> {
+            if let Some((addr, blk, dirty)) = cache.take() {
+                if dirty {
+                    let enc = match &blk {
+                        Dblk::Unfiltered(d) => d.encode(&self.ctx, max_nelmts_bits),
+                        Dblk::Filtered(d) => d.encode(&self.ctx, max_nelmts_bits, chunk_size_len),
+                    };
+                    self.handle.write_at(addr, &enc)?;
+                }
+            }
+            Ok(())
+        };
+        // Consecutive slots resolve through the same super block, so keep
+        // the last decode. Super blocks are only read here — clearing a
+        // data-block element never moves the block — so it never dirties.
+        let mut sblk_cache: Option<(usize, ExtensibleArraySuperBlock)> = None;
+
+        let mut slot = 0u64;
+        while slot < max_idx {
+            let coords = crate::io::chunk_grid::coords_of(
+                &geo.dims,
+                geo.max_dims.as_deref(),
+                &geo.chunk_dims,
+                slot,
+            )?;
+            if !chunk_outside_extent(&coords, &geo.chunk_dims, new_dims) {
+                if chunk_straddles_extent(&coords, &geo.chunk_dims, new_dims) {
+                    straddlers.push(coords);
+                }
+                slot += 1;
+                continue;
+            }
+            match ea_geo.locate(slot)? {
+                EaLoc::Index { elem } => {
+                    let c = m.chunked.as_mut().unwrap();
+                    if is_filtered {
+                        let fiblk = c.filt_iblk.as_mut().unwrap();
+                        let e = fiblk.elements[elem];
+                        if e.addr != UNDEF_ADDR {
+                            if !self.swmr_active {
+                                self.allocator.free(e.addr, e.nbytes);
+                            }
+                            fiblk.elements[elem] = FilteredChunkEntry {
+                                addr: UNDEF_ADDR,
+                                nbytes: 0,
+                                filter_mask: 0,
+                            };
+                        }
+                    } else {
+                        let a = c.ea_iblk.elements[elem];
+                        if a != UNDEF_ADDR {
+                            if !self.swmr_active {
+                                self.allocator.free(a, chunk_bytes);
+                            }
+                            c.ea_iblk.elements[elem] = UNDEF_ADDR;
+                        }
+                    }
+                    slot += 1;
+                }
+                EaLoc::Dblk(l) => {
+                    if l.paged {
+                        return Err(crate::io::IoError::InvalidState(format!(
+                            "chunk index {slot} lives in a paged extensible-array \
+                             data block, which is not yet supported"
+                        )));
+                    }
+                    let dblk_start = slot - l.offset_in_dblk;
+                    let dblk_end = dblk_start + l.dblk_nelmts;
+                    // Resolve the data block's address; an undefined super or
+                    // data block means nothing in its whole element range was
+                    // ever written, so the walk skips the range.
+                    let dblk_addr = {
+                        let c = m.chunked.as_ref().unwrap();
+                        match l.path {
+                            EaDblkPath::Direct { idx } => {
+                                if is_filtered {
+                                    c.filt_iblk.as_ref().unwrap().dblk_addrs[idx]
+                                } else {
+                                    c.ea_iblk.dblk_addrs[idx]
+                                }
+                            }
+                            EaDblkPath::ViaSblk {
+                                sblk_off,
+                                local_dblk,
+                                ndblks_in_sblk,
+                                ..
+                            } => {
+                                let sblk_addr = if is_filtered {
+                                    c.filt_iblk.as_ref().unwrap().sblk_addrs[sblk_off]
+                                } else {
+                                    c.ea_iblk.sblk_addrs[sblk_off]
+                                };
+                                if sblk_addr == UNDEF_ADDR {
+                                    UNDEF_ADDR
+                                } else {
+                                    if sblk_cache.as_ref().map(|&(o, _)| o) != Some(sblk_off) {
+                                        let buf = self.handle.read_at_most(sblk_addr, 65536)?;
+                                        let sb = ExtensibleArraySuperBlock::decode(
+                                            &buf,
+                                            &self.ctx,
+                                            max_nelmts_bits,
+                                            ndblks_in_sblk,
+                                            0,
+                                        )?;
+                                        sblk_cache = Some((sblk_off, sb));
+                                    }
+                                    sblk_cache.as_ref().unwrap().1.dblk_addrs[local_dblk]
+                                }
+                            }
+                        }
+                    };
+                    if dblk_addr == UNDEF_ADDR {
+                        slot = dblk_end;
+                        continue;
+                    }
+                    if cache.as_ref().map(|&(a, _, _)| a) != Some(dblk_addr) {
+                        flush(&mut cache)?;
+                        let buf = self.handle.read_at_most(dblk_addr, 65536)?;
+                        let blk = if is_filtered {
+                            Dblk::Filtered(FilteredDataBlock::decode(
+                                &buf,
+                                &self.ctx,
+                                max_nelmts_bits,
+                                l.dblk_nelmts as usize,
+                                chunk_size_len,
+                            )?)
+                        } else {
+                            Dblk::Unfiltered(ExtensibleArrayDataBlock::decode(
+                                &buf,
+                                &self.ctx,
+                                max_nelmts_bits,
+                                l.dblk_nelmts as usize,
+                            )?)
+                        };
+                        cache = Some((dblk_addr, blk, false));
+                    }
+                    let (_, blk, dirty) = cache.as_mut().unwrap();
+                    match blk {
+                        Dblk::Filtered(d) => {
+                            let e = d.elements[l.offset_in_dblk as usize];
+                            if e.addr != UNDEF_ADDR {
+                                if !self.swmr_active {
+                                    self.allocator.free(e.addr, e.nbytes);
+                                }
+                                d.elements[l.offset_in_dblk as usize] = FilteredChunkEntry {
+                                    addr: UNDEF_ADDR,
+                                    nbytes: 0,
+                                    filter_mask: 0,
+                                };
+                                *dirty = true;
+                            }
+                        }
+                        Dblk::Unfiltered(d) => {
+                            let a = d.elements[l.offset_in_dblk as usize];
+                            if a != UNDEF_ADDR {
+                                if !self.swmr_active {
+                                    self.allocator.free(a, chunk_bytes);
+                                }
+                                d.elements[l.offset_in_dblk as usize] = UNDEF_ADDR;
+                                *dirty = true;
+                            }
+                        }
+                    }
+                    slot += 1;
+                }
+            }
+        }
+        flush(&mut cache)?;
+        Ok(straddlers)
+    }
+
+    /// Fixed-array half of [`prune_chunks_beyond`](Self::prune_chunks_beyond):
+    /// the whole element array is in memory and flushed at close, so
+    /// clearing an entry is pure bookkeeping.
+    fn prune_fa_chunks(
+        &self,
+        index: usize,
+        geo: &ChunkGeometry,
+        new_dims: &[u64],
+    ) -> IoResult<Vec<Vec<u64>>> {
+        let ds = self.ds(index);
+        let mut m = ds.lock();
+        let is_filtered = m.filter_pipeline.is_some();
+        let chunk_bytes = geo.chunk_bytes();
+        let mut straddlers = Vec::new();
+        let fa = m.fixed_array.as_mut().unwrap();
+        let nslots = if is_filtered {
+            fa.fa_dblk.filtered_elements.len()
+        } else {
+            fa.fa_dblk.elements.len()
+        };
+        for lidx in 0..nslots {
+            let (addr, stored) = if is_filtered {
+                let e = &fa.fa_dblk.filtered_elements[lidx];
+                (e.address, e.chunk_size)
+            } else {
+                (fa.fa_dblk.elements[lidx], chunk_bytes)
+            };
+            if addr == UNDEF_ADDR {
+                continue;
+            }
+            let coords = crate::io::chunk_grid::coords_of(
+                &geo.dims,
+                geo.max_dims.as_deref(),
+                &geo.chunk_dims,
+                lidx as u64,
+            )?;
+            if chunk_outside_extent(&coords, &geo.chunk_dims, new_dims) {
+                if !self.swmr_active {
+                    self.allocator.free(addr, stored);
+                }
+                if is_filtered {
+                    fa.fa_dblk.filtered_elements[lidx] = FixedArrayFilteredChunkElement {
+                        address: UNDEF_ADDR,
+                        chunk_size: 0,
+                        filter_mask: 0,
+                    };
+                } else {
+                    fa.fa_dblk.elements[lidx] = UNDEF_ADDR;
+                }
+            } else if chunk_straddles_extent(&coords, &geo.chunk_dims, new_dims) {
+                straddlers.push(coords);
+            }
+        }
+        Ok(straddlers)
+    }
+
+    /// V2-B-tree half of [`prune_chunks_beyond`](Self::prune_chunks_beyond):
+    /// drop the records of chunks beyond the extent — the next flush
+    /// re-serializes the smaller tree over the node pool and releases the
+    /// surplus node blocks.
+    fn prune_bt2_chunks(
+        &self,
+        index: usize,
+        geo: &ChunkGeometry,
+        new_dims: &[u64],
+    ) -> IoResult<Vec<Vec<u64>>> {
+        let ds = self.ds(index);
+        let mut m = ds.lock();
+        let chunk_bytes = geo.chunk_bytes();
+        let swmr = self.swmr_active;
+        let mut straddlers = Vec::new();
+        let bt2 = m.btree_v2.as_mut().unwrap();
+        if bt2.index.filtered {
+            bt2.index.filtered_records.retain(|r| {
+                if chunk_outside_extent(&r.scaled_offsets, &geo.chunk_dims, new_dims) {
+                    if !swmr {
+                        self.allocator.free(r.chunk_address, r.chunk_size);
+                    }
+                    false
+                } else {
+                    if chunk_straddles_extent(&r.scaled_offsets, &geo.chunk_dims, new_dims) {
+                        straddlers.push(r.scaled_offsets.clone());
+                    }
+                    true
+                }
+            });
+        } else {
+            bt2.index.records.retain(|r| {
+                if chunk_outside_extent(&r.scaled_offsets, &geo.chunk_dims, new_dims) {
+                    if !swmr {
+                        self.allocator.free(r.chunk_address, chunk_bytes);
+                    }
+                    false
+                } else {
+                    if chunk_straddles_extent(&r.scaled_offsets, &geo.chunk_dims, new_dims) {
+                        straddlers.push(r.scaled_offsets.clone());
+                    }
+                    true
+                }
+            });
+        }
+        Ok(straddlers)
     }
 
     /// Flush a chunked dataset's index structures to disk (durable).

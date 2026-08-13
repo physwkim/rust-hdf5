@@ -1695,11 +1695,14 @@ impl H5Dataset {
     ///
     /// Unlike [`extend`](Self::extend), which only grows, this can reduce a
     /// dimension — for example to correct an over-extended frame count
-    /// after writing a partial multi-frame chunk. Shrinking changes the
-    /// logical dataspace only: data in chunks beyond the new extent stays
-    /// in the file but is no longer visible on read, exactly as libhdf5's
-    /// `H5Dset_extent` behaves. The new extent must not exceed the
-    /// dataset's maximum dimensions.
+    /// after writing a partial multi-frame chunk. Shrinking prunes the
+    /// stored chunks the way libhdf5's `H5Dset_extent` does: a chunk
+    /// entirely beyond the new extent is removed from the chunk index and
+    /// its storage freed for reuse, and a chunk the new extent cuts
+    /// through has its out-of-extent region overwritten with the fill
+    /// value — so growing the extent back exposes fill values, not the
+    /// old data. The new extent must not exceed the dataset's maximum
+    /// dimensions.
     pub fn set_extent(&self, new_dims: &[usize]) -> Result<()> {
         match &self.info {
             DatasetInfo::Writer { index, .. } => {

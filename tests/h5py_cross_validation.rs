@@ -974,3 +974,39 @@ fn attr_numeric_reads_from_h5py_written_file() {
     assert_eq!(be.read_numeric_as::<i64>().unwrap(), vec![100_000]);
     std::fs::remove_file(&path).ok();
 }
+
+/// A dataset shrunk with `set_extent` (pruning chunks from the index) and
+/// grown back is read by h5py/libhdf5 as retained data plus fill values —
+/// the pruned entries must leave the extensible-array index in a state
+/// libhdf5 accepts.
+#[test]
+fn shrunk_and_regrown_dataset_reads_fill_via_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("shrink_prune");
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([24usize, 4])
+            .chunk(&[2, 4])
+            .max_shape(&[None, Some(4)])
+            .create("data")
+            .unwrap();
+        let vals: Vec<i32> = (0..24 * 4).collect();
+        ds.write_slice(&[0, 0], &[24, 4], &vals).unwrap();
+        ds.set_extent(&[3, 4]).unwrap();
+        ds.set_extent(&[24, 4]).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (24, 4), d.shape\n\
+         v = d[...]\n\
+         exp = np.arange(96, dtype='int32').reshape(24, 4)\n\
+         assert (v[:3] == exp[:3]).all(), v[:3]\n\
+         assert (v[3:] == 0).all(), v[3:]\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
