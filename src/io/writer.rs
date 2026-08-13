@@ -444,6 +444,41 @@ fn swmr_attr_error(name: &str) -> crate::io::IoError {
     ))
 }
 
+/// One collection block with free space that a later vlen insert may
+/// fill — an entry in the writer's CWFS list (libhdf5 `f->shared->cwfs`).
+struct CwfsEntry {
+    /// Block address of the collection.
+    addr: u64,
+    /// Declared block size; never changes after allocation.
+    size: usize,
+    /// Bytes its free-space marker owns, per
+    /// [`GlobalHeapCollection::free_space_at`](crate::format::global_heap::GlobalHeapCollection::free_space_at).
+    free: usize,
+}
+
+/// Maximum CWFS entries tracked — libhdf5's `H5HG_NCWFS` (H5HGpkg.h).
+const H5HG_NCWFS: usize = 16;
+
+/// Record a collection with `free` bytes in the CWFS list: update its
+/// entry if present, append while the list is short, and otherwise
+/// replace the entry with the least free space when this one has more —
+/// the retention rule of libhdf5's `H5HG_insert`.
+fn cwfs_note(cwfs: &mut Vec<CwfsEntry>, addr: u64, size: usize, free: usize) {
+    if let Some(p) = cwfs.iter().position(|e| e.addr == addr) {
+        cwfs[p].free = free;
+        return;
+    }
+    if cwfs.len() < H5HG_NCWFS {
+        cwfs.insert(0, CwfsEntry { addr, size, free });
+        return;
+    }
+    if let Some(p) = (0..cwfs.len()).min_by_key(|&p| cwfs[p].free) {
+        if free > cwfs[p].free {
+            cwfs[p] = CwfsEntry { addr, size, free };
+        }
+    }
+}
+
 /// The uniform rejection for `delete_dataset` / `delete_group` while SWMR
 /// streaming is active: deleting frees the object's blocks, and a live
 /// reader may hold any of their addresses.
@@ -755,6 +790,18 @@ pub struct Hdf5Writer {
     /// libhdf5's `H5D__chunk_file_alloc`, which skips `H5MF_xfree` under
     /// `H5F_ACC_SWMR_WRITE`.
     swmr_active: bool,
+    /// Collections with free space — libhdf5's `f->shared->cwfs` list. A
+    /// vlen insert fills these partially-filled collection blocks before
+    /// creating a new one, so many small writes share 4096-byte blocks
+    /// instead of each taking their own. Entries hold `(addr, block size,
+    /// free bytes)` hints; the block on disk stays the single truth for
+    /// contents, and only the two functions that rewrite collection blocks
+    /// ([`insert_vlen_objects`](Self::insert_vlen_objects) and
+    /// [`release_vlen_references`](Self::release_vlen_references)) may
+    /// update this list. In-memory only, like the allocator's free list:
+    /// a reopened file's free space is rediscovered as releases touch its
+    /// collections. Capped at [`H5HG_NCWFS`] entries.
+    cwfs: Slot<Vec<CwfsEntry>>,
     /// Address of the root group object header (set after first finalize).
     root_group_addr: Option<u64>,
     /// Size of the encoded root group object header (for in-place rewrites).
@@ -813,6 +860,7 @@ impl Hdf5Writer {
             libver_latest: false,
             closed: false,
             swmr_active: false,
+            cwfs: Slot::new(Vec::new()),
             root_group_addr: None,
             root_group_encoded_size: 0,
             superseded_root_header: None,
@@ -1385,6 +1433,7 @@ impl Hdf5Writer {
             libver_latest: false,
             closed: false,
             swmr_active: false,
+            cwfs: Slot::new(Vec::new()),
             root_group_addr: None,
             root_group_encoded_size: 0,
             superseded_root_header: Some((root_addr, root_header_size as u64)),
@@ -3087,43 +3136,156 @@ impl Hdf5Writer {
         }
     }
 
+    /// Store each of `items` as a global heap object and return its
+    /// placement `(collection address, object index)`, in input order —
+    /// the writer side of libhdf5's `H5HG_insert`.
+    ///
+    /// Placement follows libhdf5: a collection from the CWFS list takes an
+    /// item when its free space holds the object *and* a residual
+    /// free-space marker header (`encode_at_size` always emits the
+    /// marker); what no listed collection can take goes into a fresh
+    /// collection, spilling into another at the 65535-object index cap.
+    /// One batch may therefore span several collections — invisible to
+    /// readers, which resolve each reference's own collection address. An
+    /// empty batch allocates nothing: an empty collection still encodes
+    /// to the 4096-byte `H5HG_MINALLOC` minimum, a block nothing would
+    /// reference. libhdf5 additionally tries to extend a nearly-full
+    /// collection's block in place (`H5MF_try_extend`); this writer does
+    /// not — an oversized item always starts a fresh collection.
+    ///
+    /// The `cwfs` lock is held across every read-modify-rewrite of a
+    /// listed collection block: it serializes concurrent inserts (two
+    /// datasets' writers can pack the same block) and inserts against
+    /// [`release_vlen_references`](Self::release_vlen_references), which
+    /// rewrites the same blocks when objects are freed.
+    ///
+    /// Under SWMR the CWFS list is neither consulted nor updated and every
+    /// batch gets fresh collections: packing rewrites a block a streaming
+    /// reader may be mid-walk on — the same reason `place_chunk` keeps a
+    /// relocated chunk's old block.
+    fn insert_vlen_objects(&self, items: &[&[u8]]) -> IoResult<Vec<(u64, u16)>> {
+        use crate::format::global_heap::{GlobalHeapCollection, GlobalHeapObject};
+
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let objhdr = GlobalHeapCollection::object_disk_size(&self.ctx, 0);
+        let mut placements = Vec::with_capacity(items.len());
+        let mut i = 0;
+
+        // Pack into listed collections while one can take the next item.
+        if !self.swmr_active {
+            let mut cwfs = self.cwfs.lock();
+            while i < items.len() {
+                let need = GlobalHeapCollection::object_disk_size(&self.ctx, items[i].len());
+                let Some(pos) = cwfs.iter().position(|e| e.free >= need + objhdr) else {
+                    break;
+                };
+                let (addr, size) = (cwfs[pos].addr, cwfs[pos].size);
+                let image = self.handle.read_at(addr, size)?;
+                let (mut gcol, _) = GlobalHeapCollection::decode(&image[..size], &self.ctx)?;
+                // The disk is the truth for free space; the entry is a hint.
+                let Some(mut free) = gcol.free_space_at(&self.ctx, size) else {
+                    cwfs.remove(pos);
+                    continue;
+                };
+                let mut next_idx = gcol.max_index();
+                let mut took = false;
+                while i < items.len() && next_idx < u16::MAX {
+                    let need = GlobalHeapCollection::object_disk_size(&self.ctx, items[i].len());
+                    if free < need + objhdr {
+                        break;
+                    }
+                    next_idx += 1;
+                    gcol.objects.push(GlobalHeapObject {
+                        index: next_idx,
+                        ref_count: 0,
+                        data: items[i].to_vec(),
+                    });
+                    placements.push((addr, next_idx));
+                    free -= need;
+                    took = true;
+                    i += 1;
+                }
+                if took {
+                    let rewritten = gcol.encode_at_size(&self.ctx, size)?;
+                    self.handle.write_at(addr, &rewritten)?;
+                    // Correct the entry to the measured free space and move
+                    // it to the front — libhdf5 keeps `cwfs` in
+                    // most-recently-used order.
+                    let mut e = cwfs.remove(pos);
+                    e.free = free;
+                    cwfs.insert(0, e);
+                } else if next_idx == u16::MAX {
+                    // At the index cap nothing can be inserted no matter the
+                    // free space; drop the entry or the scan re-picks it
+                    // forever. (A removal can lower the top index again, and
+                    // the release side re-lists the collection then.)
+                    cwfs.remove(pos);
+                } else {
+                    // The hint overstated the block's free space — shrink it
+                    // to the measured value so the scan moves on.
+                    cwfs[pos].free = free;
+                }
+            }
+        }
+
+        // What remains goes into fresh collections.
+        while i < items.len() {
+            let mut gcol = GlobalHeapCollection::new();
+            // Objects are pushed with a running index: `add_object` rescans
+            // for the max index per call, O(n²) across a spill-sized batch.
+            let mut next_idx: u16 = 0;
+            while i < items.len() && next_idx < u16::MAX {
+                next_idx += 1;
+                gcol.objects.push(GlobalHeapObject {
+                    index: next_idx,
+                    ref_count: 0,
+                    data: items[i].to_vec(),
+                });
+                i += 1;
+            }
+            let encoded = gcol.encode(&self.ctx);
+            let addr = self.allocator.allocate(encoded.len() as u64);
+            self.handle.write_at(addr, &encoded)?;
+            for idx in 1..=next_idx {
+                placements.push((addr, idx));
+            }
+            // List the block's leftover free space for later inserts — the
+            // minimum-size padding of a small batch is most of 4096 bytes.
+            // Below two object headers not even an empty object fits.
+            if !self.swmr_active {
+                if let Some(free) = gcol.free_space_at(&self.ctx, encoded.len()) {
+                    if free >= 2 * objhdr {
+                        cwfs_note(&mut self.cwfs.lock(), addr, encoded.len(), free);
+                    }
+                }
+            }
+        }
+        Ok(placements)
+    }
+
     /// Create a variable-length string dataset and write string data.
     ///
-    /// Stores strings in a global heap collection. The dataset raw data
-    /// consists of vlen references (collection_addr + object_index pairs).
+    /// Stores strings in the global heap. The dataset raw data consists of
+    /// vlen references (collection_addr + object_index pairs).
     pub fn create_vlen_string_dataset(&self, name: &str, strings: &[&str]) -> IoResult<usize> {
-        use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+        use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
 
         let create = self.begin_create(name)?;
         let num_strings = strings.len() as u64;
 
-        // Build a global heap collection with all strings
-        let mut gcol = GlobalHeapCollection::new();
-        let mut obj_indices = Vec::with_capacity(strings.len());
-        for s in strings {
-            let idx = gcol.add_object(s.as_bytes().to_vec())?;
-            obj_indices.push(idx);
-        }
-
-        // An empty batch must not reach the heap write: an empty collection
-        // still encodes to the 4096-byte `H5HG_MINALLOC` minimum — a block
-        // nothing references. The reference loop below is empty then, so
-        // the placeholder address is never used.
-        let gcol_addr = if strings.is_empty() {
-            UNDEF_ADDR
-        } else {
-            let gcol_encoded = gcol.encode(&self.ctx);
-            let addr = self.allocator.allocate(gcol_encoded.len() as u64);
-            self.handle.write_at(addr, &gcol_encoded)?;
-            addr
-        };
+        // Store the strings as heap objects; a batch that fits an earlier
+        // collection's free space shares its block.
+        let items: Vec<&[u8]> = strings.iter().map(|s| s.as_bytes()).collect();
+        let placements = self.insert_vlen_objects(&items)?;
 
         // Build raw data: vlen references
         let ref_size = crate::format::global_heap::vlen_reference_size(&self.ctx);
         let data_size = (num_strings as usize) * ref_size;
         let mut raw_data = Vec::with_capacity(data_size);
-        for (i, &obj_idx) in obj_indices.iter().enumerate() {
+        for (i, &(gcol_addr, obj_idx)) in placements.iter().enumerate() {
             let seq_len = crate::format::global_heap::vlen_seq_len(strings[i].len())?;
             raw_data.extend_from_slice(&encode_vlen_reference(
                 seq_len,
@@ -3178,35 +3340,21 @@ impl Hdf5Writer {
     /// of base (`u8`) elements, i.e. the byte length; no null terminator is
     /// appended.
     pub fn create_vlen_bytes_dataset(&self, name: &str, items: &[&[u8]]) -> IoResult<usize> {
-        use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+        use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
 
         let create = self.begin_create(name)?;
         let num_items = items.len() as u64;
 
-        // Build a global heap collection with all byte arrays.
-        let mut gcol = GlobalHeapCollection::new();
-        let mut obj_indices = Vec::with_capacity(items.len());
-        for item in items {
-            let idx = gcol.add_object(item.to_vec())?;
-            obj_indices.push(idx);
-        }
-
-        // Empty batch: no heap write, as in `create_vlen_string_dataset`.
-        let gcol_addr = if items.is_empty() {
-            UNDEF_ADDR
-        } else {
-            let gcol_encoded = gcol.encode(&self.ctx);
-            let addr = self.allocator.allocate(gcol_encoded.len() as u64);
-            self.handle.write_at(addr, &gcol_encoded)?;
-            addr
-        };
+        // Store the byte arrays as heap objects, sharing collection blocks
+        // as `create_vlen_string_dataset` does.
+        let placements = self.insert_vlen_objects(items)?;
 
         // Build raw data: one vlen reference per item.
         let ref_size = crate::format::global_heap::vlen_reference_size(&self.ctx);
         let data_size = (num_items as usize) * ref_size;
         let mut raw_data = Vec::with_capacity(data_size);
-        for (i, &obj_idx) in obj_indices.iter().enumerate() {
+        for (i, &(gcol_addr, obj_idx)) in placements.iter().enumerate() {
             // base is u8, so element count == byte count.
             let seq_len = crate::format::global_heap::vlen_seq_len(items[i].len())?;
             raw_data.extend_from_slice(&encode_vlen_reference(
@@ -3264,37 +3412,23 @@ impl Hdf5Writer {
         chunk_size: usize,
         pipeline: FilterPipeline,
     ) -> IoResult<usize> {
-        use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+        use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
 
         let create = self.begin_create(name)?;
         let num_strings = strings.len() as u64;
         validate_chunk_geometry(&[num_strings], &[num_strings], &[chunk_size as u64])?;
 
-        // Build a global heap collection with all strings
-        let mut gcol = GlobalHeapCollection::new();
-        let mut obj_indices = Vec::with_capacity(strings.len());
-        for s in strings {
-            let idx = gcol.add_object(s.as_bytes().to_vec())?;
-            obj_indices.push(idx);
-        }
-
-        // Encode and write the global heap collection
-        let gcol_encoded = gcol.encode(&self.ctx);
-        let gcol_addr = if strings.is_empty() {
-            // Empty batch: no heap write, as in `create_vlen_string_dataset`.
-            UNDEF_ADDR
-        } else {
-            let addr = self.allocator.allocate(gcol_encoded.len() as u64);
-            self.handle.write_at(addr, &gcol_encoded)?;
-            addr
-        };
+        // Store the strings as heap objects; the geometry validation above
+        // must precede this so a refused call allocates nothing.
+        let items: Vec<&[u8]> = strings.iter().map(|s| s.as_bytes()).collect();
+        let placements = self.insert_vlen_objects(&items)?;
 
         // Build raw data: vlen references
         let ref_size = crate::format::global_heap::vlen_reference_size(&self.ctx);
         let data_size = (num_strings as usize) * ref_size;
         let mut raw_data = Vec::with_capacity(data_size);
-        for (i, &obj_idx) in obj_indices.iter().enumerate() {
+        for (i, &(gcol_addr, obj_idx)) in placements.iter().enumerate() {
             let seq_len = crate::format::global_heap::vlen_seq_len(strings[i].len())?;
             raw_data.extend_from_slice(&encode_vlen_reference(
                 seq_len,
@@ -3454,7 +3588,7 @@ impl Hdf5Writer {
     /// Creates a new global heap collection for the strings, builds vlen
     /// references, and appends them as new chunks to the dataset.
     pub fn append_vlen_strings(&self, ds_index: usize, strings: &[&str]) -> IoResult<()> {
-        use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+        use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
 
         if strings.is_empty() {
@@ -3493,21 +3627,15 @@ impl Hdf5Writer {
             .to_vec();
         let dims = self.dataset_dims(ds_index).to_vec();
 
-        // Build a new global heap collection for this batch
-        let mut gcol = GlobalHeapCollection::new();
-        let mut obj_indices = Vec::with_capacity(strings.len());
-        for s in strings {
-            let idx = gcol.add_object(s.as_bytes().to_vec())?;
-            obj_indices.push(idx);
-        }
-        let gcol_encoded = gcol.encode(&self.ctx);
-        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
-        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+        // Store the batch's strings as heap objects; a batch that fits an
+        // earlier collection's free space shares its block.
+        let items: Vec<&[u8]> = strings.iter().map(|s| s.as_bytes()).collect();
+        let placements = self.insert_vlen_objects(&items)?;
 
         // Build raw vlen reference bytes
         let ref_size = crate::format::global_heap::vlen_reference_size(&self.ctx);
         let mut raw = Vec::with_capacity(strings.len() * ref_size);
-        for (i, &obj_idx) in obj_indices.iter().enumerate() {
+        for (i, &(gcol_addr, obj_idx)) in placements.iter().enumerate() {
             let seq_len = crate::format::global_heap::vlen_seq_len(strings[i].len())?;
             raw.extend_from_slice(&encode_vlen_reference(
                 seq_len,
@@ -3579,8 +3707,8 @@ impl Hdf5Writer {
     /// variable-length string dataset, leaving its extent and every other
     /// element alone.
     ///
-    /// The replacements go into a fresh global heap collection and only the
-    /// vlen references of the named elements are rewritten, so the cost is the
+    /// The replacements go into the global heap and only the vlen
+    /// references of the named elements are rewritten, so the cost is the
     /// new strings plus the chunks those references live in — not the column.
     /// The objects the old references pointed at are freed *before* the
     /// replacement is allocated, so repeated updates reuse space instead of
@@ -3598,14 +3726,10 @@ impl Hdf5Writer {
         start: u64,
         strings: &[&str],
     ) -> IoResult<()> {
-        use crate::format::global_heap::{
-            encode_vlen_reference, vlen_reference_size, GlobalHeapCollection,
-        };
+        use crate::format::global_heap::{encode_vlen_reference, vlen_reference_size};
         use crate::format::messages::datatype::DatatypeMessage;
 
-        // An empty batch must not reach the heap write below: an empty
-        // collection still encodes to the 4096-byte `H5HG_MINALLOC` minimum,
-        // so the file would grow by a block nothing references.
+        // An empty batch is a no-op: nothing to replace, nothing to free.
         if strings.is_empty() {
             return Ok(());
         }
@@ -3662,12 +3786,6 @@ impl Hdf5Writer {
         }
         ensure_vlen_charset(charset, strings)?;
 
-        // One collection for the batch, as `append_vlen_strings` does.
-        let mut gcol = GlobalHeapCollection::new();
-        let mut obj_indices = Vec::with_capacity(strings.len());
-        for s in strings {
-            obj_indices.push(gcol.add_object(s.as_bytes().to_vec())?);
-        }
         let ref_size = vlen_reference_size(&self.ctx);
 
         // Elements the append buffer holds are not in the chunks yet: hand
@@ -3691,12 +3809,14 @@ impl Hdf5Writer {
         // write below leaves the dataset's old references dangling.
         self.release_vlen_references(&superseded)?;
 
-        let gcol_encoded = gcol.encode(&self.ctx);
-        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
-        self.handle.write_at(gcol_addr, &gcol_encoded)?;
+        // The insert comes after the release above so the space the release
+        // recovered — a freed block, or in-collection bytes the release just
+        // listed in `cwfs` — can satisfy this batch.
+        let items: Vec<&[u8]> = strings.iter().map(|s| s.as_bytes()).collect();
+        let placements = self.insert_vlen_objects(&items)?;
 
         let mut refs = Vec::with_capacity(strings.len() * ref_size);
-        for (i, &obj_idx) in obj_indices.iter().enumerate() {
+        for (i, &(gcol_addr, obj_idx)) in placements.iter().enumerate() {
             refs.extend_from_slice(&encode_vlen_reference(
                 crate::format::global_heap::vlen_seq_len(strings[i].len())?,
                 gcol_addr,
@@ -3796,6 +3916,9 @@ impl Hdf5Writer {
     /// the object leaves its collection, the collection is rewritten at its
     /// existing size with the recovered bytes given to the free-space marker,
     /// and a collection that ends up empty returns its block to the allocator.
+    /// A rewritten collection's recovered space is listed in `cwfs` for
+    /// [`insert_vlen_objects`](Self::insert_vlen_objects) to pack into; a
+    /// freed block leaves the list.
     /// A nil reference (address 0 or `UNDEF_ADDR`) names no object. The
     /// address decides, not the sequence length: this crate's writers store
     /// even the empty string as a real heap object, so a zero-length reference
@@ -3845,6 +3968,12 @@ impl Hdf5Writer {
             per_collection.entry(addr).or_default().push(idx);
         }
 
+        // The `cwfs` lock is held across the sweep: it serializes these
+        // collection-block rewrites (and frees) against
+        // `insert_vlen_objects`, which may be packing new objects into the
+        // same blocks.
+        let objhdr = GlobalHeapCollection::object_disk_size(&self.ctx, 0);
+        let mut cwfs = self.cwfs.lock();
         for (addr, indices) in per_collection {
             // A collection is at least 4096 bytes (H5HG_MINALLOC) and most are
             // exactly that, so one read usually covers the whole image; only
@@ -3869,9 +3998,19 @@ impl Hdf5Writer {
             }
             if gcol.is_empty() {
                 self.allocator.free(addr, declared as u64);
+                // The block is gone; a lingering entry would let an insert
+                // pack into space the allocator can hand to anything.
+                cwfs.retain(|e| e.addr != addr);
             } else {
                 let rewritten = gcol.encode_at_size(&self.ctx, declared)?;
                 self.handle.write_at(addr, &rewritten)?;
+                // The recovered bytes are packable now — list them, the way
+                // libhdf5's `H5HG_remove` adds the heap to `cwfs`.
+                if let Some(free) = gcol.free_space_at(&self.ctx, declared) {
+                    if free >= 2 * objhdr {
+                        cwfs_note(&mut cwfs, addr, declared, free);
+                    }
+                }
             }
         }
         Ok(())
@@ -3907,22 +4046,16 @@ impl Hdf5Writer {
     /// `set_attr_string` value is always stored as a true variable-length
     /// string rather than the fixed-length string it used to be.
     ///
-    /// One global heap collection is allocated per attribute, matching the
-    /// per-call collection of [`create_vlen_string_dataset`](Self::create_vlen_string_dataset).
-    /// A single shared attribute heap would avoid the per-attribute padding
-    /// (`H5HG_MINALLOC` = 4096 bytes) but is a heap-management change that
-    /// would also need to cover the dataset path.
+    /// The string's heap object is placed by
+    /// [`insert_vlen_objects`](Self::insert_vlen_objects), so consecutive
+    /// attributes pack into a shared collection instead of each paying the
+    /// 4096-byte `H5HG_MINALLOC` minimum for a block that holds one string.
     fn vlen_string_attribute(&self, name: &str, value: &str) -> IoResult<AttributeMessage> {
-        use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+        use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::dataspace::DataspaceMessage;
         use crate::format::messages::datatype::DatatypeMessage;
 
-        let mut gcol = GlobalHeapCollection::new();
-        let obj_idx = gcol.add_object(value.as_bytes().to_vec())?;
-        let gcol_encoded = gcol.encode(&self.ctx);
-        let gcol_addr = self.allocator.allocate(gcol_encoded.len() as u64);
-        self.handle.write_at(gcol_addr, &gcol_encoded)?;
-
+        let (gcol_addr, obj_idx) = self.insert_vlen_objects(&[value.as_bytes()])?[0];
         let seq_len = crate::format::global_heap::vlen_seq_len(value.len())?;
         let data = encode_vlen_reference(seq_len, gcol_addr, obj_idx as u32, &self.ctx);
         Ok(AttributeMessage {
@@ -3945,16 +4078,18 @@ impl Hdf5Writer {
     /// that shape.
     ///
     /// The caller owns the invariant that `values.len()` equals the product of
-    /// `shape` (the public setters validate it before calling). One global heap
-    /// collection is allocated for the whole array (all elements share it),
-    /// matching the per-attribute collection of the scalar path.
+    /// `shape` (the public setters validate it before calling). The element
+    /// objects are placed by
+    /// [`insert_vlen_objects`](Self::insert_vlen_objects) — a zero-element
+    /// array allocates nothing, and each reference carries its element's
+    /// own collection address.
     fn vlen_string_array_attribute(
         &self,
         name: &str,
         values: &[&str],
         shape: &[u64],
     ) -> IoResult<AttributeMessage> {
-        use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+        use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::dataspace::DataspaceMessage;
         use crate::format::messages::datatype::DatatypeMessage;
 
@@ -3964,31 +4099,15 @@ impl Hdf5Writer {
             "vlen_string_array_attribute values.len() must equal product(shape)"
         );
 
-        let mut gcol = GlobalHeapCollection::new();
-        // (byte length, heap object index) per element, in order.
-        let mut entries: Vec<(u32, u16)> = Vec::with_capacity(values.len());
-        for v in values {
-            let obj_idx = gcol.add_object(v.as_bytes().to_vec())?;
-            entries.push((crate::format::global_heap::vlen_seq_len(v.len())?, obj_idx));
-        }
-        // A zero-element array attribute must not reach the heap write: an
-        // empty collection still encodes to the 4096-byte `H5HG_MINALLOC`
-        // minimum — a block nothing references.
-        let gcol_addr = if values.is_empty() {
-            UNDEF_ADDR
-        } else {
-            let gcol_encoded = gcol.encode(&self.ctx);
-            let addr = self.allocator.allocate(gcol_encoded.len() as u64);
-            self.handle.write_at(addr, &gcol_encoded)?;
-            addr
-        };
+        let items: Vec<&[u8]> = values.iter().map(|v| v.as_bytes()).collect();
+        let placements = self.insert_vlen_objects(&items)?;
 
         let mut data = Vec::with_capacity(values.len() * 16);
-        for (len, obj_idx) in &entries {
+        for (i, &(gcol_addr, obj_idx)) in placements.iter().enumerate() {
             data.extend_from_slice(&encode_vlen_reference(
-                *len,
+                crate::format::global_heap::vlen_seq_len(values[i].len())?,
                 gcol_addr,
-                *obj_idx as u32,
+                obj_idx as u32,
                 &self.ctx,
             ));
         }

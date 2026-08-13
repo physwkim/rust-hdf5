@@ -16,6 +16,19 @@
 
 ### Fixed
 
+- Vlen writes now pack their heap objects into existing global-heap
+  collections with free space, tracking them the way libhdf5's CWFS
+  list (`H5HG_insert`) does, and a batch of more than 65535 strings
+  spills into a further collection instead of failing with "global
+  heap collection is full". Every vlen write call used to allocate its
+  own collection, so each small string attribute or dataset paid the
+  4096-byte `H5HG_MINALLOC` minimum for a block that held one value,
+  and one call could never exceed a single collection's 16-bit object
+  index space. Freed space from replaced or deleted vlen values is
+  re-listed for packing, so replace loops settle inside one collection.
+  Under SWMR active, batches keep getting fresh collections — packing
+  rewrites a block a streaming reader may be walking.
+
 - `delete_dataset` and `delete_group` now free the file space the
   deleted objects owned, the way libhdf5's `H5O_delete` does: chunk
   blocks and the chunk-index structures themselves (extensible-array

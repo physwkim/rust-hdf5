@@ -515,11 +515,12 @@ fn attribute_changes_during_swmr_are_refused() {
         w.close().unwrap();
     }
 
-    // No stranded collection: the refused new-attribute call must not have
-    // written a heap block ("GCOL" appears once per pre-start vlen attr).
+    // No stranded collection: the refused post-start calls must not have
+    // written a heap block. The two pre-start vlen attrs pack into one
+    // shared collection, so exactly one "GCOL" may appear.
     let bytes = std::fs::read(&path).unwrap();
     let gcols = bytes.windows(4).filter(|w| *w == b"GCOL").count();
-    assert_eq!(gcols, 2, "only NX_class and units may own a collection");
+    assert_eq!(gcols, 1, "only the shared pre-start collection may exist");
 
     // The pre-start values are what the file holds.
     let file = rust_hdf5::H5File::open(&path).unwrap();

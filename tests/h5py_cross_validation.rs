@@ -1010,3 +1010,57 @@ fn shrunk_and_regrown_dataset_reads_fill_via_h5py() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// A vlen batch past the 65535-object collection index cap spills into a
+/// second collection; libhdf5 must resolve references across both — the
+/// per-element collection address is all it needs.
+#[test]
+fn spilled_vlen_batch_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("vlen_spill");
+    {
+        let file = H5File::create(&path).unwrap();
+        let strings = vec!["x"; 65537];
+        file.write_vlen_strings("bulk", &strings).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "d = f['bulk']\n\
+         assert d.shape == (65537,), d.shape\n\
+         v = d[...]\n\
+         assert v[0] == b'x' and v[65535] == b'x' and v[65536] == b'x', v[:3]\n\
+         assert (v == b'x').all()\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// Small vlen attributes and datasets packed into one shared collection
+/// (the writer's CWFS path) stay readable: h5py resolves each reference
+/// by its own (address, index) pair regardless of who else shares the
+/// block.
+#[test]
+fn packed_shared_collection_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("vlen_packed");
+    {
+        let file = H5File::create(&path).unwrap();
+        let g = file.root_group().create_group("entry").unwrap();
+        g.set_attr_string("NX_class", "NXentry").unwrap();
+        g.set_attr_string("title", "packed heap").unwrap();
+        file.write_vlen_strings("notes", &["alpha", "beta"])
+            .unwrap();
+        file.write_vlen_strings("tags", &["red", "green"]).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "assert f['entry'].attrs['NX_class'] == 'NXentry'\n\
+         assert f['entry'].attrs['title'] == 'packed heap'\n\
+         assert list(f['notes'][...]) == [b'alpha', b'beta']\n\
+         assert list(f['tags'][...]) == [b'red', b'green']\n",
+    );
+    std::fs::remove_file(&path).ok();
+}

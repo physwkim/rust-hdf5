@@ -120,6 +120,32 @@ impl GlobalHeapCollection {
         self.objects.is_empty()
     }
 
+    /// The bytes the free-space marker owns (its own 16-byte header
+    /// included) when this collection is encoded into a `collection_size`
+    /// block, or `None` when the objects (plus that marker header) do not
+    /// fit — the fit test [`encode_at_size`](Self::encode_at_size) applies.
+    pub fn free_space_at(&self, ctx: &FormatContext, collection_size: usize) -> Option<usize> {
+        let (header_size, objhdr_size, objects_size) = self.layout(ctx);
+        let content_size = header_size + objects_size + objhdr_size;
+        if collection_size < content_size {
+            return None;
+        }
+        Some(collection_size - header_size - objects_size)
+    }
+
+    /// The bytes an object of `data_len` occupies on disk: its aligned
+    /// header plus the 8-byte-aligned data. What one insert takes from a
+    /// collection's free space.
+    pub fn object_disk_size(ctx: &FormatContext, data_len: usize) -> usize {
+        let ss = ctx.sizeof_size as usize;
+        pad_to_8(2 + 2 + 4 + ss) + pad_to_8(data_len)
+    }
+
+    /// The highest object index in use (0 when the collection is empty).
+    pub fn max_index(&self) -> u16 {
+        self.objects.iter().map(|o| o.index).max().unwrap_or(0)
+    }
+
     /// Encode the collection into a byte vector.
     ///
     /// The encoded blob includes the GCOL header and all heap objects,
