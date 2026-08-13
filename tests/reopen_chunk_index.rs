@@ -157,6 +157,90 @@ fn reopened_fixed_array_dataset_takes_new_chunks() {
     cleanup(&path);
 }
 
+/// A paged FA data block (more than 1024 chunks) reconstructs on reopen:
+/// session 1 initializes only page 0, so page 1's bitmap bit is clear and
+/// its on-disk bytes are never decoded; session 2 writes through both
+/// pages and the whole array reads back. `open_append` used to leave any
+/// paged FA dataset as a re-link placeholder that refused writes.
+#[test]
+fn reopened_paged_fixed_array_dataset_takes_new_chunks() {
+    let path = unique_tmp("fa_paged_write");
+    let n = 1200usize;
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([n])
+            .chunk(&[1])
+            .max_shape(&[Some(n)])
+            .create("wide")
+            .unwrap();
+        // Elements 0..600 live in page 0 (elements 0..1024); page 1
+        // (elements 1024..1200) stays uninitialized on disk.
+        let front: Vec<i32> = (0..600).collect();
+        ds.write_slice(&[0], &[600], &front).unwrap();
+        file.close().unwrap();
+    }
+    {
+        let file = H5File::options().no_locking().open_rw(&path).unwrap();
+        let ds = file.dataset_writer("wide").unwrap();
+        let back: Vec<i32> = (600..n as i32).collect();
+        ds.write_slice(&[600], &[600], &back).unwrap();
+        file.close().unwrap();
+    }
+
+    let file = H5File::open(&path).unwrap();
+    let all: Vec<i32> = (0..n as i32).collect();
+    assert_eq!(
+        file.dataset("wide").unwrap().read_raw::<i32>().unwrap(),
+        all
+    );
+    drop(file);
+    cleanup(&path);
+}
+
+/// Deleting a reopened *paged* FA dataset must free all its chunks, the
+/// header, and the paged data block — the settled-size oracle again.
+#[test]
+fn reopen_session_delete_frees_paged_fixed_array_storage() {
+    let make = |file: &H5File, vals: &[i32]| {
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([1200usize])
+            .chunk(&[1])
+            .max_shape(&[Some(1200)])
+            .create("wide")
+            .unwrap();
+        ds.write_slice(&[0], &[1200], vals).unwrap();
+    };
+    let size_after = |cycles: usize| {
+        let path = unique_tmp(&format!("fa_paged_del_{cycles}"));
+        let vals: Vec<i32> = (0..1200).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            make(&file, &vals);
+            file.close().unwrap();
+        }
+        for _ in 0..cycles {
+            let file = H5File::options().no_locking().open_rw(&path).unwrap();
+            file.delete_dataset("wide").unwrap();
+            make(&file, &vals);
+            file.close().unwrap();
+        }
+        let read = H5File::open(&path).unwrap();
+        assert_eq!(
+            read.dataset("wide").unwrap().read_raw::<i32>().unwrap(),
+            vals
+        );
+        drop(read);
+        let n = std::fs::metadata(&path).unwrap().len();
+        cleanup(&path);
+        n
+    };
+
+    assert_eq!(size_after(6), size_after(2), "6 reopen cycles against 2");
+}
+
 /// The filtered-BT2 counterpart: compressed records decode back into the
 /// index (address, stored size, filter mask), a reopened write patches
 /// and adds tiles, and the whole grid reads back.

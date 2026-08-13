@@ -13,8 +13,9 @@ use crate::format::chunk_index::extensible_array::{
     EA_CLS_CHUNK, EA_CLS_FILT_CHUNK,
 };
 use crate::format::chunk_index::fixed_array::{
-    encode_filtered_page, encode_unfiltered_page, FixedArrayDataBlock,
-    FixedArrayFilteredChunkElement, FixedArrayHeader, FixedArrayPagedPrefix, FA_CLIENT_FILT_CHUNK,
+    decode_filtered_page, decode_unfiltered_page, encode_filtered_page, encode_unfiltered_page,
+    FixedArrayDataBlock, FixedArrayFilteredChunkElement, FixedArrayHeader, FixedArrayPagedPrefix,
+    FA_CLIENT_FILT_CHUNK,
 };
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::data_layout::{DataLayoutMessage, EarrayParams, FixedArrayParams};
@@ -205,6 +206,64 @@ fn encode_fixed_array_dblk(
         }
     }
     buf
+}
+
+/// Decode a fixed-array data block for the layout implied by `hdr` — the
+/// inverse of [`encode_fixed_array_dblk`], and the single decode dispatch
+/// over non-paged/paged × unfiltered/filtered.
+///
+/// For the paged layout, pages whose bitmap bit is clear are skipped, not
+/// decoded: libhdf5 never writes an uninitialized page, so its bytes are
+/// arbitrary and carry no valid checksum. Their elements stay at the
+/// undefined-address defaults, which is exactly what the bitmap means.
+fn decode_fixed_array_dblk(
+    ctx: &FormatContext,
+    hdr: &FixedArrayHeader,
+    buf: &[u8],
+    chunk_size_len: usize,
+) -> crate::format::FormatResult<FixedArrayDataBlock> {
+    let is_filtered = hdr.client_id == FA_CLIENT_FILT_CHUNK;
+    let num_elmts = hdr.num_elmts as usize;
+
+    if !hdr.is_paged() {
+        return if is_filtered {
+            FixedArrayDataBlock::decode_filtered(buf, ctx, num_elmts, chunk_size_len)
+        } else {
+            FixedArrayDataBlock::decode_unfiltered(buf, ctx, num_elmts)
+        };
+    }
+
+    let npages = hdr.npages() as usize;
+    let dblk_page_nelmts = hdr.dblk_page_nelmts() as usize;
+    let prefix = FixedArrayPagedPrefix::decode(buf, ctx, npages as u64)?;
+
+    let mut dblk = if is_filtered {
+        FixedArrayDataBlock::new_filtered(prefix.header_addr, num_elmts)
+    } else {
+        FixedArrayDataBlock::new_unfiltered(prefix.header_addr, num_elmts)
+    };
+    dblk.client_id = hdr.client_id;
+
+    // Pages follow the prefix back to back; every page spans the full
+    // `dblk_page_nelmts` stride except the last, which holds the remainder.
+    let mut pos = prefix.prefix_size;
+    for p in 0..npages {
+        let start = p * dblk_page_nelmts;
+        let end = ((p + 1) * dblk_page_nelmts).min(num_elmts);
+        let nelmts = end - start;
+        if prefix.page_initialized(p) {
+            let page_buf = buf.get(pos..).unwrap_or(&[]);
+            if is_filtered {
+                let elems = decode_filtered_page(page_buf, ctx, nelmts, chunk_size_len)?;
+                dblk.filtered_elements[start..end].clone_from_slice(&elems);
+            } else {
+                let addrs = decode_unfiltered_page(page_buf, ctx, nelmts)?;
+                dblk.elements[start..end].copy_from_slice(&addrs);
+            }
+        }
+        pos += nelmts * hdr.element_size as usize + 4;
+    }
+    Ok(dblk)
 }
 
 /// Interior-mutability cell for per-dataset write state, selected by feature.
@@ -1404,8 +1463,10 @@ impl Hdf5Writer {
                         // reopened dataset is writable and deletable, not
                         // re-link only — a placeholder made a delete free
                         // just the header and leak every chunk plus the
-                        // index. A paged data block (foreign files only;
-                        // this writer never creates one) stays placeholder.
+                        // index. Paged data blocks (any FA with more than
+                        // dblk_page_nelmts chunks, libhdf5 default 1024)
+                        // reconstruct through the same decode owner; only
+                        // pages the bitmap marks initialized are decoded.
                         let hdr_buf = handle.read_at_most(*index_address, 256)?;
                         let fa_header = FixedArrayHeader::decode(&hdr_buf, &ctx)?;
                         let is_filtered = fa_header.client_id == FA_CLIENT_FILT_CHUNK;
@@ -1420,24 +1481,16 @@ impl Hdf5Writer {
                         } else {
                             0
                         };
-                        if !fa_header.is_paged()
-                            && fa_header.data_blk_addr != UNDEF_ADDR
-                            && chunk_size_len <= 8
-                        {
-                            let num_elmts = fa_header.num_elmts as usize;
+                        if fa_header.data_blk_addr != UNDEF_ADDR && chunk_size_len <= 8 {
                             let dblk_size = fixed_array_dblk_disk_size(&ctx, &fa_header) as usize;
                             let dblk_buf =
                                 handle.read_at_most(fa_header.data_blk_addr, dblk_size)?;
-                            let fa_dblk = if is_filtered {
-                                FixedArrayDataBlock::decode_filtered(
-                                    &dblk_buf,
-                                    &ctx,
-                                    num_elmts,
-                                    chunk_size_len,
-                                )?
-                            } else {
-                                FixedArrayDataBlock::decode_unfiltered(&dblk_buf, &ctx, num_elmts)?
-                            };
+                            let fa_dblk = decode_fixed_array_dblk(
+                                &ctx,
+                                &fa_header,
+                                &dblk_buf,
+                                chunk_size_len,
+                            )?;
                             info.fixed_array = Some(FixedArrayDatasetInfo {
                                 chunk_dims: real_chunk_dims,
                                 fa_header_addr: *index_address,
@@ -8178,6 +8231,66 @@ mod tests {
             recovered.extend(addrs);
         }
         assert_eq!(recovered, dblk.elements);
+    }
+
+    #[test]
+    fn fixed_array_paged_decode_roundtrip_with_uninitialized_page() {
+        let ctx = FormatContext {
+            sizeof_addr: 8,
+            sizeof_size: 8,
+        };
+        let hdr = FixedArrayHeader::new_for_chunks(&ctx, 2500);
+        let npages = hdr.npages() as usize; // 3
+        let page = hdr.dblk_page_nelmts() as usize; // 1024
+
+        // Populate pages 0 and 2; leave page 1 entirely undefined so its
+        // bitmap bit stays clear on encode.
+        let mut dblk = FixedArrayDataBlock::new_unfiltered(0x1000, 2500);
+        for i in (0..page).chain(2 * page..2500) {
+            dblk.elements[i] = 0x10000 + (i as u64) * 0x100;
+        }
+
+        let mut encoded = encode_fixed_array_dblk(&ctx, &hdr, &dblk);
+        let prefix = FixedArrayPagedPrefix::decode(&encoded, &ctx, npages as u64).unwrap();
+        assert!(prefix.page_initialized(0));
+        assert!(!prefix.page_initialized(1));
+        assert!(prefix.page_initialized(2));
+
+        // Corrupt the uninitialized page's bytes the way libhdf5 leaves
+        // them: arbitrary, no valid checksum. Decode must not look at it.
+        let page_stride = page * 8 + 4;
+        let p1 = prefix.prefix_size + page_stride;
+        for b in &mut encoded[p1..p1 + page_stride] {
+            *b = 0x5A;
+        }
+
+        let decoded = decode_fixed_array_dblk(&ctx, &hdr, &encoded, 0).unwrap();
+        assert_eq!(decoded.elements, dblk.elements);
+        assert_eq!(decoded.header_addr, 0x1000);
+    }
+
+    #[test]
+    fn fixed_array_paged_decode_filtered_roundtrip() {
+        let ctx = FormatContext {
+            sizeof_addr: 8,
+            sizeof_size: 8,
+        };
+        let chunk_size_len = 4usize;
+        let hdr = FixedArrayHeader::new_for_filtered_chunks(&ctx, 1500, chunk_size_len as u8);
+        assert!(hdr.is_paged());
+
+        let mut dblk = FixedArrayDataBlock::new_filtered(0x2000, 1500);
+        for (i, e) in dblk.filtered_elements.iter_mut().enumerate() {
+            e.address = 0x8000 + (i as u64) * 0x40;
+            e.chunk_size = 100 + i as u64;
+            e.filter_mask = (i % 3) as u32;
+        }
+
+        let encoded = encode_fixed_array_dblk(&ctx, &hdr, &dblk);
+        assert_eq!(encoded.len() as u64, fixed_array_dblk_disk_size(&ctx, &hdr));
+        let decoded = decode_fixed_array_dblk(&ctx, &hdr, &encoded, chunk_size_len).unwrap();
+        assert_eq!(decoded.filtered_elements, dblk.filtered_elements);
+        assert_eq!(decoded.client_id, FA_CLIENT_FILT_CHUNK);
     }
 
     #[test]

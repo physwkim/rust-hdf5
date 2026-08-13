@@ -823,6 +823,104 @@ fn fa_growable_max_shape_readable_by_h5py() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A paged FA index (1200 chunks > 1024 per page) written across two rust
+/// sessions — the second reconstructs the paged data block via
+/// `open_append` — reads back exactly through h5py.
+#[test]
+fn fa_paged_reopened_write_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("fa_paged_reopen");
+    let n = 1200usize;
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([n])
+            .chunk(&[1])
+            .max_shape(&[Some(n)])
+            .create("wide")
+            .unwrap();
+        // Page 0 only; page 1 (elements 1024..1200) stays uninitialized.
+        ds.write_slice(&[0], &[600], &(0..600).collect::<Vec<i32>>())
+            .unwrap();
+        file.close().unwrap();
+    }
+    {
+        let file = H5File::options().no_locking().open_rw(&path).unwrap();
+        let ds = file.dataset_writer("wide").unwrap();
+        ds.write_slice(&[600], &[600], &(600..n as i32).collect::<Vec<i32>>())
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['wide']\n\
+         assert ds.shape == (1200,), ds.shape\n\
+         assert ds.chunks == (1,), ds.chunks\n\
+         assert np.array_equal(ds[...], np.arange(1200, dtype=np.int32)), ds[...]\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// h5py (libver='latest', fixed shape, 1200 unit chunks) writes a paged FA
+/// data block and initializes only page 0; libhdf5 leaves page 1's file
+/// space unwritten. Our reader must honor the page-init bitmap: page-0
+/// values read back, page-1 elements read as fill.
+#[test]
+fn fa_paged_written_by_h5py_readable_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("fa_paged_from_h5py");
+    write_with_h5py(
+        py,
+        &path,
+        "name = f.filename; f.close()\n\
+         f = h5py.File(name, 'w', libver='latest')\n\
+         ds = f.create_dataset('wide', shape=(1200,), chunks=(1,), dtype='<i4')\n\
+         ds[:600] = np.arange(600, dtype=np.int32)",
+    );
+    let file = H5File::open(&path).unwrap();
+    let vals = file.dataset("wide").unwrap().read_raw::<i32>().unwrap();
+    assert_eq!(vals.len(), 1200);
+    for (i, v) in vals.iter().enumerate() {
+        let expect = if i < 600 { i as i32 } else { 0 };
+        assert_eq!(*v, expect, "element {i}");
+    }
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The full parity loop: h5py writes the paged FA (page 1 genuinely
+/// unwritten by libhdf5), rust `open_append` reconstructs it and writes
+/// the remaining chunks, and h5py reads the completed array back.
+#[test]
+fn fa_paged_written_by_h5py_completed_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("fa_paged_complete");
+    write_with_h5py(
+        py,
+        &path,
+        "name = f.filename; f.close()\n\
+         f = h5py.File(name, 'w', libver='latest')\n\
+         ds = f.create_dataset('wide', shape=(1200,), chunks=(1,), dtype='<i4')\n\
+         ds[:600] = np.arange(600, dtype=np.int32)",
+    );
+    {
+        let file = H5File::options().no_locking().open_rw(&path).unwrap();
+        let ds = file.dataset_writer("wide").unwrap();
+        ds.write_slice(&[600], &[600], &(600..1200).collect::<Vec<i32>>())
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['wide']\n\
+         assert np.array_equal(ds[...], np.arange(1200, dtype=np.int32)), ds[...]\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// Issue #8: `set_libver_latest(true)` writes a version-5 data layout message
 /// for filtered chunked datasets. Two identical files differing only in the
 /// knob prove both directions: the default file stays h5py-readable (v4), and

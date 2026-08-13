@@ -16,6 +16,16 @@
 
 ### Fixed
 
+- Reopening a file for append now reconstructs *paged* fixed-array chunk
+  indexes (any fixed-shape dataset with more than 1024 chunks). The
+  writer has emitted the paged layout since paged-write support landed,
+  but `open_append` still refused it, leaving such a dataset a re-link
+  placeholder: writes to it failed and deleting it leaked every chunk
+  plus the index. Reconstruction honors the page-init bitmap — pages
+  libhdf5 never wrote are skipped, not decoded — so a partially written
+  h5py file can be completed in place. (Cross-validated both directions
+  against h5py, including the uninitialized-page case.)
+
 - `delete_dataset` and `delete_group` now follow libhdf5's `H5Ldelete`
   semantics against hard links: deleting a name only unlinks it, and an
   object a hard link still names survives under the link's path —
