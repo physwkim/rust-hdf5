@@ -373,3 +373,119 @@ fn set_extent_rejects_exceeding_max() {
     drop(file);
     cleanup(&path);
 }
+
+// ---- vlen datasets: a shrink must release the stranded heap objects ------
+
+/// Chunk-aligned shrink of a vlen dataset: every pruned chunk's strings are
+/// global-heap objects, and freeing the chunk block without releasing them
+/// strands one `H5HG_MINALLOC` (4096-byte) collection per append/shrink
+/// cycle. With the release the cycle reuses the same blocks and the file
+/// size settles.
+#[test]
+fn vlen_shrink_releases_the_pruned_chunks_heap_objects() {
+    let size_after = |cycles: usize| {
+        let path = unique_tmp(&format!("vlen_prune_release_{cycles}"));
+        let file = H5File::create(&path).unwrap();
+        file.create_appendable_vlen_dataset("notes", 2, None)
+            .unwrap();
+        file.append_vlen_strings("notes", &["keep0", "keep1"])
+            .unwrap();
+        for i in 0..cycles {
+            // One full chunk per cycle, so nothing stays in the append
+            // buffer (a buffered append blocks `set_extent`).
+            file.append_vlen_strings("notes", &[&format!("x{i}"), &format!("y{i}")])
+                .unwrap();
+            file.dataset_writer("notes")
+                .unwrap()
+                .set_extent(&[2])
+                .unwrap();
+        }
+        file.close().unwrap();
+        let n = std::fs::metadata(&path).unwrap().len();
+        let read = H5File::open(&path).unwrap();
+        assert_eq!(
+            read.dataset("notes").unwrap().read_vlen_strings().unwrap(),
+            vec!["keep0", "keep1"]
+        );
+        drop(read);
+        cleanup(&path);
+        n
+    };
+
+    let settled = size_after(3);
+    assert_eq!(size_after(20), settled, "20 cycles against 3");
+    assert_eq!(size_after(50), settled, "50 cycles against 3");
+}
+
+/// A shrink that cuts through a chunk refills its out-of-extent tail with
+/// the fill value; the strings the refill overwrites must be released too,
+/// or every cycle strands the replaced element's collection.
+#[test]
+fn vlen_shrink_releases_the_refilled_straddlers_heap_objects() {
+    let size_after = |cycles: usize| {
+        let path = unique_tmp(&format!("vlen_straddle_release_{cycles}"));
+        let file = H5File::create(&path).unwrap();
+        file.create_appendable_vlen_dataset("notes", 2, None)
+            .unwrap();
+        file.append_vlen_strings("notes", &["keep0", "stub"])
+            .unwrap();
+        let ds = file.dataset_writer("notes").unwrap();
+        ds.set_extent(&[1]).unwrap();
+        for i in 0..cycles {
+            // Regrow, write row 1 directly into the chunk (a slice write
+            // flushes, it never buffers), shrink it back out: the shrink's
+            // straddler refill is the only thing that can release `x{i}`.
+            ds.set_extent(&[2]).unwrap();
+            ds.write_vlen_strings_slice(1, &[&format!("x{i}")]).unwrap();
+            ds.set_extent(&[1]).unwrap();
+        }
+        file.close().unwrap();
+        let n = std::fs::metadata(&path).unwrap().len();
+        let read = H5File::open(&path).unwrap();
+        assert_eq!(
+            read.dataset("notes").unwrap().read_vlen_strings().unwrap(),
+            vec!["keep0"]
+        );
+        drop(read);
+        cleanup(&path);
+        n
+    };
+
+    let settled = size_after(3);
+    assert_eq!(size_after(20), settled, "20 cycles against 3");
+    assert_eq!(size_after(50), settled, "50 cycles against 3");
+}
+
+/// Survivor strings stay intact through a shrink and a regrown row reads
+/// as the fill value — the nil reference, i.e. the empty string — for both
+/// an unfiltered and a deflate-compressed vlen dataset (the compressed one
+/// must decompress the pruned chunk before parsing its references).
+#[test]
+fn vlen_shrink_then_regrow_keeps_survivors_and_reads_empty() {
+    for (tag, pipeline) in [
+        ("plain", None),
+        ("deflate", Some(rust_hdf5::FilterPipeline::deflate(4))),
+    ] {
+        let path = unique_tmp(&format!("vlen_regrow_{tag}"));
+        {
+            let file = H5File::create(&path).unwrap();
+            file.create_appendable_vlen_dataset("notes", 2, pipeline)
+                .unwrap();
+            file.append_vlen_strings("notes", &["s0", "s1", "s2", "s3", "s4", "s5"])
+                .unwrap();
+            let ds = file.dataset_writer("notes").unwrap();
+            // Chunk 1 straddles (s3 refilled), chunk 2 is pruned (s4, s5).
+            ds.set_extent(&[3]).unwrap();
+            ds.set_extent(&[6]).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("notes").unwrap().read_vlen_strings().unwrap(),
+            vec!["s0", "s1", "s2", "", "", ""],
+            "{tag}"
+        );
+        drop(file);
+        cleanup(&path);
+    }
+}

@@ -27,6 +27,16 @@
   cleared but the blocks are kept, the rule libhdf5 applies in
   `H5Dearray.c`.
 
+- A `set_extent` shrink of a variable-length dataset now releases the
+  global-heap objects of the elements it discards — both those in pruned
+  chunks and those a straddling chunk's fill refill overwrites. They used
+  to stay in their collections forever, so every shrink stranded at least
+  one 4096-byte collection; an append/shrink cycle now reuses the freed
+  blocks and the file size settles. This is more than libhdf5 does (its
+  `H5D__chunk_prune_by_extent` strands them too), matching this crate's
+  existing element-replace behavior. No-op under SWMR, like every other
+  heap release.
+
 - An extent change made in a reopen session with no chunk write is now
   persisted at close. The finalize path inferred "modified" from the
   session's chunk-write count alone, so `open_rw` + `set_extent` (or

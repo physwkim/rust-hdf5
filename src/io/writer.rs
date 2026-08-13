@@ -458,7 +458,8 @@ fn chunk_straddles_extent(coords: &[u64], chunk_dims: &[u64], extent: &[u64]) ->
 /// element at or beyond `extent` with the matching bytes of `fill` — a
 /// same-sized buffer tiled with the fill value. The caller guarantees the
 /// chunk at `coords` straddles `extent`, so every dimension keeps at least
-/// one element.
+/// one element. Returns the replaced bytes, so a vlen dataset's dead
+/// heap references can be released rather than stranded.
 fn refill_chunk_beyond_extent(
     data: &mut [u8],
     fill: &[u8],
@@ -466,7 +467,7 @@ fn refill_chunk_beyond_extent(
     chunk_dims: &[u64],
     extent: &[u64],
     element_size: usize,
-) {
+) -> Vec<u8> {
     let ndims = chunk_dims.len();
     let keep: Vec<usize> = (0..ndims)
         .map(|d| {
@@ -480,6 +481,7 @@ fn refill_chunk_beyond_extent(
     let row_elems = chunk_dims[ndims - 1] as usize;
     let keep_last = keep[ndims - 1];
     let nrows: u64 = chunk_dims[..ndims - 1].iter().product();
+    let mut replaced = Vec::new();
     for r in 0..nrows {
         let mut rem = r;
         let mut in_keep = true;
@@ -496,8 +498,10 @@ fn refill_chunk_beyond_extent(
         }
         let a = (r as usize * row_elems + start) * element_size;
         let b = (r as usize + 1) * row_elems * element_size;
+        replaced.extend_from_slice(&data[a..b]);
         data[a..b].copy_from_slice(&fill[a..b]);
     }
+    replaced
 }
 
 /// Validate caller-supplied chunk geometry at dataset definition, the rule
@@ -5226,11 +5230,34 @@ impl Hdf5Writer {
     /// stored entry still resolves. The caller holds the dataset's op lock.
     fn prune_chunks_beyond(&self, index: usize, new_dims: &[u64]) -> IoResult<()> {
         let geo = self.chunk_geometry(index)?;
-        let straddlers = match geo.kind {
-            ChunkIndexKind::ExtensibleArray => self.prune_ea_chunks(index, &geo, new_dims)?,
-            ChunkIndexKind::FixedArray => self.prune_fa_chunks(index, &geo, new_dims)?,
-            ChunkIndexKind::BtreeV2 => self.prune_bt2_chunks(index, &geo, new_dims)?,
+        // A vlen dataset's elements are global-heap IDs: the pruned chunks
+        // still reference live heap objects, so the walkers read each dead
+        // chunk's bytes before freeing its block and the heap objects are
+        // released here — otherwise every shrink strands its strings in the
+        // file. `release_vlen_references` is a SWMR no-op, so the reads are
+        // skipped under SWMR too.
+        let collect_refs = !self.swmr_active && {
+            let ds = self.ds(index);
+            let m = ds.lock();
+            matches!(
+                m.datatype,
+                DatatypeMessage::VarLenString { .. } | DatatypeMessage::VarLenSequence { .. }
+            )
         };
+        let (straddlers, dead_refs) = match geo.kind {
+            ChunkIndexKind::ExtensibleArray => {
+                self.prune_ea_chunks(index, &geo, new_dims, collect_refs)?
+            }
+            ChunkIndexKind::FixedArray => {
+                self.prune_fa_chunks(index, &geo, new_dims, collect_refs)?
+            }
+            ChunkIndexKind::BtreeV2 => {
+                self.prune_bt2_chunks(index, &geo, new_dims, collect_refs)?
+            }
+        };
+        if !dead_refs.is_empty() {
+            self.release_vlen_references(&dead_refs)?;
+        }
         // Whole-chunk read-modify-write per straddler: an unfiltered chunk
         // rewrites in place, a filtered one re-places through `place_chunk`.
         let chunk_bytes = geo.chunk_bytes() as usize;
@@ -5239,7 +5266,7 @@ impl Hdf5Writer {
                 continue;
             };
             let fill = self.new_chunk_buffer(index, chunk_bytes);
-            refill_chunk_beyond_extent(
+            let replaced = refill_chunk_beyond_extent(
                 &mut data,
                 &fill,
                 &coords,
@@ -5247,6 +5274,12 @@ impl Hdf5Writer {
                 new_dims,
                 geo.element_size as usize,
             );
+            // Release before the write-back: a filtered straddler re-places
+            // its block, and freed heap space must be visible to that
+            // allocation (free-before-alloc, as everywhere else).
+            if collect_refs && !replaced.is_empty() {
+                self.release_vlen_references(&replaced)?;
+            }
             self.write_chunk_at_coords(index, &coords, &data)?;
         }
         Ok(())
@@ -5255,18 +5288,21 @@ impl Hdf5Writer {
     /// Extensible-array half of [`prune_chunks_beyond`](Self::prune_chunks_beyond):
     /// walk every slot the array has ever set, free and clear the entries of
     /// chunks entirely beyond `new_dims`, and return the grid coordinates of
-    /// the chunks that straddle it.
+    /// the chunks that straddle it, plus — when `collect_refs` — the dead
+    /// chunks' element bytes so the caller can release their heap objects.
     fn prune_ea_chunks(
         &self,
         index: usize,
         geo: &ChunkGeometry,
         new_dims: &[u64],
-    ) -> IoResult<Vec<Vec<u64>>> {
+        collect_refs: bool,
+    ) -> IoResult<(Vec<Vec<u64>>, Vec<u8>)> {
         let ds = self.ds(index);
         // One slot guard for the whole walk, the `record_ea_chunk` pattern:
         // `self.handle`/`self.allocator`/`self.ctx` are disjoint fields.
         let mut m = ds.lock();
         let is_filtered = m.filter_pipeline.is_some();
+        let pipeline = m.filter_pipeline.clone();
         let chunk_bytes = geo.chunk_bytes();
         let (ea_geo, max_nelmts_bits, chunk_size_len, max_idx) = {
             let c = m.chunked.as_ref().unwrap();
@@ -5286,6 +5322,7 @@ impl Hdf5Writer {
         };
 
         let mut straddlers = Vec::new();
+        let mut dead_refs = Vec::new();
 
         // The decoded data block the walk is currently inside, written back
         // when the walk leaves it (or ends) having cleared an entry.
@@ -5333,6 +5370,16 @@ impl Hdf5Writer {
                         let fiblk = c.filt_iblk.as_mut().unwrap();
                         let e = fiblk.elements[elem];
                         if e.addr != UNDEF_ADDR {
+                            if collect_refs {
+                                if let Some(bytes) = self.read_chunk_block(
+                                    pipeline.as_ref(),
+                                    e.addr,
+                                    e.nbytes,
+                                    e.filter_mask,
+                                )? {
+                                    dead_refs.extend_from_slice(&bytes);
+                                }
+                            }
                             if !self.swmr_active {
                                 self.allocator.free(e.addr, e.nbytes);
                             }
@@ -5345,6 +5392,13 @@ impl Hdf5Writer {
                     } else {
                         let a = c.ea_iblk.elements[elem];
                         if a != UNDEF_ADDR {
+                            if collect_refs {
+                                if let Some(bytes) =
+                                    self.read_chunk_block(pipeline.as_ref(), a, chunk_bytes, 0)?
+                                {
+                                    dead_refs.extend_from_slice(&bytes);
+                                }
+                            }
                             if !self.swmr_active {
                                 self.allocator.free(a, chunk_bytes);
                             }
@@ -5435,6 +5489,16 @@ impl Hdf5Writer {
                         Dblk::Filtered(d) => {
                             let e = d.elements[l.offset_in_dblk as usize];
                             if e.addr != UNDEF_ADDR {
+                                if collect_refs {
+                                    if let Some(bytes) = self.read_chunk_block(
+                                        pipeline.as_ref(),
+                                        e.addr,
+                                        e.nbytes,
+                                        e.filter_mask,
+                                    )? {
+                                        dead_refs.extend_from_slice(&bytes);
+                                    }
+                                }
                                 if !self.swmr_active {
                                     self.allocator.free(e.addr, e.nbytes);
                                 }
@@ -5449,6 +5513,13 @@ impl Hdf5Writer {
                         Dblk::Unfiltered(d) => {
                             let a = d.elements[l.offset_in_dblk as usize];
                             if a != UNDEF_ADDR {
+                                if collect_refs {
+                                    if let Some(bytes) =
+                                        self.read_chunk_block(pipeline.as_ref(), a, chunk_bytes, 0)?
+                                    {
+                                        dead_refs.extend_from_slice(&bytes);
+                                    }
+                                }
                                 if !self.swmr_active {
                                     self.allocator.free(a, chunk_bytes);
                                 }
@@ -5462,7 +5533,7 @@ impl Hdf5Writer {
             }
         }
         flush(&mut cache)?;
-        Ok(straddlers)
+        Ok((straddlers, dead_refs))
     }
 
     /// Fixed-array half of [`prune_chunks_beyond`](Self::prune_chunks_beyond):
@@ -5473,12 +5544,15 @@ impl Hdf5Writer {
         index: usize,
         geo: &ChunkGeometry,
         new_dims: &[u64],
-    ) -> IoResult<Vec<Vec<u64>>> {
+        collect_refs: bool,
+    ) -> IoResult<(Vec<Vec<u64>>, Vec<u8>)> {
         let ds = self.ds(index);
         let mut m = ds.lock();
         let is_filtered = m.filter_pipeline.is_some();
+        let pipeline = m.filter_pipeline.clone();
         let chunk_bytes = geo.chunk_bytes();
         let mut straddlers = Vec::new();
+        let mut dead_refs = Vec::new();
         let fa = m.fixed_array.as_mut().unwrap();
         let nslots = if is_filtered {
             fa.fa_dblk.filtered_elements.len()
@@ -5486,11 +5560,11 @@ impl Hdf5Writer {
             fa.fa_dblk.elements.len()
         };
         for lidx in 0..nslots {
-            let (addr, stored) = if is_filtered {
+            let (addr, stored, mask) = if is_filtered {
                 let e = &fa.fa_dblk.filtered_elements[lidx];
-                (e.address, e.chunk_size)
+                (e.address, e.chunk_size, e.filter_mask)
             } else {
-                (fa.fa_dblk.elements[lidx], chunk_bytes)
+                (fa.fa_dblk.elements[lidx], chunk_bytes, 0)
             };
             if addr == UNDEF_ADDR {
                 continue;
@@ -5502,6 +5576,13 @@ impl Hdf5Writer {
                 lidx as u64,
             )?;
             if chunk_outside_extent(&coords, &geo.chunk_dims, new_dims) {
+                if collect_refs {
+                    if let Some(bytes) =
+                        self.read_chunk_block(pipeline.as_ref(), addr, stored, mask)?
+                    {
+                        dead_refs.extend_from_slice(&bytes);
+                    }
+                }
                 if !self.swmr_active {
                     self.allocator.free(addr, stored);
                 }
@@ -5518,7 +5599,7 @@ impl Hdf5Writer {
                 straddlers.push(coords);
             }
         }
-        Ok(straddlers)
+        Ok((straddlers, dead_refs))
     }
 
     /// V2-B-tree half of [`prune_chunks_beyond`](Self::prune_chunks_beyond):
@@ -5530,43 +5611,70 @@ impl Hdf5Writer {
         index: usize,
         geo: &ChunkGeometry,
         new_dims: &[u64],
-    ) -> IoResult<Vec<Vec<u64>>> {
+        collect_refs: bool,
+    ) -> IoResult<(Vec<Vec<u64>>, Vec<u8>)> {
         let ds = self.ds(index);
         let mut m = ds.lock();
+        let pipeline = m.filter_pipeline.clone();
         let chunk_bytes = geo.chunk_bytes();
         let swmr = self.swmr_active;
         let mut straddlers = Vec::new();
+        let mut dead_refs = Vec::new();
         let bt2 = m.btree_v2.as_mut().unwrap();
         if bt2.index.filtered {
-            bt2.index.filtered_records.retain(|r| {
+            let records = std::mem::take(&mut bt2.index.filtered_records);
+            let mut kept = Vec::with_capacity(records.len());
+            for r in records {
                 if chunk_outside_extent(&r.scaled_offsets, &geo.chunk_dims, new_dims) {
+                    if collect_refs {
+                        if let Some(bytes) = self.read_chunk_block(
+                            pipeline.as_ref(),
+                            r.chunk_address,
+                            r.chunk_size,
+                            r.filter_mask,
+                        )? {
+                            dead_refs.extend_from_slice(&bytes);
+                        }
+                    }
                     if !swmr {
                         self.allocator.free(r.chunk_address, r.chunk_size);
                     }
-                    false
                 } else {
                     if chunk_straddles_extent(&r.scaled_offsets, &geo.chunk_dims, new_dims) {
                         straddlers.push(r.scaled_offsets.clone());
                     }
-                    true
+                    kept.push(r);
                 }
-            });
+            }
+            bt2.index.filtered_records = kept;
         } else {
-            bt2.index.records.retain(|r| {
+            let records = std::mem::take(&mut bt2.index.records);
+            let mut kept = Vec::with_capacity(records.len());
+            for r in records {
                 if chunk_outside_extent(&r.scaled_offsets, &geo.chunk_dims, new_dims) {
+                    if collect_refs {
+                        if let Some(bytes) = self.read_chunk_block(
+                            pipeline.as_ref(),
+                            r.chunk_address,
+                            chunk_bytes,
+                            0,
+                        )? {
+                            dead_refs.extend_from_slice(&bytes);
+                        }
+                    }
                     if !swmr {
                         self.allocator.free(r.chunk_address, chunk_bytes);
                     }
-                    false
                 } else {
                     if chunk_straddles_extent(&r.scaled_offsets, &geo.chunk_dims, new_dims) {
                         straddlers.push(r.scaled_offsets.clone());
                     }
-                    true
+                    kept.push(r);
                 }
-            });
+            }
+            bt2.index.records = kept;
         }
-        Ok(straddlers)
+        Ok((straddlers, dead_refs))
     }
 
     /// Flush a chunked dataset's index structures to disk (durable).
