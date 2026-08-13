@@ -2962,8 +2962,10 @@ impl Hdf5Writer {
     /// the object leaves its collection, the collection is rewritten at its
     /// existing size with the recovered bytes given to the free-space marker,
     /// and a collection that ends up empty returns its block to the allocator.
-    /// A nil reference (address 0 or `UNDEF_ADDR`) and a zero-length sequence
-    /// name no object, which is the `seq_len > 0` test libhdf5 makes.
+    /// A nil reference (address 0 or `UNDEF_ADDR`) names no object. The
+    /// sequence length does not decide: this crate's writers store even the
+    /// empty string as a real heap object, so a zero-length reference with a
+    /// defined address still holds one that must be released.
     ///
     /// Under SWMR nothing is freed and no collection is rewritten: a reader may
     /// be following those references, the same reason `place_chunk` keeps a
@@ -2985,8 +2987,8 @@ impl Hdf5Writer {
         // rewritten and judged empty exactly once.
         let mut per_collection: std::collections::BTreeMap<u64, Vec<u16>> = Default::default();
         for r in refs.chunks_exact(ref_size) {
-            let (seq_len, addr, obj_idx) = decode_vlen_reference(r, &self.ctx)?;
-            if seq_len == 0 || addr == 0 || addr == UNDEF_ADDR {
+            let (_seq_len, addr, obj_idx) = decode_vlen_reference(r, &self.ctx)?;
+            if addr == 0 || addr == UNDEF_ADDR {
                 continue;
             }
             let Ok(idx) = u16::try_from(obj_idx) else {

@@ -5167,6 +5167,36 @@ mod tests {
         assert_eq!(size_after(50), settled, "50 updates against 3");
     }
 
+    /// An empty string is stored as a real heap object under a reference whose
+    /// sequence length is zero, so the release must go by the address, not the
+    /// length — a length test strands the object and its collection forever.
+    #[test]
+    fn write_vlen_strings_slice_frees_an_empty_strings_object() {
+        let size_after = |updates: usize| {
+            let path = temp_path(&format!("vlen_slice_empty_reuse_{updates}"));
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_strings("notes", &["", "b"]).unwrap();
+            let ds = file.dataset_writer("notes").unwrap();
+            for _ in 0..updates {
+                ds.write_vlen_strings_slice(0, &[""]).unwrap();
+            }
+            file.close().unwrap();
+            let n = std::fs::metadata(&path).unwrap().len();
+            let read = H5File::open(&path).unwrap();
+            assert_eq!(
+                read.dataset("notes").unwrap().read_vlen_strings().unwrap(),
+                vec!["".to_string(), "b".to_string()]
+            );
+            drop(read);
+            std::fs::remove_file(&path).ok();
+            n
+        };
+
+        let settled = size_after(3);
+        assert_eq!(size_after(20), settled, "20 empty updates against 3");
+        assert_eq!(size_after(50), settled, "50 empty updates against 3");
+    }
+
     /// The elements the update does not name keep their strings, so freeing
     /// the superseded objects must not disturb the collection's survivors.
     #[test]
