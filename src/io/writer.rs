@@ -3155,6 +3155,16 @@ impl Hdf5Writer {
         };
         ensure_vlen_charset(charset, strings)?;
 
+        // Every deterministic rejection must precede the heap write below:
+        // a collection written for a batch the append then refuses (a
+        // contiguous dataset, or a reopened dataset whose chunk index was
+        // not reconstructed) is a 4096-byte orphan nothing references.
+        let chunk_dims = self
+            .dataset_chunk_dims(ds_index)
+            .ok_or_else(|| crate::io::IoError::InvalidState("not a chunked dataset".into()))?
+            .to_vec();
+        let dims = self.dataset_dims(ds_index).to_vec();
+
         // Build a new global heap collection for this batch
         let mut gcol = GlobalHeapCollection::new();
         let mut obj_indices = Vec::with_capacity(strings.len());
@@ -3178,13 +3188,6 @@ impl Hdf5Writer {
                 &self.ctx,
             ));
         }
-
-        // Use the same chunked-append logic as append<T>
-        let chunk_dims = self
-            .dataset_chunk_dims(ds_index)
-            .ok_or_else(|| crate::io::IoError::InvalidState("not a chunked dataset".into()))?
-            .to_vec();
-        let dims = self.dataset_dims(ds_index).to_vec();
 
         let n_new_frames = strings.len();
         let current_dim0 = dims[0] as usize;
@@ -3287,7 +3290,7 @@ impl Hdf5Writer {
 
         // Snapshot what the write needs, then drop the guard: `write_slice`
         // below re-locks the same slot.
-        let (charset, dims) = {
+        let (charset, dims, writable) = {
             let ds = self.ds(ds_index);
             let m = ds.lock();
             let charset = match m.datatype {
@@ -3299,8 +3302,22 @@ impl Hdf5Writer {
                     ))
                 }
             };
-            (charset, m.dataspace.dims.clone())
+            let writable = m.chunked.is_some()
+                || m.fixed_array.is_some()
+                || m.btree_v2.is_some()
+                || m.data_addr != UNDEF_ADDR;
+            (charset, m.dataspace.dims.clone(), writable)
         };
+
+        // `write_slice_inner` rejects a dataset with neither chunk machinery
+        // nor allocated data (a reopened dataset whose index was not
+        // reconstructed) — that rejection must come before the heap write
+        // below, or every failed call orphans a 4096-byte collection.
+        if !writable {
+            return Err(crate::io::IoError::InvalidState(
+                "dataset has no data allocated".into(),
+            ));
+        }
 
         if dims.len() != 1 {
             return Err(crate::io::IoError::InvalidState(format!(

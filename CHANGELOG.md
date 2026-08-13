@@ -27,6 +27,15 @@
   cleared but the blocks are kept, the rule libhdf5 applies in
   `H5Dearray.c`.
 
+- A rejected vlen write no longer orphans a global-heap collection.
+  `append_vlen_strings` wrote the batch's collection before checking the
+  dataset was chunked, and `write_vlen_strings_slice` wrote it before
+  the slice write could refuse a dataset with no writable storage (a
+  reopened fixed-array/v2-B-tree dataset, which this crate re-links but
+  cannot write) — every failed call grew the file by a 4096-byte block
+  nothing referenced. All deterministic rejections now run before the
+  collection is allocated.
+
 - Variable-length reads no longer return silent empty strings when the
   global-heap collection cannot be resolved. The reader capped
   collections at 64 MiB — libhdf5 has no cap, and this crate's writers

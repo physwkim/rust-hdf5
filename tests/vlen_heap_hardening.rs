@@ -142,3 +142,35 @@ fn corrupt_gcol_signature_is_an_attr_read_error() {
     drop(file);
     cleanup(&path);
 }
+
+/// An append the dataset refuses (here: a contiguous vlen dataset — only
+/// chunked ones are appendable) must be rejected before the heap write,
+/// or every failed call orphans a 4096-byte collection.
+#[test]
+fn rejected_append_does_not_orphan_a_collection() {
+    let size_after = |attempts: usize| {
+        let path = unique_tmp(&format!("rejected_append_{attempts}"));
+        let file = H5File::create(&path).unwrap();
+        file.write_vlen_strings("notes", &["a", "b"]).unwrap();
+        for _ in 0..attempts {
+            file.append_vlen_strings("notes", &["x"])
+                .expect_err("append on a contiguous dataset must be rejected");
+        }
+        file.close().unwrap();
+        let n = std::fs::metadata(&path).unwrap().len();
+        let read = H5File::open(&path).unwrap();
+        assert_eq!(
+            read.dataset("notes").unwrap().read_vlen_strings().unwrap(),
+            vec!["a", "b"]
+        );
+        drop(read);
+        cleanup(&path);
+        n
+    };
+
+    assert_eq!(
+        size_after(20),
+        size_after(1),
+        "20 rejected appends against 1"
+    );
+}
