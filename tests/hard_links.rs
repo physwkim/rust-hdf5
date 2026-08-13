@@ -343,12 +343,14 @@ fn deleting_last_name_frees_storage() {
     assert_eq!(size_after(10), size_after(2), "10 cycles against 2");
 }
 
-/// A hard link from outside the subtree naming an inner *group* refuses
-/// the whole `delete_group`, and the refusal leaves the file untouched.
+/// A hard link from outside the subtree naming an inner *group* keeps
+/// that group alive: it is re-homed under the link with its whole
+/// subtree renamed, while the rest of the container is deleted.
 #[test]
-fn delete_group_refused_by_outside_link_to_inner_group() {
-    let path = unique_tmp("hl_del_refuse");
+fn delete_group_promotes_outside_linked_inner_group() {
+    let path = unique_tmp("hl_del_ginner");
     let data: Vec<i32> = vec![5, 6, 7];
+    let deep_data: Vec<i32> = vec![13, 14];
 
     {
         let file = H5File::create(&path).unwrap();
@@ -357,27 +359,88 @@ fn delete_group_refused_by_outside_link_to_inner_group() {
         let inner = container.create_group("inner").unwrap();
         let ds = inner.new_dataset::<i32>().shape([3]).create("ds").unwrap();
         ds.write_raw(&data).unwrap();
+        let deep = inner.create_group("deep").unwrap();
+        let ds2 = deep.new_dataset::<i32>().shape([2]).create("ds2").unwrap();
+        ds2.write_raw(&deep_data).unwrap();
+        container
+            .new_dataset::<i32>()
+            .shape([4])
+            .create("gone")
+            .unwrap();
 
         root.link("inner_alias", "/container/inner").unwrap();
 
-        let err = file.delete_group("container").unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("delete the link's parent group first"),
-            "unexpected error: {msg}"
-        );
+        file.delete_group("container").unwrap();
         file.close().unwrap();
     }
 
     {
         let file = H5File::open(&path).unwrap();
         assert_eq!(
-            file.dataset("container/inner/ds")
+            file.dataset("inner_alias/ds")
                 .unwrap()
                 .read_raw::<i32>()
                 .unwrap(),
             data,
-            "refused delete must leave the subtree intact"
+            "the linked group's dataset must survive under the link"
+        );
+        assert_eq!(
+            file.dataset("inner_alias/deep/ds2")
+                .unwrap()
+                .read_raw::<i32>()
+                .unwrap(),
+            deep_data,
+            "the rename must reach the whole promoted subtree"
+        );
+        assert!(
+            file.dataset("container/inner/ds").is_err(),
+            "the old path must not resolve"
+        );
+        assert!(
+            file.dataset("container/gone").is_err(),
+            "the unlinked sibling must be gone"
+        );
+    }
+
+    cleanup(&path);
+}
+
+/// An outside link naming the deleted group itself turns the delete into
+/// a pure rename: the whole subtree survives under the link's path.
+#[test]
+fn delete_group_promotes_the_group_itself() {
+    let path = unique_tmp("hl_del_gself");
+    let data: Vec<i32> = vec![1, 2, 3, 4];
+
+    {
+        let file = H5File::create(&path).unwrap();
+        let root = file.root_group();
+        let container = root.create_group("container").unwrap();
+        let ds = container
+            .new_dataset::<i32>()
+            .shape([4])
+            .create("ds")
+            .unwrap();
+        ds.write_raw(&data).unwrap();
+        root.link("keeper", "container").unwrap();
+
+        file.delete_group("container").unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("keeper/ds")
+                .unwrap()
+                .read_raw::<i32>()
+                .unwrap(),
+            data,
+            "the group must survive under its other name"
+        );
+        assert!(
+            file.dataset("container/ds").is_err(),
+            "the deleted name must not resolve"
         );
     }
 
@@ -477,27 +540,42 @@ fn deleting_a_link_path_unlinks_only_the_link() {
     cleanup(&path);
 }
 
-/// Deleting a group-link path unlinks it too — clearing the outside link
-/// that made `delete_group` refuse.
+/// Deleting a group-link path unlinks just that link: the target group
+/// and its tree name stay.
 #[test]
-fn deleting_a_group_link_path_clears_the_refusal() {
+fn deleting_a_group_link_path_unlinks_only_the_link() {
     let path = unique_tmp("hl_del_glink");
+    let data: Vec<i32> = vec![21, 22];
 
-    let file = H5File::create(&path).unwrap();
-    let root = file.root_group();
-    let container = root.create_group("container").unwrap();
-    let inner = container.create_group("inner").unwrap();
-    inner.new_dataset::<i32>().shape([2]).create("ds").unwrap();
-    root.link("inner_alias", "/container/inner").unwrap();
+    {
+        let file = H5File::create(&path).unwrap();
+        let root = file.root_group();
+        let container = root.create_group("container").unwrap();
+        let inner = container.create_group("inner").unwrap();
+        let ds = inner.new_dataset::<i32>().shape([2]).create("ds").unwrap();
+        ds.write_raw(&data).unwrap();
+        root.link("inner_alias", "/container/inner").unwrap();
 
-    assert!(
-        file.delete_group("container").is_err(),
-        "outside link must refuse the subtree delete"
-    );
-    file.delete_group("inner_alias").unwrap();
-    file.delete_group("container").unwrap();
+        file.delete_group("inner_alias").unwrap();
+        file.close().unwrap();
+    }
 
-    drop(file);
+    {
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("container/inner/ds")
+                .unwrap()
+                .read_raw::<i32>()
+                .unwrap(),
+            data,
+            "the tree name must survive its link's deletion"
+        );
+        assert!(
+            file.dataset("inner_alias/ds").is_err(),
+            "the deleted link path must not resolve"
+        );
+    }
+
     cleanup(&path);
 }
 
@@ -704,37 +782,42 @@ fn reopen_delete_both_names_settles_file_size() {
     assert_eq!(size_after(10), size_after(2), "10 reopen cycles against 2");
 }
 
-/// A hard link to a *group* survives reopen too: it still refuses the
-/// subtree delete, and unlinking it first clears the way.
+/// A hard link to a *group* survives reopen too: deleting the container
+/// in the second session still re-homes the linked inner group.
 #[test]
-fn reopened_group_link_still_refuses_subtree_delete() {
+fn reopened_group_link_promotes_inner_group() {
     let path = unique_tmp("hl_reopen_group");
+    let data: Vec<i32> = vec![31, 32];
 
     {
         let file = H5File::create(&path).unwrap();
         let root = file.root_group();
         let container = root.create_group("container").unwrap();
         let inner = container.create_group("inner").unwrap();
-        inner.new_dataset::<i32>().shape([2]).create("ds").unwrap();
+        let ds = inner.new_dataset::<i32>().shape([2]).create("ds").unwrap();
+        ds.write_raw(&data).unwrap();
         root.link("inner_alias", "/container/inner").unwrap();
         file.close().unwrap();
     }
     {
         let file = H5File::options().no_locking().open_rw(&path).unwrap();
-        assert!(
-            file.delete_group("container").is_err(),
-            "the reopened group link must still refuse the delete"
-        );
-        file.delete_group("inner_alias").unwrap();
         file.delete_group("container").unwrap();
         file.close().unwrap();
     }
 
     {
         let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("inner_alias/ds")
+                .unwrap()
+                .read_raw::<i32>()
+                .unwrap(),
+            data,
+            "the linked inner group must survive the cross-session delete"
+        );
         assert!(
             file.dataset("container/inner/ds").is_err(),
-            "the subtree must be gone after the cleared delete"
+            "the old path must not resolve"
         );
     }
 

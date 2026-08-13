@@ -596,9 +596,10 @@ impl H5File {
     /// file space the way [`delete_dataset`](Self::delete_dataset) does.
     ///
     /// Hard links reaching in from outside the deleted subtree keep their
-    /// targets alive: a dataset named by such a link survives under the
-    /// link's path, and if the link names an inner *group* the whole
-    /// delete is refused (delete the link's parent group first).
+    /// targets alive: a dataset or group named by such a link survives
+    /// under the link's path (a group brings its whole subtree with it),
+    /// and a `name` that is itself a hard link's path removes just that
+    /// link.
     pub fn delete_group(&self, name: &str) -> Result<()> {
         let inner = borrow_inner(&self.inner);
         match &*inner {

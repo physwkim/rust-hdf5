@@ -19,13 +19,16 @@
 - `delete_dataset` and `delete_group` now follow libhdf5's `H5Ldelete`
   semantics against hard links: deleting a name only unlinks it, and an
   object a hard link still names survives under the link's path —
-  promoted to its primary name — with storage freed only when the last
-  name goes. Deleting a dataset used to destroy the object and leave
-  its hard links silently unemitted. `delete_group` re-homes an inner
-  dataset an outside link names before deleting the subtree, and is
-  refused when an outside link names an inner *group* (re-homing a
-  group would rename its whole subtree, which the writer does not do;
-  delete the link's parent group first).
+  promoted to its primary name, a group bringing its whole subtree —
+  with storage freed only when the last name goes. Deleting a dataset
+  used to destroy the object and leave its hard links silently
+  unemitted. A path naming a hard link itself removes just that link
+  (previously `NotFound`, so links could never be removed). Hard links
+  also survive reopening the file for append — each used to come back
+  as an independent dataset carrying the same storage addresses, so
+  deleting one name freed blocks and the shared object header the other
+  names still referenced. And like `H5Dopen`/`H5Lcreate_hard`, an alias
+  path now resolves for `dataset_writer` and as a link target.
 
 - Reopening a file for appending now reads fixed-array and v2-B-tree
   chunk indexes back into the writer, as it already did for extensible

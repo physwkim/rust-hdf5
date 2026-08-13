@@ -1924,11 +1924,11 @@ impl Hdf5Writer {
     /// [`delete_dataset`](Self::delete_dataset) does — with the same
     /// `H5Ldelete` semantics: a `name` that is a user hard link's path
     /// unlinks just that link, and hard links from *outside* the subtree
-    /// keep their targets: a dataset such a link names survives, re-homed
-    /// under the link. A hard-linked inner *group* would need its whole
-    /// subtree renamed, which this writer does not do, so that delete is
-    /// refused (delete the link's parent group first). Refused while SWMR
-    /// streaming is active, same rule.
+    /// keep their targets. A dataset or group such a link names survives,
+    /// re-homed under the link (a group brings its whole subtree with
+    /// it); a link naming the deleted group itself turns the call into a
+    /// pure rename and nothing is freed. Refused while SWMR streaming is
+    /// active, same rule as `delete_dataset`.
     pub fn delete_group(&self, name: &str) -> IoResult<()> {
         if self.swmr_active {
             return Err(swmr_delete_error(name));
@@ -1964,28 +1964,43 @@ impl Hdf5Writer {
             }
         };
 
-        // Pre-scan the doomed subtree before anything is marked, so a
-        // refusal leaves the file untouched.
+        // A link is "outside" when its parent group does not die with the
+        // subtree; only outside links can keep their targets alive.
+        fn outside(parent: Option<usize>, doomed_gs: &[usize]) -> bool {
+            match parent {
+                None => true,
+                Some(pi) => !doomed_gs.contains(&pi),
+            }
+        }
+        // A group an outside link names survives, re-homed with its whole
+        // subtree under the link. Each promotion moves that subtree out of
+        // the doomed set — and can turn a link inside it into an outside
+        // one — so rescan from scratch until no promotable group is left.
+        // Promoting `gidx` itself makes the delete a pure rename: return.
         let mut doomed_ds = Vec::new();
         let mut doomed_gs = Vec::new();
-        self.collect_live_subtree(gidx, &mut doomed_ds, &mut doomed_gs);
-        let outside = |parent: Option<usize>| match parent {
-            None => true,
-            Some(pi) => !doomed_gs.contains(&pi),
-        };
-        for l in self.hard_links_vec() {
-            if !self.hard_link_emitted(&l) || !outside(l.parent) {
-                continue;
-            }
-            if let HardLinkTarget::Group(gi) = l.target {
-                if doomed_gs.contains(&gi) {
-                    return Err(crate::io::IoError::InvalidState(format!(
-                        "cannot delete '{name}': the hard link '{}' still names its \
-                         subgroup '{}'; delete the link's parent group first",
-                        self.hard_link_full_path(&l),
-                        self.grp(gi).lock().name,
-                    )));
-                }
+        loop {
+            doomed_ds.clear();
+            doomed_gs.clear();
+            self.collect_live_subtree(gidx, &mut doomed_ds, &mut doomed_gs);
+            let promote = self
+                .hard_links_vec()
+                .iter()
+                .enumerate()
+                .find_map(|(pos, l)| match l.target {
+                    HardLinkTarget::Group(gi)
+                        if self.hard_link_emitted(l)
+                            && outside(l.parent, &doomed_gs)
+                            && doomed_gs.contains(&gi) =>
+                    {
+                        Some((pos, gi))
+                    }
+                    _ => None,
+                });
+            let Some((pos, gi)) = promote else { break };
+            self.promote_group_to_link(gi, pos);
+            if gi == gidx {
+                return Ok(());
             }
         }
         // A dataset an outside link names survives its container: re-home
@@ -1993,7 +2008,7 @@ impl Hdf5Writer {
         for di in doomed_ds {
             let promote = self.hard_links_vec().iter().position(|l| {
                 self.hard_link_emitted(l)
-                    && outside(l.parent)
+                    && outside(l.parent, &doomed_gs)
                     && matches!(l.target, HardLinkTarget::Dataset(i) if i == di)
             });
             if let Some(pos) = promote {
@@ -2066,6 +2081,64 @@ impl Hdf5Writer {
             self.grp(pi).lock().child_datasets.push(idx);
         }
         self.ds(idx).lock().name = new_name;
+    }
+
+    /// The group counterpart of
+    /// [`promote_dataset_to_link`](Self::promote_dataset_to_link): re-home
+    /// group `gidx` under the hard link at `pos`, bringing its whole
+    /// subtree with it. Names are stored as full paths, so every live
+    /// descendant is renamed by prefix.
+    fn promote_group_to_link(&self, gidx: usize, pos: usize) {
+        let link = self.hard_links.lock().remove(pos);
+        let new_name = format!("/{}", self.hard_link_full_path(&link));
+        let old_name = self.grp(gidx).lock().name.clone();
+        for grp in self.group_refs() {
+            grp.lock().child_groups.retain(|&g| g != gidx);
+        }
+        {
+            let grp = self.grp(gidx);
+            let mut g = grp.lock();
+            g.parent = link.parent;
+            g.name = new_name.clone();
+        }
+        if let Some(pi) = link.parent {
+            self.grp(pi).lock().child_groups.push(gidx);
+        }
+
+        let mut ds_in = Vec::new();
+        let mut gs_in = Vec::new();
+        self.collect_live_subtree(gidx, &mut ds_in, &mut gs_in);
+        // Group names carry a leading '/' ("/a/b"), dataset names none
+        // ("a/b/ds") — two prefix forms of the same rename.
+        let old_grp_prefix = format!("{old_name}/");
+        let new_grp_prefix = format!("{new_name}/");
+        let old_ds_prefix = old_grp_prefix.trim_start_matches('/').to_string();
+        let new_ds_prefix = new_grp_prefix.trim_start_matches('/').to_string();
+        for gi in gs_in {
+            if gi == gidx {
+                continue;
+            }
+            let grp = self.grp(gi);
+            let mut g = grp.lock();
+            let renamed = g
+                .name
+                .strip_prefix(&old_grp_prefix)
+                .map(|rest| format!("{new_grp_prefix}{rest}"));
+            if let Some(n) = renamed {
+                g.name = n;
+            }
+        }
+        for di in ds_in {
+            let ds = self.ds(di);
+            let mut d = ds.lock();
+            let renamed = d
+                .name
+                .strip_prefix(&old_ds_prefix)
+                .map(|rest| format!("{new_ds_prefix}{rest}"));
+            if let Some(n) = renamed {
+                d.name = n;
+            }
+        }
     }
 
     /// Drop hard-link entries that can no longer be emitted — their parent
