@@ -434,6 +434,73 @@ fn delete_group_promotes_outside_linked_dataset() {
     cleanup(&path);
 }
 
+/// Deleting a path that names a hard link removes just that link: the
+/// target dataset and its tree name are untouched.
+#[test]
+fn deleting_a_link_path_unlinks_only_the_link() {
+    let path = unique_tmp("hl_del_link");
+    let data: Vec<i32> = (0..5).collect();
+
+    {
+        let file = H5File::create(&path).unwrap();
+        let root = file.root_group();
+        let inst = root.create_group("instrument").unwrap();
+        let ds = inst
+            .new_dataset::<i32>()
+            .shape([5])
+            .create("detector")
+            .unwrap();
+        ds.write_raw(&data).unwrap();
+        let data_grp = root.create_group("data").unwrap();
+        data_grp.link("detector", "/instrument/detector").unwrap();
+
+        file.delete_dataset("data/detector").unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("instrument/detector")
+                .unwrap()
+                .read_raw::<i32>()
+                .unwrap(),
+            data,
+            "the tree name must survive its link's deletion"
+        );
+        assert!(
+            file.dataset("data/detector").is_err(),
+            "the deleted link path must not resolve"
+        );
+    }
+
+    cleanup(&path);
+}
+
+/// Deleting a group-link path unlinks it too — clearing the outside link
+/// that made `delete_group` refuse.
+#[test]
+fn deleting_a_group_link_path_clears_the_refusal() {
+    let path = unique_tmp("hl_del_glink");
+
+    let file = H5File::create(&path).unwrap();
+    let root = file.root_group();
+    let container = root.create_group("container").unwrap();
+    let inner = container.create_group("inner").unwrap();
+    inner.new_dataset::<i32>().shape([2]).create("ds").unwrap();
+    root.link("inner_alias", "/container/inner").unwrap();
+
+    assert!(
+        file.delete_group("container").is_err(),
+        "outside link must refuse the subtree delete"
+    );
+    file.delete_group("inner_alias").unwrap();
+    file.delete_group("container").unwrap();
+
+    drop(file);
+    cleanup(&path);
+}
+
 /// A target path given with a trailing slash still resolves.
 #[test]
 fn hard_link_tolerates_trailing_slash() {

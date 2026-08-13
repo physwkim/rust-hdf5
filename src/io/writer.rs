@@ -1786,16 +1786,17 @@ impl Hdf5Writer {
         Ok(())
     }
 
-    /// Delete a dataset's tree name, with libhdf5's `H5Ldelete` semantics:
-    /// a name is only a link, so if a user hard link still names the
-    /// object, the object survives under it — the link becomes the primary
-    /// name and nothing is freed. Only deleting the *last* name
-    /// soft-deletes the object and frees the file space it owned: its
-    /// chunk blocks and chunk-index structures (or contiguous data block),
-    /// the global-heap objects of its variable-length data and attributes,
-    /// and — on a reopened file — the on-disk object header block. The
-    /// freed space is reused by later allocations in this session; the
-    /// file does not shrink.
+    /// Delete a dataset name, with libhdf5's `H5Ldelete` semantics: a name
+    /// is only a link. If `name` is a user hard link's path, just that
+    /// link is removed and the object is untouched. If it is the tree name
+    /// and a user hard link still names the object, the object survives
+    /// under it — the link becomes the primary name and nothing is freed.
+    /// Only deleting the *last* name soft-deletes the object and frees the
+    /// file space it owned: its chunk blocks and chunk-index structures
+    /// (or contiguous data block), the global-heap objects of its
+    /// variable-length data and attributes, and — on a reopened file — the
+    /// on-disk object header block. The freed space is reused by later
+    /// allocations in this session; the file does not shrink.
     ///
     /// Refused while SWMR streaming is active: a live reader may hold any
     /// of those addresses (libhdf5 forbids link deletion during SWMR
@@ -1809,13 +1810,28 @@ impl Hdf5Writer {
         // the same as every creator).
         let _create = self.create_lock.lock();
         let refs = self.dataset_refs();
-        let idx = refs
-            .iter()
-            .position(|d| {
-                let g = d.lock();
-                g.name == name && !g.deleted
-            })
-            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let idx = match refs.iter().position(|d| {
+            let g = d.lock();
+            g.name == name && !g.deleted
+        }) {
+            Some(i) => i,
+            None => {
+                // Not a tree name — the path may name a user hard link,
+                // and deleting a link path unlinks just that link (the
+                // creation collision checks keep the two namespaces
+                // disjoint, so the order of the lookups cannot matter).
+                let link = self.hard_links_vec().iter().position(|l| {
+                    self.hard_link_emitted(l)
+                        && matches!(l.target, HardLinkTarget::Dataset(_))
+                        && self.hard_link_full_path(l) == name
+                });
+                let Some(pos) = link else {
+                    return Err(crate::io::IoError::NotFound(name.to_string()));
+                };
+                self.hard_links.lock().remove(pos);
+                return Ok(());
+            }
+        };
         // A surviving hard link keeps the object: promote the first one to
         // the primary name and delete nothing.
         let promote = self.hard_links_vec().iter().position(|l| {
@@ -1839,12 +1855,13 @@ impl Hdf5Writer {
     /// Soft-delete a group and all its child datasets and sub-groups,
     /// freeing every deleted object's file space the way
     /// [`delete_dataset`](Self::delete_dataset) does — with the same
-    /// `H5Ldelete` semantics for hard links from *outside* the subtree: a
-    /// dataset such a link names survives, re-homed under the link. A
-    /// hard-linked inner *group* would need its whole subtree renamed,
-    /// which this writer does not do, so that delete is refused (delete
-    /// the link's parent group first). Refused while SWMR streaming is
-    /// active, same rule.
+    /// `H5Ldelete` semantics: a `name` that is a user hard link's path
+    /// unlinks just that link, and hard links from *outside* the subtree
+    /// keep their targets: a dataset such a link names survives, re-homed
+    /// under the link. A hard-linked inner *group* would need its whole
+    /// subtree renamed, which this writer does not do, so that delete is
+    /// refused (delete the link's parent group first). Refused while SWMR
+    /// streaming is active, same rule.
     pub fn delete_group(&self, name: &str) -> IoResult<()> {
         if self.swmr_active {
             return Err(swmr_delete_error(name));
@@ -1858,13 +1875,27 @@ impl Hdf5Writer {
             format!("/{}", name)
         };
         let groups = self.group_refs();
-        let gidx = groups
-            .iter()
-            .position(|g| {
-                let gg = g.lock();
-                gg.name == name && !gg.deleted
-            })
-            .ok_or_else(|| crate::io::IoError::NotFound(name.clone()))?;
+        let gidx = match groups.iter().position(|g| {
+            let gg = g.lock();
+            gg.name == name && !gg.deleted
+        }) {
+            Some(i) => i,
+            None => {
+                // Same `H5Ldelete` rule as `delete_dataset`: a path naming
+                // a user hard link to a group unlinks just that link.
+                let trimmed = name.trim_start_matches('/');
+                let link = self.hard_links_vec().iter().position(|l| {
+                    self.hard_link_emitted(l)
+                        && matches!(l.target, HardLinkTarget::Group(_))
+                        && self.hard_link_full_path(l) == trimmed
+                });
+                let Some(pos) = link else {
+                    return Err(crate::io::IoError::NotFound(name.clone()));
+                };
+                self.hard_links.lock().remove(pos);
+                return Ok(());
+            }
+        };
 
         // Pre-scan the doomed subtree before anything is marked, so a
         // refusal leaves the file untouched.

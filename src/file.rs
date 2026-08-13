@@ -573,9 +573,10 @@ impl H5File {
         }
     }
 
-    /// Delete a dataset name, with libhdf5's `H5Ldelete` semantics: if a
-    /// hard link still names the object, only this name is removed and the
-    /// dataset lives on under the link. Deleting the last name unlinks the
+    /// Delete a dataset name, with libhdf5's `H5Ldelete` semantics: a
+    /// path naming a hard link removes just that link, and if a hard link
+    /// still names the object whose tree name is deleted, the dataset
+    /// lives on under the link. Deleting the last name unlinks the
     /// dataset on close and the file space it owned — data blocks,
     /// chunk-index structures, and the global-heap objects of
     /// variable-length values — is freed for reuse by later writes in this
