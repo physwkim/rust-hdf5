@@ -823,6 +823,32 @@ fn fa_growable_max_shape_readable_by_h5py() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A global-heap collection extended in place (CWFS second pass: bigger
+/// declared size, free-space marker moved to the new tail) must stay
+/// standard-readable: h5py reads both the object that fit the original
+/// 4096 bytes and the one that forced the extension.
+#[test]
+fn extended_vlen_collection_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("extended_gcol");
+    let big = "x".repeat(5000);
+    {
+        let file = H5File::create(&path).unwrap();
+        let g = file.root_group().create_group("entry").unwrap();
+        g.set_attr_string("small", "hello").unwrap();
+        g.set_attr_string("big", &big).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "g = f['entry']\n\
+         assert g.attrs['small'] == 'hello', g.attrs['small']\n\
+         assert g.attrs['big'] == 'x' * 5000, len(g.attrs['big'])\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// A paged FA index (1200 chunks > 1024 per page) written across two rust
 /// sessions — the second reconstructs the paged data block via
 /// `open_append` — reads back exactly through h5py.

@@ -3852,6 +3852,12 @@ impl Hdf5Writer {
             while i < items.len() {
                 let need = GlobalHeapCollection::object_disk_size(&self.ctx, items[i].len());
                 let Some(pos) = cwfs.iter().position(|e| e.free >= need + objhdr) else {
+                    // Second pass of libhdf5's H5F_cwfs_find_free_heap: no
+                    // listed collection has room, so try to grow one in
+                    // place before falling back to a fresh collection.
+                    if self.extend_listed_collection(&mut cwfs, need + objhdr)? {
+                        continue;
+                    }
                     break;
                 };
                 let (addr, size) = (cwfs[pos].addr, cwfs[pos].size);
@@ -3936,6 +3942,65 @@ impl Hdf5Writer {
             }
         }
         Ok(placements)
+    }
+
+    /// Try to extend one listed collection in place so it can take an
+    /// object needing `want` bytes of free space — the second pass of
+    /// libhdf5's `H5F_cwfs_find_free_heap`: grow the file allocation
+    /// ([`FileAllocator::try_extend`], mirroring `H5MF_try_extend`) and then
+    /// the collection itself (`H5HG_extend`: a larger declared size and a
+    /// free-space marker covering the new tail — here by re-encoding at the
+    /// grown size, which writes exactly those two things).
+    ///
+    /// Extension size is `max(collection_size, shortfall)` — at least a
+    /// doubling — capped so the result stays within [`GCOL_MAX_SIZE`], both
+    /// as upstream computes them. On success the grown entry moves to the
+    /// front of the list and the caller's scan re-picks it; the free-space
+    /// measurement is taken from the block on disk, not the list's hint, so
+    /// the rewrite and the entry agree.
+    ///
+    /// Caller holds the `cwfs` lock (it passes the guarded list), which is
+    /// what serializes this read-modify-rewrite against concurrent inserts
+    /// and releases.
+    fn extend_listed_collection(&self, cwfs: &mut Vec<CwfsEntry>, want: usize) -> IoResult<bool> {
+        use crate::format::global_heap::{GlobalHeapCollection, GCOL_MAX_SIZE};
+
+        let mut pos = 0;
+        while pos < cwfs.len() {
+            let (addr, size) = (cwfs[pos].addr, cwfs[pos].size);
+            let image = self.handle.read_at(addr, size)?;
+            let (gcol, _) = GlobalHeapCollection::decode(&image[..size], &self.ctx)?;
+            // The disk is the truth for free space; the entry is a hint.
+            let Some(free) = gcol.free_space_at(&self.ctx, size) else {
+                cwfs.remove(pos);
+                continue;
+            };
+            // A hint can understate the block (upstream's FREE_SIZE is its
+            // in-memory truth and cannot): if the block already has room,
+            // correct the hint instead of doubling the collection.
+            if free >= want {
+                cwfs[pos].free = free;
+                return Ok(true);
+            }
+            let new_need = size.max(want.saturating_sub(free));
+            if size + new_need > GCOL_MAX_SIZE
+                || !self
+                    .allocator
+                    .try_extend(addr, size as u64, new_need as u64)
+            {
+                pos += 1;
+                continue;
+            }
+            let new_size = size + new_need;
+            let rewritten = gcol.encode_at_size(&self.ctx, new_size)?;
+            self.handle.write_at(addr, &rewritten)?;
+            let mut e = cwfs.remove(pos);
+            e.size = new_size;
+            e.free = free + new_need;
+            cwfs.insert(0, e);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Create a variable-length string dataset and write string data.
@@ -7759,6 +7824,83 @@ mod tests {
         writer.release_vlen_references(&refs).unwrap();
         assert_eq!(writer.handle.read_at(addr, 40).unwrap(), img);
 
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The CWFS second pass (`H5F_cwfs_find_free_heap`): an object too big
+    /// for the listed collection's remaining free space extends the
+    /// collection in place — the file allocation grows off the end of the
+    /// file (`H5MF_try_extend`) and the collection's declared size and
+    /// free-space marker grow with it (`H5HG_extend`) — instead of opening
+    /// a second collection.
+    #[test]
+    fn an_oversized_vlen_insert_extends_the_listed_collection() {
+        use crate::format::global_heap::GlobalHeapCollection;
+
+        let path = temp_path("cwfs_extend_tail");
+        let writer = Hdf5Writer::create(&path).unwrap();
+        // A small object opens a minimum-size (4096) listed collection —
+        // the file's last allocation, so the extension grows the file end.
+        let p1 = writer.insert_vlen_objects(&[b"hello".as_slice()]).unwrap();
+        let big = vec![0x41u8; 5000]; // more than the ~4 KiB remaining
+        let p2 = writer.insert_vlen_objects(&[big.as_slice()]).unwrap();
+        assert_eq!(
+            p2[0].0, p1[0].0,
+            "the big object opened a second collection"
+        );
+
+        // The block on disk is one grown collection holding both objects.
+        let img = writer.handle.read_at_most(p1[0].0, 65536).unwrap();
+        let (gcol, csize) = GlobalHeapCollection::decode(&img, &writer.ctx).unwrap();
+        assert!(csize > 4096, "declared size did not grow: {csize}");
+        assert_eq!(gcol.objects.len(), 2);
+        assert_eq!(gcol.objects[1].data, big);
+
+        writer.close().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes.windows(4).filter(|w| *w == b"GCOL").count(),
+            1,
+            "a second collection signature is in the file"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The non-tail counterpart: the collection is pinned away from the end
+    /// of the file, but a released block starts right after it, so the
+    /// extension consumes the front of that block (`H5MF_try_extend`'s
+    /// free-section path) and the remainder stays reusable.
+    #[test]
+    fn extension_consumes_a_freed_block_after_the_collection() {
+        use crate::format::global_heap::GlobalHeapCollection;
+
+        let path = temp_path("cwfs_extend_freed");
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let p1 = writer.insert_vlen_objects(&[b"hello".as_slice()]).unwrap();
+        let addr = p1[0].0;
+        // Land a block right after the collection, pin the file end past
+        // it, then release it: extension must use the released space.
+        let spacer = writer.allocator.allocate(8192);
+        assert_eq!(spacer, addr + 4096, "spacer not adjacent; layout changed");
+        writer.allocator.allocate(8);
+        writer.allocator.free(spacer, 8192);
+
+        let big = vec![0x42u8; 5000];
+        let p2 = writer.insert_vlen_objects(&[big.as_slice()]).unwrap();
+        assert_eq!(p2[0].0, addr, "the big object opened a second collection");
+
+        let img = writer.handle.read_at_most(addr, 65536).unwrap();
+        let (gcol, csize) = GlobalHeapCollection::decode(&img, &writer.ctx).unwrap();
+        assert_eq!(csize, 8192, "grew by max(size, shortfall) = 4096");
+        assert_eq!(gcol.objects.len(), 2);
+
+        // The remainder of the released block is still allocatable.
+        assert_eq!(
+            writer.allocator.allocate(4096),
+            addr + 8192,
+            "the freed block's tail was lost"
+        );
         writer.close().unwrap();
         std::fs::remove_file(&path).ok();
     }

@@ -36,6 +36,13 @@ const GCOL_VERSION: u8 = 1;
 /// Minimum collection size required by the HDF5 C library (H5HG_MINALLOC).
 const GCOL_MIN_SIZE: usize = 4096;
 
+/// Ceiling to which the CWFS second pass grows a collection in place
+/// (`H5HG_MAXSIZE`): `H5F_cwfs_find_free_heap` extends a listed collection
+/// only while `size + new_need <= H5HG_MAXSIZE`. Collections *created*
+/// larger than this (one oversized object) are legal — they are just never
+/// extended.
+pub const GCOL_MAX_SIZE: usize = 65536;
+
 /// A single object within a global heap collection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalHeapObject {

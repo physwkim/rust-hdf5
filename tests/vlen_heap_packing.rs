@@ -72,6 +72,35 @@ fn small_attributes_share_one_collection() {
     cleanup(&path);
 }
 
+/// A vlen attribute too big for the listed collection's remaining free
+/// space extends the collection in place — libhdf5's CWFS second pass
+/// (`H5F_cwfs_find_free_heap`: `H5MF_try_extend` + `H5HG_extend`) —
+/// instead of opening a second one.
+#[test]
+fn an_oversized_attr_extends_the_collection_instead_of_opening_a_second() {
+    let path = unique_tmp("extend");
+    let big = "x".repeat(5000);
+    {
+        let file = H5File::create(&path).unwrap();
+        let g = file.root_group().create_group("entry").unwrap();
+        g.set_attr_string("small", "hello").unwrap();
+        g.set_attr_string("big", &big).unwrap();
+        file.close().unwrap();
+    }
+
+    assert_eq!(
+        gcol_count(&path),
+        1,
+        "the big attr opened a second collection"
+    );
+    let file = H5File::open(&path).unwrap();
+    let g = file.root_group().group("entry").unwrap();
+    assert_eq!(g.attr_string("small").unwrap(), "hello");
+    assert_eq!(g.attr_string("big").unwrap(), big);
+    drop(file);
+    cleanup(&path);
+}
+
 /// Separate write calls — two contiguous datasets and two append batches —
 /// share one collection while it has room.
 #[test]

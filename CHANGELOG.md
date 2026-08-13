@@ -14,6 +14,16 @@
   widens exactly; `f64`→`f32`, float→integer and integer→float are
   rejected. `read_raw` is unchanged. (issue #11)
 
+- Global-heap collections extend in place, completing the CWFS parity:
+  when no listed collection can take a vlen object, the writer now grows
+  one — the file allocation via the allocator's new `try_extend`
+  (end-of-file bump or consuming an adjacent released block, libhdf5's
+  `H5MF_try_extend`) and the collection's declared size plus free-space
+  marker (`H5HG_extend`) — before falling back to a fresh collection.
+  Growth is `max(collection_size, shortfall)` capped at the 64 KiB
+  `H5HG_MAXSIZE`, as upstream computes it. A small-then-big attribute
+  pair used to cost two collections; it now costs one.
+
 ### Fixed
 
 - A v2 B-tree chunk index re-serializes at the node size its header
