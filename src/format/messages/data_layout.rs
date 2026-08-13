@@ -19,14 +19,17 @@
 //!   D 4-byte LE dimension sizes (chunk dims; last is the element size).
 //!   The chunk index is always a version-1 B-tree.
 //!
-//! Binary layout (version 4, chunked only):
-//!   Byte 0: version = 4
+//! Binary layout (versions 4 and 5, chunked only):
+//!   Byte 0: version = 4 or 5
 //!   Byte 1: layout class = 2 (chunked)
 //!   flags(1) + ndims(1) + enc_bytes_per_dim(1)
 //!   + dim_sizes(ndims * enc_bytes_per_dim, each LE)
 //!   + index_type(1)
 //!   + [for earray: 5 param bytes]
 //!   + index_address(sizeof_addr)
+//!
+//! Version 5 (libhdf5 2.0) differs from version 4 only in the version byte;
+//! see [`VERSION_5`] for its effect on filtered chunk indexes.
 
 use crate::format::bytes::{read_le_addr as read_addr, read_le_uint as read_size};
 use crate::format::{FormatContext, FormatError, FormatResult, UNDEF_ADDR};
@@ -149,8 +152,16 @@ pub enum DataLayoutMessage {
         /// Address of the version-1 B-tree that indexes the chunks.
         b_tree_address: u64,
     },
-    /// Version 4 chunked storage.
+    /// Version 4 chunked storage. Version 5 shares this exact wire format —
+    /// only the version byte differs — so both decode into this variant.
     ChunkedV4 {
+        /// Message version byte: 4 or 5. Version 5 (libhdf5 2.0,
+        /// `H5O_LAYOUT_VERSION_5`) declares that the chunk index encodes
+        /// filtered-chunk sizes in a fixed `sizeof_size`-byte field instead
+        /// of the width derived from the chunk byte count, so a filter may
+        /// expand a chunk without overflowing the field. Readers older than
+        /// libhdf5 2.0 reject version 5.
+        version: u8,
         flags: u8,
         /// Chunk dimension sizes.
         chunk_dims: Vec<u64>,
@@ -203,11 +214,13 @@ impl DataLayoutMessage {
     /// For example, for a 2D dataset with chunk=(1,4) and element_size=8,
     /// pass chunk_dims = [1, 4, 8].
     pub fn chunked_v4_earray(
+        version: u8,
         chunk_dims: Vec<u64>,
         earray_params: EarrayParams,
         index_address: u64,
     ) -> Self {
         Self::ChunkedV4 {
+            version,
             flags: 0,
             chunk_dims,
             index_type: ChunkIndexType::ExtensibleArray,
@@ -222,11 +235,13 @@ impl DataLayoutMessage {
     ///
     /// `chunk_dims` should include the trailing element-size dimension.
     pub fn chunked_v4_farray(
+        version: u8,
         chunk_dims: Vec<u64>,
         farray_params: FixedArrayParams,
         index_address: u64,
     ) -> Self {
         Self::ChunkedV4 {
+            version,
             flags: 0,
             chunk_dims,
             index_type: ChunkIndexType::FixedArray,
@@ -240,8 +255,9 @@ impl DataLayoutMessage {
     /// Version 4 chunked layout with B-tree v2 index.
     ///
     /// `chunk_dims` should include the trailing element-size dimension.
-    pub fn chunked_v4_btree_v2(chunk_dims: Vec<u64>, index_address: u64) -> Self {
+    pub fn chunked_v4_btree_v2(version: u8, chunk_dims: Vec<u64>, index_address: u64) -> Self {
         Self::ChunkedV4 {
+            version,
             flags: 0,
             chunk_dims,
             index_type: ChunkIndexType::BTreeV2,
@@ -257,6 +273,7 @@ impl DataLayoutMessage {
     /// `chunk_dims` should include the trailing element-size dimension.
     pub fn chunked_v4_single(chunk_dims: Vec<u64>, index_address: u64) -> Self {
         Self::ChunkedV4 {
+            version: VERSION_4,
             flags: 0,
             chunk_dims,
             index_type: ChunkIndexType::SingleChunk,
@@ -307,6 +324,7 @@ impl DataLayoutMessage {
                 buf
             }
             Self::ChunkedV4 {
+                version,
                 flags,
                 chunk_dims,
                 index_type,
@@ -323,8 +341,9 @@ impl DataLayoutMessage {
                 let max_dim = chunk_dims.iter().copied().max().unwrap_or(1);
                 let enc_bytes = enc_bytes_for_value(max_dim);
 
+                debug_assert!(matches!(*version, VERSION_4 | VERSION_5));
                 let mut buf = Vec::with_capacity(64);
-                buf.push(VERSION_4);
+                buf.push(*version);
                 buf.push(CLASS_CHUNKED);
                 buf.push(*flags);
                 buf.push(ndims);
@@ -674,6 +693,7 @@ impl DataLayoutMessage {
 
                 Ok((
                     Self::ChunkedV4 {
+                        version: buf[0],
                         flags,
                         chunk_dims,
                         index_type,
@@ -852,7 +872,7 @@ mod tests {
     #[test]
     fn roundtrip_chunked_v4_earray() {
         let params = EarrayParams::default_params();
-        let msg = DataLayoutMessage::chunked_v4_earray(vec![1, 256, 256], params, 0x2000);
+        let msg = DataLayoutMessage::chunked_v4_earray(4, vec![1, 256, 256], params, 0x2000);
         let encoded = msg.encode(&ctx8());
         assert_eq!(encoded[0], 4); // version 4
         assert_eq!(encoded[1], 2); // class chunked
@@ -864,11 +884,32 @@ mod tests {
     #[test]
     fn roundtrip_chunked_v4_earray_ctx4() {
         let params = EarrayParams::default_params();
-        let msg = DataLayoutMessage::chunked_v4_earray(vec![1, 128], params, 0x1000);
+        let msg = DataLayoutMessage::chunked_v4_earray(4, vec![1, 128], params, 0x1000);
         let encoded = msg.encode(&ctx4());
         let (decoded, consumed) = DataLayoutMessage::decode(&encoded, &ctx4()).unwrap();
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded, msg);
+    }
+
+    /// A version-5 layout differs from v4 only in the version byte; the body
+    /// encodes identically and the version must survive the round trip (a
+    /// reopen that dropped it would silently downgrade the file to v4 while
+    /// its filtered index keeps 8-byte size fields).
+    #[test]
+    fn roundtrip_chunked_v5_earray() {
+        let params = EarrayParams::default_params();
+        let v5 = DataLayoutMessage::chunked_v4_earray(5, vec![1, 256, 256], params.clone(), 0x2000);
+        let encoded = v5.encode(&ctx8());
+        assert_eq!(encoded[0], 5); // version 5
+        assert_eq!(encoded[1], 2); // class chunked
+        let (decoded, consumed) = DataLayoutMessage::decode(&encoded, &ctx8()).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, v5);
+
+        // Same message at v4: only byte 0 differs.
+        let v4 = DataLayoutMessage::chunked_v4_earray(4, vec![1, 256, 256], params, 0x2000);
+        let encoded_v4 = v4.encode(&ctx8());
+        assert_eq!(encoded[1..], encoded_v4[1..]);
     }
 
     #[test]
@@ -888,6 +929,7 @@ mod tests {
     fn roundtrip_chunked_v4_single_filtered() {
         for ctx in [ctx8(), ctx4()] {
             let msg = DataLayoutMessage::ChunkedV4 {
+                version: 4,
                 flags: 0x02,
                 chunk_dims: vec![100, 200, 4],
                 index_type: ChunkIndexType::SingleChunk,
@@ -921,7 +963,7 @@ mod tests {
     fn chunked_v4_enc_bytes() {
         // chunk dims [1, 256, 256]: max=256, needs 2 bytes
         let params = EarrayParams::default_params();
-        let msg = DataLayoutMessage::chunked_v4_earray(vec![1, 256, 256], params, 0x2000);
+        let msg = DataLayoutMessage::chunked_v4_earray(4, vec![1, 256, 256], params, 0x2000);
         let encoded = msg.encode(&ctx8());
         // version(1) + class(1) + flags(1) + ndims(1) + enc_bytes(1)
         // + 3*2 dim bytes + index_type(1) + 5 earray params + 8 addr = 25
@@ -1000,7 +1042,7 @@ mod tests {
     fn chunked_v4_large_dims() {
         // Large dims requiring 4 bytes each
         let params = EarrayParams::default_params();
-        let msg = DataLayoutMessage::chunked_v4_earray(vec![1, 65536], params, 0x4000);
+        let msg = DataLayoutMessage::chunked_v4_earray(4, vec![1, 65536], params, 0x4000);
         let encoded = msg.encode(&ctx8());
         assert_eq!(encoded[4], 3); // enc_bytes_per_dim = 3 (65536 = 0x10000, needs 3 bytes)
     }

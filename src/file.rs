@@ -166,6 +166,32 @@ impl H5File {
         H5FileOptions::default()
     }
 
+    /// Opt in to the latest file format for datasets created after this call —
+    /// the equivalent of libhdf5's `H5Pset_libver_bounds(low = H5F_LIBVER_V200)`.
+    ///
+    /// With `latest` set, filtered chunked datasets get a version-5 data layout
+    /// message, whose chunk indexes store on-disk chunk sizes in fixed-width
+    /// (`sizeof_size`, i.e. 8-byte) fields instead of fields sized from the
+    /// uncompressed chunk size. That removes the overflow risk when a filter
+    /// *expands* a chunk, but the file is only readable by libhdf5 ≥ 2.0
+    /// (h5py bundling hdf5 1.14 rejects it with "bad version number").
+    ///
+    /// Off by default; unfiltered and contiguous datasets are unaffected.
+    /// Independent of this setting, a chunk larger than 4 GiB forces version 5
+    /// because version 4 cannot represent its size field, matching libhdf5.
+    ///
+    /// Errors in read mode.
+    pub fn set_libver_latest(&self, latest: bool) -> Result<()> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                writer.set_libver_latest(latest);
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
+        }
+    }
+
     /// Return a handle to the root group.
     ///
     /// The root group can be used to create datasets and sub-groups.

@@ -83,8 +83,11 @@ pub struct Bt2FilteredChunkRecord {
     pub scaled_offsets: Vec<u64>,
     /// File address of the chunk data.
     pub chunk_address: u64,
-    /// Size of the chunk after filtering (compressed size).
-    pub chunk_size: u32,
+    /// Size of the chunk after filtering (compressed size). `u64` because the
+    /// encoded field is `chunk_size_len` bytes wide — up to 8 under a
+    /// version-5 layout (or a v4 layout whose uncompressed chunk derives an
+    /// 8-byte width).
+    pub chunk_size: u64,
     /// Filter mask (bit i set = skip filter i).
     pub filter_mask: u32,
 }
@@ -981,7 +984,7 @@ impl Bt2ChunkIndex {
         &mut self,
         scaled_offsets: Vec<u64>,
         chunk_address: u64,
-        chunk_size: u32,
+        chunk_size: u64,
         filter_mask: u32,
     ) {
         match self
@@ -1068,7 +1071,7 @@ impl Bt2ChunkIndex {
                 // filter mask, then the scaled offsets.
                 buf.extend_from_slice(&rec.chunk_address.to_le_bytes()[..sa]);
                 buf.extend_from_slice(
-                    &(rec.chunk_size as u64).to_le_bytes()[..self.chunk_size_len as usize],
+                    &rec.chunk_size.to_le_bytes()[..self.chunk_size_len as usize],
                 );
                 buf.extend_from_slice(&rec.filter_mask.to_le_bytes());
                 for &offset in &rec.scaled_offsets {
@@ -1193,7 +1196,7 @@ impl Bt2ChunkIndex {
             // mask, then the scaled offsets.
             let chunk_address = read_addr(&record_data[pos..], sa);
             pos += sa;
-            let chunk_size = read_size(&record_data[pos..], chunk_size_len) as u32;
+            let chunk_size = read_size(&record_data[pos..], chunk_size_len);
             pos += chunk_size_len;
             let filter_mask = u32::from_le_bytes([
                 record_data[pos],
@@ -1815,7 +1818,7 @@ mod tests {
         // record_size = 8 + 2 + 4 + 16 = 30, so a leaf holds (2048-10)/30 = 67.
         let mut idx = Bt2ChunkIndex::new_filtered(2, 2);
         for i in 0..500u64 {
-            idx.insert_filtered(vec![i, 0], 0x10_000 + i * 0x100, (i % 400) as u32 + 1, 0);
+            idx.insert_filtered(vec![i, 0], 0x10_000 + i * 0x100, (i % 400) + 1, 0);
         }
         let tree = idx.build_tree(&ctx);
         assert!(tree.depth() >= 1);
@@ -1828,7 +1831,7 @@ mod tests {
         for (i, r) in records.iter().enumerate() {
             assert_eq!(r.scaled_offsets, vec![i as u64, 0]);
             assert_eq!(r.chunk_address, 0x10_000 + i as u64 * 0x100);
-            assert_eq!(r.chunk_size, (i as u32 % 400) + 1);
+            assert_eq!(r.chunk_size, (i as u64 % 400) + 1);
         }
     }
 

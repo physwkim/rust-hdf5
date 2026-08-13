@@ -1845,7 +1845,7 @@ impl Hdf5Reader {
                     let elems =
                         decode_filtered_page(&page_buf, &self.ctx, page_nelmts, chunk_size_len)?;
                     for e in elems {
-                        chunk_entries.push((e.address, e.chunk_size as u64, e.filter_mask));
+                        chunk_entries.push((e.address, e.chunk_size, e.filter_mask));
                     }
                 } else {
                     let addrs = decode_unfiltered_page(&page_buf, &self.ctx, page_nelmts)?;
@@ -1872,7 +1872,7 @@ impl Hdf5Reader {
                     chunk_size_len,
                 )?;
                 for e in &fa_dblk.filtered_elements {
-                    chunk_entries.push((e.address, e.chunk_size as u64, e.filter_mask));
+                    chunk_entries.push((e.address, e.chunk_size, e.filter_mask));
                 }
             } else {
                 let fa_dblk =

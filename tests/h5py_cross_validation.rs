@@ -822,3 +822,72 @@ fn fa_growable_max_shape_readable_by_h5py() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// Issue #8: `set_libver_latest(true)` writes a version-5 data layout message
+/// for filtered chunked datasets. Two identical files differing only in the
+/// knob prove both directions: the default file stays h5py-readable (v4), and
+/// hdf5 < 2.0 rejects the opt-in file — the rejection is the on-disk proof
+/// that a genuine v5 message was written, not a v4 one with wider index
+/// fields. Under hdf5 >= 2.0 the v5 file must instead read back exactly.
+/// Either way, rust-hdf5's own reader must read the v5 file.
+#[cfg(feature = "deflate")]
+#[test]
+fn libver_latest_v5_layout_write_and_hdf5_1x_rejection() {
+    let Some(py) = python() else { return };
+    let data: Vec<i32> = (0..35).collect(); // 7 x 5 row-major
+    let path_v4 = tmp("layout_default_v4");
+    let path_v5 = tmp("layout_optin_v5");
+    for (path, latest) in [(&path_v4, false), (&path_v5, true)] {
+        let file = H5File::create(path).unwrap();
+        file.set_libver_latest(latest).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([7, 5])
+            .chunk(&[3, 2])
+            .deflate(4)
+            .create("grid")
+            .unwrap();
+        ds.write_raw(&data).unwrap();
+        file.close().unwrap();
+    }
+
+    // rust-hdf5's reader handles both versions.
+    for path in [&path_v4, &path_v5] {
+        let file = H5File::open(path).unwrap();
+        let got = file.dataset("grid").unwrap().read_raw::<i32>().unwrap();
+        assert_eq!(got, data, "rust read-back of {}", path.display());
+    }
+
+    // Positive control: the default file is plain v4 and h5py-readable.
+    read_back_with_h5py(
+        py,
+        &path_v4,
+        "ds = f['grid']\n\
+         assert ds.compression == 'gzip', ds.compression\n\
+         assert np.array_equal(ds[...], np.arange(35).reshape(7, 5)), ds[...]\n",
+    );
+
+    // The v5 file: rejected below hdf5 2.0, readable at 2.0+.
+    let script = format!(
+        "import h5py, numpy as np, sys\n\
+         v2 = h5py.version.hdf5_version_tuple >= (2, 0, 0)\n\
+         try:\n\
+         \x20   f = h5py.File(r'{}', 'r')\n\
+         \x20   v = f['grid'][...]\n\
+         except Exception:\n\
+         \x20   assert not v2, 'hdf5 >= 2.0 must read a v5 layout'\n\
+         \x20   sys.exit(0)\n\
+         assert v2, 'hdf5 < 2.0 read the opt-in file, so it is not v5 on disk'\n\
+         assert np.array_equal(v, np.arange(35).reshape(7, 5)), v\n",
+        path_v5.display()
+    );
+    let status = std::process::Command::new(py)
+        .arg("-c")
+        .arg(&script)
+        .status()
+        .expect("failed to spawn python");
+    assert!(status.success(), "v5 layout check failed for {path_v5:?}");
+
+    std::fs::remove_file(&path_v4).ok();
+    std::fs::remove_file(&path_v5).ok();
+}

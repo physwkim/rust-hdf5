@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Added
+
+- `H5File::set_libver_latest` opts datasets created after the call into the
+  latest file format, the equivalent of libhdf5's
+  `H5Pset_libver_bounds(low = H5F_LIBVER_V200)`: filtered chunked datasets
+  get a version-5 data layout message whose chunk indexes store on-disk
+  chunk sizes in fixed 8-byte fields, removing the overflow risk when a
+  filter expands a chunk. Off by default — a v5 file needs libhdf5 ≥ 2.0
+  (h5py bundling hdf5 1.14 rejects it), while the default v4 stays readable
+  everywhere. Independent of the knob, a chunk larger than 4 GiB forces
+  version 5, matching libhdf5, because v4 cannot represent its size field.
+  The version read from an existing file is preserved on reopen, so
+  appending to a v5 file never silently downgrades it. In-memory chunk-size
+  fields in the fixed-array and v2-B-tree indexes widened from `u32` to
+  `u64` to carry the 8-byte field. (issue #8)
+
 ### Fixed
 
 - Concurrent operations on the *same* dataset serialize wholly under the

@@ -217,7 +217,10 @@ pub struct FixedArrayChunkElement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FixedArrayFilteredChunkElement {
     pub address: u64,
-    pub chunk_size: u32,
+    /// Stored (on-disk) chunk size. `u64` because the encoded field is
+    /// `chunk_size_len` bytes wide — up to 8 under a version-5 layout (or a
+    /// v4 layout whose uncompressed chunk derives an 8-byte width).
+    pub chunk_size: u64,
     pub filter_mask: u32,
 }
 
@@ -448,7 +451,7 @@ impl FixedArrayDataBlock {
         for _ in 0..num_elmts {
             let address = read_addr(&buf[pos..], sa);
             pos += sa;
-            let chunk_size = read_size(&buf[pos..], chunk_size_len) as u32;
+            let chunk_size = read_size(&buf[pos..], chunk_size_len);
             pos += chunk_size_len;
             let filter_mask =
                 u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
@@ -609,7 +612,7 @@ pub fn encode_filtered_page(
     let mut buf = Vec::with_capacity(elems.len() * elem_size + 4);
     for e in elems {
         buf.extend_from_slice(&e.address.to_le_bytes()[..sa]);
-        buf.extend_from_slice(&(e.chunk_size as u64).to_le_bytes()[..chunk_size_len]);
+        buf.extend_from_slice(&e.chunk_size.to_le_bytes()[..chunk_size_len]);
         buf.extend_from_slice(&e.filter_mask.to_le_bytes());
     }
     let cksum = checksum_metadata(&buf);
@@ -705,7 +708,7 @@ pub fn decode_filtered_page(
     for _ in 0..nelmts {
         let address = read_addr(&page_buf[pos..], sa);
         pos += sa;
-        let chunk_size = read_size(&page_buf[pos..], chunk_size_len) as u32;
+        let chunk_size = read_size(&page_buf[pos..], chunk_size_len);
         pos += chunk_size_len;
         let filter_mask = u32::from_le_bytes([
             page_buf[pos],
@@ -940,7 +943,7 @@ mod tests {
         let mut buf = Vec::new();
         for e in elems {
             buf.extend_from_slice(&e.address.to_le_bytes()[..sa]);
-            buf.extend_from_slice(&(e.chunk_size as u64).to_le_bytes()[..chunk_size_len]);
+            buf.extend_from_slice(&e.chunk_size.to_le_bytes()[..chunk_size_len]);
             buf.extend_from_slice(&e.filter_mask.to_le_bytes());
         }
         let cksum = checksum_metadata(&buf);

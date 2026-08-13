@@ -326,6 +326,12 @@ pub struct DatasetInfo {
     /// means default zero-fill; `Some` is emitted as a `fill_defined = 2`
     /// fill-value message in the dataset object header.
     pub fill_value: Option<Vec<u8>>,
+    /// Layout message version for chunked storage: 4, or 5 when the chunk
+    /// index encodes stored chunk sizes in a fixed `sizeof_size` field
+    /// (libhdf5 2.0). Chosen at create by `Hdf5Writer::chunk_layout_version`,
+    /// preserved from the file on reopen, and emitted verbatim at finalize.
+    /// Contiguous datasets ignore it.
+    pub layout_version: u8,
 }
 
 /// Runtime metadata for a chunked dataset.
@@ -614,6 +620,14 @@ pub struct Hdf5Writer {
     /// outermost lock a create acquires (create_lock → spine → slot), and no
     /// write path takes it, so it cannot deadlock with the registry locks.
     pub(crate) create_lock: Slot<()>,
+    /// Target the libhdf5 2.0 file format (`H5Pset_libver_bounds` with low
+    /// bound `H5F_LIBVER_V200`): filtered chunked datasets created while
+    /// this is set get layout message version 5, whose chunk indexes encode
+    /// stored chunk sizes in a fixed `sizeof_size` field, so an expanding
+    /// filter cannot overflow the size field. Off by default — version-5
+    /// files are rejected by libhdf5 before 2.0, including the 1.14-based
+    /// h5py wheels.
+    libver_latest: bool,
     closed: bool,
     /// Set once `finalize_for_swmr` has published a readable file.
     ///
@@ -675,11 +689,49 @@ impl Hdf5Writer {
             hard_links: Slot::new(Vec::new()),
             root_attributes: Slot::new(Vec::new()),
             create_lock: Slot::new(()),
+            libver_latest: false,
             closed: false,
             swmr_active: false,
             root_group_addr: None,
             root_group_encoded_size: 0,
         })
+    }
+
+    /// Target the libhdf5 2.0 file format for datasets created after this
+    /// call: filtered chunked datasets get layout message version 5, whose
+    /// chunk indexes store chunk sizes in a fixed `sizeof_size`-byte field
+    /// with no overflow limit (see [`Self::chunk_layout_version`]). Off by
+    /// default, because readers older than libhdf5 2.0 — including the
+    /// 1.14-based h5py wheels — reject version 5.
+    pub fn set_libver_latest(&mut self, latest: bool) {
+        self.libver_latest = latest;
+    }
+
+    /// Layout message version for a new chunked dataset — the
+    /// `H5D__chunk_set_info` rule (H5Dchunk.c): version 5 is *required* for
+    /// a chunk over 4 GiB (pre-2.0 readers cannot handle one even though the
+    /// v4 wire format could express it) and *preferred* for filtered chunks
+    /// when the file targets the 2.0 format; everything else stays at
+    /// version 4, which every 1.10+ reader accepts.
+    fn chunk_layout_version(&self, filtered: bool, chunk_bytes: u64) -> u8 {
+        if chunk_bytes > u32::MAX as u64 || (filtered && self.libver_latest) {
+            5
+        } else {
+            4
+        }
+    }
+
+    /// Width of the stored-chunk-size field in a filtered chunk index:
+    /// version 5 uses the fixed `sizeof_size`; version 4 derives it from the
+    /// uncompressed chunk byte count (one spare byte included), the
+    /// `H5D_*_COMPUTE_CHUNK_SIZE_LEN` rule shared by the extensible-array,
+    /// fixed-array and v2-B-tree indexes.
+    fn chunk_size_len_for(&self, layout_version: u8, chunk_bytes: u64) -> u8 {
+        if layout_version >= 5 {
+            self.ctx.sizeof_size
+        } else {
+            compute_chunk_size_len(chunk_bytes)
+        }
     }
 
     /// Provide public access to the format context.
@@ -929,6 +981,14 @@ impl Hdf5Writer {
                 filter_pipeline: fp,
                 deleted: false,
                 fill_value,
+                // Preserve the on-disk layout version so finalize re-encodes
+                // what it read: a v5 file reopened and appended to must not be
+                // silently downgraded to v4 (the filtered indexes keep their
+                // 8-byte size fields, which v4 readers would mis-derive).
+                layout_version: match &dl {
+                    DataLayoutMessage::ChunkedV4 { version, .. } => *version,
+                    _ => 4,
+                },
             };
 
             // Reconstruct storage-specific metadata
@@ -1156,6 +1216,7 @@ impl Hdf5Writer {
             hard_links: Slot::new(Vec::new()),
             root_attributes: Slot::new(root_attributes),
             create_lock: Slot::new(()),
+            libver_latest: false,
             closed: false,
             swmr_active: false,
             root_group_addr: None,
@@ -1696,6 +1757,7 @@ impl Hdf5Writer {
                 filter_pipeline: None,
                 deleted: false,
                 fill_value: None,
+                layout_version: 4,
             },
         );
 
@@ -1718,6 +1780,8 @@ impl Hdf5Writer {
         let create = self.begin_create(name)?;
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         ensure_unlimited_is_leading(max_dims)?;
+        let chunk_bytes = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
+        let layout_version = self.chunk_layout_version(false, chunk_bytes);
         let earray_params = EarrayParams::default_params();
         let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs)?;
         let nsblk_addrs = compute_nsblk_addrs(
@@ -1780,6 +1844,7 @@ impl Hdf5Writer {
                 filter_pipeline: None,
                 deleted: false,
                 fill_value: None,
+                layout_version,
                 fixed_array: None,
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
@@ -2513,6 +2578,7 @@ impl Hdf5Writer {
                 filter_pipeline: None,
                 deleted: false,
                 fill_value: None,
+                layout_version: 4,
                 chunked: None,
                 fixed_array: None,
                 btree_v2: None,
@@ -2589,6 +2655,7 @@ impl Hdf5Writer {
                 filter_pipeline: None,
                 deleted: false,
                 fill_value: None,
+                layout_version: 4,
                 chunked: None,
                 fixed_array: None,
                 btree_v2: None,
@@ -2652,7 +2719,8 @@ impl Hdf5Writer {
         let dims: Vec<u64> = vec![num_strings];
         let max_dims: Vec<u64> = vec![num_strings];
         let chunk_bytes = chunk_size as u64 * element_size;
-        let chunk_size_len = compute_chunk_size_len(chunk_bytes);
+        let layout_version = self.chunk_layout_version(true, chunk_bytes);
+        let chunk_size_len = self.chunk_size_len_for(layout_version, chunk_bytes);
 
         let earray_params = EarrayParams::default_params();
         let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs)?;
@@ -2718,6 +2786,7 @@ impl Hdf5Writer {
                 filter_pipeline: Some(pipeline),
                 deleted: false,
                 fill_value: None,
+                layout_version,
                 fixed_array: None,
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
@@ -3664,7 +3733,7 @@ impl Hdf5Writer {
                 let lidx = linear as usize;
                 let (addr, nbytes, mask) = if pipeline.is_some() {
                     match fa.fa_dblk.filtered_elements.get(lidx) {
-                        Some(e) => (e.address, e.chunk_size as u64, e.filter_mask),
+                        Some(e) => (e.address, e.chunk_size, e.filter_mask),
                         None => return Ok(None),
                     }
                 } else {
@@ -3687,7 +3756,7 @@ impl Hdf5Writer {
                 let found = if bt2.index.filtered {
                     bt2.index
                         .lookup_filtered(chunk_coords)
-                        .map(|r| (r.chunk_address, r.chunk_size as u64, r.filter_mask))
+                        .map(|r| (r.chunk_address, r.chunk_size, r.filter_mask))
                 } else {
                     bt2.index
                         .lookup(chunk_coords)
@@ -3855,15 +3924,15 @@ impl Hdf5Writer {
             })?;
         }
 
+        let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
+        let layout_version = self.chunk_layout_version(pipeline.is_some(), chunk_bytes);
+
         // Create the FA header. For a filtered FA, chunk_size_len is sized
-        // from the uncompressed chunk byte count, the same way the filtered
-        // Extensible Array path computes it: the compressed size never
-        // exceeds the uncompressed size meaningfully, so this width always
-        // holds the stored value.
+        // the same way the filtered Extensible Array path computes it:
+        // derived from the uncompressed chunk byte count under layout v4,
+        // the fixed `sizeof_size` under layout v5.
         let mut fa_header = if pipeline.is_some() {
-            let element_size = datatype.element_size() as u64;
-            let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
-            let chunk_size_len = compute_chunk_size_len(chunk_bytes);
+            let chunk_size_len = self.chunk_size_len_for(layout_version, chunk_bytes);
             FixedArrayHeader::new_for_filtered_chunks(&self.ctx, num_chunks, chunk_size_len)
         } else {
             FixedArrayHeader::new_for_chunks(&self.ctx, num_chunks)
@@ -3918,6 +3987,7 @@ impl Hdf5Writer {
                 filter_pipeline: pipeline,
                 deleted: false,
                 fill_value: None,
+                layout_version,
                 chunked: None,
                 btree_v2: None,
                 fixed_array: Some(FixedArrayDatasetInfo {
@@ -3985,22 +4055,21 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: Option<FilterPipeline>,
     ) -> IoResult<usize> {
-        use crate::format::chunk_index::btree_v2::{
-            compute_chunk_size_len, Bt2Header, BT2_NODE_SIZE,
-        };
+        use crate::format::chunk_index::btree_v2::{Bt2Header, BT2_NODE_SIZE};
 
         let create = self.begin_create(name)?;
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         let ndims = dims.len();
+        let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
+        let layout_version = self.chunk_layout_version(pipeline.is_some(), chunk_bytes);
 
         // The filtered record's size field is as wide as libhdf5 will
-        // recompute it from the uncompressed chunk size, exactly as the
+        // recompute it — from the uncompressed chunk size under layout v4,
+        // the fixed `sizeof_size` under layout v5 — exactly as the
         // extensible- and fixed-array filtered paths size theirs.
         let bt2_index = match pipeline {
             Some(_) => {
-                let chunk_bytes: u64 =
-                    chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
-                let len = compute_chunk_size_len(chunk_bytes);
+                let len = self.chunk_size_len_for(layout_version, chunk_bytes);
                 Bt2ChunkIndex::new_filtered(ndims, len)
             }
             None => Bt2ChunkIndex::new_unfiltered(ndims),
@@ -4050,6 +4119,7 @@ impl Hdf5Writer {
                 filter_pipeline: pipeline,
                 deleted: false,
                 fill_value: None,
+                layout_version,
                 chunked: None,
                 fixed_array: None,
                 btree_v2: Some(Bt2DatasetInfo {
@@ -4085,7 +4155,8 @@ impl Hdf5Writer {
         ensure_unlimited_is_leading(max_dims)?;
         let element_size = datatype.element_size() as u64;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
-        let chunk_size_len = compute_chunk_size_len(chunk_bytes);
+        let layout_version = self.chunk_layout_version(true, chunk_bytes);
+        let chunk_size_len = self.chunk_size_len_for(layout_version, chunk_bytes);
 
         let earray_params = EarrayParams::default_params();
         let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs)?;
@@ -4152,6 +4223,7 @@ impl Hdf5Writer {
                 filter_pipeline: Some(FilterPipeline::deflate(compression_level)),
                 deleted: false,
                 fill_value: None,
+                layout_version,
                 fixed_array: None,
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
@@ -4189,7 +4261,8 @@ impl Hdf5Writer {
         ensure_unlimited_is_leading(max_dims)?;
         let element_size = datatype.element_size() as u64;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
-        let chunk_size_len = compute_chunk_size_len(chunk_bytes);
+        let layout_version = self.chunk_layout_version(true, chunk_bytes);
+        let chunk_size_len = self.chunk_size_len_for(layout_version, chunk_bytes);
 
         let earray_params = EarrayParams::default_params();
         let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs)?;
@@ -4251,6 +4324,7 @@ impl Hdf5Writer {
                 filter_pipeline: Some(pipeline),
                 deleted: false,
                 fill_value: None,
+                layout_version,
                 fixed_array: None,
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
@@ -4414,11 +4488,6 @@ impl Hdf5Writer {
             // Filtered FA: store address + stored size + filter mask. A
             // non-zero mask bit means "filter i was skipped for this chunk".
             let stored_size = final_bytes.len();
-            if stored_size > u32::MAX as usize {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "compressed chunk size {stored_size} exceeds u32::MAX"
-                )));
-            }
             // The stored size is encoded in the FA header's `chunk_size_len`-byte
             // field; libhdf5 errors if it does not fit (H5D_CHUNK_ENCODE_SIZE_CHECK)
             // rather than truncating silently. element_size = sizeof_addr +
@@ -4438,14 +4507,12 @@ impl Hdf5Writer {
             }
             if lidx < fa.fa_dblk.filtered_elements.len() {
                 let old = &fa.fa_dblk.filtered_elements[lidx];
-                let chunk_addr = self.place_chunk(
-                    Some((old.address, old.chunk_size as u64)),
-                    stored_size as u64,
-                );
+                let chunk_addr =
+                    self.place_chunk(Some((old.address, old.chunk_size)), stored_size as u64);
                 self.handle.write_at(chunk_addr, final_bytes)?;
                 fa.fa_dblk.filtered_elements[lidx] = FixedArrayFilteredChunkElement {
                     address: chunk_addr,
-                    chunk_size: stored_size as u32,
+                    chunk_size: stored_size as u64,
                     filter_mask,
                 };
                 fa.chunks_written += 1;
@@ -4629,7 +4696,7 @@ impl Hdf5Writer {
         let old = if bt2.index.filtered {
             bt2.index
                 .lookup_filtered(chunk_coords)
-                .map(|r| (r.chunk_address, r.chunk_size as u64))
+                .map(|r| (r.chunk_address, r.chunk_size))
         } else {
             bt2.index
                 .lookup(chunk_coords)
@@ -4640,12 +4707,8 @@ impl Hdf5Writer {
 
         let bt2 = m.btree_v2.as_mut().unwrap();
         if bt2.index.filtered {
-            bt2.index.insert_filtered(
-                chunk_coords.to_vec(),
-                chunk_addr,
-                stored_len as u32,
-                filter_mask,
-            );
+            bt2.index
+                .insert_filtered(chunk_coords.to_vec(), chunk_addr, stored_len, filter_mask);
         } else {
             bt2.index.insert(chunk_coords.to_vec(), chunk_addr);
         }
@@ -5350,6 +5413,7 @@ impl Hdf5Writer {
             let mut layout_dims = chunked.chunk_dims.clone();
             layout_dims.push(m.datatype.element_size() as u64);
             DataLayoutMessage::chunked_v4_earray(
+                m.layout_version,
                 layout_dims,
                 chunked.earray_params.clone(),
                 chunked.ea_header_addr,
@@ -5358,6 +5422,7 @@ impl Hdf5Writer {
             let mut layout_dims = fa.chunk_dims.clone();
             layout_dims.push(m.datatype.element_size() as u64);
             DataLayoutMessage::chunked_v4_farray(
+                m.layout_version,
                 layout_dims,
                 FixedArrayParams::default_params(),
                 fa.fa_header_addr,
@@ -5365,7 +5430,11 @@ impl Hdf5Writer {
         } else if let Some(ref bt2) = m.btree_v2 {
             let mut layout_dims = bt2.chunk_dims.clone();
             layout_dims.push(m.datatype.element_size() as u64);
-            DataLayoutMessage::chunked_v4_btree_v2(layout_dims, bt2.bt2_header_addr)
+            DataLayoutMessage::chunked_v4_btree_v2(
+                m.layout_version,
+                layout_dims,
+                bt2.bt2_header_addr,
+            )
         } else {
             DataLayoutMessage::contiguous(m.data_addr, m.data_size)
         };
@@ -6198,7 +6267,7 @@ mod tests {
         let mut paged_dblk = FixedArrayDataBlock::new_filtered(0x1000, 2500);
         for (i, e) in paged_dblk.filtered_elements.iter_mut().enumerate() {
             e.address = 0x10000 + (i as u64) * 0x100;
-            e.chunk_size = (i % 200) as u32;
+            e.chunk_size = (i % 200) as u64;
         }
         let encoded = encode_fixed_array_dblk(&ctx, &paged, &paged_dblk);
         assert_eq!(
@@ -7023,6 +7092,225 @@ mod tests {
             .create_vlen_string_dataset_compressed("empty", &[], 16, FilterPipeline::deflate(6))
             .unwrap();
 
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `set_libver_latest` moves *filtered* chunked datasets to layout v5 with
+    /// fixed 8-byte chunk-size fields; unfiltered chunked and pre-opt-in
+    /// datasets keep v4 with the derived width, matching libhdf5's
+    /// `version_perf` rule (only the filtered index arms bump to 5).
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn libver_latest_selects_v5_for_filtered_chunks_only() {
+        let path = temp_path("libver_v5_select");
+
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        let before = writer
+            .create_chunked_dataset_compressed(
+                "d4",
+                DatatypeMessage::i32_type(),
+                &[0],
+                &[u64::MAX],
+                &[16],
+                4,
+            )
+            .unwrap();
+        writer.set_libver_latest(true);
+        let ea5 = writer
+            .create_chunked_dataset_compressed(
+                "ea5",
+                DatatypeMessage::i32_type(),
+                &[0],
+                &[u64::MAX],
+                &[16],
+                4,
+            )
+            .unwrap();
+        let plain = writer
+            .create_chunked_dataset(
+                "plain",
+                DatatypeMessage::i32_type(),
+                &[0],
+                &[u64::MAX],
+                &[16],
+            )
+            .unwrap();
+        let fa5 = writer
+            .create_fixed_array_dataset_with_pipeline(
+                "fa5",
+                DatatypeMessage::i32_type(),
+                &[4, 6],
+                &[2, 3],
+                FilterPipeline::deflate(6),
+            )
+            .unwrap();
+        let bt5 = writer
+            .create_btree_v2_dataset_with_pipeline(
+                "bt5",
+                DatatypeMessage::i32_type(),
+                &[0, 0],
+                &[u64::MAX, u64::MAX],
+                &[2, 3],
+                FilterPipeline::deflate(6),
+            )
+            .unwrap();
+
+        {
+            let d4 = writer.ds(before);
+            let d4 = d4.lock();
+            assert_eq!(d4.layout_version, 4);
+            assert_eq!(
+                d4.chunked.as_ref().unwrap().chunk_size_len,
+                compute_chunk_size_len(16 * 4)
+            );
+            let e5 = writer.ds(ea5);
+            let e5 = e5.lock();
+            assert_eq!(e5.layout_version, 5);
+            assert_eq!(e5.chunked.as_ref().unwrap().chunk_size_len, 8);
+            assert_eq!(writer.ds(plain).lock().layout_version, 4);
+            assert_eq!(writer.ds(fa5).lock().layout_version, 5);
+            assert_eq!(writer.ds(bt5).lock().layout_version, 5);
+        }
+
+        // Write through the FA and BT2 v5 indexes so their 8-byte chunk-size
+        // fields are exercised end to end, not just selected.
+        for (coords, vals) in [
+            ([0u64, 0], [0i32, 1, 2, 6, 7, 8]),
+            ([0, 1], [3, 4, 5, 9, 10, 11]),
+            ([1, 0], [12, 13, 14, 18, 19, 20]),
+            ([1, 1], [15, 16, 17, 21, 22, 23]),
+        ] {
+            let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+            writer
+                .write_chunk_fixed_array(fa5, &coords, &bytes)
+                .unwrap();
+            writer.write_chunk_btree_v2(bt5, &coords, &bytes).unwrap();
+        }
+        writer.extend_dataset(bt5, &[4, 6]).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        for name in ["fa5", "bt5"] {
+            let raw = reader.read_dataset_raw(name).unwrap();
+            let values: Vec<i32> = raw
+                .chunks(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            assert_eq!(values, (0..24).collect::<Vec<i32>>(), "dataset {name}");
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A v5 file reopened for append must stay v5: the decode → `DatasetInfo`
+    /// → finalize path carries the version through, so the re-encoded layout
+    /// message matches the 8-byte size fields the filtered index was built
+    /// with. A silent v4 downgrade here would make libhdf5 derive a narrower
+    /// field width than the index uses.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn v5_layout_survives_reopen_and_append() {
+        let path = temp_path("libver_v5_reopen");
+        let chunk: usize = 8;
+
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        writer.set_libver_latest(true);
+        let idx = writer
+            .create_chunked_dataset_compressed(
+                "d",
+                DatatypeMessage::i32_type(),
+                &[0],
+                &[u64::MAX],
+                &[chunk as u64],
+                4,
+            )
+            .unwrap();
+        for c in 0..2u64 {
+            let data: Vec<u8> = (0..chunk as i32)
+                .flat_map(|i| (c as i32 * chunk as i32 + i).to_le_bytes())
+                .collect();
+            writer.write_chunk(idx, c, &data).unwrap();
+        }
+        writer.extend_dataset(idx, &[2 * chunk as u64]).unwrap();
+        writer.close().unwrap();
+
+        // Reopen: the decoded layout version must be preserved, and appends
+        // must keep working against the 8-byte-size-field index.
+        let writer = Hdf5Writer::open_append(&path).unwrap();
+        assert_eq!(writer.ds(0).lock().layout_version, 5);
+        for c in 2..4u64 {
+            let data: Vec<u8> = (0..chunk as i32)
+                .flat_map(|i| (c as i32 * chunk as i32 + i).to_le_bytes())
+                .collect();
+            writer.write_chunk(0, c, &data).unwrap();
+        }
+        writer.extend_dataset(0, &[4 * chunk as u64]).unwrap();
+        writer.close().unwrap();
+
+        // Still v5 after the second finalize, and fully readable.
+        let writer = Hdf5Writer::open_append(&path).unwrap();
+        assert_eq!(writer.ds(0).lock().layout_version, 5);
+        writer.close().unwrap();
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        let raw = reader.read_dataset_raw("d").unwrap();
+        let values: Vec<i32> = raw
+            .chunks(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, (0..4 * chunk as i32).collect::<Vec<i32>>());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A chunk strictly larger than `u32::MAX` bytes forces layout v5 with no
+    /// opt-in — v4's size field cannot represent it — while a chunk of exactly
+    /// `u32::MAX` bytes stays v4, matching libhdf5's `version_req` boundary
+    /// (`> 0xffffffff`, filtered or not).
+    #[test]
+    fn oversized_chunk_forces_v5_without_opt_in() {
+        let path = temp_path("libver_4gib_force");
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let at_limit = writer
+            .create_chunked_dataset_compressed(
+                "at_limit",
+                DatatypeMessage::u8_type(),
+                &[0],
+                &[u64::MAX],
+                &[u32::MAX as u64],
+                4,
+            )
+            .unwrap();
+        let over = writer
+            .create_chunked_dataset_compressed(
+                "over",
+                DatatypeMessage::u8_type(),
+                &[0],
+                &[u64::MAX],
+                &[u32::MAX as u64 + 1],
+                4,
+            )
+            .unwrap();
+        let over_unfiltered = writer
+            .create_chunked_dataset(
+                "over_plain",
+                DatatypeMessage::u8_type(),
+                &[0],
+                &[u64::MAX],
+                &[u32::MAX as u64 + 1],
+            )
+            .unwrap();
+
+        assert_eq!(writer.ds(at_limit).lock().layout_version, 4);
+        {
+            let ds = writer.ds(over);
+            let ds = ds.lock();
+            assert_eq!(ds.layout_version, 5);
+            assert_eq!(ds.chunked.as_ref().unwrap().chunk_size_len, 8);
+        }
+        assert_eq!(writer.ds(over_unfiltered).lock().layout_version, 5);
         writer.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
