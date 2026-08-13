@@ -2107,6 +2107,93 @@ impl H5Dataset {
         }
     }
 
+    /// Read a numeric dataset as `T`, converting each element from the
+    /// on-disk datatype.
+    ///
+    /// Unlike [`read_raw`](Self::read_raw), which requires `T`'s size to match
+    /// the stored element size exactly, this inspects the dataset's datatype
+    /// message — class, signedness, byte order, width — and converts per
+    /// element:
+    ///
+    /// - integer → integer: checked; a stored value that does not fit in `T`
+    ///   is an error naming the element index and value, never a silent wrap.
+    /// - `f32` source → `f64`: exact widening.
+    /// - `f64` source → `f32`, float → integer, and integer → float are
+    ///   rejected as [`TypeMismatch`](Hdf5Error::TypeMismatch).
+    ///
+    /// Big-endian sources are decoded according to the datatype's byte order,
+    /// which [`read_raw`](Self::read_raw)'s size-only check would misread.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open("data.h5").unwrap();
+    /// let ds = file.dataset("counts").unwrap(); // stored as e.g. i16
+    /// let counts = ds.read_numeric_as::<i64>().unwrap();
+    /// ```
+    pub fn read_numeric_as<T: ReadNumeric>(&self) -> Result<Vec<T>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let (kind, raw) = {
+                    let mut inner = borrow_inner_mut(&self.file_inner);
+                    match &mut *inner {
+                        H5FileInner::Reader(reader) => {
+                            let info = reader
+                                .dataset_info(name)
+                                .ok_or_else(|| Hdf5Error::NotFound(name.clone()))?;
+                            let kind = numeric::classify(&info.datatype)?;
+                            (kind, reader.read_dataset_raw(name)?)
+                        }
+                        _ => {
+                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()))
+                        }
+                    }
+                };
+                numeric::convert(kind, &raw)
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read from a dataset in write mode".into(),
+            )),
+        }
+    }
+
+    /// Read a slice (hyperslab) of a numeric dataset as `T`, with the same
+    /// per-element datatype conversion as
+    /// [`read_numeric_as`](Self::read_numeric_as).
+    ///
+    /// `starts` and `counts` define the N-dimensional selection exactly as in
+    /// [`read_slice`](Self::read_slice).
+    pub fn read_numeric_slice_as<T: ReadNumeric>(
+        &self,
+        starts: &[usize],
+        counts: &[usize],
+    ) -> Result<Vec<T>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let starts_u64: Vec<u64> = starts.iter().map(|&s| s as u64).collect();
+                let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
+                let (kind, raw) = {
+                    let mut inner = borrow_inner_mut(&self.file_inner);
+                    match &mut *inner {
+                        H5FileInner::Reader(reader) => {
+                            let info = reader
+                                .dataset_info(name)
+                                .ok_or_else(|| Hdf5Error::NotFound(name.clone()))?;
+                            let kind = numeric::classify(&info.datatype)?;
+                            (kind, reader.read_slice(name, &starts_u64, &counts_u64)?)
+                        }
+                        _ => {
+                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()))
+                        }
+                    }
+                };
+                numeric::convert(kind, &raw)
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read_slice from a dataset in write mode".into(),
+            )),
+        }
+    }
+
     /// Read the whole dataset into a caller-provided buffer, with no allocation.
     ///
     /// `out` must have exactly `product(dims)` elements (the dataset's element
@@ -2215,6 +2302,246 @@ impl H5Dataset {
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "cannot read from a dataset in write mode".into(),
             )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Datatype-aware numeric conversion (read_numeric_as)
+// ---------------------------------------------------------------------------
+
+/// Marker trait for the Rust types [`H5Dataset::read_numeric_as`] can convert
+/// into: the integer primitives (checked, never wrapping) plus `f32`/`f64`
+/// (widening only).
+///
+/// Sealed — the conversion policy is part of the library contract, so the
+/// trait cannot be implemented outside this crate.
+pub trait ReadNumeric: numeric::Sealed {}
+impl<T: numeric::Sealed> ReadNumeric for T {}
+
+mod numeric {
+    //! Per-element decode + checked conversion for `read_numeric_as`.
+
+    use crate::error::{Hdf5Error, Result};
+    use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+
+    /// A source element, normalized: every standard integer width — u64::MAX
+    /// included — fits in `i128` without loss.
+    pub enum NumericSource {
+        Int(i128),
+        F32(f32),
+        F64(f64),
+    }
+
+    /// The on-disk element shape `classify` accepted.
+    #[derive(Clone, Copy)]
+    pub enum SourceKind {
+        Int {
+            size: usize,
+            signed: bool,
+            byte_order: ByteOrder,
+        },
+        F32(ByteOrder),
+        F64(ByteOrder),
+    }
+
+    impl SourceKind {
+        fn element_size(self) -> usize {
+            match self {
+                SourceKind::Int { size, .. } => size,
+                SourceKind::F32(_) => 4,
+                SourceKind::F64(_) => 8,
+            }
+        }
+    }
+
+    /// Map a datatype message to a supported numeric source shape.
+    ///
+    /// Accepts standard-width integers (1/2/4/8 bytes, full precision, zero
+    /// bit offset) and IEEE binary32/binary64 floats; everything else is a
+    /// `TypeMismatch` naming what was found.
+    pub fn classify(dt: &DatatypeMessage) -> Result<SourceKind> {
+        match *dt {
+            DatatypeMessage::FixedPoint {
+                size,
+                byte_order,
+                signed,
+                bit_offset,
+                bit_precision,
+            } => {
+                if !matches!(size, 1 | 2 | 4 | 8)
+                    || bit_offset != 0
+                    || u32::from(bit_precision) != size * 8
+                {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "fixed-point datatype (size {size}, bit offset {bit_offset}, \
+                         precision {bit_precision}) is not a standard-width integer",
+                    )));
+                }
+                Ok(SourceKind::Int {
+                    size: size as usize,
+                    signed,
+                    byte_order,
+                })
+            }
+            DatatypeMessage::FloatingPoint {
+                size,
+                byte_order,
+                exponent_size,
+                mantissa_size,
+                ..
+            } => match (size, exponent_size, mantissa_size) {
+                (4, 8, 23) => Ok(SourceKind::F32(byte_order)),
+                (8, 11, 52) => Ok(SourceKind::F64(byte_order)),
+                _ => Err(Hdf5Error::TypeMismatch(format!(
+                    "floating-point datatype (size {size}, exponent {exponent_size} bits, \
+                     mantissa {mantissa_size} bits) is not IEEE binary32 or binary64",
+                ))),
+            },
+            ref other => Err(Hdf5Error::TypeMismatch(format!(
+                "dataset datatype '{other}' is not numeric",
+            ))),
+        }
+    }
+
+    fn decode_element(kind: SourceKind, bytes: &[u8]) -> NumericSource {
+        match kind {
+            SourceKind::Int {
+                size,
+                signed,
+                byte_order,
+            } => {
+                let mut le = [0u8; 8];
+                match byte_order {
+                    ByteOrder::LittleEndian => le[..size].copy_from_slice(bytes),
+                    ByteOrder::BigEndian => {
+                        for (dst, src) in le[..size].iter_mut().zip(bytes.iter().rev()) {
+                            *dst = *src;
+                        }
+                    }
+                }
+                let zero_extended = u64::from_le_bytes(le);
+                let value = if signed {
+                    // Arithmetic right shift sign-extends the low `size` bytes.
+                    let shift = 64 - 8 * size as u32;
+                    i128::from(((zero_extended as i64) << shift) >> shift)
+                } else {
+                    i128::from(zero_extended)
+                };
+                NumericSource::Int(value)
+            }
+            SourceKind::F32(byte_order) => {
+                let arr: [u8; 4] = bytes.try_into().unwrap();
+                NumericSource::F32(match byte_order {
+                    ByteOrder::LittleEndian => f32::from_le_bytes(arr),
+                    ByteOrder::BigEndian => f32::from_be_bytes(arr),
+                })
+            }
+            SourceKind::F64(byte_order) => {
+                let arr: [u8; 8] = bytes.try_into().unwrap();
+                NumericSource::F64(match byte_order {
+                    ByteOrder::LittleEndian => f64::from_le_bytes(arr),
+                    ByteOrder::BigEndian => f64::from_be_bytes(arr),
+                })
+            }
+        }
+    }
+
+    /// Decode and convert every element of `raw` into `T`.
+    pub fn convert<T: Sealed>(kind: SourceKind, raw: &[u8]) -> Result<Vec<T>> {
+        let size = kind.element_size();
+        if !raw.len().is_multiple_of(size) {
+            return Err(Hdf5Error::TypeMismatch(format!(
+                "raw data size {} is not a multiple of element size {size}",
+                raw.len(),
+            )));
+        }
+        raw.chunks_exact(size)
+            .enumerate()
+            .map(|(index, bytes)| T::from_source(decode_element(kind, bytes), index))
+            .collect()
+    }
+
+    /// The sealed half of `ReadNumeric`: how one normalized source element
+    /// becomes a `Self`, or a `TypeMismatch` explaining why it cannot.
+    pub trait Sealed: Sized {
+        fn from_source(src: NumericSource, index: usize) -> Result<Self>;
+    }
+
+    macro_rules! int_targets {
+        ($($t:ty),* $(,)?) => {$(
+            impl Sealed for $t {
+                fn from_source(src: NumericSource, index: usize) -> Result<Self> {
+                    match src {
+                        NumericSource::Int(v) => <$t>::try_from(v).map_err(|_| {
+                            Hdf5Error::TypeMismatch(format!(
+                                concat!(
+                                    "value {} at element {} does not fit in ",
+                                    stringify!($t),
+                                ),
+                                v, index,
+                            ))
+                        }),
+                        NumericSource::F32(_) | NumericSource::F64(_) => {
+                            Err(Hdf5Error::TypeMismatch(
+                                concat!(
+                                    "cannot read a floating-point dataset as ",
+                                    stringify!($t),
+                                    "; read as f64 and convert explicitly",
+                                )
+                                .into(),
+                            ))
+                        }
+                    }
+                }
+            }
+        )*};
+    }
+    int_targets!(i8, i16, i32, i64, u8, u16, u32, u64, u128);
+
+    // Not in the macro: `i128::try_from(i128)` is infallible, which trips
+    // clippy::unnecessary_fallible_conversions.
+    impl Sealed for i128 {
+        fn from_source(src: NumericSource, _index: usize) -> Result<Self> {
+            match src {
+                NumericSource::Int(v) => Ok(v),
+                NumericSource::F32(_) | NumericSource::F64(_) => Err(Hdf5Error::TypeMismatch(
+                    "cannot read a floating-point dataset as i128; read as f64 and \
+                     convert explicitly"
+                        .into(),
+                )),
+            }
+        }
+    }
+
+    impl Sealed for f32 {
+        fn from_source(src: NumericSource, _index: usize) -> Result<Self> {
+            match src {
+                NumericSource::F32(v) => Ok(v),
+                NumericSource::F64(_) => Err(Hdf5Error::TypeMismatch(
+                    "narrowing an f64 dataset to f32 loses precision; read as f64".into(),
+                )),
+                NumericSource::Int(_) => Err(Hdf5Error::TypeMismatch(
+                    "cannot read an integer dataset as f32; read as an integer type and \
+                     convert explicitly"
+                        .into(),
+                )),
+            }
+        }
+    }
+
+    impl Sealed for f64 {
+        fn from_source(src: NumericSource, _index: usize) -> Result<Self> {
+            match src {
+                NumericSource::F64(v) => Ok(v),
+                // Every f32 is exactly representable as f64.
+                NumericSource::F32(v) => Ok(f64::from(v)),
+                NumericSource::Int(_) => Err(Hdf5Error::TypeMismatch(
+                    "cannot read an integer dataset as f64; integers above 2^53 lose \
+                     precision — read as an integer type and convert explicitly"
+                        .into(),
+                )),
+            }
         }
     }
 }
@@ -5561,6 +5888,179 @@ mod tests {
             "unexpected error: {err}"
         );
         file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Boundary: `fits in T` vs `does not fit in T`, for both the too-large
+    /// (u64::MAX → i64) and the negative-to-unsigned (−1 → u32) directions.
+    #[test]
+    fn numeric_int_checked_conversion_boundaries() {
+        let path = temp_path("numeric_int_bounds");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file.new_dataset::<u64>().shape([2]).create("u").unwrap();
+            ds.write_raw(&[1u64, u64::MAX]).unwrap();
+            let ds = file.new_dataset::<i32>().shape([2]).create("i").unwrap();
+            ds.write_raw(&[-1i32, 5]).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+
+        let u = file.dataset("u").unwrap();
+        assert_eq!(u.read_numeric_as::<u64>().unwrap(), vec![1, u64::MAX]);
+        assert_eq!(
+            u.read_numeric_as::<i128>().unwrap(),
+            vec![1, i128::from(u64::MAX)]
+        );
+        let err = u.read_numeric_as::<i64>().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("value 18446744073709551615 at element 1 does not fit in i64"),
+            "unexpected error: {err}"
+        );
+
+        let i = file.dataset("i").unwrap();
+        assert_eq!(i.read_numeric_as::<i64>().unwrap(), vec![-1, 5]);
+        let err = i.read_numeric_as::<u32>().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("value -1 at element 0 does not fit in u32"),
+            "unexpected error: {err}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Boundary: f32 → f64 is exact widening; f64 → f32 is rejected.
+    #[test]
+    fn numeric_float_widening_only() {
+        let path = temp_path("numeric_float");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file.new_dataset::<f32>().shape([2]).create("f4").unwrap();
+            ds.write_raw(&[1.5f32, -2.25]).unwrap();
+            let ds = file.new_dataset::<f64>().shape([1]).create("f8").unwrap();
+            ds.write_raw(&[3.75f64]).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+
+        let f4 = file.dataset("f4").unwrap();
+        assert_eq!(f4.read_numeric_as::<f32>().unwrap(), vec![1.5, -2.25]);
+        assert_eq!(f4.read_numeric_as::<f64>().unwrap(), vec![1.5, -2.25]);
+
+        let f8 = file.dataset("f8").unwrap();
+        assert_eq!(f8.read_numeric_as::<f64>().unwrap(), vec![3.75]);
+        let err = f8.read_numeric_as::<f32>().unwrap_err();
+        assert!(
+            err.to_string().contains("narrowing"),
+            "unexpected error: {err}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Boundary: cross-class conversions (float ↔ integer) are rejected in
+    /// both directions, and a non-numeric datatype is rejected at classify.
+    #[test]
+    fn numeric_cross_class_and_non_numeric_rejected() {
+        let path = temp_path("numeric_cross_class");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file.new_dataset::<f64>().shape([1]).create("f8").unwrap();
+            ds.write_raw(&[1.0f64]).unwrap();
+            let ds = file.new_dataset::<i32>().shape([1]).create("i4").unwrap();
+            ds.write_raw(&[7i32]).unwrap();
+            file.write_vlen_strings("s", &["a", "b"]).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+
+        let err = file
+            .dataset("f8")
+            .unwrap()
+            .read_numeric_as::<i64>()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("floating-point dataset as i64"),
+            "unexpected error: {err}"
+        );
+        let err = file
+            .dataset("i4")
+            .unwrap()
+            .read_numeric_as::<f64>()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("integer dataset as f64"),
+            "unexpected error: {err}"
+        );
+        let err = file
+            .dataset("s")
+            .unwrap()
+            .read_numeric_as::<i64>()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("is not numeric"),
+            "unexpected error: {err}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Boundary: big-endian sources decode per the datatype's byte order.
+    /// Unit-level (the writer only emits little-endian): feed `convert` a
+    /// big-endian datatype plus big-endian bytes directly.
+    #[test]
+    fn numeric_big_endian_decode() {
+        use super::numeric;
+        use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+
+        let dt = DatatypeMessage::FixedPoint {
+            size: 4,
+            byte_order: ByteOrder::BigEndian,
+            signed: true,
+            bit_offset: 0,
+            bit_precision: 32,
+        };
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&(-2i32).to_be_bytes());
+        raw.extend_from_slice(&(100_000i32).to_be_bytes());
+        let kind = numeric::classify(&dt).unwrap();
+        assert_eq!(
+            numeric::convert::<i64>(kind, &raw).unwrap(),
+            vec![-2, 100_000]
+        );
+
+        let dt = DatatypeMessage::FloatingPoint {
+            size: 8,
+            byte_order: ByteOrder::BigEndian,
+            sign_location: 63,
+            bit_offset: 0,
+            bit_precision: 64,
+            exponent_location: 52,
+            exponent_size: 11,
+            mantissa_location: 0,
+            mantissa_size: 52,
+            exponent_bias: 1023,
+        };
+        let raw = (-2.25f64).to_be_bytes();
+        let kind = numeric::classify(&dt).unwrap();
+        assert_eq!(numeric::convert::<f64>(kind, &raw).unwrap(), vec![-2.25]);
+    }
+
+    /// The hyperslab variant applies the same conversion to a sub-selection.
+    #[test]
+    fn numeric_slice_conversion() {
+        let path = temp_path("numeric_slice");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file.new_dataset::<i16>().shape([2, 3]).create("m").unwrap();
+            ds.write_raw(&[1i16, 2, 3, 4, 5, 6]).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let m = file.dataset("m").unwrap();
+        assert_eq!(
+            m.read_numeric_slice_as::<i32>(&[0, 1], &[2, 2]).unwrap(),
+            vec![2, 3, 5, 6]
+        );
         std::fs::remove_file(&path).ok();
     }
 }

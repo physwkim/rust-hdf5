@@ -891,3 +891,60 @@ fn libver_latest_v5_layout_write_and_hdf5_1x_rejection() {
     std::fs::remove_file(&path_v4).ok();
     std::fs::remove_file(&path_v5).ok();
 }
+
+/// Issue #11: datatype-aware conversion reads against an externally-written
+/// file — h5py writes int16, big-endian int32, float32, and uint64 datasets;
+/// rust-hdf5 converts on read, including the checked-overflow error path.
+#[test]
+fn numeric_conversion_reads_from_h5py_written_file() {
+    let Some(py) = python() else { return };
+    let path = tmp("numeric_conv");
+    write_with_h5py(
+        py,
+        &path,
+        "f.create_dataset('i2', data=np.array([-3, -1, 0, 7], dtype='int16'))\n\
+         f.create_dataset('be_i4', data=np.array([-100000, 100000], dtype='>i4'))\n\
+         f.create_dataset('f4', data=np.array([1.5, -2.25], dtype='float32'))\n\
+         f.create_dataset('u8', data=np.array([1, 2**64 - 1], dtype='uint64'))\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("i2")
+            .unwrap()
+            .read_numeric_as::<i64>()
+            .unwrap(),
+        vec![-3, -1, 0, 7]
+    );
+    assert_eq!(
+        file.dataset("be_i4")
+            .unwrap()
+            .read_numeric_as::<i64>()
+            .unwrap(),
+        vec![-100_000, 100_000]
+    );
+    assert_eq!(
+        file.dataset("f4")
+            .unwrap()
+            .read_numeric_as::<f64>()
+            .unwrap(),
+        vec![1.5, -2.25]
+    );
+    assert_eq!(
+        file.dataset("u8")
+            .unwrap()
+            .read_numeric_as::<u128>()
+            .unwrap(),
+        vec![1, u128::from(u64::MAX)]
+    );
+    let err = file
+        .dataset("u8")
+        .unwrap()
+        .read_numeric_as::<i64>()
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("does not fit in i64"),
+        "unexpected error: {err}"
+    );
+    std::fs::remove_file(&path).ok();
+}

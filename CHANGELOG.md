@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- `H5Dataset::read_numeric_as::<T>()` and `read_numeric_slice_as::<T>()`:
+  datatype-aware numeric reads. Where `read_raw::<T>` only checks that
+  `T`'s size matches the stored element size (so an `i64` read of a
+  `uint64` dataset reinterprets bits, and a big-endian source is misread),
+  these inspect the datatype message — class, signedness, byte order,
+  width — and convert per element. Integer→integer is checked and errors
+  with the element index and value instead of wrapping; `f32`→`f64`
+  widens exactly; `f64`→`f32`, float→integer and integer→float are
+  rejected. `read_raw` is unchanged. (issue #11)
+
 ### Fixed
 
 - Rewriting variable-length string elements frees the superseded global-heap
