@@ -345,68 +345,16 @@ impl ChunkGeometry {
         self.chunk_dims.iter().product::<u64>() * self.element_size
     }
 
-    /// Number of chunks spanning each dimension at the current extent.
-    fn grid(&self) -> Vec<u64> {
-        self.dims
-            .iter()
-            .zip(&self.chunk_dims)
-            .map(|(&d, &c)| if c > 0 { d.div_ceil(c) } else { 0 })
-            .collect()
-    }
-
     /// Row-major position of `coords` in the chunk grid — the linear index an
-    /// extensible or fixed array records the chunk under.
-    ///
-    /// The grid extents multiplied here come from the *current* dims, which is
-    /// how every chunk written so far was indexed. The bound a coordinate is
-    /// checked against comes from `max_dims`, so an unlimited dimension — the
-    /// one an extensible array exists to grow — is unbounded, while a fixed
-    /// dimension still rejects an out-of-grid coordinate that would otherwise
-    /// silently alias another chunk's slot.
+    /// extensible or fixed array records the chunk under, computed against
+    /// the maximum-extent grid by [`crate::io::chunk_grid::linear_index`].
     fn linear_index(&self, coords: &[u64]) -> IoResult<u64> {
-        let ndims = self.dims.len();
-        if coords.len() != ndims {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "chunk_coords has {} entries but the dataset has {} dimensions",
-                coords.len(),
-                ndims
-            )));
-        }
-        if self.chunk_dims.len() != ndims {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "dataset chunk shape has {} dimensions but the dataspace has {}",
-                self.chunk_dims.len(),
-                ndims
-            )));
-        }
-        let grid = self.grid();
-        let mut linear = 0u64;
-        for d in 0..ndims {
-            if self.chunk_dims[d] == 0 {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "chunk dimension {d} is zero"
-                )));
-            }
-            let extent = self.max_dims.as_ref().map_or(self.dims[d], |m| m[d]);
-            if extent != u64::MAX {
-                let bound = extent.div_ceil(self.chunk_dims[d]);
-                if coords[d] >= bound {
-                    return Err(crate::io::IoError::InvalidState(format!(
-                        "chunk coordinate {} in dimension {} is outside the chunk grid (0..{})",
-                        coords[d], d, bound
-                    )));
-                }
-            }
-            linear = linear
-                .checked_mul(grid[d])
-                .and_then(|l| l.checked_add(coords[d]))
-                .ok_or_else(|| {
-                    crate::io::IoError::InvalidState(
-                        "chunk coordinates overflow the array index".into(),
-                    )
-                })?;
-        }
-        Ok(linear)
+        crate::io::chunk_grid::linear_index(
+            &self.dims,
+            self.max_dims.as_deref(),
+            &self.chunk_dims,
+            coords,
+        )
     }
 }
 
@@ -441,6 +389,24 @@ fn validate_chunk_geometry(dims: &[u64], max_dims: &[u64], chunk_dims: &[u64]) -
             return Err(crate::io::IoError::InvalidState(format!(
                 "chunk dimension {} is {} but the maximum dimension size is {}",
                 d, chunk_dims[d], max_dims[d]
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// An extensible-array index linearizes chunk coordinates, which requires
+/// every unlimited dimension to be dimension 0: any later dimension is a
+/// multiplier in the row-major index and must be finite. libhdf5 supports
+/// other positions by swizzling the unlimited dimension to the slowest one
+/// (H5Dearray.c), which this crate does not implement.
+fn ensure_unlimited_is_leading(max_dims: &[u64]) -> IoResult<()> {
+    for (d, &m) in max_dims.iter().enumerate().skip(1) {
+        if m == u64::MAX {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "unlimited dimension {d} is not the first: extensible-array \
+                 swizzling is not supported; reorder the dimensions so the \
+                 unlimited one comes first"
             )));
         }
     }
@@ -1701,6 +1667,7 @@ impl Hdf5Writer {
     ) -> IoResult<usize> {
         let create = self.begin_create(name)?;
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
+        ensure_unlimited_is_leading(max_dims)?;
         let earray_params = EarrayParams::default_params();
         let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs)?;
         let nsblk_addrs = compute_nsblk_addrs(
@@ -3583,10 +3550,16 @@ impl Hdf5Writer {
         chunk_coords: &[u64],
     ) -> IoResult<Option<Vec<u8>>> {
         let geo = self.chunk_geometry(ds_index)?;
-        let linear = geo.linear_index(chunk_coords)?;
+        // Only the linearly-addressed indexes compute a slot; a v2 B-tree is
+        // keyed by the coordinates themselves (and may hold unlimited inner
+        // dimensions, which have no linear slot).
         match geo.kind {
-            ChunkIndexKind::ExtensibleArray => self.read_chunk_if_present(ds_index, linear),
+            ChunkIndexKind::ExtensibleArray => {
+                let linear = geo.linear_index(chunk_coords)?;
+                self.read_chunk_if_present(ds_index, linear)
+            }
             ChunkIndexKind::FixedArray => {
+                let linear = geo.linear_index(chunk_coords)?;
                 let ds = self.ds(ds_index);
                 let m = ds.lock();
                 let pipeline = m.filter_pipeline.clone();
@@ -3689,10 +3662,31 @@ impl Hdf5Writer {
         })
     }
 
-    /// Define a chunked dataset indexed by a fixed array (no unlimited dimensions).
-    ///
-    /// `dims` and `max_dims` should be the same (all fixed). `chunk_dims` defines the
-    /// chunk shape. Returns the dataset index.
+    /// Index-grid slot of the chunk at grid `coords` (see
+    /// [`crate::io::chunk_grid`]).
+    pub(crate) fn chunk_slot(&self, ds_index: usize, coords: &[u64]) -> IoResult<u64> {
+        self.chunk_geometry(ds_index)?.linear_index(coords)
+    }
+
+    /// Grid coordinates of the chunk recorded under index-grid slot `linear`
+    /// — the inverse of [`Self::chunk_slot`].
+    pub(crate) fn chunk_coords_from_slot(
+        &self,
+        ds_index: usize,
+        linear: u64,
+    ) -> IoResult<Vec<u64>> {
+        let geo = self.chunk_geometry(ds_index)?;
+        crate::io::chunk_grid::coords_of(
+            &geo.dims,
+            geo.max_dims.as_deref(),
+            &geo.chunk_dims,
+            linear,
+        )
+    }
+
+    /// Define a chunked dataset indexed by a fixed array, fixed at its
+    /// current shape (`max_dims == dims`). `chunk_dims` defines the chunk
+    /// shape. Returns the dataset index.
     pub fn create_fixed_array_dataset(
         &self,
         name: &str,
@@ -3700,29 +3694,91 @@ impl Hdf5Writer {
         dims: &[u64],
         chunk_dims: &[u64],
     ) -> IoResult<usize> {
+        self.create_fixed_array_dataset_with_max(name, datatype, dims, dims, chunk_dims, None)
+    }
+
+    /// Define a fixed-shape compressed chunked dataset indexed by a
+    /// *filtered* Fixed Array (`max_dims == dims`).
+    ///
+    /// Like `create_fixed_array_dataset`, but the FA header carries the filtered
+    /// client id and a `chunk_size_len`-wide compressed-size field per chunk
+    /// (`FixedArrayFilteredChunkElement`), and the dataset gets a filter
+    /// pipeline. Chunks written via `write_chunk_fixed_array` are compressed and
+    /// their compressed size + filter mask are recorded in the data block.
+    pub fn create_fixed_array_dataset_with_pipeline(
+        &self,
+        name: &str,
+        datatype: DatatypeMessage,
+        dims: &[u64],
+        chunk_dims: &[u64],
+        pipeline: FilterPipeline,
+    ) -> IoResult<usize> {
+        self.create_fixed_array_dataset_with_max(
+            name,
+            datatype,
+            dims,
+            dims,
+            chunk_dims,
+            Some(pipeline),
+        )
+    }
+
+    /// Define a chunked dataset indexed by a fixed array, growable up to
+    /// `max_dims` (every maximum finite — libhdf5 picks this index exactly
+    /// when no dimension is unlimited).
+    ///
+    /// The array is sized for the chunk grid of the *maximum* extent, the
+    /// libhdf5 rule (`H5D__farray_idx_create` uses `max_nchunks`), so the
+    /// dataset can be extended to `max_dims` without re-indexing chunks.
+    pub fn create_fixed_array_dataset_with_max(
+        &self,
+        name: &str,
+        datatype: DatatypeMessage,
+        dims: &[u64],
+        max_dims: &[u64],
+        chunk_dims: &[u64],
+        pipeline: Option<FilterPipeline>,
+    ) -> IoResult<usize> {
         let create = self.begin_create(name)?;
-        // A fixed-array index means a fixed shape: max dims are the dims.
-        validate_chunk_geometry(dims, dims, chunk_dims)?;
-        let ndims = dims.len();
+        validate_chunk_geometry(dims, max_dims, chunk_dims)?;
+        if max_dims.contains(&u64::MAX) {
+            return Err(crate::io::IoError::InvalidState(
+                "a fixed-array index requires a fixed maximum shape (no unlimited dimension)"
+                    .into(),
+            ));
+        }
         let mut num_chunks: u64 = 1;
-        for d in 0..ndims {
-            num_chunks = num_chunks
-                .checked_mul(dims[d].div_ceil(chunk_dims[d]))
-                .ok_or_else(|| {
-                    crate::io::IoError::InvalidState("chunk count overflows u64".into())
-                })?;
+        for g in crate::io::chunk_grid::index_grid(dims, Some(max_dims), chunk_dims)? {
+            num_chunks = num_chunks.checked_mul(g).ok_or_else(|| {
+                crate::io::IoError::InvalidState("chunk count overflows u64".into())
+            })?;
         }
 
-        // Create FA header
-        let mut fa_header = FixedArrayHeader::new_for_chunks(&self.ctx, num_chunks);
+        // Create the FA header. For a filtered FA, chunk_size_len is sized
+        // from the uncompressed chunk byte count, the same way the filtered
+        // Extensible Array path computes it: the compressed size never
+        // exceeds the uncompressed size meaningfully, so this width always
+        // holds the stored value.
+        let mut fa_header = if pipeline.is_some() {
+            let element_size = datatype.element_size() as u64;
+            let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
+            let chunk_size_len = compute_chunk_size_len(chunk_bytes);
+            FixedArrayHeader::new_for_filtered_chunks(&self.ctx, num_chunks, chunk_size_len)
+        } else {
+            FixedArrayHeader::new_for_chunks(&self.ctx, num_chunks)
+        };
         let hdr_encoded = fa_header.encode(&self.ctx);
         let fa_header_addr = self.allocator.allocate(hdr_encoded.len() as u64);
 
-        // Create FA data block. libhdf5 switches to a paged layout once
+        // Create the FA data block. libhdf5 switches to a paged layout once
         // num_elmts exceeds dblk_page_nelmts; both layouts allocate space
-        // for `num_chunks` chunk addresses up front, but the paged layout
-        // also reserves the page-init bitmap and a per-page checksum.
-        let fa_dblk = FixedArrayDataBlock::new_unfiltered(fa_header_addr, num_chunks as usize);
+        // for `num_chunks` entries up front, but the paged layout also
+        // reserves the page-init bitmap and a per-page checksum.
+        let fa_dblk = if pipeline.is_some() {
+            FixedArrayDataBlock::new_filtered(fa_header_addr, num_chunks as usize)
+        } else {
+            FixedArrayDataBlock::new_unfiltered(fa_header_addr, num_chunks as usize)
+        };
         let dblk_size = fixed_array_dblk_disk_size(&self.ctx, &fa_header);
         let fa_dblk_addr = self.allocator.allocate(dblk_size);
 
@@ -3738,7 +3794,13 @@ impl Hdf5Writer {
         debug_assert_eq!(dblk_encoded.len() as u64, dblk_size);
         self.handle.write_at(fa_dblk_addr, &dblk_encoded)?;
 
-        let dataspace = DataspaceMessage::simple(dims);
+        // The maximum is stored even when it equals the dims: it is what
+        // `extend_dataset` checks growth against, and the FA capacity above
+        // is exactly its chunk grid.
+        let dataspace = DataspaceMessage {
+            dims: dims.to_vec(),
+            max_dims: Some(max_dims.to_vec()),
+        };
 
         let idx = self.push_dataset(
             &create,
@@ -3752,98 +3814,7 @@ impl Hdf5Writer {
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
                 obj_header_encoded_size: 0,
-                filter_pipeline: None,
-                deleted: false,
-                fill_value: None,
-                chunked: None,
-                btree_v2: None,
-                fixed_array: Some(FixedArrayDatasetInfo {
-                    chunk_dims: chunk_dims.to_vec(),
-                    fa_header_addr,
-                    fa_dblk_addr,
-                    fa_header,
-                    fa_dblk,
-                    chunks_written: 0,
-                }),
-                append: None,
-            },
-        );
-
-        Ok(idx)
-    }
-
-    /// Define a fixed-shape (no unlimited dimension) compressed chunked dataset
-    /// indexed by a *filtered* Fixed Array.
-    ///
-    /// Like `create_fixed_array_dataset`, but the FA header carries the filtered
-    /// client id and a `chunk_size_len`-wide compressed-size field per chunk
-    /// (`FixedArrayFilteredChunkElement`), and the dataset gets a filter
-    /// pipeline. Chunks written via `write_chunk_fixed_array` are compressed and
-    /// their compressed size + filter mask are recorded in the data block.
-    pub fn create_fixed_array_dataset_with_pipeline(
-        &self,
-        name: &str,
-        datatype: DatatypeMessage,
-        dims: &[u64],
-        chunk_dims: &[u64],
-        pipeline: FilterPipeline,
-    ) -> IoResult<usize> {
-        let create = self.begin_create(name)?;
-        // A fixed-array index means a fixed shape: max dims are the dims.
-        validate_chunk_geometry(dims, dims, chunk_dims)?;
-        let ndims = dims.len();
-        let mut num_chunks: u64 = 1;
-        for d in 0..ndims {
-            num_chunks = num_chunks
-                .checked_mul(dims[d].div_ceil(chunk_dims[d]))
-                .ok_or_else(|| {
-                    crate::io::IoError::InvalidState("chunk count overflows u64".into())
-                })?;
-        }
-
-        // chunk_size_len is sized from the uncompressed chunk byte count, the
-        // same way the filtered Extensible Array path computes it: the
-        // compressed size never exceeds the uncompressed size meaningfully, so
-        // this width always holds the stored value.
-        let element_size = datatype.element_size() as u64;
-        let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
-        let chunk_size_len = compute_chunk_size_len(chunk_bytes);
-
-        // Create the filtered FA header.
-        let mut fa_header =
-            FixedArrayHeader::new_for_filtered_chunks(&self.ctx, num_chunks, chunk_size_len);
-        let hdr_encoded = fa_header.encode(&self.ctx);
-        let fa_header_addr = self.allocator.allocate(hdr_encoded.len() as u64);
-
-        // Create the filtered FA data block; both flat and paged layouts
-        // reserve space for `num_chunks` filtered entries up front.
-        let fa_dblk = FixedArrayDataBlock::new_filtered(fa_header_addr, num_chunks as usize);
-        let dblk_size = fixed_array_dblk_disk_size(&self.ctx, &fa_header);
-        let fa_dblk_addr = self.allocator.allocate(dblk_size);
-
-        fa_header.data_blk_addr = fa_dblk_addr;
-
-        let hdr_encoded = fa_header.encode(&self.ctx);
-        self.handle.write_at(fa_header_addr, &hdr_encoded)?;
-        let dblk_encoded = encode_fixed_array_dblk(&self.ctx, &fa_header, &fa_dblk);
-        debug_assert_eq!(dblk_encoded.len() as u64, dblk_size);
-        self.handle.write_at(fa_dblk_addr, &dblk_encoded)?;
-
-        let dataspace = DataspaceMessage::simple(dims);
-
-        let idx = self.push_dataset(
-            &create,
-            DatasetInfo {
-                name: name.to_string(),
-                datatype,
-                dataspace,
-                obj_header_addr: 0,
-                data_addr: UNDEF_ADDR,
-                data_size: 0,
-                attributes: Vec::new(),
-                obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
-                filter_pipeline: Some(pipeline),
+                filter_pipeline: pipeline,
                 deleted: false,
                 fill_value: None,
                 chunked: None,
@@ -4010,6 +3981,7 @@ impl Hdf5Writer {
     ) -> IoResult<usize> {
         let create = self.begin_create(name)?;
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
+        ensure_unlimited_is_leading(max_dims)?;
         let element_size = datatype.element_size() as u64;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
         let chunk_size_len = compute_chunk_size_len(chunk_bytes);
@@ -4113,6 +4085,7 @@ impl Hdf5Writer {
     ) -> IoResult<usize> {
         let create = self.begin_create(name)?;
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
+        ensure_unlimited_is_leading(max_dims)?;
         let element_size = datatype.element_size() as u64;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
         let chunk_size_len = compute_chunk_size_len(chunk_bytes);
@@ -4296,32 +4269,14 @@ impl Hdf5Writer {
             .as_ref()
             .ok_or_else(|| crate::io::IoError::InvalidState("not a fixed-array dataset".into()))?;
 
-        // Compute linear chunk index from multidimensional coordinates.
-        let dims = &m.dataspace.dims;
-        let chunk_dims = &fa.chunk_dims;
-        let ndims = dims.len();
-        if chunk_coords.len() != ndims {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "chunk_coords has {} entries but the dataset has {} dimensions",
-                chunk_coords.len(),
-                ndims
-            )));
-        }
-        let mut linear_idx: u64 = 0;
-        let mut stride: u64 = 1;
-        for d in (0..ndims).rev() {
-            let n_chunks_in_dim = dims[d].div_ceil(chunk_dims[d]);
-            // Reject an out-of-grid coordinate: without this an inner
-            // dimension's overflow silently aliases a different chunk slot.
-            if chunk_coords[d] >= n_chunks_in_dim {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "chunk coordinate {} in dimension {} is outside the chunk grid (0..{})",
-                    chunk_coords[d], d, n_chunks_in_dim
-                )));
-            }
-            linear_idx += chunk_coords[d] * stride;
-            stride *= n_chunks_in_dim;
-        }
+        // Linear chunk index in the maximum-extent grid — the slot the fixed
+        // array (sized from that grid at create) records the chunk under.
+        let linear_idx = crate::io::chunk_grid::linear_index(
+            &m.dataspace.dims,
+            m.dataspace.max_dims.as_deref(),
+            &fa.chunk_dims,
+            chunk_coords,
+        )?;
 
         // Update the fixed array data block. The slot is read before the bytes
         // are placed so a rewrite can stay where it is (see `place_chunk`).
@@ -4667,13 +4622,22 @@ impl Hdf5Writer {
                     "extend_dataset cannot shrink dimension {d} from {cur} to {new}"
                 )));
             }
-            if let Some(ref max) = m.dataspace.max_dims {
-                if new > max[d] {
+            // An absent maximum shape means the shape is fixed (libhdf5
+            // defaults maxdims to dims at creation), so any growth exceeds it.
+            match m.dataspace.max_dims {
+                Some(ref max) if new > max[d] => {
                     return Err(crate::io::IoError::InvalidState(format!(
                         "extend_dataset dimension {d} ({new}) exceeds the maximum {}",
                         max[d]
                     )));
                 }
+                None if new > cur => {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "extend_dataset dimension {d} ({new}) exceeds the maximum {cur}: \
+                         a dataset without a stored maximum shape is fixed at its extent"
+                    )));
+                }
+                _ => {}
             }
         }
         m.dataspace.dims = new_dims.to_vec();
@@ -4714,12 +4678,26 @@ impl Hdf5Writer {
                     .into(),
             ));
         }
-        if let Some(ref max) = m.dataspace.max_dims {
-            for (d, (&new, &mx)) in new_dims.iter().zip(max).enumerate() {
-                if new > mx {
-                    return Err(crate::io::IoError::InvalidState(format!(
-                        "set_extent dimension {d} ({new}) exceeds the maximum {mx}"
-                    )));
+        // An absent maximum shape means the shape is fixed (libhdf5 defaults
+        // maxdims to dims at creation), so growth is bounded by the extent.
+        match m.dataspace.max_dims {
+            Some(ref max) => {
+                for (d, (&new, &mx)) in new_dims.iter().zip(max).enumerate() {
+                    if new > mx {
+                        return Err(crate::io::IoError::InvalidState(format!(
+                            "set_extent dimension {d} ({new}) exceeds the maximum {mx}"
+                        )));
+                    }
+                }
+            }
+            None => {
+                for (d, (&new, &cur)) in new_dims.iter().zip(&m.dataspace.dims).enumerate() {
+                    if new > cur {
+                        return Err(crate::io::IoError::InvalidState(format!(
+                            "set_extent dimension {d} ({new}) exceeds the maximum {cur}: \
+                             a dataset without a stored maximum shape is fixed at its extent"
+                        )));
+                    }
                 }
             }
         }

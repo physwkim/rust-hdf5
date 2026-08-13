@@ -772,3 +772,46 @@ fn bt2_4_depth_two_tree_readable_by_h5py() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// A fixed-array dataset with a finite maximum above its shape: the array is
+/// sized from the maximum's chunk grid and slots are row-major in that grid
+/// (libhdf5 `max_nchunks` / `max_down_chunks`), including a maximum that
+/// grows a non-leading dimension — the case where the index grid and the
+/// current-extent grid disagree. h5py must see the maxshape and read every
+/// value written before and after the extends.
+#[test]
+fn fa_growable_max_shape_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("fa_growable_max");
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([4, 3])
+            .chunk(&[2, 3])
+            .max_shape(&[Some(6), Some(9)])
+            .create("grid")
+            .unwrap();
+        ds.write_raw(&(0..12).collect::<Vec<i32>>()).unwrap();
+        ds.extend(&[6, 6]).unwrap();
+        ds.write_slice(&[0, 3], &[6, 3], &(100..118).collect::<Vec<i32>>())
+            .unwrap();
+        ds.write_slice(&[4, 0], &[2, 3], &(200..206).collect::<Vec<i32>>())
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['grid']\n\
+         assert ds.shape == (6, 6), ds.shape\n\
+         assert ds.maxshape == (6, 9), ds.maxshape\n\
+         assert ds.chunks == (2, 3), ds.chunks\n\
+         expect = np.zeros((6, 6), dtype=np.int32)\n\
+         expect[:4, :3] = np.arange(12).reshape(4, 3)\n\
+         expect[:, 3:6] = np.arange(100, 118).reshape(6, 3)\n\
+         expect[4:6, :3] = np.arange(200, 206).reshape(2, 3)\n\
+         assert np.array_equal(ds[...], expect), ds[...]\n",
+    );
+    std::fs::remove_file(&path).ok();
+}

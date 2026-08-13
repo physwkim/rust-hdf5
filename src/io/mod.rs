@@ -5,6 +5,7 @@
 //! and SWMR (Single Writer Multiple Reader) protocol support.
 
 pub mod allocator;
+pub(crate) mod chunk_grid;
 pub mod file_handle;
 pub(crate) mod hyperslab;
 pub mod locking;

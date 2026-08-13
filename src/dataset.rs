@@ -319,20 +319,13 @@ impl<T: H5Type> DatasetBuilder<T> {
                             // must use the fixed-array index — libhdf5
                             // rejects an extensible-array index here. A
                             // compressed fixed-shape dataset uses a *filtered*
-                            // fixed array (FA client id 1).
-                            if wants_filter {
-                                writer.create_fixed_array_dataset_with_pipeline(
-                                    &full_name,
-                                    datatype,
-                                    &dims_u64,
-                                    &chunk_u64,
-                                    explicit_pipeline(),
-                                )?
-                            } else {
-                                writer.create_fixed_array_dataset(
-                                    &full_name, datatype, &dims_u64, &chunk_u64,
-                                )?
-                            }
+                            // fixed array (FA client id 1). The maximum shape
+                            // sizes the array, so a finite max above the
+                            // current shape stays growable.
+                            let pipeline = wants_filter.then(explicit_pipeline);
+                            writer.create_fixed_array_dataset_with_max(
+                                &full_name, datatype, &dims_u64, &max_u64, &chunk_u64, pipeline,
+                            )?
                         } else if let Some(pipeline) = self.custom_pipeline {
                             writer.create_chunked_dataset_with_pipeline(
                                 &full_name, datatype, &dims_u64, &max_u64, &chunk_u64, pipeline,
@@ -997,7 +990,11 @@ impl H5Dataset {
         }
         let total_chunks: u64 = grid.iter().product();
 
-        // Decode a linear chunk index into row-major grid coordinates.
+        // Decode the iteration counter into row-major coordinates over the
+        // *current* image's chunk grid. This is only an odometer over the
+        // chunks the image spans — the slot a chunk is recorded under comes
+        // from the index grid (`Hdf5Writer::chunk_slot`), which the maximum
+        // extent decides.
         let coords_of = |linear: u64| -> Vec<u64> {
             let mut rem = linear;
             let mut coords = vec![0u64; rank];
@@ -1031,23 +1028,25 @@ impl H5Dataset {
             let mut start = 0u64;
             while start < total_chunks {
                 let end = (start + BATCH_WINDOW).min(total_chunks);
-                let items: Vec<(u64, Vec<u64>, Vec<u8>)> = (start..end)
-                    .map(|linear| {
-                        let coords = coords_of(linear);
+                let items: Vec<(Vec<u64>, Vec<u8>)> = (start..end)
+                    .map(|counter| {
+                        let coords = coords_of(counter);
                         let buf =
                             Self::gather_chunk(bytes, &dims, &chunk_dims, &coords, element_size);
-                        (linear, coords, buf)
+                        (coords, buf)
                     })
                     .collect();
                 if fixed_array {
                     let pairs: Vec<(&[u64], &[u8])> = items
                         .iter()
-                        .map(|(_, c, d)| (c.as_slice(), d.as_slice()))
+                        .map(|(c, d)| (c.as_slice(), d.as_slice()))
                         .collect();
                     writer.write_chunks_fixed_array_batch(index, &pairs)?;
                 } else {
-                    let pairs: Vec<(u64, &[u8])> =
-                        items.iter().map(|(l, _, d)| (*l, d.as_slice())).collect();
+                    let mut pairs: Vec<(u64, &[u8])> = Vec::with_capacity(items.len());
+                    for (c, d) in &items {
+                        pairs.push((writer.chunk_slot(index, c)?, d.as_slice()));
+                    }
                     writer.write_chunks_batch(index, &pairs)?;
                 }
                 start = end;
@@ -1165,42 +1164,9 @@ impl H5Dataset {
                 match &*inner {
                     H5FileInner::Writer(writer) => {
                         if *fixed_array {
-                            // Fixed-array dataset: convert the linear chunk
-                            // index into row-major grid coordinates.
-                            let chunk_dims = writer
-                                .dataset_chunk_dims(*index)
-                                .ok_or_else(|| {
-                                    Hdf5Error::InvalidState("dataset has no chunk info".into())
-                                })?
-                                .to_vec();
-                            let dims = writer.dataset_dims(*index).to_vec();
-                            let mut grid = vec![0u64; dims.len()];
-                            for d in 0..dims.len() {
-                                grid[d] = if chunk_dims[d] > 0 {
-                                    dims[d].div_ceil(chunk_dims[d])
-                                } else {
-                                    1
-                                };
-                            }
-                            // A zero-extent dimension yields a grid of 0
-                            // chunks — there is no chunk to write.
-                            if grid.contains(&0) {
-                                return Err(Hdf5Error::InvalidState(
-                                    "dataset has a zero-extent dimension and no chunks".into(),
-                                ));
-                            }
-                            let mut rem = chunk_idx as u64;
-                            let mut coords = vec![0u64; dims.len()];
-                            for d in (0..dims.len()).rev() {
-                                coords[d] = rem % grid[d];
-                                rem /= grid[d];
-                            }
-                            // A leftover means chunk_idx exceeded the grid.
-                            if rem != 0 {
-                                return Err(Hdf5Error::InvalidState(format!(
-                                    "chunk index {chunk_idx} is out of range for this dataset"
-                                )));
-                            }
+                            // Fixed-array dataset: decode the index-grid slot
+                            // into row-major grid coordinates.
+                            let coords = writer.chunk_coords_from_slot(*index, chunk_idx as u64)?;
                             writer.write_chunk_fixed_array(*index, &coords, data)?;
                         } else {
                             writer.write_chunk(*index, chunk_idx as u64, data)?;
@@ -1270,42 +1236,9 @@ impl H5Dataset {
                 match &*inner {
                     H5FileInner::Writer(writer) => {
                         if *fixed_array {
-                            // Fixed-array dataset: convert the linear chunk
-                            // index into row-major grid coordinates.
-                            let chunk_dims = writer
-                                .dataset_chunk_dims(*index)
-                                .ok_or_else(|| {
-                                    Hdf5Error::InvalidState("dataset has no chunk info".into())
-                                })?
-                                .to_vec();
-                            let dims = writer.dataset_dims(*index).to_vec();
-                            let mut grid = vec![0u64; dims.len()];
-                            for d in 0..dims.len() {
-                                grid[d] = if chunk_dims[d] > 0 {
-                                    dims[d].div_ceil(chunk_dims[d])
-                                } else {
-                                    1
-                                };
-                            }
-                            // A zero-extent dimension yields a grid of 0
-                            // chunks — there is no chunk to write.
-                            if grid.contains(&0) {
-                                return Err(Hdf5Error::InvalidState(
-                                    "dataset has a zero-extent dimension and no chunks".into(),
-                                ));
-                            }
-                            let mut rem = chunk_idx as u64;
-                            let mut coords = vec![0u64; dims.len()];
-                            for d in (0..dims.len()).rev() {
-                                coords[d] = rem % grid[d];
-                                rem /= grid[d];
-                            }
-                            // A leftover means chunk_idx exceeded the grid.
-                            if rem != 0 {
-                                return Err(Hdf5Error::InvalidState(format!(
-                                    "chunk index {chunk_idx} is out of range for this dataset"
-                                )));
-                            }
+                            // Fixed-array dataset: decode the index-grid slot
+                            // into row-major grid coordinates.
+                            let coords = writer.chunk_coords_from_slot(*index, chunk_idx as u64)?;
                             writer.write_compressed_chunk_fixed_array(
                                 *index,
                                 &coords,
@@ -1488,24 +1421,9 @@ impl H5Dataset {
                             .write_compressed_chunk_btree_v2(*index, &coords, data, filter_mask)?,
                     }
                 } else {
-                    // Extensible array: linearize the chunk-grid coordinates
-                    // (row-major) into the array's chunk index.
-                    let mut linear = 0u64;
-                    for d in 0..dims.len() {
-                        let grid = if chunk_dims[d] > 0 {
-                            dims[d].div_ceil(chunk_dims[d])
-                        } else {
-                            1
-                        };
-                        linear = linear
-                            .checked_mul(grid)
-                            .and_then(|l| l.checked_add(coords[d]))
-                            .ok_or_else(|| {
-                                Hdf5Error::InvalidState(
-                                    "chunk coordinates overflow the array index".into(),
-                                )
-                            })?;
-                    }
+                    // Extensible array: the chunk's index-grid slot (row-major
+                    // against the maximum extent).
+                    let linear = writer.chunk_slot(*index, &coords)?;
                     match bytes {
                         ChunkBytes::Unfiltered(data) => writer.write_chunk(*index, linear, data)?,
                         ChunkBytes::Prefiltered { data, filter_mask } => {
@@ -5464,6 +5382,125 @@ mod tests {
         let err = ds.append(&(0..6).collect::<Vec<i32>>()).unwrap_err();
         assert!(
             err.to_string().contains("chunk grid"),
+            "unexpected error: {err}"
+        );
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A finite max_shape above the current shape used to be dropped on the
+    /// fixed-array path: the array was sized from the current dims and the
+    /// stored dataspace had no maximum, so growth failed. The array is now
+    /// sized from the maximum's chunk grid (libhdf5 `max_nchunks`), so a
+    /// fixed-max dataset appends up to its maximum and roundtrips.
+    #[test]
+    fn fixed_array_with_a_larger_max_shape_grows_and_survives_close() {
+        let path = temp_path("fa_growable_dim0");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([4, 3])
+                .chunk(&[2, 3])
+                .max_shape(&[Some(10), Some(3)])
+                .create("d")
+                .unwrap();
+            ds.write_raw(&(0..12).collect::<Vec<i32>>()).unwrap();
+            ds.append(&(12..18).collect::<Vec<i32>>()).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("d").unwrap();
+            assert_eq!(ds.shape(), vec![6, 3]);
+            assert_eq!(ds.read_raw::<i32>().unwrap(), (0..18).collect::<Vec<i32>>());
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The multiplier-dimension boundary: growing a dimension other than 0
+    /// changes the current chunk grid but not the index grid. Chunk slots
+    /// must come from the maximum's grid (libhdf5 `max_down_chunks`), or the
+    /// chunks written before the extend are looked up under different
+    /// indices after it.
+    #[test]
+    fn fixed_array_growable_inner_dimension_keeps_chunk_slots() {
+        let path = temp_path("fa_growable_dim1");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([4, 3])
+                .chunk(&[2, 3])
+                .max_shape(&[Some(4), Some(9)])
+                .create("d")
+                .unwrap();
+            ds.write_raw(&(0..12).collect::<Vec<i32>>()).unwrap();
+            ds.extend(&[4, 6]).unwrap();
+            ds.write_slice(&[0, 3], &[4, 3], &(12..24).collect::<Vec<i32>>())
+                .unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("d").unwrap();
+            assert_eq!(ds.shape(), vec![4, 6]);
+            // Row-major [4,6]: row r is [r*3 .. r*3+3) from the first write
+            // then [12 + r*3 ..) from the second.
+            let mut expect = Vec::new();
+            for r in 0i32..4 {
+                expect.extend((r * 3)..(r * 3 + 3));
+                expect.extend((12 + r * 3)..(12 + r * 3 + 3));
+            }
+            assert_eq!(ds.read_raw::<i32>().unwrap(), expect);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Growth boundaries: past the stored maximum is rejected, and a dataset
+    /// without a stored maximum is fixed at its extent (libhdf5 defaults
+    /// maxdims to dims at creation).
+    #[test]
+    fn extend_beyond_the_maximum_is_rejected() {
+        let path = temp_path("extend_beyond_max");
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([4, 3])
+            .chunk(&[2, 3])
+            .max_shape(&[Some(6), Some(3)])
+            .create("d")
+            .unwrap();
+        ds.extend(&[6, 3]).unwrap();
+        let err = ds.extend(&[8, 3]).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds the maximum"),
+            "unexpected error: {err}"
+        );
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An unlimited dimension other than 0 has no fixed linear slot without
+    /// libhdf5's extensible-array swizzling, which is not implemented;
+    /// creating the geometry silently re-indexed chunks on every extend, so
+    /// it is rejected at create.
+    #[test]
+    fn builder_rejects_an_unlimited_inner_dimension() {
+        let path = temp_path("unlimited_inner_dim");
+        let file = H5File::create(&path).unwrap();
+        let err = match file
+            .new_dataset::<i32>()
+            .shape([4, 0])
+            .chunk(&[2, 2])
+            .max_shape(&[Some(4), None])
+            .create("d")
+        {
+            Ok(_) => panic!("create accepted an unlimited inner dimension"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("not the first"),
             "unexpected error: {err}"
         );
         file.close().unwrap();

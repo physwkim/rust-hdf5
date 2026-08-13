@@ -53,6 +53,33 @@
   pair is now a witness type (`begin_create` → `push_dataset`), so a
   creator cannot skip it.
 
+- Chunk slots are computed against the **maximum-extent** chunk grid, the
+  libhdf5 rule (`max_down_chunks` in H5Dfarray.c/H5Dearray.c/H5Dnone.c;
+  the fixed array is sized from `max_nchunks`). Slots were computed from
+  the *current* extent, which coincides only while every dimension after
+  the first sits at its maximum — any other geometry wrote files libhdf5
+  reads differently, and extending re-scrambled the mapping. One owner
+  (`io::chunk_grid`) now serves the writer, the reader, and the dataset
+  API. Fallout fixed with it:
+  - The builder silently dropped a finite `max_shape` on the fixed-array
+    path (no unlimited dimension): the array was sized from the current
+    shape and the stored dataspace had no maximum, so the dataset could
+    never grow. `create_fixed_array_dataset_with_max` sizes the array
+    from the maximum's grid and such datasets now extend/append up to
+    their maximum. The fixed-shape creators keep their signatures and
+    now store `max_dims == dims` explicitly.
+  - **Behavior change:** growing a dataset past its stored maximum — or
+    growing one with *no* stored maximum at all — is rejected by
+    `extend_dataset`/`set_dataset_extent`, matching `H5Dset_extent`
+    (libhdf5 defaults maxdims to dims at creation). Previously the grow
+    succeeded and writes failed later, or scrambled chunk slots.
+  - **Behavior change:** creating an extensible-array dataset whose
+    unlimited dimension is not dimension 0 is rejected. Its chunks have
+    no fixed linear slot without libhdf5's swizzling (not implemented);
+    the geometry previously re-indexed — i.e. silently lost — chunks on
+    every extend. Reading such a file (libhdf5-written) now errors
+    instead of returning wrong data.
+
 ## 0.4.1
 
 ### Added

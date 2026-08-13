@@ -1607,50 +1607,41 @@ impl Hdf5Reader {
                     return Ok(());
                 }
 
-                // Total chunk count across all dimensions.
-                let chunks_dim0: u64 = (0..dims.len())
-                    .map(|d| {
-                        if chunk_dims[d] > 0 {
-                            dims[d].div_ceil(chunk_dims[d])
-                        } else {
-                            0
-                        }
-                    })
-                    .fold(1u64, |acc, n| acc.saturating_mul(n));
+                // Total slot count of the index grid. The maximum extent
+                // decides the multipliers (libhdf5 max_down_chunks); an
+                // unlimited dimension 0 is bounded by the current extent for
+                // this read — a slot beyond it (written before a shrink) is
+                // not visible.
+                let max_dims = info.dataspace.max_dims.clone();
+                let grid =
+                    crate::io::chunk_grid::index_grid(&dims, max_dims.as_deref(), chunk_dims)?;
+                let chunks_total: u64 = grid.iter().fold(1u64, |acc, &n| acc.saturating_mul(n));
 
                 let chunk_entries = self.collect_ea_chunk_entries(
                     index_address,
                     params,
                     &dims,
+                    max_dims.as_deref(),
                     chunk_dims,
                     element_size,
                 )?;
 
-                let n_chunks = std::cmp::min(chunks_dim0 as usize, chunk_entries.len());
+                let n_chunks = std::cmp::min(chunks_total as usize, chunk_entries.len());
 
-                // Chunks are placed N-dimensionally: the linear chunk index
-                // maps (row-major) to chunk-grid coordinates, so sub-frame
-                // chunks (a chunk smaller than a full frame) land correctly.
-                let ndims = dims.len();
-                let chunks_per_dim: Vec<u64> = (0..ndims)
-                    .map(|d| {
-                        if chunk_dims[d] > 0 {
-                            dims[d].div_ceil(chunk_dims[d])
-                        } else {
-                            0
-                        }
-                    })
-                    .collect();
-                let chunk_coords = |mut i: u64| -> Vec<u64> {
-                    let mut c = vec![0u64; ndims];
-                    for d in (0..ndims).rev() {
-                        if chunks_per_dim[d] > 0 {
-                            c[d] = i % chunks_per_dim[d];
-                            i /= chunks_per_dim[d];
-                        }
-                    }
-                    c
-                };
+                // Chunks are placed N-dimensionally: each slot decodes
+                // (row-major, against the index grid) to chunk-grid
+                // coordinates, so sub-frame chunks (a chunk smaller than a
+                // full frame) land correctly.
+                let mut slot_coords = Vec::with_capacity(n_chunks);
+                for i in 0..n_chunks as u64 {
+                    slot_coords.push(crate::io::chunk_grid::coords_of(
+                        &dims,
+                        max_dims.as_deref(),
+                        chunk_dims,
+                        i,
+                    )?);
+                }
+                let chunk_coords = |i: u64| -> &[u64] { &slot_coords[i as usize] };
 
                 // Build one read job per chunk (no I/O yet), then read +
                 // decompress them together (in parallel where positioned reads
@@ -1669,7 +1660,7 @@ impl Hdf5Reader {
                                 || nbytes == 0
                                 || addr >= file_size
                                 || nbytes > file_size
-                                || !target.overlaps(&chunk_coords(i as u64), chunk_dims)
+                                || !target.overlaps(chunk_coords(i as u64), chunk_dims)
                             {
                                 None
                             } else {
@@ -1688,7 +1679,7 @@ impl Hdf5Reader {
                         .enumerate()
                         .map(|(i, &(addr, nbytes, _))| {
                             if addr == UNDEF_ADDR
-                                || !target.overlaps(&chunk_coords(i as u64), chunk_dims)
+                                || !target.overlaps(chunk_coords(i as u64), chunk_dims)
                             {
                                 None
                             } else {
@@ -1714,7 +1705,7 @@ impl Hdf5Reader {
                             output,
                             &dims,
                             chunk_dims,
-                            &coords,
+                            coords,
                             element_size,
                         );
                     }
@@ -1892,25 +1883,22 @@ impl Hdf5Reader {
             }
         }
 
-        // Compute number of chunks per dimension. A zero chunk dimension
-        // from a malformed layout message would divide by zero.
-        if chunk_dims.contains(&0) {
-            return Err(crate::io::IoError::InvalidState(
-                "fixed-array layout has a zero chunk dimension".into(),
-            ));
+        // Index-grid slot -> chunk-grid coordinates (row-major, against the
+        // maximum extent — the array was sized from its chunk grid, so a slot
+        // beyond the current extent still decodes to its true position and
+        // then simply falls outside the read target). A zero chunk dimension
+        // from a malformed layout message is rejected inside.
+        let max_dims = info.dataspace.max_dims.clone();
+        let mut slot_coords = Vec::with_capacity(chunk_entries.len());
+        for i in 0..chunk_entries.len() as u64 {
+            slot_coords.push(crate::io::chunk_grid::coords_of(
+                &dims,
+                max_dims.as_deref(),
+                chunk_dims,
+                i,
+            )?);
         }
-        let chunks_per_dim: Vec<u64> = (0..ndims)
-            .map(|d| dims[d].div_ceil(chunk_dims[d]))
-            .collect();
-        // Linear chunk index -> chunk-grid coordinates (row-major).
-        let chunk_coords = |mut i: u64| -> Vec<u64> {
-            let mut c = vec![0u64; ndims];
-            for d in (0..ndims).rev() {
-                c[d] = i % chunks_per_dim[d];
-                i /= chunks_per_dim[d];
-            }
-            c
-        };
+        let chunk_coords = |i: u64| -> &[u64] { &slot_coords[i as usize] };
 
         // Build one read job per chunk (no I/O yet). Filtered chunks carry
         // their exact compressed size (read at-most, since a zero size means
@@ -1922,7 +1910,7 @@ impl Hdf5Reader {
             .enumerate()
             .map(|(linear_idx, &(addr, comp_size, mask))| {
                 if addr == UNDEF_ADDR
-                    || !target.overlaps(&chunk_coords(linear_idx as u64), chunk_dims)
+                    || !target.overlaps(chunk_coords(linear_idx as u64), chunk_dims)
                 {
                     None
                 } else if pipeline.is_some() {
@@ -1960,7 +1948,7 @@ impl Hdf5Reader {
                 output,
                 &dims,
                 chunk_dims,
-                &coords,
+                coords,
                 element_size,
             );
         }
@@ -2648,6 +2636,7 @@ impl Hdf5Reader {
         index_address: u64,
         params: &data_layout::EarrayParams,
         dims: &[u64],
+        max_dims: Option<&[u64]>,
         chunk_dims: &[u64],
         element_size: u64,
     ) -> IoResult<Vec<(u64, u64, u32)>> {
@@ -2662,17 +2651,13 @@ impl Hdf5Reader {
             return Ok(vec![]);
         }
 
-        // Total chunk count across every dimension (sub-frame chunks make
-        // this larger than the dim-0 chunk count alone).
-        let chunks_dim0: usize = (0..dims.len())
-            .map(|d| {
-                if chunk_dims[d] > 0 {
-                    dims[d].div_ceil(chunk_dims[d]) as usize
-                } else {
-                    0
-                }
-            })
-            .fold(1usize, |acc, n| acc.saturating_mul(n));
+        // Slot count of the index grid, bounding the collection walk. The
+        // maximum extent decides the multipliers (sub-frame chunks make this
+        // larger than the dim-0 chunk count alone); the unlimited dimension 0
+        // is bounded by the current extent.
+        let chunks_dim0: usize = crate::io::chunk_grid::index_grid(dims, max_dims, chunk_dims)?
+            .iter()
+            .fold(1usize, |acc, &n| acc.saturating_mul(n as usize));
         let geo = EaGeometry::new(
             params.idx_blk_elmts,
             params.data_blk_min_elmts,
