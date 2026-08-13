@@ -27,6 +27,13 @@
   cleared but the blocks are kept, the rule libhdf5 applies in
   `H5Dearray.c`.
 
+- Global-heap objects carry their on-disk reference count through
+  decode and encode. It was hardcoded to 1 on every encode — libhdf5
+  writes 0 on insert (`H5HG_insert`), and rewriting a foreign
+  collection after an object removal reset any count its virtual-dataset
+  layer had raised via `H5HG_link`. New objects now encode 0, matching
+  libhdf5 byte-for-byte; decoded objects keep what the file declares.
+
 - Creating a zero-element vlen dataset (`write_vlen_strings`,
   `write_vlen_bytes`, `write_vlen_strings_compressed`) or an empty
   string-array attribute no longer writes a global-heap collection: an

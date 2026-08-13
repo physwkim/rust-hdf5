@@ -41,6 +41,12 @@ const GCOL_MIN_SIZE: usize = 4096;
 pub struct GlobalHeapObject {
     /// Object index (1-based). Index 0 is reserved for the free-space marker.
     pub index: u16,
+    /// On-disk reference count. libhdf5 writes 0 on insert (`H5HG_insert`)
+    /// and only its virtual-dataset layer ever raises it via `H5HG_link`,
+    /// so new objects carry 0 — but a decoded object keeps what the file
+    /// says, or rewriting a foreign collection after a removal would reset
+    /// a VDS-linked object's count.
+    pub ref_count: u16,
     /// Raw data stored in this object.
     pub data: Vec<u8>,
 }
@@ -71,7 +77,11 @@ impl GlobalHeapCollection {
             ));
         }
         let index = max_index + 1;
-        self.objects.push(GlobalHeapObject { index, data });
+        self.objects.push(GlobalHeapObject {
+            index,
+            ref_count: 0,
+            data,
+        });
         Ok(index)
     }
 
@@ -169,7 +179,7 @@ impl GlobalHeapCollection {
         for obj in &self.objects {
             let obj_start = buf.len();
             buf.extend_from_slice(&obj.index.to_le_bytes());
-            buf.extend_from_slice(&1u16.to_le_bytes()); // ref_count = 1
+            buf.extend_from_slice(&obj.ref_count.to_le_bytes());
             buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
             buf.extend_from_slice(&(obj.data.len() as u64).to_le_bytes()[..ss]);
             buf.resize(obj_start + objhdr_size, 0); // pad object header
@@ -278,7 +288,7 @@ impl GlobalHeapCollection {
             let obj_start = pos;
             let index = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
             pos += 2;
-            let _ref_count = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
+            let ref_count = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
             pos += 2;
             let _reserved =
                 u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
@@ -310,7 +320,11 @@ impl GlobalHeapCollection {
             let padded = pad_to_8(size);
             pos += padded;
 
-            objects.push(GlobalHeapObject { index, data });
+            objects.push(GlobalHeapObject {
+                index,
+                ref_count,
+                data,
+            });
         }
 
         Ok((Self { objects }, collection_size))
@@ -623,5 +637,39 @@ mod tests {
 
         // Asking for less than the objects need is refused, not truncated.
         assert!(coll.encode_at_size(&ctx(), 64).is_err());
+    }
+
+    /// New objects encode a zero reference count, matching `H5HG_insert`
+    /// (`UINT16ENCODE(p, 0)` — only the virtual-dataset layer's `H5HG_link`
+    /// ever raises it). It used to be hardcoded to 1.
+    #[test]
+    fn new_objects_encode_a_zero_ref_count() {
+        let mut coll = GlobalHeapCollection::new();
+        coll.add_object(b"x".to_vec()).unwrap();
+        let img = coll.encode(&ctx());
+        let header_size = pad_to_8(4 + 1 + 3 + ctx().sizeof_size as usize);
+        // Object header: index (2) then ref_count (2).
+        assert_eq!(&img[header_size + 2..header_size + 4], &[0, 0]);
+    }
+
+    /// A decoded object keeps the reference count the file declares, and a
+    /// removal's rewrite re-encodes it unchanged — resetting it would strip
+    /// a foreign file's VDS link count from the surviving objects.
+    #[test]
+    fn rewrite_preserves_a_foreign_objects_ref_count() {
+        let mut coll = GlobalHeapCollection::new();
+        coll.add_object(b"doomed".to_vec()).unwrap();
+        coll.add_object(b"vds linked".to_vec()).unwrap();
+        coll.objects[1].ref_count = 3;
+        let img = coll.encode(&ctx());
+
+        let (mut back, _) = GlobalHeapCollection::decode(&img, &ctx()).unwrap();
+        assert_eq!(back.objects[1].ref_count, 3, "decode must keep the count");
+
+        assert!(back.remove_object(1));
+        let rewritten = back.encode_at_size(&ctx(), img.len()).unwrap();
+        let (again, _) = GlobalHeapCollection::decode(&rewritten, &ctx()).unwrap();
+        assert_eq!(again.get_object(2), Some(b"vds linked".as_slice()));
+        assert_eq!(again.objects[0].ref_count, 3, "rewrite must keep the count");
     }
 }
