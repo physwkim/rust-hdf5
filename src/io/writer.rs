@@ -3046,9 +3046,21 @@ impl Hdf5Writer {
     /// existing size with the recovered bytes given to the free-space marker,
     /// and a collection that ends up empty returns its block to the allocator.
     /// A nil reference (address 0 or `UNDEF_ADDR`) names no object. The
-    /// sequence length does not decide: this crate's writers store even the
-    /// empty string as a real heap object, so a zero-length reference with a
-    /// defined address still holds one that must be released.
+    /// address decides, not the sequence length: this crate's writers store
+    /// even the empty string as a real heap object, so a zero-length reference
+    /// with a defined address still holds one that must be released. libhdf5
+    /// diverges here against itself — `H5T__vlen_disk_delete` returns before
+    /// `H5HG_remove` when the sequence length is zero, yet its write path
+    /// (`H5VL__native_blob_put`) inserts a heap object even for an empty
+    /// sequence, stranding it forever. The address rule frees those objects.
+    ///
+    /// Heap objects carry no reference count on this path, matching libhdf5:
+    /// its vlen code never calls `H5HG_link` (only the virtual-dataset layer
+    /// does). Releasing the same reference twice is absorbed by the
+    /// missing-index check below, but a crafted file in which two elements
+    /// share one heap object would lose it for the survivor when either is
+    /// replaced — the same exposure the file has under libhdf5. This crate's
+    /// writers never share: each element write inserts its own object.
     ///
     /// Under SWMR nothing is freed and no collection is rewritten: a reader may
     /// be following those references, the same reason `place_chunk` keeps a
