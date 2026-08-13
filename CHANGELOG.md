@@ -18,6 +18,13 @@
   controls the API mirrors) can produce such a file; previously the frame was
   zero-padded up to the tile.
 
+- `append_vlen_strings` now applies the same character-set rule as
+  `write_vlen_strings_slice` — non-ASCII strings are rejected when the
+  dataset declares ASCII, instead of being stored mislabeled (libhdf5
+  stores the bytes unvalidated; h5py raises on the same mismatch) — and
+  refuses a dataset whose elements are not variable-length strings, which
+  it previously overwrote with vlen references as raw bytes.
+
 - The append buffer records the absolute row its frames belong to, and
   every operation that writes rows the buffer holds flushes it to the
   chunks first. Before this, the buffer's position was derived from the

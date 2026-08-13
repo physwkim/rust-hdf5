@@ -436,6 +436,23 @@ fn validate_chunk_geometry(dims: &[u64], max_dims: &[u64], chunk_dims: &[u64]) -
     Ok(())
 }
 
+/// Reject strings the dataset's declared character set cannot label.
+///
+/// A Rust `&str` is always UTF-8, so only an ASCII declaration (charset 0)
+/// can be violated. libhdf5 stores the bytes unvalidated — its vlen write
+/// path has no cset check anywhere — which mislabels them for every reader
+/// that trusts the declaration (h5py raises on the same mismatch).
+fn ensure_vlen_charset(charset: u8, strings: &[&str]) -> IoResult<()> {
+    if charset == 0 {
+        if let Some((i, s)) = strings.iter().enumerate().find(|(_, s)| !s.is_ascii()) {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "string {i} ({s:?}) is not ASCII, but the dataset's character set is"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Runtime metadata for a fixed-array-indexed chunked dataset.
 pub struct FixedArrayDatasetInfo {
     /// Chunk dimension sizes.
@@ -2696,10 +2713,27 @@ impl Hdf5Writer {
     /// references, and appends them as new chunks to the dataset.
     pub fn append_vlen_strings(&self, ds_index: usize, strings: &[&str]) -> IoResult<()> {
         use crate::format::global_heap::{encode_vlen_reference, GlobalHeapCollection};
+        use crate::format::messages::datatype::DatatypeMessage;
 
         if strings.is_empty() {
             return Ok(());
         }
+
+        // The elements about to be written are vlen references; any other
+        // element type would be overwritten with them as raw bytes.
+        let charset = {
+            let ds = self.ds(ds_index);
+            let m = ds.lock();
+            match m.datatype {
+                DatatypeMessage::VarLenString { charset } => charset,
+                _ => {
+                    return Err(crate::io::IoError::InvalidState(
+                        "append_vlen_strings is only for variable-length string datasets".into(),
+                    ))
+                }
+            }
+        };
+        ensure_vlen_charset(charset, strings)?;
 
         // Build a new global heap collection for this batch
         let mut gcol = GlobalHeapCollection::new();
@@ -2852,15 +2886,7 @@ impl Hdf5Writer {
                 dims[0]
             )));
         }
-        // charset 0 is ASCII. A Rust `&str` is UTF-8, so anything non-ASCII
-        // would be stored as UTF-8 under a datatype that declares otherwise.
-        if charset == 0 {
-            if let Some((i, s)) = strings.iter().enumerate().find(|(_, s)| !s.is_ascii()) {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "string {i} ({s:?}) is not ASCII, but the dataset's character set is"
-                )));
-            }
-        }
+        ensure_vlen_charset(charset, strings)?;
 
         // One collection for the batch, as `append_vlen_strings` does.
         let mut gcol = GlobalHeapCollection::new();
@@ -5304,6 +5330,42 @@ mod tests {
             tag,
             n
         ))
+    }
+
+    /// The charset rule is one owner shared by every vlen string writer:
+    /// appends into an ASCII-declared dataset reject non-ASCII strings the
+    /// same way the slice writer does, and a dataset whose elements are not
+    /// vlen references at all is refused instead of overwritten with them.
+    #[test]
+    fn append_vlen_strings_checks_the_datatype_and_charset() {
+        let path = temp_path("append_vlen_charset");
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let idx = writer
+            .create_appendable_vlen_string_dataset("d", 4, None)
+            .unwrap();
+        writer.ds(idx).lock().datatype = DatatypeMessage::vlen_string_ascii();
+        let err = writer
+            .append_vlen_strings(idx, &["ok", "안녕"])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("is not ASCII"),
+            "unexpected error: {err}"
+        );
+        writer.append_vlen_strings(idx, &["ok", "fine"]).unwrap();
+
+        let nums = writer
+            .create_chunked_dataset("n", DatatypeMessage::i32_type(), &[0], &[u64::MAX], &[4])
+            .unwrap();
+        let err = writer.append_vlen_strings(nums, &["x"]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only for variable-length string datasets"),
+            "unexpected error: {err}"
+        );
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
     }
 
     /// A corrupt file can declare a zero-length chunk dimension; the
