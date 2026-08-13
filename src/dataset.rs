@@ -1663,39 +1663,37 @@ impl H5Dataset {
                 combined.extend_from_slice(raw);
 
                 let total_frames = buffered_frames + n_new_frames;
-                let total_bytes = combined.len();
 
-                // Base chunk index: account for buffered frames
-                let base_dim0 = current_dim0 - buffered_frames;
-                let mut byte_pos = 0usize;
-                let mut frame_pos = 0usize;
+                // First appended row: account for buffered frames.
+                let base_dim0 = current_dim0.checked_sub(buffered_frames).ok_or_else(|| {
+                    Hdf5Error::InvalidState(format!(
+                        "the append buffer holds {buffered_frames} frames but the \
+                         dataset extent is {current_dim0}"
+                    ))
+                })?;
 
-                while frame_pos < total_frames {
-                    let abs_frame = base_dim0 + frame_pos;
-                    let chunk_idx = abs_frame / chunk_dim0;
-                    let remaining_frames = total_frames - frame_pos;
-                    let frames_to_fill = chunk_dim0 - (abs_frame % chunk_dim0);
-
-                    if remaining_frames >= frames_to_fill {
-                        // These frames complete the chunk's remaining span.
-                        let end = byte_pos + frames_to_fill * frame_bytes;
-                        let offset_in_chunk = (abs_frame % chunk_dim0) * frame_bytes;
-                        writer.append_frames_into_chunk(
-                            ds_index,
-                            chunk_idx as u64,
-                            offset_in_chunk,
-                            &combined[byte_pos..end],
-                        )?;
-                        byte_pos = end;
-                        frame_pos += frames_to_fill;
-                    } else {
-                        // Partial chunk — buffer for next append
-                        let ds = writer.ds(ds_index);
-                        let mut m = ds.lock();
-                        m.append_buffer = combined[byte_pos..total_bytes].to_vec();
-                        m.append_buffered_frames = remaining_frames as u64;
-                        frame_pos = total_frames;
-                    }
+                // Rows up to the last chunk boundary are written now; the
+                // tail that does not complete a chunk goes back in the
+                // buffer for the next append (or the flush at close). The
+                // boundary can precede `base_dim0` — a reopened file's
+                // flushed partial chunk leaves the base mid-chunk — in
+                // which case everything is tail.
+                let last_boundary = ((base_dim0 + total_frames) / chunk_dim0) * chunk_dim0;
+                let write_frames = last_boundary.saturating_sub(base_dim0);
+                let tail_frames = total_frames - write_frames;
+                if write_frames > 0 {
+                    writer.write_append_frames(
+                        ds_index,
+                        base_dim0 as u64,
+                        write_frames as u64,
+                        &combined[..write_frames * frame_bytes],
+                    )?;
+                }
+                if tail_frames > 0 {
+                    let ds = writer.ds(ds_index);
+                    let mut m = ds.lock();
+                    m.append_buffer = combined[write_frames * frame_bytes..].to_vec();
+                    m.append_buffered_frames = tail_frames as u64;
                 }
 
                 // Extend dims to include all frames (buffered + new)
@@ -5320,6 +5318,93 @@ mod tests {
             size < 20 * 4096,
             "20 buffered updates left {size} bytes, one collection per update"
         );
+    }
+
+    /// Regression: appends to a v2 B-tree indexed dataset (two unlimited
+    /// dimensions) buffered fine but close() failed "not a chunked dataset"
+    /// and lost the buffered rows — the append's chunk writes required the
+    /// extensible-array index. They now go through the index-generic
+    /// hyperslab engine.
+    #[test]
+    fn append_to_a_btree_v2_dataset_survives_close() {
+        let path = temp_path("append_bt2_close");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0, 3])
+                .chunk(&[4, 3])
+                .max_shape(&[None, None])
+                .create("d")
+                .unwrap();
+            // One buffered row, then a batch that crosses the chunk
+            // boundary: 4 rows fill chunk band 0, one row stays buffered
+            // for the flush at close.
+            ds.append(&[1, 2, 3]).unwrap();
+            ds.append(&(4..=15).collect::<Vec<i32>>()).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("d").unwrap();
+            assert_eq!(ds.shape(), vec![5, 3]);
+            assert_eq!(
+                ds.read_raw::<i32>().unwrap(),
+                (1..=15).collect::<Vec<i32>>()
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A chunk row narrower than the frame row is legal geometry (libhdf5
+    /// creates it); appended frames must be scattered across the row's
+    /// tiles at the chunk stride, not packed at the frame stride.
+    #[test]
+    fn append_scatters_frames_across_narrow_chunk_tiles() {
+        let path = temp_path("append_narrow_chunks");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0, 8])
+                .chunk(&[2, 4])
+                .max_shape(&[None, Some(8)])
+                .create("d")
+                .unwrap();
+            // 3 rows of 8: rows 0..2 complete chunk band 0 (two tiles),
+            // row 2 is flushed partial at close.
+            ds.append(&(0..24).collect::<Vec<i32>>()).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("d").unwrap();
+            assert_eq!(ds.shape(), vec![3, 8]);
+            assert_eq!(ds.read_raw::<i32>().unwrap(), (0..24).collect::<Vec<i32>>());
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A fixed-array dataset has no room to grow: appending must surface an
+    /// error naming the chunk grid, not lose rows silently. (Before the
+    /// index-generic append it failed as "not a chunked dataset".)
+    #[test]
+    fn append_to_a_full_fixed_array_dataset_errors() {
+        let path = temp_path("append_fa_errors");
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([4, 3])
+            .chunk(&[2, 3])
+            .create("d")
+            .unwrap();
+        let err = ds.append(&(0..6).collect::<Vec<i32>>()).unwrap_err();
+        assert!(
+            err.to_string().contains("chunk grid"),
+            "unexpected error: {err}"
+        );
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
     }
 
     /// Regression: a chunk wider than a fixed max dimension used to be

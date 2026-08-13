@@ -18,6 +18,17 @@
   controls the API mirrors) can produce such a file; previously the frame was
   zero-padded up to the tile.
 
+- Appends work on every chunk index and chunk shape. The append paths'
+  chunk writes required the extensible-array index, so appending to a
+  fixed-array or v2 B-tree dataset buffered fine and then failed at
+  `close()` with "not a chunked dataset", losing the buffered rows. They
+  also packed rows at the frame stride, so a chunk row narrower than the
+  frame — legal, libhdf5-creatable geometry — corrupted the first chunk
+  and errored on the second. Append writes now go through the same
+  index-generic hyperslab engine as `write_slice`, which also makes
+  appends to reopened 0.4.0 files with a wider-than-row chunk land
+  correctly instead of reading back `[1, 2, 0, 0]` for `[1, 2, 3, 4]`.
+
 ## 0.4.1
 
 ### Added

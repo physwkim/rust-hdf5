@@ -2738,35 +2738,34 @@ impl Hdf5Writer {
         combined.extend_from_slice(&raw);
 
         let total_frames = buffered_frames + n_new_frames;
-        let total_bytes = combined.len();
-        let base_dim0 = current_dim0 - buffered_frames;
-        let mut byte_pos = 0usize;
-        let mut frame_pos = 0usize;
+        let base_dim0 = current_dim0.checked_sub(buffered_frames).ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!(
+                "the append buffer holds {buffered_frames} frames but the dataset \
+                 extent is {current_dim0}"
+            ))
+        })?;
 
-        while frame_pos < total_frames {
-            let abs_frame = base_dim0 + frame_pos;
-            let chunk_idx = abs_frame / chunk_dim0;
-            let remaining_frames = total_frames - frame_pos;
-            let frames_to_fill = chunk_dim0 - (abs_frame % chunk_dim0);
-
-            if remaining_frames >= frames_to_fill {
-                let end = byte_pos + frames_to_fill * frame_bytes;
-                let offset_in_chunk = (abs_frame % chunk_dim0) * frame_bytes;
-                self.append_frames_into_chunk(
-                    ds_index,
-                    chunk_idx as u64,
-                    offset_in_chunk,
-                    &combined[byte_pos..end],
-                )?;
-                byte_pos = end;
-                frame_pos += frames_to_fill;
-            } else {
-                let ds = self.ds(ds_index);
-                let mut m = ds.lock();
-                m.append_buffer = combined[byte_pos..total_bytes].to_vec();
-                m.append_buffered_frames = remaining_frames as u64;
-                frame_pos = total_frames;
-            }
+        // Rows up to the last chunk boundary are written now; the tail that
+        // does not complete a chunk goes back in the buffer for the next
+        // append (or the flush at close). The boundary can precede
+        // `base_dim0` — a reopened file's flushed partial chunk leaves the
+        // base mid-chunk — in which case everything is tail.
+        let last_boundary = ((base_dim0 + total_frames) / chunk_dim0) * chunk_dim0;
+        let write_frames = last_boundary.saturating_sub(base_dim0);
+        let tail_frames = total_frames - write_frames;
+        if write_frames > 0 {
+            self.write_append_frames(
+                ds_index,
+                base_dim0 as u64,
+                write_frames as u64,
+                &combined[..write_frames * frame_bytes],
+            )?;
+        }
+        if tail_frames > 0 {
+            let ds = self.ds(ds_index);
+            let mut m = ds.lock();
+            m.append_buffer = combined[write_frames * frame_bytes..].to_vec();
+            m.append_buffered_frames = tail_frames as u64;
         }
 
         // Extend dims
@@ -3286,56 +3285,43 @@ impl Hdf5Writer {
         crate::format::messages::fill_value::tiled_fill(chunk_bytes, fv)
     }
 
-    /// Place `frames` in chunk `chunk_idx`, `offset_in_chunk` bytes from its
-    /// start, keeping every byte outside that span.
+    /// Write `n_frames` whole frames whose first row is `base_frame`, for
+    /// whichever chunk index the dataset uses and whatever its chunk shape.
     ///
-    /// The single owner of an append's chunk write. A span covering the whole
-    /// chunk is written straight through; a narrower one is read-modify-write,
-    /// because the bytes around it belong to frames appended earlier. Building
-    /// a fresh fill-value buffer for a chunk that already holds frames is what
-    /// erased them. A chunk the index does not reach has had no write land in
-    /// it, so the fill value *is* its content — the rule
-    /// [`write_slice`](Self::write_slice) already applies to a partially
-    /// covered chunk.
-    pub(crate) fn append_frames_into_chunk(
+    /// The single owner of an append's chunk writes. The frames are one
+    /// hyperslab — rows `base_frame .. base_frame + n_frames` over the full
+    /// row shape — so the write goes through
+    /// [`write_slice_chunked`](Self::write_slice_chunked), the same engine
+    /// `write_slice` uses: a chunk the span covers completely is written
+    /// straight through, a partial one is read-modify-write on top of what
+    /// is stored (or the fill value), and a chunk row narrower or wider
+    /// than the frame row is scattered at the chunk stride. The previous
+    /// owner required the extensible-array index and packed rows at the
+    /// frame stride, so appends to a fixed-array or v2 B-tree dataset
+    /// failed at close and lost the buffered rows.
+    pub(crate) fn write_append_frames(
         &self,
         ds_index: usize,
-        chunk_idx: u64,
-        offset_in_chunk: usize,
+        base_frame: u64,
+        n_frames: u64,
         frames: &[u8],
     ) -> IoResult<()> {
-        let chunk_bytes = {
-            let ds = self.ds(ds_index);
-            let m = ds.lock();
-            let chunked = m
-                .chunked
-                .as_ref()
-                .ok_or_else(|| crate::io::IoError::InvalidState("not a chunked dataset".into()))?;
-            chunked.chunk_dims.iter().product::<u64>() as usize * m.datatype.element_size() as usize
-        };
-        if offset_in_chunk + frames.len() > chunk_bytes {
+        if n_frames == 0 {
+            return Ok(());
+        }
+        let geo = self.chunk_geometry(ds_index)?;
+        let mut starts = vec![0u64; geo.dims.len()];
+        starts[0] = base_frame;
+        let mut counts = geo.dims.clone();
+        counts[0] = n_frames;
+        let expected = counts.iter().product::<u64>() * geo.element_size;
+        if frames.len() as u64 != expected {
             return Err(crate::io::IoError::InvalidState(format!(
-                "{} bytes at offset {offset_in_chunk} do not fit chunk {chunk_idx}, \
-                 which is {chunk_bytes} bytes",
+                "{n_frames} frames at rows {base_frame}.. need {expected} bytes, got {}",
                 frames.len()
             )));
         }
-        if offset_in_chunk == 0 && frames.len() == chunk_bytes {
-            return self.write_chunk(ds_index, chunk_idx, frames);
-        }
-        let mut chunk_buf = match self.read_chunk_if_present(ds_index, chunk_idx)? {
-            Some(existing) if existing.len() == chunk_bytes => existing,
-            Some(existing) => {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "stored chunk {chunk_idx} is {} bytes but the chunk shape needs \
-                     {chunk_bytes}",
-                    existing.len()
-                )))
-            }
-            None => self.new_chunk_buffer(ds_index, chunk_bytes),
-        };
-        chunk_buf[offset_in_chunk..offset_in_chunk + frames.len()].copy_from_slice(frames);
-        self.write_chunk(ds_index, chunk_idx, &chunk_buf)
+        self.write_slice_chunked(ds_index, &starts, &counts, frames)
     }
 
     /// Read an already-written chunk's *decompressed* bytes when the chunk
@@ -4944,48 +4930,37 @@ impl Hdf5Writer {
     // ------------------------------------------------------------------
 
     /// Flush any partial append buffers into the chunks they belong to,
-    /// through [`append_frames_into_chunk`](Self::append_frames_into_chunk):
-    /// frames already in the chunk survive, and the rest of it reads back as
-    /// the dataset's fill value (zeros when none is defined).
+    /// through [`write_append_frames`](Self::write_append_frames): frames
+    /// already in the chunk survive, and the rest of it reads back as the
+    /// dataset's fill value (zeros when none is defined).
     fn flush_append_buffers(&mut self) -> IoResult<()> {
         for i in 0..self.dataset_count() {
-            // Snapshot everything needed under one brief slot guard, then drop
-            // it: `new_chunk_buffer` and `write_chunk` below re-lock the slot.
-            let (buf, buffered_frames, chunk_dims, es, dims) = {
+            // Snapshot everything needed under one brief slot guard, then
+            // drop it: `write_append_frames` below re-locks the slot.
+            let (buf, buffered_frames, dims) = {
                 let ds = self.ds(i);
                 let mut m = ds.lock();
                 if m.append_buffer.is_empty() {
                     continue;
                 }
-                let chunk_dims = if let Some(ref c) = m.chunked {
-                    c.chunk_dims.clone()
-                } else if let Some(ref f) = m.fixed_array {
-                    f.chunk_dims.clone()
-                } else if let Some(ref b) = m.btree_v2 {
-                    b.chunk_dims.clone()
-                } else {
+                if m.chunked.is_none() && m.fixed_array.is_none() && m.btree_v2.is_none() {
                     continue;
-                };
-                let es = m.datatype.element_size() as usize;
-                let buffered_frames = m.append_buffered_frames as usize;
+                }
+                let buffered_frames = m.append_buffered_frames;
                 let dims = m.dataspace.dims.clone();
                 let buf = std::mem::take(&mut m.append_buffer);
                 m.append_buffered_frames = 0;
-                (buf, buffered_frames, chunk_dims, es, dims)
+                (buf, buffered_frames, dims)
             };
 
-            let chunk_dim0 = chunk_dims[0] as usize;
-            let current_dim0 = dims[0] as usize;
-            let base_frame = current_dim0 - buffered_frames;
-            let chunk_idx = base_frame / chunk_dim0;
-
-            let frame_bytes = if dims.len() > 1 {
-                dims[1..].iter().map(|&d| d as usize).product::<usize>() * es
-            } else {
-                es
-            };
-            let offset_in_chunk = (base_frame % chunk_dim0) * frame_bytes;
-            self.append_frames_into_chunk(i, chunk_idx as u64, offset_in_chunk, &buf)?;
+            let base_frame = dims[0].checked_sub(buffered_frames).ok_or_else(|| {
+                crate::io::IoError::InvalidState(format!(
+                    "the append buffer holds {buffered_frames} frames but the \
+                     dataset extent is {}",
+                    dims[0]
+                ))
+            })?;
+            self.write_append_frames(i, base_frame, buffered_frames, &buf)?;
         }
         Ok(())
     }
@@ -6675,6 +6650,47 @@ mod tests {
         );
 
         writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A file written by 0.4.0 can carry a chunk row wider than the frame
+    /// row — create now rejects that geometry, but reopened files keep it.
+    /// Appends must scatter frames at the chunk stride, not pack them at
+    /// the frame stride (which read back `[1, 2, 0, 0]` for `[1, 2, 3, 4]`).
+    /// The wide shape is simulated by widening the registered chunk dims
+    /// after create, which also lands in the layout message at close.
+    #[test]
+    fn append_scatters_into_a_legacy_wider_than_row_chunk() {
+        let path = temp_path("legacy_wide_chunk_append");
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let idx = writer
+            .create_chunked_dataset(
+                "data",
+                DatatypeMessage::i32_type(),
+                &[0, 2],
+                &[u64::MAX, 2],
+                &[2, 2],
+            )
+            .unwrap();
+        writer.ds(idx).lock().chunked.as_mut().unwrap().chunk_dims = vec![2, 4];
+
+        let frames: Vec<u8> = [1i32, 2, 3, 4]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        writer.write_append_frames(idx, 0, 2, &frames).unwrap();
+        writer.extend_dataset(idx, &[2, 2]).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        assert_eq!(reader.dataset_shape("data").unwrap(), vec![2, 2]);
+        let raw = reader.read_dataset_raw("data").unwrap();
+        let values: Vec<i32> = raw
+            .chunks(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, vec![1, 2, 3, 4]);
         std::fs::remove_file(&path).ok();
     }
 
