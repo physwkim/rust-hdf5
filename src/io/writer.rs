@@ -2945,6 +2945,14 @@ impl Hdf5Writer {
 
         let geo = self.chunk_geometry(ds_index)?;
         let per_chunk = geo.chunk_dims[0];
+        // Only a corrupt or crafted file declares a zero-length chunk
+        // dimension; the divisions below must reject it the way
+        // `write_slice` does, not panic.
+        if per_chunk == 0 {
+            return Err(crate::io::IoError::InvalidState(
+                "chunk shape has a zero-length dimension".into(),
+            ));
+        }
         let end = start + count;
         for c in (start / per_chunk)..=((end - 1) / per_chunk) {
             let origin = c * per_chunk;
@@ -5350,6 +5358,30 @@ mod tests {
         );
 
         writer.ds(idx).lock().append_buffered_frames = 0;
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A corrupt file can declare a zero-length chunk dimension; the
+    /// superseded-reference read must reject it the way `write_slice` does,
+    /// not divide by it.
+    #[test]
+    fn vlen_slice_rejects_a_zero_chunk_dimension() {
+        let path = temp_path("vlen_slice_zero_chunk");
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let idx = writer
+            .create_appendable_vlen_string_dataset("d", 2, None)
+            .unwrap();
+        writer.append_vlen_strings(idx, &["a", "b"]).unwrap();
+        writer.ds(idx).lock().chunked.as_mut().unwrap().chunk_dims[0] = 0;
+        let err = writer.write_vlen_strings_slice(idx, 0, &["x"]).unwrap_err();
+        assert!(
+            err.to_string().contains("zero-length dimension"),
+            "unexpected error: {err}"
+        );
+
+        writer.ds(idx).lock().chunked.as_mut().unwrap().chunk_dims[0] = 2;
+        writer.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
 
