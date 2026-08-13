@@ -26,6 +26,12 @@
   same checked / widening-only policy as the dataset method, and returns
   every element of an array attribute.
 
+- `SwmrFileReader::read_dataset::<T>` and `read_slice::<T>` check `T`
+  against the dataset's stored element width. They only checked that the
+  byte count divided evenly, so reading an `f64` dataset as `i32` silently
+  returned twice as many reinterpreted values; a width mismatch is now a
+  `TypeMismatch` error, the same rule as `H5Dataset::read_raw`.
+
 - Rewriting variable-length string elements frees the superseded global-heap
   objects *before* allocating the replacement collection, the order
   libhdf5's `H5T__vlen_disk_write` uses, so the freed space is eligible for

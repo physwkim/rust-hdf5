@@ -604,7 +604,15 @@ impl SwmrFileReader {
     }
 
     /// Read a dataset as a typed vector.
+    ///
+    /// `T` must have the dataset's exact element width — the same
+    /// width-checked byte reinterpretation as
+    /// [`H5Dataset::read_raw`](crate::dataset::H5Dataset::read_raw), with no
+    /// datatype conversion. Use
+    /// [`dataset_element_size`](Self::dataset_element_size) to size-check a
+    /// type at runtime.
     pub fn read_dataset<T: H5Type>(&mut self, name: &str) -> Result<Vec<T>> {
+        self.check_element_width::<T>(name)?;
         bytes_to_typed(self.reader.read_dataset_raw(name)?)
     }
 
@@ -624,14 +632,31 @@ impl SwmrFileReader {
     }
 
     /// Read a slice (hyperslab) of a dataset as a typed vector.
-    /// See [`read_slice_raw`](Self::read_slice_raw).
+    /// See [`read_slice_raw`](Self::read_slice_raw); `T`'s width is checked
+    /// like [`read_dataset`](Self::read_dataset).
     pub fn read_slice<T: H5Type>(
         &mut self,
         name: &str,
         starts: &[u64],
         counts: &[u64],
     ) -> Result<Vec<T>> {
+        self.check_element_width::<T>(name)?;
         bytes_to_typed(self.reader.read_slice(name, starts, counts)?)
+    }
+
+    /// The width gate for the typed reads: without it, reinterpreting the
+    /// raw bytes splits or merges elements — an f64 dataset read as `i32`
+    /// passed the divisibility check and silently returned twice as many
+    /// garbage values.
+    fn check_element_width<T: H5Type>(&self, name: &str) -> Result<()> {
+        let stored = self.dataset_element_size(name)?;
+        if T::element_size() != stored {
+            return Err(crate::error::Hdf5Error::TypeMismatch(format!(
+                "read type has element size {} but dataset has element size {stored}",
+                T::element_size(),
+            )));
+        }
+        Ok(())
     }
 
     /// Read a variable-length string dataset.

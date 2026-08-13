@@ -453,3 +453,31 @@ fn swmr_chunk_rewrite_does_not_grow_the_file() {
     cleanup(&once_path);
     cleanup(&many_path);
 }
+
+/// Boundary: the typed reads check `T` against the stored element width.
+/// An f64 dataset read as `i32` used to pass the divisibility check and
+/// return twice as many garbage values.
+#[test]
+fn typed_reads_reject_a_mismatched_element_width() {
+    let path = unique_tmp("typed_width");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        w.write_dataset::<f64>("d", &[2], &[1.5, -2.25]).unwrap();
+        w.close().unwrap();
+    }
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.read_dataset::<f64>("d").unwrap(), vec![1.5, -2.25]);
+
+    let err = r.read_dataset::<i32>("d").unwrap_err();
+    assert!(
+        err.to_string().contains("element size"),
+        "unexpected error: {err}"
+    );
+    let err = r.read_slice::<i32>("d", &[0], &[1]).unwrap_err();
+    assert!(
+        err.to_string().contains("element size"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(r.read_slice::<f64>("d", &[1], &[1]).unwrap(), vec![-2.25]);
+    cleanup(&path);
+}
