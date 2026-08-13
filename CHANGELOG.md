@@ -16,6 +16,15 @@
 
 ### Fixed
 
+- A v2 B-tree chunk index re-serializes at the node size its header
+  declares instead of this writer's compile-time 2048. Reopening a file
+  whose tree uses another node size (libhdf5 built with a different
+  `H5D_BT2_NODE_SIZE`, or any other writer) previously left the dataset
+  a re-link placeholder; it now reconstructs and grows, with node blocks,
+  the rewritten B-tree header, and the object header's layout message all
+  carrying the creator's node size and split/merge percentages — the
+  layout message used to be re-stamped with the defaults on every close.
+
 - Reopening a file for append now reconstructs *paged* fixed-array chunk
   indexes (any fixed-shape dataset with more than 1024 chunks). The
   writer has emitted the paged layout since paged-write support landed,

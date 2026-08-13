@@ -781,8 +781,9 @@ pub struct Bt2DatasetInfo {
     pub max_dims: Vec<u64>,
     /// File offset of the BT2 header.
     pub bt2_header_addr: u64,
-    /// Pool of `BT2_NODE_SIZE`-byte blocks holding the tree's nodes, in the
-    /// order [`Bt2Tree::encode`] emits them.
+    /// Pool of node-size blocks (the index's
+    /// [`node_size`](Bt2ChunkIndex::node_size) bytes each) holding the tree's
+    /// nodes, in the order [`Bt2Tree::encode`] emits them.
     ///
     /// The single owner of the tree's node addresses: a flush re-serializes the
     /// whole tree over these blocks and allocates only the shortfall, so no
@@ -1506,15 +1507,18 @@ impl Hdf5Writer {
                         == crate::format::messages::data_layout::ChunkIndexType::BTreeV2
                     {
                         use crate::format::chunk_index::btree_v2::{
-                            Bt2Geometry, Bt2Header, BT2_NODE_SIZE, BT2_TYPE_CHUNK_FILT,
-                            BT2_TYPE_CHUNK_UNFILT,
+                            Bt2Geometry, Bt2Header, BT2_TYPE_CHUNK_FILT, BT2_TYPE_CHUNK_UNFILT,
                         };
 
                         // Walk the tree back into the in-memory index and
-                        // adopt its node blocks as the flush pool. A node
-                        // size other than this writer's, or a record type
-                        // that is not a chunk record (foreign files only),
-                        // cannot join the fixed-size pool and stays
+                        // adopt its node blocks as the flush pool. The pool
+                        // re-serializes at the header's node_size, whatever
+                        // it is — libhdf5 sizes every node from
+                        // hdr->node_size (H5B2leaf.c, H5B2internal.c) — so
+                        // a foreign size reopens too. Only a record type
+                        // that is not a chunk record, or a node size below
+                        // the bulk loader's few-records-per-node floor
+                        // (the same bound creation enforces), stays
                         // re-link only.
                         let hdr_buf = handle.read_at_most(*index_address, 256)?;
                         let bt2_hdr = Bt2Header::decode(&hdr_buf, &ctx)?;
@@ -1524,8 +1528,10 @@ impl Hdf5Writer {
                             BT2_TYPE_CHUNK_FILT => Some(true),
                             _ => None,
                         };
-                        if let (Some(is_filt), true) = (is_filt, bt2_hdr.node_size == BT2_NODE_SIZE)
-                        {
+                        if let (Some(is_filt), true) = (
+                            is_filt,
+                            bt2_hdr.node_size as usize >= 10 + 3 * bt2_hdr.record_size as usize,
+                        ) {
                             let mut index = if is_filt {
                                 let csl = (bt2_hdr.record_size as usize)
                                     .checked_sub(ctx.sizeof_addr as usize + 4 + ndims * 8)
@@ -1541,6 +1547,12 @@ impl Hdf5Writer {
                             } else {
                                 Bt2ChunkIndex::new_unfiltered(ndims)
                             };
+                            // Re-serialize with the creator's parameters:
+                            // node blocks keep their size and the rewritten
+                            // header keeps its declared split/merge.
+                            index.node_size = bt2_hdr.node_size;
+                            index.split_percent = bt2_hdr.split_percent;
+                            index.merge_percent = bt2_hdr.merge_percent;
                             let mut node_addrs = Vec::new();
                             if bt2_hdr.root_node_addr != UNDEF_ADDR && bt2_hdr.total_num_records > 0
                             {
@@ -5450,7 +5462,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: Option<FilterPipeline>,
     ) -> IoResult<usize> {
-        use crate::format::chunk_index::btree_v2::{Bt2Header, BT2_NODE_SIZE};
+        use crate::format::chunk_index::btree_v2::Bt2Header;
 
         let create = self.begin_create(name)?;
         let name = create.name.as_str();
@@ -5477,10 +5489,11 @@ impl Hdf5Writer {
         // wider rank than that has no valid geometry, so reject it here rather
         // than emit a tree no reader can walk.
         let record_size = bt2_index.record_size(&self.ctx) as usize;
-        if (BT2_NODE_SIZE as usize) < 10 + 3 * record_size {
+        let node_size = bt2_index.node_size as usize;
+        if node_size < 10 + 3 * record_size {
             return Err(crate::io::IoError::InvalidState(format!(
                 "a {ndims}-dimension v2 B-tree record is {record_size} bytes, too wide \
-                 for a {BT2_NODE_SIZE}-byte node"
+                 for a {node_size}-byte node"
             )));
         }
 
@@ -7387,6 +7400,11 @@ impl Hdf5Writer {
             DataLayoutMessage::chunked_v4_btree_v2(
                 m.layout_version,
                 layout_dims,
+                crate::format::messages::data_layout::Bt2Params {
+                    node_size: bt2.index.node_size,
+                    split_percent: bt2.index.split_percent,
+                    merge_percent: bt2.index.merge_percent,
+                },
                 bt2.bt2_header_addr,
             )
         } else {
@@ -8684,6 +8702,79 @@ mod tests {
 
         writer.extend_dataset(idx, &[85, 1]).unwrap();
         writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A v2 B-tree whose header declares a non-default node size — libhdf5
+    /// built with a different `H5D_BT2_NODE_SIZE`, or any other writer —
+    /// reopens for append: the reconstruction adopts the header's node_size,
+    /// split and merge instead of refusing everything but 2048, and the next
+    /// flush re-serializes at that size (upstream allocates every node at
+    /// `hdr->node_size`, H5B2leaf.c / H5B2internal.c).
+    #[test]
+    fn a_btree_v2_with_a_foreign_node_size_reopens_and_grows() {
+        let path = temp_path("bt2_foreign_node_size");
+        {
+            let writer = Hdf5Writer::create(&path).unwrap();
+            let idx = writer
+                .create_btree_v2_dataset(
+                    "data",
+                    DatatypeMessage::f64_type(),
+                    &[0, 0],
+                    &[u64::MAX, u64::MAX],
+                    &[1, 1],
+                )
+                .unwrap();
+            // Act as a foreign writer: 512-byte nodes, non-default tuning.
+            // record_size 24 => a 512-byte leaf holds 20 records, so 85
+            // records make a depth-1 tree of 512-byte blocks.
+            {
+                let ds = writer.ds(idx);
+                let mut m = ds.lock();
+                let index = &mut m.btree_v2.as_mut().unwrap().index;
+                index.node_size = 512;
+                index.split_percent = 90;
+                index.merge_percent = 30;
+            }
+            for i in 0..85u64 {
+                writer
+                    .write_chunk_btree_v2(idx, &[i, 0], &(i as f64).to_le_bytes())
+                    .unwrap();
+            }
+            writer.extend_dataset(idx, &[85, 1]).unwrap();
+            writer.close().unwrap();
+        }
+        {
+            let writer = Hdf5Writer::open_append(&path).unwrap();
+            let idx = writer.dataset_index("data").unwrap();
+            {
+                let ds = writer.ds(idx);
+                let m = ds.lock();
+                let index = &m.btree_v2.as_ref().unwrap().index;
+                assert_eq!(index.node_size, 512, "header node_size not adopted");
+                assert_eq!(index.split_percent, 90);
+                assert_eq!(index.merge_percent, 30);
+                assert_eq!(index.records.len(), 85, "records not walked back");
+            }
+            for i in 85..115u64 {
+                writer
+                    .write_chunk_btree_v2(idx, &[i, 0], &(i as f64).to_le_bytes())
+                    .unwrap();
+            }
+            writer.extend_dataset(idx, &[115, 1]).unwrap();
+            writer.close().unwrap();
+        }
+
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        let raw = reader.read_dataset_raw("data").unwrap();
+        let values: Vec<f64> = raw
+            .chunks(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values.len(), 115);
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(*v, i as f64, "element {i}");
+        }
         std::fs::remove_file(&path).ok();
     }
 
