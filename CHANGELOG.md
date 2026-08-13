@@ -16,6 +16,12 @@
 
 ### Fixed
 
+- An extent change made in a reopen session with no chunk write is now
+  persisted at close. The finalize path inferred "modified" from the
+  session's chunk-write count alone, so `open_rw` + `set_extent` (or
+  `extend`) + `close` kept the old dataset header and silently dropped
+  the new shape.
+
 - `H5Attribute::read_numeric::<T>` validates the stored datatype against
   `T`'s before reinterpreting the value bytes. It used to transmute
   unconditionally — and its length check was `<`, not `==` — so reading an

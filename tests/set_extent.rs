@@ -74,6 +74,47 @@ fn set_extent_shrinks_logical_extent() {
     cleanup(&path);
 }
 
+/// An extent change made in a reopen session with no chunk write survives
+/// the close: the finalize path must rebuild the dataset header for it,
+/// not just when chunks were written.
+#[test]
+fn set_extent_alone_survives_a_reopen_session() {
+    let path = unique_tmp("bare_extent");
+
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([0usize, 4])
+            .chunk(&[1, 4])
+            .max_shape(&[None, Some(4)])
+            .create("data")
+            .unwrap();
+        for f in 0..2i32 {
+            let row = [f, f + 1, f + 2, f + 3];
+            let raw: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+            ds.write_chunk(f as usize, &raw).unwrap();
+        }
+        ds.extend(&[2, 4]).unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let file = H5File::options().no_locking().open_rw(&path).unwrap();
+        let ds = file.dataset_writer("data").unwrap();
+        ds.set_extent(&[4, 4]).unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("data").unwrap();
+        assert_eq!(ds.shape(), vec![4, 4]);
+    }
+
+    cleanup(&path);
+}
+
 /// `set_extent` rejects an extent above the dataset's maximum dimensions.
 #[test]
 fn set_extent_rejects_exceeding_max() {

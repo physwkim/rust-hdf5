@@ -322,6 +322,12 @@ pub struct DatasetInfo {
     pub filter_pipeline: Option<FilterPipeline>,
     /// Soft-deleted: excluded from finalize output.
     pub deleted: bool,
+    /// The dataspace extent changed this session (`extend_dataset` /
+    /// `set_dataset_extent`). On a reopened dataset the finalize gate
+    /// otherwise infers "modified" from `chunks_written` alone, and a
+    /// session that only changed the extent would keep the old on-disk
+    /// header — silently dropping the new shape.
+    pub extent_dirty: bool,
     /// User-defined fill value bytes (exactly one element wide). `None`
     /// means default zero-fill; `Some` is emitted as a `fill_defined = 2`
     /// fill-value message in the dataset object header.
@@ -1010,6 +1016,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: ds_header_size,
                 filter_pipeline: fp,
                 deleted: false,
+                extent_dirty: false,
                 fill_value,
                 // Preserve the on-disk layout version so finalize re-encodes
                 // what it read: a v5 file reopened and appended to must not be
@@ -1794,6 +1801,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: None,
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version: 4,
             },
@@ -1881,6 +1889,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: None,
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -2729,6 +2738,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: None,
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version: 4,
                 chunked: None,
@@ -2806,6 +2816,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: None,
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version: 4,
                 chunked: None,
@@ -2937,6 +2948,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: Some(pipeline),
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -4123,6 +4135,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: pipeline,
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version,
                 chunked: None,
@@ -4255,6 +4268,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: pipeline,
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version,
                 chunked: None,
@@ -4359,6 +4373,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: Some(FilterPipeline::deflate(compression_level)),
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -4460,6 +4475,7 @@ impl Hdf5Writer {
                 obj_header_encoded_size: 0,
                 filter_pipeline: Some(pipeline),
                 deleted: false,
+                extent_dirty: false,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -5042,7 +5058,10 @@ impl Hdf5Writer {
                 _ => {}
             }
         }
-        m.dataspace.dims = new_dims.to_vec();
+        if m.dataspace.dims != new_dims {
+            m.dataspace.dims = new_dims.to_vec();
+            m.extent_dirty = true;
+        }
         Ok(())
     }
 
@@ -5104,7 +5123,10 @@ impl Hdf5Writer {
                 }
             }
         }
-        m.dataspace.dims = new_dims.to_vec();
+        if m.dataspace.dims != new_dims {
+            m.dataspace.dims = new_dims.to_vec();
+            m.extent_dirty = true;
+        }
         Ok(())
     }
 
@@ -5431,7 +5453,8 @@ impl Hdf5Writer {
             {
                 let m = ds.lock();
                 if m.obj_header_written_addr.is_some() {
-                    let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0);
+                    let modified =
+                        m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0) || m.extent_dirty;
                     if !modified {
                         continue;
                     }
@@ -5462,9 +5485,11 @@ impl Hdf5Writer {
                 let mut m = ds.lock();
                 if m.obj_header_written_addr.is_some() {
                     // Existing dataset from append mode.
-                    // If it has chunked info with chunks_written > 0, it was modified
+                    // If it has chunked info with chunks_written > 0 — or its
+                    // extent changed without a chunk write — it was modified
                     // and needs a new object header.
-                    let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0);
+                    let modified =
+                        m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0) || m.extent_dirty;
                     if !modified {
                         // Keep the original object header address for the root group link.
                         m.obj_header_addr = m.obj_header_written_addr.unwrap();
