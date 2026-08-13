@@ -542,6 +542,11 @@ pub struct GroupInfo {
     pub child_groups: Vec<usize>,
     /// File offset of this group's object header (set during finalize).
     pub obj_header_addr: u64,
+    /// File offset of the on-disk header a reopen found for this group, so
+    /// finalize can free the block it supersedes.
+    pub obj_header_written_addr: Option<u64>,
+    /// Encoded size of that on-disk header (first block).
+    pub obj_header_encoded_size: usize,
     /// Soft-deleted: excluded from finalize output.
     pub deleted: bool,
     /// Attributes attached to this group (e.g. NeXus `NX_class`).
@@ -641,6 +646,9 @@ pub struct Hdf5Writer {
     root_group_addr: Option<u64>,
     /// Size of the encoded root group object header (for in-place rewrites).
     root_group_encoded_size: usize,
+    /// The on-disk root header block a reopen found, `(addr, len)`, so
+    /// finalize can free the block its rewrite supersedes.
+    superseded_root_header: Option<(u64, u64)>,
 }
 
 impl Hdf5Writer {
@@ -694,6 +702,7 @@ impl Hdf5Writer {
             swmr_active: false,
             root_group_addr: None,
             root_group_encoded_size: 0,
+            superseded_root_header: None,
         })
     }
 
@@ -875,7 +884,8 @@ impl Hdf5Writer {
         let root_addr = sb.root_group_object_header_address;
         let root_buf =
             handle.read_at_most(root_addr, file_size.saturating_sub(root_addr) as usize)?;
-        let (root_header, _) = crate::format::object_header::ObjectHeader::decode(&root_buf)?;
+        let (root_header, root_header_size) =
+            crate::format::object_header::ObjectHeader::decode(&root_buf)?;
 
         // Collect existing root-level attributes
         let mut root_attributes = Vec::new();
@@ -902,11 +912,14 @@ impl Hdf5Writer {
         )?;
 
         let mut existing_datasets = Vec::new();
+        // Non-dataset link targets (groups): header block `(addr, len)` by
+        // link path, so finalize can free the block its rewrite supersedes.
+        let mut group_headers: std::collections::HashMap<String, (u64, usize)> = Default::default();
         for (name, obj_addr) in &link_entries {
             // Read the dataset's full object header (to EOF — see above).
             let ds_buf =
                 handle.read_at_most(*obj_addr, file_size.saturating_sub(*obj_addr) as usize)?;
-            let (ds_header, _) =
+            let (ds_header, ds_header_size) =
                 match crate::format::object_header::ObjectHeader::decode_any(&ds_buf) {
                     Ok(h) => h,
                     Err(_) => continue,
@@ -961,7 +974,12 @@ impl Hdf5Writer {
 
             let (dt, ds, dl) = match (datatype, dataspace, layout) {
                 (Some(dt), Some(ds), Some(dl)) => (dt, ds, dl),
-                _ => continue, // Not a dataset (probably a group)
+                _ => {
+                    // Not a dataset — a group's header. Remember its block so
+                    // finalize can free what its rewrite supersedes.
+                    group_headers.insert(name.clone(), (*obj_addr, ds_header_size));
+                    continue;
+                }
             };
 
             let mut info = DatasetInfo {
@@ -977,7 +995,7 @@ impl Hdf5Writer {
                 append: None,
                 attributes: attrs,
                 obj_header_written_addr: Some(*obj_addr),
-                obj_header_encoded_size: 0,
+                obj_header_encoded_size: ds_header_size,
                 filter_pipeline: fp,
                 deleted: false,
                 fill_value,
@@ -1168,12 +1186,17 @@ impl Hdf5Writer {
                     group_index_map.get(&parent_path).copied()
                 };
                 let gidx = groups.len();
+                let (obj_header_written_addr, obj_header_encoded_size) = group_headers
+                    .get(path.trim_start_matches('/'))
+                    .map_or((None, 0), |&(addr, len)| (Some(addr), len));
                 groups.push(GroupInfo {
                     name: path.clone(),
                     parent,
                     child_datasets: Vec::new(),
                     child_groups: Vec::new(),
                     obj_header_addr: 0,
+                    obj_header_written_addr,
+                    obj_header_encoded_size,
                     deleted: false,
                     attributes: Vec::new(),
                 });
@@ -1221,6 +1244,7 @@ impl Hdf5Writer {
             swmr_active: false,
             root_group_addr: None,
             root_group_encoded_size: 0,
+            superseded_root_header: Some((root_addr, root_header_size as u64)),
         })
     }
 
@@ -1510,6 +1534,8 @@ impl Hdf5Writer {
             child_datasets: Vec::new(),
             child_groups: Vec::new(),
             obj_header_addr: 0,
+            obj_header_written_addr: None,
+            obj_header_encoded_size: 0,
             deleted: false,
             attributes: Vec::new(),
         });
@@ -5308,6 +5334,16 @@ impl Hdf5Writer {
             self.flush_dataset_synced(i, sync)?;
         }
 
+        // Every header block this finalize supersedes — a reopened root or
+        // group header, a modified dataset's reopened header — is freed
+        // before its replacement is allocated, so the rewrite reuses the
+        // block instead of growing the file on every open/close cycle.
+        // Never under SWMR: a live reader may be walking the old headers,
+        // the same rule `release_vlen_references` and `place_chunk` follow.
+        // Hard links can alias one header under several names; the set keeps
+        // an aliased block from entering the free list twice.
+        let mut freed_headers = std::collections::HashSet::new();
+
         // 1. Write each dataset's object header.
         for i in 0..self.dataset_count() {
             let ds = self.ds(i);
@@ -5323,6 +5359,13 @@ impl Hdf5Writer {
                         m.obj_header_addr = m.obj_header_written_addr.unwrap();
                         continue;
                     }
+                    if !self.swmr_active && m.obj_header_encoded_size > 0 {
+                        let old = m.obj_header_written_addr.take().unwrap();
+                        if freed_headers.insert(old) {
+                            self.allocator.free(old, m.obj_header_encoded_size as u64);
+                        }
+                        m.obj_header_encoded_size = 0;
+                    }
                 }
             }
             let ds_header = self.build_dataset_header(i);
@@ -5336,6 +5379,20 @@ impl Hdf5Writer {
         // header is written later, so addresses are assigned in a first
         // pass (a header's encoded size is independent of the address
         // values it carries) and the content is written in a second.
+        if !self.swmr_active {
+            for gi in 0..self.group_count() {
+                let grp = self.grp(gi);
+                let mut g = grp.lock();
+                if g.obj_header_encoded_size > 0 {
+                    if let Some(old) = g.obj_header_written_addr.take() {
+                        if freed_headers.insert(old) {
+                            self.allocator.free(old, g.obj_header_encoded_size as u64);
+                        }
+                        g.obj_header_encoded_size = 0;
+                    }
+                }
+            }
+        }
         for gi in 0..self.group_count() {
             let size = self.build_group_header(gi).encode().len() as u64;
             self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
@@ -5347,6 +5404,13 @@ impl Hdf5Writer {
         }
 
         // 2. Write root group object header.
+        if !self.swmr_active {
+            if let Some((addr, len)) = self.superseded_root_header.take() {
+                if freed_headers.insert(addr) {
+                    self.allocator.free(addr, len);
+                }
+            }
+        }
         let root_header = self.build_root_group_header();
         let root_encoded = root_header.encode();
         let root_addr = self.allocator.allocate(root_encoded.len() as u64);
@@ -5788,6 +5852,57 @@ mod tests {
         assert_eq!(writer.handle.read_at(addr, 40).unwrap(), img);
 
         writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Reopen/write/close cycles must not leak the object-header blocks
+    /// finalize rewrites: the reopened root header, the reopened group
+    /// header, and the modified chunked dataset's header are each freed
+    /// before their replacements are allocated. The chunk rewrite itself is
+    /// in place (unfiltered chunks never move), so a leak of any header
+    /// block shows up as monotonic growth here.
+    #[test]
+    fn reopen_cycles_reuse_superseded_header_blocks() {
+        let path = temp_path("header_reuse");
+        {
+            let writer = Hdf5Writer::create(&path).unwrap();
+            writer.create_group("/", "g").unwrap();
+            let idx = writer
+                .create_chunked_dataset(
+                    "g/data",
+                    DatatypeMessage::i32_type(),
+                    &[4],
+                    &[u64::MAX],
+                    &[4],
+                )
+                .unwrap();
+            let seed: Vec<u8> = [1i32, 2, 3, 4]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            writer.write_chunk(idx, 0, &seed).unwrap();
+            writer.close().unwrap();
+        }
+
+        let mut sizes = Vec::new();
+        for i in 0..6i32 {
+            let writer = Hdf5Writer::open_append(&path).unwrap();
+            let data: Vec<u8> = [i; 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+            writer.write_chunk(0, 0, &data).unwrap();
+            writer.close().unwrap();
+            sizes.push(std::fs::metadata(&path).unwrap().len());
+        }
+        assert_eq!(&sizes[1..], &vec![sizes[0]; 5][..], "sizes: {sizes:?}");
+
+        // The reused header blocks still form a valid file.
+        let mut reader = Hdf5Reader::open(&path).unwrap();
+        let raw = reader.read_dataset_raw("g/data").unwrap();
+        let values: Vec<i32> = raw
+            .chunks(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, vec![5, 5, 5, 5]);
+
         std::fs::remove_file(&path).ok();
     }
 
