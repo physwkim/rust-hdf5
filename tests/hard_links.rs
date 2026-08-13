@@ -501,6 +501,78 @@ fn deleting_a_group_link_path_clears_the_refusal() {
     cleanup(&path);
 }
 
+/// `dataset_writer` resolves a hard-link path to its target, like
+/// `H5Dopen`: a write through the alias lands in the one object.
+#[test]
+fn dataset_writer_resolves_a_hard_link_path() {
+    let path = unique_tmp("hl_write_alias");
+    let data: Vec<i32> = (0..4).collect();
+
+    {
+        let file = H5File::create(&path).unwrap();
+        let root = file.root_group();
+        let inst = root.create_group("instrument").unwrap();
+        inst.new_dataset::<i32>()
+            .shape([4])
+            .chunk(&[2])
+            .max_shape(&[None])
+            .create("detector")
+            .unwrap();
+        let data_grp = root.create_group("data").unwrap();
+        data_grp.link("detector", "/instrument/detector").unwrap();
+
+        let ds = file.dataset_writer("data/detector").unwrap();
+        ds.write_slice(&[0], &[4], &data).unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("instrument/detector")
+                .unwrap()
+                .read_raw::<i32>()
+                .unwrap(),
+            data,
+            "a write through the alias must land in the target"
+        );
+    }
+
+    cleanup(&path);
+}
+
+/// A hard link whose target path is itself a hard link points straight at
+/// the object (links have no chain): it survives both other names.
+#[test]
+fn hard_link_to_a_link_path_targets_the_object() {
+    let path = unique_tmp("hl_chain");
+    let data: Vec<i32> = vec![41, 42];
+
+    {
+        let file = H5File::create(&path).unwrap();
+        let root = file.root_group();
+        let ds = root.new_dataset::<i32>().shape([2]).create("ds").unwrap();
+        ds.write_raw(&data).unwrap();
+        root.link("alias1", "ds").unwrap();
+        root.link("alias2", "alias1").unwrap();
+
+        file.delete_dataset("ds").unwrap();
+        file.delete_dataset("alias1").unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("alias2").unwrap().read_raw::<i32>().unwrap(),
+            data,
+            "the last name must keep the object"
+        );
+    }
+
+    cleanup(&path);
+}
+
 /// A target path given with a trailing slash still resolves.
 #[test]
 fn hard_link_tolerates_trailing_slash() {

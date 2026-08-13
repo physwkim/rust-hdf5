@@ -1732,12 +1732,26 @@ impl Hdf5Writer {
             .collect()
     }
 
-    /// Find a dataset index by name.
+    /// Find a dataset index by name. Like `H5Dopen`, the name may be any
+    /// link to the dataset: a user hard link's path resolves to its
+    /// target.
     pub fn dataset_index(&self, name: &str) -> Option<usize> {
-        self.dataset_refs().iter().position(|d| {
-            let g = d.lock();
-            g.name == name && !g.deleted
-        })
+        self.dataset_refs()
+            .iter()
+            .position(|d| {
+                let g = d.lock();
+                g.name == name && !g.deleted
+            })
+            .or_else(|| {
+                self.hard_links_vec().iter().find_map(|l| match l.target {
+                    HardLinkTarget::Dataset(i)
+                        if self.hard_link_emitted(l) && self.hard_link_full_path(l) == name =>
+                    {
+                        Some(i)
+                    }
+                    _ => None,
+                })
+            })
     }
 
     /// Reconstruct the fields a writer-mode `H5Dataset` handle needs for the
@@ -2465,6 +2479,14 @@ impl Hdf5Writer {
             !gg.deleted && gg.name.trim_start_matches('/') == target_rel
         }) {
             HardLinkTarget::Group(idx)
+        } else if let Some(t) = self.hard_links_vec().iter().find_map(|l| {
+            (self.hard_link_emitted(l) && self.hard_link_full_path(l) == target_rel)
+                .then_some(l.target)
+        }) {
+            // The target path may itself be a hard link: links have no
+            // chain (all point straight at the object header, as in
+            // libhdf5), so the new link copies the existing one's target.
+            t
         } else {
             return Err(crate::io::IoError::NotFound(format!(
                 "hard link target '{target_path}' not found"
