@@ -1,11 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.4.1
 
 ### Added
 
 - `H5Dataset::read_strings` and `read_strings_lossy` decode a whole string
-  dataset in one call, at whatever width the file declares (issue #5). Reading
+  dataset in one call, at whatever width the file declares (issue #5, requested
+  by @janosh). Reading
   a fixed-string column previously meant `read_raw_bytes` plus hand-written
   slicing, and the width is a per-dataset property, so the caller had to
   hard-code one and get it wrong on the next file. Both string datatypes go
@@ -15,7 +16,8 @@
   the character set.
 
 - `H5Dataset::write_vlen_strings_slice` replaces variable-length strings at an
-  arbitrary offset (issue #6). Vlen datasets could only be created whole or
+  arbitrary offset (issue #6, requested by @janosh). Vlen datasets could only
+  be created whole or
   appended to, so correcting one entry meant rewriting the dataset. The new
   strings go into one global-heap collection and their references are written
   over the range; elements still held in the append buffer are patched there,
@@ -32,6 +34,15 @@
   the file without bound. Under SWMR the release is suppressed, since a reader
   may still be following those references — the same rule a relocated chunk's
   old block follows.
+
+### Fixed
+
+- A vlen sequence of 4 GiB or more is now refused instead of silently
+  truncated. Every vlen write site cast the byte length to the 32-bit on-disk
+  length field with `as u32`, so the heap object stored all the bytes while
+  the reference recorded the wrapped length — reads returned the low-32-bits
+  prefix with no error. The conversion now has one owner (`vlen_seq_len`)
+  that errors.
 
 ## 0.4.0
 
