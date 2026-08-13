@@ -27,6 +27,16 @@
   cleared but the blocks are kept, the rule libhdf5 applies in
   `H5Dearray.c`.
 
+- Reopening a file for writing (`open_rw` / `open_append`) now keeps
+  every group and its attributes. The reopen rebuilt its group registry
+  from dataset paths alone, so a bare `open_rw` + `close` deleted any
+  group with no dataset beneath it (empty, subgroup-only, or NeXus
+  attribute-only groups) and stripped the attributes — `NX_class`
+  included — off the groups that survived. Groups are now registered
+  from the file's link records with the attributes their headers carry,
+  which also lets a reopen session set attributes on a dataset-less
+  group.
+
 - A `set_extent` shrink of a variable-length dataset now releases the
   global-heap objects of the elements it discards — both those in pruned
   chunks and those a straddling chunk's fill refill overwrites. They used

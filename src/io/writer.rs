@@ -1003,8 +1003,12 @@ impl Hdf5Writer {
 
         let mut existing_datasets = Vec::new();
         // Non-dataset link targets (groups): header block `(addr, len)` by
-        // link path, so finalize can free the block its rewrite supersedes.
-        let mut group_headers: std::collections::HashMap<String, (u64, usize)> = Default::default();
+        // link path — so finalize can free the block its rewrite supersedes —
+        // plus the attributes the header carries, which the group registry
+        // below must keep or finalize rewrites the group without them.
+        type GroupHeaderInfo = (u64, usize, Vec<AttributeMessage>);
+        let mut group_headers: std::collections::HashMap<String, GroupHeaderInfo> =
+            Default::default();
         for (name, obj_addr) in &link_entries {
             // Read the dataset's full object header (to EOF — see above).
             let ds_buf =
@@ -1066,8 +1070,9 @@ impl Hdf5Writer {
                 (Some(dt), Some(ds), Some(dl)) => (dt, ds, dl),
                 _ => {
                     // Not a dataset — a group's header. Remember its block so
-                    // finalize can free what its rewrite supersedes.
-                    group_headers.insert(name.clone(), (*obj_addr, ds_header_size));
+                    // finalize can free what its rewrite supersedes, and its
+                    // attributes so the registry rebuild keeps them.
+                    group_headers.insert(name.clone(), (*obj_addr, ds_header_size, attrs));
                     continue;
                 }
             };
@@ -1244,20 +1249,26 @@ impl Hdf5Writer {
             existing_datasets.push(info);
         }
 
-        // Reconstruct group structure from dataset paths.
-        // e.g. dataset "nodes/id" implies group "/nodes" exists.
+        // Reconstruct the group registry. Every group is a link entry of its
+        // own, whether or not a dataset lives under it, so the registry is
+        // built from the discovered links — rebuilding it from dataset paths
+        // alone made attribute-only and empty groups vanish at close, and
+        // dropped the attributes of the groups that survived.
         let mut groups: Vec<GroupInfo> = Vec::new();
         let mut group_index_map: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
 
-        for (di, ds) in existing_datasets.iter().enumerate() {
-            let parts: Vec<&str> = ds.name.split('/').collect();
-            if parts.len() <= 1 {
-                continue; // root-level dataset, no group
-            }
-            // Build group hierarchy: e.g. "a/b/c" → groups "/a", "/a/b"
+        // Register the chain of groups "/a", "/a/b", … for the link-style
+        // path `link_path` ("a/b"), taking each one's on-disk header block
+        // and attributes out of `group_headers` when the link walk saw it.
+        fn ensure_groups_for(
+            link_path: &str,
+            groups: &mut Vec<GroupInfo>,
+            group_index_map: &mut std::collections::HashMap<String, usize>,
+            group_headers: &mut std::collections::HashMap<String, GroupHeaderInfo>,
+        ) {
             let mut path = String::new();
-            for part in &parts[..parts.len() - 1] {
+            for part in link_path.split('/') {
                 let parent_path = if path.is_empty() {
                     "/".to_string()
                 } else {
@@ -1277,9 +1288,11 @@ impl Hdf5Writer {
                     group_index_map.get(&parent_path).copied()
                 };
                 let gidx = groups.len();
-                let (obj_header_written_addr, obj_header_encoded_size) = group_headers
-                    .get(path.trim_start_matches('/'))
-                    .map_or((None, 0), |&(addr, len)| (Some(addr), len));
+                let (obj_header_written_addr, obj_header_encoded_size, attributes) = group_headers
+                    .remove(path.trim_start_matches('/'))
+                    .map_or((None, 0, Vec::new()), |(addr, len, attrs)| {
+                        (Some(addr), len, attrs)
+                    });
                 groups.push(GroupInfo {
                     name: path.clone(),
                     parent,
@@ -1289,22 +1302,38 @@ impl Hdf5Writer {
                     obj_header_written_addr,
                     obj_header_encoded_size,
                     deleted: false,
-                    attributes: Vec::new(),
+                    attributes,
                 });
                 if let Some(pidx) = parent {
                     groups[pidx].child_groups.push(gidx);
                 }
                 group_index_map.insert(path.clone(), gidx);
             }
-            // Assign dataset to its immediate parent group
-            let parent_path = if parts.len() == 2 {
-                format!("/{}", parts[0])
-            } else {
-                format!("/{}", parts[..parts.len() - 1].join("/"))
-            };
-            if let Some(&gidx) = group_index_map.get(&parent_path) {
-                groups[gidx].child_datasets.push(di);
+        }
+
+        // Every linked group, in link-walk order (parents precede children).
+        for (name, _) in &link_entries {
+            if group_headers.contains_key(name.as_str()) {
+                ensure_groups_for(name, &mut groups, &mut group_index_map, &mut group_headers);
             }
+        }
+
+        // Assign each dataset to its immediate parent group, creating any
+        // group the link walk could not decode (its chain stays placeholder).
+        for (di, ds) in existing_datasets.iter().enumerate() {
+            let parts: Vec<&str> = ds.name.split('/').collect();
+            if parts.len() <= 1 {
+                continue; // root-level dataset, no group
+            }
+            let parent_link_path = parts[..parts.len() - 1].join("/");
+            ensure_groups_for(
+                &parent_link_path,
+                &mut groups,
+                &mut group_index_map,
+                &mut group_headers,
+            );
+            let gidx = group_index_map[&format!("/{}", parent_link_path)];
+            groups[gidx].child_datasets.push(di);
         }
 
         let allocator = FileAllocator::new(file_size);
