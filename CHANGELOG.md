@@ -16,6 +16,17 @@
 
 ### Fixed
 
+- `delete_dataset` and `delete_group` now follow libhdf5's `H5Ldelete`
+  semantics against hard links: deleting a name only unlinks it, and an
+  object a hard link still names survives under the link's path —
+  promoted to its primary name — with storage freed only when the last
+  name goes. Deleting a dataset used to destroy the object and leave
+  its hard links silently unemitted. `delete_group` re-homes an inner
+  dataset an outside link names before deleting the subtree, and is
+  refused when an outside link names an inner *group* (re-homing a
+  group would rename its whole subtree, which the writer does not do;
+  delete the link's parent group first).
+
 - Reopening a file for appending now reads fixed-array and v2-B-tree
   chunk indexes back into the writer, as it already did for extensible
   arrays. Those datasets used to come back as re-link placeholders:

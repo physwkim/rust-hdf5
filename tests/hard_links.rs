@@ -1,9 +1,12 @@
-//! Integration tests for hard-link creation (`H5Group::link`).
+//! Integration tests for hard-link creation (`H5Group::link`) and for
+//! deletion against hard links (`H5Ldelete` semantics).
 //!
 //! A hard link gives an existing object a second name without copying its
 //! data — the NeXus-style way to expose a dataset at `/entry/data/data`
 //! while it physically lives elsewhere. Both names must resolve to
 //! byte-identical data, and the reader must enumerate the aliased path.
+//! Deleting a name only unlinks it: the object survives under a
+//! remaining hard link, and its storage is freed with the last name.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -259,6 +262,174 @@ fn swmr_writer_builds_nexus_layout() {
         .read_raw::<u16>()
         .unwrap();
     assert_eq!(aliased, vec![1u16, 2, 3, 4]);
+
+    cleanup(&path);
+}
+
+/// Deleting a hard-linked dataset's tree name must not destroy the
+/// object: the link is promoted to the primary name, the data stays
+/// readable there, and the old path is gone.
+#[test]
+fn deleting_primary_name_promotes_hard_link() {
+    let path = unique_tmp("hl_del_promote");
+    let data: Vec<i32> = (0..8).collect();
+
+    {
+        let file = H5File::create(&path).unwrap();
+        let root = file.root_group();
+        let inst = root.create_group("instrument").unwrap();
+        let ds = inst
+            .new_dataset::<i32>()
+            .shape([8])
+            .create("detector")
+            .unwrap();
+        ds.write_raw(&data).unwrap();
+
+        let data_grp = root.create_group("data").unwrap();
+        data_grp.link("detector", "/instrument/detector").unwrap();
+
+        file.delete_dataset("instrument/detector").unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let file = H5File::open(&path).unwrap();
+        let survived = file
+            .dataset("data/detector")
+            .unwrap()
+            .read_raw::<i32>()
+            .unwrap();
+        assert_eq!(survived, data, "object survives under the hard link");
+        assert!(
+            file.dataset("instrument/detector").is_err(),
+            "the deleted name must not resolve"
+        );
+    }
+
+    cleanup(&path);
+}
+
+/// Deleting the *last* name frees the storage: cycles of
+/// create → link → delete-primary → delete-promoted-name settle to a
+/// fixed file size (the oracle of `delete_reclamation.rs`).
+#[test]
+fn deleting_last_name_frees_storage() {
+    let size_after = |cycles: usize| {
+        let path = unique_tmp(&format!("hl_del_free_{cycles}"));
+        let vals: Vec<i32> = (0..1024).collect();
+        let file = H5File::create(&path).unwrap();
+        let root = file.root_group();
+        let inst = root.create_group("instrument").unwrap();
+        let data_grp = root.create_group("data").unwrap();
+        for _ in 0..cycles {
+            let ds = inst
+                .new_dataset::<i32>()
+                .shape([1024])
+                .create("detector")
+                .unwrap();
+            ds.write_raw(&vals).unwrap();
+            data_grp.link("detector", "/instrument/detector").unwrap();
+            // First delete only unlinks (the link survives as
+            // /data/detector); the second removes the last name.
+            file.delete_dataset("instrument/detector").unwrap();
+            file.delete_dataset("data/detector").unwrap();
+        }
+        file.close().unwrap();
+        let n = std::fs::metadata(&path).unwrap().len();
+        cleanup(&path);
+        n
+    };
+
+    assert_eq!(size_after(10), size_after(2), "10 cycles against 2");
+}
+
+/// A hard link from outside the subtree naming an inner *group* refuses
+/// the whole `delete_group`, and the refusal leaves the file untouched.
+#[test]
+fn delete_group_refused_by_outside_link_to_inner_group() {
+    let path = unique_tmp("hl_del_refuse");
+    let data: Vec<i32> = vec![5, 6, 7];
+
+    {
+        let file = H5File::create(&path).unwrap();
+        let root = file.root_group();
+        let container = root.create_group("container").unwrap();
+        let inner = container.create_group("inner").unwrap();
+        let ds = inner.new_dataset::<i32>().shape([3]).create("ds").unwrap();
+        ds.write_raw(&data).unwrap();
+
+        root.link("inner_alias", "/container/inner").unwrap();
+
+        let err = file.delete_group("container").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("delete the link's parent group first"),
+            "unexpected error: {msg}"
+        );
+        file.close().unwrap();
+    }
+
+    {
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("container/inner/ds")
+                .unwrap()
+                .read_raw::<i32>()
+                .unwrap(),
+            data,
+            "refused delete must leave the subtree intact"
+        );
+    }
+
+    cleanup(&path);
+}
+
+/// `delete_group` re-homes an inner dataset a hard link from outside
+/// still names: the alias survives close, the rest of the subtree is
+/// gone.
+#[test]
+fn delete_group_promotes_outside_linked_dataset() {
+    let path = unique_tmp("hl_del_rehome");
+    let keep: Vec<i32> = (0..6).collect();
+
+    {
+        let file = H5File::create(&path).unwrap();
+        let root = file.root_group();
+        let doomed = root.create_group("doomed").unwrap();
+        let ds = doomed
+            .new_dataset::<i32>()
+            .shape([6])
+            .create("keep")
+            .unwrap();
+        ds.write_raw(&keep).unwrap();
+        doomed
+            .new_dataset::<i32>()
+            .shape([4])
+            .create("gone")
+            .unwrap();
+
+        root.link("survivor", "/doomed/keep").unwrap();
+
+        file.delete_group("doomed").unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("survivor").unwrap().read_raw::<i32>().unwrap(),
+            keep,
+            "outside-linked dataset survives its container"
+        );
+        assert!(
+            file.dataset("doomed/keep").is_err(),
+            "old path inside the deleted group must not resolve"
+        );
+        assert!(
+            file.dataset("doomed/gone").is_err(),
+            "unlinked sibling must be gone"
+        );
+    }
 
     cleanup(&path);
 }

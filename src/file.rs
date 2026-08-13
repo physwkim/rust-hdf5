@@ -573,10 +573,13 @@ impl H5File {
         }
     }
 
-    /// Delete a dataset by name. The dataset is unlinked on close and the
-    /// file space it owned — data blocks, chunk-index structures, and the
-    /// global-heap objects of variable-length values — is freed for reuse
-    /// by later writes in this session (the file itself does not shrink).
+    /// Delete a dataset name, with libhdf5's `H5Ldelete` semantics: if a
+    /// hard link still names the object, only this name is removed and the
+    /// dataset lives on under the link. Deleting the last name unlinks the
+    /// dataset on close and the file space it owned — data blocks,
+    /// chunk-index structures, and the global-heap objects of
+    /// variable-length values — is freed for reuse by later writes in this
+    /// session (the file itself does not shrink).
     pub fn delete_dataset(&self, name: &str) -> Result<()> {
         let inner = borrow_inner(&self.inner);
         match &*inner {
@@ -590,6 +593,11 @@ impl H5File {
 
     /// Delete a group and all its child datasets/sub-groups, freeing their
     /// file space the way [`delete_dataset`](Self::delete_dataset) does.
+    ///
+    /// Hard links reaching in from outside the deleted subtree keep their
+    /// targets alive: a dataset named by such a link survives under the
+    /// link's path, and if the link names an inner *group* the whole
+    /// delete is refused (delete the link's parent group first).
     pub fn delete_group(&self, name: &str) -> Result<()> {
         let inner = borrow_inner(&self.inner);
         match &*inner {
