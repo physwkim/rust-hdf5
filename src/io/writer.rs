@@ -247,12 +247,16 @@ impl<T> Slot<T> {
 /// Proof that the create gate (`create_lock`) is held and the new dataset's
 /// name passed the uniqueness check. Only [`Hdf5Writer::begin_create`]
 /// constructs one and [`Hdf5Writer::push_dataset`] demands one, so a creator
-/// cannot reach the dataset registry while skipping either step.
+/// cannot reach the dataset registry while skipping either step. Carries
+/// the canonical (link-resolved) name the creator must store, so the
+/// registry only ever holds tree paths.
 pub(crate) struct CreateGuard<'a> {
     #[cfg(not(feature = "threadsafe"))]
     _gate: std::cell::RefMut<'a, ()>,
     #[cfg(feature = "threadsafe")]
     _gate: std::sync::MutexGuard<'a, ()>,
+    /// The dataset name with every group hard link in it resolved.
+    pub(crate) name: String,
 }
 
 /// Reference-counted shared pointer, feature-selected. The single-thread
@@ -1003,8 +1007,13 @@ impl Hdf5Writer {
     /// (see `create_lock`) at every creator by construction.
     pub(crate) fn begin_create(&self, name: &str) -> IoResult<CreateGuard<'_>> {
         let gate = self.create_lock.lock();
-        self.ensure_unique_dataset_name(name)?;
-        Ok(CreateGuard { _gate: gate })
+        // A creation path through hard links lands in the link's target
+        // group, as HDF5 traversal does. Canonicalizing here — the one
+        // entry every creator passes — keeps alias forms out of the
+        // registry.
+        let name = self.canonical_dataset_path(name);
+        self.ensure_unique_dataset_name(&name)?;
+        Ok(CreateGuard { _gate: gate, name })
     }
 
     /// Push a freshly-built dataset into the registry and return its index.
@@ -1786,9 +1795,11 @@ impl Hdf5Writer {
     }
 
     /// Find a dataset index by name. Like `H5Dopen`, the name may be any
-    /// link to the dataset: a user hard link's path resolves to its
+    /// link path to the dataset: a user hard link's path — or a path
+    /// whose group components pass through such links — resolves to its
     /// target.
     pub fn dataset_index(&self, name: &str) -> Option<usize> {
+        let name = self.canonical_dataset_path(name);
         self.dataset_refs()
             .iter()
             .position(|d| {
@@ -1876,6 +1887,17 @@ impl Hdf5Writer {
         // delete reads and rewrites them (create_lock → op → slot order,
         // the same as every creator).
         let _create = self.create_lock.lock();
+        // `H5Ldelete` resolves the path through links only *up to* the
+        // leaf — the leaf is what gets deleted, so a leaf naming a user
+        // link must stay literal and be unlinked, not its target.
+        let name = match name.rsplit_once('/') {
+            None => name.to_string(),
+            Some((dir, leaf)) => format!(
+                "{}/{leaf}",
+                self.canonical_group_path(&format!("/{dir}"))
+                    .trim_start_matches('/')
+            ),
+        };
         let refs = self.dataset_refs();
         let idx = match refs.iter().position(|d| {
             let g = d.lock();
@@ -1893,7 +1915,7 @@ impl Hdf5Writer {
                         && self.hard_link_full_path(l) == name
                 });
                 let Some(pos) = link else {
-                    return Err(crate::io::IoError::NotFound(name.to_string()));
+                    return Err(crate::io::IoError::NotFound(name));
                 };
                 self.hard_links.lock().remove(pos);
                 return Ok(());
@@ -1940,6 +1962,14 @@ impl Hdf5Writer {
             name.to_string()
         } else {
             format!("/{}", name)
+        };
+        // Leaf stays literal, directory resolves through links — the
+        // same `H5Ldelete` rule as `delete_dataset`.
+        let name = match name.rsplit_once('/') {
+            Some((dir, leaf)) if !dir.is_empty() => {
+                format!("{}/{leaf}", self.canonical_group_path(dir))
+            }
+            _ => name,
         };
         let groups = self.group_refs();
         let gidx = match groups.iter().position(|g| {
@@ -2447,6 +2477,10 @@ impl Hdf5Writer {
         // Hold the create gate across the uniqueness check and the registry
         // push so the two are atomic (see `create_lock`).
         let _create = self.create_lock.lock();
+        // A parent path through hard links creates in the link's target,
+        // as HDF5 traversal does.
+        let parent_path = self.canonical_group_path(parent_path);
+        let parent_path = parent_path.as_str();
         let full_name = if parent_path == "/" {
             format!("/{}", name)
         } else {
@@ -2523,6 +2557,8 @@ impl Hdf5Writer {
     /// `group_path` is the full path of the group (e.g., "/detector").
     /// `ds_index` is the dataset index returned by `create_dataset`.
     pub fn assign_dataset_to_group(&self, group_path: &str, ds_index: usize) -> IoResult<()> {
+        let group_path = self.canonical_group_path(group_path);
+        let group_path = group_path.as_str();
         let groups = self.group_refs();
         let group_idx = groups
             .iter()
@@ -2563,6 +2599,9 @@ impl Hdf5Writer {
         // Hold the create gate across the collision check and the hard-link
         // push so the two are atomic (see `create_lock`).
         let _create = self.create_lock.lock();
+        // Both paths resolve through hard links, as HDF5 traversal does.
+        let parent_group_path = self.canonical_group_path(parent_group_path);
+        let parent_group_path = parent_group_path.as_str();
 
         let datasets = self.dataset_refs();
         let groups = self.group_refs();
@@ -2589,7 +2628,8 @@ impl Hdf5Writer {
         // Resolve the target. Dataset names are stored without a leading
         // '/', group names with one — compare on the trimmed form. A
         // trailing '/' is tolerated too.
-        let target_rel = target_path.trim_matches('/');
+        let target_rel = self.canonical_dataset_path(target_path.trim_matches('/'));
+        let target_rel = target_rel.as_str();
         if target_rel.is_empty() {
             return Err(crate::io::IoError::InvalidState(
                 "cannot hard-link the root group".into(),
@@ -2676,6 +2716,49 @@ impl Hdf5Writer {
         }
     }
 
+    /// Rewrite a group path that passes through hard links into the tree
+    /// path of the group it reaches — HDF5 traversal, where any link in a
+    /// path component resolves to its target. Group-name form (leading
+    /// `/`). Repeats because a substituted target's subtree can hold
+    /// further links; bounded like libhdf5's link-traversal limit, so a
+    /// link cycle cannot loop forever. A path with no link components
+    /// (including one naming nothing at all) comes back unchanged.
+    pub(crate) fn canonical_group_path(&self, path: &str) -> String {
+        let mut path = path.to_string();
+        for _ in 0..64 {
+            // The longest emitted group-link path that is the whole of
+            // `path` or a '/'-boundary prefix of it.
+            let mut best: Option<(usize, usize)> = None; // (prefix len, target)
+            for l in self.hard_links_vec() {
+                let HardLinkTarget::Group(gi) = l.target else {
+                    continue;
+                };
+                if !self.hard_link_emitted(&l) {
+                    continue;
+                }
+                let lp = format!("/{}", self.hard_link_full_path(&l));
+                let covers = path == lp || path.starts_with(&format!("{lp}/"));
+                if covers && best.is_none_or(|(len, _)| lp.len() > len) {
+                    best = Some((lp.len(), gi));
+                }
+            }
+            let Some((len, gi)) = best else { break };
+            let target_name = self.grp(gi).lock().name.clone();
+            path = format!("{}{}", target_name, &path[len..]);
+        }
+        path
+    }
+
+    /// [`canonical_group_path`](Self::canonical_group_path) in the
+    /// dataset-name form (no leading `/`): the leaf is a dataset, so only
+    /// group links can appear as components and the whole path can go
+    /// through the group rewrite unchanged.
+    fn canonical_dataset_path(&self, name: &str) -> String {
+        self.canonical_group_path(&format!("/{name}"))
+            .trim_start_matches('/')
+            .to_string()
+    }
+
     /// Total number of hard links resolving to an object: its own tree link
     /// plus every emitted user-created hard link pointing at it.
     fn object_link_count(&self, target: HardLinkTarget) -> u32 {
@@ -2724,6 +2807,7 @@ impl Hdf5Writer {
         dims: &[u64],
     ) -> IoResult<usize> {
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         let total_elements: u64 = if dims.is_empty() {
             1
         } else {
@@ -2786,6 +2870,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
     ) -> IoResult<usize> {
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         ensure_unlimited_is_leading(max_dims)?;
         let chunk_bytes = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
@@ -3636,6 +3721,7 @@ impl Hdf5Writer {
         match target {
             AttrTarget::Root => Ok(f(&mut self.root_attributes.lock())),
             AttrTarget::Group(path) => {
+                let path = self.canonical_group_path(path);
                 for grp in self.group_refs() {
                     let mut g = grp.lock();
                     if g.name == path && !g.deleted {
@@ -3796,6 +3882,7 @@ impl Hdf5Writer {
         use crate::format::messages::datatype::DatatypeMessage;
 
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         let num_strings = strings.len() as u64;
 
         // Store the strings as heap objects; a batch that fits an earlier
@@ -3866,6 +3953,7 @@ impl Hdf5Writer {
         use crate::format::messages::datatype::DatatypeMessage;
 
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         let num_items = items.len() as u64;
 
         // Store the byte arrays as heap objects, sharing collection blocks
@@ -3938,6 +4026,7 @@ impl Hdf5Writer {
         use crate::format::messages::datatype::DatatypeMessage;
 
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         let num_strings = strings.len() as u64;
         validate_chunk_geometry(&[num_strings], &[num_strings], &[chunk_size as u64])?;
 
@@ -5161,6 +5250,7 @@ impl Hdf5Writer {
         pipeline: Option<FilterPipeline>,
     ) -> IoResult<usize> {
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         if max_dims.contains(&u64::MAX) {
             return Err(crate::io::IoError::InvalidState(
@@ -5310,6 +5400,7 @@ impl Hdf5Writer {
         use crate::format::chunk_index::btree_v2::{Bt2Header, BT2_NODE_SIZE};
 
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         let ndims = dims.len();
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
@@ -5404,6 +5495,7 @@ impl Hdf5Writer {
         compression_level: u32,
     ) -> IoResult<usize> {
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         ensure_unlimited_is_leading(max_dims)?;
         let element_size = datatype.element_size() as u64;
@@ -5511,6 +5603,7 @@ impl Hdf5Writer {
         pipeline: FilterPipeline,
     ) -> IoResult<usize> {
         let create = self.begin_create(name)?;
+        let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         ensure_unlimited_is_leading(max_dims)?;
         let element_size = datatype.element_size() as u64;

@@ -30,6 +30,17 @@
   names still referenced. And like `H5Dopen`/`H5Lcreate_hard`, an alias
   path now resolves for `dataset_writer` and as a link target.
 
+- Paths traverse group hard links, the way HDF5 paths always resolve
+  through links: creating, writing, annotating, reading, and deleting
+  through an alias path (`root.group("inner_alias")`,
+  `file.dataset("inner_alias/ds")`) lands on the link's target group.
+  Writer-side, every path entry point canonicalizes group-link
+  prefixes; reader-side, the discovery walk records the alias of an
+  already-visited group header instead of only skipping it, and
+  lookups resolve through those aliases. Deletion still keeps the
+  *leaf* literal — `H5Ldelete` removes the named link itself, not its
+  target.
+
 - Reopening a file for appending now reads fixed-array and v2-B-tree
   chunk indexes back into the writer, as it already did for extensible
   arrays. Those datasets used to come back as re-link placeholders:

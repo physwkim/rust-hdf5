@@ -824,6 +824,92 @@ fn reopened_group_link_promotes_inner_group() {
     cleanup(&path);
 }
 
+/// Writer-mode paths traverse group hard links the way HDF5 paths do:
+/// a group handle opened through an alias creates its objects in the
+/// link's target group, attributes land there too, and the results
+/// resolve under both the alias and the tree path.
+#[test]
+fn writer_paths_traverse_group_hard_links() {
+    let path = unique_tmp("hl_traverse");
+    let data: Vec<i32> = (0..4).collect();
+
+    {
+        let file = H5File::create(&path).unwrap();
+        let root = file.root_group();
+        let container = root.create_group("container").unwrap();
+        container.create_group("inner").unwrap();
+        root.link("inner_alias", "/container/inner").unwrap();
+
+        // Create and annotate through the alias handle.
+        let via_alias = root.group("inner_alias").unwrap();
+        let ds = via_alias
+            .new_dataset::<i32>()
+            .shape([4])
+            .create("ds")
+            .unwrap();
+        ds.write_raw(&data).unwrap();
+        via_alias.set_attr_string("NX_class", "NXdata").unwrap();
+
+        // A full path through the alias resolves for the writer too.
+        file.dataset_writer("inner_alias/ds").unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("container/inner/ds")
+                .unwrap()
+                .read_raw::<i32>()
+                .unwrap(),
+            data,
+            "the object created via the alias must live in the target group"
+        );
+        assert_eq!(
+            file.dataset("inner_alias/ds")
+                .unwrap()
+                .read_raw::<i32>()
+                .unwrap(),
+            data,
+            "the alias path must resolve to it as well"
+        );
+        let inner = file.root_group().group("container").unwrap();
+        let inner = inner.group("inner").unwrap();
+        assert_eq!(
+            inner.attr_string("NX_class").unwrap(),
+            "NXdata",
+            "the attribute set via the alias must land on the target"
+        );
+    }
+
+    cleanup(&path);
+}
+
+/// Deleting through an alias directory resolves the directory but keeps
+/// the leaf literal — `H5Ldelete` deletes the named link, not what a
+/// leaf alias points at.
+#[test]
+fn delete_through_an_alias_directory() {
+    let path = unique_tmp("hl_del_traverse");
+
+    let file = H5File::create(&path).unwrap();
+    let root = file.root_group();
+    let container = root.create_group("container").unwrap();
+    let inner = container.create_group("inner").unwrap();
+    inner.new_dataset::<i32>().shape([2]).create("ds").unwrap();
+    root.link("inner_alias", "/container/inner").unwrap();
+
+    // "inner_alias/ds" resolves to the tree name "container/inner/ds".
+    file.delete_dataset("inner_alias/ds").unwrap();
+    assert!(
+        file.dataset_writer("container/inner/ds").is_err(),
+        "the delete must reach the dataset behind the alias directory"
+    );
+
+    drop(file);
+    cleanup(&path);
+}
+
 /// A target path given with a trailing slash still resolves.
 #[test]
 fn hard_link_tolerates_trailing_slash() {

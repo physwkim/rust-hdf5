@@ -131,12 +131,20 @@ impl H5Group {
         // This opens empty groups, attribute-only groups, and
         // subgroup-only groups, which have no datasets beneath them.
         let inner = borrow_inner(&self.file_inner);
-        if let H5FileInner::Reader(reader) = &*inner {
-            let group_path = full_name.trim_start_matches('/');
-            if !reader.has_group(group_path) {
-                return Err(Hdf5Error::NotFound(full_name));
+        let full_name = match &*inner {
+            H5FileInner::Reader(reader) => {
+                let group_path = full_name.trim_start_matches('/');
+                if !reader.has_group(group_path) {
+                    return Err(Hdf5Error::NotFound(full_name));
+                }
+                full_name
             }
-        }
+            // In write mode the handle stores the tree path, so a path
+            // through hard links resolves once here and every operation
+            // made through the handle lands on the link's target.
+            H5FileInner::Writer(writer) => writer.canonical_group_path(&full_name),
+            H5FileInner::Closed => full_name,
+        };
         drop(inner);
 
         Ok(H5Group {
