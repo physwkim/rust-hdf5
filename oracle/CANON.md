@@ -1,4 +1,4 @@
-# The canonical dump format (`!canon 1`)
+# The canonical dump format (`!canon 2`)
 
 Both sides of the oracle — `oracle/canon.py` (h5py / libhdf5 1.14.6) and
 `src/bin/oracle_probe.rs` (rust-hdf5 public API) — emit this format, so the
@@ -8,7 +8,7 @@ two dumps of the same file are comparable as text and, more usefully, as a
 ## Grammar
 
     line   := header | record
-    header := "!canon" TAB "1"
+    header := "!canon" TAB "2"
     record := key TAB value
     key    := path [ "@" attrname ] "#" field
     value  := <no TAB, no LF>
@@ -39,16 +39,23 @@ Everything else is an observed value and must match byte for byte.
 | field        | value                                                    |
 |--------------|----------------------------------------------------------|
 | `superblock` | superblock version integer (0, 2, 3)                      |
+| `userblock`  | user block size in bytes; `0` when there is none          |
+
+The user block displaces the superblock, so `userblock` is the offset at
+which the HDF5 signature was found (0, or the first power of two >= 512).
 
 ## Object fields
 
 `kind` is always first: `group`, `dataset`, `softlink`, `extlink`,
 `committed-datatype`, `unknown`.
 
-Group fields: `kind`, `nattrs`, then attributes.
+Group fields: `kind`, `linkorder`, `attrorder`, `nattrs`, then attributes.
 
-Dataset fields, in order: `kind`, `dtype`, `shape`, `maxshape`, `layout`,
-`chunk`, `chunkindex`, `filters`, `fillvalue`, `nattrs`, attributes, `data`.
+Dataset fields, in order: `kind`, `dtype`, `strpad`, `shape`, `maxshape`,
+`layout`, `chunk`, `chunkindex`, `external`, `virtual`, `filters`,
+`fillvalue`, `nattrs`, attributes, `data`.
+
+Committed datatype fields: `kind`, `dtype`, `strpad`, `nattrs`, attributes.
 
 Link fields: `kind`, `target`.
 
@@ -60,9 +67,15 @@ Link fields: `kind`, `target`.
 | `layout`     | `compact` \| `contiguous` \| `chunked` \| `virtual`                        |
 | `chunk`      | `[4,4]`, or `-` when the layout is not chunked                            |
 | `chunkindex` | `btree1` \| `single` \| `implicit` \| `farray` \| `earray` \| `btree2` \| `-` |
+| `external`   | `-`, or `["ext.raw"@0+64,...]` — `name@offset+size` per segment            |
+| `virtual`    | `-`, or `["src.h5"::"/d" [0]-[7]->[0]-[7],...]` — source, then bounds      |
 | `filters`    | `[]` or `[deflate(6)@0,shuffle(4)@0]` — `name(cd0\|cd1)@flags`             |
 | `fillvalue`  | `default` \| `undefined` \| `0x<hex of the raw fill bytes>`                |
-| `nattrs`     | attribute count                                                           |
+| `nattrs`     | attribute count as iteration reports it                                   |
+| `nattrs_hdr` | attribute count as the object header records it (what `H5Oget_info` uses) |
+| `linkorder`  | `-` \| `tracked` \| `tracked+indexed` — link creation-order tracking       |
+| `attrorder`  | as `linkorder`, for attributes                                            |
+| `strpad`     | `-`, or `.=null;.member=spacepad` for each vlen string in the type tree   |
 | `data`       | see below                                                                 |
 | `target`     | soft: the link path; external: `<file>::<path>`                           |
 
@@ -84,7 +97,7 @@ chosen index type. It is marked as derived in the report.
 
 ## Attribute fields (key `path@name#...`)
 
-`dtype`, `shape`, `value`. `value` uses the same encoding as `data`.
+`dtype`, `strpad`, `shape`, `value`. `value` uses the same encoding as `data`.
 
 ## Canonical values
 
@@ -118,7 +131,12 @@ Float parameters are appended only when they deviate from IEEE 754 for that
 width (sign/exponent/mantissa positions and sizes, exponent bias, bit offset,
 bit precision).
 
-`vstr` deliberately omits the string-pad field: `DatatypeMessage::VarLenString`
-in rust-hdf5 models only the character set, so including the pad would report
-a modelling gap as a per-case divergence in every variable-length string case.
-The gap is recorded once in the report instead.
+A fixed string carries its pad inline (`pad=null`), where both sides agree.
+`vstr` does not: rust-hdf5's `DatatypeMessage::VarLenString` models only the
+character set, so the pad travels in the separate `strpad` field, where the
+rust side answers `UNSUPPORTED(strpad)` and the gap is visible as a gap.
+
+`strpad` names each variable-length string by its position in the type tree:
+`.` is the type itself, `.m` a compound member, `[]` an array element, `()` a
+vlen element — so a compound is `.name=null;.tags[]=nullpad`. It is `-` when
+the type tree holds no variable-length string, which both sides can answer.
