@@ -101,14 +101,16 @@ fn collect_bt2_nodes(
             geo.max_nrec_size,
             geo.child_total_size(depth),
         )?;
-        records.extend_from_slice(&node.record_data);
+        // In-order: an internal node's records separate its children, so each
+        // one belongs between the subtrees on either side of it.
         let children: Vec<(u64, u16)> = node
             .child_addrs
             .iter()
             .zip(node.child_nrecords.iter())
             .map(|(&a, &n)| (a, n))
             .collect();
-        for (child_addr, child_nrec) in children {
+        let rec = record_size as usize;
+        for (i, (child_addr, child_nrec)) in children.into_iter().enumerate() {
             collect_bt2_nodes(
                 handle,
                 ctx,
@@ -121,6 +123,9 @@ fn collect_bt2_nodes(
                 records,
                 node_addrs,
             )?;
+            if let Some(record) = node.record_data.get(i * rec..(i + 1) * rec) {
+                records.extend_from_slice(record);
+            }
         }
     }
     Ok(())

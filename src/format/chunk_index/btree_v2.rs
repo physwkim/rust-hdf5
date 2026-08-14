@@ -741,14 +741,18 @@ fn collect_node<R: BlockReader>(
         geo.max_nrec_size,
         geo.child_total_size(depth),
     )?;
-    out.extend_from_slice(&node.record_data);
+    // A node's own records separate its children, so key order is
+    // child[0], record[0], child[1], record[1], ... record[n-1], child[n] --
+    // an in-order walk. Emitting the node's records ahead of its children
+    // would hand the caller a sequence that is sorted only within each node.
     let children: Vec<(u64, u16)> = node
         .child_addrs
         .iter()
         .zip(node.child_nrecords.iter())
         .map(|(&a, &n)| (a, n))
         .collect();
-    for (child_addr, child_nrec) in children {
+    let rec = record_size as usize;
+    for (i, (child_addr, child_nrec)) in children.into_iter().enumerate() {
         collect_node(
             reader,
             ctx,
@@ -760,6 +764,9 @@ fn collect_node<R: BlockReader>(
             node_size,
             out,
         )?;
+        if let Some(record) = node.record_data.get(i * rec..(i + 1) * rec) {
+            out.extend_from_slice(record);
+        }
     }
     Ok(())
 }
@@ -1787,6 +1794,58 @@ mod tests {
             );
         }
         (hdr, out)
+    }
+
+    /// A serialized tree laid out contiguously, so the production record walk
+    /// can be pointed at it the way it is pointed at a file.
+    struct NodePool {
+        base: u64,
+        image: Vec<u8>,
+    }
+
+    impl BlockReader for NodePool {
+        fn read_block(&mut self, offset: u64, len: usize) -> FormatResult<Vec<u8>> {
+            let start = (offset - self.base) as usize;
+            let end = (start + len).min(self.image.len());
+            Ok(self.image[start..end].to_vec())
+        }
+    }
+
+    /// Serialize `idx` into one contiguous pool and return it with its header.
+    fn serialize_into_pool(idx: &Bt2ChunkIndex, ctx: &FormatContext) -> (Bt2Header, NodePool) {
+        let tree = idx.build_tree(ctx);
+        let base = 0x1000u64;
+        let addrs: Vec<u64> = (0..tree.nodes.len() as u64)
+            .map(|i| base + i * tree.node_size as u64)
+            .collect();
+        let mut image = vec![0u8; tree.nodes.len() * tree.node_size as usize];
+        for (i, node) in tree.encode(ctx, &addrs).into_iter().enumerate() {
+            let at = i * tree.node_size as usize;
+            image[at..at + node.len()].copy_from_slice(&node);
+        }
+        let hdr = tree.header(addrs.last().copied().unwrap_or(UNDEF_ADDR));
+        (hdr, NodePool { base, image })
+    }
+
+    /// `collect_btree_v2_records` is what the dense-attribute reader and
+    /// `open_append`'s index rebuild both walk with. An internal node's
+    /// records separate its children, so emitting them ahead of the subtrees
+    /// yields a sequence sorted only within each node — enough to fool any
+    /// caller that re-keys the records, and wrong for one that does not.
+    #[test]
+    fn the_record_walk_returns_key_order_across_levels() {
+        let ctx = ctx8();
+        for n in [84u64, 85, 5270] {
+            let idx = index_with(n);
+            let (hdr, mut pool) = serialize_into_pool(&idx, &ctx);
+            let walked = collect_btree_v2_records(&hdr, &ctx, &mut pool).unwrap();
+            assert_eq!(
+                walked,
+                idx.encode_records(&ctx),
+                "{n} records at depth {} came back out of key order",
+                hdr.depth
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
