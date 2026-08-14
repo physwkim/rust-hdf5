@@ -38,6 +38,7 @@ pub struct DatasetBuilder<T: H5Type> {
     group_path: Option<String>,
     fill_value: Option<Vec<u8>>,
     datatype_override: Option<crate::format::messages::datatype::DatatypeMessage>,
+    object_references: bool,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -54,6 +55,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             group_path: None,
             fill_value: None,
             datatype_override: None,
+            object_references: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -70,6 +72,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             group_path: Some(group_path),
             fill_value: None,
             datatype_override: None,
+            object_references: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -179,6 +182,32 @@ impl<T: H5Type> DatasetBuilder<T> {
         self
     }
 
+    /// Store object references — h5py's `h5py.ref_dtype`.
+    ///
+    /// The elements are written with
+    /// [`write_object_references`](H5Dataset::write_object_references) and
+    /// name objects by path. The element width is the file's address size, so
+    /// the datatype is resolved at [`create`](Self::create) rather than here;
+    /// it overrides both `T` and any [`datatype`](Self::datatype) call.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("refs.h5").unwrap();
+    /// file.new_dataset::<i32>().shape([4]).create("target").unwrap();
+    /// let refs = file.new_dataset::<u64>()
+    ///     .object_references()
+    ///     .shape([1])
+    ///     .create("refs")
+    ///     .unwrap();
+    /// refs.write_object_references(&["/target"]).unwrap();
+    /// file.close().unwrap();
+    /// ```
+    #[must_use]
+    pub fn object_references(mut self) -> Self {
+        self.object_references = true;
+        self
+    }
+
     /// Set a user-defined fill value for unwritten elements.
     ///
     /// Without this, datasets use the HDF5 default zero-fill. When set,
@@ -229,7 +258,28 @@ impl<T: H5Type> DatasetBuilder<T> {
         let group_path = self.group_path.clone();
 
         let dims_u64: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
-        let datatype = self.datatype_override.clone().unwrap_or_else(T::hdf5_type);
+        let datatype = if self.object_references {
+            // The element is one file address wide, and only the writer knows
+            // how wide that is for this file.
+            let inner = borrow_inner(&self.file_inner);
+            match &*inner {
+                H5FileInner::Writer(writer) => {
+                    crate::format::messages::datatype::DatatypeMessage::object_reference(
+                        writer.ctx(),
+                    )
+                }
+                H5FileInner::Reader(_) => {
+                    return Err(Hdf5Error::InvalidState(
+                        "cannot create a dataset in read mode".into(),
+                    ))
+                }
+                H5FileInner::Closed => {
+                    return Err(Hdf5Error::InvalidState("file is closed".into()))
+                }
+            }
+        } else {
+            self.datatype_override.clone().unwrap_or_else(T::hdf5_type)
+        };
         // Size one element from the on-disk datatype, not the carrier `T`. For
         // the default path this equals `T::element_size()`; when a `datatype()`
         // override is set (N-bit, or a runtime `CompoundType`), the stored type
@@ -2071,6 +2121,35 @@ impl H5Dataset {
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "cannot read vlen bytes from a dataset in write mode".into(),
             )),
+        }
+    }
+
+    /// Write object references naming `paths` into elements `0..paths.len()`
+    /// — h5py's `refs[i] = f['/target'].ref`.
+    ///
+    /// The dataset must have been created with
+    /// [`object_references`](DatasetBuilder::object_references). A path names
+    /// a dataset or a group (`/` is the root group) and must already exist;
+    /// what reaches the file is the target's object header address, which is
+    /// assigned when the file is finalized. Elements left unwritten read back
+    /// as null references.
+    pub fn write_object_references(&self, paths: &[&str]) -> Result<()> {
+        match &self.info {
+            DatasetInfo::Writer { index, .. } => {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Writer(writer) => {
+                        writer.write_object_references(*index, 0, paths)?;
+                        Ok(())
+                    }
+                    _ => Err(Hdf5Error::InvalidState(
+                        "file is no longer in write mode".into(),
+                    )),
+                }
+            }
+            DatasetInfo::Reader { .. } => {
+                Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
+            }
         }
     }
 

@@ -1357,6 +1357,23 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "ref_object" => {
+            let file = H5File::create(path)?;
+            let target = file.new_dataset::<i32>().shape([8]).create("target")?;
+            target.write_raw(&ramp_n::<i32>(8))?;
+            file.create_group("grp")?;
+            let refs = file
+                .new_dataset::<u64>()
+                .object_references()
+                .shape([2])
+                .create("refs")?;
+            refs.write_object_references(&["/target", "/grp"])?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "ref_region" => Ok(unsup(
+            "region references need a selection serializer on the write side",
+        )),
 
         // ---- layouts and chunk indexes ----------------------------------
         "layout_contiguous" => simple_ramp::<i32>(path, ramp_n::<i32>(16)),

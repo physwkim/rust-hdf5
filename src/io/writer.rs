@@ -20,7 +20,7 @@ use crate::format::chunk_index::fixed_array::{
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::data_layout::{DataLayoutMessage, EarrayParams, FixedArrayParams};
 use crate::format::messages::dataspace::DataspaceMessage;
-use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::messages::datatype::{DatatypeMessage, ReferenceKind};
 use crate::format::messages::fill_value::FillValueMessage;
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::group_info::GroupInfoMessage;
@@ -933,6 +933,24 @@ pub struct Hdf5Writer {
     /// The on-disk root header block a reopen found, `(addr, len)`, so
     /// finalize can free the block its rewrite supersedes.
     superseded_root_header: Option<(u64, u64)>,
+    /// Object-reference elements waiting for their target's object header
+    /// address, which only exists once finalize has placed every header.
+    pending_object_references: Slot<Vec<PendingObjectReference>>,
+}
+
+/// One object-reference element written before its value could be known.
+///
+/// An `H5R_OBJECT1` element is the target's object header address, and
+/// addresses are assigned during finalize, so a write records the target by
+/// path here and [`Hdf5Writer::apply_object_reference_fixups`] stamps the
+/// address in once every header has one.
+pub(crate) struct PendingObjectReference {
+    /// Dataset holding the element.
+    dataset: usize,
+    /// Element index within that dataset.
+    element: u64,
+    /// Path of the object the element names; `/` is the root group.
+    target: String,
 }
 
 impl Hdf5Writer {
@@ -988,6 +1006,7 @@ impl Hdf5Writer {
             root_group_addr: None,
             root_group_encoded_size: 0,
             superseded_root_header: None,
+            pending_object_references: Slot::new(Vec::new()),
         })
     }
 
@@ -1781,6 +1800,7 @@ impl Hdf5Writer {
             root_group_addr: None,
             root_group_encoded_size: 0,
             superseded_root_header: Some((root_addr, root_header_size as u64)),
+            pending_object_references: Slot::new(Vec::new()),
         })
     }
 
@@ -2709,29 +2729,9 @@ impl Hdf5Writer {
                 "cannot hard-link the root group".into(),
             ));
         }
-        let target = if let Some(idx) = datasets.iter().position(|d| {
-            let g = d.lock();
-            !g.deleted && g.name.trim_start_matches('/') == target_rel
-        }) {
-            HardLinkTarget::Dataset(idx)
-        } else if let Some(idx) = groups.iter().position(|g| {
-            let gg = g.lock();
-            !gg.deleted && gg.name.trim_start_matches('/') == target_rel
-        }) {
-            HardLinkTarget::Group(idx)
-        } else if let Some(t) = self.hard_links_vec().iter().find_map(|l| {
-            (self.hard_link_emitted(l) && self.hard_link_full_path(l) == target_rel)
-                .then_some(l.target)
-        }) {
-            // The target path may itself be a hard link: links have no
-            // chain (all point straight at the object header, as in
-            // libhdf5), so the new link copies the existing one's target.
-            t
-        } else {
-            return Err(crate::io::IoError::NotFound(format!(
-                "hard link target '{target_path}' not found"
-            )));
-        };
+        let target = self.resolve_object(target_rel).ok_or_else(|| {
+            crate::io::IoError::NotFound(format!("hard link target '{target_path}' not found"))
+        })?;
 
         // Reject a name already taken in the parent group.
         let parent_prefix = match parent {
@@ -2849,6 +2849,147 @@ impl Hdf5Writer {
             .iter()
             .filter(|l| self.hard_link_emitted(l) && same(l.target, target))
             .count() as u32
+    }
+
+    /// The object a path names, or `None` when nothing in the file does.
+    ///
+    /// `path` is the trimmed, hard-link-canonical form (no leading or
+    /// trailing `/`) that dataset and group names compare against. The single
+    /// owner of path→object resolution on the write side: hard links and
+    /// object references must agree on what a path means, including that a
+    /// path may itself be a user hard link — links have no chain (each points
+    /// straight at the object header, as in libhdf5), so the existing link's
+    /// target is the answer.
+    pub(crate) fn resolve_object(&self, path: &str) -> Option<HardLinkTarget> {
+        if let Some(idx) = self.dataset_refs().iter().position(|d| {
+            let g = d.lock();
+            !g.deleted && g.name.trim_start_matches('/') == path
+        }) {
+            return Some(HardLinkTarget::Dataset(idx));
+        }
+        if let Some(idx) = self.group_refs().iter().position(|g| {
+            let gg = g.lock();
+            !gg.deleted && gg.name.trim_start_matches('/') == path
+        }) {
+            return Some(HardLinkTarget::Group(idx));
+        }
+        self.hard_links_vec().iter().find_map(|l| {
+            (self.hard_link_emitted(l) && self.hard_link_full_path(l) == path).then_some(l.target)
+        })
+    }
+
+    /// Store object references naming `paths` into the elements of dataset
+    /// `index` starting at `start`.
+    ///
+    /// The value of an `H5R_OBJECT1` element is its target's object header
+    /// address, which finalize assigns, so what lands here is the target path;
+    /// [`Self::apply_object_reference_fixups`] writes the addresses. Elements
+    /// never written keep the zero image libhdf5 reads back as a null
+    /// reference.
+    pub fn write_object_references(
+        &self,
+        index: usize,
+        start: u64,
+        paths: &[&str],
+    ) -> IoResult<()> {
+        let (elements, data_addr, indexed) = {
+            let ds = self.ds(index);
+            let m = ds.lock();
+            match &m.datatype {
+                DatatypeMessage::Reference {
+                    kind: ReferenceKind::Object1,
+                    ..
+                } => {}
+                other => {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "dataset '{}' has datatype {other}, not an object reference",
+                        m.name
+                    )))
+                }
+            }
+            let elements = m
+                .dataspace
+                .dims
+                .iter()
+                .fold(1u64, |a, &d| a.saturating_mul(d));
+            let indexed = m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
+            (elements, m.data_addr, indexed)
+        };
+        if indexed || data_addr == UNDEF_ADDR {
+            return Err(crate::io::IoError::InvalidState(
+                "object references are stamped into contiguous storage; \
+                 create the dataset without chunking"
+                    .into(),
+            ));
+        }
+        let end = start.saturating_add(paths.len() as u64);
+        if end > elements {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "elements {start}..{end} are outside the dataset's {elements}"
+            )));
+        }
+        // Resolve now as well as at fixup time, so a path that names nothing
+        // is reported at the call that got it wrong.
+        for path in paths {
+            self.object_reference_target(path)?;
+        }
+        let mut pending = self.pending_object_references.lock();
+        for (i, path) in paths.iter().enumerate() {
+            pending.push(PendingObjectReference {
+                dataset: index,
+                element: start + i as u64,
+                target: (*path).to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The object an object reference's path names, as a hard-link target;
+    /// `None` for the root group, which has no registry slot.
+    fn object_reference_target(&self, path: &str) -> IoResult<Option<HardLinkTarget>> {
+        let rel = self.canonical_dataset_path(path.trim_matches('/'));
+        if rel.is_empty() {
+            return Ok(None);
+        }
+        self.resolve_object(&rel)
+            .map(Some)
+            .ok_or_else(|| crate::io::IoError::NotFound(format!("reference target '{path}'")))
+    }
+
+    /// Stamp every pending object reference with its target's object header
+    /// address.
+    ///
+    /// INVARIANT: a reference element on disk holds its target's header
+    /// address. Both finalize paths call this once every dataset, group and
+    /// root header has an address and before the superblock is written, so no
+    /// file is closed with a placeholder element in it; a target that no
+    /// longer resolves fails the finalize rather than leaving one behind.
+    fn apply_object_reference_fixups(&mut self) -> IoResult<()> {
+        // Snapshot rather than drain: a SWMR session finalizes twice, and the
+        // close-time finalize rebuilds every header at a fresh address, so the
+        // elements must be stamped again with the addresses that survive.
+        let pending: Vec<(usize, u64, String)> = self
+            .pending_object_references
+            .lock()
+            .iter()
+            .map(|p| (p.dataset, p.element, p.target.clone()))
+            .collect();
+        let width = self.ctx.sizeof_addr as usize;
+        for (dataset, element, target) in &pending {
+            let addr = match self.object_reference_target(target)? {
+                Some(HardLinkTarget::Dataset(i)) => self.ds(i).lock().obj_header_addr,
+                Some(HardLinkTarget::Group(i)) => self.grp(i).lock().obj_header_addr,
+                None => self.root_group_addr.ok_or_else(|| {
+                    crate::io::IoError::InvalidState(
+                        "root group header address is not assigned yet".into(),
+                    )
+                })?,
+            };
+            let data_addr = self.ds(*dataset).lock().data_addr;
+            let at = data_addr + element * width as u64;
+            self.handle.write_at(at, &addr.to_le_bytes()[..width])?;
+        }
+        Ok(())
     }
 
     /// Append a `MSG_LINK` message for every user-created hard link whose
@@ -7229,6 +7370,9 @@ impl Hdf5Writer {
         self.root_group_addr = Some(root_addr);
         self.root_group_encoded_size = root_encoded_size;
 
+        // 2b. Stamp object references now that every header has an address.
+        self.apply_object_reference_fixups()?;
+
         // 3. Write superblock with SWMR flags.
         self.write_superblock(FLAG_WRITE_ACCESS | FLAG_SWMR_WRITE)?;
 
@@ -7407,6 +7551,10 @@ impl Hdf5Writer {
         let root_addr = self.allocator.allocate(root_encoded.len() as u64);
         self.handle.write_at(root_addr, &root_encoded)?;
         self.root_group_addr = Some(root_addr);
+
+        // 2b. Every object header now has an address, so the object
+        // references waiting on one can be stamped into their datasets.
+        self.apply_object_reference_fixups()?;
 
         // 3. Write superblock at offset 0.
         self.write_superblock(0)?;

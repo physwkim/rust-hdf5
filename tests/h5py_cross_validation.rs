@@ -1759,3 +1759,77 @@ fn region_references_written_by_h5py_report_their_bounds() {
     file.close().unwrap();
     std::fs::remove_file(&path).ok();
 }
+
+/// References rust writes are real `H5R_OBJECT1` elements: h5py dereferences
+/// them back to the objects they name, including a reference to the root
+/// group and one to an object created after the reference was stored.
+#[test]
+fn object_references_written_by_rust_dereference_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("ref_object_write");
+    let file = H5File::create(&path).unwrap();
+    let target = file
+        .new_dataset::<i32>()
+        .shape([4])
+        .create("target")
+        .unwrap();
+    target.write_raw(&[1i32, 2, 3, 4]).unwrap();
+    let grp = file.create_group("grp").unwrap();
+    let refs = file
+        .new_dataset::<u64>()
+        .object_references()
+        .shape([5])
+        .create("refs")
+        .unwrap();
+    refs.write_object_references(&["/target", "grp", "/"])
+        .unwrap();
+    // A dataset created after the reference was stored still resolves: the
+    // address is stamped in at close.
+    let late = grp.new_dataset::<i32>().shape([2]).create("late").unwrap();
+    late.write_raw(&[7i32, 8]).unwrap();
+    file.close().unwrap();
+
+    read_back_with_h5py(
+        py,
+        &path,
+        "r = f['refs']\n\
+         assert r.dtype == h5py.ref_dtype, r.dtype\n\
+         assert f[r[0]].name == '/target', f[r[0]].name\n\
+         assert (f[r[0]][:] == [1, 2, 3, 4]).all(), f[r[0]][:]\n\
+         assert f[r[1]].name == '/grp', f[r[1]].name\n\
+         assert f[r[2]].name == '/', f[r[2]].name\n\
+         assert not bool(r[3]), 'unwritten element must be a null reference'\n\
+         assert not bool(r[4]), 'unwritten element must be a null reference'\n",
+    );
+
+    // The same file reads back through this crate.
+    let file = H5File::open(&path).unwrap();
+    let got = file.dataset("refs").unwrap().read_references().unwrap();
+    assert_eq!(
+        got.iter().map(|r| r.path()).collect::<Vec<_>>(),
+        vec![Some("/target"), Some("/grp"), Some("/"), None, None]
+    );
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}
+
+/// A reference to a path that names nothing is refused at the call that got
+/// it wrong, not silently stored as a null.
+#[test]
+fn a_reference_to_a_missing_path_is_refused() {
+    let path = tmp("ref_object_missing");
+    let file = H5File::create(&path).unwrap();
+    let refs = file
+        .new_dataset::<u64>()
+        .object_references()
+        .shape([1])
+        .create("refs")
+        .unwrap();
+    let err = refs
+        .write_object_references(&["/nope"])
+        .expect_err("must refuse")
+        .to_string();
+    assert!(err.contains("/nope"), "got: {err}");
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}
