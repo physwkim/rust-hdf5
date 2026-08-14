@@ -2524,6 +2524,15 @@ impl Hdf5Writer {
         self.ds(index).lock().dataspace.dims.clone()
     }
 
+    /// Return the datatype a dataset declares on disk.
+    ///
+    /// The typed write paths need it to store bytes in the declared byte
+    /// order; a reopened dataset handle has no copy of its own, and a cached
+    /// one could disagree with what the header will say.
+    pub fn dataset_datatype(&self, index: usize) -> DatatypeMessage {
+        self.ds(index).lock().datatype.clone()
+    }
+
     /// Return the names of all groups created so far.
     pub fn group_names(&self) -> Vec<String> {
         self.group_refs()

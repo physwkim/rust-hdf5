@@ -6,7 +6,7 @@
 //! skip (pass) when neither is present, so CI without h5py is green.
 
 use rust_hdf5::types::VarLenUnicode;
-use rust_hdf5::H5File;
+use rust_hdf5::{ByteOrder, DatatypeMessage, H5File};
 
 const TEST_PYTHON: &str = "/Users/stevek/mamba/envs/bs2026.1/bin/python";
 
@@ -1530,5 +1530,142 @@ fn big_endian_compound_from_h5py_is_refused_by_typed_reads() {
         .to_string();
     assert!(err.contains("read_raw_bytes"), "got: {err}");
     assert_eq!(ds.read_raw_bytes().unwrap().len(), 16);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A dataset that declares big-endian stores big-endian: the typed write
+/// paths convert the host image of a `T` into the declared order, so h5py
+/// reads back the values that were written and the stored payload really is
+/// big-endian.
+#[test]
+fn big_endian_datasets_written_by_rust_read_as_values() {
+    let Some(py) = python() else { return };
+    let path = tmp("big_endian_write");
+    let be_i32 = DatatypeMessage::FixedPoint {
+        size: 4,
+        byte_order: ByteOrder::BigEndian,
+        signed: true,
+        bit_offset: 0,
+        bit_precision: 32,
+    };
+    let values: Vec<i32> = vec![-2, -1, 0, 1, 70000, 2, 3, 4];
+    {
+        let file = H5File::create(&path).unwrap();
+        // write_raw over a contiguous dataset.
+        let ds = file
+            .new_dataset::<i32>()
+            .datatype(be_i32.clone())
+            .shape([8])
+            .create("whole")
+            .unwrap();
+        ds.write_raw(&values).unwrap();
+
+        // write_slice into a sub-region.
+        let ds = file
+            .new_dataset::<i32>()
+            .datatype(be_i32.clone())
+            .shape([8])
+            .create("part")
+            .unwrap();
+        ds.write_slice(&[2], &[3], &values[2..5]).unwrap();
+
+        // append into a chunked dataset.
+        let ds = file
+            .new_dataset::<i32>()
+            .datatype(be_i32.clone())
+            .shape([0])
+            .chunk(&[4])
+            .max_shape(&[None])
+            .create("grown")
+            .unwrap();
+        ds.append(&values[..4]).unwrap();
+
+        // A fill value is one element in the dataset's own datatype, and it is
+        // all a never-written dataset holds.
+        file.new_dataset::<i32>()
+            .datatype(be_i32.clone())
+            .shape([3])
+            .fill_value(-7i32)
+            .create("unwritten")
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    // The stored payload, byte for byte: the whole-image dataset holds the
+    // big-endian image of `values`, not the host one.
+    let file = H5File::open(&path).unwrap();
+    let expected: Vec<u8> = values.iter().flat_map(|v| v.to_be_bytes()).collect();
+    assert_eq!(
+        file.dataset("whole").unwrap().read_raw_bytes().unwrap(),
+        expected
+    );
+    assert_eq!(
+        file.dataset("part").unwrap().read_raw_bytes().unwrap()[8..20],
+        expected[8..20]
+    );
+
+    read_back_with_h5py(
+        py,
+        &path,
+        &format!(
+            "want = np.array({values:?}, dtype='>i4')\n\
+             assert f['whole'].dtype.byteorder == '>', f['whole'].dtype\n\
+             assert (f['whole'][:] == want).all(), f['whole'][:]\n\
+             assert (f['part'][2:5] == want[2:5]).all(), f['part'][:]\n\
+             assert f['grown'].shape == (4,), f['grown'].shape\n\
+             assert (f['grown'][:] == want[:4]).all(), f['grown'][:]\n\
+             assert (f['unwritten'][:] == -7).all(), f['unwritten'][:]\n"
+        ),
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A compound element cannot be laid out as a unit, so a typed write into one
+/// that declares big-endian members is refused rather than storing host bytes
+/// under that declaration. `write_raw_bytes` still takes an encoded image.
+#[test]
+fn big_endian_compound_is_refused_by_typed_writes() {
+    let path = tmp("big_endian_compound_write");
+    let be_member = DatatypeMessage::FixedPoint {
+        size: 4,
+        byte_order: ByteOrder::BigEndian,
+        signed: true,
+        bit_offset: 0,
+        bit_precision: 32,
+    };
+    let file = H5File::create(&path).unwrap();
+    let ds = file
+        .new_dataset::<u8>()
+        .datatype(DatatypeMessage::Compound {
+            size: 8,
+            members: vec![
+                rust_hdf5::format::messages::datatype::CompoundMember {
+                    name: "x".into(),
+                    offset: 0,
+                    datatype: be_member.clone(),
+                },
+                rust_hdf5::format::messages::datatype::CompoundMember {
+                    name: "y".into(),
+                    offset: 4,
+                    datatype: be_member,
+                },
+            ],
+        })
+        .shape([2])
+        .create("recs")
+        .unwrap();
+    let err = ds
+        .write_raw(&[0u64, 0])
+        .expect_err("must refuse")
+        .to_string();
+    assert!(err.contains("write_raw_bytes"), "got: {err}");
+
+    let mut bytes = Vec::new();
+    for (x, y) in [(1i32, 2i32), (3, 4)] {
+        bytes.extend_from_slice(&x.to_be_bytes());
+        bytes.extend_from_slice(&y.to_be_bytes());
+    }
+    ds.write_raw_bytes(&bytes).unwrap();
+    file.close().unwrap();
     std::fs::remove_file(&path).ok();
 }

@@ -993,7 +993,21 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         "int_i64le" => simple_ramp::<i64>(path, ramp_n::<i64>(8)),
         "int_u64le" => simple_ramp::<u64>(path, ramp_n::<u64>(8)),
         "int_i16be" => be_ramp(path, DatatypeMessage::i16_type(), 2),
-        "int_i32be" => be_ramp(path, DatatypeMessage::i32_type(), 4),
+        // The one big-endian case written through the *typed* path: the
+        // values handed over are host-order `i32`s, and the file has to hold
+        // their big-endian image. Its siblings keep writing a pre-swapped
+        // byte image, so both write styles stay covered.
+        "int_i32be" => {
+            let file = H5File::create(path)?;
+            let ds = file
+                .new_dataset::<i32>()
+                .datatype(be_of(DatatypeMessage::i32_type()))
+                .shape([8usize])
+                .create("data")?;
+            ds.write_raw(&(0..8i32).collect::<Vec<_>>())?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "int_u64be" => be_ramp(path, DatatypeMessage::u64_type(), 8),
 
         // ---- floats -----------------------------------------------------

@@ -226,7 +226,6 @@ impl<T: H5Type> DatasetBuilder<T> {
             name.to_string()
         };
         let group_path = self.group_path.clone();
-        let fill_value = self.fill_value.clone();
 
         let dims_u64: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
         let datatype = self.datatype_override.clone().unwrap_or_else(T::hdf5_type);
@@ -237,6 +236,14 @@ impl<T: H5Type> DatasetBuilder<T> {
         // allocation, and the `write_raw` length check all agree with the bytes
         // libhdf5/h5py will read.
         let element_size = datatype.element_size() as usize;
+        // `fill_value` took the host image of a `T`; the fill-value message
+        // holds one element in the dataset's own datatype, so it is converted
+        // here — the order is only known once the override is resolved, and
+        // the builder's calls can arrive in either order.
+        let fill_value = match self.fill_value.as_deref() {
+            Some(bytes) => Some(to_stored_byte_order(bytes, &datatype, element_size)?.into_owned()),
+            None => None,
+        };
 
         // A filter pipeline requires chunked storage. When a filter is
         // requested without explicit chunk dimensions, store the whole
@@ -490,17 +497,48 @@ pub(crate) const HOST_BYTE_ORDER: ByteOrder = if cfg!(target_endian = "big") {
     ByteOrder::LittleEndian
 };
 
+/// The byte order this build does not read or write natively.
+pub(crate) const FOREIGN_BYTE_ORDER: ByteOrder = match HOST_BYTE_ORDER {
+    ByteOrder::LittleEndian => ByteOrder::BigEndian,
+    ByteOrder::BigEndian => ByteOrder::LittleEndian,
+};
+
+/// What a typed access has to do with an element image of a given datatype.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ByteOrderAction {
+    /// Stored order is the host's: the image is already the typed value.
+    Keep,
+    /// The whole element is one scalar in the foreign order: reverse it.
+    SwapElements,
+    /// A composite storing something in the foreign order.
+    Refuse,
+}
+
+/// Classify a datatype for a typed access of element width `width`.
+///
+/// The single owner of the rule; both directions ask it, so a type a read
+/// converts is exactly a type a write converts.
+///
+/// A composite element cannot be swapped as a unit — its members have their
+/// own orders and offsets — so one that touches the foreign order is refused
+/// rather than silently passed through in the wrong order.
+fn byte_order_action(datatype: &DatatypeMessage, width: usize) -> ByteOrderAction {
+    match datatype.scalar_byte_order() {
+        Some(order) if order == FOREIGN_BYTE_ORDER && width > 1 => ByteOrderAction::SwapElements,
+        Some(_) => ByteOrderAction::Keep,
+        None if datatype.contains_byte_order(FOREIGN_BYTE_ORDER) => ByteOrderAction::Refuse,
+        None => ByteOrderAction::Keep,
+    }
+}
+
 /// Put a raw element image into host byte order, in place, for a typed read.
 ///
-/// The single owner of byte order for every path that reinterprets the
-/// on-disk image as `T` — `read_raw`, `read_slice`, `read_raw_into`,
-/// `read_slice_into` and their SWMR counterparts. Reinterpretation only
-/// yields the stored value when the stored order is the host's, so a type
-/// whose whole element is one scalar is swapped here.
+/// Every path that reinterprets the on-disk image as `T` — `read_raw`,
+/// `read_slice`, `read_raw_into`, `read_slice_into` and their SWMR
+/// counterparts — passes through here. Reinterpretation only yields the
+/// stored value when the stored order is the host's.
 ///
-/// A composite element cannot be swapped as a unit: its members have their
-/// own orders and offsets. One that stores anything in the foreign order is
-/// refused, because no reinterpretation of those bytes is the stored value;
+/// A refused datatype is one no reinterpretation can decode;
 /// [`H5Dataset::read_raw_bytes`] hands over the image for the caller to
 /// decode member by member.
 ///
@@ -510,27 +548,57 @@ pub(crate) fn to_host_byte_order(
     datatype: &DatatypeMessage,
     width: usize,
 ) -> Result<()> {
-    let foreign = match HOST_BYTE_ORDER {
-        ByteOrder::LittleEndian => ByteOrder::BigEndian,
-        ByteOrder::BigEndian => ByteOrder::LittleEndian,
-    };
-    match datatype.scalar_byte_order() {
-        Some(order) if order == foreign && width > 1 => {
+    match byte_order_action(datatype, width) {
+        ByteOrderAction::Keep => {}
+        ByteOrderAction::SwapElements => {
             for elem in bytes.chunks_exact_mut(width) {
                 elem.reverse();
             }
         }
-        Some(_) => {}
-        None if datatype.contains_byte_order(foreign) => {
+        ByteOrderAction::Refuse => {
             return Err(Hdf5Error::TypeMismatch(format!(
-                "dataset datatype {datatype} stores {foreign:?} values, which a typed read \
-                 cannot reinterpret element by element; read_raw_bytes() returns the image \
-                 to decode member by member"
+                "dataset datatype {datatype} stores {FOREIGN_BYTE_ORDER:?} values, which a \
+                 typed read cannot reinterpret element by element; read_raw_bytes() returns \
+                 the image to decode member by member"
             )))
         }
-        None => {}
     }
     Ok(())
+}
+
+/// Put a typed value's host-order image into the order the datatype declares.
+///
+/// The write-side counterpart of [`to_host_byte_order`], and the one place
+/// every path that hands a `&[T]` to the file — `write_raw`, `write_slice`,
+/// `append`, and the builder's fill value — turns those bytes into stored
+/// bytes. A `T` is written from its host image, so a dataset declaring the
+/// foreign order would otherwise hold host bytes under that declaration: a
+/// file that is wrong by its own header.
+///
+/// Borrows when the declared order is the host's, which is every write that
+/// does not set a [`datatype`](DatasetBuilder::datatype) override.
+///
+/// `width` is the element size, already checked equal to `T::element_size()`.
+pub(crate) fn to_stored_byte_order<'a>(
+    bytes: &'a [u8],
+    datatype: &DatatypeMessage,
+    width: usize,
+) -> Result<std::borrow::Cow<'a, [u8]>> {
+    match byte_order_action(datatype, width) {
+        ByteOrderAction::Keep => Ok(std::borrow::Cow::Borrowed(bytes)),
+        ByteOrderAction::SwapElements => {
+            let mut owned = bytes.to_vec();
+            for elem in owned.chunks_exact_mut(width) {
+                elem.reverse();
+            }
+            Ok(std::borrow::Cow::Owned(owned))
+        }
+        ByteOrderAction::Refuse => Err(Hdf5Error::TypeMismatch(format!(
+            "dataset datatype {datatype} stores {FOREIGN_BYTE_ORDER:?} values, which a typed \
+             write cannot lay out element by element; write_raw_bytes() takes the image the \
+             caller encodes member by member"
+        ))),
+    }
 }
 
 /// Strip a fixed-string element's padding, leaving the bytes that carry the
@@ -866,8 +934,20 @@ impl H5Dataset {
                 // byte representation. The resulting slice borrows `data` and
                 // lives only as long as this block.
                 let byte_len = data.len() * T::element_size();
-                let raw =
+                let host =
                     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
+                let datatype = {
+                    let inner = borrow_inner(&self.file_inner);
+                    match &*inner {
+                        H5FileInner::Writer(writer) => writer.dataset_datatype(*index),
+                        _ => {
+                            return Err(Hdf5Error::InvalidState(
+                                "file is no longer in write mode".into(),
+                            ))
+                        }
+                    }
+                };
+                let stored = to_stored_byte_order(host, &datatype, T::element_size())?;
 
                 if *chunked {
                     // A chunked dataset has no contiguous data block; scatter
@@ -877,7 +957,7 @@ impl H5Dataset {
                         *index,
                         *btree2,
                         *fixed_array,
-                        raw,
+                        &stored,
                         *element_size,
                     );
                 }
@@ -885,7 +965,7 @@ impl H5Dataset {
                 let inner = borrow_inner(&self.file_inner);
                 match &*inner {
                     H5FileInner::Writer(writer) => {
-                        writer.write_dataset_raw(*index, raw)?;
+                        writer.write_dataset_raw(*index, &stored)?;
                         Ok(())
                     }
                     _ => Err(Hdf5Error::InvalidState(
@@ -1639,9 +1719,11 @@ impl H5Dataset {
                 let chunk_dim0 = chunk_dims[0] as usize;
                 let frame_bytes = frame_elems * es;
 
-                let raw = unsafe {
+                let host = unsafe {
                     std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * es)
                 };
+                let datatype = writer.dataset_datatype(ds_index);
+                let raw = to_stored_byte_order(host, &datatype, es)?;
 
                 // Merge the buffer with the new frames when it is the
                 // dataset's tail; a buffer left mid-extent (the extent moved
@@ -1658,7 +1740,7 @@ impl H5Dataset {
                     }
                     None => (current_dim0, 0, Vec::new()),
                 };
-                combined.extend_from_slice(raw);
+                combined.extend_from_slice(&raw);
 
                 let total_frames = buffered_frames + n_new_frames;
 
@@ -1886,13 +1968,15 @@ impl H5Dataset {
                 let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
 
                 let byte_len = data.len() * T::element_size();
-                let raw =
+                let host =
                     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
 
                 let inner = borrow_inner(&self.file_inner);
                 match &*inner {
                     H5FileInner::Writer(writer) => {
-                        writer.write_slice(*index, &starts_u64, &counts_u64, raw)?;
+                        let datatype = writer.dataset_datatype(*index);
+                        let stored = to_stored_byte_order(host, &datatype, T::element_size())?;
+                        writer.write_slice(*index, &starts_u64, &counts_u64, &stored)?;
                         Ok(())
                     }
                     _ => Err(Hdf5Error::InvalidState(
@@ -5325,6 +5409,63 @@ mod tests {
             .to_string();
         assert!(err.contains("read_raw_bytes"), "got: {err}");
         assert_eq!(buf, [1, 2, 3, 4], "the refused image is left alone");
+    }
+
+    /// The write direction answers for exactly the types the read direction
+    /// does — same classifier — and borrows the caller's bytes whenever the
+    /// declared order is already the host's.
+    #[test]
+    fn to_stored_byte_order_converts_scalars_and_refuses_composites() {
+        use crate::dataset::{to_stored_byte_order, FOREIGN_BYTE_ORDER, HOST_BYTE_ORDER};
+        use std::borrow::Cow;
+
+        let int = |order, size| DatatypeMessage::FixedPoint {
+            size,
+            byte_order: order,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: (size * 8) as u16,
+        };
+
+        // Declared foreign: each element is reversed on the way out.
+        let host = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let stored = to_stored_byte_order(&host, &int(FOREIGN_BYTE_ORDER, 4), 4).unwrap();
+        assert_eq!(&*stored, &[4, 3, 2, 1, 8, 7, 6, 5]);
+        assert!(matches!(stored, Cow::Owned(_)), "a swap needs its own copy");
+
+        // Declared host order: handed through without a copy.
+        let stored = to_stored_byte_order(&host, &int(HOST_BYTE_ORDER, 4), 4).unwrap();
+        assert!(matches!(stored, Cow::Borrowed(_)), "no copy without a swap");
+        assert_eq!(&*stored, &host);
+
+        // One byte wide: no order to lay out.
+        let stored = to_stored_byte_order(&host, &int(FOREIGN_BYTE_ORDER, 1), 1).unwrap();
+        assert_eq!(&*stored, &host);
+
+        // An enum stores its values in its base type's order.
+        let enumeration = DatatypeMessage::Enum {
+            base: Box::new(int(FOREIGN_BYTE_ORDER, 2)),
+            members: Vec::new(),
+        };
+        let stored = to_stored_byte_order(&[1u8, 2], &enumeration, 2).unwrap();
+        assert_eq!(&*stored, &[2, 1]);
+
+        // A compound cannot be laid out as a unit; one that declares the
+        // foreign order for a member is refused, not written host-order.
+        let compound = |order| DatatypeMessage::Compound {
+            size: 4,
+            members: vec![CompoundMember {
+                name: "x".into(),
+                offset: 0,
+                datatype: int(order, 4),
+            }],
+        };
+        let stored = to_stored_byte_order(&[1u8, 2, 3, 4], &compound(HOST_BYTE_ORDER), 4).unwrap();
+        assert_eq!(&*stored, &[1, 2, 3, 4]);
+        let err = to_stored_byte_order(&[1u8, 2, 3, 4], &compound(FOREIGN_BYTE_ORDER), 4)
+            .expect_err("a foreign-order compound was written from host bytes")
+            .to_string();
+        assert!(err.contains("write_raw_bytes"), "got: {err}");
     }
 
     /// The declared character set is enforced: a byte that cannot be decoded is
