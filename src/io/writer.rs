@@ -4253,22 +4253,55 @@ impl Hdf5Writer {
 
     /// Create a 1-D variable-length byte-array dataset.
     ///
-    /// Each item's bytes are stored as a global-heap object and the dataset
-    /// holds one vlen reference per item (same on-disk shape as a vlen string
-    /// dataset). The datatype is a vlen sequence of `u8`, so h5py reads it back
-    /// as an array of variable-length `uint8` arrays. `seq_len` is the number
-    /// of base (`u8`) elements, i.e. the byte length; no null terminator is
-    /// appended.
+    /// The `u8` case of [`create_vlen_sequence_dataset`], where an item's
+    /// byte image and its element count are the same number.
+    ///
+    /// [`create_vlen_sequence_dataset`]: Self::create_vlen_sequence_dataset
     pub fn create_vlen_bytes_dataset(&self, name: &str, items: &[&[u8]]) -> IoResult<usize> {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        self.create_vlen_sequence_dataset(name, DatatypeMessage::u8_type(), items)
+    }
+
+    /// Create a 1-D variable-length sequence dataset over `base`.
+    ///
+    /// Each item is the encoded image of one sequence — `n * base.element_size()`
+    /// bytes in the base type's own byte order — and is stored as a global-heap
+    /// object; the dataset holds one vlen reference per item, the same on-disk
+    /// shape a vlen string dataset has. The `H5T_VLEN` length field counts base
+    /// elements rather than bytes, so an image whose length is not a whole
+    /// number of elements is refused here rather than stored under a length
+    /// that misreads it.
+    pub fn create_vlen_sequence_dataset(
+        &self,
+        name: &str,
+        base: DatatypeMessage,
+        items: &[&[u8]],
+    ) -> IoResult<usize> {
         use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
+
+        let elem_size = base.element_size() as usize;
+        if elem_size == 0 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "vlen base datatype {base} has no element size"
+            )));
+        }
+        for (i, item) in items.iter().enumerate() {
+            if !item.len().is_multiple_of(elem_size) {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "sequence {i} is {} bytes, not a whole number of {elem_size}-byte elements",
+                    item.len()
+                )));
+            }
+        }
 
         let create = self.begin_create(name)?;
         let name = create.name.as_str();
         let num_items = items.len() as u64;
 
-        // Store the byte arrays as heap objects, sharing collection blocks
-        // as `create_vlen_string_dataset` does.
+        // Store the sequence images as heap objects, sharing collection
+        // blocks as `create_vlen_string_dataset` does.
         let placements = self.insert_vlen_objects(items)?;
 
         // Build raw data: one vlen reference per item.
@@ -4276,8 +4309,7 @@ impl Hdf5Writer {
         let data_size = (num_items as usize) * ref_size;
         let mut raw_data = Vec::with_capacity(data_size);
         for (i, &(gcol_addr, obj_idx)) in placements.iter().enumerate() {
-            // base is u8, so element count == byte count.
-            let seq_len = crate::format::global_heap::vlen_seq_len(items[i].len())?;
+            let seq_len = crate::format::global_heap::vlen_seq_len(items[i].len() / elem_size)?;
             raw_data.extend_from_slice(&encode_vlen_reference(
                 seq_len,
                 gcol_addr,
@@ -4290,8 +4322,9 @@ impl Hdf5Writer {
         let data_addr = self.allocator.allocate(data_size as u64);
         self.handle.write_at(data_addr, &raw_data)?;
 
-        // Create the dataset with a vlen byte-array datatype.
-        let datatype = DatatypeMessage::vlen_bytes();
+        let datatype = DatatypeMessage::VarLenSequence {
+            base: Box::new(base),
+        };
         let dataspace = crate::format::messages::dataspace::DataspaceMessage::simple(&[num_items]);
 
         let idx = self.push_dataset(
@@ -7949,6 +7982,35 @@ mod tests {
                 ),
             }
         }
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The `H5T_VLEN` length field counts base elements, so an image that is
+    /// not a whole number of them has no length that reads back as what was
+    /// handed over; it is refused at the call rather than stored truncated.
+    #[test]
+    fn vlen_sequence_refuses_a_partial_element() {
+        let path = temp_path("vlen_partial_element");
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let err = writer
+            .create_vlen_sequence_dataset("d", DatatypeMessage::i32_type(), &[&[1u8, 2, 3, 4, 5]])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("5 bytes"), "unexpected error: {err}");
+        assert!(err.contains("4-byte elements"), "unexpected error: {err}");
+
+        // The refusal is the length rule alone: the same base takes a whole
+        // number of elements, and an empty sequence is a legal one.
+        writer
+            .create_vlen_sequence_dataset(
+                "d",
+                DatatypeMessage::i32_type(),
+                &[&[1u8, 2, 3, 4], &[][..]],
+            )
+            .unwrap();
 
         writer.close().unwrap();
         std::fs::remove_file(&path).ok();

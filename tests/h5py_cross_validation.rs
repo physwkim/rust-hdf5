@@ -1924,3 +1924,51 @@ fn the_libver_bound_picks_the_datatype_message_version() {
         std::fs::remove_file(&path).ok();
     }
 }
+
+/// A vlen sequence over a base wider than a byte is read back by h5py as the
+/// typed vlen dtype `h5py.vlen_dtype` produces, with the values intact —
+/// which only holds if the `H5T_VLEN` length field counts elements and the
+/// heap object holds the base type's own byte order.
+#[test]
+fn vlen_numeric_written_by_rust_read_typed_by_h5py() {
+    let Some(py) = python() else { return };
+
+    let path = tmp("vlen_i32_rw");
+    let a: &[i32] = &[1, 2, 3];
+    let b: &[i32] = &[];
+    let c: &[i32] = &[-7];
+    {
+        let file = H5File::create(&path).unwrap();
+        file.write_vlen_numeric("data", &[a, b, c]).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['data']\n\
+         assert h5py.check_vlen_dtype(ds.dtype) == np.dtype('<i4'), ds.dtype\n\
+         got = [list(int(v) for v in x) for x in ds[...]]\n\
+         assert got == [[1, 2, 3], [], [-7]], got\n",
+    );
+    std::fs::remove_file(&path).ok();
+
+    // The same holds for a float base and for a dataset inside a group.
+    let path = tmp("vlen_f64_rw");
+    let x: &[f64] = &[1.5, -2.5, 1e300];
+    let y: &[f64] = &[0.0];
+    {
+        let file = H5File::create(&path).unwrap();
+        let grp = file.root_group().create_group("g").unwrap();
+        grp.write_vlen_numeric("wave", &[x, y]).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['g/wave']\n\
+         assert h5py.check_vlen_dtype(ds.dtype) == np.dtype('<f8'), ds.dtype\n\
+         got = [list(float(v) for v in x) for x in ds[...]]\n\
+         assert got == [[1.5, -2.5, 1e300], [0.0]], got\n",
+    );
+    std::fs::remove_file(&path).ok();
+}

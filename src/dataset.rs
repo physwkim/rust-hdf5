@@ -617,6 +617,33 @@ pub(crate) fn to_host_byte_order(
     Ok(())
 }
 
+/// The stored byte image of each variable-length sequence in a batch.
+///
+/// The vlen writers take `&[&[T]]` and store one global-heap object per
+/// sequence, so each sequence needs the same host-image-to-stored-image step
+/// [`to_stored_byte_order`] performs for a fixed-shape write — a `T` is
+/// written from its host bytes, and `T::hdf5_type()` declares little-endian.
+/// Borrows on a little-endian host, which is every machine that does not have
+/// to swap.
+pub(crate) fn vlen_sequence_images<'a, T: H5Type>(
+    items: &'a [&'a [T]],
+) -> Result<Vec<std::borrow::Cow<'a, [u8]>>> {
+    let base = T::hdf5_type();
+    items
+        .iter()
+        .map(|item| {
+            // Safety: the same contract `write_raw` relies on — `T: Copy +
+            // 'static` is a numeric primitive whose byte image is its value —
+            // and the extent comes from the slice itself, so it cannot name
+            // memory past it. The result borrows `items` and outlives nothing.
+            let host = unsafe {
+                std::slice::from_raw_parts(item.as_ptr() as *const u8, std::mem::size_of_val(*item))
+            };
+            to_stored_byte_order(host, &base, T::element_size())
+        })
+        .collect()
+}
+
 /// Put a typed value's host-order image into the order the datatype declares.
 ///
 /// The write-side counterpart of [`to_host_byte_order`], and the one place

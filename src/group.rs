@@ -262,7 +262,19 @@ impl H5Group {
     /// sequence of `u8`. h5py reads it back as an array of `uint8` arrays.
     /// Returns a writer-mode handle so attributes can be attached, like
     /// [`write_vlen_strings`](Self::write_vlen_strings).
+    ///
+    /// The `u8` case of [`write_vlen_numeric`](Self::write_vlen_numeric).
     pub fn write_vlen_bytes(&self, name: &str, items: &[&[u8]]) -> Result<H5Dataset> {
+        self.write_vlen_numeric(name, items)
+    }
+
+    /// Create a variable-length numeric-sequence dataset within this group.
+    ///
+    /// The group-level twin of
+    /// [`H5File::write_vlen_numeric`](crate::H5File::write_vlen_numeric).
+    pub fn write_vlen_numeric<T: H5Type>(&self, name: &str, items: &[&[T]]) -> Result<H5Dataset> {
+        let images = crate::dataset::vlen_sequence_images(items)?;
+        let images: Vec<&[u8]> = images.iter().map(|c| c.as_ref()).collect();
         let full_name = if self.name == "/" {
             name.to_string()
         } else {
@@ -273,7 +285,8 @@ impl H5Group {
         let inner = borrow_inner(&self.file_inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let idx = writer.create_vlen_bytes_dataset(&full_name, items)?;
+                let idx =
+                    writer.create_vlen_sequence_dataset(&full_name, T::hdf5_type(), &images)?;
                 if self.name != "/" {
                     writer.assign_dataset_to_group(&self.name, idx)?;
                 }

@@ -1366,6 +1366,15 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "vlen_numeric" => {
+            let file = H5File::create(path)?;
+            let a: &[i32] = &[1, 2, 3];
+            let b: &[i32] = &[];
+            let c: &[i32] = &[-7];
+            file.write_vlen_numeric("data", &[a, b, c])?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "opaque" => {
             let file = H5File::create(path)?;
             let bytes: Vec<u8> = (0u8..12).collect();

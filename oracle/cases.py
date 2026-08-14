@@ -393,7 +393,7 @@ COMPOSITE_CASES = [
          "object references to a dataset and a group"),
     Case("ref_region", "dtype-composite", gen_ref_region, "ref_region",
          "dataset region references"),
-    Case("vlen_numeric", "dtype-composite", gen_vlen_numeric, None,
+    Case("vlen_numeric", "dtype-composite", gen_vlen_numeric, "vlen_numeric",
          "variable-length i32 sequences"),
     Case("vlen_bytes", "dtype-composite", gen_vlen_bytes, "vlen_bytes",
          "variable-length u8 sequences"),

@@ -487,11 +487,35 @@ impl H5File {
     /// sequence of `u8` in global heap storage. h5py reads it back as an array
     /// of `uint8` arrays. Returns a writer-mode handle so attributes can be
     /// attached, like [`write_vlen_strings`](Self::write_vlen_strings).
+    ///
+    /// The `u8` case of [`write_vlen_numeric`](Self::write_vlen_numeric).
     pub fn write_vlen_bytes(&self, name: &str, items: &[&[u8]]) -> Result<H5Dataset> {
+        self.write_vlen_numeric(name, items)
+    }
+
+    /// Create a variable-length numeric-sequence dataset and write data.
+    ///
+    /// Each `&[T]` becomes one element of variable length, stored as a global
+    /// heap object under a vlen sequence datatype over `T`; h5py reads the
+    /// dataset back as an array of `T`-typed arrays, the type
+    /// `h5py.vlen_dtype(np.dtype(...))` produces. Sequences may have any
+    /// length, including zero. Returns a writer-mode handle so attributes can
+    /// be attached, like [`write_vlen_strings`](Self::write_vlen_strings).
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("v.h5").unwrap();
+    /// let a: &[i32] = &[1, 2, 3];
+    /// let b: &[i32] = &[];
+    /// file.write_vlen_numeric("data", &[a, b]).unwrap();
+    /// ```
+    pub fn write_vlen_numeric<T: H5Type>(&self, name: &str, items: &[&[T]]) -> Result<H5Dataset> {
+        let images = crate::dataset::vlen_sequence_images(items)?;
+        let images: Vec<&[u8]> = images.iter().map(|c| c.as_ref()).collect();
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let idx = writer.create_vlen_bytes_dataset(name, items)?;
+                let idx = writer.create_vlen_sequence_dataset(name, T::hdf5_type(), &images)?;
                 // If the name contains '/', assign the dataset to its parent group
                 if let Some(slash_pos) = name.rfind('/') {
                     let group_path = &name[..slash_pos];
@@ -1935,6 +1959,89 @@ mod integration_tests {
             let expected: Vec<Vec<u8>> = items.iter().map(|s| s.to_vec()).collect();
             assert_eq!(got, expected);
         }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A vlen sequence over a wider base stores element counts, not byte
+    /// counts, in the `H5T_VLEN` length field, and the datatype names the
+    /// base — so the file says what it holds for every width.
+    #[test]
+    fn vlen_numeric_write_read() {
+        use crate::format::global_heap::decode_vlen_reference;
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let path = temp_path("vlen_numeric_wr");
+        let a: &[i32] = &[1, 2, 3];
+        let b: &[i32] = &[];
+        let c: &[i32] = &[-7];
+        {
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_numeric("data", &[a, b, c]).unwrap();
+            let f64s: &[f64] = &[1.5, -2.5];
+            file.write_vlen_numeric("wide", &[f64s]).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("data").unwrap();
+        assert_eq!(
+            ds.datatype().unwrap(),
+            DatatypeMessage::VarLenSequence {
+                base: Box::new(DatatypeMessage::i32_type()),
+            }
+        );
+        let decoded: Vec<Vec<i32>> = ds
+            .read_vlen_bytes()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                item.chunks_exact(4)
+                    .map(|w| i32::from_le_bytes(w.try_into().unwrap()))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(decoded, vec![a.to_vec(), b.to_vec(), c.to_vec()]);
+
+        // The length field counts elements: 3 i32s, not 12 bytes.
+        let ctx = crate::format::FormatContext::default_v3();
+        let raw = ds.read_raw_bytes().unwrap();
+        let (seq_len, _, _) = decode_vlen_reference(&raw, &ctx).unwrap();
+        assert_eq!(seq_len, 3);
+
+        let wide = file.dataset("wide").unwrap();
+        assert_eq!(
+            wide.datatype().unwrap(),
+            DatatypeMessage::VarLenSequence {
+                base: Box::new(DatatypeMessage::f64_type()),
+            }
+        );
+        let (seq_len, _, _) = decode_vlen_reference(&wide.read_raw_bytes().unwrap(), &ctx).unwrap();
+        assert_eq!(seq_len, 2);
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `write_vlen_bytes` is the `u8` case of the same writer, so the byte
+    /// datatype and the byte-per-element length field are unchanged.
+    #[test]
+    fn vlen_bytes_is_the_u8_case_of_vlen_numeric() {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let path = temp_path("vlen_bytes_u8");
+        let items: [&[u8]; 2] = [b"abc", b""];
+        {
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_bytes("blobs", &items).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("blobs").unwrap();
+        assert_eq!(ds.datatype().unwrap(), DatatypeMessage::vlen_bytes());
+        let ctx = crate::format::FormatContext::default_v3();
+        let (seq_len, _, _) =
+            crate::format::global_heap::decode_vlen_reference(&ds.read_raw_bytes().unwrap(), &ctx)
+                .unwrap();
+        assert_eq!(seq_len, 3);
+        drop(file);
         std::fs::remove_file(&path).ok();
     }
 
