@@ -284,14 +284,11 @@ impl H5Attribute {
         match &mut *inner {
             H5FileInner::Reader(reader) => Ok(reader.attr_string_value(attr)?),
             _ => {
-                // No reader available — fall back to the raw fixed-length
-                // interpretation.
-                let end = attr
-                    .data
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(attr.data.len());
-                Ok(String::from_utf8_lossy(&attr.data[..end]).to_string())
+                // No reader available, so a variable-length value cannot be
+                // resolved through the heap — but a fixed-length one is right
+                // here, and its padding rule is read the same way it is on the
+                // reader path.
+                Ok(crate::io::reader::fixed_string_attr_value(attr)?)
             }
         }
     }

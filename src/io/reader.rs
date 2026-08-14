@@ -170,6 +170,33 @@ fn saturating_byte_len(dims: &[u64], element_size: u64) -> u64 {
         .saturating_mul(element_size)
 }
 
+/// A fixed-length string attribute's value, under the padding rule its
+/// datatype declares.
+///
+/// The single owner for the attribute side of that rule: both
+/// [`H5Reader::attr_string_value`] and the writer-mode fallback in
+/// `H5Attribute::read_string` end here, so a space-padded attribute does not
+/// read back with its padding attached on one path and not the other. Bytes
+/// that are not valid UTF-8 become U+FFFD, as they always have on this path.
+///
+/// A datatype that is not a string at all is read as null-terminated, which is
+/// what asking for the string value of, say, an integer attribute has always
+/// meant here.
+pub(crate) fn fixed_string_attr_value(attr: &AttributeMessage) -> IoResult<String> {
+    use crate::format::messages::datatype::{fixed_string_content, DatatypeMessage};
+    let padding = match attr.datatype {
+        DatatypeMessage::FixedString { padding, .. } => padding,
+        _ => 0,
+    };
+    let content = fixed_string_content(&attr.data, padding).ok_or_else(|| {
+        crate::io::IoError::InvalidState(format!(
+            "attribute {:?} uses string padding rule {padding}, which the format reserves",
+            attr.name
+        ))
+    })?;
+    Ok(String::from_utf8_lossy(content).to_string())
+}
+
 /// Materialize a `total`-byte fill buffer, mapping allocation failure to a
 /// clean error. `total` on a read path comes from untrusted file fields, so
 /// a crafted file declaring an absurd dataset size would otherwise abort the
@@ -1359,13 +1386,7 @@ impl Hdf5Reader {
     pub fn attr_string_value(&mut self, attr: &AttributeMessage) -> IoResult<String> {
         use crate::format::messages::datatype::DatatypeMessage;
         if !matches!(attr.datatype, DatatypeMessage::VarLenString { .. }) {
-            // Fixed-length string: raw bytes, truncated at the first NUL.
-            let end = attr
-                .data
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(attr.data.len());
-            return Ok(String::from_utf8_lossy(&attr.data[..end]).to_string());
+            return fixed_string_attr_value(attr);
         }
         // Variable-length string: the attribute value is a global-heap
         // reference (sequence length + collection address + object index).
@@ -3668,6 +3689,49 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A space-padded fixed-length string attribute reads back without its
+    /// padding: `H5T__conv_s_s` ends the value after the last non-space byte,
+    /// and nothing else in the element marks where it stops.
+    #[test]
+    fn fixed_string_attr_value_honors_the_declared_pad() {
+        use crate::format::messages::dataspace::DataspaceMessage;
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let attr = |padding: u8, data: &[u8]| AttributeMessage {
+            name: "units".to_string(),
+            datatype: DatatypeMessage::FixedString {
+                size: data.len() as u32,
+                padding,
+                charset: 0,
+            },
+            dataspace: DataspaceMessage::scalar(),
+            data: data.to_vec(),
+        };
+
+        // Space padded: no NUL anywhere, so truncating at the first NUL kept
+        // the padding.
+        assert_eq!(
+            fixed_string_attr_value(&attr(2, b"volt    ")).unwrap(),
+            "volt"
+        );
+        // Null terminated and null padded end at the first NUL, so trailing
+        // spaces before it are content.
+        assert_eq!(
+            fixed_string_attr_value(&attr(0, b"volt  \0\0")).unwrap(),
+            "volt  "
+        );
+        assert_eq!(
+            fixed_string_attr_value(&attr(1, b"volt\0\0\0\0")).unwrap(),
+            "volt"
+        );
+        // A reserved rule is named rather than guessed at.
+        let err = fixed_string_attr_value(&attr(7, b"volt    ")).unwrap_err();
+        assert!(
+            err.to_string().contains("padding rule 7"),
+            "unexpected error: {err}"
+        );
     }
 }
 

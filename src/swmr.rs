@@ -374,11 +374,26 @@ impl SwmrFileWriter {
     /// Create a variable-length string dataset (one element per string).
     /// Returns the dataset index. Useful for NeXus metadata such as
     /// `/entry/start_time` or per-frame timestamp arrays.
+    ///
+    /// The datatype declares UTF-8;
+    /// [`write_string_dataset_ascii`](Self::write_string_dataset_ascii)
+    /// declares ASCII instead.
     pub fn write_string_dataset(&mut self, name: &str, strings: &[&str]) -> Result<usize> {
         let idx = self
             .inner
             .writer_mut()
-            .create_vlen_string_dataset(name, strings)?;
+            .create_vlen_string_dataset(name, strings, 1)?;
+        Ok(idx)
+    }
+
+    /// [`write_string_dataset`](Self::write_string_dataset) under an **ASCII**
+    /// datatype, the one h5py's `string_dtype("ascii")` produces. A string
+    /// that is not 7-bit is rejected rather than mislabelled.
+    pub fn write_string_dataset_ascii(&mut self, name: &str, strings: &[&str]) -> Result<usize> {
+        let idx = self
+            .inner
+            .writer_mut()
+            .create_vlen_string_dataset(name, strings, 0)?;
         Ok(idx)
     }
 

@@ -94,6 +94,50 @@ fn metadata_datasets_and_attributes_round_trip() {
     cleanup(&path);
 }
 
+/// The SWMR metadata writers declare the character set they are named for,
+/// and the ASCII twin refuses a string that declaration would misdescribe.
+#[test]
+fn string_dataset_writers_declare_their_character_set() {
+    use rust_hdf5::{DatatypeMessage, H5File};
+
+    let path = unique_tmp("string_cset");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        w.write_string_dataset("utf8", &["\u{e9}t\u{e9}"]).unwrap();
+        w.write_string_dataset_ascii("ascii", &["2026-05-18T10:00:00"])
+            .unwrap();
+        let err = w
+            .write_string_dataset_ascii("rejected", &["\u{c548}\u{b155}"])
+            .expect_err("a non-ASCII string was accepted under an ASCII datatype")
+            .to_string();
+        assert!(err.contains("is not ASCII"), "got: {err}");
+        w.close().unwrap();
+    }
+
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("ascii").unwrap().datatype().unwrap(),
+        DatatypeMessage::VarLenString {
+            padding: 0,
+            charset: 0,
+        }
+    );
+    assert_eq!(
+        file.dataset("utf8").unwrap().datatype().unwrap(),
+        DatatypeMessage::VarLenString {
+            padding: 0,
+            charset: 1,
+        }
+    );
+    assert_eq!(
+        file.dataset("ascii").unwrap().read_strings().unwrap(),
+        vec!["2026-05-18T10:00:00".to_string()]
+    );
+    file.close().unwrap();
+
+    cleanup(&path);
+}
+
 /// `read_slice` fetches one frame of a streaming dataset without reading
 /// the whole stream.
 #[test]

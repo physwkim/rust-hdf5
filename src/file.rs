@@ -391,12 +391,43 @@ impl H5File {
     /// Create a variable-length string dataset and write data.
     ///
     /// This is a convenience method for writing h5py-compatible vlen string
-    /// datasets using global heap storage.
+    /// datasets using global heap storage. The datatype declares UTF-8, which
+    /// a Rust `&str` always is; [`write_vlen_strings_ascii`] writes the same
+    /// dataset under an ASCII declaration, the type h5py's
+    /// `string_dtype("ascii")` produces.
+    ///
+    /// [`write_vlen_strings_ascii`]: Self::write_vlen_strings_ascii
     pub fn write_vlen_strings(&self, name: &str, strings: &[&str]) -> Result<H5Dataset> {
+        self.write_vlen_strings_charset(name, strings, 1)
+    }
+
+    /// Create a variable-length **ASCII** string dataset and write data.
+    ///
+    /// The ASCII twin of [`write_vlen_strings`](Self::write_vlen_strings),
+    /// named after the [`DatatypeMessage::vlen_string_ascii`] /
+    /// [`DatatypeMessage::vlen_string_utf8`] pair it selects between. A string
+    /// that is not 7-bit is rejected rather than stored under a datatype that
+    /// misdescribes it, so the file reads the same in every library that
+    /// trusts the declaration.
+    ///
+    /// [`DatatypeMessage::vlen_string_ascii`]: crate::DatatypeMessage::vlen_string_ascii
+    /// [`DatatypeMessage::vlen_string_utf8`]: crate::DatatypeMessage::vlen_string_utf8
+    pub fn write_vlen_strings_ascii(&self, name: &str, strings: &[&str]) -> Result<H5Dataset> {
+        self.write_vlen_strings_charset(name, strings, 0)
+    }
+
+    /// The single owner of one-call vlen-string dataset creation: the two
+    /// public entry points differ only in the character set they declare.
+    fn write_vlen_strings_charset(
+        &self,
+        name: &str,
+        strings: &[&str],
+        charset: u8,
+    ) -> Result<H5Dataset> {
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let idx = writer.create_vlen_string_dataset(name, strings)?;
+                let idx = writer.create_vlen_string_dataset(name, strings, charset)?;
                 // If the name contains '/', assign the dataset to its parent group
                 if let Some(slash_pos) = name.rfind('/') {
                     let group_path = &name[..slash_pos];
@@ -1781,6 +1812,86 @@ mod integration_tests {
             let strings = ds.read_vlen_strings().unwrap();
             assert_eq!(strings, vec!["alice", "bob", "charlie"]);
         }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The one-call writers declare the character set they are named for —
+    /// `write_vlen_strings` UTF-8, `write_vlen_strings_ascii` ASCII — and the
+    /// ASCII one refuses a string its declaration would misdescribe, before
+    /// anything reaches the file.
+    #[test]
+    fn vlen_string_writers_declare_their_character_set() {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let path = temp_path("vlen_cset");
+        let file = H5File::create(&path).unwrap();
+        file.write_vlen_strings_ascii("ascii", &["alpha", "b", ""])
+            .unwrap();
+        file.write_vlen_strings("utf8", &["été", "日本"]).unwrap();
+        let err = file
+            .write_vlen_strings_ascii("rejected", &["ok", "안녕"])
+            .err()
+            .expect("a non-ASCII string was accepted under an ASCII datatype")
+            .to_string();
+        assert!(
+            err.contains("string 1") && err.contains("is not ASCII"),
+            "got: {err}"
+        );
+        file.close().unwrap();
+
+        let file = H5File::open(&path).unwrap();
+        let ascii = file.dataset("ascii").unwrap();
+        assert_eq!(
+            ascii.datatype().unwrap(),
+            DatatypeMessage::VarLenString {
+                padding: 0,
+                charset: 0,
+            }
+        );
+        assert_eq!(ascii.read_strings().unwrap(), vec!["alpha", "b", ""]);
+        let utf8 = file.dataset("utf8").unwrap();
+        assert_eq!(
+            utf8.datatype().unwrap(),
+            DatatypeMessage::VarLenString {
+                padding: 0,
+                charset: 1,
+            }
+        );
+        assert_eq!(utf8.read_strings().unwrap(), vec!["été", "日本"]);
+        // The refused write left nothing behind.
+        assert!(file.dataset("rejected").is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The group-level twin declares ASCII the same way the file-level one
+    /// does, for a dataset inside the group.
+    #[test]
+    fn group_vlen_string_writer_declares_ascii() {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let path = temp_path("vlen_cset_group");
+        let file = H5File::create(&path).unwrap();
+        let g = file.create_group("entry").unwrap();
+        g.write_vlen_strings_ascii("notes", &["alpha", "b"])
+            .unwrap();
+        let err = g
+            .write_vlen_strings_ascii("rejected", &["안녕"])
+            .err()
+            .expect("a non-ASCII string was accepted under an ASCII datatype")
+            .to_string();
+        assert!(err.contains("is not ASCII"), "got: {err}");
+        file.close().unwrap();
+
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("entry/notes").unwrap();
+        assert_eq!(
+            ds.datatype().unwrap(),
+            DatatypeMessage::VarLenString {
+                padding: 0,
+                charset: 0,
+            }
+        );
+        assert_eq!(ds.read_strings().unwrap(), vec!["alpha", "b"]);
         std::fs::remove_file(&path).ok();
     }
 

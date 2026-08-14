@@ -486,24 +486,15 @@ enum ChunkBytes<'a> {
 /// Strip a fixed-string element's padding, leaving the bytes that carry the
 /// value.
 ///
-/// The three padding rules are the HDF5 datatype message's: null-terminated
-/// stops at the first NUL and says nothing about the bytes after it,
-/// null-padded and space-padded fill the tail with that byte. `index` names
-/// the element in the error a reserved padding rule produces.
+/// The rule itself lives with the datatype message
+/// ([`fixed_string_content`]); this adds the element index a reserved padding
+/// rule needs to be reported against.
 fn trim_fixed_string(elem: &[u8], padding: u8, index: usize) -> Result<&[u8]> {
-    let end = match padding {
-        // Null-terminated.
-        0 => elem.iter().position(|&b| b == 0).unwrap_or(elem.len()),
-        // Null-padded / space-padded: the tail of that byte is padding.
-        1 => elem.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1),
-        2 => elem.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1),
-        other => {
-            return Err(Hdf5Error::InvalidState(format!(
-                "string {index} uses padding rule {other}, which the format reserves"
-            )))
-        }
-    };
-    Ok(&elem[..end])
+    crate::format::messages::datatype::fixed_string_content(elem, padding).ok_or_else(|| {
+        Hdf5Error::InvalidState(format!(
+            "string {index} uses padding rule {padding}, which the format reserves"
+        ))
+    })
 }
 
 /// Decode one string element's bytes under the datatype's character set.
@@ -1987,7 +1978,7 @@ impl H5Dataset {
             ));
         }
         match self.datatype()? {
-            DatatypeMessage::VarLenString { charset } => self
+            DatatypeMessage::VarLenString { charset, .. } => self
                 .read_vlen_bytes()?
                 .iter()
                 .enumerate()
@@ -5098,15 +5089,20 @@ mod tests {
         }
     }
 
-    /// Each padding rule decides where the value ends. Null-terminated stops at
-    /// the first NUL and ignores the bytes after it; the two pad rules strip a
-    /// tail of that byte and keep everything before it.
+    /// Each padding rule decides where the value ends. Null-terminated and
+    /// null-padded both stop at the first NUL and ignore the bytes after it;
+    /// space-padded strips only a tail of spaces, so an embedded NUL is
+    /// content there.
+    ///
+    /// Checked against libhdf5 1.14.6: reading this same `"ab\0X\0\0"`
+    /// null-padded element into a wider null-terminated destination gives
+    /// `"ab"`, and reading a space-padded `"a\0b     "` gives `"a\0b"` —
+    /// `H5T__conv_s_s` runs the same `!s[nchars]` loop for both null rules.
     #[test]
     fn read_strings_honors_every_padding_rule() {
-        // "ab" then a NUL then trailing junk a null-terminated read must drop
-        // and a null-padded read must keep.
+        // "ab" then a NUL then trailing junk that both null rules must drop.
         let elem: &[u8] = b"ab\0X\0\0";
-        for (padding, want) in [(0u8, "ab"), (1, "ab\0X")] {
+        for (padding, want) in [(0u8, "ab"), (1, "ab")] {
             let path = temp_path(&format!("fixed_pad_{padding}"));
             write_fixed_string_dataset(
                 &path,
@@ -5141,6 +5137,26 @@ mod tests {
         assert_eq!(
             file.dataset("labels").unwrap().read_strings().unwrap(),
             vec!["a b".to_string()]
+        );
+        std::fs::remove_file(&path).ok();
+
+        // ... and an embedded NUL, which no space rule marks as an end.
+        let path = temp_path("fixed_pad_2_nul");
+        write_fixed_string_dataset(
+            &path,
+            DatatypeMessage::FixedString {
+                size: 8,
+                padding: 2,
+                charset: 0,
+            },
+            8,
+            &[b"a\0b     "],
+            false,
+        );
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("labels").unwrap().read_strings().unwrap(),
+            vec!["a\0b".to_string()]
         );
         std::fs::remove_file(&path).ok();
     }

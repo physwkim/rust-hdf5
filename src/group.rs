@@ -197,8 +197,31 @@ impl H5Group {
     ///
     /// Returns a writer-mode handle to the created dataset so attributes can be
     /// attached to it (e.g. units, descriptions) just like a dataset created
-    /// via [`new_dataset`](Self::new_dataset).
+    /// via [`new_dataset`](Self::new_dataset). The datatype declares UTF-8;
+    /// [`write_vlen_strings_ascii`](Self::write_vlen_strings_ascii) is the
+    /// ASCII-declaring twin, as on [`H5File`](crate::H5File).
     pub fn write_vlen_strings(&self, name: &str, strings: &[&str]) -> Result<H5Dataset> {
+        self.write_vlen_strings_charset(name, strings, 1)
+    }
+
+    /// Create a variable-length **ASCII** string dataset within this group.
+    ///
+    /// The group-level twin of
+    /// [`H5File::write_vlen_strings_ascii`](crate::H5File::write_vlen_strings_ascii),
+    /// with the same rejection of a string the ASCII declaration would
+    /// misdescribe.
+    pub fn write_vlen_strings_ascii(&self, name: &str, strings: &[&str]) -> Result<H5Dataset> {
+        self.write_vlen_strings_charset(name, strings, 0)
+    }
+
+    /// The single owner of group-level vlen-string dataset creation: the two
+    /// public entry points differ only in the character set they declare.
+    fn write_vlen_strings_charset(
+        &self,
+        name: &str,
+        strings: &[&str],
+        charset: u8,
+    ) -> Result<H5Dataset> {
         let full_name = if self.name == "/" {
             name.to_string()
         } else {
@@ -209,7 +232,7 @@ impl H5Group {
         let inner = borrow_inner(&self.file_inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let idx = writer.create_vlen_string_dataset(&full_name, strings)?;
+                let idx = writer.create_vlen_string_dataset(&full_name, strings, charset)?;
                 if self.name != "/" {
                     writer.assign_dataset_to_group(&self.name, idx)?;
                 }

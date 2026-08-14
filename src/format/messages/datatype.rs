@@ -80,6 +80,28 @@ fn decode_name_field(
     Ok((name, next))
 }
 
+/// The bytes of one fixed-length string element that carry its value, under
+/// the padding rule the datatype declares.
+///
+/// libhdf5's `H5T__conv_s_s` (`H5Tconv_string.c`) is the rule and the only
+/// place a fixed string's padding is interpreted: a null-terminated (0) or
+/// null-padded (1) element ends at its first NUL — both branches stop on
+/// `!s[nchars]` — and a space-padded (2) one ends after its last non-space
+/// byte, so an embedded NUL survives there. Every other code is reserved;
+/// libhdf5 fails the conversion with "source string padding method not
+/// supported", and this returns `None` rather than guess a rule.
+///
+/// This is the single owner of that rule: dataset elements and attribute
+/// values are found differently, but both end here.
+pub fn fixed_string_content(elem: &[u8], padding: u8) -> Option<&[u8]> {
+    let end = match padding {
+        0 | 1 => elem.iter().position(|&b| b == 0).unwrap_or(elem.len()),
+        2 => elem.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1),
+        _ => return None,
+    };
+    Some(&elem[..end])
+}
+
 // Datatype class codes
 const CLASS_FIXED_POINT: u8 = 0;
 const CLASS_FLOATING_POINT: u8 = 1;
@@ -193,6 +215,12 @@ pub enum DatatypeMessage {
     },
     /// Variable-length string datatype (class 9, vlen type 1).
     VarLenString {
+        /// Padding type: 0 = null terminate, 1 = null pad, 2 = space pad.
+        ///
+        /// A variable-length string carries the rule in its own bit field
+        /// (`H5Odtype.c`: `vlen.pad = (flags >> 4) & 0x0f`), not in the parent
+        /// type, so it survives a round trip through this message.
+        padding: u8,
         /// Character set: 0 = ASCII, 1 = UTF-8.
         charset: u8,
     },
@@ -366,17 +394,23 @@ impl DatatypeMessage {
         }
     }
 
-    /// Variable-length UTF-8 string type.
+    /// Null-terminated variable-length UTF-8 string type.
     ///
     /// Note: `element_size()` for this type requires a `FormatContext` to
     /// compute. Use `element_size_ctx()` or `vlen_ref_size()` instead.
     pub fn vlen_string_utf8() -> Self {
-        Self::VarLenString { charset: 1 }
+        Self::VarLenString {
+            padding: 0, // null terminate, as h5py's `string_dtype` declares
+            charset: 1, // UTF-8
+        }
     }
 
-    /// Variable-length ASCII string type.
+    /// Null-terminated variable-length ASCII string type.
     pub fn vlen_string_ascii() -> Self {
-        Self::VarLenString { charset: 0 }
+        Self::VarLenString {
+            padding: 0, // null terminate
+            charset: 0, // ASCII
+        }
     }
 
     /// Variable-length byte-array type: a vlen sequence of `u8`.
@@ -762,7 +796,7 @@ impl DatatypeMessage {
 
                 buf
             }
-            Self::VarLenString { charset } => {
+            Self::VarLenString { padding, charset } => {
                 // Variable-length string: class 9, version 1
                 //
                 // On-disk element size = sizeof_addr + 4 (the vlen reference).
@@ -775,8 +809,8 @@ impl DatatypeMessage {
                     CLASS_VLEN | (DT_VERSION << 4),
                     // bytes 1-3: flags
                     // byte 1 bits 0-3: type = 1 (string)
-                    //         bits 4-7: padding type (0 = null pad)
-                    0x01, // type = string (1)
+                    //         bits 4-7: padding type
+                    0x01 | ((*padding & 0x0F) << 4),
                     // byte 2 bits 0-3: charset (0=ASCII, 1=UTF-8)
                     *charset & 0x0F, // charset
                     0,
@@ -1138,6 +1172,10 @@ impl DatatypeMessage {
                 // layout at all: libhdf5 only checks that the parent's version
                 // does not exceed this one.
                 let vlen_type = flags0 & 0x0F;
+                // Only a string-type vlen carries these: `H5Odtype.c` reads
+                // `pad` from bits 4-7 of the first flag byte and `cset` from
+                // the low nibble of the second.
+                let padding = (flags0 >> 4) & 0x0F;
                 let charset = flags1 & 0x0F;
 
                 let mut pos = 8;
@@ -1148,7 +1186,7 @@ impl DatatypeMessage {
 
                 if vlen_type == 1 {
                     // String type
-                    Ok((Self::VarLenString { charset }, pos))
+                    Ok((Self::VarLenString { padding, charset }, pos))
                 } else {
                     // Sequence type: variable-length array of `base_dt`.
                     Ok((
@@ -1256,7 +1294,7 @@ impl std::fmt::Display for DatatypeMessage {
             Self::Enum { base, members } => {
                 write!(f, "enum<{}; {} members>", base, members.len())
             }
-            Self::VarLenString { charset } => {
+            Self::VarLenString { charset, .. } => {
                 let cs = if *charset == 1 { "UTF-8" } else { "ASCII" };
                 write!(f, "vlen_string({})", cs)
             }
@@ -1570,6 +1608,89 @@ mod tests {
         // Size field in the encoded bytes should be 4+4+4=12
         let sz = u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]);
         assert_eq!(sz, 12);
+    }
+
+    /// The vlen-string datatype message h5py's `string_dtype("ascii")` puts in
+    /// the file. The pad is the high nibble of the first flag byte and the
+    /// character set the low nibble of the second (`H5Odtype.c`), and the
+    /// parent libhdf5 stores is an unsigned 8-bit integer, not a 1-byte
+    /// string — which is why only the decode is asserted against these bytes.
+    #[test]
+    fn decode_vlen_string_pad_from_libhdf5() {
+        let nullterm: [u8; 20] = [
+            0x19, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, // vlen: string, pad 0, ASCII
+            0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08,
+            0x00, // parent u8
+        ];
+        let (decoded, consumed) = DatatypeMessage::decode(&nullterm, &ctx()).unwrap();
+        assert_eq!(consumed, nullterm.len());
+        assert_eq!(
+            decoded,
+            DatatypeMessage::VarLenString {
+                padding: 0,
+                charset: 0,
+            }
+        );
+
+        // The same type with H5T_STR_NULLPAD and H5T_CSET_UTF8.
+        let mut nullpad = nullterm;
+        nullpad[1] = 0x11;
+        nullpad[2] = 0x01;
+        let (decoded, _) = DatatypeMessage::decode(&nullpad, &ctx()).unwrap();
+        assert_eq!(
+            decoded,
+            DatatypeMessage::VarLenString {
+                padding: 1,
+                charset: 1,
+            }
+        );
+    }
+
+    /// The pad survives an encode/decode round trip, which is what lets a
+    /// space-padded vlen string be reported rather than silently normalized.
+    #[test]
+    fn roundtrip_vlen_string_pad_and_charset() {
+        for padding in 0..=2u8 {
+            for charset in 0..=1u8 {
+                let msg = DatatypeMessage::VarLenString { padding, charset };
+                let encoded = msg.encode(&ctx());
+                assert_eq!(encoded[1] & 0x0F, 1, "type is still string");
+                assert_eq!((encoded[1] >> 4) & 0x0F, padding);
+                assert_eq!(encoded[2] & 0x0F, charset);
+                let (decoded, consumed) = DatatypeMessage::decode(&encoded, &ctx()).unwrap();
+                assert_eq!(consumed, encoded.len());
+                assert_eq!(decoded, msg);
+            }
+        }
+    }
+
+    // ---- fixed string padding ----
+
+    /// `H5T__conv_s_s`: null-terminated and null-padded both end at the first
+    /// NUL, space-padded ends after the last non-space byte.
+    #[test]
+    fn fixed_string_content_follows_the_declared_pad() {
+        assert_eq!(fixed_string_content(b"alpha\0\0\0", 0).unwrap(), b"alpha");
+        assert_eq!(fixed_string_content(b"alpha\0\0\0", 1).unwrap(), b"alpha");
+        assert_eq!(fixed_string_content(b"alpha   ", 2).unwrap(), b"alpha");
+
+        // Trailing spaces are content unless the pad says otherwise, and an
+        // embedded NUL survives a space-padded element.
+        assert_eq!(fixed_string_content(b"ab  \0\0\0\0", 0).unwrap(), b"ab  ");
+        assert_eq!(fixed_string_content(b"a\0b     ", 2).unwrap(), b"a\0b");
+        assert_eq!(fixed_string_content(b"a\0b\0\0\0\0\0", 1).unwrap(), b"a");
+
+        // An element that is all padding is empty, not the whole field.
+        assert_eq!(fixed_string_content(b"        ", 2).unwrap(), b"");
+        assert_eq!(fixed_string_content(b"\0\0\0\0", 0).unwrap(), b"");
+
+        // Nothing to strip.
+        assert_eq!(fixed_string_content(b"exact", 0).unwrap(), b"exact");
+        assert_eq!(fixed_string_content(b"exact", 2).unwrap(), b"exact");
+
+        // Padding rules 3-15 are reserved; libhdf5 fails the conversion.
+        assert!(fixed_string_content(b"xxxx", 3).is_none());
+        assert!(fixed_string_content(b"xxxx", 15).is_none());
     }
 
     // ---- vlen sequence (byte array) roundtrips ----

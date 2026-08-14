@@ -1390,3 +1390,68 @@ fn packed_shared_collection_readable_by_h5py() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// A space-padded fixed-length string attribute is padded with spaces and
+/// carries no terminator, so reading it as null-terminated returned the
+/// padding as part of the value. `H5T__conv_s_s` ends it after the last
+/// non-space byte.
+#[test]
+fn space_padded_string_attribute_from_h5py_reads_trimmed() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_spacepad");
+    write_with_h5py(
+        py,
+        &path,
+        "from h5py import h5t, h5s, h5a\n\
+         ds = f.create_dataset('data', data=np.arange(4, dtype='<i4'))\n\
+         for name, pad, raw in ((b'spacepad', h5t.STR_SPACEPAD, b'volt    '),\n\
+                                (b'nullpad', h5t.STR_NULLPAD, b'volt\\0\\0\\0\\0'),\n\
+                                (b'nullterm', h5t.STR_NULLTERM, b'volt\\0\\0\\0\\0')):\n\
+         \x20   tid = h5t.C_S1.copy()\n\
+         \x20   tid.set_size(8)\n\
+         \x20   tid.set_cset(h5t.CSET_ASCII)\n\
+         \x20   tid.set_strpad(pad)\n\
+         \x20   a = h5a.create(ds.id, name, tid, h5s.create(h5s.SCALAR))\n\
+         \x20   a.write(np.array(raw, dtype='S8'), mtype=tid)\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.attr("spacepad").unwrap().read_string().unwrap(), "volt");
+    assert_eq!(ds.attr("nullpad").unwrap().read_string().unwrap(), "volt");
+    assert_eq!(ds.attr("nullterm").unwrap().read_string().unwrap(), "volt");
+    std::fs::remove_file(&path).ok();
+}
+
+/// The pad of a *variable-length* string lives in the vlen type's own bit
+/// field, not in its parent, so it survives a decode of what h5py wrote.
+#[test]
+fn vlen_string_pad_from_h5py_is_decoded() {
+    use rust_hdf5::format::messages::datatype::DatatypeMessage;
+
+    let Some(py) = python() else { return };
+    let path = tmp("vstr_pad");
+    write_with_h5py(
+        py,
+        &path,
+        "from h5py import h5t, h5s, h5d\n\
+         for name, pad, cset in ((b'nullterm', h5t.STR_NULLTERM, h5t.CSET_ASCII),\n\
+                                 (b'nullpad', h5t.STR_NULLPAD, h5t.CSET_ASCII),\n\
+                                 (b'spacepad', h5t.STR_SPACEPAD, h5t.CSET_UTF8)):\n\
+         \x20   tid = h5t.C_S1.copy()\n\
+         \x20   tid.set_size(h5t.VARIABLE)\n\
+         \x20   tid.set_cset(cset)\n\
+         \x20   tid.set_strpad(pad)\n\
+         \x20   h5d.create(f.id, name, tid, h5s.create_simple((2,)))\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    for (name, padding, charset) in [("nullterm", 0, 0), ("nullpad", 1, 0), ("spacepad", 2, 1)] {
+        assert_eq!(
+            file.dataset(name).unwrap().datatype().unwrap(),
+            DatatypeMessage::VarLenString { padding, charset },
+            "{name}"
+        );
+    }
+    std::fs::remove_file(&path).ok();
+}

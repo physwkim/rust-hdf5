@@ -207,9 +207,9 @@ fn canon_dtype(dt: &DatatypeMessage) -> String {
             strpad_str(*padding),
             charset_str(*charset)
         ),
-        // `strpad` is deliberately absent: DatatypeMessage::VarLenString does
-        // not model it, and canon.py omits it too. See oracle/CANON.md.
-        DatatypeMessage::VarLenString { charset } => {
+        // The pad is deliberately absent here: it travels in the separate
+        // `strpad` field, and canon.py omits it too. See oracle/CANON.md.
+        DatatypeMessage::VarLenString { charset, .. } => {
             format!("vstr,cset={}", charset_str(*charset))
         }
         DatatypeMessage::Compound { size, members } => {
@@ -302,33 +302,42 @@ fn has_heap_type(dt: &DatatypeMessage) -> bool {
     }
 }
 
-/// True when the type tree contains a variable-length string anywhere.
+/// `where=pad` for every variable-length string in the type tree, appended to
+/// `out`.
 ///
-/// `DatatypeMessage::VarLenString` models only the character set, so wherever
-/// this holds the `strpad` field cannot be answered from the public API.
-fn has_vlen_string(dt: &DatatypeMessage) -> bool {
+/// `where` is the position in the type tree, as `oracle/CANON.md` defines it:
+/// `.` is the type itself, `.m` a compound member, `[]` an array element, `()`
+/// a vlen element.
+fn vlen_strpads(dt: &DatatypeMessage, whence: &str, out: &mut Vec<String>) {
     match dt {
-        DatatypeMessage::VarLenString { .. } => true,
-        DatatypeMessage::VarLenSequence { base } | DatatypeMessage::Array { base, .. } => {
-            has_vlen_string(base)
+        DatatypeMessage::VarLenString { padding, .. } => {
+            let at = if whence.is_empty() { "." } else { whence };
+            out.push(format!("{at}={}", strpad_str(*padding)));
         }
+        DatatypeMessage::Array { base, .. } => vlen_strpads(base, &format!("{whence}[]"), out),
+        DatatypeMessage::VarLenSequence { base } => vlen_strpads(base, &format!("{whence}()"), out),
         DatatypeMessage::Compound { members, .. } => {
-            members.iter().any(|m| has_vlen_string(&m.datatype))
+            for m in members {
+                vlen_strpads(&m.datatype, &format!("{whence}.{}", m.name), out);
+            }
         }
-        _ => false,
+        _ => {}
     }
 }
 
-/// The `strpad` field: `-` when no variable-length string is involved, and
-/// otherwise the marker, because the parsed message has dropped the pad.
+/// The `strpad` field: `-` when the type tree holds no variable-length string,
+/// otherwise one `position=pad` entry per such string.
 fn strpad_field(dtype: Option<&DatatypeMessage>) -> std::result::Result<String, String> {
     match dtype {
-        Some(dt) if has_vlen_string(dt) => Err(
-            "DatatypeMessage::VarLenString models only the character set, so the \
-             string pad of a variable-length string is not retained"
-                .into(),
-        ),
-        Some(_) => Ok("-".into()),
+        Some(dt) => {
+            let mut pads = Vec::new();
+            vlen_strpads(dt, "", &mut pads);
+            Ok(if pads.is_empty() {
+                "-".into()
+            } else {
+                pads.join(";")
+            })
+        }
         None => Err("datatype unavailable, so the string pad cannot be classified".into()),
     }
 }
@@ -1032,6 +1041,29 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        // The two pad rules the reference writes explicitly: the declared
+        // rule and the bytes actually stored have to agree.
+        "str_fixed_nullpad" | "str_fixed_spacepad" => {
+            let (padding, pad_byte) = if case == "str_fixed_spacepad" {
+                (2u8, b' ')
+            } else {
+                (1u8, 0u8)
+            };
+            let file = H5File::create(path)?;
+            raw_typed(
+                &file,
+                "data",
+                DatatypeMessage::FixedString {
+                    size: 8,
+                    padding,
+                    charset: 0,
+                },
+                &[4],
+                &fixed_string_bytes(&STRINGS, 8, pad_byte),
+            )?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "str_fixed_utf8" => {
             let file = H5File::create(path)?;
             raw_typed(
@@ -1050,7 +1082,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         }
         "str_vlen_ascii" => {
             let file = H5File::create(path)?;
-            file.write_vlen_strings("data", &STRINGS)?;
+            file.write_vlen_strings_ascii("data", &STRINGS)?;
             file.close()?;
             Ok(Ok(()))
         }

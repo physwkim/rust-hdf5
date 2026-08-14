@@ -4007,9 +4007,20 @@ impl Hdf5Writer {
     ///
     /// Stores strings in the global heap. The dataset raw data consists of
     /// vlen references (collection_addr + object_index pairs).
-    pub fn create_vlen_string_dataset(&self, name: &str, strings: &[&str]) -> IoResult<usize> {
+    ///
+    /// `charset` is the datatype's declared character set (0 = ASCII,
+    /// 1 = UTF-8); the strings are checked against it before anything is
+    /// written, so the type never misdescribes the bytes under it.
+    pub fn create_vlen_string_dataset(
+        &self,
+        name: &str,
+        strings: &[&str],
+        charset: u8,
+    ) -> IoResult<usize> {
         use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
+
+        ensure_vlen_charset(charset, strings)?;
 
         let create = self.begin_create(name)?;
         let name = create.name.as_str();
@@ -4039,7 +4050,10 @@ impl Hdf5Writer {
         self.handle.write_at(data_addr, &raw_data)?;
 
         // Create the dataset with vlen string datatype
-        let datatype = DatatypeMessage::vlen_string_utf8();
+        let datatype = DatatypeMessage::VarLenString {
+            padding: 0,
+            charset,
+        };
         let dataspace =
             crate::format::messages::dataspace::DataspaceMessage::simple(&[num_strings]);
 
@@ -4348,7 +4362,7 @@ impl Hdf5Writer {
             let ds = self.ds(ds_index);
             let m = ds.lock();
             match m.datatype {
-                DatatypeMessage::VarLenString { charset } => charset,
+                DatatypeMessage::VarLenString { charset, .. } => charset,
                 _ => {
                     return Err(crate::io::IoError::InvalidState(
                         "append_vlen_strings is only for variable-length string datasets".into(),
@@ -4487,7 +4501,7 @@ impl Hdf5Writer {
             let ds = self.ds(ds_index);
             let m = ds.lock();
             let charset = match m.datatype {
-                DatatypeMessage::VarLenString { charset } => charset,
+                DatatypeMessage::VarLenString { charset, .. } => charset,
                 _ => {
                     return Err(crate::io::IoError::InvalidState(
                         "write_vlen_strings_slice is only for variable-length string datasets"
@@ -7728,7 +7742,7 @@ mod tests {
         let attempts: [(&str, IoResult<usize>); 4] = [
             (
                 "vlen_string",
-                writer.create_vlen_string_dataset("d", &["x"]),
+                writer.create_vlen_string_dataset("d", &["x"], 1),
             ),
             ("vlen_bytes", writer.create_vlen_bytes_dataset("d", &[b"x"])),
             (
@@ -7918,7 +7932,7 @@ mod tests {
 
         let writer = Hdf5Writer::create(&path).unwrap();
         writer
-            .create_vlen_string_dataset("notes", &["initial"])
+            .create_vlen_string_dataset("notes", &["initial"], 1)
             .unwrap();
         writer.close().unwrap();
 
