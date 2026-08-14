@@ -28,7 +28,7 @@ use crate::format::messages::group_info::GroupInfoMessage;
 use crate::format::messages::link::LinkMessage;
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::*;
-use crate::format::object_header::ObjectHeader;
+use crate::format::object_header::{ObjectHeader, MAX_MESSAGE_SIZE};
 use crate::format::superblock::*;
 use crate::format::{FormatContext, UNDEF_ADDR};
 
@@ -566,6 +566,42 @@ fn swmr_attr_error(name: &str) -> crate::io::IoError {
          value's heap storage could never be reclaimed; set attributes before \
          start_swmr (libhdf5 forbids attribute changes during SWMR writes too)"
     ))
+}
+
+/// An attribute whose encoded message will not fit an object header.
+///
+/// libhdf5 answers the same size by moving the attribute to dense storage
+/// (`H5O__attr_create`'s phase change on `raw_size >= H5O_MESG_MAX_SIZE`),
+/// which this writer cannot yet create. Refusing here keeps the failure at the
+/// call that caused it: the alternative, letting the value reach
+/// `ObjectHeader::encode`, reports it at `close()` with the whole file's worth
+/// of writes already done.
+fn oversized_attr_error(name: &str, encoded_size: usize) -> crate::io::IoError {
+    crate::io::IoError::InvalidState(format!(
+        "attribute '{name}' encodes to {encoded_size} bytes, over the \
+         {MAX_MESSAGE_SIZE}-byte limit an object header message can express; \
+         libhdf5 stores an attribute this large in dense attribute storage, \
+         which this writer cannot yet create"
+    ))
+}
+
+/// Refuse to reopen a file holding an attribute the writer could not put back.
+///
+/// Append mode rebuilds every object header it touches out of the attributes
+/// read from it, so an attribute libhdf5 kept in dense storage comes back as a
+/// compact message — and above [`MAX_MESSAGE_SIZE`] that message cannot be
+/// encoded at all. Left to surface at `finalize`, the failure would land after
+/// this session's chunk data and indices had already been written past the
+/// allocation point the superblock still records, leaving a file libhdf5 reads
+/// as truncated. Refusing the open leaves it untouched.
+fn check_reopened_attributes(attrs: &[AttributeMessage], ctx: &FormatContext) -> IoResult<()> {
+    for attr in attrs {
+        let encoded_size = attr.encode(ctx).len();
+        if encoded_size > MAX_MESSAGE_SIZE {
+            return Err(oversized_attr_error(&attr.name, encoded_size));
+        }
+    }
+    Ok(())
 }
 
 /// One collection block with free space that a later vlen insert may
@@ -1183,6 +1219,7 @@ impl Hdf5Writer {
         // erased by the header rewrite at finalize.
         let root_attributes =
             crate::io::reader::collect_object_attributes(&mut handle, &ctx, &root_header);
+        check_reopened_attributes(&root_attributes, &ctx)?;
 
         let mut link_entries: Vec<(String, u64)> = Vec::new();
         let mut visited_groups = std::collections::HashSet::new();
@@ -1237,6 +1274,7 @@ impl Hdf5Writer {
             let mut fp = None;
             let mut fill_value = None;
             let attrs = crate::io::reader::collect_object_attributes(&mut handle, &ctx, &ds_header);
+            check_reopened_attributes(&attrs, &ctx)?;
 
             for msg in &ds_header.messages {
                 match msg.msg_type {
@@ -3701,6 +3739,10 @@ impl Hdf5Writer {
     pub fn set_attribute(&self, target: AttrTarget<'_>, attr: AttributeMessage) -> IoResult<()> {
         if self.swmr_active {
             return Err(swmr_attr_error(&attr.name));
+        }
+        let encoded_size = attr.encode(&self.ctx).len();
+        if encoded_size > MAX_MESSAGE_SIZE {
+            return Err(oversized_attr_error(&attr.name, encoded_size));
         }
         let old = self.with_attr_list(target, |attrs| {
             if let Some(pos) = attrs.iter().position(|a| a.name == attr.name) {
@@ -7134,7 +7176,7 @@ impl Hdf5Writer {
         };
 
         let header = self.build_dataset_header(index);
-        let encoded = header.encode();
+        let encoded = header.encode()?;
 
         if encoded.len() > original_size {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -7179,7 +7221,7 @@ impl Hdf5Writer {
                 continue;
             }
             let ds_header = self.build_dataset_header(i);
-            let encoded = ds_header.encode();
+            let encoded = ds_header.encode()?;
             let encoded_size = encoded.len();
             let addr = self.allocator.allocate(encoded_size as u64);
             self.handle.write_at(addr, &encoded)?;
@@ -7198,21 +7240,21 @@ impl Hdf5Writer {
             if self.grp(gi).lock().deleted {
                 continue;
             }
-            let size = self.build_group_header(gi).encode().len() as u64;
+            let size = self.build_group_header(gi).encode()?.len() as u64;
             self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
         }
         for gi in 0..self.group_count() {
             if self.grp(gi).lock().deleted {
                 continue;
             }
-            let encoded = self.build_group_header(gi).encode();
+            let encoded = self.build_group_header(gi).encode()?;
             let addr = self.grp(gi).lock().obj_header_addr;
             self.handle.write_at(addr, &encoded)?;
         }
 
         // 2. Write root group object header.
         let root_header = self.build_root_group_header();
-        let root_encoded = root_header.encode();
+        let root_encoded = root_header.encode()?;
         let root_encoded_size = root_encoded.len();
         let root_addr = self.allocator.allocate(root_encoded_size as u64);
         self.handle.write_at(root_addr, &root_encoded)?;
@@ -7344,7 +7386,7 @@ impl Hdf5Writer {
                 }
             }
             let ds_header = self.build_dataset_header(i);
-            let encoded = ds_header.encode();
+            let encoded = ds_header.encode()?;
             let addr = self.allocator.allocate(encoded.len() as u64);
             self.handle.write_at(addr, &encoded)?;
             ds.lock().obj_header_addr = addr;
@@ -7372,14 +7414,14 @@ impl Hdf5Writer {
             if self.grp(gi).lock().deleted {
                 continue;
             }
-            let size = self.build_group_header(gi).encode().len() as u64;
+            let size = self.build_group_header(gi).encode()?.len() as u64;
             self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
         }
         for gi in 0..self.group_count() {
             if self.grp(gi).lock().deleted {
                 continue;
             }
-            let encoded = self.build_group_header(gi).encode();
+            let encoded = self.build_group_header(gi).encode()?;
             let addr = self.grp(gi).lock().obj_header_addr;
             self.handle.write_at(addr, &encoded)?;
         }
@@ -7393,7 +7435,7 @@ impl Hdf5Writer {
             }
         }
         let root_header = self.build_root_group_header();
-        let root_encoded = root_header.encode();
+        let root_encoded = root_header.encode()?;
         let root_addr = self.allocator.allocate(root_encoded.len() as u64);
         self.handle.write_at(root_addr, &root_encoded)?;
         self.root_group_addr = Some(root_addr);

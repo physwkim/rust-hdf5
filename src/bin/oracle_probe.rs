@@ -1408,10 +1408,18 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             let ds = file.new_dataset::<i32>().shape([8usize]).create("data")?;
             ds.write_raw(&ramp_n::<i32>(8))?;
             let big: Vec<i32> = (0..25600i32).collect();
-            ds.new_attr::<i32>()
-                .shape([25600usize])
-                .create("big")?
-                .write_array(&big)?;
+            let attr = ds.new_attr::<i32>().shape([25600usize]).create("big")?;
+            // An attribute this large has no compact form: the object header
+            // message size field is a u16. libhdf5 answers by moving it to
+            // dense storage; this writer refuses it instead, which is a
+            // missing capability rather than a failed write.
+            if let Err(e) = attr.write_array(&big) {
+                let why = oneline(&e);
+                if why.contains("dense attribute storage") {
+                    return Ok(unsup(&why));
+                }
+                return Err(e);
+            }
             file.close()?;
             Ok(Ok(()))
         }

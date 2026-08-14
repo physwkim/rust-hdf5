@@ -38,6 +38,14 @@ pub const OHDR_SIGNATURE: [u8; 4] = *b"OHDR";
 /// Object header version 2.
 pub const OHDR_VERSION: u8 = 2;
 
+/// Largest payload one object header message can carry.
+///
+/// The message envelope encodes the payload length in a `u16`, so this is a
+/// hard on-disk ceiling, not a policy: libhdf5 refuses the same sizes through
+/// `H5O_MESG_MAX_SIZE` (65536) and moves anything that reaches it out of the
+/// header — `H5O__attr_create` switches such an attribute to dense storage.
+pub const MAX_MESSAGE_SIZE: usize = u16::MAX as usize;
+
 // Flag bit masks
 const FLAG_SIZE_MASK: u8 = 0x03;
 const FLAG_ATTR_CREATION_ORDER_TRACKED: u8 = 0x04;
@@ -119,7 +127,25 @@ impl ObjectHeader {
 
     /// Encode the object header to a byte vector, including "OHDR" signature
     /// and trailing checksum.
-    pub fn encode(&self) -> Vec<u8> {
+    ///
+    /// Fails when any message payload exceeds [`MAX_MESSAGE_SIZE`]. The size
+    /// field is a `u16`, so writing such a message would record its length
+    /// modulo 65536: the reader would then take the payload's own tail for the
+    /// next message envelope and every message after it would decode as
+    /// garbage. Nothing downstream can detect that — the checksum is computed
+    /// over the truncated image and matches — so the check has to happen here,
+    /// before any bytes are produced.
+    pub fn encode(&self) -> FormatResult<Vec<u8>> {
+        for msg in &self.messages {
+            if msg.data.len() > MAX_MESSAGE_SIZE {
+                return Err(FormatError::InvalidData(format!(
+                    "object header message type 0x{:02X} is {} bytes, over the \
+                     {MAX_MESSAGE_SIZE}-byte limit the message size field can express",
+                    msg.msg_type,
+                    msg.data.len()
+                )));
+            }
+        }
         let messages_size = self.messages_data_size();
 
         // Estimate total size for pre-allocation
@@ -162,6 +188,7 @@ impl ObjectHeader {
         // Messages
         for msg in &self.messages {
             buf.push(msg.msg_type);
+            // Checked against MAX_MESSAGE_SIZE above.
             buf.extend_from_slice(&(msg.data.len() as u16).to_le_bytes());
             buf.push(msg.flags);
             if self.has_creation_order() {
@@ -177,7 +204,7 @@ impl ObjectHeader {
         buf.extend_from_slice(&cksum.to_le_bytes());
 
         debug_assert_eq!(buf.len(), total);
-        buf
+        Ok(buf)
     }
 
     /// Decode an object header from a byte buffer. Returns the parsed header
@@ -533,7 +560,7 @@ mod tests_v1 {
     fn test_decode_any_v2() {
         let mut hdr = ObjectHeader::new();
         hdr.add_message(0x01, 0x00, vec![1, 2, 3]);
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
         let (decoded, _) = ObjectHeader::decode_any(&encoded).unwrap();
         assert_eq!(decoded.messages.len(), 1);
     }
@@ -572,7 +599,7 @@ mod tests {
     #[test]
     fn test_empty_header_roundtrip() {
         let hdr = ObjectHeader::new();
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
 
         // OHDR(4) + version(1) + flags(1) + chunk0_size(4) + checksum(4) = 14
         assert_eq!(encoded.len(), 14);
@@ -589,7 +616,7 @@ mod tests {
         let mut hdr = ObjectHeader::new();
         hdr.add_message(0x01, 0x00, vec![0xAA, 0xBB, 0xCC]);
 
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
         let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded.messages.len(), 1);
@@ -605,7 +632,7 @@ mod tests {
         hdr.add_message(0x03, 0x01, vec![10, 20]);
         hdr.add_message(0x0C, 0x00, vec![]);
 
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
         let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded.messages.len(), 3);
@@ -621,7 +648,7 @@ mod tests {
         hdr.add_message(0x01, 0x00, vec![0xFF; 8]);
         hdr.add_message(0x03, 0x00, vec![0xEE; 4]);
 
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
         let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded.messages.len(), 2);
@@ -638,7 +665,7 @@ mod tests {
         };
         hdr.add_message(0x01, 0x00, vec![42]);
 
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
         let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded.messages[0].data, vec![42]);
@@ -653,7 +680,7 @@ mod tests {
         };
         hdr.add_message(0x01, 0x00, vec![1, 2, 3]);
 
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
         let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded.messages[0].data, vec![1, 2, 3]);
@@ -668,7 +695,7 @@ mod tests {
         };
         hdr.add_message(0x01, 0x00, vec![0xDE, 0xAD]);
 
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
         let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded.messages[0].data, vec![0xDE, 0xAD]);
@@ -685,7 +712,7 @@ mod tests {
     #[test]
     fn test_decode_bad_version() {
         let hdr = ObjectHeader::new();
-        let mut encoded = hdr.encode();
+        let mut encoded = hdr.encode().unwrap();
         encoded[4] = 99; // corrupt version
         let err = ObjectHeader::decode(&encoded).unwrap_err();
         assert!(matches!(err, FormatError::InvalidVersion(99)));
@@ -695,7 +722,7 @@ mod tests {
     fn test_decode_checksum_mismatch() {
         let mut hdr = ObjectHeader::new();
         hdr.add_message(0x01, 0x00, vec![1, 2, 3]);
-        let mut encoded = hdr.encode();
+        let mut encoded = hdr.encode().unwrap();
         // Corrupt a message byte
         let last_data = encoded.len() - 5;
         encoded[last_data] ^= 0xFF;
@@ -713,7 +740,7 @@ mod tests {
     fn test_decode_with_trailing_data() {
         let mut hdr = ObjectHeader::new();
         hdr.add_message(0x01, 0x00, vec![7, 8, 9]);
-        let mut encoded = hdr.encode();
+        let mut encoded = hdr.encode().unwrap();
         let original_len = encoded.len();
         encoded.extend_from_slice(&[0xBB; 50]); // trailing garbage
 
@@ -728,11 +755,38 @@ mod tests {
         let big_data = vec![0x42; 1000];
         hdr.add_message(0x0C, 0x00, big_data.clone());
 
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
         let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded.messages[0].data.len(), 1000);
         assert_eq!(decoded.messages[0].data, big_data);
+    }
+
+    /// The largest payload the size field can express still round-trips.
+    #[test]
+    fn test_message_payload_at_size_limit() {
+        let mut hdr = ObjectHeader::new();
+        hdr.add_message(0x0C, 0x00, vec![0x42; MAX_MESSAGE_SIZE]);
+
+        let encoded = hdr.encode().expect("encode at the limit must succeed");
+        let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.messages[0].data.len(), MAX_MESSAGE_SIZE);
+    }
+
+    /// One byte past the limit is refused. Encoding it would store the length
+    /// modulo 65536 — here 0 — and every message after it would decode from
+    /// the middle of this one's payload, with a checksum that still matches.
+    #[test]
+    fn test_message_payload_over_size_limit_is_refused() {
+        let mut hdr = ObjectHeader::new();
+        hdr.add_message(0x01, 0x00, vec![7; 4]);
+        hdr.add_message(0x0C, 0x00, vec![0x42; MAX_MESSAGE_SIZE + 1]);
+
+        let err = hdr.encode().expect_err("over the limit must not encode");
+        let msg = err.to_string();
+        assert!(msg.contains("0x0C"), "{msg}");
+        assert!(msg.contains(&(MAX_MESSAGE_SIZE + 1).to_string()), "{msg}");
     }
 
     #[test]

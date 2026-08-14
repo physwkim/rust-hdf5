@@ -1397,3 +1397,99 @@ fn object_header_attribute_count_matches_h5py() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// An attribute at or past the object header message limit must never reach
+/// the file. The message size field is a `u16`, so writing one truncates the
+/// length modulo 65536 and every following message decodes from the middle of
+/// this one's payload — under a checksum that still matches, which is why
+/// libhdf5 reports the result as `bad flag combination for message` rather
+/// than as damage. The rest of the file must survive the refusal intact.
+#[test]
+fn oversized_attribute_refused_leaving_file_readable() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_oversized");
+    let big: Vec<i32> = (0..25600).collect();
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file.new_dataset::<i32>().shape([4]).create("data").unwrap();
+        ds.write_raw(&[1, 2, 3, 4]).unwrap();
+        ds.new_attr::<i32>()
+            .shape(())
+            .create("gain")
+            .unwrap()
+            .write_numeric(&7i32)
+            .unwrap();
+
+        let err = ds
+            .new_attr::<i32>()
+            .shape([25600])
+            .create("big")
+            .unwrap()
+            .write_array(&big)
+            .expect_err("a 100 KiB attribute must be refused, not truncated");
+        assert!(err.to_string().contains("dense attribute storage"), "{err}");
+        let err = file
+            .set_attr_array_numeric("rootbig", &big)
+            .expect_err("a 100 KiB root attribute must be refused too");
+        assert!(err.to_string().contains("65535"), "{err}");
+
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "d = f['data']\n\
+         assert list(d[...]) == [1, 2, 3, 4], list(d[...])\n\
+         assert sorted(d.attrs.keys()) == ['gain'], sorted(d.attrs.keys())\n\
+         assert d.attrs['gain'] == 7\n\
+         assert sorted(f.attrs.keys()) == [], sorted(f.attrs.keys())\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// The append path takes the same attribute in through the other door: it
+/// rebuilds an object header from the attributes read out of it, so an
+/// attribute libhdf5 put in dense storage would come back as a compact
+/// message too large to encode. The refusal has to happen at open, before any
+/// write moves data past the allocation point the superblock still records —
+/// so the file is left byte-for-byte as it was.
+#[test]
+fn reopen_refuses_oversized_dense_attribute_without_touching_the_file() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_oversized_reopen");
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v108"),
+        "d = f.create_dataset('data', data=np.arange(8, dtype='<i4'))\n\
+         d.attrs.create('big', np.arange(25600, dtype='<i4'))\n",
+    );
+    let before = std::fs::read(&path).unwrap();
+
+    let err = match H5File::open_rw(&path) {
+        Ok(_) => panic!("reopen must refuse the oversized attribute"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("dense attribute storage"), "{err}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "a refused reopen must leave the file byte-identical"
+    );
+
+    // Read-only access is unaffected: the dense attribute still reads back.
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let big = ds.attr("big").unwrap().read_numeric_as::<i32>().unwrap();
+    assert_eq!(big.len(), 25600);
+    assert_eq!(big[25599], 25599);
+    drop(file);
+
+    read_back_with_h5py(
+        py,
+        &path,
+        "assert f['data'].attrs['big'].shape == (25600,)\n\
+         assert list(f['data'][...]) == list(range(8))\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
