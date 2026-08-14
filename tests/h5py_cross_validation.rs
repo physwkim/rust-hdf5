@@ -1972,3 +1972,56 @@ fn vlen_numeric_written_by_rust_read_typed_by_h5py() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// A scale-offset chunk this crate compressed is decoded by libhdf5, and the
+/// chunk libhdf5 itself would have produced for the same values is decoded by
+/// this crate. Both halves have to hold for the filter to be usable in a file
+/// anyone else opens.
+#[test]
+fn scaleoffset_written_by_rust_read_by_h5py() {
+    let Some(py) = python() else { return };
+    use rust_hdf5::format::messages::filter::FilterPipeline;
+
+    let values: Vec<i32> = (0..64).map(|i| 1000 + (i * 37) % 500).collect();
+
+    let path = tmp("scaleoffset_rust_write");
+    {
+        let file = H5File::create(&path).unwrap();
+        let pipeline = FilterPipeline::scaleoffset(&DatatypeMessage::i32_type(), 16, 0).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([64usize])
+            .chunk(&[16])
+            .filter_pipeline(pipeline)
+            .create("data")
+            .unwrap();
+        ds.write_raw(&values).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['data']\n\
+         assert ds.dtype == np.dtype('<i4'), ds.dtype\n\
+         assert ds.scaleoffset == 0, ds.scaleoffset\n\
+         want = [1000 + (i * 37) % 500 for i in range(64)]\n\
+         got = [int(v) for v in ds[...]]\n\
+         assert got == want, got\n",
+    );
+    std::fs::remove_file(&path).ok();
+
+    // The other direction: libhdf5 writes the same values with the same
+    // filter, and this crate reads them back.
+    let path = tmp("scaleoffset_h5py_write");
+    write_with_h5py(
+        py,
+        &path,
+        "ds = f.create_dataset('data', (64,), chunks=(16,), dtype='<i4', scaleoffset=0)\n\
+         ds[...] = np.array([1000 + (i * 37) % 500 for i in range(64)], dtype='<i4')\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let got: Vec<i32> = file.dataset("data").unwrap().read_raw().unwrap();
+    assert_eq!(got, values);
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}

@@ -577,6 +577,9 @@ FILTER_CASES = [
     _filter_case("filter_deflate_shuffle", "filter_deflate_shuffle",
                  "shuffle then deflate",
                  compression="gzip", compression_opts=6, shuffle=True),
+    _filter_case("filter_scaleoffset", "filter_scaleoffset",
+                 "scale-offset, library-computed minimum bits",
+                 scaleoffset=0),
 ]
 
 

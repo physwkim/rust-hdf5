@@ -1481,6 +1481,14 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 }],
             })
         }),
+        "filter_scaleoffset" => filtered(path, |b| {
+            // `filtered` writes 64 i32 elements in chunks of 16, and the
+            // filter parameters carry that per-chunk element count.
+            b.filter_pipeline(
+                FilterPipeline::scaleoffset(&DatatypeMessage::i32_type(), 16, 0)
+                    .expect("i32 is scale-offset filterable"),
+            )
+        }),
 
         // ---- fill values --------------------------------------------------
         "fill_default" => {
