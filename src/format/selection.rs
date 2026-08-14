@@ -150,6 +150,105 @@ impl Selection {
             ))),
         }
     }
+
+    /// Decompose this selection into `(start, count)` boxes — each
+    /// `dims.len()` elements wide — whose union is exactly the selected
+    /// elements, with no overlap between boxes. `dims` supplies the full
+    /// extent for [`Selection::All`] and must match a hyperslab's `rank`;
+    /// it is not otherwise consulted (coordinates are absolute, so this
+    /// does not clip an out-of-range block against `dims` — a caller that
+    /// needs that validates it itself).
+    ///
+    /// `Err` for a regular hyperslab whose `count` or `block` holds
+    /// [`UNLIMITED`]: an unbounded dimension cannot become a finite box
+    /// without a growable-dataset extent this call does not have.
+    pub fn to_boxes(&self, dims: &[u64]) -> FormatResult<Vec<(Vec<u64>, Vec<u64>)>> {
+        match self {
+            Self::None => Ok(Vec::new()),
+            Self::All => Ok(vec![(vec![0u64; dims.len()], dims.to_vec())]),
+            Self::Hyperslab { rank, form } => {
+                if *rank != dims.len() {
+                    return Err(FormatError::InvalidData(format!(
+                        "hyperslab selection rank {rank} does not match the \
+                         {}-dimensional extent",
+                        dims.len()
+                    )));
+                }
+                match form {
+                    Hyperslab::Blocks(blocks) => blocks
+                        .iter()
+                        .map(|b| {
+                            let count = b
+                                .start
+                                .iter()
+                                .zip(&b.end)
+                                .map(|(&s, &e)| {
+                                    e.checked_sub(s).and_then(|d| d.checked_add(1)).ok_or_else(
+                                        || {
+                                            FormatError::InvalidData(
+                                                "hyperslab block end precedes its start".into(),
+                                            )
+                                        },
+                                    )
+                                })
+                                .collect::<FormatResult<Vec<u64>>>()?;
+                            Ok((b.start.clone(), count))
+                        })
+                        .collect(),
+                    Hyperslab::Regular(r) => regular_hyperslab_to_boxes(r),
+                }
+            }
+        }
+    }
+}
+
+/// Cap on the number of boxes [`Selection::to_boxes`] will materialize for
+/// a REGULAR hyperslab (`count[0] * count[1] * ...`). `count` comes
+/// straight off the wire with no relation to buffer size the way a
+/// block-list's `num_blocks` is implicitly bounded by (each block consumes
+/// buffer bytes; a `(start, stride, count, block)` tuple does not), so an
+/// unchecked expansion could turn a few dozen bytes of crafted input into
+/// an unbounded allocation.
+const MAX_REGULAR_BOXES: u64 = 1 << 20;
+
+fn regular_hyperslab_to_boxes(r: &RegularHyperslab) -> FormatResult<Vec<(Vec<u64>, Vec<u64>)>> {
+    let rank = r.start.len();
+    if r.count.contains(&UNLIMITED) || r.block.contains(&UNLIMITED) {
+        return Err(FormatError::UnsupportedFeature(
+            "unlimited (H5S_UNLIMITED) regular hyperslab dimension".into(),
+        ));
+    }
+    if r.count.contains(&0) || r.block.contains(&0) {
+        return Ok(Vec::new());
+    }
+    let total_boxes = r
+        .count
+        .iter()
+        .try_fold(1u64, |acc, &c| acc.checked_mul(c))
+        .ok_or_else(|| FormatError::InvalidData("regular hyperslab box count overflows".into()))?;
+    if total_boxes > MAX_REGULAR_BOXES {
+        return Err(FormatError::UnsupportedFeature(format!(
+            "regular hyperslab selection expands to {total_boxes} boxes, over the \
+             {MAX_REGULAR_BOXES} cap"
+        )));
+    }
+
+    let mut boxes = Vec::with_capacity(total_boxes as usize);
+    let mut idx = vec![0u64; rank];
+    for _ in 0..total_boxes {
+        let start: Vec<u64> = (0..rank)
+            .map(|d| r.start[d] + idx[d] * r.stride[d])
+            .collect();
+        boxes.push((start, r.block.clone()));
+        for d in (0..rank).rev() {
+            idx[d] += 1;
+            if idx[d] < r.count[d] {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+    Ok(boxes)
 }
 
 fn decode_all_none_body(buf: &[u8]) -> FormatResult<usize> {
@@ -623,5 +722,180 @@ mod tests {
         buf.extend_from_slice(&(u64::MAX - 1).to_le_bytes()); // num_blocks (lie)
         let err = Selection::decode(&buf).unwrap_err();
         assert!(matches!(err, FormatError::BufferTooShort { .. }));
+    }
+
+    // --------------------------------------------------------------- to_boxes
+
+    #[test]
+    fn to_boxes_all_covers_the_full_extent() {
+        let boxes = Selection::All.to_boxes(&[3, 5]).unwrap();
+        assert_eq!(boxes, vec![(vec![0, 0], vec![3, 5])]);
+    }
+
+    #[test]
+    fn to_boxes_none_is_empty() {
+        assert_eq!(Selection::None.to_boxes(&[3, 5]).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn to_boxes_single_block_matches_h5py_fixture() {
+        // layout[4:12] = VirtualSource(..., shape=(8,)): one block, [4, 11].
+        let sel = Selection::Hyperslab {
+            rank: 1,
+            form: Hyperslab::Blocks(vec![HyperslabBlock {
+                start: vec![4],
+                end: vec![11],
+            }]),
+        };
+        let boxes = sel.to_boxes(&[20]).unwrap();
+        assert_eq!(boxes, vec![(vec![4], vec![8])]);
+    }
+
+    #[test]
+    fn to_boxes_multi_block_2d() {
+        let sel = Selection::Hyperslab {
+            rank: 2,
+            form: Hyperslab::Blocks(vec![
+                HyperslabBlock {
+                    start: vec![0, 0],
+                    end: vec![1, 1],
+                },
+                HyperslabBlock {
+                    start: vec![2, 2],
+                    end: vec![3, 3],
+                },
+            ]),
+        };
+        let boxes = sel.to_boxes(&[4, 4]).unwrap();
+        assert_eq!(
+            boxes,
+            vec![(vec![0, 0], vec![2, 2]), (vec![2, 2], vec![2, 2])]
+        );
+    }
+
+    #[test]
+    fn to_boxes_rejects_rank_mismatch() {
+        let sel = Selection::Hyperslab {
+            rank: 2,
+            form: Hyperslab::Blocks(vec![]),
+        };
+        let err = sel.to_boxes(&[4]).unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)));
+    }
+
+    #[test]
+    fn to_boxes_rejects_inverted_block() {
+        let sel = Selection::Hyperslab {
+            rank: 1,
+            form: Hyperslab::Blocks(vec![HyperslabBlock {
+                start: vec![5],
+                end: vec![2],
+            }]),
+        };
+        let err = sel.to_boxes(&[10]).unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)));
+    }
+
+    /// A regular hyperslab expands into one box per `count` position, block
+    /// sized `block`, spaced `stride` apart — the odometer must walk the
+    /// last dimension fastest, matching row-major box order.
+    #[test]
+    fn to_boxes_regular_expands_2d_grid() {
+        let sel = Selection::Hyperslab {
+            rank: 2,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: vec![0, 0],
+                stride: vec![4, 4],
+                count: vec![2, 2],
+                block: vec![2, 2],
+            }),
+        };
+        let boxes = sel.to_boxes(&[8, 8]).unwrap();
+        assert_eq!(
+            boxes,
+            vec![
+                (vec![0, 0], vec![2, 2]),
+                (vec![0, 4], vec![2, 2]),
+                (vec![4, 0], vec![2, 2]),
+                (vec![4, 4], vec![2, 2]),
+            ]
+        );
+    }
+
+    #[test]
+    fn to_boxes_regular_single_block_matches_block_list_shape() {
+        // A count=1 regular hyperslab is the same box a block-list form of
+        // the same selection would produce.
+        let sel = Selection::Hyperslab {
+            rank: 1,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: vec![4],
+                stride: vec![1],
+                count: vec![1],
+                block: vec![8],
+            }),
+        };
+        assert_eq!(sel.to_boxes(&[20]).unwrap(), vec![(vec![4], vec![8])]);
+    }
+
+    #[test]
+    fn to_boxes_regular_zero_count_is_empty() {
+        let sel = Selection::Hyperslab {
+            rank: 1,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: vec![0],
+                stride: vec![1],
+                count: vec![0],
+                block: vec![1],
+            }),
+        };
+        assert_eq!(sel.to_boxes(&[10]).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn to_boxes_regular_rejects_unlimited_count() {
+        let sel = Selection::Hyperslab {
+            rank: 1,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: vec![0],
+                stride: vec![1],
+                count: vec![UNLIMITED],
+                block: vec![1],
+            }),
+        };
+        let err = sel.to_boxes(&[10]).unwrap_err();
+        assert!(matches!(err, FormatError::UnsupportedFeature(_)));
+    }
+
+    #[test]
+    fn to_boxes_regular_rejects_unlimited_block() {
+        let sel = Selection::Hyperslab {
+            rank: 1,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: vec![0],
+                stride: vec![1],
+                count: vec![1],
+                block: vec![UNLIMITED],
+            }),
+        };
+        let err = sel.to_boxes(&[10]).unwrap_err();
+        assert!(matches!(err, FormatError::UnsupportedFeature(_)));
+    }
+
+    /// A crafted `count` product over the box cap must fail cleanly instead
+    /// of attempting a huge allocation.
+    #[test]
+    fn to_boxes_regular_rejects_huge_box_count() {
+        let sel = Selection::Hyperslab {
+            rank: 2,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: vec![0, 0],
+                stride: vec![1, 1],
+                count: vec![1 << 30, 1 << 30],
+                block: vec![1, 1],
+            }),
+        };
+        let err = sel.to_boxes(&[u64::MAX, u64::MAX]).unwrap_err();
+        assert!(matches!(err, FormatError::UnsupportedFeature(_)));
     }
 }

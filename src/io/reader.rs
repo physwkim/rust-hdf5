@@ -35,7 +35,7 @@ use crate::format::{FormatContext, UNDEF_ADDR};
 use crate::io::file_handle::FileHandle;
 #[cfg(feature = "mmap")]
 use crate::io::file_handle::MmapFileHandle;
-use crate::io::hyperslab::{compute_strides, for_each_contiguous_run};
+use crate::io::hyperslab::{compute_strides, for_each_contiguous_run, for_each_dual_run};
 use crate::io::locking::FileLocking;
 use crate::io::IoResult;
 
@@ -245,19 +245,21 @@ fn fill_tiled_into(out: &mut [u8], fill_value: Option<&[u8]>) {
 /// the same all-ones bit pattern as [`UNDEF_ADDR`]).
 const EFL_UNLIMITED_SIZE: u64 = u64::MAX;
 
-/// Resolve the directory external raw-data file names are joined against,
-/// matching libhdf5's `H5D__build_file_prefix` (H5Dint.c) for the
-/// `HDF5_EXTFILE_PREFIX` environment variable. There is no dataset access
-/// property list here to fall back to, so unset behaves exactly as an
-/// unset/empty DAPL property would.
+/// Resolve the directory a raw-data file name is joined against, matching
+/// libhdf5's `H5D__build_file_prefix` (H5Dint.c) for the given environment
+/// variable — `HDF5_EXTFILE_PREFIX` for External Data Files
+/// ([`resolve_extfile_prefix`]), `HDF5_VDS_PREFIX` for Virtual Dataset
+/// sources ([`resolve_vdsfile_prefix`]); both features route through the
+/// same C function, just keyed on a different variable. There is no dataset
+/// access property list here to fall back to, so unset behaves exactly as
+/// an unset/empty DAPL property would.
 ///
 /// `${ORIGIN}` expands to `source_dir` (the directory holding the open
 /// HDF5 file); any other value is used as a literal prefix; unset, empty,
 /// or `"."` means "no prefix" (`H5_combine_path`'s own default), so a
-/// relative external file name resolves against the process's current
-/// directory instead.
-fn resolve_extfile_prefix(source_dir: &Path) -> Option<PathBuf> {
-    let prefix = std::env::var("HDF5_EXTFILE_PREFIX").ok()?;
+/// relative name resolves against the process's current directory instead.
+fn resolve_file_prefix(env_var: &str, source_dir: &Path) -> Option<PathBuf> {
+    let prefix = std::env::var(env_var).ok()?;
     if prefix.is_empty() || prefix == "." {
         return None;
     }
@@ -274,12 +276,23 @@ fn resolve_extfile_prefix(source_dir: &Path) -> Option<PathBuf> {
     })
 }
 
-/// Join an external-file `name` against a resolved prefix, matching
+fn resolve_extfile_prefix(source_dir: &Path) -> Option<PathBuf> {
+    resolve_file_prefix("HDF5_EXTFILE_PREFIX", source_dir)
+}
+
+/// Resolve the directory Virtual Dataset source file names are joined
+/// against (`HDF5_VDS_PREFIX`; see [`resolve_file_prefix`]).
+fn resolve_vdsfile_prefix(source_dir: &Path) -> Option<PathBuf> {
+    resolve_file_prefix("HDF5_VDS_PREFIX", source_dir)
+}
+
+/// Join a raw-data file `name` against a resolved prefix, matching
 /// libhdf5's `H5_combine_path` (H5system.c): an absolute `name` is used
 /// as-is regardless of the prefix, and no prefix means "relative to the
 /// process's current directory" — both of which `Path::join` already
-/// implements for an absolute joinee.
-fn combine_extfile_path(prefix: Option<&Path>, name: &str) -> PathBuf {
+/// implements for an absolute joinee. Shared by External Data Files and
+/// Virtual Dataset source resolution — both call the same C function.
+fn combine_prefixed_path(prefix: Option<&Path>, name: &str) -> PathBuf {
     match prefix {
         Some(p) => p.join(name),
         None => PathBuf::from(name),
@@ -318,7 +331,7 @@ fn read_external_file_bytes(
                 "unlimited (growable) external file slots are not supported".into(),
             ));
         }
-        let full_path = combine_extfile_path(extfile_prefix, &slot.name);
+        let full_path = combine_prefixed_path(extfile_prefix, &slot.name);
         let ext_handle = FileHandle::open_read_with_locking(&full_path, FileLocking::Disabled)
             .map_err(|e| {
                 crate::io::IoError::InvalidState(format!(
@@ -340,6 +353,96 @@ fn read_external_file_bytes(
         written += this_read;
         skip = 0;
         slot_idx += 1;
+    }
+    Ok(())
+}
+
+/// Recursion ceiling for virtual dataset nesting (a VDS whose source is
+/// itself a VDS — possibly in another file). Bounded so a crafted cyclic
+/// mapping chain fails cleanly instead of recursing until the stack
+/// overflows; real VDS chains do not nest anywhere near this deep.
+const MAX_VIRTUAL_DEPTH: usize = 16;
+
+/// Detect a printf-style `%b` block-index substitution pattern in a
+/// virtual dataset source name (`H5D_virtual_parse_source_name`,
+/// H5Dvirtual.c) — used for unlimited/growable mappings whose source
+/// expands across a sequence of files or datasets indexed by block
+/// number. `%%` is an escaped literal percent, not a pattern; any other
+/// `%`-led sequence (including `%b` itself) marks a name this reader does
+/// not resolve.
+fn has_virtual_printf_pattern(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'%' {
+                i += 2;
+                continue;
+            }
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Read each of `source_boxes` (via `read_source_box`) and scatter it into
+/// `out` (shaped `virtual_dims`) at the same-indexed box in
+/// `virtual_boxes`.
+///
+/// The two box lists must have equal length with identical per-dimension
+/// `count` at each index — H5S requires a mapping's source and virtual
+/// selections to select the same number of points, and this is the
+/// well-defined case where they also decompose into the same box shapes
+/// in the same order (every selection form h5py's `VirtualLayout` writes,
+/// and any hand-built mapping whose two sides were selected the same way).
+/// A mapping whose selections diverge beyond that — same point count but a
+/// different box decomposition on each side — would need the general
+/// element-by-element linear-order match H5S's own iterator does; rather
+/// than risk a silently wrong scatter, that case is rejected here.
+fn copy_matched_boxes(
+    mut read_source_box: impl FnMut(&[u64], &[u64], &mut [u8]) -> IoResult<()>,
+    source_boxes: &[(Vec<u64>, Vec<u64>)],
+    virtual_boxes: &[(Vec<u64>, Vec<u64>)],
+    virtual_dims: &[u64],
+    element_size: u64,
+    out: &mut [u8],
+) -> IoResult<()> {
+    if source_boxes.len() != virtual_boxes.len() {
+        return Err(crate::io::IoError::InvalidState(format!(
+            "virtual dataset mapping's source and virtual selections decompose into a \
+             different number of boxes ({} vs {}), which is not supported",
+            source_boxes.len(),
+            virtual_boxes.len()
+        )));
+    }
+    for ((src_start, src_count), (dst_start, dst_count)) in source_boxes.iter().zip(virtual_boxes) {
+        if src_count != dst_count {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "virtual dataset mapping's source box shape {src_count:?} does not match its \
+                 virtual box shape {dst_count:?}, which is not supported"
+            )));
+        }
+        let nbytes = saturating_byte_len(src_count, element_size) as usize;
+        let mut buf = alloc_tiled_fill(nbytes, None)?;
+        read_source_box(src_start, src_count, &mut buf)?;
+
+        let src_dims = src_count.clone();
+        let src_origin = vec![0u64; src_count.len()];
+        for_each_dual_run(
+            virtual_dims,
+            dst_start,
+            &src_dims,
+            &src_origin,
+            dst_count,
+            element_size,
+            |dst_off, src_off, len| {
+                let dst_off = dst_off as usize;
+                let src_off = src_off as usize;
+                out[dst_off..dst_off + len].copy_from_slice(&buf[src_off..src_off + len]);
+                Ok(())
+            },
+        )?;
     }
     Ok(())
 }
@@ -1807,9 +1910,146 @@ impl Hdf5Reader {
                 )?;
             }
             DataLayoutMessage::Virtual { .. } => {
+                fill_tiled_into(out, fill_value.as_deref());
+                self.read_virtual_into(name, out, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fill `out` (shaped like the virtual dataset's own extent) by
+    /// stitching each mapping's source bytes in order (`H5D__virtual_read`,
+    /// H5Dvirtual.c). `out` must already be pre-filled with the tiled fill
+    /// value — every element no mapping covers is left exactly as the
+    /// caller filled it, matching the fixed-extent default of
+    /// `H5Pset_virtual_view` (`H5D_VDS_LAST_AVAILABLE`/`FIRST_MISSING` only
+    /// change how an *unlimited* mapping's extent is computed, which this
+    /// reader does not support — see [`has_virtual_printf_pattern`]).
+    /// Mappings apply in list order, so a later mapping's bytes win over an
+    /// earlier one's on overlap, exactly like the C reader.
+    ///
+    /// `depth` counts virtual-dataset nesting — a mapping whose source is
+    /// itself a virtual dataset, possibly in another file — so a crafted
+    /// cyclic mapping chain fails cleanly instead of recursing until the
+    /// stack overflows.
+    fn read_virtual_into(&mut self, name: &str, out: &mut [u8], depth: usize) -> IoResult<()> {
+        if depth >= MAX_VIRTUAL_DEPTH {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset {name:?}: virtual dataset mapping nests {MAX_VIRTUAL_DEPTH} levels \
+                 deep, aborting (possible cyclic mapping)"
+            )));
+        }
+        let info = self
+            .dataset_info(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let dims = info.dataspace.dims.clone();
+        let element_size = info.datatype.element_size() as u64;
+        let Some(mappings) = info.virtual_mappings.clone() else {
+            // No mapping list written yet: every element is unmapped, and
+            // `out` is already the fill value the caller pre-filled it with.
+            return Ok(());
+        };
+        let source_dir = self.source_dir.clone();
+
+        // Cross-file source readers, opened at most once per distinct
+        // resolved path for the duration of this call.
+        let mut cross_file_cache: std::collections::HashMap<PathBuf, Hdf5Reader> =
+            std::collections::HashMap::new();
+
+        for mapping in &mappings.mappings {
+            if has_virtual_printf_pattern(&mapping.source_file_name)
+                || has_virtual_printf_pattern(&mapping.source_dset_name)
+            {
                 return Err(crate::io::IoError::InvalidState(format!(
-                    "dataset {name:?}: virtual dataset read is not yet implemented"
+                    "dataset {name:?}: virtual mapping to {:?}/{:?} uses a printf-style \
+                     (%b) unlimited source name pattern, which is not supported",
+                    mapping.source_file_name, mapping.source_dset_name
                 )));
+            }
+
+            let virtual_boxes = mapping.virtual_selection.to_boxes(&dims).map_err(|e| {
+                crate::io::IoError::InvalidState(format!(
+                    "dataset {name:?}: virtual mapping's virtual selection is not \
+                     supported: {e}"
+                ))
+            })?;
+            if virtual_boxes.is_empty() {
+                continue;
+            }
+
+            let source_name = mapping.source_dset_name.trim_start_matches('/');
+
+            if mapping.source_file_name == "." {
+                let src_dims = self
+                    .dataset_info(source_name)
+                    .ok_or_else(|| {
+                        crate::io::IoError::InvalidState(format!(
+                            "dataset {name:?}: virtual mapping source dataset \
+                             {source_name:?} not found in the same file"
+                        ))
+                    })?
+                    .dataspace
+                    .dims
+                    .clone();
+                let source_boxes = mapping.source_selection.to_boxes(&src_dims).map_err(|e| {
+                    crate::io::IoError::InvalidState(format!(
+                        "dataset {name:?}: virtual mapping's source selection is not \
+                         supported: {e}"
+                    ))
+                })?;
+                copy_matched_boxes(
+                    |s, c, buf| self.read_slice_into_unconverted(source_name, s, c, buf, depth + 1),
+                    &source_boxes,
+                    &virtual_boxes,
+                    &dims,
+                    element_size,
+                    out,
+                )?;
+            } else {
+                let prefix = resolve_vdsfile_prefix(&source_dir);
+                let full_path = combine_prefixed_path(prefix.as_deref(), &mapping.source_file_name);
+                let cache_key =
+                    std::fs::canonicalize(&full_path).unwrap_or_else(|_| full_path.clone());
+                if !cross_file_cache.contains_key(&cache_key) {
+                    let reader = Hdf5Reader::open_with_locking(&full_path, FileLocking::Disabled)
+                        .map_err(|e| {
+                        crate::io::IoError::InvalidState(format!(
+                            "dataset {name:?}: unable to open virtual dataset source \
+                                 file {}: {e}",
+                            full_path.display()
+                        ))
+                    })?;
+                    cross_file_cache.insert(cache_key.clone(), reader);
+                }
+                let src_reader = cross_file_cache.get_mut(&cache_key).unwrap();
+                let src_dims = src_reader
+                    .dataset_info(source_name)
+                    .ok_or_else(|| {
+                        crate::io::IoError::InvalidState(format!(
+                            "dataset {name:?}: virtual mapping source dataset \
+                             {source_name:?} not found in {}",
+                            full_path.display()
+                        ))
+                    })?
+                    .dataspace
+                    .dims
+                    .clone();
+                let source_boxes = mapping.source_selection.to_boxes(&src_dims).map_err(|e| {
+                    crate::io::IoError::InvalidState(format!(
+                        "dataset {name:?}: virtual mapping's source selection is not \
+                         supported: {e}"
+                    ))
+                })?;
+                copy_matched_boxes(
+                    |s, c, buf| {
+                        src_reader.read_slice_into_unconverted(source_name, s, c, buf, depth + 1)
+                    },
+                    &source_boxes,
+                    &virtual_boxes,
+                    &dims,
+                    element_size,
+                    out,
+                )?;
             }
         }
         Ok(())
@@ -3332,7 +3572,7 @@ impl Hdf5Reader {
     pub fn read_slice(&mut self, name: &str, starts: &[u64], counts: &[u64]) -> IoResult<Vec<u8>> {
         let (datatype, out_bytes) = self.slice_size_and_datatype(name, counts)?;
         let mut data = alloc_tiled_fill(out_bytes as usize, None)?;
-        self.read_slice_into_unconverted(name, starts, counts, &mut data)?;
+        self.read_slice_into_unconverted(name, starts, counts, &mut data, 0)?;
         Self::apply_post_filter_conversion(&mut data, &datatype)?;
         Ok(data)
     }
@@ -3359,7 +3599,7 @@ impl Hdf5Reader {
                 out_bytes
             )));
         }
-        self.read_slice_into_unconverted(name, starts, counts, out)?;
+        self.read_slice_into_unconverted(name, starts, counts, out, 0)?;
         Self::apply_post_filter_conversion(out, &datatype)?;
         Ok(())
     }
@@ -3387,13 +3627,17 @@ impl Hdf5Reader {
     /// Both [`read_slice`](Self::read_slice) and [`read_slice_into`](Self::read_slice_into)
     /// wrap it and apply the conversion exactly once.
     ///
-    /// `out.len()` must equal `product(counts) * element_size`.
+    /// `out.len()` must equal `product(counts) * element_size`. `depth`
+    /// counts virtual-dataset nesting for a caller reached through
+    /// [`read_virtual_into`](Self::read_virtual_into); pass `0` for a
+    /// top-level call.
     fn read_slice_into_unconverted(
         &mut self,
         name: &str,
         starts: &[u64],
         counts: &[u64],
         out: &mut [u8],
+        depth: usize,
     ) -> IoResult<()> {
         let info = self
             .dataset_info(name)
@@ -3541,9 +3785,30 @@ impl Hdf5Reader {
                 )?;
             }
             DataLayoutMessage::Virtual { .. } => {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "dataset {name:?}: virtual dataset read is not yet implemented"
-                )));
+                // Stitch the full virtual image, then extract the
+                // requested region from it. This reads more than the
+                // selection strictly needs (no per-mapping intersection
+                // against the caller's box), but a virtual dataset's data
+                // is composed from other datasets rather than stored
+                // contiguously, so there is no cheaper selective path
+                // without duplicating `read_virtual_into`'s mapping walk
+                // for a bounded region — correctness, not I/O pruning, is
+                // what a VDS slice read needs here.
+                fill_tiled_into(out, fill_value.as_deref());
+                let total = saturating_byte_len(&dims, element_size) as usize;
+                let mut full = alloc_tiled_fill(total, fill_value.as_deref())?;
+                self.read_virtual_into(name, &mut full, depth)?;
+                for_each_contiguous_run(
+                    &dims,
+                    starts,
+                    counts,
+                    element_size,
+                    |src_off, out_off, len| {
+                        let src_off = src_off as usize;
+                        out[out_off..out_off + len].copy_from_slice(&full[src_off..src_off + len]);
+                        Ok(())
+                    },
+                )?;
             }
         }
         Ok(())

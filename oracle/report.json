@@ -3,7 +3,7 @@
   "hdf5_version": "1.14.6",
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
-  "python": "/home/stevek/micromamba/envs/tomo/bin/python",
+  "python": "/home/stevek/micromamba/envs/tomo/bin/python3",
   "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-space-500431fd-1/target/release/oracle_probe",
   "cases": 82
  },
@@ -6266,7 +6266,7 @@
    "note": "virtual dataset mapped onto a dataset in a sibling file",
    "rust_case": null,
    "a": {
-    "verdict": "MISS",
+    "verdict": "PASS",
     "divergences": [],
     "gaps": [
      {
@@ -6310,15 +6310,64 @@
       "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
      },
      {
-      "key": "/vds",
-      "kind": "missing-object",
-      "field": "kind",
-      "structural": false,
-      "ref": "dataset"
+      "key": "/vds#external",
+      "kind": "unsupported",
+      "field": "external",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(external): H5Dataset exposes no external file list accessor"
+     },
+     {
+      "key": "/vds#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/vds#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/vds#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "virtual",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/vds#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[16]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/vds#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/vds#virtual",
+      "kind": "unsupported",
+      "field": "virtual",
+      "structural": true,
+      "ref": "[\"vds_src.h5\"::\"src\" ?->[0]-[15]]",
+      "probe": "UNSUPPORTED(virtual): H5Dataset exposes no virtual mapping accessor"
      }
     ],
     "oracle_errors": [],
-    "matched": 2,
+    "matched": 10,
     "detail": ""
    },
    "b": {
@@ -11646,7 +11695,6 @@
     "ref_region",
     "named_datatype",
     "layout_contiguous_v110",
-    "vds",
     "link_soft",
     "link_external",
     "libver_v110",
@@ -12258,6 +12306,7 @@
     "layout_chunked_v108",
     "chunkidx_earray_dim1",
     "external_storage",
+    "vds",
     "filter_deflate",
     "filter_shuffle",
     "filter_fletcher32",
@@ -12340,6 +12389,7 @@
     "layout_chunked_v108",
     "chunkidx_earray_dim1",
     "external_storage",
+    "vds",
     "filter_deflate",
     "filter_shuffle",
     "filter_fletcher32",
@@ -12422,6 +12472,7 @@
     "layout_chunked_v108",
     "chunkidx_earray_dim1",
     "external_storage",
+    "vds",
     "filter_deflate",
     "filter_shuffle",
     "filter_fletcher32",
@@ -12504,6 +12555,7 @@
     "layout_chunked_v108",
     "chunkidx_earray_dim1",
     "external_storage",
+    "vds",
     "filter_deflate",
     "filter_shuffle",
     "filter_fletcher32",
@@ -12586,6 +12638,7 @@
     "layout_chunked_v108",
     "chunkidx_earray_dim1",
     "external_storage",
+    "vds",
     "filter_deflate",
     "filter_shuffle",
     "filter_fletcher32",
@@ -12668,6 +12721,7 @@
     "layout_chunked_v108",
     "chunkidx_earray_dim1",
     "external_storage",
+    "vds",
     "filter_deflate",
     "filter_shuffle",
     "filter_fletcher32",
@@ -12740,6 +12794,7 @@
     "layout_contiguous",
     "layout_contiguous_v108",
     "external_storage",
+    "vds",
     "space_scalar",
     "space_null",
     "space_zerosized",

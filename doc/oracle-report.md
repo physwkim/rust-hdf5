@@ -23,7 +23,7 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 
 | direction | PASS | GAP | MISS | DIFF | READ-ERROR | GEN-ERROR |
 |---|---|---|---|---|---|---|
-| A (read) | 64 | 4 | 11 | 2 | 1 | 0 |
+| A (read) | 65 | 4 | 10 | 2 | 1 | 0 |
 
 | direction | PASS | INVALID | UNSUPPORTED-API | SKIPPED |
 |---|---|---|---|---|
@@ -34,7 +34,7 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | # | severity | finding | cases |
 |---|---|---|---|
 | 1 | value divergence | nattrs: value | 2 (attrs_dense, attr_large) |
-| 2 | object silently dropped | object present in the file is not listed by the reader | 11 (opaque, bitfield, ref_object, ref_region…) |
+| 2 | object silently dropped | object present in the file is not listed by the reader | 10 (opaque, bitfield, ref_object, ref_region…) |
 | 3 | written file rejected | nattrs_hdr | 5 (attr_scalar_num, attr_array_num, attr_string, attrs_dense…) |
 | 4 | written file rejected | dtype | 1 (str_vlen_ascii) |
 | 5 | written file rejected | object | 1 (attr_large) |
@@ -99,7 +99,7 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `layout_chunked_v108` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
 | `chunkidx_earray_dim1` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `external_storage` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
-| `vds` | layout | MISS | 0 | 1 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `vds` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
 | `filter_deflate` | filter | PASS | 0 | 0 | 0 | PASS |  |
 | `filter_shuffle` | filter | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
 | `filter_fletcher32` | filter | PASS | 0 | 0 | 0 | PASS |  |
@@ -158,7 +158,6 @@ These paths exist in the file and h5py describes them, but `H5Group::group_names
 | `named_datatype` | `/shared` | dataset | committed datatype object, and a dataset that shares it |
 | `named_datatype` | `/t` | committed-datatype | committed datatype object, and a dataset that shares it |
 | `layout_contiguous_v110` | `/data` | dataset | contiguous layout under v1.10 bounds — data layout message … |
-| `vds` | `/vds` | dataset | virtual dataset mapped onto a dataset in a sibling file |
 | `link_soft` | `/alias` | softlink | soft link to /orig |
 | `link_external` | `/ext` | extlink | external link into a sibling file |
 | `libver_v110` | `/data` | dataset | libver v1.10 bounds |
@@ -246,7 +245,7 @@ None: every metadata deviation in this run is a declared one.
 | severity | finding | cases | example |
 |---|---|---|---|
 | value divergence | nattrs: value | 2 | /data#nattrs libhdf5: 12 rust: 0 |
-| object silently dropped | object present in the file is not listed by the reader | 11 | /data (dataset) |
+| object silently dropped | object present in the file is not listed by the reader | 10 | /data (dataset) |
 | written file rejected | nattrs_hdr | 5 |  |
 | written file rejected | dtype | 1 |  |
 | written file rejected | object | 1 | Error: Could not get file contents |
@@ -262,13 +261,13 @@ None: every metadata deviation in this run is a declared one.
 | no public accessor (API-wide) | nattrs_hdr — H5Group exposes no object-header attribute count | 81 | /#nattrs_hdr |
 | no public accessor (API-wide) | superblock — H5File exposes no superblock/libver accessor | 81 | #superblock |
 | no public accessor (API-wide) | userblock — H5File exposes no user block accessor | 81 | #userblock |
-| no public accessor (API-wide) | external — H5Dataset exposes no external file list accessor | 75 | /data#external |
-| no public accessor (API-wide) | fillvalue — H5Dataset exposes no fill value accessor | 75 | /data#fillvalue |
-| no public accessor (API-wide) | filters — H5Dataset exposes no filter pipeline accessor | 75 | /data#filters |
-| no public accessor (API-wide) | maxshape — H5Dataset exposes no max_shape() accessor | 75 | /data#maxshape |
-| no public accessor (API-wide) | nattrs_hdr — H5Dataset exposes no object-header attribute count | 75 | /data#nattrs_hdr |
-| no public accessor (API-wide) | virtual — H5Dataset exposes no virtual mapping accessor | 75 | /data#virtual |
-| no public accessor (API-wide) | layout — H5Dataset::is_chunked() is false | 55 | /data#layout |
+| no public accessor (API-wide) | external — H5Dataset exposes no external file list accessor | 76 | /data#external |
+| no public accessor (API-wide) | fillvalue — H5Dataset exposes no fill value accessor | 76 | /data#fillvalue |
+| no public accessor (API-wide) | filters — H5Dataset exposes no filter pipeline accessor | 76 | /data#filters |
+| no public accessor (API-wide) | maxshape — H5Dataset exposes no max_shape() accessor | 76 | /data#maxshape |
+| no public accessor (API-wide) | nattrs_hdr — H5Dataset exposes no object-header attribute count | 76 | /data#nattrs_hdr |
+| no public accessor (API-wide) | virtual — H5Dataset exposes no virtual mapping accessor | 76 | /data#virtual |
+| no public accessor (API-wide) | layout — H5Dataset::is_chunked() is false | 56 | /data#layout |
 | no public accessor (API-wide) | chunkindex — H5Dataset exposes no chunk index type | 20 | /data#chunkindex |
 | no public accessor (API-wide) | dtype — H5Group has no attr() handle in read mode | 3 | /@alpha#dtype |
 | no public accessor (API-wide) | shape — H5Attribute exposes no shape() accessor | 3 | /data@count#shape |
