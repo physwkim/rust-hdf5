@@ -33,6 +33,7 @@ use crate::format::messages::link::{LinkMessage, LinkTarget};
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::*;
 use crate::format::object_header::{ObjectHeader, ObjectTimes, MAX_MESSAGE_SIZE};
+use crate::format::sohm::SharedMessagePointer;
 use crate::format::superblock::*;
 use crate::format::{FormatContext, LibverBound, ObjectFormat, UNDEF_ADDR};
 
@@ -436,6 +437,12 @@ pub struct DatasetInfo {
     pub name: String,
     /// Element datatype.
     pub datatype: DatatypeMessage,
+    /// The committed datatype this dataset shares, when it was created from
+    /// one. The type itself stays in [`datatype`](Self::datatype) — the
+    /// dataspace, the element width and every payload check need it — and
+    /// this says the header must store a pointer to that object instead of a
+    /// datatype message of its own.
+    pub committed_type: Option<usize>,
     /// Dataspace (dimensionality).
     pub dataspace: DataspaceMessage,
     /// File offset of the dataset's object header (set during finalize).
@@ -1125,6 +1132,49 @@ pub struct HardLink {
     pub creation_seq: u64,
 }
 
+/// A user-created symbolic link: a name in a group whose value is a path
+/// rather than an object header address.
+///
+/// A soft link holds a path within this file; an external link holds a file
+/// name and a path within that file. Neither names an object this writer
+/// owns, so — unlike [`HardLink`] — nothing about it is resolved: the link is
+/// stored as written and answered at traversal time, exactly as `H5Lcreate_soft`
+/// and `H5Lcreate_external` store theirs.
+#[derive(Clone)]
+pub struct SymbolicLink {
+    /// Parent group index (`None` = the root group).
+    pub parent: Option<usize>,
+    /// Leaf name of the link within the parent group.
+    pub name: String,
+    /// The path (and, for an external link, the file) this link names.
+    pub target: LinkTarget,
+    /// When this link was created; see [`GroupInfo::creation_seq`].
+    pub creation_seq: u64,
+}
+
+/// A committed (named) datatype: an object header holding one datatype
+/// message and nothing else, reached by a link like any other object.
+///
+/// `H5Tcommit2` makes the type an object in its own right so several datasets
+/// can declare they share it; each of those datasets then stores a pointer to
+/// this object header in place of its own datatype message. The object's
+/// reference count is therefore the links naming it *plus* the datasets
+/// sharing it — `H5O__shared_link_adj` counts a share as a link — and an
+/// object no link and no dataset reaches is not written at all.
+#[derive(Clone)]
+pub struct CommittedDatatype {
+    /// Full path with no leading `/`, the form dataset names take.
+    pub name: String,
+    /// Parent group index (`None` = the root group).
+    pub parent: Option<usize>,
+    /// The committed type.
+    pub datatype: DatatypeMessage,
+    /// When the link naming it was created; see [`GroupInfo::creation_seq`].
+    pub creation_seq: u64,
+    /// File offset of its object header (set during finalize).
+    pub obj_header_addr: u64,
+}
+
 /// A link a reopened file already held that this writer cannot express.
 ///
 /// Soft, external and user-defined links have no creation, retarget or delete
@@ -1259,17 +1309,22 @@ struct DenseCarry {
     links: Option<LinkInfoMessage>,
 }
 
-/// The raw-data storage a creator is about to give a dataset.
+/// The raw-data storage a creator is about to give the object it creates.
 ///
 /// Passed into [`Hdf5Writer::begin_create`] rather than checked inside each
 /// creator, so that a creator added later has to say which it is and cannot
 /// silently skip the format check that goes with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NewStorage {
-    /// One contiguous run of bytes, or none at all (a null dataspace).
+    /// One contiguous run of bytes, or none at all (a null dataspace). A
+    /// compact dataset is this too: its image lives inside the layout
+    /// message, which is one run of bytes in the object header.
     Contiguous,
     /// Chunks reached through an index.
     Chunked,
+    /// No raw data at all — a committed datatype, whose object holds one
+    /// datatype message and nothing else.
+    None,
 }
 
 /// A modelled object, as the walk hands it to the registry rebuild. A group's
@@ -1703,6 +1758,7 @@ fn rebuild_dataset(
     let mut info = DatasetInfo {
         name,
         datatype: dt,
+        committed_type: None,
         dataspace: ds,
         obj_header_addr: obj_addr,
         data_addr: UNDEF_ADDR,
@@ -2086,6 +2142,13 @@ pub struct Hdf5Writer {
     /// User-created hard links (additional names for existing objects),
     /// resolved and emitted during finalize.
     pub(crate) hard_links: Slot<Vec<HardLink>>,
+    /// User-created soft and external links. Held apart from
+    /// [`Self::hard_links`] because they name a path rather than an object:
+    /// nothing resolves them, and no object's reference count counts them.
+    pub(crate) symbolic_links: Slot<Vec<SymbolicLink>>,
+    /// Datatypes committed this session, each an object of its own; see
+    /// [`CommittedDatatype`].
+    pub(crate) committed_datatypes: Slot<Vec<CommittedDatatype>>,
     /// Links a reopened file held that this writer cannot express, carried
     /// through every header rewrite by their encoded bytes. Always empty for
     /// a freshly created file; see [`PreservedLink`].
@@ -2304,6 +2367,8 @@ impl Hdf5Writer {
             datasets: Slot::new(Vec::new()),
             groups: Slot::new(Vec::new()),
             hard_links: Slot::new(Vec::new()),
+            symbolic_links: Slot::new(Vec::new()),
+            committed_datatypes: Slot::new(Vec::new()),
             preserved_links: Slot::new(Vec::new()),
             root_attributes: Slot::new(Vec::new()),
             create_lock: Slot::new(()),
@@ -2530,10 +2595,6 @@ impl Hdf5Writer {
         Shared::clone(&self.groups.lock()[index])
     }
 
-    /// Enter the create gate: take `create_lock` and check that `name` is not
-    /// already taken. The returned witness is what [`Self::push_dataset`]
-    /// requires, so the uniqueness check and the registry push are atomic
-    /// (see `create_lock`) at every creator by construction.
     /// Refuse a storage form this file's format cannot hold.
     ///
     /// A chunked dataset in a classic file is a version-3 data layout message
@@ -2551,6 +2612,10 @@ impl Hdf5Writer {
         Ok(())
     }
 
+    /// Enter the create gate: take `create_lock` and check that `name` is not
+    /// already taken. The returned witness is what [`Self::push_dataset`]
+    /// requires, so the uniqueness check and the registry push are atomic
+    /// (see `create_lock`) at every creator by construction.
     pub(crate) fn begin_create(
         &self,
         name: &str,
@@ -2570,7 +2635,7 @@ impl Hdf5Writer {
         // instead of naming what stops the path. Uniqueness comes first among
         // them: a name already in the file is taken whatever holds it.
         self.reject_external_traversal(&name)?;
-        self.ensure_unique_dataset_name(&name)?;
+        self.ensure_name_free(&name)?;
         self.reject_preserved_object(&name)?;
         self.reject_unwritable_storage(storage, &name)?;
         let (parent, _leaf) = self.split_parent(&name)?;
@@ -2678,6 +2743,11 @@ impl Hdf5Writer {
 
     pub(crate) fn hard_links_vec(&self) -> Vec<HardLink> {
         self.hard_links.lock().clone()
+    }
+
+    /// Snapshot the symbolic-link list; see [`Self::hard_links_vec`].
+    pub(crate) fn symbolic_links_vec(&self) -> Vec<SymbolicLink> {
+        self.symbolic_links.lock().clone()
     }
 
     /// Open an existing HDF5 file for appending new datasets, using the
@@ -3195,6 +3265,11 @@ impl Hdf5Writer {
             datasets: Slot::new(datasets),
             groups: Slot::new(groups),
             hard_links: Slot::new(hard_links),
+            // A reopen carries the soft and external links it found as
+            // `preserved_links`, byte for byte; this list holds only the ones
+            // created in this session.
+            symbolic_links: Slot::new(Vec::new()),
+            committed_datatypes: Slot::new(Vec::new()),
             preserved_links: Slot::new(preserved_links),
             root_attributes: Slot::new(root_attributes),
             create_lock: Slot::new(()),
@@ -3288,38 +3363,59 @@ impl Hdf5Writer {
         (shape, element_size, chunked, btree2, fixed_array)
     }
 
-    /// Reject a dataset name already used by a live dataset. Dataset names
-    /// here are full paths, so they must be unique across the file (HDF5
-    /// requires link names to be unique within their group).
-    fn ensure_unique_dataset_name(&self, name: &str) -> IoResult<()> {
-        // A path *through* a carried external link belongs to the other file:
-        // creating it here would put a second link of that name in the group.
-        self.reject_external_traversal(name)?;
-        let exists = self.dataset_refs().iter().any(|d| {
+    /// Reject a name some other link in the file already occupies.
+    ///
+    /// `name` is the registry's full-path form, with no leading `/`. HDF5
+    /// requires link names to be unique within their group, and every kind of
+    /// link this writer can emit competes for the same name: a dataset's own
+    /// link, a group's, a user hard link, a soft or external link, and a link
+    /// a reopen is carrying through verbatim. This is the one place that list
+    /// is written down, so a creator cannot be blind to a kind it does not
+    /// itself make — nor a kind added after it.
+    fn ensure_name_free(&self, name: &str) -> IoResult<()> {
+        let taken = |kind: &str| {
+            Err(crate::io::IoError::InvalidState(format!(
+                "a {kind} named '{name}' already exists"
+            )))
+        };
+        if self.dataset_refs().iter().any(|d| {
             let g = d.lock();
             !g.deleted && g.name == name
-        });
-        if exists {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "a dataset named '{name}' already exists"
-            )));
+        }) {
+            return taken("dataset");
+        }
+        if self.group_refs().iter().any(|g| {
+            let gg = g.lock();
+            !gg.deleted && gg.name.trim_start_matches('/') == name
+        }) {
+            return taken("group");
+        }
+        if self
+            .committed_datatypes_vec()
+            .iter()
+            .any(|c| self.parent_alive(c.parent) && c.name == name)
+        {
+            return taken("committed datatype");
         }
         if self
             .hard_links_vec()
             .iter()
             .any(|l| self.hard_link_emitted(l) && self.hard_link_full_path(l) == name)
         {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "a hard link named '{name}' already exists"
-            )));
+            return taken("hard link");
+        }
+        if self
+            .symbolic_links_vec()
+            .iter()
+            .any(|l| self.symbolic_link_emitted(l) && self.symbolic_link_full_path(l) == name)
+        {
+            return taken("link");
         }
         // A preserved link occupies its name in the group just as a modelled
         // one does; both are emitted, and two link messages of one name in a
         // group is an invalid file.
         if self.preserved_link_paths().iter().any(|(p, _)| *p == name) {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "a link named '{name}' already exists"
-            )));
+            return taken("link");
         }
         Ok(())
     }
@@ -3396,7 +3492,7 @@ impl Hdf5Writer {
         for grp in self.group_refs() {
             grp.lock().child_datasets.retain(|&di| di != idx);
         }
-        self.purge_dead_hard_links();
+        self.purge_dead_links();
         let ds = self.ds(idx);
         let _op = ds.op.lock();
         self.release_dataset_storage(idx)
@@ -3516,7 +3612,7 @@ impl Hdf5Writer {
         if let Some(pidx) = parent {
             groups[pidx].lock().child_groups.retain(|&gi| gi != gidx);
         }
-        self.purge_dead_hard_links();
+        self.purge_dead_links();
         // Free storage only after the whole subtree is marked: the lists
         // hold each object exactly once (the marking pass skips anything
         // already deleted), so nothing is freed twice.
@@ -3633,10 +3729,12 @@ impl Hdf5Writer {
         }
     }
 
-    /// Drop hard-link entries that can no longer be emitted — their parent
-    /// group or target object was just deleted — so the list mirrors what
-    /// the file will hold instead of carrying suppressed zombies.
-    fn purge_dead_hard_links(&self) {
+    /// Drop link entries that can no longer be emitted — their parent group
+    /// or, for a hard link, their target object was just deleted — so the
+    /// lists mirror what the file will hold instead of carrying suppressed
+    /// zombies. Both kinds are purged here so a delete cannot clear one list
+    /// and leave the other holding a name in a group that is gone.
+    fn purge_dead_links(&self) {
         let dead: Vec<usize> = self
             .hard_links_vec()
             .iter()
@@ -3645,6 +3743,19 @@ impl Hdf5Writer {
             .map(|(p, _)| p)
             .collect();
         let mut links = self.hard_links.lock();
+        for p in dead.into_iter().rev() {
+            links.remove(p);
+        }
+        drop(links);
+
+        let dead: Vec<usize> = self
+            .symbolic_links_vec()
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| !self.symbolic_link_emitted(l))
+            .map(|(p, _)| p)
+            .collect();
+        let mut links = self.symbolic_links.lock();
         for p in dead.into_iter().rev() {
             links.remove(p);
         }
@@ -4064,29 +4175,7 @@ impl Hdf5Writer {
         // is what keeps a '/' out of the link this group will be reached by.
         let (parent_idx, _leaf) = self.split_parent(full_name.trim_start_matches('/'))?;
 
-        let groups = self.group_refs();
-        // Check for duplicates (ignore deleted groups)
-        let dup = groups.iter().any(|g| {
-            let gg = g.lock();
-            gg.name == full_name && !gg.deleted
-        });
-        if dup {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "group '{}' already exists",
-                full_name
-            )));
-        }
-        // A hard link must not already occupy this name in its parent.
-        let full_rel = full_name.trim_start_matches('/');
-        if self
-            .hard_links_vec()
-            .iter()
-            .any(|l| self.hard_link_emitted(l) && self.hard_link_full_path(l) == full_rel)
-        {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "a hard link named '{full_name}' already exists"
-            )));
-        }
+        self.ensure_name_free(full_name.trim_start_matches('/'))?;
 
         let group_idx = self.push_group(GroupInfo {
             name: full_name,
@@ -4177,15 +4266,12 @@ impl Hdf5Writer {
         let parent_group_path = self.canonical_group_path(parent_group_path);
         let parent_group_path = parent_group_path.as_str();
 
-        let datasets = self.dataset_refs();
-        let groups = self.group_refs();
-
         // Resolve the parent group (None == root).
         let parent = if parent_group_path == "/" {
             None
         } else {
             Some(
-                groups
+                self.group_refs()
                     .iter()
                     .position(|g| {
                         let gg = g.lock();
@@ -4214,26 +4300,7 @@ impl Hdf5Writer {
         })?;
 
         // Reject a name already taken in the parent group.
-        let parent_prefix = match parent {
-            None => String::new(),
-            Some(pi) => format!("{}/", groups[pi].lock().name.trim_start_matches('/')),
-        };
-        let full = format!("{parent_prefix}{link_name}");
-        let collides = datasets.iter().any(|d| {
-            let g = d.lock();
-            !g.deleted && g.name.trim_start_matches('/') == full
-        }) || groups.iter().any(|g| {
-            let gg = g.lock();
-            !gg.deleted && gg.name.trim_start_matches('/') == full
-        }) || self
-            .hard_links_vec()
-            .iter()
-            .any(|l| l.parent == parent && l.name == link_name);
-        if collides {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "'{full}' already exists in the file"
-            )));
-        }
+        self.ensure_name_free(&self.link_full_path(parent, link_name))?;
 
         self.hard_links.lock().push(HardLink {
             parent,
@@ -4247,10 +4314,7 @@ impl Hdf5Writer {
     /// Whether a hard link will actually be emitted: both its parent group
     /// and its target object must still be present (not soft-deleted).
     fn hard_link_emitted(&self, link: &HardLink) -> bool {
-        let parent_ok = match link.parent {
-            None => true,
-            Some(pi) => !self.grp(pi).lock().deleted,
-        };
+        let parent_ok = self.parent_alive(link.parent);
         let target_ok = match link.target {
             HardLinkTarget::Dataset(i) => !self.ds(i).lock().deleted,
             HardLinkTarget::Group(i) => !self.grp(i).lock().deleted,
@@ -4258,16 +4322,242 @@ impl Hdf5Writer {
         parent_ok && target_ok
     }
 
-    /// The full path a hard link occupies, with no leading `/` — the same
-    /// form dataset names are stored in. Used for name-collision checks.
-    fn hard_link_full_path(&self, link: &HardLink) -> String {
-        match link.parent {
-            None => link.name.clone(),
+    /// The full path a link occupies, with no leading `/` — the same form
+    /// dataset names are stored in. The one place a parent index and a leaf
+    /// name become a path, so every link kind answers the collision check in
+    /// the same spelling.
+    fn link_full_path(&self, parent: Option<usize>, name: &str) -> String {
+        match parent {
+            None => name.to_string(),
             Some(pi) => format!(
-                "{}/{}",
-                self.grp(pi).lock().name.trim_start_matches('/'),
-                link.name
+                "{}/{name}",
+                self.grp(pi).lock().name.trim_start_matches('/')
             ),
+        }
+    }
+
+    /// The full path a hard link occupies; see [`Self::link_full_path`].
+    fn hard_link_full_path(&self, link: &HardLink) -> String {
+        self.link_full_path(link.parent, &link.name)
+    }
+
+    /// Whether a symbolic link will actually be emitted: its parent group
+    /// must still be present. There is no target to check — a soft or
+    /// external link is allowed to dangle, and `H5Lcreate_soft` does not look
+    /// at the path it stores.
+    fn symbolic_link_emitted(&self, link: &SymbolicLink) -> bool {
+        self.parent_alive(link.parent)
+    }
+
+    /// Whether the group that would hold a link still exists; `None` is the
+    /// root group, which cannot be deleted.
+    ///
+    /// A deleted group's header is never written, so nothing it would have
+    /// held is in the file — and the name is free again. Every registry
+    /// decides that the same way, through here.
+    fn parent_alive(&self, parent: Option<usize>) -> bool {
+        match parent {
+            None => true,
+            Some(pi) => !self.grp(pi).lock().deleted,
+        }
+    }
+
+    /// The full path a symbolic link occupies; see [`Self::link_full_path`].
+    fn symbolic_link_full_path(&self, link: &SymbolicLink) -> String {
+        self.link_full_path(link.parent, &link.name)
+    }
+
+    /// Create a soft or external link: a name in a group whose value is a
+    /// path rather than an object.
+    ///
+    /// The single owner of symbolic-link creation — `H5Lcreate_soft` and
+    /// `H5Lcreate_external` differ only in the value they store, and the
+    /// name, parent and collision rules they share are all here.
+    ///
+    /// * `parent_group_path` — full path of the group that will hold the
+    ///   link (`"/"` for the root group).
+    /// * `link_name` — leaf name of the new link within that group.
+    /// * `target` — the path this link names, and for an external link the
+    ///   file holding it. Neither is resolved or required to exist: HDF5
+    ///   answers a symbolic link at traversal time, so a dangling one is a
+    ///   legal file.
+    pub fn create_symbolic_link(
+        &self,
+        parent_group_path: &str,
+        link_name: &str,
+        target: LinkTarget,
+    ) -> IoResult<()> {
+        if link_name.is_empty() || link_name.contains('/') {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "link name '{link_name}' must be a non-empty leaf name"
+            )));
+        }
+        // `H5Lcreate_external` refuses an empty file or object name, and
+        // stores the object path normalized; a link written here and one
+        // libhdf5 writes from the same arguments then hold the same bytes.
+        let target = match target {
+            LinkTarget::External { file, path } => {
+                if file.is_empty() || path.is_empty() {
+                    return Err(crate::io::IoError::InvalidState(
+                        "an external link needs both a file name and an object path".into(),
+                    ));
+                }
+                LinkTarget::External {
+                    file,
+                    path: crate::format::messages::link::normalize_object_path(&path),
+                }
+            }
+            other => other,
+        };
+        // The link itself would be a name in a group that lives in another
+        // file; its *value* may name anything, including a path this writer
+        // cannot follow, because nothing follows it here.
+        self.reject_external_traversal(&format!(
+            "{}/{link_name}",
+            parent_group_path.trim_end_matches('/')
+        ))?;
+
+        let _create = self.create_lock.lock();
+        let parent_group_path = self.canonical_group_path(parent_group_path);
+        let parent_group_path = parent_group_path.as_str();
+        let parent = if parent_group_path == "/" {
+            None
+        } else {
+            Some(
+                self.group_refs()
+                    .iter()
+                    .position(|g| {
+                        let gg = g.lock();
+                        gg.name == parent_group_path && !gg.deleted
+                    })
+                    .ok_or_else(|| {
+                        crate::io::IoError::NotFound(format!(
+                            "parent group '{parent_group_path}' not found"
+                        ))
+                    })?,
+            )
+        };
+
+        self.ensure_name_free(&self.link_full_path(parent, link_name))?;
+        self.symbolic_links.lock().push(SymbolicLink {
+            parent,
+            name: link_name.to_string(),
+            target,
+            creation_seq: self.take_creation_seq(),
+        });
+        Ok(())
+    }
+
+    // ---------------------------------------------------------- committed types
+
+    /// Snapshot the committed-datatype list; see [`Self::hard_links_vec`].
+    pub(crate) fn committed_datatypes_vec(&self) -> Vec<CommittedDatatype> {
+        self.committed_datatypes.lock().clone()
+    }
+
+    /// The paths of every committed datatype a name still reaches, in
+    /// creation order. One inside a deleted group is not among them: no link
+    /// to it is emitted, so the file will not hold that name.
+    pub(crate) fn committed_datatype_names(&self) -> Vec<String> {
+        self.committed_datatypes_vec()
+            .iter()
+            .filter(|c| self.parent_alive(c.parent))
+            .map(|c| c.name.clone())
+            .collect()
+    }
+
+    /// Commit `datatype` as an object of its own under `name` —
+    /// `H5Tcommit2`. Returns its index in the committed-datatype registry.
+    ///
+    /// The object holds one datatype message and nothing else. It goes
+    /// through [`begin_create`](Self::begin_create) like a dataset, so its
+    /// name is resolved to a real parent group, refused if taken, and refused
+    /// if it would cross a carried external link.
+    pub fn commit_datatype(&self, name: &str, datatype: DatatypeMessage) -> IoResult<usize> {
+        let create = self.begin_create(name.trim_start_matches('/'), NewStorage::None)?;
+        let entry = CommittedDatatype {
+            name: create.name.clone(),
+            parent: create.parent,
+            datatype,
+            creation_seq: self.take_creation_seq(),
+            obj_header_addr: 0,
+        };
+        let mut reg = self.committed_datatypes.lock();
+        let idx = reg.len();
+        reg.push(entry);
+        Ok(idx)
+    }
+
+    /// Resolve a committed datatype's path to its registry index and the type
+    /// it holds — the pair a dataset needs to be built on it.
+    ///
+    /// Returned together so the caller cannot pair one committed type's index
+    /// with another's datatype: the dataset's element width, dataspace and
+    /// payload checks all come from the type, and its header names the index.
+    pub(crate) fn committed_datatype_for_share(
+        &self,
+        name: &str,
+    ) -> IoResult<(usize, DatatypeMessage)> {
+        let name = self.canonical_dataset_path(name.trim_start_matches('/'));
+        let all = self.committed_datatypes_vec();
+        all.iter()
+            .position(|c| self.parent_alive(c.parent) && c.name == name)
+            .map(|i| (i, all[i].datatype.clone()))
+            .ok_or_else(|| {
+                crate::io::IoError::NotFound(format!("no committed datatype named '{name}'"))
+            })
+    }
+
+    /// Record that dataset `dataset` stores its datatype as a pointer to the
+    /// committed datatype `committed`.
+    ///
+    /// Takes an index [`committed_datatype_for_share`](Self::committed_datatype_for_share)
+    /// produced, alongside the datatype from the same call, so the two cannot
+    /// disagree and there is nothing here that can fail after the dataset
+    /// exists.
+    pub(crate) fn share_committed_type(&self, dataset: usize, committed: usize) {
+        debug_assert!(committed < self.committed_datatypes.lock().len());
+        self.ds(dataset).lock().committed_type = Some(committed);
+    }
+
+    /// How many names reach the committed datatype `index`: the link that
+    /// gave it its name, plus every live dataset that shares it.
+    ///
+    /// `H5O__shared_link_adj` counts a share as a link, which is why a type
+    /// h5py commits and then builds one dataset on reports `rc == 2`. Zero
+    /// means nothing reaches it at all — the group holding its name was
+    /// deleted and no dataset shares it — and then it is not written.
+    fn committed_datatype_refcount(&self, index: usize) -> u32 {
+        let linked = {
+            let parent = self.committed_datatypes.lock()[index].parent;
+            u32::from(self.parent_alive(parent))
+        };
+        let shares = self
+            .dataset_refs()
+            .iter()
+            .filter(|d| {
+                let m = d.lock();
+                !m.deleted && m.committed_type == Some(index)
+            })
+            .count() as u32;
+        linked + shares
+    }
+
+    /// Append the link naming each committed datatype whose parent group is
+    /// `parent`. A committed datatype is reached by an ordinary hard link —
+    /// what makes it a datatype rather than a group or a dataset is the one
+    /// message in the header it points at.
+    ///
+    /// Only a live group's links are collected, and a live parent is itself a
+    /// reference, so every address named here belongs to a header
+    /// `write_committed_datatype_headers` wrote.
+    fn push_committed_datatypes(&self, links: &mut Vec<(u64, LinkMessage)>, parent: Option<usize>) {
+        for cd in self.committed_datatypes_vec() {
+            if cd.parent != parent {
+                continue;
+            }
+            let leaf = cd.name.rsplit('/').next().unwrap_or(&cd.name);
+            links.push((cd.creation_seq, LinkMessage::hard(leaf, cd.obj_header_addr)));
         }
     }
 
@@ -4521,6 +4811,28 @@ impl Hdf5Writer {
         }
     }
 
+    /// Append every user-created symbolic link whose parent group is `parent`
+    /// (`None` == the root group).
+    ///
+    /// Nothing here waits on the layout pass — the link's value is a path, not
+    /// an address — but it is collected with the rest so it takes its place in
+    /// creation order and counts toward the phase change.
+    fn push_symbolic_links(&self, links: &mut Vec<(u64, LinkMessage)>, parent: Option<usize>) {
+        for link in self.symbolic_links_vec() {
+            if link.parent != parent || !self.symbolic_link_emitted(&link) {
+                continue;
+            }
+            links.push((
+                link.creation_seq,
+                LinkMessage {
+                    name: link.name.clone(),
+                    target: link.target.clone(),
+                    creation_order: None,
+                },
+            ));
+        }
+    }
+
     /// Refuse a caller path that would have to leave this file through one of
     /// the external links a reopened file brought in.
     ///
@@ -4593,6 +4905,30 @@ impl Hdf5Writer {
                  kept exactly as it found it because {why}"
             ))),
         }
+    }
+
+    /// Every link this writer will emit that names a *path* rather than an
+    /// object, with the class a listing reports for it: the soft and external
+    /// links created this session, and the ones a reopen is carrying through.
+    ///
+    /// The object listings answer for hard links, so a write-mode link
+    /// listing is this plus those; keeping both sources in one place is what
+    /// stops a listing from seeing a kind the class lookup does not, or the
+    /// reverse.
+    pub(crate) fn path_link_classes(&self) -> Vec<(String, crate::io::reader::LinkClass)> {
+        let mut out: Vec<(String, crate::io::reader::LinkClass)> = self
+            .symbolic_links_vec()
+            .iter()
+            .filter(|l| self.symbolic_link_emitted(l))
+            .map(|l| {
+                (
+                    self.symbolic_link_full_path(l),
+                    crate::io::reader::LinkClass::from_target(&l.target),
+                )
+            })
+            .collect();
+        out.extend(self.preserved_link_paths());
+        out
     }
 
     /// Every link this writer is carrying but cannot express, by full path.
@@ -4668,6 +5004,8 @@ impl Hdf5Writer {
                     ));
                 }
                 self.push_hard_links(&mut links, None);
+                self.push_symbolic_links(&mut links, None);
+                self.push_committed_datatypes(&mut links, None);
             }
             LinkScope::Group(group_idx) => {
                 // Snapshot the child lists, then drop the slot guard: the
@@ -4703,6 +5041,8 @@ impl Hdf5Writer {
                     ));
                 }
                 self.push_hard_links(&mut links, Some(group_idx));
+                self.push_symbolic_links(&mut links, Some(group_idx));
+                self.push_committed_datatypes(&mut links, Some(group_idx));
             }
         }
         // Creation order, not order by kind: a run of create_group and
@@ -5280,6 +5620,7 @@ impl Hdf5Writer {
             DatasetInfo {
                 name: name.to_string(),
                 datatype,
+                committed_type: None,
                 dataspace,
                 obj_header_addr: 0, // set during finalize
                 data_addr,
@@ -5323,6 +5664,7 @@ impl Hdf5Writer {
             DatasetInfo {
                 name: name.to_string(),
                 datatype,
+                committed_type: None,
                 dataspace: DataspaceMessage::null(),
                 obj_header_addr: 0, // set during finalize
                 data_addr: UNDEF_ADDR,
@@ -5424,6 +5766,7 @@ impl Hdf5Writer {
             DatasetInfo {
                 name: name.to_string(),
                 datatype,
+                committed_type: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
@@ -6545,6 +6888,7 @@ impl Hdf5Writer {
             DatasetInfo {
                 name: name.to_string(),
                 datatype,
+                committed_type: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr,
@@ -6653,6 +6997,7 @@ impl Hdf5Writer {
             DatasetInfo {
                 name: name.to_string(),
                 datatype,
+                committed_type: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr,
@@ -6786,6 +7131,7 @@ impl Hdf5Writer {
             DatasetInfo {
                 name: name.to_string(),
                 datatype,
+                committed_type: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
@@ -8000,6 +8346,7 @@ impl Hdf5Writer {
             DatasetInfo {
                 name: name.to_string(),
                 datatype,
+                committed_type: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
@@ -8143,6 +8490,7 @@ impl Hdf5Writer {
             DatasetInfo {
                 name: name.to_string(),
                 datatype,
+                committed_type: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
@@ -8257,6 +8605,7 @@ impl Hdf5Writer {
             DatasetInfo {
                 name: name.to_string(),
                 datatype,
+                committed_type: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
@@ -8368,6 +8717,7 @@ impl Hdf5Writer {
             DatasetInfo {
                 name: name.to_string(),
                 datatype,
+                committed_type: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
@@ -9855,6 +10205,9 @@ impl Hdf5Writer {
             .filter(|&i| !self.ds(i).lock().deleted)
             .collect();
         self.prepare_dense_attributes(&live)?;
+        // Same order as the full finalize: a sharing dataset's header names
+        // the committed type's address.
+        self.write_committed_datatype_headers()?;
         for i in live {
             let nlink = self.object_link_count(HardLinkTarget::Dataset(i));
             let ds_header = self.build_dataset_header(i);
@@ -10039,6 +10392,9 @@ impl Hdf5Writer {
             rewritten.push(i);
         }
         self.prepare_dense_attributes(&rewritten)?;
+        // Before any dataset header: one that shares a committed type stores
+        // that object's address.
+        self.write_committed_datatype_headers()?;
         for i in rewritten {
             let nlink = self.object_link_count(HardLinkTarget::Dataset(i));
             let ds_header = self.build_dataset_header(i);
@@ -10137,6 +10493,12 @@ impl Hdf5Writer {
         // group slots (including this one), so it must run before we take this
         // dataset's slot guard — otherwise it would deadlock on the same slot.
         let rc = self.object_link_count(HardLinkTarget::Dataset(index));
+        // Same reason: reading the committed type's address locks the
+        // committed-datatype registry, which the slot guard below must not be
+        // held across.
+        let committed = self.ds(index).lock().committed_type;
+        let committed_addr =
+            committed.map(|ci| self.committed_datatypes.lock()[ci].obj_header_addr);
 
         // Hold one slot guard for the whole header build.
         let ds = self.ds(index);
@@ -10148,9 +10510,22 @@ impl Hdf5Writer {
         let ds_msg = m.dataspace.encode_for(&self.ctx, self.message_format());
         header.add_message(MSG_DATASPACE, 0x00, ds_msg);
 
-        // Datatype message (type 0x03), flag 0x01 = constant
-        let dt_msg = m.datatype.encode_at(&self.ctx, self.encoding_libver());
-        header.add_message(MSG_DATATYPE, 0x01, dt_msg);
+        // Datatype message (type 0x03). A dataset built on a committed type
+        // stores a pointer to that object header in place of the message, and
+        // the shared flag is what says the body is a pointer — the two are one
+        // statement, so they are written together.
+        match committed_addr {
+            Some(addr) => header.add_message(
+                MSG_DATATYPE,
+                MSG_FLAG_CONSTANT | MSG_FLAG_SHARED,
+                SharedMessagePointer::encode_committed(addr, &self.ctx),
+            ),
+            None => header.add_message(
+                MSG_DATATYPE,
+                MSG_FLAG_CONSTANT,
+                m.datatype.encode_at(&self.ctx, self.encoding_libver()),
+            ),
+        }
 
         // Fill Value message (type 0x05)
         let is_chunked = m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
@@ -10239,6 +10614,53 @@ impl Hdf5Writer {
 
         self.emit_refcount(&mut header, rc, format);
 
+        header
+    }
+
+    /// Write the object header of every committed datatype something still
+    /// reaches, recording the address each one landed at.
+    ///
+    /// Runs before the dataset and group headers because both name these
+    /// addresses — a sharing dataset in its datatype message, the parent
+    /// group in the link. One pass is enough: the header holds a datatype
+    /// message and at most a reference count, neither of which depends on an
+    /// address.
+    fn write_committed_datatype_headers(&mut self) -> IoResult<()> {
+        // The count is bound first: a lock guard in the `for` iterator
+        // expression would live for the whole loop body, which locks the same
+        // registry again.
+        let count = self.committed_datatypes.lock().len();
+        for i in 0..count {
+            let rc = self.committed_datatype_refcount(i);
+            if rc == 0 {
+                // Its name's group was deleted and no dataset shares it, so
+                // nothing in the file could reach the header.
+                continue;
+            }
+            let encoded = self.build_committed_datatype_header(i, rc).encode()?;
+            let addr = self.allocator.allocate(encoded.len() as u64);
+            self.handle.write_at(addr, &encoded)?;
+            self.committed_datatypes.lock()[i].obj_header_addr = addr;
+        }
+        Ok(())
+    }
+
+    /// Build the object header for a committed datatype: the type, and the
+    /// reference count when more than one name reaches it.
+    fn build_committed_datatype_header(&self, index: usize, rc: u32) -> ObjectHeader {
+        let datatype = self.committed_datatypes.lock()[index].datatype.clone();
+        let mut header = ObjectHeader::new();
+        // `H5T__commit` marks the message constant and unshareable: this
+        // header is where shared datatype bodies are read *from*, so its own
+        // message must never become a pointer into the shared-message heap.
+        header.add_message(
+            MSG_DATATYPE,
+            MSG_FLAG_CONSTANT | MSG_FLAG_DONTSHARE,
+            datatype.encode_at(&self.ctx, self.libver),
+        );
+        if rc > 1 {
+            header.add_message(MSG_OBJ_REF_COUNT, 0x00, encode_refcount(rc));
+        }
         header
     }
 

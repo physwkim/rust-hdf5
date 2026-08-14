@@ -27,13 +27,13 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 
 | direction | PASS | INVALID | UNSUPPORTED-API | SKIPPED |
 |---|---|---|---|---|
-| B (write) | 69 | 0 | 22 | 0 |
+| B (write) | 72 | 0 | 19 | 0 |
 
 ## Top gaps by severity
 
 | # | severity | finding | cases |
 |---|---|---|---|
-| 1 | API cannot express | no rust writer arm: the public API cannot express this case | 21 (named_datatype, layout_compact, layout_contiguous_v110, lay…) |
+| 1 | API cannot express | no rust writer arm: the public API cannot express this case | 18 (layout_compact, layout_contiguous_v110, layout_chunked_v110…) |
 | 2 | API cannot express | region references need a selection serializer on the write side | 1 (ref_region) |
 | 3 | no public accessor (API-wide) | attrorder — H5Group exposes no attribute creation-order tracking flags | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
 | 4 | no public accessor (API-wide) | attrstore — H5Group exposes no compact/dense attribute storage accessor | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
@@ -84,7 +84,7 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `ref_region` | dtype-composite | PASS | 0 | 0 | 0 | UNSUPPORTED-API | UNSUPPORTED-API: region references need a selection serializer on the… |
 | `vlen_numeric` | dtype-composite | PASS | 0 | 0 | 0 | PASS |  |
 | `vlen_bytes` | dtype-composite | PASS | 0 | 0 | 0 | PASS |  |
-| `named_datatype` | dtype-composite | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `named_datatype` | dtype-composite | PASS | 0 | 0 | 0 | PASS |  |
 | `layout_compact` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
 | `layout_contiguous` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `layout_contiguous_v110` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
@@ -115,8 +115,8 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `space_unlimited_resized` | dataspace | PASS | 0 | 0 | 0 | PASS |  |
 | `groups_nested` | group | PASS | 0 | 0 | 0 | PASS |  |
 | `link_hard` | link | PASS | 0 | 0 | 0 | PASS |  |
-| `link_soft` | link | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
-| `link_external` | link | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `link_soft` | link | PASS | 0 | 0 | 0 | PASS |  |
+| `link_external` | link | PASS | 0 | 0 | 0 | PASS |  |
 | `link_external_read` | link | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
 | `links_dense` | link | PASS | 0 | 0 | 0 | PASS |  |
 | `track_order` | group | PASS | 0 | 0 | 0 | PASS |  |
@@ -155,7 +155,7 @@ The rust-written file carries the same data, type and shape as the h5py referenc
 |---|---|---|---|---|---|
 | `superblock-always-v3` | `superblock` | `*` | `3` | yes | 1 (chunkidx_btree1) |
 | `btree1-index-substituted` | `chunkindex` | `btree1` | `earray` | yes | 1 (chunkidx_btree1) |
-| `new-style-groups-always` | `linkstore` | `symtab` | `compact` | yes | 47 (int_i8, int_u8, int_i16le…) |
+| `new-style-groups-always` | `linkstore` | `symtab` | `compact` | yes | 50 (int_i8, int_u8, int_i16le…) |
 | `filter-flags-zero` | `filters` | `*` | `*` | yes | 3 (filter_deflate, filter_deflate_shuffle, fil…) |
 
 - `superblock-always-v3`: the writer emits a v3 superblock for every file it creates; H5File::set_libver_latest(false) does not select an older one; observed as `0 -> 3`
@@ -169,7 +169,7 @@ Metadata deviations matching no `EXPECTED_DEVIATIONS` entry. These are new since
 
 | key | libhdf5 | rust-hdf5 | cases |
 |---|---|---|---|
-| `#superblock` | `0` | `2` | 46 (int_i8, int_u8, int_i16le…) |
+| `#superblock` | `0` | `2` | 49 (int_i8, int_u8, int_i16le…) |
 
 ## Direction B failures, in full
 
@@ -178,7 +178,7 @@ None.
 
 | severity | finding | cases | example |
 |---|---|---|---|
-| API cannot express | no rust writer arm: the public API cannot express this case | 21 |  |
+| API cannot express | no rust writer arm: the public API cannot express this case | 18 |  |
 | API cannot express | region references need a selection serializer on the write side | 1 |  |
 | no public accessor (API-wide) | attrorder — H5Group exposes no attribute creation-order tracking flags | 91 | /#attrorder |
 | no public accessor (API-wide) | attrstore — H5Group exposes no compact/dense attribute storage accessor | 91 | /#attrstore |

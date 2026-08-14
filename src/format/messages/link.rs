@@ -317,6 +317,29 @@ impl LinkMessage {
 
 // ========================================================================= helpers
 
+/// Strip duplicate and trailing slashes from an object path, the way
+/// `H5G_normalize` does before `H5Lcreate_external` stores it.
+///
+/// The stored value is what a reader gets back from `H5Lget_val`, so a link
+/// this crate writes and one libhdf5 writes from the same arguments have to
+/// agree here or the two files differ in a field a comparison reports.
+pub(crate) fn normalize_object_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut last_slash = false;
+    for c in path.chars() {
+        if c == '/' && last_slash {
+            continue;
+        }
+        last_slash = c == '/';
+        out.push(c);
+    }
+    // The root path is the one trailing slash that stays.
+    if out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
 /// Encode the external-link value: `(version << 4) | flags`, then the
 /// NUL-terminated file name and the NUL-terminated object path (`H5L.c`,
 /// `H5L__create_ud` for `H5L_TYPE_EXTERNAL`).
@@ -510,6 +533,28 @@ mod tests {
         );
     }
 
+    /// The other half of [`decode_h5py_external_link_bytes`]: the value this
+    /// encoder produces for the same arguments is the byte string
+    /// `H5Lcreate_external` builds. Only the value is compared — the message
+    /// envelope around it differs from libhdf5's by the charset byte this
+    /// encoder always writes, which libhdf5 reads either way.
+    ///
+    /// [`decode_h5py_external_link_bytes`]: self::tests::decode_h5py_external_link_bytes
+    #[test]
+    fn encoded_external_value_is_the_byte_string_h5lcreate_external_builds() {
+        let encoded =
+            LinkMessage::external("ext", "link_external_ext.h5", "/payload").encode(&ctx8());
+        let mut want = vec![0u8];
+        want.extend_from_slice(b"link_external_ext.h5\0");
+        want.extend_from_slice(b"/payload\0");
+        let len_at = encoded.len() - want.len() - 2;
+        assert_eq!(
+            u16::from_le_bytes([encoded[len_at], encoded[len_at + 1]]) as usize,
+            want.len()
+        );
+        assert_eq!(&encoded[len_at + 2..], &want[..]);
+    }
+
     /// A user-defined class other than the external link keeps its value
     /// verbatim so the link still has a name and still appears in a listing.
     #[test]
@@ -611,6 +656,20 @@ mod tests {
         assert_eq!(&encoded[3..11], &(-3i64).to_le_bytes());
         assert_eq!(encoded[11], 1, "charset follows the creation order");
         assert_eq!(LinkMessage::decode(&encoded, &ctx8()).unwrap().0, msg);
+    }
+
+    /// `H5G_normalize`: duplicate slashes collapse, one trailing slash goes,
+    /// and the root path keeps its only character.
+    #[test]
+    fn object_paths_normalize_like_h5g_normalize() {
+        assert_eq!(normalize_object_path("/payload"), "/payload");
+        assert_eq!(normalize_object_path("//a///b"), "/a/b");
+        assert_eq!(normalize_object_path("/a/b/"), "/a/b");
+        assert_eq!(normalize_object_path("/a/b//"), "/a/b");
+        assert_eq!(normalize_object_path("/"), "/");
+        assert_eq!(normalize_object_path("//"), "/");
+        assert_eq!(normalize_object_path("a/b"), "a/b");
+        assert_eq!(normalize_object_path(""), "");
     }
 
     #[test]

@@ -400,7 +400,7 @@ COMPOSITE_CASES = [
          "variable-length i32 sequences"),
     Case("vlen_bytes", "dtype-composite", gen_vlen_bytes, "vlen_bytes",
          "variable-length u8 sequences"),
-    Case("named_datatype", "dtype-composite", gen_named_datatype, None,
+    Case("named_datatype", "dtype-composite", gen_named_datatype, "named_datatype",
          "committed datatype object, and a dataset that shares it"),
 ]
 
@@ -778,8 +778,8 @@ LINK_CASES = [
          "three levels of nested groups plus an empty leaf group"),
     Case("link_hard", "link", gen_link_hard, "link_hard",
          "two names for one object"),
-    Case("link_soft", "link", gen_link_soft, None, "soft link to /orig"),
-    Case("link_external", "link", gen_link_external, None,
+    Case("link_soft", "link", gen_link_soft, "link_soft", "soft link to /orig"),
+    Case("link_external", "link", gen_link_external, "link_external",
          "external link into a sibling file",
          ext_files=("_ext.h5",)),
     Case("link_external_read", "link", gen_link_external_read, None,

@@ -17,4 +17,6 @@
 //! module is only the flag that says a body is one.
 
 /// `H5O_MSG_FLAG_SHARED` — the message body is a reference, not the message.
-pub const MSG_FLAG_SHARED: u8 = 0x02;
+/// Defined with the rest of the message-envelope flags and re-exported here,
+/// where the readers that consult it look for it.
+pub use super::MSG_FLAG_SHARED;

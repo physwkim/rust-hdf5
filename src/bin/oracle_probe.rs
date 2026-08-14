@@ -1590,6 +1590,22 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "named_datatype" => {
+            let file = H5File::create(path)?;
+            file.commit_datatype("t", DatatypeMessage::i32_type())?;
+            // `data` describes its own type; `shared` points at /t.
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("data")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.new_dataset::<i32>()
+                .committed_type("t")
+                .shape([8usize])
+                .create("shared")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "opaque" => {
             let file = H5File::create(path)?;
             let bytes: Vec<u8> = (0u8..12).collect();
@@ -1812,6 +1828,47 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 .create("orig")?
                 .write_raw(&ramp_n::<i32>(8))?;
             file.root_group().link("alias", "/orig")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "link_soft" => {
+            let file = H5File::create(path)?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("orig")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.create_soft_link("alias", "/orig")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "link_external" => {
+            // The reference builds the sibling's name from this file's stem,
+            // and stores the bare file name so the link resolves against the
+            // directory holding the master.
+            let target = std::path::Path::new(path).with_file_name(format!(
+                "{}_ext.h5",
+                std::path::Path::new(path)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            ));
+            let ext = H5File::create(&target)?;
+            ext.new_dataset::<i32>()
+                .shape([8usize])
+                .create("payload")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            ext.close()?;
+
+            let file = H5File::create(path)?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("orig")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.create_external_link(
+                "ext",
+                &target.file_name().unwrap_or_default().to_string_lossy(),
+                "/payload",
+            )?;
             file.close()?;
             Ok(Ok(()))
         }

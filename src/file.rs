@@ -265,6 +265,57 @@ impl H5File {
         self.root_group().create_group(name)
     }
 
+    /// Create a soft link in the root of the file.
+    ///
+    /// See [`H5Group::create_soft_link`](crate::group::H5Group::create_soft_link).
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    /// let file = H5File::create("soft.h5").unwrap();
+    /// file.new_dataset::<i32>().shape([8]).create("orig").unwrap();
+    /// file.create_soft_link("alias", "/orig").unwrap();
+    /// ```
+    pub fn create_soft_link(&self, link_name: &str, target_path: &str) -> Result<()> {
+        self.root_group().create_soft_link(link_name, target_path)
+    }
+
+    /// Create an external link in the root of the file.
+    ///
+    /// See [`H5Group::create_external_link`](crate::group::H5Group::create_external_link).
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    /// let file = H5File::create("master.h5").unwrap();
+    /// file.create_external_link("ext", "payload.h5", "/data").unwrap();
+    /// ```
+    pub fn create_external_link(
+        &self,
+        link_name: &str,
+        target_file: &str,
+        target_path: &str,
+    ) -> Result<()> {
+        self.root_group()
+            .create_external_link(link_name, target_file, target_path)
+    }
+
+    /// Commit a datatype in the root of the file.
+    ///
+    /// See [`H5Group::commit_datatype`](crate::group::H5Group::commit_datatype).
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    /// use rust_hdf5::format::messages::datatype::DatatypeMessage;
+    /// let file = H5File::create("committed.h5").unwrap();
+    /// file.commit_datatype("temperature", DatatypeMessage::f64_type()).unwrap();
+    /// ```
+    pub fn commit_datatype(
+        &self,
+        name: &str,
+        datatype: crate::format::messages::datatype::DatatypeMessage,
+    ) -> Result<()> {
+        self.root_group().commit_datatype(name, datatype)
+    }
+
     /// Start building a new dataset with the given element type.
     ///
     /// This returns a fluent builder. Call `.shape(...)` to set dimensions and
@@ -819,8 +870,9 @@ impl H5File {
     /// The paths of every committed (named) datatype in this file.
     ///
     /// A committed datatype is an object in its own right, in neither
-    /// [`dataset_names`](Self::dataset_names) nor the group listing. Write
-    /// mode answers empty: this crate does not commit types.
+    /// [`dataset_names`](Self::dataset_names) nor the group listing. In write
+    /// mode these are the types [`commit_datatype`](Self::commit_datatype)
+    /// committed this session.
     pub fn named_datatype_names(&self) -> Vec<String> {
         let inner = borrow_inner(&self.inner);
         match &*inner {
@@ -829,7 +881,8 @@ impl H5File {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            H5FileInner::Writer(_) | H5FileInner::Closed => Vec::new(),
+            H5FileInner::Writer(writer) => writer.committed_datatype_names(),
+            H5FileInner::Closed => Vec::new(),
         }
     }
 

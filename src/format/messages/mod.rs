@@ -38,6 +38,9 @@ pub const MSG_OBJ_REF_COUNT: u8 = 0x16;
 pub const MSG_FILE_SPACE_INFO: u8 = 0x17;
 
 // Object header message flags (the `flags` byte of the message envelope)
+/// `H5O_MSG_FLAG_CONSTANT`: the message will not change once written, so a
+/// reader may cache it. libhdf5 sets it on a datatype message.
+pub const MSG_FLAG_CONSTANT: u8 = 0x01;
 /// `H5O_MSG_FLAG_SHARED`: the message body is not the message, it is a
 /// pointer to where the body is really stored (SOHM heap or another object
 /// header). Decoding the body literally silently yields nonsense.

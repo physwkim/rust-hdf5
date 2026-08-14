@@ -39,6 +39,7 @@ pub struct DatasetBuilder<T: H5Type> {
     group_path: Option<String>,
     fill_value: Option<Vec<u8>>,
     datatype_override: Option<crate::format::messages::datatype::DatatypeMessage>,
+    committed_type: Option<String>,
     object_references: bool,
     _marker: std::marker::PhantomData<T>,
 }
@@ -57,6 +58,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             group_path: None,
             fill_value: None,
             datatype_override: None,
+            committed_type: None,
             object_references: false,
             _marker: std::marker::PhantomData,
         }
@@ -75,6 +77,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             group_path: Some(group_path),
             fill_value: None,
             datatype_override: None,
+            committed_type: None,
             object_references: false,
             _marker: std::marker::PhantomData,
         }
@@ -199,6 +202,36 @@ impl<T: H5Type> DatasetBuilder<T> {
         self
     }
 
+    /// Build the dataset on the committed (named) datatype at `path` —
+    /// h5py's `dtype=f["name"]`, `H5Dcreate2` with a committed type id.
+    ///
+    /// The dataset does not describe its type: its header stores a pointer to
+    /// that object, so the type is defined once and every dataset sharing it
+    /// is guaranteed to agree. The type comes from the committed object, so
+    /// this supersedes both `T` and [`datatype`](Self::datatype).
+    ///
+    /// The path is resolved at [`create`](Self::create), which fails when no
+    /// committed datatype is there — commit it with
+    /// [`H5File::commit_datatype`](crate::file::H5File::commit_datatype)
+    /// first.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// # use rust_hdf5::format::messages::datatype::DatatypeMessage;
+    /// let file = H5File::create("committed.h5").unwrap();
+    /// file.commit_datatype("temperature", DatatypeMessage::f64_type()).unwrap();
+    /// file.new_dataset::<f64>()
+    ///     .committed_type("temperature")
+    ///     .shape([4])
+    ///     .create("readings")
+    ///     .unwrap();
+    /// ```
+    #[must_use]
+    pub fn committed_type(mut self, path: &str) -> Self {
+        self.committed_type = Some(path.to_string());
+        self
+    }
+
     /// Store object references — h5py's `h5py.ref_dtype`.
     ///
     /// The elements are written with
@@ -257,6 +290,52 @@ impl<T: H5Type> DatasetBuilder<T> {
     /// The name is the link name within the root group (e.g. `"data"` or
     /// `"group1/data"` once nested groups are supported).
     pub fn create(self, name: &str) -> Result<H5Dataset> {
+        // A committed type is resolved before the dataset exists and recorded
+        // after, here rather than in each storage path: every path reaches
+        // this one return, so a dataset can never be built on a committed
+        // type and then fail to say so — which would silently write the type
+        // out in full instead of pointing at the object.
+        let committed = self.resolve_committed_type()?;
+        let file_inner = clone_inner(&self.file_inner);
+        let ds = self.create_object(name, committed.as_ref().map(|(_, dt)| dt.clone()))?;
+        if let (Some((share, _)), DatasetInfo::Writer { index, .. }) = (committed, &ds.info) {
+            let inner = borrow_inner(&file_inner);
+            if let H5FileInner::Writer(writer) = &*inner {
+                writer.share_committed_type(*index, share);
+            }
+        }
+        Ok(ds)
+    }
+
+    /// The committed datatype this dataset is built on, with the type it
+    /// holds; `None` when [`committed_type`](Self::committed_type) was not
+    /// called.
+    fn resolve_committed_type(&self) -> Result<Option<(usize, DatatypeMessage)>> {
+        let Some(path) = self.committed_type.as_deref() else {
+            return Ok(None);
+        };
+        if self.object_references {
+            // Both name the stored type and they cannot both be it: the
+            // pointer would say the elements are the committed type while
+            // `write_object_references` writes addresses.
+            return Err(Hdf5Error::InvalidState(
+                "a dataset cannot be built on a committed datatype and hold object references"
+                    .into(),
+            ));
+        }
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => Ok(Some(writer.committed_datatype_for_share(path)?)),
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot create a dataset in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
+    /// Everything [`create`](Self::create) does apart from recording the
+    /// committed-type share; `committed` is the type that object holds.
+    fn create_object(self, name: &str, committed: Option<DatatypeMessage>) -> Result<H5Dataset> {
         // Build the full name: if created within a group, prefix with group path
         let full_name = if let Some(ref gp) = self.group_path {
             if gp == "/" {
@@ -288,6 +367,11 @@ impl<T: H5Type> DatasetBuilder<T> {
                     return Err(Hdf5Error::InvalidState("file is closed".into()))
                 }
             }
+        } else if let Some(dt) = committed {
+            // The object header holds the type; the dataset stores a pointer
+            // to it, but every size and payload check still needs the type
+            // itself.
+            dt
         } else {
             self.datatype_override.clone().unwrap_or_else(T::hdf5_type)
         };
@@ -6987,6 +7071,93 @@ mod tests {
             .create("b")
             .is_err());
         file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A committed type is resolved before the dataset is created, so a name
+    /// that is not one — or one paired with object references, which would
+    /// make the stored type disagree with the payload — leaves no dataset
+    /// behind.
+    #[test]
+    fn a_committed_type_that_cannot_be_shared_creates_no_dataset() {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let path = temp_path("committed_refused");
+        let file = H5File::create(&path).unwrap();
+        file.commit_datatype("t", DatatypeMessage::i32_type())
+            .unwrap();
+
+        assert!(file
+            .new_dataset::<i32>()
+            .committed_type("absent")
+            .shape([2usize])
+            .create("a")
+            .is_err());
+        assert!(file
+            .new_dataset::<u64>()
+            .committed_type("t")
+            .object_references()
+            .shape([2usize])
+            .create("b")
+            .is_err());
+        // A dataset already exists under that name, so the type cannot take
+        // it either.
+        file.new_dataset::<i32>()
+            .shape([2usize])
+            .create("taken")
+            .unwrap();
+        assert!(file
+            .commit_datatype("taken", DatatypeMessage::i32_type())
+            .is_err());
+        assert!(file
+            .commit_datatype("t", DatatypeMessage::f64_type())
+            .is_err());
+
+        assert_eq!(file.dataset_names(), vec!["taken".to_string()]);
+        assert_eq!(file.named_datatype_names(), vec!["t".to_string()]);
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Deleting the group that named a committed datatype takes the name with
+    /// it: nothing in the file reaches the type, so it is not written, the
+    /// name is free again, and it can no longer be shared by that name.
+    #[test]
+    fn deleting_a_group_takes_the_committed_datatypes_it_named() {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let path = temp_path("committed_group_deleted");
+        {
+            let file = H5File::create(&path).unwrap();
+            let types = file.create_group("types").unwrap();
+            types
+                .commit_datatype("t", DatatypeMessage::i32_type())
+                .unwrap();
+            assert_eq!(file.named_datatype_names(), vec!["types/t".to_string()]);
+
+            file.delete_group("types").unwrap();
+            assert!(file.named_datatype_names().is_empty());
+            assert!(file
+                .new_dataset::<i32>()
+                .committed_type("types/t")
+                .shape([2usize])
+                .create("d")
+                .is_err());
+
+            // The name is free, so a new group may take it back.
+            let types = file.create_group("types").unwrap();
+            types
+                .commit_datatype("t", DatatypeMessage::f64_type())
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(file.named_datatype_names(), vec!["types/t".to_string()]);
+        assert_eq!(
+            file.named_datatype("types/t").unwrap().datatype().unwrap(),
+            crate::format::messages::datatype::DatatypeMessage::f64_type()
+        );
+        drop(file);
         std::fs::remove_file(&path).ok();
     }
 }
