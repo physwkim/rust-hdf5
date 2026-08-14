@@ -9,6 +9,7 @@ use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
 use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
 use crate::format::reference::Reference;
+use crate::format::selection::Selection;
 use crate::types::H5Type;
 
 // ---------------------------------------------------------------------------
@@ -39,8 +40,38 @@ pub struct DatasetBuilder<T: H5Type> {
     group_path: Option<String>,
     fill_value: Option<Vec<u8>>,
     datatype_override: Option<crate::format::messages::datatype::DatatypeMessage>,
-    object_references: bool,
+    references: Option<ReferenceElement>,
     _marker: std::marker::PhantomData<T>,
+}
+
+/// Which reference a `*_references()` builder call asked the elements to be.
+///
+/// One field rather than a flag per kind: an element is a whole-object
+/// reference or a region reference, never both, and the width of each is only
+/// known once the file's address size is (see
+/// [`DatatypeMessage::object_reference`] and
+/// [`DatatypeMessage::region_reference`]).
+///
+/// [`DatatypeMessage::object_reference`]: crate::format::messages::datatype::DatatypeMessage::object_reference
+/// [`DatatypeMessage::region_reference`]: crate::format::messages::datatype::DatatypeMessage::region_reference
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReferenceElement {
+    Object,
+    Region,
+}
+
+impl ReferenceElement {
+    /// The stored datatype for this kind in a file with `ctx`'s address size.
+    fn datatype(
+        self,
+        ctx: &crate::format::FormatContext,
+    ) -> crate::format::messages::datatype::DatatypeMessage {
+        use crate::format::messages::datatype::DatatypeMessage;
+        match self {
+            Self::Object => DatatypeMessage::object_reference(ctx),
+            Self::Region => DatatypeMessage::region_reference(ctx),
+        }
+    }
 }
 
 impl<T: H5Type> DatasetBuilder<T> {
@@ -57,7 +88,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             group_path: None,
             fill_value: None,
             datatype_override: None,
-            object_references: false,
+            references: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -75,7 +106,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             group_path: Some(group_path),
             fill_value: None,
             datatype_override: None,
-            object_references: false,
+            references: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -221,7 +252,38 @@ impl<T: H5Type> DatasetBuilder<T> {
     /// ```
     #[must_use]
     pub fn object_references(mut self) -> Self {
-        self.object_references = true;
+        self.references = Some(ReferenceElement::Object);
+        self
+    }
+
+    /// Store dataset region references — h5py's `h5py.regionref_dtype`.
+    ///
+    /// The elements are written with
+    /// [`write_region_references`](H5Dataset::write_region_references) and name
+    /// a dataset plus a selection over it. The element is a global-heap id, so
+    /// its width follows the file's address size and the datatype is resolved
+    /// at [`create`](Self::create) rather than here; it overrides both `T` and
+    /// any [`datatype`](Self::datatype) call.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::{H5File, Hyperslab, HyperslabBlock, Selection};
+    /// let file = H5File::create("regions.h5").unwrap();
+    /// file.new_dataset::<i32>().shape([8]).create("target").unwrap();
+    /// let refs = file.new_dataset::<u64>()
+    ///     .region_references()
+    ///     .shape([1])
+    ///     .create("refs")
+    ///     .unwrap();
+    /// let rows = Selection::Hyperslab {
+    ///     rank: 1,
+    ///     form: Hyperslab::Blocks(vec![HyperslabBlock { start: vec![0], end: vec![2] }]),
+    /// };
+    /// refs.write_region_references(&[("/target", rows)]).unwrap();
+    /// file.close().unwrap();
+    /// ```
+    #[must_use]
+    pub fn region_references(mut self) -> Self {
+        self.references = Some(ReferenceElement::Region);
         self
     }
 
@@ -269,16 +331,12 @@ impl<T: H5Type> DatasetBuilder<T> {
             name.to_string()
         };
 
-        let datatype = if self.object_references {
-            // The element is one file address wide, and only the writer knows
-            // how wide that is for this file.
+        let datatype = if let Some(kind) = self.references {
+            // The element is measured in file addresses, and only the writer
+            // knows how wide one is for this file.
             let inner = borrow_inner(&self.file_inner);
             match &*inner {
-                H5FileInner::Writer(writer) => {
-                    crate::format::messages::datatype::DatatypeMessage::object_reference(
-                        writer.ctx(),
-                    )
-                }
+                H5FileInner::Writer(writer) => kind.datatype(writer.ctx()),
                 H5FileInner::Reader(_) => {
                     return Err(Hdf5Error::InvalidState(
                         "cannot create a dataset in read mode".into(),
@@ -2331,6 +2389,53 @@ impl H5Dataset {
                 match &*inner {
                     H5FileInner::Writer(writer) => {
                         writer.write_object_references(*index, 0, paths)?;
+                        Ok(())
+                    }
+                    _ => Err(Hdf5Error::InvalidState(
+                        "file is no longer in write mode".into(),
+                    )),
+                }
+            }
+            DatasetInfo::Reader { .. } => {
+                Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
+            }
+        }
+    }
+
+    /// Write region references over `targets` into elements
+    /// `0..targets.len()` — h5py's `refs[i] = f['/target'].regionref[0:3]`.
+    ///
+    /// The dataset must have been created with
+    /// [`region_references`](DatasetBuilder::region_references). Each target is
+    /// the path of an existing *dataset* and a [`Selection`] over it, which
+    /// must fit that dataset's extent — the rule `H5Rcreate` applies. What
+    /// reaches the file is a global-heap object holding the target's object
+    /// header address (assigned when the file is finalized) and the serialized
+    /// selection. Elements left unwritten read back as null references.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::{H5File, PointSelection, Selection};
+    /// let file = H5File::create("regions.h5").unwrap();
+    /// file.new_dataset::<i32>().shape([4, 6]).create("m").unwrap();
+    /// let refs = file.new_dataset::<u64>()
+    ///     .region_references()
+    ///     .shape([1])
+    ///     .create("refs")
+    ///     .unwrap();
+    /// let points = Selection::Points(PointSelection {
+    ///     rank: 2,
+    ///     points: vec![vec![0, 1], vec![3, 5]],
+    /// });
+    /// refs.write_region_references(&[("/m", points)]).unwrap();
+    /// file.close().unwrap();
+    /// ```
+    pub fn write_region_references(&self, targets: &[(&str, Selection)]) -> Result<()> {
+        match &self.info {
+            DatasetInfo::Writer { index, .. } => {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Writer(writer) => {
+                        writer.write_region_references(*index, 0, targets)?;
                         Ok(())
                     }
                     _ => Err(Hdf5Error::InvalidState(
