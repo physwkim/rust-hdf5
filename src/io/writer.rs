@@ -850,6 +850,39 @@ pub struct HardLink {
     pub target: HardLinkTarget,
 }
 
+/// A link a reopened file already held that this writer cannot express.
+///
+/// Soft, external and user-defined links have no creation, retarget or delete
+/// operation here — only hard links do — so a header rewrite that emits what
+/// the registry models would erase them. Their encoded `Link` message rides
+/// along instead and is written back byte for byte, which preserves every
+/// field (name character set, creation order, the link value) without this
+/// writer having to model any of them.
+#[derive(Clone)]
+pub struct PreservedLink {
+    /// Parent group index (`None` = the root group).
+    pub parent: Option<usize>,
+    /// Leaf name of the link within the parent group.
+    pub name: String,
+    /// The link's class, decoded once at collection so listings can report
+    /// it. Never the source of what gets written — `encoded` is.
+    pub class: crate::io::reader::LinkClass,
+    /// The encoded `Link` message body, exactly as read from the file.
+    pub encoded: Vec<u8>,
+}
+
+/// Every link a reopen walk met, split by what the writer can do with it.
+/// A header rewrite emits both halves, so a link in neither half is a link
+/// the close would destroy.
+#[derive(Default)]
+struct CollectedLinks {
+    /// Hard links: full path and the object header address it names.
+    hard: Vec<(String, u64)>,
+    /// Links this writer cannot express: full path, class, and the encoded
+    /// message to write back unchanged.
+    preserved: Vec<(String, crate::io::reader::LinkClass, Vec<u8>)>,
+}
+
 /// Encode an Object Reference Count message (type 0x16) body: a version
 /// byte (`H5O_REFCOUNT_VERSION` = 0) followed by the little-endian u32
 /// count. Emitted on objects reached by more than one hard link.
@@ -882,6 +915,10 @@ pub struct Hdf5Writer {
     /// User-created hard links (additional names for existing objects),
     /// resolved and emitted during finalize.
     pub(crate) hard_links: Slot<Vec<HardLink>>,
+    /// Links a reopened file held that this writer cannot express, carried
+    /// through every header rewrite by their encoded bytes. Always empty for
+    /// a freshly created file; see [`PreservedLink`].
+    pub(crate) preserved_links: Slot<Vec<PreservedLink>>,
     /// Attributes attached to the root group (file-level attributes).
     pub(crate) root_attributes: Slot<Vec<crate::format::messages::attribute::AttributeMessage>>,
     /// Serializes object creation so name-uniqueness check and registry insert
@@ -979,6 +1016,7 @@ impl Hdf5Writer {
             datasets: Slot::new(Vec::new()),
             groups: Slot::new(Vec::new()),
             hard_links: Slot::new(Vec::new()),
+            preserved_links: Slot::new(Vec::new()),
             root_attributes: Slot::new(Vec::new()),
             create_lock: Slot::new(()),
             libver_latest: false,
@@ -1168,14 +1206,18 @@ impl Hdf5Writer {
             sizeof_size: sb.sizeof_lengths,
         };
 
-        // Discover links from root group (and subgroups recursively).
-        // Read to end-of-file so a large object header (many attributes) is
-        // not truncated, which would silently drop datasets on reopen.
+        // Discover links from root group (and subgroups recursively). The
+        // header must be read whole — chunk 0 *and* every continuation block
+        // — because close rewrites the root group from what this walk found:
+        // a link that lives in a continuation and is not seen here is a link
+        // the rewrite deletes. `root_header_size` stays the chunk-0 size,
+        // which is the block the rewrite supersedes.
         let root_addr = sb.root_group_object_header_address;
         let root_buf =
             handle.read_at_most(root_addr, file_size.saturating_sub(root_addr) as usize)?;
-        let (root_header, root_header_size) =
-            crate::format::object_header::ObjectHeader::decode(&root_buf)?;
+        let (_, root_header_size) = crate::format::object_header::ObjectHeader::decode(&root_buf)?;
+        let root_header =
+            crate::io::object_header_io::read_object_header_full(&mut handle, &ctx, root_addr)?;
 
         // Collect existing root-level attributes
         let mut root_attributes = Vec::new();
@@ -1189,17 +1231,18 @@ impl Hdf5Writer {
             }
         }
 
-        let mut link_entries: Vec<(String, u64)> = Vec::new();
+        let mut collected = CollectedLinks::default();
         let mut visited_groups = std::collections::HashSet::new();
         Self::collect_links_recursive(
             &mut handle,
             &root_header,
             &ctx,
             "",
-            &mut link_entries,
+            &mut collected,
             &mut visited_groups,
             0,
         )?;
+        let mut link_entries = collected.hard;
 
         // Two link entries can share one object header — hard links. Only
         // the first-walked path becomes the object; the rest are rebuilt
@@ -1227,14 +1270,23 @@ impl Hdf5Writer {
         let mut group_headers: std::collections::HashMap<String, GroupHeaderInfo> =
             Default::default();
         for (name, obj_addr) in &link_entries {
-            // Read the dataset's full object header (to EOF — see above).
+            // Chunk 0 only, for its encoded size: that is the block the
+            // rewrite supersedes and frees.
             let ds_buf =
                 handle.read_at_most(*obj_addr, file_size.saturating_sub(*obj_addr) as usize)?;
-            let (ds_header, ds_header_size) =
+            let ds_header_size =
                 match crate::format::object_header::ObjectHeader::decode_any(&ds_buf) {
-                    Ok(h) => h,
+                    Ok((_, size)) => size,
                     Err(_) => continue,
                 };
+            // The messages, on the other hand, must come from the whole
+            // chain: a filter pipeline or an attribute that spilled into a
+            // continuation is one the rewrite would otherwise drop.
+            let Ok(ds_header) =
+                crate::io::object_header_io::read_object_header_full(&mut handle, &ctx, *obj_addr)
+            else {
+                continue;
+            };
 
             let mut datatype = None;
             let mut dataspace = None;
@@ -1751,6 +1803,31 @@ impl Hdf5Writer {
             });
         }
 
+        // Attach every link the writer cannot express to the group that
+        // holds it, so the rewrite of that group's header emits it again.
+        // `ensure_groups_for` registers the parent chain, which matters for
+        // a group whose only content is such a link: nothing else would put
+        // it in the registry, and the close would drop group and link alike.
+        let mut preserved_links: Vec<PreservedLink> = Vec::new();
+        for (path, class, encoded) in collected.preserved {
+            let (parent, link_name) = match path.rsplit_once('/') {
+                None => (None, path),
+                Some((dir, leaf)) => {
+                    ensure_groups_for(dir, &mut groups, &mut group_index_map, &mut group_headers);
+                    (
+                        group_index_map.get(&format!("/{dir}")).copied(),
+                        leaf.to_string(),
+                    )
+                }
+            };
+            preserved_links.push(PreservedLink {
+                parent,
+                name: link_name,
+                class,
+                encoded,
+            });
+        }
+
         let allocator = FileAllocator::new(file_size);
 
         // Wrap the reconstructed plain vecs into the per-slot registry. The
@@ -1772,6 +1849,7 @@ impl Hdf5Writer {
             datasets: Slot::new(datasets),
             groups: Slot::new(groups),
             hard_links: Slot::new(hard_links),
+            preserved_links: Slot::new(preserved_links),
             root_attributes: Slot::new(root_attributes),
             create_lock: Slot::new(()),
             libver_latest: false,
@@ -1784,13 +1862,13 @@ impl Hdf5Writer {
         })
     }
 
-    /// Recursively collect (name, obj_header_addr) pairs from link messages.
+    /// Recursively collect every link message under `header`.
     fn collect_links_recursive(
         handle: &mut FileHandle,
         header: &crate::format::object_header::ObjectHeader,
         ctx: &FormatContext,
         prefix: &str,
-        out: &mut Vec<(String, u64)>,
+        out: &mut CollectedLinks,
         visited: &mut std::collections::HashSet<u64>,
         depth: usize,
     ) -> IoResult<()> {
@@ -1802,46 +1880,54 @@ impl Hdf5Writer {
         }
         use crate::format::messages::link::{LinkMessage, LinkTarget};
         for msg in &header.messages {
-            if msg.msg_type == crate::format::messages::MSG_LINK {
-                if let Ok((link, _)) = LinkMessage::decode(&msg.data, ctx) {
-                    if let LinkTarget::Hard { address } = &link.target {
-                        let full_name = if prefix.is_empty() {
-                            link.name.clone()
-                        } else {
-                            format!("{}/{}", prefix, link.name)
-                        };
-                        out.push((full_name.clone(), *address));
+            if msg.msg_type != crate::format::messages::MSG_LINK {
+                continue;
+            }
+            let Ok((link, _)) = LinkMessage::decode(&msg.data, ctx) else {
+                continue;
+            };
+            let full_name = if prefix.is_empty() {
+                link.name.clone()
+            } else {
+                format!("{}/{}", prefix, link.name)
+            };
 
-                        // Try to recurse into groups (read to EOF so a large
-                        // child object header is not truncated).
-                        let child_len = handle
-                            .file_size()
-                            .map(|fs| fs.saturating_sub(*address) as usize)
-                            .unwrap_or(8192);
-                        if let Ok(child_buf) = handle.read_at_most(*address, child_len) {
-                            if let Ok((child_header, _)) =
-                                crate::format::object_header::ObjectHeader::decode_any(&child_buf)
-                            {
-                                let has_links = child_header
-                                    .messages
-                                    .iter()
-                                    .any(|m| m.msg_type == crate::format::messages::MSG_LINK);
-                                // Recurse only into a group's header we have
-                                // not entered before — breaks hard-link cycles.
-                                if has_links && visited.insert(*address) {
-                                    let _ = Self::collect_links_recursive(
-                                        handle,
-                                        &child_header,
-                                        ctx,
-                                        &full_name,
-                                        out,
-                                        visited,
-                                        depth + 1,
-                                    );
-                                }
-                            }
-                        }
-                    }
+            // Only a hard link names an object this writer can rebuild. Every
+            // other class is kept by its bytes, because a close that emitted
+            // only what the registry models would drop it from the file.
+            let LinkTarget::Hard { address } = &link.target else {
+                out.preserved.push((
+                    full_name,
+                    crate::io::reader::LinkClass::from_target(&link.target),
+                    msg.data.clone(),
+                ));
+                continue;
+            };
+            out.hard.push((full_name.clone(), *address));
+
+            // Try to recurse into groups, following continuation blocks: a
+            // subgroup with more links than fit chunk 0 keeps the rest there,
+            // and a walk that stopped at chunk 0 would have the close rewrite
+            // that group without them.
+            if let Ok(child_header) =
+                crate::io::object_header_io::read_object_header_full(handle, ctx, *address)
+            {
+                let has_links = child_header
+                    .messages
+                    .iter()
+                    .any(|m| m.msg_type == crate::format::messages::MSG_LINK);
+                // Recurse only into a group's header we have
+                // not entered before — breaks hard-link cycles.
+                if has_links && visited.insert(*address) {
+                    let _ = Self::collect_links_recursive(
+                        handle,
+                        &child_header,
+                        ctx,
+                        &full_name,
+                        out,
+                        visited,
+                        depth + 1,
+                    );
                 }
             }
         }
@@ -1924,6 +2010,14 @@ impl Hdf5Writer {
         {
             return Err(crate::io::IoError::InvalidState(format!(
                 "a hard link named '{name}' already exists"
+            )));
+        }
+        // A preserved link occupies its name in the group just as a modelled
+        // one does; both are emitted, and two link messages of one name in a
+        // group is an invalid file.
+        if self.preserved_link_paths().iter().any(|(p, _)| *p == name) {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "a link named '{name}' already exists"
             )));
         }
         Ok(())
@@ -2857,6 +2951,38 @@ impl Hdf5Writer {
             };
             let msg = LinkMessage::hard(&link.name, addr);
             header.add_message(MSG_LINK, 0x00, msg.encode(&self.ctx));
+        }
+    }
+
+    /// Re-emit the links of a reopened file that this writer cannot express,
+    /// verbatim. Every header rewrite goes through the two group-header
+    /// builders, and both call this, so no rewrite can drop them.
+    fn emit_preserved_links(&self, header: &mut ObjectHeader, parent: Option<usize>) {
+        for link in self.preserved_links.lock().iter() {
+            if link.parent == parent {
+                header.add_message(MSG_LINK, 0x00, link.encoded.clone());
+            }
+        }
+    }
+
+    /// Every link this writer is carrying but cannot express, by full path.
+    pub(crate) fn preserved_link_paths(&self) -> Vec<(String, crate::io::reader::LinkClass)> {
+        self.preserved_links
+            .lock()
+            .iter()
+            .map(|l| (self.preserved_link_full_path(l), l.class.clone()))
+            .collect()
+    }
+
+    /// The full path of a preserved link: its parent group's path plus its
+    /// leaf name, in the no-leading-`/` form the registry uses.
+    fn preserved_link_full_path(&self, link: &PreservedLink) -> String {
+        match link.parent {
+            None => link.name.clone(),
+            Some(gi) => {
+                let group = self.grp(gi).lock().name.clone();
+                format!("{}/{}", group.trim_start_matches('/'), link.name)
+            }
         }
     }
 
@@ -7554,8 +7680,10 @@ impl Hdf5Writer {
             header.add_message(MSG_LINK, 0x00, link_msg);
         }
 
-        // User-created hard links whose parent is this group.
+        // User-created hard links whose parent is this group, then the links
+        // a reopen carried through that this writer cannot express.
         self.emit_hard_links(&mut header, Some(group_idx));
+        self.emit_preserved_links(&mut header, Some(group_idx));
 
         // Attribute messages (type 0x0C) -- e.g. NeXus `NX_class`.
         for attr in &attributes {
@@ -7626,8 +7754,10 @@ impl Hdf5Writer {
             }
         }
 
-        // User-created hard links in the root group.
+        // User-created hard links in the root group, then the links a reopen
+        // carried through that this writer cannot express.
         self.emit_hard_links(&mut header, None);
+        self.emit_preserved_links(&mut header, None);
 
         // Root-level attributes
         for attr in self.root_attributes.lock().iter() {

@@ -9,6 +9,7 @@ pub(crate) mod chunk_grid;
 pub mod file_handle;
 pub(crate) mod hyperslab;
 pub mod locking;
+pub(crate) mod object_header_io;
 pub mod reader;
 pub mod swmr;
 pub mod writer;

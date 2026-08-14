@@ -138,7 +138,7 @@ pub enum LinkClass {
 }
 
 impl LinkClass {
-    fn from_target(target: &LinkTarget) -> Self {
+    pub(crate) fn from_target(target: &LinkTarget) -> Self {
         match target {
             LinkTarget::Hard { .. } => Self::Hard,
             LinkTarget::Soft { target } => Self::Soft {
@@ -1116,149 +1116,15 @@ impl Hdf5Reader {
         }
     }
 
-    /// Read an object header at `addr` and return it with the messages from
-    /// every object-header continuation block flattened in.
-    ///
-    /// Handles both wire formats:
-    /// - v1 headers: continuation blocks are bare v1 messages (type:u16,
-    ///   size:u16, flags:u8, reserved:3, data, padded to 8-byte alignment).
-    /// - v2 headers: continuation blocks are `"OCHK"(4) + messages +
-    ///   checksum(4)` with v2 message headers (type:u8, size:u16, flags:u8,
-    ///   and a 2-byte creation-order field when the header tracks creation
-    ///   order).
-    ///
-    /// Nested continuations are followed; the total block count is bounded.
+    /// Read the object header at `addr` with every continuation block
+    /// flattened in. One owner for both halves of the crate — see
+    /// [`crate::io::object_header_io`].
     fn read_object_header_full(
         handle: &mut FileHandle,
         ctx: &FormatContext,
         addr: u64,
     ) -> IoResult<ObjectHeader> {
-        /// Bound on the number of continuation blocks followed per header.
-        const MAX_CONT_BLOCKS: usize = 4096;
-
-        // An object header's chunk-0 can hold more than 8 KiB of inline
-        // messages (many/large attributes), but reading the whole file tail
-        // would allocate gigabytes per object on a large valid file. Probe a
-        // bounded prefix; if the header declares a larger chunk-0,
-        // `decode_any` reports the exact byte count via `BufferTooShort` and
-        // we read precisely that much.
-        const HEADER_PROBE: usize = 8192;
-        let mut buf = handle.read_at_most(addr, HEADER_PROBE)?;
-        if let Err(crate::format::FormatError::BufferTooShort { needed, .. }) =
-            ObjectHeader::decode_any(&buf)
-        {
-            if needed > buf.len() {
-                buf = handle.read_at_most(addr, needed)?;
-            }
-        }
-        let (mut header, _) = ObjectHeader::decode_any(&buf)?;
-
-        // A v1 header has no "OHDR" signature; detect by it.
-        let is_v2 = buf.len() >= 4 && buf[0..4] == crate::format::object_header::OHDR_SIGNATURE;
-        // v2 creation-order tracking is recorded in object-header flag bit 2.
-        let track_creation_order = is_v2 && (header.flags & 0x04) != 0;
-
-        let sa = ctx.sizeof_addr as usize;
-        let ss = ctx.sizeof_size as usize;
-
-        // Collect continuation references from a slice of messages.
-        let collect = |msgs: &[crate::format::object_header::ObjectHeaderMessage],
-                       out: &mut Vec<(u64, u64)>| {
-            for msg in msgs {
-                if msg.msg_type == MSG_OBJ_HEADER_CONTINUATION && msg.data.len() >= sa + ss {
-                    let cont_addr = read_uint(&msg.data, sa);
-                    let cont_len = read_uint(&msg.data[sa..], ss);
-                    out.push((cont_addr, cont_len));
-                }
-            }
-        };
-
-        let mut pending: Vec<(u64, u64)> = Vec::new();
-        collect(&header.messages, &mut pending);
-
-        let mut visited = std::collections::HashSet::new();
-        let mut blocks_read = 0usize;
-
-        while let Some((cont_addr, cont_len)) = pending.pop() {
-            if cont_addr == UNDEF_ADDR || cont_addr == 0 || cont_len == 0 {
-                continue;
-            }
-            if !visited.insert(cont_addr) {
-                continue; // already followed — guard against cycles
-            }
-            blocks_read += 1;
-            if blocks_read > MAX_CONT_BLOCKS {
-                break;
-            }
-
-            let cont_buf = handle.read_at_most(cont_addr, cont_len as usize)?;
-            let mut new_msgs = Vec::new();
-            Self::parse_continuation_block(&cont_buf, is_v2, track_creation_order, &mut new_msgs);
-            collect(&new_msgs, &mut pending);
-            header.messages.extend(new_msgs);
-        }
-
-        Ok(header)
-    }
-
-    /// Parse the messages out of a single object-header continuation block.
-    ///
-    /// For v2 (`is_v2`) the block is `"OCHK"(4) + messages + checksum(4)`;
-    /// for v1 it is bare messages. Null/padding messages (type 0) are skipped.
-    fn parse_continuation_block(
-        cont_buf: &[u8],
-        is_v2: bool,
-        track_creation_order: bool,
-        out: &mut Vec<crate::format::object_header::ObjectHeaderMessage>,
-    ) {
-        if is_v2 {
-            // "OCHK"(4) signature + messages + checksum(4).
-            if cont_buf.len() < 8 || cont_buf[0..4] != *b"OCHK" {
-                return;
-            }
-            let msgs_end = cont_buf.len() - 4; // strip trailing checksum
-            let mut pos = 4; // skip "OCHK" signature
-                             // v2 message header: type(1) + size(2) + flags(1) [+ crt_order(2)]
-            let hdr_size = if track_creation_order { 6 } else { 4 };
-            while pos + hdr_size <= msgs_end {
-                let msg_type = cont_buf[pos];
-                let data_size = u16::from_le_bytes([cont_buf[pos + 1], cont_buf[pos + 2]]) as usize;
-                let msg_flags = cont_buf[pos + 3];
-                pos += hdr_size;
-                if pos + data_size > msgs_end {
-                    break;
-                }
-                if msg_type != 0 {
-                    out.push(crate::format::object_header::ObjectHeaderMessage {
-                        msg_type,
-                        flags: msg_flags,
-                        data: cont_buf[pos..pos + data_size].to_vec(),
-                    });
-                }
-                pos += data_size;
-            }
-        } else {
-            // v1 continuation: bare messages, 8-byte aligned, no prefix.
-            let mut pos = 0;
-            while pos + 8 <= cont_buf.len() {
-                let msg_type = u16::from_le_bytes([cont_buf[pos], cont_buf[pos + 1]]);
-                let data_size = u16::from_le_bytes([cont_buf[pos + 2], cont_buf[pos + 3]]) as usize;
-                let msg_flags = cont_buf[pos + 4];
-                pos += 8; // type(2) + size(2) + flags(1) + reserved(3)
-                if pos + data_size > cont_buf.len() {
-                    break;
-                }
-                if msg_type != 0 {
-                    out.push(crate::format::object_header::ObjectHeaderMessage {
-                        msg_type: msg_type as u8,
-                        flags: msg_flags,
-                        data: cont_buf[pos..pos + data_size].to_vec(),
-                    });
-                }
-                pos += data_size;
-                pos = (pos + 7) & !7; // v1 8-byte alignment
-            }
-        }
+        crate::io::object_header_io::read_object_header_full(handle, ctx, addr)
     }
 
     /// Classify one object from its (already read) header, and decode the

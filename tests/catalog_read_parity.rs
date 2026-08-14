@@ -39,8 +39,9 @@ fn tmp(name: &str) -> std::path::PathBuf {
     ))
 }
 
-/// Run `body` (top-level python statements) with `path` available as `PATH`.
-/// A non-zero exit fails the test; python's traceback reaches the test stderr.
+/// Run `body` (top-level python statements) with `path` available as `PATH`,
+/// to write a fixture or to assert over one. A non-zero exit — including a
+/// failed `assert` — fails the test; python's traceback reaches test stderr.
 fn h5py_write(py: &str, path: &std::path::Path, body: &str) {
     let script = format!(
         "import h5py, numpy as np\nPATH = r'{}'\n{}\n",
@@ -375,4 +376,161 @@ fn a_dataset_whose_message_does_not_decode_is_listed_and_says_why() {
 
         std::fs::remove_file(&path).ok();
     }
+}
+
+/// Reopening a file for writing rewrites every group object header from the
+/// writer's registry, and the registry modelled hard links only — so a soft
+/// or external link the file already held was erased by a rewrite that had
+/// nothing to do with it. h5py writes the links, rust appends something
+/// unrelated and closes, h5py checks that every link came back with its kind
+/// and value intact.
+#[test]
+fn reopening_for_write_preserves_soft_and_external_links() {
+    let Some(py) = python() else { return };
+    let target = tmp("preserve_extlink_target");
+    let path = tmp("preserve_links");
+    h5py_write(
+        py,
+        &target,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f.create_dataset('data', data=np.arange(4, dtype='<i4'))\n",
+    );
+    // libver='latest' because the reopen path refuses a v0/v1-superblock file.
+    h5py_write(
+        py,
+        &path,
+        &format!(
+            "with h5py.File(PATH, 'w', libver='latest') as f:\n\
+             \x20   f.create_dataset('kept', data=np.arange(4, dtype='<i4'))\n\
+             \x20   g = f.create_group('g')\n\
+             \x20   g.create_dataset('inner', data=np.arange(4, dtype='<i4'))\n\
+             \x20   f['soft'] = h5py.SoftLink('/kept')\n\
+             \x20   f['dangling'] = h5py.SoftLink('/nowhere')\n\
+             \x20   g['nested_soft'] = h5py.SoftLink('/g/inner')\n\
+             \x20   f['ext'] = h5py.ExternalLink(r'{}', '/data')\n",
+            target.display()
+        ),
+    );
+
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        // The links the writer is carrying are listed, with their own kinds.
+        let root = file.root_group();
+        assert!(matches!(
+            root.link_class("soft").unwrap(),
+            LinkClass::Soft { path } if path == "/kept"
+        ));
+        assert!(matches!(
+            root.link_class("ext").unwrap(),
+            LinkClass::External { path, .. } if path == "/data"
+        ));
+        assert!(root.link_names().unwrap().contains(&"dangling".to_string()));
+
+        // Something unrelated, so every group header gets rewritten.
+        file.new_dataset::<i32>()
+            .shape([4usize])
+            .create("added")
+            .unwrap()
+            .write_raw(&[9i32, 9, 9, 9])
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    h5py_write(
+        py,
+        &path,
+        &format!(
+            "with h5py.File(PATH, 'r') as f:\n\
+             \x20   soft = f.get('soft', getlink=True)\n\
+             \x20   assert isinstance(soft, h5py.SoftLink), soft\n\
+             \x20   assert soft.path == '/kept', soft.path\n\
+             \x20   dang = f.get('dangling', getlink=True)\n\
+             \x20   assert isinstance(dang, h5py.SoftLink), dang\n\
+             \x20   assert dang.path == '/nowhere', dang.path\n\
+             \x20   nested = f['g'].get('nested_soft', getlink=True)\n\
+             \x20   assert isinstance(nested, h5py.SoftLink), nested\n\
+             \x20   assert nested.path == '/g/inner', nested.path\n\
+             \x20   ext = f.get('ext', getlink=True)\n\
+             \x20   assert isinstance(ext, h5py.ExternalLink), ext\n\
+             \x20   assert ext.filename == r'{}', ext.filename\n\
+             \x20   assert ext.path == '/data', ext.path\n\
+             \x20   assert f['soft'][...].tolist() == [0, 1, 2, 3]\n\
+             \x20   assert f['ext'][...].tolist() == [0, 1, 2, 3]\n\
+             \x20   assert f['added'][...].tolist() == [9, 9, 9, 9]\n\
+             \x20   assert f['kept'][...].tolist() == [0, 1, 2, 3]\n\
+             \x20   assert f['g/inner'][...].tolist() == [0, 1, 2, 3]\n",
+            target.display()
+        ),
+    );
+
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&target).ok();
+}
+
+/// A group whose only child is a link the writer cannot express: nothing
+/// else would put it in the registry, so a rewrite would drop the group and
+/// the link with it.
+#[test]
+fn reopening_for_write_keeps_a_group_holding_only_a_soft_link() {
+    let Some(py) = python() else { return };
+    let path = tmp("preserve_lone_softlink");
+    h5py_write(
+        py,
+        &path,
+        "with h5py.File(PATH, 'w', libver='latest') as f:\n\
+         \x20   f.create_dataset('data', data=np.arange(4, dtype='<i4'))\n\
+         \x20   f.create_group('only').__setitem__('s', h5py.SoftLink('/data'))\n",
+    );
+
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.new_dataset::<i32>()
+            .shape([2usize])
+            .create("added")
+            .unwrap()
+            .write_raw(&[1i32, 2])
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    h5py_write(
+        py,
+        &path,
+        "with h5py.File(PATH, 'r') as f:\n\
+         \x20   assert 'only' in f, list(f.keys())\n\
+         \x20   s = f['only'].get('s', getlink=True)\n\
+         \x20   assert isinstance(s, h5py.SoftLink), s\n\
+         \x20   assert s.path == '/data', s.path\n\
+         \x20   assert f['only/s'][...].tolist() == [0, 1, 2, 3]\n",
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A name a preserved link already holds is taken: creating over it would
+/// emit two `Link` messages of one name into a group, which is an invalid
+/// file rather than a replacement.
+#[test]
+fn creating_over_a_preserved_link_name_is_refused() {
+    let Some(py) = python() else { return };
+    let path = tmp("preserve_name_clash");
+    h5py_write(
+        py,
+        &path,
+        "with h5py.File(PATH, 'w', libver='latest') as f:\n\
+         \x20   f.create_dataset('data', data=np.arange(4, dtype='<i4'))\n\
+         \x20   f['soft'] = h5py.SoftLink('/data')\n",
+    );
+
+    let file = H5File::open_rw(&path).unwrap();
+    let err = file
+        .new_dataset::<i32>()
+        .shape([2usize])
+        .create("soft")
+        .err()
+        .expect("creating over an existing link name must be refused");
+    assert!(format!("{err}").contains("already exists"), "{err}");
+    file.close().unwrap();
+
+    std::fs::remove_file(&path).ok();
 }

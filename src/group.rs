@@ -521,12 +521,25 @@ impl H5Group {
                 }
                 Ok(names.into_iter().collect())
             }
-            // The writer creates hard links only, so its link listing is the
-            // union of the object listings.
-            H5FileInner::Writer(_) => {
+            // The writer creates hard links only, so its own objects are the
+            // union of the object listings — plus the links a reopened file
+            // brought in that the writer carries but cannot express.
+            H5FileInner::Writer(writer) => {
+                let mut names = std::collections::BTreeSet::new();
+                for (path, _) in writer.preserved_link_paths() {
+                    let stripped = if prefix.is_empty() {
+                        path.as_str()
+                    } else if let Some(rest) = path.strip_prefix(&prefix) {
+                        rest
+                    } else {
+                        continue;
+                    };
+                    if !stripped.is_empty() && !stripped.contains('/') {
+                        names.insert(stripped.to_string());
+                    }
+                }
                 drop(inner);
-                let mut names: std::collections::BTreeSet<String> =
-                    self.dataset_names()?.into_iter().collect();
+                names.extend(self.dataset_names()?);
                 names.extend(self.group_names()?);
                 Ok(names.into_iter().collect())
             }
@@ -553,13 +566,19 @@ impl H5Group {
                 .link_class(&full_name)
                 .cloned()
                 .ok_or(Hdf5Error::NotFound(full_name)),
-            // The writer creates hard links only.
-            H5FileInner::Writer(_) => {
+            // The writer creates hard links only; anything else it holds came
+            // in with a reopened file and kept its class.
+            H5FileInner::Writer(writer) => {
+                let preserved = writer
+                    .preserved_link_paths()
+                    .into_iter()
+                    .find(|(p, _)| *p == full_name)
+                    .map(|(_, class)| class);
                 drop(inner);
-                if self.link_names()?.iter().any(|n| n == name) {
-                    Ok(LinkClass::Hard)
-                } else {
-                    Err(Hdf5Error::NotFound(full_name))
+                match preserved {
+                    Some(class) => Ok(class),
+                    None if self.link_names()?.iter().any(|n| n == name) => Ok(LinkClass::Hard),
+                    None => Err(Hdf5Error::NotFound(full_name)),
                 }
             }
             H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
