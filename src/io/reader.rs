@@ -451,15 +451,15 @@ impl Hdf5Reader {
         let root_header =
             Self::read_object_header_full(&mut handle, &meta, sb.root_group_object_header_address)?;
 
-        // Walk link messages to discover datasets, group attributes, and
-        // every group path that exists.
-        let (datasets, group_attributes, group_paths, group_aliases) =
-            Self::discover_datasets_from_links(
-                &mut handle,
-                &root_header,
-                sb.root_group_object_header_address,
-                &meta,
-            )?;
+        // Discover datasets, group attributes, and every group path that
+        // exists, from whichever storage the root group actually uses.
+        let (datasets, group_attributes, group_paths, group_aliases) = Self::discover_from_root(
+            &mut handle,
+            &meta,
+            Some(&root_header),
+            sb.root_group_object_header_address,
+            None,
+        )?;
 
         // Collect root group attributes
         let mut root_attributes = Vec::new();
@@ -534,54 +534,17 @@ impl Hdf5Reader {
             }
         }
 
-        // A v0/v1-superblock file whose root group has migrated to link
-        // storage (more than ~8 objects) carries `Link` / `Link Info`
-        // messages in its object header; the superblock symbol-table
-        // scratch-pad is then stale. Prefer the link-based walk when those
-        // messages are present, and fall back to the symbol-table B-tree.
-        let has_links = root_hdr.as_ref().is_some_and(|h| {
-            h.messages
-                .iter()
-                .any(|m| m.msg_type == MSG_LINK || m.msg_type == MSG_LINK_INFO)
-        });
-
-        let (datasets, group_attributes, group_paths, group_aliases) = if has_links {
-            Self::discover_datasets_from_links(
-                &mut handle,
-                root_hdr.as_ref().unwrap(),
-                root_obj_addr,
-                &meta,
-            )?
-        } else {
-            // Symbol-table storage: the STE scratch-pad caches the B-tree
-            // and local heap; otherwise read them from the object header.
-            let (btree_addr, heap_addr) = if ste_cache_type == 1 {
-                (ste_btree_addr, ste_heap_addr)
-            } else {
-                // Read the symbol-table message from the already-loaded
-                // full root header (which followed continuation blocks).
-                root_hdr
-                    .as_ref()
-                    .map(|h| Self::stab_from_header(h, &ctx))
-                    .unwrap_or((UNDEF_ADDR, UNDEF_ADDR))
-            };
-            if btree_addr != UNDEF_ADDR && heap_addr != UNDEF_ADDR {
-                Self::discover_datasets_from_btree(
-                    &mut handle,
-                    &meta,
-                    btree_addr,
-                    heap_addr,
-                    root_obj_addr,
-                )?
-            } else {
-                (
-                    Vec::new(),
-                    std::collections::HashMap::new(),
-                    std::collections::BTreeSet::new(),
-                    std::collections::HashMap::new(),
-                )
-            }
-        };
+        // The symbol-table scratch pad in the root entry caches the root
+        // group's B-tree and local heap; it is only meaningful for a
+        // symbol-table root group (`H5G_CACHED_STAB`).
+        let stab_hint = (ste_cache_type == 1).then_some((ste_btree_addr, ste_heap_addr));
+        let (datasets, group_attributes, group_paths, group_aliases) = Self::discover_from_root(
+            &mut handle,
+            &meta,
+            root_hdr.as_ref(),
+            root_obj_addr,
+            stab_hint,
+        )?;
 
         Ok(Self {
             handle,
@@ -599,6 +562,66 @@ impl Hdf5Reader {
             group_paths,
             group_aliases,
         })
+    }
+
+    /// Enumerate the file's objects from the root group, using whichever group
+    /// storage the root object header declares.
+    ///
+    /// Group storage and superblock version are independent. A file gets a
+    /// version-2 superblock as soon as it needs a shared-message table, a
+    /// file-space strategy or non-default B-tree ranks, none of which changes
+    /// how its groups are stored: unless the library-version bounds ask for
+    /// the newer format, the root group is still a symbol table. `H5G` picks
+    /// per group by the messages present (`H5G__obj_lookup`), and so does
+    /// this — reading a symbol-table root group as link storage finds nothing
+    /// and reports an empty file.
+    ///
+    /// `stab_hint` is the v0/v1 root symbol-table entry's scratch pad, when it
+    /// caches one.
+    #[allow(clippy::type_complexity)]
+    fn discover_from_root(
+        handle: &mut FileHandle,
+        meta: &FileMeta,
+        root_header: Option<&ObjectHeader>,
+        root_addr: u64,
+        stab_hint: Option<(u64, u64)>,
+    ) -> IoResult<(
+        Vec<DatasetReadInfo>,
+        std::collections::HashMap<String, Vec<AttributeMessage>>,
+        std::collections::BTreeSet<String>,
+        std::collections::HashMap<String, String>,
+    )> {
+        let empty = || {
+            (
+                Vec::new(),
+                std::collections::HashMap::new(),
+                std::collections::BTreeSet::new(),
+                std::collections::HashMap::new(),
+            )
+        };
+        let Some(header) = root_header else {
+            return Ok(empty());
+        };
+
+        // Link storage wins when present: a group that has migrated to it
+        // carries `Link` / `Link Info` messages, and any symbol-table
+        // scratch pad left in the superblock is then stale.
+        let has_links = header
+            .messages
+            .iter()
+            .any(|m| m.msg_type == MSG_LINK || m.msg_type == MSG_LINK_INFO);
+        if has_links {
+            return Self::discover_datasets_from_links(handle, header, root_addr, meta);
+        }
+
+        // Symbol-table storage: prefer the cached scratch pad, else the
+        // header's own symbol-table message.
+        let (btree_addr, heap_addr) =
+            stab_hint.unwrap_or_else(|| Self::stab_from_header(header, &meta.ctx));
+        if btree_addr == UNDEF_ADDR || heap_addr == UNDEF_ADDR {
+            return Ok(empty());
+        }
+        Self::discover_datasets_from_btree(handle, meta, btree_addr, heap_addr, root_addr)
     }
 
     /// Read the superblock extension object header at `ext_addr` (if any) and
@@ -1740,15 +1763,14 @@ impl Hdf5Reader {
             sb.root_group_object_header_address,
         )?;
 
-        // Re-scan datasets, group attributes, and group paths from link
-        // messages.
-        let (datasets, group_attributes, group_paths, group_aliases) =
-            Self::discover_datasets_from_links(
-                &mut self.handle,
-                &root_header,
-                sb.root_group_object_header_address,
-                &meta,
-            )?;
+        // Re-scan datasets, group attributes, and group paths.
+        let (datasets, group_attributes, group_paths, group_aliases) = Self::discover_from_root(
+            &mut self.handle,
+            &meta,
+            Some(&root_header),
+            sb.root_group_object_header_address,
+            None,
+        )?;
 
         self._eof = sb.end_of_file_address;
         self.meta = meta;
