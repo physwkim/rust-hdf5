@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -33,6 +34,10 @@ import traceback
 
 DEFAULT_PYTHON = "/home/stevek/micromamba/envs/tomo/bin/python"
 REPO = pathlib.Path(__file__).resolve().parent.parent
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+import hdf5env  # noqa: E402,F401  (must precede h5py; see the module docstring)
 
 
 def reexec_with_h5py():
@@ -58,8 +63,6 @@ def reexec_with_h5py():
 
 reexec_with_h5py()
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-
 import canon  # noqa: E402
 import cases  # noqa: E402
 
@@ -77,7 +80,86 @@ B_TOLERATED_FIELDS = {
     "filters",
     "fillvalue",
     "maxshape",
+    "linkorder",
+    "attrorder",
 }
+
+# Direction-B metadata deviations that are known, understood and stable: the
+# rust writer describes the file differently from libhdf5 while the data,
+# datatype and shape it stores read back identically. Each entry is matched
+# against (field, libhdf5 value, rust-hdf5 value); `None` matches anything.
+# A deviation that matches none of these is reported as unexpected, and an
+# entry that matches nothing in a run is reported as no longer observed — so
+# a rerun after a writer fix shows the change rather than hiding it.
+EXPECTED_DEVIATIONS = [
+    {
+        "id": "superblock-always-v3",
+        "field": "superblock",
+        "ref": None,
+        "rust": "3",
+        "why": "the writer emits a v3 superblock for every file it creates; "
+               "H5File::set_libver_latest(false) does not select an older one",
+    },
+    {
+        "id": "btree1-index-substituted",
+        "field": "chunkindex",
+        "ref": "btree1",
+        "rust": "earray",
+        "why": "a v1 B-tree chunk index is only legal below superblock v3, so "
+               "this follows from superblock-always-v3: one unlimited "
+               "dimension in a v3 file selects the extensible array",
+    },
+    {
+        "id": "creation-order-not-tracked",
+        "field": "linkorder",
+        "ref": "tracked+indexed",
+        "rust": "-",
+        "why": "the public API has no creation-order option, so the writer "
+               "records name order only; every link and attribute is still "
+               "present and reads back identically",
+    },
+    {
+        "id": "creation-order-not-tracked-attrs",
+        "field": "attrorder",
+        "ref": "tracked+indexed",
+        "rust": "-",
+        "why": "the attribute half of creation-order-not-tracked",
+    },
+    {
+        "id": "filter-flags-zero",
+        "field": "filters",
+        "ref": None,
+        "rust": None,
+        "check": lambda ref, rust: FILTER_FLAGS_RE.sub("@", ref)
+        == FILTER_FLAGS_RE.sub("@", rust),
+        "why": "the writer stores the per-filter flags byte as 0 where "
+               "libhdf5 stores 1 (H5Z_FLAG_OPTIONAL); both pipelines "
+               "decode to the same bytes",
+    },
+]
+
+FILTER_FLAGS_RE = re.compile(r"@\d+")
+
+
+def expected_deviation(entry):
+    """The EXPECTED_DEVIATIONS id matching this diff, or None."""
+    ref, rust = entry["ref"], entry["rust"]
+    if ref is None or rust is None:
+        # One side does not describe the field at all. That is a missing
+        # object or a missing field, never one of the declared deviations.
+        return None
+    for exp in EXPECTED_DEVIATIONS:
+        if exp["field"] != entry["field"]:
+            continue
+        if exp["ref"] is not None and exp["ref"] != ref:
+            continue
+        if exp["rust"] is not None and exp["rust"] != rust:
+            continue
+        if "check" in exp and not exp["check"](ref, rust):
+            continue
+        return exp["id"]
+    return None
+
 
 # Fields the public rust-hdf5 API has no accessor for *at all*, in any file.
 # Each is one API gap, listed once in the findings; they say nothing about the
@@ -86,17 +168,25 @@ B_TOLERATED_FIELDS = {
 # file at hand and does.
 STRUCTURAL_FIELDS = {
     "superblock",
+    "userblock",
     "maxshape",
     "layout",
     "chunkindex",
+    "external",
+    "virtual",
     "filters",
     "fillvalue",
     "nattrs_hdr",
+    "linkorder",
+    "attrorder",
 }
+# `strpad` is deliberately NOT structural: the probe answers it for every type
+# except a variable-length string, so an UNSUPPORTED there is a gap in the
+# datatype model for that one class, not a missing accessor.
 
 
 def parse_dump(text):
-    """`!canon 1` text -> (records, header) where records is key -> value."""
+    """Canonical dump text -> (records, header) where records is key -> value."""
     records, header = {}, {}
     for line in text.splitlines():
         if not line:
@@ -263,8 +353,18 @@ class Oracle:
             out["detail"] = tail(proc.stdout + proc.stderr)
             return out, ref_path
 
-        ref, _ = parse_dump(ref_text)
-        probe, _ = parse_dump(proc.stdout)
+        ref, ref_hdr = parse_dump(ref_text)
+        probe, probe_hdr = parse_dump(proc.stdout)
+        if ref_hdr.get("!canon") != probe_hdr.get("!canon"):
+            # A stale probe binary would otherwise diff as hundreds of
+            # spurious field mismatches.
+            out["verdict"] = "READ-ERROR"
+            out["detail"] = "canonical format mismatch: canon.py emits %r, %s emits %r" % (
+                ref_hdr.get("!canon"),
+                self.probe,
+                probe_hdr.get("!canon"),
+            )
+            return out, ref_path
         div, gaps, errs, matched = compare(ref, probe)
         out.update(
             divergences=div, gaps=gaps, oracle_errors=errs, matched=matched
@@ -317,12 +417,32 @@ class Oracle:
 
         ref, _ = parse_dump(canon.dump(str(ref_path)))
         got, _ = parse_dump(written_text)
+        # An object h5py cannot open in the rust-written file makes every one
+        # of its fields diverge; report the object once instead, the same way
+        # direction A collapses an object the reader never lists.
+        unreadable = {
+            object_of(k)
+            for k, v in got.items()
+            if field_of(k) == "kind" and (marker(v, "ERROR") or marker(v, "UNSUPPORTED"))
+        }
+        for obj in sorted(unreadable):
+            out["core_diffs"].append(
+                {
+                    "key": obj,
+                    "field": "object",
+                    "ref": ref.get("%s#kind" % obj),
+                    "rust": got.get("%s#kind" % obj),
+                }
+            )
         for key in sorted(set(ref) | set(got)):
             rv, gv = ref.get(key), got.get(key)
             if rv == gv:
                 continue
+            if object_of(key).split("@", 1)[0] in unreadable:
+                continue
             entry = {"key": key, "field": field_of(key), "ref": rv, "rust": gv}
             if field_of(key) in B_TOLERATED_FIELDS:
+                entry["expected"] = expected_deviation(entry)
                 out["metadata_diffs"].append(entry)
             else:
                 out["core_diffs"].append(entry)
@@ -374,6 +494,44 @@ SEVERITY_LABEL = {
     "write-unsupported": "API cannot express",
     "structural": "no public accessor (API-wide)",
 }
+
+
+def deviation_tables(results):
+    """(expected rows, unexpected rows) for the direction-B metadata diffs.
+
+    Expected rows keep the declared order and carry the cases that hit them,
+    so an entry that stops firing stays visible as `observed: no`.
+    """
+    hits = {exp["id"]: [] for exp in EXPECTED_DEVIATIONS}
+    seen = {exp["id"]: (None, None) for exp in EXPECTED_DEVIATIONS}
+    unexpected = {}
+    for r in results:
+        for d in r["b"].get("metadata_diffs", []):
+            eid = d.get("expected")
+            if eid is None:
+                unexpected.setdefault(
+                    (d["key"], d["ref"], d["rust"]), []
+                ).append(r["case"])
+            elif r["case"] not in hits[eid]:
+                hits[eid].append(r["case"])
+                seen[eid] = (d["ref"], d["rust"])
+    expected = []
+    for exp in EXPECTED_DEVIATIONS:
+        ref, rust = seen[exp["id"]]
+        expected.append(
+            {
+                "id": exp["id"],
+                "field": exp["field"],
+                # `*` where the entry deliberately matches a family of values
+                # rather than one pair; the example then carries a real pair.
+                "ref": exp["ref"] or "*",
+                "rust": exp["rust"] or "*",
+                "example": None if ref is None else "%s -> %s" % (ref, rust),
+                "why": exp["why"],
+                "cases": hits[exp["id"]],
+            }
+        )
+    return expected, sorted(unexpected.items())
 
 
 def collect_gaps(results):
@@ -606,27 +764,61 @@ def write_report(results, gaps, meta, md_path, json_path):
             )
     L.append("")
 
-    bmeta = [r for r in results if r["b"].get("metadata_diffs")]
-    L.append("## Direction B metadata deviations")
+    expected, unexpected = deviation_tables(results)
+
+    L.append("## Direction B expected deviations")
     L.append("")
-    if not bmeta:
-        L.append("None.")
+    L.append(
+        "The rust-written file carries the same data, type and shape as the "
+        "h5py reference but describes itself differently. Each row below is a "
+        "known, understood writer deviation declared in `EXPECTED_DEVIATIONS` "
+        "(oracle/run.py); it does not fail a case. `observed: no` means a "
+        "declared deviation no longer happens — either the writer was fixed "
+        "and the entry should go, or the cases that exercised it changed."
+    )
+    L.append("")
+    L.append("| id | field | libhdf5 | rust-hdf5 | observed | cases |")
+    L.append("|---|---|---|---|---|---|")
+    for e in expected:
+        L.append(
+            "| `%s` | `%s` | `%s` | `%s` | %s | %d%s |"
+            % (
+                e["id"],
+                e["field"],
+                clip(e["ref"], 34),
+                clip(e["rust"], 34),
+                "yes" if e["cases"] else "no",
+                len(e["cases"]),
+                (" (%s)" % clip(", ".join(e["cases"][:3])
+                                + ("…" if len(e["cases"]) > 3 else ""), 44))
+                if e["cases"] else "",
+            )
+        )
+    L.append("")
+    for e in expected:
+        L.append(
+            "- `%s`: %s%s"
+            % (
+                e["id"],
+                e["why"],
+                ("; observed as `%s`" % clip(e["example"], 70)) if e["example"] else "",
+            )
+        )
+    L.append("")
+
+    L.append("## Direction B unexpected deviations")
+    L.append("")
+    if not unexpected:
+        L.append("None: every metadata deviation in this run is a declared one.")
     else:
         L.append(
-            "The rust-written file carries the same data, type and shape as the "
-            "h5py reference, but describes itself differently in these fields."
+            "Metadata deviations matching no `EXPECTED_DEVIATIONS` entry. These "
+            "are new since the table was written and want a verdict."
         )
-        L.append("")
         L.append("")
         L.append("| key | libhdf5 | rust-hdf5 | cases |")
         L.append("|---|---|---|---|")
-        grouped = {}
-        for r in bmeta:
-            for d in r["b"]["metadata_diffs"]:
-                grouped.setdefault(
-                    (d["key"], d["ref"], d["rust"]), []
-                ).append(r["case"])
-        for (key, ref, rust), cs in sorted(grouped.items()):
+        for (key, ref, rust), cs in unexpected:
             L.append(
                 "| `%s` | `%s` | `%s` | %d (%s) |"
                 % (
@@ -675,10 +867,11 @@ def write_report(results, gaps, meta, md_path, json_path):
     L.append("## Known modelling gaps in the canonical format")
     L.append("")
     L.append(
-        "- `vstr` omits the HDF5 string-pad field, because "
-        "`DatatypeMessage::VarLenString` models only the character set. "
-        "Including it would report one modelling gap as a divergence in every "
-        "variable-length string case."
+        "- The string pad of a *variable-length* string is reported in the "
+        "separate `strpad` field rather than inline in `dtype`, because "
+        "`DatatypeMessage::VarLenString` models only the character set and the "
+        "reader therefore answers `UNSUPPORTED(strpad)`. A fixed string keeps "
+        "its pad inline, where both sides agree."
     )
     L.append(
         "- `chunkindex` is derived on the libhdf5 side from the DCPL and the "
@@ -695,7 +888,16 @@ def write_report(results, gaps, meta, md_path, json_path):
     md_path.write_text("\n".join(L) + "\n")
     json_path.write_text(
         json.dumps(
-            {"meta": meta, "results": results, "findings": gaps},
+            {
+                "meta": meta,
+                "results": results,
+                "findings": gaps,
+                "expected_deviations": expected,
+                "unexpected_deviations": [
+                    {"key": k, "ref": rv, "rust": gv, "cases": cs}
+                    for (k, rv, gv), cs in unexpected
+                ],
+            },
             indent=1,
             sort_keys=False,
         )
