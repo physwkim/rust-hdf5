@@ -27,13 +27,13 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 
 | direction | PASS | INVALID | UNSUPPORTED-API | SKIPPED |
 |---|---|---|---|---|
-| B (write) | 69 | 0 | 22 | 0 |
+| B (write) | 78 | 0 | 13 | 0 |
 
 ## Top gaps by severity
 
 | # | severity | finding | cases |
 |---|---|---|---|
-| 1 | API cannot express | no rust writer arm: the public API cannot express this case | 21 (named_datatype, layout_compact, layout_contiguous_v110, lay…) |
+| 1 | API cannot express | no rust writer arm: the public API cannot express this case | 12 (named_datatype, chunkidx_implicit, external_storage, vds…) |
 | 2 | API cannot express | region references need a selection serializer on the write side | 1 (ref_region) |
 | 3 | no public accessor (API-wide) | attrorder — H5Group exposes no attribute creation-order tracking flags | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
 | 4 | no public accessor (API-wide) | attrstore — H5Group exposes no compact/dense attribute storage accessor | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
@@ -85,10 +85,10 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `vlen_numeric` | dtype-composite | PASS | 0 | 0 | 0 | PASS |  |
 | `vlen_bytes` | dtype-composite | PASS | 0 | 0 | 0 | PASS |  |
 | `named_datatype` | dtype-composite | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
-| `layout_compact` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `layout_compact` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `layout_contiguous` | layout | PASS | 0 | 0 | 0 | PASS |  |
-| `layout_contiguous_v110` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
-| `layout_chunked_v110` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `layout_contiguous_v110` | layout | PASS | 0 | 0 | 0 | PASS |  |
+| `layout_chunked_v110` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `chunkidx_btree1` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `chunkidx_single` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `chunkidx_implicit` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
@@ -96,13 +96,13 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `chunkidx_earray` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `chunkidx_earray_unlim_inner` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `chunkidx_btree2` | layout | PASS | 0 | 0 | 0 | PASS |  |
-| `layout_contiguous_v108` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
-| `layout_chunked_v108` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `layout_contiguous_v108` | layout | PASS | 0 | 0 | 0 | PASS |  |
+| `layout_chunked_v108` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `chunkidx_earray_dim1` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `external_storage` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
 | `vds` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
 | `filter_deflate` | filter | PASS | 0 | 0 | 0 | PASS |  |
-| `filter_shuffle` | filter | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `filter_shuffle` | filter | PASS | 0 | 0 | 0 | PASS |  |
 | `filter_fletcher32` | filter | PASS | 0 | 0 | 0 | PASS |  |
 | `filter_deflate_shuffle` | filter | PASS | 0 | 0 | 0 | PASS |  |
 | `filter_scaleoffset` | filter | PASS | 0 | 0 | 0 | PASS |  |
@@ -130,10 +130,10 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `attr_on_root` | attribute | PASS | 0 | 0 | 0 | PASS |  |
 | `attr_large` | attribute | PASS | 0 | 0 | 0 | PASS |  |
 | `libver_earliest` | superblock | PASS | 0 | 0 | 0 | PASS |  |
-| `libver_v108` | superblock | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
-| `libver_v110` | superblock | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `libver_v108` | superblock | PASS | 0 | 0 | 0 | PASS |  |
+| `libver_v110` | superblock | PASS | 0 | 0 | 0 | PASS |  |
 | `libver_latest` | superblock | PASS | 0 | 0 | 0 | PASS |  |
-| `userblock` | superblock | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `userblock` | superblock | PASS | 0 | 0 | 0 | PASS |  |
 | `swmr_created` | swmr | PASS | 0 | 0 | 0 | PASS |  |
 | `large_multi_mb` | bulk | PASS | 0 | 0 | 0 | PASS |  |
 | `sohm_list` | sohm | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
@@ -153,23 +153,21 @@ The rust-written file carries the same data, type and shape as the h5py referenc
 
 | id | field | libhdf5 | rust-hdf5 | observed | cases |
 |---|---|---|---|---|---|
-| `superblock-always-v3` | `superblock` | `*` | `3` | yes | 1 (chunkidx_btree1) |
-| `btree1-index-substituted` | `chunkindex` | `btree1` | `earray` | yes | 1 (chunkidx_btree1) |
-| `new-style-groups-always` | `linkstore` | `symtab` | `compact` | yes | 47 (int_i8, int_u8, int_i16le…) |
-| `filter-flags-zero` | `filters` | `*` | `*` | yes | 3 (filter_deflate, filter_deflate_shuffle, fil…) |
+| `superblock-floor-v2` | `superblock` | `0` | `2` | yes | 48 (int_i8, int_u8, int_i16le…) |
+| `superblock-v3-for-chunk-index` | `superblock` | `*` | `3` | yes | 2 (chunkidx_btree1, layout_chunked_v108) |
+| `btree1-index-substituted` | `chunkindex` | `btree1` | `*` | yes | 2 (chunkidx_btree1, layout_chunked_v108) |
+| `new-style-groups-always` | `linkstore` | `symtab` | `compact` | yes | 49 (int_i8, int_u8, int_i16le…) |
+| `filter-flags-zero` | `filters` | `*` | `*` | yes | 4 (filter_deflate, filter_shuffle, filter_defl…) |
 
-- `superblock-always-v3`: the writer emits a v3 superblock for every file it creates; H5File::set_libver_latest(false) does not select an older one; observed as `0 -> 3`
-- `btree1-index-substituted`: a v1 B-tree chunk index is only legal below superblock v3, so this follows from superblock-always-v3: one unlimited dimension in a v3 file selects the extensible array; observed as `btree1 -> earray`
-- `new-style-groups-always`: the writer emits a version-2 object header for every group, so links libhdf5 would keep in a symbol table are stored as link messages; follows from superblock-always-v3, and the phase change past max_compact still moves them to dense storage; observed as `symtab -> compact`
+- `superblock-floor-v2`: libhdf5 writes a v0 superblock at the earliest libver bound, over symbol-table groups and version-1 object headers; this writer emits neither, and no libhdf5 writes a v0 superblock over the link-message groups it does emit, so its floor is the v1.8 bound's version 2 (HDF5_superblock_ver_bounds); observed as `0 -> 2`
+- `superblock-v3-for-chunk-index`: every chunked dataset this writer emits is indexed by a v1.10 structure through a version-4 data layout message, which H5O_layout_ver_bounds puts at the v1.10 bound and so at superblock version 3, whatever bound the file asked for; observed as `2 -> 3`
+- `btree1-index-substituted`: a v1 B-tree chunk index is only legal below superblock v3, so this follows from superblock-v3-for-chunk-index: the file gets whichever v1.10 index its shape selects — the extensible array for one unlimited dimension, the single-chunk index for a fixed shape covered by one chunk; observed as `btree1 -> single`
+- `new-style-groups-always`: the writer emits a version-2 object header for every group, so links libhdf5 would keep in a symbol table are stored as link messages; the same cause as superblock-floor-v2, and the phase change past max_compact still moves them to dense storage; observed as `symtab -> compact`
 - `filter-flags-zero`: the writer stores the per-filter flags byte as 0 where libhdf5 stores 1 (H5Z_FLAG_OPTIONAL); both pipelines decode to the same bytes; observed as `[scaleoffset(2|0|16|0|4|1|0|1|0|0|0|0|0|0|0|0|1818321779|1717989221|7…`
 
 ## Direction B unexpected deviations
 
-Metadata deviations matching no `EXPECTED_DEVIATIONS` entry. These are new since the table was written and want a verdict.
-
-| key | libhdf5 | rust-hdf5 | cases |
-|---|---|---|---|
-| `#superblock` | `0` | `2` | 46 (int_i8, int_u8, int_i16le…) |
+None: every metadata deviation in this run is a declared one.
 
 ## Direction B failures, in full
 
@@ -178,7 +176,7 @@ None.
 
 | severity | finding | cases | example |
 |---|---|---|---|
-| API cannot express | no rust writer arm: the public API cannot express this case | 21 |  |
+| API cannot express | no rust writer arm: the public API cannot express this case | 12 |  |
 | API cannot express | region references need a selection serializer on the write side | 1 |  |
 | no public accessor (API-wide) | attrorder — H5Group exposes no attribute creation-order tracking flags | 91 | /#attrorder |
 | no public accessor (API-wide) | attrstore — H5Group exposes no compact/dense attribute storage accessor | 91 | /#attrstore |
