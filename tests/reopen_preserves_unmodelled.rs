@@ -634,3 +634,78 @@ fn a_preserved_object_is_named_by_the_writer_rather_than_reported_absent() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A version-3 data layout indexes its chunks with a version-1 B-tree, and a
+/// compact layout keeps the data inside the message. This writer builds
+/// neither, but the reopen registered both as datasets anyway and the close
+/// rewrote each header as a *contiguous, unallocated* one — the address the
+/// rebuild never filled in. Setting one attribute on the chunked dataset (all
+/// it takes to make its header stale) zeroed all 64 of its elements, with no
+/// error anywhere.
+///
+/// h5py at `libver='v108'` writes exactly that layout over a version-2
+/// superblock, which is a file this writer otherwise appends to happily; a
+/// classic file's chunked datasets are all of this shape.
+#[test]
+fn a_layout_this_writer_does_not_build_keeps_its_bytes_through_a_reopen() {
+    let Some(py) = python() else { return };
+    let dir = tmp_dir("layout_v3");
+    let (orig, work) = (dir.join("orig.h5"), dir.join("work.h5"));
+
+    py_run(
+        py,
+        &orig,
+        &work,
+        "from h5py import h5d, h5s, h5p, h5t\n\
+         with h5py.File(ORIG, 'w', libver=('v108', 'v108')) as f:\n\
+         \x20   f.create_dataset('chunky', data=np.arange(64, dtype='<i4'), chunks=(8,))\n\
+         \x20   dcpl = h5p.create(h5p.DATASET_CREATE)\n\
+         \x20   dcpl.set_layout(h5d.COMPACT)\n\
+         \x20   sid = h5s.create_simple((4,))\n\
+         \x20   did = h5d.create(f.id, b'packed', h5t.STD_I32LE, sid, dcpl)\n\
+         \x20   did.write(h5s.ALL, h5s.ALL, np.arange(4, dtype='<i4'))\n\
+         \x20   f.create_dataset('plain', data=np.arange(4, dtype='<i4'))\n",
+    );
+    std::fs::copy(&orig, &work).unwrap();
+    reopen_touch_and_add(&work);
+
+    py_run(
+        py,
+        &orig,
+        &work,
+        &format!(
+            "{HEADER_IDENTITY}\
+             with h5py.File(WORK, 'r') as f:\n\
+             \x20   assert sorted(f.keys()) == ['added', 'chunky', 'packed', 'plain'], \
+             sorted(f.keys())\n\
+             \x20   assert list(f['chunky'][...]) == list(range(64)), list(f['chunky'][...])\n\
+             \x20   assert list(f['packed'][...]) == [0, 1, 2, 3], list(f['packed'][...])\n\
+             \x20   assert list(f['plain'][...]) == [0, 1, 2, 3]\n\
+             \x20   assert list(f['added'][...]) == [7, 8]\n\
+             for name in ('chunky', 'packed'):\n\
+             \x20   assert_untouched(name)\n"
+        ),
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Reopen `work`, set an attribute on `chunky` — which is what makes its
+/// header stale, and therefore rewritten — add one dataset, close.
+fn reopen_touch_and_add(work: &std::path::Path) {
+    let file = rust_hdf5::H5File::open_rw(work).expect("open_rw");
+    // A preserved object is not in the registry at all, so there is nothing to
+    // hang an attribute on. Refusing here is the point: the alternative was
+    // accepting the attribute and dropping the data.
+    assert!(
+        file.dataset_writer("chunky").is_err(),
+        "a version-3-layout dataset must not be writable through a reopen"
+    );
+    file.new_dataset::<i32>()
+        .shape([2])
+        .create("added")
+        .expect("create")
+        .write_raw(&[7i32, 8])
+        .expect("write");
+    file.close().expect("close");
+}

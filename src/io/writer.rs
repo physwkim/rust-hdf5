@@ -1391,6 +1391,25 @@ impl<'a> ReopenWalk<'a> {
         }
 
         match (datatype, dataspace, layout) {
+            // A layout `rebuild_dataset` has no arm for leaves the registry
+            // entry with an undefined data address, and the close then rewrites
+            // the header as a contiguous, unallocated dataset — every element
+            // gone, silently. Only the two layouts that rebuild are modelled;
+            // the rest keep their bytes, as an undecodable message already
+            // does. Version-3 chunked (a version-1 B-tree index, which h5py
+            // writes at `libver='v108'` and in every classic file), compact and
+            // virtual layouts are all this.
+            (Some(_), Some(_), Some(layout))
+                if !matches!(
+                    layout,
+                    DataLayoutMessage::Contiguous { .. } | DataLayoutMessage::ChunkedV4 { .. }
+                ) =>
+            {
+                Ok(ObjectPlan::Preserve(format!(
+                    "its data layout is {}, which this writer reads but does not build",
+                    layout.describe()
+                )))
+            }
             (Some(datatype), Some(dataspace), Some(layout)) => {
                 Ok(ObjectPlan::Dataset(Box::new(DatasetParts {
                     header_size,
