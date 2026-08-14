@@ -171,9 +171,13 @@ fn appending_behind_a_userblock_keeps_the_block_and_both_datasets() {
         file.dataset("again").unwrap().read_raw::<i32>().unwrap(),
         vec![200, 201]
     );
-    // The `note` root attribute is not checked here: the append path drops
-    // root-group attributes on any file, userblock or not (measured on a
-    // no-userblock file of the same shape), which is a separate defect.
+    // sbext measured the append path dropping root-group attributes on any
+    // file, userblock or not; the root attribute lives in chunk 0 of the root
+    // header, so this is the exact repro re-run.
+    assert_eq!(
+        file.attr_string("note").unwrap(),
+        "the superblock starts at 512"
+    );
     drop(file);
     cleanup(&path);
 }
