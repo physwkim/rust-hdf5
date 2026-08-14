@@ -539,11 +539,27 @@ impl ObjectHeader {
     /// Refuses a header carrying attribute-creation-order flags: those bits
     /// live in the version-2 flags byte, which version 1 does not have, so
     /// encoding such a header would silently drop the policy the caller set.
+    ///
+    /// Refuses a header carrying [`times`](Self::times) for the same reason.
+    /// The four times and the `H5O_HDR_STORE_TIMES` bit that announces them
+    /// are version-2 prefix fields; a version-1 header records only its
+    /// modification time, in an `H5O_MTIME_NEW` message, which this writer
+    /// does not emit. Refusing keeps the version gate at the one encoder that
+    /// knows which prefix it is writing, instead of letting a v2-shaped header
+    /// reach `encode_v1` and come back out with its times gone.
     pub fn encode_v1(&self, nlink: u32) -> FormatResult<Vec<u8>> {
         if self.flags & (FLAG_ATTR_CREATION_ORDER_TRACKED | FLAG_ATTR_CREATION_ORDER_INDEXED) != 0 {
             return Err(FormatError::InvalidData(
                 "a version-1 object header cannot record attribute creation order: \
                  the tracking flags exist only in the version-2 header prefix"
+                    .into(),
+            ));
+        }
+        if self.times.is_some() {
+            return Err(FormatError::InvalidData(
+                "a version-1 object header cannot store access/modification/change/birth \
+                 times: they are version-2 prefix fields, and version 1 carries only a \
+                 modification time, as an H5O_MTIME_NEW message"
                     .into(),
             ));
         }
@@ -873,6 +889,25 @@ mod tests_v1 {
             header.encode_v1(1).unwrap_err(),
             FormatError::InvalidData(_)
         ));
+    }
+
+    /// The times gate is the header version, not the caller: a version-1
+    /// prefix has nowhere to put them, so `encode_v1` says so instead of
+    /// returning a header whose times are gone.
+    #[test]
+    fn a_v1_header_refuses_to_drop_its_stored_times() {
+        let mut header = ObjectHeader::new();
+        header.add_message(0x11, 0x00, vec![0u8; 16]);
+        assert!(header.encode_v1(1).is_ok());
+
+        header.times = Some(ObjectTimes::created_at(0x1234_5678));
+        assert!(matches!(
+            header.encode_v1(1).unwrap_err(),
+            FormatError::InvalidData(_)
+        ));
+        // The same header is fine as version 2, where the prefix holds them.
+        let v2 = header.encode().unwrap();
+        assert_eq!(v2[5] & FLAG_STORE_TIMESTAMPS, FLAG_STORE_TIMESTAMPS);
     }
 
     #[test]
