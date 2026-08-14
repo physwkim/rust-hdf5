@@ -72,6 +72,91 @@ impl LocalHeapHeader {
     }
 }
 
+/// `H5HL_FREE_NULL` (H5HLpkg.h:54): the free-list head value that means "no
+/// free block", written in the header's free-list field. It is 1, not an
+/// undefined address, because 1 can never be a legal 8-aligned block offset.
+pub const LOCAL_HEAP_FREE_NULL: u64 = 1;
+
+/// `H5HL_ALIGN` (H5HLprivate.h:29): every heap object, and the data block
+/// itself, is a multiple of eight bytes long.
+pub fn local_heap_align(n: u64) -> u64 {
+    (n + 7) & !7
+}
+
+/// `H5HL_SIZEOF_HDR`: the heap header's own on-disk length, aligned.
+pub fn local_heap_header_size(sizeof_addr: usize, sizeof_size: usize) -> usize {
+    local_heap_align((4 + 1 + 3 + 2 * sizeof_size + sizeof_addr) as u64) as usize
+}
+
+impl LocalHeapHeader {
+    /// Encode the heap header (`H5HL__cache_prefix_serialize`).
+    ///
+    /// A `free_list_offset` of [`LOCAL_HEAP_FREE_NULL`] is the "no free space"
+    /// value; the field is not an address, so it has no undefined form.
+    pub fn encode(&self, sizeof_addr: usize, sizeof_size: usize) -> Vec<u8> {
+        let size = local_heap_header_size(sizeof_addr, sizeof_size);
+        let mut buf = Vec::with_capacity(size);
+        buf.extend_from_slice(&LOCAL_HEAP_SIGNATURE);
+        buf.push(0); // version
+        buf.extend_from_slice(&[0u8; 3]); // reserved
+        buf.extend_from_slice(&self.data_size.to_le_bytes()[..sizeof_size]);
+        buf.extend_from_slice(&self.free_list_offset.to_le_bytes()[..sizeof_size]);
+        buf.extend_from_slice(&self.data_addr.to_le_bytes()[..sizeof_addr]);
+        buf.resize(size, 0); // the alignment tail of H5HL_SIZEOF_HDR
+        buf
+    }
+}
+
+/// A local heap's data segment, built up object by object.
+///
+/// This is the bulk-load half of `H5HL_insert`: every object is placed at the
+/// end of the block and the block grows to fit, which is what that function
+/// does once its free list is empty. The free list itself is not modelled —
+/// the writer rebuilds a group's heap whole rather than patching the one on
+/// disk, so there is never a hole to record.
+#[derive(Debug, Default)]
+pub struct LocalHeapImage {
+    data: Vec<u8>,
+}
+
+impl LocalHeapImage {
+    /// A heap holding just the empty string at offset 0.
+    ///
+    /// Not an optimisation: `H5G__stab_create_components` asserts that offset,
+    /// because a symbol-table B-tree's leftmost key is the empty string and
+    /// every comparison against it reads heap offset 0.
+    pub fn with_empty_string() -> Self {
+        let mut image = Self::default();
+        let offset = image.insert(b"\0");
+        debug_assert_eq!(offset, 0);
+        image
+    }
+
+    /// Append `bytes` (null terminator included) and return its offset.
+    pub fn insert(&mut self, bytes: &[u8]) -> u64 {
+        let offset = self.data.len() as u64;
+        self.data.extend_from_slice(bytes);
+        let padded = local_heap_align(self.data.len() as u64) as usize;
+        self.data.resize(padded, 0);
+        offset
+    }
+
+    /// Append a name as a null-terminated string, returning its offset.
+    pub fn insert_str(&mut self, s: &str) -> u64 {
+        let offset = self.data.len() as u64;
+        self.data.extend_from_slice(s.as_bytes());
+        self.data.push(0);
+        let padded = local_heap_align(self.data.len() as u64) as usize;
+        self.data.resize(padded, 0);
+        offset
+    }
+
+    /// The data segment's bytes, whose length is the heap's `data_size`.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+}
+
 /// Look up a null-terminated string in the heap data block by offset.
 ///
 /// `heap_data` is the raw bytes of the local heap data segment.
@@ -186,5 +271,75 @@ mod tests {
             local_heap_get_string(data, 100).unwrap_err(),
             FormatError::InvalidData(_)
         ));
+    }
+
+    /// The 32-byte header of the root group's heap in a file h5py wrote with
+    /// no `libver` argument (three datasets `alpha`/`beta`/`gamma`).
+    #[test]
+    fn a_local_heap_header_matches_the_bytes_libhdf5_wrote() {
+        let hdr = LocalHeapHeader {
+            data_size: 88,
+            free_list_offset: 0x20,
+            data_addr: 0x2c8,
+        };
+        let expected = [
+            b'H', b'E', b'A', b'P', 0, 0, 0, 0, // signature, version 0, reserved
+            0x58, 0, 0, 0, 0, 0, 0, 0, // data_size
+            0x20, 0, 0, 0, 0, 0, 0, 0, // free list head
+            0xc8, 0x02, 0, 0, 0, 0, 0, 0, // data segment address
+        ];
+        assert_eq!(hdr.encode(8, 8), expected);
+        assert_eq!(local_heap_header_size(8, 8), 32);
+        assert_eq!(LocalHeapHeader::decode(&expected, 8, 8).unwrap(), hdr);
+    }
+
+    /// The header is 8-aligned, so the 4/4 form pads rather than shrinking to
+    /// its 20 significant bytes.
+    #[test]
+    fn a_four_byte_local_heap_header_pads_to_its_alignment() {
+        assert_eq!(local_heap_header_size(4, 4), 24);
+        let hdr = LocalHeapHeader {
+            data_size: 64,
+            free_list_offset: LOCAL_HEAP_FREE_NULL,
+            data_addr: 0x800,
+        };
+        let buf = hdr.encode(4, 4);
+        assert_eq!(buf.len(), 24);
+        assert_eq!(&buf[20..], &[0, 0, 0, 0]);
+        assert_eq!(LocalHeapHeader::decode(&buf, 4, 4).unwrap(), hdr);
+    }
+
+    /// The same three names, laid into a data segment: the empty string at
+    /// offset 0 and every object padded to eight.
+    #[test]
+    fn a_heap_image_lays_names_out_the_way_libhdf5_does() {
+        let mut heap = LocalHeapImage::with_empty_string();
+        assert_eq!(heap.insert_str("alpha"), 8);
+        assert_eq!(heap.insert_str("beta"), 16);
+        assert_eq!(heap.insert_str("gamma"), 24);
+        assert_eq!(
+            heap.as_bytes(),
+            b"\0\0\0\0\0\0\0\0alpha\0\0\0beta\0\0\0\0gamma\0\0\0"
+        );
+        for (offset, name) in [(0, ""), (8, "alpha"), (16, "beta"), (24, "gamma")] {
+            assert_eq!(
+                local_heap_get_string(heap.as_bytes(), offset).unwrap(),
+                name
+            );
+        }
+    }
+
+    /// A name whose length is already a multiple of eight still gets its
+    /// terminator, so it costs a whole extra eight bytes.
+    #[test]
+    fn a_heap_object_is_padded_after_its_terminator_not_before() {
+        let mut heap = LocalHeapImage::with_empty_string();
+        assert_eq!(heap.insert_str("12345678"), 8);
+        assert_eq!(heap.insert_str("next"), 24);
+        assert_eq!(heap.as_bytes().len(), 32);
+        assert_eq!(
+            local_heap_get_string(heap.as_bytes(), 8).unwrap(),
+            "12345678"
+        );
     }
 }
