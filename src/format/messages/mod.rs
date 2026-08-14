@@ -1,3 +1,4 @@
+pub mod attr_info;
 pub mod attribute;
 pub mod continuation;
 pub mod data_layout;

@@ -858,6 +858,11 @@ pub struct HardLink {
 /// along instead and is written back byte for byte, which preserves every
 /// field (name character set, creation order, the link value) without this
 /// writer having to model any of them.
+///
+/// A *hard* link is preserved the same way when the object it names is one
+/// the reopen could not model: writing the link back unchanged leaves that
+/// object's header exactly where it is, which is the only way the rewrite can
+/// keep what it cannot rebuild.
 #[derive(Clone)]
 pub struct PreservedLink {
     /// Parent group index (`None` = the root group).
@@ -869,6 +874,10 @@ pub struct PreservedLink {
     pub class: crate::io::reader::LinkClass,
     /// The encoded `Link` message body, exactly as read from the file.
     pub encoded: Vec<u8>,
+    /// Why the object this link names could not be modelled, for the callers
+    /// that ask for it by name. `None` when the link's own class — not its
+    /// target — is what this writer cannot express.
+    pub reason: Option<String>,
 }
 
 /// Every link a reopen walk met, split by what the writer can do with it.
@@ -876,11 +885,379 @@ pub struct PreservedLink {
 /// the close would destroy.
 #[derive(Default)]
 struct CollectedLinks {
-    /// Hard links: full path and the object header address it names.
-    hard: Vec<(String, u64)>,
-    /// Links this writer cannot express: full path, class, and the encoded
-    /// message to write back unchanged.
-    preserved: Vec<(String, crate::io::reader::LinkClass, Vec<u8>)>,
+    /// Hard links whose target the reopen modelled, with the plan that says
+    /// how to rebuild it.
+    hard: Vec<(HardEntry, CollectedObject)>,
+    /// Links written back unchanged: the class this writer cannot express,
+    /// and the hard links whose object it cannot model.
+    preserved: Vec<PreservedEntry>,
+}
+
+/// One hard link the reopen walk met: what it names, and the exact message
+/// that names it.
+#[derive(Clone)]
+struct HardEntry {
+    /// Full link path, in the no-leading-`/` form the registry uses.
+    path: String,
+    /// Object header address the link names.
+    address: u64,
+    /// The encoded `Link` message body, exactly as read from the file.
+    encoded: Vec<u8>,
+}
+
+/// A link the rewrite writes back exactly as it read it.
+struct PreservedEntry {
+    path: String,
+    class: crate::io::reader::LinkClass,
+    encoded: Vec<u8>,
+    /// Why the object it names could not be modelled; `None` when the link's
+    /// own class is what this writer cannot express.
+    reason: Option<String>,
+}
+
+/// What a reopen can do with one object it reached.
+///
+/// A header rewrite emits a modelled object out of the registry, so the
+/// registry may hold an object only when *every* message the model consumes
+/// decoded. A partial read is not a smaller object, it is a different one:
+/// before this rule a dataset whose datatype message did not decode was
+/// registered as a group, and the close rewrote its header as one.
+enum ObjectPlan {
+    /// A dataset the rewrite can rebuild.
+    Dataset(Box<DatasetParts>),
+    /// A group the rewrite can rebuild, and the links it holds.
+    Group(GroupParts),
+    /// An object this writer cannot model, and why. Its header is never
+    /// rewritten and never freed; the link naming it is written back byte for
+    /// byte, so the object stays exactly as the file already had it — what
+    /// libhdf5 does with the parts of a file it does not understand.
+    Preserve(String),
+}
+
+/// The messages a dataset's rewrite is built from, all decoded.
+struct DatasetParts {
+    /// Chunk-0 size: the block the rewrite supersedes and frees.
+    header_size: usize,
+    datatype: DatatypeMessage,
+    dataspace: crate::format::messages::dataspace::DataspaceMessage,
+    layout: crate::format::messages::data_layout::DataLayoutMessage,
+    filter_pipeline: Option<FilterPipeline>,
+    fill_value: Option<Vec<u8>>,
+    attributes: Vec<crate::format::messages::attribute::AttributeMessage>,
+}
+
+/// The same for a group, plus the links it holds — decoded once, with the
+/// bytes they came from, so the walk and the rewrite agree on its contents.
+struct GroupParts {
+    header_size: usize,
+    attributes: Vec<crate::format::messages::attribute::AttributeMessage>,
+    links: Vec<(crate::format::messages::link::LinkMessage, Vec<u8>)>,
+}
+
+/// A modelled object, as the walk hands it to the registry rebuild. A group's
+/// links are not here: the walk followed them, and each child is an entry of
+/// its own.
+enum CollectedObject {
+    Dataset(Box<DatasetParts>),
+    Group {
+        header_size: usize,
+        attributes: Vec<crate::format::messages::attribute::AttributeMessage>,
+    },
+}
+
+/// The reopen's discovery pass: one walk that classifies every object it
+/// reaches and descends into the groups among them.
+///
+/// Every object the close will touch is decided here and nowhere else, so
+/// "modelled or preserved" is a property of the walk rather than of whatever
+/// each later stage happened to be able to decode.
+struct ReopenWalk<'a> {
+    handle: &'a mut FileHandle,
+    ctx: &'a FormatContext,
+    /// End of the file, bounding each object-header read.
+    file_size: u64,
+    out: CollectedLinks,
+    /// Object headers already descended into, so hard-link cycles end.
+    visited: std::collections::HashSet<u64>,
+}
+
+impl<'a> ReopenWalk<'a> {
+    fn new(handle: &'a mut FileHandle, ctx: &'a FormatContext, file_size: u64) -> Self {
+        Self {
+            handle,
+            ctx,
+            file_size,
+            out: CollectedLinks::default(),
+            visited: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Everything the walk found.
+    fn finish(self) -> CollectedLinks {
+        self.out
+    }
+
+    /// Decide what the reopen can do with the object at `addr`.
+    ///
+    /// The single gate: every object the rewrite touches is classified here,
+    /// and an object is modelled only when each message the model consumes
+    /// decoded. See [`ObjectPlan`] for why anything else must keep its bytes.
+    fn plan(&mut self, addr: u64) -> IoResult<ObjectPlan> {
+        let (handle, ctx, file_size) = (&mut *self.handle, self.ctx, self.file_size);
+        use crate::format::messages::attr_info::AttrInfoMessage;
+        use crate::format::messages::attribute::AttributeMessage;
+        use crate::format::messages::data_layout::DataLayoutMessage;
+        use crate::format::messages::dataspace::DataspaceMessage;
+        use crate::format::messages::link::LinkMessage;
+        use crate::format::messages::link_info::LinkInfoMessage;
+        use crate::format::messages::shared::MSG_FLAG_SHARED;
+        use crate::format::messages::{
+            MSG_ATTRIBUTE, MSG_ATTR_INFO, MSG_DATASPACE, MSG_DATATYPE, MSG_DATA_LAYOUT,
+            MSG_FILL_VALUE, MSG_FILTER_PIPELINE, MSG_LINK, MSG_LINK_INFO,
+        };
+
+        // Chunk 0 only, for its encoded size: that is the block the rewrite
+        // supersedes and frees.
+        let buf = handle.read_at_most(addr, file_size.saturating_sub(addr) as usize)?;
+        let header_size = match crate::format::object_header::ObjectHeader::decode_any(&buf) {
+            Ok((_, size)) => size,
+            Err(e) => {
+                return Ok(ObjectPlan::Preserve(format!(
+                    "its object header does not decode: {e}"
+                )))
+            }
+        };
+        // The messages, on the other hand, must come from the whole chain: a
+        // filter pipeline or an attribute that spilled into a continuation is
+        // one the rewrite would otherwise drop.
+        let header = match crate::io::object_header_io::read_object_header_full(handle, ctx, addr) {
+            Ok(h) => h,
+            Err(e) => {
+                return Ok(ObjectPlan::Preserve(format!(
+                    "its object header chain does not read: {e}"
+                )))
+            }
+        };
+
+        let mut datatype = None;
+        let mut dataspace = None;
+        let mut layout = None;
+        let mut filter_pipeline = None;
+        let mut fill_value = None;
+        let mut attributes = Vec::new();
+        let mut links = Vec::new();
+        // A datatype, dataspace or layout message says the object is not a
+        // group, whether or not the three a dataset needs are all there.
+        let mut dataset_shaped = false;
+
+        for msg in &header.messages {
+            let consumed = matches!(
+                msg.msg_type,
+                MSG_DATATYPE
+                    | MSG_DATASPACE
+                    | MSG_DATA_LAYOUT
+                    | MSG_FILTER_PIPELINE
+                    | MSG_FILL_VALUE
+                    | MSG_ATTRIBUTE
+                    | MSG_LINK
+                    | MSG_LINK_INFO
+            );
+            // A shared message holds a reference to where its body lives, not
+            // the body. Decoding those bytes as one does not fail loudly — the
+            // reference's version byte reads as a version and a class of its
+            // own — so the guard is the only thing between a shared datatype
+            // and a rewrite that invents a type for it.
+            if consumed && msg.flags & MSG_FLAG_SHARED != 0 {
+                return Ok(ObjectPlan::Preserve(format!(
+                    "its message of type {:#04x} is a shared-message reference, which this \
+                     writer does not resolve",
+                    msg.msg_type
+                )));
+            }
+            macro_rules! consume {
+                ($decode:expr, $what:literal) => {
+                    match $decode {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return Ok(ObjectPlan::Preserve(format!(
+                                "its {} message does not decode: {e}",
+                                $what
+                            )))
+                        }
+                    }
+                };
+            }
+            match msg.msg_type {
+                MSG_DATATYPE => {
+                    dataset_shaped = true;
+                    let (dt, _) = consume!(DatatypeMessage::decode(&msg.data, ctx), "datatype");
+                    datatype = Some(dt);
+                }
+                MSG_DATASPACE => {
+                    dataset_shaped = true;
+                    let (ds, _) = consume!(DataspaceMessage::decode(&msg.data, ctx), "dataspace");
+                    dataspace = Some(ds);
+                }
+                MSG_DATA_LAYOUT => {
+                    dataset_shaped = true;
+                    let (dl, _) =
+                        consume!(DataLayoutMessage::decode(&msg.data, ctx), "data layout");
+                    layout = Some(dl);
+                }
+                MSG_FILTER_PIPELINE => {
+                    let (p, _) = consume!(FilterPipeline::decode(&msg.data), "filter pipeline");
+                    if !p.filters.is_empty() {
+                        filter_pipeline = Some(p);
+                    }
+                }
+                MSG_FILL_VALUE => {
+                    let (fv, _) = consume!(FillValueMessage::decode(&msg.data), "fill value");
+                    if fv.fill_defined == 2 {
+                        fill_value = fv.fill_value;
+                    }
+                }
+                MSG_ATTRIBUTE => {
+                    let (a, _) = consume!(AttributeMessage::decode(&msg.data, ctx), "attribute");
+                    attributes.push(a);
+                }
+                MSG_LINK => {
+                    let (l, _) = consume!(LinkMessage::decode(&msg.data, ctx), "link");
+                    links.push((l, msg.data.clone()));
+                }
+                MSG_LINK_INFO => {
+                    let (li, _) = consume!(LinkInfoMessage::decode(&msg.data, ctx), "link info");
+                    // Dense storage: the names are in a fractal heap this
+                    // writer does not read, so a rewrite from the messages
+                    // alone would emit the group without its children.
+                    if li.fractal_heap_address != UNDEF_ADDR {
+                        return Ok(ObjectPlan::Preserve(
+                            "its links are in a fractal heap (dense link storage), which this \
+                             writer does not read"
+                                .into(),
+                        ));
+                    }
+                }
+                MSG_ATTR_INFO => {
+                    // Same for attributes: once there are enough of them
+                    // libhdf5 moves them into the heap this message names and
+                    // writes no attribute messages at all, so a rewrite from
+                    // the messages alone emits the object without them. While
+                    // the message only tracks creation order the attributes
+                    // are still messages, and it says so.
+                    let (ai, _) =
+                        consume!(AttrInfoMessage::decode(&msg.data, ctx), "attribute info");
+                    if ai.fractal_heap_address != UNDEF_ADDR {
+                        return Ok(ObjectPlan::Preserve(
+                            "its attributes are in a fractal heap (dense attribute storage), \
+                             which this writer does not read"
+                                .into(),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        match (datatype, dataspace, layout) {
+            (Some(datatype), Some(dataspace), Some(layout)) => {
+                Ok(ObjectPlan::Dataset(Box::new(DatasetParts {
+                    header_size,
+                    datatype,
+                    dataspace,
+                    layout,
+                    filter_pipeline,
+                    fill_value,
+                    attributes,
+                })))
+            }
+            // A committed (named) datatype has a datatype message and neither
+            // of the other two; so does a dataset whose header this crate only
+            // half understands. Neither is a group, and modelling either as
+            // one is what rewrote them into empty groups.
+            _ if dataset_shaped => Ok(ObjectPlan::Preserve(
+                "it carries a datatype, dataspace or layout message but not the three a \
+                 dataset is built from; this writer models only groups and datasets"
+                    .into(),
+            )),
+            _ => Ok(ObjectPlan::Group(GroupParts {
+                header_size,
+                attributes,
+                links,
+            })),
+        }
+    }
+
+    /// Walk `links` (one group's, already decoded), classifying every object
+    /// they name and descending into the groups among them.
+    fn group(
+        &mut self,
+        links: &[(crate::format::messages::link::LinkMessage, Vec<u8>)],
+        prefix: &str,
+        depth: usize,
+    ) -> IoResult<()> {
+        // Bound nesting depth so a pathologically deep group chain cannot
+        // overflow the stack (the `visited` set bounds total work but not
+        // recursion depth).
+        if depth > 256 {
+            return Ok(());
+        }
+        use crate::format::messages::link::LinkTarget;
+        for (link, encoded) in links {
+            let full_name = if prefix.is_empty() {
+                link.name.clone()
+            } else {
+                format!("{}/{}", prefix, link.name)
+            };
+
+            // Only a hard link names an object this writer can rebuild. Every
+            // other class is kept by its bytes, because a close that emitted
+            // only what the registry models would drop it from the file.
+            let LinkTarget::Hard { address } = &link.target else {
+                self.out.preserved.push(PreservedEntry {
+                    path: full_name,
+                    class: crate::io::reader::LinkClass::from_target(&link.target),
+                    encoded: encoded.clone(),
+                    reason: None,
+                });
+                continue;
+            };
+            let entry = HardEntry {
+                path: full_name.clone(),
+                address: *address,
+                encoded: encoded.clone(),
+            };
+
+            match self.plan(*address)? {
+                // Kept by its bytes, exactly as a link class this writer
+                // cannot express is: writing the link back unchanged is what
+                // leaves the object's header where the file already has it.
+                ObjectPlan::Preserve(reason) => self.out.preserved.push(PreservedEntry {
+                    path: full_name,
+                    class: crate::io::reader::LinkClass::Hard,
+                    encoded: entry.encoded,
+                    reason: Some(reason),
+                }),
+                ObjectPlan::Dataset(parts) => {
+                    self.out.hard.push((entry, CollectedObject::Dataset(parts)));
+                }
+                ObjectPlan::Group(parts) => {
+                    self.out.hard.push((
+                        entry,
+                        CollectedObject::Group {
+                            header_size: parts.header_size,
+                            attributes: parts.attributes,
+                        },
+                    ));
+                    // Recurse only into a group's header we have not entered
+                    // before — breaks hard-link cycles.
+                    if self.visited.insert(*address) {
+                        self.group(&parts.links, &full_name, depth + 1)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Encode an Object Reference Count message (type 0x16) body: a version
@@ -1175,8 +1552,6 @@ impl Hdf5Writer {
     ) -> IoResult<Self> {
         use crate::format::messages::attribute::AttributeMessage;
         use crate::format::messages::data_layout::DataLayoutMessage;
-        use crate::format::messages::dataspace::DataspaceMessage;
-        use crate::format::messages::datatype::DatatypeMessage;
 
         let mut handle = FileHandle::open_readwrite_with_locking(path, locking)?;
         let file_size = handle.file_size()?;
@@ -1206,42 +1581,36 @@ impl Hdf5Writer {
             sizeof_size: sb.sizeof_lengths,
         };
 
-        // Discover links from root group (and subgroups recursively). The
-        // header must be read whole — chunk 0 *and* every continuation block
-        // — because close rewrites the root group from what this walk found:
-        // a link that lives in a continuation and is not seen here is a link
-        // the rewrite deletes. `root_header_size` stays the chunk-0 size,
-        // which is the block the rewrite supersedes.
+        // Discover links from root group (and subgroups recursively). Every
+        // object is classified before it is registered, and the root is the
+        // one object with no alternative: its header must be rewritten to
+        // hold anything new, so an unmodellable root is refused here rather
+        // than rewritten into whatever this writer could read of it.
         let root_addr = sb.root_group_object_header_address;
-        let root_buf =
-            handle.read_at_most(root_addr, file_size.saturating_sub(root_addr) as usize)?;
-        let (_, root_header_size) = crate::format::object_header::ObjectHeader::decode(&root_buf)?;
-        let root_header =
-            crate::io::object_header_io::read_object_header_full(&mut handle, &ctx, root_addr)?;
-
-        // Collect existing root-level attributes
-        let mut root_attributes = Vec::new();
-        for msg in &root_header.messages {
-            if msg.msg_type == crate::format::messages::MSG_ATTRIBUTE {
-                if let Ok((a, _)) =
-                    crate::format::messages::attribute::AttributeMessage::decode(&msg.data, &ctx)
-                {
-                    root_attributes.push(a);
-                }
+        let mut walk = ReopenWalk::new(&mut handle, &ctx, file_size);
+        let root = match walk.plan(root_addr)? {
+            ObjectPlan::Group(parts) => parts,
+            ObjectPlan::Dataset(_) => {
+                return Err(crate::io::IoError::InvalidState(
+                    "cannot open this file for appending: its root object is a dataset, \
+                     not a group"
+                        .into(),
+                ))
             }
-        }
+            ObjectPlan::Preserve(why) => {
+                return Err(crate::io::IoError::Unsupported(format!(
+                    "cannot open this file for appending: {why}. Every append rewrites the \
+                     root group's header, and this writer will not rewrite it from the part \
+                     of it that it can read"
+                )));
+            }
+        };
+        // Chunk 0 is the block the rewrite supersedes.
+        let root_header_size = root.header_size;
+        let root_attributes = root.attributes;
 
-        let mut collected = CollectedLinks::default();
-        let mut visited_groups = std::collections::HashSet::new();
-        Self::collect_links_recursive(
-            &mut handle,
-            &root_header,
-            &ctx,
-            "",
-            &mut collected,
-            &mut visited_groups,
-            0,
-        )?;
+        walk.group(&root.links, "", 0)?;
+        let collected = walk.finish();
         let mut link_entries = collected.hard;
 
         // Two link entries can share one object header — hard links. Only
@@ -1251,15 +1620,20 @@ impl Hdf5Writer {
         // storage addresses, so deleting (or finalizing) one freed blocks
         // the others still referenced.
         let mut seen_header_addrs = std::collections::HashSet::new();
-        let mut alias_entries: Vec<(String, u64)> = Vec::new();
-        link_entries.retain(|(name, addr)| {
-            if seen_header_addrs.insert(*addr) {
+        let mut alias_entries: Vec<HardEntry> = Vec::new();
+        link_entries.retain(|(entry, _)| {
+            if seen_header_addrs.insert(entry.address) {
                 true
             } else {
-                alias_entries.push((name.clone(), *addr));
+                alias_entries.push(entry.clone());
                 false
             }
         });
+
+        // The order the walk met each object, kept before the loop below
+        // consumes the entries: `ensure_groups_for` needs parents to precede
+        // children.
+        let walk_order: Vec<String> = link_entries.iter().map(|(e, _)| e.path.clone()).collect();
 
         let mut existing_datasets = Vec::new();
         // Non-dataset link targets (groups): header block `(addr, len)` by
@@ -1269,88 +1643,37 @@ impl Hdf5Writer {
         type GroupHeaderInfo = (u64, usize, Vec<AttributeMessage>);
         let mut group_headers: std::collections::HashMap<String, GroupHeaderInfo> =
             Default::default();
-        for (name, obj_addr) in &link_entries {
-            // Chunk 0 only, for its encoded size: that is the block the
-            // rewrite supersedes and frees.
-            let ds_buf =
-                handle.read_at_most(*obj_addr, file_size.saturating_sub(*obj_addr) as usize)?;
-            let ds_header_size =
-                match crate::format::object_header::ObjectHeader::decode_any(&ds_buf) {
-                    Ok((_, size)) => size,
-                    Err(_) => continue,
-                };
-            // The messages, on the other hand, must come from the whole
-            // chain: a filter pipeline or an attribute that spilled into a
-            // continuation is one the rewrite would otherwise drop.
-            let Ok(ds_header) =
-                crate::io::object_header_io::read_object_header_full(&mut handle, &ctx, *obj_addr)
-            else {
-                continue;
-            };
-
-            let mut datatype = None;
-            let mut dataspace = None;
-            let mut layout = None;
-            let mut fp = None;
-            let mut fill_value = None;
-            let mut attrs = Vec::new();
-
-            for msg in &ds_header.messages {
-                match msg.msg_type {
-                    crate::format::messages::MSG_DATATYPE => {
-                        if let Ok((dt, _)) = DatatypeMessage::decode(&msg.data, &ctx) {
-                            datatype = Some(dt);
-                        }
-                    }
-                    crate::format::messages::MSG_DATASPACE => {
-                        if let Ok((ds, _)) = DataspaceMessage::decode(&msg.data, &ctx) {
-                            dataspace = Some(ds);
-                        }
-                    }
-                    crate::format::messages::MSG_DATA_LAYOUT => {
-                        if let Ok((dl, _)) = DataLayoutMessage::decode(&msg.data, &ctx) {
-                            layout = Some(dl);
-                        }
-                    }
-                    crate::format::messages::MSG_FILTER_PIPELINE => {
-                        if let Ok((p, _)) = FilterPipeline::decode(&msg.data) {
-                            if !p.filters.is_empty() {
-                                fp = Some(p);
-                            }
-                        }
-                    }
-                    crate::format::messages::MSG_FILL_VALUE => {
-                        if let Ok((fv, _)) = FillValueMessage::decode(&msg.data) {
-                            if fv.fill_defined == 2 {
-                                fill_value = fv.fill_value;
-                            }
-                        }
-                    }
-                    crate::format::messages::MSG_ATTRIBUTE => {
-                        if let Ok((a, _)) = AttributeMessage::decode(&msg.data, &ctx) {
-                            attrs.push(a);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            let (dt, ds, dl) = match (datatype, dataspace, layout) {
-                (Some(dt), Some(ds), Some(dl)) => (dt, ds, dl),
-                _ => {
-                    // Not a dataset — a group's header. Remember its block so
-                    // finalize can free what its rewrite supersedes, and its
-                    // attributes so the registry rebuild keeps them.
-                    group_headers.insert(name.clone(), (*obj_addr, ds_header_size, attrs));
+        for (entry, object) in link_entries {
+            let HardEntry {
+                path: name,
+                address: obj_addr,
+                ..
+            } = entry;
+            let parts = match object {
+                CollectedObject::Group {
+                    header_size,
+                    attributes,
+                } => {
+                    group_headers.insert(name, (obj_addr, header_size, attributes));
                     continue;
                 }
+                CollectedObject::Dataset(parts) => *parts,
             };
-
-            let mut info = DatasetInfo {
-                name: name.clone(),
+            let DatasetParts {
+                header_size: ds_header_size,
                 datatype: dt,
                 dataspace: ds,
-                obj_header_addr: *obj_addr,
+                layout: dl,
+                filter_pipeline: fp,
+                fill_value,
+                attributes: attrs,
+            } = parts;
+
+            let mut info = DatasetInfo {
+                name,
+                datatype: dt,
+                dataspace: ds,
+                obj_header_addr: obj_addr,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
                 chunked: None,
@@ -1358,7 +1681,7 @@ impl Hdf5Writer {
                 btree_v2: None,
                 append: None,
                 attributes: attrs,
-                obj_header_written_addr: Some(*obj_addr),
+                obj_header_written_addr: Some(obj_addr),
                 obj_header_encoded_size: ds_header_size,
                 filter_pipeline: fp,
                 deleted: false,
@@ -1743,7 +2066,7 @@ impl Hdf5Writer {
         }
 
         // Every linked group, in link-walk order (parents precede children).
-        for (name, _) in &link_entries {
+        for name in &walk_order {
             if group_headers.contains_key(name.as_str()) {
                 ensure_groups_for(name, &mut groups, &mut group_index_map, &mut group_headers);
             }
@@ -1768,11 +2091,17 @@ impl Hdf5Writer {
         }
 
         // Rebuild the hard-link registry from the alias entries set aside
-        // above, so the H5Ldelete semantics survive a reopen. An alias
-        // whose target header did not decode is dropped with its target
-        // (the primary path was skipped the same way).
+        // above, so the H5Ldelete semantics survive a reopen. An alias whose
+        // target the walk could not model is not here at all: it was
+        // preserved by its own bytes, exactly as the first link to that
+        // object was.
         let mut hard_links: Vec<HardLink> = Vec::new();
-        for (path, addr) in alias_entries {
+        for HardEntry {
+            path,
+            address: addr,
+            ..
+        } in alias_entries
+        {
             let target = if let Some(di) = existing_datasets
                 .iter()
                 .position(|d| d.obj_header_addr == addr)
@@ -1809,7 +2138,13 @@ impl Hdf5Writer {
         // a group whose only content is such a link: nothing else would put
         // it in the registry, and the close would drop group and link alike.
         let mut preserved_links: Vec<PreservedLink> = Vec::new();
-        for (path, class, encoded) in collected.preserved {
+        for PreservedEntry {
+            path,
+            class,
+            encoded,
+            reason,
+        } in collected.preserved
+        {
             let (parent, link_name) = match path.rsplit_once('/') {
                 None => (None, path),
                 Some((dir, leaf)) => {
@@ -1825,6 +2160,7 @@ impl Hdf5Writer {
                 name: link_name,
                 class,
                 encoded,
+                reason,
             });
         }
 
@@ -1860,78 +2196,6 @@ impl Hdf5Writer {
             root_group_encoded_size: 0,
             superseded_root_header: Some((root_addr, root_header_size as u64)),
         })
-    }
-
-    /// Recursively collect every link message under `header`.
-    fn collect_links_recursive(
-        handle: &mut FileHandle,
-        header: &crate::format::object_header::ObjectHeader,
-        ctx: &FormatContext,
-        prefix: &str,
-        out: &mut CollectedLinks,
-        visited: &mut std::collections::HashSet<u64>,
-        depth: usize,
-    ) -> IoResult<()> {
-        // Bound nesting depth so a pathologically deep group chain cannot
-        // overflow the stack (the `visited` set bounds total work but not
-        // recursion depth).
-        if depth > 256 {
-            return Ok(());
-        }
-        use crate::format::messages::link::{LinkMessage, LinkTarget};
-        for msg in &header.messages {
-            if msg.msg_type != crate::format::messages::MSG_LINK {
-                continue;
-            }
-            let Ok((link, _)) = LinkMessage::decode(&msg.data, ctx) else {
-                continue;
-            };
-            let full_name = if prefix.is_empty() {
-                link.name.clone()
-            } else {
-                format!("{}/{}", prefix, link.name)
-            };
-
-            // Only a hard link names an object this writer can rebuild. Every
-            // other class is kept by its bytes, because a close that emitted
-            // only what the registry models would drop it from the file.
-            let LinkTarget::Hard { address } = &link.target else {
-                out.preserved.push((
-                    full_name,
-                    crate::io::reader::LinkClass::from_target(&link.target),
-                    msg.data.clone(),
-                ));
-                continue;
-            };
-            out.hard.push((full_name.clone(), *address));
-
-            // Try to recurse into groups, following continuation blocks: a
-            // subgroup with more links than fit chunk 0 keeps the rest there,
-            // and a walk that stopped at chunk 0 would have the close rewrite
-            // that group without them.
-            if let Ok(child_header) =
-                crate::io::object_header_io::read_object_header_full(handle, ctx, *address)
-            {
-                let has_links = child_header
-                    .messages
-                    .iter()
-                    .any(|m| m.msg_type == crate::format::messages::MSG_LINK);
-                // Recurse only into a group's header we have
-                // not entered before — breaks hard-link cycles.
-                if has_links && visited.insert(*address) {
-                    let _ = Self::collect_links_recursive(
-                        handle,
-                        &child_header,
-                        ctx,
-                        &full_name,
-                        out,
-                        visited,
-                        depth + 1,
-                    );
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Return the names of all datasets created so far.
@@ -3019,8 +3283,41 @@ impl Hdf5Writer {
     /// [`Hdf5Reader::open_dataset`]: crate::io::reader::Hdf5Reader::open_dataset
     pub(crate) fn open_dataset_index(&self, name: &str) -> IoResult<usize> {
         self.reject_external_traversal(name)?;
+        self.reject_preserved_object(name)?;
         self.dataset_index(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))
+    }
+
+    /// Refuse a caller path that names an object the reopen kept by its bytes
+    /// rather than modelling.
+    ///
+    /// Such an object is in the file and stays in it, but this writer holds
+    /// none of what it would need to read or rewrite it. Saying so — with the
+    /// reason the classification recorded — is the difference between an
+    /// object the writer will not touch and a name the file does not have.
+    pub(crate) fn reject_preserved_object(&self, path: &str) -> IoResult<()> {
+        let path = path.trim_start_matches('/');
+        let objects: Vec<(String, String)> = {
+            let preserved = self.preserved_links.lock();
+            preserved
+                .iter()
+                .filter_map(|l| {
+                    l.reason
+                        .as_ref()
+                        .map(|why| (self.preserved_link_full_path(l), why.clone()))
+                })
+                .collect()
+        };
+        match objects
+            .into_iter()
+            .find(|(full, _)| path == full || path.starts_with(&format!("{full}/")))
+        {
+            None => Ok(()),
+            Some((link, why)) => Err(crate::io::IoError::Unsupported(format!(
+                "'{path}' is, or is inside, the object '{link}', which this file's reopen \
+                 kept exactly as it found it because {why}"
+            ))),
+        }
     }
 
     /// Every link this writer is carrying but cannot express, by full path.
