@@ -310,15 +310,17 @@ fn contiguous_lists_at_every_libver_bound() {
 }
 
 /// One dataset per message this crate cannot decode: an opaque datatype, an
-/// object-reference datatype, a shared (committed) datatype, and a virtual
-/// data layout. Each is a dataset the file plainly contains, so each must be
-/// listed by name and must say what stands in the way — the catalog walk used
-/// to drop all four on the floor and report an empty file.
+/// object-reference datatype, and a virtual data layout. Each is a dataset the
+/// file plainly contains, so each must be listed by name and must say what
+/// stands in the way — the catalog walk used to drop all three on the floor
+/// and report an empty file. A dataset sharing a committed datatype was a
+/// fourth case here until the reference became readable; it now belongs to
+/// `a_dataset_that_shares_a_committed_datatype_reads_through_the_reference`.
 #[test]
 fn a_dataset_whose_message_does_not_decode_is_listed_and_says_why() {
     let Some(py) = python() else { return };
     // (name, h5py statements, the word the reason must name)
-    let cases: [(&str, &str, &str); 4] = [
+    let cases: [(&str, &str, &str); 3] = [
         (
             "opaque",
             "f.create_dataset('x', data=np.arange(4, dtype='u1').view('V4'))",
@@ -328,12 +330,6 @@ fn a_dataset_whose_message_does_not_decode_is_listed_and_says_why() {
             "objref",
             "f.create_dataset('t', data=np.arange(4, dtype='<i4'))\n\
              \x20   f.create_dataset('x', data=[f['t'].ref], dtype=h5py.ref_dtype)",
-            "datatype",
-        ),
-        (
-            "committed",
-            "f['dt'] = np.dtype('<i4')\n\
-             \x20   f.create_dataset('x', (4,), dtype=f['dt'])",
             "datatype",
         ),
         (
@@ -992,4 +988,46 @@ fn a_group_keeps_its_children_when_its_storage_differs_from_its_parents() {
     );
     drop(file);
     std::fs::remove_file(&legacy_root).ok();
+}
+
+/// A dataset built on a committed (named) datatype does not store a type of
+/// its own — it stores a *reference* to the object header holding it. Reading
+/// those bytes as a datatype does not fail loudly: the first byte of the
+/// reference is its version, which the datatype decoder reads as a version
+/// and a class of its own, so the dataset came back as one this crate cannot
+/// read.
+#[test]
+fn a_dataset_that_shares_a_committed_datatype_reads_through_the_reference() {
+    let Some(py) = python() else { return };
+    let path = tmp("shared_datatype");
+    h5py_write(
+        py,
+        &path,
+        "from h5py import h5d, h5s\n\
+         with h5py.File(PATH, 'w') as f:\n\
+         \x20   f['t'] = np.dtype('<i4')\n\
+         \x20   own = f.create_dataset('own', data=np.arange(8, dtype='<i4'))\n\
+         \x20   sid = h5s.create_simple((8,))\n\
+         \x20   dsid = h5d.create(f.id, b'shared', f['t'].id, sid)\n\
+         \x20   dsid.write(h5s.ALL, h5s.ALL, np.arange(8, dtype='<i4'))\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let expected: Vec<i32> = (0..8).collect();
+    assert_eq!(
+        file.root_group().unreadable_reason("shared").unwrap(),
+        None,
+        "a shared datatype must not make the dataset unreadable"
+    );
+    let shared = file.dataset("shared").unwrap();
+    assert_eq!(shared.shape(), vec![8]);
+    assert_eq!(shared.read_raw::<i32>().unwrap(), expected);
+    // The type the reference resolves to is the committed one, decoded the
+    // same as a dataset carrying its own copy.
+    assert_eq!(
+        format!("{:?}", shared.datatype().unwrap()),
+        format!("{:?}", file.dataset("own").unwrap().datatype().unwrap())
+    );
+
+    std::fs::remove_file(&path).ok();
 }

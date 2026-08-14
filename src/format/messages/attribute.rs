@@ -162,7 +162,26 @@ impl AttributeMessage {
             return Err(FormatError::InvalidVersion(version));
         }
 
-        // flags at buf[1]
+        // Byte 1 says whether the datatype and dataspace that follow are
+        // bodies or references (`H5O_ATTR_FLAG_TYPE_SHARED` /
+        // `H5O_ATTR_FLAG_SPACE_SHARED`). A reference decoded as a body reads
+        // its version byte as the body's, which invents a type rather than
+        // failing, so an attribute that carries one is named here instead.
+        // Resolving it needs the file the reference points into, which a
+        // message decoder does not have.
+        const ATTR_FLAG_TYPE_SHARED: u8 = 0x01;
+        const ATTR_FLAG_SPACE_SHARED: u8 = 0x02;
+        let flags = buf[1];
+        if flags & (ATTR_FLAG_TYPE_SHARED | ATTR_FLAG_SPACE_SHARED) != 0 {
+            let what = if flags & ATTR_FLAG_TYPE_SHARED != 0 {
+                "datatype"
+            } else {
+                "dataspace"
+            };
+            return Err(FormatError::UnsupportedFeature(format!(
+                "attribute whose {what} is a shared-message reference"
+            )));
+        }
         let name_size = u16::from_le_bytes([buf[2], buf[3]]) as usize;
         let datatype_size = u16::from_le_bytes([buf[4], buf[5]]) as usize;
         let dataspace_size = u16::from_le_bytes([buf[6], buf[7]]) as usize;

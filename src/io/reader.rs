@@ -24,6 +24,7 @@ use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::link::LinkMessage;
 use crate::format::messages::link::LinkTarget;
 use crate::format::messages::link_info::LinkInfoMessage;
+use crate::format::messages::shared::MSG_FLAG_SHARED;
 use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
 use crate::format::superblock::{
@@ -490,7 +491,7 @@ impl<'a> CatalogWalk<'a> {
                 return Ok(());
             }
         };
-        match Hdf5Reader::classify_object(&header, self.ctx, &full_name) {
+        match Hdf5Reader::classify_object(self.handle, &header, self.ctx, &full_name) {
             ObjectKind::Dataset(info) => {
                 self.catalog.datasets.push(*info);
                 return Ok(());
@@ -1160,7 +1161,12 @@ impl Hdf5Reader {
     /// Only the messages the payload depends on can make a dataset
     /// unreadable. A failed *attribute* decode leaves the dataset itself
     /// readable, so it does not.
-    fn classify_object(header: &ObjectHeader, ctx: &FormatContext, name: &str) -> ObjectKind {
+    fn classify_object(
+        handle: &mut FileHandle,
+        header: &ObjectHeader,
+        ctx: &FormatContext,
+        name: &str,
+    ) -> ObjectKind {
         let present = |t: u8| header.messages.iter().any(|m| m.msg_type == t);
         let is_group = present(MSG_LINK)
             || present(MSG_LINK_INFO)
@@ -1188,25 +1194,46 @@ impl Hdf5Reader {
         // The first message that did not decode, kept verbatim: it is the
         // answer a caller gets when it asks for this dataset.
         let mut blocked: Option<String> = None;
-        let mut block = |what: &str, e: crate::format::FormatError| {
+        let mut block = |why: String| {
             if blocked.is_none() {
-                blocked = Some(format!("its {what} message does not decode: {e}"));
+                blocked = Some(why);
             }
         };
 
         for msg in &header.messages {
+            // A shared message holds a reference to where its body lives, not
+            // the body. Decoding one as a body does not fail loudly — it
+            // reads the reference's version byte as the body's — so anything
+            // this crate does not follow is named here instead. A datatype
+            // reference is followed; an attribute reference is skipped, since
+            // an attribute never blocks the dataset it hangs on.
+            let shared = msg.flags & MSG_FLAG_SHARED != 0;
+            if shared && !matches!(msg.msg_type, MSG_DATATYPE | MSG_ATTRIBUTE) {
+                block(format!(
+                    "its message of type {:#04x} is a shared-message reference, which this \
+                     crate follows only for datatypes",
+                    msg.msg_type
+                ));
+                continue;
+            }
             match msg.msg_type {
-                MSG_DATATYPE => match DatatypeMessage::decode(&msg.data, ctx) {
-                    Ok((dt, _)) => datatype = Some(dt),
-                    Err(e) => block("datatype", e),
-                },
+                // The resolver already says whether the type failed to decode
+                // or sits somewhere this crate does not follow, so its wording
+                // is the reason rather than something to wrap.
+                MSG_DATATYPE => {
+                    match crate::io::object_header_io::read_datatype_message(handle, ctx, msg) {
+                        Ok(dt) => datatype = Some(dt),
+                        Err(crate::io::IoError::Unsupported(why)) => block(why),
+                        Err(e) => block(format!("its datatype message does not decode: {e}")),
+                    }
+                }
                 MSG_DATASPACE => match DataspaceMessage::decode(&msg.data, ctx) {
                     Ok((ds, _)) => dataspace = Some(ds),
-                    Err(e) => block("dataspace", e),
+                    Err(e) => block(format!("its dataspace message does not decode: {e}")),
                 },
                 MSG_DATA_LAYOUT => match DataLayoutMessage::decode(&msg.data, ctx) {
                     Ok((dl, _)) => layout = Some(dl),
-                    Err(e) => block("data layout", e),
+                    Err(e) => block(format!("its data layout message does not decode: {e}")),
                 },
                 // A filter pipeline that does not decode would leave the raw
                 // chunk bytes to be handed back as if they were never
@@ -1219,7 +1246,7 @@ impl Hdf5Reader {
                             filter_pipeline = Some(fp);
                         }
                     }
-                    Err(e) => block("filter pipeline", e),
+                    Err(e) => block(format!("its filter pipeline message does not decode: {e}")),
                 },
                 MSG_FILL_VALUE => match FillValueMessage::decode(&msg.data) {
                     Ok((fv, _)) => {
@@ -1227,9 +1254,10 @@ impl Hdf5Reader {
                             fill_value = fv.fill_value;
                         }
                     }
-                    Err(e) => block("fill value", e),
+                    Err(e) => block(format!("its fill value message does not decode: {e}")),
                 },
-                MSG_ATTRIBUTE => {
+                // A shared attribute is skipped above; only a body decodes.
+                MSG_ATTRIBUTE if !shared => {
                     if let Ok((attr, _)) = AttributeMessage::decode(&msg.data, ctx) {
                         attributes.push(attr);
                     }

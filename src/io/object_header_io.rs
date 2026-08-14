@@ -11,7 +11,9 @@
 //! than as a habit each side has to remember.
 
 use crate::format::bytes::read_le_uint as read_uint;
-use crate::format::messages::MSG_OBJ_HEADER_CONTINUATION;
+use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::messages::shared::{SharedMessage, MSG_FLAG_SHARED};
+use crate::format::messages::{MSG_DATATYPE, MSG_OBJ_HEADER_CONTINUATION};
 use crate::format::object_header::{ObjectHeader, ObjectHeaderMessage};
 use crate::format::{FormatContext, UNDEF_ADDR};
 use crate::io::file_handle::FileHandle;
@@ -158,5 +160,69 @@ fn parse_continuation_block(
             pos += data_size;
             pos = (pos + 7) & !7; // v1 8-byte alignment
         }
+    }
+}
+
+/// Decode the datatype a message carries, following it into the object header
+/// it shares when the message is a reference rather than a body.
+///
+/// Every read path that wants a type from an object header message goes
+/// through here. Decoding `msg.data` directly is only correct for a message
+/// that is not shared, and the shared form does not fail loudly enough to
+/// notice: `H5O_shared_t`'s first byte is its version, which a datatype
+/// decoder reads as a version and a class of its own.
+pub(crate) fn read_datatype_message(
+    handle: &mut FileHandle,
+    ctx: &FormatContext,
+    msg: &ObjectHeaderMessage,
+) -> IoResult<DatatypeMessage> {
+    read_datatype_message_at(handle, ctx, msg, MAX_SHARE_HOPS)
+}
+
+/// A committed datatype's own message is a body, not another reference, so
+/// one hop is all a well-formed file needs. The bound is here because a
+/// crafted file can point a shared message at itself.
+const MAX_SHARE_HOPS: usize = 8;
+
+fn read_datatype_message_at(
+    handle: &mut FileHandle,
+    ctx: &FormatContext,
+    msg: &ObjectHeaderMessage,
+    hops: usize,
+) -> IoResult<DatatypeMessage> {
+    if msg.flags & MSG_FLAG_SHARED == 0 {
+        let (dt, _) = DatatypeMessage::decode(&msg.data, ctx)?;
+        return Ok(dt);
+    }
+    if hops == 0 {
+        return Err(crate::io::IoError::InvalidState(
+            "a shared datatype message points at another shared datatype message more than \
+             8 times over; the references may form a cycle"
+                .into(),
+        ));
+    }
+    match SharedMessage::decode(&msg.data, ctx)? {
+        SharedMessage::Committed { object_header } => {
+            let header = read_object_header_full(handle, ctx, object_header)?;
+            let shared = header
+                .messages
+                .iter()
+                .find(|m| m.msg_type == MSG_DATATYPE)
+                .ok_or_else(|| {
+                    crate::io::IoError::InvalidState(format!(
+                        "a shared datatype message names the object header at {object_header}, \
+                         which holds no datatype message"
+                    ))
+                })?
+                // The borrow ends before the recursive call reads the file
+                // again, so the followed message is cloned out of it.
+                .clone();
+            read_datatype_message_at(handle, ctx, &shared, hops - 1)
+        }
+        SharedMessage::Sohm { .. } => Err(crate::io::IoError::Unsupported(
+            "its datatype is stored in the file's shared object header message heap, \
+             which this crate does not read"
+                .into(),
+        )),
     }
 }
