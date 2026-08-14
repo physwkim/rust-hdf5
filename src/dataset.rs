@@ -2388,6 +2388,30 @@ pub(crate) mod numeric {
                     byte_order,
                 })
             }
+            DatatypeMessage::BitField {
+                size,
+                byte_order,
+                bit_offset,
+                bit_precision,
+            } => {
+                // A bit field has no signed form; a full-width one is the
+                // unsigned integer of the stored width. A narrower one would
+                // need a shift-and-mask conversion this path does not model.
+                if !matches!(size, 1 | 2 | 4 | 8)
+                    || bit_offset != 0
+                    || u32::from(bit_precision) != size * 8
+                {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "bit-field datatype (size {size}, bit offset {bit_offset}, \
+                         precision {bit_precision}) is not a whole-width bit field",
+                    )));
+                }
+                Ok(SourceKind::Int {
+                    size: size as usize,
+                    signed: false,
+                    byte_order,
+                })
+            }
             DatatypeMessage::FloatingPoint {
                 size,
                 byte_order,

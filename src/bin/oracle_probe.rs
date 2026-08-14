@@ -185,6 +185,19 @@ fn canon_dtype(dt: &DatatypeMessage) -> String {
             }
             s
         }
+        DatatypeMessage::BitField {
+            size,
+            byte_order,
+            bit_offset,
+            bit_precision,
+        } => {
+            let mut s = format!("bits[{size}]{}", order_str(byte_order));
+            if *bit_offset != 0 || u32::from(*bit_precision) != size * 8 {
+                s.push_str(&format!("+off{bit_offset}p{bit_precision}"));
+            }
+            s
+        }
+        DatatypeMessage::Opaque { size, tag } => format!("opaque[{size}],tag={}", esc(tag)),
         DatatypeMessage::FixedString {
             size,
             padding,

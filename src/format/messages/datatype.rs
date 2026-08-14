@@ -75,10 +75,17 @@ fn decode_name_field(
 const CLASS_FIXED_POINT: u8 = 0;
 const CLASS_FLOATING_POINT: u8 = 1;
 const CLASS_STRING: u8 = 3;
+const CLASS_BITFIELD: u8 = 4;
+const CLASS_OPAQUE: u8 = 5;
 const CLASS_COMPOUND: u8 = 6;
 const CLASS_ENUM: u8 = 8;
 const CLASS_VLEN: u8 = 9;
 const CLASS_ARRAY: u8 = 10;
+
+/// libhdf5 `H5T_OPAQUE_TAG_MAX`: the opaque tag field is stored in
+/// `(strlen + 7) & (H5T_OPAQUE_TAG_MAX - 8)` bytes, i.e. rounded up to a
+/// multiple of 8 and capped at 248.
+const OPAQUE_TAG_MAX: usize = 256;
 
 /// Byte order for numeric types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +135,29 @@ pub enum DatatypeMessage {
         mantissa_location: u8,
         mantissa_size: u8,
         exponent_bias: u32,
+    },
+    /// Bit field (class 4): `bit_precision` bits starting at `bit_offset`
+    /// within a `size`-byte element, stored in `byte_order`.
+    ///
+    /// libhdf5 has no bit-level Rust analogue; a full-width bit field is read
+    /// as an unsigned integer of the stored width (`H5T_STD_B8LE` → `u8`).
+    BitField {
+        /// Element size in bytes.
+        size: u32,
+        /// Byte order of the element.
+        byte_order: ByteOrder,
+        /// Bit offset of the first significant bit.
+        bit_offset: u16,
+        /// Number of significant bits.
+        bit_precision: u16,
+    },
+    /// Opaque datatype (class 5): `size` uninterpreted bytes plus an ASCII tag
+    /// naming the format they are in (`H5Tset_tag`).
+    Opaque {
+        /// Element size in bytes.
+        size: u32,
+        /// The tag, without the null padding it carries on disk.
+        tag: String,
     },
     /// Fixed-length string type (class 3).
     FixedString {
@@ -384,6 +414,8 @@ impl DatatypeMessage {
         match self {
             Self::FixedPoint { size, .. } => *size,
             Self::FloatingPoint { size, .. } => *size,
+            Self::BitField { size, .. } => *size,
+            Self::Opaque { size, .. } => *size,
             Self::FixedString { size, .. } => *size,
             Self::Compound { size, .. } => *size,
             Self::Enum { base, .. } => base.element_size(),
@@ -504,6 +536,44 @@ impl DatatypeMessage {
                 buf.push(*mantissa_size);
                 buf.extend_from_slice(&exponent_bias.to_le_bytes());
 
+                buf
+            }
+            Self::BitField {
+                size,
+                byte_order,
+                bit_offset,
+                bit_precision,
+            } => {
+                // Same shape as a fixed-point type: 8 header + 4 properties.
+                let mut buf = Vec::with_capacity(12);
+                buf.push(CLASS_BITFIELD | (DT_VERSION << 4));
+                let mut flags0: u8 = 0;
+                if *byte_order == ByteOrder::BigEndian {
+                    flags0 |= 0x01; // bit 0
+                }
+                buf.push(flags0);
+                buf.push(0);
+                buf.push(0);
+                buf.extend_from_slice(&size.to_le_bytes());
+                buf.extend_from_slice(&bit_offset.to_le_bytes());
+                buf.extend_from_slice(&bit_precision.to_le_bytes());
+                buf
+            }
+            Self::Opaque { size, tag } => {
+                // The tag occupies a field that is a multiple of 8 bytes, null
+                // padded and not necessarily null terminated; its length lives
+                // in the low byte of the class bit field (`H5Odtype.c`).
+                let tag_len = tag.len().min(OPAQUE_TAG_MAX - 8);
+                let aligned = tag_len.div_ceil(8) * 8;
+
+                let mut buf = Vec::with_capacity(8 + aligned);
+                buf.push(CLASS_OPAQUE | (DT_VERSION << 4));
+                buf.push(aligned as u8);
+                buf.push(0);
+                buf.push(0);
+                buf.extend_from_slice(&size.to_le_bytes());
+                buf.extend_from_slice(&tag.as_bytes()[..tag_len]);
+                buf.resize(8 + aligned, 0);
                 buf
             }
             Self::FixedString {
@@ -818,6 +888,57 @@ impl DatatypeMessage {
                     20,
                 ))
             }
+            CLASS_BITFIELD => {
+                // Bit fields carry the same 4 property bytes as a fixed-point
+                // type: bit offset and bit precision (`H5Odtype.c`).
+                if !(1..=3).contains(&version) {
+                    return Err(FormatError::InvalidVersion(version));
+                }
+                if buf.len() < 12 {
+                    return Err(FormatError::BufferTooShort {
+                        needed: 12,
+                        available: buf.len(),
+                    });
+                }
+                let byte_order = if (flags0 & 0x01) != 0 {
+                    ByteOrder::BigEndian
+                } else {
+                    ByteOrder::LittleEndian
+                };
+                Ok((
+                    Self::BitField {
+                        size,
+                        byte_order,
+                        bit_offset: u16::from_le_bytes([buf[8], buf[9]]),
+                        bit_precision: u16::from_le_bytes([buf[10], buf[11]]),
+                    },
+                    12,
+                ))
+            }
+            CLASS_OPAQUE => {
+                if !(1..=3).contains(&version) {
+                    return Err(FormatError::InvalidVersion(version));
+                }
+                // The low byte of the class bit field holds the length of the
+                // tag field, which must be a multiple of 8.
+                let tag_len = (flags0 as usize) & (OPAQUE_TAG_MAX - 1);
+                if !tag_len.is_multiple_of(8) {
+                    return Err(FormatError::InvalidData(format!(
+                        "opaque tag field length {tag_len} is not a multiple of 8"
+                    )));
+                }
+                if buf.len() < 8 + tag_len {
+                    return Err(FormatError::BufferTooShort {
+                        needed: 8 + tag_len,
+                        available: buf.len(),
+                    });
+                }
+                // The tag is null padded, not necessarily null terminated.
+                let raw = &buf[8..8 + tag_len];
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                let tag = String::from_utf8_lossy(&raw[..end]).to_string();
+                Ok((Self::Opaque { size, tag }, 8 + tag_len))
+            }
             CLASS_STRING => {
                 // String class: 8-byte header, no additional properties
                 // Accept version 1 or 3 (HDF5 uses both)
@@ -1044,6 +1165,19 @@ impl std::fmt::Display for DatatypeMessage {
                 write!(f, "{}{}", prefix, size * 8)
             }
             Self::FloatingPoint { size, .. } => write!(f, "f{}", size * 8),
+            Self::BitField {
+                size,
+                bit_offset,
+                bit_precision,
+                ..
+            } => write!(
+                f,
+                "bitfield[{}; {}+{}]",
+                size * 8,
+                bit_offset,
+                bit_precision
+            ),
+            Self::Opaque { size, tag } => write!(f, "opaque[{size}; {tag}]"),
             Self::FixedString { size, charset, .. } => {
                 let cs = if *charset == 1 { "UTF-8" } else { "ASCII" };
                 write!(f, "string[{}; {}]", size, cs)
@@ -1247,9 +1381,9 @@ mod tests {
 
     #[test]
     fn decode_unsupported_class() {
-        // class 5, version 1
+        // class 7 (reference), version 1
         let mut buf = [0u8; 12];
-        buf[0] = 5 | (1 << 4);
+        buf[0] = 7 | (1 << 4);
         buf[4] = 1; // size = 1
         let err = DatatypeMessage::decode(&buf, &ctx()).unwrap_err();
         match err {
@@ -1415,6 +1549,90 @@ mod tests {
         assert_eq!(decoded, msg);
         let sz = u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]);
         assert_eq!(sz, 12);
+    }
+
+    // ---- opaque / bit field ----
+
+    /// The opaque datatype message libhdf5 writes for `H5Tcreate(H5T_OPAQUE, 4)`
+    /// with tag "raw4" (from `H5Tencode`, minus its 2-byte prefix): the tag
+    /// field is padded to 8 bytes and is not null terminated at its end.
+    #[test]
+    fn decode_opaque_from_libhdf5() {
+        let msg: [u8; 16] = [
+            0x15, 0x08, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, b'r', b'a', b'w', b'4', 0, 0, 0, 0,
+        ];
+        let (decoded, consumed) = DatatypeMessage::decode(&msg, &ctx()).unwrap();
+        assert_eq!(consumed, msg.len());
+        assert_eq!(
+            decoded,
+            DatatypeMessage::Opaque {
+                size: 4,
+                tag: "raw4".to_string(),
+            }
+        );
+        assert_eq!(decoded.element_size(), 4);
+        assert_eq!(decoded.encode(&ctx()), msg);
+    }
+
+    #[test]
+    fn decode_opaque_rejects_unaligned_tag_field() {
+        let msg: [u8; 16] = [
+            0x15, 0x05, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, b'r', b'a', b'w', b'4', 0, 0, 0, 0,
+        ];
+        let err = DatatypeMessage::decode(&msg, &ctx()).unwrap_err();
+        assert!(
+            matches!(&err, FormatError::InvalidData(m) if m.contains("multiple of 8")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// `H5T_STD_B8LE` as libhdf5 encodes it.
+    #[test]
+    fn decode_bitfield_from_libhdf5() {
+        let msg: [u8; 12] = [
+            0x14, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00,
+        ];
+        let (decoded, consumed) = DatatypeMessage::decode(&msg, &ctx()).unwrap();
+        assert_eq!(consumed, msg.len());
+        assert_eq!(
+            decoded,
+            DatatypeMessage::BitField {
+                size: 1,
+                byte_order: ByteOrder::LittleEndian,
+                bit_offset: 0,
+                bit_precision: 8,
+            }
+        );
+        assert_eq!(decoded.element_size(), 1);
+        assert_eq!(decoded.encode(&ctx()), msg);
+    }
+
+    #[test]
+    fn roundtrip_bitfield_be_narrow() {
+        let msg = DatatypeMessage::BitField {
+            size: 4,
+            byte_order: ByteOrder::BigEndian,
+            bit_offset: 3,
+            bit_precision: 12,
+        };
+        let (decoded, consumed) = DatatypeMessage::decode(&msg.encode(&ctx()), &ctx()).unwrap();
+        assert_eq!(consumed, 12);
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn roundtrip_opaque_tag_padding() {
+        // 9-byte tag: the field grows to 16 bytes, the tag is truncated by
+        // neither side.
+        let msg = DatatypeMessage::Opaque {
+            size: 24,
+            tag: "nine-char".to_string(),
+        };
+        let encoded = msg.encode(&ctx());
+        assert_eq!(encoded.len(), 8 + 16);
+        let (decoded, consumed) = DatatypeMessage::decode(&encoded, &ctx()).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, msg);
     }
 
     // ---- compound roundtrips ----

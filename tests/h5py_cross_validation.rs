@@ -1073,6 +1073,66 @@ fn numeric_conversion_reads_from_h5py_written_file() {
     std::fs::remove_file(&path).ok();
 }
 
+/// An `H5T_OPAQUE` dataset (tagged 4-byte blobs) and an `H5T_STD_B8LE` bit
+/// field written by h5py: both classes used to fail to decode, which dropped
+/// the dataset from the catalog entirely.
+#[test]
+fn opaque_and_bitfield_from_h5py_are_readable() {
+    use rust_hdf5::format::messages::datatype::{ByteOrder, DatatypeMessage};
+
+    let Some(py) = python() else { return };
+    let path = tmp("opaque_bitfield");
+    write_with_h5py(
+        py,
+        &path,
+        "from h5py import h5t, h5s, h5d\n\
+         tid = h5t.create(h5t.OPAQUE, 4)\n\
+         tid.set_tag(b'raw4')\n\
+         sid = h5s.create_simple((3,))\n\
+         ds = h5d.create(f.id, b'blobs', tid, sid)\n\
+         ds.write(h5s.ALL, h5s.ALL, np.frombuffer(bytes(range(12)), dtype='V4'), mtype=tid)\n\
+         bid = h5t.STD_B8LE.copy()\n\
+         bsid = h5s.create_simple((4,))\n\
+         bds = h5d.create(f.id, b'flags', bid, bsid)\n\
+         bds.write(h5s.ALL, h5s.ALL, np.array([1, 0x80, 0xFF, 0], dtype='u1'))\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.dataset_names();
+    names.sort();
+    assert_eq!(names, vec!["blobs", "flags"]);
+
+    let blobs = file.dataset("blobs").unwrap();
+    assert_eq!(
+        blobs.datatype().unwrap(),
+        DatatypeMessage::Opaque {
+            size: 4,
+            tag: "raw4".to_string()
+        }
+    );
+    assert_eq!(
+        blobs.read_raw_bytes().unwrap(),
+        (0u8..12).collect::<Vec<_>>()
+    );
+
+    let flags = file.dataset("flags").unwrap();
+    assert_eq!(
+        flags.datatype().unwrap(),
+        DatatypeMessage::BitField {
+            size: 1,
+            byte_order: ByteOrder::LittleEndian,
+            bit_offset: 0,
+            bit_precision: 8,
+        }
+    );
+    // A whole-width bit field reads as the unsigned integer of that width.
+    assert_eq!(
+        flags.read_numeric_as::<u32>().unwrap(),
+        vec![1, 0x80, 0xFF, 0]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// A compound with an array-typed member forces libhdf5 to emit a *version 2*
 /// datatype message under the default libver bound. v2 still pads member names
 /// to a multiple of 8 bytes (only v3 dropped the padding), so decoding it with
