@@ -10,6 +10,7 @@ pub mod checksum;
 pub mod chunk_index;
 pub mod dense_attr;
 pub mod fractal_heap;
+pub mod fractal_heap_write;
 pub mod global_heap;
 pub mod local_heap;
 pub mod messages;

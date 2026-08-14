@@ -36,7 +36,14 @@ const HDR_FLAG_CHECKSUM_DBLOCKS: u8 = 0x02;
 /// bound work on a corrupt or hostile file.
 const MAX_BLOCKS: usize = 65_536;
 
-/// Decoded fractal heap header — the fields needed to walk managed blocks.
+/// A fractal heap header, decoded from a file or built for one.
+///
+/// Every field libhdf5 stores is here, because this type is both ends of the
+/// round trip: [`decode`](Self::decode) fills it from a file and
+/// [`encode`](Self::encode) writes one back. The derived fields below the
+/// stored ones are recomputed by [`derive`](Self::derive) either way, so a
+/// heap this crate writes and a heap libhdf5 wrote parse through identical
+/// arithmetic.
 #[derive(Debug, Clone)]
 pub struct FractalHeapHeader {
     /// Length of a heap ID in bytes.
@@ -45,13 +52,34 @@ pub struct FractalHeapHeader {
     pub filter_len: u16,
     /// Whether direct blocks carry a trailing checksum.
     pub checksum_dblocks: bool,
-    /// Number of managed objects currently stored in the heap.
-    pub man_nobjs: u64,
     /// Largest object size the managed blocks accept; anything at or above it
     /// is stored as a "huge" object instead.
     pub max_man_size: u32,
+    /// Last "huge" object ID handed out; the next one is this plus one
+    /// (`H5HF__huge_new_id` pre-increments, so ID 0 is never used).
+    pub huge_next_id: u64,
     /// v2 B-tree tracking the heap's "huge" objects (`UNDEF_ADDR` if none).
     pub huge_bt2_addr: u64,
+    /// Free bytes inside allocated managed direct blocks.
+    pub total_man_free: u64,
+    /// Free-space manager tracking those bytes (`UNDEF_ADDR` if none).
+    pub fs_addr: u64,
+    /// Managed heap space the root block spans.
+    pub man_size: u64,
+    /// Bytes of managed direct blocks actually allocated in the file.
+    pub man_alloc_size: u64,
+    /// Heap-space offset the "next block" iterator sits at.
+    pub man_iter_off: u64,
+    /// Number of managed objects currently stored in the heap.
+    pub man_nobjs: u64,
+    /// Total size of the heap's "huge" objects.
+    pub huge_size: u64,
+    /// Number of "huge" objects in the heap.
+    pub huge_nobjs: u64,
+    /// Total size of the heap's "tiny" objects.
+    pub tiny_size: u64,
+    /// Number of "tiny" objects in the heap.
+    pub tiny_nobjs: u64,
     /// Doubling-table: number of columns.
     pub table_width: u16,
     /// Doubling-table: starting (row 0) direct-block size in bytes.
@@ -60,6 +88,8 @@ pub struct FractalHeapHeader {
     pub max_direct_size: u64,
     /// Doubling-table: maximum heap size expressed as a count of bits.
     pub max_heap_size_bits: u16,
+    /// Doubling-table: rows a root indirect block starts with.
+    pub start_root_rows: u16,
     /// Doubling-table: file address of the root block.
     pub table_addr: u64,
     /// Doubling-table: current number of rows in the root indirect block
@@ -71,6 +101,9 @@ pub struct FractalHeapHeader {
     pub max_direct_rows: u32,
     /// Per-row direct-block sizes (length == `max_root_rows`).
     pub row_block_size: Vec<u64>,
+    /// Per-row heap-space offset at which the row's first block starts
+    /// (`H5HF_dtable_t::row_block_off`).
+    pub row_block_off: Vec<u64>,
     /// Bytes used to encode a managed object's length inside a heap ID
     /// (`H5HF_hdr_t::heap_len_size`).
     pub heap_len_size: u8,
@@ -137,6 +170,166 @@ impl FractalHeapHeader {
         4 + 1 + 2 + 2 + 1 + 4 + ss + sa + ss + sa + 8 * ss + 2 + ss + ss + 2 + 2 + sa + 2 + 4
     }
 
+    /// On-disk size of the header this crate writes (no filter pipeline).
+    pub fn encoded_size(ctx: &FormatContext) -> usize {
+        Self::base_size(ctx)
+    }
+
+    /// An empty heap with the given creation parameters.
+    ///
+    /// The caller fills in `table_addr`, `curr_root_rows` and the statistics
+    /// once it has laid the blocks out — see
+    /// [`build_heap`](crate::format::fractal_heap_write::build_heap).
+    pub fn new(params: &HeapParams, ctx: &FormatContext) -> Self {
+        let mut hdr = Self {
+            id_len: params.id_len,
+            filter_len: 0,
+            checksum_dblocks: params.checksum_dblocks,
+            max_man_size: params.max_man_size,
+            huge_next_id: 0,
+            huge_bt2_addr: UNDEF_ADDR,
+            total_man_free: 0,
+            fs_addr: UNDEF_ADDR,
+            man_size: 0,
+            man_alloc_size: 0,
+            man_iter_off: 0,
+            man_nobjs: 0,
+            huge_size: 0,
+            huge_nobjs: 0,
+            tiny_size: 0,
+            tiny_nobjs: 0,
+            table_width: params.table_width,
+            start_block_size: params.start_block_size,
+            max_direct_size: params.max_direct_size,
+            max_heap_size_bits: params.max_heap_size_bits,
+            start_root_rows: params.start_root_rows,
+            table_addr: UNDEF_ADDR,
+            curr_root_rows: 0,
+            // Filled in by `derive` below.
+            heap_off_size: 0,
+            max_direct_rows: 0,
+            row_block_size: Vec::new(),
+            row_block_off: Vec::new(),
+            heap_len_size: 0,
+            huge_id_size: 0,
+            huge_ids_direct: false,
+        };
+        hdr.derive(ctx);
+        hdr
+    }
+
+    /// Recompute every field the doubling-table parameters imply.
+    ///
+    /// None of these are stored: `H5HF__dtable_init` and
+    /// `H5HF__hdr_finish_init_phase1/2` rebuild them from the parameters on
+    /// every open, which is why a heap ID is only parseable alongside the
+    /// header that produced it.
+    fn derive(&mut self, ctx: &FormatContext) {
+        let sa = ctx.sizeof_addr as usize;
+        let ss = ctx.sizeof_size as usize;
+
+        let start_bits = log2_of2(self.start_block_size);
+        let first_row_bits = start_bits + log2_of2(self.table_width as u64);
+        let max_root_rows = (self.max_heap_size_bits as u32)
+            .saturating_sub(first_row_bits)
+            .saturating_add(1);
+        let max_direct_bits = log2_of2(self.max_direct_size);
+        self.max_direct_rows = max_direct_bits.saturating_sub(start_bits).saturating_add(2);
+        self.heap_off_size = size_of_offset_bits(self.max_heap_size_bits);
+
+        // Per-row direct-block sizes: row 0 == start, row 1 == start,
+        // doubling from row 2 onward (H5HF__dtable_init).
+        self.row_block_size = Vec::with_capacity(max_root_rows as usize);
+        self.row_block_off = Vec::with_capacity(max_root_rows as usize);
+        let mut tmp = self.start_block_size;
+        let mut off = 0u64;
+        for row in 0..max_root_rows {
+            let size = if row == 0 { self.start_block_size } else { tmp };
+            self.row_block_size.push(size);
+            self.row_block_off.push(off);
+            off = off.saturating_add(size.saturating_mul(self.table_width as u64));
+            if row > 0 {
+                tmp = tmp.saturating_mul(2);
+            }
+        }
+
+        // Heap-ID field widths — H5HFhdr.c::H5HF__hdr_finish_init_phase1/2 and
+        // H5HFhuge.c::H5HF__huge_init.
+        let max_dir_blk_off_size = size_of_offset_bits(log2_of2(self.max_direct_size) as u16);
+        self.heap_len_size = max_dir_blk_off_size.min(limit_enc_size(self.max_man_size as u64));
+        let direct_huge_id_size = if self.filter_len > 0 {
+            sa + ss + 4 + ss
+        } else {
+            sa + ss
+        };
+        self.huge_ids_direct =
+            self.id_len >= 1 && direct_huge_id_size <= (self.id_len as usize - 1);
+        self.huge_id_size = if self.huge_ids_direct {
+            if self.filter_len > 0 {
+                (sa + ss + ss) as u8
+            } else {
+                (sa + ss) as u8
+            }
+        } else if self.id_len as usize - 1 < 8 {
+            (self.id_len - 1) as u8
+        } else {
+            8
+        };
+    }
+
+    /// Serialize the header, mirroring `H5HF__cache_hdr_serialize`.
+    ///
+    /// Only unfiltered heaps are written, so the filter block that would
+    /// follow the doubling table is absent and `filter_len` stays 0.
+    pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
+        let sa = ctx.sizeof_addr as usize;
+        let ss = ctx.sizeof_size as usize;
+        let mut buf = Vec::with_capacity(Self::base_size(ctx));
+
+        buf.extend_from_slice(&FRHP_SIGNATURE);
+        buf.push(0); // version
+        buf.extend_from_slice(&self.id_len.to_le_bytes());
+        buf.extend_from_slice(&self.filter_len.to_le_bytes());
+        buf.push(if self.checksum_dblocks {
+            HDR_FLAG_CHECKSUM_DBLOCKS
+        } else {
+            0
+        });
+
+        buf.extend_from_slice(&self.max_man_size.to_le_bytes());
+        buf.extend_from_slice(&self.huge_next_id.to_le_bytes()[..ss]);
+        buf.extend_from_slice(&self.huge_bt2_addr.to_le_bytes()[..sa]);
+
+        buf.extend_from_slice(&self.total_man_free.to_le_bytes()[..ss]);
+        buf.extend_from_slice(&self.fs_addr.to_le_bytes()[..sa]);
+
+        for stat in [
+            self.man_size,
+            self.man_alloc_size,
+            self.man_iter_off,
+            self.man_nobjs,
+            self.huge_size,
+            self.huge_nobjs,
+            self.tiny_size,
+            self.tiny_nobjs,
+        ] {
+            buf.extend_from_slice(&stat.to_le_bytes()[..ss]);
+        }
+
+        buf.extend_from_slice(&self.table_width.to_le_bytes());
+        buf.extend_from_slice(&self.start_block_size.to_le_bytes()[..ss]);
+        buf.extend_from_slice(&self.max_direct_size.to_le_bytes()[..ss]);
+        buf.extend_from_slice(&self.max_heap_size_bits.to_le_bytes());
+        buf.extend_from_slice(&self.start_root_rows.to_le_bytes());
+        buf.extend_from_slice(&self.table_addr.to_le_bytes()[..sa]);
+        buf.extend_from_slice(&self.curr_root_rows.to_le_bytes());
+
+        let cksum = checksum_metadata(&buf);
+        buf.extend_from_slice(&cksum.to_le_bytes());
+        debug_assert_eq!(buf.len(), Self::base_size(ctx));
+        buf
+    }
+
     /// Decode a fractal heap header from the bytes at its file address.
     pub fn decode(buf: &[u8], ctx: &FormatContext) -> FormatResult<Self> {
         let sa = ctx.sizeof_addr as usize;
@@ -166,25 +359,26 @@ impl FractalHeapHeader {
         // "Huge" object info.
         let max_man_size = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
         pos += 4;
-        pos += ss; // huge_next_id
+        let huge_next_id = read_uint(&buf[pos..], ss);
+        pos += ss;
         let huge_bt2_addr = read_uint(&buf[pos..], sa);
         pos += sa;
 
         // "Managed" free-space info.
-        pos += ss; // total_man_free
-        pos += sa; // fs_addr
+        let total_man_free = read_uint(&buf[pos..], ss);
+        pos += ss;
+        let fs_addr = read_uint(&buf[pos..], sa);
+        pos += sa;
 
         // Statistics: man_size, man_alloc_size, man_iter_off, man_nobjs,
         // huge_size, huge_nobjs, tiny_size, tiny_nobjs.
-        pos += ss; // man_size
-        pos += ss; // man_alloc_size
-        pos += ss; // man_iter_off
-        let man_nobjs = read_uint(&buf[pos..], ss);
-        pos += ss;
-        pos += ss; // huge_size
-        pos += ss; // huge_nobjs
-        pos += ss; // tiny_size
-        pos += ss; // tiny_nobjs
+        let mut stats = [0u64; 8];
+        for stat in &mut stats {
+            *stat = read_uint(&buf[pos..], ss);
+            pos += ss;
+        }
+        let [man_size, man_alloc_size, man_iter_off, man_nobjs, huge_size, huge_nobjs, tiny_size, tiny_nobjs] =
+            stats;
 
         // Doubling-table info.
         let table_width = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
@@ -195,7 +389,8 @@ impl FractalHeapHeader {
         pos += ss;
         let max_heap_size_bits = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
         pos += 2;
-        pos += 2; // start_root_rows
+        let start_root_rows = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
+        pos += 2;
         let table_addr = read_uint(&buf[pos..], sa);
         pos += sa;
         let curr_root_rows = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
@@ -219,73 +414,82 @@ impl FractalHeapHeader {
             ));
         }
 
-        // Doubling-table derived values — see H5HFdtable.c::H5HF__dtable_init
-        // and H5HFhdr.c::H5HF__hdr_finish_init_phase1.
-        let start_bits = log2_of2(start_block_size);
-        let first_row_bits = start_bits + log2_of2(table_width as u64);
-        let max_root_rows = (max_heap_size_bits as u32)
-            .saturating_sub(first_row_bits)
-            .saturating_add(1);
-        let max_direct_bits = log2_of2(max_direct_size);
-        let max_direct_rows = max_direct_bits.saturating_sub(start_bits).saturating_add(2);
-        let heap_off_size = size_of_offset_bits(max_heap_size_bits);
-
-        // Per-row direct-block sizes: row 0 == start, row 1 == start,
-        // doubling from row 2 onward (H5HF__dtable_init).
-        let mut row_block_size = Vec::with_capacity(max_root_rows as usize);
-        if max_root_rows > 0 {
-            row_block_size.push(start_block_size);
-            let mut tmp = start_block_size;
-            for _ in 1..max_root_rows {
-                row_block_size.push(tmp);
-                tmp = tmp.saturating_mul(2);
-            }
-        }
-
-        // Heap-ID field widths — H5HFhdr.c::H5HF__hdr_finish_init_phase1/2 and
-        // H5HFhuge.c::H5HF__huge_init. Neither width is stored on disk; both
-        // are recomputed from the doubling-table parameters, so a heap ID is
-        // only parseable alongside the header that produced it.
-        let max_dir_blk_off_size = size_of_offset_bits(log2_of2(max_direct_size) as u16);
-        let heap_len_size = max_dir_blk_off_size.min(limit_enc_size(max_man_size as u64));
-        let direct_huge_id_size = if filter_len > 0 {
-            sa + ss + 4 + ss
-        } else {
-            sa + ss
-        };
-        let huge_ids_direct = id_len >= 1 && direct_huge_id_size <= (id_len as usize - 1);
-        let huge_id_size = if huge_ids_direct {
-            if filter_len > 0 {
-                (sa + ss + ss) as u8
-            } else {
-                (sa + ss) as u8
-            }
-        } else if id_len as usize - 1 < 8 {
-            (id_len - 1) as u8
-        } else {
-            8
-        };
-
-        Ok(Self {
+        let mut hdr = Self {
             id_len,
             filter_len,
             checksum_dblocks,
-            man_nobjs,
             max_man_size,
+            huge_next_id,
             huge_bt2_addr,
+            total_man_free,
+            fs_addr,
+            man_size,
+            man_alloc_size,
+            man_iter_off,
+            man_nobjs,
+            huge_size,
+            huge_nobjs,
+            tiny_size,
+            tiny_nobjs,
             table_width,
             start_block_size,
             max_direct_size,
             max_heap_size_bits,
+            start_root_rows,
             table_addr,
             curr_root_rows,
-            heap_off_size,
-            max_direct_rows,
-            row_block_size,
-            heap_len_size,
-            huge_id_size,
-            huge_ids_direct,
-        })
+            heap_off_size: 0,
+            max_direct_rows: 0,
+            row_block_size: Vec::new(),
+            row_block_off: Vec::new(),
+            heap_len_size: 0,
+            huge_id_size: 0,
+            huge_ids_direct: false,
+        };
+        hdr.derive(ctx);
+        Ok(hdr)
+    }
+}
+
+/// Creation parameters for a new fractal heap (`H5HF_create_t`).
+///
+/// The defaults are the ones every object-header client uses
+/// (`H5O_FHEAP_*` in H5Oprivate.h): dense attribute storage, dense link
+/// storage and the shared-message heap all create their heaps with these, so
+/// there is exactly one shape of heap to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeapParams {
+    /// Heap ID width (`H5O_FHEAP_ID_LEN`).
+    pub id_len: u16,
+    /// Doubling-table columns.
+    pub table_width: u16,
+    /// Row-0 direct-block size.
+    pub start_block_size: u64,
+    /// Largest direct block the table reaches before rows become indirect.
+    pub max_direct_size: u64,
+    /// Heap address space, in bits.
+    pub max_heap_size_bits: u16,
+    /// Rows a root indirect block starts with.
+    pub start_root_rows: u16,
+    /// Whether direct blocks carry a checksum.
+    pub checksum_dblocks: bool,
+    /// Objects this size or larger bypass the managed blocks.
+    pub max_man_size: u32,
+}
+
+impl HeapParams {
+    /// The parameters `H5A__dense_create` uses for an object's attributes.
+    pub fn object_header() -> Self {
+        Self {
+            id_len: 8,
+            table_width: 4,
+            start_block_size: 1024,
+            max_direct_size: 64 * 1024,
+            max_heap_size_bits: 40,
+            start_root_rows: 1,
+            checksum_dblocks: true,
+            max_man_size: 4 * 1024,
+        }
     }
 }
 
