@@ -98,6 +98,7 @@ pub mod dataset;
 pub mod error;
 pub mod file;
 pub mod group;
+pub mod named_datatype;
 pub mod swmr;
 pub mod types;
 
@@ -110,4 +111,5 @@ pub use format::messages::filter::FilterPipeline;
 pub use group::H5Group;
 pub use io::locking::{FileLocking, LockMode};
 pub use io::reader::LinkClass;
+pub use named_datatype::H5NamedDatatype;
 pub use types::{Complex32, Complex64, CompoundType, H5Type, HBool, VarLenUnicode};

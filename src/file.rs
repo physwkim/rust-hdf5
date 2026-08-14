@@ -696,6 +696,53 @@ impl H5File {
         }
     }
 
+    /// The paths of every committed (named) datatype in this file.
+    ///
+    /// A committed datatype is an object in its own right, in neither
+    /// [`dataset_names`](Self::dataset_names) nor the group listing. Write
+    /// mode answers empty: this crate does not commit types.
+    pub fn named_datatype_names(&self) -> Vec<String> {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => reader
+                .named_datatype_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            H5FileInner::Writer(_) | H5FileInner::Closed => Vec::new(),
+        }
+    }
+
+    /// Open a committed (named) datatype by path (read mode).
+    ///
+    /// The handle opens whenever the object is there; a type this crate
+    /// cannot decode reports why from
+    /// [`H5NamedDatatype::datatype`](crate::named_datatype::H5NamedDatatype::datatype),
+    /// so its attributes stay reachable.
+    ///
+    /// # Errors
+    ///
+    /// [`Hdf5Error::NotFound`] when no committed datatype is at that path.
+    pub fn named_datatype(&self, path: &str) -> Result<crate::H5NamedDatatype> {
+        // Mutable: a path that crosses an external link opens the file that
+        // link names, and the reader caches that handle for the next one.
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => {
+                reader.named_datatype_info(path)?;
+                drop(inner);
+                Ok(crate::H5NamedDatatype::new_reader(
+                    clone_inner(&self.inner),
+                    path.to_string(),
+                ))
+            }
+            H5FileInner::Writer(_) => Err(Hdf5Error::InvalidState(
+                "committed datatypes are readable only in read mode".to_string(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".to_string())),
+        }
+    }
+
     /// Explicitly close the file. For a writer, this finalizes the file
     /// (writes superblock, headers, etc.). For a reader, this is a no-op.
     ///

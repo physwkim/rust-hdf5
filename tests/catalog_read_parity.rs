@@ -1031,3 +1031,164 @@ fn a_dataset_that_shares_a_committed_datatype_reads_through_the_reference() {
 
     std::fs::remove_file(&path).ok();
 }
+
+/// A committed (named) datatype is an object, not a property of the datasets
+/// that use it: `H5Tcommit` gives it an object header and a name, and h5py
+/// hands it back as a `Datatype`. Classifying it as neither a group nor a
+/// dataset left its name in the file with nothing behind it — the link was
+/// listed, and every accessor answered as if the object were not there.
+#[test]
+fn a_committed_datatype_is_listed_and_opens_as_an_object_of_its_own() {
+    let Some(py) = python() else { return };
+    let path = tmp("named_datatype");
+    h5py_write(
+        py,
+        &path,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f['t'] = np.dtype('<i4')\n\
+         \x20   f.create_dataset('own', data=np.arange(4, dtype='<i4'))\n\
+         \x20   f.create_group('g')\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(file.named_datatype_names(), vec!["t".to_string()]);
+    let root = file.root_group();
+    assert_eq!(root.named_datatype_names().unwrap(), vec!["t".to_string()]);
+    // It belongs to no other listing, and the link to it is still a link.
+    assert_eq!(root.dataset_names().unwrap(), vec!["own".to_string()]);
+    assert_eq!(root.group_names().unwrap(), vec!["g".to_string()]);
+    assert_eq!(
+        root.link_names().unwrap(),
+        vec!["g".to_string(), "own".to_string(), "t".to_string()]
+    );
+    assert!(matches!(root.link_class("t").unwrap(), LinkClass::Hard));
+
+    // The committed type decodes to what a dataset carrying its own copy of
+    // the same type decodes to.
+    let t = file.named_datatype("t").unwrap();
+    assert_eq!(t.name(), "t");
+    assert_eq!(
+        format!("{:?}", t.datatype().unwrap()),
+        format!("{:?}", file.dataset("own").unwrap().datatype().unwrap())
+    );
+    assert_eq!(root.named_datatype("t").unwrap().name(), "t");
+
+    // A name that is not one is an absence, not an empty answer.
+    assert!(matches!(
+        file.named_datatype("own"),
+        Err(Hdf5Error::NotFound(_))
+    ));
+    assert!(matches!(
+        file.named_datatype("nope"),
+        Err(Hdf5Error::NotFound(_))
+    ));
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A committed datatype can sit in any group and can carry attributes of its
+/// own — `H5Aopen` works on it exactly as on a dataset.
+#[test]
+fn a_committed_datatype_in_a_group_carries_its_own_attributes() {
+    let Some(py) = python() else { return };
+    let path = tmp("named_datatype_attrs");
+    h5py_write(
+        py,
+        &path,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   g = f.create_group('g')\n\
+         \x20   g['t'] = np.dtype('<f8')\n\
+         \x20   g['t'].attrs['units'] = 'mm'\n\
+         \x20   g['t'].attrs['scale'] = np.int32(7)\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(file.named_datatype_names(), vec!["g/t".to_string()]);
+    let g = file.root_group().group("g").unwrap();
+    assert_eq!(g.named_datatype_names().unwrap(), vec!["t".to_string()]);
+    // The root group holds none of its own.
+    assert!(file.root_group().named_datatype_names().unwrap().is_empty());
+
+    for t in [
+        file.named_datatype("g/t").unwrap(),
+        g.named_datatype("t").unwrap(),
+    ] {
+        assert_eq!(t.datatype().unwrap().element_size(), 8);
+        // Sorted: this crate lists attributes in object-header order, not the
+        // name order h5py indexes by, for every object alike.
+        let mut names = t.attr_names().unwrap();
+        names.sort();
+        assert_eq!(names, vec!["scale".to_string(), "units".to_string()]);
+        assert_eq!(t.attr("units").unwrap().read_string().unwrap(), "mm");
+        assert_eq!(t.attr("scale").unwrap().read_numeric::<i32>().unwrap(), 7);
+    }
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A committed datatype whose type this crate cannot decode is still an
+/// object with a name: it stays in the listing and it still opens, and the
+/// reason lands on the type rather than turning the object into an absence.
+#[test]
+fn a_committed_datatype_this_crate_cannot_decode_is_still_listed() {
+    let Some(py) = python() else { return };
+    let path = tmp("named_datatype_opaque");
+    h5py_write(
+        py,
+        &path,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f['t'] = np.dtype('V4')\n\
+         \x20   f['t'].attrs['tag'] = np.int32(3)\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(file.named_datatype_names(), vec!["t".to_string()]);
+    let t = file.named_datatype("t").unwrap();
+    let why = match t.datatype() {
+        Err(Hdf5Error::Unsupported(why)) => why,
+        other => panic!("expected an unsupported type, got {other:?}"),
+    };
+    assert!(
+        why.contains("datatype"),
+        "the reason must name the datatype: {why}"
+    );
+    // Its attributes are readable regardless: they do not depend on the type.
+    assert_eq!(t.attr("tag").unwrap().read_numeric::<i32>().unwrap(), 3);
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// An external link reaching a committed datatype resolves through the same
+/// traversal every other object uses, and the type comes back decoded from
+/// the file that holds it.
+#[test]
+fn a_committed_datatype_reached_through_an_external_link_resolves() {
+    let Some(py) = python() else { return };
+    let dir = tmp_dir("named_datatype_extlink");
+    let (master, target) = (dir.join("master.h5"), dir.join("target.h5"));
+
+    h5py_write(
+        py,
+        &target,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f['t'] = np.dtype('<u2')\n\
+         \x20   f['t'].attrs['tag'] = np.int32(11)\n",
+    );
+    h5py_write(
+        py,
+        &master,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f['far'] = h5py.ExternalLink('target.h5', '/t')\n",
+    );
+
+    let file = H5File::open(&master).unwrap();
+    // The link is the master's; the object is not, so it is not in the
+    // master's own listing.
+    assert!(file.named_datatype_names().is_empty());
+    let t = file.named_datatype("far").unwrap();
+    assert_eq!(t.datatype().unwrap().element_size(), 2);
+    assert_eq!(t.attr("tag").unwrap().read_numeric::<i32>().unwrap(), 11);
+    drop(file);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

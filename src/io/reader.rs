@@ -269,6 +269,8 @@ struct Catalog {
     group_aliases: std::collections::HashMap<String, String>,
     /// Every link record seen, keyed by its full path (no leading `/`).
     links: std::collections::BTreeMap<String, LinkClass>,
+    /// Committed (named) datatype objects, keyed by path.
+    datatypes: std::collections::BTreeMap<String, CommittedDatatypeInfo>,
 }
 
 /// The state one catalog walk threads through every group it visits.
@@ -503,7 +505,10 @@ impl<'a> CatalogWalk<'a> {
             // A committed (named) datatype is neither a group nor a dataset,
             // so it must not be recorded as either; the link record above
             // already carries its name.
-            ObjectKind::CommittedDatatype => return Ok(()),
+            ObjectKind::CommittedDatatype(info) => {
+                self.catalog.datatypes.insert(full_name, *info);
+                return Ok(());
+            }
             ObjectKind::Group => {}
         }
 
@@ -570,7 +575,37 @@ enum ObjectKind {
     Group,
     /// A committed (named) datatype object: a datatype message with neither
     /// group storage nor the dataspace/layout pair a dataset needs.
-    CommittedDatatype,
+    CommittedDatatype(Box<CommittedDatatypeInfo>),
+}
+
+/// A committed (named) datatype as read from its own object header.
+///
+/// `H5Tcommit` gives a type a name and a place in the file; every dataset and
+/// attribute built on it then stores a reference to this object rather than a
+/// copy of the type. It is a third kind of object beside groups and datasets,
+/// and classifying it as neither is what left its name in the file with
+/// nothing behind it.
+#[derive(Debug, Clone)]
+pub struct CommittedDatatypeInfo {
+    /// The type this object commits, or what stopped it from decoding. The
+    /// object is in the listing either way, exactly as an unreadable dataset
+    /// is: the name is in the file whether or not this crate can read what it
+    /// names.
+    datatype: Result<DatatypeMessage, String>,
+    /// Attributes attached to the committed datatype itself.
+    attributes: Vec<AttributeMessage>,
+}
+
+impl CommittedDatatypeInfo {
+    /// The committed type, or the reason it cannot be read.
+    pub fn datatype(&self) -> Result<&DatatypeMessage, &str> {
+        self.datatype.as_ref().map_err(String::as_str)
+    }
+
+    /// The attributes attached to the committed datatype.
+    pub fn attributes(&self) -> &[AttributeMessage] {
+        &self.attributes
+    }
 }
 
 /// Internal enum to represent what we know about the root group from the
@@ -650,6 +685,8 @@ pub struct Hdf5Reader {
     /// link answer differently mid-session, and would fail to find the handle
     /// it already holds once the target has been renamed or unlinked.
     external_resolved: std::collections::BTreeMap<String, PathBuf>,
+    /// Committed (named) datatype objects, keyed by path (no leading `/`).
+    datatypes: std::collections::BTreeMap<String, CommittedDatatypeInfo>,
 }
 
 /// Total byte length of `dims.product() * element_size`, computed with
@@ -936,6 +973,7 @@ impl Hdf5Reader {
             group_paths: catalog.group_paths,
             group_aliases: catalog.group_aliases,
             links: catalog.links,
+            datatypes: catalog.datatypes,
             path: origin.path,
             locking: origin.locking,
             external: Default::default(),
@@ -1002,6 +1040,7 @@ impl Hdf5Reader {
             group_paths: catalog.group_paths,
             group_aliases: catalog.group_aliases,
             links: catalog.links,
+            datatypes: catalog.datatypes,
             path: origin.path,
             locking: origin.locking,
             external: Default::default(),
@@ -1149,6 +1188,42 @@ impl Hdf5Reader {
         crate::io::object_header_io::read_object_header_full(handle, ctx, addr)
     }
 
+    /// Read a committed datatype object's type and attributes from its header.
+    ///
+    /// A committed datatype's own message holds the type itself, but the
+    /// format does not forbid it being a reference in turn, so it goes
+    /// through the same resolver every other datatype message does.
+    fn committed_datatype(
+        handle: &mut FileHandle,
+        header: &ObjectHeader,
+        ctx: &FormatContext,
+    ) -> CommittedDatatypeInfo {
+        let datatype = header
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MSG_DATATYPE)
+            .cloned()
+            .ok_or_else(|| "it holds no datatype message".to_string())
+            .and_then(|m| {
+                crate::io::object_header_io::read_datatype_message(handle, ctx, &m).map_err(|e| {
+                    match e {
+                        crate::io::IoError::Unsupported(why) => why,
+                        other => format!("its datatype message does not decode: {other}"),
+                    }
+                })
+            });
+        let attributes = header
+            .messages
+            .iter()
+            .filter(|m| m.msg_type == MSG_ATTRIBUTE && m.flags & MSG_FLAG_SHARED == 0)
+            .filter_map(|m| AttributeMessage::decode(&m.data, ctx).ok().map(|(a, _)| a))
+            .collect();
+        CommittedDatatypeInfo {
+            datatype,
+            attributes,
+        }
+    }
+
     /// Classify one object from its (already read) header, and decode the
     /// dataset metadata while doing so.
     ///
@@ -1179,7 +1254,9 @@ impl Hdf5Reader {
             present(MSG_DATATYPE) && present(MSG_DATASPACE) && present(MSG_DATA_LAYOUT);
         if !is_dataset {
             return if present(MSG_DATATYPE) {
-                ObjectKind::CommittedDatatype
+                ObjectKind::CommittedDatatype(Box::new(Self::committed_datatype(
+                    handle, header, ctx,
+                )))
             } else {
                 ObjectKind::Group
             };
@@ -1316,6 +1393,70 @@ impl Hdf5Reader {
     /// Every link record in the file, keyed by full path (no leading `/`).
     pub fn links(&self) -> &std::collections::BTreeMap<String, LinkClass> {
         &self.links
+    }
+
+    /// The paths of every committed (named) datatype object in this file.
+    ///
+    /// A committed datatype is in neither [`dataset_names`](Self::dataset_names)
+    /// nor the group listing — it is a third kind of object, and this is its
+    /// listing.
+    pub fn named_datatype_names(&self) -> Vec<&str> {
+        self.datatypes.keys().map(String::as_str).collect()
+    }
+
+    /// The committed datatype at `path` (no leading `/`), following group hard
+    /// links, soft links and external links the way `H5Topen` does.
+    ///
+    /// `NotFound` means no committed datatype of that name; a name that *is*
+    /// one but whose type this crate cannot decode answers `Unsupported` with
+    /// the reason, never an absence.
+    pub fn named_datatype(&mut self, path: &str) -> IoResult<&DatatypeMessage> {
+        self.named_datatype_info(path)?
+            .datatype()
+            .map_err(|why| crate::io::IoError::Unsupported(why.to_string()))
+    }
+
+    /// The attribute names of the committed datatype at `path`.
+    pub fn named_datatype_attr_names(&mut self, path: &str) -> IoResult<Vec<String>> {
+        Ok(self
+            .named_datatype_info(path)?
+            .attributes()
+            .iter()
+            .map(|a| a.name.clone())
+            .collect())
+    }
+
+    /// One attribute of the committed datatype at `path`, by name.
+    pub fn named_datatype_attr(
+        &mut self,
+        path: &str,
+        attr_name: &str,
+    ) -> IoResult<&AttributeMessage> {
+        let owned = attr_name.to_string();
+        self.named_datatype_info(path)?
+            .attributes()
+            .iter()
+            .find(|a| a.name == owned)
+            .ok_or_else(|| crate::io::IoError::NotFound(format!("{path}:{attr_name}")))
+    }
+
+    /// The committed datatype object at `path`, after link traversal.
+    ///
+    /// The object answers here whether or not its type decodes; the reason it
+    /// does not is on [`CommittedDatatypeInfo::datatype`].
+    pub fn named_datatype_info(&mut self, path: &str) -> IoResult<&CommittedDatatypeInfo> {
+        if self.external_edge(path).is_some() {
+            let (owner, local, _) = self.external_owner(path, MAX_EXTERNAL_HOPS)?;
+            let local = owner.canonical_path(&local);
+            return owner
+                .datatypes
+                .get(&local)
+                .ok_or(crate::io::IoError::NotFound(local));
+        }
+        let local = self.canonical_path(path);
+        self.datatypes
+            .get(&local)
+            .ok_or(crate::io::IoError::NotFound(local))
     }
 
     /// The class of the link at `path` (no leading `/`), or `None` when no
@@ -1940,6 +2081,7 @@ impl Hdf5Reader {
         self.group_paths = catalog.group_paths;
         self.group_aliases = catalog.group_aliases;
         self.links = catalog.links;
+        self.datatypes = catalog.datatypes;
 
         Ok(())
     }

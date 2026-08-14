@@ -555,6 +555,68 @@ impl H5Group {
         }
     }
 
+    /// The committed (named) datatypes that are direct children of this
+    /// group, in the order the catalog holds them.
+    pub fn named_datatype_names(&self) -> Result<Vec<String>> {
+        let inner = borrow_inner(&self.file_inner);
+        let all = match &*inner {
+            H5FileInner::Reader(reader) => reader
+                .named_datatype_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            H5FileInner::Writer(_) | H5FileInner::Closed => return Ok(vec![]),
+        };
+        Ok(all
+            .iter()
+            .filter_map(|path| self.direct_child(path))
+            .collect())
+    }
+
+    /// Open a committed (named) datatype that is a child of this group.
+    pub fn named_datatype(&self, name: &str) -> Result<crate::H5NamedDatatype> {
+        let full_name = if self.name == "/" {
+            name.to_string()
+        } else {
+            format!("{}/{}", self.name.trim_start_matches('/'), name)
+        };
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => {
+                reader.named_datatype_info(&full_name)?;
+                drop(inner);
+                Ok(crate::H5NamedDatatype::new_reader(
+                    clone_inner(&self.file_inner),
+                    full_name,
+                ))
+            }
+            H5FileInner::Writer(_) => Err(Hdf5Error::InvalidState(
+                "committed datatypes are readable only in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
+    /// `path` as a direct child name of this group, or `None` when it is not
+    /// one.
+    fn direct_child(&self, path: &str) -> Option<String> {
+        let prefix = if self.name == "/" {
+            String::new()
+        } else {
+            format!("{}/", self.name.trim_start_matches('/'))
+        };
+        let stripped = if prefix.is_empty() {
+            path
+        } else {
+            path.strip_prefix(&prefix)?
+        };
+        if stripped.is_empty() || stripped.contains('/') {
+            None
+        } else {
+            Some(stripped.to_string())
+        }
+    }
+
     /// The class of the link `name` in this group, carrying the value
     /// `H5Lget_val` returns for the classes that have one — the target path
     /// of a soft link, the file and path of an external link.

@@ -27,7 +27,7 @@ use rust_hdf5::format::messages::datatype::{
 };
 use rust_hdf5::format::messages::filter::{Filter, FilterPipeline, FILTER_FLETCHER32};
 use rust_hdf5::types::VarLenUnicode;
-use rust_hdf5::{H5Dataset, H5File, H5Group, Hdf5Error, LinkClass};
+use rust_hdf5::{H5Attribute, H5Dataset, H5File, H5Group, H5NamedDatatype, Hdf5Error, LinkClass};
 
 const CANON_VERSION: &str = "3";
 const RAW_LIMIT: usize = 1024;
@@ -461,6 +461,8 @@ impl Dump {
 enum Child {
     Group,
     Dataset,
+    /// A committed (named) datatype: an object, and neither of the above.
+    NamedDatatype,
     Soft(String),
     External(String, String),
     /// The name is linked but the public API answers neither "which kind of
@@ -549,6 +551,21 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
             unsupported("dataset_names", &format!("panic: {p}")),
         ),
     }
+    match guarded(|| group.named_datatype_names()) {
+        Ok(Ok(names)) => {
+            for n in names {
+                children.insert(n, Child::NamedDatatype);
+            }
+        }
+        Ok(Err(e)) => d.emit(
+            &format!("{path}#named_datatype_names"),
+            unsupported("named_datatype_names", &oneline(e)),
+        ),
+        Err(p) => d.emit(
+            &format!("{path}#named_datatype_names"),
+            unsupported("named_datatype_names", &format!("panic: {p}")),
+        ),
+    }
     // canon.py classifies by link kind first (`grp.get(name, getlink=True)`)
     // and only falls through to the object type for a hard link, so the link
     // listing both adds names the typed listings cannot answer for and
@@ -632,6 +649,14 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
                     ),
                 }
             }
+            Child::NamedDatatype => match guarded(|| group.named_datatype(&name)) {
+                Ok(Ok(t)) => dump_named_datatype(d, &cpath, &t),
+                Ok(Err(e)) => d.emit(&format!("{cpath}#kind"), unsupported("kind", &oneline(e))),
+                Err(p) => d.emit(
+                    &format!("{cpath}#kind"),
+                    unsupported("kind", &format!("panic: {p}")),
+                ),
+            },
             // A soft link is reported by its value and never followed here,
             // exactly as canon.py reports it.
             Child::Soft(target) => {
@@ -658,6 +683,11 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
 /// that gap is real and is what the field is here to measure.
 fn resolve_extlink(file: &H5File, cpath: &str) -> std::result::Result<String, String> {
     let lookup = cpath.trim_start_matches('/').to_string();
+    // A committed datatype is an object of its own, so it is asked about
+    // first; every other answer comes from the dataset entry point.
+    if let Ok(Ok(_)) = guarded(|| file.named_datatype(&lookup)) {
+        return Ok("committed-datatype".into());
+    }
     match guarded(|| file.dataset(&lookup)) {
         Ok(Ok(ds)) => {
             let dims = guarded(|| ds.shape()).map_err(|p| format!("panic: {p}"))?;
@@ -746,7 +776,7 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
         Err("H5Dataset exposes no fill value accessor".into())
     });
 
-    dump_dataset_attrs(d, path, ds);
+    dump_object_attrs(d, path, ds);
 
     d.field(path, "data", || dataset_payload(ds, dtype.as_ref()));
 }
@@ -795,7 +825,55 @@ fn dataset_payload(
     }
 }
 
-fn dump_dataset_attrs(d: &mut Dump, path: &str, ds: &H5Dataset) {
+/// An object whose attributes are readable through a typed handle. Datasets
+/// and committed datatypes both are, and canon.py dumps their attributes with
+/// one function, so this side does too.
+trait AttrSource {
+    fn attr_names(&self) -> rust_hdf5::Result<Vec<String>>;
+    fn attr(&self, name: &str) -> rust_hdf5::Result<H5Attribute>;
+    /// What stands in the way of the object-header attribute count.
+    fn nattrs_hdr_gap() -> &'static str;
+}
+
+impl AttrSource for H5Dataset {
+    fn attr_names(&self) -> rust_hdf5::Result<Vec<String>> {
+        H5Dataset::attr_names(self)
+    }
+    fn attr(&self, name: &str) -> rust_hdf5::Result<H5Attribute> {
+        H5Dataset::attr(self, name)
+    }
+    fn nattrs_hdr_gap() -> &'static str {
+        "H5Dataset exposes no object-header attribute count"
+    }
+}
+
+impl AttrSource for H5NamedDatatype {
+    fn attr_names(&self) -> rust_hdf5::Result<Vec<String>> {
+        H5NamedDatatype::attr_names(self)
+    }
+    fn attr(&self, name: &str) -> rust_hdf5::Result<H5Attribute> {
+        H5NamedDatatype::attr(self, name)
+    }
+    fn nattrs_hdr_gap() -> &'static str {
+        "H5NamedDatatype exposes no object-header attribute count"
+    }
+}
+
+/// A committed (named) datatype: the type it commits, then its attributes.
+fn dump_named_datatype(d: &mut Dump, path: &str, t: &H5NamedDatatype) {
+    d.emit(&format!("{path}#kind"), "committed-datatype");
+
+    let dtype = guarded(|| t.datatype()).ok().and_then(|r| r.ok());
+    d.field(path, "dtype", || match &dtype {
+        Some(dt) => Ok(canon_dtype(dt)),
+        None => Err("H5NamedDatatype::datatype() failed or is unavailable".into()),
+    });
+    d.field(path, "strpad", || strpad_field(dtype.as_ref()));
+
+    dump_object_attrs(d, path, t);
+}
+
+fn dump_object_attrs<T: AttrSource>(d: &mut Dump, path: &str, ds: &T) {
     let names = match guarded(|| ds.attr_names()) {
         Ok(Ok(mut n)) => {
             n.sort();
@@ -819,10 +897,7 @@ fn dump_dataset_attrs(d: &mut Dump, path: &str, ds: &H5Dataset) {
     d.emit(&format!("{path}#nattrs"), names.len().to_string());
     d.emit(
         &format!("{path}#nattrs_hdr"),
-        unsupported(
-            "nattrs_hdr",
-            "H5Dataset exposes no object-header attribute count",
-        ),
+        unsupported("nattrs_hdr", T::nattrs_hdr_gap()),
     );
 
     for name in names {
@@ -848,9 +923,7 @@ fn dump_dataset_attrs(d: &mut Dump, path: &str, ds: &H5Dataset) {
         });
 
         d.field(&key, "value", || {
-            let a = attr
-                .as_ref()
-                .ok_or("H5Dataset::attr() did not return a handle")?;
+            let a = attr.as_ref().ok_or("attr() did not return a handle")?;
             let dt = dtype
                 .as_ref()
                 .ok_or("datatype unavailable, so the value cannot be classified")?;
