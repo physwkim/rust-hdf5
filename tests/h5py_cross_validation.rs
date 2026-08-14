@@ -1534,6 +1534,55 @@ fn past_max_compact_the_link_set_goes_dense() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A dense attribute set big enough to overrun the fractal heap's direct
+/// rows: past ~504 KiB of managed objects the doubling table's next row holds
+/// child *indirect* blocks, and libhdf5 must find every attribute through
+/// them. 130 attributes of 3800 bytes clear that boundary with each message
+/// still under `max_man_size`, so none of them escapes to huge storage.
+#[test]
+fn a_dense_attribute_set_past_the_direct_rows_is_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("heap_indirect_blocks");
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file.new_dataset::<i32>().shape([4]).create("data").unwrap();
+        ds.write_raw(&[0, 1, 2, 3]).unwrap();
+        for a in 0..130i32 {
+            let values: Vec<i32> = (0..950).map(|i| a * 1000 + i).collect();
+            ds.new_attr::<i32>()
+                .shape([950])
+                .create(&format!("a{a:03}"))
+                .unwrap()
+                .write_array(&values)
+                .unwrap();
+        }
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['data']\n\
+         info = h5py.h5o.get_info(ds.id)\n\
+         assert info.meta_size.attr.heap_size > 500 * 1024, info.meta_size.attr.heap_size\n\
+         assert len(ds.attrs) == 130, len(ds.attrs)\n\
+         for a in range(130):\n\
+         \x20   v = ds.attrs['a%03d' % a]\n\
+         \x20   assert v.shape == (950,), v.shape\n\
+         \x20   assert (v == np.arange(950) + a * 1000).all(), a\n",
+    );
+
+    // And this crate reads its own indirect-block heap back.
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let mut names = ds.attr_names().unwrap();
+    names.sort();
+    assert_eq!(
+        names,
+        (0..130).map(|a| format!("a{a:03}")).collect::<Vec<_>>()
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// Creation-order tracking is a property of the object, captured from the
 /// file's policy when it is created: `H5Pget_link_creation_order` and
 /// `H5Pget_attr_creation_order` report TRACKED|INDEXED for the root group and

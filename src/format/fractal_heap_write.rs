@@ -25,7 +25,11 @@
 
 use crate::format::checksum::checksum_metadata;
 use crate::format::chunk_index::btree_v2::{Bt2Tree, BT2_TYPE_FHEAP_HUGE_INDIR};
-use crate::format::fractal_heap::{FractalHeapHeader, HeapParams, FHDB_SIGNATURE, FHIB_SIGNATURE};
+use std::collections::HashMap;
+
+use crate::format::fractal_heap::{
+    indirect_nrows, FractalHeapHeader, HeapParams, FHDB_SIGNATURE, FHIB_SIGNATURE,
+};
 use crate::format::{FormatContext, FormatError, FormatResult, UNDEF_ADDR};
 
 /// Node size of the huge-object index (`H5HF_HUGE_BT2_NODE_SIZE`).
@@ -150,17 +154,80 @@ struct DirectBlock {
     used: usize,
 }
 
-/// Size and heap offset of the `seq`-th block in row-major order, or `None`
-/// once the sequence runs past the table's direct rows.
-fn seq_block(header: &FractalHeapHeader, seq: usize) -> Option<(u64, u64)> {
+/// Direct blocks reachable from an indirect block of `n` rows, for every `n`
+/// the doubling table can produce.
+///
+/// A row past `max_direct_rows` holds child indirect blocks rather than direct
+/// ones, and each child covers that row's block size with rows of its own
+/// (`H5HF__dtable_size_to_rows`), so the count is recursive. Every child has
+/// strictly fewer rows than the row that names it, which is what lets this be
+/// filled in one ascending pass.
+fn direct_block_counts(header: &FractalHeapHeader) -> Vec<usize> {
     let width = header.table_width as usize;
-    let row = seq / width;
-    if row >= header.max_direct_rows as usize || row >= header.row_block_size.len() {
-        return None;
+    let mut counts = Vec::with_capacity(header.row_block_size.len() + 1);
+    counts.push(0);
+    for row in 0..header.row_block_size.len() {
+        let this_row = if row < header.max_direct_rows as usize {
+            width
+        } else {
+            let child = indirect_nrows(header, header.row_block_size[row]) as usize;
+            width * counts[child]
+        };
+        counts.push(counts[row] + this_row);
     }
-    let size = header.row_block_size[row];
-    let off = header.row_block_off[row] + size * (seq % width) as u64;
-    Some((size, off))
+    counts
+}
+
+/// Heap-space offset one past `nrows` rows of an indirect block, i.e. the span
+/// such a block covers.
+fn row_span(header: &FractalHeapHeader, nrows: usize) -> u64 {
+    match header.row_block_off.get(nrows) {
+        Some(&off) => off,
+        None => {
+            let last = header.row_block_off.len() - 1;
+            header.row_block_off[last] + header.row_block_size[last] * header.table_width as u64
+        }
+    }
+}
+
+/// Size and heap offset of the `n`-th managed direct block, walking the rows
+/// of the indirect block at `base_off` in heap-offset order and descending
+/// into the indirect rows the way `H5HF__man_iter_next` does. `None` once the
+/// sequence runs past what this block's rows address.
+fn nth_direct_block(
+    header: &FractalHeapHeader,
+    counts: &[usize],
+    base_off: u64,
+    nrows: usize,
+    mut n: usize,
+) -> Option<(u64, u64)> {
+    let width = header.table_width as usize;
+    for row in 0..nrows.min(header.row_block_size.len()) {
+        let size = header.row_block_size[row];
+        let row_base = base_off + header.row_block_off[row];
+        if row < header.max_direct_rows as usize {
+            if n < width {
+                return Some((size, row_base + size * n as u64));
+            }
+            n -= width;
+        } else {
+            let child_nrows = indirect_nrows(header, size) as usize;
+            let per_child = counts[child_nrows];
+            for col in 0..width {
+                if n < per_child {
+                    return nth_direct_block(
+                        header,
+                        counts,
+                        row_base + size * col as u64,
+                        child_nrows,
+                        n,
+                    );
+                }
+                n -= per_child;
+            }
+        }
+    }
+    None
 }
 
 /// Pack the managed objects into direct blocks and record their heap IDs.
@@ -179,6 +246,8 @@ fn place_managed(
         return Ok(());
     }
     let overhead = direct_overhead(header, ctx);
+    let counts = direct_block_counts(header);
+    let root_rows = header.row_block_size.len();
     let mut built: Vec<DirectBlock> = Vec::new();
     // Which block each managed object went into, and where inside its object
     // area — the heap ID cannot be encoded until the block's own offset is
@@ -189,11 +258,13 @@ fn place_managed(
     for &i in managed {
         let len = objects[i].len();
         loop {
-            let Some((size, block_off)) = seq_block(header, cursor) else {
+            let Some((size, block_off)) = nth_direct_block(header, &counts, 0, root_rows, cursor)
+            else {
                 return Err(FormatError::UnsupportedFeature(format!(
-                    "fractal heap needs more than the {} direct blocks the doubling table's \
-                     direct rows hold; writing indirect block trees is not implemented",
-                    header.max_direct_rows as usize * header.table_width as usize
+                    "fractal heap needs more than the {} bytes its {}-bit address space \
+                     addresses",
+                    row_span(header, root_rows),
+                    header.max_heap_size_bits
                 )));
             };
             let capacity = size as usize - overhead;
@@ -247,7 +318,7 @@ fn place_managed(
     }
 
     let last = built.last().expect("a managed object built a block");
-    let root_is_direct = built.len() == 1 && last.seq == 0;
+    let root_is_direct = built.len() == 1 && last.block_off == 0;
     if root_is_direct {
         header.table_addr = addrs[0];
         header.curr_root_rows = 0;
@@ -257,14 +328,32 @@ fn place_managed(
         // root indirect block exists.
         header.man_iter_off = 0;
     } else {
-        let nrows = last.seq / header.table_width as usize + 1;
-        let (iblock_addr, iblock_image) =
-            encode_root_indirect(header, ctx, header_addr, nrows, &built, &addrs, alloc);
+        // The root needs whatever rows it takes to reach the last block used.
+        // libhdf5 grows the root by doubling and can end up with more; either
+        // is legal, because `curr_root_rows` is what a reader goes by.
+        let end = last.block_off + last.size;
+        let nrows = (1..=root_rows)
+            .find(|&r| row_span(header, r) >= end)
+            .expect("the placement loop never runs past the addressable rows");
+        let block_addrs: HashMap<u64, u64> = built
+            .iter()
+            .zip(&addrs)
+            .map(|(b, &addr)| (b.block_off, addr))
+            .collect();
+        let iblock_addr = encode_indirect(
+            header,
+            ctx,
+            header_addr,
+            0,
+            nrows,
+            &block_addrs,
+            alloc,
+            blocks,
+        );
         header.table_addr = iblock_addr;
         header.curr_root_rows = nrows as u16;
-        header.man_size = header.row_block_off[nrows];
-        header.man_iter_off = last.block_off + last.size;
-        blocks.push(iblock_image);
+        header.man_size = row_span(header, nrows);
+        header.man_iter_off = end;
     }
     header.man_alloc_size = built.iter().map(|b| b.size).sum();
     header.man_nobjs = managed.len() as u64;
@@ -321,38 +410,68 @@ fn finish_direct_block(
     image[at..at + 4].copy_from_slice(&cksum.to_le_bytes());
 }
 
-/// Encode the root indirect block naming `built`'s direct blocks.
-fn encode_root_indirect(
+/// Encode the indirect block covering `base_off` with `nrows` rows, appending
+/// its image — and those of every child indirect block under it — to `blocks`.
+/// Returns its address.
+///
+/// A row below `max_direct_rows` names direct blocks, which `block_addrs`
+/// already places by heap offset; a row at or above it names child indirect
+/// blocks, each covering that row's block size, which this builds on the way
+/// past. An entry with nothing under it is `UNDEF_ADDR`, exactly as
+/// `H5HF__cache_iblock_serialize` writes an unallocated child.
+#[allow(clippy::too_many_arguments)]
+fn encode_indirect(
     header: &FractalHeapHeader,
     ctx: &FormatContext,
     header_addr: u64,
+    base_off: u64,
     nrows: usize,
-    built: &[DirectBlock],
-    addrs: &[u64],
+    block_addrs: &HashMap<u64, u64>,
     alloc: &mut dyn FnMut(u64) -> u64,
-) -> (u64, HeapBlock) {
+    blocks: &mut Vec<HeapBlock>,
+) -> u64 {
     let sa = ctx.sizeof_addr as usize;
-    let entries = nrows * header.table_width as usize;
+    let width = header.table_width as usize;
+    let entries = nrows * width;
     let mut image =
         Vec::with_capacity(4 + 1 + sa + header.heap_off_size as usize + entries * sa + 4);
     image.extend_from_slice(&FHIB_SIGNATURE);
     image.push(0); // version
     image.extend_from_slice(&header_addr.to_le_bytes()[..sa]);
-    // The root indirect block starts the heap address space.
-    image.extend_from_slice(&0u64.to_le_bytes()[..header.heap_off_size as usize]);
-    for entry in 0..entries {
-        let addr = built
-            .iter()
-            .position(|b| b.seq == entry)
-            .map_or(UNDEF_ADDR, |bi| addrs[bi]);
-        image.extend_from_slice(&addr.to_le_bytes()[..sa]);
+    image.extend_from_slice(&base_off.to_le_bytes()[..header.heap_off_size as usize]);
+    for row in 0..nrows {
+        let size = header.row_block_size[row];
+        for col in 0..width {
+            let off = base_off + header.row_block_off[row] + size * col as u64;
+            let addr = if row < header.max_direct_rows as usize {
+                block_addrs.get(&off).copied().unwrap_or(UNDEF_ADDR)
+            } else if block_addrs
+                .keys()
+                .any(|&b| b >= off && b < off.saturating_add(size))
+            {
+                encode_indirect(
+                    header,
+                    ctx,
+                    header_addr,
+                    off,
+                    indirect_nrows(header, size) as usize,
+                    block_addrs,
+                    alloc,
+                    blocks,
+                )
+            } else {
+                UNDEF_ADDR
+            };
+            image.extend_from_slice(&addr.to_le_bytes()[..sa]);
+        }
     }
     let cksum = checksum_metadata(&image);
     image.extend_from_slice(&cksum.to_le_bytes());
 
     let len = image.len() as u64;
     let addr = alloc(len);
-    (addr, HeapBlock { addr, len, image })
+    blocks.push(HeapBlock { addr, len, image });
+    addr
 }
 
 /// A managed heap ID: flags, the object's heap-space offset, its length.
@@ -566,6 +685,57 @@ mod tests {
         let heap_buf = file.read_block(built.header_addr, 512).unwrap();
         let header = FractalHeapHeader::decode(&heap_buf, &ctx).unwrap();
         assert!(header.curr_root_rows >= 2, "{}", header.curr_root_rows);
+        assert_eq!(round_trip(&objects), objects);
+    }
+
+    /// Past the doubling table's direct rows the root's next row holds child
+    /// *indirect* blocks, each with rows of its own. 130 objects of 4000
+    /// bytes overrun the 504 KiB the direct rows address, so the writer must
+    /// build that second level for them.
+    #[test]
+    fn objects_past_the_direct_rows_grow_child_indirect_blocks() {
+        let objects: Vec<Vec<u8>> = (0..130).map(|i| obj(i as u8, 4000)).collect();
+        let ctx = ctx();
+        let params = HeapParams::object_header();
+        let mut file = MemFile::new();
+        let built = {
+            let mut alloc = |len: u64| file.alloc(len);
+            build_heap(&params, &ctx, &objects, &mut alloc).unwrap()
+        };
+        for block in &built.blocks {
+            file.put(block);
+        }
+        let heap_buf = file.read_block(built.header_addr, 512).unwrap();
+        let header = FractalHeapHeader::decode(&heap_buf, &ctx).unwrap();
+        assert!(
+            header.curr_root_rows as u32 > header.max_direct_rows,
+            "{} rows does not reach the indirect ones ({} direct)",
+            header.curr_root_rows,
+            header.max_direct_rows
+        );
+        assert_eq!(header.man_nobjs, 130);
+        assert_eq!(round_trip(&objects), objects);
+    }
+
+    /// Deep enough that a child indirect block has indirect rows of its own:
+    /// the root's row 11 covers 1 MiB, which needs nine rows, one more than
+    /// the eight the table's direct rows fill.
+    #[test]
+    fn a_heap_deep_enough_nests_indirect_blocks_two_levels() {
+        let objects: Vec<Vec<u8>> = (0..1000).map(|i| obj(i as u8, 4000)).collect();
+        let ctx = ctx();
+        let params = HeapParams::object_header();
+        let mut file = MemFile::new();
+        let built = {
+            let mut alloc = |len: u64| file.alloc(len);
+            build_heap(&params, &ctx, &objects, &mut alloc).unwrap()
+        };
+        for block in &built.blocks {
+            file.put(block);
+        }
+        let heap_buf = file.read_block(built.header_addr, 512).unwrap();
+        let header = FractalHeapHeader::decode(&heap_buf, &ctx).unwrap();
+        assert!(header.curr_root_rows >= 12, "{}", header.curr_root_rows);
         assert_eq!(round_trip(&objects), objects);
     }
 

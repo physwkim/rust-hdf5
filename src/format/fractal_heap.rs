@@ -932,7 +932,7 @@ fn walk_indirect_block<R: BlockReader>(
 
 /// Number of rows in a child indirect block whose row-block size is
 /// `block_size` (H5HF__dtable_size_to_rows).
-fn indirect_nrows(header: &FractalHeapHeader, block_size: u64) -> u32 {
+pub(crate) fn indirect_nrows(header: &FractalHeapHeader, block_size: u64) -> u32 {
     let start_bits = log2_of2(header.start_block_size);
     let first_row_bits = start_bits + log2_of2(header.table_width as u64);
     let size_log2 = log2_of2(block_size);
