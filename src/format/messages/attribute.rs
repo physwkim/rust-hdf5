@@ -14,7 +14,7 @@
 
 use crate::format::messages::dataspace::DataspaceMessage;
 use crate::format::messages::datatype::DatatypeMessage;
-use crate::format::{FormatContext, FormatError, FormatResult};
+use crate::format::{FormatContext, FormatError, FormatResult, LibverBound};
 
 const ATTR_VERSION: u8 = 3;
 
@@ -97,7 +97,13 @@ impl AttributeMessage {
     /// 0x0C (MSG_ATTRIBUTE). It does NOT include the object header message
     /// envelope (type, size, flags bytes); that is handled by the caller.
     pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
-        let encoded_dt = self.datatype.encode(ctx);
+        self.encode_at(ctx, LibverBound::Earliest)
+    }
+
+    /// Encode the attribute message for a file whose low libver bound is
+    /// `libver`, which the datatype message inside it follows.
+    pub fn encode_at(&self, ctx: &FormatContext, libver: LibverBound) -> Vec<u8> {
+        let encoded_dt = self.datatype.encode_at(ctx, libver);
         let encoded_ds = self.dataspace.encode(ctx);
 
         // Name with null terminator

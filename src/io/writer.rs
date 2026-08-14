@@ -29,7 +29,7 @@ use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
 use crate::format::superblock::*;
-use crate::format::{FormatContext, UNDEF_ADDR};
+use crate::format::{FormatContext, LibverBound, UNDEF_ADDR};
 
 use crate::io::allocator::FileAllocator;
 use crate::io::file_handle::FileHandle;
@@ -897,14 +897,15 @@ pub struct Hdf5Writer {
     /// outermost lock a create acquires (create_lock → spine → slot), and no
     /// write path takes it, so it cannot deadlock with the registry locks.
     pub(crate) create_lock: Slot<()>,
-    /// Target the libhdf5 2.0 file format (`H5Pset_libver_bounds` with low
-    /// bound `H5F_LIBVER_V200`): filtered chunked datasets created while
-    /// this is set get layout message version 5, whose chunk indexes encode
-    /// stored chunk sizes in a fixed `sizeof_size` field, so an expanding
-    /// filter cannot overflow the size field. Off by default — version-5
-    /// files are rejected by libhdf5 before 2.0, including the 1.14-based
-    /// h5py wheels.
-    libver_latest: bool,
+    /// The file's low `H5Pset_libver_bounds` bound: the oldest libhdf5 a
+    /// file this writer creates must stay readable by. It is the one switch
+    /// the version-bearing messages read — the datatype message version
+    /// (`H5O_dtype_ver_bounds`) and, at `V200`, layout version 5 for filtered
+    /// chunked datasets, whose chunk indexes encode stored chunk sizes in a
+    /// fixed `sizeof_size` field so an expanding filter cannot overflow it.
+    /// `Earliest` by default — version-5 files are rejected by libhdf5 before
+    /// 2.0, including the 1.14-based h5py wheels.
+    libver: LibverBound,
     closed: bool,
     /// Set once `finalize_for_swmr` has published a readable file.
     ///
@@ -999,7 +1000,7 @@ impl Hdf5Writer {
             hard_links: Slot::new(Vec::new()),
             root_attributes: Slot::new(Vec::new()),
             create_lock: Slot::new(()),
-            libver_latest: false,
+            libver: LibverBound::Earliest,
             closed: false,
             swmr_active: false,
             cwfs: Slot::new(Vec::new()),
@@ -1017,7 +1018,23 @@ impl Hdf5Writer {
     /// default, because readers older than libhdf5 2.0 — including the
     /// 1.14-based h5py wheels — reject version 5.
     pub fn set_libver_latest(&mut self, latest: bool) {
-        self.libver_latest = latest;
+        self.set_libver_bound(if latest {
+            LibverBound::V200
+        } else {
+            LibverBound::Earliest
+        });
+    }
+
+    /// Set the file's low libver bound, the equivalent of
+    /// `H5Pset_libver_bounds`'s `low` argument. Objects created after this
+    /// call encode their messages at the versions that bound calls for.
+    pub fn set_libver_bound(&mut self, libver: LibverBound) {
+        self.libver = libver;
+    }
+
+    /// The file's low libver bound.
+    pub fn libver(&self) -> LibverBound {
+        self.libver
     }
 
     /// Layout message version for a new chunked dataset — the
@@ -1027,7 +1044,7 @@ impl Hdf5Writer {
     /// when the file targets the 2.0 format; everything else stays at
     /// version 4, which every 1.10+ reader accepts.
     fn chunk_layout_version(&self, filtered: bool, chunk_bytes: u64) -> u8 {
-        if chunk_bytes > u32::MAX as u64 || (filtered && self.libver_latest) {
+        if chunk_bytes > u32::MAX as u64 || (filtered && self.libver == LibverBound::V200) {
             5
         } else {
             4
@@ -1793,7 +1810,7 @@ impl Hdf5Writer {
             hard_links: Slot::new(hard_links),
             root_attributes: Slot::new(root_attributes),
             create_lock: Slot::new(()),
-            libver_latest: false,
+            libver: LibverBound::Earliest,
             closed: false,
             swmr_active: false,
             cwfs: Slot::new(Vec::new()),
@@ -7584,7 +7601,7 @@ impl Hdf5Writer {
         header.add_message(MSG_DATASPACE, 0x00, ds_msg);
 
         // Datatype message (type 0x03), flag 0x01 = constant
-        let dt_msg = m.datatype.encode(&self.ctx);
+        let dt_msg = m.datatype.encode_at(&self.ctx, self.libver);
         header.add_message(MSG_DATATYPE, 0x01, dt_msg);
 
         // Fill Value message (type 0x05)
@@ -7659,7 +7676,7 @@ impl Hdf5Writer {
 
         // Attribute messages (type 0x0C)
         for attr in &m.attributes {
-            let attr_msg = attr.encode(&self.ctx);
+            let attr_msg = attr.encode_at(&self.ctx, self.libver);
             header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
         }
 
@@ -7730,7 +7747,7 @@ impl Hdf5Writer {
 
         // Attribute messages (type 0x0C) -- e.g. NeXus `NX_class`.
         for attr in &attributes {
-            let attr_msg = attr.encode(&self.ctx);
+            let attr_msg = attr.encode_at(&self.ctx, self.libver);
             header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
         }
 
@@ -7802,7 +7819,7 @@ impl Hdf5Writer {
 
         // Root-level attributes
         for attr in self.root_attributes.lock().iter() {
-            let attr_msg = attr.encode(&self.ctx);
+            let attr_msg = attr.encode_at(&self.ctx, self.libver);
             header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
         }
 

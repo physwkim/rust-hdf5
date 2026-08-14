@@ -108,6 +108,7 @@ pub use file::{H5File, H5FileOptions};
 pub use format::messages::datatype::{ByteOrder, DatatypeMessage};
 pub use format::messages::filter::FilterPipeline;
 pub use format::reference::{Reference, RegionSelection};
+pub use format::LibverBound;
 pub use group::H5Group;
 pub use io::locking::{FileLocking, LockMode};
 pub use types::{Complex32, Complex64, CompoundType, H5Type, HBool, VarLenUnicode};

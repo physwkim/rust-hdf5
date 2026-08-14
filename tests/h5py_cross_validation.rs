@@ -1833,3 +1833,94 @@ fn a_reference_to_a_missing_path_is_refused() {
     file.close().unwrap();
     std::fs::remove_file(&path).ok();
 }
+
+/// The file's low libver bound picks the datatype message version, the way
+/// `H5T_set_version` does: at `H5F_LIBVER_V112` a compound message is tagged
+/// version 4, and libhdf5 reads that file as readily as the default one.
+#[test]
+fn the_libver_bound_picks_the_datatype_message_version() {
+    use rust_hdf5::format::messages::datatype::CompoundMember;
+    use rust_hdf5::format::FormatContext;
+    use rust_hdf5::LibverBound;
+
+    let dt = DatatypeMessage::Compound {
+        size: 8,
+        members: vec![
+            CompoundMember {
+                name: "x".into(),
+                offset: 0,
+                datatype: DatatypeMessage::f32_type(),
+            },
+            CompoundMember {
+                name: "y".into(),
+                offset: 4,
+                datatype: DatatypeMessage::f32_type(),
+            },
+        ],
+    };
+    let mut bytes = Vec::new();
+    for i in 0..4u32 {
+        bytes.extend_from_slice(&(i as f32).to_le_bytes());
+        bytes.extend_from_slice(&((100 + i) as f32).to_le_bytes());
+    }
+    let ctx = FormatContext::default_v3();
+
+    for (bound, version) in [
+        (LibverBound::Earliest, 3u8),
+        (LibverBound::V18, 3),
+        (LibverBound::V112, 4),
+    ] {
+        let path = tmp(&format!("libver_{version}_{bound:?}"));
+        let file = H5File::create(&path).unwrap();
+        file.set_libver_bound(bound).unwrap();
+        let ds = file
+            .new_dataset::<u8>()
+            .datatype(dt.clone())
+            .shape([4])
+            .chunk(&[4])
+            .create("data")
+            .unwrap();
+        ds.write_raw_bytes(&bytes).unwrap();
+        file.close().unwrap();
+
+        // The message really landed at that version: its exact encoding is a
+        // substring of the file, and the encoding at any other version — the
+        // same bytes with a different nibble — is not.
+        let image = std::fs::read(&path).unwrap();
+        let wanted = dt.encode_at(&ctx, bound);
+        assert_eq!(wanted[0] >> 4, version);
+        let occurrences =
+            |needle: &[u8]| image.windows(needle.len()).filter(|w| *w == needle).count();
+        assert_eq!(occurrences(&wanted), 1, "{bound:?}: v{version} message");
+        for other in [3u8, 4, 5] {
+            if other == version {
+                continue;
+            }
+            let mut variant = wanted.clone();
+            variant[0] = (variant[0] & 0x0F) | (other << 4);
+            assert_eq!(
+                occurrences(&variant),
+                0,
+                "{bound:?}: stray v{other} message"
+            );
+        }
+
+        // And libhdf5 reads every one of them back.
+        if let Some(py) = python() {
+            read_back_with_h5py(
+                py,
+                &path,
+                "d = f['data']\n\
+                 assert d.dtype.names == ('x', 'y'), d.dtype\n\
+                 assert (d['x'] == np.arange(4, dtype='<f4')).all(), d['x']\n\
+                 assert (d['y'] == np.arange(100, 104, dtype='<f4')).all(), d['y']\n",
+            );
+        }
+
+        // As does this crate, whatever version stamped the message.
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(file.dataset("data").unwrap().datatype().unwrap(), dt);
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+}

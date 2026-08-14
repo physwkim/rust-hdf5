@@ -35,6 +35,46 @@ impl FormatContext {
     }
 }
 
+/// The low half of libhdf5's `H5Pset_libver_bounds` — the oldest library
+/// release a file must stay readable by.
+///
+/// It is the file-wide switch that picks between on-disk message versions:
+/// libhdf5 keeps one table per message type (`H5O_dtype_ver_bounds`,
+/// `H5O_layout_ver_bounds`, ...) mapping the bound to the version it stamps.
+/// Raising the bound lets the library use newer, tighter encodings; lowering
+/// it keeps older readers able to open the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum LibverBound {
+    /// `H5F_LIBVER_EARLIEST`, the default: every message at its oldest
+    /// version that can express what the file holds.
+    #[default]
+    Earliest,
+    /// `H5F_LIBVER_V18`.
+    V18,
+    /// `H5F_LIBVER_V110`.
+    V110,
+    /// `H5F_LIBVER_V112`.
+    V112,
+    /// `H5F_LIBVER_V114`.
+    V114,
+    /// `H5F_LIBVER_V200`, which is `H5F_LIBVER_LATEST` for libhdf5 2.0.
+    V200,
+}
+
+impl LibverBound {
+    /// The datatype message version this bound calls for — libhdf5's
+    /// `H5O_dtype_ver_bounds` (H5T.c), the floor `H5T_set_version` raises a
+    /// datatype to.
+    pub fn dtype_version(self) -> u8 {
+        match self {
+            Self::Earliest => 1,
+            Self::V18 | Self::V110 => 3,
+            Self::V112 | Self::V114 => 4,
+            Self::V200 => 5,
+        }
+    }
+}
+
 /// UNDEF address constant
 pub const UNDEF_ADDR: u64 = u64::MAX;
 

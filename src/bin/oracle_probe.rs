@@ -27,7 +27,7 @@ use rust_hdf5::format::messages::datatype::{
 };
 use rust_hdf5::format::messages::filter::{Filter, FilterPipeline, FILTER_FLETCHER32};
 use rust_hdf5::types::VarLenUnicode;
-use rust_hdf5::{H5Dataset, H5File, H5Group, Reference};
+use rust_hdf5::{H5Dataset, H5File, H5Group, LibverBound, Reference};
 
 const CANON_VERSION: &str = "2";
 const RAW_LIMIT: usize = 1024;
@@ -1265,6 +1265,34 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             }
             let file = H5File::create(path)?;
             raw_typed(&file, "data", dt, &[4], &bytes)?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "compound_dtype_v4" => {
+            // Same compound as `compound_simple`, written into a file whose
+            // low libver bound is v1.12, which is what makes the datatype
+            // message version 4. Chunked, matching the h5py generator.
+            let dt = DatatypeMessage::Compound {
+                size: 8,
+                members: vec![
+                    member("x", 0, DatatypeMessage::f32_type()),
+                    member("y", 4, DatatypeMessage::f32_type()),
+                ],
+            };
+            let mut bytes = Vec::new();
+            for i in 0..4u32 {
+                bytes.extend_from_slice(&(i as f32).to_le_bytes());
+                bytes.extend_from_slice(&((100 + i) as f32).to_le_bytes());
+            }
+            let file = H5File::create(path)?;
+            file.set_libver_bound(LibverBound::V112)?;
+            let ds = file
+                .new_dataset::<u8>()
+                .datatype(dt)
+                .shape([4usize])
+                .chunk(&[4])
+                .create("data")?;
+            ds.write_raw_bytes(&bytes)?;
             file.close()?;
             Ok(Ok(()))
         }

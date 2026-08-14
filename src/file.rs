@@ -24,6 +24,7 @@ use crate::io::{Hdf5Reader, Hdf5Writer};
 use crate::dataset::{DatasetBuilder, H5Dataset};
 use crate::error::{Hdf5Error, Result};
 use crate::format::messages::filter::FilterPipeline;
+use crate::format::LibverBound;
 use crate::group::H5Group;
 use crate::types::H5Type;
 
@@ -182,10 +183,33 @@ impl H5File {
     ///
     /// Errors in read mode.
     pub fn set_libver_latest(&self, latest: bool) -> Result<()> {
+        self.set_libver_bound(if latest {
+            LibverBound::V200
+        } else {
+            LibverBound::Earliest
+        })
+    }
+
+    /// Set the file's low libver bound — `H5Pset_libver_bounds`'s `low`
+    /// argument, the oldest libhdf5 release the file must stay readable by.
+    ///
+    /// Objects created after this call encode their messages at the versions
+    /// that bound calls for: a compound, enum or array datatype message moves
+    /// to version 3 at [`LibverBound::V18`] and version 4 at
+    /// [`LibverBound::V112`], the way `H5T_set_version` upgrades a datatype,
+    /// while an integer or string message stays at version 1 in every file.
+    /// [`LibverBound::V200`] additionally selects the version-5 data layout
+    /// for filtered chunked datasets, as [`Self::set_libver_latest`] does.
+    ///
+    /// [`LibverBound::Earliest`] by default, matching libhdf5's own default
+    /// file access property list.
+    ///
+    /// Errors in read mode.
+    pub fn set_libver_bound(&self, libver: LibverBound) -> Result<()> {
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
-                writer.set_libver_latest(latest);
+                writer.set_libver_bound(libver);
                 Ok(())
             }
             _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),

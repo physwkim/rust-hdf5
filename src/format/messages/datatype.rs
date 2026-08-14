@@ -6,18 +6,27 @@
 //!   Bytes 4-7: element size (u32 LE)
 //!   Bytes 8+:  class-specific properties
 
-use crate::format::{FormatContext, FormatError, FormatResult};
+use crate::format::{FormatContext, FormatError, FormatResult, LibverBound};
 
+/// The version a datatype message carries when nothing asks for a newer one:
+/// every atomic class encodes identically in all versions, so version 1 is
+/// what libhdf5 stamps on them at any libver bound.
 const DT_VERSION: u8 = 1;
+
+/// The compound member layout this encoder writes — null-terminated names
+/// with no padding and offsets in `limit_enc_size` bytes — is the version-3
+/// one (`H5O__dtype_encode_helper`), so a compound message never claims less.
+/// libhdf5 writes the version-1 layout at the earliest bound instead; both are
+/// read by every 1.8+ library.
+const COMPOUND_ENCODED_VERSION: u8 = 3;
+
+/// Likewise for arrays: this encoder omits the dimension permutations that
+/// version 2 carries, which is the version-3 layout.
+const ARRAY_ENCODED_VERSION: u8 = 3;
 
 /// libhdf5 `H5O_DTYPE_VERSION_LATEST`: the highest datatype message version
 /// the format defines (5, the HDF5 2.0 encoding).
 const DT_VERSION_LATEST: u8 = 5;
-
-/// The highest datatype message version this crate decodes. Versions 1-4 share
-/// the property layouts below; version 5 came with the 2.0 complex-number
-/// encoding and is reported as unsupported rather than misread.
-const DT_VERSION_MAX_SUPPORTED: u8 = 4;
 
 /// libhdf5 `H5VM_limit_enc_size`: the number of bytes needed to encode any
 /// value in `0..=limit`. Used for version-3 compound member offsets, which
@@ -150,6 +159,11 @@ const CLASS_ARRAY: u8 = 10;
 /// libhdf5 `H5R_ENCODE_VERSION` (`H5Rprivate.h`): the only encoding version
 /// the 1.12 reference kinds accept, stored in the bit field's second nibble.
 const REFERENCE_ENCODE_VERSION: u8 = 1;
+
+/// `H5T_STD_REF` is born at datatype message version 4 (`H5T_INIT_TYPE_REF_CORE`
+/// in H5T.c), so a message holding one of the 1.12 reference kinds carries at
+/// least that version whatever the file's libver bound is.
+const REVISED_REFERENCE_MESSAGE_VERSION: u8 = 4;
 
 /// libhdf5 `H5T_OPAQUE_TAG_MAX`: the opaque tag field is stored in
 /// `(strlen + 7) & (H5T_OPAQUE_TAG_MAX - 8)` bytes, i.e. rounded up to a
@@ -775,8 +789,53 @@ impl DatatypeMessage {
 // ========================================================================= encode / decode
 
 impl DatatypeMessage {
-    /// Encode into a byte vector.
+    /// The message version libhdf5 would stamp on this datatype in a file
+    /// whose low libver bound is `libver` — `H5T_set_version` together with
+    /// `H5T__upgrade_version_cb` (H5T.c).
+    ///
+    /// The bound raises the version of the classes that gain from a newer
+    /// encoding — compound, enum and array — and of nothing else: an integer
+    /// or a string stays at version 1 in every file, and a variable-length
+    /// type takes its parent's version rather than the bound. On top of that
+    /// each class has a floor of its own: an array is at least version 2 in
+    /// the format, revised references are born at version 4, and a compound is
+    /// at least as new as its newest member. The two remaining floors libhdf5
+    /// carries — VAX floats at 3, complex numbers at 5 — need classes this
+    /// encoder cannot build, so they have nothing to raise here.
+    pub fn message_version(&self, libver: LibverBound) -> u8 {
+        let bound = libver.dtype_version();
+        match self {
+            Self::Compound { members, .. } => members
+                .iter()
+                .map(|m| m.datatype.message_version(libver))
+                .fold(bound.max(COMPOUND_ENCODED_VERSION), u8::max),
+            Self::Enum { base, .. } => bound.max(base.message_version(libver)),
+            Self::Array { base, .. } => bound
+                .max(ARRAY_ENCODED_VERSION)
+                .max(base.message_version(libver)),
+            Self::VarLenSequence { base } => base.message_version(libver),
+            Self::Reference { kind, .. } => {
+                if kind.is_revised() {
+                    REVISED_REFERENCE_MESSAGE_VERSION
+                } else {
+                    DT_VERSION
+                }
+            }
+            _ => DT_VERSION,
+        }
+    }
+
+    /// Encode into a byte vector at the default libver bound
+    /// ([`LibverBound::Earliest`], libhdf5's own default).
     pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
+        self.encode_at(ctx, LibverBound::Earliest)
+    }
+
+    /// Encode into a byte vector for a file whose low libver bound is
+    /// `libver`, which decides the message version through
+    /// [`Self::message_version`].
+    pub fn encode_at(&self, ctx: &FormatContext, libver: LibverBound) -> Vec<u8> {
+        let version = self.message_version(libver);
         match self {
             Self::FixedPoint {
                 size,
@@ -789,7 +848,7 @@ impl DatatypeMessage {
                 let mut buf = Vec::with_capacity(12);
 
                 // byte 0: class | version<<4
-                buf.push(CLASS_FIXED_POINT | (DT_VERSION << 4));
+                buf.push(CLASS_FIXED_POINT | (version << 4));
 
                 // bytes 1-3: class bit-field (24 bits LE)
                 let mut flags0: u8 = 0;
@@ -828,7 +887,7 @@ impl DatatypeMessage {
                 let mut buf = Vec::with_capacity(20);
 
                 // byte 0: class | version<<4
-                buf.push(CLASS_FLOATING_POINT | (DT_VERSION << 4));
+                buf.push(CLASS_FLOATING_POINT | (version << 4));
 
                 // bytes 1-3: class bit-field
                 let mut flags0: u8 = 0;
@@ -867,7 +926,7 @@ impl DatatypeMessage {
             } => {
                 // Same shape as a fixed-point type: 8 header + 4 properties.
                 let mut buf = Vec::with_capacity(12);
-                buf.push(CLASS_BITFIELD | (DT_VERSION << 4));
+                buf.push(CLASS_BITFIELD | (version << 4));
                 let mut flags0: u8 = 0;
                 if *byte_order == ByteOrder::BigEndian {
                     flags0 |= 0x01; // bit 0
@@ -888,7 +947,7 @@ impl DatatypeMessage {
                 let aligned = tag_len.div_ceil(8) * 8;
 
                 let mut buf = Vec::with_capacity(8 + aligned);
-                buf.push(CLASS_OPAQUE | (DT_VERSION << 4));
+                buf.push(CLASS_OPAQUE | (version << 4));
                 buf.push(aligned as u8);
                 buf.push(0);
                 buf.push(0);
@@ -906,7 +965,7 @@ impl DatatypeMessage {
                 let mut buf = Vec::with_capacity(8);
 
                 // byte 0: class | version<<4
-                buf.push(CLASS_STRING | (DT_VERSION << 4));
+                buf.push(CLASS_STRING | (version << 4));
 
                 // byte 1: (padding & 0x0f) | ((charset & 0x0f) << 4)
                 buf.push((padding & 0x0F) | ((charset & 0x0F) << 4));
@@ -921,8 +980,8 @@ impl DatatypeMessage {
                 buf
             }
             Self::Compound { size, members } => {
-                // Version 3 compound type
-                let version: u8 = 3;
+                // message_version keeps this at COMPOUND_ENCODED_VERSION or
+                // above, which is the member layout written below.
                 let num_members = members.len() as u16;
 
                 let mut buf = vec![
@@ -952,7 +1011,7 @@ impl DatatypeMessage {
                     buf.extend_from_slice(&member.offset.to_le_bytes()[..offset_nbytes]);
 
                     // Member datatype (recursive)
-                    let dt_encoded = member.datatype.encode(ctx);
+                    let dt_encoded = member.datatype.encode_at(ctx, libver);
                     buf.extend_from_slice(&dt_encoded);
                 }
 
@@ -964,7 +1023,7 @@ impl DatatypeMessage {
 
                 let mut buf = vec![
                     // byte 0: class | version<<4
-                    CLASS_ENUM | (DT_VERSION << 4),
+                    CLASS_ENUM | (version << 4),
                     // bytes 1-3: num_members as 16-bit LE
                     num_members as u8,
                     (num_members >> 8) as u8,
@@ -975,20 +1034,21 @@ impl DatatypeMessage {
                 buf.extend_from_slice(&base_size.to_le_bytes());
 
                 // Properties: base datatype message
-                let base_encoded = base.encode(ctx);
+                let base_encoded = base.encode_at(ctx, libver);
                 buf.extend_from_slice(&base_encoded);
 
-                // Then each member name (null-terminated, padded to 8-byte boundary)
+                // Then each member name, null-terminated. Versions 1 and 2 pad
+                // the field to a multiple of 8 bytes; version 3 dropped the
+                // padding (`H5O__dtype_encode_helper`), so the version the
+                // file's bound picked decides the layout here.
                 for member in members {
                     let name_start = buf.len();
                     buf.extend_from_slice(member.name.as_bytes());
                     buf.push(0);
-                    // Pad name field (including null) to 8-byte boundary
-                    let name_field_len = buf.len() - name_start;
-                    let padded = (name_field_len + 7) & !7;
-                    let pad = padded - name_field_len;
-                    if pad > 0 {
-                        buf.extend_from_slice(&vec![0u8; pad]);
+                    if version < 3 {
+                        let name_field_len = buf.len() - name_start;
+                        let padded = (name_field_len + 7) & !7;
+                        buf.resize(name_start + padded, 0);
                     }
                 }
                 // Then all values contiguously
@@ -1008,7 +1068,7 @@ impl DatatypeMessage {
 
                 let mut buf = vec![
                     // byte 0: class 9 | version<<4
-                    CLASS_VLEN | (DT_VERSION << 4),
+                    CLASS_VLEN | (version << 4),
                     // bytes 1-3: flags
                     // byte 1 bits 0-3: type = 1 (string)
                     //         bits 4-7: padding type
@@ -1028,7 +1088,7 @@ impl DatatypeMessage {
                     padding: 0,
                     charset: *charset,
                 };
-                let base_encoded = base_type.encode(ctx);
+                let base_encoded = base_type.encode_at(ctx, libver);
                 buf.extend_from_slice(&base_encoded);
 
                 buf
@@ -1045,7 +1105,7 @@ impl DatatypeMessage {
 
                 let mut buf = vec![
                     // byte 0: class 9 | version<<4
-                    CLASS_VLEN | (DT_VERSION << 4),
+                    CLASS_VLEN | (version << 4),
                     // byte 1 bits 0-3: type = 0 (sequence)
                     0x00,
                     // bytes 2-3: reserved (no charset/pad for sequences)
@@ -1057,14 +1117,14 @@ impl DatatypeMessage {
                 buf.extend_from_slice(&vlen_size.to_le_bytes());
 
                 // Properties: base (parent) datatype message, recursive.
-                let base_encoded = base.encode(ctx);
+                let base_encoded = base.encode_at(ctx, libver);
                 buf.extend_from_slice(&base_encoded);
 
                 buf
             }
             Self::Array { dims, base } => {
-                // Array: class 10, version 3
-                let version: u8 = 3;
+                // message_version keeps this at ARRAY_ENCODED_VERSION or
+                // above: no dimension permutations follow the sizes.
                 let base_size = base.element_size();
                 let product = dims.iter().fold(1u32, |acc, &d| acc.saturating_mul(d));
                 let total_size = product.saturating_mul(base_size);
@@ -1091,21 +1151,23 @@ impl DatatypeMessage {
                 }
 
                 // base datatype message (recursive)
-                let base_encoded = base.encode(ctx);
+                let base_encoded = base.encode_at(ctx, libver);
                 buf.extend_from_slice(&base_encoded);
 
                 buf
             }
             Self::Reference { size, kind } => {
-                // Class 7, version 1, no properties: the whole message is the
-                // 8-byte header, with the reference type in the bit field's
-                // low nibble and — for the 1.12 kinds — the encoding version
-                // in the next one (`H5O__dtype_encode_helper`).
+                // Class 7, no properties: the whole message is the 8-byte
+                // header, with the reference type in the bit field's low
+                // nibble and — for the 1.12 kinds — the encoding version in
+                // the next one (`H5O__dtype_encode_helper`). The message
+                // version is 1 for the old kinds and 4 for the 1.12 ones,
+                // which `message_version` already settled.
                 let mut flags0 = kind.code();
                 if kind.is_revised() {
                     flags0 |= REFERENCE_ENCODE_VERSION << 4;
                 }
-                let mut buf = vec![CLASS_REFERENCE | (1 << 4), flags0, 0, 0];
+                let mut buf = vec![CLASS_REFERENCE | (version << 4), flags0, 0, 0];
                 buf.extend_from_slice(&size.to_le_bytes());
                 buf
             }
@@ -1147,19 +1209,14 @@ impl DatatypeMessage {
 
         // libhdf5 validates the message version once, before dispatching on
         // the class (`H5O__dtype_decode_helper`): anything outside
-        // 1..=H5O_DTYPE_VERSION_LATEST is a bad message. Versions 1-4 share
-        // every property layout decoded below — the version only selects the
+        // 1..=H5O_DTYPE_VERSION_LATEST is a bad message. Every version shares
+        // the property layouts decoded below — the version only selects the
         // name padding, the compound offset width and the array reserved
-        // fields — so no class repeats the range check. Version 5 is the
-        // HDF5 2.0 encoding introduced for complex numbers; a v5 message is
-        // well-formed but not one this crate reads yet.
+        // fields. Version 5 is the HDF5 2.0 encoding, and all it added was
+        // the complex-number class, which the class dispatch below refuses on
+        // its own; a v5 compound or array is byte-identical to a v4 one.
         if !(1..=DT_VERSION_LATEST).contains(&version) {
             return Err(FormatError::InvalidVersion(version));
-        }
-        if version > DT_VERSION_MAX_SUPPORTED {
-            return Err(FormatError::UnsupportedFeature(format!(
-                "datatype message version {version}"
-            )));
         }
 
         match class {
@@ -1975,11 +2032,12 @@ mod tests {
         msg
     }
 
-    /// Versions 1-4 share the property layout of every class this crate
-    /// decodes, so a v4-tagged message — what libhdf5 emits under a
-    /// `H5F_LIBVER_V112` or later low bound — must decode, not be rejected.
+    /// Every version shares the property layout of every class this crate
+    /// decodes, so a v4- or v5-tagged message — what libhdf5 emits under a
+    /// `H5F_LIBVER_V112` or `H5F_LIBVER_V200` low bound — must decode, not be
+    /// rejected.
     #[test]
-    fn decode_accepts_version_4() {
+    fn decode_accepts_versions_4_and_5() {
         for msg in [
             DatatypeMessage::u32_type(),
             DatatypeMessage::f64_type(),
@@ -1997,10 +2055,12 @@ mod tests {
             DatatypeMessage::vlen_string_utf8(),
             DatatypeMessage::vlen_bytes(),
         ] {
-            let v4 = with_version(msg.encode(&ctx()), 4);
-            let (decoded, _) = DatatypeMessage::decode(&v4, &ctx())
-                .unwrap_or_else(|e| panic!("v4 {msg} rejected: {e:?}"));
-            assert_eq!(decoded, msg, "v4 {msg} decoded differently");
+            for version in [4u8, 5] {
+                let tagged = with_version(msg.encode(&ctx()), version);
+                let (decoded, _) = DatatypeMessage::decode(&tagged, &ctx())
+                    .unwrap_or_else(|e| panic!("v{version} {msg} rejected: {e:?}"));
+                assert_eq!(decoded, msg, "v{version} {msg} decoded differently");
+            }
         }
     }
 
@@ -2029,15 +2089,21 @@ mod tests {
         assert_eq!(decoded, msg);
     }
 
-    /// Version 5 is the HDF5 2.0 encoding; it is legal on the wire, so the
-    /// error must name it as unsupported rather than claim a bad version.
+    /// All version 5 — the HDF5 2.0 encoding — added is the complex-number
+    /// class, so what a v5 message can carry that a v4 one cannot is refused
+    /// by class, naming class 11 rather than the version.
     #[test]
-    fn decode_reports_version_5_as_unsupported() {
-        let v5 = with_version(DatatypeMessage::u32_type().encode(&ctx()), 5);
-        let err = DatatypeMessage::decode(&v5, &ctx()).unwrap_err();
+    fn decode_reports_the_complex_class_as_unsupported() {
+        // A v5 rectangular complex over an 8-byte float: class 11
+        // (`H5T_COMPLEX`), the homogeneous bit set, base type in the
+        // properties.
+        let mut msg = vec![11 | (5 << 4), 0x01, 0, 0];
+        msg.extend_from_slice(&16u32.to_le_bytes());
+        msg.extend_from_slice(&DatatypeMessage::f64_type().encode(&ctx()));
+        let err = DatatypeMessage::decode(&msg, &ctx()).unwrap_err();
         assert!(
             matches!(&err, FormatError::UnsupportedFeature(m)
-                     if m == "datatype message version 5"),
+                     if m == "datatype class 11"),
             "unexpected error: {err:?}"
         );
     }
@@ -2492,5 +2558,206 @@ mod tests {
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded, msg);
         assert_eq!(msg.element_size(), 80); // 10 * 8
+    }
+
+    // ---- libver bounds pick the message version ----
+
+    fn xy_compound() -> DatatypeMessage {
+        DatatypeMessage::compound(
+            8,
+            vec![
+                CompoundMember {
+                    name: "x".to_string(),
+                    offset: 0,
+                    datatype: DatatypeMessage::f32_type(),
+                },
+                CompoundMember {
+                    name: "y".to_string(),
+                    offset: 4,
+                    datatype: DatatypeMessage::f32_type(),
+                },
+            ],
+        )
+    }
+
+    /// The version each class carries at each low libver bound.
+    ///
+    /// Measured from libhdf5 1.14.6 (`h5debug` on files h5py wrote with
+    /// `libver=` earliest / v108 / v112 / latest):
+    ///
+    /// ```text
+    ///             compound  enum  array  int  vlen(i32)
+    ///  earliest      1        1     2      1      1
+    ///  v108          3        3     3      1      1
+    ///  v112          4        4     4      1      1
+    ///  latest        4        4     4      1      1
+    /// ```
+    ///
+    /// This encoder deviates in the earliest column: it writes the version-3
+    /// member layout for compound and array (unpadded names, minimum-width
+    /// offsets, no dimension permutations) rather than the version-1/2 one,
+    /// so those two never claim less than 3. Every 1.8+ library reads that,
+    /// and it keeps the default output byte-identical to what this crate has
+    /// always written. Every other cell matches libhdf5 exactly, including
+    /// the two that matter most: an integer never moves off version 1, and a
+    /// vlen inherits its parent instead of the bound.
+    #[test]
+    fn message_version_follows_the_libver_bound() {
+        let cases: [(LibverBound, [u8; 5]); 6] = [
+            (LibverBound::Earliest, [3, 1, 3, 1, 1]),
+            (LibverBound::V18, [3, 3, 3, 1, 1]),
+            (LibverBound::V110, [3, 3, 3, 1, 1]),
+            (LibverBound::V112, [4, 4, 4, 1, 1]),
+            (LibverBound::V114, [4, 4, 4, 1, 1]),
+            (LibverBound::V200, [5, 5, 5, 1, 1]),
+        ];
+        for (bound, expected) in cases {
+            let got = [
+                xy_compound().message_version(bound),
+                DatatypeMessage::bool_type().message_version(bound),
+                DatatypeMessage::array(vec![3], DatatypeMessage::i32_type()).message_version(bound),
+                DatatypeMessage::i32_type().message_version(bound),
+                DatatypeMessage::VarLenSequence {
+                    base: Box::new(DatatypeMessage::i32_type()),
+                }
+                .message_version(bound),
+            ];
+            assert_eq!(got, expected, "{bound:?}");
+        }
+    }
+
+    /// A compound is at least as new as its newest member (H5Tcompound.c),
+    /// and an array at least as new as its base — even at the earliest bound,
+    /// where a revised reference drags the whole message to version 4.
+    #[test]
+    fn a_composite_is_at_least_as_new_as_what_it_holds() {
+        let stdref = DatatypeMessage::Reference {
+            size: 8,
+            kind: ReferenceKind::Object2,
+        };
+        let compound = DatatypeMessage::compound(
+            12,
+            vec![
+                CompoundMember {
+                    name: "id".to_string(),
+                    offset: 0,
+                    datatype: DatatypeMessage::i32_type(),
+                },
+                CompoundMember {
+                    name: "to".to_string(),
+                    offset: 4,
+                    datatype: stdref.clone(),
+                },
+            ],
+        );
+        assert_eq!(compound.message_version(LibverBound::Earliest), 4);
+        let array = DatatypeMessage::array(vec![2], stdref.clone());
+        assert_eq!(array.message_version(LibverBound::Earliest), 4);
+        // A vlen takes its parent's version rather than the bound's, so it
+        // reaches 4 through the reference and stays at 1 over an integer.
+        let vlen = DatatypeMessage::VarLenSequence {
+            base: Box::new(stdref),
+        };
+        assert_eq!(vlen.message_version(LibverBound::V112), 4);
+    }
+
+    /// `H5T_STD_REF` is born at version 4 and `H5T__upgrade_version_cb`
+    /// leaves references alone, so the 1.12 kinds sit at 4 under every bound
+    /// while the old kinds sit at 1.
+    #[test]
+    fn reference_versions_ignore_the_bound() {
+        for bound in [LibverBound::Earliest, LibverBound::V112, LibverBound::V200] {
+            for kind in [ReferenceKind::Object1, ReferenceKind::DatasetRegion1] {
+                let msg = DatatypeMessage::Reference { size: 8, kind };
+                assert_eq!(msg.message_version(bound), 1, "{kind:?} at {bound:?}");
+                assert_eq!(msg.encode_at(&ctx(), bound)[0] >> 4, 1);
+            }
+            for kind in [
+                ReferenceKind::Object2,
+                ReferenceKind::DatasetRegion2,
+                ReferenceKind::Attr,
+            ] {
+                let msg = DatatypeMessage::Reference { size: 64, kind };
+                assert_eq!(msg.message_version(bound), 4, "{kind:?} at {bound:?}");
+                assert_eq!(msg.encode_at(&ctx(), bound)[0] >> 4, 4);
+            }
+        }
+    }
+
+    /// Version 3 dropped the padding that rounds an enum member name field up
+    /// to a multiple of 8 bytes (`H5O__dtype_encode_helper`), so the bound
+    /// that picks the version picks the layout with it.
+    #[test]
+    fn enum_name_padding_follows_the_message_version() {
+        let msg = DatatypeMessage::bool_type();
+
+        let v1 = msg.encode_at(&ctx(), LibverBound::Earliest);
+        assert_eq!(v1[0] >> 4, 1);
+        // 8 header + 12 base + "FALSE\0" padded to 8 + "TRUE\0" padded to 8
+        // + two 1-byte values.
+        assert_eq!(v1.len(), 8 + 12 + 8 + 8 + 2);
+        assert_eq!(&v1[20..28], b"FALSE\0\0\0");
+        assert_eq!(&v1[28..36], b"TRUE\0\0\0\0");
+
+        let v4 = msg.encode_at(&ctx(), LibverBound::V112);
+        assert_eq!(v4[0] >> 4, 4);
+        assert_eq!(v4.len(), 8 + 12 + 6 + 5 + 2);
+        assert_eq!(&v4[20..26], b"FALSE\0");
+        assert_eq!(&v4[26..31], b"TRUE\0");
+
+        // Both layouts survive a round trip, which is what the reader's
+        // version-dependent padding rule is for.
+        for encoded in [v1, v4] {
+            let (decoded, consumed) = DatatypeMessage::decode(&encoded, &ctx()).unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(decoded, msg);
+        }
+    }
+
+    /// Raising the bound changes the version nibble and nothing else for a
+    /// compound or an array: this encoder already writes the version-3 member
+    /// layout, which versions 4 and 5 kept unchanged.
+    #[test]
+    fn a_higher_bound_moves_only_the_version_nibble() {
+        for msg in [
+            xy_compound(),
+            DatatypeMessage::array(vec![2, 3], DatatypeMessage::i32_type()),
+        ] {
+            let base = msg.encode_at(&ctx(), LibverBound::Earliest);
+            for (bound, version) in [(LibverBound::V112, 4u8), (LibverBound::V200, 5)] {
+                let raised = msg.encode_at(&ctx(), bound);
+                assert_eq!(raised[0] >> 4, version);
+                assert_eq!(raised[1..], base[1..], "{msg} at {bound:?}");
+                let (decoded, consumed) = DatatypeMessage::decode(&raised, &ctx()).unwrap();
+                assert_eq!(consumed, raised.len());
+                assert_eq!(decoded, msg);
+            }
+        }
+    }
+
+    /// The default bound is libhdf5's own default, and `encode` is exactly
+    /// `encode_at` at that bound — the guarantee that adding the bound
+    /// changed no file this crate already wrote.
+    #[test]
+    fn the_default_bound_encodes_what_encode_always_did() {
+        assert_eq!(LibverBound::default(), LibverBound::Earliest);
+        for msg in [
+            xy_compound(),
+            DatatypeMessage::bool_type(),
+            DatatypeMessage::array(vec![4], DatatypeMessage::f64_type()),
+            DatatypeMessage::i32_type(),
+            DatatypeMessage::vlen_string_utf8(),
+            DatatypeMessage::vlen_bytes(),
+            DatatypeMessage::fixed_string(8),
+        ] {
+            assert_eq!(
+                msg.encode(&ctx()),
+                msg.encode_at(&ctx(), Default::default())
+            );
+            assert_eq!(
+                msg.encode(&ctx())[0] >> 4,
+                msg.message_version(LibverBound::Earliest)
+            );
+        }
     }
 }
