@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::format::btree_v1::{BTreeV1Node, ChunkBTreeV1Node};
+use crate::format::btree_v1::{BTreeV1Config, BTreeV1Node, ChunkBTreeV1Node};
 use crate::format::bytes::read_le_uint as read_uint;
 use crate::format::fractal_heap::{self, BlockReader, FractalHeapHeader};
 use crate::format::global_heap::{
@@ -25,8 +25,12 @@ use crate::format::messages::link::LinkMessage;
 use crate::format::messages::link::LinkTarget;
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::shared::MSG_FLAG_SHARED;
+use crate::format::messages::superblock_ext::{
+    BtreeKMessage, DriverInfoMessage, FileSpaceInfoMessage, SharedMessageTableMessage,
+};
 use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
+use crate::format::sohm::SohmMasterTable;
 use crate::format::superblock::{
     detect_superblock_version, SuperblockV0V1, SuperblockV2V3, SymbolTableCache,
 };
@@ -37,7 +41,7 @@ use crate::io::file_handle::FileHandle;
 #[cfg(feature = "mmap")]
 use crate::io::file_handle::MmapFileHandle;
 use crate::io::hyperslab::{compute_strides, for_each_contiguous_run};
-use crate::io::IoResult;
+use crate::io::{FileMeta, IoResult};
 
 /// The version-4 chunk-index descriptor pulled from a data-layout message:
 /// the index kind, its address, and the per-kind parameters the reader needs
@@ -288,7 +292,7 @@ struct Catalog {
 /// classified, recorded and descended into.
 struct CatalogWalk<'a> {
     handle: &'a mut FileHandle,
-    ctx: &'a FormatContext,
+    meta: &'a FileMeta,
     catalog: Catalog,
     /// Object headers already descended into, keyed to the first path that
     /// reached them: a later path to the same header is a group hard link,
@@ -303,15 +307,21 @@ impl<'a> CatalogWalk<'a> {
 
     /// Start a walk at the root group's object header address, seeded so a
     /// hard link cycling back to the root is not descended into again.
-    fn new(handle: &'a mut FileHandle, ctx: &'a FormatContext, root_addr: u64) -> Self {
+    fn new(handle: &'a mut FileHandle, meta: &'a FileMeta, root_addr: u64) -> Self {
         let mut visited = std::collections::HashMap::new();
         visited.insert(root_addr, String::new());
         Self {
             handle,
-            ctx,
+            meta,
             catalog: Catalog::default(),
             visited,
         }
+    }
+
+    /// The address/length widths, which most of the walk needs and `meta`
+    /// carries alongside the file's B-tree ranks and shared-message table.
+    fn ctx(&self) -> &FormatContext {
+        &self.meta.ctx
     }
 
     fn finish(self) -> Catalog {
@@ -348,7 +358,7 @@ impl<'a> CatalogWalk<'a> {
         let (btree_addr, heap_addr) = match stab {
             Some(pair) if pair.0 != UNDEF_ADDR && pair.1 != UNDEF_ADDR => pair,
             _ => header.map_or((UNDEF_ADDR, UNDEF_ADDR), |h| {
-                Hdf5Reader::stab_from_header(h, self.ctx)
+                Hdf5Reader::stab_from_header(h, self.ctx())
             }),
         };
         if btree_addr != UNDEF_ADDR && heap_addr != UNDEF_ADDR {
@@ -371,16 +381,14 @@ impl<'a> CatalogWalk<'a> {
         let mut links: Vec<LinkMessage> = Vec::new();
         for msg in &header.messages {
             if msg.msg_type == MSG_LINK {
-                let (link, _) = LinkMessage::decode(&msg.data, self.ctx)?;
+                let (link, _) = LinkMessage::decode(&msg.data, self.ctx())?;
                 links.push(link);
             } else if msg.msg_type == MSG_LINK_INFO {
-                let (info, _) = LinkInfoMessage::decode(&msg.data, self.ctx)?;
+                let (info, _) = LinkInfoMessage::decode(&msg.data, self.ctx())?;
                 if info.fractal_heap_address != UNDEF_ADDR {
-                    let dense = Hdf5Reader::read_dense_links(
-                        self.handle,
-                        self.ctx,
-                        info.fractal_heap_address,
-                    )?;
+                    let ctx = self.meta.ctx;
+                    let dense =
+                        Hdf5Reader::read_dense_links(self.handle, &ctx, info.fractal_heap_address)?;
                     links.extend(dense);
                 }
             }
@@ -410,8 +418,8 @@ impl<'a> CatalogWalk<'a> {
         prefix: &str,
         depth: usize,
     ) -> IoResult<()> {
-        let sa = self.ctx.sizeof_addr as usize;
-        let ss = self.ctx.sizeof_size as usize;
+        let sa = self.ctx().sizeof_addr as usize;
+        let ss = self.ctx().sizeof_size as usize;
 
         // Read the local heap header + data for this group.
         let heap_hdr_buf = self.handle.read_at_most(heap_addr, 64)?;
@@ -424,16 +432,19 @@ impl<'a> CatalogWalk<'a> {
         let mut snod_tree_visited = std::collections::HashSet::new();
         let snod_addrs = Hdf5Reader::collect_snod_addresses(
             self.handle,
+            self.meta,
             btree_addr,
-            sa,
-            ss,
             0,
             &mut snod_tree_visited,
         )?;
 
+        // A symbol-table node is a fixed-size record sized by `sym_leaf_k`,
+        // which the superblock extension may have overridden.
+        let snod_size = self.meta.btree.symbol_table_node_size(sa, ss);
         for snod_addr in snod_addrs {
-            let snod_buf = self.handle.read_at_most(snod_addr, 8192)?;
-            let snod = SymbolTableNode::decode(&snod_buf, sa, ss)?;
+            let snod_buf = self.handle.read_at_most(snod_addr, snod_size)?;
+            let snod =
+                SymbolTableNode::decode(&snod_buf, sa, ss, self.meta.btree.sym_leaf_max_entries())?;
 
             for entry in &snod.entries {
                 let name = local_heap_get_string(&heap_data, entry.name_offset)?;
@@ -484,7 +495,7 @@ impl<'a> CatalogWalk<'a> {
         // comes of reading it: a header that does not decode (a stale link
         // left by a deletion, say) is reported against this name, never
         // dropped from it.
-        let header = match Hdf5Reader::read_object_header_full(self.handle, self.ctx, addr) {
+        let header = match Hdf5Reader::read_object_header_full(self.handle, self.meta, addr) {
             Ok(h) => h,
             Err(e) => {
                 self.catalog
@@ -493,7 +504,7 @@ impl<'a> CatalogWalk<'a> {
                 return Ok(());
             }
         };
-        match Hdf5Reader::classify_object(self.handle, &header, self.ctx, &full_name) {
+        match Hdf5Reader::classify_object(self.handle, &header, self.meta, &full_name) {
             ObjectKind::Dataset(info) => {
                 self.catalog.datasets.push(*info);
                 return Ok(());
@@ -521,7 +532,7 @@ impl<'a> CatalogWalk<'a> {
         let mut attrs = Vec::new();
         for m in &header.messages {
             if m.msg_type == MSG_ATTRIBUTE {
-                if let Ok((a, _)) = AttributeMessage::decode(&m.data, self.ctx) {
+                if let Ok((a, _)) = AttributeMessage::decode(&m.data, self.ctx()) {
                     attrs.push(a);
                 }
             }
@@ -624,10 +635,32 @@ enum RootGroupInfo {
     },
 }
 
+/// Everything the superblock extension object header contributes to the
+/// file-level view.
+///
+/// `H5Fsuper.c::H5F__super_read` opens this header immediately after decoding
+/// the superblock, before any user object is reachable, so every message here
+/// is in force for the first metadata decode that follows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SuperblockExtension {
+    /// Shared Message Table message (0x000F): where the SOHM master table is.
+    pub shared_message_table: Option<SharedMessageTableMessage>,
+    /// v1 B-tree "K" values message (0x0013): non-default split ranks.
+    pub btree_k: Option<BtreeKMessage>,
+    /// Driver info message (0x0014).
+    pub driver_info: Option<DriverInfoMessage>,
+    /// File space info message (0x0017): allocation strategy, page size, and
+    /// the persisted free-space manager addresses.
+    pub file_space_info: Option<FileSpaceInfoMessage>,
+}
+
 /// HDF5 file reader.
 pub struct Hdf5Reader {
     handle: FileHandle,
-    ctx: FormatContext,
+    meta: FileMeta,
+    /// Messages read from the superblock extension object header, empty when
+    /// the file has no extension.
+    ext: SuperblockExtension,
     /// End-of-file address from the superblock.
     _eof: u64,
     #[allow(dead_code)]
@@ -866,8 +899,11 @@ impl Hdf5Reader {
     pub fn open_mmap(path: &Path) -> IoResult<(Self, MmapFileHandle)> {
         // Open normally first to parse metadata
         let reader = Self::open(path)?;
-        // Also open an mmap handle for zero-copy data access
-        let mmap = MmapFileHandle::open(path)?;
+        // Also open an mmap handle for zero-copy data access, in the same
+        // address space the reader located the superblock in — otherwise every
+        // address read through the mmap would be short by the userblock.
+        let mut mmap = MmapFileHandle::open(path)?;
+        mmap.set_base(reader.userblock_size());
         Ok((reader, mmap))
     }
 
@@ -907,7 +943,18 @@ impl Hdf5Reader {
         path: &Path,
         locking: crate::io::locking::FileLocking,
     ) -> IoResult<Self> {
-        let handle = FileHandle::open_read_with_locking(path, locking)?;
+        let mut handle = FileHandle::open_read_with_locking(path, locking)?;
+
+        // The superblock is not necessarily at the start of the file: a
+        // userblock precedes it, and `H5FD_locate_signature` finds it by
+        // probing offset 0 and then every power of two from 512 up. The offset
+        // it is found at is where HDF5 addresses are measured from, so it
+        // becomes the handle's base address and every later offset — including
+        // the superblock read just below — is relative to it.
+        let super_addr = handle
+            .locate_signature()?
+            .ok_or(crate::format::FormatError::InvalidSignature)?;
+        handle.set_base(super_addr);
 
         // Read enough bytes to detect the superblock version and parse it.
         let sb_buf = handle.read_at_most(0, 1024)?;
@@ -935,15 +982,25 @@ impl Hdf5Reader {
             sizeof_size: sb.sizeof_lengths,
         };
 
+        // A v2/v3 superblock has no room for the B-tree K values, so they are
+        // the library defaults unless the extension carries the K message.
+        let (meta, ext) = Self::read_extension_and_meta(
+            &mut handle,
+            ctx,
+            BTreeV1Config::default(),
+            sb.superblock_extension_address,
+        )?;
+
         // Read root group object header, following continuation blocks.
         let root_header =
-            Self::read_object_header_full(&mut handle, &ctx, sb.root_group_object_header_address)?;
+            Self::read_object_header_full(&mut handle, &meta, sb.root_group_object_header_address)?;
 
         // Walk the root group to discover datasets, group attributes, and
-        // every group path that exists.
+        // every group path that exists, from whichever storage each group's
+        // own header declares.
         let catalog = Self::build_catalog(
             &mut handle,
-            &ctx,
+            &meta,
             Some(&root_header),
             sb.root_group_object_header_address,
             None,
@@ -961,7 +1018,8 @@ impl Hdf5Reader {
 
         Ok(Self {
             handle,
-            ctx,
+            meta,
+            ext,
             _eof: sb.end_of_file_address,
             root_group_info: RootGroupInfo::V2V3 {
                 root_group_object_header_address: sb.root_group_object_header_address,
@@ -990,13 +1048,30 @@ impl Hdf5Reader {
             sizeof_size: sb.sizeof_lengths,
         };
 
+        // A v0/v1 superblock carries the K values itself; a v0 superblock has
+        // no chunk-tree field, so that one keeps the library default. The
+        // extension's K message, when present, overrides all three.
+        let sb_btree = BTreeV1Config {
+            sym_leaf_k: sb.sym_leaf_k,
+            snode_internal_k: sb.btree_internal_k,
+            chunk_internal_k: sb
+                .indexed_storage_k
+                .unwrap_or(BTreeV1Config::default().chunk_internal_k),
+        };
+        let (meta, ext) = Self::read_extension_and_meta(
+            &mut handle,
+            ctx,
+            sb_btree,
+            sb.superblock_extension_address,
+        )?;
+
         let ste = &sb.root_symbol_table_entry;
         let root_obj_addr = ste.obj_header_addr;
         let ste_stab = ste.cached_symbol_table();
         let (ste_btree_addr, ste_heap_addr) = ste_stab.unwrap_or((UNDEF_ADDR, UNDEF_ADDR));
 
         // Read the root group's object header (following continuations).
-        let root_hdr = Self::read_object_header_full(&mut handle, &ctx, root_obj_addr).ok();
+        let root_hdr = Self::read_object_header_full(&mut handle, &meta, root_obj_addr).ok();
 
         // Collect the root group's own attributes.
         let mut root_attributes = Vec::new();
@@ -1015,10 +1090,12 @@ impl Hdf5Reader {
         // express) carries `Link` / `Link Info` messages in its object
         // header, and the superblock symbol-table scratch-pad is then stale.
         // The walk picks the storage from the header for that reason, taking
-        // the scratch-pad only as the symbol-table addresses.
+        // the scratch-pad only as the symbol-table addresses — and only for a
+        // symbol-table root group (`H5G_CACHED_STAB`), which is the one cache
+        // type those two addresses mean anything for.
         let catalog = Self::build_catalog(
             &mut handle,
-            &ctx,
+            &meta,
             root_hdr.as_ref(),
             root_obj_addr,
             ste_stab,
@@ -1026,7 +1103,8 @@ impl Hdf5Reader {
 
         Ok(Self {
             handle,
-            ctx,
+            meta,
+            ext,
             _eof: sb.end_of_file_address,
             root_group_info: RootGroupInfo::V0V1 {
                 root_obj_header_addr: root_obj_addr,
@@ -1046,6 +1124,128 @@ impl Hdf5Reader {
             external: Default::default(),
             external_resolved: Default::default(),
         })
+    }
+
+    /// Read the superblock extension object header at `ext_addr` (if any) and
+    /// fold what it says into the file-level decode parameters.
+    ///
+    /// `sb_btree` is what the superblock alone implies; the extension's
+    /// v1-B-tree-"K" message replaces all three ranks when present, exactly as
+    /// `H5F__super_read` does after `H5O_msg_read(&ext_loc, H5O_BTREEK_ID)`.
+    pub(crate) fn read_extension_and_meta(
+        handle: &mut FileHandle,
+        ctx: FormatContext,
+        sb_btree: BTreeV1Config,
+        ext_addr: u64,
+    ) -> IoResult<(FileMeta, SuperblockExtension)> {
+        let mut meta = FileMeta {
+            ctx,
+            btree: sb_btree,
+            sohm: None,
+        };
+        let ext = Self::superblock_extension_at(handle, ctx, sb_btree, ext_addr)?;
+        if let Some(k) = ext.btree_k {
+            meta.btree = BTreeV1Config {
+                sym_leaf_k: k.sym_leaf_k,
+                snode_internal_k: k.snode_internal_k,
+                chunk_internal_k: k.chunk_internal_k,
+            };
+        }
+        // A zero rank would make every v1 B-tree node zero-sized and every
+        // symbol-table node hold no entries; libhdf5 rejects it at creation
+        // (`H5Pset_sym_k`, `H5Pset_istore_k`), so a file carrying one is
+        // corrupt rather than merely unusual.
+        let b = &meta.btree;
+        if b.sym_leaf_k == 0 || b.snode_internal_k == 0 || b.chunk_internal_k == 0 {
+            return Err(crate::io::IoError::Format(
+                crate::format::FormatError::InvalidData(format!(
+                    "v1 B-tree K values must be non-zero (sym_leaf={}, snode={}, chunk={})",
+                    b.sym_leaf_k, b.snode_internal_k, b.chunk_internal_k
+                )),
+            ));
+        }
+        // `H5F__super_read` calls `H5SM_get_info` here, so the shared-message
+        // table is in place before the root group — the first object header
+        // that can hold a shared message — is opened.
+        if let Some(smt) = &ext.shared_message_table {
+            meta.sohm = Some(Self::read_sohm_table(handle, &meta.ctx, smt)?);
+        }
+        Ok((meta, ext))
+    }
+
+    /// The superblock extension's messages, for the address the superblock
+    /// names. Yields the default (every field `None`) when there is no
+    /// extension.
+    ///
+    /// The extension header is read with the pre-extension parameters: its own
+    /// messages are never shared and never in a v1 B-tree, so nothing it
+    /// contains is needed to decode it. This is also how the writer's append
+    /// path learns what the file declares before it rewrites anything.
+    pub(crate) fn superblock_extension_at(
+        handle: &mut FileHandle,
+        ctx: FormatContext,
+        btree: BTreeV1Config,
+        ext_addr: u64,
+    ) -> IoResult<SuperblockExtension> {
+        if ext_addr == UNDEF_ADDR || ext_addr == 0 {
+            return Ok(SuperblockExtension::default());
+        }
+        let meta = FileMeta {
+            ctx,
+            btree,
+            sohm: None,
+        };
+        Self::read_superblock_extension(handle, &meta, ext_addr)
+    }
+
+    /// Decode the messages of the superblock extension object header.
+    ///
+    /// Upstream reads each of these with `H5O_msg_exists` + `H5O_msg_read` and
+    /// fails the open when one is present but undecodable; a message this
+    /// crate does not model is skipped, as an unknown non-critical message is
+    /// elsewhere.
+    fn read_superblock_extension(
+        handle: &mut FileHandle,
+        meta: &FileMeta,
+        addr: u64,
+    ) -> IoResult<SuperblockExtension> {
+        let header = Self::read_object_header_full(handle, meta, addr)?;
+        let ctx = &meta.ctx;
+        let mut ext = SuperblockExtension::default();
+        for msg in &header.messages {
+            match msg.msg_type {
+                MSG_SHARED_MESSAGE_TABLE => {
+                    ext.shared_message_table =
+                        Some(SharedMessageTableMessage::decode(&msg.data, ctx)?);
+                }
+                MSG_BTREE_K => ext.btree_k = Some(BtreeKMessage::decode(&msg.data)?),
+                MSG_DRIVER_INFO => ext.driver_info = Some(DriverInfoMessage::decode(&msg.data)?),
+                MSG_FILE_SPACE_INFO => {
+                    ext.file_space_info = Some(FileSpaceInfoMessage::decode(&msg.data, ctx)?);
+                }
+                _ => {}
+            }
+        }
+        Ok(ext)
+    }
+
+    /// Read the SOHM master table named by the extension's shared-message
+    /// table message.
+    ///
+    /// The table's length is not stored with it: the index count comes from
+    /// the message, exactly as `H5SM__cache_table_get_final_load_size` takes it
+    /// from `H5F_SOHM_NINDEXES`.
+    fn read_sohm_table(
+        handle: &mut FileHandle,
+        ctx: &FormatContext,
+        smt: &SharedMessageTableMessage,
+    ) -> IoResult<SohmMasterTable> {
+        if smt.table_address == UNDEF_ADDR || smt.nindexes == 0 {
+            return Ok(SohmMasterTable::default());
+        }
+        let size = SohmMasterTable::encoded_size(ctx, smt.nindexes);
+        let buf = handle.read_at(smt.table_address, size)?;
+        Ok(SohmMasterTable::decode(&buf, ctx, smt.nindexes)?)
     }
 
     /// Extract the symbol-table message (btree_addr, heap_addr) from an
@@ -1069,12 +1269,12 @@ impl Hdf5Reader {
     /// cached B-tree and local heap, which is enough to list a legacy file.
     fn build_catalog(
         handle: &mut FileHandle,
-        ctx: &FormatContext,
+        meta: &FileMeta,
         root_header: Option<&ObjectHeader>,
         root_addr: u64,
         root_stab: Option<(u64, u64)>,
     ) -> IoResult<Catalog> {
-        let mut walk = CatalogWalk::new(handle, ctx, root_addr);
+        let mut walk = CatalogWalk::new(handle, meta, root_addr);
         walk.group(root_header, "", 0, root_stab)?;
         Ok(walk.finish())
     }
@@ -1140,12 +1340,13 @@ impl Hdf5Reader {
     /// Recursively walk a B-tree v1 to collect leaf-level SNOD addresses.
     fn collect_snod_addresses(
         handle: &mut FileHandle,
+        meta: &FileMeta,
         tree_addr: u64,
-        sizeof_addr: usize,
-        sizeof_size: usize,
         depth: usize,
         visited: &mut std::collections::HashSet<u64>,
     ) -> IoResult<Vec<u64>> {
+        let sizeof_addr = meta.ctx.sizeof_addr as usize;
+        let sizeof_size = meta.ctx.sizeof_size as usize;
         // A well-formed v1 B-tree's level strictly decreases with depth;
         // bound the descent so a corrupt/cyclic tree cannot recurse forever.
         // The `visited` set additionally stops a corrupt tree whose child
@@ -1153,8 +1354,17 @@ impl Hdf5Reader {
         if depth > 256 || !visited.insert(tree_addr) {
             return Ok(Vec::new());
         }
-        let buf = handle.read_at_most(tree_addr, 8192)?;
-        let node = BTreeV1Node::decode(&buf, sizeof_addr, sizeof_size)?;
+        // A v1 B-tree node is a fixed-size record whose length follows from
+        // the file's K values; reading exactly that much also bounds what a
+        // corrupt address can pull in.
+        let node_size = meta.btree.snode_btree_node_size(sizeof_addr, sizeof_size);
+        let buf = handle.read_at_most(tree_addr, node_size)?;
+        let node = BTreeV1Node::decode(
+            &buf,
+            sizeof_addr,
+            sizeof_size,
+            meta.btree.snode_max_entries(),
+        )?;
 
         if node.level == 0 {
             // Leaf level: children are SNOD addresses
@@ -1163,14 +1373,8 @@ impl Hdf5Reader {
             // Internal level: children are sub-TREE addresses
             let mut addrs = Vec::new();
             for &child_addr in &node.children {
-                let child_addrs = Self::collect_snod_addresses(
-                    handle,
-                    child_addr,
-                    sizeof_addr,
-                    sizeof_size,
-                    depth + 1,
-                    visited,
-                )?;
+                let child_addrs =
+                    Self::collect_snod_addresses(handle, meta, child_addr, depth + 1, visited)?;
                 addrs.extend(child_addrs);
             }
             Ok(addrs)
@@ -1178,14 +1382,15 @@ impl Hdf5Reader {
     }
 
     /// Read the object header at `addr` with every continuation block
-    /// flattened in. One owner for both halves of the crate — see
+    /// flattened in and every stored-shared message resolved to its literal
+    /// body. One owner for both halves of the crate — see
     /// [`crate::io::object_header_io`].
     fn read_object_header_full(
         handle: &mut FileHandle,
-        ctx: &FormatContext,
+        meta: &FileMeta,
         addr: u64,
     ) -> IoResult<ObjectHeader> {
-        crate::io::object_header_io::read_object_header_full(handle, ctx, addr)
+        crate::io::object_header_io::read_object_header_full(handle, meta, addr)
     }
 
     /// Read a committed datatype object's type and attributes from its header.
@@ -1196,7 +1401,7 @@ impl Hdf5Reader {
     fn committed_datatype(
         handle: &mut FileHandle,
         header: &ObjectHeader,
-        ctx: &FormatContext,
+        meta: &FileMeta,
     ) -> CommittedDatatypeInfo {
         let datatype = header
             .messages
@@ -1205,7 +1410,7 @@ impl Hdf5Reader {
             .cloned()
             .ok_or_else(|| "it holds no datatype message".to_string())
             .and_then(|m| {
-                crate::io::object_header_io::read_datatype_message(handle, ctx, &m).map_err(|e| {
+                crate::io::object_header_io::read_datatype_message(handle, meta, &m).map_err(|e| {
                     match e {
                         crate::io::IoError::Unsupported(why) => why,
                         other => format!("its datatype message does not decode: {other}"),
@@ -1216,7 +1421,11 @@ impl Hdf5Reader {
             .messages
             .iter()
             .filter(|m| m.msg_type == MSG_ATTRIBUTE && m.flags & MSG_FLAG_SHARED == 0)
-            .filter_map(|m| AttributeMessage::decode(&m.data, ctx).ok().map(|(a, _)| a))
+            .filter_map(|m| {
+                AttributeMessage::decode(&m.data, &meta.ctx)
+                    .ok()
+                    .map(|(a, _)| a)
+            })
             .collect();
         CommittedDatatypeInfo {
             datatype,
@@ -1239,9 +1448,10 @@ impl Hdf5Reader {
     fn classify_object(
         handle: &mut FileHandle,
         header: &ObjectHeader,
-        ctx: &FormatContext,
+        meta: &FileMeta,
         name: &str,
     ) -> ObjectKind {
+        let ctx = &meta.ctx;
         let present = |t: u8| header.messages.iter().any(|m| m.msg_type == t);
         let is_group = present(MSG_LINK)
             || present(MSG_LINK_INFO)
@@ -1255,7 +1465,7 @@ impl Hdf5Reader {
         if !is_dataset {
             return if present(MSG_DATATYPE) {
                 ObjectKind::CommittedDatatype(Box::new(Self::committed_datatype(
-                    handle, header, ctx,
+                    handle, header, meta,
                 )))
             } else {
                 ObjectKind::Group
@@ -1298,7 +1508,7 @@ impl Hdf5Reader {
                 // or sits somewhere this crate does not follow, so its wording
                 // is the reason rather than something to wrap.
                 MSG_DATATYPE => {
-                    match crate::io::object_header_io::read_datatype_message(handle, ctx, msg) {
+                    match crate::io::object_header_io::read_datatype_message(handle, meta, msg) {
                         Ok(dt) => datatype = Some(dt),
                         Err(crate::io::IoError::Unsupported(why)) => block(why),
                         Err(e) => block(format!("its datatype message does not decode: {e}")),
@@ -1539,6 +1749,25 @@ impl Hdf5Reader {
             }
         }
         Traversal::Path { path: name, via }
+    }
+
+    /// The messages read from the superblock extension object header. All
+    /// fields are `None` for a file without an extension.
+    pub fn superblock_extension(&self) -> &SuperblockExtension {
+        &self.ext
+    }
+
+    /// Size in bytes of the userblock preceding the superblock: the offset the
+    /// signature was found at, which is also the file's base address. Zero for
+    /// a file without a userblock.
+    pub fn userblock_size(&self) -> u64 {
+        self.handle.base()
+    }
+
+    /// The v1 B-tree split ranks in force for this file, after the superblock
+    /// and the extension's K message have both been applied.
+    pub fn btree_config(&self) -> BTreeV1Config {
+        self.meta.btree
     }
 
     /// Rewrite a path (no leading `/`) into the path of the object it reaches
@@ -1823,7 +2052,7 @@ impl Hdf5Reader {
     /// has none, and this crate's writers put a whole write call's strings
     /// into one collection, which a cap would turn into silent data loss.
     fn read_heap_collection(&mut self, addr: u64) -> IoResult<GlobalHeapCollection> {
-        let ss = self.ctx.sizeof_size as usize;
+        let ss = self.meta.ctx.sizeof_size as usize;
         let header_len = 4 + 1 + 3 + ss;
         let header_buf = self.handle.read_at_most(addr, header_len)?;
         if header_buf.len() < header_len || header_buf[0..4] != *b"GCOL" {
@@ -1839,7 +2068,7 @@ impl Hdf5Reader {
             )));
         }
         let heap_buf = self.handle.read_at(addr, declared)?;
-        let (coll, _) = GlobalHeapCollection::decode(&heap_buf, &self.ctx)?;
+        let (coll, _) = GlobalHeapCollection::decode(&heap_buf, &self.meta.ctx)?;
         Ok(coll)
     }
 
@@ -1859,10 +2088,10 @@ impl Hdf5Reader {
         }
         // Variable-length string: the attribute value is a global-heap
         // reference (sequence length + collection address + object index).
-        if attr.data.len() < vlen_reference_size(&self.ctx) {
+        if attr.data.len() < vlen_reference_size(&self.meta.ctx) {
             return Ok(String::new());
         }
-        let (_seq, coll_addr, obj_index) = decode_vlen_reference(&attr.data, &self.ctx)?;
+        let (_seq, coll_addr, obj_index) = decode_vlen_reference(&attr.data, &self.meta.ctx)?;
         if coll_addr == UNDEF_ADDR || coll_addr == 0 {
             return Ok(String::new());
         }
@@ -2056,25 +2285,34 @@ impl Hdf5Reader {
             sizeof_size: sb.sizeof_lengths,
         };
 
+        // The superblock extension can also have changed under SWMR (a new
+        // free-space or shared-message table), so re-read it before the walk.
+        let (meta, ext) = Self::read_extension_and_meta(
+            &mut self.handle,
+            ctx,
+            self.meta.btree,
+            sb.superblock_extension_address,
+        )?;
+
         // Re-read root group object header, following continuation blocks.
         let root_header = Self::read_object_header_full(
             &mut self.handle,
-            &ctx,
+            &meta,
             sb.root_group_object_header_address,
         )?;
 
-        // Re-scan datasets, group attributes, group paths, and link records
-        // from link messages.
+        // Re-scan datasets, group attributes, group paths, and link records.
         let catalog = Self::build_catalog(
             &mut self.handle,
-            &ctx,
+            &meta,
             Some(&root_header),
             sb.root_group_object_header_address,
             None,
         )?;
 
         self._eof = sb.end_of_file_address;
-        self.ctx = ctx;
+        self.meta = meta;
+        self.ext = ext;
         self.datasets = catalog.datasets;
         self.unreadable = catalog.unreadable;
         self.group_attributes = catalog.group_attributes;
@@ -2344,7 +2582,7 @@ impl Hdf5Reader {
 
         // Read FA header
         let hdr_buf = self.handle.read_at_most(index_address, 256)?;
-        let fa_hdr = FixedArrayHeader::decode(&hdr_buf, &self.ctx)?;
+        let fa_hdr = FixedArrayHeader::decode(&hdr_buf, &self.meta.ctx)?;
 
         if fa_hdr.data_blk_addr == UNDEF_ADDR {
             // Unallocated data block: `output` is already pre-filled.
@@ -2362,7 +2600,7 @@ impl Hdf5Reader {
         }
 
         let is_filtered = fa_hdr.client_id == FA_CLIENT_FILT_CHUNK;
-        let sizeof_addr = self.ctx.sizeof_addr as usize;
+        let sizeof_addr = self.meta.ctx.sizeof_addr as usize;
         // chunk_size_len = element_size - sizeof_addr - filter_mask(4)
         let chunk_size_len = if is_filtered {
             (fa_hdr.element_size as usize)
@@ -2400,7 +2638,7 @@ impl Hdf5Reader {
             let dblk_page_nelmts = fa_hdr.dblk_page_nelmts();
             let prefix_len = 4 + 1 + 1 + sizeof_addr + (npages as usize).div_ceil(8) + 4;
             let prefix_buf = self.handle.read_at_most(fa_hdr.data_blk_addr, prefix_len)?;
-            let prefix = FixedArrayPagedPrefix::decode(&prefix_buf, &self.ctx, npages)?;
+            let prefix = FixedArrayPagedPrefix::decode(&prefix_buf, &self.meta.ctx, npages)?;
 
             let elem_size = if is_filtered {
                 sizeof_addr + chunk_size_len + 4
@@ -2437,13 +2675,17 @@ impl Hdf5Reader {
                 let page_buf = self.handle.read_at_most(page_addr, page_size)?;
 
                 if is_filtered {
-                    let elems =
-                        decode_filtered_page(&page_buf, &self.ctx, page_nelmts, chunk_size_len)?;
+                    let elems = decode_filtered_page(
+                        &page_buf,
+                        &self.meta.ctx,
+                        page_nelmts,
+                        chunk_size_len,
+                    )?;
                     for e in elems {
                         chunk_entries.push((e.address, e.chunk_size, e.filter_mask));
                     }
                 } else {
-                    let addrs = decode_unfiltered_page(&page_buf, &self.ctx, page_nelmts)?;
+                    let addrs = decode_unfiltered_page(&page_buf, &self.meta.ctx, page_nelmts)?;
                     for addr in addrs {
                         chunk_entries.push((addr, chunk_bytes, 0));
                     }
@@ -2462,7 +2704,7 @@ impl Hdf5Reader {
             if is_filtered {
                 let fa_dblk = FixedArrayDataBlock::decode_filtered(
                     &dblk_buf,
-                    &self.ctx,
+                    &self.meta.ctx,
                     num_elmts,
                     chunk_size_len,
                 )?;
@@ -2471,7 +2713,7 @@ impl Hdf5Reader {
                 }
             } else {
                 let fa_dblk =
-                    FixedArrayDataBlock::decode_unfiltered(&dblk_buf, &self.ctx, num_elmts)?;
+                    FixedArrayDataBlock::decode_unfiltered(&dblk_buf, &self.meta.ctx, num_elmts)?;
                 for &addr in &fa_dblk.elements {
                     chunk_entries.push((addr, chunk_bytes, 0));
                 }
@@ -2580,7 +2822,7 @@ impl Hdf5Reader {
 
         // Read BT2 header
         let hdr_buf = self.handle.read_at_most(index_address, 256)?;
-        let bt2_hdr = Bt2Header::decode(&hdr_buf, &self.ctx)?;
+        let bt2_hdr = Bt2Header::decode(&hdr_buf, &self.meta.ctx)?;
 
         if bt2_hdr.root_node_addr == UNDEF_ADDR || bt2_hdr.total_num_records == 0 {
             // No records: `output` is already pre-filled.
@@ -2593,7 +2835,7 @@ impl Hdf5Reader {
             bt2_hdr.node_size,
             bt2_hdr.record_size,
             bt2_hdr.depth,
-            self.ctx.sizeof_addr,
+            self.meta.ctx.sizeof_addr,
         );
         let mut record_bytes: Vec<u8> = Vec::new();
         self.collect_bt2_records(
@@ -2625,7 +2867,7 @@ impl Hdf5Reader {
                     &record_bytes,
                     total_records,
                     ndims,
-                    &self.ctx,
+                    &self.meta.ctx,
                 )?
                 .into_iter()
                 .map(|r| (r.chunk_address, chunk_bytes as usize, r.scaled_offsets, 0))
@@ -2636,7 +2878,7 @@ impl Hdf5Reader {
                     total_records,
                     ndims,
                     bt2_hdr.record_size,
-                    &self.ctx,
+                    &self.meta.ctx,
                 )?
                 .into_iter()
                 .map(|r| {
@@ -2710,7 +2952,7 @@ impl Hdf5Reader {
         } else {
             let node = Bt2InternalNode::decode(
                 &buf,
-                &self.ctx,
+                &self.meta.ctx,
                 depth,
                 nrec,
                 record_size,
@@ -2881,15 +3123,12 @@ impl Hdf5Reader {
             return Ok(());
         }
 
-        // A node is the header (8 + 2*sizeof_addr) plus interleaved
-        // keys/children. Read a generous slice; ChunkBTreeV1Node::decode
-        // validates the exact length it needs.
-        let sa = self.ctx.sizeof_addr as usize;
-        let key_size = 4 + 4 + (rank + 1) * 8;
-        // u16 entries_used: at most 65535 children.
-        let max_node = 8 + sa * 2 + 65536 * (key_size + sa);
-        let buf = self.handle.read_at_most(addr, max_node)?;
-        let node = ChunkBTreeV1Node::decode(&buf, sa, rank)?;
+        // A node is a fixed-size record: the header (8 + 2*sizeof_addr) plus
+        // `2 * chunk_internal_k` interleaved keys/children.
+        let sa = self.meta.ctx.sizeof_addr as usize;
+        let node_size = self.meta.btree.chunk_btree_node_size(sa, rank);
+        let buf = self.handle.read_at_most(addr, node_size)?;
+        let node = ChunkBTreeV1Node::decode(&buf, sa, rank, self.meta.btree.chunk_max_entries())?;
 
         if node.level == 0 {
             // Leaf node: each child points at chunk data.
@@ -3165,7 +3404,7 @@ impl Hdf5Reader {
             }
         };
 
-        let ref_size = vlen_reference_size(&self.ctx);
+        let ref_size = vlen_reference_size(&self.meta.ctx);
         let mut items: Vec<Vec<u8>> = Vec::with_capacity(total_elements as usize);
 
         // Cache global heap collections to avoid re-reading.
@@ -3182,7 +3421,7 @@ impl Hdf5Reader {
             }
 
             let (_seq_len, collection_addr, obj_index) =
-                decode_vlen_reference(&raw[offset..], &self.ctx)?;
+                decode_vlen_reference(&raw[offset..], &self.meta.ctx)?;
 
             if collection_addr == UNDEF_ADDR || collection_addr == 0 {
                 items.push(Vec::new());
@@ -3238,7 +3477,7 @@ impl Hdf5Reader {
             return Ok(vec![]);
         }
         let hdr_buf = self.handle.read_at_most(index_address, 256)?;
-        let ea_hdr = ExtensibleArrayHeader::decode(&hdr_buf, &self.ctx)?;
+        let ea_hdr = ExtensibleArrayHeader::decode(&hdr_buf, &self.meta.ctx)?;
         if ea_hdr.idx_blk_addr == UNDEF_ADDR {
             return Ok(vec![]);
         }
@@ -3260,7 +3499,7 @@ impl Hdf5Reader {
         let chunk_bytes = saturating_byte_len(chunk_dims, element_size);
         let is_filtered = ea_hdr.class_id == ea::EA_CLS_FILT_CHUNK;
         let chunk_size_len = if is_filtered {
-            ea_hdr.raw_elmt_size - self.ctx.sizeof_addr - 4
+            ea_hdr.raw_elmt_size - self.meta.ctx.sizeof_addr - 4
         } else {
             0
         };
@@ -3276,7 +3515,7 @@ impl Hdf5Reader {
             let buf = self.handle.read_at_most(ea_hdr.idx_blk_addr, 65536)?;
             let fiblk = ea::FilteredIndexBlock::decode(
                 &buf,
-                &self.ctx,
+                &self.meta.ctx,
                 params.idx_blk_elmts as usize,
                 geo.ndblk_addrs,
                 geo.nsblk_addrs,
@@ -3290,7 +3529,7 @@ impl Hdf5Reader {
             let buf = self.handle.read_at_most(ea_hdr.idx_blk_addr, 65536)?;
             let iblk = ExtensibleArrayIndexBlock::decode(
                 &buf,
-                &self.ctx,
+                &self.meta.ctx,
                 params.idx_blk_elmts as usize,
                 geo.ndblk_addrs,
                 geo.nsblk_addrs,
@@ -3302,9 +3541,9 @@ impl Hdf5Reader {
         };
 
         // Walk super blocks in order, collecting each data block's entries.
-        let sa = self.ctx.sizeof_addr as usize;
+        let sa = self.meta.ctx.sizeof_addr as usize;
         let raw_elmt_size = if is_filtered {
-            ea::FilteredChunkEntry::raw_size(self.ctx.sizeof_addr, chunk_size_len) as usize
+            ea::FilteredChunkEntry::raw_size(self.meta.ctx.sizeof_addr, chunk_size_len) as usize
         } else {
             sa
         };
@@ -3347,7 +3586,7 @@ impl Hdf5Reader {
                     let buf = self.handle.read_at_most(sblk_addr, sblk_size)?;
                     let sb = ExtensibleArraySuperBlock::decode(
                         &buf,
-                        &self.ctx,
+                        &self.meta.ctx,
                         max_nelmts_bits,
                         s.ndblks as usize,
                         page_init_total,
@@ -3358,7 +3597,7 @@ impl Hdf5Reader {
 
             let npages = geo.npages(u) as usize;
             let page_size = geo.dblk_page_size(raw_elmt_size);
-            let prefix = geo.dblk_prefix_size(self.ctx.sizeof_addr, max_nelmts_bits);
+            let prefix = geo.dblk_prefix_size(self.meta.ctx.sizeof_addr, max_nelmts_bits);
 
             for (d, &dblk_addr) in this_dblk_addrs.iter().enumerate() {
                 if dblk_addr == UNDEF_ADDR {
@@ -3401,7 +3640,7 @@ impl Hdf5Reader {
                     let buf = self.handle.read_at_most(dblk_addr, dblk_size)?;
                     let dblk = ea::FilteredDataBlock::decode(
                         &buf,
-                        &self.ctx,
+                        &self.meta.ctx,
                         max_nelmts_bits,
                         dblk_nelmts,
                         chunk_size_len,
@@ -3414,7 +3653,7 @@ impl Hdf5Reader {
                     let buf = self.handle.read_at_most(dblk_addr, dblk_size)?;
                     let dblk = ExtensibleArrayDataBlock::decode(
                         &buf,
-                        &self.ctx,
+                        &self.meta.ctx,
                         max_nelmts_bits,
                         dblk_nelmts,
                     )?;
@@ -4249,6 +4488,7 @@ mod h5py_debug_tests {
             &btree_buf,
             ctx.sizeof_addr as usize,
             ctx.sizeof_size as usize,
+            BTreeV1Config::default().snode_max_entries(),
         )
         .unwrap();
         eprintln!(
@@ -4263,6 +4503,7 @@ mod h5py_debug_tests {
                 &snod_buf,
                 ctx.sizeof_addr as usize,
                 ctx.sizeof_size as usize,
+                BTreeV1Config::default().sym_leaf_max_entries(),
             )
             .unwrap();
             eprintln!("SNOD at {}: {} entries", child, snod.entries.len());

@@ -973,7 +973,7 @@ enum CollectedObject {
 /// each later stage happened to be able to decode.
 struct ReopenWalk<'a> {
     handle: &'a mut FileHandle,
-    ctx: &'a FormatContext,
+    meta: &'a crate::io::FileMeta,
     /// End of the file, bounding each object-header read.
     file_size: u64,
     out: CollectedLinks,
@@ -982,10 +982,10 @@ struct ReopenWalk<'a> {
 }
 
 impl<'a> ReopenWalk<'a> {
-    fn new(handle: &'a mut FileHandle, ctx: &'a FormatContext, file_size: u64) -> Self {
+    fn new(handle: &'a mut FileHandle, meta: &'a crate::io::FileMeta, file_size: u64) -> Self {
         Self {
             handle,
-            ctx,
+            meta,
             file_size,
             out: CollectedLinks::default(),
             visited: std::collections::HashSet::new(),
@@ -1003,7 +1003,8 @@ impl<'a> ReopenWalk<'a> {
     /// and an object is modelled only when each message the model consumes
     /// decoded. See [`ObjectPlan`] for why anything else must keep its bytes.
     fn plan(&mut self, addr: u64) -> IoResult<ObjectPlan> {
-        let (handle, ctx, file_size) = (&mut *self.handle, self.ctx, self.file_size);
+        let (handle, meta, file_size) = (&mut *self.handle, self.meta, self.file_size);
+        let ctx = &meta.ctx;
         use crate::format::messages::attr_info::AttrInfoMessage;
         use crate::format::messages::attribute::AttributeMessage;
         use crate::format::messages::data_layout::DataLayoutMessage;
@@ -1030,7 +1031,8 @@ impl<'a> ReopenWalk<'a> {
         // The messages, on the other hand, must come from the whole chain: a
         // filter pipeline or an attribute that spilled into a continuation is
         // one the rewrite would otherwise drop.
-        let header = match crate::io::object_header_io::read_object_header_full(handle, ctx, addr) {
+        let header = match crate::io::object_header_io::read_object_header_full(handle, meta, addr)
+        {
             Ok(h) => h,
             Err(e) => {
                 return Ok(ObjectPlan::Preserve(format!(
@@ -1681,6 +1683,10 @@ pub struct Hdf5Writer {
     /// The on-disk root header block a reopen found, `(addr, len)`, so
     /// finalize can free the block its rewrite supersedes.
     superseded_root_header: Option<(u64, u64)>,
+    /// Superblock version this file starts from — the lowest one it may be
+    /// written with. [`superblock_version_for`](Self::superblock_version_for)
+    /// raises it to what the content needs.
+    superblock_version_base: u8,
 }
 
 impl Hdf5Writer {
@@ -1704,21 +1710,11 @@ impl Hdf5Writer {
         let handle = FileHandle::create_with_locking(path, locking)?;
         let ctx = FormatContext::default_v3();
 
-        // Reserve space for the superblock. We compute the size from a dummy
-        // instance so that we stay in sync with the encoder.
-        let sb_size = (SuperblockV2V3 {
-            version: SUPERBLOCK_V3,
-            sizeof_offsets: ctx.sizeof_addr,
-            sizeof_lengths: ctx.sizeof_size,
-            file_consistency_flags: 0,
-            base_address: 0,
-            superblock_extension_address: UNDEF_ADDR,
-            end_of_file_address: 0,
-            root_group_object_header_address: 0,
-        })
-        .encoded_size() as u64;
-
-        let allocator = FileAllocator::new(sb_size);
+        // Reserve the superblock at offset 0. Which version it gets is only
+        // known once the file's content is (see `superblock_version_for`),
+        // but versions 2 and 3 encode to the same size, so the reservation
+        // does not have to wait for that choice.
+        let allocator = FileAllocator::new(SuperblockV2V3::size_for(ctx.sizeof_addr) as u64);
 
         Ok(Self {
             handle,
@@ -1737,6 +1733,10 @@ impl Hdf5Writer {
             root_group_addr: None,
             root_group_encoded_size: 0,
             superseded_root_header: None,
+            // A new file starts at the oldest superblock this writer's own
+            // structures allow, and finalize raises it if the content needs
+            // a newer one.
+            superblock_version_base: SUPERBLOCK_V2,
         })
     }
 
@@ -1887,6 +1887,15 @@ impl Hdf5Writer {
         use crate::format::messages::attribute::AttributeMessage;
 
         let mut handle = FileHandle::open_readwrite_with_locking(path, locking)?;
+        // The same `H5FD_locate_signature` search the read path makes, through
+        // the same handle mechanism: the offset it finds is the file's base
+        // address, so the allocator's end-of-file, every write and the
+        // superblock rewrite all work in the HDF5 address space, and the
+        // userblock in `[0, base)` is not addressable from this writer at all.
+        let super_addr = handle
+            .locate_signature()?
+            .ok_or(crate::format::FormatError::InvalidSignature)?;
+        handle.set_base(super_addr);
         let file_size = handle.file_size()?;
 
         let sb_buf = handle.read_at_most(0, 256)?;
@@ -1914,13 +1923,42 @@ impl Hdf5Writer {
             sizeof_size: sb.sizeof_lengths,
         };
 
+        // The reopen reads object headers exactly as the reader does, so it
+        // needs the same file-level parameters: a v2/v3 superblock carries no
+        // B-tree K values, and only the extension can override the defaults.
+        let (meta, ext) = crate::io::reader::Hdf5Reader::read_extension_and_meta(
+            &mut handle,
+            ctx,
+            crate::format::btree_v1::BTreeV1Config::default(),
+            sb.superblock_extension_address,
+        )?;
+
+        // A file with shared object header messages keeps datatypes,
+        // dataspaces and attributes in a SOHM fractal heap, and each object
+        // header holds only a heap ID pointing at them. This crate reads that
+        // indirection but never writes it, so finalize would rewrite every
+        // header it touches with the shared messages dropped and the master
+        // table left claiming they are still referenced — a file libhdf5 then
+        // reads as missing its objects. Refuse before anything is written.
+        let nindexes = ext
+            .shared_message_table
+            .as_ref()
+            .map_or(0, |smt| smt.nindexes);
+        if nindexes > 0 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "cannot open this file for appending: its superblock extension \
+                 declares {nindexes} shared object header message (SOHM) \
+                 index(es), which this crate can read but not write"
+            )));
+        }
+
         // Discover links from root group (and subgroups recursively). Every
         // object is classified before it is registered, and the root is the
         // one object with no alternative: its header must be rewritten to
         // hold anything new, so an unmodellable root is refused here rather
         // than rewritten into whatever this writer could read of it.
         let root_addr = sb.root_group_object_header_address;
-        let mut walk = ReopenWalk::new(&mut handle, &ctx, file_size);
+        let mut walk = ReopenWalk::new(&mut handle, &meta, file_size);
         let root = match walk.plan(root_addr)? {
             ObjectPlan::Group(parts) => parts,
             ObjectPlan::Dataset(_) => {
@@ -2223,6 +2261,10 @@ impl Hdf5Writer {
             root_group_addr: None,
             root_group_encoded_size: 0,
             superseded_root_header: Some((root_addr, root_header_size as u64)),
+            // Start from the version the file already has, so an append that
+            // adds nothing needing a newer one hands the file back as it
+            // found it. (v0/v1 was refused above, so this is 2 or 3.)
+            superblock_version_base: sb.version,
         })
     }
 
@@ -7590,6 +7632,54 @@ impl Hdf5Writer {
         self.allocator.eof()
     }
 
+    /// The superblock version this file will be written with.
+    ///
+    /// `H5F__super_init` takes the oldest version that can describe the file
+    /// and raises it to the one the file's library-version low bound implies:
+    /// `super_vers = MAX(super_vers, HDF5_superblock_ver_bounds[low_bound])`,
+    /// with the bounds table reading 0, 2, 3, 3, 3, 3, 3 for EARLIEST, V18,
+    /// V110, V112, V114, V200, LATEST (H5Fsuper.c:68, :1128-1154). This crate
+    /// has no version-bound property list, so the bound is read back from
+    /// what it writes:
+    ///
+    /// * The floor is `H5F_LIBVER_V18`, hence version 2. Every group this
+    ///   writer emits is a link-message group, which libhdf5 only writes at a
+    ///   low bound of V18 or newer (`use_at_least_v18`, H5Gobj.c:179), and
+    ///   every object header it emits is version 2, which `H5O_obj_ver_bounds`
+    ///   likewise puts at V18 (H5Oint.c:125). A version-0 superblock over
+    ///   this content would claim a file libhdf5 1.6 can read, and no libhdf5
+    ///   writes that combination.
+    /// * A chunked dataset — extensible array, fixed array or version-2
+    ///   B-tree, all reached through a version-4 or -5 data layout message —
+    ///   raises the bound to V110 (`H5O_layout_ver_bounds`, H5Dlayout.c:44),
+    ///   hence version 3.
+    /// * SWMR writes version 3 outright (H5Fsuper.c:1129), and so does the
+    ///   2.0 format [`set_libver_latest`](Self::set_libver_latest) asks for.
+    ///
+    /// A reopened file starts from the version it already carries, so an
+    /// append that adds nothing newer leaves that version alone.
+    fn superblock_version_for(&self, flags: u8) -> u8 {
+        let mut version = self.superblock_version_base.max(SUPERBLOCK_V2);
+        if self.libver_latest
+            || self.swmr_active
+            || flags & FLAG_SWMR_WRITE != 0
+            || self.has_chunked_dataset()
+        {
+            version = version.max(SUPERBLOCK_V3);
+        }
+        version
+    }
+
+    /// Whether any dataset still in the file is chunked — the three index
+    /// markers `build_dataset_header` turns into a version-4/5 data layout
+    /// message, and nothing else it can emit reaches that version.
+    fn has_chunked_dataset(&self) -> bool {
+        self.dataset_refs().iter().any(|d| {
+            let m = d.lock();
+            !m.deleted && (m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some())
+        })
+    }
+
     /// Write the superblock at offset 0 with the given flags.
     ///
     /// Requires that the root group has already been written (via `finalize`
@@ -7598,18 +7688,28 @@ impl Hdf5Writer {
         let root_addr = self
             .root_group_addr
             .ok_or_else(|| crate::io::IoError::InvalidState("root group not yet written".into()))?;
+        // The userblock this file was opened with. `H5F__super_read` prefers
+        // the located address over this field, but `H5Pget_userblock` reports
+        // it, so a rewrite that zeroed it would hide the block from every
+        // reader that asks for its size.
+        let base = self.handle.base();
+        // The end of file is the one address in the superblock measured from
+        // the start of the *file* rather than from the base: `H5F__super_read`
+        // sets the EOA to `stored_eof - base_addr` (H5Fsuper.c:635) and calls
+        // the file truncated when `eof + base_addr < stored_eof` (:573). The
+        // allocator counts in the based space, so the userblock is added back.
+        let eof = self.allocator.eof() + base;
         let sb = SuperblockV2V3 {
-            version: SUPERBLOCK_V3,
+            version: self.superblock_version_for(flags),
             sizeof_offsets: self.ctx.sizeof_addr,
             sizeof_lengths: self.ctx.sizeof_size,
             file_consistency_flags: flags,
-            base_address: 0,
+            base_address: base,
             superblock_extension_address: UNDEF_ADDR,
-            end_of_file_address: self.allocator.eof(),
+            end_of_file_address: eof,
             root_group_object_header_address: root_addr,
         };
-        let sb_encoded = sb.encode();
-        self.handle.write_at(0, &sb_encoded)?;
+        self.handle.write_at(0, &sb.encode())?;
         Ok(())
     }
 
@@ -10254,6 +10354,32 @@ mod tests {
         }
         assert_eq!(writer.ds(over_unfiltered).lock().layout_version, 5);
         writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SWMR reaches version 3 on its own, without a chunked dataset to raise
+    /// the bound — through the flags `finalize_for_swmr` passes, and then
+    /// through `swmr_active` for every superblock written after it. Only a
+    /// file with nothing else newer in it can tell the two arms apart, and
+    /// the public SWMR API always creates a chunked streaming dataset.
+    #[test]
+    fn swmr_reaches_version_3_with_no_chunked_dataset_in_the_file() {
+        let path = temp_path("swmr_superblock");
+
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        writer
+            .create_dataset("d", DatatypeMessage::i32_type(), &[2])
+            .unwrap();
+        assert_eq!(writer.superblock_version_for(0), SUPERBLOCK_V2);
+
+        writer.finalize_for_swmr().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap()[8], SUPERBLOCK_V3);
+
+        // The close-time finalize carries no SWMR flag; the file is still an
+        // SWMR file and must not be handed back a version older than the one
+        // its readers attached to.
+        writer.close().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap()[8], SUPERBLOCK_V3);
         std::fs::remove_file(&path).ok();
     }
 }

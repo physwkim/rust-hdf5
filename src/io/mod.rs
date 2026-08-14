@@ -18,6 +18,26 @@ pub use reader::Hdf5Reader;
 pub use swmr::SwmrWriter;
 pub use writer::Hdf5Writer;
 
+/// The decode parameters that belong to a *file* rather than to any one
+/// object in it.
+///
+/// Address/length widths come from the superblock, the v1-B-tree "K" ranks
+/// from the superblock extension when it carries them, and the shared-message
+/// master table says which fractal heap a shared message ID belongs to. They
+/// travel together because reading any object header can need all three: a
+/// symbol-table group needs the ranks, a shared message needs the table, and
+/// everything needs the widths. Threading them as one value is what stops a
+/// call site from reaching for a library default the file overrode.
+#[derive(Debug, Clone)]
+pub(crate) struct FileMeta {
+    pub(crate) ctx: crate::format::FormatContext,
+    pub(crate) btree: crate::format::btree_v1::BTreeV1Config,
+    /// The SOHM master table, when the superblock extension names one. A
+    /// message whose `H5O_MSG_FLAG_SHARED` bit is set stores a heap ID, and
+    /// only this table says which fractal heap that ID belongs to.
+    pub(crate) sohm: Option<crate::format::sohm::SohmMasterTable>,
+}
+
 #[derive(Debug)]
 pub enum IoError {
     Io(std::io::Error),

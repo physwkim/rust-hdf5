@@ -19,6 +19,7 @@
 use std::path::Path;
 
 use crate::io::locking::FileLocking;
+use crate::io::reader::SuperblockExtension;
 use crate::io::{Hdf5Reader, Hdf5Writer};
 
 use crate::dataset::{DatasetBuilder, H5Dataset};
@@ -176,9 +177,14 @@ impl H5File {
     /// *expands* a chunk, but the file is only readable by libhdf5 ≥ 2.0
     /// (h5py bundling hdf5 1.14 rejects it with "bad version number").
     ///
-    /// Off by default; unfiltered and contiguous datasets are unaffected.
-    /// Independent of this setting, a chunk larger than 4 GiB forces version 5
-    /// because version 4 cannot represent its size field, matching libhdf5.
+    /// It also sets the file's library-version low bound, and so its
+    /// superblock version: version 3, where a file this crate writes without
+    /// it is version 2 (or 3 anyway, once it holds a chunked dataset).
+    ///
+    /// Off by default; the data layout of unfiltered and contiguous datasets
+    /// is unaffected. Independent of this setting, a chunk larger than 4 GiB
+    /// forces version 5 because version 4 cannot represent its size field,
+    /// matching libhdf5.
     ///
     /// Errors in read mode.
     pub fn set_libver_latest(&self, latest: bool) -> Result<()> {
@@ -379,6 +385,32 @@ impl H5File {
                 Ok(reader.attr_string_value(&attr)?)
             }
             _ => Err(Hdf5Error::InvalidState("not in read mode".into())),
+        }
+    }
+
+    /// The file-level metadata carried by the superblock extension: the
+    /// shared-message table, the v1 B-tree K values, the driver-info block and
+    /// the file-space strategy.
+    ///
+    /// Every field is `None` for a file written without an extension, and for
+    /// a file this handle has open for writing.
+    pub fn superblock_extension(&self) -> SuperblockExtension {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => reader.superblock_extension().clone(),
+            _ => SuperblockExtension::default(),
+        }
+    }
+
+    /// Size in bytes of the userblock this file was written with — the
+    /// application-owned prefix the superblock follows (`H5Pget_userblock`).
+    /// Zero for a file without one, and for a file this handle has open for
+    /// writing (the writer never places a userblock).
+    pub fn userblock_size(&self) -> u64 {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => reader.userblock_size(),
+            _ => 0,
         }
     }
 

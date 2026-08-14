@@ -12,6 +12,9 @@ without the two sides sharing a data file.
 Only the standard library, numpy and h5py are used.
 """
 
+import pathlib
+import shutil
+
 import numpy as np
 
 import h5py
@@ -845,14 +848,18 @@ def _libver_case(name, libver, rust, note):
 
 
 def gen_userblock(path):
+    """A 512-byte userblock in front of the superblock.
+
+    The block is filled with text afterwards, as an application that keeps a
+    script or a header there would: the reader has to find the superblock at
+    512 rather than at 0, and must not mistake the block's bytes for metadata.
+    """
     with h5py.File(path, "w", userblock_size=512) as f:
         f.create_dataset("data", data=ramp("<i4"))
         f.create_group("g")
-    # The user block is the caller's to fill; libhdf5 only reserves it. Every
-    # address in the file is relative to its end, so a reader that assumes the
-    # superblock starts at offset 0 cannot open this.
+    prefix = b"#!/bin/sh\n# userblock\n"
     with open(path, "r+b") as fh:
-        fh.write(b"oracle user block\n")
+        fh.write(prefix + b"#" * (512 - len(prefix) - 1) + b"\n")
 
 
 LIBVER_CASES = [
@@ -866,8 +873,9 @@ LIBVER_CASES = [
     # non-default B-tree K value (H5Pset_sym_k / H5Pset_istore_k), and neither
     # is wrapped on PropFCID. v0, v2 and v3 are covered by the four cases
     # above; the user block below is the remaining v0 variant.
+    # No rust writer arm: the public API cannot ask for a userblock.
     Case("userblock", "superblock", gen_userblock, None,
-         "512-byte user block — the superblock does not start at offset 0"),
+         "512-byte userblock — the superblock, and every address, is based at 512"),
 ]
 
 
@@ -902,6 +910,50 @@ MISC_CASES = [
 
 
 # --------------------------------------------------------------------------
+# checked-in fixtures
+#
+# Some file-level features have no h5py binding at all, so the reference file
+# cannot be written from Python. Those come from a C generator run against the
+# pinned libhdf5 (`tests/fixtures/gen_*.sh`), are checked in, and are copied
+# into the run directory here. h5py still reads them, so direction A compares
+# exactly as it does for a generated case.
+# --------------------------------------------------------------------------
+
+FIXTURE_DIR = pathlib.Path(__file__).resolve().parent.parent / "tests" / "fixtures"
+
+
+def _fixture_case(name, fixture, generator, group, note):
+    def gen(path):
+        src = FIXTURE_DIR / fixture
+        if not src.exists():
+            raise FileNotFoundError(
+                "%s is missing; regenerate it with tests/fixtures/%s"
+                % (src, generator)
+            )
+        shutil.copyfile(src, path)
+
+    # No rust writer arm: the public API cannot ask for these files.
+    return Case(name, group, gen, None, note)
+
+
+FIXTURE_CASES = [
+    _fixture_case(
+        "sohm_list", "sohm_list.h5", "gen_sohm.sh", "sohm",
+        "shared datatype/dataspace/attribute messages, list index "
+        "(H5Pset_shared_mesg_index) + a committed datatype",
+    ),
+    _fixture_case(
+        "sohm_btree", "sohm_btree.h5", "gen_sohm.sh", "sohm",
+        "the same file with the shared-message index forced to a v2 B-tree",
+    ),
+    _fixture_case(
+        "ochk_root", "ochk_root.h5", "gen_ochk.sh", "objectheader",
+        "root group whose object header spills into two continuation chunks",
+    ),
+]
+
+
+# --------------------------------------------------------------------------
 
 ALL_CASES = (
     INT_CASES
@@ -916,6 +968,7 @@ ALL_CASES = (
     + ATTR_CASES
     + LIBVER_CASES
     + MISC_CASES
+    + FIXTURE_CASES
 )
 
 

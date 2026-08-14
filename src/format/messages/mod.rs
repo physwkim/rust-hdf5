@@ -11,6 +11,7 @@ pub mod link;
 pub mod link_info;
 pub mod mod_time;
 pub mod shared;
+pub mod superblock_ext;
 
 // Message type IDs
 pub const MSG_DATASPACE: u8 = 0x01;
@@ -23,9 +24,18 @@ pub const MSG_DATA_LAYOUT: u8 = 0x08;
 pub const MSG_GROUP_INFO: u8 = 0x0A;
 pub const MSG_FILTER_PIPELINE: u8 = 0x0B;
 pub const MSG_ATTRIBUTE: u8 = 0x0C;
+pub const MSG_SHARED_MESSAGE_TABLE: u8 = 0x0F;
 pub const MSG_OBJ_HEADER_CONTINUATION: u8 = 0x10;
 pub const MSG_SYMBOL_TABLE: u8 = 0x11;
 pub const MSG_MOD_TIME: u8 = 0x12;
 pub const MSG_BTREE_K: u8 = 0x13;
+pub const MSG_DRIVER_INFO: u8 = 0x14;
 pub const MSG_ATTR_INFO: u8 = 0x15;
 pub const MSG_OBJ_REF_COUNT: u8 = 0x16;
+pub const MSG_FILE_SPACE_INFO: u8 = 0x17;
+
+// Object header message flags
+/// `H5O_MSG_FLAG_SHARED`: the message body is not the message, it is a
+/// pointer to where the body is really stored (SOHM heap or another object
+/// header). Decoding the body literally silently yields nonsense.
+pub const MSG_FLAG_SHARED: u8 = 0x02;

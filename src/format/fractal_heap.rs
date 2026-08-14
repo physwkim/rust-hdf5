@@ -40,6 +40,8 @@ pub struct FractalHeapHeader {
     pub filter_len: u16,
     /// Whether direct blocks carry a trailing checksum.
     pub checksum_dblocks: bool,
+    /// Managed space currently allocated to the heap, in bytes.
+    pub man_size: u64,
     /// Number of managed objects currently stored in the heap.
     pub man_nobjs: u64,
     /// Doubling-table: number of columns.
@@ -57,6 +59,11 @@ pub struct FractalHeapHeader {
     pub curr_root_rows: u16,
     /// Bytes used to encode a block offset within the heap address space.
     pub heap_off_size: u8,
+    /// Bytes used to encode a managed object's length in a heap ID.
+    pub heap_len_size: u8,
+    /// Largest object the managed blocks may hold; anything bigger is a
+    /// "huge" object stored outside the heap.
+    pub max_man_size: u64,
     /// Number of rows whose blocks are direct blocks.
     pub max_direct_rows: u32,
     /// Per-row direct-block sizes (length == `max_root_rows`).
@@ -70,6 +77,15 @@ fn log2_of2(n: u64) -> u32 {
         return 0;
     }
     n.trailing_zeros()
+}
+
+/// `floor(log2(n))` for any positive `n` (`H5VM_log2_gen`); 0 for zero.
+fn log2_gen(n: u64) -> u32 {
+    if n == 0 {
+        0
+    } else {
+        63 - n.leading_zeros()
+    }
 }
 
 /// Number of bytes needed to store a value spanning `bits` bits.
@@ -133,7 +149,9 @@ impl FractalHeapHeader {
         let checksum_dblocks = heap_flags & HDR_FLAG_CHECKSUM_DBLOCKS != 0;
 
         // "Huge" object info.
-        pos += 4; // max_man_size (u32)
+        let max_man_size =
+            u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as u64;
+        pos += 4;
         pos += ss; // huge_next_id
         pos += sa; // huge_bt2_addr
 
@@ -143,7 +161,8 @@ impl FractalHeapHeader {
 
         // Statistics: man_size, man_alloc_size, man_iter_off, man_nobjs,
         // huge_size, huge_nobjs, tiny_size, tiny_nobjs.
-        pos += ss; // man_size
+        let man_size = read_uint(&buf[pos..], ss);
+        pos += ss;
         pos += ss; // man_alloc_size
         pos += ss; // man_iter_off
         let man_nobjs = read_uint(&buf[pos..], ss);
@@ -196,6 +215,13 @@ impl FractalHeapHeader {
         let max_direct_bits = log2_of2(max_direct_size);
         let max_direct_rows = max_direct_bits.saturating_sub(start_bits).saturating_add(2);
         let heap_off_size = size_of_offset_bits(max_heap_size_bits);
+        // H5HFhdr.c::H5HF__hdr_finish_init_phase1 — the length field of a
+        // managed heap ID is sized by whichever bound is tighter: the largest
+        // direct block, or the largest object the managed blocks may hold.
+        let heap_len_size = std::cmp::min(
+            size_of_offset_bits(log2_of2(max_direct_size) as u16),
+            (log2_gen(max_man_size) / 8 + 1) as u8,
+        );
 
         // Per-row direct-block sizes: row 0 == start, row 1 == start,
         // doubling from row 2 onward (H5HF__dtable_init).
@@ -213,6 +239,7 @@ impl FractalHeapHeader {
             id_len,
             filter_len,
             checksum_dblocks,
+            man_size,
             man_nobjs,
             table_width,
             start_block_size,
@@ -221,6 +248,8 @@ impl FractalHeapHeader {
             table_addr,
             curr_root_rows,
             heap_off_size,
+            heap_len_size,
+            max_man_size,
             max_direct_rows,
             row_block_size,
         })
@@ -310,6 +339,63 @@ fn walk_indirect_block<R: BlockReader>(
     }
     *budget -= 1;
 
+    let width = header.table_width as usize;
+    let block = read_indirect_block(header, ctx, reader, addr, nrows)?;
+
+    for (entry, &child_addr) in block.entries.iter().enumerate() {
+        let row = entry / width;
+        if child_addr == u64::MAX || child_addr == 0 {
+            continue;
+        }
+
+        if row < header.max_direct_rows as usize {
+            // Direct-block child.
+            let size = header
+                .row_block_size
+                .get(row)
+                .copied()
+                .unwrap_or(header.start_block_size) as usize;
+            read_direct_block(header, ctx, reader, child_addr, size, objects, budget)?;
+        } else {
+            // Indirect-block child. Its row count is derived from the row's
+            // block size (see H5HFhdr.c / H5HF__dtable_size_to_rows).
+            let block_size = header
+                .row_block_size
+                .get(row)
+                .copied()
+                .unwrap_or(header.start_block_size);
+            let child_nrows = indirect_nrows(header, block_size);
+            walk_indirect_block(
+                header,
+                ctx,
+                reader,
+                child_addr,
+                child_nrows,
+                objects,
+                budget,
+                depth + 1,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+/// An indirect block's decoded fields: where it starts in the heap's address
+/// space, and its child block addresses in entry order.
+struct IndirectBlock {
+    block_off: u64,
+    entries: Vec<u64>,
+}
+
+/// Read and verify one indirect block (`FHIB`).
+fn read_indirect_block<R: BlockReader>(
+    header: &FractalHeapHeader,
+    ctx: &FormatContext,
+    reader: &mut R,
+    addr: u64,
+    nrows: u32,
+) -> FormatResult<IndirectBlock> {
     let sa = ctx.sizeof_addr as usize;
     let width = header.table_width as usize;
     let n_entries = nrows as usize * width;
@@ -359,54 +445,217 @@ fn walk_indirect_block<R: BlockReader>(
         });
     }
 
-    // Skip prefix: signature(4) + version(1) + heap header address(sa)
-    //              + block offset(heap_off_size).
-    let mut pos = 4 + 1 + sa + header.heap_off_size as usize;
+    // prefix: signature(4) + version(1) + heap header address(sa)
+    //         + block offset(heap_off_size).
+    let mut pos = 4 + 1 + sa;
+    let block_off = read_uint(&buf[pos..], header.heap_off_size as usize);
+    pos += header.heap_off_size as usize;
 
+    let mut entries = Vec::with_capacity(n_entries);
     for entry in 0..n_entries {
         let row = entry / width;
-        let child_addr = read_uint(&buf[pos..], sa);
+        entries.push(read_uint(&buf[pos..], sa));
         pos += sa;
         if header.filter_len > 0 && row < header.max_direct_rows as usize {
             // Filtered direct-block entries carry size + filter mask.
             pos += ctx.sizeof_size as usize + 4;
         }
-
-        if child_addr == u64::MAX || child_addr == 0 {
-            continue;
-        }
-
-        if row < header.max_direct_rows as usize {
-            // Direct-block child.
-            let size = header
-                .row_block_size
-                .get(row)
-                .copied()
-                .unwrap_or(header.start_block_size) as usize;
-            read_direct_block(header, ctx, reader, child_addr, size, objects, budget)?;
-        } else {
-            // Indirect-block child. Its row count is derived from the row's
-            // block size (see H5HFhdr.c / H5HF__dtable_size_to_rows).
-            let block_size = header
-                .row_block_size
-                .get(row)
-                .copied()
-                .unwrap_or(header.start_block_size);
-            let child_nrows = indirect_nrows(header, block_size);
-            walk_indirect_block(
-                header,
-                ctx,
-                reader,
-                child_addr,
-                child_nrows,
-                objects,
-                budget,
-                depth + 1,
-            )?;
-        }
     }
 
-    Ok(())
+    Ok(IndirectBlock { block_off, entries })
+}
+
+/// Row and column of `off` in the doubling table (`H5HF__dtable_lookup`).
+fn dtable_lookup(header: &FractalHeapHeader, off: u64) -> (u32, u32) {
+    let width = header.table_width as u64;
+    let num_id_first_row = header.start_block_size.saturating_mul(width);
+    if off < num_id_first_row {
+        (0, (off / header.start_block_size) as u32)
+    } else {
+        let first_row_bits = log2_of2(header.start_block_size) + log2_of2(width);
+        let high_bit = log2_gen(off);
+        let off_mask = 1u64 << high_bit;
+        let row = high_bit.saturating_sub(first_row_bits) + 1;
+        let row_size = header
+            .row_block_size
+            .get(row as usize)
+            .copied()
+            .unwrap_or(header.start_block_size)
+            .max(1);
+        (row, ((off - off_mask) / row_size) as u32)
+    }
+}
+
+/// A managed-object heap ID: an offset into the heap's address space and the
+/// object's length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagedHeapId {
+    /// Offset of the object in the heap's address space.
+    pub obj_off: u64,
+    /// Length of the object in bytes.
+    pub obj_len: usize,
+}
+
+/// Heap-ID flag bits (`H5HFpkg.h`): version in the top two bits, storage type
+/// in the next two.
+const ID_VERSION_MASK: u8 = 0xC0;
+const ID_TYPE_MASK: u8 = 0x30;
+const ID_TYPE_MANAGED: u8 = 0x00;
+
+impl ManagedHeapId {
+    /// Decode a managed heap ID. Huge and tiny objects are rejected: this
+    /// reader resolves only managed ones, and silently treating one kind as
+    /// another would read unrelated bytes.
+    pub fn decode(header: &FractalHeapHeader, id: &[u8]) -> FormatResult<Self> {
+        let off_size = header.heap_off_size as usize;
+        let len_size = header.heap_len_size as usize;
+        need(id, 0, 1 + off_size + len_size)?;
+
+        let flags = id[0];
+        if flags & ID_VERSION_MASK != 0 {
+            return Err(FormatError::InvalidData(format!(
+                "unsupported fractal heap ID version in flags {flags:#04x}"
+            )));
+        }
+        if flags & ID_TYPE_MASK != ID_TYPE_MANAGED {
+            return Err(FormatError::UnsupportedFeature(
+                "fractal heap ID refers to a huge or tiny object".into(),
+            ));
+        }
+
+        let obj_off = read_uint(&id[1..], off_size);
+        let obj_len = read_uint(&id[1 + off_size..], len_size);
+
+        // H5HF__man_op_real's range checks, in the same order.
+        if obj_off == 0 || obj_off > header.man_size {
+            return Err(FormatError::InvalidData(format!(
+                "fractal heap object offset {obj_off} outside the managed space"
+            )));
+        }
+        if obj_len == 0 || obj_len > header.max_direct_size || obj_len > header.max_man_size {
+            return Err(FormatError::InvalidData(format!(
+                "fractal heap object length {obj_len} is not storable in a direct block"
+            )));
+        }
+
+        Ok(Self {
+            obj_off,
+            obj_len: obj_len as usize,
+        })
+    }
+}
+
+/// Read one managed object out of the heap, given its heap ID.
+///
+/// This is the read half of `H5HF_read`: decode the ID, walk the doubling
+/// table down to the direct block that owns the offset, and return the bytes
+/// of the object itself.
+pub fn read_managed_object<R: BlockReader>(
+    header: &FractalHeapHeader,
+    ctx: &FormatContext,
+    reader: &mut R,
+    id: &[u8],
+) -> FormatResult<Vec<u8>> {
+    let id = ManagedHeapId::decode(header, id)?;
+
+    // Locate the direct block holding the offset.
+    let (dblock_addr, dblock_size) = if header.curr_root_rows == 0 {
+        (header.table_addr, header.start_block_size as usize)
+    } else {
+        locate_direct_block(header, ctx, reader, id.obj_off)?
+    };
+    if dblock_addr == u64::MAX || dblock_addr == 0 {
+        return Err(FormatError::InvalidData(
+            "fractal heap ID is not in an allocated direct block".into(),
+        ));
+    }
+
+    let buf = reader.read_block(dblock_addr, dblock_size)?;
+    need(&buf, 0, dblock_size)?;
+    if buf[0..4] != FHDB_SIGNATURE {
+        return Err(FormatError::InvalidSignature);
+    }
+    if buf[4] != 0 {
+        return Err(FormatError::InvalidVersion(buf[4]));
+    }
+
+    let sa = ctx.sizeof_addr as usize;
+    let mut overhead = 4 + 1 + sa + header.heap_off_size as usize;
+    let block_off = read_uint(&buf[4 + 1 + sa..], header.heap_off_size as usize);
+    if header.checksum_dblocks {
+        overhead += 4;
+    }
+
+    if id.obj_off < block_off {
+        return Err(FormatError::InvalidData(
+            "fractal heap object offset precedes its direct block".into(),
+        ));
+    }
+    let blk_off = (id.obj_off - block_off) as usize;
+    if blk_off < overhead {
+        return Err(FormatError::InvalidData(
+            "fractal heap object located in the prefix of its direct block".into(),
+        ));
+    }
+    if blk_off + id.obj_len > dblock_size {
+        return Err(FormatError::InvalidData(
+            "fractal heap object overruns the end of its direct block".into(),
+        ));
+    }
+
+    Ok(buf[blk_off..blk_off + id.obj_len].to_vec())
+}
+
+/// Walk the doubling table from the root indirect block down to the direct
+/// block that owns `obj_off` (`H5HF__man_dblock_locate`), returning its
+/// address and size.
+fn locate_direct_block<R: BlockReader>(
+    header: &FractalHeapHeader,
+    ctx: &FormatContext,
+    reader: &mut R,
+    obj_off: u64,
+) -> FormatResult<(u64, usize)> {
+    // Each descent moves to a strictly smaller indirect block, so the row
+    // count bounds the walk; cap it anyway for a corrupt heap.
+    const MAX_DESCENT: usize = 256;
+
+    let width = header.table_width as usize;
+    let mut addr = header.table_addr;
+    let mut nrows = header.curr_root_rows as u32;
+
+    for _ in 0..MAX_DESCENT {
+        let block = read_indirect_block(header, ctx, reader, addr, nrows)?;
+        if obj_off < block.block_off {
+            return Err(FormatError::InvalidData(
+                "fractal heap object offset precedes its indirect block".into(),
+            ));
+        }
+        let (row, col) = dtable_lookup(header, obj_off - block.block_off);
+        let entry = row as usize * width + col as usize;
+        let child = block.entries.get(entry).copied().ok_or_else(|| {
+            FormatError::InvalidData("fractal heap object offset outside its indirect block".into())
+        })?;
+        let block_size = header
+            .row_block_size
+            .get(row as usize)
+            .copied()
+            .unwrap_or(header.start_block_size);
+
+        if row < header.max_direct_rows {
+            return Ok((child, block_size as usize));
+        }
+        if child == u64::MAX || child == 0 {
+            return Err(FormatError::InvalidData(
+                "fractal heap ID is not in an allocated indirect block".into(),
+            ));
+        }
+        addr = child;
+        nrows = indirect_nrows(header, block_size);
+    }
+
+    Err(FormatError::InvalidData(
+        "fractal heap doubling-table descent exceeds maximum depth".into(),
+    ))
 }
 
 /// Number of rows in a child indirect block whose row-block size is
