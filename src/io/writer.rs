@@ -1212,6 +1212,9 @@ pub struct PreservedLink {
     /// that ask for it by name. `None` when the link's own class — not its
     /// target — is what this writer cannot express.
     pub reason: Option<String>,
+    /// What the object this link names is, when the walk could tell. A
+    /// listing asks this; `reason` is prose for the caller that asks why.
+    pub kind: PreservedKind,
 }
 
 /// Every link a reopen walk met, split by what the writer can do with it.
@@ -1247,6 +1250,8 @@ struct PreservedEntry {
     /// Why the object it names could not be modelled; `None` when the link's
     /// own class is what this writer cannot express.
     reason: Option<String>,
+    /// What the object is, when the walk could tell.
+    kind: PreservedKind,
 }
 
 /// What a reopen can do with one object it reached.
@@ -1265,7 +1270,41 @@ enum ObjectPlan {
     /// rewritten and never freed; the link naming it is written back byte for
     /// byte, so the object stays exactly as the file already had it — what
     /// libhdf5 does with the parts of a file it does not understand.
-    Preserve(String),
+    ///
+    /// `kind` is what the walk could still tell about the object it is
+    /// keeping. Not modelling an object is not the same as not knowing what
+    /// it is, and answering the second question with the first is what made
+    /// `named_datatype_names` deny, in write mode, a datatype the same file
+    /// reports in read mode.
+    Preserve { why: String, kind: PreservedKind },
+}
+
+/// What a preserved object is, as far as the reopen walk could tell.
+///
+/// Deliberately not a copy of the reader's `ObjectKind`: that one carries the
+/// decoded object, and a preserved object is precisely the one whose contents
+/// the writer does not decode. This says only what a listing needs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PreservedKind {
+    /// The walk did not classify it — or the link's own class, not its
+    /// target, is what could not be expressed.
+    Unclassified,
+    /// A committed (named) datatype, by
+    /// [`header_is_committed_datatype`](crate::io::reader::header_is_committed_datatype).
+    NamedDatatype,
+}
+
+impl ObjectPlan {
+    /// An object kept by its bytes, of a kind the walk did not classify.
+    ///
+    /// Every reason that is a *failure* to read reaches this: a message that
+    /// did not decode says nothing about what the object was.
+    fn preserve(why: impl Into<String>) -> Self {
+        ObjectPlan::Preserve {
+            why: why.into(),
+            kind: PreservedKind::Unclassified,
+        }
+    }
 }
 
 /// The messages a dataset's rewrite is built from, all decoded.
@@ -1408,7 +1447,7 @@ impl<'a> ReopenWalk<'a> {
         let header_size = match crate::format::object_header::ObjectHeader::decode_any(&buf) {
             Ok((_, size)) => size,
             Err(e) => {
-                return Ok(ObjectPlan::Preserve(format!(
+                return Ok(ObjectPlan::preserve(format!(
                     "its object header does not decode: {e}"
                 )))
             }
@@ -1420,7 +1459,7 @@ impl<'a> ReopenWalk<'a> {
         {
             Ok(h) => h,
             Err(e) => {
-                return Ok(ObjectPlan::Preserve(format!(
+                return Ok(ObjectPlan::preserve(format!(
                     "its object header chain does not read: {e}"
                 )))
             }
@@ -1444,7 +1483,7 @@ impl<'a> ReopenWalk<'a> {
         ) {
             Ok(a) => a,
             Err(e) => {
-                return Ok(ObjectPlan::Preserve(format!(
+                return Ok(ObjectPlan::preserve(format!(
                     "its attributes do not read back whole: {e}"
                 )))
             }
@@ -1480,7 +1519,7 @@ impl<'a> ReopenWalk<'a> {
             // own — so the guard is the only thing between a shared datatype
             // and a rewrite that invents a type for it.
             if consumed && msg.flags & MSG_FLAG_SHARED != 0 {
-                return Ok(ObjectPlan::Preserve(format!(
+                return Ok(ObjectPlan::preserve(format!(
                     "its message of type {:#04x} is a shared-message reference, which this \
                      writer does not resolve",
                     msg.msg_type
@@ -1491,7 +1530,7 @@ impl<'a> ReopenWalk<'a> {
                     match $decode {
                         Ok(v) => v,
                         Err(e) => {
-                            return Ok(ObjectPlan::Preserve(format!(
+                            return Ok(ObjectPlan::preserve(format!(
                                 "its {} message does not decode: {e}",
                                 $what
                             )))
@@ -1548,7 +1587,7 @@ impl<'a> ReopenWalk<'a> {
                         ) {
                             Ok(l) => l,
                             Err(e) => {
-                                return Ok(ObjectPlan::Preserve(format!(
+                                return Ok(ObjectPlan::preserve(format!(
                                     "its dense link storage does not read: {e}"
                                 )))
                             }
@@ -1571,16 +1610,15 @@ impl<'a> ReopenWalk<'a> {
                     // registry, the preserve path — work on one link model
                     // whichever form the group is in.
                     let Some(s) = Stab::decode(&msg.data, ctx) else {
-                        return Ok(ObjectPlan::Preserve(
+                        return Ok(ObjectPlan::preserve(
                             "its symbol table message is shorter than the two addresses it \
-                             must carry"
-                                .into(),
+                             must carry",
                         ));
                     };
                     let contents = match crate::io::symbol_table_io::read_stab(handle, meta, s) {
                         Ok(c) => c,
                         Err(e) => {
-                            return Ok(ObjectPlan::Preserve(format!(
+                            return Ok(ObjectPlan::preserve(format!(
                                 "its symbol table does not read: {e}"
                             )))
                         }
@@ -1609,7 +1647,7 @@ impl<'a> ReopenWalk<'a> {
             // at `libver='v108'` and in every classic file) and virtual
             // layouts are both this.
             (Some(_), Some(_), Some(layout)) if !layout_rebuilds(&layout) => {
-                Ok(ObjectPlan::Preserve(format!(
+                Ok(ObjectPlan::preserve(format!(
                     "its data layout is {}, which this writer reads but does not build",
                     layout.describe()
                 )))
@@ -1634,11 +1672,20 @@ impl<'a> ReopenWalk<'a> {
             // A committed (named) datatype has a datatype message and neither
             // of the other two; so does a dataset whose header this crate only
             // half understands. Neither is a group, and modelling either as
-            // one is what rewrote them into empty groups.
-            _ if dataset_shaped => Ok(ObjectPlan::Preserve(
+            // one is what rewrote them into empty groups. They part company
+            // here and nowhere else: the datatype is kept by its bytes like
+            // the other, but a listing can still name it.
+            _ if crate::io::reader::header_is_committed_datatype(&header) => {
+                Ok(ObjectPlan::Preserve {
+                    why: "it is a committed (named) datatype, which this writer carries by \
+                          its bytes rather than re-encoding"
+                        .into(),
+                    kind: PreservedKind::NamedDatatype,
+                })
+            }
+            _ if dataset_shaped => Ok(ObjectPlan::preserve(
                 "it carries a datatype, dataspace or layout message but not the three a \
-                 dataset is built from; this writer models only groups and datasets"
-                    .into(),
+                 dataset is built from; this writer models only groups and datasets",
             )),
             _ => Ok(ObjectPlan::Group(GroupParts {
                 header_size,
@@ -1686,6 +1733,7 @@ impl<'a> ReopenWalk<'a> {
                     class: crate::io::reader::LinkClass::from_target(&link.target),
                     encoded: encoded.clone(),
                     reason: None,
+                    kind: PreservedKind::Unclassified,
                 });
                 continue;
             };
@@ -1699,11 +1747,12 @@ impl<'a> ReopenWalk<'a> {
                 // Kept by its bytes, exactly as a link class this writer
                 // cannot express is: writing the link back unchanged is what
                 // leaves the object's header where the file already has it.
-                ObjectPlan::Preserve(reason) => self.out.preserved.push(PreservedEntry {
+                ObjectPlan::Preserve { why, kind } => self.out.preserved.push(PreservedEntry {
                     path: full_name,
                     class: crate::io::reader::LinkClass::Hard,
                     encoded: entry.encoded,
-                    reason: Some(reason),
+                    reason: Some(why),
+                    kind,
                 }),
                 ObjectPlan::Dataset(parts) => {
                     self.out.hard.push((entry, CollectedObject::Dataset(parts)));
@@ -3027,7 +3076,7 @@ impl Hdf5Writer {
                         .into(),
                 ))
             }
-            ObjectPlan::Preserve(why) => {
+            ObjectPlan::Preserve { why, .. } => {
                 return Err(crate::io::IoError::Unsupported(format!(
                     "cannot open this file for appending: {why}. Every append rewrites the \
                      root group's header, and this writer will not rewrite it from the part \
@@ -3144,6 +3193,9 @@ impl Hdf5Writer {
                         class: crate::io::reader::LinkClass::Hard,
                         encoded,
                         reason: Some(why),
+                        // A dataset whose chunk index would not rebuild: the
+                        // walk classified it, and it is not a datatype.
+                        kind: PreservedKind::Unclassified,
                     });
                 }
             }
@@ -3255,6 +3307,7 @@ impl Hdf5Writer {
                     class: crate::io::reader::LinkClass::Hard,
                     encoded: entry.encoded.clone(),
                     reason: Some(why.clone()),
+                    kind: PreservedKind::Unclassified,
                 });
                 false
             }
@@ -3314,6 +3367,7 @@ impl Hdf5Writer {
             class,
             encoded,
             reason,
+            kind,
         } in preserved
         {
             let (parent, link_name) = match path.rsplit_once('/') {
@@ -3332,6 +3386,7 @@ impl Hdf5Writer {
                 class,
                 encoded,
                 reason,
+                kind,
             });
         }
 
@@ -4622,12 +4677,28 @@ impl Hdf5Writer {
     /// The paths of every committed datatype a name still reaches, in
     /// creation order. One inside a deleted group is not among them: no link
     /// to it is emitted, so the file will not hold that name.
+    ///
+    /// Both halves of the file answer. A datatype an earlier session
+    /// committed is carried by its bytes, not re-encoded, so it lives in the
+    /// preserved-link list rather than the registry — and listing only the
+    /// registry is what made this answer `[]` for a file whose every named
+    /// type was committed before it was opened, while a reader of the same
+    /// file named them all.
     pub(crate) fn committed_datatype_names(&self) -> Vec<String> {
-        self.committed_datatypes_vec()
+        let mut out: Vec<String> = self
+            .committed_datatypes_vec()
             .iter()
             .filter(|c| self.parent_alive(c.parent))
             .map(|c| c.name.clone())
-            .collect()
+            .collect();
+        out.extend(
+            self.preserved_links
+                .lock()
+                .iter()
+                .filter(|l| l.kind == PreservedKind::NamedDatatype)
+                .map(|l| self.preserved_link_full_path(l)),
+        );
+        out
     }
 
     /// Commit `datatype` as an object of its own under `name` —

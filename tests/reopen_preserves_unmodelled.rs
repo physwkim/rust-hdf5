@@ -721,3 +721,95 @@ fn reopen_touch_and_add(work: &std::path::Path) {
         .expect("write");
     file.close().expect("close");
 }
+
+/// A committed datatype the file already held is kept by its bytes, so it was
+/// in no registry — and `named_datatype_names` reads the registry. A writer
+/// that had just reopened a file full of named types therefore answered `[]`,
+/// while a reader of the same file named them all. The walk knows what the
+/// object is (`header_is_committed_datatype`, the same rule the reader
+/// classifies by); it simply threw the answer away, keeping only the prose
+/// reason it could not model it.
+#[test]
+fn a_reopened_committed_datatype_is_named_in_write_mode() {
+    let Some(py) = python() else { return };
+    let dir = tmp_dir("named_type_reopen");
+    let (orig, work) = (dir.join("orig.h5"), dir.join("work.h5"));
+
+    py_run(
+        py,
+        &orig,
+        &work,
+        "with h5py.File(ORIG, 'w', libver='latest') as f:\n\
+         \x20   f['t'] = np.dtype('<i4')\n\
+         \x20   g = f.create_group('types')\n\
+         \x20   g['lonely'] = np.dtype('<f8')\n\
+         \x20   f.create_dataset('plain', data=np.arange(4, dtype='<i2'))\n",
+    );
+    std::fs::copy(&orig, &work).unwrap();
+
+    // What a reader of the same file answers, first: the two lists must agree.
+    let mut read_names = rust_hdf5::H5File::open(&orig)
+        .unwrap()
+        .named_datatype_names();
+    read_names.sort();
+    assert_eq!(
+        read_names,
+        vec!["t".to_string(), "types/lonely".to_string()]
+    );
+
+    let file = rust_hdf5::H5File::open_rw(&work).unwrap();
+    let mut names = file.named_datatype_names();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["t".to_string(), "types/lonely".to_string()],
+        "a reopen must name the types the file already held"
+    );
+    // Group-scoped listings answer from the same source.
+    assert_eq!(
+        file.root_group().named_datatype_names().unwrap(),
+        vec!["t".to_string()]
+    );
+    assert_eq!(
+        file.root_group()
+            .group("types")
+            .unwrap()
+            .named_datatype_names()
+            .unwrap(),
+        vec!["lonely".to_string()]
+    );
+    // A dataset is not one of them, whether or not the writer could model it.
+    assert!(!names.contains(&"plain".to_string()));
+
+    // One committed in this session joins them, in one list.
+    file.commit_datatype("fresh", rust_hdf5::DatatypeMessage::u8_type())
+        .unwrap();
+    let mut both = file.named_datatype_names();
+    both.sort();
+    assert_eq!(
+        both,
+        vec![
+            "fresh".to_string(),
+            "t".to_string(),
+            "types/lonely".to_string()
+        ]
+    );
+    file.close().unwrap();
+
+    // And the two carried types are still exactly where they were.
+    py_run(
+        py,
+        &orig,
+        &work,
+        &format!(
+            "{HEADER_IDENTITY}\
+             for name in ('t', 'types/lonely'):\n\
+             \x20   assert_untouched(name)\n\
+             with h5py.File(WORK, 'r') as f:\n\
+             \x20   assert isinstance(f['fresh'], h5py.Datatype), type(f['fresh'])\n\
+             \x20   assert f['fresh'].dtype == np.dtype('u1'), f['fresh'].dtype\n"
+        ),
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

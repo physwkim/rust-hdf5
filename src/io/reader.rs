@@ -656,6 +656,24 @@ enum ObjectKind {
     CommittedDatatype(Box<CommittedDatatypeInfo>),
 }
 
+/// Whether a header's messages say it is a committed (named) datatype: a
+/// datatype message, no group storage, and not the dataspace/layout pair a
+/// dataset needs.
+///
+/// The one authority for that question. [`Hdf5Reader::classify_object`] asks it
+/// of a file being read and `ReopenWalk::plan` of one being appended to, and a
+/// header that is a named datatype to one and an unclassifiable object to the
+/// other is how `named_datatype_names` came to answer differently in the two
+/// modes for the same file.
+pub(crate) fn header_is_committed_datatype(header: &ObjectHeader) -> bool {
+    let present = |t: u8| header.messages.iter().any(|m| m.msg_type == t);
+    let is_group = present(MSG_LINK)
+        || present(MSG_LINK_INFO)
+        || present(MSG_SYMBOL_TABLE)
+        || present(MSG_GROUP_INFO);
+    !is_group && present(MSG_DATATYPE) && !(present(MSG_DATASPACE) && present(MSG_DATA_LAYOUT))
+}
+
 /// A committed (named) datatype as read from its own object header.
 ///
 /// `H5Tcommit` gives a type a name and a place in the file; every dataset and
@@ -1818,16 +1836,15 @@ impl Hdf5Reader {
         if is_group {
             return ObjectKind::Group;
         }
+        if header_is_committed_datatype(header) {
+            return ObjectKind::CommittedDatatype(Box::new(Self::committed_datatype(
+                handle, header, meta,
+            )));
+        }
         let is_dataset =
             present(MSG_DATATYPE) && present(MSG_DATASPACE) && present(MSG_DATA_LAYOUT);
         if !is_dataset {
-            return if present(MSG_DATATYPE) {
-                ObjectKind::CommittedDatatype(Box::new(Self::committed_datatype(
-                    handle, header, meta,
-                )))
-            } else {
-                ObjectKind::Group
-            };
+            return ObjectKind::Group;
         }
 
         let mut datatype = None;
