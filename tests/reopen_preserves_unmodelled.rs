@@ -298,6 +298,89 @@ fn a_root_group_this_writer_cannot_rewrite_in_full_is_refused_untouched() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Flip one byte of the first `sig` block in `path`, at `offset` bytes past
+/// the signature. Every chunk-index block ends in a checksum over its own
+/// bytes, so this is enough to make one unreadable while leaving the object
+/// header — and the rest of the file — exactly as libhdf5 wrote it.
+fn corrupt_block(path: &std::path::Path, sig: &[u8], offset: usize) {
+    let mut data = std::fs::read(path).unwrap();
+    let at = data
+        .windows(sig.len())
+        .position(|w| w == sig)
+        .unwrap_or_else(|| panic!("{} not in fixture", String::from_utf8_lossy(sig)));
+    data[at + offset] ^= 0xff;
+    std::fs::write(path, data).unwrap();
+}
+
+/// A chunk index the reopen cannot read back is the same loss one message
+/// down: the extensible-array index block was decoded with a fallback that
+/// substituted an *empty* index, so the reopened dataset was registered
+/// believing it had no chunks. Writing one chunk to it then rewrote the index
+/// with that chunk alone and every chunk the file already held was stranded —
+/// the blocks still in the file, nothing naming them.
+#[test]
+fn a_chunk_index_that_does_not_read_back_keeps_its_chunks_through_a_reopen() {
+    let Some(py) = python() else { return };
+    let dir = tmp_dir("bad_chunk_index");
+    let (orig, work) = (dir.join("orig.h5"), dir.join("work.h5"));
+
+    // maxshape with exactly one unlimited dimension is what makes libhdf5
+    // index the chunks with an extensible array.
+    py_run(
+        py,
+        &orig,
+        &work,
+        "with h5py.File(ORIG, 'w', libver='latest') as f:\n\
+         \x20   f.create_dataset('ea', data=np.arange(8, dtype='<i4'), \
+         maxshape=(None,), chunks=(2,))\n\
+         \x20   f.create_dataset('plain', data=np.arange(4, dtype='<i4'))\n",
+    );
+    corrupt_block(&orig, b"EAIB", 6);
+    std::fs::copy(&orig, &work).unwrap();
+
+    let file = rust_hdf5::H5File::open_rw(&work).expect("the rest of the file still opens");
+    let why = match file.dataset_writer("ea") {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("the writer must not hand out a dataset whose index it could not read"),
+    };
+    assert!(
+        why.contains("ea") && why.contains("chunk index"),
+        "the writer must say which object it kept and why: {why}"
+    );
+    file.new_dataset::<i32>()
+        .shape([2])
+        .create("added")
+        .expect("create")
+        .write_raw(&[7i32, 8])
+        .expect("write");
+    file.close().expect("close");
+
+    py_run(
+        py,
+        &orig,
+        &work,
+        &format!(
+            "{HEADER_IDENTITY}\
+             def block(path, sig, n):\n\
+             \x20   data = open(path, 'rb').read()\n\
+             \x20   i = data.find(sig)\n\
+             \x20   assert i > 0, (path, sig)\n\
+             \x20   return i, data[i:i + n]\n\
+             with h5py.File(WORK, 'r') as f:\n\
+             \x20   assert sorted(f.keys()) == ['added', 'ea', 'plain'], sorted(f.keys())\n\
+             \x20   assert f['ea'].shape == (8,), f['ea'].shape\n\
+             \x20   assert list(f['plain'][...]) == [0, 1, 2, 3]\n\
+             \x20   assert list(f['added'][...]) == [7, 8]\n\
+             assert_untouched('ea')\n\
+             # header, then signature through the four chunk addresses.\n\
+             assert block(ORIG, b'EAHD', 44) == block(WORK, b'EAHD', 44), 'array header moved'\n\
+             assert block(ORIG, b'EAIB', 46) == block(WORK, b'EAIB', 46), 'index block rewritten'\n"
+        ),
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A preserved object still occupies its name. Asking for it by name says
 /// what it is rather than reporting it absent, and creating something of that
 /// name is refused — two link messages of one name in a group is an invalid
