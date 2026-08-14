@@ -498,6 +498,100 @@ fn creating_a_chunked_dataset_in_a_classic_file_is_refused() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// What a classic file accepts is decided per storage form, not per file.
+///
+/// Compact and contiguous layouts both encode as a version-3 data layout
+/// message, which is exactly what libhdf5 writes at `H5F_LIBVER_EARLIEST`, so
+/// both belong in a version-0 file and are written into one here. Chunked
+/// storage does not — its index would be a version-1 B-tree this crate reads
+/// but cannot write — so it stays refused, and so does every filter, because
+/// a filter pipeline in HDF5 has nowhere to live but a chunk.
+#[test]
+fn a_classic_file_takes_compact_and_contiguous_but_no_chunk() {
+    let Some(py) = python() else { return };
+    let path = tmp("storage_matrix");
+    write_default_h5py(py, &path, "f['alpha'] = np.arange(6, dtype='<i4')\n");
+
+    let file = H5File::open_rw(&path).unwrap();
+
+    // Writable: the image lives inside the layout message in the object
+    // header, so a compact dataset asks the file for no structure a version-0
+    // superblock lacks.
+    file.new_dataset::<i32>()
+        .shape([4])
+        .compact()
+        .create("packed")
+        .unwrap()
+        .write_raw(&[10i32, 20, 30, 40])
+        .unwrap();
+
+    // Writable: one run of bytes and an address to it.
+    file.new_dataset::<i32>()
+        .shape([3])
+        .create("flat")
+        .unwrap()
+        .write_raw(&[1i32, 2, 3])
+        .unwrap();
+
+    // Refused, each for the chunk index it would need. A filter is refused by
+    // the same rule and not a second one: it is the chunking it requires that
+    // the file cannot hold.
+    for (which, res) in [
+        (
+            "chunked",
+            file.new_dataset::<i32>()
+                .shape([64])
+                .chunk(&[8])
+                .create("a"),
+        ),
+        (
+            "deflate",
+            file.new_dataset::<i32>()
+                .shape([64])
+                .chunk(&[8])
+                .deflate(6)
+                .create("b"),
+        ),
+        (
+            "shuffle",
+            file.new_dataset::<i32>()
+                .shape([64])
+                .chunk(&[8])
+                .shuffle()
+                .create("c"),
+        ),
+        (
+            "shuffle+deflate",
+            file.new_dataset::<i32>()
+                .shape([64])
+                .chunk(&[8])
+                .shuffle_deflate(6)
+                .create("d"),
+        ),
+    ] {
+        match res {
+            Ok(_) => panic!("{which} needs a chunk index this writer cannot build here"),
+            Err(e) => assert!(e.to_string().contains("version-1 B-tree"), "{which}: {e}"),
+        }
+    }
+
+    file.close().unwrap();
+
+    // Still the file it was, and libhdf5 reads both new datasets — including
+    // the compact one, whose bytes are only in its header.
+    assert_eq!(superblock_version(&path), 0);
+    read_with_h5py(
+        py,
+        &path,
+        "assert sorted(f.keys()) == ['alpha', 'flat', 'packed'], sorted(f.keys())\n\
+         assert list(f['packed'][...]) == [10, 20, 30, 40], list(f['packed'][...])\n\
+         assert list(f['flat'][...]) == [1, 2, 3], list(f['flat'][...])\n\
+         assert f['packed'].id.get_create_plist().get_layout() == h5py.h5d.COMPACT\n",
+    );
+    libhdf5_tools_accept(py, &path);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Raising the library-version bound on a classic file is refused rather than
 /// ignored: `H5F_LIBVER_EARLIEST` is the only bound at which libhdf5 writes
 /// this format, so a caller who asks for a newer one is asking for a file this

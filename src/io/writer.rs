@@ -2752,16 +2752,24 @@ impl Hdf5Writer {
 
     /// Refuse a storage form this file's format cannot hold.
     ///
-    /// A chunked dataset in a classic file is a version-3 data layout message
-    /// over a version-1 B-tree chunk index — the shape libhdf5 writes at
-    /// default bounds, and the one this crate reads but does not build. The
-    /// version-4 layout it does build would drag the superblock to version 3
-    /// (`H5O_layout_ver_bounds`, H5Dlayout.c:44), silently converting the file
-    /// the append was supposed to leave classic.
+    /// Per form, not per file. Contiguous and compact storage both encode as
+    /// a version-3 data layout message, which is what
+    /// `H5O_layout_ver_bounds` gives `H5F_LIBVER_EARLIEST` (H5Dlayout.c:44),
+    /// so a classic file takes both; a committed datatype has no layout at
+    /// all. Only chunked storage is out of reach: its index would be a
+    /// version-1 B-tree this crate reads but does not build, and the
+    /// version-4 layout it *does* build would drag the superblock to version
+    /// 3, silently converting the file the append was supposed to leave
+    /// classic. A filter needs a chunk to live in, so this refusal covers
+    /// deflate and shuffle without naming them.
     fn reject_unwritable_storage(&self, storage: NewStorage, name: &str) -> IoResult<()> {
         if storage == NewStorage::Chunked && self.is_legacy() {
             return Err(crate::io::IoError::Unsupported(format!(
-                "cannot create the chunked dataset '{name}' in this file: it is in the                  classic (version-0/1 superblock) format, whose chunk index is a                  version-1 B-tree that this crate reads but does not write. Create it                  contiguously, or re-create the file at a newer library-version bound"
+                "cannot create the chunked dataset '{name}' in this file: it is in \
+                 the classic (version-0/1 superblock) format, whose chunk index is \
+                 a version-1 B-tree that this crate reads but does not write. \
+                 Create it contiguously or compactly, or re-create the file at a \
+                 newer library-version bound"
             )));
         }
         Ok(())
