@@ -25,6 +25,7 @@ use crate::io::{Hdf5Reader, Hdf5Writer};
 use crate::dataset::{DatasetBuilder, H5Dataset};
 use crate::error::{Hdf5Error, Result};
 use crate::format::messages::filter::FilterPipeline;
+use crate::format::LibverBound;
 use crate::group::H5Group;
 use crate::types::H5Type;
 
@@ -188,10 +189,33 @@ impl H5File {
     ///
     /// Errors in read mode.
     pub fn set_libver_latest(&self, latest: bool) -> Result<()> {
+        self.set_libver_bound(if latest {
+            LibverBound::V200
+        } else {
+            LibverBound::Earliest
+        })
+    }
+
+    /// Set the file's low libver bound — `H5Pset_libver_bounds`'s `low`
+    /// argument, the oldest libhdf5 release the file must stay readable by.
+    ///
+    /// Objects created after this call encode their messages at the versions
+    /// that bound calls for: a compound, enum or array datatype message moves
+    /// to version 3 at [`LibverBound::V18`] and version 4 at
+    /// [`LibverBound::V112`], the way `H5T_set_version` upgrades a datatype,
+    /// while an integer or string message stays at version 1 in every file.
+    /// [`LibverBound::V200`] additionally selects the version-5 data layout
+    /// for filtered chunked datasets, as [`Self::set_libver_latest`] does.
+    ///
+    /// [`LibverBound::Earliest`] by default, matching libhdf5's own default
+    /// file access property list.
+    ///
+    /// Errors in read mode.
+    pub fn set_libver_bound(&self, libver: LibverBound) -> Result<()> {
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
-                writer.set_libver_latest(latest);
+                writer.set_libver_bound(libver);
                 Ok(())
             }
             _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
@@ -470,12 +494,43 @@ impl H5File {
     /// Create a variable-length string dataset and write data.
     ///
     /// This is a convenience method for writing h5py-compatible vlen string
-    /// datasets using global heap storage.
+    /// datasets using global heap storage. The datatype declares UTF-8, which
+    /// a Rust `&str` always is; [`write_vlen_strings_ascii`] writes the same
+    /// dataset under an ASCII declaration, the type h5py's
+    /// `string_dtype("ascii")` produces.
+    ///
+    /// [`write_vlen_strings_ascii`]: Self::write_vlen_strings_ascii
     pub fn write_vlen_strings(&self, name: &str, strings: &[&str]) -> Result<H5Dataset> {
+        self.write_vlen_strings_charset(name, strings, 1)
+    }
+
+    /// Create a variable-length **ASCII** string dataset and write data.
+    ///
+    /// The ASCII twin of [`write_vlen_strings`](Self::write_vlen_strings),
+    /// named after the [`DatatypeMessage::vlen_string_ascii`] /
+    /// [`DatatypeMessage::vlen_string_utf8`] pair it selects between. A string
+    /// that is not 7-bit is rejected rather than stored under a datatype that
+    /// misdescribes it, so the file reads the same in every library that
+    /// trusts the declaration.
+    ///
+    /// [`DatatypeMessage::vlen_string_ascii`]: crate::DatatypeMessage::vlen_string_ascii
+    /// [`DatatypeMessage::vlen_string_utf8`]: crate::DatatypeMessage::vlen_string_utf8
+    pub fn write_vlen_strings_ascii(&self, name: &str, strings: &[&str]) -> Result<H5Dataset> {
+        self.write_vlen_strings_charset(name, strings, 0)
+    }
+
+    /// The single owner of one-call vlen-string dataset creation: the two
+    /// public entry points differ only in the character set they declare.
+    fn write_vlen_strings_charset(
+        &self,
+        name: &str,
+        strings: &[&str],
+        charset: u8,
+    ) -> Result<H5Dataset> {
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let idx = writer.create_vlen_string_dataset(name, strings)?;
+                let idx = writer.create_vlen_string_dataset(name, strings, charset)?;
                 let (shape, element_size, chunked, btree2, fixed_array) =
                     writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
@@ -501,11 +556,35 @@ impl H5File {
     /// sequence of `u8` in global heap storage. h5py reads it back as an array
     /// of `uint8` arrays. Returns a writer-mode handle so attributes can be
     /// attached, like [`write_vlen_strings`](Self::write_vlen_strings).
+    ///
+    /// The `u8` case of [`write_vlen_numeric`](Self::write_vlen_numeric).
     pub fn write_vlen_bytes(&self, name: &str, items: &[&[u8]]) -> Result<H5Dataset> {
+        self.write_vlen_numeric(name, items)
+    }
+
+    /// Create a variable-length numeric-sequence dataset and write data.
+    ///
+    /// Each `&[T]` becomes one element of variable length, stored as a global
+    /// heap object under a vlen sequence datatype over `T`; h5py reads the
+    /// dataset back as an array of `T`-typed arrays, the type
+    /// `h5py.vlen_dtype(np.dtype(...))` produces. Sequences may have any
+    /// length, including zero. Returns a writer-mode handle so attributes can
+    /// be attached, like [`write_vlen_strings`](Self::write_vlen_strings).
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("v.h5").unwrap();
+    /// let a: &[i32] = &[1, 2, 3];
+    /// let b: &[i32] = &[];
+    /// file.write_vlen_numeric("data", &[a, b]).unwrap();
+    /// ```
+    pub fn write_vlen_numeric<T: H5Type>(&self, name: &str, items: &[&[T]]) -> Result<H5Dataset> {
+        let images = crate::dataset::vlen_sequence_images(items)?;
+        let images: Vec<&[u8]> = images.iter().map(|c| c.as_ref()).collect();
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let idx = writer.create_vlen_bytes_dataset(name, items)?;
+                let idx = writer.create_vlen_sequence_dataset(name, T::hdf5_type(), &images)?;
                 let (shape, element_size, chunked, btree2, fixed_array) =
                     writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
@@ -1888,6 +1967,86 @@ mod integration_tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// The one-call writers declare the character set they are named for —
+    /// `write_vlen_strings` UTF-8, `write_vlen_strings_ascii` ASCII — and the
+    /// ASCII one refuses a string its declaration would misdescribe, before
+    /// anything reaches the file.
+    #[test]
+    fn vlen_string_writers_declare_their_character_set() {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let path = temp_path("vlen_cset");
+        let file = H5File::create(&path).unwrap();
+        file.write_vlen_strings_ascii("ascii", &["alpha", "b", ""])
+            .unwrap();
+        file.write_vlen_strings("utf8", &["été", "日本"]).unwrap();
+        let err = file
+            .write_vlen_strings_ascii("rejected", &["ok", "안녕"])
+            .err()
+            .expect("a non-ASCII string was accepted under an ASCII datatype")
+            .to_string();
+        assert!(
+            err.contains("string 1") && err.contains("is not ASCII"),
+            "got: {err}"
+        );
+        file.close().unwrap();
+
+        let file = H5File::open(&path).unwrap();
+        let ascii = file.dataset("ascii").unwrap();
+        assert_eq!(
+            ascii.datatype().unwrap(),
+            DatatypeMessage::VarLenString {
+                padding: 0,
+                charset: 0,
+            }
+        );
+        assert_eq!(ascii.read_strings().unwrap(), vec!["alpha", "b", ""]);
+        let utf8 = file.dataset("utf8").unwrap();
+        assert_eq!(
+            utf8.datatype().unwrap(),
+            DatatypeMessage::VarLenString {
+                padding: 0,
+                charset: 1,
+            }
+        );
+        assert_eq!(utf8.read_strings().unwrap(), vec!["été", "日本"]);
+        // The refused write left nothing behind.
+        assert!(file.dataset("rejected").is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The group-level twin declares ASCII the same way the file-level one
+    /// does, for a dataset inside the group.
+    #[test]
+    fn group_vlen_string_writer_declares_ascii() {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let path = temp_path("vlen_cset_group");
+        let file = H5File::create(&path).unwrap();
+        let g = file.create_group("entry").unwrap();
+        g.write_vlen_strings_ascii("notes", &["alpha", "b"])
+            .unwrap();
+        let err = g
+            .write_vlen_strings_ascii("rejected", &["안녕"])
+            .err()
+            .expect("a non-ASCII string was accepted under an ASCII datatype")
+            .to_string();
+        assert!(err.contains("is not ASCII"), "got: {err}");
+        file.close().unwrap();
+
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("entry/notes").unwrap();
+        assert_eq!(
+            ds.datatype().unwrap(),
+            DatatypeMessage::VarLenString {
+                padding: 0,
+                charset: 0,
+            }
+        );
+        assert_eq!(ds.read_strings().unwrap(), vec!["alpha", "b"]);
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn vlen_bytes_write_read() {
         let path = temp_path("vlen_bytes_wr");
@@ -1904,6 +2063,89 @@ mod integration_tests {
             let expected: Vec<Vec<u8>> = items.iter().map(|s| s.to_vec()).collect();
             assert_eq!(got, expected);
         }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A vlen sequence over a wider base stores element counts, not byte
+    /// counts, in the `H5T_VLEN` length field, and the datatype names the
+    /// base — so the file says what it holds for every width.
+    #[test]
+    fn vlen_numeric_write_read() {
+        use crate::format::global_heap::decode_vlen_reference;
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let path = temp_path("vlen_numeric_wr");
+        let a: &[i32] = &[1, 2, 3];
+        let b: &[i32] = &[];
+        let c: &[i32] = &[-7];
+        {
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_numeric("data", &[a, b, c]).unwrap();
+            let f64s: &[f64] = &[1.5, -2.5];
+            file.write_vlen_numeric("wide", &[f64s]).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("data").unwrap();
+        assert_eq!(
+            ds.datatype().unwrap(),
+            DatatypeMessage::VarLenSequence {
+                base: Box::new(DatatypeMessage::i32_type()),
+            }
+        );
+        let decoded: Vec<Vec<i32>> = ds
+            .read_vlen_bytes()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                item.chunks_exact(4)
+                    .map(|w| i32::from_le_bytes(w.try_into().unwrap()))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(decoded, vec![a.to_vec(), b.to_vec(), c.to_vec()]);
+
+        // The length field counts elements: 3 i32s, not 12 bytes.
+        let ctx = crate::format::FormatContext::default_v3();
+        let raw = ds.read_raw_bytes().unwrap();
+        let (seq_len, _, _) = decode_vlen_reference(&raw, &ctx).unwrap();
+        assert_eq!(seq_len, 3);
+
+        let wide = file.dataset("wide").unwrap();
+        assert_eq!(
+            wide.datatype().unwrap(),
+            DatatypeMessage::VarLenSequence {
+                base: Box::new(DatatypeMessage::f64_type()),
+            }
+        );
+        let (seq_len, _, _) = decode_vlen_reference(&wide.read_raw_bytes().unwrap(), &ctx).unwrap();
+        assert_eq!(seq_len, 2);
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `write_vlen_bytes` is the `u8` case of the same writer, so the byte
+    /// datatype and the byte-per-element length field are unchanged.
+    #[test]
+    fn vlen_bytes_is_the_u8_case_of_vlen_numeric() {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let path = temp_path("vlen_bytes_u8");
+        let items: [&[u8]; 2] = [b"abc", b""];
+        {
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_bytes("blobs", &items).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("blobs").unwrap();
+        assert_eq!(ds.datatype().unwrap(), DatatypeMessage::vlen_bytes());
+        let ctx = crate::format::FormatContext::default_v3();
+        let (seq_len, _, _) =
+            crate::format::global_heap::decode_vlen_reference(&ds.read_raw_bytes().unwrap(), &ctx)
+                .unwrap();
+        assert_eq!(seq_len, 3);
+        drop(file);
         std::fs::remove_file(&path).ok();
     }
 

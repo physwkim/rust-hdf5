@@ -7,7 +7,8 @@
 use crate::attribute::AttrBuilder;
 use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
-use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+use crate::format::reference::Reference;
 use crate::types::H5Type;
 
 // ---------------------------------------------------------------------------
@@ -37,6 +38,7 @@ pub struct DatasetBuilder<T: H5Type> {
     group_path: Option<String>,
     fill_value: Option<Vec<u8>>,
     datatype_override: Option<crate::format::messages::datatype::DatatypeMessage>,
+    object_references: bool,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -53,6 +55,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             group_path: None,
             fill_value: None,
             datatype_override: None,
+            object_references: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -69,6 +72,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             group_path: Some(group_path),
             fill_value: None,
             datatype_override: None,
+            object_references: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -178,6 +182,32 @@ impl<T: H5Type> DatasetBuilder<T> {
         self
     }
 
+    /// Store object references — h5py's `h5py.ref_dtype`.
+    ///
+    /// The elements are written with
+    /// [`write_object_references`](H5Dataset::write_object_references) and
+    /// name objects by path. The element width is the file's address size, so
+    /// the datatype is resolved at [`create`](Self::create) rather than here;
+    /// it overrides both `T` and any [`datatype`](Self::datatype) call.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("refs.h5").unwrap();
+    /// file.new_dataset::<i32>().shape([4]).create("target").unwrap();
+    /// let refs = file.new_dataset::<u64>()
+    ///     .object_references()
+    ///     .shape([1])
+    ///     .create("refs")
+    ///     .unwrap();
+    /// refs.write_object_references(&["/target"]).unwrap();
+    /// file.close().unwrap();
+    /// ```
+    #[must_use]
+    pub fn object_references(mut self) -> Self {
+        self.object_references = true;
+        self
+    }
+
     /// Set a user-defined fill value for unwritten elements.
     ///
     /// Without this, datasets use the HDF5 default zero-fill. When set,
@@ -225,10 +255,30 @@ impl<T: H5Type> DatasetBuilder<T> {
         } else {
             name.to_string()
         };
-        let fill_value = self.fill_value.clone();
 
         let dims_u64: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
-        let datatype = self.datatype_override.clone().unwrap_or_else(T::hdf5_type);
+        let datatype = if self.object_references {
+            // The element is one file address wide, and only the writer knows
+            // how wide that is for this file.
+            let inner = borrow_inner(&self.file_inner);
+            match &*inner {
+                H5FileInner::Writer(writer) => {
+                    crate::format::messages::datatype::DatatypeMessage::object_reference(
+                        writer.ctx(),
+                    )
+                }
+                H5FileInner::Reader(_) => {
+                    return Err(Hdf5Error::InvalidState(
+                        "cannot create a dataset in read mode".into(),
+                    ))
+                }
+                H5FileInner::Closed => {
+                    return Err(Hdf5Error::InvalidState("file is closed".into()))
+                }
+            }
+        } else {
+            self.datatype_override.clone().unwrap_or_else(T::hdf5_type)
+        };
         // Size one element from the on-disk datatype, not the carrier `T`. For
         // the default path this equals `T::element_size()`; when a `datatype()`
         // override is set (N-bit, or a runtime `CompoundType`), the stored type
@@ -236,6 +286,14 @@ impl<T: H5Type> DatasetBuilder<T> {
         // allocation, and the `write_raw` length check all agree with the bytes
         // libhdf5/h5py will read.
         let element_size = datatype.element_size() as usize;
+        // `fill_value` took the host image of a `T`; the fill-value message
+        // holds one element in the dataset's own datatype, so it is converted
+        // here — the order is only known once the override is resolved, and
+        // the builder's calls can arrive in either order.
+        let fill_value = match self.fill_value.as_deref() {
+            Some(bytes) => Some(to_stored_byte_order(bytes, &datatype, element_size)?.into_owned()),
+            None => None,
+        };
 
         // A filter pipeline requires chunked storage. When a filter is
         // requested without explicit chunk dimensions, store the whole
@@ -472,27 +530,156 @@ enum ChunkBytes<'a> {
     Prefiltered { data: &'a [u8], filter_mask: u32 },
 }
 
+/// The byte order this build reads and writes natively.
+pub(crate) const HOST_BYTE_ORDER: ByteOrder = if cfg!(target_endian = "big") {
+    ByteOrder::BigEndian
+} else {
+    ByteOrder::LittleEndian
+};
+
+/// The byte order this build does not read or write natively.
+pub(crate) const FOREIGN_BYTE_ORDER: ByteOrder = match HOST_BYTE_ORDER {
+    ByteOrder::LittleEndian => ByteOrder::BigEndian,
+    ByteOrder::BigEndian => ByteOrder::LittleEndian,
+};
+
+/// What a typed access has to do with an element image of a given datatype.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ByteOrderAction {
+    /// Stored order is the host's: the image is already the typed value.
+    Keep,
+    /// The whole element is one scalar in the foreign order: reverse it.
+    SwapElements,
+    /// A composite storing something in the foreign order.
+    Refuse,
+}
+
+/// Classify a datatype for a typed access of element width `width`.
+///
+/// The single owner of the rule; both directions ask it, so a type a read
+/// converts is exactly a type a write converts.
+///
+/// A composite element cannot be swapped as a unit — its members have their
+/// own orders and offsets — so one that touches the foreign order is refused
+/// rather than silently passed through in the wrong order.
+fn byte_order_action(datatype: &DatatypeMessage, width: usize) -> ByteOrderAction {
+    match datatype.scalar_byte_order() {
+        Some(order) if order == FOREIGN_BYTE_ORDER && width > 1 => ByteOrderAction::SwapElements,
+        Some(_) => ByteOrderAction::Keep,
+        None if datatype.contains_byte_order(FOREIGN_BYTE_ORDER) => ByteOrderAction::Refuse,
+        None => ByteOrderAction::Keep,
+    }
+}
+
+/// Put a raw element image into host byte order, in place, for a typed read.
+///
+/// Every path that reinterprets the on-disk image as `T` — `read_raw`,
+/// `read_slice`, `read_raw_into`, `read_slice_into` and their SWMR
+/// counterparts — passes through here. Reinterpretation only yields the
+/// stored value when the stored order is the host's.
+///
+/// A refused datatype is one no reinterpretation can decode;
+/// [`H5Dataset::read_raw_bytes`] hands over the image for the caller to
+/// decode member by member.
+///
+/// `width` is the element size, already checked equal to `T::element_size()`.
+pub(crate) fn to_host_byte_order(
+    bytes: &mut [u8],
+    datatype: &DatatypeMessage,
+    width: usize,
+) -> Result<()> {
+    match byte_order_action(datatype, width) {
+        ByteOrderAction::Keep => {}
+        ByteOrderAction::SwapElements => {
+            for elem in bytes.chunks_exact_mut(width) {
+                elem.reverse();
+            }
+        }
+        ByteOrderAction::Refuse => {
+            return Err(Hdf5Error::TypeMismatch(format!(
+                "dataset datatype {datatype} stores {FOREIGN_BYTE_ORDER:?} values, which a \
+                 typed read cannot reinterpret element by element; read_raw_bytes() returns \
+                 the image to decode member by member"
+            )))
+        }
+    }
+    Ok(())
+}
+
+/// The stored byte image of each variable-length sequence in a batch.
+///
+/// The vlen writers take `&[&[T]]` and store one global-heap object per
+/// sequence, so each sequence needs the same host-image-to-stored-image step
+/// [`to_stored_byte_order`] performs for a fixed-shape write — a `T` is
+/// written from its host bytes, and `T::hdf5_type()` declares little-endian.
+/// Borrows on a little-endian host, which is every machine that does not have
+/// to swap.
+pub(crate) fn vlen_sequence_images<'a, T: H5Type>(
+    items: &'a [&'a [T]],
+) -> Result<Vec<std::borrow::Cow<'a, [u8]>>> {
+    let base = T::hdf5_type();
+    items
+        .iter()
+        .map(|item| {
+            // Safety: the same contract `write_raw` relies on — `T: Copy +
+            // 'static` is a numeric primitive whose byte image is its value —
+            // and the extent comes from the slice itself, so it cannot name
+            // memory past it. The result borrows `items` and outlives nothing.
+            let host = unsafe {
+                std::slice::from_raw_parts(item.as_ptr() as *const u8, std::mem::size_of_val(*item))
+            };
+            to_stored_byte_order(host, &base, T::element_size())
+        })
+        .collect()
+}
+
+/// Put a typed value's host-order image into the order the datatype declares.
+///
+/// The write-side counterpart of [`to_host_byte_order`], and the one place
+/// every path that hands a `&[T]` to the file — `write_raw`, `write_slice`,
+/// `append`, and the builder's fill value — turns those bytes into stored
+/// bytes. A `T` is written from its host image, so a dataset declaring the
+/// foreign order would otherwise hold host bytes under that declaration: a
+/// file that is wrong by its own header.
+///
+/// Borrows when the declared order is the host's, which is every write that
+/// does not set a [`datatype`](DatasetBuilder::datatype) override.
+///
+/// `width` is the element size, already checked equal to `T::element_size()`.
+pub(crate) fn to_stored_byte_order<'a>(
+    bytes: &'a [u8],
+    datatype: &DatatypeMessage,
+    width: usize,
+) -> Result<std::borrow::Cow<'a, [u8]>> {
+    match byte_order_action(datatype, width) {
+        ByteOrderAction::Keep => Ok(std::borrow::Cow::Borrowed(bytes)),
+        ByteOrderAction::SwapElements => {
+            let mut owned = bytes.to_vec();
+            for elem in owned.chunks_exact_mut(width) {
+                elem.reverse();
+            }
+            Ok(std::borrow::Cow::Owned(owned))
+        }
+        ByteOrderAction::Refuse => Err(Hdf5Error::TypeMismatch(format!(
+            "dataset datatype {datatype} stores {FOREIGN_BYTE_ORDER:?} values, which a typed \
+             write cannot lay out element by element; write_raw_bytes() takes the image the \
+             caller encodes member by member"
+        ))),
+    }
+}
+
 /// Strip a fixed-string element's padding, leaving the bytes that carry the
 /// value.
 ///
-/// The three padding rules are the HDF5 datatype message's: null-terminated
-/// stops at the first NUL and says nothing about the bytes after it,
-/// null-padded and space-padded fill the tail with that byte. `index` names
-/// the element in the error a reserved padding rule produces.
+/// The rule itself lives with the datatype message
+/// ([`fixed_string_content`]); this adds the element index a reserved padding
+/// rule needs to be reported against.
 fn trim_fixed_string(elem: &[u8], padding: u8, index: usize) -> Result<&[u8]> {
-    let end = match padding {
-        // Null-terminated.
-        0 => elem.iter().position(|&b| b == 0).unwrap_or(elem.len()),
-        // Null-padded / space-padded: the tail of that byte is padding.
-        1 => elem.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1),
-        2 => elem.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1),
-        other => {
-            return Err(Hdf5Error::InvalidState(format!(
-                "string {index} uses padding rule {other}, which the format reserves"
-            )))
-        }
-    };
-    Ok(&elem[..end])
+    crate::format::messages::datatype::fixed_string_content(elem, padding).ok_or_else(|| {
+        Hdf5Error::InvalidState(format!(
+            "string {index} uses padding rule {padding}, which the format reserves"
+        ))
+    })
 }
 
 /// Decode one string element's bytes under the datatype's character set.
@@ -864,8 +1051,20 @@ impl H5Dataset {
                 // byte representation. The resulting slice borrows `data` and
                 // lives only as long as this block.
                 let byte_len = data.len() * T::element_size();
-                let raw =
+                let host =
                     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
+                let datatype = {
+                    let inner = borrow_inner(&self.file_inner);
+                    match &*inner {
+                        H5FileInner::Writer(writer) => writer.dataset_datatype(*index),
+                        _ => {
+                            return Err(Hdf5Error::InvalidState(
+                                "file is no longer in write mode".into(),
+                            ))
+                        }
+                    }
+                };
+                let stored = to_stored_byte_order(host, &datatype, T::element_size())?;
 
                 if *chunked {
                     // A chunked dataset has no contiguous data block; scatter
@@ -875,7 +1074,7 @@ impl H5Dataset {
                         *index,
                         *btree2,
                         *fixed_array,
-                        raw,
+                        &stored,
                         *element_size,
                     );
                 }
@@ -883,7 +1082,7 @@ impl H5Dataset {
                 let inner = borrow_inner(&self.file_inner);
                 match &*inner {
                     H5FileInner::Writer(writer) => {
-                        writer.write_dataset_raw(*index, raw)?;
+                        writer.write_dataset_raw(*index, &stored)?;
                         Ok(())
                     }
                     _ => Err(Hdf5Error::InvalidState(
@@ -1637,9 +1836,11 @@ impl H5Dataset {
                 let chunk_dim0 = chunk_dims[0] as usize;
                 let frame_bytes = frame_elems * es;
 
-                let raw = unsafe {
+                let host = unsafe {
                     std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * es)
                 };
+                let datatype = writer.dataset_datatype(ds_index);
+                let raw = to_stored_byte_order(host, &datatype, es)?;
 
                 // Merge the buffer with the new frames when it is the
                 // dataset's tail; a buffer left mid-extent (the extent moved
@@ -1656,7 +1857,7 @@ impl H5Dataset {
                     }
                     None => (current_dim0, 0, Vec::new()),
                 };
-                combined.extend_from_slice(raw);
+                combined.extend_from_slice(&raw);
 
                 let total_frames = buffered_frames + n_new_frames;
 
@@ -1796,10 +1997,11 @@ impl H5Dataset {
                         element_size,
                     )));
                 }
+                let datatype = self.datatype()?;
                 let starts_u64: Vec<u64> = starts.iter().map(|&s| s as u64).collect();
                 let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
 
-                let raw = {
+                let mut raw = {
                     let mut inner = borrow_inner_mut(&self.file_inner);
                     match &mut *inner {
                         H5FileInner::Reader(reader) => {
@@ -1810,6 +2012,7 @@ impl H5Dataset {
                         }
                     }
                 };
+                to_host_byte_order(&mut raw, &datatype, T::element_size())?;
 
                 if raw.len() % T::element_size() != 0 {
                     return Err(Hdf5Error::TypeMismatch(format!(
@@ -1882,13 +2085,15 @@ impl H5Dataset {
                 let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
 
                 let byte_len = data.len() * T::element_size();
-                let raw =
+                let host =
                     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
 
                 let inner = borrow_inner(&self.file_inner);
                 match &*inner {
                     H5FileInner::Writer(writer) => {
-                        writer.write_slice(*index, &starts_u64, &counts_u64, raw)?;
+                        let datatype = writer.dataset_datatype(*index);
+                        let stored = to_stored_byte_order(host, &datatype, T::element_size())?;
+                        writer.write_slice(*index, &starts_u64, &counts_u64, &stored)?;
                         Ok(())
                     }
                     _ => Err(Hdf5Error::InvalidState(
@@ -1985,6 +2190,71 @@ impl H5Dataset {
         }
     }
 
+    /// Write object references naming `paths` into elements `0..paths.len()`
+    /// — h5py's `refs[i] = f['/target'].ref`.
+    ///
+    /// The dataset must have been created with
+    /// [`object_references`](DatasetBuilder::object_references). A path names
+    /// a dataset or a group (`/` is the root group) and must already exist;
+    /// what reaches the file is the target's object header address, which is
+    /// assigned when the file is finalized. Elements left unwritten read back
+    /// as null references.
+    pub fn write_object_references(&self, paths: &[&str]) -> Result<()> {
+        match &self.info {
+            DatasetInfo::Writer { index, .. } => {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Writer(writer) => {
+                        writer.write_object_references(*index, 0, paths)?;
+                        Ok(())
+                    }
+                    _ => Err(Hdf5Error::InvalidState(
+                        "file is no longer in write mode".into(),
+                    )),
+                }
+            }
+            DatasetInfo::Reader { .. } => {
+                Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
+            }
+        }
+    }
+
+    /// Read a reference dataset's elements, each resolved to the object it
+    /// names.
+    ///
+    /// Every reference kind is read: the pre-1.12 pair h5py writes —
+    /// `Reference` (an object header address) and `RegionReference` (a heap id
+    /// whose heap object holds the target plus a serialized selection) — and
+    /// the 1.12 `H5T_STD_REF` trio, `H5R_OBJECT2`, `H5R_DATASET_REGION2` and
+    /// `H5R_ATTR`. An object reference comes back as [`Reference::Object`]
+    /// carrying the target's path, a region reference as
+    /// [`Reference::Region`], whose [`bounds`](Reference::bounds) is the
+    /// selection's bounding box — libhdf5's `H5Sget_select_bounds` — and an
+    /// attribute reference as [`Reference::Attr`], which adds the attribute's
+    /// name.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open("refs.h5").unwrap();
+    /// for r in file.dataset("refs").unwrap().read_references().unwrap() {
+    ///     println!("{:?} {:?}", r.path(), r.bounds());
+    /// }
+    /// ```
+    pub fn read_references(&self) -> Result<Vec<Reference>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => Ok(reader.read_references(name)?),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read references from a dataset in write mode".into(),
+            )),
+        }
+    }
+
     /// Read a string dataset, fixed-width or variable-length, as one `String`
     /// per element.
     ///
@@ -2026,7 +2296,7 @@ impl H5Dataset {
             ));
         }
         match self.datatype()? {
-            DatatypeMessage::VarLenString { charset } => self
+            DatatypeMessage::VarLenString { charset, .. } => self
                 .read_vlen_bytes()?
                 .iter()
                 .enumerate()
@@ -2084,7 +2354,8 @@ impl H5Dataset {
                     )));
                 }
 
-                let raw = {
+                let datatype = self.datatype()?;
+                let mut raw = {
                     let mut inner = borrow_inner_mut(&self.file_inner);
                     match &mut *inner {
                         H5FileInner::Reader(reader) => reader.read_dataset_raw(name)?,
@@ -2093,6 +2364,7 @@ impl H5Dataset {
                         }
                     }
                 };
+                to_host_byte_order(&mut raw, &datatype, T::element_size())?;
 
                 if raw.len() % T::element_size() != 0 {
                     return Err(Hdf5Error::TypeMismatch(format!(
@@ -2269,6 +2541,7 @@ impl H5Dataset {
                         element_size,
                     )));
                 }
+                let datatype = self.datatype()?;
                 // Safety: `T: H5Type` is a `Copy` POD numeric with a defined
                 // byte representation; every bit pattern the read writes is a
                 // valid `T`. The byte view borrows `out` exclusively for this
@@ -2278,11 +2551,16 @@ impl H5Dataset {
                 let bytes = unsafe {
                     std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, byte_len)
                 };
-                let mut inner = borrow_inner_mut(&self.file_inner);
-                match &mut *inner {
-                    H5FileInner::Reader(reader) => Ok(reader.read_dataset_raw_into(name, bytes)?),
-                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                {
+                    let mut inner = borrow_inner_mut(&self.file_inner);
+                    match &mut *inner {
+                        H5FileInner::Reader(reader) => reader.read_dataset_raw_into(name, bytes)?,
+                        _ => {
+                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()))
+                        }
+                    }
                 }
+                to_host_byte_order(bytes, &datatype, T::element_size())
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "cannot read from a dataset in write mode".into(),
@@ -2325,6 +2603,7 @@ impl H5Dataset {
                         element_size,
                     )));
                 }
+                let datatype = self.datatype()?;
                 let starts_u64: Vec<u64> = starts.iter().map(|&s| s as u64).collect();
                 let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
                 // Safety: see `read_raw_into` — `T: H5Type` POD, exclusive
@@ -2333,13 +2612,18 @@ impl H5Dataset {
                 let bytes = unsafe {
                     std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, byte_len)
                 };
-                let mut inner = borrow_inner_mut(&self.file_inner);
-                match &mut *inner {
-                    H5FileInner::Reader(reader) => {
-                        Ok(reader.read_slice_into(name, &starts_u64, &counts_u64, bytes)?)
+                {
+                    let mut inner = borrow_inner_mut(&self.file_inner);
+                    match &mut *inner {
+                        H5FileInner::Reader(reader) => {
+                            reader.read_slice_into(name, &starts_u64, &counts_u64, bytes)?
+                        }
+                        _ => {
+                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()))
+                        }
                     }
-                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
                 }
+                to_host_byte_order(bytes, &datatype, T::element_size())
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "cannot read from a dataset in write mode".into(),
@@ -2366,7 +2650,7 @@ pub(crate) mod numeric {
     //! attribute counterpart `H5Attribute::read_numeric_as`).
 
     use crate::error::{Hdf5Error, Result};
-    use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+    use crate::format::messages::datatype::{ByteOrder, DatatypeMessage, IeeeFormat};
 
     /// A source element, normalized: every standard integer width — u64::MAX
     /// included — fits in `i128` without loss.
@@ -2384,6 +2668,7 @@ pub(crate) mod numeric {
             signed: bool,
             byte_order: ByteOrder,
         },
+        F16(ByteOrder),
         F32(ByteOrder),
         F64(ByteOrder),
     }
@@ -2392,10 +2677,38 @@ pub(crate) mod numeric {
         fn element_size(self) -> usize {
             match self {
                 SourceKind::Int { size, .. } => size,
+                SourceKind::F16(_) => 2,
                 SourceKind::F32(_) => 4,
                 SourceKind::F64(_) => 8,
             }
         }
+    }
+
+    /// Widen an IEEE 754 binary16 bit pattern to `f32`, which represents every
+    /// half — including subnormals, infinities and NaN payloads — exactly.
+    ///
+    /// Rust has no stable `f16` to convert through.
+    fn f16_bits_to_f32(bits: u16) -> f32 {
+        let sign = u32::from(bits >> 15);
+        let exponent = u32::from((bits >> 10) & 0x1f);
+        let mantissa = u32::from(bits & 0x03ff);
+        if exponent == 0 {
+            // Zero and subnormals: the value is mantissa * 2^-24, which is a
+            // normal f32 for every mantissa, so the multiply is exact. Going
+            // through the sign separately keeps -0.0.
+            let magnitude = mantissa as f32 * (1.0 / 16_777_216.0);
+            return if sign == 1 { -magnitude } else { magnitude };
+        }
+        let out = if exponent == 0x1f {
+            // Infinity and NaN; shifting the mantissa maps the quiet bit onto
+            // f32's quiet bit and preserves the rest of the payload.
+            (sign << 31) | 0x7f80_0000 | (mantissa << 13)
+        } else {
+            // Normal: rebias the exponent (127 - 15) and left-align the
+            // mantissa.
+            (sign << 31) | ((exponent + 112) << 23) | (mantissa << 13)
+        };
+        f32::from_bits(out)
     }
 
     /// Map a datatype message to a supported numeric source shape.
@@ -2427,18 +2740,43 @@ pub(crate) mod numeric {
                     byte_order,
                 })
             }
+            DatatypeMessage::BitField {
+                size,
+                byte_order,
+                bit_offset,
+                bit_precision,
+            } => {
+                // A bit field has no signed form; a full-width one is the
+                // unsigned integer of the stored width. A narrower one would
+                // need a shift-and-mask conversion this path does not model.
+                if !matches!(size, 1 | 2 | 4 | 8)
+                    || bit_offset != 0
+                    || u32::from(bit_precision) != size * 8
+                {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "bit-field datatype (size {size}, bit offset {bit_offset}, \
+                         precision {bit_precision}) is not a whole-width bit field",
+                    )));
+                }
+                Ok(SourceKind::Int {
+                    size: size as usize,
+                    signed: false,
+                    byte_order,
+                })
+            }
             DatatypeMessage::FloatingPoint {
                 size,
                 byte_order,
                 exponent_size,
                 mantissa_size,
                 ..
-            } => match (size, exponent_size, mantissa_size) {
-                (4, 8, 23) => Ok(SourceKind::F32(byte_order)),
-                (8, 11, 52) => Ok(SourceKind::F64(byte_order)),
-                _ => Err(Hdf5Error::TypeMismatch(format!(
+            } => match dt.ieee_format() {
+                Some(IeeeFormat::Binary16) => Ok(SourceKind::F16(byte_order)),
+                Some(IeeeFormat::Binary32) => Ok(SourceKind::F32(byte_order)),
+                Some(IeeeFormat::Binary64) => Ok(SourceKind::F64(byte_order)),
+                None => Err(Hdf5Error::TypeMismatch(format!(
                     "floating-point datatype (size {size}, exponent {exponent_size} bits, \
-                     mantissa {mantissa_size} bits) is not IEEE binary32 or binary64",
+                     mantissa {mantissa_size} bits) is not an IEEE 754 interchange format",
                 ))),
             },
             ref other => Err(Hdf5Error::TypeMismatch(format!(
@@ -2472,6 +2810,14 @@ pub(crate) mod numeric {
                     i128::from(zero_extended)
                 };
                 NumericSource::Int(value)
+            }
+            SourceKind::F16(byte_order) => {
+                let arr: [u8; 2] = bytes.try_into().unwrap();
+                let bits = match byte_order {
+                    ByteOrder::LittleEndian => u16::from_le_bytes(arr),
+                    ByteOrder::BigEndian => u16::from_be_bytes(arr),
+                };
+                NumericSource::F32(f16_bits_to_f32(bits))
             }
             SourceKind::F32(byte_order) => {
                 let arr: [u8; 4] = bytes.try_into().unwrap();
@@ -2585,6 +2931,84 @@ pub(crate) mod numeric {
                         .into(),
                 )),
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Every binary16 bit pattern class widens to the f32 with the same
+        /// value: zeros keep their sign, subnormals stay exact, infinities and
+        /// NaN payloads survive.
+        #[test]
+        fn f16_widening_is_exact() {
+            let cases: [(u16, f32); 10] = [
+                (0x0000, 0.0),
+                (0x3c00, 1.0),
+                (0xc000, -2.0),
+                (0x3555, 0.333_251_95),   // nearest half to 1/3
+                (0x0001, 5.960_464_5e-8), // smallest subnormal, 2^-24
+                (0x03ff, 6.097_555e-5),   // largest subnormal
+                (0x0400, 6.103_515_6e-5), // smallest normal
+                (0x7bff, 65504.0),        // largest finite
+                (0x7c00, f32::INFINITY),
+                (0xfc00, f32::NEG_INFINITY),
+            ];
+            for (bits, expected) in cases {
+                let got = f16_bits_to_f32(bits);
+                assert_eq!(got, expected, "0x{bits:04x} widened to {got}");
+            }
+
+            let neg_zero = f16_bits_to_f32(0x8000);
+            assert_eq!(neg_zero, 0.0);
+            assert!(neg_zero.is_sign_negative(), "-0.0 lost its sign");
+
+            let nan = f16_bits_to_f32(0x7e01);
+            assert!(nan.is_nan());
+            // The quiet bit and the payload land in f32's mantissa.
+            assert_eq!(nan.to_bits(), 0x7fc0_2000);
+        }
+
+        #[test]
+        fn f16_source_converts_and_honors_byte_order() {
+            let kind = classify(&DatatypeMessage::f16_type()).unwrap();
+            // 1.0, -2.0, 0.333..., 65504
+            let raw = [0x00, 0x3c, 0x00, 0xc0, 0x55, 0x35, 0xff, 0x7b];
+            assert_eq!(
+                convert::<f32>(kind, &raw).unwrap(),
+                vec![1.0, -2.0, 0.333_251_95, 65504.0]
+            );
+            assert_eq!(
+                convert::<f64>(kind, &raw).unwrap(),
+                vec![1.0, -2.0, 0.333_251_953_125, 65504.0]
+            );
+
+            let DatatypeMessage::FloatingPoint { .. } = DatatypeMessage::f16_type() else {
+                unreachable!()
+            };
+            let mut be = DatatypeMessage::f16_type();
+            if let DatatypeMessage::FloatingPoint { byte_order, .. } = &mut be {
+                *byte_order = ByteOrder::BigEndian;
+            }
+            let be_kind = classify(&be).unwrap();
+            assert_eq!(convert::<f32>(be_kind, &[0x3c, 0x00]).unwrap(), vec![1.0]);
+        }
+
+        /// A float whose layout is not an interchange format is refused, not
+        /// reinterpreted.
+        #[test]
+        fn non_ieee_float_is_refused() {
+            let mut odd = DatatypeMessage::f32_type();
+            if let DatatypeMessage::FloatingPoint { exponent_bias, .. } = &mut odd {
+                *exponent_bias = 63;
+            }
+            assert!(odd.ieee_format().is_none());
+            let err = classify(&odd).err().expect("non-IEEE float was accepted");
+            assert!(
+                err.to_string().contains("IEEE 754 interchange format"),
+                "unexpected error: {err}"
+            );
         }
     }
 }
@@ -4950,7 +5374,7 @@ mod tests {
 
     // ---- issue #5: runtime-width fixed-string reading ----------------------
 
-    use crate::format::messages::datatype::DatatypeMessage;
+    use crate::format::messages::datatype::{CompoundMember, DatatypeMessage};
 
     /// Build a 1-D fixed-string dataset of `width` bytes per element from raw
     /// element images, optionally chunked and deflated.
@@ -4997,15 +5421,20 @@ mod tests {
         }
     }
 
-    /// Each padding rule decides where the value ends. Null-terminated stops at
-    /// the first NUL and ignores the bytes after it; the two pad rules strip a
-    /// tail of that byte and keep everything before it.
+    /// Each padding rule decides where the value ends. Null-terminated and
+    /// null-padded both stop at the first NUL and ignore the bytes after it;
+    /// space-padded strips only a tail of spaces, so an embedded NUL is
+    /// content there.
+    ///
+    /// Checked against libhdf5 1.14.6: reading this same `"ab\0X\0\0"`
+    /// null-padded element into a wider null-terminated destination gives
+    /// `"ab"`, and reading a space-padded `"a\0b     "` gives `"a\0b"` —
+    /// `H5T__conv_s_s` runs the same `!s[nchars]` loop for both null rules.
     #[test]
     fn read_strings_honors_every_padding_rule() {
-        // "ab" then a NUL then trailing junk a null-terminated read must drop
-        // and a null-padded read must keep.
+        // "ab" then a NUL then trailing junk that both null rules must drop.
         let elem: &[u8] = b"ab\0X\0\0";
-        for (padding, want) in [(0u8, "ab"), (1, "ab\0X")] {
+        for (padding, want) in [(0u8, "ab"), (1, "ab")] {
             let path = temp_path(&format!("fixed_pad_{padding}"));
             write_fixed_string_dataset(
                 &path,
@@ -5042,6 +5471,26 @@ mod tests {
             vec!["a b".to_string()]
         );
         std::fs::remove_file(&path).ok();
+
+        // ... and an embedded NUL, which no space rule marks as an end.
+        let path = temp_path("fixed_pad_2_nul");
+        write_fixed_string_dataset(
+            &path,
+            DatatypeMessage::FixedString {
+                size: 8,
+                padding: 2,
+                charset: 0,
+            },
+            8,
+            &[b"a\0b     "],
+            false,
+        );
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("labels").unwrap().read_strings().unwrap(),
+            vec!["a\0b".to_string()]
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     /// A reserved padding or character-set code is an error naming the element,
@@ -5071,6 +5520,134 @@ mod tests {
             assert!(err.contains(want), "got: {err}");
             std::fs::remove_file(&path).ok();
         }
+    }
+
+    /// The typed read paths reinterpret the element image, so the stored order
+    /// has to be the host's first. A scalar is swapped; a composite cannot be
+    /// (its members have their own orders and offsets) and is refused.
+    #[test]
+    fn to_host_byte_order_converts_scalars_and_refuses_composites() {
+        use crate::dataset::{to_host_byte_order, HOST_BYTE_ORDER};
+        use crate::format::messages::datatype::ByteOrder;
+
+        let foreign = match HOST_BYTE_ORDER {
+            ByteOrder::LittleEndian => ByteOrder::BigEndian,
+            ByteOrder::BigEndian => ByteOrder::LittleEndian,
+        };
+        let int = |order, size| DatatypeMessage::FixedPoint {
+            size,
+            byte_order: order,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: (size * 8) as u16,
+        };
+
+        // Foreign order: each element is reversed, elementwise.
+        let mut buf = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        to_host_byte_order(&mut buf, &int(foreign, 4), 4).unwrap();
+        assert_eq!(buf, [4, 3, 2, 1, 8, 7, 6, 5]);
+
+        // Host order: untouched.
+        let mut buf = [1u8, 2, 3, 4];
+        to_host_byte_order(&mut buf, &int(HOST_BYTE_ORDER, 4), 4).unwrap();
+        assert_eq!(buf, [1, 2, 3, 4]);
+
+        // One byte wide: no order to convert.
+        let mut buf = [1u8, 2, 3, 4];
+        to_host_byte_order(&mut buf, &int(foreign, 1), 1).unwrap();
+        assert_eq!(buf, [1, 2, 3, 4]);
+
+        // An enum stores its values in its base type's order.
+        let mut buf = [1u8, 2];
+        let enumeration = DatatypeMessage::Enum {
+            base: Box::new(int(foreign, 2)),
+            members: Vec::new(),
+        };
+        to_host_byte_order(&mut buf, &enumeration, 2).unwrap();
+        assert_eq!(buf, [2, 1]);
+
+        // A string has no byte order at all.
+        let mut buf = *b"abcd";
+        to_host_byte_order(&mut buf, &DatatypeMessage::fixed_string(4), 4).unwrap();
+        assert_eq!(&buf, b"abcd");
+
+        // A compound whose members are all host-order is reinterpretable.
+        let compound = |order| DatatypeMessage::Compound {
+            size: 4,
+            members: vec![CompoundMember {
+                name: "x".into(),
+                offset: 0,
+                datatype: int(order, 4),
+            }],
+        };
+        let mut buf = [1u8, 2, 3, 4];
+        to_host_byte_order(&mut buf, &compound(HOST_BYTE_ORDER), 4).unwrap();
+        assert_eq!(buf, [1, 2, 3, 4]);
+
+        // One that is not says so, rather than handing back the raw bytes.
+        let mut buf = [1u8, 2, 3, 4];
+        let err = to_host_byte_order(&mut buf, &compound(foreign), 4)
+            .expect_err("a foreign-order compound was reinterpreted")
+            .to_string();
+        assert!(err.contains("read_raw_bytes"), "got: {err}");
+        assert_eq!(buf, [1, 2, 3, 4], "the refused image is left alone");
+    }
+
+    /// The write direction answers for exactly the types the read direction
+    /// does — same classifier — and borrows the caller's bytes whenever the
+    /// declared order is already the host's.
+    #[test]
+    fn to_stored_byte_order_converts_scalars_and_refuses_composites() {
+        use crate::dataset::{to_stored_byte_order, FOREIGN_BYTE_ORDER, HOST_BYTE_ORDER};
+        use std::borrow::Cow;
+
+        let int = |order, size| DatatypeMessage::FixedPoint {
+            size,
+            byte_order: order,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: (size * 8) as u16,
+        };
+
+        // Declared foreign: each element is reversed on the way out.
+        let host = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let stored = to_stored_byte_order(&host, &int(FOREIGN_BYTE_ORDER, 4), 4).unwrap();
+        assert_eq!(&*stored, &[4, 3, 2, 1, 8, 7, 6, 5]);
+        assert!(matches!(stored, Cow::Owned(_)), "a swap needs its own copy");
+
+        // Declared host order: handed through without a copy.
+        let stored = to_stored_byte_order(&host, &int(HOST_BYTE_ORDER, 4), 4).unwrap();
+        assert!(matches!(stored, Cow::Borrowed(_)), "no copy without a swap");
+        assert_eq!(&*stored, &host);
+
+        // One byte wide: no order to lay out.
+        let stored = to_stored_byte_order(&host, &int(FOREIGN_BYTE_ORDER, 1), 1).unwrap();
+        assert_eq!(&*stored, &host);
+
+        // An enum stores its values in its base type's order.
+        let enumeration = DatatypeMessage::Enum {
+            base: Box::new(int(FOREIGN_BYTE_ORDER, 2)),
+            members: Vec::new(),
+        };
+        let stored = to_stored_byte_order(&[1u8, 2], &enumeration, 2).unwrap();
+        assert_eq!(&*stored, &[2, 1]);
+
+        // A compound cannot be laid out as a unit; one that declares the
+        // foreign order for a member is refused, not written host-order.
+        let compound = |order| DatatypeMessage::Compound {
+            size: 4,
+            members: vec![CompoundMember {
+                name: "x".into(),
+                offset: 0,
+                datatype: int(order, 4),
+            }],
+        };
+        let stored = to_stored_byte_order(&[1u8, 2, 3, 4], &compound(HOST_BYTE_ORDER), 4).unwrap();
+        assert_eq!(&*stored, &[1, 2, 3, 4]);
+        let err = to_stored_byte_order(&[1u8, 2, 3, 4], &compound(FOREIGN_BYTE_ORDER), 4)
+            .expect_err("a foreign-order compound was written from host bytes")
+            .to_string();
+        assert!(err.contains("write_raw_bytes"), "got: {err}");
     }
 
     /// The declared character set is enforced: a byte that cannot be decoded is

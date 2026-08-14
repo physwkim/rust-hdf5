@@ -219,9 +219,9 @@ STRING_CASES = [
          "8-byte fixed ASCII strings"),
     Case("str_fixed_utf8", "dtype-string", gen_str_fixed_utf8, "str_fixed_utf8",
          "16-byte fixed UTF-8 strings"),
-    Case("str_fixed_nullpad", "dtype-string", _fixed_str_pad(h5t.STR_NULLPAD), None,
+    Case("str_fixed_nullpad", "dtype-string", _fixed_str_pad(h5t.STR_NULLPAD), "str_fixed_nullpad",
          "fixed string with STR_NULLPAD"),
-    Case("str_fixed_spacepad", "dtype-string", _fixed_str_pad(h5t.STR_SPACEPAD), None,
+    Case("str_fixed_spacepad", "dtype-string", _fixed_str_pad(h5t.STR_SPACEPAD), "str_fixed_spacepad",
          "fixed string with STR_SPACEPAD"),
     Case("str_vlen_ascii", "dtype-string", gen_str_vlen_ascii, "str_vlen_ascii",
          "variable-length ASCII strings via the global heap"),
@@ -295,6 +295,22 @@ def gen_enum_i32(path):
         f.create_dataset("data", data=np.array([-1, 0, 1000, 0], dtype="<i4"), dtype=dt)
 
 
+def gen_compound_dtype_v4(path):
+    # A v1.12 low bound makes libhdf5 tag the compound datatype message
+    # version 4 (H5O_dtype_ver_bounds); its members stay version 1. Nothing
+    # else in the matrix produces a datatype message above version 3.
+    #
+    # Chunked on purpose: a *contiguous* dataset at a v1.10+ bound is dropped
+    # from the listing by an unrelated gap (`layout_contiguous_v110`), which
+    # would mask what this case is about.
+    arr = np.zeros(4, dtype=COMPOUND_SIMPLE)
+    arr["x"] = np.arange(4, dtype="<f4")
+    arr["y"] = np.arange(100, 104, dtype="<f4")
+    with h5py.File(path, "w", libver=("v112", "v112")) as f:
+        ds = f.create_dataset("data", (4,), chunks=(4,), dtype=COMPOUND_SIMPLE)
+        ds[...] = arr
+
+
 def gen_opaque(path):
     with h5py.File(path, "w") as f:
         tid = h5t.create(h5t.OPAQUE, 4)
@@ -366,18 +382,21 @@ COMPOSITE_CASES = [
          "compound_with_string", "fixed string member"),
     Case("compound_padded", "dtype-composite", gen_compound_padded, "compound_padded",
          "member offsets with gaps and trailing padding"),
+    Case("compound_dtype_v4", "dtype-composite", gen_compound_dtype_v4,
+         "compound_dtype_v4", "version-4 datatype message (libver v1.12 bounds)"),
     Case("array_dtype", "dtype-composite", gen_array_dtype, "array_dtype",
          "H5T_ARRAY element type (2x3 f64)"),
     Case("enum_i8", "dtype-composite", gen_enum_i8, "enum_i8", "3-member i8 enum"),
     Case("enum_i32", "dtype-composite", gen_enum_i32, "enum_i32",
          "i32 enum with a negative member"),
-    Case("opaque", "dtype-composite", gen_opaque, None, "H5T_OPAQUE with a tag"),
-    Case("bitfield", "dtype-composite", gen_bitfield, None, "H5T_BITFIELD (STD_B8LE)"),
-    Case("ref_object", "dtype-composite", gen_ref_object, None,
+    Case("opaque", "dtype-composite", gen_opaque, "opaque", "H5T_OPAQUE with a tag"),
+    Case("bitfield", "dtype-composite", gen_bitfield, "bitfield",
+         "H5T_BITFIELD (STD_B8LE)"),
+    Case("ref_object", "dtype-composite", gen_ref_object, "ref_object",
          "object references to a dataset and a group"),
-    Case("ref_region", "dtype-composite", gen_ref_region, None,
+    Case("ref_region", "dtype-composite", gen_ref_region, "ref_region",
          "dataset region references"),
-    Case("vlen_numeric", "dtype-composite", gen_vlen_numeric, None,
+    Case("vlen_numeric", "dtype-composite", gen_vlen_numeric, "vlen_numeric",
          "variable-length i32 sequences"),
     Case("vlen_bytes", "dtype-composite", gen_vlen_bytes, "vlen_bytes",
          "variable-length u8 sequences"),
@@ -561,6 +580,9 @@ FILTER_CASES = [
     _filter_case("filter_deflate_shuffle", "filter_deflate_shuffle",
                  "shuffle then deflate",
                  compression="gzip", compression_opts=6, shuffle=True),
+    _filter_case("filter_scaleoffset", "filter_scaleoffset",
+                 "scale-offset, library-computed minimum bits",
+                 scaleoffset=0),
 ]
 
 

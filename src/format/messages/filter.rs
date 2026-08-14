@@ -240,6 +240,73 @@ impl FilterPipeline {
         }
     }
 
+    /// Create a pipeline with a single scale-offset filter
+    /// (`H5Z_FILTER_SCALEOFFSET`, id 6) for an atomic numeric datatype.
+    ///
+    /// `d_nelmts` is the number of elements per chunk and `scale_factor` is
+    /// what `H5Pset_scaleoffset` takes: for an integer datatype the minimum
+    /// number of bits to store each offset (0 lets the filter work it out per
+    /// chunk), for a floating-point datatype the number of decimal digits to
+    /// keep. The `cd_values` layout mirrors `H5Z__set_local_scaleoffset`,
+    /// which fills all 20 entries; the fill value is left at zero and flagged
+    /// defined, which is what libhdf5 records for a dataset that never set
+    /// one.
+    ///
+    /// Only fixed-point and floating-point datatypes can be scale-offset
+    /// filtered; anything else returns `None`, as `H5Z__set_local_scaleoffset`
+    /// errors on it.
+    pub fn scaleoffset(
+        dt: &crate::format::messages::datatype::DatatypeMessage,
+        d_nelmts: usize,
+        scale_factor: i32,
+    ) -> Option<Self> {
+        use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+        use crate::format::nbit_scaleoffset::{
+            SO_CLS_FLOAT, SO_CLS_INTEGER, SO_FLOAT_DSCALE, SO_INT, SO_ORDER_BE, SO_ORDER_LE,
+            SO_SGN_2, SO_SGN_NONE, SO_TOTAL_NPARMS,
+        };
+
+        let (scale_type, class, size, sign, byte_order) = match dt {
+            DatatypeMessage::FixedPoint {
+                size,
+                byte_order,
+                signed,
+                ..
+            } => (
+                SO_INT,
+                SO_CLS_INTEGER,
+                *size,
+                if *signed { SO_SGN_2 } else { SO_SGN_NONE },
+                *byte_order,
+            ),
+            DatatypeMessage::FloatingPoint {
+                size, byte_order, ..
+            } => (SO_FLOAT_DSCALE, SO_CLS_FLOAT, *size, 0, *byte_order),
+            _ => return None,
+        };
+        let order = match byte_order {
+            ByteOrder::LittleEndian => SO_ORDER_LE,
+            ByteOrder::BigEndian => SO_ORDER_BE,
+        };
+
+        let mut cd_values = vec![0u32; SO_TOTAL_NPARMS];
+        cd_values[0] = scale_type;
+        cd_values[1] = scale_factor as u32;
+        cd_values[2] = d_nelmts as u32;
+        cd_values[3] = class;
+        cd_values[4] = size;
+        cd_values[5] = sign;
+        cd_values[6] = order;
+        cd_values[7] = 1; // fill value defined, and it is the zero left below
+        Some(Self {
+            filters: vec![Filter {
+                id: FILTER_SCALEOFFSET,
+                flags: 0,
+                cd_values,
+            }],
+        })
+    }
+
     /// Create an empty pipeline (no filters).
     pub fn none() -> Self {
         Self {
@@ -628,14 +695,12 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
 
         // =====================================================================
         // Scale-offset (6) — stores values as small integers relative to a
-        // per-chunk minimum (H5Zscaleoffset.c). Decompress only; compress is
-        // not implemented (the writer never needs it).
+        // per-chunk minimum (H5Zscaleoffset.c). Both directions are byte-exact
+        // with libhdf5.
         // =====================================================================
         FILTER_SCALEOFFSET => {
             if compress {
-                Err(FormatError::UnsupportedFeature(
-                    "scale-offset filter compression is not implemented".into(),
-                ))
+                crate::format::nbit_scaleoffset::forward_scaleoffset(data, &filter.cd_values)
             } else {
                 crate::format::nbit_scaleoffset::reverse_scaleoffset(data, &filter.cd_values)
             }
@@ -2410,8 +2475,8 @@ mod tests {
     /// helpers, never be swallowed into raw bytes. If it were swallowed, a
     /// caller recording the chunk under filter_mask=0 would claim the pipeline
     /// ran, and the reader would try to reverse-filter raw data and corrupt it.
-    /// Scale-offset compression is unimplemented, so apply_single_filter errors
-    /// deterministically (no feature flag needed).
+    /// Scale-offset with empty `cd_values` cannot describe a datatype, so
+    /// apply_single_filter errors deterministically (no feature flag needed).
     #[cfg(feature = "parallel")]
     #[test]
     fn parallel_compress_propagates_filter_error() {
@@ -2854,6 +2919,63 @@ mod tests {
         );
         let back = reverse_filters(&pipeline, &packed).unwrap();
         assert_eq!(back, data, "nbit 12-bit roundtrip mismatch");
+    }
+
+    #[test]
+    fn scaleoffset_cd_values_layout() {
+        use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+        // int32 LE, library-computed minbits: the layout libhdf5 stores for a
+        // dataset created with `H5Pset_scaleoffset(H5Z_SO_INT, 0)`.
+        let dt = DatatypeMessage::i32_type();
+        let f = &FilterPipeline::scaleoffset(&dt, 100, 0).unwrap().filters[0];
+        assert_eq!(f.id, FILTER_SCALEOFFSET);
+        // [scale_type, scale_factor, d_nelmts, class, size, sign, order,
+        //  filavail, fill value ...]
+        assert_eq!(
+            f.cd_values,
+            vec![2, 0, 100, 0, 4, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+
+        // Unsigned drops the sign code; big-endian raises the order code.
+        let be = DatatypeMessage::FixedPoint {
+            size: 2,
+            byte_order: ByteOrder::BigEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 16,
+        };
+        let f = &FilterPipeline::scaleoffset(&be, 8, 0).unwrap().filters[0];
+        assert_eq!((f.cd_values[5], f.cd_values[6]), (0, 1));
+
+        // A float carries the D-scale type and the digit count, and no sign.
+        let f = &FilterPipeline::scaleoffset(&DatatypeMessage::f64_type(), 8, 3)
+            .unwrap()
+            .filters[0];
+        assert_eq!(f.cd_values[..8], [0, 3, 8, 1, 8, 0, 0, 1]);
+
+        // Classes the filter cannot describe are refused, as H5Z__set_local
+        // does.
+        assert!(FilterPipeline::scaleoffset(&DatatypeMessage::fixed_string(4), 8, 0).is_none());
+    }
+
+    /// The `d_nelmts` a pipeline is built with is what both directions read
+    /// the chunk length from, so a pipeline and its chunk must agree.
+    #[test]
+    fn scaleoffset_pipeline_roundtrips_its_own_chunk() {
+        use crate::format::messages::datatype::DatatypeMessage;
+        let n = 40usize;
+        let pipeline = FilterPipeline::scaleoffset(&DatatypeMessage::i32_type(), n, 0).unwrap();
+        let data: Vec<u8> = (0..n as i32)
+            .flat_map(|i| (-40 + i * 3).to_le_bytes())
+            .collect();
+        let packed = apply_filters(&pipeline, &data).unwrap();
+        assert!(
+            packed.len() < data.len(),
+            "scaleoffset did not pack: {} >= {}",
+            packed.len(),
+            data.len()
+        );
+        assert_eq!(reverse_filters(&pipeline, &packed).unwrap(), data);
     }
 
     // --- BitGroom golden test ---

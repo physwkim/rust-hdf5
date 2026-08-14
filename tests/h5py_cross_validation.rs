@@ -6,7 +6,7 @@
 //! skip (pass) when neither is present, so CI without h5py is green.
 
 use rust_hdf5::types::VarLenUnicode;
-use rust_hdf5::{H5File, H5FileOptions};
+use rust_hdf5::{ByteOrder, DatatypeMessage, H5File, H5FileOptions, Reference, RegionSelection};
 
 /// Interpreters tried in order when `RUST_HDF5_TEST_PYTHON` is unset. The
 /// second is the same environment the parity oracle pins
@@ -1109,6 +1109,208 @@ fn numeric_conversion_reads_from_h5py_written_file() {
     std::fs::remove_file(&path).ok();
 }
 
+/// An IEEE half-precision (`numpy.float16`) dataset written by h5py: the raw
+/// image reads, and the values come back as exact `f32`s. Rust has no stable
+/// `f16`, so `read_numeric_as` is the typed path.
+#[test]
+fn float16_from_h5py_reads_as_f32() {
+    let Some(py) = python() else { return };
+    let path = tmp("float16");
+    write_with_h5py(
+        py,
+        &path,
+        "vals = np.array([0.0, -0.0, 1.0, -2.0, 1/3, 65504.0, np.inf, 6e-8], dtype='<f2')\n\
+         f.create_dataset('data', data=vals)\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.read_raw_bytes().unwrap().len(), 16);
+    let got = ds.read_numeric_as::<f32>().unwrap();
+    let expected: [f32; 8] = [
+        0.0,
+        -0.0,
+        1.0,
+        -2.0,
+        0.333_251_95,
+        65504.0,
+        f32::INFINITY,
+        5.960_464_5e-8, // 6e-8 rounds to the smallest half subnormal
+    ];
+    assert_eq!(got, expected);
+    assert!(got[1].is_sign_negative(), "-0.0 lost its sign");
+    // f64 widening goes through the same source, exactly.
+    assert_eq!(
+        ds.read_numeric_as::<f64>().unwrap()[4],
+        0.333_251_953_125_f64
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// libhdf5 tags datatype messages with version 4 once the file's low libver
+/// bound is v1.12 or later (`H5O_dtype_ver_bounds`). A v4 message is decoded
+/// exactly like a v3 one; rejecting the version dropped the dataset.
+#[test]
+fn v4_datatype_message_from_h5py_is_readable() {
+    use rust_hdf5::format::messages::datatype::DatatypeMessage;
+
+    let Some(py) = python() else { return };
+    let path = tmp("dtype_v4");
+    write_with_h5py(
+        py,
+        &path,
+        // The libver bound has to be set at open time, so the file the helper
+        // opened is reopened under it. Chunked on purpose: a contiguous
+        // dataset at this bound is dropped from the listing by an unrelated
+        // gap, which would mask the datatype version.
+        "p = f.filename\n\
+         f.close()\n\
+         f = h5py.File(p, 'w', libver=('v112', 'v112'))\n\
+         dt = np.dtype([('x', '<f4'), ('y', '<f4')])\n\
+         arr = np.zeros(4, dtype=dt)\n\
+         arr['x'] = np.arange(4, dtype='<f4')\n\
+         arr['y'] = np.arange(100, 104, dtype='<f4')\n\
+         ds = f.create_dataset('data', (4,), chunks=(4,), dtype=dt)\n\
+         ds[...] = arr\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let DatatypeMessage::Compound { size, members } = ds.datatype().unwrap() else {
+        panic!("expected a compound datatype");
+    };
+    assert_eq!(size, 8);
+    assert_eq!(
+        members
+            .iter()
+            .map(|m| (m.name.as_str(), m.offset))
+            .collect::<Vec<_>>(),
+        vec![("x", 0), ("y", 4)]
+    );
+    let raw = ds.read_raw_bytes().unwrap();
+    let xs: Vec<f32> = raw
+        .chunks_exact(8)
+        .map(|e| f32::from_le_bytes(e[0..4].try_into().unwrap()))
+        .collect();
+    assert_eq!(xs, vec![0.0, 1.0, 2.0, 3.0]);
+    std::fs::remove_file(&path).ok();
+}
+
+/// An `H5T_OPAQUE` dataset (tagged 4-byte blobs) and an `H5T_STD_B8LE` bit
+/// field written by h5py: both classes used to fail to decode, which dropped
+/// the dataset from the catalog entirely.
+#[test]
+fn opaque_and_bitfield_from_h5py_are_readable() {
+    use rust_hdf5::format::messages::datatype::{ByteOrder, DatatypeMessage};
+
+    let Some(py) = python() else { return };
+    let path = tmp("opaque_bitfield");
+    write_with_h5py(
+        py,
+        &path,
+        "from h5py import h5t, h5s, h5d\n\
+         tid = h5t.create(h5t.OPAQUE, 4)\n\
+         tid.set_tag(b'raw4')\n\
+         sid = h5s.create_simple((3,))\n\
+         ds = h5d.create(f.id, b'blobs', tid, sid)\n\
+         ds.write(h5s.ALL, h5s.ALL, np.frombuffer(bytes(range(12)), dtype='V4'), mtype=tid)\n\
+         bid = h5t.STD_B8LE.copy()\n\
+         bsid = h5s.create_simple((4,))\n\
+         bds = h5d.create(f.id, b'flags', bid, bsid)\n\
+         bds.write(h5s.ALL, h5s.ALL, np.array([1, 0x80, 0xFF, 0], dtype='u1'))\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.dataset_names();
+    names.sort();
+    assert_eq!(names, vec!["blobs", "flags"]);
+
+    let blobs = file.dataset("blobs").unwrap();
+    assert_eq!(
+        blobs.datatype().unwrap(),
+        DatatypeMessage::Opaque {
+            size: 4,
+            tag: "raw4".to_string()
+        }
+    );
+    assert_eq!(
+        blobs.read_raw_bytes().unwrap(),
+        (0u8..12).collect::<Vec<_>>()
+    );
+
+    let flags = file.dataset("flags").unwrap();
+    assert_eq!(
+        flags.datatype().unwrap(),
+        DatatypeMessage::BitField {
+            size: 1,
+            byte_order: ByteOrder::LittleEndian,
+            bit_offset: 0,
+            bit_precision: 8,
+        }
+    );
+    // A whole-width bit field reads as the unsigned integer of that width.
+    assert_eq!(
+        flags.read_numeric_as::<u32>().unwrap(),
+        vec![1, 0x80, 0xFF, 0]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A compound with an array-typed member forces libhdf5 to emit a *version 2*
+/// datatype message under the default libver bound. v2 still pads member names
+/// to a multiple of 8 bytes (only v3 dropped the padding), so decoding it with
+/// the v3 rule misplaces every member after the first.
+#[test]
+fn v2_compound_from_h5py_decodes_member_offsets() {
+    use rust_hdf5::format::messages::datatype::DatatypeMessage;
+
+    let Some(py) = python() else { return };
+    let path = tmp("v2_compound");
+    write_with_h5py(
+        py,
+        &path,
+        "dt = np.dtype([('alpha', '<i4'), ('beta', ('<f4', (2,)))])\n\
+         arr = np.zeros(3, dtype=dt)\n\
+         arr['alpha'] = [1, 2, 3]\n\
+         arr['beta'] = [[1.5, 2.5], [3.5, 4.5], [5.5, 6.5]]\n\
+         f.create_dataset('data', data=arr)\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let DatatypeMessage::Compound { size, members } = ds.datatype().unwrap() else {
+        panic!("expected a compound datatype");
+    };
+    assert_eq!(size, 12);
+    let shape: Vec<(&str, u32)> = members
+        .iter()
+        .map(|m| (m.name.as_str(), m.offset))
+        .collect();
+    assert_eq!(shape, vec![("alpha", 0), ("beta", 4)]);
+    assert_eq!(members[1].datatype.element_size(), 8);
+
+    // The member offsets are only right if the names were consumed with the
+    // padding rule, so check the values they address.
+    let raw = ds.read_raw_bytes().unwrap();
+    assert_eq!(raw.len(), 3 * 12);
+    let alpha: Vec<i32> = raw
+        .chunks_exact(12)
+        .map(|e| i32::from_le_bytes(e[0..4].try_into().unwrap()))
+        .collect();
+    assert_eq!(alpha, vec![1, 2, 3]);
+    let beta: Vec<f32> = raw
+        .chunks_exact(12)
+        .flat_map(|e| {
+            [
+                f32::from_le_bytes(e[4..8].try_into().unwrap()),
+                f32::from_le_bytes(e[8..12].try_into().unwrap()),
+            ]
+        })
+        .collect();
+    assert_eq!(beta, vec![1.5, 2.5, 3.5, 4.5, 5.5, 6.5]);
+    std::fs::remove_file(&path).ok();
+}
+
 /// `H5Attribute::read_numeric` must accept h5py's standard little-endian
 /// numeric attribute datatypes (the strict datatype check cannot be *too*
 /// strict), refuse a big-endian one, and `read_numeric_as` must convert it.
@@ -2100,6 +2302,67 @@ fn attributes_set_on_a_reopened_dataset_reach_the_file() {
 /// datatype in the message, so it is knowable either way — the listing keeps
 /// it, `attr_unreadable_reason` says what stands in the way, and typed access
 /// fails with the same text.
+/// Rewrite every 4-byte float datatype message in `path` as a version-3
+/// `H5T_ORDER_VAX` float.
+///
+/// VAX order is a real libhdf5 type — it decodes the message and reports the
+/// order — that this crate names rather than decodes, and patching is the only
+/// way to get one into a fixture: h5py cannot create one, and every type it
+/// *can* create now decodes. The edit is two bytes wide and changes no length,
+/// so each version-2 object header it lands in keeps its layout and needs only
+/// its checksum recomputed.
+fn retype_floats_as_vax(path: &std::path::Path, expected: usize) {
+    let mut raw = std::fs::read(path).unwrap();
+    // Version 1, class 1 (float), 4 bytes wide: h5py writes nothing else that
+    // starts this way.
+    let hits: Vec<usize> = (0..raw.len() - 8)
+        .filter(|&i| {
+            raw[i] == 0x11 && u32::from_le_bytes(raw[i + 4..i + 8].try_into().unwrap()) == 4
+        })
+        .collect();
+    assert_eq!(
+        hits.len(),
+        expected,
+        "fixture must hold exactly {expected} f32 datatype message(s)"
+    );
+    for at in &hits {
+        // Only a version-3-or-later float gives flag bit 6 the VAX meaning
+        // (`H5T__decode_helper`), so the version moves with it.
+        raw[*at] = 0x31;
+        raw[*at + 1] |= 0x41;
+    }
+    // Every version-2 object header chunk holding an edited byte, re-checksummed.
+    let headers: Vec<usize> = (0..raw.len() - 4)
+        .filter(|&i| &raw[i..i + 4] == b"OHDR")
+        .collect();
+    for start in headers {
+        if raw[start + 4] != 2 {
+            continue;
+        }
+        let flags = raw[start + 5];
+        let mut pos = start + 6;
+        if flags & 0x20 != 0 {
+            pos += 16; // access/modification/change/birth times
+        }
+        if flags & 0x10 != 0 {
+            pos += 4; // max compact / min dense
+        }
+        let size_len = 1usize << (flags & 0x03);
+        let mut chunk0 = 0u64;
+        for (i, b) in raw[pos..pos + size_len].iter().enumerate() {
+            chunk0 |= (*b as u64) << (8 * i);
+        }
+        pos += size_len;
+        let end = pos + chunk0 as usize;
+        if !hits.iter().any(|&at| (pos..end).contains(&at)) {
+            continue;
+        }
+        let cksum = rust_hdf5::format::checksum::checksum_metadata(&raw[start..end]);
+        raw[end..end + 4].copy_from_slice(&cksum.to_le_bytes());
+    }
+    std::fs::write(path, &raw).unwrap();
+}
+
 #[test]
 fn undecodable_attribute_is_listed_with_a_reason() {
     let Some(py) = python() else { return };
@@ -2111,10 +2374,11 @@ fn undecodable_attribute_is_listed_with_a_reason() {
         "d = f.create_dataset('data', data=np.arange(8, dtype='<i4'))\n\
          g = f.create_group('g')\n\
          d.attrs['gain'] = np.int32(7)\n\
-         d.attrs.create('ref', d.ref, dtype=h5py.ref_dtype)\n\
+         d.attrs.create('ref', np.float32(1.5))\n\
          g.attrs['label'] = 'ok'\n\
-         g.attrs.create('gref', d.ref, dtype=h5py.ref_dtype)\n",
+         g.attrs.create('gref', np.float32(2.5))\n",
     );
+    retype_floats_as_vax(&path, 2);
     {
         let file = H5File::open(&path).unwrap();
         let ds = file.dataset("data").unwrap();
@@ -2126,13 +2390,13 @@ fn undecodable_attribute_is_listed_with_a_reason() {
             .attr_unreadable_reason("ref")
             .unwrap()
             .expect("a reference attribute must report why it cannot be read");
-        assert!(why.contains("datatype class 7"), "{why}");
+        assert!(why.contains("VAX"), "{why}");
         assert_eq!(ds.attr_unreadable_reason("gain").unwrap(), None);
 
         // Typed access refuses with the same reason, and the readable
         // attribute beside it is unaffected.
         let err = ds.attr("ref").err().expect("attr('ref') must fail");
-        assert!(err.to_string().contains("datatype class 7"), "{err}");
+        assert!(err.to_string().contains("VAX"), "{err}");
         assert_eq!(ds.attr("gain").unwrap().read_numeric::<i32>().unwrap(), 7);
 
         let grp = file.root_group().group("g").unwrap();
@@ -2142,7 +2406,7 @@ fn undecodable_attribute_is_listed_with_a_reason() {
         assert!(grp
             .attr_unreadable_reason("gref")
             .unwrap()
-            .is_some_and(|w| w.contains("datatype class 7")));
+            .is_some_and(|w| w.contains("VAX")));
         assert_eq!(grp.attr_unreadable_reason("label").unwrap(), None);
         assert_eq!(grp.attr_string("label").unwrap(), "ok");
 
@@ -2162,16 +2426,20 @@ fn undecodable_attribute_is_listed_with_a_reason() {
             .unwrap();
         file.close().unwrap();
     }
+    // libhdf5 lists the retyped attributes by name and still reports VAX
+    // order: the rewrite put the message bytes back exactly, so the type this
+    // crate could not decode is the type on disk.
     read_back_with_h5py(
         py,
         &path,
-        "g = f['g']\n\
+        "from h5py import h5t\n\
+         g = f['g']\n\
          assert sorted(g.attrs.keys()) == ['added', 'gref', 'label'], sorted(g.attrs.keys())\n\
-         assert f[g.attrs['gref']].name == '/data', f[g.attrs['gref']].name\n\
          assert g.attrs['label'] == 'ok'\n\
+         assert g.attrs.get_id('gref').get_type().get_order() == h5t.ORDER_VAX\n\
          d = f['data']\n\
          assert sorted(d.attrs.keys()) == ['gain', 'ref'], sorted(d.attrs.keys())\n\
-         assert f[d.attrs['ref']].name == '/data'\n",
+         assert d.attrs.get_id('ref').get_type().get_order() == h5t.ORDER_VAX\n",
     );
     std::fs::remove_file(&path).ok();
 }
@@ -2496,4 +2764,639 @@ fn each_creation_order_subsystem_survives_a_reopen_rewrite_on_its_own() {
         );
         std::fs::remove_file(&path).ok();
     }
+}
+
+/// A space-padded fixed-length string attribute is padded with spaces and
+/// carries no terminator, so reading it as null-terminated returned the
+/// padding as part of the value. `H5T__conv_s_s` ends it after the last
+/// non-space byte.
+#[test]
+fn space_padded_string_attribute_from_h5py_reads_trimmed() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_spacepad");
+    write_with_h5py(
+        py,
+        &path,
+        "from h5py import h5t, h5s, h5a\n\
+         ds = f.create_dataset('data', data=np.arange(4, dtype='<i4'))\n\
+         for name, pad, raw in ((b'spacepad', h5t.STR_SPACEPAD, b'volt    '),\n\
+                                (b'nullpad', h5t.STR_NULLPAD, b'volt\\0\\0\\0\\0'),\n\
+                                (b'nullterm', h5t.STR_NULLTERM, b'volt\\0\\0\\0\\0')):\n\
+         \x20   tid = h5t.C_S1.copy()\n\
+         \x20   tid.set_size(8)\n\
+         \x20   tid.set_cset(h5t.CSET_ASCII)\n\
+         \x20   tid.set_strpad(pad)\n\
+         \x20   a = h5a.create(ds.id, name, tid, h5s.create(h5s.SCALAR))\n\
+         \x20   a.write(np.array(raw, dtype='S8'), mtype=tid)\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.attr("spacepad").unwrap().read_string().unwrap(), "volt");
+    assert_eq!(ds.attr("nullpad").unwrap().read_string().unwrap(), "volt");
+    assert_eq!(ds.attr("nullterm").unwrap().read_string().unwrap(), "volt");
+    std::fs::remove_file(&path).ok();
+}
+
+/// The pad of a *variable-length* string lives in the vlen type's own bit
+/// field, not in its parent, so it survives a decode of what h5py wrote.
+#[test]
+fn vlen_string_pad_from_h5py_is_decoded() {
+    use rust_hdf5::format::messages::datatype::DatatypeMessage;
+
+    let Some(py) = python() else { return };
+    let path = tmp("vstr_pad");
+    write_with_h5py(
+        py,
+        &path,
+        "from h5py import h5t, h5s, h5d\n\
+         for name, pad, cset in ((b'nullterm', h5t.STR_NULLTERM, h5t.CSET_ASCII),\n\
+                                 (b'nullpad', h5t.STR_NULLPAD, h5t.CSET_ASCII),\n\
+                                 (b'spacepad', h5t.STR_SPACEPAD, h5t.CSET_UTF8)):\n\
+         \x20   tid = h5t.C_S1.copy()\n\
+         \x20   tid.set_size(h5t.VARIABLE)\n\
+         \x20   tid.set_cset(cset)\n\
+         \x20   tid.set_strpad(pad)\n\
+         \x20   h5d.create(f.id, name, tid, h5s.create_simple((2,)))\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    for (name, padding, charset) in [("nullterm", 0, 0), ("nullpad", 1, 0), ("spacepad", 2, 1)] {
+        assert_eq!(
+            file.dataset(name).unwrap().datatype().unwrap(),
+            DatatypeMessage::VarLenString { padding, charset },
+            "{name}"
+        );
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+/// Big-endian datasets: the typed read paths reinterpret the on-disk element
+/// image as `T`, which is the stored value only after the byte order is put
+/// into the host's. Every one of them is checked here, because each copies
+/// the image on its own.
+#[test]
+fn big_endian_datasets_from_h5py_read_as_values() {
+    let Some(py) = python() else { return };
+    let path = tmp("big_endian");
+    write_with_h5py(
+        py,
+        &path,
+        "f.create_dataset('u32', data=np.arange(8, dtype='>u4') * 65537)\n\
+         f.create_dataset('f64', data=np.array([1.5, -2.25, 3e300, 0.0], dtype='>f8'))\n\
+         f.create_dataset('i16', data=np.array([-1, 2, -32768, 32767], dtype='>i2'))\n\
+         f.create_dataset('u8', data=np.arange(4, dtype='u1'))\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+
+    let u32s: Vec<u32> = (0..8u32).map(|i| i * 65537).collect();
+    let ds = file.dataset("u32").unwrap();
+    assert_eq!(ds.read_raw::<u32>().unwrap(), u32s);
+    assert_eq!(ds.read_slice::<u32>(&[2], &[3]).unwrap(), u32s[2..5]);
+    let mut into = vec![0u32; 8];
+    ds.read_raw_into(&mut into).unwrap();
+    assert_eq!(into, u32s);
+    let mut slice_into = vec![0u32; 3];
+    ds.read_slice_into(&mut slice_into, &[2], &[3]).unwrap();
+    assert_eq!(slice_into, u32s[2..5]);
+    // The datatype-aware path already converted; both agree now.
+    assert_eq!(
+        ds.read_numeric_as::<u64>().unwrap(),
+        u32s.iter().map(|&v| v as u64).collect::<Vec<_>>()
+    );
+
+    let f64s = vec![1.5f64, -2.25, 3e300, 0.0];
+    let ds = file.dataset("f64").unwrap();
+    assert_eq!(ds.read_raw::<f64>().unwrap(), f64s);
+    assert_eq!(ds.read_slice::<f64>(&[1], &[2]).unwrap(), f64s[1..3]);
+
+    let ds = file.dataset("i16").unwrap();
+    assert_eq!(ds.read_raw::<i16>().unwrap(), vec![-1i16, 2, -32768, 32767]);
+
+    // A single-byte type has no order to convert.
+    assert_eq!(
+        file.dataset("u8").unwrap().read_raw::<u8>().unwrap(),
+        vec![0u8, 1, 2, 3]
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A compound element cannot be swapped as a unit, so a typed read of one
+/// that stores big-endian members is refused instead of returning the bytes
+/// as if they were host order. Its raw image is still available.
+#[test]
+fn big_endian_compound_from_h5py_is_refused_by_typed_reads() {
+    let Some(py) = python() else { return };
+    let path = tmp("big_endian_compound");
+    write_with_h5py(
+        py,
+        &path,
+        "dt = np.dtype([('x', '>i4'), ('y', '>i4')])\n\
+         f.create_dataset('recs', data=np.array([(1, 2), (3, 4)], dtype=dt))\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("recs").unwrap();
+    let err = ds
+        .read_raw::<u64>()
+        .expect_err("a big-endian compound was reinterpreted as a host-order u64")
+        .to_string();
+    assert!(err.contains("read_raw_bytes"), "got: {err}");
+    assert_eq!(ds.read_raw_bytes().unwrap().len(), 16);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A dataset that declares big-endian stores big-endian: the typed write
+/// paths convert the host image of a `T` into the declared order, so h5py
+/// reads back the values that were written and the stored payload really is
+/// big-endian.
+#[test]
+fn big_endian_datasets_written_by_rust_read_as_values() {
+    let Some(py) = python() else { return };
+    let path = tmp("big_endian_write");
+    let be_i32 = DatatypeMessage::FixedPoint {
+        size: 4,
+        byte_order: ByteOrder::BigEndian,
+        signed: true,
+        bit_offset: 0,
+        bit_precision: 32,
+    };
+    let values: Vec<i32> = vec![-2, -1, 0, 1, 70000, 2, 3, 4];
+    {
+        let file = H5File::create(&path).unwrap();
+        // write_raw over a contiguous dataset.
+        let ds = file
+            .new_dataset::<i32>()
+            .datatype(be_i32.clone())
+            .shape([8])
+            .create("whole")
+            .unwrap();
+        ds.write_raw(&values).unwrap();
+
+        // write_slice into a sub-region.
+        let ds = file
+            .new_dataset::<i32>()
+            .datatype(be_i32.clone())
+            .shape([8])
+            .create("part")
+            .unwrap();
+        ds.write_slice(&[2], &[3], &values[2..5]).unwrap();
+
+        // append into a chunked dataset.
+        let ds = file
+            .new_dataset::<i32>()
+            .datatype(be_i32.clone())
+            .shape([0])
+            .chunk(&[4])
+            .max_shape(&[None])
+            .create("grown")
+            .unwrap();
+        ds.append(&values[..4]).unwrap();
+
+        // A fill value is one element in the dataset's own datatype, and it is
+        // all a never-written dataset holds.
+        file.new_dataset::<i32>()
+            .datatype(be_i32.clone())
+            .shape([3])
+            .fill_value(-7i32)
+            .create("unwritten")
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    // The stored payload, byte for byte: the whole-image dataset holds the
+    // big-endian image of `values`, not the host one.
+    let file = H5File::open(&path).unwrap();
+    let expected: Vec<u8> = values.iter().flat_map(|v| v.to_be_bytes()).collect();
+    assert_eq!(
+        file.dataset("whole").unwrap().read_raw_bytes().unwrap(),
+        expected
+    );
+    assert_eq!(
+        file.dataset("part").unwrap().read_raw_bytes().unwrap()[8..20],
+        expected[8..20]
+    );
+
+    read_back_with_h5py(
+        py,
+        &path,
+        &format!(
+            "want = np.array({values:?}, dtype='>i4')\n\
+             assert f['whole'].dtype.byteorder == '>', f['whole'].dtype\n\
+             assert (f['whole'][:] == want).all(), f['whole'][:]\n\
+             assert (f['part'][2:5] == want[2:5]).all(), f['part'][:]\n\
+             assert f['grown'].shape == (4,), f['grown'].shape\n\
+             assert (f['grown'][:] == want[:4]).all(), f['grown'][:]\n\
+             assert (f['unwritten'][:] == -7).all(), f['unwritten'][:]\n"
+        ),
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A compound element cannot be laid out as a unit, so a typed write into one
+/// that declares big-endian members is refused rather than storing host bytes
+/// under that declaration. `write_raw_bytes` still takes an encoded image.
+#[test]
+fn big_endian_compound_is_refused_by_typed_writes() {
+    let path = tmp("big_endian_compound_write");
+    let be_member = DatatypeMessage::FixedPoint {
+        size: 4,
+        byte_order: ByteOrder::BigEndian,
+        signed: true,
+        bit_offset: 0,
+        bit_precision: 32,
+    };
+    let file = H5File::create(&path).unwrap();
+    let ds = file
+        .new_dataset::<u8>()
+        .datatype(DatatypeMessage::Compound {
+            size: 8,
+            members: vec![
+                rust_hdf5::format::messages::datatype::CompoundMember {
+                    name: "x".into(),
+                    offset: 0,
+                    datatype: be_member.clone(),
+                },
+                rust_hdf5::format::messages::datatype::CompoundMember {
+                    name: "y".into(),
+                    offset: 4,
+                    datatype: be_member,
+                },
+            ],
+        })
+        .shape([2])
+        .create("recs")
+        .unwrap();
+    let err = ds
+        .write_raw(&[0u64, 0])
+        .expect_err("must refuse")
+        .to_string();
+    assert!(err.contains("write_raw_bytes"), "got: {err}");
+
+    let mut bytes = Vec::new();
+    for (x, y) in [(1i32, 2i32), (3, 4)] {
+        bytes.extend_from_slice(&x.to_be_bytes());
+        bytes.extend_from_slice(&y.to_be_bytes());
+    }
+    ds.write_raw_bytes(&bytes).unwrap();
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}
+
+/// h5py's `Reference` — the pre-1.12 `H5R_OBJECT1` element — resolves to the
+/// path of the object it names, for a dataset, a group, a nested dataset, and
+/// the same reference stored in an attribute. A zeroed element (an unset
+/// reference, which h5py's `zeros` produces) reads back as null.
+#[test]
+fn object_references_written_by_h5py_resolve_to_paths() {
+    let Some(py) = python() else { return };
+    let path = tmp("ref_object_read");
+    write_with_h5py(
+        py,
+        &path,
+        "t = f.create_dataset('target', data=np.arange(8, dtype='<i4'))\n\
+         g = f.create_group('grp')\n\
+         inner = g.create_dataset('inner', data=np.arange(3, dtype='<i4'))\n\
+         r = f.create_dataset('refs', (4,), dtype=h5py.ref_dtype)\n\
+         r[0] = t.ref\n\
+         r[1] = g.ref\n\
+         r[2] = inner.ref\n\
+         t.attrs.create('source', g.ref, dtype=h5py.ref_dtype)\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let refs = file.dataset("refs").unwrap().read_references().unwrap();
+    let paths: Vec<Option<&str>> = refs.iter().map(|r| r.path()).collect();
+    assert_eq!(
+        paths,
+        vec![Some("/target"), Some("/grp"), Some("/grp/inner"), None]
+    );
+    assert!(refs[3].is_null(), "unset element: {:?}", refs[3]);
+    assert!(matches!(refs[0], Reference::Object { .. }), "{:?}", refs[0]);
+
+    let attr = file
+        .dataset("target")
+        .unwrap()
+        .attr("source")
+        .unwrap()
+        .read_references()
+        .unwrap();
+    assert_eq!(attr.len(), 1);
+    assert_eq!(attr[0].path(), Some("/grp"));
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}
+
+/// h5py's `RegionReference` — `H5R_DATASET_REGION1`, a global-heap id whose
+/// heap object is the target address plus a serialized selection — resolves to
+/// the target's path and to the selection's bounding box, matching what
+/// `H5Sget_select_bounds` reports for the same selection.
+#[test]
+fn region_references_written_by_h5py_report_their_bounds() {
+    let Some(py) = python() else { return };
+    let path = tmp("ref_region_read");
+    write_with_h5py(
+        py,
+        &path,
+        "t = f.create_dataset('target', data=np.arange(8, dtype='<i4'))\n\
+         m = f.create_dataset('matrix', data=np.arange(24, dtype='<i4').reshape(4, 6))\n\
+         r = f.create_dataset('refs', (4,), dtype=h5py.regionref_dtype)\n\
+         r[0] = t.regionref[0:3]\n\
+         r[1] = t.regionref[4:8]\n\
+         r[2] = m.regionref[1:3, 2:5]\n\
+         sp = m.id.get_space()\n\
+         sp.select_elements([(0, 1), (3, 5)])\n\
+         r[3] = h5py.h5r.create(f.id, b'/matrix', h5py.h5r.DATASET_REGION, sp)\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let refs = file.dataset("refs").unwrap().read_references().unwrap();
+    assert_eq!(
+        refs.iter().map(|r| r.path()).collect::<Vec<_>>(),
+        vec![
+            Some("/target"),
+            Some("/target"),
+            Some("/matrix"),
+            Some("/matrix")
+        ]
+    );
+    assert_eq!(refs[0].bounds(), Some((vec![0], vec![2])));
+    assert_eq!(refs[1].bounds(), Some((vec![4], vec![7])));
+    assert_eq!(refs[2].bounds(), Some((vec![1, 2], vec![2, 4])));
+    // Fancy indexing is a point selection, whose bounds cover both points.
+    assert_eq!(refs[3].bounds(), Some((vec![0, 1], vec![3, 5])));
+    assert_eq!(
+        refs[3].selection(),
+        Some(&RegionSelection::Points(vec![vec![0, 1], vec![3, 5]]))
+    );
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}
+
+/// References rust writes are real `H5R_OBJECT1` elements: h5py dereferences
+/// them back to the objects they name, including a reference to the root
+/// group and one to an object created after the reference was stored.
+#[test]
+fn object_references_written_by_rust_dereference_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("ref_object_write");
+    let file = H5File::create(&path).unwrap();
+    let target = file
+        .new_dataset::<i32>()
+        .shape([4])
+        .create("target")
+        .unwrap();
+    target.write_raw(&[1i32, 2, 3, 4]).unwrap();
+    let grp = file.create_group("grp").unwrap();
+    let refs = file
+        .new_dataset::<u64>()
+        .object_references()
+        .shape([5])
+        .create("refs")
+        .unwrap();
+    refs.write_object_references(&["/target", "grp", "/"])
+        .unwrap();
+    // A dataset created after the reference was stored still resolves: the
+    // address is stamped in at close.
+    let late = grp.new_dataset::<i32>().shape([2]).create("late").unwrap();
+    late.write_raw(&[7i32, 8]).unwrap();
+    file.close().unwrap();
+
+    read_back_with_h5py(
+        py,
+        &path,
+        "r = f['refs']\n\
+         assert r.dtype == h5py.ref_dtype, r.dtype\n\
+         assert f[r[0]].name == '/target', f[r[0]].name\n\
+         assert (f[r[0]][:] == [1, 2, 3, 4]).all(), f[r[0]][:]\n\
+         assert f[r[1]].name == '/grp', f[r[1]].name\n\
+         assert f[r[2]].name == '/', f[r[2]].name\n\
+         assert not bool(r[3]), 'unwritten element must be a null reference'\n\
+         assert not bool(r[4]), 'unwritten element must be a null reference'\n",
+    );
+
+    // The same file reads back through this crate.
+    let file = H5File::open(&path).unwrap();
+    let got = file.dataset("refs").unwrap().read_references().unwrap();
+    assert_eq!(
+        got.iter().map(|r| r.path()).collect::<Vec<_>>(),
+        vec![Some("/target"), Some("/grp"), Some("/"), None, None]
+    );
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}
+
+/// A reference to a path that names nothing is refused at the call that got
+/// it wrong, not silently stored as a null.
+#[test]
+fn a_reference_to_a_missing_path_is_refused() {
+    let path = tmp("ref_object_missing");
+    let file = H5File::create(&path).unwrap();
+    let refs = file
+        .new_dataset::<u64>()
+        .object_references()
+        .shape([1])
+        .create("refs")
+        .unwrap();
+    let err = refs
+        .write_object_references(&["/nope"])
+        .expect_err("must refuse")
+        .to_string();
+    assert!(err.contains("/nope"), "got: {err}");
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}
+
+/// The file's low libver bound picks the datatype message version, the way
+/// `H5T_set_version` does: at `H5F_LIBVER_V112` a compound message is tagged
+/// version 4, and libhdf5 reads that file as readily as the default one.
+#[test]
+fn the_libver_bound_picks_the_datatype_message_version() {
+    use rust_hdf5::format::messages::datatype::CompoundMember;
+    use rust_hdf5::format::FormatContext;
+    use rust_hdf5::LibverBound;
+
+    let dt = DatatypeMessage::Compound {
+        size: 8,
+        members: vec![
+            CompoundMember {
+                name: "x".into(),
+                offset: 0,
+                datatype: DatatypeMessage::f32_type(),
+            },
+            CompoundMember {
+                name: "y".into(),
+                offset: 4,
+                datatype: DatatypeMessage::f32_type(),
+            },
+        ],
+    };
+    let mut bytes = Vec::new();
+    for i in 0..4u32 {
+        bytes.extend_from_slice(&(i as f32).to_le_bytes());
+        bytes.extend_from_slice(&((100 + i) as f32).to_le_bytes());
+    }
+    let ctx = FormatContext::default_v3();
+
+    for (bound, version) in [
+        (LibverBound::Earliest, 3u8),
+        (LibverBound::V18, 3),
+        (LibverBound::V112, 4),
+    ] {
+        let path = tmp(&format!("libver_{version}_{bound:?}"));
+        let file = H5File::create(&path).unwrap();
+        file.set_libver_bound(bound).unwrap();
+        let ds = file
+            .new_dataset::<u8>()
+            .datatype(dt.clone())
+            .shape([4])
+            .chunk(&[4])
+            .create("data")
+            .unwrap();
+        ds.write_raw_bytes(&bytes).unwrap();
+        file.close().unwrap();
+
+        // The message really landed at that version: its exact encoding is a
+        // substring of the file, and the encoding at any other version — the
+        // same bytes with a different nibble — is not.
+        let image = std::fs::read(&path).unwrap();
+        let wanted = dt.encode_at(&ctx, bound);
+        assert_eq!(wanted[0] >> 4, version);
+        let occurrences =
+            |needle: &[u8]| image.windows(needle.len()).filter(|w| *w == needle).count();
+        assert_eq!(occurrences(&wanted), 1, "{bound:?}: v{version} message");
+        for other in [3u8, 4, 5] {
+            if other == version {
+                continue;
+            }
+            let mut variant = wanted.clone();
+            variant[0] = (variant[0] & 0x0F) | (other << 4);
+            assert_eq!(
+                occurrences(&variant),
+                0,
+                "{bound:?}: stray v{other} message"
+            );
+        }
+
+        // And libhdf5 reads every one of them back.
+        if let Some(py) = python() {
+            read_back_with_h5py(
+                py,
+                &path,
+                "d = f['data']\n\
+                 assert d.dtype.names == ('x', 'y'), d.dtype\n\
+                 assert (d['x'] == np.arange(4, dtype='<f4')).all(), d['x']\n\
+                 assert (d['y'] == np.arange(100, 104, dtype='<f4')).all(), d['y']\n",
+            );
+        }
+
+        // As does this crate, whatever version stamped the message.
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(file.dataset("data").unwrap().datatype().unwrap(), dt);
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+}
+
+/// A vlen sequence over a base wider than a byte is read back by h5py as the
+/// typed vlen dtype `h5py.vlen_dtype` produces, with the values intact —
+/// which only holds if the `H5T_VLEN` length field counts elements and the
+/// heap object holds the base type's own byte order.
+#[test]
+fn vlen_numeric_written_by_rust_read_typed_by_h5py() {
+    let Some(py) = python() else { return };
+
+    let path = tmp("vlen_i32_rw");
+    let a: &[i32] = &[1, 2, 3];
+    let b: &[i32] = &[];
+    let c: &[i32] = &[-7];
+    {
+        let file = H5File::create(&path).unwrap();
+        file.write_vlen_numeric("data", &[a, b, c]).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['data']\n\
+         assert h5py.check_vlen_dtype(ds.dtype) == np.dtype('<i4'), ds.dtype\n\
+         got = [list(int(v) for v in x) for x in ds[...]]\n\
+         assert got == [[1, 2, 3], [], [-7]], got\n",
+    );
+    std::fs::remove_file(&path).ok();
+
+    // The same holds for a float base and for a dataset inside a group.
+    let path = tmp("vlen_f64_rw");
+    let x: &[f64] = &[1.5, -2.5, 1e300];
+    let y: &[f64] = &[0.0];
+    {
+        let file = H5File::create(&path).unwrap();
+        let grp = file.root_group().create_group("g").unwrap();
+        grp.write_vlen_numeric("wave", &[x, y]).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['g/wave']\n\
+         assert h5py.check_vlen_dtype(ds.dtype) == np.dtype('<f8'), ds.dtype\n\
+         got = [list(float(v) for v in x) for x in ds[...]]\n\
+         assert got == [[1.5, -2.5, 1e300], [0.0]], got\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A scale-offset chunk this crate compressed is decoded by libhdf5, and the
+/// chunk libhdf5 itself would have produced for the same values is decoded by
+/// this crate. Both halves have to hold for the filter to be usable in a file
+/// anyone else opens.
+#[test]
+fn scaleoffset_written_by_rust_read_by_h5py() {
+    let Some(py) = python() else { return };
+    use rust_hdf5::format::messages::filter::FilterPipeline;
+
+    let values: Vec<i32> = (0..64).map(|i| 1000 + (i * 37) % 500).collect();
+
+    let path = tmp("scaleoffset_rust_write");
+    {
+        let file = H5File::create(&path).unwrap();
+        let pipeline = FilterPipeline::scaleoffset(&DatatypeMessage::i32_type(), 16, 0).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([64usize])
+            .chunk(&[16])
+            .filter_pipeline(pipeline)
+            .create("data")
+            .unwrap();
+        ds.write_raw(&values).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['data']\n\
+         assert ds.dtype == np.dtype('<i4'), ds.dtype\n\
+         assert ds.scaleoffset == 0, ds.scaleoffset\n\
+         want = [1000 + (i * 37) % 500 for i in range(64)]\n\
+         got = [int(v) for v in ds[...]]\n\
+         assert got == want, got\n",
+    );
+    std::fs::remove_file(&path).ok();
+
+    // The other direction: libhdf5 writes the same values with the same
+    // filter, and this crate reads them back.
+    let path = tmp("scaleoffset_h5py_write");
+    write_with_h5py(
+        py,
+        &path,
+        "ds = f.create_dataset('data', (64,), chunks=(16,), dtype='<i4', scaleoffset=0)\n\
+         ds[...] = np.array([1000 + (i * 37) % 500 for i in range(64)], dtype='<i4')\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let got: Vec<i32> = file.dataset("data").unwrap().read_raw().unwrap();
+    assert_eq!(got, values);
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
 }

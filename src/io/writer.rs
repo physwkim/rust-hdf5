@@ -25,7 +25,7 @@ use crate::format::messages::attr_info::AttributeInfoMessage;
 use crate::format::messages::attribute::{AttributeEntry, AttributeMessage};
 use crate::format::messages::data_layout::{DataLayoutMessage, EarrayParams, FixedArrayParams};
 use crate::format::messages::dataspace::DataspaceMessage;
-use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::messages::datatype::{DatatypeMessage, ReferenceKind};
 use crate::format::messages::fill_value::FillValueMessage;
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::group_info::GroupInfoMessage;
@@ -34,7 +34,7 @@ use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::*;
 use crate::format::object_header::{ObjectHeader, MAX_MESSAGE_SIZE};
 use crate::format::superblock::*;
-use crate::format::{FormatContext, UNDEF_ADDR};
+use crate::format::{FormatContext, LibverBound, UNDEF_ADDR};
 
 use crate::io::allocator::FileAllocator;
 use crate::io::file_handle::FileHandle;
@@ -1890,14 +1890,15 @@ pub struct Hdf5Writer {
     /// outermost lock a create acquires (create_lock → spine → slot), and no
     /// write path takes it, so it cannot deadlock with the registry locks.
     pub(crate) create_lock: Slot<()>,
-    /// Target the libhdf5 2.0 file format (`H5Pset_libver_bounds` with low
-    /// bound `H5F_LIBVER_V200`): filtered chunked datasets created while
-    /// this is set get layout message version 5, whose chunk indexes encode
-    /// stored chunk sizes in a fixed `sizeof_size` field, so an expanding
-    /// filter cannot overflow the size field. Off by default — version-5
-    /// files are rejected by libhdf5 before 2.0, including the 1.14-based
-    /// h5py wheels.
-    libver_latest: bool,
+    /// The file's low `H5Pset_libver_bounds` bound: the oldest libhdf5 a
+    /// file this writer creates must stay readable by. It is the one switch
+    /// the version-bearing messages read — the datatype message version
+    /// (`H5O_dtype_ver_bounds`) and, at `V200`, layout version 5 for filtered
+    /// chunked datasets, whose chunk indexes encode stored chunk sizes in a
+    /// fixed `sizeof_size` field so an expanding filter cannot overflow it.
+    /// `Earliest` by default — version-5 files are rejected by libhdf5 before
+    /// 2.0, including the 1.14-based h5py wheels.
+    libver: LibverBound,
     closed: bool,
     /// Set once `finalize_for_swmr` has published a readable file.
     ///
@@ -1975,6 +1976,24 @@ pub struct Hdf5Writer {
     root_track_order: TrackOrder,
     /// Hands out the creation sequence numbers that order a group's links.
     next_creation_seq: Slot<u64>,
+    /// Object-reference elements waiting for their target's object header
+    /// address, which only exists once finalize has placed every header.
+    pending_object_references: Slot<Vec<PendingObjectReference>>,
+}
+
+/// One object-reference element written before its value could be known.
+///
+/// An `H5R_OBJECT1` element is the target's object header address, and
+/// addresses are assigned during finalize, so a write records the target by
+/// path here and [`Hdf5Writer::apply_object_reference_fixups`] stamps the
+/// address in once every header has one.
+pub(crate) struct PendingObjectReference {
+    /// Dataset holding the element.
+    dataset: usize,
+    /// Element index within that dataset.
+    element: u64,
+    /// Path of the object the element names; `/` is the root group.
+    target: String,
 }
 
 /// What a reopen found already on disk in dense form, by the scope whose
@@ -2065,7 +2084,7 @@ impl Hdf5Writer {
             preserved_links: Slot::new(Vec::new()),
             root_attributes: Slot::new(Vec::new()),
             create_lock: Slot::new(()),
-            libver_latest: false,
+            libver: LibverBound::Earliest,
             closed: false,
             swmr_active: false,
             cwfs: Slot::new(Vec::new()),
@@ -2082,6 +2101,7 @@ impl Hdf5Writer {
             track_order: TrackOrder::uniform(track_order),
             root_track_order: TrackOrder::uniform(track_order),
             next_creation_seq: Slot::new(0),
+            pending_object_references: Slot::new(Vec::new()),
         })
     }
 
@@ -2092,7 +2112,23 @@ impl Hdf5Writer {
     /// default, because readers older than libhdf5 2.0 — including the
     /// 1.14-based h5py wheels — reject version 5.
     pub fn set_libver_latest(&mut self, latest: bool) {
-        self.libver_latest = latest;
+        self.set_libver_bound(if latest {
+            LibverBound::V200
+        } else {
+            LibverBound::Earliest
+        });
+    }
+
+    /// Set the file's low libver bound, the equivalent of
+    /// `H5Pset_libver_bounds`'s `low` argument. Objects created after this
+    /// call encode their messages at the versions that bound calls for.
+    pub fn set_libver_bound(&mut self, libver: LibverBound) {
+        self.libver = libver;
+    }
+
+    /// The file's low libver bound.
+    pub fn libver(&self) -> LibverBound {
+        self.libver
     }
 
     /// Track and index creation order for the links and the attributes of
@@ -2116,7 +2152,7 @@ impl Hdf5Writer {
     /// when the file targets the 2.0 format; everything else stays at
     /// version 4, which every 1.10+ reader accepts.
     fn chunk_layout_version(&self, filtered: bool, chunk_bytes: u64) -> u8 {
-        if chunk_bytes > u32::MAX as u64 || (filtered && self.libver_latest) {
+        if chunk_bytes > u32::MAX as u64 || (filtered && self.libver == LibverBound::V200) {
             5
         } else {
             4
@@ -2754,7 +2790,7 @@ impl Hdf5Writer {
             preserved_links: Slot::new(preserved_links),
             root_attributes: Slot::new(root_attributes),
             create_lock: Slot::new(()),
-            libver_latest: false,
+            libver: LibverBound::Earliest,
             closed: false,
             swmr_active: false,
             cwfs: Slot::new(Vec::new()),
@@ -2773,6 +2809,7 @@ impl Hdf5Writer {
             superseded_dense: Slot::new(superseded),
             track_order: root_track_order,
             next_creation_seq: Slot::new(creation_seq),
+            pending_object_references: Slot::new(Vec::new()),
         })
     }
 
@@ -3565,6 +3602,15 @@ impl Hdf5Writer {
         self.ds(index).lock().dataspace.dims.clone()
     }
 
+    /// Return the datatype a dataset declares on disk.
+    ///
+    /// The typed write paths need it to store bytes in the declared byte
+    /// order; a reopened dataset handle has no copy of its own, and a cached
+    /// one could disagree with what the header will say.
+    pub fn dataset_datatype(&self, index: usize) -> DatatypeMessage {
+        self.ds(index).lock().datatype.clone()
+    }
+
     /// Return the names of all groups created so far.
     pub fn group_names(&self) -> Vec<String> {
         self.group_refs()
@@ -3743,29 +3789,9 @@ impl Hdf5Writer {
                 "cannot hard-link the root group".into(),
             ));
         }
-        let target = if let Some(idx) = datasets.iter().position(|d| {
-            let g = d.lock();
-            !g.deleted && g.name.trim_start_matches('/') == target_rel
-        }) {
-            HardLinkTarget::Dataset(idx)
-        } else if let Some(idx) = groups.iter().position(|g| {
-            let gg = g.lock();
-            !gg.deleted && gg.name.trim_start_matches('/') == target_rel
-        }) {
-            HardLinkTarget::Group(idx)
-        } else if let Some(t) = self.hard_links_vec().iter().find_map(|l| {
-            (self.hard_link_emitted(l) && self.hard_link_full_path(l) == target_rel)
-                .then_some(l.target)
-        }) {
-            // The target path may itself be a hard link: links have no
-            // chain (all point straight at the object header, as in
-            // libhdf5), so the new link copies the existing one's target.
-            t
-        } else {
-            return Err(crate::io::IoError::NotFound(format!(
-                "hard link target '{target_path}' not found"
-            )));
-        };
+        let target = self.resolve_object(target_rel).ok_or_else(|| {
+            crate::io::IoError::NotFound(format!("hard link target '{target_path}' not found"))
+        })?;
 
         // Reject a name already taken in the parent group.
         let parent_prefix = match parent {
@@ -3884,6 +3910,147 @@ impl Hdf5Writer {
             .iter()
             .filter(|l| self.hard_link_emitted(l) && same(l.target, target))
             .count() as u32
+    }
+
+    /// The object a path names, or `None` when nothing in the file does.
+    ///
+    /// `path` is the trimmed, hard-link-canonical form (no leading or
+    /// trailing `/`) that dataset and group names compare against. The single
+    /// owner of path→object resolution on the write side: hard links and
+    /// object references must agree on what a path means, including that a
+    /// path may itself be a user hard link — links have no chain (each points
+    /// straight at the object header, as in libhdf5), so the existing link's
+    /// target is the answer.
+    pub(crate) fn resolve_object(&self, path: &str) -> Option<HardLinkTarget> {
+        if let Some(idx) = self.dataset_refs().iter().position(|d| {
+            let g = d.lock();
+            !g.deleted && g.name.trim_start_matches('/') == path
+        }) {
+            return Some(HardLinkTarget::Dataset(idx));
+        }
+        if let Some(idx) = self.group_refs().iter().position(|g| {
+            let gg = g.lock();
+            !gg.deleted && gg.name.trim_start_matches('/') == path
+        }) {
+            return Some(HardLinkTarget::Group(idx));
+        }
+        self.hard_links_vec().iter().find_map(|l| {
+            (self.hard_link_emitted(l) && self.hard_link_full_path(l) == path).then_some(l.target)
+        })
+    }
+
+    /// Store object references naming `paths` into the elements of dataset
+    /// `index` starting at `start`.
+    ///
+    /// The value of an `H5R_OBJECT1` element is its target's object header
+    /// address, which finalize assigns, so what lands here is the target path;
+    /// [`Self::apply_object_reference_fixups`] writes the addresses. Elements
+    /// never written keep the zero image libhdf5 reads back as a null
+    /// reference.
+    pub fn write_object_references(
+        &self,
+        index: usize,
+        start: u64,
+        paths: &[&str],
+    ) -> IoResult<()> {
+        let (elements, data_addr, indexed) = {
+            let ds = self.ds(index);
+            let m = ds.lock();
+            match &m.datatype {
+                DatatypeMessage::Reference {
+                    kind: ReferenceKind::Object1,
+                    ..
+                } => {}
+                other => {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "dataset '{}' has datatype {other}, not an object reference",
+                        m.name
+                    )))
+                }
+            }
+            let elements = m
+                .dataspace
+                .dims
+                .iter()
+                .fold(1u64, |a, &d| a.saturating_mul(d));
+            let indexed = m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
+            (elements, m.data_addr, indexed)
+        };
+        if indexed || data_addr == UNDEF_ADDR {
+            return Err(crate::io::IoError::InvalidState(
+                "object references are stamped into contiguous storage; \
+                 create the dataset without chunking"
+                    .into(),
+            ));
+        }
+        let end = start.saturating_add(paths.len() as u64);
+        if end > elements {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "elements {start}..{end} are outside the dataset's {elements}"
+            )));
+        }
+        // Resolve now as well as at fixup time, so a path that names nothing
+        // is reported at the call that got it wrong.
+        for path in paths {
+            self.object_reference_target(path)?;
+        }
+        let mut pending = self.pending_object_references.lock();
+        for (i, path) in paths.iter().enumerate() {
+            pending.push(PendingObjectReference {
+                dataset: index,
+                element: start + i as u64,
+                target: (*path).to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The object an object reference's path names, as a hard-link target;
+    /// `None` for the root group, which has no registry slot.
+    fn object_reference_target(&self, path: &str) -> IoResult<Option<HardLinkTarget>> {
+        let rel = self.canonical_dataset_path(path.trim_matches('/'));
+        if rel.is_empty() {
+            return Ok(None);
+        }
+        self.resolve_object(&rel)
+            .map(Some)
+            .ok_or_else(|| crate::io::IoError::NotFound(format!("reference target '{path}'")))
+    }
+
+    /// Stamp every pending object reference with its target's object header
+    /// address.
+    ///
+    /// INVARIANT: a reference element on disk holds its target's header
+    /// address. Both finalize paths call this once every dataset, group and
+    /// root header has an address and before the superblock is written, so no
+    /// file is closed with a placeholder element in it; a target that no
+    /// longer resolves fails the finalize rather than leaving one behind.
+    fn apply_object_reference_fixups(&mut self) -> IoResult<()> {
+        // Snapshot rather than drain: a SWMR session finalizes twice, and the
+        // close-time finalize rebuilds every header at a fresh address, so the
+        // elements must be stamped again with the addresses that survive.
+        let pending: Vec<(usize, u64, String)> = self
+            .pending_object_references
+            .lock()
+            .iter()
+            .map(|p| (p.dataset, p.element, p.target.clone()))
+            .collect();
+        let width = self.ctx.sizeof_addr as usize;
+        for (dataset, element, target) in &pending {
+            let addr = match self.object_reference_target(target)? {
+                Some(HardLinkTarget::Dataset(i)) => self.ds(i).lock().obj_header_addr,
+                Some(HardLinkTarget::Group(i)) => self.grp(i).lock().obj_header_addr,
+                None => self.root_group_addr.ok_or_else(|| {
+                    crate::io::IoError::InvalidState(
+                        "root group header address is not assigned yet".into(),
+                    )
+                })?,
+            };
+            let data_addr = self.ds(*dataset).lock().data_addr;
+            let at = data_addr + element * width as u64;
+            self.handle.write_at(at, &addr.to_le_bytes()[..width])?;
+        }
+        Ok(())
     }
 
     /// Append every user-created hard link whose parent group is `parent`
@@ -4303,7 +4470,12 @@ impl Hdf5Writer {
         // The list is in creation order, so an attribute's position in it is
         // the creation index libhdf5 would have stamped on its message.
         for (i, attr) in attributes.iter().enumerate() {
-            header.add_message_indexed(MSG_ATTRIBUTE, 0x00, attr.encode(&self.ctx), i as u16);
+            header.add_message_indexed(
+                MSG_ATTRIBUTE,
+                0x00,
+                attr.encode_at(&self.ctx, self.libver),
+                i as u16,
+            );
         }
     }
 
@@ -4320,7 +4492,7 @@ impl Hdf5Writer {
         attributes.len() > MAX_COMPACT_ATTRS
             || attributes
                 .iter()
-                .any(|a| a.encode(&self.ctx).len() > MAX_MESSAGE_SIZE)
+                .any(|a| a.encode_at(&self.ctx, self.libver).len() > MAX_MESSAGE_SIZE)
     }
 
     /// Lay out and write dense attribute storage for every object that needs
@@ -5566,9 +5738,20 @@ impl Hdf5Writer {
     ///
     /// Stores strings in the global heap. The dataset raw data consists of
     /// vlen references (collection_addr + object_index pairs).
-    pub fn create_vlen_string_dataset(&self, name: &str, strings: &[&str]) -> IoResult<usize> {
+    ///
+    /// `charset` is the datatype's declared character set (0 = ASCII,
+    /// 1 = UTF-8); the strings are checked against it before anything is
+    /// written, so the type never misdescribes the bytes under it.
+    pub fn create_vlen_string_dataset(
+        &self,
+        name: &str,
+        strings: &[&str],
+        charset: u8,
+    ) -> IoResult<usize> {
         use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
+
+        ensure_vlen_charset(charset, strings)?;
 
         let create = self.begin_create(name)?;
         let name = create.name.as_str();
@@ -5598,7 +5781,10 @@ impl Hdf5Writer {
         self.handle.write_at(data_addr, &raw_data)?;
 
         // Create the dataset with vlen string datatype
-        let datatype = DatatypeMessage::vlen_string_utf8();
+        let datatype = DatatypeMessage::VarLenString {
+            padding: 0,
+            charset,
+        };
         let dataspace =
             crate::format::messages::dataspace::DataspaceMessage::simple(&[num_strings]);
 
@@ -5634,22 +5820,55 @@ impl Hdf5Writer {
 
     /// Create a 1-D variable-length byte-array dataset.
     ///
-    /// Each item's bytes are stored as a global-heap object and the dataset
-    /// holds one vlen reference per item (same on-disk shape as a vlen string
-    /// dataset). The datatype is a vlen sequence of `u8`, so h5py reads it back
-    /// as an array of variable-length `uint8` arrays. `seq_len` is the number
-    /// of base (`u8`) elements, i.e. the byte length; no null terminator is
-    /// appended.
+    /// The `u8` case of [`create_vlen_sequence_dataset`], where an item's
+    /// byte image and its element count are the same number.
+    ///
+    /// [`create_vlen_sequence_dataset`]: Self::create_vlen_sequence_dataset
     pub fn create_vlen_bytes_dataset(&self, name: &str, items: &[&[u8]]) -> IoResult<usize> {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        self.create_vlen_sequence_dataset(name, DatatypeMessage::u8_type(), items)
+    }
+
+    /// Create a 1-D variable-length sequence dataset over `base`.
+    ///
+    /// Each item is the encoded image of one sequence — `n * base.element_size()`
+    /// bytes in the base type's own byte order — and is stored as a global-heap
+    /// object; the dataset holds one vlen reference per item, the same on-disk
+    /// shape a vlen string dataset has. The `H5T_VLEN` length field counts base
+    /// elements rather than bytes, so an image whose length is not a whole
+    /// number of elements is refused here rather than stored under a length
+    /// that misreads it.
+    pub fn create_vlen_sequence_dataset(
+        &self,
+        name: &str,
+        base: DatatypeMessage,
+        items: &[&[u8]],
+    ) -> IoResult<usize> {
         use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
+
+        let elem_size = base.element_size() as usize;
+        if elem_size == 0 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "vlen base datatype {base} has no element size"
+            )));
+        }
+        for (i, item) in items.iter().enumerate() {
+            if !item.len().is_multiple_of(elem_size) {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "sequence {i} is {} bytes, not a whole number of {elem_size}-byte elements",
+                    item.len()
+                )));
+            }
+        }
 
         let create = self.begin_create(name)?;
         let name = create.name.as_str();
         let num_items = items.len() as u64;
 
-        // Store the byte arrays as heap objects, sharing collection blocks
-        // as `create_vlen_string_dataset` does.
+        // Store the sequence images as heap objects, sharing collection
+        // blocks as `create_vlen_string_dataset` does.
         let placements = self.insert_vlen_objects(items)?;
 
         // Build raw data: one vlen reference per item.
@@ -5657,8 +5876,7 @@ impl Hdf5Writer {
         let data_size = (num_items as usize) * ref_size;
         let mut raw_data = Vec::with_capacity(data_size);
         for (i, &(gcol_addr, obj_idx)) in placements.iter().enumerate() {
-            // base is u8, so element count == byte count.
-            let seq_len = crate::format::global_heap::vlen_seq_len(items[i].len())?;
+            let seq_len = crate::format::global_heap::vlen_seq_len(items[i].len() / elem_size)?;
             raw_data.extend_from_slice(&encode_vlen_reference(
                 seq_len,
                 gcol_addr,
@@ -5671,8 +5889,9 @@ impl Hdf5Writer {
         let data_addr = self.allocator.allocate(data_size as u64);
         self.handle.write_at(data_addr, &raw_data)?;
 
-        // Create the dataset with a vlen byte-array datatype.
-        let datatype = DatatypeMessage::vlen_bytes();
+        let datatype = DatatypeMessage::VarLenSequence {
+            base: Box::new(base),
+        };
         let dataspace = crate::format::messages::dataspace::DataspaceMessage::simple(&[num_items]);
 
         let idx = self.push_dataset(
@@ -5916,7 +6135,7 @@ impl Hdf5Writer {
             let ds = self.ds(ds_index);
             let m = ds.lock();
             match m.datatype {
-                DatatypeMessage::VarLenString { charset } => charset,
+                DatatypeMessage::VarLenString { charset, .. } => charset,
                 _ => {
                     return Err(crate::io::IoError::InvalidState(
                         "append_vlen_strings is only for variable-length string datasets".into(),
@@ -6055,7 +6274,7 @@ impl Hdf5Writer {
             let ds = self.ds(ds_index);
             let m = ds.lock();
             let charset = match m.datatype {
-                DatatypeMessage::VarLenString { charset } => charset,
+                DatatypeMessage::VarLenString { charset, .. } => charset,
                 _ => {
                     return Err(crate::io::IoError::InvalidState(
                         "write_vlen_strings_slice is only for variable-length string datasets"
@@ -8690,7 +8909,7 @@ impl Hdf5Writer {
     /// append that adds nothing newer leaves that version alone.
     fn superblock_version_for(&self, flags: u8) -> u8 {
         let mut version = self.superblock_version_base.max(SUPERBLOCK_V2);
-        if self.libver_latest
+        if self.libver == LibverBound::V200
             || self.swmr_active
             || flags & FLAG_SWMR_WRITE != 0
             || self.has_chunked_dataset()
@@ -8849,6 +9068,9 @@ impl Hdf5Writer {
         self.handle.write_at(root_addr, &root_encoded)?;
         self.root_group_addr = Some(root_addr);
         self.root_group_encoded_size = root_encoded_size;
+
+        // 2b. Stamp object references now that every header has an address.
+        self.apply_object_reference_fixups()?;
 
         // 3. Write superblock with SWMR flags.
         self.write_superblock(FLAG_WRITE_ACCESS | FLAG_SWMR_WRITE)?;
@@ -9027,6 +9249,10 @@ impl Hdf5Writer {
         self.handle.write_at(root_addr, &root_encoded)?;
         self.root_group_addr = Some(root_addr);
 
+        // 2b. Every object header now has an address, so the object
+        // references waiting on one can be stamped into their datasets.
+        self.apply_object_reference_fixups()?;
+
         // 3. Write superblock at offset 0.
         self.write_superblock(0)?;
 
@@ -9055,7 +9281,7 @@ impl Hdf5Writer {
         header.add_message(MSG_DATASPACE, 0x00, ds_msg);
 
         // Datatype message (type 0x03), flag 0x01 = constant
-        let dt_msg = m.datatype.encode(&self.ctx);
+        let dt_msg = m.datatype.encode_at(&self.ctx, self.libver);
         header.add_message(MSG_DATATYPE, 0x01, dt_msg);
 
         // Fill Value message (type 0x05)
@@ -9475,7 +9701,7 @@ mod tests {
         let attempts: [(&str, IoResult<usize>); 4] = [
             (
                 "vlen_string",
-                writer.create_vlen_string_dataset("d", &["x"]),
+                writer.create_vlen_string_dataset("d", &["x"], 1),
             ),
             ("vlen_bytes", writer.create_vlen_bytes_dataset("d", &[b"x"])),
             (
@@ -9508,6 +9734,35 @@ mod tests {
                 ),
             }
         }
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The `H5T_VLEN` length field counts base elements, so an image that is
+    /// not a whole number of them has no length that reads back as what was
+    /// handed over; it is refused at the call rather than stored truncated.
+    #[test]
+    fn vlen_sequence_refuses_a_partial_element() {
+        let path = temp_path("vlen_partial_element");
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let err = writer
+            .create_vlen_sequence_dataset("d", DatatypeMessage::i32_type(), &[&[1u8, 2, 3, 4, 5]])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("5 bytes"), "unexpected error: {err}");
+        assert!(err.contains("4-byte elements"), "unexpected error: {err}");
+
+        // The refusal is the length rule alone: the same base takes a whole
+        // number of elements, and an empty sequence is a legal one.
+        writer
+            .create_vlen_sequence_dataset(
+                "d",
+                DatatypeMessage::i32_type(),
+                &[&[1u8, 2, 3, 4], &[][..]],
+            )
+            .unwrap();
 
         writer.close().unwrap();
         std::fs::remove_file(&path).ok();
@@ -9665,7 +9920,7 @@ mod tests {
 
         let writer = Hdf5Writer::create(&path).unwrap();
         writer
-            .create_vlen_string_dataset("notes", &["initial"])
+            .create_vlen_string_dataset("notes", &["initial"], 1)
             .unwrap();
         writer.close().unwrap();
 

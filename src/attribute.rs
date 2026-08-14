@@ -20,6 +20,7 @@ use std::marker::PhantomData;
 
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::reference::Reference;
 
 use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
@@ -284,14 +285,11 @@ impl H5Attribute {
         match &mut *inner {
             H5FileInner::Reader(reader) => Ok(reader.attr_string_value(attr)?),
             _ => {
-                // No reader available — fall back to the raw fixed-length
-                // interpretation.
-                let end = attr
-                    .data
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(attr.data.len());
-                Ok(String::from_utf8_lossy(&attr.data[..end]).to_string())
+                // No reader available, so a variable-length value cannot be
+                // resolved through the heap — but a fixed-length one is right
+                // here, and its padding rule is read the same way it is on the
+                // reader path.
+                Ok(crate::io::reader::fixed_string_attr_value(attr)?)
             }
         }
     }
@@ -327,6 +325,32 @@ impl H5Attribute {
             .ok_or_else(|| {
                 Hdf5Error::InvalidState("attribute has no read data (write-mode handle?)".into())
             })
+    }
+
+    /// Read a reference attribute's elements, each resolved to the object it
+    /// names — the attribute counterpart of
+    /// [`H5Dataset::read_references`](crate::dataset::H5Dataset::read_references).
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open("refs.h5").unwrap();
+    /// let ds = file.dataset("image").unwrap();
+    /// let target = ds.attr("source").unwrap().read_references().unwrap();
+    /// println!("{:?}", target[0].path());
+    /// ```
+    pub fn read_references(&self) -> Result<Vec<Reference>> {
+        let attr = self.read_attr.as_ref().ok_or_else(|| {
+            Hdf5Error::InvalidState("attribute has no read data (write-mode handle?)".into())
+        })?;
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => Ok(reader.attr_references(attr)?),
+            // References name file addresses, so resolving them needs the
+            // reader's view of the file.
+            _ => Err(Hdf5Error::InvalidState(
+                "cannot read references from an attribute in write mode".into(),
+            )),
+        }
     }
 
     /// Read the raw attribute data bytes.

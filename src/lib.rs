@@ -112,6 +112,8 @@ pub use format::messages::superblock_ext::{
     BtreeKMessage, DriverInfoMessage, FileSpaceInfoMessage, FileSpaceStrategy,
     SharedMessageTableMessage,
 };
+pub use format::reference::{Reference, RegionSelection};
+pub use format::LibverBound;
 pub use group::H5Group;
 pub use io::locking::{FileLocking, LockMode};
 pub use io::reader::LinkClass;

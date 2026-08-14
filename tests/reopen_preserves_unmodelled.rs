@@ -457,7 +457,10 @@ fn a_preserved_object_is_named_by_the_writer_rather_than_reported_absent() {
         &orig,
         &work,
         "with h5py.File(ORIG, 'w', libver='latest') as f:\n\
-         \x20   f.create_dataset('opaque', data=np.arange(4, dtype='u1').view('V4'))\n",
+         \x20   f.create_dataset('src', data=np.arange(4, dtype='<i4'))\n\
+         \x20   layout = h5py.VirtualLayout(shape=(4,), dtype='<i4')\n\
+         \x20   layout[...] = h5py.VirtualSource(f['src'])\n\
+         \x20   f.create_virtual_dataset('opaque', layout)\n",
     );
     std::fs::copy(&orig, &work).unwrap();
 

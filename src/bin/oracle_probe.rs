@@ -28,7 +28,8 @@ use rust_hdf5::format::messages::datatype::{
 use rust_hdf5::format::messages::filter::{Filter, FilterPipeline, FILTER_FLETCHER32};
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
-    H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error, LinkClass,
+    H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error,
+    LibverBound, LinkClass, Reference,
 };
 
 const CANON_VERSION: &str = "3";
@@ -187,6 +188,19 @@ fn canon_dtype(dt: &DatatypeMessage) -> String {
             }
             s
         }
+        DatatypeMessage::BitField {
+            size,
+            byte_order,
+            bit_offset,
+            bit_precision,
+        } => {
+            let mut s = format!("bits[{size}]{}", order_str(byte_order));
+            if *bit_offset != 0 || u32::from(*bit_precision) != size * 8 {
+                s.push_str(&format!("+off{bit_offset}p{bit_precision}"));
+            }
+            s
+        }
+        DatatypeMessage::Opaque { size, tag } => format!("opaque[{size}],tag={}", esc(tag)),
         DatatypeMessage::FixedString {
             size,
             padding,
@@ -196,9 +210,9 @@ fn canon_dtype(dt: &DatatypeMessage) -> String {
             strpad_str(*padding),
             charset_str(*charset)
         ),
-        // `strpad` is deliberately absent: DatatypeMessage::VarLenString does
-        // not model it, and canon.py omits it too. See oracle/CANON.md.
-        DatatypeMessage::VarLenString { charset } => {
+        // The pad is deliberately absent here: it travels in the separate
+        // `strpad` field, and canon.py omits it too. See oracle/CANON.md.
+        DatatypeMessage::VarLenString { charset, .. } => {
             format!("vstr,cset={}", charset_str(*charset))
         }
         DatatypeMessage::Compound { size, members } => {
@@ -215,6 +229,19 @@ fn canon_dtype(dt: &DatatypeMessage) -> String {
                 .collect();
             format!("enum({}){{{}}}", canon_dtype(base), parts.join(";"))
         }
+        // canon.py splits the class by element width, not by the stored
+        // reference type: an 8-byte element is an object reference, anything
+        // else a region one. That rule only covers what h5py can express —
+        // the 1.12 kinds, which it refuses outright, get their own name so a
+        // file holding them is never reported as a pre-1.12 region reference.
+        DatatypeMessage::Reference { size, kind } => if kind.is_revised() {
+            "stdref"
+        } else if *size == 8 {
+            "objref"
+        } else {
+            "regref"
+        }
+        .to_string(),
         DatatypeMessage::VarLenSequence { base } => format!("vlen({})", canon_dtype(base)),
         DatatypeMessage::Array { dims, base } => {
             let parts: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
@@ -278,46 +305,97 @@ fn render_elem(base: &DatatypeMessage, bytes: &[u8]) -> String {
     }
 }
 
-/// True when the datatype stores its payload outside the element image, so
-/// there is no flat byte picture to compare.
-fn has_heap_type(dt: &DatatypeMessage) -> bool {
+/// True when the element image is not comparable between two writers, so the
+/// canonical form is the rendered values rather than the raw bytes: a
+/// variable-length payload lives in a heap the element only points at, and a
+/// reference names a file address whose value is an allocation detail.
+fn renders_as_values(dt: &DatatypeMessage) -> bool {
     match dt {
-        DatatypeMessage::VarLenString { .. } | DatatypeMessage::VarLenSequence { .. } => true,
-        DatatypeMessage::Array { base, .. } => has_heap_type(base),
+        DatatypeMessage::VarLenString { .. }
+        | DatatypeMessage::VarLenSequence { .. }
+        | DatatypeMessage::Reference { .. } => true,
+        DatatypeMessage::Array { base, .. } => renders_as_values(base),
         DatatypeMessage::Compound { members, .. } => {
-            members.iter().any(|m| has_heap_type(&m.datatype))
+            members.iter().any(|m| renders_as_values(&m.datatype))
         }
         _ => false,
     }
 }
 
-/// True when the type tree contains a variable-length string anywhere.
+/// One reference element in the form `oracle/canon.py`'s `render_ref` prints:
+/// the target's path, plus the selection's bounding box for a region
+/// reference. An address the reader could not name is printed as the address,
+/// which compares unequal to h5py's path — a difference, not a silent match.
+fn render_ref(r: &Reference) -> String {
+    fn target(path: &Option<String>, address: u64) -> String {
+        path.clone().unwrap_or_else(|| format!("<{address:#x}>"))
+    }
+    fn coords(dims: &[u64]) -> String {
+        let parts: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
+        format!("[{}]", parts.join(","))
+    }
+    match r {
+        Reference::Null => "objref:null".to_string(),
+        Reference::Object { address, path } => format!("objref:{}", target(path, *address)),
+        Reference::Region {
+            address,
+            path,
+            selection,
+        } => match selection.bounds() {
+            Some((lo, hi)) => format!(
+                "regref:{}:{}-{}",
+                target(path, *address),
+                coords(&lo),
+                coords(&hi)
+            ),
+            None => format!("regref:{}:unbounded", target(path, *address)),
+        },
+        // No h5py-generated case can reach this arm: h5py 3.x refuses the
+        // `H5T_STD_REF` datatype an attribute reference needs.
+        Reference::Attr {
+            address,
+            path,
+            name,
+        } => format!("attrref:{}:{name}", target(path, *address)),
+    }
+}
+
+/// `where=pad` for every variable-length string in the type tree, appended to
+/// `out`.
 ///
-/// `DatatypeMessage::VarLenString` models only the character set, so wherever
-/// this holds the `strpad` field cannot be answered from the public API.
-fn has_vlen_string(dt: &DatatypeMessage) -> bool {
+/// `where` is the position in the type tree, as `oracle/CANON.md` defines it:
+/// `.` is the type itself, `.m` a compound member, `[]` an array element, `()`
+/// a vlen element.
+fn vlen_strpads(dt: &DatatypeMessage, whence: &str, out: &mut Vec<String>) {
     match dt {
-        DatatypeMessage::VarLenString { .. } => true,
-        DatatypeMessage::VarLenSequence { base } | DatatypeMessage::Array { base, .. } => {
-            has_vlen_string(base)
+        DatatypeMessage::VarLenString { padding, .. } => {
+            let at = if whence.is_empty() { "." } else { whence };
+            out.push(format!("{at}={}", strpad_str(*padding)));
         }
+        DatatypeMessage::Array { base, .. } => vlen_strpads(base, &format!("{whence}[]"), out),
+        DatatypeMessage::VarLenSequence { base } => vlen_strpads(base, &format!("{whence}()"), out),
         DatatypeMessage::Compound { members, .. } => {
-            members.iter().any(|m| has_vlen_string(&m.datatype))
+            for m in members {
+                vlen_strpads(&m.datatype, &format!("{whence}.{}", m.name), out);
+            }
         }
-        _ => false,
+        _ => {}
     }
 }
 
-/// The `strpad` field: `-` when no variable-length string is involved, and
-/// otherwise the marker, because the parsed message has dropped the pad.
+/// The `strpad` field: `-` when the type tree holds no variable-length string,
+/// otherwise one `position=pad` entry per such string.
 fn strpad_field(dtype: Option<&DatatypeMessage>) -> std::result::Result<String, String> {
     match dtype {
-        Some(dt) if has_vlen_string(dt) => Err(
-            "DatatypeMessage::VarLenString models only the character set, so the \
-             string pad of a variable-length string is not retained"
-                .into(),
-        ),
-        Some(_) => Ok("-".into()),
+        Some(dt) => {
+            let mut pads = Vec::new();
+            vlen_strpads(dt, "", &mut pads);
+            Ok(if pads.is_empty() {
+                "-".into()
+            } else {
+                pads.join(";")
+            })
+        }
         None => Err("datatype unavailable, so the string pad cannot be classified".into()),
     }
 }
@@ -795,7 +873,7 @@ fn dataset_payload(
     dtype: Option<&DatatypeMessage>,
 ) -> std::result::Result<String, String> {
     let dt = dtype.ok_or("datatype unavailable, so the payload cannot be classified")?;
-    if !has_heap_type(dt) {
+    if !renders_as_values(dt) {
         let bytes = guarded(|| ds.read_raw_bytes())
             .map_err(|p| format!("panic: {p}"))?
             .map_err(oneline)?;
@@ -827,8 +905,15 @@ fn dataset_payload(
                 .collect();
             Ok(encode_vals(&vals))
         }
+        DatatypeMessage::Reference { .. } => {
+            let refs = guarded(|| ds.read_references())
+                .map_err(|p| format!("panic: {p}"))?
+                .map_err(oneline)?;
+            let vals: Vec<String> = refs.iter().map(render_ref).collect();
+            Ok(encode_vals(&vals))
+        }
         other => Err(format!(
-            "no public reader for a heap-backed {} payload",
+            "no public reader for a {} payload",
             canon_dtype(other)
         )),
     }
@@ -943,7 +1028,7 @@ fn dump_object_attrs<T: AttrSource>(d: &mut Dump, path: &str, ds: &T) {
             let dt = dtype
                 .as_ref()
                 .ok_or("datatype unavailable, so the value cannot be classified")?;
-            if !has_heap_type(dt) {
+            if !renders_as_values(dt) {
                 let bytes = guarded(|| a.read_raw())
                     .map_err(|p| format!("panic: {p}"))?
                     .map_err(oneline)?;
@@ -956,8 +1041,15 @@ fn dump_object_attrs<T: AttrSource>(d: &mut Dump, path: &str, ds: &T) {
                         .map_err(oneline)?;
                     Ok(encode_vals(&[esc(&s)]))
                 }
+                DatatypeMessage::Reference { .. } => {
+                    let refs = guarded(|| a.read_references())
+                        .map_err(|p| format!("panic: {p}"))?
+                        .map_err(oneline)?;
+                    let vals: Vec<String> = refs.iter().map(render_ref).collect();
+                    Ok(encode_vals(&vals))
+                }
                 other => Err(format!(
-                    "no public reader for a heap-backed {} attribute",
+                    "no public reader for a {} attribute",
                     canon_dtype(other)
                 )),
             }
@@ -1177,7 +1269,21 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         "int_i64le" => simple_ramp::<i64>(path, ramp_n::<i64>(8)),
         "int_u64le" => simple_ramp::<u64>(path, ramp_n::<u64>(8)),
         "int_i16be" => be_ramp(path, DatatypeMessage::i16_type(), 2),
-        "int_i32be" => be_ramp(path, DatatypeMessage::i32_type(), 4),
+        // The one big-endian case written through the *typed* path: the
+        // values handed over are host-order `i32`s, and the file has to hold
+        // their big-endian image. Its siblings keep writing a pre-swapped
+        // byte image, so both write styles stay covered.
+        "int_i32be" => {
+            let file = H5File::create(path)?;
+            let ds = file
+                .new_dataset::<i32>()
+                .datatype(be_of(DatatypeMessage::i32_type()))
+                .shape([8usize])
+                .create("data")?;
+            ds.write_raw(&(0..8i32).collect::<Vec<_>>())?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "int_u64be" => be_ramp(path, DatatypeMessage::u64_type(), 8),
 
         // ---- floats -----------------------------------------------------
@@ -1225,6 +1331,29 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        // The two pad rules the reference writes explicitly: the declared
+        // rule and the bytes actually stored have to agree.
+        "str_fixed_nullpad" | "str_fixed_spacepad" => {
+            let (padding, pad_byte) = if case == "str_fixed_spacepad" {
+                (2u8, b' ')
+            } else {
+                (1u8, 0u8)
+            };
+            let file = H5File::create(path)?;
+            raw_typed(
+                &file,
+                "data",
+                DatatypeMessage::FixedString {
+                    size: 8,
+                    padding,
+                    charset: 0,
+                },
+                &[4],
+                &fixed_string_bytes(&STRINGS, 8, pad_byte),
+            )?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "str_fixed_utf8" => {
             let file = H5File::create(path)?;
             raw_typed(
@@ -1243,7 +1372,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         }
         "str_vlen_ascii" => {
             let file = H5File::create(path)?;
-            file.write_vlen_strings("data", &STRINGS)?;
+            file.write_vlen_strings_ascii("data", &STRINGS)?;
             file.close()?;
             Ok(Ok(()))
         }
@@ -1346,6 +1475,34 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "compound_dtype_v4" => {
+            // Same compound as `compound_simple`, written into a file whose
+            // low libver bound is v1.12, which is what makes the datatype
+            // message version 4. Chunked, matching the h5py generator.
+            let dt = DatatypeMessage::Compound {
+                size: 8,
+                members: vec![
+                    member("x", 0, DatatypeMessage::f32_type()),
+                    member("y", 4, DatatypeMessage::f32_type()),
+                ],
+            };
+            let mut bytes = Vec::new();
+            for i in 0..4u32 {
+                bytes.extend_from_slice(&(i as f32).to_le_bytes());
+                bytes.extend_from_slice(&((100 + i) as f32).to_le_bytes());
+            }
+            let file = H5File::create(path)?;
+            file.set_libver_bound(LibverBound::V112)?;
+            let ds = file
+                .new_dataset::<u8>()
+                .datatype(dt)
+                .shape([4usize])
+                .chunk(&[4])
+                .create("data")?;
+            ds.write_raw_bytes(&bytes)?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "array_dtype" => {
             let dt = DatatypeMessage::Array {
                 dims: vec![2, 3],
@@ -1416,6 +1573,65 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "vlen_numeric" => {
+            let file = H5File::create(path)?;
+            let a: &[i32] = &[1, 2, 3];
+            let b: &[i32] = &[];
+            let c: &[i32] = &[-7];
+            file.write_vlen_numeric("data", &[a, b, c])?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "opaque" => {
+            let file = H5File::create(path)?;
+            let bytes: Vec<u8> = (0u8..12).collect();
+            raw_typed(
+                &file,
+                "data",
+                DatatypeMessage::Opaque {
+                    size: 4,
+                    tag: "raw4".into(),
+                },
+                &[3],
+                &bytes,
+            )?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "bitfield" => {
+            let file = H5File::create(path)?;
+            raw_typed(
+                &file,
+                "data",
+                DatatypeMessage::BitField {
+                    size: 1,
+                    byte_order: ByteOrder::LittleEndian,
+                    bit_offset: 0,
+                    bit_precision: 8,
+                },
+                &[4],
+                &[0x01, 0x80, 0xFF, 0x00],
+            )?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "ref_object" => {
+            let file = H5File::create(path)?;
+            let target = file.new_dataset::<i32>().shape([8]).create("target")?;
+            target.write_raw(&ramp_n::<i32>(8))?;
+            file.create_group("grp")?;
+            let refs = file
+                .new_dataset::<u64>()
+                .object_references()
+                .shape([2])
+                .create("refs")?;
+            refs.write_object_references(&["/target", "/grp"])?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "ref_region" => Ok(unsup(
+            "region references need a selection serializer on the write side",
+        )),
 
         // ---- layouts and chunk indexes ----------------------------------
         "layout_contiguous" => simple_ramp::<i32>(path, ramp_n::<i32>(16)),
@@ -1471,6 +1687,14 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                     cd_values: vec![],
                 }],
             })
+        }),
+        "filter_scaleoffset" => filtered(path, |b| {
+            // `filtered` writes 64 i32 elements in chunks of 16, and the
+            // filter parameters carry that per-chunk element count.
+            b.filter_pipeline(
+                FilterPipeline::scaleoffset(&DatatypeMessage::i32_type(), 16, 0)
+                    .expect("i32 is scale-offset filterable"),
+            )
         }),
 
         // ---- fill values --------------------------------------------------

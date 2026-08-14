@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use crate::format::messages::attribute::AttributeMessage;
+use crate::format::messages::datatype::DatatypeMessage;
 use crate::io::locking::FileLocking;
 use crate::io::Hdf5Reader;
 use crate::io::SwmrWriter as IoSwmrWriter;
@@ -374,11 +375,26 @@ impl SwmrFileWriter {
     /// Create a variable-length string dataset (one element per string).
     /// Returns the dataset index. Useful for NeXus metadata such as
     /// `/entry/start_time` or per-frame timestamp arrays.
+    ///
+    /// The datatype declares UTF-8;
+    /// [`write_string_dataset_ascii`](Self::write_string_dataset_ascii)
+    /// declares ASCII instead.
     pub fn write_string_dataset(&mut self, name: &str, strings: &[&str]) -> Result<usize> {
         let idx = self
             .inner
             .writer_mut()
-            .create_vlen_string_dataset(name, strings)?;
+            .create_vlen_string_dataset(name, strings, 1)?;
+        Ok(idx)
+    }
+
+    /// [`write_string_dataset`](Self::write_string_dataset) under an **ASCII**
+    /// datatype, the one h5py's `string_dtype("ascii")` produces. A string
+    /// that is not 7-bit is rejected rather than mislabelled.
+    pub fn write_string_dataset_ascii(&mut self, name: &str, strings: &[&str]) -> Result<usize> {
+        let idx = self
+            .inner
+            .writer_mut()
+            .create_vlen_string_dataset(name, strings, 0)?;
         Ok(idx)
     }
 
@@ -612,7 +628,8 @@ impl SwmrFileReader {
     /// type at runtime.
     pub fn read_dataset<T: H5Type>(&mut self, name: &str) -> Result<Vec<T>> {
         self.check_element_width::<T>(name)?;
-        bytes_to_typed(self.reader.read_dataset_raw(name)?)
+        let datatype = self.dataset_datatype(name)?;
+        bytes_to_typed(self.reader.read_dataset_raw(name)?, &datatype)
     }
 
     /// Read a slice (hyperslab) of a dataset as raw bytes.
@@ -640,7 +657,8 @@ impl SwmrFileReader {
         counts: &[u64],
     ) -> Result<Vec<T>> {
         self.check_element_width::<T>(name)?;
-        bytes_to_typed(self.reader.read_slice(name, starts, counts)?)
+        let datatype = self.dataset_datatype(name)?;
+        bytes_to_typed(self.reader.read_slice(name, starts, counts)?, &datatype)
     }
 
     /// The width gate for the typed reads: without it, reinterpreting the
@@ -669,6 +687,15 @@ impl SwmrFileReader {
         self.reader
             .dataset_info(name)
             .map(|i| i.datatype.element_size() as usize)
+            .ok_or_else(|| crate::error::Hdf5Error::NotFound(name.to_string()))
+    }
+
+    /// The stored datatype of a dataset, which the typed reads need to put
+    /// the element image into host byte order.
+    fn dataset_datatype(&mut self, name: &str) -> Result<DatatypeMessage> {
+        self.reader
+            .dataset_info(name)
+            .map(|i| i.datatype.clone())
             .ok_or_else(|| crate::error::Hdf5Error::NotFound(name.to_string()))
     }
 
@@ -729,8 +756,10 @@ fn group_attr_target(group_path: &str) -> crate::io::writer::AttrTarget<'_> {
 }
 
 /// Reinterpret a raw byte buffer as a typed vector. The buffer length must
-/// be a whole multiple of `T`'s element size.
-fn bytes_to_typed<T: H5Type>(raw: Vec<u8>) -> Result<Vec<T>> {
+/// be a whole multiple of `T`'s element size, and the stored byte order is
+/// converted to the host's first — reinterpretation is only the stored value
+/// when the two agree.
+fn bytes_to_typed<T: H5Type>(mut raw: Vec<u8>, datatype: &DatatypeMessage) -> Result<Vec<T>> {
     let es = T::element_size();
     if es == 0 || !raw.len().is_multiple_of(es) {
         return Err(crate::error::Hdf5Error::TypeMismatch(format!(
@@ -738,6 +767,7 @@ fn bytes_to_typed<T: H5Type>(raw: Vec<u8>) -> Result<Vec<T>> {
             raw.len()
         )));
     }
+    crate::dataset::to_host_byte_order(&mut raw, datatype, es)?;
     let count = raw.len() / es;
     let mut result = Vec::<T>::with_capacity(count);
     // Safety: `T: H5Type` is a `Copy` POD primitive exactly `element_size()`

@@ -309,28 +309,46 @@ fn contiguous_lists_at_every_libver_bound() {
     }
 }
 
-/// One dataset per message this crate cannot decode: an opaque datatype, an
-/// object-reference datatype, and a virtual data layout. Each is a dataset the
-/// file plainly contains, so each must be listed by name and must say what
-/// stands in the way — the catalog walk used to drop all three on the floor
-/// and report an empty file. A dataset sharing a committed datatype was a
-/// fourth case here until the reference became readable; it now belongs to
-/// `a_dataset_that_shares_a_committed_datatype_reads_through_the_reference`.
+/// Rewrite the one opaque (`V4`) datatype message in `path` as class 2,
+/// `H5T_TIME` — a real HDF5 class this crate does not model, and the only way
+/// to get one into a fixture, since h5py cannot create one. h5py's default
+/// libver writes version-1 object headers, which carry no checksum, so the
+/// message is editable in place.
+fn retype_opaque_as_time(path: &std::path::Path, expected: usize) {
+    let mut raw = std::fs::read(path).unwrap();
+    // Version 1, class 5 (opaque), no tag, 4 bytes wide.
+    const OPAQUE_V4: [u8; 8] = [0x15, 0, 0, 0, 4, 0, 0, 0];
+    let hits: Vec<usize> = (0..raw.len() - 8)
+        .filter(|&i| raw[i..i + 8] == OPAQUE_V4)
+        .collect();
+    assert_eq!(
+        hits.len(),
+        expected,
+        "fixture must hold exactly {expected} opaque V4 datatype message(s)"
+    );
+    for at in hits {
+        raw[at] = 0x12; // version 1, class 2 (H5T_TIME)
+    }
+    std::fs::write(path, &raw).unwrap();
+}
+
+/// One dataset per message this crate cannot decode: a datatype whose class it
+/// does not model, and a virtual data layout. Each is a dataset the file
+/// plainly contains, so each must be listed by name and must say what stands
+/// in the way — the catalog walk used to drop them on the floor and report an
+/// empty file. Opaque, object-reference and committed-datatype datasets were
+/// cases here until each became readable.
 #[test]
 fn a_dataset_whose_message_does_not_decode_is_listed_and_says_why() {
     let Some(py) = python() else { return };
-    // (name, h5py statements, the word the reason must name)
-    let cases: [(&str, &str, &str); 3] = [
+    // (name, h5py statements, the word the reason must name, opaque messages
+    // to retype as H5T_TIME afterwards)
+    let cases: [(&str, &str, &str, usize); 2] = [
         (
-            "opaque",
+            "time",
             "f.create_dataset('x', data=np.arange(4, dtype='u1').view('V4'))",
             "datatype",
-        ),
-        (
-            "objref",
-            "f.create_dataset('t', data=np.arange(4, dtype='<i4'))\n\
-             \x20   f.create_dataset('x', data=[f['t'].ref], dtype=h5py.ref_dtype)",
-            "datatype",
+            1,
         ),
         (
             "virtual",
@@ -340,10 +358,11 @@ fn a_dataset_whose_message_does_not_decode_is_listed_and_says_why() {
              \x20   layout[...] = h5py.VirtualSource(f['src'])\n\
              \x20   f.create_virtual_dataset('x', layout)",
             "data layout",
+            0,
         ),
     ];
 
-    for (case, body, blame) in cases {
+    for (case, body, blame, opaque_messages) in cases {
         let path = tmp(&format!("undecodable_{case}"));
         h5py_write(
             py,
@@ -354,6 +373,9 @@ fn a_dataset_whose_message_does_not_decode_is_listed_and_says_why() {
                  \x20   f.create_dataset('ok', data=np.arange(4, dtype='<i4'))\n"
             ),
         );
+        if opaque_messages > 0 {
+            retype_opaque_as_time(&path, opaque_messages);
+        }
 
         let file = H5File::open(&path).unwrap();
         let root = file.root_group();
@@ -1140,6 +1162,7 @@ fn a_committed_datatype_this_crate_cannot_decode_is_still_listed() {
          \x20   f['t'] = np.dtype('V4')\n\
          \x20   f['t'].attrs['tag'] = np.int32(3)\n",
     );
+    retype_opaque_as_time(&path, 1);
 
     let file = H5File::open(&path).unwrap();
     assert_eq!(file.named_datatype_names(), vec!["t".to_string()]);

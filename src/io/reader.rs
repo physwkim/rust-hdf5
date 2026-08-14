@@ -19,7 +19,7 @@ use crate::format::messages::attr_info::AttributeInfoMessage;
 use crate::format::messages::attribute::{AttributeEntry, AttributeMessage};
 use crate::format::messages::data_layout::{self, DataLayoutMessage};
 use crate::format::messages::dataspace::DataspaceMessage;
-use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::messages::datatype::{DatatypeMessage, OldReferenceKind, ReferenceEncoding};
 use crate::format::messages::fill_value::{try_tiled_fill, FillValueMessage};
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::link::LinkMessage;
@@ -31,6 +31,10 @@ use crate::format::messages::superblock_ext::{
 };
 use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
+use crate::format::reference::{
+    decode_object_element, decode_region_element, decode_region_heap_object, decode_revised_body,
+    decode_revised_element, Reference, ReferenceTarget, RevisedElement,
+};
 use crate::format::sohm::SohmMasterTable;
 use crate::format::superblock::{
     detect_superblock_version, SuperblockV0V1, SuperblockV2V3, SymbolTableCache,
@@ -109,6 +113,9 @@ impl<'a> ChunkTarget<'a> {
 pub struct DatasetReadInfo {
     /// Dataset name (the link name in the root group).
     pub name: String,
+    /// Address of the dataset's object header — what an object reference to
+    /// this dataset stores.
+    pub object_header_address: u64,
     /// Element datatype.
     pub datatype: DatatypeMessage,
     /// Dataspace (dimensionality).
@@ -270,12 +277,36 @@ struct Catalog {
     group_attributes: std::collections::HashMap<String, ObjectAttributes>,
     /// Every non-root group path the walk traversed into.
     group_paths: std::collections::BTreeSet<String>,
+    /// Group object header address → the first path that reached it (no
+    /// leading `/`), taken from the walk's cycle guard. What turns the
+    /// address an object reference stores back into a name.
+    group_object_paths: std::collections::HashMap<u64, String>,
     /// Group hard-link aliases: alias path → first-walked path.
     group_aliases: std::collections::HashMap<String, String>,
     /// Every link record seen, keyed by its full path (no leading `/`).
     links: std::collections::BTreeMap<String, LinkClass>,
     /// Committed (named) datatype objects, keyed by path.
     datatypes: std::collections::BTreeMap<String, CommittedDatatypeInfo>,
+}
+
+impl Catalog {
+    /// The address→absolute-path catalog this walk implies, with `root_addr`
+    /// named `/` whether or not the walk itself reached it.
+    ///
+    /// The single owner of the catalog: file open and the SWMR
+    /// [`Hdf5Reader::refresh`] rescan both build it here, so a dataset that
+    /// appears after open is resolvable exactly as one present at open is.
+    fn object_paths(&self, root_addr: u64) -> std::collections::HashMap<u64, String> {
+        let mut paths = std::collections::HashMap::new();
+        paths.insert(root_addr, "/".to_string());
+        for (addr, path) in &self.group_object_paths {
+            paths.insert(*addr, absolute_path(path));
+        }
+        for ds in &self.datasets {
+            paths.insert(ds.object_header_address, absolute_path(&ds.name));
+        }
+        paths
+    }
 }
 
 /// The state one catalog walk threads through every group it visits.
@@ -325,7 +356,8 @@ impl<'a> CatalogWalk<'a> {
         &self.meta.ctx
     }
 
-    fn finish(self) -> Catalog {
+    fn finish(mut self) -> Catalog {
+        self.catalog.group_object_paths = self.visited;
         self.catalog
     }
 
@@ -505,7 +537,7 @@ impl<'a> CatalogWalk<'a> {
                 return Ok(());
             }
         };
-        match Hdf5Reader::classify_object(self.handle, &header, self.meta, &full_name) {
+        match Hdf5Reader::classify_object(self.handle, &header, self.meta, &full_name, addr) {
             ObjectKind::Dataset(info) => {
                 self.catalog.datasets.push(*info);
                 return Ok(());
@@ -717,6 +749,17 @@ pub struct Hdf5Reader {
     external_resolved: std::collections::BTreeMap<String, PathBuf>,
     /// Committed (named) datatype objects, keyed by path (no leading `/`).
     datatypes: std::collections::BTreeMap<String, CommittedDatatypeInfo>,
+    /// Object header address → absolute path, for every group and dataset the
+    /// discovery walk reached plus the root group. This is what turns the
+    /// address an object reference stores back into a name.
+    object_paths: std::collections::HashMap<u64, String>,
+}
+
+/// The absolute form of a discovery-walk path (which carries no leading `/`):
+/// the root group's empty path becomes `/`, `entry/data` becomes
+/// `/entry/data`.
+fn absolute_path(path: &str) -> String {
+    format!("/{}", path.trim_start_matches('/'))
 }
 
 /// Total byte length of `dims.product() * element_size`, computed with
@@ -728,6 +771,33 @@ fn saturating_byte_len(dims: &[u64], element_size: u64) -> u64 {
     dims.iter()
         .fold(1u64, |acc, &d| acc.saturating_mul(d))
         .saturating_mul(element_size)
+}
+
+/// A fixed-length string attribute's value, under the padding rule its
+/// datatype declares.
+///
+/// The single owner for the attribute side of that rule: both
+/// [`H5Reader::attr_string_value`] and the writer-mode fallback in
+/// `H5Attribute::read_string` end here, so a space-padded attribute does not
+/// read back with its padding attached on one path and not the other. Bytes
+/// that are not valid UTF-8 become U+FFFD, as they always have on this path.
+///
+/// A datatype that is not a string at all is read as null-terminated, which is
+/// what asking for the string value of, say, an integer attribute has always
+/// meant here.
+pub(crate) fn fixed_string_attr_value(attr: &AttributeMessage) -> IoResult<String> {
+    use crate::format::messages::datatype::{fixed_string_content, DatatypeMessage};
+    let padding = match attr.datatype {
+        DatatypeMessage::FixedString { padding, .. } => padding,
+        _ => 0,
+    };
+    let content = fixed_string_content(&attr.data, padding).ok_or_else(|| {
+        crate::io::IoError::InvalidState(format!(
+            "attribute {:?} uses string padding rule {padding}, which the format reserves",
+            attr.name
+        ))
+    })?;
+    Ok(String::from_utf8_lossy(content).to_string())
 }
 
 /// Materialize a `total`-byte fill buffer, mapping allocation failure to a
@@ -1014,6 +1084,7 @@ impl Hdf5Reader {
             root_group_info: RootGroupInfo::V2V3 {
                 root_group_object_header_address: sb.root_group_object_header_address,
             },
+            object_paths: catalog.object_paths(sb.root_group_object_header_address),
             datasets: catalog.datasets,
             unreadable: catalog.unreadable,
             root_attributes,
@@ -1095,6 +1166,7 @@ impl Hdf5Reader {
                 btree_addr: ste_btree_addr,
                 heap_addr: ste_heap_addr,
             },
+            object_paths: catalog.object_paths(root_obj_addr),
             datasets: catalog.datasets,
             unreadable: catalog.unreadable,
             root_attributes,
@@ -1434,6 +1506,7 @@ impl Hdf5Reader {
         header: &ObjectHeader,
         meta: &FileMeta,
         name: &str,
+        addr: u64,
     ) -> ObjectKind {
         let ctx = &meta.ctx;
         let present = |t: u8| header.messages.iter().any(|m| m.msg_type == t);
@@ -1540,6 +1613,7 @@ impl Hdf5Reader {
         match (datatype, dataspace, layout) {
             (Some(dt), Some(ds), Some(dl)) => ObjectKind::Dataset(Box::new(DatasetReadInfo {
                 name: name.to_string(),
+                object_header_address: addr,
                 datatype: dt,
                 dataspace: ds,
                 layout: dl,
@@ -2159,13 +2233,7 @@ impl Hdf5Reader {
     pub fn attr_string_value(&mut self, attr: &AttributeMessage) -> IoResult<String> {
         use crate::format::messages::datatype::DatatypeMessage;
         if !matches!(attr.datatype, DatatypeMessage::VarLenString { .. }) {
-            // Fixed-length string: raw bytes, truncated at the first NUL.
-            let end = attr
-                .data
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(attr.data.len());
-            return Ok(String::from_utf8_lossy(&attr.data[..end]).to_string());
+            return fixed_string_attr_value(attr);
         }
         // Variable-length string: the attribute value is a global-heap
         // reference (sequence length + collection address + object index).
@@ -2188,6 +2256,146 @@ impl Hdf5Reader {
             ))
         })?;
         Ok(String::from_utf8_lossy(obj).to_string())
+    }
+
+    /// The absolute path of the object whose header sits at `addr` — what an
+    /// object reference to it names — or `None` when no group or dataset the
+    /// discovery walk reached lives there (a reference into a file region the
+    /// walk never traversed, or a stale one).
+    pub fn path_for_object(&self, addr: u64) -> Option<&str> {
+        self.object_paths.get(&addr).map(String::as_str)
+    }
+
+    /// Read a reference dataset's elements, resolved to the objects they name.
+    pub fn read_references(&mut self, name: &str) -> IoResult<Vec<Reference>> {
+        let datatype = self
+            .dataset_info(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?
+            .datatype
+            .clone();
+        let raw = self.read_dataset_raw(name)?;
+        self.decode_references(&datatype, &raw)
+    }
+
+    /// Read an attribute's value as reference elements.
+    pub fn attr_references(&mut self, attr: &AttributeMessage) -> IoResult<Vec<Reference>> {
+        self.decode_references(&attr.datatype, &attr.data)
+    }
+
+    /// The single owner of reference decoding for both carriers of reference
+    /// elements — dataset payloads and attribute values.
+    fn decode_references(
+        &mut self,
+        datatype: &DatatypeMessage,
+        bytes: &[u8],
+    ) -> IoResult<Vec<Reference>> {
+        let DatatypeMessage::Reference { size, kind } = datatype else {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "datatype {datatype} is not a reference"
+            )));
+        };
+        let (size, kind) = (*size as usize, *kind);
+        if size == 0 {
+            // A corrupt file can declare it; `chunks_exact(0)` panics.
+            return Err(crate::io::IoError::InvalidState(
+                "reference datatype has zero width".into(),
+            ));
+        }
+        let encoding = kind.encoding();
+
+        // References written by one call share one heap collection, so read
+        // each collection once rather than per element.
+        let mut heaps = std::collections::HashMap::new();
+        let mut out = Vec::with_capacity(bytes.len() / size);
+        for elem in bytes.chunks_exact(size) {
+            out.push(self.decode_reference_element(elem, encoding, &mut heaps)?);
+        }
+        Ok(out)
+    }
+
+    /// One reference element, resolved against the file.
+    ///
+    /// `heaps` caches the global-heap collections region references point
+    /// into, keyed by collection address.
+    fn decode_reference_element(
+        &mut self,
+        elem: &[u8],
+        encoding: ReferenceEncoding,
+        heaps: &mut std::collections::HashMap<u64, GlobalHeapCollection>,
+    ) -> IoResult<Reference> {
+        match encoding {
+            ReferenceEncoding::Old(OldReferenceKind::Object) => {
+                match decode_object_element(elem, &self.meta.ctx)? {
+                    None => Ok(Reference::Null),
+                    Some(address) => Ok(self.resolve_reference(address, ReferenceTarget::Object)),
+                }
+            }
+            ReferenceEncoding::Old(OldReferenceKind::DatasetRegion) => {
+                let Some((coll_addr, obj_index)) = decode_region_element(elem, &self.meta.ctx)?
+                else {
+                    return Ok(Reference::Null);
+                };
+                let obj = self.heap_object(coll_addr, obj_index, heaps)?;
+                let (address, selection) = decode_region_heap_object(obj, &self.meta.ctx)?;
+                Ok(self.resolve_reference(address, ReferenceTarget::Region(selection)))
+            }
+            ReferenceEncoding::Revised => {
+                let (kind, body) = match decode_revised_element(elem, &self.meta.ctx)? {
+                    RevisedElement::Null => return Ok(Reference::Null),
+                    RevisedElement::Inline { kind, body } => (kind, body.to_vec()),
+                    RevisedElement::Heap {
+                        kind,
+                        collection,
+                        index,
+                    } => (kind, self.heap_object(collection, index, heaps)?.to_vec()),
+                };
+                match decode_revised_body(kind, &body, &self.meta.ctx)? {
+                    None => Ok(Reference::Null),
+                    Some((address, target)) => Ok(self.resolve_reference(address, target)),
+                }
+            }
+        }
+    }
+
+    /// Attach the target's path to a decoded reference — the one place an
+    /// address becomes a [`Reference`], so every kind resolves the same way.
+    fn resolve_reference(&self, address: u64, target: ReferenceTarget) -> Reference {
+        let path = self.path_for_object(address).map(str::to_string);
+        match target {
+            ReferenceTarget::Object => Reference::Object { address, path },
+            ReferenceTarget::Region(selection) => Reference::Region {
+                address,
+                path,
+                selection,
+            },
+            ReferenceTarget::Attribute(name) => Reference::Attr {
+                address,
+                path,
+                name,
+            },
+        }
+    }
+
+    /// One global-heap object, reading its collection at most once.
+    fn heap_object<'h>(
+        &mut self,
+        collection: u64,
+        index: u32,
+        heaps: &'h mut std::collections::HashMap<u64, GlobalHeapCollection>,
+    ) -> IoResult<&'h [u8]> {
+        if let std::collections::hash_map::Entry::Vacant(slot) = heaps.entry(collection) {
+            slot.insert(self.read_heap_collection(collection)?);
+        }
+        let idx = u16::try_from(index).map_err(|_| {
+            crate::io::IoError::InvalidState(format!(
+                "global heap object index {index} does not fit the 16-bit on-disk field"
+            ))
+        })?;
+        heaps[&collection].get_object(idx).ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!(
+                "global heap object {idx} not found in the collection at address {collection:#x}"
+            ))
+        })
     }
 
     /// Return the dimensions of a dataset.
@@ -2394,6 +2602,7 @@ impl Hdf5Reader {
         self._eof = sb.end_of_file_address;
         self.meta = meta;
         self.ext = ext;
+        self.object_paths = catalog.object_paths(sb.root_group_object_header_address);
         self.datasets = catalog.datasets;
         self.unreadable = catalog.unreadable;
         self.group_attributes = catalog.group_attributes;
@@ -4653,6 +4862,49 @@ mod tests {
         let ainfo = crate::format::messages::attr_info::AttributeInfoMessage::compact();
         let names = collect_from(vec![msg(MSG_ATTR_INFO, ainfo.encode(&ctx))]).unwrap();
         assert!(names.is_empty(), "{names:?}");
+    }
+
+    /// A space-padded fixed-length string attribute reads back without its
+    /// padding: `H5T__conv_s_s` ends the value after the last non-space byte,
+    /// and nothing else in the element marks where it stops.
+    #[test]
+    fn fixed_string_attr_value_honors_the_declared_pad() {
+        use crate::format::messages::dataspace::DataspaceMessage;
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let attr = |padding: u8, data: &[u8]| AttributeMessage {
+            name: "units".to_string(),
+            datatype: DatatypeMessage::FixedString {
+                size: data.len() as u32,
+                padding,
+                charset: 0,
+            },
+            dataspace: DataspaceMessage::scalar(),
+            data: data.to_vec(),
+        };
+
+        // Space padded: no NUL anywhere, so truncating at the first NUL kept
+        // the padding.
+        assert_eq!(
+            fixed_string_attr_value(&attr(2, b"volt    ")).unwrap(),
+            "volt"
+        );
+        // Null terminated and null padded end at the first NUL, so trailing
+        // spaces before it are content.
+        assert_eq!(
+            fixed_string_attr_value(&attr(0, b"volt  \0\0")).unwrap(),
+            "volt  "
+        );
+        assert_eq!(
+            fixed_string_attr_value(&attr(1, b"volt\0\0\0\0")).unwrap(),
+            "volt"
+        );
+        // A reserved rule is named rather than guessed at.
+        let err = fixed_string_attr_value(&attr(7, b"volt    ")).unwrap_err();
+        assert!(
+            err.to_string().contains("padding rule 7"),
+            "unexpected error: {err}"
+        );
     }
 }
 
