@@ -24,7 +24,7 @@ use crate::format::dense_link::build_dense_links;
 use crate::format::messages::attr_info::AttributeInfoMessage;
 use crate::format::messages::attribute::{AttributeEntry, AttributeMessage};
 use crate::format::messages::data_layout::{DataLayoutMessage, EarrayParams, FixedArrayParams};
-use crate::format::messages::dataspace::DataspaceMessage;
+use crate::format::messages::dataspace::{DataspaceClass, DataspaceMessage};
 use crate::format::messages::datatype::{DatatypeMessage, ReferenceKind};
 use crate::format::messages::fill_value::FillValueMessage;
 use crate::format::messages::filter::{self, FilterPipeline};
@@ -861,20 +861,26 @@ fn validate_chunk_geometry(dims: &[u64], max_dims: &[u64], chunk_dims: &[u64]) -
     Ok(())
 }
 
-/// An extensible-array index linearizes chunk coordinates, which requires
-/// every unlimited dimension to be dimension 0: any later dimension is a
-/// multiplier in the row-major index and must be finite. libhdf5 supports
-/// other positions by swizzling the unlimited dimension to the slowest one
-/// (H5Dearray.c), which this crate does not implement.
-fn ensure_unlimited_is_leading(max_dims: &[u64]) -> IoResult<()> {
-    for (d, &m) in max_dims.iter().enumerate().skip(1) {
-        if m == u64::MAX {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "unlimited dimension {d} is not the first: extensible-array \
-                 swizzling is not supported; reorder the dimensions so the \
-                 unlimited one comes first"
-            )));
-        }
+/// An extensible-array index requires at most one unlimited dimension —
+/// `H5D__chunk_construct` (H5Dchunk.c) only selects this index for exactly
+/// one — at any position: `chunk_grid::linear_index` seeds the unlimited
+/// dimension into the slot no down-chunks multiplier touches, the same
+/// address libhdf5 reaches by swizzling it to the slowest position
+/// (`H5VM_swizzle_coords`, H5Dearray.c). Two or more unlimited dimensions
+/// have no finite grid at all; that shape needs a v2 B-tree index instead.
+fn ensure_at_most_one_unlimited(max_dims: &[u64]) -> IoResult<()> {
+    let unlimited: Vec<usize> = max_dims
+        .iter()
+        .enumerate()
+        .filter(|&(_, &m)| m == u64::MAX)
+        .map(|(d, _)| d)
+        .collect();
+    if unlimited.len() > 1 {
+        return Err(crate::io::IoError::InvalidState(format!(
+            "an extensible-array index supports at most one unlimited dimension, \
+             but dimensions {unlimited:?} are all unlimited; a v2 B-tree index \
+             handles two or more"
+        )));
     }
     Ok(())
 }
@@ -4633,6 +4639,47 @@ impl Hdf5Writer {
         Ok(idx)
     }
 
+    /// Define a new dataset with the NULL dataspace: no elements at all.
+    ///
+    /// Distinct from a scalar dataset (`create_dataset` with `dims == []`),
+    /// which holds exactly one element — a NULL dataspace holds zero, so
+    /// there is no raw image to allocate: `data_addr` stays `UNDEF_ADDR` and
+    /// `data_size` stays 0 permanently, the same terminal state
+    /// `create_dataset` already reaches for a zero-length dimension.
+    pub fn create_null_dataset(&self, name: &str, datatype: DatatypeMessage) -> IoResult<usize> {
+        let create = self.begin_create(name)?;
+        let name = create.name.as_str();
+
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                dataspace: DataspaceMessage::null(),
+                obj_header_addr: 0, // set during finalize
+                data_addr: UNDEF_ADDR,
+                data_size: 0,
+                chunked: None,
+                fixed_array: None,
+                btree_v2: None,
+                append: None,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: None,
+                deleted: false,
+                extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
+                fill_value: None,
+                layout_version: 4,
+            },
+        );
+
+        Ok(idx)
+    }
+
     /// Define a new chunked dataset with an extensible array index.
     ///
     /// Returns the dataset index. The dataset starts empty (dims[0] = 0 if
@@ -4649,7 +4696,7 @@ impl Hdf5Writer {
         let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
-        ensure_unlimited_is_leading(max_dims)?;
+        ensure_at_most_one_unlimited(max_dims)?;
         let chunk_bytes = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
         let layout_version = self.chunk_layout_version(false, chunk_bytes);
         let earray_params = EarrayParams::default_params();
@@ -4695,6 +4742,9 @@ impl Hdf5Writer {
 
         // Build dataspace with max dims
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };
@@ -6011,6 +6061,9 @@ impl Hdf5Writer {
         self.handle.write_at(ea_iblk_addr, &iblk_encoded)?;
 
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };
@@ -7227,6 +7280,9 @@ impl Hdf5Writer {
         // `extend_dataset` checks growth against, and the FA capacity above
         // is exactly its chunk grid.
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };
@@ -7365,6 +7421,9 @@ impl Hdf5Writer {
         self.handle.write_at(bt2_header_addr, &hdr_encoded)?;
 
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };
@@ -7422,7 +7481,7 @@ impl Hdf5Writer {
         let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
-        ensure_unlimited_is_leading(max_dims)?;
+        ensure_at_most_one_unlimited(max_dims)?;
         let element_size = datatype.element_size() as u64;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
         let layout_version = self.chunk_layout_version(true, chunk_bytes);
@@ -7466,6 +7525,9 @@ impl Hdf5Writer {
         self.handle.write_at(ea_iblk_addr, &iblk_encoded)?;
 
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };
@@ -7533,7 +7595,7 @@ impl Hdf5Writer {
         let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
-        ensure_unlimited_is_leading(max_dims)?;
+        ensure_at_most_one_unlimited(max_dims)?;
         let element_size = datatype.element_size() as u64;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
         let layout_version = self.chunk_layout_version(true, chunk_bytes);
@@ -7574,6 +7636,9 @@ impl Hdf5Writer {
         self.handle.write_at(ea_iblk_addr, &iblk_encoded)?;
 
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };
@@ -9682,6 +9747,29 @@ mod tests {
             "unexpected error: {err}"
         );
 
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `create_chunked_dataset` builds an extensible-array index unconditionally
+    /// (the caller — the high-level dataset API — is the one that decides when
+    /// two-or-more unlimited dimensions should go to a v2 B-tree instead), so
+    /// its own guard is the last line of defense against a shape that index
+    /// can't represent at all.
+    #[test]
+    fn create_chunked_dataset_rejects_two_unlimited_dimensions() {
+        let path = temp_path("earray_two_unlimited");
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let err = writer
+            .create_chunked_dataset(
+                "d",
+                DatatypeMessage::i32_type(),
+                &[4, 4],
+                &[u64::MAX, u64::MAX],
+                &[2, 2],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("at most one unlimited"), "{err}");
         writer.close().unwrap();
         std::fs::remove_file(&path).ok();
     }

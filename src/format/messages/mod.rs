@@ -4,6 +4,7 @@ pub mod continuation;
 pub mod data_layout;
 pub mod dataspace;
 pub mod datatype;
+pub mod external_file_list;
 pub mod fill_value;
 pub mod filter;
 pub mod group_info;
@@ -12,6 +13,7 @@ pub mod link_info;
 pub mod mod_time;
 pub mod shared;
 pub mod superblock_ext;
+pub mod virtual_mapping;
 
 // Message type IDs
 pub const MSG_DATASPACE: u8 = 0x01;
@@ -20,6 +22,7 @@ pub const MSG_DATATYPE: u8 = 0x03;
 pub const MSG_FILL_VALUE_OLD: u8 = 0x04;
 pub const MSG_FILL_VALUE: u8 = 0x05;
 pub const MSG_LINK: u8 = 0x06;
+pub const MSG_EXTERNAL_FILE_LIST: u8 = 0x07;
 pub const MSG_DATA_LAYOUT: u8 = 0x08;
 pub const MSG_GROUP_INFO: u8 = 0x0A;
 pub const MSG_FILTER_PIPELINE: u8 = 0x0B;

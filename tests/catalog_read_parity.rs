@@ -332,37 +332,66 @@ fn retype_opaque_as_time(path: &std::path::Path, expected: usize) {
     std::fs::write(path, &raw).unwrap();
 }
 
+/// Rewrite the one contiguous data-layout message in `path` as class 4, a
+/// layout class the format does not define — the only remaining way to get an
+/// undecodable layout into a fixture now that virtual layouts (class 3) read.
+/// Same in-place edit as [`retype_opaque_as_time`]: h5py's default libver
+/// writes version-1 object headers, which carry no checksum.
+fn retype_layout_class_as_unknown(path: &std::path::Path, expected: usize) {
+    let mut raw = std::fs::read(path).unwrap();
+    // Version-1 object-header message prologue for a data layout (type 8),
+    // whose 18-byte body pads to 24, followed by version 3 and class 1
+    // (contiguous).
+    let hits: Vec<usize> = (0..raw.len() - 10)
+        .filter(|&i| {
+            raw[i..i + 4] == [0x08, 0x00, 0x18, 0x00]
+                && raw[i + 5..i + 8] == [0, 0, 0]
+                && raw[i + 8] == 3
+                && raw[i + 9] == 1
+        })
+        .collect();
+    assert_eq!(
+        hits.len(),
+        expected,
+        "fixture must hold exactly {expected} contiguous layout message(s)"
+    );
+    for at in hits {
+        raw[at + 9] = 4;
+    }
+    std::fs::write(path, &raw).unwrap();
+}
+
 /// One dataset per message this crate cannot decode: a datatype whose class it
-/// does not model, and a virtual data layout. Each is a dataset the file
-/// plainly contains, so each must be listed by name and must say what stands
-/// in the way — the catalog walk used to drop them on the floor and report an
-/// empty file. Opaque, object-reference and committed-datatype datasets were
-/// cases here until each became readable.
+/// does not model, and a data-layout class the format does not define. Each is
+/// a dataset the file plainly contains, so each must be listed by name and must
+/// say what stands in the way — the catalog walk used to drop them on the floor
+/// and report an empty file. Opaque, object-reference, committed-datatype and
+/// virtual datasets were cases here until each became readable.
 #[test]
 fn a_dataset_whose_message_does_not_decode_is_listed_and_says_why() {
     let Some(py) = python() else { return };
-    // (name, h5py statements, the word the reason must name, opaque messages
-    // to retype as H5T_TIME afterwards)
-    let cases: [(&str, &str, &str, usize); 2] = [
+    enum Patch {
+        OpaqueToTime,
+        LayoutClass,
+    }
+    // (name, h5py statements, the word the reason must name, the byte patch
+    // that makes 'x' undecodable)
+    let cases: [(&str, &str, &str, Patch); 2] = [
         (
             "time",
             "f.create_dataset('x', data=np.arange(4, dtype='u1').view('V4'))",
             "datatype",
-            1,
+            Patch::OpaqueToTime,
         ),
         (
-            "virtual",
-            "src = np.arange(4, dtype='<i4')\n\
-             \x20   f.create_dataset('src', data=src)\n\
-             \x20   layout = h5py.VirtualLayout(shape=(4,), dtype='<i4')\n\
-             \x20   layout[...] = h5py.VirtualSource(f['src'])\n\
-             \x20   f.create_virtual_dataset('x', layout)",
+            "layout",
+            "f.create_dataset('x', data=np.arange(4, dtype='<i4'))",
             "data layout",
-            0,
+            Patch::LayoutClass,
         ),
     ];
 
-    for (case, body, blame, opaque_messages) in cases {
+    for (case, body, blame, patch) in cases {
         let path = tmp(&format!("undecodable_{case}"));
         h5py_write(
             py,
@@ -370,11 +399,14 @@ fn a_dataset_whose_message_does_not_decode_is_listed_and_says_why() {
             &format!(
                 "with h5py.File(PATH, 'w') as f:\n\
                  \x20   {body}\n\
-                 \x20   f.create_dataset('ok', data=np.arange(4, dtype='<i4'))\n"
+                 \x20   f.create_dataset('ok', data=np.arange(4, dtype='<i4'), chunks=(2,))\n"
             ),
         );
-        if opaque_messages > 0 {
-            retype_opaque_as_time(&path, opaque_messages);
+        // 'ok' is chunked so that the contiguous layout of 'x' is the only
+        // message either patch can land on.
+        match patch {
+            Patch::OpaqueToTime => retype_opaque_as_time(&path, 1),
+            Patch::LayoutClass => retype_layout_class_as_unknown(&path, 1),
         }
 
         let file = H5File::open(&path).unwrap();

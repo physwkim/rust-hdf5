@@ -3400,3 +3400,240 @@ fn scaleoffset_written_by_rust_read_by_h5py() {
     file.close().unwrap();
     std::fs::remove_file(&path).ok();
 }
+
+/// NULL dataspace (rust → h5py): `.null()` writes a dataset with the NULL
+/// dataspace — h5py must read it back with `shape is None` (its own
+/// null-dataspace marker) and an `Empty` value, not a 1-element scalar.
+#[test]
+fn null_dataspace_written_by_rust_read_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("null_rw");
+    {
+        let file = H5File::create(&path).unwrap();
+        file.new_dataset::<i32>().null().create("data").unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "d = f['data']\n\
+         assert d.shape is None, d.shape\n\
+         assert d.dtype == np.dtype('<i4'), d.dtype\n\
+         v = d[()]\n\
+         assert isinstance(v, h5py.Empty), v\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// NULL dataspace (h5py → rust): `h5py.Empty` writes the NULL dataspace —
+/// rust-hdf5 must read it back as `is_null() == true`, an empty `shape()`
+/// AND an empty raw byte image (0 elements, not 1 as a scalar would be).
+#[test]
+fn null_dataspace_written_by_h5py_read_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("null_wr");
+    write_with_h5py(py, &path, "f['data'] = h5py.Empty('<i4')\n");
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert!(ds.is_null());
+    assert_eq!(ds.shape(), Vec::<usize>::new());
+    assert_eq!(ds.total_elements(), 0);
+    assert_eq!(ds.read_raw_bytes().unwrap(), Vec::<u8>::new());
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+/// Implicit chunk index (h5py → rust): a fixed-shape, early-allocated,
+/// unfiltered chunked dataset has no on-disk index structure at all —
+/// libhdf5 (`H5Dnone.c`) computes each chunk's address arithmetically from
+/// the dataset's base address. rust-hdf5 must read every chunk correctly
+/// instead of hard-erroring on the index type, for both a full read and a
+/// selection spanning multiple chunks.
+#[test]
+fn chunk_index_implicit_written_by_h5py_read_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("chunkidx_implicit");
+    write_with_h5py(
+        py,
+        &path,
+        "from h5py import h5d, h5p, h5s, h5t\n\
+         dcpl = h5p.create(h5p.DATASET_CREATE)\n\
+         dcpl.set_layout(h5d.CHUNKED)\n\
+         dcpl.set_chunk((4,))\n\
+         dcpl.set_alloc_time(h5d.ALLOC_TIME_EARLY)\n\
+         sid = h5s.create_simple((16,))\n\
+         dsid = h5d.create(f.id, b'data', h5t.STD_I32LE, sid, dcpl=dcpl)\n\
+         dsid.write(h5s.ALL, h5s.ALL, np.arange(16, dtype='<i4'))\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.shape(), vec![16]);
+    assert_eq!(ds.read_raw::<i32>().unwrap(), (0..16).collect::<Vec<i32>>());
+    // Selection [6, 10) spans two chunks ([4,8) and [8,12)), exercising the
+    // slice-read path through the same implicit-index dispatch.
+    assert_eq!(ds.read_slice::<i32>(&[6], &[4]).unwrap(), vec![6, 7, 8, 9]);
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+/// External file list (h5py → rust): a dataset whose raw data lives in a
+/// separate file (H5O_EFL_ID) has no local storage address of its own — the
+/// data layout message it still carries (`Contiguous`) leaves `address`
+/// undefined, so a reader that ignores the external file list reads the
+/// dataset back as the fill value (all zero) with no error at all.
+/// rust-hdf5 must resolve the real bytes instead, for both a full read and
+/// a slice. The external file is named by an absolute path here so the
+/// test does not depend on `HDF5_EXTFILE_PREFIX` or the process's current
+/// directory — that resolution is covered separately by the oracle's
+/// `external_storage` case, which names its raw file relatively under
+/// `HDF5_EXTFILE_PREFIX=${ORIGIN}` (see `oracle/hdf5env.py`), not by this
+/// test.
+#[test]
+fn external_file_list_written_by_h5py_read_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("efl_wr");
+    let raw_path = path.with_extension("raw");
+    let raw_bytes: Vec<u8> = (0..16i32).flat_map(|v| v.to_le_bytes()).collect();
+    std::fs::write(&raw_path, &raw_bytes).unwrap();
+    write_with_h5py(
+        py,
+        &path,
+        &format!(
+            "f.create_dataset('data', shape=(16,), dtype='<i4', \
+             external=[(r'{}', 0, 64)])\n",
+            raw_path.display()
+        ),
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.shape(), vec![16]);
+    assert_eq!(ds.read_raw::<i32>().unwrap(), (0..16).collect::<Vec<i32>>());
+    // Selection [6, 10) exercises the slice-read path through the same
+    // external-file dispatch.
+    assert_eq!(ds.read_slice::<i32>(&[6], &[4]).unwrap(), vec![6, 7, 8, 9]);
+    drop(file);
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&raw_path).ok();
+}
+
+/// Virtual dataset, full-extent cross-file mapping (h5py → rust): the
+/// layout message carries no data address at all — every byte comes from
+/// stitching the one mapping's source dataset in a sibling file
+/// (`H5D__virtual_read`, H5Dvirtual.c). Matches the oracle's `vds` case
+/// shape exactly (`oracle/cases.py` `gen_vds`), except the source is named
+/// by an absolute path here so the test does not depend on
+/// `HDF5_VDS_PREFIX` or the process's current directory — that resolution
+/// is covered separately by the oracle case, which names its source file
+/// relatively under `HDF5_VDS_PREFIX=${ORIGIN}` (see `oracle/hdf5env.py`),
+/// not by this test.
+#[test]
+fn vds_full_extent_cross_file_mapping_readable_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("vds_full");
+    let src_path = path.with_file_name(format!(
+        "{}_src.h5",
+        path.file_stem().unwrap().to_str().unwrap()
+    ));
+    write_with_h5py(
+        py,
+        &src_path,
+        "f.create_dataset('src', data=np.arange(16, dtype='<i4'))\n",
+    );
+    write_with_h5py(
+        py,
+        &path,
+        &format!(
+            "layout = h5py.VirtualLayout(shape=(16,), dtype='<i4')\n\
+             layout[...] = h5py.VirtualSource(r'{}', 'src', shape=(16,))\n\
+             f.create_virtual_dataset('vds', layout)\n",
+            src_path.display()
+        ),
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("vds").unwrap();
+    assert_eq!(ds.shape(), vec![16]);
+    assert_eq!(ds.read_raw::<i32>().unwrap(), (0..16).collect::<Vec<i32>>());
+    // Selection [6, 10) exercises the slice-read path through the same
+    // virtual-dataset dispatch.
+    assert_eq!(ds.read_slice::<i32>(&[6], &[4]).unwrap(), vec![6, 7, 8, 9]);
+    drop(file);
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&src_path).ok();
+}
+
+/// Virtual dataset, partial hyperslab mapping with a fill value: only
+/// elements `[4, 12)` are mapped, so the rest of the 20-element output must
+/// read back as the dataset's own fill value — exercising both the
+/// tiled-fill pre-pass and a non-zero destination offset in the box
+/// scatter. The virtual selection is a real (non-`ALL`) hyperslab, which
+/// h5py's `VirtualLayout` always serializes in the version-1 block-list
+/// wire form (see `src/format/selection.rs`), not the REGULAR-flag form.
+#[test]
+fn vds_partial_hyperslab_mapping_with_fill_value_readable_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("vds_partial");
+    let src_path = path.with_file_name(format!(
+        "{}_src.h5",
+        path.file_stem().unwrap().to_str().unwrap()
+    ));
+    write_with_h5py(
+        py,
+        &src_path,
+        "f.create_dataset('src', data=np.arange(8, dtype='<i4'))\n",
+    );
+    write_with_h5py(
+        py,
+        &path,
+        &format!(
+            "layout = h5py.VirtualLayout(shape=(20,), dtype='<i4')\n\
+             layout[4:12] = h5py.VirtualSource(r'{}', 'src', shape=(8,))\n\
+             f.create_virtual_dataset('vds', layout, fillvalue=-1)\n",
+            src_path.display()
+        ),
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("vds").unwrap();
+    assert_eq!(ds.shape(), vec![20]);
+    let mut expected = vec![-1i32; 20];
+    expected[4..12].copy_from_slice(&(0..8i32).collect::<Vec<i32>>());
+    assert_eq!(ds.read_raw::<i32>().unwrap(), expected);
+    // A slice straddling the mapping's left edge exercises both the fill
+    // value and the mapped bytes in one scatter.
+    assert_eq!(
+        ds.read_slice::<i32>(&[2], &[6]).unwrap(),
+        vec![-1, -1, 0, 1, 2, 3]
+    );
+    drop(file);
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&src_path).ok();
+}
+
+/// Virtual dataset, same-file mapping: h5py normalizes a source file whose
+/// resolved path equals the enclosing VDS file's own path down to the
+/// literal string `"."` on the wire (confirmed by parsing the raw global
+/// heap bytes directly, not trusting `h5dump`'s rendering), so this
+/// exercises the same-file fast path (reads through `self` directly)
+/// instead of opening a nested reader.
+#[test]
+fn vds_same_file_mapping_readable_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("vds_samefile");
+    write_with_h5py(
+        py,
+        &path,
+        &format!(
+            "f.create_dataset('real', data=np.arange(8, dtype='<i4'))\n\
+             layout = h5py.VirtualLayout(shape=(8,), dtype='<i4')\n\
+             layout[...] = h5py.VirtualSource(r'{}', 'real', shape=(8,))\n\
+             f.create_virtual_dataset('vds', layout)\n",
+            path.display()
+        ),
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("vds").unwrap();
+    assert_eq!(ds.shape(), vec![8]);
+    assert_eq!(ds.read_raw::<i32>().unwrap(), (0..8).collect::<Vec<i32>>());
+    assert_eq!(ds.read_slice::<i32>(&[2], &[4]).unwrap(), vec![2, 3, 4, 5]);
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}

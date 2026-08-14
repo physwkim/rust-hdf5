@@ -442,10 +442,70 @@ fn a_chunk_index_that_does_not_read_back_keeps_its_chunks_through_a_reopen() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Rewrite every 4-byte float datatype message in `path` as a version-3
+/// `H5T_ORDER_VAX` float — a real libhdf5 byte order this crate names rather
+/// than decodes, and the only way to get an unmodelled object into a fixture,
+/// since h5py cannot write one and every type it *can* write now decodes. The
+/// edit is two bytes wide and changes no length, so each version-2 object
+/// header it lands in keeps its layout and needs only its checksum recomputed.
+fn retype_floats_as_vax(path: &std::path::Path, expected: usize) {
+    let mut raw = std::fs::read(path).unwrap();
+    // Version 1, class 1 (float), 4 bytes wide.
+    let hits: Vec<usize> = (0..raw.len() - 8)
+        .filter(|&i| {
+            raw[i] == 0x11 && u32::from_le_bytes(raw[i + 4..i + 8].try_into().unwrap()) == 4
+        })
+        .collect();
+    assert_eq!(
+        hits.len(),
+        expected,
+        "fixture must hold exactly {expected} f32 datatype message(s)"
+    );
+    for at in &hits {
+        // Only a version-3-or-later float gives flag bit 6 the VAX meaning
+        // (`H5T__decode_helper`), so the version moves with it.
+        raw[*at] = 0x31;
+        raw[*at + 1] |= 0x41;
+    }
+    // Every version-2 object header chunk holding an edited byte, re-checksummed.
+    let headers: Vec<usize> = (0..raw.len() - 4)
+        .filter(|&i| &raw[i..i + 4] == b"OHDR")
+        .collect();
+    for start in headers {
+        if raw[start + 4] != 2 {
+            continue;
+        }
+        let flags = raw[start + 5];
+        let mut pos = start + 6;
+        if flags & 0x20 != 0 {
+            pos += 16; // access/modification/change/birth times
+        }
+        if flags & 0x10 != 0 {
+            pos += 4; // max compact / min dense
+        }
+        let size_len = 1usize << (flags & 0x03);
+        let mut chunk0 = 0u64;
+        for (i, b) in raw[pos..pos + size_len].iter().enumerate() {
+            chunk0 |= (*b as u64) << (8 * i);
+        }
+        pos += size_len;
+        let end = pos + chunk0 as usize;
+        if !hits.iter().any(|&at| (pos..end).contains(&at)) {
+            continue;
+        }
+        let cksum = rust_hdf5::format::checksum::checksum_metadata(&raw[start..end]);
+        raw[end..end + 4].copy_from_slice(&cksum.to_le_bytes());
+    }
+    std::fs::write(path, &raw).unwrap();
+}
+
 /// A preserved object still occupies its name. Asking for it by name says
 /// what it is rather than reporting it absent, and creating something of that
 /// name is refused — two link messages of one name in a group is an invalid
 /// file, and the preserved one is written back on every rewrite.
+///
+/// The unmodelled object was opaque, then virtual, until each became
+/// readable; it is now a VAX-order float, which this crate rejects by design.
 #[test]
 fn a_preserved_object_is_named_by_the_writer_rather_than_reported_absent() {
     let Some(py) = python() else { return };
@@ -457,11 +517,9 @@ fn a_preserved_object_is_named_by_the_writer_rather_than_reported_absent() {
         &orig,
         &work,
         "with h5py.File(ORIG, 'w', libver='latest') as f:\n\
-         \x20   f.create_dataset('src', data=np.arange(4, dtype='<i4'))\n\
-         \x20   layout = h5py.VirtualLayout(shape=(4,), dtype='<i4')\n\
-         \x20   layout[...] = h5py.VirtualSource(f['src'])\n\
-         \x20   f.create_virtual_dataset('opaque', layout)\n",
+         \x20   f.create_dataset('opaque', data=np.arange(4, dtype='<f4'))\n",
     );
+    retype_floats_as_vax(&orig, 1);
     std::fs::copy(&orig, &work).unwrap();
 
     let file = rust_hdf5::H5File::open_rw(&work).unwrap();

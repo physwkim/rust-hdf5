@@ -35,6 +35,16 @@
 //!
 //! Version 5 (libhdf5 2.0) differs from version 4 only in the version byte;
 //! see [`VERSION_5`] for its effect on filtered chunk indexes.
+//!
+//! Binary layout (versions 4 and 5, virtual only):
+//!   Byte 0: version = 4 or 5
+//!   Byte 1: layout class = 3 (virtual)
+//!   heap_address(sizeof_addr) + heap_index(4, u32 LE)
+//!
+//! The virtual mapping list itself (source/virtual file names and
+//! selections) is not inline: `heap_address`/`heap_index` name a global
+//! heap object holding it (H5D__virtual_load_layout, H5Dvirtual.c) —
+//! decoded separately by [`crate::format::messages::virtual_mapping`].
 
 use crate::format::bytes::{read_le_addr as read_addr, read_le_uint as read_size};
 use crate::format::{FormatContext, FormatError, FormatResult, UNDEF_ADDR};
@@ -55,6 +65,7 @@ const VERSION_5: u8 = 5;
 const CLASS_COMPACT: u8 = 0;
 const CLASS_CONTIGUOUS: u8 = 1;
 const CLASS_CHUNKED: u8 = 2;
+const CLASS_VIRTUAL: u8 = 3;
 
 /// Chunk index type for version-4 chunked layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +229,21 @@ pub enum DataLayoutMessage {
         /// Address of the chunk index structure.
         index_address: u64,
     },
+    /// Virtual dataset storage (H5D_VIRTUAL): the layout carries no data
+    /// address of its own. `heap_address`/`heap_index` name the global
+    /// heap object holding the mapping list — decode it with
+    /// [`crate::format::messages::virtual_mapping::VirtualMappingList`].
+    Virtual {
+        /// Message version byte: 4 or 5 (virtual layout did not exist
+        /// before version 4; version 5 is identical here).
+        version: u8,
+        /// Address of the global heap collection holding the mapping list.
+        heap_address: u64,
+        /// 1-based index of the mapping-list object within that
+        /// collection. `0` means no mapping list has been written yet
+        /// (a virtual dataset created but never given any mappings).
+        heap_index: u32,
+    },
 }
 
 impl DataLayoutMessage {
@@ -314,6 +340,15 @@ impl DataLayoutMessage {
             bt2_params: Some(bt2_params),
             single_chunk_filter: None,
             index_address,
+        }
+    }
+
+    /// Virtual dataset layout pointing at a global-heap mapping list.
+    pub fn virtual_layout(version: u8, heap_address: u64, heap_index: u32) -> Self {
+        Self::Virtual {
+            version,
+            heap_address,
+            heap_index,
         }
     }
 
@@ -455,6 +490,20 @@ impl DataLayoutMessage {
                 // Index address
                 buf.extend_from_slice(&index_address.to_le_bytes()[..sa]);
 
+                buf
+            }
+            Self::Virtual {
+                version,
+                heap_address,
+                heap_index,
+            } => {
+                let sa = ctx.sizeof_addr as usize;
+                debug_assert!(matches!(*version, VERSION_4 | VERSION_5));
+                let mut buf = Vec::with_capacity(2 + sa + 4);
+                buf.push(*version);
+                buf.push(CLASS_VIRTUAL);
+                buf.extend_from_slice(&heap_address.to_le_bytes()[..sa]);
+                buf.extend_from_slice(&heap_index.to_le_bytes());
                 buf
             }
         }
@@ -788,6 +837,44 @@ impl DataLayoutMessage {
                     pos,
                 ))
             }
+            CLASS_VIRTUAL => {
+                // libhdf5 (H5Olayout.c) rejects a virtual layout below
+                // version 4 outright ("invalid layout version with virtual
+                // layout") — the class did not exist before version 4, so a
+                // version-3 message can never legitimately carry it.
+                if version == VERSION_3 {
+                    return Err(FormatError::InvalidVersion(VERSION_3));
+                }
+                let sa = ctx.sizeof_addr as usize;
+                let mut pos = 2;
+                if buf.len() < pos + sa {
+                    return Err(FormatError::BufferTooShort {
+                        needed: pos + sa,
+                        available: buf.len(),
+                    });
+                }
+                let heap_address = read_addr(&buf[pos..], sa);
+                pos += sa;
+
+                if buf.len() < pos + 4 {
+                    return Err(FormatError::BufferTooShort {
+                        needed: pos + 4,
+                        available: buf.len(),
+                    });
+                }
+                let heap_index =
+                    u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
+                pos += 4;
+
+                Ok((
+                    Self::Virtual {
+                        version: buf[0],
+                        heap_address,
+                        heap_index,
+                    },
+                    pos,
+                ))
+            }
             other => Err(FormatError::UnsupportedFeature(format!(
                 "data layout class {}",
                 other
@@ -965,16 +1052,13 @@ mod tests {
         }
     }
 
-    /// The virtual-dataset class is not implemented, but it must report itself
-    /// as an unsupported *class* at every version, not as a bad version.
     #[test]
-    fn decode_virtual_class_is_unsupported_at_every_modern_version() {
-        for version in [3u8, 4, 5] {
-            let buf = [version, 3];
-            match DataLayoutMessage::decode(&buf, &ctx8()).unwrap_err() {
-                FormatError::UnsupportedFeature(ref s) => assert!(s.contains("class 3"), "{s}"),
-                other => panic!("unexpected error for version {version}: {other:?}"),
-            }
+    fn decode_unsupported_class() {
+        let buf = [3u8, 4]; // class 4 = unknown (0-3 are all defined)
+        let err = DataLayoutMessage::decode(&buf, &ctx8()).unwrap_err();
+        match err {
+            FormatError::UnsupportedFeature(_) => {}
+            other => panic!("unexpected error: {:?}", other),
         }
     }
 
@@ -1202,6 +1286,51 @@ mod tests {
         let buf = [3u8, 2, 2];
         let err = DataLayoutMessage::decode(&buf, &ctx8()).unwrap_err();
         assert!(matches!(err, FormatError::BufferTooShort { .. }));
+    }
+
+    #[test]
+    fn roundtrip_virtual_layout() {
+        for ctx in [ctx8(), ctx4()] {
+            for version in [4u8, 5u8] {
+                let msg = DataLayoutMessage::virtual_layout(version, 0x5000, 3);
+                let encoded = msg.encode(&ctx);
+                assert_eq!(encoded[0], version);
+                assert_eq!(encoded[1], CLASS_VIRTUAL);
+                let (decoded, consumed) = DataLayoutMessage::decode(&encoded, &ctx).unwrap();
+                assert_eq!(consumed, encoded.len());
+                assert_eq!(decoded, msg);
+            }
+        }
+    }
+
+    #[test]
+    fn virtual_layout_undefined_heap_address() {
+        // A virtual dataset created but never given any mappings: no heap
+        // object exists yet, so the address is UNDEF and the index is 0.
+        let msg = DataLayoutMessage::virtual_layout(4, UNDEF_ADDR, 0);
+        let encoded = msg.encode(&ctx8());
+        let (decoded, _) = DataLayoutMessage::decode(&encoded, &ctx8()).unwrap();
+        match decoded {
+            DataLayoutMessage::Virtual {
+                heap_address,
+                heap_index,
+                ..
+            } => {
+                assert_eq!(heap_address, UNDEF_ADDR);
+                assert_eq!(heap_index, 0);
+            }
+            other => panic!("expected Virtual, got {other:?}"),
+        }
+    }
+
+    /// libhdf5 rejects a virtual layout below version 4 outright — the
+    /// class did not exist before version 4 (H5Olayout.c: "invalid layout
+    /// version with virtual layout").
+    #[test]
+    fn virtual_layout_rejects_version_3() {
+        let buf = [VERSION_3, CLASS_VIRTUAL];
+        let err = DataLayoutMessage::decode(&buf, &ctx8()).unwrap_err();
+        assert!(matches!(err, FormatError::InvalidVersion(VERSION_3)));
     }
 
     #[test]

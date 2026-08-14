@@ -3,9 +3,9 @@
   "hdf5_version": "1.14.6",
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
-  "python": "/home/stevek/micromamba/envs/tomo/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-oracle-harness-d1c0a356-1/target/release/oracle_probe",
-  "cases": 81
+  "python": "/home/stevek/micromamba/envs/tomo/bin/python3",
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-space-500431fd-1/target/release/oracle_probe",
+  "cases": 82
  },
  "results": [
   {
@@ -5195,7 +5195,7 @@
    "note": "implicit index \u2014 fixed shape, early allocation, no filter",
    "rust_case": null,
    "a": {
-    "verdict": "GAP",
+    "verdict": "PASS",
     "divergences": [],
     "gaps": [
      {
@@ -5247,14 +5247,6 @@
       "probe": "UNSUPPORTED(chunkindex): H5Dataset exposes no chunk index type"
      },
      {
-      "key": "/data#data",
-      "kind": "unsupported",
-      "field": "data",
-      "structural": false,
-      "ref": "raw:000000000100000002000000030000000400000005000000060000000700000008000000090000000a0000000b0000000c0000000d0000000e0000000f000000",
-      "probe": "UNSUPPORTED(data): hdf5-io error: invalid state: unsupported chunk index type: Implicit"
-     },
-     {
       "key": "/data#external",
       "kind": "unsupported",
       "field": "external",
@@ -5304,7 +5296,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 9,
+    "matched": 10,
     "detail": ""
    },
    "b": {
@@ -5522,6 +5514,125 @@
       "field": "maxshape",
       "structural": true,
       "ref": "[U]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/data#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/data#virtual",
+      "kind": "unsupported",
+      "field": "virtual",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(virtual): H5Dataset exposes no virtual mapping accessor"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 10,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "chunkidx_earray_unlim_inner",
+   "group": "layout",
+   "note": "extensible-array index \u2014 the unlimited dimension is dim 1, not dim 0",
+   "rust_case": "chunkidx_earray_unlim_inner",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "#superblock",
+      "kind": "unsupported",
+      "field": "superblock",
+      "structural": true,
+      "ref": "3",
+      "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
+     },
+     {
+      "key": "#userblock",
+      "kind": "unsupported",
+      "field": "userblock",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
+     },
+     {
+      "key": "/#attrorder",
+      "kind": "unsupported",
+      "field": "attrorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(attrorder): H5Group exposes no attribute creation-order tracking flags"
+     },
+     {
+      "key": "/#linkorder",
+      "kind": "unsupported",
+      "field": "linkorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(linkorder): H5Group exposes no link creation-order tracking flags"
+     },
+     {
+      "key": "/#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
+     },
+     {
+      "key": "/data#chunkindex",
+      "kind": "unsupported",
+      "field": "chunkindex",
+      "structural": true,
+      "ref": "earray",
+      "probe": "UNSUPPORTED(chunkindex): H5Dataset exposes no chunk index type"
+     },
+     {
+      "key": "/data#external",
+      "kind": "unsupported",
+      "field": "external",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(external): H5Dataset exposes no external file list accessor"
+     },
+     {
+      "key": "/data#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/data#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/data#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[4,U]",
       "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
      },
      {
@@ -5917,7 +6028,7 @@
    "note": "extensible-array index whose unlimited dimension is not the first",
    "rust_case": "chunkidx_earray_dim1",
    "a": {
-    "verdict": "GAP",
+    "verdict": "PASS",
     "divergences": [],
     "gaps": [
      {
@@ -5969,14 +6080,6 @@
       "probe": "UNSUPPORTED(chunkindex): H5Dataset exposes no chunk index type"
      },
      {
-      "key": "/data#data",
-      "kind": "unsupported",
-      "field": "data",
-      "structural": false,
-      "ref": "raw:000000000100000002000000030000000400000005000000060000000700000008000000090000000a0000000b0000000c0000000d0000000e0000000f000000",
-      "probe": "UNSUPPORTED(data): hdf5-io error: invalid state: unlimited dimension 1 is not the first: its chunks have no fixed linear index (extensible-array swizzling is not supported)"
-     },
-     {
       "key": "/data#external",
       "kind": "unsupported",
       "field": "external",
@@ -6026,16 +6129,16 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 9,
+    "matched": 10,
     "detail": ""
    },
    "b": {
-    "verdict": "INVALID",
-    "detail": "rust writer failed: WRITE-ERROR: hdf5-io error: invalid state: unlimited dimension 1 is not the first: extensible-array swizzling is not supported; reorder the dimensions so the unlimited one comes first",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
     "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
@@ -6044,16 +6147,8 @@
    "note": "contiguous data held in an external raw file",
    "rust_case": null,
    "a": {
-    "verdict": "DIFF",
-    "divergences": [
-     {
-      "key": "/data#data",
-      "kind": "value",
-      "field": "data",
-      "ref": "raw:000000000100000002000000030000000400000005000000060000000700000008000000090000000a0000000b0000000c0000000d0000000e0000000f000000",
-      "probe": "raw:00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-     }
-    ],
+    "verdict": "PASS",
+    "divergences": [],
     "gaps": [
      {
       "key": "#superblock",
@@ -6153,7 +6248,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 9,
+    "matched": 10,
     "detail": ""
    },
    "b": {
@@ -6171,7 +6266,7 @@
    "note": "virtual dataset mapped onto a dataset in a sibling file",
    "rust_case": null,
    "a": {
-    "verdict": "MISS",
+    "verdict": "PASS",
     "divergences": [],
     "gaps": [
      {
@@ -6215,15 +6310,64 @@
       "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
      },
      {
-      "key": "/vds",
-      "kind": "missing-object",
-      "field": "kind",
-      "structural": false,
-      "ref": "dataset"
+      "key": "/vds#external",
+      "kind": "unsupported",
+      "field": "external",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(external): H5Dataset exposes no external file list accessor"
+     },
+     {
+      "key": "/vds#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/vds#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/vds#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "virtual",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/vds#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[16]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/vds#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/vds#virtual",
+      "kind": "unsupported",
+      "field": "virtual",
+      "structural": true,
+      "ref": "[\"vds_src.h5\"::\"src\" ?->[0]-[15]]",
+      "probe": "UNSUPPORTED(virtual): H5Dataset exposes no virtual mapping accessor"
      }
     ],
     "oracle_errors": [],
-    "matched": 2,
+    "matched": 10,
     "detail": ""
    },
    "b": {
@@ -7215,25 +7359,10 @@
    "case": "space_null",
    "group": "dataspace",
    "note": "NULL dataspace \u2014 no elements at all",
-   "rust_case": null,
+   "rust_case": "space_null",
    "a": {
-    "verdict": "DIFF",
-    "divergences": [
-     {
-      "key": "/data#data",
-      "kind": "value",
-      "field": "data",
-      "ref": "empty",
-      "probe": "raw:00000000"
-     },
-     {
-      "key": "/data#shape",
-      "kind": "value",
-      "field": "shape",
-      "ref": "null",
-      "probe": "[]"
-     }
-    ],
+    "verdict": "PASS",
+    "divergences": [],
     "gaps": [
      {
       "key": "#superblock",
@@ -7333,16 +7462,24 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 8,
+    "matched": 10,
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "metadata_diffs": [
+     {
+      "key": "#superblock",
+      "field": "superblock",
+      "ref": "0",
+      "rust": "3",
+      "expected": "superblock-always-v3"
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
@@ -11541,29 +11678,12 @@
  "findings": [
   {
    "kind": "divergence",
-   "signature": "data: value",
-   "cases": [
-    "external_storage",
-    "space_null"
-   ],
-   "example": "/data#data\n  libhdf5: raw:000000000100000002000000030000000400000005000000060000000700000008000000090000000a0000000b0000000c0000000d0000000e0\u2026\n  rust:    raw:0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\u2026"
-  },
-  {
-   "kind": "divergence",
    "signature": "nattrs: value",
    "cases": [
     "attrs_dense",
     "attr_large"
    ],
    "example": "/data#nattrs\n  libhdf5: 12\n  rust:    0"
-  },
-  {
-   "kind": "divergence",
-   "signature": "shape: value",
-   "cases": [
-    "space_null"
-   ],
-   "example": "/data#shape\n  libhdf5: null\n  rust:    []"
   },
   {
    "kind": "missing-object",
@@ -11575,7 +11695,6 @@
     "ref_region",
     "named_datatype",
     "layout_contiguous_v110",
-    "vds",
     "link_soft",
     "link_external",
     "libver_v110",
@@ -11612,14 +11731,6 @@
    "example": "Error: Could not get file contents"
   },
   {
-   "kind": "write-invalid",
-   "signature": "writer/reader error",
-   "cases": [
-    "chunkidx_earray_dim1"
-   ],
-   "example": "rust writer failed: WRITE-ERROR: hdf5-io error: invalid state: unlimited dimension 1 is not the first: extensible-array swizzling is not supported; reorder the\u2026"
-  },
-  {
    "kind": "capability",
    "signature": "strpad \u2014 DatatypeMessage::VarLenString models only the character set, so the string pad of a variable-length\u2026",
    "cases": [
@@ -11634,22 +11745,6 @@
    "signature": "data \u2014 hdf5-io error: format error: invalid data: datatype conversion: non-standard floating-point bit lay\u2026",
    "cases": [
     "float_f16le"
-   ],
-   "example": "/data#data"
-  },
-  {
-   "kind": "capability",
-   "signature": "data \u2014 hdf5-io error: invalid state: unlimited dimension 1 is not the first: its chunks have no fixed line\u2026",
-   "cases": [
-    "chunkidx_earray_dim1"
-   ],
-   "example": "/data#data"
-  },
-  {
-   "kind": "capability",
-   "signature": "data \u2014 hdf5-io error: invalid state: unsupported chunk index type: Implicit",
-   "cases": [
-    "chunkidx_implicit"
    ],
    "example": "/data#data"
   },
@@ -11710,7 +11805,6 @@
     "external_storage",
     "vds",
     "filter_shuffle",
-    "space_null",
     "link_soft",
     "link_external",
     "track_order",
@@ -11769,6 +11863,7 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "layout_contiguous_v108",
     "layout_chunked_v108",
@@ -11856,6 +11951,7 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "layout_contiguous_v108",
     "layout_chunked_v108",
@@ -11943,6 +12039,7 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "layout_contiguous_v108",
     "layout_chunked_v108",
@@ -12030,6 +12127,7 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "layout_contiguous_v108",
     "layout_chunked_v108",
@@ -12117,6 +12215,7 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "layout_contiguous_v108",
     "layout_chunked_v108",
@@ -12201,11 +12300,13 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "layout_contiguous_v108",
     "layout_chunked_v108",
     "chunkidx_earray_dim1",
     "external_storage",
+    "vds",
     "filter_deflate",
     "filter_shuffle",
     "filter_fletcher32",
@@ -12282,11 +12383,13 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "layout_contiguous_v108",
     "layout_chunked_v108",
     "chunkidx_earray_dim1",
     "external_storage",
+    "vds",
     "filter_deflate",
     "filter_shuffle",
     "filter_fletcher32",
@@ -12363,11 +12466,13 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "layout_contiguous_v108",
     "layout_chunked_v108",
     "chunkidx_earray_dim1",
     "external_storage",
+    "vds",
     "filter_deflate",
     "filter_shuffle",
     "filter_fletcher32",
@@ -12444,11 +12549,13 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "layout_contiguous_v108",
     "layout_chunked_v108",
     "chunkidx_earray_dim1",
     "external_storage",
+    "vds",
     "filter_deflate",
     "filter_shuffle",
     "filter_fletcher32",
@@ -12525,11 +12632,13 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "layout_contiguous_v108",
     "layout_chunked_v108",
     "chunkidx_earray_dim1",
     "external_storage",
+    "vds",
     "filter_deflate",
     "filter_shuffle",
     "filter_fletcher32",
@@ -12606,11 +12715,13 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "layout_contiguous_v108",
     "layout_chunked_v108",
     "chunkidx_earray_dim1",
     "external_storage",
+    "vds",
     "filter_deflate",
     "filter_shuffle",
     "filter_fletcher32",
@@ -12683,6 +12794,7 @@
     "layout_contiguous",
     "layout_contiguous_v108",
     "external_storage",
+    "vds",
     "space_scalar",
     "space_null",
     "space_zerosized",
@@ -12713,6 +12825,7 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "layout_chunked_v108",
     "chunkidx_earray_dim1",
@@ -12820,6 +12933,7 @@
     "layout_contiguous",
     "chunkidx_btree1",
     "space_scalar",
+    "space_null",
     "space_zerosized",
     "groups_nested",
     "link_hard",

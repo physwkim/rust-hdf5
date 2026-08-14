@@ -471,6 +471,14 @@ def gen_chunkidx_earray(path):
         ds[...] = ramp("<i4", 16)
 
 
+def gen_chunkidx_earray_unlim_inner(path):
+    with h5py.File(path, "w", libver="latest") as f:
+        ds = f.create_dataset(
+            "data", (4, 4), maxshape=(4, None), chunks=(2, 2), dtype="<i4"
+        )
+        ds[...] = ramp("<i4", 16).reshape(4, 4)
+
+
 def gen_layout_contiguous_v108(path):
     with h5py.File(path, "w", libver=("v108", "v108")) as f:
         f.create_dataset("data", data=ramp("<i4", 16))
@@ -538,6 +546,9 @@ LAYOUT_CASES = [
          "fixed-array index"),
     Case("chunkidx_earray", "layout", gen_chunkidx_earray, "chunkidx_earray",
          "extensible-array index — one unlimited dimension"),
+    Case("chunkidx_earray_unlim_inner", "layout", gen_chunkidx_earray_unlim_inner,
+         "chunkidx_earray_unlim_inner",
+         "extensible-array index — the unlimited dimension is dim 1, not dim 0"),
     Case("chunkidx_btree2", "layout", gen_chunkidx_btree2, "chunkidx_btree2",
          "version-2 B-tree index — two unlimited dimensions"),
     Case("layout_contiguous_v108", "layout", gen_layout_contiguous_v108, None,
@@ -650,7 +661,7 @@ def gen_space_unlimited_resized(path):
 SPACE_CASES = [
     Case("space_scalar", "dataspace", gen_space_scalar, "space_scalar",
          "scalar (rank 0) dataspace"),
-    Case("space_null", "dataspace", gen_space_null, None,
+    Case("space_null", "dataspace", gen_space_null, "space_null",
          "NULL dataspace — no elements at all"),
     Case("space_zerosized", "dataspace", gen_space_zerosized, "space_zerosized",
          "simple dataspace with a zero-length dimension"),

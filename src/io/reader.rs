@@ -20,6 +20,7 @@ use crate::format::messages::attribute::{AttributeEntry, AttributeMessage};
 use crate::format::messages::data_layout::{self, DataLayoutMessage};
 use crate::format::messages::dataspace::DataspaceMessage;
 use crate::format::messages::datatype::{DatatypeMessage, OldReferenceKind, ReferenceEncoding};
+use crate::format::messages::external_file_list::ExternalFileListMessage;
 use crate::format::messages::fill_value::{try_tiled_fill, FillValueMessage};
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::link::LinkMessage;
@@ -29,6 +30,7 @@ use crate::format::messages::shared::MSG_FLAG_SHARED;
 use crate::format::messages::superblock_ext::{
     BtreeKMessage, DriverInfoMessage, FileSpaceInfoMessage, SharedMessageTableMessage,
 };
+use crate::format::messages::virtual_mapping::VirtualMappingList;
 use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
 use crate::format::reference::{
@@ -45,7 +47,8 @@ use crate::format::{BlockReader, FormatContext, UNDEF_ADDR};
 use crate::io::file_handle::FileHandle;
 #[cfg(feature = "mmap")]
 use crate::io::file_handle::MmapFileHandle;
-use crate::io::hyperslab::{compute_strides, for_each_contiguous_run};
+use crate::io::hyperslab::{compute_strides, for_each_contiguous_run, for_each_dual_run};
+use crate::io::locking::FileLocking;
 use crate::io::{FileMeta, IoResult};
 
 /// The version-4 chunk-index descriptor pulled from a data-layout message:
@@ -109,6 +112,23 @@ impl<'a> ChunkTarget<'a> {
     }
 }
 
+/// One resolved external-file slot (H5O_EFL_ID): the on-disk message
+/// stores each slot's name as an offset into a local heap, so this is that
+/// slot after the heap lookup, in the order the dataset's logical byte
+/// range concatenates them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalFileSegment {
+    /// The external file's name, exactly as stored — relative names are
+    /// resolved against `HDF5_EXTFILE_PREFIX` at read time, not here.
+    pub name: String,
+    /// Byte offset within the named file where this slot's reserved
+    /// region begins.
+    pub offset: u64,
+    /// Bytes reserved for this slot. `u64::MAX` (`H5O_EFL_UNLIMITED`)
+    /// marks the last slot as unlimited/growable.
+    pub size: u64,
+}
+
 /// Read-side metadata for a single dataset.
 pub struct DatasetReadInfo {
     /// Dataset name (the link name in the root group).
@@ -130,6 +150,18 @@ pub struct DatasetReadInfo {
     /// fill-value message when `fill_defined == 2`. `None` => default
     /// zero-fill. Applied to unallocated chunks and unwritten regions.
     pub fill_value: Option<Vec<u8>>,
+    /// External raw-data segments (H5O_EFL_ID). Non-empty only when this
+    /// dataset's storage is an External Data Files list instead of a
+    /// normal contiguous block — `layout` still reports `Contiguous` with
+    /// an undefined address in that case (H5Dlayout.c overrides the
+    /// layout's storage ops whenever this message is present).
+    pub external_files: Vec<ExternalFileSegment>,
+    /// Virtual dataset source/virtual mappings (H5D_VIRTUAL), resolved from
+    /// the global heap object `layout`'s `Virtual` variant points at.
+    /// `Some` only when `layout` is `DataLayoutMessage::Virtual` and it
+    /// names a mapping list (`heap_index != 0`); `None` for every other
+    /// layout, and for a virtual dataset that has no mappings yet.
+    pub virtual_mappings: Option<VirtualMappingList>,
 }
 
 /// The class of one link record in a group: what `H5Lget_info` reports,
@@ -724,6 +756,13 @@ pub struct Hdf5Reader {
     /// thing as `H5F_EXTPATH`), so the reader has to remember where it came
     /// from.
     path: PathBuf,
+    /// The directory holding this HDF5 file, resolved once at open time.
+    /// External raw-data files (H5O_EFL_ID) are named relative to it when
+    /// `HDF5_EXTFILE_PREFIX` contains `${ORIGIN}` (`H5D__build_file_prefix`,
+    /// H5Dint.c) — captured at open time rather than re-derived from the
+    /// process's current directory at read time, matching libhdf5's own
+    /// one-time capture in `H5F_t::extpath`.
+    source_dir: PathBuf,
     /// The locking policy this file was opened under, reused verbatim for
     /// every external target: libhdf5 hands `H5F_prefix_open_file` the
     /// parent's file-access property list, so one `HDF5_USE_FILE_LOCKING`
@@ -829,6 +868,248 @@ fn fill_tiled_into(out: &mut [u8], fill_value: Option<&[u8]>) {
             }
         }
     }
+}
+
+/// The declared-size sentinel that marks an External Data Files slot as
+/// unlimited/growable (`H5O_EFL_UNLIMITED` in H5Oprivate.h, `HSIZE_UNDEF` —
+/// the same all-ones bit pattern as [`UNDEF_ADDR`]).
+const EFL_UNLIMITED_SIZE: u64 = u64::MAX;
+
+/// Resolve the directory a raw-data file name is joined against, matching
+/// libhdf5's `H5D__build_file_prefix` (H5Dint.c) for the given environment
+/// variable — `HDF5_EXTFILE_PREFIX` for External Data Files
+/// ([`resolve_extfile_prefix`]), `HDF5_VDS_PREFIX` for Virtual Dataset
+/// sources ([`resolve_vdsfile_prefix`]); both features route through the
+/// same C function, just keyed on a different variable. There is no dataset
+/// access property list here to fall back to, so unset behaves exactly as
+/// an unset/empty DAPL property would.
+///
+/// `${ORIGIN}` expands to `source_dir` (the directory holding the open
+/// HDF5 file); any other value is used as a literal prefix; unset, empty,
+/// or `"."` means "no prefix" (`H5_combine_path`'s own default), so a
+/// relative name resolves against the process's current directory instead.
+fn resolve_file_prefix(env_var: &str, source_dir: &Path) -> Option<PathBuf> {
+    let prefix = std::env::var(env_var).ok()?;
+    if prefix.is_empty() || prefix == "." {
+        return None;
+    }
+    Some(match prefix.strip_prefix("${ORIGIN}") {
+        Some(rest) => {
+            let rest = rest.trim_start_matches(['/', '\\']);
+            if rest.is_empty() {
+                source_dir.to_path_buf()
+            } else {
+                source_dir.join(rest)
+            }
+        }
+        None => PathBuf::from(prefix),
+    })
+}
+
+fn resolve_extfile_prefix(source_dir: &Path) -> Option<PathBuf> {
+    resolve_file_prefix("HDF5_EXTFILE_PREFIX", source_dir)
+}
+
+/// Resolve the directory Virtual Dataset source file names are joined
+/// against (`HDF5_VDS_PREFIX`; see [`resolve_file_prefix`]).
+fn resolve_vdsfile_prefix(source_dir: &Path) -> Option<PathBuf> {
+    resolve_file_prefix("HDF5_VDS_PREFIX", source_dir)
+}
+
+/// Join a raw-data file `name` against a resolved prefix, matching
+/// libhdf5's `H5_combine_path` (H5system.c): an absolute `name` is used
+/// as-is regardless of the prefix, and no prefix means "relative to the
+/// process's current directory" — both of which `Path::join` already
+/// implements for an absolute joinee. Shared by External Data Files and
+/// Virtual Dataset source resolution — both call the same C function.
+fn combine_prefixed_path(prefix: Option<&Path>, name: &str) -> PathBuf {
+    match prefix {
+        Some(p) => p.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// Read `len` bytes starting at *dataset-relative* offset `skip` from an
+/// external file list into `out`, walking slots by cumulative declared
+/// size exactly like libhdf5's `H5D__efl_read` (H5Defl.c). A read past an
+/// individual slot's actual on-disk length reads back as zero — the file
+/// backing a slot may be shorter than the space the layout reserved in
+/// it — but a read past the *total* declared size of the file list is
+/// still an error, matching `H5D__efl_read`'s own "read past logical end
+/// of file" check.
+fn read_external_file_bytes(
+    external_files: &[ExternalFileSegment],
+    extfile_prefix: Option<&Path>,
+    mut skip: u64,
+    out: &mut [u8],
+) -> IoResult<()> {
+    let mut slot_idx = 0usize;
+    while slot_idx < external_files.len() && skip >= external_files[slot_idx].size {
+        skip -= external_files[slot_idx].size;
+        slot_idx += 1;
+    }
+
+    let mut written = 0usize;
+    while written < out.len() {
+        let Some(slot) = external_files.get(slot_idx) else {
+            return Err(crate::io::IoError::InvalidState(
+                "read past the logical end of the external file list".into(),
+            ));
+        };
+        if slot.size == EFL_UNLIMITED_SIZE {
+            return Err(crate::io::IoError::InvalidState(
+                "unlimited (growable) external file slots are not supported".into(),
+            ));
+        }
+        let full_path = combine_prefixed_path(extfile_prefix, &slot.name);
+        let ext_handle = FileHandle::open_read_with_locking(&full_path, FileLocking::Disabled)
+            .map_err(|e| {
+                crate::io::IoError::InvalidState(format!(
+                    "unable to open external raw data file {}: {e}",
+                    full_path.display()
+                ))
+            })?;
+        let avail_in_slot = slot.size.saturating_sub(skip);
+        let want = (out.len() - written) as u64;
+        let this_read = avail_in_slot.min(want) as usize;
+        let dst = &mut out[written..written + this_read];
+        // A short physical file — the reserved slot size exceeds what was
+        // ever actually written to it — reads back as zero for the
+        // remainder, exactly like `H5D__efl_read`.
+        let got = ext_handle.read_at_most(slot.offset + skip, this_read)?;
+        dst[..got.len()].copy_from_slice(&got);
+        dst[got.len()..].fill(0);
+
+        written += this_read;
+        skip = 0;
+        slot_idx += 1;
+    }
+    Ok(())
+}
+
+/// Recursion ceiling for virtual dataset nesting (a VDS whose source is
+/// itself a VDS — possibly in another file). Bounded so a crafted cyclic
+/// mapping chain fails cleanly instead of recursing until the stack
+/// overflows; real VDS chains do not nest anywhere near this deep.
+const MAX_VIRTUAL_DEPTH: usize = 16;
+
+/// Detect a printf-style `%b` block-index substitution pattern in a
+/// virtual dataset source name (`H5D_virtual_parse_source_name`,
+/// H5Dvirtual.c) — used for unlimited/growable mappings whose source
+/// expands across a sequence of files or datasets indexed by block
+/// number. `%%` is an escaped literal percent, not a pattern; any other
+/// `%`-led sequence (including `%b` itself) marks a name this reader does
+/// not resolve.
+fn has_virtual_printf_pattern(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'%' {
+                i += 2;
+                continue;
+            }
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Read each of `source_boxes` (via `read_source_box`) and scatter it into
+/// `out` (shaped `virtual_dims`) at the same-indexed box in
+/// `virtual_boxes`.
+///
+/// The two box lists must have equal length with identical per-dimension
+/// `count` at each index — H5S requires a mapping's source and virtual
+/// selections to select the same number of points, and this is the
+/// well-defined case where they also decompose into the same box shapes
+/// in the same order (every selection form h5py's `VirtualLayout` writes,
+/// and any hand-built mapping whose two sides were selected the same way).
+/// A mapping whose selections diverge beyond that — same point count but a
+/// different box decomposition on each side — would need the general
+/// element-by-element linear-order match H5S's own iterator does; rather
+/// than risk a silently wrong scatter, that case is rejected here.
+fn copy_matched_boxes(
+    mut read_source_box: impl FnMut(&[u64], &[u64], &mut [u8]) -> IoResult<()>,
+    source_boxes: &[(Vec<u64>, Vec<u64>)],
+    virtual_boxes: &[(Vec<u64>, Vec<u64>)],
+    virtual_dims: &[u64],
+    element_size: u64,
+    out: &mut [u8],
+) -> IoResult<()> {
+    if source_boxes.len() != virtual_boxes.len() {
+        return Err(crate::io::IoError::InvalidState(format!(
+            "virtual dataset mapping's source and virtual selections decompose into a \
+             different number of boxes ({} vs {}), which is not supported",
+            source_boxes.len(),
+            virtual_boxes.len()
+        )));
+    }
+    for ((src_start, src_count), (dst_start, dst_count)) in source_boxes.iter().zip(virtual_boxes) {
+        if src_count != dst_count {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "virtual dataset mapping's source box shape {src_count:?} does not match its \
+                 virtual box shape {dst_count:?}, which is not supported"
+            )));
+        }
+        let nbytes = saturating_byte_len(src_count, element_size) as usize;
+        let mut buf = alloc_tiled_fill(nbytes, None)?;
+        read_source_box(src_start, src_count, &mut buf)?;
+
+        let src_dims = src_count.clone();
+        let src_origin = vec![0u64; src_count.len()];
+        for_each_dual_run(
+            virtual_dims,
+            dst_start,
+            &src_dims,
+            &src_origin,
+            dst_count,
+            element_size,
+            |dst_off, src_off, len| {
+                let dst_off = dst_off as usize;
+                let src_off = src_off as usize;
+                out[dst_off..dst_off + len].copy_from_slice(&buf[src_off..src_off + len]);
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Read and decode the global-heap collection at `addr`, applying the
+/// validation of libhdf5's `H5HG__cache_heap_deserialize`: the `GCOL`
+/// signature must be present and the declared size at least `H5HG_MINSIZE`
+/// (4096 bytes). There is no upper size cap — libhdf5 has none, and this
+/// crate's writers put a whole write call's strings into one collection,
+/// which a cap would turn into silent data loss.
+///
+/// A free function (not a method) so both [`Hdf5Reader::read_heap_collection`]
+/// and the static dataset-open path (which only has a `&mut FileHandle`, not
+/// a full `&mut Hdf5Reader`) share the one implementation.
+fn read_heap_collection_from(
+    handle: &mut FileHandle,
+    ctx: &FormatContext,
+    addr: u64,
+) -> IoResult<GlobalHeapCollection> {
+    let ss = ctx.sizeof_size as usize;
+    let header_len = 4 + 1 + 3 + ss;
+    let header_buf = handle.read_at_most(addr, header_len)?;
+    if header_buf.len() < header_len || header_buf[0..4] != *b"GCOL" {
+        return Err(crate::io::IoError::InvalidState(format!(
+            "bad global heap collection signature at address {addr:#x}"
+        )));
+    }
+    let declared = read_uint(&header_buf[8..], ss) as usize;
+    if declared < 4096 {
+        return Err(crate::io::IoError::InvalidState(format!(
+            "global heap collection at address {addr:#x} declares size {declared}, \
+             below the 4096-byte minimum"
+        )));
+    }
+    let heap_buf = handle.read_at(addr, declared)?;
+    let (coll, _) = GlobalHeapCollection::decode(&heap_buf, ctx)?;
+    Ok(coll)
 }
 
 /// One chunk's on-disk read request, built by a read path before any I/O.
@@ -1031,13 +1312,23 @@ impl Hdf5Reader {
             path: path.to_path_buf(),
             locking,
         };
-        match version {
-            0 | 1 => Self::open_v0v1(handle, &sb_buf, origin),
-            2 | 3 => Self::open_v2v3(handle, &sb_buf, origin),
-            v => Err(crate::io::IoError::Format(
-                crate::format::FormatError::InvalidVersion(v),
-            )),
-        }
+        let mut reader = match version {
+            0 | 1 => Self::open_v0v1(handle, &sb_buf, origin)?,
+            2 | 3 => Self::open_v2v3(handle, &sb_buf, origin)?,
+            v => {
+                return Err(crate::io::IoError::Format(
+                    crate::format::FormatError::InvalidVersion(v),
+                ))
+            }
+        };
+        // Resolved from the path this file was opened with (not the
+        // process's current directory at read time) — see `source_dir`.
+        let canonical = std::fs::canonicalize(path)?;
+        reader.source_dir = canonical
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        Ok(reader)
     }
 
     /// Open a file with v2/v3 superblock (existing code path).
@@ -1097,6 +1388,8 @@ impl Hdf5Reader {
             locking: origin.locking,
             external: Default::default(),
             external_resolved: Default::default(),
+            // Overwritten by `open_with_locking` once this returns.
+            source_dir: PathBuf::new(),
         })
     }
 
@@ -1179,6 +1472,8 @@ impl Hdf5Reader {
             locking: origin.locking,
             external: Default::default(),
             external_resolved: Default::default(),
+            // Overwritten by `open_with_locking` once this returns.
+            source_dir: PathBuf::new(),
         })
     }
 
@@ -1542,6 +1837,7 @@ impl Hdf5Reader {
                 blocked = Some(why);
             }
         };
+        let mut external_file_list = None;
 
         for msg in &header.messages {
             // A shared message holds a reference to where its body lives, not
@@ -1599,6 +1895,19 @@ impl Hdf5Reader {
                     }
                     Err(e) => block(format!("its fill value message does not decode: {e}")),
                 },
+                MSG_EXTERNAL_FILE_LIST => {
+                    // Unlike a layout message, this one *is* the storage: a
+                    // dataset with an external file list has no data address
+                    // of its own (H5Dlayout.c routes storage through this
+                    // message instead), so a list that does not decode must
+                    // block the dataset rather than read back as zero bytes.
+                    match ExternalFileListMessage::decode(&msg.data, ctx) {
+                        Ok((efl, _)) => external_file_list = Some(efl),
+                        Err(e) => block(format!(
+                            "its external file list message does not decode: {e}"
+                        )),
+                    }
+                }
                 _ => {}
             }
         }
@@ -1606,6 +1915,40 @@ impl Hdf5Reader {
         if let Some(why) = blocked {
             return ObjectKind::UnreadableDataset(why);
         }
+        // The storage a dataset names outside its layout message. Both are
+        // resolved before the dataset is registered and both block it when
+        // they do not resolve, for the same reason the decode above does: a
+        // `Virtual` or external-file layout carries no address of its own, so
+        // a dropped mapping reads back as fill with no error at all.
+        let external_files = match external_file_list {
+            Some(efl) => match Self::resolve_external_file_slots(handle, ctx, &efl) {
+                Ok(slots) => slots,
+                Err(e) => {
+                    return ObjectKind::UnreadableDataset(format!(
+                        "its external file list does not resolve: {e}"
+                    ))
+                }
+            },
+            None => Vec::new(),
+        };
+        let virtual_mappings = match &layout {
+            Some(DataLayoutMessage::Virtual {
+                heap_address,
+                heap_index,
+                ..
+            }) if *heap_index != 0 => {
+                match Self::resolve_virtual_mappings(handle, ctx, *heap_address, *heap_index, name)
+                {
+                    Ok(list) => Some(list),
+                    Err(e) => {
+                        return ObjectKind::UnreadableDataset(format!(
+                            "its virtual dataset mapping list does not resolve: {e}"
+                        ))
+                    }
+                }
+            }
+            _ => None,
+        };
         // The attribute set is collected whole, or the object says it could
         // not be: a short list here would be a dataset reporting attributes
         // the file does not agree it has.
@@ -1620,6 +1963,8 @@ impl Hdf5Reader {
                 filter_pipeline,
                 attributes,
                 fill_value,
+                external_files,
+                virtual_mappings,
             })),
             // The three messages are present and none of them reported an
             // error, so this is unreachable; report it as unreadable rather
@@ -1637,6 +1982,68 @@ impl Hdf5Reader {
     /// A dataset this crate cannot read is still a dataset the file
     /// contains, so it is listed here alongside the readable ones and
     /// answers [`Self::unreadable_reason`]; opening it reports that reason.
+    /// Resolve a virtual dataset's mapping list from the global heap object
+    /// its layout message points at (`H5D__virtual_load_layout`,
+    /// H5Dvirtual.c). Like the external-file-list decode above, a failure
+    /// here must not fall back to silently treating the dataset as having
+    /// no data: a `Virtual` layout carries no data address of its own, so a
+    /// dropped mapping list would read back as all-fill with no error.
+    fn resolve_virtual_mappings(
+        handle: &mut FileHandle,
+        ctx: &FormatContext,
+        heap_address: u64,
+        heap_index: u32,
+        name: &str,
+    ) -> IoResult<VirtualMappingList> {
+        let coll = read_heap_collection_from(handle, ctx, heap_address)?;
+        let idx = u16::try_from(heap_index).map_err(|_| {
+            crate::io::IoError::InvalidState(format!(
+                "dataset {name:?} virtual mapping heap index {heap_index} does not fit \
+                 the 16-bit on-disk field"
+            ))
+        })?;
+        let obj = coll.get_object(idx).ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!(
+                "dataset {name:?} virtual mapping list object {idx} not found in the \
+                 global heap collection at address {heap_address:#x}"
+            ))
+        })?;
+        VirtualMappingList::decode(obj, ctx).map_err(|e| {
+            crate::io::IoError::InvalidState(format!(
+                "dataset {name:?} has a malformed virtual dataset mapping list: {e}"
+            ))
+        })
+    }
+
+    /// Resolve every external-file slot's name through the local heap the
+    /// EFL message points at (H5Oefl.c decodes only the byte offset; the
+    /// string itself lives in a separate on-disk local heap, exactly like a
+    /// v0/v1 group's link names — see [`local_heap_get_string`]).
+    fn resolve_external_file_slots(
+        handle: &mut FileHandle,
+        ctx: &FormatContext,
+        efl: &ExternalFileListMessage,
+    ) -> IoResult<Vec<ExternalFileSegment>> {
+        let sa = ctx.sizeof_addr as usize;
+        let ss = ctx.sizeof_size as usize;
+        let heap_hdr_buf = handle.read_at_most(efl.heap_addr, 64)?;
+        let heap_hdr = LocalHeapHeader::decode(&heap_hdr_buf, sa, ss)?;
+        let heap_data = handle.read_at(heap_hdr.data_addr, heap_hdr.data_size as usize)?;
+
+        efl.slots
+            .iter()
+            .map(|slot| {
+                let name = local_heap_get_string(&heap_data, slot.name_offset)?;
+                Ok(ExternalFileSegment {
+                    name,
+                    offset: slot.offset,
+                    size: slot.size,
+                })
+            })
+            .collect()
+    }
+
+    /// Return the names of all datasets in the root group.
     pub fn dataset_names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.datasets.iter().map(|d| d.name.as_str()).collect();
         names.extend(self.unreadable.keys().map(String::as_str));
@@ -2207,24 +2614,7 @@ impl Hdf5Reader {
     /// has none, and this crate's writers put a whole write call's strings
     /// into one collection, which a cap would turn into silent data loss.
     fn read_heap_collection(&mut self, addr: u64) -> IoResult<GlobalHeapCollection> {
-        let ss = self.meta.ctx.sizeof_size as usize;
-        let header_len = 4 + 1 + 3 + ss;
-        let header_buf = self.handle.read_at_most(addr, header_len)?;
-        if header_buf.len() < header_len || header_buf[0..4] != *b"GCOL" {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "bad global heap collection signature at address {addr:#x}"
-            )));
-        }
-        let declared = read_uint(&header_buf[8..], ss) as usize;
-        if declared < 4096 {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "global heap collection at address {addr:#x} declares size {declared}, \
-                 below the 4096-byte minimum"
-            )));
-        }
-        let heap_buf = self.handle.read_at(addr, declared)?;
-        let (coll, _) = GlobalHeapCollection::decode(&heap_buf, &self.meta.ctx)?;
-        Ok(coll)
+        read_heap_collection_from(&mut self.handle, &self.meta.ctx, addr)
     }
 
     /// Decode an attribute's value as a string, resolving a variable-length
@@ -2408,11 +2798,19 @@ impl Hdf5Reader {
 
     /// Logical byte size of a dataset's full image (`product(dims) *
     /// element_size`), with the datatype needed for the post-filter conversion.
+    ///
+    /// The NULL dataspace (`dataspace.is_null()`) holds zero elements — not
+    /// one, the way an empty `dims` would suggest by the same product-of-dims
+    /// arithmetic a scalar dataspace uses (`dims` is empty for both).
     fn raw_size_and_datatype(&self, name: &str) -> IoResult<(DatatypeMessage, u64)> {
         let info = self
             .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
-        let total = saturating_byte_len(&info.dataspace.dims, info.datatype.element_size() as u64);
+        let total = if info.dataspace.is_null() {
+            0
+        } else {
+            saturating_byte_len(&info.dataspace.dims, info.datatype.element_size() as u64)
+        };
         Ok((info.datatype.clone(), total))
     }
 
@@ -2473,8 +2871,13 @@ impl Hdf5Reader {
         let layout = info.layout.clone();
         let pipeline = info.filter_pipeline.clone();
         let fill_value = info.fill_value.clone();
+        let external_files = info.external_files.clone();
 
         match &layout {
+            DataLayoutMessage::Contiguous { .. } if !external_files.is_empty() => {
+                let prefix = resolve_extfile_prefix(&self.source_dir);
+                read_external_file_bytes(&external_files, prefix.as_deref(), 0, out)?;
+            }
             DataLayoutMessage::Contiguous { address, .. } => {
                 if *address == UNDEF_ADDR {
                     // Never-written contiguous data reads back as the fill value.
@@ -2530,6 +2933,148 @@ impl Hdf5Reader {
                     },
                     pipeline.as_ref(),
                     ChunkTarget::Full,
+                    out,
+                )?;
+            }
+            DataLayoutMessage::Virtual { .. } => {
+                fill_tiled_into(out, fill_value.as_deref());
+                self.read_virtual_into(name, out, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fill `out` (shaped like the virtual dataset's own extent) by
+    /// stitching each mapping's source bytes in order (`H5D__virtual_read`,
+    /// H5Dvirtual.c). `out` must already be pre-filled with the tiled fill
+    /// value — every element no mapping covers is left exactly as the
+    /// caller filled it, matching the fixed-extent default of
+    /// `H5Pset_virtual_view` (`H5D_VDS_LAST_AVAILABLE`/`FIRST_MISSING` only
+    /// change how an *unlimited* mapping's extent is computed, which this
+    /// reader does not support — see [`has_virtual_printf_pattern`]).
+    /// Mappings apply in list order, so a later mapping's bytes win over an
+    /// earlier one's on overlap, exactly like the C reader.
+    ///
+    /// `depth` counts virtual-dataset nesting — a mapping whose source is
+    /// itself a virtual dataset, possibly in another file — so a crafted
+    /// cyclic mapping chain fails cleanly instead of recursing until the
+    /// stack overflows.
+    fn read_virtual_into(&mut self, name: &str, out: &mut [u8], depth: usize) -> IoResult<()> {
+        if depth >= MAX_VIRTUAL_DEPTH {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset {name:?}: virtual dataset mapping nests {MAX_VIRTUAL_DEPTH} levels \
+                 deep, aborting (possible cyclic mapping)"
+            )));
+        }
+        let info = self
+            .dataset_info(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let dims = info.dataspace.dims.clone();
+        let element_size = info.datatype.element_size() as u64;
+        let Some(mappings) = info.virtual_mappings.clone() else {
+            // No mapping list written yet: every element is unmapped, and
+            // `out` is already the fill value the caller pre-filled it with.
+            return Ok(());
+        };
+        let source_dir = self.source_dir.clone();
+
+        // Cross-file source readers, opened at most once per distinct
+        // resolved path for the duration of this call.
+        let mut cross_file_cache: std::collections::HashMap<PathBuf, Hdf5Reader> =
+            std::collections::HashMap::new();
+
+        for mapping in &mappings.mappings {
+            if has_virtual_printf_pattern(&mapping.source_file_name)
+                || has_virtual_printf_pattern(&mapping.source_dset_name)
+            {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "dataset {name:?}: virtual mapping to {:?}/{:?} uses a printf-style \
+                     (%b) unlimited source name pattern, which is not supported",
+                    mapping.source_file_name, mapping.source_dset_name
+                )));
+            }
+
+            let virtual_boxes = mapping.virtual_selection.to_boxes(&dims).map_err(|e| {
+                crate::io::IoError::InvalidState(format!(
+                    "dataset {name:?}: virtual mapping's virtual selection is not \
+                     supported: {e}"
+                ))
+            })?;
+            if virtual_boxes.is_empty() {
+                continue;
+            }
+
+            let source_name = mapping.source_dset_name.trim_start_matches('/');
+
+            if mapping.source_file_name == "." {
+                let src_dims = self
+                    .dataset_info(source_name)
+                    .ok_or_else(|| {
+                        crate::io::IoError::InvalidState(format!(
+                            "dataset {name:?}: virtual mapping source dataset \
+                             {source_name:?} not found in the same file"
+                        ))
+                    })?
+                    .dataspace
+                    .dims
+                    .clone();
+                let source_boxes = mapping.source_selection.to_boxes(&src_dims).map_err(|e| {
+                    crate::io::IoError::InvalidState(format!(
+                        "dataset {name:?}: virtual mapping's source selection is not \
+                         supported: {e}"
+                    ))
+                })?;
+                copy_matched_boxes(
+                    |s, c, buf| self.read_slice_into_unconverted(source_name, s, c, buf, depth + 1),
+                    &source_boxes,
+                    &virtual_boxes,
+                    &dims,
+                    element_size,
+                    out,
+                )?;
+            } else {
+                let prefix = resolve_vdsfile_prefix(&source_dir);
+                let full_path = combine_prefixed_path(prefix.as_deref(), &mapping.source_file_name);
+                let cache_key =
+                    std::fs::canonicalize(&full_path).unwrap_or_else(|_| full_path.clone());
+                if !cross_file_cache.contains_key(&cache_key) {
+                    let reader = Hdf5Reader::open_with_locking(&full_path, FileLocking::Disabled)
+                        .map_err(|e| {
+                        crate::io::IoError::InvalidState(format!(
+                            "dataset {name:?}: unable to open virtual dataset source \
+                                 file {}: {e}",
+                            full_path.display()
+                        ))
+                    })?;
+                    cross_file_cache.insert(cache_key.clone(), reader);
+                }
+                let src_reader = cross_file_cache.get_mut(&cache_key).unwrap();
+                let src_dims = src_reader
+                    .dataset_info(source_name)
+                    .ok_or_else(|| {
+                        crate::io::IoError::InvalidState(format!(
+                            "dataset {name:?}: virtual mapping source dataset \
+                             {source_name:?} not found in {}",
+                            full_path.display()
+                        ))
+                    })?
+                    .dataspace
+                    .dims
+                    .clone();
+                let source_boxes = mapping.source_selection.to_boxes(&src_dims).map_err(|e| {
+                    crate::io::IoError::InvalidState(format!(
+                        "dataset {name:?}: virtual mapping's source selection is not \
+                         supported: {e}"
+                    ))
+                })?;
+                copy_matched_boxes(
+                    |s, c, buf| {
+                        src_reader.read_slice_into_unconverted(source_name, s, c, buf, depth + 1)
+                    },
+                    &source_boxes,
+                    &virtual_boxes,
+                    &dims,
+                    element_size,
                     out,
                 )?;
             }
@@ -2704,6 +3249,9 @@ impl Hdf5Reader {
                 }
                 Ok(())
             }
+            data_layout::ChunkIndexType::Implicit => {
+                self.read_chunked_implicit(name, chunk_dims, index_address, target, output)
+            }
             data_layout::ChunkIndexType::FixedArray => self.read_chunked_fixed_array(
                 name,
                 chunk_dims,
@@ -2836,10 +3384,6 @@ impl Hdf5Reader {
 
                 Ok(())
             }
-            _ => Err(crate::io::IoError::InvalidState(format!(
-                "unsupported chunk index type: {:?}",
-                index_type
-            ))),
         }
     }
 
@@ -3078,6 +3622,101 @@ impl Hdf5Reader {
                 coords,
                 element_size,
             );
+        }
+
+        Ok(())
+    }
+
+    /// Read a dataset indexed by the implicit ("none") chunk index.
+    ///
+    /// There is no on-disk index structure at all (`H5Dnone.c`): every chunk
+    /// slot in the maximum-extent grid is allocated in one block at dataset
+    /// creation, so a chunk's address is purely arithmetic — `index_address +
+    /// slot * chunk_bytes`, where `slot` is its row-major position in the
+    /// same maximum-extent grid the fixed/extensible-array/v2-B-tree indexes
+    /// use (`H5D__chunk_set_info_real`'s `max_down_chunks`). This index type
+    /// is only ever selected for a fixed (non-unlimited) chunked dataset with
+    /// early allocation and no filters, so there is no per-chunk allocation
+    /// flag, compressed size, or filter mask to track.
+    ///
+    /// Scatters only; `output` must already be sized to the target extent and
+    /// pre-filled with the tiled fill value by the caller.
+    fn read_chunked_implicit(
+        &mut self,
+        name: &str,
+        chunk_dims: &[u64],
+        index_address: u64,
+        target: ChunkTarget,
+        output: &mut [u8],
+    ) -> IoResult<()> {
+        let info = self
+            .dataset_info(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let dims = info.dataspace.dims.clone();
+        let element_size = info.datatype.element_size() as u64;
+        let ndims = dims.len();
+
+        if index_address == UNDEF_ADDR {
+            // Unallocated: `output` is already the pre-filled buffer.
+            return Ok(());
+        }
+
+        if chunk_dims.len() != ndims {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "implicit-index dataset rank {} does not match chunk rank {}",
+                ndims,
+                chunk_dims.len()
+            )));
+        }
+
+        let max_dims = info.dataspace.max_dims.clone();
+        let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
+        let grid = crate::io::chunk_grid::index_grid(&dims, max_dims.as_deref(), chunk_dims)?;
+        let chunks_total: u64 = grid.iter().fold(1u64, |acc, &n| acc.saturating_mul(n));
+
+        // Every slot's coordinates and address are computed directly, not
+        // read from disk, so there is no "unallocated chunk" case here the
+        // way a sparse index has one: `at_most: false` because
+        // `H5D__none_idx_create` guarantees the whole block is present.
+        let mut slot_coords = Vec::with_capacity(chunks_total as usize);
+        for i in 0..chunks_total {
+            slot_coords.push(crate::io::chunk_grid::coords_of(
+                &dims,
+                max_dims.as_deref(),
+                chunk_dims,
+                i,
+            )?);
+        }
+
+        let jobs: Vec<Option<ChunkReadJob>> = (0..chunks_total)
+            .map(|i| {
+                let coords = &slot_coords[i as usize];
+                if !target.overlaps(coords, chunk_dims) {
+                    None
+                } else {
+                    Some(ChunkReadJob {
+                        addr: index_address + i * chunk_bytes,
+                        len: chunk_bytes as usize,
+                        at_most: false,
+                        mask: 0,
+                    })
+                }
+            })
+            .collect();
+
+        let decompressed = read_and_decompress_chunks(&self.handle, None, jobs)?;
+        for (i, chunk_data) in decompressed.iter().enumerate() {
+            if let Some(data) = chunk_data {
+                self.scatter_chunk(
+                    target,
+                    data,
+                    output,
+                    &dims,
+                    chunk_dims,
+                    &slot_coords[i],
+                    element_size,
+                );
+            }
         }
 
         Ok(())
@@ -3617,9 +4256,16 @@ impl Hdf5Reader {
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let layout = info.layout.clone();
+        let external_files = info.external_files.clone();
         let total_elements: u64 = dims.iter().fold(1u64, |acc, &d| acc.saturating_mul(d));
 
         let raw = match &layout {
+            DataLayoutMessage::Contiguous { size, .. } if !external_files.is_empty() => {
+                let prefix = resolve_extfile_prefix(&self.source_dir);
+                let mut buf = vec![0u8; *size as usize];
+                read_external_file_bytes(&external_files, prefix.as_deref(), 0, &mut buf)?;
+                buf
+            }
             DataLayoutMessage::Contiguous { address, size } => {
                 if *address == UNDEF_ADDR {
                     return Ok(vec![]);
@@ -3914,7 +4560,7 @@ impl Hdf5Reader {
         }
         let (datatype, out_bytes) = self.slice_size_and_datatype(name, counts)?;
         let mut data = alloc_tiled_fill(out_bytes as usize, None)?;
-        self.read_slice_into_unconverted(name, starts, counts, &mut data)?;
+        self.read_slice_into_unconverted(name, starts, counts, &mut data, 0)?;
         Self::apply_post_filter_conversion(&mut data, &datatype)?;
         Ok(data)
     }
@@ -3945,7 +4591,7 @@ impl Hdf5Reader {
                 out_bytes
             )));
         }
-        self.read_slice_into_unconverted(name, starts, counts, out)?;
+        self.read_slice_into_unconverted(name, starts, counts, out, 0)?;
         Self::apply_post_filter_conversion(out, &datatype)?;
         Ok(())
     }
@@ -3973,13 +4619,17 @@ impl Hdf5Reader {
     /// Both [`read_slice`](Self::read_slice) and [`read_slice_into`](Self::read_slice_into)
     /// wrap it and apply the conversion exactly once.
     ///
-    /// `out.len()` must equal `product(counts) * element_size`.
+    /// `out.len()` must equal `product(counts) * element_size`. `depth`
+    /// counts virtual-dataset nesting for a caller reached through
+    /// [`read_virtual_into`](Self::read_virtual_into); pass `0` for a
+    /// top-level call.
     fn read_slice_into_unconverted(
         &mut self,
         name: &str,
         starts: &[u64],
         counts: &[u64],
         out: &mut [u8],
+        depth: usize,
     ) -> IoResult<()> {
         let info = self
             .dataset_info_local(name)
@@ -3989,6 +4639,7 @@ impl Hdf5Reader {
         let layout = info.layout.clone();
         let pipeline = info.filter_pipeline.clone();
         let fill_value = info.fill_value.clone();
+        let external_files = info.external_files.clone();
         let ndims = dims.len();
 
         if starts.len() != ndims || counts.len() != ndims {
@@ -4011,6 +4662,28 @@ impl Hdf5Reader {
         }
 
         match &layout {
+            DataLayoutMessage::Contiguous { .. } if !external_files.is_empty() => {
+                // Same coalesced run geometry as the normal contiguous case
+                // below, but each run is read through the external file
+                // list instead of straight from this file (H5D__efl_read,
+                // H5Defl.c) — `src_off` is already dataset-relative, which
+                // is exactly what `read_external_file_bytes` walks slots by.
+                let prefix = resolve_extfile_prefix(&self.source_dir);
+                for_each_contiguous_run(
+                    &dims,
+                    starts,
+                    counts,
+                    element_size,
+                    |src_off, out_off, len| {
+                        read_external_file_bytes(
+                            &external_files,
+                            prefix.as_deref(),
+                            src_off,
+                            &mut out[out_off..out_off + len],
+                        )
+                    },
+                )?;
+            }
             DataLayoutMessage::Contiguous { address, .. } => {
                 if *address == UNDEF_ADDR {
                     // Never-written: the selection reads back as the fill value.
@@ -4101,6 +4774,32 @@ impl Hdf5Reader {
                     pipeline.as_ref(),
                     ChunkTarget::Slice { starts, counts },
                     out,
+                )?;
+            }
+            DataLayoutMessage::Virtual { .. } => {
+                // Stitch the full virtual image, then extract the
+                // requested region from it. This reads more than the
+                // selection strictly needs (no per-mapping intersection
+                // against the caller's box), but a virtual dataset's data
+                // is composed from other datasets rather than stored
+                // contiguously, so there is no cheaper selective path
+                // without duplicating `read_virtual_into`'s mapping walk
+                // for a bounded region — correctness, not I/O pruning, is
+                // what a VDS slice read needs here.
+                fill_tiled_into(out, fill_value.as_deref());
+                let total = saturating_byte_len(&dims, element_size) as usize;
+                let mut full = alloc_tiled_fill(total, fill_value.as_deref())?;
+                self.read_virtual_into(name, &mut full, depth)?;
+                for_each_contiguous_run(
+                    &dims,
+                    starts,
+                    counts,
+                    element_size,
+                    |src_off, out_off, len| {
+                        let src_off = src_off as usize;
+                        out[out_off..out_off + len].copy_from_slice(&full[src_off..src_off + len]);
+                        Ok(())
+                    },
                 )?;
             }
         }
