@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use crate::format::messages::attribute::AttributeMessage;
+use crate::format::messages::datatype::DatatypeMessage;
 use crate::io::locking::FileLocking;
 use crate::io::Hdf5Reader;
 use crate::io::SwmrWriter as IoSwmrWriter;
@@ -374,11 +375,26 @@ impl SwmrFileWriter {
     /// Create a variable-length string dataset (one element per string).
     /// Returns the dataset index. Useful for NeXus metadata such as
     /// `/entry/start_time` or per-frame timestamp arrays.
+    ///
+    /// The datatype declares UTF-8;
+    /// [`write_string_dataset_ascii`](Self::write_string_dataset_ascii)
+    /// declares ASCII instead.
     pub fn write_string_dataset(&mut self, name: &str, strings: &[&str]) -> Result<usize> {
         let idx = self
             .inner
             .writer_mut()
-            .create_vlen_string_dataset(name, strings)?;
+            .create_vlen_string_dataset(name, strings, 1)?;
+        Ok(idx)
+    }
+
+    /// [`write_string_dataset`](Self::write_string_dataset) under an **ASCII**
+    /// datatype, the one h5py's `string_dtype("ascii")` produces. A string
+    /// that is not 7-bit is rejected rather than mislabelled.
+    pub fn write_string_dataset_ascii(&mut self, name: &str, strings: &[&str]) -> Result<usize> {
+        let idx = self
+            .inner
+            .writer_mut()
+            .create_vlen_string_dataset(name, strings, 0)?;
         Ok(idx)
     }
 
@@ -593,7 +609,7 @@ impl SwmrFileReader {
     }
 
     /// Return the current shape of a dataset.
-    pub fn dataset_shape(&self, name: &str) -> Result<Vec<u64>> {
+    pub fn dataset_shape(&mut self, name: &str) -> Result<Vec<u64>> {
         Ok(self.reader.dataset_shape(name)?)
     }
 
@@ -612,7 +628,8 @@ impl SwmrFileReader {
     /// type at runtime.
     pub fn read_dataset<T: H5Type>(&mut self, name: &str) -> Result<Vec<T>> {
         self.check_element_width::<T>(name)?;
-        bytes_to_typed(self.reader.read_dataset_raw(name)?)
+        let datatype = self.dataset_datatype(name)?;
+        bytes_to_typed(self.reader.read_dataset_raw(name)?, &datatype)
     }
 
     /// Read a slice (hyperslab) of a dataset as raw bytes.
@@ -640,14 +657,15 @@ impl SwmrFileReader {
         counts: &[u64],
     ) -> Result<Vec<T>> {
         self.check_element_width::<T>(name)?;
-        bytes_to_typed(self.reader.read_slice(name, starts, counts)?)
+        let datatype = self.dataset_datatype(name)?;
+        bytes_to_typed(self.reader.read_slice(name, starts, counts)?, &datatype)
     }
 
     /// The width gate for the typed reads: without it, reinterpreting the
     /// raw bytes splits or merges elements — an f64 dataset read as `i32`
     /// passed the divisibility check and silently returned twice as many
     /// garbage values.
-    fn check_element_width<T: H5Type>(&self, name: &str) -> Result<()> {
+    fn check_element_width<T: H5Type>(&mut self, name: &str) -> Result<()> {
         let stored = self.dataset_element_size(name)?;
         if T::element_size() != stored {
             return Err(crate::error::Hdf5Error::TypeMismatch(format!(
@@ -665,10 +683,19 @@ impl SwmrFileReader {
 
     /// Element size of a dataset's datatype, in bytes — enough to size a
     /// read buffer without knowing the concrete element type at compile time.
-    pub fn dataset_element_size(&self, name: &str) -> Result<usize> {
+    pub fn dataset_element_size(&mut self, name: &str) -> Result<usize> {
         self.reader
             .dataset_info(name)
             .map(|i| i.datatype.element_size() as usize)
+            .ok_or_else(|| crate::error::Hdf5Error::NotFound(name.to_string()))
+    }
+
+    /// The stored datatype of a dataset, which the typed reads need to put
+    /// the element image into host byte order.
+    fn dataset_datatype(&mut self, name: &str) -> Result<DatatypeMessage> {
+        self.reader
+            .dataset_info(name)
+            .map(|i| i.datatype.clone())
             .ok_or_else(|| crate::error::Hdf5Error::NotFound(name.to_string()))
     }
 
@@ -683,7 +710,7 @@ impl SwmrFileReader {
     }
 
     /// Names of the attributes on a dataset.
-    pub fn dataset_attr_names(&self, name: &str) -> Result<Vec<String>> {
+    pub fn dataset_attr_names(&mut self, name: &str) -> Result<Vec<String>> {
         Ok(self.reader.dataset_attr_names(name)?)
     }
 
@@ -695,13 +722,13 @@ impl SwmrFileReader {
 
     /// Names of the attributes on a group, or on the root group when
     /// `group_path` is `"/"`. A leading `/` is tolerated.
-    pub fn group_attr_names(&self, group_path: &str) -> Vec<String> {
-        if group_path == "/" {
-            self.reader.root_attr_names()
+    pub fn group_attr_names(&mut self, group_path: &str) -> Result<Vec<String>> {
+        Ok(if group_path == "/" {
+            self.reader.root_attr_names()?
         } else {
             self.reader
-                .group_attr_names(group_path.trim_start_matches('/'))
-        }
+                .group_attr_names(group_path.trim_start_matches('/'))?
+        })
     }
 
     /// Read a group's attribute as a string (the NeXus `NX_class` etc.), or
@@ -712,8 +739,7 @@ impl SwmrFileReader {
         } else {
             self.reader
                 .group_attr(group_path.trim_start_matches('/'), attr)
-        }
-        .ok_or_else(|| crate::error::Hdf5Error::NotFound(attr.to_string()))?
+        }?
         .clone();
         Ok(self.reader.attr_string_value(&a)?)
     }
@@ -730,8 +756,10 @@ fn group_attr_target(group_path: &str) -> crate::io::writer::AttrTarget<'_> {
 }
 
 /// Reinterpret a raw byte buffer as a typed vector. The buffer length must
-/// be a whole multiple of `T`'s element size.
-fn bytes_to_typed<T: H5Type>(raw: Vec<u8>) -> Result<Vec<T>> {
+/// be a whole multiple of `T`'s element size, and the stored byte order is
+/// converted to the host's first — reinterpretation is only the stored value
+/// when the two agree.
+fn bytes_to_typed<T: H5Type>(mut raw: Vec<u8>, datatype: &DatatypeMessage) -> Result<Vec<T>> {
     let es = T::element_size();
     if es == 0 || !raw.len().is_multiple_of(es) {
         return Err(crate::error::Hdf5Error::TypeMismatch(format!(
@@ -739,6 +767,7 @@ fn bytes_to_typed<T: H5Type>(raw: Vec<u8>) -> Result<Vec<T>> {
             raw.len()
         )));
     }
+    crate::dataset::to_host_byte_order(&mut raw, datatype, es)?;
     let count = raw.len() / es;
     let mut result = Vec::<T>::with_capacity(count);
     // Safety: `T: H5Type` is a `Copy` POD primitive exactly `element_size()`

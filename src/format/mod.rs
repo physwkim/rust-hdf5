@@ -8,12 +8,19 @@ pub mod btree_v1;
 pub(crate) mod bytes;
 pub mod checksum;
 pub mod chunk_index;
+pub mod creation_order;
+pub mod dense_attr;
+pub mod dense_link;
 pub mod fractal_heap;
+pub mod fractal_heap_write;
 pub mod global_heap;
 pub mod local_heap;
 pub mod messages;
 pub mod nbit_scaleoffset;
 pub mod object_header;
+pub mod reference;
+pub mod selection;
+pub mod sohm;
 pub mod superblock;
 pub mod symbol_table;
 pub mod szip;
@@ -34,8 +41,58 @@ impl FormatContext {
     }
 }
 
+/// The low half of libhdf5's `H5Pset_libver_bounds` — the oldest library
+/// release a file must stay readable by.
+///
+/// It is the file-wide switch that picks between on-disk message versions:
+/// libhdf5 keeps one table per message type (`H5O_dtype_ver_bounds`,
+/// `H5O_layout_ver_bounds`, ...) mapping the bound to the version it stamps.
+/// Raising the bound lets the library use newer, tighter encodings; lowering
+/// it keeps older readers able to open the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum LibverBound {
+    /// `H5F_LIBVER_EARLIEST`, the default: every message at its oldest
+    /// version that can express what the file holds.
+    #[default]
+    Earliest,
+    /// `H5F_LIBVER_V18`.
+    V18,
+    /// `H5F_LIBVER_V110`.
+    V110,
+    /// `H5F_LIBVER_V112`.
+    V112,
+    /// `H5F_LIBVER_V114`.
+    V114,
+    /// `H5F_LIBVER_V200`, which is `H5F_LIBVER_LATEST` for libhdf5 2.0.
+    V200,
+}
+
+impl LibverBound {
+    /// The datatype message version this bound calls for — libhdf5's
+    /// `H5O_dtype_ver_bounds` (H5T.c), the floor `H5T_set_version` raises a
+    /// datatype to.
+    pub fn dtype_version(self) -> u8 {
+        match self {
+            Self::Earliest => 1,
+            Self::V18 | Self::V110 => 3,
+            Self::V112 | Self::V114 => 4,
+            Self::V200 => 5,
+        }
+    }
+}
+
 /// UNDEF address constant
 pub const UNDEF_ADDR: u64 = u64::MAX;
+
+/// Fetches arbitrary file regions for the structure walkers that cannot hold a
+/// file handle themselves (fractal heap, v2 B-tree, dense attribute storage).
+pub trait BlockReader {
+    /// Read up to `len` bytes starting at `offset`. Returning fewer bytes is
+    /// only permitted at end of file; every caller re-checks the length it
+    /// actually needs, so a short read surfaces as `BufferTooShort` rather
+    /// than a misparse.
+    fn read_block(&mut self, offset: u64, len: usize) -> FormatResult<Vec<u8>>;
+}
 
 /// Encode/decode error
 #[derive(Debug)]

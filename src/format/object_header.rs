@@ -30,6 +30,7 @@
 /// msg_data:       [u8; msg_data_size]
 /// ```
 use crate::format::checksum::checksum_metadata;
+use crate::format::creation_order::CreationOrder;
 use crate::format::{FormatError, FormatResult};
 
 /// The 4-byte object header v2 signature.
@@ -38,10 +39,18 @@ pub const OHDR_SIGNATURE: [u8; 4] = *b"OHDR";
 /// Object header version 2.
 pub const OHDR_VERSION: u8 = 2;
 
+/// Largest payload one object header message can carry.
+///
+/// The message envelope encodes the payload length in a `u16`, so this is a
+/// hard on-disk ceiling, not a policy: libhdf5 refuses the same sizes through
+/// `H5O_MESG_MAX_SIZE` (65536) and moves anything that reaches it out of the
+/// header — `H5O__attr_create` switches such an attribute to dense storage.
+pub const MAX_MESSAGE_SIZE: usize = u16::MAX as usize;
+
 // Flag bit masks
 const FLAG_SIZE_MASK: u8 = 0x03;
 const FLAG_ATTR_CREATION_ORDER_TRACKED: u8 = 0x04;
-// const FLAG_ATTR_CREATION_ORDER_INDEXED: u8 = 0x08; // bit 3
+const FLAG_ATTR_CREATION_ORDER_INDEXED: u8 = 0x08;
 const FLAG_NON_DEFAULT_ATTR_THRESHOLDS: u8 = 0x10;
 const FLAG_STORE_TIMESTAMPS: u8 = 0x20;
 
@@ -52,6 +61,11 @@ pub struct ObjectHeaderMessage {
     pub msg_type: u8,
     /// Per-message flags (bit 0 = constant, bit 1 = shared, etc.)
     pub flags: u8,
+    /// Creation index, written only when the header tracks attribute creation
+    /// order (flags bit 2). Only the attribute message class has one in
+    /// libhdf5 — `H5O_msg_class_t::get_crt_index` is null for every other
+    /// type, leaving the field zero (`H5O_msg_append_real`).
+    pub creation_index: u16,
     /// Raw message payload.
     pub data: Vec<u8>,
 }
@@ -80,11 +94,56 @@ impl ObjectHeader {
 
     /// Append a message to the object header.
     pub fn add_message(&mut self, msg_type: u8, flags: u8, data: Vec<u8>) {
+        self.add_message_indexed(msg_type, flags, data, 0);
+    }
+
+    /// Append a message carrying a creation index.
+    ///
+    /// The index reaches the file only when the header's flags bit 2 says the
+    /// creation order is tracked; libhdf5 does not encode the field otherwise
+    /// (`H5O_SIZEOF_MSGHDR_OH`).
+    pub fn add_message_indexed(
+        &mut self,
+        msg_type: u8,
+        flags: u8,
+        data: Vec<u8>,
+        creation_index: u16,
+    ) {
         self.messages.push(ObjectHeaderMessage {
             msg_type,
             flags,
+            creation_index,
             data,
         });
+    }
+
+    /// Declare `order` as this object's attribute creation-order policy.
+    ///
+    /// `H5Pget_attr_creation_order` reads these two bits back out of the
+    /// header, not out of the Attribute Info message (`H5Pocpl.c`), so they
+    /// are what makes an object report its attributes as creation-ordered.
+    /// Setting `TRACKED` also widens every message envelope by the two-byte
+    /// creation index.
+    pub fn set_attribute_creation_order(&mut self, order: CreationOrder) {
+        self.flags &= !(FLAG_ATTR_CREATION_ORDER_TRACKED | FLAG_ATTR_CREATION_ORDER_INDEXED);
+        if order.is_tracked() {
+            self.flags |= FLAG_ATTR_CREATION_ORDER_TRACKED;
+        }
+        if order.is_indexed() {
+            self.flags |= FLAG_ATTR_CREATION_ORDER_INDEXED;
+        }
+    }
+
+    /// This object's attribute creation-order policy, as its flag bits
+    /// declare it — the reverse of
+    /// [`set_attribute_creation_order`](Self::set_attribute_creation_order),
+    /// and what a reopen must consult so a rewrite re-declares what the file
+    /// already says.
+    pub fn attribute_creation_order(&self) -> CreationOrder {
+        CreationOrder::from_flags(
+            self.flags & FLAG_ATTR_CREATION_ORDER_TRACKED != 0,
+            self.flags & FLAG_ATTR_CREATION_ORDER_INDEXED != 0,
+        )
     }
 
     /// Returns the number of bytes used to encode chunk0's data size, based on
@@ -100,7 +159,7 @@ impl ObjectHeader {
     }
 
     /// Whether attribute creation order tracking is enabled (flags bit 2).
-    fn has_creation_order(&self) -> bool {
+    pub fn has_creation_order(&self) -> bool {
         self.flags & FLAG_ATTR_CREATION_ORDER_TRACKED != 0
     }
 
@@ -119,7 +178,25 @@ impl ObjectHeader {
 
     /// Encode the object header to a byte vector, including "OHDR" signature
     /// and trailing checksum.
-    pub fn encode(&self) -> Vec<u8> {
+    ///
+    /// Fails when any message payload exceeds [`MAX_MESSAGE_SIZE`]. The size
+    /// field is a `u16`, so writing such a message would record its length
+    /// modulo 65536: the reader would then take the payload's own tail for the
+    /// next message envelope and every message after it would decode as
+    /// garbage. Nothing downstream can detect that — the checksum is computed
+    /// over the truncated image and matches — so the check has to happen here,
+    /// before any bytes are produced.
+    pub fn encode(&self) -> FormatResult<Vec<u8>> {
+        for msg in &self.messages {
+            if msg.data.len() > MAX_MESSAGE_SIZE {
+                return Err(FormatError::InvalidData(format!(
+                    "object header message type 0x{:02X} is {} bytes, over the \
+                     {MAX_MESSAGE_SIZE}-byte limit the message size field can express",
+                    msg.msg_type,
+                    msg.data.len()
+                )));
+            }
+        }
         let messages_size = self.messages_data_size();
 
         // Estimate total size for pre-allocation
@@ -162,12 +239,11 @@ impl ObjectHeader {
         // Messages
         for msg in &self.messages {
             buf.push(msg.msg_type);
+            // Checked against MAX_MESSAGE_SIZE above.
             buf.extend_from_slice(&(msg.data.len() as u16).to_le_bytes());
             buf.push(msg.flags);
             if self.has_creation_order() {
-                // We don't track actual creation order values in the MVP --
-                // write 0.
-                buf.extend_from_slice(&0u16.to_le_bytes());
+                buf.extend_from_slice(&msg.creation_index.to_le_bytes());
             }
             buf.extend_from_slice(&msg.data);
         }
@@ -177,7 +253,7 @@ impl ObjectHeader {
         buf.extend_from_slice(&cksum.to_le_bytes());
 
         debug_assert_eq!(buf.len(), total);
-        buf
+        Ok(buf)
     }
 
     /// Decode an object header from a byte buffer. Returns the parsed header
@@ -303,10 +379,13 @@ impl ObjectHeader {
             let msg_flags = buf[pos + 3];
             pos += 4;
 
-            if has_creation_order {
-                // Skip creation_order for now
+            let creation_index = if has_creation_order {
+                let v = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
                 pos += 2;
-            }
+                v
+            } else {
+                0
+            };
 
             if pos + msg_data_size > messages_end {
                 return Err(FormatError::InvalidData(format!(
@@ -321,6 +400,7 @@ impl ObjectHeader {
             messages.push(ObjectHeaderMessage {
                 msg_type,
                 flags: msg_flags,
+                creation_index,
                 data,
             });
         }
@@ -428,6 +508,8 @@ impl ObjectHeader {
             messages.push(ObjectHeaderMessage {
                 msg_type: msg_type as u8,
                 flags: msg_flags,
+                // A version-1 message envelope has no creation index.
+                creation_index: 0,
                 data,
             });
         }
@@ -533,7 +615,7 @@ mod tests_v1 {
     fn test_decode_any_v2() {
         let mut hdr = ObjectHeader::new();
         hdr.add_message(0x01, 0x00, vec![1, 2, 3]);
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
         let (decoded, _) = ObjectHeader::decode_any(&encoded).unwrap();
         assert_eq!(decoded.messages.len(), 1);
     }
@@ -572,7 +654,7 @@ mod tests {
     #[test]
     fn test_empty_header_roundtrip() {
         let hdr = ObjectHeader::new();
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
 
         // OHDR(4) + version(1) + flags(1) + chunk0_size(4) + checksum(4) = 14
         assert_eq!(encoded.len(), 14);
@@ -589,7 +671,7 @@ mod tests {
         let mut hdr = ObjectHeader::new();
         hdr.add_message(0x01, 0x00, vec![0xAA, 0xBB, 0xCC]);
 
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
         let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded.messages.len(), 1);
@@ -605,7 +687,7 @@ mod tests {
         hdr.add_message(0x03, 0x01, vec![10, 20]);
         hdr.add_message(0x0C, 0x00, vec![]);
 
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
         let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded.messages.len(), 3);
@@ -621,12 +703,71 @@ mod tests {
         hdr.add_message(0x01, 0x00, vec![0xFF; 8]);
         hdr.add_message(0x03, 0x00, vec![0xEE; 4]);
 
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
         let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded.messages.len(), 2);
         assert_eq!(decoded.messages[0].data, vec![0xFF; 8]);
         assert_eq!(decoded.messages[1].data, vec![0xEE; 4]);
+    }
+
+    /// The per-message creation index survives a round trip, and lands where
+    /// libhdf5 puts it: right after the message flags byte, ahead of the
+    /// message data.
+    #[test]
+    fn a_tracked_header_round_trips_each_message_creation_index() {
+        let mut hdr = ObjectHeader::new();
+        hdr.set_attribute_creation_order(CreationOrder::Indexed);
+        hdr.add_message_indexed(0x0C, 0x00, vec![0xAA; 6], 0);
+        hdr.add_message_indexed(0x0C, 0x00, vec![0xBB; 6], 1);
+        hdr.add_message_indexed(0x0C, 0x00, vec![0xCC; 6], 2);
+
+        let encoded = hdr.encode().unwrap();
+        let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, hdr);
+        let indices: Vec<u16> = decoded.messages.iter().map(|m| m.creation_index).collect();
+        assert_eq!(indices, vec![0, 1, 2]);
+
+        // Off: no index is written, and every message decodes with 0.
+        let mut plain = ObjectHeader::new();
+        plain.add_message(0x0C, 0x00, vec![0xAA; 6]);
+        assert!(plain.encode().unwrap().len() < encoded.len());
+        let (plain_back, _) = ObjectHeader::decode(&plain.encode().unwrap()).unwrap();
+        assert_eq!(plain_back.messages[0].creation_index, 0);
+    }
+
+    /// The two flag bits are set and read back independently, so a header that
+    /// tracks without indexing survives a decode as exactly that — the state
+    /// `H5Pset_attr_creation_order(H5P_CRT_ORDER_TRACKED)` produces.
+    #[test]
+    fn each_attribute_creation_order_state_round_trips_through_the_flags() {
+        for order in [
+            CreationOrder::Untracked,
+            CreationOrder::Tracked,
+            CreationOrder::Indexed,
+        ] {
+            let mut hdr = ObjectHeader::new();
+            hdr.set_attribute_creation_order(order);
+            hdr.add_message_indexed(0x0C, 0x00, vec![0xAA; 6], 3);
+            let (decoded, _) = ObjectHeader::decode(&hdr.encode().unwrap()).unwrap();
+            assert_eq!(decoded.attribute_creation_order(), order);
+            let want_index = if order.is_tracked() { 3 } else { 0 };
+            assert_eq!(decoded.messages[0].creation_index, want_index);
+        }
+    }
+
+    /// Setting a policy clears whatever the previous one left behind, so a
+    /// header recovered as indexed and re-declared untracked does not keep a
+    /// stale bit.
+    #[test]
+    fn setting_a_weaker_policy_clears_the_stronger_one() {
+        let mut hdr = ObjectHeader::new();
+        hdr.set_attribute_creation_order(CreationOrder::Indexed);
+        hdr.set_attribute_creation_order(CreationOrder::Untracked);
+        assert_eq!(hdr.attribute_creation_order(), CreationOrder::Untracked);
+        // Bits 0-1 (the chunk0 size encoding) are untouched.
+        assert_eq!(hdr.flags, 0x02);
     }
 
     #[test]
@@ -638,7 +779,7 @@ mod tests {
         };
         hdr.add_message(0x01, 0x00, vec![42]);
 
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
         let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded.messages[0].data, vec![42]);
@@ -653,7 +794,7 @@ mod tests {
         };
         hdr.add_message(0x01, 0x00, vec![1, 2, 3]);
 
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
         let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded.messages[0].data, vec![1, 2, 3]);
@@ -668,7 +809,7 @@ mod tests {
         };
         hdr.add_message(0x01, 0x00, vec![0xDE, 0xAD]);
 
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
         let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded.messages[0].data, vec![0xDE, 0xAD]);
@@ -685,7 +826,7 @@ mod tests {
     #[test]
     fn test_decode_bad_version() {
         let hdr = ObjectHeader::new();
-        let mut encoded = hdr.encode();
+        let mut encoded = hdr.encode().unwrap();
         encoded[4] = 99; // corrupt version
         let err = ObjectHeader::decode(&encoded).unwrap_err();
         assert!(matches!(err, FormatError::InvalidVersion(99)));
@@ -695,7 +836,7 @@ mod tests {
     fn test_decode_checksum_mismatch() {
         let mut hdr = ObjectHeader::new();
         hdr.add_message(0x01, 0x00, vec![1, 2, 3]);
-        let mut encoded = hdr.encode();
+        let mut encoded = hdr.encode().unwrap();
         // Corrupt a message byte
         let last_data = encoded.len() - 5;
         encoded[last_data] ^= 0xFF;
@@ -713,7 +854,7 @@ mod tests {
     fn test_decode_with_trailing_data() {
         let mut hdr = ObjectHeader::new();
         hdr.add_message(0x01, 0x00, vec![7, 8, 9]);
-        let mut encoded = hdr.encode();
+        let mut encoded = hdr.encode().unwrap();
         let original_len = encoded.len();
         encoded.extend_from_slice(&[0xBB; 50]); // trailing garbage
 
@@ -728,11 +869,38 @@ mod tests {
         let big_data = vec![0x42; 1000];
         hdr.add_message(0x0C, 0x00, big_data.clone());
 
-        let encoded = hdr.encode();
+        let encoded = hdr.encode().unwrap();
         let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded.messages[0].data.len(), 1000);
         assert_eq!(decoded.messages[0].data, big_data);
+    }
+
+    /// The largest payload the size field can express still round-trips.
+    #[test]
+    fn test_message_payload_at_size_limit() {
+        let mut hdr = ObjectHeader::new();
+        hdr.add_message(0x0C, 0x00, vec![0x42; MAX_MESSAGE_SIZE]);
+
+        let encoded = hdr.encode().expect("encode at the limit must succeed");
+        let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.messages[0].data.len(), MAX_MESSAGE_SIZE);
+    }
+
+    /// One byte past the limit is refused. Encoding it would store the length
+    /// modulo 65536 — here 0 — and every message after it would decode from
+    /// the middle of this one's payload, with a checksum that still matches.
+    #[test]
+    fn test_message_payload_over_size_limit_is_refused() {
+        let mut hdr = ObjectHeader::new();
+        hdr.add_message(0x01, 0x00, vec![7; 4]);
+        hdr.add_message(0x0C, 0x00, vec![0x42; MAX_MESSAGE_SIZE + 1]);
+
+        let err = hdr.encode().expect_err("over the limit must not encode");
+        let msg = err.to_string();
+        assert!(msg.contains("0x0C"), "{msg}");
+        assert!(msg.contains(&(MAX_MESSAGE_SIZE + 1).to_string()), "{msg}");
     }
 
     #[test]

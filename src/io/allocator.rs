@@ -194,6 +194,22 @@ impl FileAllocator {
     pub fn eof(&self) -> u64 {
         self.eof.load(Ordering::Acquire)
     }
+
+    /// Snapshot of the free list, as `(addr, len)` sorted by address.
+    ///
+    /// A test seam: a reclamation test asserts on the blocks that came back,
+    /// which stays true even where the file size cannot show it — a session
+    /// that reuses the freed space immediately, or one whose file is dominated
+    /// by something else.
+    #[cfg(test)]
+    pub(crate) fn free_blocks(&self) -> Vec<(u64, u64)> {
+        self.free_list
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| (b.addr, b.len))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -283,13 +299,7 @@ mod tests {
 
     /// Snapshot of the free list for assertions.
     fn free_blocks(alloc: &FileAllocator) -> Vec<(u64, u64)> {
-        alloc
-            .free_list
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|b| (b.addr, b.len))
-            .collect()
+        alloc.free_blocks()
     }
 
     #[test]

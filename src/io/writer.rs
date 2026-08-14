@@ -3,6 +3,7 @@
 //! Produces a valid HDF5 file with superblock v3, a root group object header,
 //! and datasets with contiguous or chunked storage. The output is readable by `h5dump`.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::format::chunk_index::btree_v2::Bt2ChunkIndex;
@@ -17,19 +18,23 @@ use crate::format::chunk_index::fixed_array::{
     FixedArrayDataBlock, FixedArrayFilteredChunkElement, FixedArrayHeader, FixedArrayPagedPrefix,
     FA_CLIENT_FILT_CHUNK,
 };
-use crate::format::messages::attribute::AttributeMessage;
+use crate::format::creation_order::CreationOrder;
+use crate::format::dense_attr::build_dense_attributes;
+use crate::format::dense_link::build_dense_links;
+use crate::format::messages::attr_info::AttributeInfoMessage;
+use crate::format::messages::attribute::{AttributeEntry, AttributeMessage};
 use crate::format::messages::data_layout::{DataLayoutMessage, EarrayParams, FixedArrayParams};
-use crate::format::messages::dataspace::DataspaceMessage;
-use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::messages::dataspace::{DataspaceClass, DataspaceMessage};
+use crate::format::messages::datatype::{DatatypeMessage, ReferenceKind};
 use crate::format::messages::fill_value::FillValueMessage;
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::group_info::GroupInfoMessage;
 use crate::format::messages::link::LinkMessage;
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::*;
-use crate::format::object_header::ObjectHeader;
+use crate::format::object_header::{ObjectHeader, MAX_MESSAGE_SIZE};
 use crate::format::superblock::*;
-use crate::format::{FormatContext, UNDEF_ADDR};
+use crate::format::{FormatContext, LibverBound, UNDEF_ADDR};
 
 use crate::io::allocator::FileAllocator;
 use crate::io::file_handle::FileHandle;
@@ -100,14 +105,16 @@ fn collect_bt2_nodes(
             geo.max_nrec_size,
             geo.child_total_size(depth),
         )?;
-        records.extend_from_slice(&node.record_data);
+        // In-order: an internal node's records separate its children, so each
+        // one belongs between the subtrees on either side of it.
         let children: Vec<(u64, u16)> = node
             .child_addrs
             .iter()
             .zip(node.child_nrecords.iter())
             .map(|(&a, &n)| (a, n))
             .collect();
-        for (child_addr, child_nrec) in children {
+        let rec = record_size as usize;
+        for (i, (child_addr, child_nrec)) in children.into_iter().enumerate() {
             collect_bt2_nodes(
                 handle,
                 ctx,
@@ -120,6 +127,9 @@ fn collect_bt2_nodes(
                 records,
                 node_addrs,
             )?;
+            if let Some(record) = node.record_data.get(i * rec..(i + 1) * rec) {
+                records.extend_from_slice(record);
+            }
         }
     }
     Ok(())
@@ -316,6 +326,12 @@ pub(crate) struct CreateGuard<'a> {
     _gate: std::sync::MutexGuard<'a, ()>,
     /// The dataset name with every group hard link in it resolved.
     pub(crate) name: String,
+    /// The group that will hold the new dataset's link, resolved from the
+    /// path components of `name`; `None` is the root group. Carried here so
+    /// [`Hdf5Writer::push_dataset`] registers the child itself and no creator
+    /// can leave a dataset whose name says one thing and whose parent group
+    /// says another.
+    pub(crate) parent: Option<usize>,
 }
 
 /// Reference-counted shared pointer, feature-selected. The single-thread
@@ -436,7 +452,7 @@ pub struct DatasetInfo {
     /// Appended frames not yet written to chunks, `None` when empty.
     pub append: Option<AppendBuffer>,
     /// Attributes attached to this dataset.
-    pub attributes: Vec<AttributeMessage>,
+    pub attributes: Vec<AttributeEntry>,
     /// File offset where the dataset object header was written (for SWMR in-place rewrites).
     pub obj_header_written_addr: Option<u64>,
     /// Encoded size of the dataset object header (for verifying in-place rewrites fit).
@@ -451,6 +467,18 @@ pub struct DatasetInfo {
     /// session that only changed the extent would keep the old on-disk
     /// header — silently dropping the new shape.
     pub extent_dirty: bool,
+    /// Something the object header encodes changed this session without
+    /// touching the dataset's storage — an attribute set or removed, a fill
+    /// value defined. See [`header_stale`](DatasetInfo::header_stale).
+    pub header_dirty: bool,
+    /// When the link naming this dataset was created; see
+    /// [`GroupInfo::creation_seq`].
+    pub creation_seq: u64,
+    /// How this dataset records creation order for its attributes — the
+    /// file's creation-order policy captured when the dataset was created,
+    /// the way libhdf5 captures the DCPL. A dataset holds no links, so only
+    /// the attribute half of [`TrackOrder`] applies to it.
+    pub track_attr_order: CreationOrder,
     /// User-defined fill value bytes (exactly one element wide). `None`
     /// means default zero-fill; `Some` is emitted as a `fill_defined = 2`
     /// fill-value message in the dataset object header.
@@ -461,6 +489,33 @@ pub struct DatasetInfo {
     /// preserved from the file on reopen, and emitted verbatim at finalize.
     /// Contiguous datasets ignore it.
     pub layout_version: u8,
+}
+
+impl DatasetInfo {
+    /// Whether this session wrote chunk data or changed the extent, so the
+    /// dataset's index structures have to be re-flushed.
+    fn storage_dirty(&self) -> bool {
+        self.chunked.as_ref().is_some_and(|c| c.chunks_written > 0)
+            || self
+                .fixed_array
+                .as_ref()
+                .is_some_and(|f| f.chunks_written > 0)
+            || self.btree_v2.as_ref().is_some_and(|b| b.chunks_written > 0)
+            || self.extent_dirty
+    }
+
+    /// Whether a reopened dataset's on-disk object header no longer describes
+    /// it.
+    ///
+    /// INVARIANT: every mutation of something `build_dataset_header` encodes
+    /// must show up here. Finalize keeps the original header when this is
+    /// false, so a change this misses is not deferred — it is discarded, with
+    /// no error to say so. Attributes were the case that proved it: they are
+    /// invisible to the chunk-write counters, so an attribute set on a
+    /// reopened dataset vanished at close.
+    fn header_stale(&self) -> bool {
+        self.storage_dirty() || self.header_dirty
+    }
 }
 
 /// Runtime metadata for a chunked dataset.
@@ -565,6 +620,90 @@ fn swmr_attr_error(name: &str) -> crate::io::IoError {
          value's heap storage could never be reclaimed; set attributes before \
          start_swmr (libhdf5 forbids attribute changes during SWMR writes too)"
     ))
+}
+
+/// Take an object's attributes into the append session, or refuse the reopen.
+///
+/// Append mode rebuilds every object header it touches out of the attributes
+/// read from it, so what this returns is what the object will still have when
+/// the session finalizes. An attribute set that could not be read whole —
+/// `ObjectAttributes::into_complete` refuses it — would come back as the part
+/// that did read, silently deleting the rest.
+///
+/// Left to surface at `finalize`, that failure would land after this session's
+/// chunk data and indices had already been written past the allocation point
+/// the superblock still records, leaving a file libhdf5 reads as truncated.
+/// Refusing the open leaves it untouched.
+///
+/// Size is no longer a reason to refuse: an attribute too large for a header
+/// message goes back out through dense storage, the form libhdf5 read it from.
+fn take_reopened_attributes(
+    attrs: crate::io::reader::ObjectAttributes,
+    owner: &str,
+) -> IoResult<Vec<AttributeEntry>> {
+    attrs.into_complete(owner)
+}
+
+/// The creation-order policy an on-disk object header declares — the single
+/// owner of the recovery rule, used for the root group, every reopened group
+/// and (through its attribute half) every reopened dataset.
+///
+/// The two halves come from two different places, and reading one for both is
+/// how a file that sets only one of them came back with both or neither:
+///
+///   * links — the `Link Info` message's flag bits, which is what
+///     `H5Pget_link_creation_order` reads (`H5G__get_create_plist`). A group
+///     with no such message (or one this crate cannot decode) tracks nothing;
+///     so does every dataset, which has no links to order.
+///   * attributes — the object header's own flag bits, which is what
+///     `H5Pget_attr_creation_order` reads (`H5Pocpl.c`). The `Attribute Info`
+///     message carries the same two bits, but the header is the authority
+///     libhdf5 consults, and it is present even when the object has no
+///     attributes yet.
+fn recover_track_order(
+    header: &crate::format::object_header::ObjectHeader,
+    ctx: &FormatContext,
+) -> TrackOrder {
+    let links = header
+        .messages
+        .iter()
+        .find(|m| m.msg_type == crate::format::messages::MSG_LINK_INFO)
+        .and_then(|m| LinkInfoMessage::decode(&m.data, ctx).ok())
+        .map(|(info, _)| info.creation_order())
+        .unwrap_or_default();
+    TrackOrder {
+        links,
+        attrs: header.attribute_creation_order(),
+    }
+}
+
+/// The dense storage an on-disk object header names: the fractal heap and the
+/// indices its `Attribute Info` and `Link Info` messages point at.
+///
+/// A rewrite of that header lays fresh storage out and stops naming this, so
+/// what this returns is exactly what the rewrite supersedes and must free.
+/// Compact storage names no heap and yields `None` — there is nothing to free
+/// and nothing that could be freed twice.
+fn superseded_dense(
+    header: &crate::format::object_header::ObjectHeader,
+    ctx: &FormatContext,
+) -> (Option<AttributeInfoMessage>, Option<LinkInfoMessage>) {
+    let decode = |msg_type: u8| {
+        header
+            .messages
+            .iter()
+            .find(|m| m.msg_type == msg_type)
+            .map(|m| m.data.as_slice())
+    };
+    let attrs = decode(crate::format::messages::MSG_ATTR_INFO)
+        .and_then(|d| AttributeInfoMessage::decode(d, ctx).ok())
+        .map(|(info, _)| info)
+        .filter(|info| info.is_dense());
+    let links = decode(crate::format::messages::MSG_LINK_INFO)
+        .and_then(|d| LinkInfoMessage::decode(d, ctx).ok())
+        .map(|(info, _)| info)
+        .filter(|info| info.is_dense());
+    (attrs, links)
 }
 
 /// One collection block with free space that a later vlen insert may
@@ -722,20 +861,26 @@ fn validate_chunk_geometry(dims: &[u64], max_dims: &[u64], chunk_dims: &[u64]) -
     Ok(())
 }
 
-/// An extensible-array index linearizes chunk coordinates, which requires
-/// every unlimited dimension to be dimension 0: any later dimension is a
-/// multiplier in the row-major index and must be finite. libhdf5 supports
-/// other positions by swizzling the unlimited dimension to the slowest one
-/// (H5Dearray.c), which this crate does not implement.
-fn ensure_unlimited_is_leading(max_dims: &[u64]) -> IoResult<()> {
-    for (d, &m) in max_dims.iter().enumerate().skip(1) {
-        if m == u64::MAX {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "unlimited dimension {d} is not the first: extensible-array \
-                 swizzling is not supported; reorder the dimensions so the \
-                 unlimited one comes first"
-            )));
-        }
+/// An extensible-array index requires at most one unlimited dimension —
+/// `H5D__chunk_construct` (H5Dchunk.c) only selects this index for exactly
+/// one — at any position: `chunk_grid::linear_index` seeds the unlimited
+/// dimension into the slot no down-chunks multiplier touches, the same
+/// address libhdf5 reaches by swizzling it to the slowest position
+/// (`H5VM_swizzle_coords`, H5Dearray.c). Two or more unlimited dimensions
+/// have no finite grid at all; that shape needs a v2 B-tree index instead.
+fn ensure_at_most_one_unlimited(max_dims: &[u64]) -> IoResult<()> {
+    let unlimited: Vec<usize> = max_dims
+        .iter()
+        .enumerate()
+        .filter(|&(_, &m)| m == u64::MAX)
+        .map(|(d, _)| d)
+        .collect();
+    if unlimited.len() > 1 {
+        return Err(crate::io::IoError::InvalidState(format!(
+            "an extensible-array index supports at most one unlimited dimension, \
+             but dimensions {unlimited:?} are all unlimited; a v2 B-tree index \
+             handles two or more"
+        )));
     }
     Ok(())
 }
@@ -822,7 +967,52 @@ pub struct GroupInfo {
     /// Soft-deleted: excluded from finalize output.
     pub deleted: bool,
     /// Attributes attached to this group (e.g. NeXus `NX_class`).
-    pub attributes: Vec<AttributeMessage>,
+    pub attributes: Vec<AttributeEntry>,
+    /// When the link naming this group was created, on the writer's single
+    /// monotonic sequence. Groups, datasets and hard links share it, so a
+    /// parent can order its links the way they were actually made.
+    pub creation_seq: u64,
+    /// How this group records creation order for its links and, separately,
+    /// for its attributes. Creation-order tracking is a property of the
+    /// object's creation property list in libhdf5, so it is captured here
+    /// when the group is created rather than read from the writer at
+    /// finalize: a later change of policy must not rewrite an object already
+    /// made.
+    pub track_order: TrackOrder,
+}
+
+/// One object's creation-order policy, with the two subsystems libhdf5 keeps
+/// apart kept apart here too.
+///
+/// `H5Pset_link_creation_order` and `H5Pset_attr_creation_order` are separate
+/// calls reading back out of separate places on disk — the Link Info message
+/// and the object header's own flag bits — and a file may set either alone.
+/// Carrying them as one flag made a reopen give a one-of-two file both or
+/// neither.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrackOrder {
+    /// Creation order of the links this group holds. Meaningless for a
+    /// dataset, which is why `DatasetInfo` keeps only the attribute half.
+    pub links: CreationOrder,
+    /// Creation order of the attributes attached to this object.
+    pub attrs: CreationOrder,
+}
+
+impl TrackOrder {
+    /// The policy the crate's single `track_order` knob selects: both
+    /// subsystems tracked *and* indexed, or neither — the pair h5py's
+    /// `File(track_order=True)` writes.
+    pub fn uniform(track: bool) -> Self {
+        let order = if track {
+            CreationOrder::Indexed
+        } else {
+            CreationOrder::Untracked
+        };
+        Self {
+            links: order,
+            attrs: order,
+        }
+    }
 }
 
 /// The object a [`HardLink`] resolves to.
@@ -848,6 +1038,811 @@ pub struct HardLink {
     pub name: String,
     /// Object this link resolves to.
     pub target: HardLinkTarget,
+    /// When this link was created; see [`GroupInfo::creation_seq`].
+    pub creation_seq: u64,
+}
+
+/// A link a reopened file already held that this writer cannot express.
+///
+/// Soft, external and user-defined links have no creation, retarget or delete
+/// operation here — only hard links do — so a header rewrite that emits what
+/// the registry models would erase them. Their encoded `Link` message rides
+/// along instead and is written back byte for byte, which preserves every
+/// field (name character set, creation order, the link value) without this
+/// writer having to model any of them.
+///
+/// A *hard* link is preserved the same way when the object it names is one
+/// the reopen could not model: writing the link back unchanged leaves that
+/// object's header exactly where it is, which is the only way the rewrite can
+/// keep what it cannot rebuild.
+#[derive(Clone)]
+pub struct PreservedLink {
+    /// Parent group index (`None` = the root group).
+    pub parent: Option<usize>,
+    /// Leaf name of the link within the parent group.
+    pub name: String,
+    /// The link's class, decoded once at collection so listings can report
+    /// it. Never the source of what gets written — `encoded` is.
+    pub class: crate::io::reader::LinkClass,
+    /// The encoded `Link` message body, exactly as read from the file.
+    pub encoded: Vec<u8>,
+    /// Why the object this link names could not be modelled, for the callers
+    /// that ask for it by name. `None` when the link's own class — not its
+    /// target — is what this writer cannot express.
+    pub reason: Option<String>,
+}
+
+/// Every link a reopen walk met, split by what the writer can do with it.
+/// A header rewrite emits both halves, so a link in neither half is a link
+/// the close would destroy.
+#[derive(Default)]
+struct CollectedLinks {
+    /// Hard links whose target the reopen modelled, with the plan that says
+    /// how to rebuild it.
+    hard: Vec<(HardEntry, CollectedObject)>,
+    /// Links written back unchanged: the class this writer cannot express,
+    /// and the hard links whose object it cannot model.
+    preserved: Vec<PreservedEntry>,
+}
+
+/// One hard link the reopen walk met: what it names, and the exact message
+/// that names it.
+#[derive(Clone)]
+struct HardEntry {
+    /// Full link path, in the no-leading-`/` form the registry uses.
+    path: String,
+    /// Object header address the link names.
+    address: u64,
+    /// The encoded `Link` message body, exactly as read from the file.
+    encoded: Vec<u8>,
+}
+
+/// A link the rewrite writes back exactly as it read it.
+struct PreservedEntry {
+    path: String,
+    class: crate::io::reader::LinkClass,
+    encoded: Vec<u8>,
+    /// Why the object it names could not be modelled; `None` when the link's
+    /// own class is what this writer cannot express.
+    reason: Option<String>,
+}
+
+/// What a reopen can do with one object it reached.
+///
+/// A header rewrite emits a modelled object out of the registry, so the
+/// registry may hold an object only when *every* message the model consumes
+/// decoded. A partial read is not a smaller object, it is a different one:
+/// before this rule a dataset whose datatype message did not decode was
+/// registered as a group, and the close rewrote its header as one.
+enum ObjectPlan {
+    /// A dataset the rewrite can rebuild.
+    Dataset(Box<DatasetParts>),
+    /// A group the rewrite can rebuild, and the links it holds.
+    Group(GroupParts),
+    /// An object this writer cannot model, and why. Its header is never
+    /// rewritten and never freed; the link naming it is written back byte for
+    /// byte, so the object stays exactly as the file already had it — what
+    /// libhdf5 does with the parts of a file it does not understand.
+    Preserve(String),
+}
+
+/// The messages a dataset's rewrite is built from, all decoded.
+struct DatasetParts {
+    /// Chunk-0 size: the block the rewrite supersedes and frees.
+    header_size: usize,
+    datatype: DatatypeMessage,
+    dataspace: crate::format::messages::dataspace::DataspaceMessage,
+    layout: crate::format::messages::data_layout::DataLayoutMessage,
+    filter_pipeline: Option<FilterPipeline>,
+    fill_value: Option<Vec<u8>>,
+    attributes: Vec<AttributeEntry>,
+    /// The creation-order policy the on-disk header declares; a rewrite that
+    /// read it from the writer instead would stamp this session's policy onto
+    /// an object libhdf5 created under another.
+    track_order: TrackOrder,
+    /// The dense storage the rewrite supersedes and must free.
+    dense: DenseCarry,
+}
+
+/// The same for a group, plus the links it holds — decoded once, with the
+/// bytes they came from, so the walk and the rewrite agree on its contents.
+struct GroupParts {
+    header_size: usize,
+    attributes: Vec<AttributeEntry>,
+    links: Vec<(crate::format::messages::link::LinkMessage, Vec<u8>)>,
+    track_order: TrackOrder,
+    dense: DenseCarry,
+}
+
+/// The dense storage one reopened object's header names, which the rewrite of
+/// that header stops naming and therefore has to free. Both halves are read
+/// back before this is built — a heap that could not be read makes the object
+/// [`ObjectPlan::Preserve`], so nothing here describes storage whose contents
+/// were lost.
+#[derive(Default)]
+struct DenseCarry {
+    attrs: Option<AttributeInfoMessage>,
+    links: Option<LinkInfoMessage>,
+}
+
+/// A modelled object, as the walk hands it to the registry rebuild. A group's
+/// links are not here: the walk followed them, and each child is an entry of
+/// its own.
+enum CollectedObject {
+    Dataset(Box<DatasetParts>),
+    Group {
+        header_size: usize,
+        attributes: Vec<AttributeEntry>,
+        track_order: TrackOrder,
+        dense: DenseCarry,
+    },
+}
+
+/// The reopen's discovery pass: one walk that classifies every object it
+/// reaches and descends into the groups among them.
+///
+/// Every object the close will touch is decided here and nowhere else, so
+/// "modelled or preserved" is a property of the walk rather than of whatever
+/// each later stage happened to be able to decode.
+struct ReopenWalk<'a> {
+    handle: &'a mut FileHandle,
+    meta: &'a crate::io::FileMeta,
+    /// End of the file, bounding each object-header read.
+    file_size: u64,
+    out: CollectedLinks,
+    /// Object headers already descended into, so hard-link cycles end.
+    visited: std::collections::HashSet<u64>,
+}
+
+impl<'a> ReopenWalk<'a> {
+    fn new(handle: &'a mut FileHandle, meta: &'a crate::io::FileMeta, file_size: u64) -> Self {
+        Self {
+            handle,
+            meta,
+            file_size,
+            out: CollectedLinks::default(),
+            visited: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Everything the walk found.
+    fn finish(self) -> CollectedLinks {
+        self.out
+    }
+
+    /// Decide what the reopen can do with the object at `addr`.
+    ///
+    /// The single gate: every object the rewrite touches is classified here,
+    /// and an object is modelled only when each message the model consumes
+    /// decoded. See [`ObjectPlan`] for why anything else must keep its bytes.
+    fn plan(&mut self, addr: u64) -> IoResult<ObjectPlan> {
+        let (handle, meta, file_size) = (&mut *self.handle, self.meta, self.file_size);
+        let ctx = &meta.ctx;
+        use crate::format::messages::data_layout::DataLayoutMessage;
+        use crate::format::messages::dataspace::DataspaceMessage;
+        use crate::format::messages::link::LinkMessage;
+        use crate::format::messages::link_info::LinkInfoMessage;
+        use crate::format::messages::shared::MSG_FLAG_SHARED;
+        use crate::format::messages::{
+            MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE, MSG_DATA_LAYOUT, MSG_FILL_VALUE,
+            MSG_FILTER_PIPELINE, MSG_LINK, MSG_LINK_INFO,
+        };
+
+        // Chunk 0 only, for its encoded size: that is the block the rewrite
+        // supersedes and frees.
+        let buf = handle.read_at_most(addr, file_size.saturating_sub(addr) as usize)?;
+        let header_size = match crate::format::object_header::ObjectHeader::decode_any(&buf) {
+            Ok((_, size)) => size,
+            Err(e) => {
+                return Ok(ObjectPlan::Preserve(format!(
+                    "its object header does not decode: {e}"
+                )))
+            }
+        };
+        // The messages, on the other hand, must come from the whole chain: a
+        // filter pipeline or an attribute that spilled into a continuation is
+        // one the rewrite would otherwise drop.
+        let header = match crate::io::object_header_io::read_object_header_full(handle, meta, addr)
+        {
+            Ok(h) => h,
+            Err(e) => {
+                return Ok(ObjectPlan::Preserve(format!(
+                    "its object header chain does not read: {e}"
+                )))
+            }
+        };
+
+        // The policy and the storage the header declares, read once from the
+        // whole chain: both are properties of the object, not of any one
+        // message the loop below happens to reach.
+        let track_order = recover_track_order(&header, ctx);
+        let (dense_attrs, dense_links) = superseded_dense(&header, ctx);
+
+        // Attributes come from the reader's collector rather than from the
+        // loop below, so compact, dense and shared attributes all reach the
+        // rewrite by the one path that knows how to read each of them. An
+        // object whose set did not read whole is preserved: a short set here
+        // would be a rewrite deleting the attributes it could not read.
+        let attributes = match take_reopened_attributes(
+            crate::io::reader::collect_object_attributes(handle, ctx, &header),
+            &format!("the object at {addr:#x}"),
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                return Ok(ObjectPlan::Preserve(format!(
+                    "its attributes do not read back whole: {e}"
+                )))
+            }
+        };
+
+        let mut datatype = None;
+        let mut dataspace = None;
+        let mut layout = None;
+        let mut filter_pipeline = None;
+        let mut fill_value = None;
+        let mut links = Vec::new();
+        // A datatype, dataspace or layout message says the object is not a
+        // group, whether or not the three a dataset needs are all there.
+        let mut dataset_shaped = false;
+
+        for msg in &header.messages {
+            let consumed = matches!(
+                msg.msg_type,
+                MSG_DATATYPE
+                    | MSG_DATASPACE
+                    | MSG_DATA_LAYOUT
+                    | MSG_FILTER_PIPELINE
+                    | MSG_FILL_VALUE
+                    | MSG_ATTRIBUTE
+                    | MSG_LINK
+                    | MSG_LINK_INFO
+            );
+            // A shared message holds a reference to where its body lives, not
+            // the body. Decoding those bytes as one does not fail loudly — the
+            // reference's version byte reads as a version and a class of its
+            // own — so the guard is the only thing between a shared datatype
+            // and a rewrite that invents a type for it.
+            if consumed && msg.flags & MSG_FLAG_SHARED != 0 {
+                return Ok(ObjectPlan::Preserve(format!(
+                    "its message of type {:#04x} is a shared-message reference, which this \
+                     writer does not resolve",
+                    msg.msg_type
+                )));
+            }
+            macro_rules! consume {
+                ($decode:expr, $what:literal) => {
+                    match $decode {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return Ok(ObjectPlan::Preserve(format!(
+                                "its {} message does not decode: {e}",
+                                $what
+                            )))
+                        }
+                    }
+                };
+            }
+            match msg.msg_type {
+                MSG_DATATYPE => {
+                    dataset_shaped = true;
+                    let (dt, _) = consume!(DatatypeMessage::decode(&msg.data, ctx), "datatype");
+                    datatype = Some(dt);
+                }
+                MSG_DATASPACE => {
+                    dataset_shaped = true;
+                    let (ds, _) = consume!(DataspaceMessage::decode(&msg.data, ctx), "dataspace");
+                    dataspace = Some(ds);
+                }
+                MSG_DATA_LAYOUT => {
+                    dataset_shaped = true;
+                    let (dl, _) =
+                        consume!(DataLayoutMessage::decode(&msg.data, ctx), "data layout");
+                    layout = Some(dl);
+                }
+                MSG_FILTER_PIPELINE => {
+                    let (p, _) = consume!(FilterPipeline::decode(&msg.data), "filter pipeline");
+                    if !p.filters.is_empty() {
+                        filter_pipeline = Some(p);
+                    }
+                }
+                MSG_FILL_VALUE => {
+                    let (fv, _) = consume!(FillValueMessage::decode(&msg.data), "fill value");
+                    if fv.fill_defined == 2 {
+                        fill_value = fv.fill_value;
+                    }
+                }
+                MSG_LINK => {
+                    let (l, _) = consume!(LinkMessage::decode(&msg.data, ctx), "link");
+                    links.push((l, msg.data.clone()));
+                }
+                MSG_LINK_INFO => {
+                    let (li, _) = consume!(LinkInfoMessage::decode(&msg.data, ctx), "link info");
+                    // Once a group holds enough links libhdf5 moves them into
+                    // the fractal heap this message names and writes no `Link`
+                    // messages at all. Reading them back is what makes the
+                    // rewrite emit the group with its children; a rewrite from
+                    // the header messages alone emitted it empty, orphaning
+                    // every object below it.
+                    if li.fractal_heap_address != UNDEF_ADDR {
+                        let dense = match crate::io::reader::Hdf5Reader::read_dense_links(
+                            handle,
+                            ctx,
+                            li.fractal_heap_address,
+                        ) {
+                            Ok(l) => l,
+                            Err(e) => {
+                                return Ok(ObjectPlan::Preserve(format!(
+                                    "its dense link storage does not read: {e}"
+                                )))
+                            }
+                        };
+                        // Re-encoded rather than carried as bytes: a heap
+                        // object is not a header message, so there are no
+                        // message bytes to carry. The encoding round-trips
+                        // through the same decoder that just read it.
+                        links.extend(dense.into_iter().map(|l| {
+                            let bytes = l.encode(ctx);
+                            (l, bytes)
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        match (datatype, dataspace, layout) {
+            (Some(datatype), Some(dataspace), Some(layout)) => {
+                Ok(ObjectPlan::Dataset(Box::new(DatasetParts {
+                    header_size,
+                    datatype,
+                    dataspace,
+                    layout,
+                    filter_pipeline,
+                    fill_value,
+                    attributes,
+                    track_order,
+                    dense: DenseCarry {
+                        attrs: dense_attrs,
+                        links: dense_links,
+                    },
+                })))
+            }
+            // A committed (named) datatype has a datatype message and neither
+            // of the other two; so does a dataset whose header this crate only
+            // half understands. Neither is a group, and modelling either as
+            // one is what rewrote them into empty groups.
+            _ if dataset_shaped => Ok(ObjectPlan::Preserve(
+                "it carries a datatype, dataspace or layout message but not the three a \
+                 dataset is built from; this writer models only groups and datasets"
+                    .into(),
+            )),
+            _ => Ok(ObjectPlan::Group(GroupParts {
+                header_size,
+                attributes,
+                links,
+                track_order,
+                dense: DenseCarry {
+                    attrs: dense_attrs,
+                    links: dense_links,
+                },
+            })),
+        }
+    }
+
+    /// Walk `links` (one group's, already decoded), classifying every object
+    /// they name and descending into the groups among them.
+    fn group(
+        &mut self,
+        links: &[(crate::format::messages::link::LinkMessage, Vec<u8>)],
+        prefix: &str,
+        depth: usize,
+    ) -> IoResult<()> {
+        // Bound nesting depth so a pathologically deep group chain cannot
+        // overflow the stack (the `visited` set bounds total work but not
+        // recursion depth).
+        if depth > 256 {
+            return Ok(());
+        }
+        use crate::format::messages::link::LinkTarget;
+        for (link, encoded) in links {
+            let full_name = if prefix.is_empty() {
+                link.name.clone()
+            } else {
+                format!("{}/{}", prefix, link.name)
+            };
+
+            // Only a hard link names an object this writer can rebuild. Every
+            // other class is kept by its bytes, because a close that emitted
+            // only what the registry models would drop it from the file.
+            let LinkTarget::Hard { address } = &link.target else {
+                self.out.preserved.push(PreservedEntry {
+                    path: full_name,
+                    class: crate::io::reader::LinkClass::from_target(&link.target),
+                    encoded: encoded.clone(),
+                    reason: None,
+                });
+                continue;
+            };
+            let entry = HardEntry {
+                path: full_name.clone(),
+                address: *address,
+                encoded: encoded.clone(),
+            };
+
+            match self.plan(*address)? {
+                // Kept by its bytes, exactly as a link class this writer
+                // cannot express is: writing the link back unchanged is what
+                // leaves the object's header where the file already has it.
+                ObjectPlan::Preserve(reason) => self.out.preserved.push(PreservedEntry {
+                    path: full_name,
+                    class: crate::io::reader::LinkClass::Hard,
+                    encoded: entry.encoded,
+                    reason: Some(reason),
+                }),
+                ObjectPlan::Dataset(parts) => {
+                    self.out.hard.push((entry, CollectedObject::Dataset(parts)));
+                }
+                ObjectPlan::Group(parts) => {
+                    self.out.hard.push((
+                        entry,
+                        CollectedObject::Group {
+                            header_size: parts.header_size,
+                            attributes: parts.attributes,
+                            track_order: parts.track_order,
+                            dense: parts.dense,
+                        },
+                    ));
+                    // Recurse only into a group's header we have not entered
+                    // before — breaks hard-link cycles.
+                    if self.visited.insert(*address) {
+                        self.group(&parts.links, &full_name, depth + 1)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Rebuild one reopened dataset's in-memory registry entry, storage and
+/// all, from the header messages the walk decoded.
+///
+/// Fails when the chunk index the file names does not read back. The
+/// caller answers that by preserving the object rather than registering
+/// a dataset whose index has forgotten where its chunks are: the close
+/// rewrites what the registry holds, so an index rebuilt from the part of
+/// it that decoded would strand every chunk it could not read.
+fn rebuild_dataset(
+    handle: &mut FileHandle,
+    ctx: &FormatContext,
+    name: String,
+    obj_addr: u64,
+    parts: DatasetParts,
+) -> IoResult<DatasetInfo> {
+    let DatasetParts {
+        header_size: ds_header_size,
+        datatype: dt,
+        dataspace: ds,
+        layout: dl,
+        filter_pipeline: fp,
+        fill_value,
+        attributes: attrs,
+        track_order,
+        dense: _,
+    } = parts;
+
+    let mut info = DatasetInfo {
+        name,
+        datatype: dt,
+        dataspace: ds,
+        obj_header_addr: obj_addr,
+        data_addr: UNDEF_ADDR,
+        data_size: 0,
+        chunked: None,
+        fixed_array: None,
+        btree_v2: None,
+        append: None,
+        attributes: attrs,
+        obj_header_written_addr: Some(obj_addr),
+        obj_header_encoded_size: ds_header_size,
+        filter_pipeline: fp,
+        deleted: false,
+        extent_dirty: false,
+        header_dirty: false,
+        // Stamped by the caller, which knows the order the walk met each
+        // object; the rebuild sees one dataset at a time.
+        creation_seq: 0,
+        track_attr_order: track_order.attrs,
+        fill_value,
+        // Preserve the on-disk layout version so finalize re-encodes
+        // what it read: a v5 file reopened and appended to must not be
+        // silently downgraded to v4 (the filtered indexes keep their
+        // 8-byte size fields, which v4 readers would mis-derive).
+        layout_version: match &dl {
+            DataLayoutMessage::ChunkedV4 { version, .. } => *version,
+            _ => 4,
+        },
+    };
+
+    // Reconstruct storage-specific metadata
+    match &dl {
+        DataLayoutMessage::Contiguous { address, size } => {
+            info.data_addr = *address;
+            info.data_size = *size;
+        }
+        DataLayoutMessage::ChunkedV4 {
+            chunk_dims,
+            index_address,
+            index_type,
+            earray_params,
+            ..
+        } => {
+            let real_chunk_dims: Vec<u64> = chunk_dims[..chunk_dims.len() - 1].to_vec();
+
+            if *index_type == crate::format::messages::data_layout::ChunkIndexType::ExtensibleArray
+            {
+                if let Some(params) = earray_params {
+                    let ep = EarrayParams {
+                        max_nelmts_bits: params.max_nelmts_bits,
+                        idx_blk_elmts: params.idx_blk_elmts,
+                        sup_blk_min_data_ptrs: params.sup_blk_min_data_ptrs,
+                        data_blk_min_elmts: params.data_blk_min_elmts,
+                        max_dblk_page_nelmts_bits: params.max_dblk_page_nelmts_bits,
+                    };
+                    let ndblk_addrs = compute_ndblk_addrs(ep.sup_blk_min_data_ptrs)?;
+                    let nsblk_addrs = compute_nsblk_addrs(
+                        ep.idx_blk_elmts,
+                        ep.data_blk_min_elmts,
+                        ep.sup_blk_min_data_ptrs,
+                        ep.max_nelmts_bits,
+                    )?;
+
+                    // Read EA header
+                    let hdr_buf = handle.read_at_most(*index_address, 256)?;
+                    let ea_header = ExtensibleArrayHeader::decode(&hdr_buf, ctx)?;
+
+                    let is_filtered = ea_header.class_id
+                        == crate::format::chunk_index::extensible_array::EA_CLS_FILT_CHUNK;
+                    let chunk_size_len = if is_filtered {
+                        ea_header.raw_elmt_size - ctx.sizeof_addr - 4
+                    } else {
+                        0
+                    };
+
+                    // Read the EA index block. Filtered datasets
+                    // store a `FilteredIndexBlock`; unfiltered ones a
+                    // plain `ExtensibleArrayIndexBlock`. Both must be
+                    // reconstructed so a reopened dataset can append
+                    // (write_chunk consults whichever applies).
+                    let ea_iblk_addr = ea_header.idx_blk_addr;
+                    let (ea_iblk, filt_iblk) = if is_filtered {
+                        let placeholder = ExtensibleArrayIndexBlock::new(
+                            *index_address,
+                            ep.idx_blk_elmts,
+                            ndblk_addrs,
+                            nsblk_addrs,
+                        );
+                        let fib = if ea_iblk_addr != UNDEF_ADDR {
+                            let iblk_buf = handle.read_at_most(ea_iblk_addr, 65536)?;
+                            FilteredIndexBlock::decode(
+                                &iblk_buf,
+                                ctx,
+                                ep.idx_blk_elmts as usize,
+                                ndblk_addrs,
+                                nsblk_addrs,
+                                chunk_size_len,
+                            )?
+                        } else {
+                            FilteredIndexBlock::new(
+                                *index_address,
+                                ep.idx_blk_elmts,
+                                ndblk_addrs,
+                                nsblk_addrs,
+                            )
+                        };
+                        (placeholder, Some(fib))
+                    } else {
+                        let eib = if ea_iblk_addr != UNDEF_ADDR {
+                            let iblk_buf = handle.read_at_most(ea_iblk_addr, 65536)?;
+                            ExtensibleArrayIndexBlock::decode(
+                                &iblk_buf,
+                                ctx,
+                                ep.idx_blk_elmts as usize,
+                                ndblk_addrs,
+                                nsblk_addrs,
+                            )?
+                        } else {
+                            ExtensibleArrayIndexBlock::new(
+                                *index_address,
+                                ep.idx_blk_elmts,
+                                ndblk_addrs,
+                                nsblk_addrs,
+                            )
+                        };
+                        (eib, None)
+                    };
+
+                    let max_dims = info
+                        .dataspace
+                        .max_dims
+                        .clone()
+                        .unwrap_or_else(|| info.dataspace.dims.clone());
+
+                    info.chunked = Some(ChunkedDatasetInfo {
+                        chunk_dims: real_chunk_dims,
+                        max_dims,
+                        earray_params: ep,
+                        ea_header_addr: *index_address,
+                        ea_iblk_addr,
+                        ndblk_addrs,
+                        ea_header,
+                        ea_iblk,
+                        chunks_written: 0,
+                        filt_iblk,
+                        chunk_size_len,
+                    });
+                }
+            } else if *index_type
+                == crate::format::messages::data_layout::ChunkIndexType::FixedArray
+            {
+                // Read the FA header and data block back so a
+                // reopened dataset is writable and deletable, not
+                // re-link only — a placeholder made a delete free
+                // just the header and leak every chunk plus the
+                // index. Paged data blocks (any FA with more than
+                // dblk_page_nelmts chunks, libhdf5 default 1024)
+                // reconstruct through the same decode owner; only
+                // pages the bitmap marks initialized are decoded.
+                let hdr_buf = handle.read_at_most(*index_address, 256)?;
+                let fa_header = FixedArrayHeader::decode(&hdr_buf, ctx)?;
+                let is_filtered = fa_header.client_id == FA_CLIENT_FILT_CHUNK;
+                let chunk_size_len = if is_filtered {
+                    (fa_header.element_size as usize)
+                        .checked_sub(ctx.sizeof_addr as usize + 4)
+                        .ok_or_else(|| {
+                            crate::io::IoError::InvalidState(
+                                "fixed array filtered element_size too small".into(),
+                            )
+                        })?
+                } else {
+                    0
+                };
+                if fa_header.data_blk_addr != UNDEF_ADDR && chunk_size_len <= 8 {
+                    let dblk_size = fixed_array_dblk_disk_size(ctx, &fa_header) as usize;
+                    let dblk_buf = handle.read_at_most(fa_header.data_blk_addr, dblk_size)?;
+                    let fa_dblk =
+                        decode_fixed_array_dblk(ctx, &fa_header, &dblk_buf, chunk_size_len)?;
+                    info.fixed_array = Some(FixedArrayDatasetInfo {
+                        chunk_dims: real_chunk_dims,
+                        fa_header_addr: *index_address,
+                        fa_dblk_addr: fa_header.data_blk_addr,
+                        fa_header,
+                        fa_dblk,
+                        // Chunks written this session, matching the
+                        // EA reconstruction above.
+                        chunks_written: 0,
+                    });
+                }
+            } else if *index_type == crate::format::messages::data_layout::ChunkIndexType::BTreeV2 {
+                use crate::format::chunk_index::btree_v2::{
+                    Bt2Geometry, Bt2Header, BT2_TYPE_CHUNK_FILT, BT2_TYPE_CHUNK_UNFILT,
+                };
+
+                // Walk the tree back into the in-memory index and
+                // adopt its node blocks as the flush pool. The pool
+                // re-serializes at the header's node_size, whatever
+                // it is — libhdf5 sizes every node from
+                // hdr->node_size (H5B2leaf.c, H5B2internal.c) — so
+                // a foreign size reopens too. Only a record type
+                // that is not a chunk record, or a node size below
+                // the bulk loader's few-records-per-node floor
+                // (the same bound creation enforces), stays
+                // re-link only.
+                let hdr_buf = handle.read_at_most(*index_address, 256)?;
+                let bt2_hdr = Bt2Header::decode(&hdr_buf, ctx)?;
+                let ndims = real_chunk_dims.len();
+                let is_filt = match bt2_hdr.record_type {
+                    BT2_TYPE_CHUNK_UNFILT => Some(false),
+                    BT2_TYPE_CHUNK_FILT => Some(true),
+                    _ => None,
+                };
+                if let (Some(is_filt), true) = (
+                    is_filt,
+                    bt2_hdr.node_size as usize >= 10 + 3 * bt2_hdr.record_size as usize,
+                ) {
+                    let mut index = if is_filt {
+                        let csl = (bt2_hdr.record_size as usize)
+                            .checked_sub(ctx.sizeof_addr as usize + 4 + ndims * 8)
+                            .filter(|&c| c <= 8)
+                            .ok_or_else(|| {
+                                crate::io::IoError::InvalidState(
+                                    "v2 B-tree filtered record size does not fit \
+                                     its rank and address width"
+                                        .into(),
+                                )
+                            })?;
+                        Bt2ChunkIndex::new_filtered(ndims, csl as u8)
+                    } else {
+                        Bt2ChunkIndex::new_unfiltered(ndims)
+                    };
+                    // Re-serialize with the creator's parameters:
+                    // node blocks keep their size and the rewritten
+                    // header keeps its declared split/merge.
+                    index.node_size = bt2_hdr.node_size;
+                    index.split_percent = bt2_hdr.split_percent;
+                    index.merge_percent = bt2_hdr.merge_percent;
+                    let mut node_addrs = Vec::new();
+                    if bt2_hdr.root_node_addr != UNDEF_ADDR && bt2_hdr.total_num_records > 0 {
+                        let geo = Bt2Geometry::new(
+                            bt2_hdr.node_size,
+                            bt2_hdr.record_size,
+                            bt2_hdr.depth,
+                            ctx.sizeof_addr,
+                        );
+                        let mut record_bytes = Vec::new();
+                        collect_bt2_nodes(
+                            handle,
+                            ctx,
+                            bt2_hdr.root_node_addr,
+                            bt2_hdr.depth,
+                            bt2_hdr.num_records_in_root,
+                            bt2_hdr.record_size,
+                            bt2_hdr.node_size,
+                            &geo,
+                            &mut record_bytes,
+                            &mut node_addrs,
+                        )?;
+                        let total = if bt2_hdr.record_size > 0 {
+                            record_bytes.len() / bt2_hdr.record_size as usize
+                        } else {
+                            0
+                        };
+                        if is_filt {
+                            for r in Bt2ChunkIndex::decode_filtered_records(
+                                &record_bytes,
+                                total,
+                                ndims,
+                                bt2_hdr.record_size,
+                                ctx,
+                            )? {
+                                index.insert_filtered(
+                                    r.scaled_offsets,
+                                    r.chunk_address,
+                                    r.chunk_size,
+                                    r.filter_mask,
+                                );
+                            }
+                        } else {
+                            for r in Bt2ChunkIndex::decode_unfiltered_records(
+                                &record_bytes,
+                                total,
+                                ndims,
+                                ctx,
+                            )? {
+                                index.insert(r.scaled_offsets, r.chunk_address);
+                            }
+                        }
+                    }
+                    let max_dims = info
+                        .dataspace
+                        .max_dims
+                        .clone()
+                        .unwrap_or_else(|| info.dataspace.dims.clone());
+                    info.btree_v2 = Some(Bt2DatasetInfo {
+                        chunk_dims: real_chunk_dims,
+                        max_dims,
+                        bt2_header_addr: *index_address,
+                        node_addrs,
+                        index,
+                        chunks_written: 0,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(info)
 }
 
 /// Encode an Object Reference Count message (type 0x16) body: a version
@@ -882,8 +1877,12 @@ pub struct Hdf5Writer {
     /// User-created hard links (additional names for existing objects),
     /// resolved and emitted during finalize.
     pub(crate) hard_links: Slot<Vec<HardLink>>,
+    /// Links a reopened file held that this writer cannot express, carried
+    /// through every header rewrite by their encoded bytes. Always empty for
+    /// a freshly created file; see [`PreservedLink`].
+    pub(crate) preserved_links: Slot<Vec<PreservedLink>>,
     /// Attributes attached to the root group (file-level attributes).
-    pub(crate) root_attributes: Slot<Vec<crate::format::messages::attribute::AttributeMessage>>,
+    pub(crate) root_attributes: Slot<Vec<crate::format::messages::attribute::AttributeEntry>>,
     /// Serializes object creation so name-uniqueness check and registry insert
     /// happen atomically.
     ///
@@ -897,14 +1896,15 @@ pub struct Hdf5Writer {
     /// outermost lock a create acquires (create_lock → spine → slot), and no
     /// write path takes it, so it cannot deadlock with the registry locks.
     pub(crate) create_lock: Slot<()>,
-    /// Target the libhdf5 2.0 file format (`H5Pset_libver_bounds` with low
-    /// bound `H5F_LIBVER_V200`): filtered chunked datasets created while
-    /// this is set get layout message version 5, whose chunk indexes encode
-    /// stored chunk sizes in a fixed `sizeof_size` field, so an expanding
-    /// filter cannot overflow the size field. Off by default — version-5
-    /// files are rejected by libhdf5 before 2.0, including the 1.14-based
-    /// h5py wheels.
-    libver_latest: bool,
+    /// The file's low `H5Pset_libver_bounds` bound: the oldest libhdf5 a
+    /// file this writer creates must stay readable by. It is the one switch
+    /// the version-bearing messages read — the datatype message version
+    /// (`H5O_dtype_ver_bounds`) and, at `V200`, layout version 5 for filtered
+    /// chunked datasets, whose chunk indexes encode stored chunk sizes in a
+    /// fixed `sizeof_size` field so an expanding filter cannot overflow it.
+    /// `Earliest` by default — version-5 files are rejected by libhdf5 before
+    /// 2.0, including the 1.14-based h5py wheels.
+    libver: LibverBound,
     closed: bool,
     /// Set once `finalize_for_swmr` has published a readable file.
     ///
@@ -933,7 +1933,111 @@ pub struct Hdf5Writer {
     /// The on-disk root header block a reopen found, `(addr, len)`, so
     /// finalize can free the block its rewrite supersedes.
     superseded_root_header: Option<(u64, u64)>,
+    /// Superblock version this file starts from — the lowest one it may be
+    /// written with. [`superblock_version_for`](Self::superblock_version_for)
+    /// raises it to what the content needs.
+    superblock_version_base: u8,
+    /// Objects whose attributes this finalize spilled to dense storage, and
+    /// the `Attribute Info` message naming what was written for each.
+    ///
+    /// INVARIANT: an entry exists here only after every block of that
+    /// object's heap and name index is on disk, and only
+    /// [`prepare_dense_attributes`](Self::prepare_dense_attributes) may add
+    /// one. `emit_attributes` reads it and never builds — a header is sized
+    /// and then written by two separate `build_*_header` calls, so a build
+    /// that allocated would allocate twice and leave the sized-for blocks
+    /// stranded.
+    dense_attributes: Slot<HashMap<AttrScope, AttributeInfoMessage>>,
+    /// Groups whose links this finalize spilled to dense storage, and the
+    /// `Link Info` message naming what was written for each.
+    ///
+    /// INVARIANT: an entry exists here only after every block of that group's
+    /// heap and name index is on disk, and only
+    /// [`prepare_dense_links`](Self::prepare_dense_links) may add one.
+    dense_links: Slot<HashMap<LinkScope, LinkInfoMessage>>,
+    /// The dense storage the reopened object headers already name — the heaps
+    /// and indices this session's rewrites and deletes supersede.
+    ///
+    /// `None` for a file this session created: every block such a file will
+    /// hold was allocated here, so there is nothing on disk to supersede and
+    /// nothing to allocate for the bookkeeping either.
+    ///
+    /// INVARIANT: every entry is freed exactly once, by
+    /// [`release_superseded_dense_attrs`](Self::release_superseded_dense_attrs)
+    /// or [`release_superseded_dense_links`](Self::release_superseded_dense_links),
+    /// which remove it as they free. Nothing else may remove one: an entry
+    /// that leaves without reaching the allocator is a leaked heap, and one
+    /// that reaches it twice hands the same blocks to two objects.
+    superseded_dense: Slot<Option<Box<SupersededDense>>>,
+    /// The creation-order policy in force: whether an object created from
+    /// now on records creation order for its links and its attributes. The
+    /// h5py `track_order` analogue; see
+    /// [`set_track_order`](Self::set_track_order). Each object captures this
+    /// at creation, so changing it never rewrites an object already made.
+    track_order: TrackOrder,
+    /// The root group's own captured policy. The root is created with the
+    /// file, so its value comes from
+    /// [`create_with_options`](Self::create_with_options) — or, on reopen,
+    /// from the header already on disk.
+    root_track_order: TrackOrder,
+    /// Hands out the creation sequence numbers that order a group's links.
+    next_creation_seq: Slot<u64>,
+    /// Object-reference elements waiting for their target's object header
+    /// address, which only exists once finalize has placed every header.
+    pending_object_references: Slot<Vec<PendingObjectReference>>,
 }
+
+/// One object-reference element written before its value could be known.
+///
+/// An `H5R_OBJECT1` element is the target's object header address, and
+/// addresses are assigned during finalize, so a write records the target by
+/// path here and [`Hdf5Writer::apply_object_reference_fixups`] stamps the
+/// address in once every header has one.
+pub(crate) struct PendingObjectReference {
+    /// Dataset holding the element.
+    dataset: usize,
+    /// Element index within that dataset.
+    element: u64,
+    /// Path of the object the element names; `/` is the root group.
+    target: String,
+}
+
+/// What a reopen found already on disk in dense form, by the scope whose
+/// header names it.
+///
+/// Both halves together because they are found together — one walk of the
+/// reopened headers fills both — and released together only in the delete
+/// path; a finalize supersedes attribute storage before it lays object
+/// headers out and link storage after, so each half has its own owner.
+#[derive(Debug, Default)]
+struct SupersededDense {
+    attrs: HashMap<AttrScope, AttributeInfoMessage>,
+    links: HashMap<LinkScope, LinkInfoMessage>,
+}
+
+/// Which object's attribute list a prepared dense layout belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum AttrScope {
+    Root,
+    Group(usize),
+    Dataset(usize),
+}
+
+/// Which group's link list a prepared dense layout belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum LinkScope {
+    Root,
+    Group(usize),
+}
+
+/// Attributes an object header keeps before libhdf5 spills the whole set to
+/// dense storage (`H5O_CRT_ATTR_MAX_COMPACT_DEF`).
+const MAX_COMPACT_ATTRS: usize = 8;
+
+/// Links a group header keeps before libhdf5 spills the whole set to dense
+/// storage (`H5G_CRT_GINFO_MAX_COMPACT`). This writer emits no phase-change
+/// values in the Group Info message, so the default is what applies.
+const MAX_COMPACT_LINKS: usize = 8;
 
 impl Hdf5Writer {
     /// Create a new HDF5 file at `path` using the env-var-derived locking
@@ -953,24 +2057,28 @@ impl Hdf5Writer {
         path: &Path,
         locking: crate::io::locking::FileLocking,
     ) -> IoResult<Self> {
+        Self::create_with_options(path, locking, false)
+    }
+
+    /// Create a new HDF5 file at `path` with an explicit locking policy and
+    /// creation-order policy.
+    ///
+    /// `track_order` is the policy the root group is created under and the
+    /// default for every object created afterwards; see
+    /// [`set_track_order`](Self::set_track_order).
+    pub fn create_with_options(
+        path: &Path,
+        locking: crate::io::locking::FileLocking,
+        track_order: bool,
+    ) -> IoResult<Self> {
         let handle = FileHandle::create_with_locking(path, locking)?;
         let ctx = FormatContext::default_v3();
 
-        // Reserve space for the superblock. We compute the size from a dummy
-        // instance so that we stay in sync with the encoder.
-        let sb_size = (SuperblockV2V3 {
-            version: SUPERBLOCK_V3,
-            sizeof_offsets: ctx.sizeof_addr,
-            sizeof_lengths: ctx.sizeof_size,
-            file_consistency_flags: 0,
-            base_address: 0,
-            superblock_extension_address: UNDEF_ADDR,
-            end_of_file_address: 0,
-            root_group_object_header_address: 0,
-        })
-        .encoded_size() as u64;
-
-        let allocator = FileAllocator::new(sb_size);
+        // Reserve the superblock at offset 0. Which version it gets is only
+        // known once the file's content is (see `superblock_version_for`),
+        // but versions 2 and 3 encode to the same size, so the reservation
+        // does not have to wait for that choice.
+        let allocator = FileAllocator::new(SuperblockV2V3::size_for(ctx.sizeof_addr) as u64);
 
         Ok(Self {
             handle,
@@ -979,15 +2087,27 @@ impl Hdf5Writer {
             datasets: Slot::new(Vec::new()),
             groups: Slot::new(Vec::new()),
             hard_links: Slot::new(Vec::new()),
+            preserved_links: Slot::new(Vec::new()),
             root_attributes: Slot::new(Vec::new()),
             create_lock: Slot::new(()),
-            libver_latest: false,
+            libver: LibverBound::Earliest,
             closed: false,
             swmr_active: false,
             cwfs: Slot::new(Vec::new()),
             root_group_addr: None,
             root_group_encoded_size: 0,
             superseded_root_header: None,
+            // A new file starts at the oldest superblock this writer's own
+            // structures allow, and finalize raises it if the content needs
+            // a newer one.
+            superblock_version_base: SUPERBLOCK_V2,
+            dense_attributes: Slot::new(HashMap::new()),
+            dense_links: Slot::new(HashMap::new()),
+            superseded_dense: Slot::new(None),
+            track_order: TrackOrder::uniform(track_order),
+            root_track_order: TrackOrder::uniform(track_order),
+            next_creation_seq: Slot::new(0),
+            pending_object_references: Slot::new(Vec::new()),
         })
     }
 
@@ -998,7 +2118,37 @@ impl Hdf5Writer {
     /// default, because readers older than libhdf5 2.0 — including the
     /// 1.14-based h5py wheels — reject version 5.
     pub fn set_libver_latest(&mut self, latest: bool) {
-        self.libver_latest = latest;
+        self.set_libver_bound(if latest {
+            LibverBound::V200
+        } else {
+            LibverBound::Earliest
+        });
+    }
+
+    /// Set the file's low libver bound, the equivalent of
+    /// `H5Pset_libver_bounds`'s `low` argument. Objects created after this
+    /// call encode their messages at the versions that bound calls for.
+    pub fn set_libver_bound(&mut self, libver: LibverBound) {
+        self.libver = libver;
+    }
+
+    /// The file's low libver bound.
+    pub fn libver(&self) -> LibverBound {
+        self.libver
+    }
+
+    /// Track and index creation order for the links and the attributes of
+    /// every object created after this call — the equivalent of setting
+    /// `H5Pset_link_creation_order` and `H5Pset_attr_creation_order` to
+    /// `H5P_CRT_ORDER_TRACKED | H5P_CRT_ORDER_INDEXED` on the creation
+    /// property lists those objects are made with.
+    ///
+    /// Objects already created keep the policy they were made under, exactly
+    /// as libhdf5 keeps what their creation property list said. The root
+    /// group is created with the file, so its policy comes from
+    /// [`create_with_options`](Self::create_with_options) instead.
+    pub fn set_track_order(&mut self, track: bool) {
+        self.track_order = TrackOrder::uniform(track);
     }
 
     /// Layout message version for a new chunked dataset — the
@@ -1008,7 +2158,7 @@ impl Hdf5Writer {
     /// when the file targets the 2.0 format; everything else stays at
     /// version 4, which every 1.10+ reader accepts.
     fn chunk_layout_version(&self, filtered: bool, chunk_bytes: u64) -> u8 {
-        if chunk_bytes > u32::MAX as u64 || (filtered && self.libver_latest) {
+        if chunk_bytes > u32::MAX as u64 || (filtered && self.libver == LibverBound::V200) {
             5
         } else {
             4
@@ -1072,8 +2222,60 @@ impl Hdf5Writer {
         // entry every creator passes — keeps alias forms out of the
         // registry.
         let name = self.canonical_dataset_path(name);
+        // A path that leaves this file, or that runs into an object the
+        // reopen kept verbatim, is refused here rather than at each creator:
+        // this is the one gate every creation passes, so a creator added
+        // later cannot forget the check. Both run before the parent lookup,
+        // which would otherwise report the group such a path names as absent
+        // instead of naming what stops the path. Uniqueness comes first among
+        // them: a name already in the file is taken whatever holds it.
+        self.reject_external_traversal(&name)?;
         self.ensure_unique_dataset_name(&name)?;
-        Ok(CreateGuard { _gate: gate, name })
+        self.reject_preserved_object(&name)?;
+        let (parent, _leaf) = self.split_parent(&name)?;
+        Ok(CreateGuard {
+            _gate: gate,
+            name,
+            parent,
+        })
+    }
+
+    /// Split an object path into the group that will hold its link and the
+    /// leaf link name, resolving every component through the group registry.
+    ///
+    /// `path` is the registry form — no leading `/`, e.g. `"grp/sub/late"`.
+    /// This is what keeps a `/` out of a link name: HDF5 link names are
+    /// single path components (`H5G_traverse` splits on `/` before it ever
+    /// reaches `H5L_link`), so a name that carries a path must name a group
+    /// that exists, or be refused.
+    ///
+    /// A missing component is an error rather than an implicit group: the
+    /// default link creation property list has `H5Pset_create_intermediate_group`
+    /// off, and this writer exposes no property list to turn it on with.
+    fn split_parent(&self, path: &str) -> IoResult<(Option<usize>, String)> {
+        let (parent_path, leaf) = path.rsplit_once('/').unwrap_or(("", path));
+        if leaf.is_empty() {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "'{path}' does not end in a link name"
+            )));
+        }
+        if parent_path.is_empty() {
+            return Ok((None, leaf.to_string()));
+        }
+        let abs = format!("/{parent_path}");
+        let groups = self.group_refs();
+        let idx = groups
+            .iter()
+            .position(|g| {
+                let gg = g.lock();
+                gg.name == abs && !gg.deleted
+            })
+            .ok_or_else(|| {
+                crate::io::IoError::NotFound(format!(
+                    "cannot create '{path}': group '{abs}' does not exist"
+                ))
+            })?;
+        Ok((Some(idx), leaf.to_string()))
     }
 
     /// Push a freshly-built dataset into the registry and return its index.
@@ -1081,10 +2283,18 @@ impl Hdf5Writer {
     /// in-flight write that already cloned its own [`DatasetRef`] out.
     /// The [`CreateGuard`] proves the caller entered through
     /// [`Self::begin_create`] and still holds the gate.
-    pub(crate) fn push_dataset(&self, _create: &CreateGuard<'_>, info: DatasetInfo) -> usize {
-        let mut reg = self.datasets.lock();
-        let idx = reg.len();
-        reg.push(Shared::new(DatasetCell::new(info)));
+    pub(crate) fn push_dataset(&self, create: &CreateGuard<'_>, info: DatasetInfo) -> usize {
+        let idx = {
+            let mut reg = self.datasets.lock();
+            let idx = reg.len();
+            reg.push(Shared::new(DatasetCell::new(info)));
+            idx
+        };
+        // The spine guard is dropped before the group slot is taken: the lock
+        // order is spine -> slot and never the reverse.
+        if let Some(pidx) = create.parent {
+            self.grp(pidx).lock().child_datasets.push(idx);
+        }
         idx
     }
 
@@ -1112,6 +2322,19 @@ impl Hdf5Writer {
     /// Snapshot the hard-link list (the lock is held only for the clone), so
     /// callers can resolve each link's target/parent — which locks dataset and
     /// group slots — without holding the hard-link lock.
+    /// The next creation sequence number.
+    ///
+    /// One monotonic counter for datasets, groups and hard links alike: a
+    /// group orders its links by it, so an interleaved run of `create_group`
+    /// and `create_dataset` comes back out in the order it was made rather
+    /// than grouped by kind.
+    fn take_creation_seq(&self) -> u64 {
+        let mut next = self.next_creation_seq.lock();
+        let seq = *next;
+        *next += 1;
+        seq
+    }
+
     pub(crate) fn hard_links_vec(&self) -> Vec<HardLink> {
         self.hard_links.lock().clone()
     }
@@ -1135,12 +2358,16 @@ impl Hdf5Writer {
         path: &Path,
         locking: crate::io::locking::FileLocking,
     ) -> IoResult<Self> {
-        use crate::format::messages::attribute::AttributeMessage;
-        use crate::format::messages::data_layout::DataLayoutMessage;
-        use crate::format::messages::dataspace::DataspaceMessage;
-        use crate::format::messages::datatype::DatatypeMessage;
-
         let mut handle = FileHandle::open_readwrite_with_locking(path, locking)?;
+        // The same `H5FD_locate_signature` search the read path makes, through
+        // the same handle mechanism: the offset it finds is the file's base
+        // address, so the allocator's end-of-file, every write and the
+        // superblock rewrite all work in the HDF5 address space, and the
+        // userblock in `[0, base)` is not addressable from this writer at all.
+        let super_addr = handle
+            .locate_signature()?
+            .ok_or(crate::format::FormatError::InvalidSignature)?;
+        handle.set_base(super_addr);
         let file_size = handle.file_size()?;
 
         let sb_buf = handle.read_at_most(0, 256)?;
@@ -1168,38 +2395,72 @@ impl Hdf5Writer {
             sizeof_size: sb.sizeof_lengths,
         };
 
-        // Discover links from root group (and subgroups recursively).
-        // Read to end-of-file so a large object header (many attributes) is
-        // not truncated, which would silently drop datasets on reopen.
-        let root_addr = sb.root_group_object_header_address;
-        let root_buf =
-            handle.read_at_most(root_addr, file_size.saturating_sub(root_addr) as usize)?;
-        let (root_header, root_header_size) =
-            crate::format::object_header::ObjectHeader::decode(&root_buf)?;
-
-        // Collect existing root-level attributes
-        let mut root_attributes = Vec::new();
-        for msg in &root_header.messages {
-            if msg.msg_type == crate::format::messages::MSG_ATTRIBUTE {
-                if let Ok((a, _)) =
-                    crate::format::messages::attribute::AttributeMessage::decode(&msg.data, &ctx)
-                {
-                    root_attributes.push(a);
-                }
-            }
-        }
-
-        let mut link_entries: Vec<(String, u64)> = Vec::new();
-        let mut visited_groups = std::collections::HashSet::new();
-        Self::collect_links_recursive(
+        // The reopen reads object headers exactly as the reader does, so it
+        // needs the same file-level parameters: a v2/v3 superblock carries no
+        // B-tree K values, and only the extension can override the defaults.
+        let (meta, ext) = crate::io::reader::Hdf5Reader::read_extension_and_meta(
             &mut handle,
-            &root_header,
-            &ctx,
-            "",
-            &mut link_entries,
-            &mut visited_groups,
-            0,
+            ctx,
+            crate::format::btree_v1::BTreeV1Config::default(),
+            sb.superblock_extension_address,
         )?;
+
+        // A file with shared object header messages keeps datatypes,
+        // dataspaces and attributes in a SOHM fractal heap, and each object
+        // header holds only a heap ID pointing at them. This crate reads that
+        // indirection but never writes it, so finalize would rewrite every
+        // header it touches with the shared messages dropped and the master
+        // table left claiming they are still referenced — a file libhdf5 then
+        // reads as missing its objects. Refuse before anything is written.
+        let nindexes = ext
+            .shared_message_table
+            .as_ref()
+            .map_or(0, |smt| smt.nindexes);
+        if nindexes > 0 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "cannot open this file for appending: its superblock extension \
+                 declares {nindexes} shared object header message (SOHM) \
+                 index(es), which this crate can read but not write"
+            )));
+        }
+        // Discover links from root group (and subgroups recursively). Every
+        // object is classified before it is registered, and the root is the
+        // one object with no alternative: its header must be rewritten to
+        // hold anything new, so an unmodellable root is refused here rather
+        // than rewritten into whatever this writer could read of it.
+        let root_addr = sb.root_group_object_header_address;
+        let mut walk = ReopenWalk::new(&mut handle, &meta, file_size);
+        let root = match walk.plan(root_addr)? {
+            ObjectPlan::Group(parts) => parts,
+            ObjectPlan::Dataset(_) => {
+                return Err(crate::io::IoError::InvalidState(
+                    "cannot open this file for appending: its root object is a dataset, \
+                     not a group"
+                        .into(),
+                ))
+            }
+            ObjectPlan::Preserve(why) => {
+                return Err(crate::io::IoError::Unsupported(format!(
+                    "cannot open this file for appending: {why}. Every append rewrites the \
+                     root group's header, and this writer will not rewrite it from the part \
+                     of it that it can read"
+                )));
+            }
+        };
+        // Chunk 0 is the block the rewrite supersedes.
+        let root_header_size = root.header_size;
+        let root_attributes = root.attributes;
+        let root_track_order = root.track_order;
+        let root_dense = root.dense;
+
+        walk.group(&root.links, "", 0)?;
+        let collected = walk.finish();
+        let mut link_entries = collected.hard;
+        let mut preserved = collected.preserved;
+        // Objects the loop below could not rebuild, by header address, so the
+        // other links to one are preserved with it rather than left pointing
+        // at a registry entry that is no longer there.
+        let mut unrebuilt: std::collections::HashMap<u64, String> = Default::default();
 
         // Two link entries can share one object header — hard links. Only
         // the first-walked path becomes the object; the rest are rebuilt
@@ -1208,424 +2469,76 @@ impl Hdf5Writer {
         // storage addresses, so deleting (or finalizing) one freed blocks
         // the others still referenced.
         let mut seen_header_addrs = std::collections::HashSet::new();
-        let mut alias_entries: Vec<(String, u64)> = Vec::new();
-        link_entries.retain(|(name, addr)| {
-            if seen_header_addrs.insert(*addr) {
+        let mut alias_entries: Vec<HardEntry> = Vec::new();
+        link_entries.retain(|(entry, _)| {
+            if seen_header_addrs.insert(entry.address) {
                 true
             } else {
-                alias_entries.push((name.clone(), *addr));
+                alias_entries.push(entry.clone());
                 false
             }
         });
+
+        // The order the walk met each object, kept before the loop below
+        // consumes the entries: `ensure_groups_for` needs parents to precede
+        // children.
+        let walk_order: Vec<String> = link_entries.iter().map(|(e, _)| e.path.clone()).collect();
 
         let mut existing_datasets = Vec::new();
         // Non-dataset link targets (groups): header block `(addr, len)` by
         // link path — so finalize can free the block its rewrite supersedes —
         // plus the attributes the header carries, which the group registry
         // below must keep or finalize rewrites the group without them.
-        type GroupHeaderInfo = (u64, usize, Vec<AttributeMessage>);
+        type GroupHeaderInfo = (u64, usize, Vec<AttributeEntry>, TrackOrder);
         let mut group_headers: std::collections::HashMap<String, GroupHeaderInfo> =
             Default::default();
-        for (name, obj_addr) in &link_entries {
-            // Read the dataset's full object header (to EOF — see above).
-            let ds_buf =
-                handle.read_at_most(*obj_addr, file_size.saturating_sub(*obj_addr) as usize)?;
-            let (ds_header, ds_header_size) =
-                match crate::format::object_header::ObjectHeader::decode_any(&ds_buf) {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
-
-            let mut datatype = None;
-            let mut dataspace = None;
-            let mut layout = None;
-            let mut fp = None;
-            let mut fill_value = None;
-            let mut attrs = Vec::new();
-
-            for msg in &ds_header.messages {
-                match msg.msg_type {
-                    crate::format::messages::MSG_DATATYPE => {
-                        if let Ok((dt, _)) = DatatypeMessage::decode(&msg.data, &ctx) {
-                            datatype = Some(dt);
-                        }
-                    }
-                    crate::format::messages::MSG_DATASPACE => {
-                        if let Ok((ds, _)) = DataspaceMessage::decode(&msg.data, &ctx) {
-                            dataspace = Some(ds);
-                        }
-                    }
-                    crate::format::messages::MSG_DATA_LAYOUT => {
-                        if let Ok((dl, _)) = DataLayoutMessage::decode(&msg.data, &ctx) {
-                            layout = Some(dl);
-                        }
-                    }
-                    crate::format::messages::MSG_FILTER_PIPELINE => {
-                        if let Ok((p, _)) = FilterPipeline::decode(&msg.data) {
-                            if !p.filters.is_empty() {
-                                fp = Some(p);
-                            }
-                        }
-                    }
-                    crate::format::messages::MSG_FILL_VALUE => {
-                        if let Ok((fv, _)) = FillValueMessage::decode(&msg.data) {
-                            if fv.fill_defined == 2 {
-                                fill_value = fv.fill_value;
-                            }
-                        }
-                    }
-                    crate::format::messages::MSG_ATTRIBUTE => {
-                        if let Ok((a, _)) = AttributeMessage::decode(&msg.data, &ctx) {
-                            attrs.push(a);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            let (dt, ds, dl) = match (datatype, dataspace, layout) {
-                (Some(dt), Some(ds), Some(dl)) => (dt, ds, dl),
-                _ => {
-                    // Not a dataset — a group's header. Remember its block so
-                    // finalize can free what its rewrite supersedes, and its
-                    // attributes so the registry rebuild keeps them.
-                    group_headers.insert(name.clone(), (*obj_addr, ds_header_size, attrs));
+        // The dense storage each rebuilt dataset's header named, by registry
+        // index, so finalize frees exactly what its rewrite supersedes. Keyed
+        // after the rebuild succeeded: a preserved dataset keeps its header,
+        // and freeing the heap that header still names would strand it.
+        let mut dataset_dense: Vec<(usize, AttributeInfoMessage)> = Vec::new();
+        let mut group_dense: Vec<(String, DenseCarry)> = Vec::new();
+        for (entry, object) in link_entries {
+            let HardEntry {
+                path: name,
+                address: obj_addr,
+                encoded,
+            } = entry;
+            let parts = match object {
+                CollectedObject::Group {
+                    header_size,
+                    attributes,
+                    track_order,
+                    dense,
+                } => {
+                    group_dense.push((name.clone(), dense));
+                    group_headers.insert(name, (obj_addr, header_size, attributes, track_order));
                     continue;
                 }
+                CollectedObject::Dataset(parts) => *parts,
             };
-
-            let mut info = DatasetInfo {
-                name: name.clone(),
-                datatype: dt,
-                dataspace: ds,
-                obj_header_addr: *obj_addr,
-                data_addr: UNDEF_ADDR,
-                data_size: 0,
-                chunked: None,
-                fixed_array: None,
-                btree_v2: None,
-                append: None,
-                attributes: attrs,
-                obj_header_written_addr: Some(*obj_addr),
-                obj_header_encoded_size: ds_header_size,
-                filter_pipeline: fp,
-                deleted: false,
-                extent_dirty: false,
-                fill_value,
-                // Preserve the on-disk layout version so finalize re-encodes
-                // what it read: a v5 file reopened and appended to must not be
-                // silently downgraded to v4 (the filtered indexes keep their
-                // 8-byte size fields, which v4 readers would mis-derive).
-                layout_version: match &dl {
-                    DataLayoutMessage::ChunkedV4 { version, .. } => *version,
-                    _ => 4,
-                },
-            };
-
-            // Reconstruct storage-specific metadata
-            match &dl {
-                DataLayoutMessage::Contiguous { address, size } => {
-                    info.data_addr = *address;
-                    info.data_size = *size;
-                }
-                DataLayoutMessage::ChunkedV4 {
-                    chunk_dims,
-                    index_address,
-                    index_type,
-                    earray_params,
-                    ..
-                } => {
-                    let real_chunk_dims: Vec<u64> = chunk_dims[..chunk_dims.len() - 1].to_vec();
-
-                    if *index_type
-                        == crate::format::messages::data_layout::ChunkIndexType::ExtensibleArray
-                    {
-                        if let Some(params) = earray_params {
-                            let ep = EarrayParams {
-                                max_nelmts_bits: params.max_nelmts_bits,
-                                idx_blk_elmts: params.idx_blk_elmts,
-                                sup_blk_min_data_ptrs: params.sup_blk_min_data_ptrs,
-                                data_blk_min_elmts: params.data_blk_min_elmts,
-                                max_dblk_page_nelmts_bits: params.max_dblk_page_nelmts_bits,
-                            };
-                            let ndblk_addrs = compute_ndblk_addrs(ep.sup_blk_min_data_ptrs)?;
-                            let nsblk_addrs = compute_nsblk_addrs(
-                                ep.idx_blk_elmts,
-                                ep.data_blk_min_elmts,
-                                ep.sup_blk_min_data_ptrs,
-                                ep.max_nelmts_bits,
-                            )?;
-
-                            // Read EA header
-                            let hdr_buf = handle.read_at_most(*index_address, 256)?;
-                            let ea_header = ExtensibleArrayHeader::decode(&hdr_buf, &ctx)?;
-
-                            let is_filtered = ea_header.class_id
-                                == crate::format::chunk_index::extensible_array::EA_CLS_FILT_CHUNK;
-                            let chunk_size_len = if is_filtered {
-                                ea_header.raw_elmt_size - ctx.sizeof_addr - 4
-                            } else {
-                                0
-                            };
-
-                            // Read the EA index block. Filtered datasets
-                            // store a `FilteredIndexBlock`; unfiltered ones a
-                            // plain `ExtensibleArrayIndexBlock`. Both must be
-                            // reconstructed so a reopened dataset can append
-                            // (write_chunk consults whichever applies).
-                            let ea_iblk_addr = ea_header.idx_blk_addr;
-                            let (ea_iblk, filt_iblk) = if is_filtered {
-                                let placeholder = ExtensibleArrayIndexBlock::new(
-                                    *index_address,
-                                    ep.idx_blk_elmts,
-                                    ndblk_addrs,
-                                    nsblk_addrs,
-                                );
-                                let fib = if ea_iblk_addr != UNDEF_ADDR {
-                                    let iblk_buf = handle.read_at_most(ea_iblk_addr, 65536)?;
-                                    FilteredIndexBlock::decode(
-                                        &iblk_buf,
-                                        &ctx,
-                                        ep.idx_blk_elmts as usize,
-                                        ndblk_addrs,
-                                        nsblk_addrs,
-                                        chunk_size_len,
-                                    )
-                                    .unwrap_or_else(|_| {
-                                        FilteredIndexBlock::new(
-                                            *index_address,
-                                            ep.idx_blk_elmts,
-                                            ndblk_addrs,
-                                            nsblk_addrs,
-                                        )
-                                    })
-                                } else {
-                                    FilteredIndexBlock::new(
-                                        *index_address,
-                                        ep.idx_blk_elmts,
-                                        ndblk_addrs,
-                                        nsblk_addrs,
-                                    )
-                                };
-                                (placeholder, Some(fib))
-                            } else {
-                                let eib = if ea_iblk_addr != UNDEF_ADDR {
-                                    let iblk_buf = handle.read_at_most(ea_iblk_addr, 65536)?;
-                                    ExtensibleArrayIndexBlock::decode(
-                                        &iblk_buf,
-                                        &ctx,
-                                        ep.idx_blk_elmts as usize,
-                                        ndblk_addrs,
-                                        nsblk_addrs,
-                                    )
-                                    .unwrap_or_else(|_| {
-                                        ExtensibleArrayIndexBlock::new(
-                                            *index_address,
-                                            ep.idx_blk_elmts,
-                                            ndblk_addrs,
-                                            nsblk_addrs,
-                                        )
-                                    })
-                                } else {
-                                    ExtensibleArrayIndexBlock::new(
-                                        *index_address,
-                                        ep.idx_blk_elmts,
-                                        ndblk_addrs,
-                                        nsblk_addrs,
-                                    )
-                                };
-                                (eib, None)
-                            };
-
-                            let max_dims = info
-                                .dataspace
-                                .max_dims
-                                .clone()
-                                .unwrap_or_else(|| info.dataspace.dims.clone());
-
-                            info.chunked = Some(ChunkedDatasetInfo {
-                                chunk_dims: real_chunk_dims,
-                                max_dims,
-                                earray_params: ep,
-                                ea_header_addr: *index_address,
-                                ea_iblk_addr,
-                                ndblk_addrs,
-                                ea_header,
-                                ea_iblk,
-                                chunks_written: 0,
-                                filt_iblk,
-                                chunk_size_len,
-                            });
-                        }
-                    } else if *index_type
-                        == crate::format::messages::data_layout::ChunkIndexType::FixedArray
-                    {
-                        // Read the FA header and data block back so a
-                        // reopened dataset is writable and deletable, not
-                        // re-link only — a placeholder made a delete free
-                        // just the header and leak every chunk plus the
-                        // index. Paged data blocks (any FA with more than
-                        // dblk_page_nelmts chunks, libhdf5 default 1024)
-                        // reconstruct through the same decode owner; only
-                        // pages the bitmap marks initialized are decoded.
-                        let hdr_buf = handle.read_at_most(*index_address, 256)?;
-                        let fa_header = FixedArrayHeader::decode(&hdr_buf, &ctx)?;
-                        let is_filtered = fa_header.client_id == FA_CLIENT_FILT_CHUNK;
-                        let chunk_size_len = if is_filtered {
-                            (fa_header.element_size as usize)
-                                .checked_sub(ctx.sizeof_addr as usize + 4)
-                                .ok_or_else(|| {
-                                    crate::io::IoError::InvalidState(
-                                        "fixed array filtered element_size too small".into(),
-                                    )
-                                })?
-                        } else {
-                            0
-                        };
-                        if fa_header.data_blk_addr != UNDEF_ADDR && chunk_size_len <= 8 {
-                            let dblk_size = fixed_array_dblk_disk_size(&ctx, &fa_header) as usize;
-                            let dblk_buf =
-                                handle.read_at_most(fa_header.data_blk_addr, dblk_size)?;
-                            let fa_dblk = decode_fixed_array_dblk(
-                                &ctx,
-                                &fa_header,
-                                &dblk_buf,
-                                chunk_size_len,
-                            )?;
-                            info.fixed_array = Some(FixedArrayDatasetInfo {
-                                chunk_dims: real_chunk_dims,
-                                fa_header_addr: *index_address,
-                                fa_dblk_addr: fa_header.data_blk_addr,
-                                fa_header,
-                                fa_dblk,
-                                // Chunks written this session, matching the
-                                // EA reconstruction above.
-                                chunks_written: 0,
-                            });
-                        }
-                    } else if *index_type
-                        == crate::format::messages::data_layout::ChunkIndexType::BTreeV2
-                    {
-                        use crate::format::chunk_index::btree_v2::{
-                            Bt2Geometry, Bt2Header, BT2_TYPE_CHUNK_FILT, BT2_TYPE_CHUNK_UNFILT,
-                        };
-
-                        // Walk the tree back into the in-memory index and
-                        // adopt its node blocks as the flush pool. The pool
-                        // re-serializes at the header's node_size, whatever
-                        // it is — libhdf5 sizes every node from
-                        // hdr->node_size (H5B2leaf.c, H5B2internal.c) — so
-                        // a foreign size reopens too. Only a record type
-                        // that is not a chunk record, or a node size below
-                        // the bulk loader's few-records-per-node floor
-                        // (the same bound creation enforces), stays
-                        // re-link only.
-                        let hdr_buf = handle.read_at_most(*index_address, 256)?;
-                        let bt2_hdr = Bt2Header::decode(&hdr_buf, &ctx)?;
-                        let ndims = real_chunk_dims.len();
-                        let is_filt = match bt2_hdr.record_type {
-                            BT2_TYPE_CHUNK_UNFILT => Some(false),
-                            BT2_TYPE_CHUNK_FILT => Some(true),
-                            _ => None,
-                        };
-                        if let (Some(is_filt), true) = (
-                            is_filt,
-                            bt2_hdr.node_size as usize >= 10 + 3 * bt2_hdr.record_size as usize,
-                        ) {
-                            let mut index = if is_filt {
-                                let csl = (bt2_hdr.record_size as usize)
-                                    .checked_sub(ctx.sizeof_addr as usize + 4 + ndims * 8)
-                                    .filter(|&c| c <= 8)
-                                    .ok_or_else(|| {
-                                        crate::io::IoError::InvalidState(
-                                            "v2 B-tree filtered record size does not fit \
-                                             its rank and address width"
-                                                .into(),
-                                        )
-                                    })?;
-                                Bt2ChunkIndex::new_filtered(ndims, csl as u8)
-                            } else {
-                                Bt2ChunkIndex::new_unfiltered(ndims)
-                            };
-                            // Re-serialize with the creator's parameters:
-                            // node blocks keep their size and the rewritten
-                            // header keeps its declared split/merge.
-                            index.node_size = bt2_hdr.node_size;
-                            index.split_percent = bt2_hdr.split_percent;
-                            index.merge_percent = bt2_hdr.merge_percent;
-                            let mut node_addrs = Vec::new();
-                            if bt2_hdr.root_node_addr != UNDEF_ADDR && bt2_hdr.total_num_records > 0
-                            {
-                                let geo = Bt2Geometry::new(
-                                    bt2_hdr.node_size,
-                                    bt2_hdr.record_size,
-                                    bt2_hdr.depth,
-                                    ctx.sizeof_addr,
-                                );
-                                let mut record_bytes = Vec::new();
-                                collect_bt2_nodes(
-                                    &handle,
-                                    &ctx,
-                                    bt2_hdr.root_node_addr,
-                                    bt2_hdr.depth,
-                                    bt2_hdr.num_records_in_root,
-                                    bt2_hdr.record_size,
-                                    bt2_hdr.node_size,
-                                    &geo,
-                                    &mut record_bytes,
-                                    &mut node_addrs,
-                                )?;
-                                let total = if bt2_hdr.record_size > 0 {
-                                    record_bytes.len() / bt2_hdr.record_size as usize
-                                } else {
-                                    0
-                                };
-                                if is_filt {
-                                    for r in Bt2ChunkIndex::decode_filtered_records(
-                                        &record_bytes,
-                                        total,
-                                        ndims,
-                                        bt2_hdr.record_size,
-                                        &ctx,
-                                    )? {
-                                        index.insert_filtered(
-                                            r.scaled_offsets,
-                                            r.chunk_address,
-                                            r.chunk_size,
-                                            r.filter_mask,
-                                        );
-                                    }
-                                } else {
-                                    for r in Bt2ChunkIndex::decode_unfiltered_records(
-                                        &record_bytes,
-                                        total,
-                                        ndims,
-                                        &ctx,
-                                    )? {
-                                        index.insert(r.scaled_offsets, r.chunk_address);
-                                    }
-                                }
-                            }
-                            let max_dims = info
-                                .dataspace
-                                .max_dims
-                                .clone()
-                                .unwrap_or_else(|| info.dataspace.dims.clone());
-                            info.btree_v2 = Some(Bt2DatasetInfo {
-                                chunk_dims: real_chunk_dims,
-                                max_dims,
-                                bt2_header_addr: *index_address,
-                                node_addrs,
-                                index,
-                                chunks_written: 0,
-                            });
-                        }
+            let dense_attrs = parts.dense.attrs.clone();
+            match rebuild_dataset(&mut handle, &ctx, name.clone(), obj_addr, parts) {
+                Ok(info) => {
+                    if let Some(ainfo) = dense_attrs {
+                        dataset_dense.push((existing_datasets.len(), ainfo));
                     }
+                    existing_datasets.push(info);
                 }
-                _ => {}
+                // Kept by its bytes for the same reason a header this walk
+                // could not decode is: the rewrite would otherwise emit an
+                // object whose chunk index no longer names its chunks.
+                Err(e) => {
+                    let why = format!("this writer could not rebuild its chunk index: {e}");
+                    unrebuilt.insert(obj_addr, why.clone());
+                    preserved.push(PreservedEntry {
+                        path: name,
+                        class: crate::io::reader::LinkClass::Hard,
+                        encoded,
+                        reason: Some(why),
+                    });
+                }
             }
-
-            existing_datasets.push(info);
         }
 
         // Reconstruct the group registry. Every group is a link entry of its
@@ -1667,14 +2580,16 @@ impl Hdf5Writer {
                     group_index_map.get(&parent_path).copied()
                 };
                 let gidx = groups.len();
-                let (obj_header_written_addr, obj_header_encoded_size, attributes) = group_headers
-                    .remove(path.trim_start_matches('/'))
-                    .map_or((None, 0, Vec::new()), |(addr, len, attrs)| {
-                        (Some(addr), len, attrs)
-                    });
+                let (obj_header_written_addr, obj_header_encoded_size, attributes, track_order) =
+                    group_headers.remove(path.trim_start_matches('/')).map_or(
+                        (None, 0, Vec::new(), TrackOrder::default()),
+                        |(addr, len, attrs, track)| (Some(addr), len, attrs, track),
+                    );
                 groups.push(GroupInfo {
                     name: path.clone(),
                     parent,
+                    creation_seq: 0,
+                    track_order,
                     child_datasets: Vec::new(),
                     child_groups: Vec::new(),
                     obj_header_addr: 0,
@@ -1691,7 +2606,7 @@ impl Hdf5Writer {
         }
 
         // Every linked group, in link-walk order (parents precede children).
-        for (name, _) in &link_entries {
+        for name in &walk_order {
             if group_headers.contains_key(name.as_str()) {
                 ensure_groups_for(name, &mut groups, &mut group_index_map, &mut group_headers);
             }
@@ -1715,12 +2630,34 @@ impl Hdf5Writer {
             groups[gidx].child_datasets.push(di);
         }
 
+        // An object the rebuild above gave up on is preserved by its bytes,
+        // so the other links to it are preserved too: there is no registry
+        // entry for them to name.
+        alias_entries.retain(|entry| match unrebuilt.get(&entry.address) {
+            None => true,
+            Some(why) => {
+                preserved.push(PreservedEntry {
+                    path: entry.path.clone(),
+                    class: crate::io::reader::LinkClass::Hard,
+                    encoded: entry.encoded.clone(),
+                    reason: Some(why.clone()),
+                });
+                false
+            }
+        });
+
         // Rebuild the hard-link registry from the alias entries set aside
-        // above, so the H5Ldelete semantics survive a reopen. An alias
-        // whose target header did not decode is dropped with its target
-        // (the primary path was skipped the same way).
+        // above, so the H5Ldelete semantics survive a reopen. An alias whose
+        // target the walk could not model is not here at all: it was
+        // preserved by its own bytes, exactly as the first link to that
+        // object was.
         let mut hard_links: Vec<HardLink> = Vec::new();
-        for (path, addr) in alias_entries {
+        for HardEntry {
+            path,
+            address: addr,
+            ..
+        } in alias_entries
+        {
             let target = if let Some(di) = existing_datasets
                 .iter()
                 .position(|d| d.obj_header_addr == addr)
@@ -1748,10 +2685,94 @@ impl Hdf5Writer {
                 parent,
                 name: link_name,
                 target,
+                creation_seq: 0,
             });
         }
 
+        // Attach every link the writer cannot express to the group that
+        // holds it, so the rewrite of that group's header emits it again.
+        // `ensure_groups_for` registers the parent chain, which matters for
+        // a group whose only content is such a link: nothing else would put
+        // it in the registry, and the close would drop group and link alike.
+        let mut preserved_links: Vec<PreservedLink> = Vec::new();
+        for PreservedEntry {
+            path,
+            class,
+            encoded,
+            reason,
+        } in preserved
+        {
+            let (parent, link_name) = match path.rsplit_once('/') {
+                None => (None, path),
+                Some((dir, leaf)) => {
+                    ensure_groups_for(dir, &mut groups, &mut group_index_map, &mut group_headers);
+                    (
+                        group_index_map.get(&format!("/{dir}")).copied(),
+                        leaf.to_string(),
+                    )
+                }
+            };
+            preserved_links.push(PreservedLink {
+                parent,
+                name: link_name,
+                class,
+                encoded,
+                reason,
+            });
+        }
+
+        // Stamp the creation sequence a reopened file cannot supply. Nothing
+        // on disk says which link was made first unless the group tracked
+        // creation order, and this reader does not carry that back out, so
+        // discovery order is what there is: datasets, then groups, then the
+        // hard links found beside them — the order the writer emitted links
+        // in before it ordered them at all.
+        let mut creation_seq = 0u64;
+        for d in &mut existing_datasets {
+            d.creation_seq = creation_seq;
+            creation_seq += 1;
+        }
+        for g in &mut groups {
+            g.creation_seq = creation_seq;
+            creation_seq += 1;
+        }
+        for l in &mut hard_links {
+            l.creation_seq = creation_seq;
+            creation_seq += 1;
+        }
+
         let allocator = FileAllocator::new(file_size);
+
+        // Now that every object has its registry index, key the dense storage
+        // found on disk by the scope that will supersede it. A group the link
+        // walk saw but never registered is not rewritten either, so leaving it
+        // out is what keeps its storage referenced.
+        let mut superseded = SupersededDense {
+            attrs: dataset_dense
+                .into_iter()
+                .map(|(di, ainfo)| (AttrScope::Dataset(di), ainfo))
+                .collect(),
+            links: HashMap::new(),
+        };
+        superseded
+            .attrs
+            .extend(root_dense.attrs.map(|a| (AttrScope::Root, a)));
+        superseded
+            .links
+            .extend(root_dense.links.map(|l| (LinkScope::Root, l)));
+        for (name, dense) in group_dense {
+            let Some(&gidx) = group_index_map.get(&format!("/{name}")) else {
+                continue;
+            };
+            superseded
+                .attrs
+                .extend(dense.attrs.map(|a| (AttrScope::Group(gidx), a)));
+            superseded
+                .links
+                .extend(dense.links.map(|l| (LinkScope::Group(gidx), l)));
+        }
+        let superseded = (!superseded.attrs.is_empty() || !superseded.links.is_empty())
+            .then(|| Box::new(superseded));
 
         // Wrap the reconstructed plain vecs into the per-slot registry. The
         // reconstruction logic above runs single-threaded on local `Vec`s;
@@ -1772,80 +2793,30 @@ impl Hdf5Writer {
             datasets: Slot::new(datasets),
             groups: Slot::new(groups),
             hard_links: Slot::new(hard_links),
+            preserved_links: Slot::new(preserved_links),
             root_attributes: Slot::new(root_attributes),
             create_lock: Slot::new(()),
-            libver_latest: false,
+            libver: LibverBound::Earliest,
             closed: false,
             swmr_active: false,
             cwfs: Slot::new(Vec::new()),
             root_group_addr: None,
             root_group_encoded_size: 0,
             superseded_root_header: Some((root_addr, root_header_size as u64)),
+            // Start from the version the file already has, so an append that
+            // adds nothing needing a newer one hands the file back as it
+            // found it. (v0/v1 was refused above, so this is 2 or 3.)
+            superblock_version_base: sb.version,
+            // The reopened file's own policy, so objects added in this
+            // session are made the way the file already declares.
+            root_track_order,
+            dense_attributes: Slot::new(HashMap::new()),
+            dense_links: Slot::new(HashMap::new()),
+            superseded_dense: Slot::new(superseded),
+            track_order: root_track_order,
+            next_creation_seq: Slot::new(creation_seq),
+            pending_object_references: Slot::new(Vec::new()),
         })
-    }
-
-    /// Recursively collect (name, obj_header_addr) pairs from link messages.
-    fn collect_links_recursive(
-        handle: &mut FileHandle,
-        header: &crate::format::object_header::ObjectHeader,
-        ctx: &FormatContext,
-        prefix: &str,
-        out: &mut Vec<(String, u64)>,
-        visited: &mut std::collections::HashSet<u64>,
-        depth: usize,
-    ) -> IoResult<()> {
-        // Bound nesting depth so a pathologically deep group chain cannot
-        // overflow the stack (the `visited` set bounds total work but not
-        // recursion depth).
-        if depth > 256 {
-            return Ok(());
-        }
-        use crate::format::messages::link::{LinkMessage, LinkTarget};
-        for msg in &header.messages {
-            if msg.msg_type == crate::format::messages::MSG_LINK {
-                if let Ok((link, _)) = LinkMessage::decode(&msg.data, ctx) {
-                    if let LinkTarget::Hard { address } = &link.target {
-                        let full_name = if prefix.is_empty() {
-                            link.name.clone()
-                        } else {
-                            format!("{}/{}", prefix, link.name)
-                        };
-                        out.push((full_name.clone(), *address));
-
-                        // Try to recurse into groups (read to EOF so a large
-                        // child object header is not truncated).
-                        let child_len = handle
-                            .file_size()
-                            .map(|fs| fs.saturating_sub(*address) as usize)
-                            .unwrap_or(8192);
-                        if let Ok(child_buf) = handle.read_at_most(*address, child_len) {
-                            if let Ok((child_header, _)) =
-                                crate::format::object_header::ObjectHeader::decode_any(&child_buf)
-                            {
-                                let has_links = child_header
-                                    .messages
-                                    .iter()
-                                    .any(|m| m.msg_type == crate::format::messages::MSG_LINK);
-                                // Recurse only into a group's header we have
-                                // not entered before — breaks hard-link cycles.
-                                if has_links && visited.insert(*address) {
-                                    let _ = Self::collect_links_recursive(
-                                        handle,
-                                        &child_header,
-                                        ctx,
-                                        &full_name,
-                                        out,
-                                        visited,
-                                        depth + 1,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Return the names of all datasets created so far.
@@ -1908,6 +2879,9 @@ impl Hdf5Writer {
     /// here are full paths, so they must be unique across the file (HDF5
     /// requires link names to be unique within their group).
     fn ensure_unique_dataset_name(&self, name: &str) -> IoResult<()> {
+        // A path *through* a carried external link belongs to the other file:
+        // creating it here would put a second link of that name in the group.
+        self.reject_external_traversal(name)?;
         let exists = self.dataset_refs().iter().any(|d| {
             let g = d.lock();
             !g.deleted && g.name == name
@@ -1924,6 +2898,14 @@ impl Hdf5Writer {
         {
             return Err(crate::io::IoError::InvalidState(format!(
                 "a hard link named '{name}' already exists"
+            )));
+        }
+        // A preserved link occupies its name in the group just as a modelled
+        // one does; both are emitted, and two link messages of one name in a
+        // group is an invalid file.
+        if self.preserved_link_paths().iter().any(|(p, _)| *p == name) {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "a link named '{name}' already exists"
             )));
         }
         Ok(())
@@ -1948,6 +2930,7 @@ impl Hdf5Writer {
         if self.swmr_active {
             return Err(swmr_delete_error(name));
         }
+        self.reject_external_traversal(name)?;
         // The gate keeps the link list and child lists still while this
         // delete reads and rewrites them (create_lock → op → slot order,
         // the same as every creator).
@@ -2020,6 +3003,7 @@ impl Hdf5Writer {
         if self.swmr_active {
             return Err(swmr_delete_error(name));
         }
+        self.reject_external_traversal(name)?;
         // Same gate as `delete_dataset`: the pre-scan below and the
         // promotions must see a still link list and child lists.
         let _create = self.create_lock.lock();
@@ -2345,6 +3329,7 @@ impl Hdf5Writer {
         for attr in &attrs {
             self.release_attr_vlen(attr)?;
         }
+        self.release_superseded_dense_attrs(AttrScope::Dataset(index))?;
         if let Some((addr, size)) = header_block {
             self.allocator.free(addr, size);
         }
@@ -2371,8 +3356,107 @@ impl Hdf5Writer {
         for attr in &attrs {
             self.release_attr_vlen(attr)?;
         }
+        self.release_superseded_dense_attrs(AttrScope::Group(gidx))?;
+        self.release_superseded_dense_links(LinkScope::Group(gidx))?;
         if let Some((addr, size)) = header_block {
             self.allocator.free(addr, size);
+        }
+        Ok(())
+    }
+
+    /// Free the dense attribute storage a reopened header names, once, when
+    /// this session stops naming it — because the header is being rewritten
+    /// around fresh storage, or because the object was deleted.
+    ///
+    /// The single owner of that transition: nothing else removes an attribute
+    /// entry from [`superseded_dense`](Self::superseded_dense), and this
+    /// removes it as it frees, so no heap is freed twice or left half freed.
+    /// An object whose storage was compact, or whose header this session
+    /// keeps, has no entry and nothing happens.
+    ///
+    /// Never under SWMR: a live reader may still be walking the storage the
+    /// published headers name, the same rule the superseded-header and
+    /// relocated-chunk paths follow. The entry stays in place, unfreed.
+    fn release_superseded_dense_attrs(&self, scope: AttrScope) -> IoResult<()> {
+        if self.swmr_active {
+            return Ok(());
+        }
+        let taken = self
+            .superseded_dense
+            .lock()
+            .as_mut()
+            .and_then(|s| s.attrs.remove(&scope));
+        let Some(ainfo) = taken else {
+            return Ok(());
+        };
+        self.release_dense_storage(
+            ainfo.fractal_heap_address,
+            ainfo.name_btree_address,
+            ainfo.creation_order_btree_address,
+        )
+    }
+
+    /// The link counterpart of
+    /// [`release_superseded_dense_attrs`](Self::release_superseded_dense_attrs),
+    /// under the same invariant and the same SWMR rule. Split from it because
+    /// the two are superseded at different points of a finalize: attribute
+    /// storage before the object headers are laid out, link storage after
+    /// every one of them has an address.
+    fn release_superseded_dense_links(&self, scope: LinkScope) -> IoResult<()> {
+        if self.swmr_active {
+            return Ok(());
+        }
+        let taken = self
+            .superseded_dense
+            .lock()
+            .as_mut()
+            .and_then(|s| s.links.remove(&scope));
+        let Some(linfo) = taken else {
+            return Ok(());
+        };
+        self.release_dense_storage(
+            linfo.fractal_heap_address,
+            linfo.name_btree_address,
+            linfo.creation_order_btree_address,
+        )
+    }
+
+    /// Return one dense storage's file space to the allocator: the fractal
+    /// heap in full, its name index, and the creation-order index when the
+    /// object had one.
+    ///
+    /// The extents come from walking the structures themselves rather than
+    /// from re-deriving what a writer would have allocated, so storage
+    /// libhdf5 laid out is freed as accurately as storage this crate wrote.
+    /// Every walk here already ran once this session — the reopen read every
+    /// attribute out of this heap through the same index — so a failure means
+    /// the file changed underneath us, and surfacing it beats freeing a
+    /// partial extent list.
+    fn release_dense_storage(
+        &self,
+        heap_addr: u64,
+        name_bt2_addr: u64,
+        corder_bt2_addr: Option<u64>,
+    ) -> IoResult<()> {
+        use crate::format::chunk_index::btree_v2::collect_btree_v2_extents;
+        use crate::format::fractal_heap::collect_heap_extents;
+
+        let mut reader = crate::io::reader::HandleBlockReader {
+            handle: &self.handle,
+        };
+        let mut extents = Vec::new();
+        if heap_addr != UNDEF_ADDR {
+            extents.extend(collect_heap_extents(heap_addr, &self.ctx, &mut reader)?);
+        }
+        for addr in [Some(name_bt2_addr), corder_bt2_addr]
+            .into_iter()
+            .flatten()
+            .filter(|&a| a != UNDEF_ADDR)
+        {
+            extents.extend(collect_btree_v2_extents(addr, &self.ctx, &mut reader)?);
+        }
+        for (addr, len) in extents {
+            self.allocator.free(addr, len);
         }
         Ok(())
     }
@@ -2524,6 +3608,15 @@ impl Hdf5Writer {
         self.ds(index).lock().dataspace.dims.clone()
     }
 
+    /// Return the datatype a dataset declares on disk.
+    ///
+    /// The typed write paths need it to store bytes in the declared byte
+    /// order; a reopened dataset handle has no copy of its own, and a cached
+    /// one could disagree with what the header will say.
+    pub fn dataset_datatype(&self, index: usize) -> DatatypeMessage {
+        self.ds(index).lock().datatype.clone()
+    }
+
     /// Return the names of all groups created so far.
     pub fn group_names(&self) -> Vec<String> {
         self.group_refs()
@@ -2551,6 +3644,12 @@ impl Hdf5Writer {
         } else {
             format!("{}/{}", parent_path, name)
         };
+        // Same rule as dataset creation: a path through a carried external
+        // link names a group in the other file, which this writer cannot make.
+        self.reject_external_traversal(&full_name)?;
+        // `name` may itself carry path components; resolving the whole thing
+        // is what keeps a '/' out of the link this group will be reached by.
+        let (parent_idx, _leaf) = self.split_parent(full_name.trim_start_matches('/'))?;
 
         let groups = self.group_refs();
         // Check for duplicates (ignore deleted groups)
@@ -2576,30 +3675,11 @@ impl Hdf5Writer {
             )));
         }
 
-        // Find parent group index (None means it's a root-level group). Indices
-        // are append-only, so a parent found in the snapshot stays valid even
-        // if another thread pushes a new group concurrently.
-        let parent_idx = if parent_path == "/" {
-            None
-        } else {
-            let idx = groups
-                .iter()
-                .position(|g| {
-                    let gg = g.lock();
-                    gg.name == parent_path && !gg.deleted
-                })
-                .ok_or_else(|| {
-                    crate::io::IoError::NotFound(format!(
-                        "parent group '{}' not found",
-                        parent_path
-                    ))
-                })?;
-            Some(idx)
-        };
-
         let group_idx = self.push_group(GroupInfo {
             name: full_name,
             parent: parent_idx,
+            creation_seq: self.take_creation_seq(),
+            track_order: self.track_order,
             child_datasets: Vec::new(),
             child_groups: Vec::new(),
             obj_header_addr: 0,
@@ -2634,6 +3714,12 @@ impl Hdf5Writer {
             .ok_or_else(|| {
                 crate::io::IoError::NotFound(format!("group '{}' not found", group_path))
             })?;
+        // A move, not an addition: the create gate has already placed every
+        // dataset from the path components of its name, so appending here
+        // would leave one dataset linked from two groups at once.
+        for g in &groups {
+            g.lock().child_datasets.retain(|&d| d != ds_index);
+        }
         groups[group_idx].lock().child_datasets.push(ds_index);
         Ok(())
     }
@@ -2660,6 +3746,15 @@ impl Hdf5Writer {
                 "hard link name '{link_name}' must be a non-empty leaf name"
             )));
         }
+
+        // Neither end may sit across a carried external link: the target
+        // would be an object in the other file, and the link itself would be
+        // a name in a group this writer does not own.
+        self.reject_external_traversal(target_path)?;
+        self.reject_external_traversal(&format!(
+            "{}/{link_name}",
+            parent_group_path.trim_end_matches('/')
+        ))?;
 
         // Hold the create gate across the collision check and the hard-link
         // push so the two are atomic (see `create_lock`).
@@ -2700,29 +3795,9 @@ impl Hdf5Writer {
                 "cannot hard-link the root group".into(),
             ));
         }
-        let target = if let Some(idx) = datasets.iter().position(|d| {
-            let g = d.lock();
-            !g.deleted && g.name.trim_start_matches('/') == target_rel
-        }) {
-            HardLinkTarget::Dataset(idx)
-        } else if let Some(idx) = groups.iter().position(|g| {
-            let gg = g.lock();
-            !gg.deleted && gg.name.trim_start_matches('/') == target_rel
-        }) {
-            HardLinkTarget::Group(idx)
-        } else if let Some(t) = self.hard_links_vec().iter().find_map(|l| {
-            (self.hard_link_emitted(l) && self.hard_link_full_path(l) == target_rel)
-                .then_some(l.target)
-        }) {
-            // The target path may itself be a hard link: links have no
-            // chain (all point straight at the object header, as in
-            // libhdf5), so the new link copies the existing one's target.
-            t
-        } else {
-            return Err(crate::io::IoError::NotFound(format!(
-                "hard link target '{target_path}' not found"
-            )));
-        };
+        let target = self.resolve_object(target_rel).ok_or_else(|| {
+            crate::io::IoError::NotFound(format!("hard link target '{target_path}' not found"))
+        })?;
 
         // Reject a name already taken in the parent group.
         let parent_prefix = match parent {
@@ -2750,6 +3825,7 @@ impl Hdf5Writer {
             parent,
             name: link_name.to_string(),
             target,
+            creation_seq: self.take_creation_seq(),
         });
         Ok(())
     }
@@ -2842,11 +3918,151 @@ impl Hdf5Writer {
             .count() as u32
     }
 
-    /// Append a `MSG_LINK` message for every user-created hard link whose
-    /// parent group is `parent` (`None` == the root group). Called while
-    /// building group object headers, once every object's header address
-    /// has been assigned.
-    fn emit_hard_links(&self, header: &mut ObjectHeader, parent: Option<usize>) {
+    /// The object a path names, or `None` when nothing in the file does.
+    ///
+    /// `path` is the trimmed, hard-link-canonical form (no leading or
+    /// trailing `/`) that dataset and group names compare against. The single
+    /// owner of path→object resolution on the write side: hard links and
+    /// object references must agree on what a path means, including that a
+    /// path may itself be a user hard link — links have no chain (each points
+    /// straight at the object header, as in libhdf5), so the existing link's
+    /// target is the answer.
+    pub(crate) fn resolve_object(&self, path: &str) -> Option<HardLinkTarget> {
+        if let Some(idx) = self.dataset_refs().iter().position(|d| {
+            let g = d.lock();
+            !g.deleted && g.name.trim_start_matches('/') == path
+        }) {
+            return Some(HardLinkTarget::Dataset(idx));
+        }
+        if let Some(idx) = self.group_refs().iter().position(|g| {
+            let gg = g.lock();
+            !gg.deleted && gg.name.trim_start_matches('/') == path
+        }) {
+            return Some(HardLinkTarget::Group(idx));
+        }
+        self.hard_links_vec().iter().find_map(|l| {
+            (self.hard_link_emitted(l) && self.hard_link_full_path(l) == path).then_some(l.target)
+        })
+    }
+
+    /// Store object references naming `paths` into the elements of dataset
+    /// `index` starting at `start`.
+    ///
+    /// The value of an `H5R_OBJECT1` element is its target's object header
+    /// address, which finalize assigns, so what lands here is the target path;
+    /// [`Self::apply_object_reference_fixups`] writes the addresses. Elements
+    /// never written keep the zero image libhdf5 reads back as a null
+    /// reference.
+    pub fn write_object_references(
+        &self,
+        index: usize,
+        start: u64,
+        paths: &[&str],
+    ) -> IoResult<()> {
+        let (elements, data_addr, indexed) = {
+            let ds = self.ds(index);
+            let m = ds.lock();
+            match &m.datatype {
+                DatatypeMessage::Reference {
+                    kind: ReferenceKind::Object1,
+                    ..
+                } => {}
+                other => {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "dataset '{}' has datatype {other}, not an object reference",
+                        m.name
+                    )))
+                }
+            }
+            let elements = m
+                .dataspace
+                .dims
+                .iter()
+                .fold(1u64, |a, &d| a.saturating_mul(d));
+            let indexed = m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
+            (elements, m.data_addr, indexed)
+        };
+        if indexed || data_addr == UNDEF_ADDR {
+            return Err(crate::io::IoError::InvalidState(
+                "object references are stamped into contiguous storage; \
+                 create the dataset without chunking"
+                    .into(),
+            ));
+        }
+        let end = start.saturating_add(paths.len() as u64);
+        if end > elements {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "elements {start}..{end} are outside the dataset's {elements}"
+            )));
+        }
+        // Resolve now as well as at fixup time, so a path that names nothing
+        // is reported at the call that got it wrong.
+        for path in paths {
+            self.object_reference_target(path)?;
+        }
+        let mut pending = self.pending_object_references.lock();
+        for (i, path) in paths.iter().enumerate() {
+            pending.push(PendingObjectReference {
+                dataset: index,
+                element: start + i as u64,
+                target: (*path).to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The object an object reference's path names, as a hard-link target;
+    /// `None` for the root group, which has no registry slot.
+    fn object_reference_target(&self, path: &str) -> IoResult<Option<HardLinkTarget>> {
+        let rel = self.canonical_dataset_path(path.trim_matches('/'));
+        if rel.is_empty() {
+            return Ok(None);
+        }
+        self.resolve_object(&rel)
+            .map(Some)
+            .ok_or_else(|| crate::io::IoError::NotFound(format!("reference target '{path}'")))
+    }
+
+    /// Stamp every pending object reference with its target's object header
+    /// address.
+    ///
+    /// INVARIANT: a reference element on disk holds its target's header
+    /// address. Both finalize paths call this once every dataset, group and
+    /// root header has an address and before the superblock is written, so no
+    /// file is closed with a placeholder element in it; a target that no
+    /// longer resolves fails the finalize rather than leaving one behind.
+    fn apply_object_reference_fixups(&mut self) -> IoResult<()> {
+        // Snapshot rather than drain: a SWMR session finalizes twice, and the
+        // close-time finalize rebuilds every header at a fresh address, so the
+        // elements must be stamped again with the addresses that survive.
+        let pending: Vec<(usize, u64, String)> = self
+            .pending_object_references
+            .lock()
+            .iter()
+            .map(|p| (p.dataset, p.element, p.target.clone()))
+            .collect();
+        let width = self.ctx.sizeof_addr as usize;
+        for (dataset, element, target) in &pending {
+            let addr = match self.object_reference_target(target)? {
+                Some(HardLinkTarget::Dataset(i)) => self.ds(i).lock().obj_header_addr,
+                Some(HardLinkTarget::Group(i)) => self.grp(i).lock().obj_header_addr,
+                None => self.root_group_addr.ok_or_else(|| {
+                    crate::io::IoError::InvalidState(
+                        "root group header address is not assigned yet".into(),
+                    )
+                })?,
+            };
+            let data_addr = self.ds(*dataset).lock().data_addr;
+            let at = data_addr + element * width as u64;
+            self.handle.write_at(at, &addr.to_le_bytes()[..width])?;
+        }
+        Ok(())
+    }
+
+    /// Append every user-created hard link whose parent group is `parent`
+    /// (`None` == the root group). Called while collecting a group's links,
+    /// once every object's header address has been assigned.
+    fn push_hard_links(&self, links: &mut Vec<(u64, LinkMessage)>, parent: Option<usize>) {
         for link in self.hard_links_vec() {
             if link.parent != parent || !self.hard_link_emitted(&link) {
                 continue;
@@ -2855,9 +4071,508 @@ impl Hdf5Writer {
                 HardLinkTarget::Dataset(i) => self.ds(i).lock().obj_header_addr,
                 HardLinkTarget::Group(i) => self.grp(i).lock().obj_header_addr,
             };
-            let msg = LinkMessage::hard(&link.name, addr);
-            header.add_message(MSG_LINK, 0x00, msg.encode(&self.ctx));
+            links.push((link.creation_seq, LinkMessage::hard(&link.name, addr)));
         }
+    }
+
+    /// Refuse a caller path that would have to leave this file through one of
+    /// the external links a reopened file brought in.
+    ///
+    /// The reader follows such a path into the file the link names; the writer
+    /// cannot, because it models one file and would have to write into
+    /// another. Saying which link stops the path — rather than reporting the
+    /// name as absent, or worse, creating a second link of that name beside
+    /// it — is the whole of what write mode does here.
+    pub(crate) fn reject_external_traversal(&self, path: &str) -> IoResult<()> {
+        let path = path.trim_start_matches('/');
+        let crossing = self.preserved_link_paths().into_iter().find(|(p, class)| {
+            matches!(class, crate::io::reader::LinkClass::External { .. })
+                && (path == p || path.starts_with(&format!("{p}/")))
+        });
+        match crossing {
+            None => Ok(()),
+            Some((link, crate::io::reader::LinkClass::External { file, path: target })) => {
+                Err(crate::io::IoError::Unsupported(format!(
+                    "'{path}' resolves through the external link '{link}' to '{target}' in \
+                     '{file}'; this writer carries external links through a rewrite but does \
+                     not open the file they name"
+                )))
+            }
+            // `find` matched on the External arm, so no other class reaches here.
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Resolve `name` to a live dataset index, reporting *why* it does not
+    /// resolve rather than collapsing every cause into absence.
+    ///
+    /// The write-mode counterpart of [`Hdf5Reader::open_dataset`]: the single
+    /// gate every by-name dataset lookup in write mode goes through.
+    ///
+    /// [`Hdf5Reader::open_dataset`]: crate::io::reader::Hdf5Reader::open_dataset
+    pub(crate) fn open_dataset_index(&self, name: &str) -> IoResult<usize> {
+        self.reject_external_traversal(name)?;
+        self.reject_preserved_object(name)?;
+        self.dataset_index(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))
+    }
+
+    /// Refuse a caller path that names an object the reopen kept by its bytes
+    /// rather than modelling.
+    ///
+    /// Such an object is in the file and stays in it, but this writer holds
+    /// none of what it would need to read or rewrite it. Saying so — with the
+    /// reason the classification recorded — is the difference between an
+    /// object the writer will not touch and a name the file does not have.
+    pub(crate) fn reject_preserved_object(&self, path: &str) -> IoResult<()> {
+        let path = path.trim_start_matches('/');
+        let objects: Vec<(String, String)> = {
+            let preserved = self.preserved_links.lock();
+            preserved
+                .iter()
+                .filter_map(|l| {
+                    l.reason
+                        .as_ref()
+                        .map(|why| (self.preserved_link_full_path(l), why.clone()))
+                })
+                .collect()
+        };
+        match objects
+            .into_iter()
+            .find(|(full, _)| path == full || path.starts_with(&format!("{full}/")))
+        {
+            None => Ok(()),
+            Some((link, why)) => Err(crate::io::IoError::Unsupported(format!(
+                "'{path}' is, or is inside, the object '{link}', which this file's reopen \
+                 kept exactly as it found it because {why}"
+            ))),
+        }
+    }
+
+    /// Every link this writer is carrying but cannot express, by full path.
+    pub(crate) fn preserved_link_paths(&self) -> Vec<(String, crate::io::reader::LinkClass)> {
+        self.preserved_links
+            .lock()
+            .iter()
+            .map(|l| (self.preserved_link_full_path(l), l.class.clone()))
+            .collect()
+    }
+
+    /// The full path of a preserved link: its parent group's path plus its
+    /// leaf name, in the no-leading-`/` form the registry uses.
+    fn preserved_link_full_path(&self, link: &PreservedLink) -> String {
+        match link.parent {
+            None => link.name.clone(),
+            Some(gi) => {
+                let group = self.grp(gi).lock().name.clone();
+                format!("{}/{}", group.trim_start_matches('/'), link.name)
+            }
+        }
+    }
+
+    /// The single owner of "which links does this group hold", in the order
+    /// they were created and, when the file tracks creation order, stamped
+    /// with it.
+    ///
+    /// Both the compact form (one `MSG_LINK` per link) and the dense form (the
+    /// same messages inside a fractal heap) are built from this one list, so
+    /// the phase-change decision, the storage it selects and the creation
+    /// order recorded in either can never disagree about what the group
+    /// contains.
+    fn group_links(&self, scope: LinkScope, order: CreationOrder) -> Vec<LinkMessage> {
+        let mut links: Vec<(u64, LinkMessage)> = Vec::new();
+        match scope {
+            LinkScope::Root => {
+                // Datasets that belong to a subgroup are that group's links,
+                // not the root's. Each group slot is locked one at a time.
+                let mut datasets_in_subgroups: std::collections::HashSet<usize> =
+                    std::collections::HashSet::new();
+                for grp in self.group_refs() {
+                    let g = grp.lock();
+                    if g.deleted {
+                        continue;
+                    }
+                    datasets_in_subgroups.extend(g.child_datasets.iter().copied());
+                }
+                // `dataset_refs` preserves registry order, so `enumerate`
+                // yields each dataset's true index.
+                for (i, ds) in self.dataset_refs().into_iter().enumerate() {
+                    let m = ds.lock();
+                    if m.deleted || datasets_in_subgroups.contains(&i) {
+                        continue;
+                    }
+                    // The leaf, never the registry path: a link name is one
+                    // path component, and `H5G_traverse` would split a '/'
+                    // in it before `H5L_link` ever saw the name.
+                    let leaf_name = m.name.rsplit('/').next().unwrap_or(&m.name);
+                    links.push((
+                        m.creation_seq,
+                        LinkMessage::hard(leaf_name, m.obj_header_addr),
+                    ));
+                }
+                for grp in self.group_refs() {
+                    let g = grp.lock();
+                    if g.deleted || g.parent.is_some() {
+                        continue;
+                    }
+                    let leaf_name = g.name.rsplit('/').next().unwrap_or(&g.name);
+                    links.push((
+                        g.creation_seq,
+                        LinkMessage::hard(leaf_name, g.obj_header_addr),
+                    ));
+                }
+                self.push_hard_links(&mut links, None);
+            }
+            LinkScope::Group(group_idx) => {
+                // Snapshot the child lists, then drop the slot guard: the
+                // per-child reads below re-lock dataset and group slots
+                // (including this one).
+                let (child_datasets, child_groups) = {
+                    let grp = self.grp(group_idx);
+                    let g = grp.lock();
+                    (g.child_datasets.clone(), g.child_groups.clone())
+                };
+                for ds_idx in child_datasets {
+                    let ds = self.ds(ds_idx);
+                    let m = ds.lock();
+                    if m.deleted {
+                        continue;
+                    }
+                    let leaf_name = m.name.rsplit('/').next().unwrap_or(&m.name);
+                    links.push((
+                        m.creation_seq,
+                        LinkMessage::hard(leaf_name, m.obj_header_addr),
+                    ));
+                }
+                for child_idx in child_groups {
+                    let child_grp = self.grp(child_idx);
+                    let g = child_grp.lock();
+                    if g.deleted {
+                        continue;
+                    }
+                    let leaf_name = g.name.rsplit('/').next().unwrap_or(&g.name);
+                    links.push((
+                        g.creation_seq,
+                        LinkMessage::hard(leaf_name, g.obj_header_addr),
+                    ));
+                }
+                self.push_hard_links(&mut links, Some(group_idx));
+            }
+        }
+        // Creation order, not order by kind: a run of create_group and
+        // create_dataset draws from one counter, so this is the order the
+        // caller made them in. `H5G_obj_insert` numbers from zero within the
+        // group, so the rank here is the link's creation order.
+        links.sort_by_key(|(seq, _)| *seq);
+        links
+            .into_iter()
+            .enumerate()
+            .map(|(rank, (_, link))| {
+                if order.is_tracked() {
+                    link.with_creation_order(rank as i64)
+                } else {
+                    link
+                }
+            })
+            .collect()
+    }
+
+    /// Whether `links` must live in dense storage rather than in the group's
+    /// object header — the `H5G_obj_insert` phase-change rule, applied to the
+    /// whole set at once because this writer builds each header from scratch
+    /// rather than inserting one link at a time.
+    ///
+    /// libhdf5 converts when the count *reaches* `max_compact` and another
+    /// link arrives, so a set of exactly `max_compact` is still compact; and
+    /// separately when one message would not fit the 16-bit size field an
+    /// object header message has.
+    ///
+    /// The answer depends only on the link names and kinds, never on the
+    /// addresses they point at, which is what lets a group header be sized
+    /// before [`prepare_dense_links`](Self::prepare_dense_links) has run.
+    fn links_need_dense(&self, links: &[LinkMessage]) -> bool {
+        links.len() > MAX_COMPACT_LINKS
+            || links
+                .iter()
+                .any(|l| l.encode(&self.ctx).len() > MAX_MESSAGE_SIZE)
+    }
+
+    /// The single owner of link emission into a group object header: the Link
+    /// Info and Group Info messages, and then either one `MSG_LINK` per link
+    /// or nothing at all when the set has spilled to dense storage.
+    ///
+    /// The two storage forms are exclusive (`H5G_obj_insert` moves the whole
+    /// set at once), and a header carrying both would report every link twice.
+    ///
+    /// A group whose links are dense but not yet laid out gets a compact Link
+    /// Info message here. That is deliberate: the message encodes to the same
+    /// length either way — two addresses, defined or not — so the sizing pass
+    /// that runs before `prepare_dense_links` still reserves the right number
+    /// of bytes, and the write pass that runs after it emits the real heap and
+    /// index addresses. It is the same two-pass rule the child link addresses
+    /// already follow.
+    fn emit_links(
+        &self,
+        header: &mut ObjectHeader,
+        scope: LinkScope,
+        links: &[LinkMessage],
+        order: CreationOrder,
+    ) {
+        // Links a reopen carried through verbatim because this writer cannot
+        // express them. They are emitted here rather than by a second caller
+        // so that no header-rewrite path can drop them, and their presence
+        // pins the group to compact storage: dense storage would have to
+        // re-encode each link into the heap, which is exactly the byte
+        // fidelity preserving them is for.
+        let preserved = self.preserved_links_for(scope);
+        let dense = preserved.is_empty() && self.links_need_dense(links);
+        let link_info = self.dense_links.lock().get(&scope).cloned();
+        let link_info = link_info.unwrap_or_else(|| {
+            let mut info = LinkInfoMessage::compact();
+            if order.is_tracked() {
+                // `H5G__obj_insert` post-increments `max_corder`, so a group
+                // holding n links reports n.
+                info.max_creation_order = Some(links.len() as u64);
+            }
+            if order.is_indexed() {
+                // The index address stays undefined while the links live in
+                // the header, but the message must still carry the field:
+                // `H5Pget_link_creation_order` reads INDEXED off this flag,
+                // not off the address.
+                info.creation_order_btree_address = Some(UNDEF_ADDR);
+            }
+            info
+        });
+        header.add_message(MSG_LINK_INFO, 0x00, link_info.encode(&self.ctx));
+        header.add_message(MSG_GROUP_INFO, 0x00, GroupInfoMessage::default().encode());
+        if dense {
+            return;
+        }
+        for link in links {
+            header.add_message(MSG_LINK, 0x00, link.encode(&self.ctx));
+        }
+        for encoded in preserved {
+            header.add_message(MSG_LINK, 0x00, encoded);
+        }
+    }
+
+    /// The verbatim link bodies a reopen carried into `scope`.
+    fn preserved_links_for(&self, scope: LinkScope) -> Vec<Vec<u8>> {
+        let parent = match scope {
+            LinkScope::Root => None,
+            LinkScope::Group(i) => Some(i),
+        };
+        self.preserved_links
+            .lock()
+            .iter()
+            .filter(|l| l.parent == parent)
+            .map(|l| l.encoded.clone())
+            .collect()
+    }
+
+    /// Lay out and write dense link storage for every group that needs it,
+    /// recording the resulting `Link Info` message per group.
+    ///
+    /// The sole owner of that transition. It must run after every object
+    /// header address is assigned — the heap holds encoded link messages, and
+    /// those name their targets — and before any group header is written.
+    ///
+    /// Every group whose header this finalize rewrites passes through here,
+    /// dense or not: the storage a reopened header named is superseded by the
+    /// rewrite whichever form the new link set takes, and freeing it first is
+    /// what lets the replacement reuse those blocks.
+    fn prepare_dense_links(&self) -> IoResult<()> {
+        let mut scopes: Vec<(LinkScope, Vec<LinkMessage>, CreationOrder)> = Vec::new();
+        for gi in 0..self.group_count() {
+            let (deleted, order) = {
+                let grp = self.grp(gi);
+                let g = grp.lock();
+                (g.deleted, g.track_order.links)
+            };
+            if deleted {
+                continue;
+            }
+            self.release_superseded_dense_links(LinkScope::Group(gi))?;
+            let links = self.group_links(LinkScope::Group(gi), order);
+            if self.links_need_dense(&links) {
+                scopes.push((LinkScope::Group(gi), links, order));
+            }
+        }
+        let root_order = self.root_track_order.links;
+        self.release_superseded_dense_links(LinkScope::Root)?;
+        let root_links = self.group_links(LinkScope::Root, root_order);
+        if self.links_need_dense(&root_links) {
+            scopes.push((LinkScope::Root, root_links, root_order));
+        }
+
+        for (scope, links, order) in scopes {
+            // `close` after `start_swmr` finalizes a second time over the same
+            // groups, so rebuilding here would allocate a whole second heap
+            // and strand the one the published headers already name.
+            if self.dense_links.lock().contains_key(&scope) {
+                continue;
+            }
+            let dense = build_dense_links(&links, &self.ctx, order, &mut |len| {
+                self.allocator.allocate(len)
+            })?;
+            for block in &dense.blocks {
+                self.handle.write_at(block.addr, &block.image)?;
+            }
+            self.dense_links.lock().insert(scope, dense.linfo);
+        }
+        Ok(())
+    }
+
+    /// The single owner of attribute emission into an object header: appends
+    /// the Attribute Info message and then one `MSG_ATTRIBUTE` per attribute.
+    ///
+    /// On a version-2 object header the two are inseparable.
+    /// `H5O__attr_count_real` derives `H5Oget_info().num_attrs` from the
+    /// Attribute Info message alone — with no such message the count reads as
+    /// zero however many attribute messages follow, which is what made every
+    /// rust-written file report `num_attrs == 0` to libhdf5 while
+    /// `H5Aiterate2` still yielded the attributes. The message carries no
+    /// count of its own: `H5A__get_ainfo` fills `nattrs` from the attribute
+    /// messages the header loader actually saw, so compact storage needs
+    /// nothing but the message's presence.
+    ///
+    /// When [`prepare_dense_attributes`](Self::prepare_dense_attributes) has
+    /// spilled `scope`'s attributes to a fractal heap, the same message names
+    /// that heap instead and *no* attribute message follows: the two storage
+    /// forms are exclusive (`H5O__attr_create` moves the whole set at once),
+    /// and a header carrying both would report every attribute twice.
+    fn emit_attributes(
+        &self,
+        header: &mut ObjectHeader,
+        scope: AttrScope,
+        attributes: &[AttributeEntry],
+        order: CreationOrder,
+    ) {
+        // `H5Pget_attr_creation_order` reads the object header's own flags,
+        // not the Attribute Info message, so this is what makes the object
+        // report creation-ordered attributes — and tracking widens every
+        // message envelope by the creation index below.
+        header.set_attribute_creation_order(order);
+        if attributes.is_empty() {
+            return;
+        }
+        if let Some(ainfo) = self.dense_attributes.lock().get(&scope) {
+            header.add_message(MSG_ATTR_INFO, MSG_FLAG_DONTSHARE, ainfo.encode(&self.ctx));
+            return;
+        }
+        let mut ainfo = AttributeInfoMessage::compact();
+        if order.is_tracked() {
+            // Post-increment, as `H5O__attr_create` does: after n attributes
+            // the running maximum is n.
+            ainfo.max_creation_index = Some(attributes.len() as u16);
+        }
+        if order.is_indexed() {
+            // Compact storage has no index B-tree, but the message still
+            // announces one so that its flags match the header's
+            // (`H5O__attr_create` asserts they agree).
+            ainfo.creation_order_btree_address = Some(UNDEF_ADDR);
+        }
+        header.add_message(MSG_ATTR_INFO, MSG_FLAG_DONTSHARE, ainfo.encode(&self.ctx));
+        // The list is in creation order, so an attribute's position in it is
+        // the creation index libhdf5 would have stamped on its message.
+        for (i, attr) in attributes.iter().enumerate() {
+            header.add_message_indexed(
+                MSG_ATTRIBUTE,
+                0x00,
+                attr.encode_at(&self.ctx, self.libver),
+                i as u16,
+            );
+        }
+    }
+
+    /// Whether `attributes` must live in dense storage rather than in the
+    /// object header — the `H5O__attr_create` phase-change rule, applied to
+    /// the whole set at once because this writer builds each header from
+    /// scratch rather than inserting one attribute at a time.
+    ///
+    /// libhdf5 converts when the count *reaches* `max_compact` and another
+    /// attribute arrives, so a set of exactly `max_compact` is still compact;
+    /// and separately when one message would not fit the 16-bit size field an
+    /// object header message has.
+    fn attributes_need_dense(&self, attributes: &[AttributeEntry]) -> bool {
+        attributes.len() > MAX_COMPACT_ATTRS
+            || attributes
+                .iter()
+                .any(|a| a.encode_at(&self.ctx, self.libver).len() > MAX_MESSAGE_SIZE)
+    }
+
+    /// Lay out and write dense attribute storage for every object that needs
+    /// it, recording the resulting `Attribute Info` message per object.
+    ///
+    /// The sole owner of that transition: it runs before any object header is
+    /// built, so `emit_attributes` never allocates. Every block is on disk
+    /// before the map naming it is populated, so a header written from that
+    /// map can only point at bytes that exist.
+    ///
+    /// `datasets` lists the datasets whose headers this finalize will
+    /// actually write. A reopened dataset that took no writes keeps its
+    /// original header — and with it whatever storage that header already
+    /// names — so building a heap for it would strand every block of it.
+    ///
+    /// That list is also what makes freeing safe: every object named here has
+    /// its header rewritten, so the dense storage a reopen found on it is
+    /// superseded whether or not the new attribute set is dense again, and
+    /// freeing it before the replacement is laid out is what lets the
+    /// replacement reuse the same blocks.
+    fn prepare_dense_attributes(&self, datasets: &[usize]) -> IoResult<()> {
+        let mut scopes: Vec<(AttrScope, Vec<AttributeEntry>, CreationOrder)> = Vec::new();
+        {
+            self.release_superseded_dense_attrs(AttrScope::Root)?;
+            let root = self.root_attributes.lock();
+            if self.attributes_need_dense(&root) {
+                scopes.push((AttrScope::Root, root.clone(), self.root_track_order.attrs));
+            }
+        }
+        for gi in 0..self.group_count() {
+            if self.grp(gi).lock().deleted {
+                continue;
+            }
+            self.release_superseded_dense_attrs(AttrScope::Group(gi))?;
+            let grp = self.grp(gi);
+            let g = grp.lock();
+            if self.attributes_need_dense(&g.attributes) {
+                scopes.push((
+                    AttrScope::Group(gi),
+                    g.attributes.clone(),
+                    g.track_order.attrs,
+                ));
+            }
+        }
+        for &i in datasets {
+            self.release_superseded_dense_attrs(AttrScope::Dataset(i))?;
+            let ds = self.ds(i);
+            let m = ds.lock();
+            if self.attributes_need_dense(&m.attributes) {
+                scopes.push((
+                    AttrScope::Dataset(i),
+                    m.attributes.clone(),
+                    m.track_attr_order,
+                ));
+            }
+        }
+
+        for (scope, attributes, order) in scopes {
+            // `close` after `start_swmr` finalizes a second time over the same
+            // attribute sets — SWMR refuses every attribute mutation — so
+            // rebuilding here would allocate a whole second heap and strand
+            // the one the published headers already name.
+            if self.dense_attributes.lock().contains_key(&scope) {
+                continue;
+            }
+            let dense = build_dense_attributes(&attributes, &self.ctx, order, &mut |len| {
+                self.allocator.allocate(len)
+            })?;
+            for block in &dense.blocks {
+                self.handle.write_at(block.addr, &block.image)?;
+            }
+            self.dense_attributes.lock().insert(scope, dense.ainfo);
+        }
+        Ok(())
     }
 
     /// Define a new contiguous dataset. Returns the dataset index (used with
@@ -2913,6 +4628,50 @@ impl Hdf5Writer {
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
+                fill_value: None,
+                layout_version: 4,
+            },
+        );
+
+        Ok(idx)
+    }
+
+    /// Define a new dataset with the NULL dataspace: no elements at all.
+    ///
+    /// Distinct from a scalar dataset (`create_dataset` with `dims == []`),
+    /// which holds exactly one element — a NULL dataspace holds zero, so
+    /// there is no raw image to allocate: `data_addr` stays `UNDEF_ADDR` and
+    /// `data_size` stays 0 permanently, the same terminal state
+    /// `create_dataset` already reaches for a zero-length dimension.
+    pub fn create_null_dataset(&self, name: &str, datatype: DatatypeMessage) -> IoResult<usize> {
+        let create = self.begin_create(name)?;
+        let name = create.name.as_str();
+
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                dataspace: DataspaceMessage::null(),
+                obj_header_addr: 0, // set during finalize
+                data_addr: UNDEF_ADDR,
+                data_size: 0,
+                chunked: None,
+                fixed_array: None,
+                btree_v2: None,
+                append: None,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: None,
+                deleted: false,
+                extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version: 4,
             },
@@ -2937,7 +4696,7 @@ impl Hdf5Writer {
         let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
-        ensure_unlimited_is_leading(max_dims)?;
+        ensure_at_most_one_unlimited(max_dims)?;
         let chunk_bytes = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
         let layout_version = self.chunk_layout_version(false, chunk_bytes);
         let earray_params = EarrayParams::default_params();
@@ -2983,6 +4742,9 @@ impl Hdf5Writer {
 
         // Build dataspace with max dims
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };
@@ -3002,6 +4764,9 @@ impl Hdf5Writer {
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -3689,11 +5454,16 @@ impl Hdf5Writer {
         if self.swmr_active {
             return Err(swmr_attr_error(&attr.name));
         }
+        // No size gate: an attribute whose message is too large for the
+        // 16-bit size field an object header message has spills the object's
+        // whole attribute set to dense storage at finalize, exactly as
+        // `H5O__attr_create` does. See `attributes_need_dense`.
+        let entry = AttributeEntry::Readable(attr);
         let old = self.with_attr_list(target, |attrs| {
-            if let Some(pos) = attrs.iter().position(|a| a.name == attr.name) {
-                Some(std::mem::replace(&mut attrs[pos], attr))
+            if let Some(pos) = attrs.iter().position(|a| a.name() == entry.name()) {
+                Some(std::mem::replace(&mut attrs[pos], entry))
             } else {
-                attrs.push(attr);
+                attrs.push(entry);
                 None
             }
         })?;
@@ -3748,7 +5518,7 @@ impl Hdf5Writer {
         let old = self.with_attr_list(target, |attrs| {
             attrs
                 .iter()
-                .position(|a| a.name == name)
+                .position(|a| a.name() == name)
                 .map(|pos| attrs.remove(pos))
         })?;
         match old {
@@ -3765,8 +5535,14 @@ impl Hdf5Writer {
     /// class stores its value inline in the message. Per-object removal
     /// keeps collections shared with other refs (libhdf5-written files)
     /// intact.
-    fn release_attr_vlen(&self, old: &AttributeMessage) -> IoResult<()> {
+    fn release_attr_vlen(&self, old: &AttributeEntry) -> IoResult<()> {
         use crate::format::messages::datatype::DatatypeMessage;
+        // An attribute whose message this crate could not decode keeps
+        // whatever heap space it references: releasing objects named by bytes
+        // we cannot interpret would free storage that is still live.
+        let Some(old) = old.readable() else {
+            return Ok(());
+        };
         if matches!(
             old.datatype,
             DatatypeMessage::VarLenString { .. } | DatatypeMessage::VarLenSequence { .. }
@@ -3781,7 +5557,7 @@ impl Hdf5Writer {
     fn with_attr_list<R>(
         &self,
         target: AttrTarget<'_>,
-        f: impl FnOnce(&mut Vec<AttributeMessage>) -> R,
+        f: impl FnOnce(&mut Vec<AttributeEntry>) -> R,
     ) -> IoResult<R> {
         match target {
             AttrTarget::Root => Ok(f(&mut self.root_attributes.lock())),
@@ -3804,7 +5580,12 @@ impl Hdf5Writer {
                         "dataset index {index} out of range (have {count})"
                     )));
                 }
-                Ok(f(&mut self.ds(index).lock().attributes))
+                let ds = self.ds(index);
+                let mut m = ds.lock();
+                // Every caller of this mutates the list, and a reopened
+                // dataset's header is rewritten only when it is marked stale.
+                m.header_dirty = true;
+                Ok(f(&mut m.attributes))
             }
         }
     }
@@ -4007,9 +5788,20 @@ impl Hdf5Writer {
     ///
     /// Stores strings in the global heap. The dataset raw data consists of
     /// vlen references (collection_addr + object_index pairs).
-    pub fn create_vlen_string_dataset(&self, name: &str, strings: &[&str]) -> IoResult<usize> {
+    ///
+    /// `charset` is the datatype's declared character set (0 = ASCII,
+    /// 1 = UTF-8); the strings are checked against it before anything is
+    /// written, so the type never misdescribes the bytes under it.
+    pub fn create_vlen_string_dataset(
+        &self,
+        name: &str,
+        strings: &[&str],
+        charset: u8,
+    ) -> IoResult<usize> {
         use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
+
+        ensure_vlen_charset(charset, strings)?;
 
         let create = self.begin_create(name)?;
         let name = create.name.as_str();
@@ -4039,7 +5831,10 @@ impl Hdf5Writer {
         self.handle.write_at(data_addr, &raw_data)?;
 
         // Create the dataset with vlen string datatype
-        let datatype = DatatypeMessage::vlen_string_utf8();
+        let datatype = DatatypeMessage::VarLenString {
+            padding: 0,
+            charset,
+        };
         let dataspace =
             crate::format::messages::dataspace::DataspaceMessage::simple(&[num_strings]);
 
@@ -4058,6 +5853,9 @@ impl Hdf5Writer {
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version: 4,
                 chunked: None,
@@ -4072,22 +5870,55 @@ impl Hdf5Writer {
 
     /// Create a 1-D variable-length byte-array dataset.
     ///
-    /// Each item's bytes are stored as a global-heap object and the dataset
-    /// holds one vlen reference per item (same on-disk shape as a vlen string
-    /// dataset). The datatype is a vlen sequence of `u8`, so h5py reads it back
-    /// as an array of variable-length `uint8` arrays. `seq_len` is the number
-    /// of base (`u8`) elements, i.e. the byte length; no null terminator is
-    /// appended.
+    /// The `u8` case of [`create_vlen_sequence_dataset`], where an item's
+    /// byte image and its element count are the same number.
+    ///
+    /// [`create_vlen_sequence_dataset`]: Self::create_vlen_sequence_dataset
     pub fn create_vlen_bytes_dataset(&self, name: &str, items: &[&[u8]]) -> IoResult<usize> {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        self.create_vlen_sequence_dataset(name, DatatypeMessage::u8_type(), items)
+    }
+
+    /// Create a 1-D variable-length sequence dataset over `base`.
+    ///
+    /// Each item is the encoded image of one sequence — `n * base.element_size()`
+    /// bytes in the base type's own byte order — and is stored as a global-heap
+    /// object; the dataset holds one vlen reference per item, the same on-disk
+    /// shape a vlen string dataset has. The `H5T_VLEN` length field counts base
+    /// elements rather than bytes, so an image whose length is not a whole
+    /// number of elements is refused here rather than stored under a length
+    /// that misreads it.
+    pub fn create_vlen_sequence_dataset(
+        &self,
+        name: &str,
+        base: DatatypeMessage,
+        items: &[&[u8]],
+    ) -> IoResult<usize> {
         use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
+
+        let elem_size = base.element_size() as usize;
+        if elem_size == 0 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "vlen base datatype {base} has no element size"
+            )));
+        }
+        for (i, item) in items.iter().enumerate() {
+            if !item.len().is_multiple_of(elem_size) {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "sequence {i} is {} bytes, not a whole number of {elem_size}-byte elements",
+                    item.len()
+                )));
+            }
+        }
 
         let create = self.begin_create(name)?;
         let name = create.name.as_str();
         let num_items = items.len() as u64;
 
-        // Store the byte arrays as heap objects, sharing collection blocks
-        // as `create_vlen_string_dataset` does.
+        // Store the sequence images as heap objects, sharing collection
+        // blocks as `create_vlen_string_dataset` does.
         let placements = self.insert_vlen_objects(items)?;
 
         // Build raw data: one vlen reference per item.
@@ -4095,8 +5926,7 @@ impl Hdf5Writer {
         let data_size = (num_items as usize) * ref_size;
         let mut raw_data = Vec::with_capacity(data_size);
         for (i, &(gcol_addr, obj_idx)) in placements.iter().enumerate() {
-            // base is u8, so element count == byte count.
-            let seq_len = crate::format::global_heap::vlen_seq_len(items[i].len())?;
+            let seq_len = crate::format::global_heap::vlen_seq_len(items[i].len() / elem_size)?;
             raw_data.extend_from_slice(&encode_vlen_reference(
                 seq_len,
                 gcol_addr,
@@ -4109,8 +5939,9 @@ impl Hdf5Writer {
         let data_addr = self.allocator.allocate(data_size as u64);
         self.handle.write_at(data_addr, &raw_data)?;
 
-        // Create the dataset with a vlen byte-array datatype.
-        let datatype = DatatypeMessage::vlen_bytes();
+        let datatype = DatatypeMessage::VarLenSequence {
+            base: Box::new(base),
+        };
         let dataspace = crate::format::messages::dataspace::DataspaceMessage::simple(&[num_items]);
 
         let idx = self.push_dataset(
@@ -4128,6 +5959,9 @@ impl Hdf5Writer {
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version: 4,
                 chunked: None,
@@ -4227,6 +6061,9 @@ impl Hdf5Writer {
         self.handle.write_at(ea_iblk_addr, &iblk_encoded)?;
 
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };
@@ -4253,6 +6090,9 @@ impl Hdf5Writer {
                 filter_pipeline: Some(pipeline),
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -4348,7 +6188,7 @@ impl Hdf5Writer {
             let ds = self.ds(ds_index);
             let m = ds.lock();
             match m.datatype {
-                DatatypeMessage::VarLenString { charset } => charset,
+                DatatypeMessage::VarLenString { charset, .. } => charset,
                 _ => {
                     return Err(crate::io::IoError::InvalidState(
                         "append_vlen_strings is only for variable-length string datasets".into(),
@@ -4487,7 +6327,7 @@ impl Hdf5Writer {
             let ds = self.ds(ds_index);
             let m = ds.lock();
             let charset = match m.datatype {
-                DatatypeMessage::VarLenString { charset } => charset,
+                DatatypeMessage::VarLenString { charset, .. } => charset,
                 _ => {
                     return Err(crate::io::IoError::InvalidState(
                         "write_vlen_strings_slice is only for variable-length string datasets"
@@ -4890,6 +6730,7 @@ impl Hdf5Writer {
             )));
         }
         ds.fill_value = Some(bytes);
+        ds.header_dirty = true;
 
         // For a contiguous dataset the fill-value message declares
         // fill-on-allocation, but contiguous storage has no per-chunk
@@ -5439,6 +7280,9 @@ impl Hdf5Writer {
         // `extend_dataset` checks growth against, and the FA capacity above
         // is exactly its chunk grid.
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };
@@ -5458,6 +7302,9 @@ impl Hdf5Writer {
                 filter_pipeline: pipeline,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
                 chunked: None,
@@ -5574,6 +7421,9 @@ impl Hdf5Writer {
         self.handle.write_at(bt2_header_addr, &hdr_encoded)?;
 
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };
@@ -5593,6 +7443,9 @@ impl Hdf5Writer {
                 filter_pipeline: pipeline,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
                 chunked: None,
@@ -5628,7 +7481,7 @@ impl Hdf5Writer {
         let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
-        ensure_unlimited_is_leading(max_dims)?;
+        ensure_at_most_one_unlimited(max_dims)?;
         let element_size = datatype.element_size() as u64;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
         let layout_version = self.chunk_layout_version(true, chunk_bytes);
@@ -5672,6 +7525,9 @@ impl Hdf5Writer {
         self.handle.write_at(ea_iblk_addr, &iblk_encoded)?;
 
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };
@@ -5699,6 +7555,9 @@ impl Hdf5Writer {
                 filter_pipeline: Some(FilterPipeline::deflate(compression_level)),
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -5736,7 +7595,7 @@ impl Hdf5Writer {
         let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
-        ensure_unlimited_is_leading(max_dims)?;
+        ensure_at_most_one_unlimited(max_dims)?;
         let element_size = datatype.element_size() as u64;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
         let layout_version = self.chunk_layout_version(true, chunk_bytes);
@@ -5777,6 +7636,9 @@ impl Hdf5Writer {
         self.handle.write_at(ea_iblk_addr, &iblk_encoded)?;
 
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };
@@ -5802,6 +7664,9 @@ impl Hdf5Writer {
                 filter_pipeline: Some(pipeline),
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -7081,6 +8946,54 @@ impl Hdf5Writer {
         self.allocator.eof()
     }
 
+    /// The superblock version this file will be written with.
+    ///
+    /// `H5F__super_init` takes the oldest version that can describe the file
+    /// and raises it to the one the file's library-version low bound implies:
+    /// `super_vers = MAX(super_vers, HDF5_superblock_ver_bounds[low_bound])`,
+    /// with the bounds table reading 0, 2, 3, 3, 3, 3, 3 for EARLIEST, V18,
+    /// V110, V112, V114, V200, LATEST (H5Fsuper.c:68, :1128-1154). This crate
+    /// has no version-bound property list, so the bound is read back from
+    /// what it writes:
+    ///
+    /// * The floor is `H5F_LIBVER_V18`, hence version 2. Every group this
+    ///   writer emits is a link-message group, which libhdf5 only writes at a
+    ///   low bound of V18 or newer (`use_at_least_v18`, H5Gobj.c:179), and
+    ///   every object header it emits is version 2, which `H5O_obj_ver_bounds`
+    ///   likewise puts at V18 (H5Oint.c:125). A version-0 superblock over
+    ///   this content would claim a file libhdf5 1.6 can read, and no libhdf5
+    ///   writes that combination.
+    /// * A chunked dataset — extensible array, fixed array or version-2
+    ///   B-tree, all reached through a version-4 or -5 data layout message —
+    ///   raises the bound to V110 (`H5O_layout_ver_bounds`, H5Dlayout.c:44),
+    ///   hence version 3.
+    /// * SWMR writes version 3 outright (H5Fsuper.c:1129), and so does the
+    ///   2.0 format [`set_libver_latest`](Self::set_libver_latest) asks for.
+    ///
+    /// A reopened file starts from the version it already carries, so an
+    /// append that adds nothing newer leaves that version alone.
+    fn superblock_version_for(&self, flags: u8) -> u8 {
+        let mut version = self.superblock_version_base.max(SUPERBLOCK_V2);
+        if self.libver == LibverBound::V200
+            || self.swmr_active
+            || flags & FLAG_SWMR_WRITE != 0
+            || self.has_chunked_dataset()
+        {
+            version = version.max(SUPERBLOCK_V3);
+        }
+        version
+    }
+
+    /// Whether any dataset still in the file is chunked — the three index
+    /// markers `build_dataset_header` turns into a version-4/5 data layout
+    /// message, and nothing else it can emit reaches that version.
+    fn has_chunked_dataset(&self) -> bool {
+        self.dataset_refs().iter().any(|d| {
+            let m = d.lock();
+            !m.deleted && (m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some())
+        })
+    }
+
     /// Write the superblock at offset 0 with the given flags.
     ///
     /// Requires that the root group has already been written (via `finalize`
@@ -7089,18 +9002,28 @@ impl Hdf5Writer {
         let root_addr = self
             .root_group_addr
             .ok_or_else(|| crate::io::IoError::InvalidState("root group not yet written".into()))?;
+        // The userblock this file was opened with. `H5F__super_read` prefers
+        // the located address over this field, but `H5Pget_userblock` reports
+        // it, so a rewrite that zeroed it would hide the block from every
+        // reader that asks for its size.
+        let base = self.handle.base();
+        // The end of file is the one address in the superblock measured from
+        // the start of the *file* rather than from the base: `H5F__super_read`
+        // sets the EOA to `stored_eof - base_addr` (H5Fsuper.c:635) and calls
+        // the file truncated when `eof + base_addr < stored_eof` (:573). The
+        // allocator counts in the based space, so the userblock is added back.
+        let eof = self.allocator.eof() + base;
         let sb = SuperblockV2V3 {
-            version: SUPERBLOCK_V3,
+            version: self.superblock_version_for(flags),
             sizeof_offsets: self.ctx.sizeof_addr,
             sizeof_lengths: self.ctx.sizeof_size,
             file_consistency_flags: flags,
-            base_address: 0,
+            base_address: base,
             superblock_extension_address: UNDEF_ADDR,
-            end_of_file_address: self.allocator.eof(),
+            end_of_file_address: eof,
             root_group_object_header_address: root_addr,
         };
-        let sb_encoded = sb.encode();
-        self.handle.write_at(0, &sb_encoded)?;
+        self.handle.write_at(0, &sb.encode())?;
         Ok(())
     }
 
@@ -7121,7 +9044,7 @@ impl Hdf5Writer {
         };
 
         let header = self.build_dataset_header(index);
-        let encoded = header.encode();
+        let encoded = header.encode()?;
 
         if encoded.len() > original_size {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -7161,12 +9084,13 @@ impl Hdf5Writer {
 
         // 1. Write each dataset's object header (none for a dataset deleted
         // before start_swmr — its storage was freed at delete time).
-        for i in 0..self.dataset_count() {
-            if self.ds(i).lock().deleted {
-                continue;
-            }
+        let live: Vec<usize> = (0..self.dataset_count())
+            .filter(|&i| !self.ds(i).lock().deleted)
+            .collect();
+        self.prepare_dense_attributes(&live)?;
+        for i in live {
             let ds_header = self.build_dataset_header(i);
-            let encoded = ds_header.encode();
+            let encoded = ds_header.encode()?;
             let encoded_size = encoded.len();
             let addr = self.allocator.allocate(encoded_size as u64);
             self.handle.write_at(addr, &encoded)?;
@@ -7185,26 +9109,33 @@ impl Hdf5Writer {
             if self.grp(gi).lock().deleted {
                 continue;
             }
-            let size = self.build_group_header(gi).encode().len() as u64;
+            let size = self.build_group_header(gi).encode()?.len() as u64;
             self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
         }
+        // Every object header now has an address, so a link message names its
+        // real target; and no group header has been written yet, so the Link
+        // Info messages this lays out are the ones that reach the file.
+        self.prepare_dense_links()?;
         for gi in 0..self.group_count() {
             if self.grp(gi).lock().deleted {
                 continue;
             }
-            let encoded = self.build_group_header(gi).encode();
+            let encoded = self.build_group_header(gi).encode()?;
             let addr = self.grp(gi).lock().obj_header_addr;
             self.handle.write_at(addr, &encoded)?;
         }
 
         // 2. Write root group object header.
         let root_header = self.build_root_group_header();
-        let root_encoded = root_header.encode();
+        let root_encoded = root_header.encode()?;
         let root_encoded_size = root_encoded.len();
         let root_addr = self.allocator.allocate(root_encoded_size as u64);
         self.handle.write_at(root_addr, &root_encoded)?;
         self.root_group_addr = Some(root_addr);
         self.root_group_encoded_size = root_encoded_size;
+
+        // 2b. Stamp object references now that every header has an address.
+        self.apply_object_reference_fixups()?;
 
         // 3. Write superblock with SWMR flags.
         self.write_superblock(FLAG_WRITE_ACCESS | FLAG_SWMR_WRITE)?;
@@ -7270,14 +9201,8 @@ impl Hdf5Writer {
                 if m.deleted {
                     continue;
                 }
-                if m.obj_header_written_addr.is_some() {
-                    let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0)
-                        || m.fixed_array.as_ref().is_some_and(|f| f.chunks_written > 0)
-                        || m.btree_v2.as_ref().is_some_and(|b| b.chunks_written > 0)
-                        || m.extent_dirty;
-                    if !modified {
-                        continue;
-                    }
+                if m.obj_header_written_addr.is_some() && !m.storage_dirty() {
+                    continue;
                 }
                 let is_indexed =
                     m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
@@ -7299,42 +9224,42 @@ impl Hdf5Writer {
         let mut freed_headers = std::collections::HashSet::new();
 
         // 1. Write each dataset's object header (deleted datasets get none —
-        // their storage was already freed at delete time).
+        // their storage was already freed at delete time). Which datasets get
+        // one is settled first, because dense attribute storage is laid out
+        // only for headers this finalize actually rewrites.
+        let mut rewritten: Vec<usize> = Vec::new();
         for i in 0..self.dataset_count() {
             let ds = self.ds(i);
-            {
-                let mut m = ds.lock();
-                if m.deleted {
+            let mut m = ds.lock();
+            if m.deleted {
+                continue;
+            }
+            if m.obj_header_written_addr.is_some() {
+                // An existing dataset from append mode keeps its header — and
+                // everything that header names — unless this session changed
+                // what the header says.
+                if !m.header_stale() {
+                    // Keep the original object header address for the root group link.
+                    m.obj_header_addr = m.obj_header_written_addr.unwrap();
                     continue;
                 }
-                if m.obj_header_written_addr.is_some() {
-                    // Existing dataset from append mode.
-                    // If any chunk index took writes this session — or its
-                    // extent changed without a chunk write — it was modified
-                    // and needs a new object header.
-                    let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0)
-                        || m.fixed_array.as_ref().is_some_and(|f| f.chunks_written > 0)
-                        || m.btree_v2.as_ref().is_some_and(|b| b.chunks_written > 0)
-                        || m.extent_dirty;
-                    if !modified {
-                        // Keep the original object header address for the root group link.
-                        m.obj_header_addr = m.obj_header_written_addr.unwrap();
-                        continue;
+                if !self.swmr_active && m.obj_header_encoded_size > 0 {
+                    let old = m.obj_header_written_addr.take().unwrap();
+                    if freed_headers.insert(old) {
+                        self.allocator.free(old, m.obj_header_encoded_size as u64);
                     }
-                    if !self.swmr_active && m.obj_header_encoded_size > 0 {
-                        let old = m.obj_header_written_addr.take().unwrap();
-                        if freed_headers.insert(old) {
-                            self.allocator.free(old, m.obj_header_encoded_size as u64);
-                        }
-                        m.obj_header_encoded_size = 0;
-                    }
+                    m.obj_header_encoded_size = 0;
                 }
             }
+            rewritten.push(i);
+        }
+        self.prepare_dense_attributes(&rewritten)?;
+        for i in rewritten {
             let ds_header = self.build_dataset_header(i);
-            let encoded = ds_header.encode();
+            let encoded = ds_header.encode()?;
             let addr = self.allocator.allocate(encoded.len() as u64);
             self.handle.write_at(addr, &encoded)?;
-            ds.lock().obj_header_addr = addr;
+            self.ds(i).lock().obj_header_addr = addr;
         }
 
         // 1b. Group object headers. A hard link can point to a group whose
@@ -7359,14 +9284,18 @@ impl Hdf5Writer {
             if self.grp(gi).lock().deleted {
                 continue;
             }
-            let size = self.build_group_header(gi).encode().len() as u64;
+            let size = self.build_group_header(gi).encode()?.len() as u64;
             self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
         }
+        // Every object header now has an address, so a link message names its
+        // real target; and no group header has been written yet, so the Link
+        // Info messages this lays out are the ones that reach the file.
+        self.prepare_dense_links()?;
         for gi in 0..self.group_count() {
             if self.grp(gi).lock().deleted {
                 continue;
             }
-            let encoded = self.build_group_header(gi).encode();
+            let encoded = self.build_group_header(gi).encode()?;
             let addr = self.grp(gi).lock().obj_header_addr;
             self.handle.write_at(addr, &encoded)?;
         }
@@ -7380,10 +9309,14 @@ impl Hdf5Writer {
             }
         }
         let root_header = self.build_root_group_header();
-        let root_encoded = root_header.encode();
+        let root_encoded = root_header.encode()?;
         let root_addr = self.allocator.allocate(root_encoded.len() as u64);
         self.handle.write_at(root_addr, &root_encoded)?;
         self.root_group_addr = Some(root_addr);
+
+        // 2b. Every object header now has an address, so the object
+        // references waiting on one can be stamped into their datasets.
+        self.apply_object_reference_fixups()?;
 
         // 3. Write superblock at offset 0.
         self.write_superblock(0)?;
@@ -7413,7 +9346,7 @@ impl Hdf5Writer {
         header.add_message(MSG_DATASPACE, 0x00, ds_msg);
 
         // Datatype message (type 0x03), flag 0x01 = constant
-        let dt_msg = m.datatype.encode(&self.ctx);
+        let dt_msg = m.datatype.encode_at(&self.ctx, self.libver);
         header.add_message(MSG_DATATYPE, 0x01, dt_msg);
 
         // Fill Value message (type 0x05)
@@ -7486,11 +9419,13 @@ impl Hdf5Writer {
             }
         }
 
-        // Attribute messages (type 0x0C)
-        for attr in &m.attributes {
-            let attr_msg = attr.encode(&self.ctx);
-            header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
-        }
+        // Attribute Info (type 0x15) + attribute messages (type 0x0C)
+        self.emit_attributes(
+            &mut header,
+            AttrScope::Dataset(index),
+            &m.attributes,
+            m.track_attr_order,
+        );
 
         // Object Reference Count message (type 0x16): emitted only when
         // more than one hard link resolves to this dataset (computed above).
@@ -7505,63 +9440,32 @@ impl Hdf5Writer {
     fn build_group_header(&self, group_idx: usize) -> ObjectHeader {
         let mut header = ObjectHeader::new();
 
-        // Link Info message (type 0x02) -- compact storage
-        let link_info = LinkInfoMessage::compact();
-        let li_msg = link_info.encode(&self.ctx);
-        header.add_message(MSG_LINK_INFO, 0x00, li_msg);
-
-        // Group Info message (type 0x0A) -- defaults
-        let group_info = GroupInfoMessage::default();
-        let gi_msg = group_info.encode();
-        header.add_message(MSG_GROUP_INFO, 0x00, gi_msg);
-
-        // Snapshot the group's child lists and attributes, then drop the slot
-        // guard: the per-child reads and emit_hard_links/object_link_count
-        // below re-lock dataset and group slots (including this one).
-        let (child_datasets, child_groups, attributes) = {
+        // Link Info (type 0x02) + Group Info (type 0x0A) + the links
+        // themselves, compact or dense.
+        // Snapshot what the header needs, then drop the slot guard: the calls
+        // below re-lock group slots (including this one).
+        let (attributes, track_order) = {
             let grp = self.grp(group_idx);
             let g = grp.lock();
-            (
-                g.child_datasets.clone(),
-                g.child_groups.clone(),
-                g.attributes.clone(),
-            )
+            (g.attributes.clone(), g.track_order)
         };
 
-        // Link messages for child datasets (skip deleted)
-        for ds_idx in child_datasets {
-            let ds = self.ds(ds_idx);
-            let m = ds.lock();
-            if m.deleted {
-                continue;
-            }
-            let leaf_name = m.name.rsplit('/').next().unwrap_or(&m.name);
-            let link = LinkMessage::hard(leaf_name, m.obj_header_addr);
-            let link_msg = link.encode(&self.ctx);
-            header.add_message(MSG_LINK, 0x00, link_msg);
-        }
+        let links = self.group_links(LinkScope::Group(group_idx), track_order.links);
+        self.emit_links(
+            &mut header,
+            LinkScope::Group(group_idx),
+            &links,
+            track_order.links,
+        );
 
-        // Link messages for child groups (skip deleted)
-        for child_idx in child_groups {
-            let child_grp = self.grp(child_idx);
-            let g = child_grp.lock();
-            if g.deleted {
-                continue;
-            }
-            let leaf_name = g.name.rsplit('/').next().unwrap_or(&g.name);
-            let link = LinkMessage::hard(leaf_name, g.obj_header_addr);
-            let link_msg = link.encode(&self.ctx);
-            header.add_message(MSG_LINK, 0x00, link_msg);
-        }
-
-        // User-created hard links whose parent is this group.
-        self.emit_hard_links(&mut header, Some(group_idx));
-
-        // Attribute messages (type 0x0C) -- e.g. NeXus `NX_class`.
-        for attr in &attributes {
-            let attr_msg = attr.encode(&self.ctx);
-            header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
-        }
+        // Attribute Info (type 0x15) + attributes (type 0x0C) -- e.g. NeXus
+        // `NX_class`.
+        self.emit_attributes(
+            &mut header,
+            AttrScope::Group(group_idx),
+            &attributes,
+            track_order.attrs,
+        );
 
         // Object Reference Count message: emitted only when this group is
         // itself a hard-link target reached by more than one link.
@@ -7576,64 +9480,24 @@ impl Hdf5Writer {
     fn build_root_group_header(&self) -> ObjectHeader {
         let mut header = ObjectHeader::new();
 
-        // Link Info message (type 0x02) — compact storage
-        let link_info = LinkInfoMessage::compact();
-        let li_msg = link_info.encode(&self.ctx);
-        header.add_message(MSG_LINK_INFO, 0x00, li_msg);
-
-        // Group Info message (type 0x0A) — defaults
-        let group_info = GroupInfoMessage::default();
-        let gi_msg = group_info.encode();
-        header.add_message(MSG_GROUP_INFO, 0x00, gi_msg);
-
-        // Collect dataset indices that belong to a subgroup (not the root
-        // group). Each group slot is locked one at a time, then released.
-        let mut datasets_in_subgroups: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
-        for grp in self.group_refs() {
-            let g = grp.lock();
-            if g.deleted {
-                continue;
-            }
-            datasets_in_subgroups.extend(g.child_datasets.iter().copied());
-        }
-
-        // Link messages for root-level datasets. `dataset_refs` preserves
-        // registry order, so `enumerate` yields each dataset's true index.
-        for (i, ds) in self.dataset_refs().into_iter().enumerate() {
-            let m = ds.lock();
-            if m.deleted {
-                continue;
-            }
-            if !datasets_in_subgroups.contains(&i) {
-                let link = LinkMessage::hard(&m.name, m.obj_header_addr);
-                let link_msg = link.encode(&self.ctx);
-                header.add_message(MSG_LINK, 0x00, link_msg);
-            }
-        }
-
-        // Link messages for root-level groups (those with no parent)
-        for grp in self.group_refs() {
-            let g = grp.lock();
-            if g.deleted {
-                continue;
-            }
-            if g.parent.is_none() {
-                let leaf_name = g.name.rsplit('/').next().unwrap_or(&g.name);
-                let link = LinkMessage::hard(leaf_name, g.obj_header_addr);
-                let link_msg = link.encode(&self.ctx);
-                header.add_message(MSG_LINK, 0x00, link_msg);
-            }
-        }
-
-        // User-created hard links in the root group.
-        self.emit_hard_links(&mut header, None);
+        // Link Info (type 0x02) + Group Info (type 0x0A) + the links
+        // themselves, compact or dense.
+        let links = self.group_links(LinkScope::Root, self.root_track_order.links);
+        self.emit_links(
+            &mut header,
+            LinkScope::Root,
+            &links,
+            self.root_track_order.links,
+        );
 
         // Root-level attributes
-        for attr in self.root_attributes.lock().iter() {
-            let attr_msg = attr.encode(&self.ctx);
-            header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
-        }
+        let root_attributes = self.root_attributes.lock();
+        self.emit_attributes(
+            &mut header,
+            AttrScope::Root,
+            &root_attributes,
+            self.root_track_order.attrs,
+        );
 
         header
     }
@@ -7677,6 +9541,180 @@ mod tests {
         ))
     }
 
+    /// A group past the link phase change keeps its links in a fractal heap
+    /// with a v2 B-tree name index. The reopen that rewrites that group's
+    /// header lays a fresh pair out, so both blocks the old header named must
+    /// come back to the allocator — every block of the heap, and the index
+    /// header with its nodes.
+    ///
+    /// Asserted on the free list rather than on the file size: a reopen does
+    /// not yet carry dense links forward, so the rewritten group's links (and
+    /// the datasets they name) are dropped, and the file size that follows
+    /// says more about that than about this.
+    #[test]
+    fn a_reopen_frees_the_dense_link_storage_its_rewrite_supersedes() {
+        let path = temp_path("dense_link_reclaim");
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        writer.create_group("/", "run").unwrap();
+        for i in 0..12 {
+            writer
+                .create_dataset(&format!("run/d{i:02}"), DatatypeMessage::i32_type(), &[2])
+                .unwrap();
+        }
+        writer.close().unwrap();
+
+        let writer = Hdf5Writer::open_append(&path).unwrap();
+        let gidx = (0..writer.group_count())
+            .find(|&g| writer.grp(g).lock().name == "/run")
+            .expect("the reopen registered the group");
+        let linfo = writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .and_then(|s| s.links.get(&LinkScope::Group(gidx)).cloned())
+            .expect("the reopen recorded the group's dense link storage");
+        assert_ne!(linfo.fractal_heap_address, UNDEF_ADDR);
+        assert_ne!(linfo.name_btree_address, UNDEF_ADDR);
+
+        writer
+            .release_superseded_dense_links(LinkScope::Group(gidx))
+            .unwrap();
+        let freed = writer.allocator.free_blocks();
+        let covers = |addr: u64| {
+            freed
+                .iter()
+                .any(|&(a, len)| addr >= a && addr < a.saturating_add(len))
+        };
+        assert!(covers(linfo.fractal_heap_address), "heap header: {freed:?}");
+        assert!(covers(linfo.name_btree_address), "name index: {freed:?}");
+
+        // And exactly once: the entry is gone, so the finalize that follows
+        // cannot hand the same blocks back a second time.
+        assert!(writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .is_none_or(|s| s.links.is_empty()));
+        writer
+            .release_superseded_dense_links(LinkScope::Group(gidx))
+            .unwrap();
+        assert_eq!(writer.allocator.free_blocks(), freed);
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The rewrite frees what it supersedes even when the replacement is not
+    /// dense at all. An attribute set that drops back under `max_compact`
+    /// goes into the object header, so nothing names the old heap any more —
+    /// and a free driven by "the new set needs dense storage" would never
+    /// reach this one.
+    #[test]
+    fn a_rewrite_that_drops_out_of_dense_storage_still_frees_it() {
+        let path = temp_path("dense_attr_to_compact");
+        let numeric = |name: &str| {
+            AttributeMessage::scalar_numeric(
+                name,
+                DatatypeMessage::i32_type(),
+                7i32.to_le_bytes().to_vec(),
+            )
+        };
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        for i in 0..12 {
+            writer
+                .add_root_attribute(numeric(&format!("a{i:02}")))
+                .unwrap();
+        }
+        writer.close().unwrap();
+
+        let writer = Hdf5Writer::open_append(&path).unwrap();
+        let ainfo = writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .and_then(|s| s.attrs.get(&AttrScope::Root).cloned())
+            .expect("the reopen recorded the root's dense attribute storage");
+        for i in 0..10 {
+            writer
+                .evict_attr(AttrTarget::Root, &format!("a{i:02}"))
+                .unwrap();
+        }
+        assert!(!writer.attributes_need_dense(&writer.root_attributes.lock()));
+
+        writer.prepare_dense_attributes(&[]).unwrap();
+        let freed = writer.allocator.free_blocks();
+        let covers = |addr: u64| {
+            freed
+                .iter()
+                .any(|&(a, len)| addr >= a && addr < a.saturating_add(len))
+        };
+        assert!(covers(ainfo.fractal_heap_address), "heap header: {freed:?}");
+        assert!(covers(ainfo.name_btree_address), "name index: {freed:?}");
+        assert!(writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .is_none_or(|s| s.attrs.is_empty()));
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Deleting a reopened object supersedes its dense storage as surely as
+    /// rewriting one does: nothing in the finalized file names the heap, so
+    /// the delete owner frees it through the same entry.
+    #[test]
+    fn deleting_a_reopened_group_frees_its_dense_attribute_storage() {
+        let path = temp_path("dense_attr_delete");
+        let numeric = |name: &str| {
+            AttributeMessage::scalar_numeric(
+                name,
+                DatatypeMessage::i32_type(),
+                7i32.to_le_bytes().to_vec(),
+            )
+        };
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        writer.create_group("/", "run").unwrap();
+        for i in 0..12 {
+            writer
+                .set_attribute(AttrTarget::Group("/run"), numeric(&format!("a{i:02}")))
+                .unwrap();
+        }
+        writer.close().unwrap();
+
+        let writer = Hdf5Writer::open_append(&path).unwrap();
+        let gidx = (0..writer.group_count())
+            .find(|&g| writer.grp(g).lock().name == "/run")
+            .expect("the reopen registered the group");
+        let ainfo = writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .and_then(|s| s.attrs.get(&AttrScope::Group(gidx)).cloned())
+            .expect("the reopen recorded the group's dense attribute storage");
+
+        writer.delete_group("/run").unwrap();
+        let freed = writer.allocator.free_blocks();
+        let covers = |addr: u64| {
+            freed
+                .iter()
+                .any(|&(a, len)| addr >= a && addr < a.saturating_add(len))
+        };
+        assert!(covers(ainfo.fractal_heap_address), "heap header: {freed:?}");
+        assert!(covers(ainfo.name_btree_address), "name index: {freed:?}");
+        assert!(writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .is_none_or(|s| s.attrs.is_empty()));
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
     /// The charset rule is one owner shared by every vlen string writer:
     /// appends into an ASCII-declared dataset reject non-ASCII strings the
     /// same way the slice writer does, and a dataset whose elements are not
@@ -7713,6 +9751,29 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// `create_chunked_dataset` builds an extensible-array index unconditionally
+    /// (the caller — the high-level dataset API — is the one that decides when
+    /// two-or-more unlimited dimensions should go to a v2 B-tree instead), so
+    /// its own guard is the last line of defense against a shape that index
+    /// can't represent at all.
+    #[test]
+    fn create_chunked_dataset_rejects_two_unlimited_dimensions() {
+        let path = temp_path("earray_two_unlimited");
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let err = writer
+            .create_chunked_dataset(
+                "d",
+                DatatypeMessage::i32_type(),
+                &[4, 4],
+                &[u64::MAX, u64::MAX],
+                &[2, 2],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("at most one unlimited"), "{err}");
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
     /// Every creator must enter through `begin_create`; the four that used
     /// to bypass it could push a second dataset under an existing name and
     /// emit an invalid file with two same-named links.
@@ -7728,7 +9789,7 @@ mod tests {
         let attempts: [(&str, IoResult<usize>); 4] = [
             (
                 "vlen_string",
-                writer.create_vlen_string_dataset("d", &["x"]),
+                writer.create_vlen_string_dataset("d", &["x"], 1),
             ),
             ("vlen_bytes", writer.create_vlen_bytes_dataset("d", &[b"x"])),
             (
@@ -7761,6 +9822,35 @@ mod tests {
                 ),
             }
         }
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The `H5T_VLEN` length field counts base elements, so an image that is
+    /// not a whole number of them has no length that reads back as what was
+    /// handed over; it is refused at the call rather than stored truncated.
+    #[test]
+    fn vlen_sequence_refuses_a_partial_element() {
+        let path = temp_path("vlen_partial_element");
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let err = writer
+            .create_vlen_sequence_dataset("d", DatatypeMessage::i32_type(), &[&[1u8, 2, 3, 4, 5]])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("5 bytes"), "unexpected error: {err}");
+        assert!(err.contains("4-byte elements"), "unexpected error: {err}");
+
+        // The refusal is the length rule alone: the same base takes a whole
+        // number of elements, and an empty sequence is a legal one.
+        writer
+            .create_vlen_sequence_dataset(
+                "d",
+                DatatypeMessage::i32_type(),
+                &[&[1u8, 2, 3, 4], &[][..]],
+            )
+            .unwrap();
 
         writer.close().unwrap();
         std::fs::remove_file(&path).ok();
@@ -7918,7 +10008,7 @@ mod tests {
 
         let writer = Hdf5Writer::create(&path).unwrap();
         writer
-            .create_vlen_string_dataset("notes", &["initial"])
+            .create_vlen_string_dataset("notes", &["initial"], 1)
             .unwrap();
         writer.close().unwrap();
 
@@ -9341,7 +11431,6 @@ mod tests {
         let ds_g0 = writer
             .create_dataset("group1/data", DatatypeMessage::i32_type(), &[3])
             .unwrap();
-        writer.assign_dataset_to_group("/group1", ds_g0).unwrap();
         let raw_g0: Vec<u8> = [10i32, 20, 30]
             .iter()
             .flat_map(|v| v.to_le_bytes())
@@ -9350,9 +11439,6 @@ mod tests {
 
         let ds_g1 = writer
             .create_dataset("group1/sub/values", DatatypeMessage::u8_type(), &[4])
-            .unwrap();
-        writer
-            .assign_dataset_to_group("/group1/sub", ds_g1)
             .unwrap();
         writer.write_dataset_raw(ds_g1, &[1u8, 2, 3, 4]).unwrap();
 
@@ -9741,6 +11827,32 @@ mod tests {
         }
         assert_eq!(writer.ds(over_unfiltered).lock().layout_version, 5);
         writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SWMR reaches version 3 on its own, without a chunked dataset to raise
+    /// the bound — through the flags `finalize_for_swmr` passes, and then
+    /// through `swmr_active` for every superblock written after it. Only a
+    /// file with nothing else newer in it can tell the two arms apart, and
+    /// the public SWMR API always creates a chunked streaming dataset.
+    #[test]
+    fn swmr_reaches_version_3_with_no_chunked_dataset_in_the_file() {
+        let path = temp_path("swmr_superblock");
+
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        writer
+            .create_dataset("d", DatatypeMessage::i32_type(), &[2])
+            .unwrap();
+        assert_eq!(writer.superblock_version_for(0), SUPERBLOCK_V2);
+
+        writer.finalize_for_swmr().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap()[8], SUPERBLOCK_V3);
+
+        // The close-time finalize carries no SWMR flag; the file is still an
+        // SWMR file and must not be handed back a version older than the one
+        // its readers attached to.
+        writer.close().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap()[8], SUPERBLOCK_V3);
         std::fs::remove_file(&path).ok();
     }
 }

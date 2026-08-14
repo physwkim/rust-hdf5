@@ -49,6 +49,11 @@ pub struct FileHandle {
     lock_policy: FileLocking,
     /// True if a lock is currently held on the underlying file.
     lock_held: bool,
+    /// Byte offset of the HDF5 address space within the file: 0 unless the
+    /// file has a userblock. Every offset passed to this handle is relative to
+    /// it, which is what `H5FD_set_base_addr` does for the C library's
+    /// drivers — no caller can forget to add it.
+    base: u64,
 }
 
 impl FileHandle {
@@ -86,6 +91,7 @@ impl FileHandle {
             writable: true,
             lock_policy: policy,
             lock_held,
+            base: 0,
         })
     }
 
@@ -105,6 +111,7 @@ impl FileHandle {
             writable: false,
             lock_policy: policy,
             lock_held,
+            base: 0,
         })
     }
 
@@ -124,7 +131,48 @@ impl FileHandle {
             writable: true,
             lock_policy: policy,
             lock_held,
+            base: 0,
         })
+    }
+
+    /// Byte offset of the HDF5 address space within the file — the userblock
+    /// size. Zero for a file without one.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// Move this handle's address space to start at `base`
+    /// (`H5FD_set_base_addr`). Every later offset is taken relative to it.
+    pub fn set_base(&mut self, base: u64) {
+        self.base = base;
+    }
+
+    /// Absolute file offset of the HDF5 superblock signature, or `None` when
+    /// the file holds no signature at all.
+    ///
+    /// `H5FD_locate_signature` looks at offset 0 and then at every power of
+    /// two from 512 up to the file size: a userblock is a multiple-of-512
+    /// power-of-two prefix, so those are the only places a superblock can
+    /// start. Called before [`set_base`](Self::set_base), so it reads absolute
+    /// offsets.
+    pub fn locate_signature(&self) -> std::io::Result<Option<u64>> {
+        use crate::format::superblock::HDF5_SIGNATURE;
+        let file_len = self.file.metadata()?.len();
+        let mut buf = [0u8; HDF5_SIGNATURE.len()];
+        let mut addr = 0u64;
+        loop {
+            if addr + HDF5_SIGNATURE.len() as u64 <= file_len {
+                pread_exact(&self.file, addr, &mut buf)?;
+                if buf == HDF5_SIGNATURE {
+                    return Ok(Some(addr));
+                }
+            }
+            // 0, then 512, 1024, 2048, ... while the probe is inside the file.
+            addr = if addr == 0 { 512 } else { addr * 2 };
+            if addr >= file_len {
+                return Ok(None);
+            }
+        }
     }
 
     /// Locking policy this handle was opened with.
@@ -172,7 +220,7 @@ impl FileHandle {
                 "file opened read-only",
             ));
         }
-        pwrite_all(&self.file, offset, data)
+        pwrite_all(&self.file, self.abs(offset)?, data)
     }
 
     /// Read exactly `len` bytes starting at the given byte offset.
@@ -181,7 +229,8 @@ impl FileHandle {
         // the file before allocating, so a corrupt size field cannot drive an
         // unbounded allocation.
         let file_len = self.file.metadata()?.len();
-        let end = offset.checked_add(len as u64);
+        let start = self.abs(offset)?;
+        let end = start.checked_add(len as u64);
         if end.is_none_or(|e| e > file_len) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -189,7 +238,7 @@ impl FileHandle {
             ));
         }
         let mut buf = vec![0u8; len];
-        pread_exact(&self.file, offset, &mut buf)?;
+        pread_exact(&self.file, start, &mut buf)?;
         Ok(buf)
     }
 
@@ -207,19 +256,20 @@ impl FileHandle {
     /// read returns `UnexpectedEof` when it cannot fill `buf` — but without
     /// paying a per-call `fstat` on the hot coalesced-read path.
     pub fn read_exact_at_into(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        pread_exact(&self.file, offset, buf)
+        pread_exact(&self.file, self.abs(offset)?, buf)
     }
 
     /// Read up to `max_len` bytes starting at the given byte offset.
     pub fn read_at_most(&self, offset: u64, max_len: usize) -> std::io::Result<Vec<u8>> {
         // Clamp the allocation to what the file can actually hold.
         let file_len = self.file.metadata()?.len();
-        let avail = file_len.saturating_sub(offset);
+        let start = self.abs(offset)?;
+        let avail = file_len.saturating_sub(start);
         let max_len = (max_len as u64).min(avail) as usize;
         let mut buf = vec![0u8; max_len];
         let mut total = 0;
         while total < buf.len() {
-            match pread(&self.file, offset + total as u64, &mut buf[total..]) {
+            match pread(&self.file, start + total as u64, &mut buf[total..]) {
                 Ok(0) => break,
                 Ok(n) => total += n,
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -228,6 +278,20 @@ impl FileHandle {
         }
         buf.truncate(total);
         Ok(buf)
+    }
+
+    /// Translate an HDF5 address into a file offset. Fails rather than wraps
+    /// when a corrupt address plus the userblock would overflow.
+    fn abs(&self, offset: u64) -> std::io::Result<u64> {
+        offset.checked_add(self.base).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "address {offset} overflows past the userblock at {}",
+                    self.base
+                ),
+            )
+        })
     }
 
     /// Flush file data (not necessarily metadata) to disk.
@@ -240,9 +304,12 @@ impl FileHandle {
         self.file.sync_all()
     }
 
-    /// Return the current file size.
+    /// Return the current file size, in the same address space as every offset
+    /// this handle takes: the userblock is not part of it, so the result is
+    /// directly comparable against an HDF5 address (which is what
+    /// `H5FD_get_eof` returns for the same reason).
     pub fn file_size(&self) -> std::io::Result<u64> {
-        Ok(self.file.metadata()?.len())
+        Ok(self.file.metadata()?.len().saturating_sub(self.base))
     }
 }
 
@@ -366,6 +433,10 @@ pub struct MmapFileHandle {
     /// Keep the underlying file alive so the OS lock survives for the
     /// lifetime of this handle. (The mmap itself doesn't pin the fd.)
     _file: File,
+    /// Userblock size, as in [`FileHandle::base`]: this handle shares the
+    /// address space of the [`FileHandle`] the same file was opened with, so
+    /// an address is read from the same bytes through either.
+    base: u64,
 }
 
 #[cfg(feature = "mmap")]
@@ -386,29 +457,41 @@ impl MmapFileHandle {
         // modified.
         let _ = locking::try_acquire(&file, LockMode::Shared, policy)?;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        Ok(Self { mmap, _file: file })
+        Ok(Self {
+            mmap,
+            _file: file,
+            base: 0,
+        })
     }
 
-    /// Return the total size of the mapped file.
+    /// Move this handle's address space to start at `base`, as
+    /// [`FileHandle::set_base`] does.
+    pub fn set_base(&mut self, base: u64) {
+        self.base = base;
+    }
+
+    /// Return the size of the mapped file's HDF5 address space — the mapping
+    /// less the userblock, so the result bounds the offsets this handle takes.
     pub fn len(&self) -> usize {
-        self.mmap.len()
+        self.mmap.len().saturating_sub(self.base as usize)
     }
 
     /// Return whether the file is empty.
     pub fn is_empty(&self) -> bool {
-        self.mmap.is_empty()
+        self.len() == 0
     }
 
     /// Read exactly `len` bytes at `offset`. Zero-copy: returns a slice.
     pub fn read_at(&self, offset: u64, len: usize) -> std::io::Result<&[u8]> {
         // `offset`/`len` are file-derived; compute the end in u64 and reject
         // overflow so a hostile value cannot wrap past the bounds check.
-        let end = offset
-            .checked_add(len as u64)
+        let start = offset.checked_add(self.base);
+        let end = start
+            .and_then(|s| s.checked_add(len as u64))
             .filter(|&e| e <= self.mmap.len() as u64);
-        match end {
-            Some(end) => Ok(&self.mmap[offset as usize..end as usize]),
-            None => Err(std::io::Error::new(
+        match (start, end) {
+            (Some(start), Some(end)) => Ok(&self.mmap[start as usize..end as usize]),
+            _ => Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!(
                     "mmap read past end: offset={} len={} file_size={}",
@@ -422,13 +505,15 @@ impl MmapFileHandle {
 
     /// Read up to `max_len` bytes at `offset`. Returns a slice.
     pub fn read_at_most(&self, offset: u64, max_len: usize) -> &[u8] {
-        if offset >= self.mmap.len() as u64 {
+        let Some(start) = offset
+            .checked_add(self.base)
+            .filter(|&s| s < self.mmap.len() as u64)
+        else {
             return &[];
-        }
-        let start = offset as usize;
-        let end = (start as u64)
+        };
+        let end = start
             .saturating_add(max_len as u64)
             .min(self.mmap.len() as u64) as usize;
-        &self.mmap[start..end]
+        &self.mmap[start as usize..end]
     }
 }

@@ -98,6 +98,7 @@ pub mod dataset;
 pub mod error;
 pub mod file;
 pub mod group;
+pub mod named_datatype;
 pub mod swmr;
 pub mod types;
 
@@ -107,6 +108,18 @@ pub use error::{Hdf5Error, Result};
 pub use file::{H5File, H5FileOptions};
 pub use format::messages::datatype::{ByteOrder, DatatypeMessage};
 pub use format::messages::filter::FilterPipeline;
+pub use format::messages::superblock_ext::{
+    BtreeKMessage, DriverInfoMessage, FileSpaceInfoMessage, FileSpaceStrategy,
+    SharedMessageTableMessage,
+};
+pub use format::reference::Reference;
+pub use format::selection::{
+    Hyperslab, HyperslabBlock, PointSelection, RegularHyperslab, Selection,
+};
+pub use format::LibverBound;
 pub use group::H5Group;
 pub use io::locking::{FileLocking, LockMode};
+pub use io::reader::LinkClass;
+pub use io::reader::SuperblockExtension;
+pub use named_datatype::H5NamedDatatype;
 pub use types::{Complex32, Complex64, CompoundType, H5Type, HBool, VarLenUnicode};

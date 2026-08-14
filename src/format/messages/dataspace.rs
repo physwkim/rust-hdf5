@@ -17,12 +17,31 @@ const FLAG_MAX_DIMS: u8 = 0x01;
 /// Dataspace type field values.
 const DS_TYPE_SCALAR: u8 = 0;
 const DS_TYPE_SIMPLE: u8 = 1;
-const _DS_TYPE_NULL: u8 = 2;
+const DS_TYPE_NULL: u8 = 2;
+
+/// Which of the three dataspace classes a message describes (`H5Osdspace.c`'s
+/// type byte / `H5S_class_t`).
+///
+/// `Scalar` (rank 0, exactly one element) and `Null` (no elements at all) both
+/// carry an empty `dims`, so the class cannot be inferred from `dims` alone —
+/// it must be tracked explicitly, matching upstream's dedicated type field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataspaceClass {
+    /// Rank 0: a single element, no dimensions.
+    Scalar,
+    /// Rank >= 1: an ordinary N-dimensional dataspace.
+    Simple,
+    /// No elements at all (`H5Screate(H5S_NULL)`) — distinct from a scalar
+    /// or from a `Simple` dataspace with a zero-length dimension.
+    Null,
+}
 
 /// Dataspace message payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataspaceMessage {
-    /// Current dimension sizes.
+    /// Which dataspace class this message describes.
+    pub class: DataspaceClass,
+    /// Current dimension sizes. Empty for `Scalar` and `Null`.
     pub dims: Vec<u64>,
     /// Optional maximum dimension sizes.  An entry of `u64::MAX` means unlimited.
     pub max_dims: Option<Vec<u64>>,
@@ -34,14 +53,28 @@ impl DataspaceMessage {
     /// A scalar dataspace (rank 0, no max dims).
     pub fn scalar() -> Self {
         Self {
+            class: DataspaceClass::Scalar,
             dims: Vec::new(),
             max_dims: None,
         }
     }
 
-    /// A simple dataspace with fixed dimensions (max == current).
+    /// The NULL dataspace: no elements at all. Unlike [`scalar`](Self::scalar),
+    /// a dataset with this dataspace holds zero bytes of data.
+    pub fn null() -> Self {
+        Self {
+            class: DataspaceClass::Null,
+            dims: Vec::new(),
+            max_dims: None,
+        }
+    }
+
+    /// A simple dataspace with fixed dimensions (max == current). An empty
+    /// `dims` yields a scalar dataspace, matching how upstream never emits a
+    /// `Simple`-class dataspace at rank 0.
     pub fn simple(dims: &[u64]) -> Self {
         Self {
+            class: Self::class_for_rank(dims.len()),
             dims: dims.to_vec(),
             max_dims: None,
         }
@@ -50,9 +83,25 @@ impl DataspaceMessage {
     /// A simple dataspace where every dimension is unlimited.
     pub fn unlimited(current: &[u64]) -> Self {
         Self {
+            class: Self::class_for_rank(current.len()),
             dims: current.to_vec(),
             max_dims: Some(vec![u64::MAX; current.len()]),
         }
+    }
+
+    /// `Scalar` at rank 0 (matching upstream, which never writes a
+    /// `Simple`-class dataspace with zero dimensions), `Simple` otherwise.
+    fn class_for_rank(ndims: usize) -> DataspaceClass {
+        if ndims == 0 {
+            DataspaceClass::Scalar
+        } else {
+            DataspaceClass::Simple
+        }
+    }
+
+    /// Whether this is the NULL dataspace (no elements at all).
+    pub fn is_null(&self) -> bool {
+        self.class == DataspaceClass::Null
     }
 
     // ------------------------------------------------------------------ encode
@@ -63,11 +112,10 @@ impl DataspaceMessage {
         let has_max = self.max_dims.is_some();
         let flags: u8 = if has_max { FLAG_MAX_DIMS } else { 0 };
 
-        // Determine dataspace type
-        let ds_type = if ndims == 0 {
-            DS_TYPE_SCALAR
-        } else {
-            DS_TYPE_SIMPLE
+        let ds_type = match self.class {
+            DataspaceClass::Scalar => DS_TYPE_SCALAR,
+            DataspaceClass::Simple => DS_TYPE_SIMPLE,
+            DataspaceClass::Null => DS_TYPE_NULL,
         };
 
         let body_len = 4 + ndims * ss + if has_max { ndims * ss } else { 0 };
@@ -115,7 +163,16 @@ impl DataspaceMessage {
     fn decode_v2(buf: &[u8], ctx: &FormatContext) -> FormatResult<(Self, usize)> {
         let ndims = buf[1] as usize;
         let flags = buf[2];
-        let _ds_type = buf[3]; // type byte: 0=scalar, 1=simple, 2=null
+        let class = match buf[3] {
+            DS_TYPE_SCALAR => DataspaceClass::Scalar,
+            DS_TYPE_SIMPLE => DataspaceClass::Simple,
+            DS_TYPE_NULL => DataspaceClass::Null,
+            other => {
+                return Err(FormatError::InvalidData(format!(
+                    "dataspace type byte {other} is not scalar(0)/simple(1)/null(2)"
+                )))
+            }
+        };
         let has_max = (flags & FLAG_MAX_DIMS) != 0;
         let ss = ctx.sizeof_size as usize;
 
@@ -146,7 +203,14 @@ impl DataspaceMessage {
             None
         };
 
-        Ok((Self { dims, max_dims }, pos))
+        Ok((
+            Self {
+                class,
+                dims,
+                max_dims,
+            },
+            pos,
+        ))
     }
 
     /// Decode version 1 dataspace message.
@@ -215,7 +279,17 @@ impl DataspaceMessage {
             pos += ndims * ss;
         }
 
-        Ok((Self { dims, max_dims }, pos))
+        // Version 1 predates the NULL dataspace (added with the version-2
+        // message, `H5Osdspace.c`): it carries no type byte, so the class is
+        // always inferred from rank, same as `simple()`/`unlimited()`.
+        Ok((
+            Self {
+                class: Self::class_for_rank(ndims),
+                dims,
+                max_dims,
+            },
+            pos,
+        ))
     }
 }
 
@@ -286,6 +360,7 @@ mod tests {
     #[test]
     fn roundtrip_partial_max() {
         let msg = DataspaceMessage {
+            class: DataspaceClass::Simple,
             dims: vec![3, 4],
             max_dims: Some(vec![100, u64::MAX]),
         };
@@ -371,5 +446,58 @@ mod tests {
         let msg = DataspaceMessage::simple(&[42]);
         let encoded = msg.encode(&ctx8());
         assert_eq!(encoded[0], 2);
+    }
+
+    #[test]
+    fn roundtrip_null() {
+        let msg = DataspaceMessage::null();
+        let encoded = msg.encode(&ctx8());
+        assert_eq!(encoded.len(), 4); // version + ndims + flags + type, no dims
+        assert_eq!(encoded[3], 2); // type byte: null
+        let (decoded, consumed) = DataspaceMessage::decode(&encoded, &ctx8()).unwrap();
+        assert_eq!(consumed, 4);
+        assert_eq!(decoded, msg);
+        assert!(decoded.is_null());
+    }
+
+    /// A NULL dataspace and a scalar dataspace both have an empty `dims`,
+    /// but must not decode to the same message: only the type byte tells
+    /// them apart, and it must round-trip distinctly.
+    #[test]
+    fn null_and_scalar_are_distinct() {
+        let null = DataspaceMessage::null();
+        let scalar = DataspaceMessage::scalar();
+        assert_ne!(null, scalar);
+        assert!(null.is_null());
+        assert!(!scalar.is_null());
+
+        let null_encoded = null.encode(&ctx8());
+        let scalar_encoded = scalar.encode(&ctx8());
+        assert_ne!(null_encoded[3], scalar_encoded[3]);
+
+        let (null_decoded, _) = DataspaceMessage::decode(&null_encoded, &ctx8()).unwrap();
+        let (scalar_decoded, _) = DataspaceMessage::decode(&scalar_encoded, &ctx8()).unwrap();
+        assert!(null_decoded.is_null());
+        assert!(!scalar_decoded.is_null());
+    }
+
+    #[test]
+    fn decode_v2_bad_type_byte() {
+        // version 2, ndims=0, flags=0, type=3 (not scalar/simple/null)
+        let buf = [2u8, 0, 0, 3];
+        let err = DataspaceMessage::decode(&buf, &ctx8()).unwrap_err();
+        match err {
+            FormatError::InvalidData(_) => {}
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decode_v1_is_never_null() {
+        // Version 1 has no type byte; rank 0 must decode as Scalar, not Null.
+        let buf = [1u8, 0, 0, 0, 0, 0, 0, 0];
+        let (msg, _) = DataspaceMessage::decode(&buf, &ctx8()).unwrap();
+        assert!(!msg.is_null());
+        assert_eq!(msg.class, DataspaceClass::Scalar);
     }
 }

@@ -6,35 +6,50 @@
 //! Supports both legacy (v0/v1 superblock, v1 object headers, symbol tables)
 //! and modern (v2/v3 superblock, v2 object headers, link messages) formats.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::format::btree_v1::{BTreeV1Node, ChunkBTreeV1Node};
+use crate::format::btree_v1::{BTreeV1Config, BTreeV1Node, ChunkBTreeV1Node};
 use crate::format::bytes::read_le_uint as read_uint;
-use crate::format::fractal_heap::{self, BlockReader, FractalHeapHeader};
+use crate::format::fractal_heap::{self, FractalHeapHeader};
 use crate::format::global_heap::{
     decode_vlen_reference, vlen_reference_size, GlobalHeapCollection,
 };
 use crate::format::local_heap::{local_heap_get_string, LocalHeapHeader};
-use crate::format::messages::attribute::AttributeMessage;
+use crate::format::messages::attr_info::AttributeInfoMessage;
+use crate::format::messages::attribute::{AttributeEntry, AttributeMessage};
 use crate::format::messages::data_layout::{self, DataLayoutMessage};
 use crate::format::messages::dataspace::DataspaceMessage;
-use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::messages::datatype::{DatatypeMessage, OldReferenceKind, ReferenceEncoding};
+use crate::format::messages::external_file_list::ExternalFileListMessage;
 use crate::format::messages::fill_value::{try_tiled_fill, FillValueMessage};
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::link::LinkMessage;
 use crate::format::messages::link::LinkTarget;
 use crate::format::messages::link_info::LinkInfoMessage;
+use crate::format::messages::shared::MSG_FLAG_SHARED;
+use crate::format::messages::superblock_ext::{
+    BtreeKMessage, DriverInfoMessage, FileSpaceInfoMessage, SharedMessageTableMessage,
+};
+use crate::format::messages::virtual_mapping::VirtualMappingList;
 use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
-use crate::format::superblock::{detect_superblock_version, SuperblockV0V1, SuperblockV2V3};
+use crate::format::reference::{
+    decode_object_element, decode_region_element, decode_region_heap_object, decode_revised_body,
+    decode_revised_element, Reference, ReferenceTarget, RevisedElement,
+};
+use crate::format::sohm::SohmMasterTable;
+use crate::format::superblock::{
+    detect_superblock_version, SuperblockV0V1, SuperblockV2V3, SymbolTableCache,
+};
 use crate::format::symbol_table::SymbolTableNode;
-use crate::format::{FormatContext, UNDEF_ADDR};
+use crate::format::{BlockReader, FormatContext, UNDEF_ADDR};
 
 use crate::io::file_handle::FileHandle;
 #[cfg(feature = "mmap")]
 use crate::io::file_handle::MmapFileHandle;
-use crate::io::hyperslab::{compute_strides, for_each_contiguous_run};
-use crate::io::IoResult;
+use crate::io::hyperslab::{compute_strides, for_each_contiguous_run, for_each_dual_run};
+use crate::io::locking::FileLocking;
+use crate::io::{FileMeta, IoResult};
 
 /// The version-4 chunk-index descriptor pulled from a data-layout message:
 /// the index kind, its address, and the per-kind parameters the reader needs
@@ -97,10 +112,30 @@ impl<'a> ChunkTarget<'a> {
     }
 }
 
+/// One resolved external-file slot (H5O_EFL_ID): the on-disk message
+/// stores each slot's name as an offset into a local heap, so this is that
+/// slot after the heap lookup, in the order the dataset's logical byte
+/// range concatenates them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalFileSegment {
+    /// The external file's name, exactly as stored — relative names are
+    /// resolved against `HDF5_EXTFILE_PREFIX` at read time, not here.
+    pub name: String,
+    /// Byte offset within the named file where this slot's reserved
+    /// region begins.
+    pub offset: u64,
+    /// Bytes reserved for this slot. `u64::MAX` (`H5O_EFL_UNLIMITED`)
+    /// marks the last slot as unlimited/growable.
+    pub size: u64,
+}
+
 /// Read-side metadata for a single dataset.
 pub struct DatasetReadInfo {
     /// Dataset name (the link name in the root group).
     pub name: String,
+    /// Address of the dataset's object header — what an object reference to
+    /// this dataset stores.
+    pub object_header_address: u64,
     /// Element datatype.
     pub datatype: DatatypeMessage,
     /// Dataspace (dimensionality).
@@ -110,11 +145,539 @@ pub struct DatasetReadInfo {
     /// Filter pipeline for compressed chunks (None = uncompressed).
     pub filter_pipeline: Option<FilterPipeline>,
     /// Attributes attached to this dataset.
-    pub attributes: Vec<AttributeMessage>,
+    pub attributes: ObjectAttributes,
     /// User-defined fill value bytes (one element wide), decoded from the
     /// fill-value message when `fill_defined == 2`. `None` => default
     /// zero-fill. Applied to unallocated chunks and unwritten regions.
     pub fill_value: Option<Vec<u8>>,
+    /// External raw-data segments (H5O_EFL_ID). Non-empty only when this
+    /// dataset's storage is an External Data Files list instead of a
+    /// normal contiguous block — `layout` still reports `Contiguous` with
+    /// an undefined address in that case (H5Dlayout.c overrides the
+    /// layout's storage ops whenever this message is present).
+    pub external_files: Vec<ExternalFileSegment>,
+    /// Virtual dataset source/virtual mappings (H5D_VIRTUAL), resolved from
+    /// the global heap object `layout`'s `Virtual` variant points at.
+    /// `Some` only when `layout` is `DataLayoutMessage::Virtual` and it
+    /// names a mapping list (`heap_index != 0`); `None` for every other
+    /// layout, and for a virtual dataset that has no mappings yet.
+    pub virtual_mappings: Option<VirtualMappingList>,
+}
+
+/// The class of one link record in a group: what `H5Lget_info` reports,
+/// carrying the value `H5Lget_val` returns for the classes that have one.
+///
+/// Every link a group holds gets one of these, whether or not the object it
+/// names can be opened — a listing is a listing of links, not of objects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkClass {
+    /// Another name for an object in this file.
+    Hard,
+    /// A path inside this file, resolved when the link is traversed.
+    Soft { path: String },
+    /// A path inside another file. Listed and reported, but not followed.
+    External { file: String, path: String },
+    /// A user-defined link class this reader has no interpreter for; libhdf5
+    /// needs a registered link class for these too.
+    UserDefined { link_type: u8 },
+}
+
+impl LinkClass {
+    pub(crate) fn from_target(target: &LinkTarget) -> Self {
+        match target {
+            LinkTarget::Hard { .. } => Self::Hard,
+            LinkTarget::Soft { target } => Self::Soft {
+                path: target.clone(),
+            },
+            LinkTarget::External { file, path } => Self::External {
+                file: file.clone(),
+                path: path.clone(),
+            },
+            LinkTarget::UserDefined { link_type, .. } => Self::UserDefined {
+                link_type: *link_type,
+            },
+        }
+    }
+}
+
+/// The soft link a traversal crossed, kept so a lookup that finds nothing can
+/// say the link dangles instead of reporting a bare absence.
+struct SoftLinkRef {
+    link: String,
+    target: String,
+}
+
+/// Where a path leaves this file: the external link it crosses, the file that
+/// link names, and the remainder of the path inside that file.
+pub(crate) struct ExternalEdge {
+    pub link: String,
+    pub file: String,
+    pub path: String,
+}
+
+impl ExternalEdge {
+    /// The error for "the link resolved to a file, but the object it names is
+    /// not in it" — the external counterpart of a dangling soft link.
+    fn dangling(&self) -> crate::io::IoError {
+        crate::io::IoError::DanglingLink {
+            link: self.link.clone(),
+            target: format!("{}::{}", self.file, self.path),
+        }
+    }
+}
+
+/// How a reader was opened, carried from the entry point to the per-superblock
+/// constructors: both facts an external link needs later (where to resolve a
+/// relative target from, and under which locking policy to open it) are fixed
+/// at open time and belong together.
+struct Origin {
+    path: PathBuf,
+    locking: crate::io::locking::FileLocking,
+}
+
+/// Bound on how many external links one path resolution may cross, matching
+/// libhdf5's `H5L_NUM_LINKS` (the `H5Pset_nlinks` default). Two files that
+/// link to each other form a cycle whose every hop opens a fresh target, so it
+/// is this count, not target identity, that terminates the walk.
+const MAX_EXTERNAL_HOPS: usize = 16;
+
+/// What path traversal produced.
+enum Traversal {
+    /// A path in this file, after every group hard-link alias and soft link
+    /// on it was followed. `via` names the last soft link crossed, if any.
+    Path {
+        path: String,
+        via: Option<SoftLinkRef>,
+    },
+    /// A component of the path is an external link, so the path leaves this
+    /// file. `path` is the remainder inside `file`.
+    External {
+        link: String,
+        file: String,
+        path: String,
+    },
+}
+
+/// One rewrite a traversal step can apply to the path prefix it matched.
+#[derive(Clone, Copy)]
+enum Rewrite<'a> {
+    /// A group hard link: continue from the group's first-walked path.
+    Alias(&'a str),
+    /// A soft link: continue from its value.
+    Soft(&'a str),
+    /// An external link: stop, the rest of the path is in another file.
+    External { file: &'a str, path: &'a str },
+}
+
+/// Resolve a soft link's value against the group the link lives in, the way
+/// `H5G_traverse` does: a value starting with `/` is absolute, anything else
+/// is relative to that group. `.` and `..` components fold. The result has no
+/// leading `/`.
+fn resolve_link_value(link_path: &str, value: &str) -> String {
+    let mut components: Vec<&str> = Vec::new();
+    if !value.starts_with('/') {
+        // The link's own parent group is everything before its last component.
+        if let Some(parent) = link_path.rsplit_once('/').map(|(p, _)| p) {
+            components.extend(parent.split('/').filter(|c| !c.is_empty()));
+        }
+    }
+    for component in value.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            c => components.push(c),
+        }
+    }
+    components.join("/")
+}
+
+/// Everything one discovery walk found: the objects, the link records that
+/// name them, and the group metadata the lookup paths need. Carried as one
+/// value so the walk has a single owner rather than a widening tuple, and so
+/// every walk (link-message and symbol-table alike) fills the same fields.
+#[derive(Default)]
+struct Catalog {
+    datasets: Vec<DatasetReadInfo>,
+    /// Dataset-shaped objects this crate cannot read, keyed by path; the
+    /// value names what stopped it. They are listed exactly like readable
+    /// datasets — the name is in the file either way — and refuse typed
+    /// access with that reason.
+    unreadable: std::collections::BTreeMap<String, String>,
+    /// Attributes on non-root groups, keyed by group path.
+    group_attributes: std::collections::HashMap<String, ObjectAttributes>,
+    /// Every non-root group path the walk traversed into.
+    group_paths: std::collections::BTreeSet<String>,
+    /// Group object header address → the first path that reached it (no
+    /// leading `/`), taken from the walk's cycle guard. What turns the
+    /// address an object reference stores back into a name.
+    group_object_paths: std::collections::HashMap<u64, String>,
+    /// Group hard-link aliases: alias path → first-walked path.
+    group_aliases: std::collections::HashMap<String, String>,
+    /// Every link record seen, keyed by its full path (no leading `/`).
+    links: std::collections::BTreeMap<String, LinkClass>,
+    /// Committed (named) datatype objects, keyed by path.
+    datatypes: std::collections::BTreeMap<String, CommittedDatatypeInfo>,
+}
+
+impl Catalog {
+    /// The address→absolute-path catalog this walk implies, with `root_addr`
+    /// named `/` whether or not the walk itself reached it.
+    ///
+    /// The single owner of the catalog: file open and the SWMR
+    /// [`Hdf5Reader::refresh`] rescan both build it here, so a dataset that
+    /// appears after open is resolvable exactly as one present at open is.
+    fn object_paths(&self, root_addr: u64) -> std::collections::HashMap<u64, String> {
+        let mut paths = std::collections::HashMap::new();
+        paths.insert(root_addr, "/".to_string());
+        for (addr, path) in &self.group_object_paths {
+            paths.insert(*addr, absolute_path(path));
+        }
+        for ds in &self.datasets {
+            paths.insert(ds.object_header_address, absolute_path(&ds.name));
+        }
+        paths
+    }
+}
+
+/// The state one catalog walk threads through every group it visits.
+///
+/// A group stores its children either as `Link` messages in its object header
+/// (with dense overflow in a fractal heap) or in the legacy symbol-table
+/// B-tree plus local heap — and *which* it uses is a property of that group
+/// alone. One file mixes the two freely: writing a single link that the old
+/// format cannot express (an external link, a creation-order-tracked group)
+/// migrates just that group, leaving its parent and its children where they
+/// were. Walking a group in the format its *parent* used therefore finds no
+/// children at all and reports an empty group, which is why the two storages
+/// share one walker here: [`CatalogWalk::group`] asks each object header what
+/// it declares, and [`CatalogWalk::child`] is the single place a child is
+/// classified, recorded and descended into.
+struct CatalogWalk<'a> {
+    handle: &'a mut FileHandle,
+    meta: &'a FileMeta,
+    catalog: Catalog,
+    /// Object headers already descended into, keyed to the first path that
+    /// reached them: a later path to the same header is a group hard link,
+    /// recorded in `group_aliases` so lookups resolve through it instead of
+    /// walking (and cycling) a second time.
+    visited: std::collections::HashMap<u64, String>,
+}
+
+impl<'a> CatalogWalk<'a> {
+    /// Bound group nesting on a hostile or corrupt file.
+    const MAX_DEPTH: usize = 256;
+
+    /// Start a walk at the root group's object header address, seeded so a
+    /// hard link cycling back to the root is not descended into again.
+    fn new(handle: &'a mut FileHandle, meta: &'a FileMeta, root_addr: u64) -> Self {
+        let mut visited = std::collections::HashMap::new();
+        visited.insert(root_addr, String::new());
+        Self {
+            handle,
+            meta,
+            catalog: Catalog::default(),
+            visited,
+        }
+    }
+
+    /// The address/length widths, which most of the walk needs and `meta`
+    /// carries alongside the file's B-tree ranks and shared-message table.
+    fn ctx(&self) -> &FormatContext {
+        &self.meta.ctx
+    }
+
+    fn finish(mut self) -> Catalog {
+        self.catalog.group_object_paths = self.visited;
+        self.catalog
+    }
+
+    /// Enumerate one group's children, choosing the storage from what this
+    /// group's own header declares.
+    ///
+    /// `stab` is the symbol-table scratch-pad copy from the entry that named
+    /// this group (the superblock's root entry, or the parent's symbol-table
+    /// entry), which is the only source of those addresses when the header
+    /// itself did not decode. `header` is `None` in exactly that case.
+    fn group(
+        &mut self,
+        header: Option<&ObjectHeader>,
+        prefix: &str,
+        depth: usize,
+        stab: Option<(u64, u64)>,
+    ) -> IoResult<()> {
+        if depth > Self::MAX_DEPTH {
+            return Ok(());
+        }
+        let link_storage = header.filter(|h| {
+            h.messages
+                .iter()
+                .any(|m| m.msg_type == MSG_LINK || m.msg_type == MSG_LINK_INFO)
+        });
+        if let Some(h) = link_storage {
+            return self.links(h, prefix, depth);
+        }
+        // Symbol-table storage: the scratch-pad copy wins when it is set,
+        // otherwise the addresses come from the group's own `stab` message.
+        let (btree_addr, heap_addr) = match stab {
+            Some(pair) if pair.0 != UNDEF_ADDR && pair.1 != UNDEF_ADDR => pair,
+            _ => header.map_or((UNDEF_ADDR, UNDEF_ADDR), |h| {
+                Hdf5Reader::stab_from_header(h, self.ctx())
+            }),
+        };
+        if btree_addr != UNDEF_ADDR && heap_addr != UNDEF_ADDR {
+            self.btree(btree_addr, heap_addr, prefix, depth)?;
+        }
+        Ok(())
+    }
+
+    /// Enumerate a group that stores its children as `Link` messages.
+    fn links(&mut self, header: &ObjectHeader, prefix: &str, depth: usize) -> IoResult<()> {
+        // Collect every link in this group: inline `Link` messages plus, for
+        // groups using dense storage, links held in a fractal heap referenced
+        // by the `Link Info` message.
+        //
+        // A link message that does not decode has no name to report the
+        // failure against, and a `Link Info` message that does not decode
+        // hides a whole group's dense storage. Either way the listing would
+        // come back silently short, so both are errors: a listing this
+        // reader cannot complete must not present itself as complete.
+        let mut links: Vec<LinkMessage> = Vec::new();
+        for msg in &header.messages {
+            if msg.msg_type == MSG_LINK {
+                let (link, _) = LinkMessage::decode(&msg.data, self.ctx())?;
+                links.push(link);
+            } else if msg.msg_type == MSG_LINK_INFO {
+                let (info, _) = LinkInfoMessage::decode(&msg.data, self.ctx())?;
+                if info.fractal_heap_address != UNDEF_ADDR {
+                    let ctx = self.meta.ctx;
+                    let dense =
+                        Hdf5Reader::read_dense_links(self.handle, &ctx, info.fractal_heap_address)?;
+                    links.extend(dense);
+                }
+            }
+        }
+
+        for link in &links {
+            let full_name = join_path(prefix, &link.name);
+            // Every link is a listing entry whatever it points at; only a
+            // hard link names an object in this file to descend into.
+            self.catalog
+                .links
+                .insert(full_name.clone(), LinkClass::from_target(&link.target));
+            let LinkTarget::Hard { address } = &link.target else {
+                continue;
+            };
+            self.child(full_name, *address, depth, None)?;
+        }
+        Ok(())
+    }
+
+    /// Enumerate a group that stores its children in a symbol-table B-tree
+    /// plus local heap.
+    fn btree(
+        &mut self,
+        btree_addr: u64,
+        heap_addr: u64,
+        prefix: &str,
+        depth: usize,
+    ) -> IoResult<()> {
+        let sa = self.ctx().sizeof_addr as usize;
+        let ss = self.ctx().sizeof_size as usize;
+
+        // Read the local heap header + data for this group.
+        let heap_hdr_buf = self.handle.read_at_most(heap_addr, 64)?;
+        let heap_hdr = LocalHeapHeader::decode(&heap_hdr_buf, sa, ss)?;
+        let heap_data = self
+            .handle
+            .read_at(heap_hdr.data_addr, heap_hdr.data_size as usize)?;
+
+        // Collect all SNOD addresses by walking the B-tree.
+        let mut snod_tree_visited = std::collections::HashSet::new();
+        let snod_addrs = Hdf5Reader::collect_snod_addresses(
+            self.handle,
+            self.meta,
+            btree_addr,
+            0,
+            &mut snod_tree_visited,
+        )?;
+
+        // A symbol-table node is a fixed-size record sized by `sym_leaf_k`,
+        // which the superblock extension may have overridden.
+        let snod_size = self.meta.btree.symbol_table_node_size(sa, ss);
+        for snod_addr in snod_addrs {
+            let snod_buf = self.handle.read_at_most(snod_addr, snod_size)?;
+            let snod =
+                SymbolTableNode::decode(&snod_buf, sa, ss, self.meta.btree.sym_leaf_max_entries())?;
+
+            for entry in &snod.entries {
+                let name = local_heap_get_string(&heap_data, entry.name_offset)?;
+                // Skip empty names (root group self-reference).
+                if name.is_empty() {
+                    continue;
+                }
+                let full_name = join_path(prefix, &name);
+
+                // A `H5G_CACHED_SLINK` entry is a soft link: it names no
+                // object at all, and its value string lives in this group's
+                // local heap. Record the link and move on — reading its
+                // undefined object-header address is what used to drop it.
+                if let SymbolTableCache::SoftLink { value_offset } = entry.cache {
+                    let target = local_heap_get_string(&heap_data, value_offset as u64)?;
+                    self.catalog
+                        .links
+                        .insert(full_name, LinkClass::Soft { path: target });
+                    continue;
+                }
+                self.catalog
+                    .links
+                    .insert(full_name.clone(), LinkClass::Hard);
+                self.child(
+                    full_name,
+                    entry.obj_header_addr,
+                    depth,
+                    entry.cached_symbol_table(),
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Record one child of a group and, when it is itself a group, descend.
+    ///
+    /// Both storages end here, so a child is classified, catalogued and
+    /// cycle-guarded the same way whichever way its name was found.
+    fn child(
+        &mut self,
+        full_name: String,
+        addr: u64,
+        depth: usize,
+        stab: Option<(u64, u64)>,
+    ) -> IoResult<()> {
+        // The entry names an object, so the object is in the listing whatever
+        // comes of reading it: a header that does not decode (a stale link
+        // left by a deletion, say) is reported against this name, never
+        // dropped from it.
+        let header = match Hdf5Reader::read_object_header_full(self.handle, self.meta, addr) {
+            Ok(h) => h,
+            Err(e) => {
+                self.catalog
+                    .unreadable
+                    .insert(full_name, format!("its object header does not decode: {e}"));
+                return Ok(());
+            }
+        };
+        match Hdf5Reader::classify_object(self.handle, &header, self.meta, &full_name, addr) {
+            ObjectKind::Dataset(info) => {
+                self.catalog.datasets.push(*info);
+                return Ok(());
+            }
+            ObjectKind::UnreadableDataset(why) => {
+                self.catalog.unreadable.insert(full_name, why);
+                return Ok(());
+            }
+            // A committed (named) datatype is neither a group nor a dataset,
+            // so it must not be recorded as either; the link record above
+            // already carries its name.
+            ObjectKind::CommittedDatatype(info) => {
+                self.catalog.datatypes.insert(full_name, *info);
+                return Ok(());
+            }
+            ObjectKind::Group => {}
+        }
+
+        // It is a group. Record its path from the actual link record — before
+        // the cycle check, so a hard-link alias of an already-visited group
+        // still appears — whether or not it holds datasets or attributes.
+        self.catalog.group_paths.insert(full_name.clone());
+        // Capture group attributes (e.g. the NeXus `NX_class` marker), keyed
+        // by path. Through the shared collector, which carries a per-attribute
+        // failure as an entry naming it: a group whose attribute did not
+        // decode must not come back as a group with one fewer attribute.
+        let ctx = self.meta.ctx;
+        let attrs = collect_object_attributes(self.handle, &ctx, &header);
+        if !attrs.is_empty() {
+            self.catalog
+                .group_attributes
+                .insert(full_name.clone(), attrs);
+        }
+
+        // Descend at most once per object header (cycle guard); a second path
+        // to it is a group hard link — record the alias for lookups instead.
+        if let Some(first) = self.visited.get(&addr) {
+            let first = first.clone();
+            self.catalog.group_aliases.insert(full_name, first);
+            return Ok(());
+        }
+        self.visited.insert(addr, full_name.clone());
+        self.group(Some(&header), &full_name, depth + 1, stab)
+    }
+}
+
+/// Join a group path prefix and a child name, with no leading `/` on a
+/// root-level name.
+fn join_path(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", prefix, name)
+    }
+}
+
+/// What an object header describes.
+///
+/// libhdf5 decides an object's class from *which* messages the header holds
+/// (`H5O_obj_class`) and only then reads their contents; the two questions are
+/// separate, and answering them with one `Option<DatasetReadInfo>` is what let
+/// a dataset whose datatype this crate cannot decode leave the catalog as if
+/// the file did not contain it. Each outcome now has its own name, so no
+/// caller can turn "unreadable" back into "absent".
+enum ObjectKind {
+    /// A dataset: it carries a datatype, a dataspace and a data layout, and
+    /// every message the payload depends on decoded.
+    Dataset(Box<DatasetReadInfo>),
+    /// A dataset whose payload depends on a message this crate cannot decode.
+    /// The string names what stopped it and reaches the caller of any typed
+    /// access to the name.
+    UnreadableDataset(String),
+    /// A group: it carries link, link-info, symbol-table or group-info
+    /// storage, or none of the messages that identify anything else.
+    Group,
+    /// A committed (named) datatype object: a datatype message with neither
+    /// group storage nor the dataspace/layout pair a dataset needs.
+    CommittedDatatype(Box<CommittedDatatypeInfo>),
+}
+
+/// A committed (named) datatype as read from its own object header.
+///
+/// `H5Tcommit` gives a type a name and a place in the file; every dataset and
+/// attribute built on it then stores a reference to this object rather than a
+/// copy of the type. It is a third kind of object beside groups and datasets,
+/// and classifying it as neither is what left its name in the file with
+/// nothing behind it.
+#[derive(Debug, Clone)]
+pub struct CommittedDatatypeInfo {
+    /// The type this object commits, or what stopped it from decoding. The
+    /// object is in the listing either way, exactly as an unreadable dataset
+    /// is: the name is in the file whether or not this crate can read what it
+    /// names.
+    datatype: Result<DatatypeMessage, String>,
+    /// Attributes attached to the committed datatype itself.
+    attributes: Vec<AttributeMessage>,
+}
+
+impl CommittedDatatypeInfo {
+    /// The committed type, or the reason it cannot be read.
+    pub fn datatype(&self) -> Result<&DatatypeMessage, &str> {
+        self.datatype.as_ref().map_err(String::as_str)
+    }
+
+    /// The attributes attached to the committed datatype.
+    pub fn attributes(&self) -> &[AttributeMessage] {
+        &self.attributes
+    }
 }
 
 /// Internal enum to represent what we know about the root group from the
@@ -133,19 +696,46 @@ enum RootGroupInfo {
     },
 }
 
+/// Everything the superblock extension object header contributes to the
+/// file-level view.
+///
+/// `H5Fsuper.c::H5F__super_read` opens this header immediately after decoding
+/// the superblock, before any user object is reachable, so every message here
+/// is in force for the first metadata decode that follows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SuperblockExtension {
+    /// Shared Message Table message (0x000F): where the SOHM master table is.
+    pub shared_message_table: Option<SharedMessageTableMessage>,
+    /// v1 B-tree "K" values message (0x0013): non-default split ranks.
+    pub btree_k: Option<BtreeKMessage>,
+    /// Driver info message (0x0014).
+    pub driver_info: Option<DriverInfoMessage>,
+    /// File space info message (0x0017): allocation strategy, page size, and
+    /// the persisted free-space manager addresses.
+    pub file_space_info: Option<FileSpaceInfoMessage>,
+}
+
 /// HDF5 file reader.
 pub struct Hdf5Reader {
     handle: FileHandle,
-    ctx: FormatContext,
+    meta: FileMeta,
+    /// Messages read from the superblock extension object header, empty when
+    /// the file has no extension.
+    ext: SuperblockExtension,
     /// End-of-file address from the superblock.
     _eof: u64,
     #[allow(dead_code)]
     root_group_info: RootGroupInfo,
     datasets: Vec<DatasetReadInfo>,
+    /// Dataset-shaped objects this crate cannot read, keyed by path (no
+    /// leading `/`), the value naming what stopped it. They are listed with
+    /// the readable datasets and refuse typed access with that reason: an
+    /// object the file contains is never reported as one it does not.
+    unreadable: std::collections::BTreeMap<String, String>,
     /// Attributes on the root group (file-level attributes).
-    root_attributes: Vec<AttributeMessage>,
+    root_attributes: ObjectAttributes,
     /// Attributes on non-root groups, keyed by group path (no leading `/`).
-    group_attributes: std::collections::HashMap<String, Vec<AttributeMessage>>,
+    group_attributes: std::collections::HashMap<String, ObjectAttributes>,
     /// Every non-root group path the discovery walk traversed into (no
     /// leading `/`), regardless of whether the group has datasets or
     /// attributes. Built from actual link records, so empty groups,
@@ -157,6 +747,58 @@ pub struct Hdf5Reader {
     /// under the first path; lookups resolve alias prefixes through this
     /// map, as HDF5 path traversal does.
     group_aliases: std::collections::HashMap<String, String>,
+    /// Every link record in the file, keyed by full path (no leading `/`).
+    /// A listing is a listing of links, so this holds soft and external
+    /// links as well as the hard links that name the objects above.
+    links: std::collections::BTreeMap<String, LinkClass>,
+    /// The path this file was opened with. An external link resolves its
+    /// target relative to the directory holding it (libhdf5 keeps the same
+    /// thing as `H5F_EXTPATH`), so the reader has to remember where it came
+    /// from.
+    path: PathBuf,
+    /// The directory holding this HDF5 file, resolved once at open time.
+    /// External raw-data files (H5O_EFL_ID) are named relative to it when
+    /// `HDF5_EXTFILE_PREFIX` contains `${ORIGIN}` (`H5D__build_file_prefix`,
+    /// H5Dint.c) — captured at open time rather than re-derived from the
+    /// process's current directory at read time, matching libhdf5's own
+    /// one-time capture in `H5F_t::extpath`.
+    source_dir: PathBuf,
+    /// The locking policy this file was opened under, reused verbatim for
+    /// every external target: libhdf5 hands `H5F_prefix_open_file` the
+    /// parent's file-access property list, so one `HDF5_USE_FILE_LOCKING`
+    /// setting (or one `H5FileOptions::locking` call) governs every file a
+    /// path touches, not just the first.
+    locking: crate::io::locking::FileLocking,
+    /// External-link target files, keyed by the resolved path that opened
+    /// them, so N links naming one file share one open handle.
+    ///
+    /// An entry is created the first time a path actually crosses the link and
+    /// lives until this reader is dropped — that is, for the life of the
+    /// `H5File` that owns it. A target's own external links are cached in that
+    /// target's map, so the first reader in a chain transitively holds the
+    /// whole chain open.
+    external: std::collections::BTreeMap<PathBuf, Box<Hdf5Reader>>,
+    /// What each external link's stored file name resolved to, keyed by that
+    /// name exactly as the link holds it.
+    ///
+    /// The search runs once per distinct name per reader and its answer is
+    /// then fixed: re-probing the filesystem on a later crossing would let one
+    /// link answer differently mid-session, and would fail to find the handle
+    /// it already holds once the target has been renamed or unlinked.
+    external_resolved: std::collections::BTreeMap<String, PathBuf>,
+    /// Committed (named) datatype objects, keyed by path (no leading `/`).
+    datatypes: std::collections::BTreeMap<String, CommittedDatatypeInfo>,
+    /// Object header address → absolute path, for every group and dataset the
+    /// discovery walk reached plus the root group. This is what turns the
+    /// address an object reference stores back into a name.
+    object_paths: std::collections::HashMap<u64, String>,
+}
+
+/// The absolute form of a discovery-walk path (which carries no leading `/`):
+/// the root group's empty path becomes `/`, `entry/data` becomes
+/// `/entry/data`.
+fn absolute_path(path: &str) -> String {
+    format!("/{}", path.trim_start_matches('/'))
 }
 
 /// Total byte length of `dims.product() * element_size`, computed with
@@ -168,6 +810,33 @@ fn saturating_byte_len(dims: &[u64], element_size: u64) -> u64 {
     dims.iter()
         .fold(1u64, |acc, &d| acc.saturating_mul(d))
         .saturating_mul(element_size)
+}
+
+/// A fixed-length string attribute's value, under the padding rule its
+/// datatype declares.
+///
+/// The single owner for the attribute side of that rule: both
+/// [`H5Reader::attr_string_value`] and the writer-mode fallback in
+/// `H5Attribute::read_string` end here, so a space-padded attribute does not
+/// read back with its padding attached on one path and not the other. Bytes
+/// that are not valid UTF-8 become U+FFFD, as they always have on this path.
+///
+/// A datatype that is not a string at all is read as null-terminated, which is
+/// what asking for the string value of, say, an integer attribute has always
+/// meant here.
+pub(crate) fn fixed_string_attr_value(attr: &AttributeMessage) -> IoResult<String> {
+    use crate::format::messages::datatype::{fixed_string_content, DatatypeMessage};
+    let padding = match attr.datatype {
+        DatatypeMessage::FixedString { padding, .. } => padding,
+        _ => 0,
+    };
+    let content = fixed_string_content(&attr.data, padding).ok_or_else(|| {
+        crate::io::IoError::InvalidState(format!(
+            "attribute {:?} uses string padding rule {padding}, which the format reserves",
+            attr.name
+        ))
+    })?;
+    Ok(String::from_utf8_lossy(content).to_string())
 }
 
 /// Materialize a `total`-byte fill buffer, mapping allocation failure to a
@@ -199,6 +868,248 @@ fn fill_tiled_into(out: &mut [u8], fill_value: Option<&[u8]>) {
             }
         }
     }
+}
+
+/// The declared-size sentinel that marks an External Data Files slot as
+/// unlimited/growable (`H5O_EFL_UNLIMITED` in H5Oprivate.h, `HSIZE_UNDEF` —
+/// the same all-ones bit pattern as [`UNDEF_ADDR`]).
+const EFL_UNLIMITED_SIZE: u64 = u64::MAX;
+
+/// Resolve the directory a raw-data file name is joined against, matching
+/// libhdf5's `H5D__build_file_prefix` (H5Dint.c) for the given environment
+/// variable — `HDF5_EXTFILE_PREFIX` for External Data Files
+/// ([`resolve_extfile_prefix`]), `HDF5_VDS_PREFIX` for Virtual Dataset
+/// sources ([`resolve_vdsfile_prefix`]); both features route through the
+/// same C function, just keyed on a different variable. There is no dataset
+/// access property list here to fall back to, so unset behaves exactly as
+/// an unset/empty DAPL property would.
+///
+/// `${ORIGIN}` expands to `source_dir` (the directory holding the open
+/// HDF5 file); any other value is used as a literal prefix; unset, empty,
+/// or `"."` means "no prefix" (`H5_combine_path`'s own default), so a
+/// relative name resolves against the process's current directory instead.
+fn resolve_file_prefix(env_var: &str, source_dir: &Path) -> Option<PathBuf> {
+    let prefix = std::env::var(env_var).ok()?;
+    if prefix.is_empty() || prefix == "." {
+        return None;
+    }
+    Some(match prefix.strip_prefix("${ORIGIN}") {
+        Some(rest) => {
+            let rest = rest.trim_start_matches(['/', '\\']);
+            if rest.is_empty() {
+                source_dir.to_path_buf()
+            } else {
+                source_dir.join(rest)
+            }
+        }
+        None => PathBuf::from(prefix),
+    })
+}
+
+fn resolve_extfile_prefix(source_dir: &Path) -> Option<PathBuf> {
+    resolve_file_prefix("HDF5_EXTFILE_PREFIX", source_dir)
+}
+
+/// Resolve the directory Virtual Dataset source file names are joined
+/// against (`HDF5_VDS_PREFIX`; see [`resolve_file_prefix`]).
+fn resolve_vdsfile_prefix(source_dir: &Path) -> Option<PathBuf> {
+    resolve_file_prefix("HDF5_VDS_PREFIX", source_dir)
+}
+
+/// Join a raw-data file `name` against a resolved prefix, matching
+/// libhdf5's `H5_combine_path` (H5system.c): an absolute `name` is used
+/// as-is regardless of the prefix, and no prefix means "relative to the
+/// process's current directory" — both of which `Path::join` already
+/// implements for an absolute joinee. Shared by External Data Files and
+/// Virtual Dataset source resolution — both call the same C function.
+fn combine_prefixed_path(prefix: Option<&Path>, name: &str) -> PathBuf {
+    match prefix {
+        Some(p) => p.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// Read `len` bytes starting at *dataset-relative* offset `skip` from an
+/// external file list into `out`, walking slots by cumulative declared
+/// size exactly like libhdf5's `H5D__efl_read` (H5Defl.c). A read past an
+/// individual slot's actual on-disk length reads back as zero — the file
+/// backing a slot may be shorter than the space the layout reserved in
+/// it — but a read past the *total* declared size of the file list is
+/// still an error, matching `H5D__efl_read`'s own "read past logical end
+/// of file" check.
+fn read_external_file_bytes(
+    external_files: &[ExternalFileSegment],
+    extfile_prefix: Option<&Path>,
+    mut skip: u64,
+    out: &mut [u8],
+) -> IoResult<()> {
+    let mut slot_idx = 0usize;
+    while slot_idx < external_files.len() && skip >= external_files[slot_idx].size {
+        skip -= external_files[slot_idx].size;
+        slot_idx += 1;
+    }
+
+    let mut written = 0usize;
+    while written < out.len() {
+        let Some(slot) = external_files.get(slot_idx) else {
+            return Err(crate::io::IoError::InvalidState(
+                "read past the logical end of the external file list".into(),
+            ));
+        };
+        if slot.size == EFL_UNLIMITED_SIZE {
+            return Err(crate::io::IoError::InvalidState(
+                "unlimited (growable) external file slots are not supported".into(),
+            ));
+        }
+        let full_path = combine_prefixed_path(extfile_prefix, &slot.name);
+        let ext_handle = FileHandle::open_read_with_locking(&full_path, FileLocking::Disabled)
+            .map_err(|e| {
+                crate::io::IoError::InvalidState(format!(
+                    "unable to open external raw data file {}: {e}",
+                    full_path.display()
+                ))
+            })?;
+        let avail_in_slot = slot.size.saturating_sub(skip);
+        let want = (out.len() - written) as u64;
+        let this_read = avail_in_slot.min(want) as usize;
+        let dst = &mut out[written..written + this_read];
+        // A short physical file — the reserved slot size exceeds what was
+        // ever actually written to it — reads back as zero for the
+        // remainder, exactly like `H5D__efl_read`.
+        let got = ext_handle.read_at_most(slot.offset + skip, this_read)?;
+        dst[..got.len()].copy_from_slice(&got);
+        dst[got.len()..].fill(0);
+
+        written += this_read;
+        skip = 0;
+        slot_idx += 1;
+    }
+    Ok(())
+}
+
+/// Recursion ceiling for virtual dataset nesting (a VDS whose source is
+/// itself a VDS — possibly in another file). Bounded so a crafted cyclic
+/// mapping chain fails cleanly instead of recursing until the stack
+/// overflows; real VDS chains do not nest anywhere near this deep.
+const MAX_VIRTUAL_DEPTH: usize = 16;
+
+/// Detect a printf-style `%b` block-index substitution pattern in a
+/// virtual dataset source name (`H5D_virtual_parse_source_name`,
+/// H5Dvirtual.c) — used for unlimited/growable mappings whose source
+/// expands across a sequence of files or datasets indexed by block
+/// number. `%%` is an escaped literal percent, not a pattern; any other
+/// `%`-led sequence (including `%b` itself) marks a name this reader does
+/// not resolve.
+fn has_virtual_printf_pattern(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'%' {
+                i += 2;
+                continue;
+            }
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Read each of `source_boxes` (via `read_source_box`) and scatter it into
+/// `out` (shaped `virtual_dims`) at the same-indexed box in
+/// `virtual_boxes`.
+///
+/// The two box lists must have equal length with identical per-dimension
+/// `count` at each index — H5S requires a mapping's source and virtual
+/// selections to select the same number of points, and this is the
+/// well-defined case where they also decompose into the same box shapes
+/// in the same order (every selection form h5py's `VirtualLayout` writes,
+/// and any hand-built mapping whose two sides were selected the same way).
+/// A mapping whose selections diverge beyond that — same point count but a
+/// different box decomposition on each side — would need the general
+/// element-by-element linear-order match H5S's own iterator does; rather
+/// than risk a silently wrong scatter, that case is rejected here.
+fn copy_matched_boxes(
+    mut read_source_box: impl FnMut(&[u64], &[u64], &mut [u8]) -> IoResult<()>,
+    source_boxes: &[(Vec<u64>, Vec<u64>)],
+    virtual_boxes: &[(Vec<u64>, Vec<u64>)],
+    virtual_dims: &[u64],
+    element_size: u64,
+    out: &mut [u8],
+) -> IoResult<()> {
+    if source_boxes.len() != virtual_boxes.len() {
+        return Err(crate::io::IoError::InvalidState(format!(
+            "virtual dataset mapping's source and virtual selections decompose into a \
+             different number of boxes ({} vs {}), which is not supported",
+            source_boxes.len(),
+            virtual_boxes.len()
+        )));
+    }
+    for ((src_start, src_count), (dst_start, dst_count)) in source_boxes.iter().zip(virtual_boxes) {
+        if src_count != dst_count {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "virtual dataset mapping's source box shape {src_count:?} does not match its \
+                 virtual box shape {dst_count:?}, which is not supported"
+            )));
+        }
+        let nbytes = saturating_byte_len(src_count, element_size) as usize;
+        let mut buf = alloc_tiled_fill(nbytes, None)?;
+        read_source_box(src_start, src_count, &mut buf)?;
+
+        let src_dims = src_count.clone();
+        let src_origin = vec![0u64; src_count.len()];
+        for_each_dual_run(
+            virtual_dims,
+            dst_start,
+            &src_dims,
+            &src_origin,
+            dst_count,
+            element_size,
+            |dst_off, src_off, len| {
+                let dst_off = dst_off as usize;
+                let src_off = src_off as usize;
+                out[dst_off..dst_off + len].copy_from_slice(&buf[src_off..src_off + len]);
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Read and decode the global-heap collection at `addr`, applying the
+/// validation of libhdf5's `H5HG__cache_heap_deserialize`: the `GCOL`
+/// signature must be present and the declared size at least `H5HG_MINSIZE`
+/// (4096 bytes). There is no upper size cap — libhdf5 has none, and this
+/// crate's writers put a whole write call's strings into one collection,
+/// which a cap would turn into silent data loss.
+///
+/// A free function (not a method) so both [`Hdf5Reader::read_heap_collection`]
+/// and the static dataset-open path (which only has a `&mut FileHandle`, not
+/// a full `&mut Hdf5Reader`) share the one implementation.
+fn read_heap_collection_from(
+    handle: &mut FileHandle,
+    ctx: &FormatContext,
+    addr: u64,
+) -> IoResult<GlobalHeapCollection> {
+    let ss = ctx.sizeof_size as usize;
+    let header_len = 4 + 1 + 3 + ss;
+    let header_buf = handle.read_at_most(addr, header_len)?;
+    if header_buf.len() < header_len || header_buf[0..4] != *b"GCOL" {
+        return Err(crate::io::IoError::InvalidState(format!(
+            "bad global heap collection signature at address {addr:#x}"
+        )));
+    }
+    let declared = read_uint(&header_buf[8..], ss) as usize;
+    if declared < 4096 {
+        return Err(crate::io::IoError::InvalidState(format!(
+            "global heap collection at address {addr:#x} declares size {declared}, \
+             below the 4096-byte minimum"
+        )));
+    }
+    let heap_buf = handle.read_at(addr, declared)?;
+    let (coll, _) = GlobalHeapCollection::decode(&heap_buf, ctx)?;
+    Ok(coll)
 }
 
 /// One chunk's on-disk read request, built by a read path before any I/O.
@@ -336,8 +1247,11 @@ impl Hdf5Reader {
     pub fn open_mmap(path: &Path) -> IoResult<(Self, MmapFileHandle)> {
         // Open normally first to parse metadata
         let reader = Self::open(path)?;
-        // Also open an mmap handle for zero-copy data access
-        let mmap = MmapFileHandle::open(path)?;
+        // Also open an mmap handle for zero-copy data access, in the same
+        // address space the reader located the superblock in — otherwise every
+        // address read through the mmap would be short by the userblock.
+        let mut mmap = MmapFileHandle::open(path)?;
+        mmap.set_base(reader.userblock_size());
         Ok((reader, mmap))
     }
 
@@ -377,23 +1291,48 @@ impl Hdf5Reader {
         path: &Path,
         locking: crate::io::locking::FileLocking,
     ) -> IoResult<Self> {
-        let handle = FileHandle::open_read_with_locking(path, locking)?;
+        let mut handle = FileHandle::open_read_with_locking(path, locking)?;
+
+        // The superblock is not necessarily at the start of the file: a
+        // userblock precedes it, and `H5FD_locate_signature` finds it by
+        // probing offset 0 and then every power of two from 512 up. The offset
+        // it is found at is where HDF5 addresses are measured from, so it
+        // becomes the handle's base address and every later offset — including
+        // the superblock read just below — is relative to it.
+        let super_addr = handle
+            .locate_signature()?
+            .ok_or(crate::format::FormatError::InvalidSignature)?;
+        handle.set_base(super_addr);
 
         // Read enough bytes to detect the superblock version and parse it.
         let sb_buf = handle.read_at_most(0, 1024)?;
         let version = detect_superblock_version(&sb_buf)?;
 
-        match version {
-            0 | 1 => Self::open_v0v1(handle, &sb_buf),
-            2 | 3 => Self::open_v2v3(handle, &sb_buf),
-            v => Err(crate::io::IoError::Format(
-                crate::format::FormatError::InvalidVersion(v),
-            )),
-        }
+        let origin = Origin {
+            path: path.to_path_buf(),
+            locking,
+        };
+        let mut reader = match version {
+            0 | 1 => Self::open_v0v1(handle, &sb_buf, origin)?,
+            2 | 3 => Self::open_v2v3(handle, &sb_buf, origin)?,
+            v => {
+                return Err(crate::io::IoError::Format(
+                    crate::format::FormatError::InvalidVersion(v),
+                ))
+            }
+        };
+        // Resolved from the path this file was opened with (not the
+        // process's current directory at read time) — see `source_dir`.
+        let canonical = std::fs::canonicalize(path)?;
+        reader.source_dir = canonical
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        Ok(reader)
     }
 
     /// Open a file with v2/v3 superblock (existing code path).
-    fn open_v2v3(mut handle: FileHandle, sb_buf: &[u8]) -> IoResult<Self> {
+    fn open_v2v3(mut handle: FileHandle, sb_buf: &[u8], origin: Origin) -> IoResult<Self> {
         let sb = SuperblockV2V3::decode(sb_buf)?;
 
         let ctx = FormatContext {
@@ -401,47 +1340,61 @@ impl Hdf5Reader {
             sizeof_size: sb.sizeof_lengths,
         };
 
+        // A v2/v3 superblock has no room for the B-tree K values, so they are
+        // the library defaults unless the extension carries the K message.
+        let (meta, ext) = Self::read_extension_and_meta(
+            &mut handle,
+            ctx,
+            BTreeV1Config::default(),
+            sb.superblock_extension_address,
+        )?;
+
         // Read root group object header, following continuation blocks.
         let root_header =
-            Self::read_object_header_full(&mut handle, &ctx, sb.root_group_object_header_address)?;
+            Self::read_object_header_full(&mut handle, &meta, sb.root_group_object_header_address)?;
 
-        // Walk link messages to discover datasets, group attributes, and
-        // every group path that exists.
-        let (datasets, group_attributes, group_paths, group_aliases) =
-            Self::discover_datasets_from_links(
-                &mut handle,
-                &root_header,
-                sb.root_group_object_header_address,
-                &ctx,
-            )?;
+        // Walk the root group to discover datasets, group attributes, and
+        // every group path that exists, from whichever storage each group's
+        // own header declares.
+        let catalog = Self::build_catalog(
+            &mut handle,
+            &meta,
+            Some(&root_header),
+            sb.root_group_object_header_address,
+            None,
+        )?;
 
         // Collect root group attributes
-        let mut root_attributes = Vec::new();
-        for msg in &root_header.messages {
-            if msg.msg_type == MSG_ATTRIBUTE {
-                if let Ok((attr, _)) = AttributeMessage::decode(&msg.data, &ctx) {
-                    root_attributes.push(attr);
-                }
-            }
-        }
+        let root_attributes = collect_object_attributes(&mut handle, &ctx, &root_header);
 
         Ok(Self {
             handle,
-            ctx,
+            meta,
+            ext,
             _eof: sb.end_of_file_address,
             root_group_info: RootGroupInfo::V2V3 {
                 root_group_object_header_address: sb.root_group_object_header_address,
             },
-            datasets,
+            object_paths: catalog.object_paths(sb.root_group_object_header_address),
+            datasets: catalog.datasets,
+            unreadable: catalog.unreadable,
             root_attributes,
-            group_attributes,
-            group_paths,
-            group_aliases,
+            group_attributes: catalog.group_attributes,
+            group_paths: catalog.group_paths,
+            group_aliases: catalog.group_aliases,
+            links: catalog.links,
+            datatypes: catalog.datatypes,
+            path: origin.path,
+            locking: origin.locking,
+            external: Default::default(),
+            external_resolved: Default::default(),
+            // Overwritten by `open_with_locking` once this returns.
+            source_dir: PathBuf::new(),
         })
     }
 
     /// Open a file with v0/v1 superblock (legacy format).
-    fn open_v0v1(mut handle: FileHandle, sb_buf: &[u8]) -> IoResult<Self> {
+    fn open_v0v1(mut handle: FileHandle, sb_buf: &[u8], origin: Origin) -> IoResult<Self> {
         let sb = SuperblockV0V1::decode(sb_buf)?;
 
         let ctx = FormatContext {
@@ -449,91 +1402,201 @@ impl Hdf5Reader {
             sizeof_size: sb.sizeof_lengths,
         };
 
+        // A v0/v1 superblock carries the K values itself; a v0 superblock has
+        // no chunk-tree field, so that one keeps the library default. The
+        // extension's K message, when present, overrides all three.
+        let sb_btree = BTreeV1Config {
+            sym_leaf_k: sb.sym_leaf_k,
+            snode_internal_k: sb.btree_internal_k,
+            chunk_internal_k: sb
+                .indexed_storage_k
+                .unwrap_or(BTreeV1Config::default().chunk_internal_k),
+        };
+        let (meta, ext) = Self::read_extension_and_meta(
+            &mut handle,
+            ctx,
+            sb_btree,
+            sb.superblock_extension_address,
+        )?;
+
         let ste = &sb.root_symbol_table_entry;
         let root_obj_addr = ste.obj_header_addr;
-        let ste_cache_type = ste.cache_type;
-        let ste_btree_addr = ste.btree_addr;
-        let ste_heap_addr = ste.heap_addr;
+        let ste_stab = ste.cached_symbol_table();
+        let (ste_btree_addr, ste_heap_addr) = ste_stab.unwrap_or((UNDEF_ADDR, UNDEF_ADDR));
 
         // Read the root group's object header (following continuations).
-        let root_hdr = Self::read_object_header_full(&mut handle, &ctx, root_obj_addr).ok();
+        let root_hdr = Self::read_object_header_full(&mut handle, &meta, root_obj_addr).ok();
 
         // Collect the root group's own attributes.
-        let mut root_attributes = Vec::new();
-        if let Some(ref h) = root_hdr {
-            for m in &h.messages {
-                if m.msg_type == MSG_ATTRIBUTE {
-                    if let Ok((a, _)) = AttributeMessage::decode(&m.data, &ctx) {
-                        root_attributes.push(a);
-                    }
-                }
-            }
-        }
+        let root_attributes = match root_hdr {
+            Some(ref h) => collect_object_attributes(&mut handle, &ctx, h),
+            None => ObjectAttributes::default(),
+        };
 
         // A v0/v1-superblock file whose root group has migrated to link
-        // storage (more than ~8 objects) carries `Link` / `Link Info`
-        // messages in its object header; the superblock symbol-table
-        // scratch-pad is then stale. Prefer the link-based walk when those
-        // messages are present, and fall back to the symbol-table B-tree.
-        let has_links = root_hdr.as_ref().is_some_and(|h| {
-            h.messages
-                .iter()
-                .any(|m| m.msg_type == MSG_LINK || m.msg_type == MSG_LINK_INFO)
-        });
-
-        let (datasets, group_attributes, group_paths, group_aliases) = if has_links {
-            Self::discover_datasets_from_links(
-                &mut handle,
-                root_hdr.as_ref().unwrap(),
-                root_obj_addr,
-                &ctx,
-            )?
-        } else {
-            // Symbol-table storage: the STE scratch-pad caches the B-tree
-            // and local heap; otherwise read them from the object header.
-            let (btree_addr, heap_addr) = if ste_cache_type == 1 {
-                (ste_btree_addr, ste_heap_addr)
-            } else {
-                // Read the symbol-table message from the already-loaded
-                // full root header (which followed continuation blocks).
-                root_hdr
-                    .as_ref()
-                    .map(|h| Self::stab_from_header(h, &ctx))
-                    .unwrap_or((UNDEF_ADDR, UNDEF_ADDR))
-            };
-            if btree_addr != UNDEF_ADDR && heap_addr != UNDEF_ADDR {
-                Self::discover_datasets_from_btree(
-                    &mut handle,
-                    &ctx,
-                    btree_addr,
-                    heap_addr,
-                    root_obj_addr,
-                )?
-            } else {
-                (
-                    Vec::new(),
-                    std::collections::HashMap::new(),
-                    std::collections::BTreeSet::new(),
-                    std::collections::HashMap::new(),
-                )
-            }
-        };
+        // storage (more than ~8 objects, or one link the old format cannot
+        // express) carries `Link` / `Link Info` messages in its object
+        // header, and the superblock symbol-table scratch-pad is then stale.
+        // The walk picks the storage from the header for that reason, taking
+        // the scratch-pad only as the symbol-table addresses — and only for a
+        // symbol-table root group (`H5G_CACHED_STAB`), which is the one cache
+        // type those two addresses mean anything for.
+        let catalog = Self::build_catalog(
+            &mut handle,
+            &meta,
+            root_hdr.as_ref(),
+            root_obj_addr,
+            ste_stab,
+        )?;
 
         Ok(Self {
             handle,
-            ctx,
+            meta,
+            ext,
             _eof: sb.end_of_file_address,
             root_group_info: RootGroupInfo::V0V1 {
                 root_obj_header_addr: root_obj_addr,
                 btree_addr: ste_btree_addr,
                 heap_addr: ste_heap_addr,
             },
-            datasets,
+            object_paths: catalog.object_paths(root_obj_addr),
+            datasets: catalog.datasets,
+            unreadable: catalog.unreadable,
             root_attributes,
-            group_attributes,
-            group_paths,
-            group_aliases,
+            group_attributes: catalog.group_attributes,
+            group_paths: catalog.group_paths,
+            group_aliases: catalog.group_aliases,
+            links: catalog.links,
+            datatypes: catalog.datatypes,
+            path: origin.path,
+            locking: origin.locking,
+            external: Default::default(),
+            external_resolved: Default::default(),
+            // Overwritten by `open_with_locking` once this returns.
+            source_dir: PathBuf::new(),
         })
+    }
+
+    /// Read the superblock extension object header at `ext_addr` (if any) and
+    /// fold what it says into the file-level decode parameters.
+    ///
+    /// `sb_btree` is what the superblock alone implies; the extension's
+    /// v1-B-tree-"K" message replaces all three ranks when present, exactly as
+    /// `H5F__super_read` does after `H5O_msg_read(&ext_loc, H5O_BTREEK_ID)`.
+    pub(crate) fn read_extension_and_meta(
+        handle: &mut FileHandle,
+        ctx: FormatContext,
+        sb_btree: BTreeV1Config,
+        ext_addr: u64,
+    ) -> IoResult<(FileMeta, SuperblockExtension)> {
+        let mut meta = FileMeta {
+            ctx,
+            btree: sb_btree,
+            sohm: None,
+        };
+        let ext = Self::superblock_extension_at(handle, ctx, sb_btree, ext_addr)?;
+        if let Some(k) = ext.btree_k {
+            meta.btree = BTreeV1Config {
+                sym_leaf_k: k.sym_leaf_k,
+                snode_internal_k: k.snode_internal_k,
+                chunk_internal_k: k.chunk_internal_k,
+            };
+        }
+        // A zero rank would make every v1 B-tree node zero-sized and every
+        // symbol-table node hold no entries; libhdf5 rejects it at creation
+        // (`H5Pset_sym_k`, `H5Pset_istore_k`), so a file carrying one is
+        // corrupt rather than merely unusual.
+        let b = &meta.btree;
+        if b.sym_leaf_k == 0 || b.snode_internal_k == 0 || b.chunk_internal_k == 0 {
+            return Err(crate::io::IoError::Format(
+                crate::format::FormatError::InvalidData(format!(
+                    "v1 B-tree K values must be non-zero (sym_leaf={}, snode={}, chunk={})",
+                    b.sym_leaf_k, b.snode_internal_k, b.chunk_internal_k
+                )),
+            ));
+        }
+        // `H5F__super_read` calls `H5SM_get_info` here, so the shared-message
+        // table is in place before the root group — the first object header
+        // that can hold a shared message — is opened.
+        if let Some(smt) = &ext.shared_message_table {
+            meta.sohm = Some(Self::read_sohm_table(handle, &meta.ctx, smt)?);
+        }
+        Ok((meta, ext))
+    }
+
+    /// The superblock extension's messages, for the address the superblock
+    /// names. Yields the default (every field `None`) when there is no
+    /// extension.
+    ///
+    /// The extension header is read with the pre-extension parameters: its own
+    /// messages are never shared and never in a v1 B-tree, so nothing it
+    /// contains is needed to decode it. This is also how the writer's append
+    /// path learns what the file declares before it rewrites anything.
+    pub(crate) fn superblock_extension_at(
+        handle: &mut FileHandle,
+        ctx: FormatContext,
+        btree: BTreeV1Config,
+        ext_addr: u64,
+    ) -> IoResult<SuperblockExtension> {
+        if ext_addr == UNDEF_ADDR || ext_addr == 0 {
+            return Ok(SuperblockExtension::default());
+        }
+        let meta = FileMeta {
+            ctx,
+            btree,
+            sohm: None,
+        };
+        Self::read_superblock_extension(handle, &meta, ext_addr)
+    }
+
+    /// Decode the messages of the superblock extension object header.
+    ///
+    /// Upstream reads each of these with `H5O_msg_exists` + `H5O_msg_read` and
+    /// fails the open when one is present but undecodable; a message this
+    /// crate does not model is skipped, as an unknown non-critical message is
+    /// elsewhere.
+    fn read_superblock_extension(
+        handle: &mut FileHandle,
+        meta: &FileMeta,
+        addr: u64,
+    ) -> IoResult<SuperblockExtension> {
+        let header = Self::read_object_header_full(handle, meta, addr)?;
+        let ctx = &meta.ctx;
+        let mut ext = SuperblockExtension::default();
+        for msg in &header.messages {
+            match msg.msg_type {
+                MSG_SHARED_MESSAGE_TABLE => {
+                    ext.shared_message_table =
+                        Some(SharedMessageTableMessage::decode(&msg.data, ctx)?);
+                }
+                MSG_BTREE_K => ext.btree_k = Some(BtreeKMessage::decode(&msg.data)?),
+                MSG_DRIVER_INFO => ext.driver_info = Some(DriverInfoMessage::decode(&msg.data)?),
+                MSG_FILE_SPACE_INFO => {
+                    ext.file_space_info = Some(FileSpaceInfoMessage::decode(&msg.data, ctx)?);
+                }
+                _ => {}
+            }
+        }
+        Ok(ext)
+    }
+
+    /// Read the SOHM master table named by the extension's shared-message
+    /// table message.
+    ///
+    /// The table's length is not stored with it: the index count comes from
+    /// the message, exactly as `H5SM__cache_table_get_final_load_size` takes it
+    /// from `H5F_SOHM_NINDEXES`.
+    fn read_sohm_table(
+        handle: &mut FileHandle,
+        ctx: &FormatContext,
+        smt: &SharedMessageTableMessage,
+    ) -> IoResult<SohmMasterTable> {
+        if smt.table_address == UNDEF_ADDR || smt.nindexes == 0 {
+            return Ok(SohmMasterTable::default());
+        }
+        let size = SohmMasterTable::encoded_size(ctx, smt.nindexes);
+        let buf = handle.read_at(smt.table_address, size)?;
+        Ok(SohmMasterTable::decode(&buf, ctx, smt.nindexes)?)
     }
 
     /// Extract the symbol-table message (btree_addr, heap_addr) from an
@@ -550,172 +1613,21 @@ impl Hdf5Reader {
         (UNDEF_ADDR, UNDEF_ADDR)
     }
 
-    /// Discover datasets by walking link messages in a v2 object header.
-    /// Recursively descends into groups, prefixing dataset names with the group path.
-    #[allow(clippy::type_complexity)]
-    fn discover_datasets_from_links(
+    /// Build the file catalog for a whole file, starting at its root group.
+    ///
+    /// `root_header` is `None` only when the root object header did not
+    /// decode; `root_stab` then carries the superblock symbol-table entry's
+    /// cached B-tree and local heap, which is enough to list a legacy file.
+    fn build_catalog(
         handle: &mut FileHandle,
-        root_header: &ObjectHeader,
+        meta: &FileMeta,
+        root_header: Option<&ObjectHeader>,
         root_addr: u64,
-        ctx: &FormatContext,
-    ) -> IoResult<(
-        Vec<DatasetReadInfo>,
-        std::collections::HashMap<String, Vec<AttributeMessage>>,
-        std::collections::BTreeSet<String>,
-        std::collections::HashMap<String, String>,
-    )> {
-        let mut group_attrs = std::collections::HashMap::new();
-        let mut group_paths = std::collections::BTreeSet::new();
-        // Object headers already descended into, keyed to the first path
-        // that reached them: a later path to the same header is a group
-        // hard link, recorded in `aliases` so lookups can resolve through
-        // it instead of walking (and cycling) a second time.
-        let mut visited = std::collections::HashMap::new();
-        let mut aliases = std::collections::HashMap::new();
-        // Seed the root object header so a hard link cycling back to the
-        // root is not descended into a second time.
-        visited.insert(root_addr, String::new());
-        let datasets = Self::discover_datasets_recursive(
-            handle,
-            root_header,
-            ctx,
-            "",
-            &mut group_attrs,
-            &mut group_paths,
-            &mut visited,
-            &mut aliases,
-        )?;
-        Ok((datasets, group_attrs, group_paths, aliases))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn discover_datasets_recursive(
-        handle: &mut FileHandle,
-        header: &ObjectHeader,
-        ctx: &FormatContext,
-        prefix: &str,
-        group_attrs: &mut std::collections::HashMap<String, Vec<AttributeMessage>>,
-        group_paths: &mut std::collections::BTreeSet<String>,
-        visited: &mut std::collections::HashMap<u64, String>,
-        aliases: &mut std::collections::HashMap<String, String>,
-    ) -> IoResult<Vec<DatasetReadInfo>> {
-        // Bound recursion depth on a hostile/corrupt file.
-        const MAX_GROUP_DEPTH: usize = 256;
-        let depth = if prefix.is_empty() {
-            0
-        } else {
-            prefix.matches('/').count() + 1
-        };
-        if depth > MAX_GROUP_DEPTH {
-            return Ok(Vec::new());
-        }
-
-        let mut datasets = Vec::new();
-
-        // Collect every link in this group: inline `Link` messages plus, for
-        // groups using dense storage, links held in a fractal heap referenced
-        // by the `Link Info` message.
-        let mut links: Vec<LinkMessage> = Vec::new();
-        for msg in &header.messages {
-            if msg.msg_type == MSG_LINK {
-                if let Ok((link, _)) = LinkMessage::decode(&msg.data, ctx) {
-                    links.push(link);
-                }
-            } else if msg.msg_type == MSG_LINK_INFO {
-                if let Ok((info, _)) = LinkInfoMessage::decode(&msg.data, ctx) {
-                    if info.fractal_heap_address != UNDEF_ADDR {
-                        let dense = Self::read_dense_links(handle, ctx, info.fractal_heap_address)?;
-                        links.extend(dense);
-                    }
-                }
-            }
-        }
-
-        for link in &links {
-            if let LinkTarget::Hard { address } = &link.target {
-                let full_name = if prefix.is_empty() {
-                    link.name.clone()
-                } else {
-                    format!("{}/{}", prefix, link.name)
-                };
-
-                // Try to read as a dataset. A target whose object header
-                // fails to decode (e.g. a stale link left by a deletion) is
-                // skipped rather than aborting the whole file open.
-                match Self::read_dataset_from_object_header(handle, ctx, *address, &full_name) {
-                    Ok(Some(info)) => {
-                        datasets.push(info);
-                        continue;
-                    }
-                    Err(_) => continue,
-                    Ok(None) => {}
-                }
-                // Not a dataset. Read the object header to classify it.
-                let child_header = match Self::read_object_header_full(handle, ctx, *address) {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
-                // A committed (named) datatype object has a datatype message
-                // and no group-storage message — it is neither a group nor a
-                // dataset, so it must not be recorded as a group.
-                let is_group = child_header.messages.iter().any(|m| {
-                    m.msg_type == MSG_LINK
-                        || m.msg_type == MSG_LINK_INFO
-                        || m.msg_type == MSG_SYMBOL_TABLE
-                        || m.msg_type == MSG_GROUP_INFO
-                });
-                if !is_group
-                    && child_header
-                        .messages
-                        .iter()
-                        .any(|m| m.msg_type == MSG_DATATYPE)
-                {
-                    continue;
-                }
-                {
-                    // It is a group. Record its path from the actual link
-                    // record — before the cycle check, so a hard-link alias
-                    // of an already-visited group still appears — whether or
-                    // not it contains datasets or attributes.
-                    group_paths.insert(full_name.clone());
-                    {
-                        // Capture group attributes (e.g. the NeXus `NX_class`
-                        // marker), keyed by path.
-                        let mut attrs = Vec::new();
-                        for m in &child_header.messages {
-                            if m.msg_type == MSG_ATTRIBUTE {
-                                if let Ok((a, _)) = AttributeMessage::decode(&m.data, ctx) {
-                                    attrs.push(a);
-                                }
-                            }
-                        }
-                        if !attrs.is_empty() {
-                            group_attrs.insert(full_name.clone(), attrs);
-                        }
-                        // Descend at most once per object header (cycle
-                        // guard); a second path to it is a group hard
-                        // link — record the alias for lookups instead.
-                        if let Some(first) = visited.get(address) {
-                            aliases.insert(full_name.clone(), first.clone());
-                            continue;
-                        }
-                        visited.insert(*address, full_name.clone());
-                        let child_ds = Self::discover_datasets_recursive(
-                            handle,
-                            &child_header,
-                            ctx,
-                            &full_name,
-                            group_attrs,
-                            group_paths,
-                            visited,
-                            aliases,
-                        )?;
-                        datasets.extend(child_ds);
-                    }
-                }
-            }
-        }
-        Ok(datasets)
+        root_stab: Option<(u64, u64)>,
+    ) -> IoResult<Catalog> {
+        let mut walk = CatalogWalk::new(handle, meta, root_addr);
+        walk.group(root_header, "", 0, root_stab)?;
+        Ok(walk.finish())
     }
 
     /// Read every link stored in a group's dense (fractal-heap) link storage.
@@ -723,7 +1635,7 @@ impl Hdf5Reader {
     /// The `Link Info` message gives the fractal-heap address; each managed
     /// object in the heap is an encoded `Link` message. Returns the decoded
     /// links (hard and soft).
-    fn read_dense_links(
+    pub(crate) fn read_dense_links(
         handle: &mut FileHandle,
         ctx: &FormatContext,
         fractal_heap_addr: u64,
@@ -731,18 +1643,12 @@ impl Hdf5Reader {
         // Read the fractal heap header. Its on-disk size depends only on the
         // address/length widths, so a generous prefix read covers it.
         let hdr_buf = handle.read_at_most(fractal_heap_addr, 512)?;
-        let fh_header = match FractalHeapHeader::decode(&hdr_buf, ctx) {
-            Ok(h) => h,
-            Err(_) => return Ok(Vec::new()),
-        };
+        let fh_header = FractalHeapHeader::decode(&hdr_buf, ctx)?;
 
         // Walk the heap's managed blocks; each block hands back a payload
         // region holding one or more packed encoded `Link` messages.
         let mut br = HandleBlockReader { handle };
-        let payloads = match fractal_heap::collect_managed_objects(&fh_header, ctx, &mut br) {
-            Ok(p) => p,
-            Err(_) => return Ok(Vec::new()),
-        };
+        let payloads = fractal_heap::collect_managed_objects(&fh_header, ctx, &mut br)?;
 
         let mut links = Vec::new();
         for payload in payloads {
@@ -765,212 +1671,33 @@ impl Hdf5Reader {
             }
         }
 
+        // That scan stops at the first byte that does not begin a link, which
+        // is how trailing free space in a direct block ends it — and would
+        // equally swallow a link the scan could not read. The heap header
+        // counts its managed objects, so a short scan is detectable, and a
+        // group listing that is short is the loss this guards against.
+        if links.len() < fh_header.man_nobjs as usize {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dense link storage at address {fractal_heap_addr:#x} holds {} managed \
+                 objects but only {} decoded as links",
+                fh_header.man_nobjs,
+                links.len()
+            )));
+        }
+
         Ok(links)
-    }
-
-    /// Discover datasets by walking the B-tree v1 + local heap (legacy format).
-    ///
-    /// Recurses into subgroups: a symbol-table entry whose `cache_type == 1`
-    /// carries scratch-pad `btree_addr`/`heap_addr` for the subgroup; for
-    /// other entries the child object header is read for a symbol-table
-    /// message. Discovered dataset names are prefixed with the group path.
-    #[allow(clippy::type_complexity)]
-    fn discover_datasets_from_btree(
-        handle: &mut FileHandle,
-        ctx: &FormatContext,
-        btree_addr: u64,
-        heap_addr: u64,
-        root_obj_addr: u64,
-    ) -> IoResult<(
-        Vec<DatasetReadInfo>,
-        std::collections::HashMap<String, Vec<AttributeMessage>>,
-        std::collections::BTreeSet<String>,
-        std::collections::HashMap<String, String>,
-    )> {
-        let mut datasets = Vec::new();
-        // First path per descended object header + the group-hard-link
-        // aliases met later, as in `discover_datasets_from_links`.
-        let mut visited = std::collections::HashMap::new();
-        let mut aliases = std::collections::HashMap::new();
-        // Seed the root object header so a hard link cycling back to the
-        // root group is not descended into a second time.
-        visited.insert(root_obj_addr, String::new());
-        let mut group_attrs = std::collections::HashMap::new();
-        let mut group_paths = std::collections::BTreeSet::new();
-        Self::discover_datasets_from_btree_recursive(
-            handle,
-            ctx,
-            btree_addr,
-            heap_addr,
-            "",
-            0,
-            &mut datasets,
-            &mut visited,
-            &mut aliases,
-            &mut group_attrs,
-            &mut group_paths,
-        )?;
-        Ok((datasets, group_attrs, group_paths, aliases))
-    }
-
-    /// Recursive worker for `discover_datasets_from_btree`. `prefix` is the
-    /// path of the group being scanned; `depth` bounds recursion.
-    #[allow(clippy::too_many_arguments)]
-    fn discover_datasets_from_btree_recursive(
-        handle: &mut FileHandle,
-        ctx: &FormatContext,
-        btree_addr: u64,
-        heap_addr: u64,
-        prefix: &str,
-        depth: usize,
-        datasets: &mut Vec<DatasetReadInfo>,
-        visited: &mut std::collections::HashMap<u64, String>,
-        aliases: &mut std::collections::HashMap<String, String>,
-        group_attrs: &mut std::collections::HashMap<String, Vec<AttributeMessage>>,
-        group_paths: &mut std::collections::BTreeSet<String>,
-    ) -> IoResult<()> {
-        // Bound legacy-group nesting depth on a hostile/corrupt file.
-        const MAX_GROUP_DEPTH: usize = 256;
-        if depth > MAX_GROUP_DEPTH {
-            return Ok(());
-        }
-        if btree_addr == UNDEF_ADDR || heap_addr == UNDEF_ADDR {
-            return Ok(());
-        }
-
-        let sa = ctx.sizeof_addr as usize;
-        let ss = ctx.sizeof_size as usize;
-
-        // Read the local heap header + data for this group.
-        let heap_hdr_buf = handle.read_at_most(heap_addr, 64)?;
-        let heap_hdr = LocalHeapHeader::decode(&heap_hdr_buf, sa, ss)?;
-        let heap_data = handle.read_at(heap_hdr.data_addr, heap_hdr.data_size as usize)?;
-
-        // Collect all SNOD addresses by walking the B-tree.
-        let mut snod_tree_visited = std::collections::HashSet::new();
-        let snod_addrs =
-            Self::collect_snod_addresses(handle, btree_addr, sa, ss, 0, &mut snod_tree_visited)?;
-
-        for snod_addr in snod_addrs {
-            let snod_buf = handle.read_at_most(snod_addr, 8192)?;
-            let snod = SymbolTableNode::decode(&snod_buf, sa, ss)?;
-
-            for entry in &snod.entries {
-                let name = local_heap_get_string(&heap_data, entry.name_offset)?;
-                // Skip empty names (root group self-reference).
-                if name.is_empty() {
-                    continue;
-                }
-                let full_name = if prefix.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{}/{}", prefix, name)
-                };
-
-                // Try to read this entry as a dataset. A target whose
-                // object header fails to decode is skipped, not fatal.
-                match Self::read_dataset_from_object_header(
-                    handle,
-                    ctx,
-                    entry.obj_header_addr,
-                    &full_name,
-                ) {
-                    Ok(Some(info)) => {
-                        datasets.push(info);
-                        continue;
-                    }
-                    Err(_) => continue,
-                    Ok(None) => {}
-                }
-
-                // Not a dataset. Read the object header to classify it.
-                let hdr = match Self::read_object_header_full(handle, ctx, entry.obj_header_addr) {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
-                // A committed (named) datatype object has a datatype message
-                // and no group-storage message — it is neither group nor
-                // dataset and must not be recorded as a group.
-                let is_group = hdr.messages.iter().any(|m| {
-                    m.msg_type == MSG_LINK
-                        || m.msg_type == MSG_LINK_INFO
-                        || m.msg_type == MSG_SYMBOL_TABLE
-                        || m.msg_type == MSG_GROUP_INFO
-                });
-                if !is_group && hdr.messages.iter().any(|m| m.msg_type == MSG_DATATYPE) {
-                    continue;
-                }
-
-                // It is a subgroup. Record its path from the actual
-                // symbol-table entry, whether or not it has datasets or
-                // attributes.
-                group_paths.insert(full_name.clone());
-
-                // Break cycles: descend into each group object header at
-                // most once. A second path to it is a group hard link —
-                // record the alias for lookups instead.
-                if let Some(first) = visited.get(&entry.obj_header_addr) {
-                    aliases.insert(full_name.clone(), first.clone());
-                    continue;
-                }
-                visited.insert(entry.obj_header_addr, full_name.clone());
-
-                // Collect this subgroup's attributes (e.g. NeXus NX_class).
-                {
-                    let mut attrs = Vec::new();
-                    for m in &hdr.messages {
-                        if m.msg_type == MSG_ATTRIBUTE {
-                            if let Ok((a, _)) = AttributeMessage::decode(&m.data, ctx) {
-                                attrs.push(a);
-                            }
-                        }
-                    }
-                    if !attrs.is_empty() {
-                        group_attrs.insert(full_name.clone(), attrs);
-                    }
-                }
-
-                // Find its B-tree + local heap and recurse, prefixing names
-                // with the group path.
-                let (sub_btree, sub_heap) = if entry.cache_type == 1 {
-                    // Scratch-pad caches the subgroup's symbol-table info.
-                    (entry.btree_addr, entry.heap_addr)
-                } else {
-                    // No scratch pad — take the symbol-table message from
-                    // the child object header already read above.
-                    Self::stab_from_header(&hdr, ctx)
-                };
-
-                if sub_btree != UNDEF_ADDR && sub_heap != UNDEF_ADDR {
-                    Self::discover_datasets_from_btree_recursive(
-                        handle,
-                        ctx,
-                        sub_btree,
-                        sub_heap,
-                        &full_name,
-                        depth + 1,
-                        datasets,
-                        visited,
-                        aliases,
-                        group_attrs,
-                        group_paths,
-                    )?;
-                }
-            }
-        }
-
-        Ok(())
     }
 
     /// Recursively walk a B-tree v1 to collect leaf-level SNOD addresses.
     fn collect_snod_addresses(
         handle: &mut FileHandle,
+        meta: &FileMeta,
         tree_addr: u64,
-        sizeof_addr: usize,
-        sizeof_size: usize,
         depth: usize,
         visited: &mut std::collections::HashSet<u64>,
     ) -> IoResult<Vec<u64>> {
+        let sizeof_addr = meta.ctx.sizeof_addr as usize;
+        let sizeof_size = meta.ctx.sizeof_size as usize;
         // A well-formed v1 B-tree's level strictly decreases with depth;
         // bound the descent so a corrupt/cyclic tree cannot recurse forever.
         // The `visited` set additionally stops a corrupt tree whose child
@@ -978,8 +1705,17 @@ impl Hdf5Reader {
         if depth > 256 || !visited.insert(tree_addr) {
             return Ok(Vec::new());
         }
-        let buf = handle.read_at_most(tree_addr, 8192)?;
-        let node = BTreeV1Node::decode(&buf, sizeof_addr, sizeof_size)?;
+        // A v1 B-tree node is a fixed-size record whose length follows from
+        // the file's K values; reading exactly that much also bounds what a
+        // corrupt address can pull in.
+        let node_size = meta.btree.snode_btree_node_size(sizeof_addr, sizeof_size);
+        let buf = handle.read_at_most(tree_addr, node_size)?;
+        let node = BTreeV1Node::decode(
+            &buf,
+            sizeof_addr,
+            sizeof_size,
+            meta.btree.snode_max_entries(),
+        )?;
 
         if node.level == 0 {
             // Leaf level: children are SNOD addresses
@@ -988,324 +1724,869 @@ impl Hdf5Reader {
             // Internal level: children are sub-TREE addresses
             let mut addrs = Vec::new();
             for &child_addr in &node.children {
-                let child_addrs = Self::collect_snod_addresses(
-                    handle,
-                    child_addr,
-                    sizeof_addr,
-                    sizeof_size,
-                    depth + 1,
-                    visited,
-                )?;
+                let child_addrs =
+                    Self::collect_snod_addresses(handle, meta, child_addr, depth + 1, visited)?;
                 addrs.extend(child_addrs);
             }
             Ok(addrs)
         }
     }
 
-    /// Read an object header at `addr` and return it with the messages from
-    /// every object-header continuation block flattened in.
-    ///
-    /// Handles both wire formats:
-    /// - v1 headers: continuation blocks are bare v1 messages (type:u16,
-    ///   size:u16, flags:u8, reserved:3, data, padded to 8-byte alignment).
-    /// - v2 headers: continuation blocks are `"OCHK"(4) + messages +
-    ///   checksum(4)` with v2 message headers (type:u8, size:u16, flags:u8,
-    ///   and a 2-byte creation-order field when the header tracks creation
-    ///   order).
-    ///
-    /// Nested continuations are followed; the total block count is bounded.
+    /// Read the object header at `addr` with every continuation block
+    /// flattened in and every stored-shared message resolved to its literal
+    /// body. One owner for both halves of the crate — see
+    /// [`crate::io::object_header_io`].
     fn read_object_header_full(
         handle: &mut FileHandle,
-        ctx: &FormatContext,
+        meta: &FileMeta,
         addr: u64,
     ) -> IoResult<ObjectHeader> {
-        /// Bound on the number of continuation blocks followed per header.
-        const MAX_CONT_BLOCKS: usize = 4096;
-
-        // An object header's chunk-0 can hold more than 8 KiB of inline
-        // messages (many/large attributes), but reading the whole file tail
-        // would allocate gigabytes per object on a large valid file. Probe a
-        // bounded prefix; if the header declares a larger chunk-0,
-        // `decode_any` reports the exact byte count via `BufferTooShort` and
-        // we read precisely that much.
-        const HEADER_PROBE: usize = 8192;
-        let mut buf = handle.read_at_most(addr, HEADER_PROBE)?;
-        if let Err(crate::format::FormatError::BufferTooShort { needed, .. }) =
-            ObjectHeader::decode_any(&buf)
-        {
-            if needed > buf.len() {
-                buf = handle.read_at_most(addr, needed)?;
-            }
-        }
-        let (mut header, _) = ObjectHeader::decode_any(&buf)?;
-
-        // A v1 header has no "OHDR" signature; detect by it.
-        let is_v2 = buf.len() >= 4 && buf[0..4] == crate::format::object_header::OHDR_SIGNATURE;
-        // v2 creation-order tracking is recorded in object-header flag bit 2.
-        let track_creation_order = is_v2 && (header.flags & 0x04) != 0;
-
-        let sa = ctx.sizeof_addr as usize;
-        let ss = ctx.sizeof_size as usize;
-
-        // Collect continuation references from a slice of messages.
-        let collect = |msgs: &[crate::format::object_header::ObjectHeaderMessage],
-                       out: &mut Vec<(u64, u64)>| {
-            for msg in msgs {
-                if msg.msg_type == MSG_OBJ_HEADER_CONTINUATION && msg.data.len() >= sa + ss {
-                    let cont_addr = read_uint(&msg.data, sa);
-                    let cont_len = read_uint(&msg.data[sa..], ss);
-                    out.push((cont_addr, cont_len));
-                }
-            }
-        };
-
-        let mut pending: Vec<(u64, u64)> = Vec::new();
-        collect(&header.messages, &mut pending);
-
-        let mut visited = std::collections::HashSet::new();
-        let mut blocks_read = 0usize;
-
-        while let Some((cont_addr, cont_len)) = pending.pop() {
-            if cont_addr == UNDEF_ADDR || cont_addr == 0 || cont_len == 0 {
-                continue;
-            }
-            if !visited.insert(cont_addr) {
-                continue; // already followed — guard against cycles
-            }
-            blocks_read += 1;
-            if blocks_read > MAX_CONT_BLOCKS {
-                break;
-            }
-
-            let cont_buf = handle.read_at_most(cont_addr, cont_len as usize)?;
-            let mut new_msgs = Vec::new();
-            Self::parse_continuation_block(&cont_buf, is_v2, track_creation_order, &mut new_msgs);
-            collect(&new_msgs, &mut pending);
-            header.messages.extend(new_msgs);
-        }
-
-        Ok(header)
+        crate::io::object_header_io::read_object_header_full(handle, meta, addr)
     }
 
-    /// Parse the messages out of a single object-header continuation block.
+    /// Read a committed datatype object's type and attributes from its header.
     ///
-    /// For v2 (`is_v2`) the block is `"OCHK"(4) + messages + checksum(4)`;
-    /// for v1 it is bare messages. Null/padding messages (type 0) are skipped.
-    fn parse_continuation_block(
-        cont_buf: &[u8],
-        is_v2: bool,
-        track_creation_order: bool,
-        out: &mut Vec<crate::format::object_header::ObjectHeaderMessage>,
-    ) {
-        if is_v2 {
-            // "OCHK"(4) signature + messages + checksum(4).
-            if cont_buf.len() < 8 || cont_buf[0..4] != *b"OCHK" {
-                return;
-            }
-            let msgs_end = cont_buf.len() - 4; // strip trailing checksum
-            let mut pos = 4; // skip "OCHK" signature
-                             // v2 message header: type(1) + size(2) + flags(1) [+ crt_order(2)]
-            let hdr_size = if track_creation_order { 6 } else { 4 };
-            while pos + hdr_size <= msgs_end {
-                let msg_type = cont_buf[pos];
-                let data_size = u16::from_le_bytes([cont_buf[pos + 1], cont_buf[pos + 2]]) as usize;
-                let msg_flags = cont_buf[pos + 3];
-                pos += hdr_size;
-                if pos + data_size > msgs_end {
-                    break;
-                }
-                if msg_type != 0 {
-                    out.push(crate::format::object_header::ObjectHeaderMessage {
-                        msg_type,
-                        flags: msg_flags,
-                        data: cont_buf[pos..pos + data_size].to_vec(),
-                    });
-                }
-                pos += data_size;
-            }
-        } else {
-            // v1 continuation: bare messages, 8-byte aligned, no prefix.
-            let mut pos = 0;
-            while pos + 8 <= cont_buf.len() {
-                let msg_type = u16::from_le_bytes([cont_buf[pos], cont_buf[pos + 1]]);
-                let data_size = u16::from_le_bytes([cont_buf[pos + 2], cont_buf[pos + 3]]) as usize;
-                let msg_flags = cont_buf[pos + 4];
-                pos += 8; // type(2) + size(2) + flags(1) + reserved(3)
-                if pos + data_size > cont_buf.len() {
-                    break;
-                }
-                if msg_type != 0 {
-                    out.push(crate::format::object_header::ObjectHeaderMessage {
-                        msg_type: msg_type as u8,
-                        flags: msg_flags,
-                        data: cont_buf[pos..pos + data_size].to_vec(),
-                    });
-                }
-                pos += data_size;
-                pos = (pos + 7) & !7; // v1 8-byte alignment
-            }
+    /// A committed datatype's own message holds the type itself, but the
+    /// format does not forbid it being a reference in turn, so it goes
+    /// through the same resolver every other datatype message does.
+    fn committed_datatype(
+        handle: &mut FileHandle,
+        header: &ObjectHeader,
+        meta: &FileMeta,
+    ) -> CommittedDatatypeInfo {
+        let datatype = header
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MSG_DATATYPE)
+            .cloned()
+            .ok_or_else(|| "it holds no datatype message".to_string())
+            .and_then(|m| {
+                crate::io::object_header_io::read_datatype_message(handle, meta, &m).map_err(|e| {
+                    match e {
+                        crate::io::IoError::Unsupported(why) => why,
+                        other => format!("its datatype message does not decode: {other}"),
+                    }
+                })
+            });
+        let attributes = header
+            .messages
+            .iter()
+            .filter(|m| m.msg_type == MSG_ATTRIBUTE && m.flags & MSG_FLAG_SHARED == 0)
+            .filter_map(|m| {
+                AttributeMessage::decode(&m.data, &meta.ctx)
+                    .ok()
+                    .map(|(a, _)| a)
+            })
+            .collect();
+        CommittedDatatypeInfo {
+            datatype,
+            attributes,
         }
     }
 
-    /// Read a dataset's object header and extract metadata. Returns None if
-    /// the object is not a dataset (e.g., it's a group).
-    fn read_dataset_from_object_header(
+    /// Classify one object from its (already read) header, and decode the
+    /// dataset metadata while doing so.
+    ///
+    /// The class comes from which messages are present, never from whether
+    /// they decode: an object holding a datatype, a dataspace and a data
+    /// layout is a dataset even when this crate cannot decode one of them,
+    /// and it says so as [`ObjectKind::UnreadableDataset`] rather than
+    /// vanishing.
+    ///
+    /// Only the messages the payload depends on can make a dataset
+    /// unreadable. A failed *attribute* decode leaves the dataset itself
+    /// readable, so it does not.
+    fn classify_object(
         handle: &mut FileHandle,
-        ctx: &FormatContext,
-        addr: u64,
+        header: &ObjectHeader,
+        meta: &FileMeta,
         name: &str,
-    ) -> IoResult<Option<DatasetReadInfo>> {
-        // Read the object header, following continuation blocks (v1 and v2).
-        let header = Self::read_object_header_full(handle, ctx, addr)?;
+        addr: u64,
+    ) -> ObjectKind {
+        let ctx = &meta.ctx;
+        let present = |t: u8| header.messages.iter().any(|m| m.msg_type == t);
+        let is_group = present(MSG_LINK)
+            || present(MSG_LINK_INFO)
+            || present(MSG_SYMBOL_TABLE)
+            || present(MSG_GROUP_INFO);
+        if is_group {
+            return ObjectKind::Group;
+        }
+        let is_dataset =
+            present(MSG_DATATYPE) && present(MSG_DATASPACE) && present(MSG_DATA_LAYOUT);
+        if !is_dataset {
+            return if present(MSG_DATATYPE) {
+                ObjectKind::CommittedDatatype(Box::new(Self::committed_datatype(
+                    handle, header, meta,
+                )))
+            } else {
+                ObjectKind::Group
+            };
+        }
 
         let mut datatype = None;
         let mut dataspace = None;
         let mut layout = None;
         let mut filter_pipeline = None;
         let mut fill_value = None;
-        let mut attributes = Vec::new();
+        // The first message that did not decode, kept verbatim: it is the
+        // answer a caller gets when it asks for this dataset.
+        let mut blocked: Option<String> = None;
+        let mut block = |why: String| {
+            if blocked.is_none() {
+                blocked = Some(why);
+            }
+        };
+        let mut external_file_list = None;
 
         for msg in &header.messages {
+            // A shared message holds a reference to where its body lives, not
+            // the body. Decoding one as a body does not fail loudly — it
+            // reads the reference's version byte as the body's — so anything
+            // this crate does not follow is named here instead. A datatype
+            // reference is followed; an attribute reference is skipped, since
+            // an attribute never blocks the dataset it hangs on.
+            let shared = msg.flags & MSG_FLAG_SHARED != 0;
+            if shared && !matches!(msg.msg_type, MSG_DATATYPE | MSG_ATTRIBUTE) {
+                block(format!(
+                    "its message of type {:#04x} is a shared-message reference, which this \
+                     crate follows only for datatypes",
+                    msg.msg_type
+                ));
+                continue;
+            }
             match msg.msg_type {
+                // The resolver already says whether the type failed to decode
+                // or sits somewhere this crate does not follow, so its wording
+                // is the reason rather than something to wrap.
                 MSG_DATATYPE => {
-                    if let Ok((dt, _)) = DatatypeMessage::decode(&msg.data, ctx) {
-                        datatype = Some(dt);
+                    match crate::io::object_header_io::read_datatype_message(handle, meta, msg) {
+                        Ok(dt) => datatype = Some(dt),
+                        Err(crate::io::IoError::Unsupported(why)) => block(why),
+                        Err(e) => block(format!("its datatype message does not decode: {e}")),
                     }
                 }
-                MSG_DATASPACE => {
-                    if let Ok((ds, _)) = DataspaceMessage::decode(&msg.data, ctx) {
-                        dataspace = Some(ds);
-                    }
-                }
-                MSG_DATA_LAYOUT => {
-                    if let Ok((dl, _)) = DataLayoutMessage::decode(&msg.data, ctx) {
-                        layout = Some(dl);
-                    }
-                }
-                MSG_FILTER_PIPELINE => {
-                    if let Ok((fp, _)) = FilterPipeline::decode(&msg.data) {
+                MSG_DATASPACE => match DataspaceMessage::decode(&msg.data, ctx) {
+                    Ok((ds, _)) => dataspace = Some(ds),
+                    Err(e) => block(format!("its dataspace message does not decode: {e}")),
+                },
+                MSG_DATA_LAYOUT => match DataLayoutMessage::decode(&msg.data, ctx) {
+                    Ok((dl, _)) => layout = Some(dl),
+                    Err(e) => block(format!("its data layout message does not decode: {e}")),
+                },
+                // A filter pipeline that does not decode would leave the raw
+                // chunk bytes to be handed back as if they were never
+                // filtered, and an undecodable fill value would leave
+                // unwritten regions reading as zeros. Both change the data a
+                // read returns, so both block the dataset.
+                MSG_FILTER_PIPELINE => match FilterPipeline::decode(&msg.data) {
+                    Ok((fp, _)) => {
                         if !fp.filters.is_empty() {
                             filter_pipeline = Some(fp);
                         }
                     }
-                }
-                MSG_FILL_VALUE => {
-                    if let Ok((fv, _)) = FillValueMessage::decode(&msg.data) {
+                    Err(e) => block(format!("its filter pipeline message does not decode: {e}")),
+                },
+                MSG_FILL_VALUE => match FillValueMessage::decode(&msg.data) {
+                    Ok((fv, _)) => {
                         if fv.fill_defined == 2 {
                             fill_value = fv.fill_value;
                         }
                     }
-                }
-                MSG_ATTRIBUTE => {
-                    if let Ok((attr, _)) = AttributeMessage::decode(&msg.data, ctx) {
-                        attributes.push(attr);
+                    Err(e) => block(format!("its fill value message does not decode: {e}")),
+                },
+                MSG_EXTERNAL_FILE_LIST => {
+                    // Unlike a layout message, this one *is* the storage: a
+                    // dataset with an external file list has no data address
+                    // of its own (H5Dlayout.c routes storage through this
+                    // message instead), so a list that does not decode must
+                    // block the dataset rather than read back as zero bytes.
+                    match ExternalFileListMessage::decode(&msg.data, ctx) {
+                        Ok((efl, _)) => external_file_list = Some(efl),
+                        Err(e) => block(format!(
+                            "its external file list message does not decode: {e}"
+                        )),
                     }
                 }
                 _ => {}
             }
         }
 
-        if let (Some(dt), Some(ds), Some(dl)) = (datatype, dataspace, layout) {
-            Ok(Some(DatasetReadInfo {
+        if let Some(why) = blocked {
+            return ObjectKind::UnreadableDataset(why);
+        }
+        // The storage a dataset names outside its layout message. Both are
+        // resolved before the dataset is registered and both block it when
+        // they do not resolve, for the same reason the decode above does: a
+        // `Virtual` or external-file layout carries no address of its own, so
+        // a dropped mapping reads back as fill with no error at all.
+        let external_files = match external_file_list {
+            Some(efl) => match Self::resolve_external_file_slots(handle, ctx, &efl) {
+                Ok(slots) => slots,
+                Err(e) => {
+                    return ObjectKind::UnreadableDataset(format!(
+                        "its external file list does not resolve: {e}"
+                    ))
+                }
+            },
+            None => Vec::new(),
+        };
+        let virtual_mappings = match &layout {
+            Some(DataLayoutMessage::Virtual {
+                heap_address,
+                heap_index,
+                ..
+            }) if *heap_index != 0 => {
+                match Self::resolve_virtual_mappings(handle, ctx, *heap_address, *heap_index, name)
+                {
+                    Ok(list) => Some(list),
+                    Err(e) => {
+                        return ObjectKind::UnreadableDataset(format!(
+                            "its virtual dataset mapping list does not resolve: {e}"
+                        ))
+                    }
+                }
+            }
+            _ => None,
+        };
+        // The attribute set is collected whole, or the object says it could
+        // not be: a short list here would be a dataset reporting attributes
+        // the file does not agree it has.
+        let attributes = collect_object_attributes(handle, ctx, header);
+        match (datatype, dataspace, layout) {
+            (Some(dt), Some(ds), Some(dl)) => ObjectKind::Dataset(Box::new(DatasetReadInfo {
                 name: name.to_string(),
+                object_header_address: addr,
                 datatype: dt,
                 dataspace: ds,
                 layout: dl,
                 filter_pipeline,
                 attributes,
                 fill_value,
-            }))
-        } else {
-            Ok(None)
+                external_files,
+                virtual_mappings,
+            })),
+            // The three messages are present and none of them reported an
+            // error, so this is unreachable; report it as unreadable rather
+            // than dropping the name on an invariant this function owns.
+            _ => ObjectKind::UnreadableDataset(
+                "its datatype, dataspace and data layout messages decoded but did not all \
+                 produce a value"
+                    .into(),
+            ),
         }
+    }
+
+    /// Every dataset in the file, by path (no leading `/`).
+    ///
+    /// A dataset this crate cannot read is still a dataset the file
+    /// contains, so it is listed here alongside the readable ones and
+    /// answers [`Self::unreadable_reason`]; opening it reports that reason.
+    /// Resolve a virtual dataset's mapping list from the global heap object
+    /// its layout message points at (`H5D__virtual_load_layout`,
+    /// H5Dvirtual.c). Like the external-file-list decode above, a failure
+    /// here must not fall back to silently treating the dataset as having
+    /// no data: a `Virtual` layout carries no data address of its own, so a
+    /// dropped mapping list would read back as all-fill with no error.
+    fn resolve_virtual_mappings(
+        handle: &mut FileHandle,
+        ctx: &FormatContext,
+        heap_address: u64,
+        heap_index: u32,
+        name: &str,
+    ) -> IoResult<VirtualMappingList> {
+        let coll = read_heap_collection_from(handle, ctx, heap_address)?;
+        let idx = u16::try_from(heap_index).map_err(|_| {
+            crate::io::IoError::InvalidState(format!(
+                "dataset {name:?} virtual mapping heap index {heap_index} does not fit \
+                 the 16-bit on-disk field"
+            ))
+        })?;
+        let obj = coll.get_object(idx).ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!(
+                "dataset {name:?} virtual mapping list object {idx} not found in the \
+                 global heap collection at address {heap_address:#x}"
+            ))
+        })?;
+        VirtualMappingList::decode(obj, ctx).map_err(|e| {
+            crate::io::IoError::InvalidState(format!(
+                "dataset {name:?} has a malformed virtual dataset mapping list: {e}"
+            ))
+        })
+    }
+
+    /// Resolve every external-file slot's name through the local heap the
+    /// EFL message points at (H5Oefl.c decodes only the byte offset; the
+    /// string itself lives in a separate on-disk local heap, exactly like a
+    /// v0/v1 group's link names — see [`local_heap_get_string`]).
+    fn resolve_external_file_slots(
+        handle: &mut FileHandle,
+        ctx: &FormatContext,
+        efl: &ExternalFileListMessage,
+    ) -> IoResult<Vec<ExternalFileSegment>> {
+        let sa = ctx.sizeof_addr as usize;
+        let ss = ctx.sizeof_size as usize;
+        let heap_hdr_buf = handle.read_at_most(efl.heap_addr, 64)?;
+        let heap_hdr = LocalHeapHeader::decode(&heap_hdr_buf, sa, ss)?;
+        let heap_data = handle.read_at(heap_hdr.data_addr, heap_hdr.data_size as usize)?;
+
+        efl.slots
+            .iter()
+            .map(|slot| {
+                let name = local_heap_get_string(&heap_data, slot.name_offset)?;
+                Ok(ExternalFileSegment {
+                    name,
+                    offset: slot.offset,
+                    size: slot.size,
+                })
+            })
+            .collect()
     }
 
     /// Return the names of all datasets in the root group.
     pub fn dataset_names(&self) -> Vec<&str> {
-        self.datasets.iter().map(|d| d.name.as_str()).collect()
+        let mut names: Vec<&str> = self.datasets.iter().map(|d| d.name.as_str()).collect();
+        names.extend(self.unreadable.keys().map(String::as_str));
+        names
     }
 
-    /// Rewrite a path (no leading `/`) whose group components pass
-    /// through hard links into the first-walked path of the object it
-    /// reaches — HDF5 traversal over the aliases the discovery walk
-    /// recorded. Bounded like libhdf5's link-traversal limit, so a link
-    /// cycle cannot loop forever; a path with no alias components comes
-    /// back unchanged.
-    fn canonical_path(&self, name: &str) -> String {
-        let mut name = name.to_string();
-        for _ in 0..64 {
-            let mut best: Option<(&str, &str)> = None;
+    /// Why the dataset at `path` (no leading `/`) cannot be read, or `None`
+    /// when it can be — or does not exist.
+    pub fn unreadable_reason(&mut self, path: &str) -> Option<&str> {
+        if self.external_edge(path).is_some() {
+            let (owner, local, _) = self.external_owner(path, MAX_EXTERNAL_HOPS).ok()?;
+            let local = owner.canonical_path(&local);
+            return owner.unreadable.get(&local).map(String::as_str);
+        }
+        let path = self.canonical_path(path);
+        self.unreadable.get(&path).map(String::as_str)
+    }
+
+    /// Every link record in the file, keyed by full path (no leading `/`).
+    pub fn links(&self) -> &std::collections::BTreeMap<String, LinkClass> {
+        &self.links
+    }
+
+    /// The paths of every committed (named) datatype object in this file.
+    ///
+    /// A committed datatype is in neither [`dataset_names`](Self::dataset_names)
+    /// nor the group listing — it is a third kind of object, and this is its
+    /// listing.
+    pub fn named_datatype_names(&self) -> Vec<&str> {
+        self.datatypes.keys().map(String::as_str).collect()
+    }
+
+    /// The committed datatype at `path` (no leading `/`), following group hard
+    /// links, soft links and external links the way `H5Topen` does.
+    ///
+    /// `NotFound` means no committed datatype of that name; a name that *is*
+    /// one but whose type this crate cannot decode answers `Unsupported` with
+    /// the reason, never an absence.
+    pub fn named_datatype(&mut self, path: &str) -> IoResult<&DatatypeMessage> {
+        self.named_datatype_info(path)?
+            .datatype()
+            .map_err(|why| crate::io::IoError::Unsupported(why.to_string()))
+    }
+
+    /// The attribute names of the committed datatype at `path`.
+    pub fn named_datatype_attr_names(&mut self, path: &str) -> IoResult<Vec<String>> {
+        Ok(self
+            .named_datatype_info(path)?
+            .attributes()
+            .iter()
+            .map(|a| a.name.clone())
+            .collect())
+    }
+
+    /// One attribute of the committed datatype at `path`, by name.
+    pub fn named_datatype_attr(
+        &mut self,
+        path: &str,
+        attr_name: &str,
+    ) -> IoResult<&AttributeMessage> {
+        let owned = attr_name.to_string();
+        self.named_datatype_info(path)?
+            .attributes()
+            .iter()
+            .find(|a| a.name == owned)
+            .ok_or_else(|| crate::io::IoError::NotFound(format!("{path}:{attr_name}")))
+    }
+
+    /// The committed datatype object at `path`, after link traversal.
+    ///
+    /// The object answers here whether or not its type decodes; the reason it
+    /// does not is on [`CommittedDatatypeInfo::datatype`].
+    pub fn named_datatype_info(&mut self, path: &str) -> IoResult<&CommittedDatatypeInfo> {
+        if self.external_edge(path).is_some() {
+            let (owner, local, _) = self.external_owner(path, MAX_EXTERNAL_HOPS)?;
+            let local = owner.canonical_path(&local);
+            return owner
+                .datatypes
+                .get(&local)
+                .ok_or(crate::io::IoError::NotFound(local));
+        }
+        let local = self.canonical_path(path);
+        self.datatypes
+            .get(&local)
+            .ok_or(crate::io::IoError::NotFound(local))
+    }
+
+    /// The class of the link at `path` (no leading `/`), or `None` when no
+    /// link of that name exists. The path is traversed first, so a link
+    /// reached through a group hard link, a soft link or an external link
+    /// resolves — an external link's own record is found before the
+    /// traversal crosses it, since a name matches its own link exactly.
+    pub fn link_class(&mut self, path: &str) -> Option<&LinkClass> {
+        let path = path.trim_start_matches('/');
+        if self.links.contains_key(path) {
+            return self.links.get(path);
+        }
+        if self.external_edge(path).is_some() {
+            let (owner, local, _) = self.external_owner(path, MAX_EXTERNAL_HOPS).ok()?;
+            let local = owner.canonical_path(&local);
+            return owner.links.get(&local);
+        }
+        let path = self.canonical_path(path);
+        self.links.get(&path)
+    }
+
+    /// Follow a path (no leading `/`) the way `H5Dopen` / `H5Gopen` do:
+    /// rewrite each component that is a group hard-link alias or a soft link
+    /// until nothing changes, bounded so a link cycle cannot loop forever.
+    ///
+    /// This is the single owner of link traversal — every lookup that takes a
+    /// caller-supplied path goes through it rather than comparing the path to
+    /// a catalog key directly.
+    fn traverse(&self, name: &str) -> Traversal {
+        // libhdf5 bounds soft-link traversal at `H5L_NLINKS_DEF`; this covers
+        // that and the hard-link alias rewrites interleaved with it.
+        const MAX_TRAVERSALS: usize = 64;
+        let mut name = name.trim_start_matches('/').to_string();
+        let mut via = None;
+        for _ in 0..MAX_TRAVERSALS {
+            // Take the longest matching prefix so a nested alias wins over a
+            // shorter one that also covers the path.
+            let covers = |prefix: &str| name == prefix || name.starts_with(&format!("{prefix}/"));
+            let mut best: Option<(&str, Rewrite<'_>)> = None;
             for (alias, first) in &self.group_aliases {
-                let covers = name == *alias || name.starts_with(&format!("{alias}/"));
-                if covers && best.is_none_or(|(a, _)| alias.len() > a.len()) {
-                    best = Some((alias, first));
+                if covers(alias) && best.is_none_or(|(p, _)| alias.len() > p.len()) {
+                    best = Some((alias, Rewrite::Alias(first)));
                 }
             }
-            let Some((alias, first)) = best else { break };
-            // `first` is empty for an alias of the root group; trimming
-            // keeps the no-leading-'/' form either way.
-            name = format!("{first}{}", &name[alias.len()..])
-                .trim_start_matches('/')
-                .to_string();
+            for (link, class) in &self.links {
+                let rewrite = match class {
+                    LinkClass::Soft { path } => Rewrite::Soft(path),
+                    LinkClass::External { file, path } => Rewrite::External { file, path },
+                    _ => continue,
+                };
+                if covers(link) && best.is_none_or(|(p, _)| link.len() > p.len()) {
+                    best = Some((link, rewrite));
+                }
+            }
+            let Some((prefix, rewrite)) = best else { break };
+            let rest = name[prefix.len()..].to_string();
+            match rewrite {
+                Rewrite::Alias(first) => {
+                    // `first` is empty for an alias of the root group;
+                    // trimming keeps the no-leading-'/' form either way.
+                    name = format!("{first}{rest}").trim_start_matches('/').to_string();
+                }
+                Rewrite::Soft(target) => {
+                    let resolved = resolve_link_value(prefix, target);
+                    via = Some(SoftLinkRef {
+                        link: prefix.to_string(),
+                        target: target.to_string(),
+                    });
+                    name = format!("{resolved}{rest}")
+                        .trim_start_matches('/')
+                        .to_string();
+                }
+                Rewrite::External { file, path } => {
+                    return Traversal::External {
+                        link: prefix.to_string(),
+                        file: file.to_string(),
+                        path: format!("{path}{rest}"),
+                    };
+                }
+            }
         }
-        name
+        Traversal::Path { path: name, via }
     }
 
-    /// Return metadata for a dataset by name. Like `H5Dopen`, the name
-    /// may pass through group hard links.
-    pub fn dataset_info(&self, name: &str) -> Option<&DatasetReadInfo> {
+    /// The messages read from the superblock extension object header. All
+    /// fields are `None` for a file without an extension.
+    pub fn superblock_extension(&self) -> &SuperblockExtension {
+        &self.ext
+    }
+
+    /// Size in bytes of the userblock preceding the superblock: the offset the
+    /// signature was found at, which is also the file's base address. Zero for
+    /// a file without a userblock.
+    pub fn userblock_size(&self) -> u64 {
+        self.handle.base()
+    }
+
+    /// The v1 B-tree split ranks in force for this file, after the superblock
+    /// and the extension's K message have both been applied.
+    pub fn btree_config(&self) -> BTreeV1Config {
+        self.meta.btree
+    }
+
+    /// Rewrite a path (no leading `/`) into the path of the object it reaches
+    /// after link traversal. A path that leaves the file through an external
+    /// link comes back unchanged — the callers that must report that case use
+    /// [`Self::traverse`] directly.
+    pub fn canonical_path(&self, name: &str) -> String {
+        match self.traverse(name) {
+            Traversal::Path { path, .. } => path,
+            Traversal::External { .. } => name.trim_start_matches('/').to_string(),
+        }
+    }
+
+    /// Where `name` leaves this file, or `None` when it resolves inside it.
+    ///
+    /// This is the one question every path-taking entry point asks before it
+    /// looks anything up: a name that crosses an external link is not this
+    /// file's to answer, and answering it from this file's catalog anyway is
+    /// how such a name came back as a plain absence.
+    pub(crate) fn external_edge(&self, name: &str) -> Option<ExternalEdge> {
+        match self.traverse(name) {
+            Traversal::Path { .. } => None,
+            Traversal::External { link, file, path } => Some(ExternalEdge { link, file, path }),
+        }
+    }
+
+    /// Candidate filesystem paths for an external link's target file, in the
+    /// order `H5F_prefix_open_file` tries them: an absolute name as given,
+    /// then each `HDF5_EXT_PREFIX` component, then the directory holding this
+    /// file, then the working directory. An absolute name that does not exist
+    /// falls back to its last component for the later attempts, as the C does.
+    ///
+    /// The one step of that order this does not implement is the link-access
+    /// property list's `H5Pset_elink_prefix`, which has no equivalent in this
+    /// crate's API yet; it would sit between the environment variable and this
+    /// file's directory.
+    fn external_candidates(&self, file: &str) -> Vec<PathBuf> {
+        let raw = Path::new(file);
+        let mut candidates = Vec::new();
+        if raw.is_absolute() {
+            candidates.push(raw.to_path_buf());
+        }
+        // Every attempt after an absolute miss uses the bare file name.
+        let base: &Path = if raw.is_absolute() {
+            Path::new(raw.file_name().unwrap_or(raw.as_os_str()))
+        } else {
+            raw
+        };
+        if let Ok(prefixes) = std::env::var("HDF5_EXT_PREFIX") {
+            candidates.extend(
+                prefixes
+                    .split(':')
+                    .filter(|p| !p.is_empty())
+                    .map(|p| Path::new(p).join(base)),
+            );
+        }
+        if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            candidates.push(dir.join(base));
+        }
+        candidates.push(base.to_path_buf());
+        candidates
+    }
+
+    /// Open one external link's target file, or hand back the handle a
+    /// previous link to the same resolved path already opened.
+    fn external_target(&mut self, link: &str, file: &str) -> IoResult<&mut Hdf5Reader> {
+        // The search runs once per link value; after that the answer is what
+        // this reader resolved it to, whatever the filesystem does next.
+        let resolved = match self.external_resolved.get(file) {
+            Some(resolved) => resolved.clone(),
+            None => {
+                let candidates = self.external_candidates(file);
+                let resolved = candidates
+                    .iter()
+                    .find(|p| p.is_file())
+                    .cloned()
+                    .ok_or_else(|| crate::io::IoError::ExternalFileNotFound {
+                        link: link.to_string(),
+                        file: file.to_string(),
+                        searched: candidates.iter().map(|p| p.display().to_string()).collect(),
+                    })?;
+                self.external_resolved
+                    .insert(file.to_string(), resolved.clone());
+                resolved
+            }
+        };
+        let locking = self.locking;
+        match self.external.entry(resolved) {
+            std::collections::btree_map::Entry::Occupied(e) => Ok(&mut **e.into_mut()),
+            std::collections::btree_map::Entry::Vacant(e) => {
+                let reader = Hdf5Reader::open_with_locking(e.key(), locking)?;
+                Ok(&mut **e.insert(Box::new(reader)))
+            }
+        }
+    }
+
+    /// The reader that owns `name`, the path of `name` inside it, and the last
+    /// external link crossed to get there.
+    ///
+    /// This is the single owner of cross-file resolution: it follows external
+    /// links until the remaining path resolves inside the reader it returns,
+    /// so callers do exactly one delegation and never have to re-check.
+    fn external_owner(
+        &mut self,
+        name: &str,
+        hops: usize,
+    ) -> IoResult<(&mut Self, String, Option<ExternalEdge>)> {
+        let path = name.trim_start_matches('/').to_string();
+        let Some(edge) = self.external_edge(&path) else {
+            return Ok((self, path, None));
+        };
+        if hops == 0 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "resolving '{name}' crossed more than {MAX_EXTERNAL_HOPS} external links \
+                 (libhdf5 stops at the same H5L_NUM_LINKS); the links may form a cycle"
+            )));
+        }
+        let target = self.external_target(&edge.link, &edge.file)?;
+        let (owner, path, deeper) = target.external_owner(&edge.path, hops - 1)?;
+        Ok((owner, path, deeper.or(Some(edge))))
+    }
+
+    /// Return metadata for a dataset by name. Like `H5Dopen`, the name may
+    /// pass through group hard links, soft links and external links.
+    pub fn dataset_info(&mut self, name: &str) -> Option<&DatasetReadInfo> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS).ok()?;
+            return owner.dataset_info_local(&path);
+        }
+        self.dataset_info_local(name)
+    }
+
+    /// [`dataset_info`](Self::dataset_info) restricted to this file: soft
+    /// links and group hard links resolve, an external link does not. Every
+    /// read path uses this, because by then the owning reader has already been
+    /// selected and the path is local to it.
+    fn dataset_info_local(&self, name: &str) -> Option<&DatasetReadInfo> {
         let name = self.canonical_path(name);
         self.datasets.iter().find(|d| d.name == name)
     }
 
+    /// Open `name` as a dataset the way `H5Dopen` does, reporting *why* it
+    /// cannot be opened instead of collapsing every cause into absence: a
+    /// soft link whose target does not exist is a dangling link, and a path
+    /// through an external link is resolved in the file that link names.
+    ///
+    /// This is the gate every typed dataset access goes through.
+    pub fn open_dataset(&mut self, name: &str) -> IoResult<&DatasetReadInfo> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, edge) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return match owner.open_dataset_local(&path) {
+                // The name is absent in the target file, which makes the link
+                // that pointed there dangling — not the caller's path absent.
+                Err(crate::io::IoError::NotFound(_)) => {
+                    Err(edge.map_or_else(|| crate::io::IoError::NotFound(path), |e| e.dangling()))
+                }
+                other => other,
+            };
+        }
+        self.open_dataset_local(name)
+    }
+
+    /// [`open_dataset`](Self::open_dataset) restricted to this file.
+    fn open_dataset_local(&self, name: &str) -> IoResult<&DatasetReadInfo> {
+        let Traversal::Path { path, via } = self.traverse(name) else {
+            // `external_owner` only ever returns a reader in which the
+            // remaining path resolves locally, so no caller can land here.
+            return Err(crate::io::IoError::NotFound(name.to_string()));
+        };
+        if let Some(info) = self.datasets.iter().find(|d| d.name == path) {
+            return Ok(info);
+        }
+        if let Some(why) = self.unreadable.get(&path) {
+            return Err(crate::io::IoError::Unsupported(format!(
+                "'{name}' is a dataset this crate cannot read: {why}"
+            )));
+        }
+        if let Some(SoftLinkRef { link, target }) = via {
+            return Err(crate::io::IoError::DanglingLink { link, target });
+        }
+        Err(crate::io::IoError::NotFound(name.to_string()))
+    }
+
+    /// Resolve one entry of an attribute list.
+    ///
+    /// The cases an attribute list can answer are kept apart here rather than
+    /// at each call site: decoded, present but undecodable, absent from a set
+    /// known to be whole, and absent from a set that was never read whole. A
+    /// caller that collapsed any of the middle cases into the last would
+    /// report an attribute the file contains as one it does not.
+    fn resolve_attr<'a>(
+        attrs: &'a ObjectAttributes,
+        owner: &str,
+        name: &str,
+    ) -> IoResult<&'a AttributeMessage> {
+        match attrs.entries.iter().find(|a| a.name() == name) {
+            Some(AttributeEntry::Readable(attr)) => Ok(attr),
+            Some(AttributeEntry::Unreadable { reason, .. }) => {
+                Err(crate::io::IoError::Unsupported(format!(
+                    "attribute '{name}' on '{owner}' cannot be decoded: {reason}"
+                )))
+            }
+            // Not among what was read — but the part that was not read could
+            // hold it, so an incomplete set cannot answer "absent".
+            None => match attrs.unreadable_reason() {
+                Some(reason) => Err(incomplete_error(owner, reason)),
+                None => Err(crate::io::IoError::NotFound(format!("{owner}:{name}"))),
+            },
+        }
+    }
+
+    /// Why the attribute `name` in `attrs` cannot be read, or `None` when it
+    /// can be — or is not there at all, which the accessors above report as
+    /// `NotFound`.
+    fn attr_reason<'a>(attrs: &'a ObjectAttributes, name: &str) -> Option<&'a str> {
+        attrs
+            .entries
+            .iter()
+            .find(|a| a.name() == name)?
+            .unreadable_reason()
+    }
+
+    /// Why a dataset's attribute cannot be read, or `None` when it can be.
+    pub fn dataset_attr_unreadable_reason(
+        &mut self,
+        ds_name: &str,
+        attr_name: &str,
+    ) -> Option<&str> {
+        Self::attr_reason(&self.dataset_info(ds_name)?.attributes, attr_name)
+    }
+
+    /// Why a root-level attribute cannot be read, or `None` when it can be.
+    pub fn root_attr_unreadable_reason(&self, name: &str) -> Option<&str> {
+        Self::attr_reason(&self.root_attributes, name)
+    }
+
+    /// Why a non-root group's attribute cannot be read, or `None` when it can
+    /// be.
+    pub fn group_attr_unreadable_reason(&self, group_path: &str, name: &str) -> Option<&str> {
+        Self::attr_reason(
+            self.group_attributes
+                .get(&self.canonical_path(group_path))?,
+            name,
+        )
+    }
+
+    /// Why a dataset's attributes cannot be listed at all, or `None` when the
+    /// set is whole. Object scope, unlike
+    /// [`Self::dataset_attr_unreadable_reason`]: the failure belongs to no
+    /// single name.
+    pub fn dataset_attrs_unreadable_reason(&mut self, ds_name: &str) -> Option<&str> {
+        self.dataset_info(ds_name)?.attributes.unreadable_reason()
+    }
+
+    /// Why the root group's attributes cannot be listed at all, or `None` when
+    /// the set is whole.
+    pub fn root_attrs_unreadable_reason(&self) -> Option<&str> {
+        self.root_attributes.unreadable_reason()
+    }
+
+    /// Why a non-root group's attributes cannot be listed at all, or `None`
+    /// when the set is whole.
+    pub fn group_attrs_unreadable_reason(&self, group_path: &str) -> Option<&str> {
+        self.group_attributes
+            .get(&self.canonical_path(group_path))?
+            .unreadable_reason()
+    }
+
     /// Return the attribute names of a dataset.
-    pub fn dataset_attr_names(&self, name: &str) -> IoResult<Vec<String>> {
+    ///
+    /// Includes attributes this crate cannot decode: the object header carries
+    /// them, so the listing does too. [`Self::dataset_attr`] says why one of
+    /// those cannot be read. An object whose attribute set could not be read
+    /// whole has no listing to give and returns the reason instead — see
+    /// [`Self::dataset_attrs_unreadable_reason`].
+    pub fn dataset_attr_names(&mut self, name: &str) -> IoResult<Vec<String>> {
         let info = self
             .dataset_info(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
-        Ok(info.attributes.iter().map(|a| a.name.clone()).collect())
+        Ok(info
+            .attributes
+            .complete(name)?
+            .iter()
+            .map(|a| a.name().to_string())
+            .collect())
     }
 
     /// Return a specific attribute by dataset name and attribute name.
-    pub fn dataset_attr(&self, ds_name: &str, attr_name: &str) -> IoResult<&AttributeMessage> {
+    pub fn dataset_attr(&mut self, ds_name: &str, attr_name: &str) -> IoResult<&AttributeMessage> {
         let info = self
             .dataset_info(ds_name)
             .ok_or_else(|| crate::io::IoError::NotFound(ds_name.to_string()))?;
-        info.attributes
-            .iter()
-            .find(|a| a.name == attr_name)
-            .ok_or_else(|| crate::io::IoError::NotFound(format!("{}:{}", ds_name, attr_name)))
+        Self::resolve_attr(&info.attributes, ds_name, attr_name)
     }
 
-    /// Return the names of root-level (file) attributes.
-    pub fn root_attr_names(&self) -> Vec<String> {
-        self.root_attributes
+    /// Return the names of root-level (file) attributes, undecodable ones
+    /// included — see [`Self::dataset_attr_names`].
+    pub fn root_attr_names(&self) -> IoResult<Vec<String>> {
+        Ok(self
+            .root_attributes
+            .complete("/")?
             .iter()
-            .map(|a| a.name.clone())
-            .collect()
+            .map(|a| a.name().to_string())
+            .collect())
     }
 
     /// Return a root-level attribute by name.
-    pub fn root_attr(&self, name: &str) -> Option<&AttributeMessage> {
-        self.root_attributes.iter().find(|a| a.name == name)
+    pub fn root_attr(&self, name: &str) -> IoResult<&AttributeMessage> {
+        Self::resolve_attr(&self.root_attributes, "/", name)
     }
 
     /// Return the attribute names of a non-root group (path without a
     /// leading `/`, e.g. `"detector"` or `"entry/instrument"`; may pass
-    /// through group hard links).
-    pub fn group_attr_names(&self, group_path: &str) -> Vec<String> {
-        self.group_attributes
-            .get(&self.canonical_path(group_path))
-            .map(|v| v.iter().map(|a| a.name.clone()).collect())
-            .unwrap_or_default()
+    /// through group hard links). Undecodable attributes included — see
+    /// [`Self::dataset_attr_names`].
+    pub fn group_attr_names(&mut self, group_path: &str) -> IoResult<Vec<String>> {
+        if self.external_edge(group_path).is_some() {
+            let (owner, local, _) = self.external_owner(group_path, MAX_EXTERNAL_HOPS)?;
+            // The empty remainder is the target file's root group, whose
+            // attributes are not in the per-group map.
+            if local.is_empty() {
+                return owner.root_attr_names();
+            }
+            return owner.group_attr_names_local(&local);
+        }
+        self.group_attr_names_local(group_path)
+    }
+
+    fn group_attr_names_local(&self, group_path: &str) -> IoResult<Vec<String>> {
+        let Some(attrs) = self.group_attributes.get(&self.canonical_path(group_path)) else {
+            return Ok(Vec::new());
+        };
+        Ok(attrs
+            .complete(group_path)?
+            .iter()
+            .map(|a| a.name().to_string())
+            .collect())
     }
 
     /// Return a non-root group's attribute by name.
-    pub fn group_attr(&self, group_path: &str, name: &str) -> Option<&AttributeMessage> {
-        self.group_attributes
-            .get(&self.canonical_path(group_path))?
-            .iter()
-            .find(|a| a.name == name)
+    pub fn group_attr(&mut self, group_path: &str, name: &str) -> IoResult<&AttributeMessage> {
+        if self.external_edge(group_path).is_some() {
+            let (owner, local, _) = self.external_owner(group_path, MAX_EXTERNAL_HOPS)?;
+            if local.is_empty() {
+                return owner.root_attr(name);
+            }
+            return owner.group_attr_local(&local, name);
+        }
+        self.group_attr_local(group_path, name)
+    }
+
+    fn group_attr_local(&self, group_path: &str, name: &str) -> IoResult<&AttributeMessage> {
+        match self.group_attributes.get(&self.canonical_path(group_path)) {
+            Some(attrs) => Self::resolve_attr(attrs, group_path, name),
+            // No entry at all: the walk found nothing to record on this group.
+            None => Err(crate::io::IoError::NotFound(format!("{group_path}:{name}"))),
+        }
     }
 
     /// Return every non-root group path the discovery walk traversed into
@@ -1333,24 +2614,7 @@ impl Hdf5Reader {
     /// has none, and this crate's writers put a whole write call's strings
     /// into one collection, which a cap would turn into silent data loss.
     fn read_heap_collection(&mut self, addr: u64) -> IoResult<GlobalHeapCollection> {
-        let ss = self.ctx.sizeof_size as usize;
-        let header_len = 4 + 1 + 3 + ss;
-        let header_buf = self.handle.read_at_most(addr, header_len)?;
-        if header_buf.len() < header_len || header_buf[0..4] != *b"GCOL" {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "bad global heap collection signature at address {addr:#x}"
-            )));
-        }
-        let declared = read_uint(&header_buf[8..], ss) as usize;
-        if declared < 4096 {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "global heap collection at address {addr:#x} declares size {declared}, \
-                 below the 4096-byte minimum"
-            )));
-        }
-        let heap_buf = self.handle.read_at(addr, declared)?;
-        let (coll, _) = GlobalHeapCollection::decode(&heap_buf, &self.ctx)?;
-        Ok(coll)
+        read_heap_collection_from(&mut self.handle, &self.meta.ctx, addr)
     }
 
     /// Decode an attribute's value as a string, resolving a variable-length
@@ -1359,20 +2623,14 @@ impl Hdf5Reader {
     pub fn attr_string_value(&mut self, attr: &AttributeMessage) -> IoResult<String> {
         use crate::format::messages::datatype::DatatypeMessage;
         if !matches!(attr.datatype, DatatypeMessage::VarLenString { .. }) {
-            // Fixed-length string: raw bytes, truncated at the first NUL.
-            let end = attr
-                .data
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(attr.data.len());
-            return Ok(String::from_utf8_lossy(&attr.data[..end]).to_string());
+            return fixed_string_attr_value(attr);
         }
         // Variable-length string: the attribute value is a global-heap
         // reference (sequence length + collection address + object index).
-        if attr.data.len() < vlen_reference_size(&self.ctx) {
+        if attr.data.len() < vlen_reference_size(&self.meta.ctx) {
             return Ok(String::new());
         }
-        let (_seq, coll_addr, obj_index) = decode_vlen_reference(&attr.data, &self.ctx)?;
+        let (_seq, coll_addr, obj_index) = decode_vlen_reference(&attr.data, &self.meta.ctx)?;
         if coll_addr == UNDEF_ADDR || coll_addr == 0 {
             return Ok(String::new());
         }
@@ -1390,8 +2648,148 @@ impl Hdf5Reader {
         Ok(String::from_utf8_lossy(obj).to_string())
     }
 
+    /// The absolute path of the object whose header sits at `addr` — what an
+    /// object reference to it names — or `None` when no group or dataset the
+    /// discovery walk reached lives there (a reference into a file region the
+    /// walk never traversed, or a stale one).
+    pub fn path_for_object(&self, addr: u64) -> Option<&str> {
+        self.object_paths.get(&addr).map(String::as_str)
+    }
+
+    /// Read a reference dataset's elements, resolved to the objects they name.
+    pub fn read_references(&mut self, name: &str) -> IoResult<Vec<Reference>> {
+        let datatype = self
+            .dataset_info(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?
+            .datatype
+            .clone();
+        let raw = self.read_dataset_raw(name)?;
+        self.decode_references(&datatype, &raw)
+    }
+
+    /// Read an attribute's value as reference elements.
+    pub fn attr_references(&mut self, attr: &AttributeMessage) -> IoResult<Vec<Reference>> {
+        self.decode_references(&attr.datatype, &attr.data)
+    }
+
+    /// The single owner of reference decoding for both carriers of reference
+    /// elements — dataset payloads and attribute values.
+    fn decode_references(
+        &mut self,
+        datatype: &DatatypeMessage,
+        bytes: &[u8],
+    ) -> IoResult<Vec<Reference>> {
+        let DatatypeMessage::Reference { size, kind } = datatype else {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "datatype {datatype} is not a reference"
+            )));
+        };
+        let (size, kind) = (*size as usize, *kind);
+        if size == 0 {
+            // A corrupt file can declare it; `chunks_exact(0)` panics.
+            return Err(crate::io::IoError::InvalidState(
+                "reference datatype has zero width".into(),
+            ));
+        }
+        let encoding = kind.encoding();
+
+        // References written by one call share one heap collection, so read
+        // each collection once rather than per element.
+        let mut heaps = std::collections::HashMap::new();
+        let mut out = Vec::with_capacity(bytes.len() / size);
+        for elem in bytes.chunks_exact(size) {
+            out.push(self.decode_reference_element(elem, encoding, &mut heaps)?);
+        }
+        Ok(out)
+    }
+
+    /// One reference element, resolved against the file.
+    ///
+    /// `heaps` caches the global-heap collections region references point
+    /// into, keyed by collection address.
+    fn decode_reference_element(
+        &mut self,
+        elem: &[u8],
+        encoding: ReferenceEncoding,
+        heaps: &mut std::collections::HashMap<u64, GlobalHeapCollection>,
+    ) -> IoResult<Reference> {
+        match encoding {
+            ReferenceEncoding::Old(OldReferenceKind::Object) => {
+                match decode_object_element(elem, &self.meta.ctx)? {
+                    None => Ok(Reference::Null),
+                    Some(address) => Ok(self.resolve_reference(address, ReferenceTarget::Object)),
+                }
+            }
+            ReferenceEncoding::Old(OldReferenceKind::DatasetRegion) => {
+                let Some((coll_addr, obj_index)) = decode_region_element(elem, &self.meta.ctx)?
+                else {
+                    return Ok(Reference::Null);
+                };
+                let obj = self.heap_object(coll_addr, obj_index, heaps)?;
+                let (address, selection) = decode_region_heap_object(obj, &self.meta.ctx)?;
+                Ok(self.resolve_reference(address, ReferenceTarget::Region(selection)))
+            }
+            ReferenceEncoding::Revised => {
+                let (kind, body) = match decode_revised_element(elem, &self.meta.ctx)? {
+                    RevisedElement::Null => return Ok(Reference::Null),
+                    RevisedElement::Inline { kind, body } => (kind, body.to_vec()),
+                    RevisedElement::Heap {
+                        kind,
+                        collection,
+                        index,
+                    } => (kind, self.heap_object(collection, index, heaps)?.to_vec()),
+                };
+                match decode_revised_body(kind, &body, &self.meta.ctx)? {
+                    None => Ok(Reference::Null),
+                    Some((address, target)) => Ok(self.resolve_reference(address, target)),
+                }
+            }
+        }
+    }
+
+    /// Attach the target's path to a decoded reference — the one place an
+    /// address becomes a [`Reference`], so every kind resolves the same way.
+    fn resolve_reference(&self, address: u64, target: ReferenceTarget) -> Reference {
+        let path = self.path_for_object(address).map(str::to_string);
+        match target {
+            ReferenceTarget::Object => Reference::Object { address, path },
+            ReferenceTarget::Region(selection) => Reference::Region {
+                address,
+                path,
+                selection,
+            },
+            ReferenceTarget::Attribute(name) => Reference::Attr {
+                address,
+                path,
+                name,
+            },
+        }
+    }
+
+    /// One global-heap object, reading its collection at most once.
+    fn heap_object<'h>(
+        &mut self,
+        collection: u64,
+        index: u32,
+        heaps: &'h mut std::collections::HashMap<u64, GlobalHeapCollection>,
+    ) -> IoResult<&'h [u8]> {
+        if let std::collections::hash_map::Entry::Vacant(slot) = heaps.entry(collection) {
+            slot.insert(self.read_heap_collection(collection)?);
+        }
+        let idx = u16::try_from(index).map_err(|_| {
+            crate::io::IoError::InvalidState(format!(
+                "global heap object index {index} does not fit the 16-bit on-disk field"
+            ))
+        })?;
+        heaps[&collection].get_object(idx).ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!(
+                "global heap object {idx} not found in the collection at address {collection:#x}"
+            ))
+        })
+    }
+
     /// Return the dimensions of a dataset.
-    pub fn dataset_shape(&self, name: &str) -> IoResult<Vec<u64>> {
+    pub fn dataset_shape(&mut self, name: &str) -> IoResult<Vec<u64>> {
         let info = self
             .dataset_info(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
@@ -1400,16 +2798,28 @@ impl Hdf5Reader {
 
     /// Logical byte size of a dataset's full image (`product(dims) *
     /// element_size`), with the datatype needed for the post-filter conversion.
+    ///
+    /// The NULL dataspace (`dataspace.is_null()`) holds zero elements — not
+    /// one, the way an empty `dims` would suggest by the same product-of-dims
+    /// arithmetic a scalar dataspace uses (`dims` is empty for both).
     fn raw_size_and_datatype(&self, name: &str) -> IoResult<(DatatypeMessage, u64)> {
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
-        let total = saturating_byte_len(&info.dataspace.dims, info.datatype.element_size() as u64);
+        let total = if info.dataspace.is_null() {
+            0
+        } else {
+            saturating_byte_len(&info.dataspace.dims, info.datatype.element_size() as u64)
+        };
         Ok((info.datatype.clone(), total))
     }
 
     /// Read the raw bytes of a dataset.
     pub fn read_dataset_raw(&mut self, name: &str) -> IoResult<Vec<u8>> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.read_dataset_raw(&path);
+        }
         let (datatype, total) = self.raw_size_and_datatype(name)?;
         let mut data = alloc_tiled_fill(total as usize, None)?;
         self.read_dataset_raw_into_unconverted(name, &mut data)?;
@@ -1426,6 +2836,10 @@ impl Hdf5Reader {
     /// point for reading directly into a pinned/registered host buffer for an
     /// H2D transfer.
     pub fn read_dataset_raw_into(&mut self, name: &str, out: &mut [u8]) -> IoResult<()> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.read_dataset_raw_into(&path, out);
+        }
         let (datatype, total) = self.raw_size_and_datatype(name)?;
         if out.len() as u64 != total {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -1450,15 +2864,20 @@ impl Hdf5Reader {
     /// `out.len()` must equal `product(dims) * element_size`.
     fn read_dataset_raw_into_unconverted(&mut self, name: &str, out: &mut [u8]) -> IoResult<()> {
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
 
         // Clone to avoid borrow conflict with &mut self in read methods.
         let layout = info.layout.clone();
         let pipeline = info.filter_pipeline.clone();
         let fill_value = info.fill_value.clone();
+        let external_files = info.external_files.clone();
 
         match &layout {
+            DataLayoutMessage::Contiguous { .. } if !external_files.is_empty() => {
+                let prefix = resolve_extfile_prefix(&self.source_dir);
+                read_external_file_bytes(&external_files, prefix.as_deref(), 0, out)?;
+            }
             DataLayoutMessage::Contiguous { address, .. } => {
                 if *address == UNDEF_ADDR {
                     // Never-written contiguous data reads back as the fill value.
@@ -1517,6 +2936,148 @@ impl Hdf5Reader {
                     out,
                 )?;
             }
+            DataLayoutMessage::Virtual { .. } => {
+                fill_tiled_into(out, fill_value.as_deref());
+                self.read_virtual_into(name, out, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fill `out` (shaped like the virtual dataset's own extent) by
+    /// stitching each mapping's source bytes in order (`H5D__virtual_read`,
+    /// H5Dvirtual.c). `out` must already be pre-filled with the tiled fill
+    /// value — every element no mapping covers is left exactly as the
+    /// caller filled it, matching the fixed-extent default of
+    /// `H5Pset_virtual_view` (`H5D_VDS_LAST_AVAILABLE`/`FIRST_MISSING` only
+    /// change how an *unlimited* mapping's extent is computed, which this
+    /// reader does not support — see [`has_virtual_printf_pattern`]).
+    /// Mappings apply in list order, so a later mapping's bytes win over an
+    /// earlier one's on overlap, exactly like the C reader.
+    ///
+    /// `depth` counts virtual-dataset nesting — a mapping whose source is
+    /// itself a virtual dataset, possibly in another file — so a crafted
+    /// cyclic mapping chain fails cleanly instead of recursing until the
+    /// stack overflows.
+    fn read_virtual_into(&mut self, name: &str, out: &mut [u8], depth: usize) -> IoResult<()> {
+        if depth >= MAX_VIRTUAL_DEPTH {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset {name:?}: virtual dataset mapping nests {MAX_VIRTUAL_DEPTH} levels \
+                 deep, aborting (possible cyclic mapping)"
+            )));
+        }
+        let info = self
+            .dataset_info(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let dims = info.dataspace.dims.clone();
+        let element_size = info.datatype.element_size() as u64;
+        let Some(mappings) = info.virtual_mappings.clone() else {
+            // No mapping list written yet: every element is unmapped, and
+            // `out` is already the fill value the caller pre-filled it with.
+            return Ok(());
+        };
+        let source_dir = self.source_dir.clone();
+
+        // Cross-file source readers, opened at most once per distinct
+        // resolved path for the duration of this call.
+        let mut cross_file_cache: std::collections::HashMap<PathBuf, Hdf5Reader> =
+            std::collections::HashMap::new();
+
+        for mapping in &mappings.mappings {
+            if has_virtual_printf_pattern(&mapping.source_file_name)
+                || has_virtual_printf_pattern(&mapping.source_dset_name)
+            {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "dataset {name:?}: virtual mapping to {:?}/{:?} uses a printf-style \
+                     (%b) unlimited source name pattern, which is not supported",
+                    mapping.source_file_name, mapping.source_dset_name
+                )));
+            }
+
+            let virtual_boxes = mapping.virtual_selection.to_boxes(&dims).map_err(|e| {
+                crate::io::IoError::InvalidState(format!(
+                    "dataset {name:?}: virtual mapping's virtual selection is not \
+                     supported: {e}"
+                ))
+            })?;
+            if virtual_boxes.is_empty() {
+                continue;
+            }
+
+            let source_name = mapping.source_dset_name.trim_start_matches('/');
+
+            if mapping.source_file_name == "." {
+                let src_dims = self
+                    .dataset_info(source_name)
+                    .ok_or_else(|| {
+                        crate::io::IoError::InvalidState(format!(
+                            "dataset {name:?}: virtual mapping source dataset \
+                             {source_name:?} not found in the same file"
+                        ))
+                    })?
+                    .dataspace
+                    .dims
+                    .clone();
+                let source_boxes = mapping.source_selection.to_boxes(&src_dims).map_err(|e| {
+                    crate::io::IoError::InvalidState(format!(
+                        "dataset {name:?}: virtual mapping's source selection is not \
+                         supported: {e}"
+                    ))
+                })?;
+                copy_matched_boxes(
+                    |s, c, buf| self.read_slice_into_unconverted(source_name, s, c, buf, depth + 1),
+                    &source_boxes,
+                    &virtual_boxes,
+                    &dims,
+                    element_size,
+                    out,
+                )?;
+            } else {
+                let prefix = resolve_vdsfile_prefix(&source_dir);
+                let full_path = combine_prefixed_path(prefix.as_deref(), &mapping.source_file_name);
+                let cache_key =
+                    std::fs::canonicalize(&full_path).unwrap_or_else(|_| full_path.clone());
+                if !cross_file_cache.contains_key(&cache_key) {
+                    let reader = Hdf5Reader::open_with_locking(&full_path, FileLocking::Disabled)
+                        .map_err(|e| {
+                        crate::io::IoError::InvalidState(format!(
+                            "dataset {name:?}: unable to open virtual dataset source \
+                                 file {}: {e}",
+                            full_path.display()
+                        ))
+                    })?;
+                    cross_file_cache.insert(cache_key.clone(), reader);
+                }
+                let src_reader = cross_file_cache.get_mut(&cache_key).unwrap();
+                let src_dims = src_reader
+                    .dataset_info(source_name)
+                    .ok_or_else(|| {
+                        crate::io::IoError::InvalidState(format!(
+                            "dataset {name:?}: virtual mapping source dataset \
+                             {source_name:?} not found in {}",
+                            full_path.display()
+                        ))
+                    })?
+                    .dataspace
+                    .dims
+                    .clone();
+                let source_boxes = mapping.source_selection.to_boxes(&src_dims).map_err(|e| {
+                    crate::io::IoError::InvalidState(format!(
+                        "dataset {name:?}: virtual mapping's source selection is not \
+                         supported: {e}"
+                    ))
+                })?;
+                copy_matched_boxes(
+                    |s, c, buf| {
+                        src_reader.read_slice_into_unconverted(source_name, s, c, buf, depth + 1)
+                    },
+                    &source_boxes,
+                    &virtual_boxes,
+                    &dims,
+                    element_size,
+                    out,
+                )?;
+            }
         }
         Ok(())
     }
@@ -1558,29 +3119,42 @@ impl Hdf5Reader {
             sizeof_size: sb.sizeof_lengths,
         };
 
+        // The superblock extension can also have changed under SWMR (a new
+        // free-space or shared-message table), so re-read it before the walk.
+        let (meta, ext) = Self::read_extension_and_meta(
+            &mut self.handle,
+            ctx,
+            self.meta.btree,
+            sb.superblock_extension_address,
+        )?;
+
         // Re-read root group object header, following continuation blocks.
         let root_header = Self::read_object_header_full(
             &mut self.handle,
-            &ctx,
+            &meta,
             sb.root_group_object_header_address,
         )?;
 
-        // Re-scan datasets, group attributes, and group paths from link
-        // messages.
-        let (datasets, group_attributes, group_paths, group_aliases) =
-            Self::discover_datasets_from_links(
-                &mut self.handle,
-                &root_header,
-                sb.root_group_object_header_address,
-                &ctx,
-            )?;
+        // Re-scan datasets, group attributes, group paths, and link records.
+        let catalog = Self::build_catalog(
+            &mut self.handle,
+            &meta,
+            Some(&root_header),
+            sb.root_group_object_header_address,
+            None,
+        )?;
 
         self._eof = sb.end_of_file_address;
-        self.ctx = ctx;
-        self.datasets = datasets;
-        self.group_attributes = group_attributes;
-        self.group_paths = group_paths;
-        self.group_aliases = group_aliases;
+        self.meta = meta;
+        self.ext = ext;
+        self.object_paths = catalog.object_paths(sb.root_group_object_header_address);
+        self.datasets = catalog.datasets;
+        self.unreadable = catalog.unreadable;
+        self.group_attributes = catalog.group_attributes;
+        self.group_paths = catalog.group_paths;
+        self.group_aliases = catalog.group_aliases;
+        self.links = catalog.links;
+        self.datatypes = catalog.datatypes;
 
         Ok(())
     }
@@ -1610,7 +3184,7 @@ impl Hdf5Reader {
             single_chunk_filter,
         } = desc;
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
@@ -1674,6 +3248,9 @@ impl Hdf5Reader {
                     ),
                 }
                 Ok(())
+            }
+            data_layout::ChunkIndexType::Implicit => {
+                self.read_chunked_implicit(name, chunk_dims, index_address, target, output)
             }
             data_layout::ChunkIndexType::FixedArray => self.read_chunked_fixed_array(
                 name,
@@ -1807,10 +3384,6 @@ impl Hdf5Reader {
 
                 Ok(())
             }
-            _ => Err(crate::io::IoError::InvalidState(format!(
-                "unsupported chunk index type: {:?}",
-                index_type
-            ))),
         }
     }
 
@@ -1830,7 +3403,7 @@ impl Hdf5Reader {
         use crate::format::chunk_index::fixed_array::*;
 
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
@@ -1843,7 +3416,7 @@ impl Hdf5Reader {
 
         // Read FA header
         let hdr_buf = self.handle.read_at_most(index_address, 256)?;
-        let fa_hdr = FixedArrayHeader::decode(&hdr_buf, &self.ctx)?;
+        let fa_hdr = FixedArrayHeader::decode(&hdr_buf, &self.meta.ctx)?;
 
         if fa_hdr.data_blk_addr == UNDEF_ADDR {
             // Unallocated data block: `output` is already pre-filled.
@@ -1861,7 +3434,7 @@ impl Hdf5Reader {
         }
 
         let is_filtered = fa_hdr.client_id == FA_CLIENT_FILT_CHUNK;
-        let sizeof_addr = self.ctx.sizeof_addr as usize;
+        let sizeof_addr = self.meta.ctx.sizeof_addr as usize;
         // chunk_size_len = element_size - sizeof_addr - filter_mask(4)
         let chunk_size_len = if is_filtered {
             (fa_hdr.element_size as usize)
@@ -1899,7 +3472,7 @@ impl Hdf5Reader {
             let dblk_page_nelmts = fa_hdr.dblk_page_nelmts();
             let prefix_len = 4 + 1 + 1 + sizeof_addr + (npages as usize).div_ceil(8) + 4;
             let prefix_buf = self.handle.read_at_most(fa_hdr.data_blk_addr, prefix_len)?;
-            let prefix = FixedArrayPagedPrefix::decode(&prefix_buf, &self.ctx, npages)?;
+            let prefix = FixedArrayPagedPrefix::decode(&prefix_buf, &self.meta.ctx, npages)?;
 
             let elem_size = if is_filtered {
                 sizeof_addr + chunk_size_len + 4
@@ -1936,13 +3509,17 @@ impl Hdf5Reader {
                 let page_buf = self.handle.read_at_most(page_addr, page_size)?;
 
                 if is_filtered {
-                    let elems =
-                        decode_filtered_page(&page_buf, &self.ctx, page_nelmts, chunk_size_len)?;
+                    let elems = decode_filtered_page(
+                        &page_buf,
+                        &self.meta.ctx,
+                        page_nelmts,
+                        chunk_size_len,
+                    )?;
                     for e in elems {
                         chunk_entries.push((e.address, e.chunk_size, e.filter_mask));
                     }
                 } else {
-                    let addrs = decode_unfiltered_page(&page_buf, &self.ctx, page_nelmts)?;
+                    let addrs = decode_unfiltered_page(&page_buf, &self.meta.ctx, page_nelmts)?;
                     for addr in addrs {
                         chunk_entries.push((addr, chunk_bytes, 0));
                     }
@@ -1961,7 +3538,7 @@ impl Hdf5Reader {
             if is_filtered {
                 let fa_dblk = FixedArrayDataBlock::decode_filtered(
                     &dblk_buf,
-                    &self.ctx,
+                    &self.meta.ctx,
                     num_elmts,
                     chunk_size_len,
                 )?;
@@ -1970,7 +3547,7 @@ impl Hdf5Reader {
                 }
             } else {
                 let fa_dblk =
-                    FixedArrayDataBlock::decode_unfiltered(&dblk_buf, &self.ctx, num_elmts)?;
+                    FixedArrayDataBlock::decode_unfiltered(&dblk_buf, &self.meta.ctx, num_elmts)?;
                 for &addr in &fa_dblk.elements {
                     chunk_entries.push((addr, chunk_bytes, 0));
                 }
@@ -2050,6 +3627,101 @@ impl Hdf5Reader {
         Ok(())
     }
 
+    /// Read a dataset indexed by the implicit ("none") chunk index.
+    ///
+    /// There is no on-disk index structure at all (`H5Dnone.c`): every chunk
+    /// slot in the maximum-extent grid is allocated in one block at dataset
+    /// creation, so a chunk's address is purely arithmetic — `index_address +
+    /// slot * chunk_bytes`, where `slot` is its row-major position in the
+    /// same maximum-extent grid the fixed/extensible-array/v2-B-tree indexes
+    /// use (`H5D__chunk_set_info_real`'s `max_down_chunks`). This index type
+    /// is only ever selected for a fixed (non-unlimited) chunked dataset with
+    /// early allocation and no filters, so there is no per-chunk allocation
+    /// flag, compressed size, or filter mask to track.
+    ///
+    /// Scatters only; `output` must already be sized to the target extent and
+    /// pre-filled with the tiled fill value by the caller.
+    fn read_chunked_implicit(
+        &mut self,
+        name: &str,
+        chunk_dims: &[u64],
+        index_address: u64,
+        target: ChunkTarget,
+        output: &mut [u8],
+    ) -> IoResult<()> {
+        let info = self
+            .dataset_info(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let dims = info.dataspace.dims.clone();
+        let element_size = info.datatype.element_size() as u64;
+        let ndims = dims.len();
+
+        if index_address == UNDEF_ADDR {
+            // Unallocated: `output` is already the pre-filled buffer.
+            return Ok(());
+        }
+
+        if chunk_dims.len() != ndims {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "implicit-index dataset rank {} does not match chunk rank {}",
+                ndims,
+                chunk_dims.len()
+            )));
+        }
+
+        let max_dims = info.dataspace.max_dims.clone();
+        let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
+        let grid = crate::io::chunk_grid::index_grid(&dims, max_dims.as_deref(), chunk_dims)?;
+        let chunks_total: u64 = grid.iter().fold(1u64, |acc, &n| acc.saturating_mul(n));
+
+        // Every slot's coordinates and address are computed directly, not
+        // read from disk, so there is no "unallocated chunk" case here the
+        // way a sparse index has one: `at_most: false` because
+        // `H5D__none_idx_create` guarantees the whole block is present.
+        let mut slot_coords = Vec::with_capacity(chunks_total as usize);
+        for i in 0..chunks_total {
+            slot_coords.push(crate::io::chunk_grid::coords_of(
+                &dims,
+                max_dims.as_deref(),
+                chunk_dims,
+                i,
+            )?);
+        }
+
+        let jobs: Vec<Option<ChunkReadJob>> = (0..chunks_total)
+            .map(|i| {
+                let coords = &slot_coords[i as usize];
+                if !target.overlaps(coords, chunk_dims) {
+                    None
+                } else {
+                    Some(ChunkReadJob {
+                        addr: index_address + i * chunk_bytes,
+                        len: chunk_bytes as usize,
+                        at_most: false,
+                        mask: 0,
+                    })
+                }
+            })
+            .collect();
+
+        let decompressed = read_and_decompress_chunks(&self.handle, None, jobs)?;
+        for (i, chunk_data) in decompressed.iter().enumerate() {
+            if let Some(data) = chunk_data {
+                self.scatter_chunk(
+                    target,
+                    data,
+                    output,
+                    &dims,
+                    chunk_dims,
+                    &slot_coords[i],
+                    element_size,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Read a dataset indexed by a B-tree v2.
     ///
     /// Scatters only; `output` must already be sized to the target extent and
@@ -2066,7 +3738,7 @@ impl Hdf5Reader {
         use crate::format::chunk_index::btree_v2::*;
 
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
@@ -2079,7 +3751,7 @@ impl Hdf5Reader {
 
         // Read BT2 header
         let hdr_buf = self.handle.read_at_most(index_address, 256)?;
-        let bt2_hdr = Bt2Header::decode(&hdr_buf, &self.ctx)?;
+        let bt2_hdr = Bt2Header::decode(&hdr_buf, &self.meta.ctx)?;
 
         if bt2_hdr.root_node_addr == UNDEF_ADDR || bt2_hdr.total_num_records == 0 {
             // No records: `output` is already pre-filled.
@@ -2088,21 +3760,13 @@ impl Hdf5Reader {
 
         // Walk the B-tree to any depth, collecting every record's raw bytes
         // from the internal nodes and leaves.
-        let geo = Bt2Geometry::new(
-            bt2_hdr.node_size,
-            bt2_hdr.record_size,
-            bt2_hdr.depth,
-            self.ctx.sizeof_addr,
-        );
-        let mut record_bytes: Vec<u8> = Vec::new();
-        self.collect_bt2_records(
-            bt2_hdr.root_node_addr,
-            bt2_hdr.depth,
-            bt2_hdr.num_records_in_root,
-            bt2_hdr.record_size,
-            bt2_hdr.node_size,
-            &geo,
-            &mut record_bytes,
+        let ctx = self.meta.ctx;
+        let record_bytes = collect_btree_v2_records(
+            &bt2_hdr,
+            &ctx,
+            &mut HandleBlockReader {
+                handle: &mut self.handle,
+            },
         )?;
         let total_records = if bt2_hdr.record_size > 0 {
             record_bytes.len() / bt2_hdr.record_size as usize
@@ -2124,7 +3788,7 @@ impl Hdf5Reader {
                     &record_bytes,
                     total_records,
                     ndims,
-                    &self.ctx,
+                    &self.meta.ctx,
                 )?
                 .into_iter()
                 .map(|r| (r.chunk_address, chunk_bytes as usize, r.scaled_offsets, 0))
@@ -2135,7 +3799,7 @@ impl Hdf5Reader {
                     total_records,
                     ndims,
                     bt2_hdr.record_size,
-                    &self.ctx,
+                    &self.meta.ctx,
                 )?
                 .into_iter()
                 .map(|r| {
@@ -2187,59 +3851,6 @@ impl Hdf5Reader {
         Ok(())
     }
 
-    /// Recursively walk a v2 B-tree, appending every node's raw record bytes
-    /// (internal nodes and leaves alike) to `out`.
-    #[allow(clippy::too_many_arguments)]
-    fn collect_bt2_records(
-        &mut self,
-        addr: u64,
-        depth: u16,
-        nrec: u16,
-        record_size: u16,
-        node_size: u32,
-        geo: &crate::format::chunk_index::btree_v2::Bt2Geometry,
-        out: &mut Vec<u8>,
-    ) -> IoResult<()> {
-        use crate::format::chunk_index::btree_v2::{Bt2InternalNode, Bt2LeafNode};
-
-        let buf = self.handle.read_at_most(addr, node_size as usize)?;
-        if depth == 0 {
-            let leaf = Bt2LeafNode::decode(&buf, nrec, record_size)?;
-            out.extend_from_slice(&leaf.record_data);
-        } else {
-            let node = Bt2InternalNode::decode(
-                &buf,
-                &self.ctx,
-                depth,
-                nrec,
-                record_size,
-                geo.max_nrec_size,
-                geo.child_total_size(depth),
-            )?;
-            out.extend_from_slice(&node.record_data);
-            // Collect (addr, nrec) up front so the node borrow is released
-            // before recursing.
-            let children: Vec<(u64, u16)> = node
-                .child_addrs
-                .iter()
-                .zip(node.child_nrecords.iter())
-                .map(|(&a, &n)| (a, n))
-                .collect();
-            for (child_addr, child_nrec) in children {
-                self.collect_bt2_records(
-                    child_addr,
-                    depth - 1,
-                    child_nrec,
-                    record_size,
-                    node_size,
-                    geo,
-                    out,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
     /// Read a chunked dataset indexed by a version-1 B-tree (layout
     /// message version 3, class 2 "chunked").
     ///
@@ -2257,7 +3868,7 @@ impl Hdf5Reader {
         output: &mut [u8],
     ) -> IoResult<()> {
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
@@ -2380,15 +3991,12 @@ impl Hdf5Reader {
             return Ok(());
         }
 
-        // A node is the header (8 + 2*sizeof_addr) plus interleaved
-        // keys/children. Read a generous slice; ChunkBTreeV1Node::decode
-        // validates the exact length it needs.
-        let sa = self.ctx.sizeof_addr as usize;
-        let key_size = 4 + 4 + (rank + 1) * 8;
-        // u16 entries_used: at most 65535 children.
-        let max_node = 8 + sa * 2 + 65536 * (key_size + sa);
-        let buf = self.handle.read_at_most(addr, max_node)?;
-        let node = ChunkBTreeV1Node::decode(&buf, sa, rank)?;
+        // A node is a fixed-size record: the header (8 + 2*sizeof_addr) plus
+        // `2 * chunk_internal_k` interleaved keys/children.
+        let sa = self.meta.ctx.sizeof_addr as usize;
+        let node_size = self.meta.btree.chunk_btree_node_size(sa, rank);
+        let buf = self.handle.read_at_most(addr, node_size)?;
+        let node = ChunkBTreeV1Node::decode(&buf, sa, rank, self.meta.btree.chunk_max_entries())?;
 
         if node.level == 0 {
             // Leaf node: each child points at chunk data.
@@ -2639,14 +4247,25 @@ impl Hdf5Reader {
     /// references. Both `read_vlen_strings` (UTF-8 view) and `read_vlen_bytes`
     /// (raw view) layer on top of this.
     fn read_vlen_objects(&mut self, name: &str) -> IoResult<Vec<Vec<u8>>> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.read_vlen_objects(&path);
+        }
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let layout = info.layout.clone();
+        let external_files = info.external_files.clone();
         let total_elements: u64 = dims.iter().fold(1u64, |acc, &d| acc.saturating_mul(d));
 
         let raw = match &layout {
+            DataLayoutMessage::Contiguous { size, .. } if !external_files.is_empty() => {
+                let prefix = resolve_extfile_prefix(&self.source_dir);
+                let mut buf = vec![0u8; *size as usize];
+                read_external_file_bytes(&external_files, prefix.as_deref(), 0, &mut buf)?;
+                buf
+            }
             DataLayoutMessage::Contiguous { address, size } => {
                 if *address == UNDEF_ADDR {
                     return Ok(vec![]);
@@ -2660,7 +4279,7 @@ impl Hdf5Reader {
             }
         };
 
-        let ref_size = vlen_reference_size(&self.ctx);
+        let ref_size = vlen_reference_size(&self.meta.ctx);
         let mut items: Vec<Vec<u8>> = Vec::with_capacity(total_elements as usize);
 
         // Cache global heap collections to avoid re-reading.
@@ -2677,7 +4296,7 @@ impl Hdf5Reader {
             }
 
             let (_seq_len, collection_addr, obj_index) =
-                decode_vlen_reference(&raw[offset..], &self.ctx)?;
+                decode_vlen_reference(&raw[offset..], &self.meta.ctx)?;
 
             if collection_addr == UNDEF_ADDR || collection_addr == 0 {
                 items.push(Vec::new());
@@ -2733,7 +4352,7 @@ impl Hdf5Reader {
             return Ok(vec![]);
         }
         let hdr_buf = self.handle.read_at_most(index_address, 256)?;
-        let ea_hdr = ExtensibleArrayHeader::decode(&hdr_buf, &self.ctx)?;
+        let ea_hdr = ExtensibleArrayHeader::decode(&hdr_buf, &self.meta.ctx)?;
         if ea_hdr.idx_blk_addr == UNDEF_ADDR {
             return Ok(vec![]);
         }
@@ -2755,7 +4374,7 @@ impl Hdf5Reader {
         let chunk_bytes = saturating_byte_len(chunk_dims, element_size);
         let is_filtered = ea_hdr.class_id == ea::EA_CLS_FILT_CHUNK;
         let chunk_size_len = if is_filtered {
-            ea_hdr.raw_elmt_size - self.ctx.sizeof_addr - 4
+            ea_hdr.raw_elmt_size - self.meta.ctx.sizeof_addr - 4
         } else {
             0
         };
@@ -2771,7 +4390,7 @@ impl Hdf5Reader {
             let buf = self.handle.read_at_most(ea_hdr.idx_blk_addr, 65536)?;
             let fiblk = ea::FilteredIndexBlock::decode(
                 &buf,
-                &self.ctx,
+                &self.meta.ctx,
                 params.idx_blk_elmts as usize,
                 geo.ndblk_addrs,
                 geo.nsblk_addrs,
@@ -2785,7 +4404,7 @@ impl Hdf5Reader {
             let buf = self.handle.read_at_most(ea_hdr.idx_blk_addr, 65536)?;
             let iblk = ExtensibleArrayIndexBlock::decode(
                 &buf,
-                &self.ctx,
+                &self.meta.ctx,
                 params.idx_blk_elmts as usize,
                 geo.ndblk_addrs,
                 geo.nsblk_addrs,
@@ -2797,9 +4416,9 @@ impl Hdf5Reader {
         };
 
         // Walk super blocks in order, collecting each data block's entries.
-        let sa = self.ctx.sizeof_addr as usize;
+        let sa = self.meta.ctx.sizeof_addr as usize;
         let raw_elmt_size = if is_filtered {
-            ea::FilteredChunkEntry::raw_size(self.ctx.sizeof_addr, chunk_size_len) as usize
+            ea::FilteredChunkEntry::raw_size(self.meta.ctx.sizeof_addr, chunk_size_len) as usize
         } else {
             sa
         };
@@ -2842,7 +4461,7 @@ impl Hdf5Reader {
                     let buf = self.handle.read_at_most(sblk_addr, sblk_size)?;
                     let sb = ExtensibleArraySuperBlock::decode(
                         &buf,
-                        &self.ctx,
+                        &self.meta.ctx,
                         max_nelmts_bits,
                         s.ndblks as usize,
                         page_init_total,
@@ -2853,7 +4472,7 @@ impl Hdf5Reader {
 
             let npages = geo.npages(u) as usize;
             let page_size = geo.dblk_page_size(raw_elmt_size);
-            let prefix = geo.dblk_prefix_size(self.ctx.sizeof_addr, max_nelmts_bits);
+            let prefix = geo.dblk_prefix_size(self.meta.ctx.sizeof_addr, max_nelmts_bits);
 
             for (d, &dblk_addr) in this_dblk_addrs.iter().enumerate() {
                 if dblk_addr == UNDEF_ADDR {
@@ -2896,7 +4515,7 @@ impl Hdf5Reader {
                     let buf = self.handle.read_at_most(dblk_addr, dblk_size)?;
                     let dblk = ea::FilteredDataBlock::decode(
                         &buf,
-                        &self.ctx,
+                        &self.meta.ctx,
                         max_nelmts_bits,
                         dblk_nelmts,
                         chunk_size_len,
@@ -2909,7 +4528,7 @@ impl Hdf5Reader {
                     let buf = self.handle.read_at_most(dblk_addr, dblk_size)?;
                     let dblk = ExtensibleArrayDataBlock::decode(
                         &buf,
-                        &self.ctx,
+                        &self.meta.ctx,
                         max_nelmts_bits,
                         dblk_nelmts,
                     )?;
@@ -2935,9 +4554,13 @@ impl Hdf5Reader {
     /// starts[d] is the first index along dim d, counts[d] is how many.
     /// Returns the selected data in row-major order.
     pub fn read_slice(&mut self, name: &str, starts: &[u64], counts: &[u64]) -> IoResult<Vec<u8>> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.read_slice(&path, starts, counts);
+        }
         let (datatype, out_bytes) = self.slice_size_and_datatype(name, counts)?;
         let mut data = alloc_tiled_fill(out_bytes as usize, None)?;
-        self.read_slice_into_unconverted(name, starts, counts, &mut data)?;
+        self.read_slice_into_unconverted(name, starts, counts, &mut data, 0)?;
         Self::apply_post_filter_conversion(&mut data, &datatype)?;
         Ok(data)
     }
@@ -2956,6 +4579,10 @@ impl Hdf5Reader {
         counts: &[u64],
         out: &mut [u8],
     ) -> IoResult<()> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.read_slice_into(&path, starts, counts, out);
+        }
         let (datatype, out_bytes) = self.slice_size_and_datatype(name, counts)?;
         if out.len() as u64 != out_bytes {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -2964,7 +4591,7 @@ impl Hdf5Reader {
                 out_bytes
             )));
         }
-        self.read_slice_into_unconverted(name, starts, counts, out)?;
+        self.read_slice_into_unconverted(name, starts, counts, out, 0)?;
         Self::apply_post_filter_conversion(out, &datatype)?;
         Ok(())
     }
@@ -2977,7 +4604,7 @@ impl Hdf5Reader {
         counts: &[u64],
     ) -> IoResult<(DatatypeMessage, u64)> {
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let out_bytes = saturating_byte_len(counts, info.datatype.element_size() as u64);
         Ok((info.datatype.clone(), out_bytes))
@@ -2992,22 +4619,27 @@ impl Hdf5Reader {
     /// Both [`read_slice`](Self::read_slice) and [`read_slice_into`](Self::read_slice_into)
     /// wrap it and apply the conversion exactly once.
     ///
-    /// `out.len()` must equal `product(counts) * element_size`.
+    /// `out.len()` must equal `product(counts) * element_size`. `depth`
+    /// counts virtual-dataset nesting for a caller reached through
+    /// [`read_virtual_into`](Self::read_virtual_into); pass `0` for a
+    /// top-level call.
     fn read_slice_into_unconverted(
         &mut self,
         name: &str,
         starts: &[u64],
         counts: &[u64],
         out: &mut [u8],
+        depth: usize,
     ) -> IoResult<()> {
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
         let layout = info.layout.clone();
         let pipeline = info.filter_pipeline.clone();
         let fill_value = info.fill_value.clone();
+        let external_files = info.external_files.clone();
         let ndims = dims.len();
 
         if starts.len() != ndims || counts.len() != ndims {
@@ -3030,6 +4662,28 @@ impl Hdf5Reader {
         }
 
         match &layout {
+            DataLayoutMessage::Contiguous { .. } if !external_files.is_empty() => {
+                // Same coalesced run geometry as the normal contiguous case
+                // below, but each run is read through the external file
+                // list instead of straight from this file (H5D__efl_read,
+                // H5Defl.c) — `src_off` is already dataset-relative, which
+                // is exactly what `read_external_file_bytes` walks slots by.
+                let prefix = resolve_extfile_prefix(&self.source_dir);
+                for_each_contiguous_run(
+                    &dims,
+                    starts,
+                    counts,
+                    element_size,
+                    |src_off, out_off, len| {
+                        read_external_file_bytes(
+                            &external_files,
+                            prefix.as_deref(),
+                            src_off,
+                            &mut out[out_off..out_off + len],
+                        )
+                    },
+                )?;
+            }
             DataLayoutMessage::Contiguous { address, .. } => {
                 if *address == UNDEF_ADDR {
                     // Never-written: the selection reads back as the fill value.
@@ -3122,6 +4776,32 @@ impl Hdf5Reader {
                     out,
                 )?;
             }
+            DataLayoutMessage::Virtual { .. } => {
+                // Stitch the full virtual image, then extract the
+                // requested region from it. This reads more than the
+                // selection strictly needs (no per-mapping intersection
+                // against the caller's box), but a virtual dataset's data
+                // is composed from other datasets rather than stored
+                // contiguously, so there is no cheaper selective path
+                // without duplicating `read_virtual_into`'s mapping walk
+                // for a bounded region — correctness, not I/O pruning, is
+                // what a VDS slice read needs here.
+                fill_tiled_into(out, fill_value.as_deref());
+                let total = saturating_byte_len(&dims, element_size) as usize;
+                let mut full = alloc_tiled_fill(total, fill_value.as_deref())?;
+                self.read_virtual_into(name, &mut full, depth)?;
+                for_each_contiguous_run(
+                    &dims,
+                    starts,
+                    counts,
+                    element_size,
+                    |src_off, out_off, len| {
+                        let src_off = src_off as usize;
+                        out[out_off..out_off + len].copy_from_slice(&full[src_off..src_off + len]);
+                        Ok(())
+                    },
+                )?;
+            }
         }
         Ok(())
     }
@@ -3129,15 +4809,158 @@ impl Hdf5Reader {
 
 /// Adapts a `FileHandle` to the `BlockReader` trait used by the fractal-heap
 /// walker, so heap blocks can be fetched from the open file.
-struct HandleBlockReader<'a> {
-    handle: &'a mut FileHandle,
+///
+/// The handle is shared, not exclusive: every read goes through
+/// `FileHandle::read_at_most`, which takes `&self`, so the writer can walk a
+/// structure it is about to free while holding only `&self` itself.
+pub(crate) struct HandleBlockReader<'a> {
+    pub(crate) handle: &'a FileHandle,
+}
+
+/// One object's attribute set, or the reason it could not be read whole.
+///
+/// [`AttributeEntry`] carries a per-attribute failure, which needs a name to
+/// hang on. Two failures have none. A dense set is indexed by name *hash*, so
+/// a heap or index that will not read yields no names at all; and an attribute
+/// message too damaged to yield its own name cannot be listed under one
+/// either. The only listing that can report those honestly is the object's, so
+/// this type carries the object-scope reason beside the entries, and every
+/// accessor that would present the set as whole returns the reason instead.
+///
+/// The entries are deliberately unreachable while the set is incomplete: the
+/// only way out is [`Self::into_complete`], which refuses. That is what keeps
+/// the writer from rebuilding an object header out of a partial set and
+/// deleting the attributes it never saw.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ObjectAttributes {
+    entries: Vec<AttributeEntry>,
+    incomplete: Option<String>,
+}
+
+impl ObjectAttributes {
+    /// Whether this object has nothing to say about attributes: none read,
+    /// and no failure to report. An incomplete empty set is *not* empty — the
+    /// reason is the thing worth keeping.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.incomplete.is_none()
+    }
+
+    /// Record an attribute this collector could name.
+    fn push(&mut self, entry: AttributeEntry) {
+        self.entries.push(entry);
+    }
+
+    /// Record that part of the set could not be read. The first reason stands:
+    /// it is the one that explains the earliest missing attributes.
+    fn mark_incomplete(&mut self, reason: String) {
+        if self.incomplete.is_none() {
+            self.incomplete = Some(reason);
+        }
+    }
+
+    /// Why this object's attributes cannot be listed, or `None` when the set
+    /// is whole. Individual entries in a whole set may still be undecodable —
+    /// [`AttributeEntry::unreadable_reason`] answers for those.
+    pub fn unreadable_reason(&self) -> Option<&str> {
+        self.incomplete.as_deref()
+    }
+
+    /// Nothing worth recording: no attribute read, and no failure to report.
+    pub(crate) fn is_absent(&self) -> bool {
+        self.entries.is_empty() && self.incomplete.is_none()
+    }
+
+    /// The entries, once the set is known to be whole.
+    ///
+    /// The sole route from an `ObjectAttributes` to an owned entry list. A
+    /// caller that rewrites the object header — the append path — must take
+    /// this route, so an unread set stops the rewrite instead of erasing the
+    /// attributes behind it.
+    pub(crate) fn into_complete(self, owner: &str) -> IoResult<Vec<AttributeEntry>> {
+        match self.incomplete {
+            Some(reason) => Err(incomplete_error(owner, &reason)),
+            None => Ok(self.entries),
+        }
+    }
+
+    /// The entries, once the set is known to be whole, borrowed.
+    fn complete(&self, owner: &str) -> IoResult<&[AttributeEntry]> {
+        match &self.incomplete {
+            Some(reason) => Err(incomplete_error(owner, reason)),
+            None => Ok(&self.entries),
+        }
+    }
+}
+
+/// The one wording for "this object's attributes are not all here".
+///
+/// `Unsupported`, the same variant an undecodable dataset message raises: the
+/// name is in the listing and the content is out of reach, which is what the
+/// variant is for. Wrapping a `FormatError` here instead would put the same
+/// condition behind two different public variants.
+fn incomplete_error(owner: &str, reason: &str) -> crate::io::IoError {
+    crate::io::IoError::Unsupported(format!(
+        "attributes of '{owner}' cannot be read whole: {reason}"
+    ))
+}
+
+/// Every attribute attached to an object, whichever storage it uses.
+///
+/// This is the only place attributes are pulled off an object header — reader
+/// and writer alike. Compact storage keeps them as `Attribute` messages in the
+/// header itself; once an object crosses the phase-change threshold libhdf5
+/// moves *all* of them into a fractal heap named by the `Attribute Info`
+/// message and leaves no attribute message behind
+/// (`H5Oattribute.c::H5O__attr_create`). Scanning only the messages therefore
+/// reports zero attributes for a dense object: a silent loss on read, and a
+/// silent deletion when the writer rebuilds that object's header from what it
+/// collected.
+///
+/// An attribute this crate cannot decode is kept, named, with the reason
+/// attached: a listing that omitted it would report a file that does not
+/// contain it. What cannot be named at all — a damaged attribute message, an
+/// attribute info message that will not decode, a dense set whose heap or name
+/// index will not read — marks the whole set incomplete, so the object reports
+/// the failure rather than a short list.
+pub(crate) fn collect_object_attributes(
+    handle: &mut FileHandle,
+    ctx: &FormatContext,
+    header: &ObjectHeader,
+) -> ObjectAttributes {
+    let mut attrs = ObjectAttributes::default();
+    for msg in &header.messages {
+        match msg.msg_type {
+            MSG_ATTRIBUTE => match AttributeEntry::parse(&msg.data, ctx) {
+                Ok(entry) => attrs.push(entry),
+                Err(e) => attrs.mark_incomplete(format!("an attribute message is unreadable: {e}")),
+            },
+            MSG_ATTR_INFO => match AttributeInfoMessage::decode(&msg.data, ctx) {
+                Ok((info, _)) => {
+                    let mut br = HandleBlockReader { handle };
+                    match crate::format::dense_attr::read_dense_attributes(&info, ctx, &mut br) {
+                        Ok(dense) => attrs.entries.extend(dense),
+                        Err(e) => attrs
+                            .mark_incomplete(format!("dense attribute storage is unreadable: {e}")),
+                    }
+                }
+                Err(e) => {
+                    attrs.mark_incomplete(format!("the attribute info message is unreadable: {e}"))
+                }
+            },
+            _ => {}
+        }
+    }
+    attrs
 }
 
 impl BlockReader for HandleBlockReader<'_> {
     fn read_block(&mut self, offset: u64, len: usize) -> crate::format::FormatResult<Vec<u8>> {
-        self.handle.read_at(offset, len).map_err(|e| {
+        // `read_at_most`, not `read_at`: a metadata block allocated at the end
+        // of the file can be shorter on disk than its nominal size, and every
+        // decoder re-checks the length it needs.
+        self.handle.read_at_most(offset, len).map_err(|e| {
             crate::format::FormatError::InvalidData(format!(
-                "fractal heap block read failed at {:#x}: {}",
+                "metadata block read failed at {:#x}: {}",
                 offset, e
             ))
         })
@@ -3669,6 +5492,124 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    /// Run the collector against a header built by hand. The handle is only
+    /// touched when a message sends the collector to the heap, which none of
+    /// these do, so an empty file is enough of a file.
+    fn collect_from(
+        messages: Vec<crate::format::object_header::ObjectHeaderMessage>,
+    ) -> Result<Vec<String>, String> {
+        let path = temp_path("collect");
+        std::fs::File::create(&path).unwrap();
+        let mut handle = FileHandle::open_read(&path).unwrap();
+        let ctx = FormatContext {
+            sizeof_addr: 8,
+            sizeof_size: 8,
+        };
+        let header = ObjectHeader {
+            flags: 0x02,
+            messages,
+        };
+        let attrs = collect_object_attributes(&mut handle, &ctx, &header);
+        drop(handle);
+        let _ = std::fs::remove_file(&path);
+        attrs
+            .complete("obj")
+            .map(|e| e.iter().map(|a| a.name().to_string()).collect())
+            .map_err(|e| e.to_string())
+    }
+
+    fn msg(msg_type: u8, data: Vec<u8>) -> crate::format::object_header::ObjectHeaderMessage {
+        crate::format::object_header::ObjectHeaderMessage {
+            msg_type,
+            flags: 0,
+            data,
+            creation_index: 0,
+        }
+    }
+
+    /// An attribute info message that will not decode takes the object's whole
+    /// attribute set with it — the dense storage it names is where the
+    /// attributes are. The listing must say so rather than come back short.
+    #[test]
+    fn an_undecodable_attribute_info_message_fails_the_listing() {
+        // Version 9: `H5O_AINFO_VERSION_0` is the only one that exists.
+        let err = collect_from(vec![msg(MSG_ATTR_INFO, vec![9, 0])]).unwrap_err();
+        assert!(
+            err.contains("attributes of 'obj' cannot be read whole")
+                && err.contains("attribute info message"),
+            "{err}"
+        );
+    }
+
+    /// An attribute message damaged past its own name has no name to be listed
+    /// under, so it too is an object-level failure — the one case
+    /// [`AttributeEntry::parse`] cannot name.
+    #[test]
+    fn an_unnameable_attribute_message_fails_the_listing() {
+        let err = collect_from(vec![msg(MSG_ATTRIBUTE, vec![1, 0, 0])]).unwrap_err();
+        assert!(
+            err.contains("attributes of 'obj' cannot be read whole")
+                && err.contains("attribute message"),
+            "{err}"
+        );
+    }
+
+    /// The failure is the object's, not one name's: a set that reads whole
+    /// still lists, and a compact attribute info message is not dense storage.
+    #[test]
+    fn a_whole_attribute_set_still_lists() {
+        let ctx = FormatContext {
+            sizeof_addr: 8,
+            sizeof_size: 8,
+        };
+        let ainfo = crate::format::messages::attr_info::AttributeInfoMessage::compact();
+        let names = collect_from(vec![msg(MSG_ATTR_INFO, ainfo.encode(&ctx))]).unwrap();
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    /// A space-padded fixed-length string attribute reads back without its
+    /// padding: `H5T__conv_s_s` ends the value after the last non-space byte,
+    /// and nothing else in the element marks where it stops.
+    #[test]
+    fn fixed_string_attr_value_honors_the_declared_pad() {
+        use crate::format::messages::dataspace::DataspaceMessage;
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let attr = |padding: u8, data: &[u8]| AttributeMessage {
+            name: "units".to_string(),
+            datatype: DatatypeMessage::FixedString {
+                size: data.len() as u32,
+                padding,
+                charset: 0,
+            },
+            dataspace: DataspaceMessage::scalar(),
+            data: data.to_vec(),
+        };
+
+        // Space padded: no NUL anywhere, so truncating at the first NUL kept
+        // the padding.
+        assert_eq!(
+            fixed_string_attr_value(&attr(2, b"volt    ")).unwrap(),
+            "volt"
+        );
+        // Null terminated and null padded end at the first NUL, so trailing
+        // spaces before it are content.
+        assert_eq!(
+            fixed_string_attr_value(&attr(0, b"volt  \0\0")).unwrap(),
+            "volt  "
+        );
+        assert_eq!(
+            fixed_string_attr_value(&attr(1, b"volt\0\0\0\0")).unwrap(),
+            "volt"
+        );
+        // A reserved rule is named rather than guessed at.
+        let err = fixed_string_attr_value(&attr(7, b"volt    ")).unwrap_err();
+        assert!(
+            err.to_string().contains("padding rule 7"),
+            "unexpected error: {err}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3692,12 +5633,16 @@ mod h5py_debug_tests {
             "sizeof_addr={}, sizeof_size={}",
             sb.sizeof_offsets, sb.sizeof_lengths
         );
+        let (ste_btree, ste_heap) = sb
+            .root_symbol_table_entry
+            .cached_symbol_table()
+            .unwrap_or((UNDEF_ADDR, UNDEF_ADDR));
         eprintln!(
-            "STE: obj_header={}, cache_type={}, btree={}, heap={}",
+            "STE: obj_header={}, cache={:?}, btree={}, heap={}",
             sb.root_symbol_table_entry.obj_header_addr,
-            sb.root_symbol_table_entry.cache_type,
-            sb.root_symbol_table_entry.btree_addr,
-            sb.root_symbol_table_entry.heap_addr
+            sb.root_symbol_table_entry.cache,
+            ste_btree,
+            ste_heap
         );
 
         let ctx = FormatContext {
@@ -3706,9 +5651,7 @@ mod h5py_debug_tests {
         };
 
         // Read local heap
-        let heap_buf = handle
-            .read_at_most(sb.root_symbol_table_entry.heap_addr, 128)
-            .unwrap();
+        let heap_buf = handle.read_at_most(ste_heap, 128).unwrap();
         let heap_hdr = LocalHeapHeader::decode(
             &heap_buf,
             ctx.sizeof_addr as usize,
@@ -3729,13 +5672,12 @@ mod h5py_debug_tests {
         );
 
         // Read btree
-        let btree_buf = handle
-            .read_at_most(sb.root_symbol_table_entry.btree_addr, 8192)
-            .unwrap();
+        let btree_buf = handle.read_at_most(ste_btree, 8192).unwrap();
         let btree = BTreeV1Node::decode(
             &btree_buf,
             ctx.sizeof_addr as usize,
             ctx.sizeof_size as usize,
+            BTreeV1Config::default().snode_max_entries(),
         )
         .unwrap();
         eprintln!(
@@ -3750,14 +5692,15 @@ mod h5py_debug_tests {
                 &snod_buf,
                 ctx.sizeof_addr as usize,
                 ctx.sizeof_size as usize,
+                BTreeV1Config::default().sym_leaf_max_entries(),
             )
             .unwrap();
             eprintln!("SNOD at {}: {} entries", child, snod.entries.len());
             for entry in &snod.entries {
                 let name = local_heap_get_string(&heap_data, entry.name_offset).unwrap();
                 eprintln!(
-                    "  entry: name='{}' (offset={}), obj_header={}, cache_type={}",
-                    name, entry.name_offset, entry.obj_header_addr, entry.cache_type
+                    "  entry: name='{}' (offset={}), obj_header={}, cache={:?}",
+                    name, entry.name_offset, entry.obj_header_addr, entry.cache
                 );
             }
         }
