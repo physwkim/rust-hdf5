@@ -11514,6 +11514,101 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Every creator and every kind of name meet at `ensure_name_free`.
+    ///
+    /// The gate's whole value is that it is one list: a creator must be
+    /// blind neither to a name kind it does not itself make nor to one added
+    /// after it. This crosses the two — six names, one of each kind the
+    /// writer can put in a group, against every creator — so a creator that
+    /// grows its own check, or a name kind that stops being on the list,
+    /// fails here rather than in a file holding two links of one name.
+    #[test]
+    fn every_creator_refuses_every_kind_of_taken_name() {
+        let path = temp_path("create_gate_matrix");
+        let writer = Hdf5Writer::create(&path).unwrap();
+
+        let i32t = || DatatypeMessage::i32_type();
+        writer.create_dataset("d", i32t(), &[2]).unwrap();
+        writer.create_compact_dataset("c", i32t(), &[2]).unwrap();
+        writer.create_group("/", "g").unwrap();
+        writer.commit_datatype("t", i32t()).unwrap();
+        writer.create_hard_link("/", "h", "d").unwrap();
+        writer
+            .create_symbolic_link(
+                "/",
+                "s",
+                LinkTarget::Soft {
+                    target: "/d".into(),
+                },
+            )
+            .unwrap();
+        writer
+            .create_symbolic_link(
+                "/",
+                "e",
+                LinkTarget::External {
+                    file: "other.h5".into(),
+                    path: "/x".into(),
+                },
+            )
+            .unwrap();
+
+        for taken in ["d", "c", "g", "t", "h", "s", "e"] {
+            let attempts: [(&str, IoResult<()>); 8] = [
+                (
+                    "dataset",
+                    writer.create_dataset(taken, i32t(), &[2]).map(|_| ()),
+                ),
+                (
+                    "compact",
+                    writer
+                        .create_compact_dataset(taken, i32t(), &[2])
+                        .map(|_| ()),
+                ),
+                (
+                    "chunked",
+                    writer
+                        .create_chunked_dataset(taken, i32t(), &[0], &[u64::MAX], &[4])
+                        .map(|_| ()),
+                ),
+                (
+                    "vlen_string",
+                    writer
+                        .create_vlen_string_dataset(taken, &["x"], 1)
+                        .map(|_| ()),
+                ),
+                (
+                    "committed datatype",
+                    writer.commit_datatype(taken, i32t()).map(|_| ()),
+                ),
+                ("group", writer.create_group("/", taken).map(|_| ())),
+                ("hard link", writer.create_hard_link("/", taken, "d")),
+                (
+                    "soft link",
+                    writer.create_symbolic_link(
+                        "/",
+                        taken,
+                        LinkTarget::Soft {
+                            target: "/d".into(),
+                        },
+                    ),
+                ),
+            ];
+            for (which, res) in attempts {
+                match res {
+                    Ok(()) => panic!("{which} accepted the taken name '{taken}'"),
+                    Err(e) => assert!(
+                        e.to_string().contains("already exists"),
+                        "{which} on '{taken}': unexpected error: {e}"
+                    ),
+                }
+            }
+        }
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
     /// The `H5T_VLEN` length field counts base elements, so an image that is
     /// not a whole number of them has no length that reads back as what was
     /// handed over; it is refused at the call rather than stored truncated.
