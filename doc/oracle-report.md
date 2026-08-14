@@ -167,8 +167,8 @@ The rust-written file carries the same data, type and shape as the h5py referenc
 
 | key | libhdf5 | rust-hdf5 | cases |
 |---|---|---|---|
-| `#superblock` | `0` | `3` | 39 (int_i8, int_u8, int_i16le…) |
-| `#superblock` | `2` | `3` | 2 (links_dense, attrs_dense) |
+| `#superblock` | `0` | `2` | 38 (int_i8, int_u8, int_i16le…) |
+| `#superblock` | `0` | `3` | 1 (chunkidx_btree1) |
 | `/data#chunkindex` | `btree1` | `earray` | 1 (chunkidx_btree1) |
 | `/data#filters` | `[deflate(6)@1]` | `[deflate(6)@0]` | 1 (filter_deflate) |
 | `/data#filters` | `[shuffle(4)@1,deflate(6)@1]` | `[shuffle(4)@0,deflate(6)@0]` | 1 (filter_deflate_shuffle) |

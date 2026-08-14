@@ -177,9 +177,14 @@ impl H5File {
     /// *expands* a chunk, but the file is only readable by libhdf5 ≥ 2.0
     /// (h5py bundling hdf5 1.14 rejects it with "bad version number").
     ///
-    /// Off by default; unfiltered and contiguous datasets are unaffected.
-    /// Independent of this setting, a chunk larger than 4 GiB forces version 5
-    /// because version 4 cannot represent its size field, matching libhdf5.
+    /// It also sets the file's library-version low bound, and so its
+    /// superblock version: version 3, where a file this crate writes without
+    /// it is version 2 (or 3 anyway, once it holds a chunked dataset).
+    ///
+    /// Off by default; the data layout of unfiltered and contiguous datasets
+    /// is unaffected. Independent of this setting, a chunk larger than 4 GiB
+    /// forces version 5 because version 4 cannot represent its size field,
+    /// matching libhdf5.
     ///
     /// Errors in read mode.
     pub fn set_libver_latest(&self, latest: bool) -> Result<()> {

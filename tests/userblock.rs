@@ -143,6 +143,9 @@ fn appending_behind_a_userblock_keeps_the_block_and_both_datasets() {
         "the writer must never touch [0, base)"
     );
     assert_eq!(&after[USERBLOCK..USERBLOCK + 8], b"\x89HDF\r\n\x1a\n");
+    // h5py wrote this fixture at version 2 and the appended datasets are
+    // contiguous, so nothing in it asks for a newer superblock.
+    assert_eq!(after[USERBLOCK + 8], 2, "superblock version");
     // The rewritten superblock keeps the userblock size (H5Pget_userblock
     // reports this field) and records the end of file measured from the start
     // of the file: libhdf5 takes the allocated end as `stored_eof -

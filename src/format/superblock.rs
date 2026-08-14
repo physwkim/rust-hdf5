@@ -73,7 +73,14 @@ pub struct SuperblockV2V3 {
 impl SuperblockV2V3 {
     /// Returns the total encoded size in bytes: 12 + 4*O + 4 (checksum).
     pub fn encoded_size(&self) -> usize {
-        12 + 4 * (self.sizeof_offsets as usize) + 4
+        Self::size_for(self.sizeof_offsets)
+    }
+
+    /// The size a superblock with this offset width encodes to. Versions 2
+    /// and 3 have the same layout, so a writer that must reserve the space
+    /// before it knows which of the two it will emit can ask for it here.
+    pub fn size_for(sizeof_offsets: u8) -> usize {
+        12 + 4 * (sizeof_offsets as usize) + 4
     }
 
     /// Encode the superblock to a byte vector, including the trailing checksum.

@@ -87,7 +87,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -173,7 +173,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -259,7 +259,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -345,7 +345,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -431,7 +431,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -517,7 +517,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -603,7 +603,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -689,7 +689,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -775,7 +775,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -861,7 +861,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -947,7 +947,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -1041,7 +1041,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -1127,7 +1127,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -1213,7 +1213,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -1299,7 +1299,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -1385,7 +1385,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -1471,7 +1471,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -1557,7 +1557,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -1808,7 +1808,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -1894,7 +1894,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -1980,7 +1980,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -2066,7 +2066,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -2152,7 +2152,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -2238,7 +2238,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -2324,7 +2324,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -2410,7 +2410,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -2496,7 +2496,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -2933,7 +2933,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -3098,7 +3098,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -4371,7 +4371,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -4551,7 +4551,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -4780,7 +4780,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -4906,7 +4906,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
@@ -5607,14 +5607,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "2",
-      "rust": "3"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -5721,7 +5714,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 1,
@@ -5830,7 +5823,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 1,
@@ -5969,7 +5962,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 1,
@@ -6317,14 +6310,7 @@
       "rust": "0"
      }
     ],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "2",
-      "rust": "3"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 1,
     "h5dump_rc": 0
    }
@@ -6463,7 +6449,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 1,
@@ -6557,7 +6543,7 @@
       "key": "#superblock",
       "field": "superblock",
       "ref": "0",
-      "rust": "3"
+      "rust": "2"
      }
     ],
     "h5diff_rc": 0,
