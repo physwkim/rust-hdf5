@@ -23,26 +23,26 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 
 | direction | PASS | GAP | MISS | DIFF | READ-ERROR | GEN-ERROR |
 |---|---|---|---|---|---|---|
-| A (read) | 59 | 2 | 9 | 2 | 0 | 0 |
+| A (read) | 60 | 2 | 9 | 1 | 0 | 0 |
 
 | direction | PASS | INVALID | UNSUPPORTED-API | SKIPPED |
 |---|---|---|---|---|
-| B (write) | 49 | 6 | 17 | 0 |
+| B (write) | 50 | 6 | 16 | 0 |
 
 ## Top gaps by severity
 
 | # | severity | finding | cases |
 |---|---|---|---|
-| 1 | value divergence | data: value | 1 (space_null) |
-| 2 | value divergence | nattrs: value | 1 (attrs_dense) |
-| 3 | value divergence | shape: value | 1 (space_null) |
-| 4 | object silently dropped | object present in the file is not listed by the reader | 9 (opaque, bitfield, ref_object, ref_region…) |
-| 5 | written file rejected | nattrs_hdr | 5 (attr_scalar_num, attr_array_num, attr_string, attrs_dense…) |
-| 6 | written file rejected | dtype | 1 (str_vlen_ascii) |
-| 7 | read capability missing | data — hdf5-io error: format error: invalid data: datatype conversion: non-standard floating-point bit lay… | 1 (float_f16le) |
-| 8 | read capability missing | data — hdf5-io error: invalid state: unsupported chunk index type: Implicit | 1 (chunkidx_implicit) |
-| 9 | field not reported | dtype not emitted | 1 (attrs_dense) |
-| 10 | field not reported | shape not emitted | 1 (attrs_dense) |
+| 1 | value divergence | nattrs: value | 1 (attrs_dense) |
+| 2 | object silently dropped | object present in the file is not listed by the reader | 9 (opaque, bitfield, ref_object, ref_region…) |
+| 3 | written file rejected | nattrs_hdr | 5 (attr_scalar_num, attr_array_num, attr_string, attrs_dense…) |
+| 4 | written file rejected | dtype | 1 (str_vlen_ascii) |
+| 5 | read capability missing | data — hdf5-io error: format error: invalid data: datatype conversion: non-standard floating-point bit lay… | 1 (float_f16le) |
+| 6 | read capability missing | data — hdf5-io error: invalid state: unsupported chunk index type: Implicit | 1 (chunkidx_implicit) |
+| 7 | field not reported | dtype not emitted | 1 (attrs_dense) |
+| 8 | field not reported | shape not emitted | 1 (attrs_dense) |
+| 9 | field not reported | value not emitted | 1 (attrs_dense) |
+| 10 | API cannot express | no rust writer arm: the public API cannot express this case | 16 (str_fixed_nullpad, str_fixed_spacepad, opaque, bitfield…) |
 
 ## Case matrix
 
@@ -101,7 +101,7 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `fill_set_int` | fillvalue | PASS | 0 | 0 | 0 | PASS |  |
 | `fill_set_float_nan` | fillvalue | PASS | 0 | 0 | 0 | PASS |  |
 | `space_scalar` | dataspace | PASS | 0 | 0 | 0 | PASS |  |
-| `space_null` | dataspace | DIFF | 2 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `space_null` | dataspace | PASS | 0 | 0 | 0 | PASS |  |
 | `space_zerosized` | dataspace | PASS | 0 | 0 | 0 | PASS |  |
 | `space_unlimited_resized` | dataspace | PASS | 0 | 0 | 0 | PASS |  |
 | `groups_nested` | group | PASS | 0 | 0 | 0 | PASS |  |
@@ -122,15 +122,6 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `large_multi_mb` | bulk | PASS | 0 | 0 | 0 | PASS |  |
 
 ## Direction A divergences, in full
-
-### `space_null`
-
-- `/data#data` (value)
-  - libhdf5: `empty`
-  - rust-hdf5: `raw:00000000`
-- `/data#shape` (value)
-  - libhdf5: `null`
-  - rust-hdf5: `[]`
 
 ### `attrs_dense`
 
@@ -161,7 +152,7 @@ The rust-written file carries the same data, type and shape as the h5py referenc
 
 | key | libhdf5 | rust-hdf5 | cases |
 |---|---|---|---|
-| `#superblock` | `0` | `3` | 39 (int_i8, int_u8, int_i16le…) |
+| `#superblock` | `0` | `3` | 40 (int_i8, int_u8, int_i16le…) |
 | `#superblock` | `2` | `3` | 2 (links_dense, attrs_dense) |
 | `/data#chunkindex` | `btree1` | `earray` | 1 (chunkidx_btree1) |
 | `/data#filters` | `[deflate(6)@1]` | `[deflate(6)@0]` | 1 (filter_deflate) |
@@ -218,9 +209,7 @@ The rust-written file carries the same data, type and shape as the h5py referenc
 
 | severity | finding | cases | example |
 |---|---|---|---|
-| value divergence | data: value | 1 | /data#data libhdf5: empty rust: raw:00000000 |
 | value divergence | nattrs: value | 1 | /data#nattrs libhdf5: 12 rust: 0 |
-| value divergence | shape: value | 1 | /data#shape libhdf5: null rust: [] |
 | object silently dropped | object present in the file is not listed by the reader | 9 | /data (dataset) |
 | written file rejected | nattrs_hdr | 5 |  |
 | written file rejected | dtype | 1 |  |
@@ -229,7 +218,7 @@ The rust-written file carries the same data, type and shape as the h5py referenc
 | field not reported | dtype not emitted | 1 | /data@a00#dtype |
 | field not reported | shape not emitted | 1 | /data@a00#shape |
 | field not reported | value not emitted | 1 | /data@a00#value |
-| API cannot express | no rust writer arm: the public API cannot express this case | 17 |  |
+| API cannot express | no rust writer arm: the public API cannot express this case | 16 |  |
 | no public accessor (API-wide) | nattrs_hdr — H5Group exposes no object-header attribute count | 72 | /#nattrs_hdr |
 | no public accessor (API-wide) | superblock — H5File exposes no superblock/libver accessor | 72 | #superblock |
 | no public accessor (API-wide) | fillvalue — H5Dataset exposes no fill value accessor | 67 | /data#fillvalue |

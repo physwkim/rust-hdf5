@@ -560,7 +560,7 @@ def gen_space_unlimited_resized(path):
 SPACE_CASES = [
     Case("space_scalar", "dataspace", gen_space_scalar, "space_scalar",
          "scalar (rank 0) dataspace"),
-    Case("space_null", "dataspace", gen_space_null, None,
+    Case("space_null", "dataspace", gen_space_null, "space_null",
          "NULL dataspace — no elements at all"),
     Case("space_zerosized", "dataspace", gen_space_zerosized, "space_zerosized",
          "simple dataspace with a zero-length dimension"),

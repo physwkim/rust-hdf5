@@ -4,7 +4,7 @@
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
   "python": "/home/stevek/micromamba/envs/tomo/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-oracle-harness-d1c0a356-1/target/release/oracle_probe",
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-space-500431fd-1/target/release/oracle_probe",
   "cases": 72
  },
  "results": [
@@ -4382,25 +4382,10 @@
    "case": "space_null",
    "group": "dataspace",
    "note": "NULL dataspace \u2014 no elements at all",
-   "rust_case": null,
+   "rust_case": "space_null",
    "a": {
-    "verdict": "DIFF",
-    "divergences": [
-     {
-      "key": "/data#data",
-      "kind": "value",
-      "field": "data",
-      "ref": "empty",
-      "probe": "raw:00000000"
-     },
-     {
-      "key": "/data#shape",
-      "kind": "value",
-      "field": "shape",
-      "ref": "null",
-      "probe": "[]"
-     }
-    ],
+    "verdict": "PASS",
+    "divergences": [],
     "gaps": [
      {
       "key": "#superblock",
@@ -4460,16 +4445,23 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 7,
+    "matched": 9,
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "metadata_diffs": [
+     {
+      "key": "#superblock",
+      "field": "superblock",
+      "ref": "0",
+      "rust": "3"
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
@@ -6921,27 +6913,11 @@
  "findings": [
   {
    "kind": "divergence",
-   "signature": "data: value",
-   "cases": [
-    "space_null"
-   ],
-   "example": "/data#data\n  libhdf5: empty\n  rust:    raw:00000000"
-  },
-  {
-   "kind": "divergence",
    "signature": "nattrs: value",
    "cases": [
     "attrs_dense"
    ],
    "example": "/data#nattrs\n  libhdf5: 12\n  rust:    0"
-  },
-  {
-   "kind": "divergence",
-   "signature": "shape: value",
-   "cases": [
-    "space_null"
-   ],
-   "example": "/data#shape\n  libhdf5: null\n  rust:    []"
   },
   {
    "kind": "missing-object",
@@ -7035,7 +7011,6 @@
     "layout_chunked_v110",
     "chunkidx_implicit",
     "filter_shuffle",
-    "space_null",
     "link_soft",
     "link_external",
     "libver_v108",

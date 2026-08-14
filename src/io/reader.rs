@@ -1400,11 +1400,19 @@ impl Hdf5Reader {
 
     /// Logical byte size of a dataset's full image (`product(dims) *
     /// element_size`), with the datatype needed for the post-filter conversion.
+    ///
+    /// The NULL dataspace (`dataspace.is_null()`) holds zero elements — not
+    /// one, the way an empty `dims` would suggest by the same product-of-dims
+    /// arithmetic a scalar dataspace uses (`dims` is empty for both).
     fn raw_size_and_datatype(&self, name: &str) -> IoResult<(DatatypeMessage, u64)> {
         let info = self
             .dataset_info(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
-        let total = saturating_byte_len(&info.dataspace.dims, info.datatype.element_size() as u64);
+        let total = if info.dataspace.is_null() {
+            0
+        } else {
+            saturating_byte_len(&info.dataspace.dims, info.datatype.element_size() as u64)
+        };
         Ok((info.datatype.clone(), total))
     }
 

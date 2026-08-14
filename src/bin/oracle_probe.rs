@@ -533,9 +533,12 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
         None => Err("H5Dataset::datatype() failed or is unavailable".into()),
     });
 
-    // H5Dataset::shape() returns Vec<usize>, so a scalar dataspace and a NULL
-    // dataspace are both the empty vector and cannot be told apart.
+    let is_null = guarded(|| ds.is_null()).unwrap_or(false);
+
     d.field(path, "shape", || {
+        if is_null {
+            return Ok("null".into());
+        }
         Ok(dims_str(
             &guarded(|| ds.shape()).map_err(|p| format!("panic: {p}"))?,
         ))
@@ -594,6 +597,9 @@ fn dataset_payload(
     ds: &H5Dataset,
     dtype: Option<&DatatypeMessage>,
 ) -> std::result::Result<String, String> {
+    if guarded(|| ds.is_null()).unwrap_or(false) {
+        return Ok("empty".into());
+    }
     let dt = dtype.ok_or("datatype unavailable, so the payload cannot be classified")?;
     if !has_heap_type(dt) {
         let bytes = guarded(|| ds.read_raw_bytes())
@@ -1236,6 +1242,13 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             let file = H5File::create(path)?;
             let ds = file.new_dataset::<i32>().scalar().create("data")?;
             ds.write_raw(&[42i32])?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "space_null" => {
+            // Mirrors h5py.Empty("<i4"): the dataset holds no elements at all.
+            let file = H5File::create(path)?;
+            file.new_dataset::<i32>().null().create("data")?;
             file.close()?;
             Ok(Ok(()))
         }

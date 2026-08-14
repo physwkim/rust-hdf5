@@ -19,7 +19,7 @@ use crate::format::chunk_index::fixed_array::{
 };
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::data_layout::{DataLayoutMessage, EarrayParams, FixedArrayParams};
-use crate::format::messages::dataspace::DataspaceMessage;
+use crate::format::messages::dataspace::{DataspaceClass, DataspaceMessage};
 use crate::format::messages::datatype::DatatypeMessage;
 use crate::format::messages::fill_value::FillValueMessage;
 use crate::format::messages::filter::{self, FilterPipeline};
@@ -2921,6 +2921,44 @@ impl Hdf5Writer {
         Ok(idx)
     }
 
+    /// Define a new dataset with the NULL dataspace: no elements at all.
+    ///
+    /// Distinct from a scalar dataset (`create_dataset` with `dims == []`),
+    /// which holds exactly one element — a NULL dataspace holds zero, so
+    /// there is no raw image to allocate: `data_addr` stays `UNDEF_ADDR` and
+    /// `data_size` stays 0 permanently, the same terminal state
+    /// `create_dataset` already reaches for a zero-length dimension.
+    pub fn create_null_dataset(&self, name: &str, datatype: DatatypeMessage) -> IoResult<usize> {
+        let create = self.begin_create(name)?;
+        let name = create.name.as_str();
+
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                dataspace: DataspaceMessage::null(),
+                obj_header_addr: 0, // set during finalize
+                data_addr: UNDEF_ADDR,
+                data_size: 0,
+                chunked: None,
+                fixed_array: None,
+                btree_v2: None,
+                append: None,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: None,
+                deleted: false,
+                extent_dirty: false,
+                fill_value: None,
+                layout_version: 4,
+            },
+        );
+
+        Ok(idx)
+    }
+
     /// Define a new chunked dataset with an extensible array index.
     ///
     /// Returns the dataset index. The dataset starts empty (dims[0] = 0 if
@@ -2983,6 +3021,9 @@ impl Hdf5Writer {
 
         // Build dataspace with max dims
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };
@@ -4227,6 +4268,9 @@ impl Hdf5Writer {
         self.handle.write_at(ea_iblk_addr, &iblk_encoded)?;
 
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };
@@ -5439,6 +5483,9 @@ impl Hdf5Writer {
         // `extend_dataset` checks growth against, and the FA capacity above
         // is exactly its chunk grid.
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };
@@ -5574,6 +5621,9 @@ impl Hdf5Writer {
         self.handle.write_at(bt2_header_addr, &hdr_encoded)?;
 
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };
@@ -5672,6 +5722,9 @@ impl Hdf5Writer {
         self.handle.write_at(ea_iblk_addr, &iblk_encoded)?;
 
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };
@@ -5777,6 +5830,9 @@ impl Hdf5Writer {
         self.handle.write_at(ea_iblk_addr, &iblk_encoded)?;
 
         let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
             dims: dims.to_vec(),
             max_dims: Some(max_dims.to_vec()),
         };

@@ -1188,3 +1188,45 @@ fn packed_shared_collection_readable_by_h5py() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// NULL dataspace (rust → h5py): `.null()` writes a dataset with the NULL
+/// dataspace — h5py must read it back with `shape is None` (its own
+/// null-dataspace marker) and an `Empty` value, not a 1-element scalar.
+#[test]
+fn null_dataspace_written_by_rust_read_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("null_rw");
+    {
+        let file = H5File::create(&path).unwrap();
+        file.new_dataset::<i32>().null().create("data").unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "d = f['data']\n\
+         assert d.shape is None, d.shape\n\
+         assert d.dtype == np.dtype('<i4'), d.dtype\n\
+         v = d[()]\n\
+         assert isinstance(v, h5py.Empty), v\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// NULL dataspace (h5py → rust): `h5py.Empty` writes the NULL dataspace —
+/// rust-hdf5 must read it back as `is_null() == true`, an empty `shape()`
+/// AND an empty raw byte image (0 elements, not 1 as a scalar would be).
+#[test]
+fn null_dataspace_written_by_h5py_read_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("null_wr");
+    write_with_h5py(py, &path, "f['data'] = h5py.Empty('<i4')\n");
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert!(ds.is_null());
+    assert_eq!(ds.shape(), Vec::<usize>::new());
+    assert_eq!(ds.total_elements(), 0);
+    assert_eq!(ds.read_raw_bytes().unwrap(), Vec::<u8>::new());
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}

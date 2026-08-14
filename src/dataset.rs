@@ -29,6 +29,7 @@ use crate::types::H5Type;
 pub struct DatasetBuilder<T: H5Type> {
     file_inner: SharedInner,
     shape: Option<Vec<usize>>,
+    is_null: bool,
     chunk_dims: Option<Vec<usize>>,
     max_shape: Option<Vec<Option<usize>>>,
     deflate_level: Option<u32>,
@@ -45,6 +46,7 @@ impl<T: H5Type> DatasetBuilder<T> {
         Self {
             file_inner,
             shape: None,
+            is_null: false,
             chunk_dims: None,
             max_shape: None,
             deflate_level: None,
@@ -61,6 +63,7 @@ impl<T: H5Type> DatasetBuilder<T> {
         Self {
             file_inner,
             shape: None,
+            is_null: false,
             chunk_dims: None,
             max_shape: None,
             deflate_level: None,
@@ -75,7 +78,8 @@ impl<T: H5Type> DatasetBuilder<T> {
 
     /// Set the dataset dimensions.
     ///
-    /// This is required before calling [`create`](Self::create).
+    /// This is required before calling [`create`](Self::create), unless
+    /// [`null`](Self::null) was called instead.
     /// Use an empty slice `&[]` for a scalar (0-dimensional) dataset.
     #[must_use]
     pub fn shape<S: AsRef<[usize]>>(mut self, dims: S) -> Self {
@@ -87,6 +91,19 @@ impl<T: H5Type> DatasetBuilder<T> {
     #[must_use]
     pub fn scalar(mut self) -> Self {
         self.shape = Some(vec![]);
+        self
+    }
+
+    /// Create a dataset with the NULL dataspace: no elements at all.
+    ///
+    /// Distinct from [`scalar`](Self::scalar), which holds exactly one
+    /// element. A NULL dataset holds zero bytes of data and cannot be
+    /// written to — [`write_raw`](H5Dataset::write_raw) and
+    /// [`write_raw_bytes`](H5Dataset::write_raw_bytes) return an error, and
+    /// it cannot be chunked or filtered, matching h5py's `h5py.Empty`.
+    #[must_use]
+    pub fn null(mut self) -> Self {
+        self.is_null = true;
         self
     }
 
@@ -210,10 +227,6 @@ impl<T: H5Type> DatasetBuilder<T> {
     /// The name is the link name within the root group (e.g. `"data"` or
     /// `"group1/data"` once nested groups are supported).
     pub fn create(self, name: &str) -> Result<H5Dataset> {
-        let shape = self.shape.ok_or_else(|| {
-            Hdf5Error::InvalidState("shape must be set before calling create()".into())
-        })?;
-
         // Build the full name: if created within a group, prefix with group path
         let full_name = if let Some(ref gp) = self.group_path {
             if gp == "/" {
@@ -228,7 +241,6 @@ impl<T: H5Type> DatasetBuilder<T> {
         let group_path = self.group_path.clone();
         let fill_value = self.fill_value.clone();
 
-        let dims_u64: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
         let datatype = self.datatype_override.clone().unwrap_or_else(T::hdf5_type);
         // Size one element from the on-disk datatype, not the carrier `T`. For
         // the default path this equals `T::element_size()`; when a `datatype()`
@@ -237,6 +249,68 @@ impl<T: H5Type> DatasetBuilder<T> {
         // allocation, and the `write_raw` length check all agree with the bytes
         // libhdf5/h5py will read.
         let element_size = datatype.element_size() as usize;
+
+        if self.is_null {
+            // A NULL dataspace holds no elements at all: no chunk grid to
+            // scatter into, no fill value to apply to unwritten elements
+            // (there are none), matching upstream's rejection of these
+            // combinations (`H5Dchunk.c`'s chunked-layout dataspace check).
+            if self.chunk_dims.is_some()
+                || self.custom_pipeline.is_some()
+                || self.shuffle_deflate_level.is_some()
+                || self.deflate_level.is_some()
+            {
+                return Err(Hdf5Error::InvalidState(
+                    "a NULL dataspace dataset cannot be chunked or filtered".into(),
+                ));
+            }
+            if fill_value.is_some() {
+                return Err(Hdf5Error::InvalidState(
+                    "a NULL dataspace dataset cannot have a fill value".into(),
+                ));
+            }
+
+            let index = {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Writer(writer) => {
+                        let idx = writer.create_null_dataset(&full_name, datatype)?;
+                        if let Some(ref gp) = group_path {
+                            if gp != "/" {
+                                writer.assign_dataset_to_group(gp, idx)?;
+                            }
+                        }
+                        idx
+                    }
+                    H5FileInner::Reader(_) => {
+                        return Err(Hdf5Error::InvalidState(
+                            "cannot create a dataset in read mode".into(),
+                        ));
+                    }
+                    H5FileInner::Closed => {
+                        return Err(Hdf5Error::InvalidState("file is closed".into()));
+                    }
+                }
+            };
+
+            return Ok(H5Dataset {
+                file_inner: clone_inner(&self.file_inner),
+                info: DatasetInfo::Writer {
+                    index,
+                    shape: Vec::new(),
+                    element_size,
+                    chunked: false,
+                    btree2: false,
+                    fixed_array: false,
+                    is_null: true,
+                },
+            });
+        }
+
+        let shape = self.shape.ok_or_else(|| {
+            Hdf5Error::InvalidState("shape must be set before calling create()".into())
+        })?;
+        let dims_u64: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
 
         // A filter pipeline requires chunked storage. When a filter is
         // requested without explicit chunk dimensions, store the whole
@@ -378,6 +452,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                     chunked: true,
                     btree2: is_btree2,
                     fixed_array: is_fixed_array,
+                    is_null: false,
                 },
             })
         } else {
@@ -417,6 +492,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                     chunked: false,
                     btree2: false,
                     fixed_array: false,
+                    is_null: false,
                 },
             })
         }
@@ -443,6 +519,10 @@ enum DatasetInfo {
         btree2: bool,
         /// Whether the chunk index is a Fixed Array (no unlimited dims).
         fixed_array: bool,
+        /// Whether this is a NULL dataspace (no elements at all — distinct
+        /// from a scalar, which holds exactly one). Always `false` when
+        /// `chunked` is `true`: a NULL dataspace can never be chunked.
+        is_null: bool,
     },
     /// A dataset opened by name in read mode.
     Reader {
@@ -557,6 +637,11 @@ impl H5Dataset {
     ///
     /// Reconstructs the same handle `new_dataset().create()` returns, so the
     /// reopened dataset supports attribute writes and chunk appends.
+    ///
+    /// `is_null` is always `false` here: reopening an existing NULL-dataspace
+    /// dataset for further writes is not a case this constructor's caller
+    /// distinguishes (a NULL dataset has nothing to append or chunk-write in
+    /// the first place).
     pub(crate) fn new_writer(
         file_inner: SharedInner,
         index: usize,
@@ -575,6 +660,7 @@ impl H5Dataset {
                 chunked,
                 btree2,
                 fixed_array,
+                is_null: false,
             },
         }
     }
@@ -596,7 +682,14 @@ impl H5Dataset {
     }
 
     /// Return the total number of elements in the dataset.
+    ///
+    /// 0 for a NULL dataspace ([`is_null`](Self::is_null)) — unlike a scalar,
+    /// whose `shape()` is the same empty `Vec` but which holds exactly one
+    /// element, so `shape().iter().product()` cannot be used here.
     pub fn total_elements(&self) -> usize {
+        if self.is_null() {
+            return 0;
+        }
         match &self.info {
             DatasetInfo::Writer { shape, .. } => shape.iter().product(),
             DatasetInfo::Reader { shape, .. } => shape.iter().product(),
@@ -608,6 +701,26 @@ impl H5Dataset {
         match &self.info {
             DatasetInfo::Writer { element_size, .. } => *element_size,
             DatasetInfo::Reader { element_size, .. } => *element_size,
+        }
+    }
+
+    /// Return whether this dataset has the NULL dataspace: no elements at
+    /// all, distinct from a scalar dataset (rank 0, exactly one element) —
+    /// both report the same empty [`shape`](Self::shape). See
+    /// [`DatasetBuilder::null`].
+    pub fn is_null(&self) -> bool {
+        match &self.info {
+            DatasetInfo::Writer { is_null, .. } => *is_null,
+            DatasetInfo::Reader { name, .. } => {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Reader(reader) => reader
+                        .dataset_info(name)
+                        .map(|info| info.dataspace.is_null())
+                        .unwrap_or(false),
+                    _ => false,
+                }
+            }
         }
     }
 
@@ -802,7 +915,13 @@ impl H5Dataset {
                 chunked,
                 btree2,
                 fixed_array,
+                is_null,
             } => {
+                if *is_null {
+                    return Err(Hdf5Error::InvalidState(
+                        "cannot write to a NULL dataspace dataset".into(),
+                    ));
+                }
                 let total_elements: usize = shape.iter().product();
                 if data.len() != total_elements {
                     return Err(Hdf5Error::InvalidState(format!(
@@ -904,7 +1023,13 @@ impl H5Dataset {
                 chunked,
                 btree2,
                 fixed_array,
+                is_null,
             } => {
+                if *is_null {
+                    return Err(Hdf5Error::InvalidState(
+                        "cannot write to a NULL dataspace dataset".into(),
+                    ));
+                }
                 let expected: usize = shape.iter().product::<usize>() * *element_size;
                 if bytes.len() != expected {
                     return Err(Hdf5Error::InvalidState(format!(
@@ -6165,6 +6290,74 @@ mod tests {
             m.read_numeric_slice_as::<i32>(&[0, 1], &[2, 2]).unwrap(),
             vec![2, 3, 5, 6]
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A NULL dataspace round-trips through the public API as `is_null() ==
+    /// true`, `shape() == []`, and `read_raw_bytes()` empty — and stays
+    /// distinguishable from a scalar dataset, which shares the same empty
+    /// `shape()` but holds exactly one element.
+    #[test]
+    fn null_dataspace_distinct_from_scalar() {
+        let path = temp_path("null_vs_scalar");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>().null().create("empty").unwrap();
+            let scalar = file.new_dataset::<i32>().scalar().create("scalar").unwrap();
+            scalar.write_raw(&[42i32]).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+
+        let empty = file.dataset("empty").unwrap();
+        assert!(empty.is_null());
+        assert_eq!(empty.shape(), Vec::<usize>::new());
+        assert_eq!(empty.total_elements(), 0);
+        assert_eq!(empty.read_raw_bytes().unwrap(), Vec::<u8>::new());
+
+        let scalar = file.dataset("scalar").unwrap();
+        assert!(!scalar.is_null());
+        assert_eq!(scalar.shape(), Vec::<usize>::new());
+        assert_eq!(scalar.total_elements(), 1);
+        assert_eq!(scalar.read_raw::<i32>().unwrap(), vec![42]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A NULL dataspace dataset rejects writes outright — there is nothing
+    /// to write into — rather than silently accepting a scalar-shaped
+    /// write against unallocated storage.
+    #[test]
+    fn null_dataspace_rejects_writes() {
+        let path = temp_path("null_write_rejected");
+        let file = H5File::create(&path).unwrap();
+        let ds = file.new_dataset::<i32>().null().create("empty").unwrap();
+        assert!(ds.write_raw(&[1i32]).is_err());
+        assert!(ds.write_raw_bytes(&[0u8; 4]).is_err());
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `.null()` combined with `.chunk()` or a fill value is rejected at
+    /// `create()` rather than silently dropping the conflicting option —
+    /// a NULL dataspace can never be chunked or filtered upstream.
+    #[test]
+    fn null_dataspace_rejects_chunking_and_fill_value() {
+        let path = temp_path("null_chunk_rejected");
+        let file = H5File::create(&path).unwrap();
+        assert!(file
+            .new_dataset::<i32>()
+            .null()
+            .chunk(&[4])
+            .create("a")
+            .is_err());
+        assert!(file
+            .new_dataset::<i32>()
+            .null()
+            .fill_value(7i32)
+            .create("b")
+            .is_err());
+        file.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
 }
