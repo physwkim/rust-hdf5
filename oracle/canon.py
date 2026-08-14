@@ -1,0 +1,727 @@
+#!/usr/bin/env python3
+"""Canonical h5py-side dump of an HDF5 file — the reference half of the oracle.
+
+Emits the `!canon 2` format described in oracle/CANON.md. The rust-hdf5 side
+(`src/bin/oracle_probe.rs`, `dump` subcommand) emits the same format from the
+same file, so the two are comparable line by line and field by field.
+
+Usage:  canon.py <file.h5>
+
+Only the standard library, numpy and h5py are used.
+"""
+
+import hashlib
+import sys
+import traceback
+
+import numpy as np
+
+import hdf5env  # noqa: F401  (must precede h5py; see the module docstring)
+
+import h5py
+from h5py import h5d, h5p, h5s, h5t
+
+CANON_VERSION = "2"
+RAW_LIMIT = 1024
+MAX_DEPTH = 32
+
+# --------------------------------------------------------------------------
+# canonical scalar / string encoding
+# --------------------------------------------------------------------------
+
+
+def esc(s):
+    """Canonical quoted-string encoding, identical on the rust side."""
+    if isinstance(s, (bytes, bytearray, np.bytes_)):
+        try:
+            s = bytes(s).decode("utf-8")
+        except UnicodeDecodeError:
+            return "b0x" + bytes(s).hex()
+    if isinstance(s, np.str_):
+        s = str(s)
+    out = ['"']
+    for ch in s:
+        o = ord(ch)
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif 0x20 <= o < 0x7F:
+            out.append(ch)
+        elif o <= 0xFF:
+            out.append("\\x%02x" % o)
+        elif o <= 0xFFFF:
+            out.append("\\u%04x" % o)
+        else:
+            out.append("\\U%08x" % o)
+    out.append('"')
+    return "".join(out)
+
+
+def float_bits(value, size):
+    """IEEE bits of `value` as big-endian hex — never a formatted decimal."""
+    arr = np.asarray(value).astype(">f%d" % size, copy=False)
+    return "0x" + arr.tobytes().hex()
+
+
+def dims_str(dims):
+    return "[" + ",".join(str(d) for d in dims) + "]"
+
+
+def maxdims_str(dims):
+    return "[" + ",".join("U" if d is None else str(d) for d in dims) + "]"
+
+
+# --------------------------------------------------------------------------
+# canonical datatype strings
+# --------------------------------------------------------------------------
+
+_ORDER = {
+    h5t.ORDER_LE: "le",
+    h5t.ORDER_BE: "be",
+    h5t.ORDER_VAX: "vax",
+    h5t.ORDER_NONE: "none",
+}
+
+_CSET = {h5t.CSET_ASCII: "ascii", h5t.CSET_UTF8: "utf8"}
+
+_STRPAD = {
+    h5t.STR_NULLTERM: "null",
+    h5t.STR_NULLPAD: "nullpad",
+    h5t.STR_SPACEPAD: "spacepad",
+}
+
+# (sign_pos, exp_pos, exp_size, mant_pos, mant_size, bias) for IEEE 754.
+_FLOAT_STD = {
+    2: (15, 10, 5, 0, 10, 15),
+    4: (31, 23, 8, 0, 23, 127),
+    8: (63, 52, 11, 0, 52, 1023),
+}
+
+
+def _order(tid):
+    return _ORDER.get(tid.get_order(), "ord%d" % tid.get_order())
+
+
+def canon_dtype(tid):
+    cls = tid.get_class()
+    size = tid.get_size()
+
+    if cls == h5t.INTEGER:
+        sgn = "i" if tid.get_sign() == h5t.SGN_2 else "u"
+        s = "%s%d%s" % (sgn, size * 8, _order(tid))
+        off, prec = tid.get_offset(), tid.get_precision()
+        if off != 0 or prec != size * 8:
+            s += "+off%dp%d" % (off, prec)
+        return s
+
+    if cls == h5t.FLOAT:
+        s = "f%d%s" % (size * 8, _order(tid))
+        spos, epos, esize, mpos, msize = tid.get_fields()
+        bias = tid.get_ebias()
+        off, prec = tid.get_offset(), tid.get_precision()
+        std = _FLOAT_STD.get(size)
+        if std != (spos, epos, esize, mpos, msize, bias) or off != 0 or prec != size * 8:
+            s += "+s%de%d,%dm%d,%db%doff%dp%d" % (
+                spos,
+                epos,
+                esize,
+                mpos,
+                msize,
+                bias,
+                off,
+                prec,
+            )
+        return s
+
+    if cls == h5t.STRING:
+        cset = _CSET.get(tid.get_cset(), "cset%d" % tid.get_cset())
+        if tid.is_variable_str():
+            # The pad of a variable-length string travels in the separate
+            # `strpad` field, not inline here; see oracle/CANON.md.
+            return "vstr,cset=%s" % cset
+        pad = _STRPAD.get(tid.get_strpad(), "pad%d" % tid.get_strpad())
+        return "str[%d],pad=%s,cset=%s" % (size, pad, cset)
+
+    if cls == h5t.BITFIELD:
+        s = "bits[%d]%s" % (size, _order(tid))
+        # h5py 3.x's TypeBitfieldID exposes neither get_offset nor
+        # get_precision, so a bitfield whose precision is narrower than its
+        # size is reported as full width. No case exercises that today.
+        off = tid.get_offset() if hasattr(tid, "get_offset") else 0
+        prec = tid.get_precision() if hasattr(tid, "get_precision") else size * 8
+        if off != 0 or prec != size * 8:
+            s += "+off%dp%d" % (off, prec)
+        return s
+
+    if cls == h5t.OPAQUE:
+        return "opaque[%d],tag=%s" % (size, esc(tid.get_tag()))
+
+    if cls == h5t.COMPOUND:
+        parts = []
+        for i in range(tid.get_nmembers()):
+            parts.append(
+                "%s@%d:%s"
+                % (
+                    _name(tid.get_member_name(i)),
+                    tid.get_member_offset(i),
+                    canon_dtype(tid.get_member_type(i)),
+                )
+            )
+        return "compound[%d]{%s}" % (size, ";".join(parts))
+
+    if cls == h5t.ENUM:
+        base = tid.get_super()
+        parts = []
+        for i in range(tid.get_nmembers()):
+            parts.append(
+                "%s=%d" % (_name(tid.get_member_name(i)), tid.get_member_value(i))
+            )
+        return "enum(%s){%s}" % (canon_dtype(base), ";".join(parts))
+
+    if cls == h5t.VLEN:
+        return "vlen(%s)" % canon_dtype(tid.get_super())
+
+    if cls == h5t.ARRAY:
+        return "array%s(%s)" % (
+            dims_str(tid.get_array_dims()),
+            canon_dtype(tid.get_super()),
+        )
+
+    if cls == h5t.REFERENCE:
+        return "objref" if size == 8 else "regref"
+
+    if cls == h5t.TIME:
+        return "time[%d]%s" % (size, _order(tid))
+
+    return "class%d[%d]" % (cls, size)
+
+
+def _name(v):
+    return v.decode("utf-8") if isinstance(v, bytes) else v
+
+
+# --------------------------------------------------------------------------
+# value rendering
+# --------------------------------------------------------------------------
+
+
+def has_heap_type(tid):
+    """True when the datatype has no flat on-disk byte image we can compare."""
+    cls = tid.get_class()
+    if cls == h5t.VLEN:
+        return True
+    if cls == h5t.REFERENCE:
+        return True
+    if cls == h5t.STRING and tid.is_variable_str():
+        return True
+    if cls == h5t.ARRAY:
+        return has_heap_type(tid.get_super())
+    if cls == h5t.COMPOUND:
+        return any(
+            has_heap_type(tid.get_member_type(i)) for i in range(tid.get_nmembers())
+        )
+    return False
+
+
+def vlen_strpads(tid, where=""):
+    """`where=pad` for every variable-length string in the type tree.
+
+    A fixed string carries its pad inline in the dtype, where both sides
+    agree. A variable-length one cannot, so it is reported here. `where` is
+    the position in the type tree: `.` is the type itself, `.m` a compound
+    member, `[]` an array element, `()` a vlen element.
+    """
+    cls = tid.get_class()
+    if cls == h5t.STRING and tid.is_variable_str():
+        pad = _STRPAD.get(tid.get_strpad(), "pad%d" % tid.get_strpad())
+        return ["%s=%s" % (where or ".", pad)]
+    if cls == h5t.ARRAY:
+        return vlen_strpads(tid.get_super(), where + "[]")
+    if cls == h5t.VLEN:
+        return vlen_strpads(tid.get_super(), where + "()")
+    if cls == h5t.COMPOUND:
+        out = []
+        for i in range(tid.get_nmembers()):
+            name = tid.get_member_name(i).decode("utf-8", "replace")
+            out.extend(vlen_strpads(tid.get_member_type(i), where + "." + name))
+        return out
+    return []
+
+
+def strpad_str(tid):
+    pads = vlen_strpads(tid)
+    return ";".join(pads) if pads else "-"
+
+
+def render_elem(value, tid):
+    """Canonical rendering of one element of type `tid`."""
+    cls = tid.get_class()
+
+    if cls == h5t.FLOAT:
+        return float_bits(value, tid.get_size())
+
+    if cls in (h5t.INTEGER, h5t.ENUM, h5t.BITFIELD, h5t.TIME):
+        return str(int(value))
+
+    if cls == h5t.STRING:
+        return esc(value)
+
+    if cls == h5t.OPAQUE:
+        return "0x" + np.asarray(value).tobytes().hex()
+
+    if cls == h5t.REFERENCE:
+        return render_ref(value)
+
+    if cls == h5t.VLEN:
+        base = tid.get_super()
+        arr = np.asarray(value)
+        return "[" + ",".join(render_elem(v, base) for v in arr.ravel()) + "]"
+
+    if cls == h5t.ARRAY:
+        base = tid.get_super()
+        arr = np.asarray(value)
+        return "[" + ",".join(render_elem(v, base) for v in arr.ravel()) + "]"
+
+    if cls == h5t.COMPOUND:
+        parts = []
+        for i in range(tid.get_nmembers()):
+            name = _name(tid.get_member_name(i))
+            parts.append(render_elem(value[name], tid.get_member_type(i)))
+        return "{" + ",".join(parts) + "}"
+
+    return "0x" + np.asarray(value).tobytes().hex()
+
+
+_REF_FILE = None
+
+
+def render_ref(ref):
+    """Object / region references render as their resolved target path.
+
+    A raw address would not be comparable between two writers, so the
+    canonical form is the target path — plus the selection bounds for a
+    region reference, which is what distinguishes two region references into
+    the same dataset.
+    """
+    if ref is None:
+        return "objref:null"
+    try:
+        if isinstance(ref, h5py.RegionReference):
+            target = _REF_FILE[ref]
+            space = h5py.h5r.get_region(ref, target.id)
+            lo, hi = space.get_select_bounds()
+            return "regref:%s:%s-%s" % (target.name, dims_str(lo), dims_str(hi))
+        target = _REF_FILE[ref]
+        return "objref:%s" % target.name
+    except Exception as exc:  # pragma: no cover - defensive
+        return "ERROR(ref): %s" % oneline(exc)
+
+
+def encode_payload(text_vals=None, raw=None):
+    """Apply the size policy and return the canonical `data`/`value` string."""
+    if raw is not None:
+        if len(raw) <= RAW_LIMIT:
+            return "raw:" + raw.hex()
+        return "sha256:" + hashlib.sha256(raw).hexdigest()
+    body = "vals:[" + ",".join(text_vals) + "]"
+    if len(body) <= RAW_LIMIT:
+        return body
+    return "valsha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def raw_image(read_into, tid, sid):
+    """The on-disk byte image, read with the file type as the memory type.
+
+    Going through an untyped `V<size>` buffer with `mtype` pinned to the file
+    type means libhdf5 performs no conversion at all, so the bytes are exactly
+    what is stored. That matters for compounds with gaps, for opaque data
+    (which has no numpy conversion path), and for big-endian types, all of
+    which a plain `dset[()]` either reorders or refuses.
+    """
+    size = tid.get_size()
+    dims = tuple(sid.get_simple_extent_dims())
+    arr = np.empty(dims, dtype="V%d" % size)
+    if arr.size:
+        read_into(arr)
+    return arr.tobytes()
+
+
+def flatten_heap(data):
+    if isinstance(data, np.ndarray):
+        return [data[()]] if data.ndim == 0 else list(data.ravel())
+    return [data]
+
+
+def heap_payload(data, tid):
+    return encode_payload(
+        text_vals=[render_elem(v, tid) for v in flatten_heap(data)]
+    )
+
+
+def dataset_payload(dset):
+    dsid = dset.id
+    tid, sid = dsid.get_type(), dsid.get_space()
+    if sid.get_simple_extent_type() == h5s.NULL:
+        return "empty"
+    if has_heap_type(tid):
+        return heap_payload(dset[()], tid)
+    return encode_payload(
+        raw=raw_image(
+            lambda arr: dsid.read(h5s.ALL, h5s.ALL, arr, mtype=tid), tid, sid
+        )
+    )
+
+
+def attr_payload(obj, name, aid, tid, sid):
+    if sid.get_simple_extent_type() == h5s.NULL:
+        return "empty"
+    if has_heap_type(tid):
+        return heap_payload(obj.attrs[name], tid)
+    return encode_payload(
+        raw=raw_image(lambda arr: aid.read(arr, mtype=tid), tid, sid)
+    )
+
+
+# --------------------------------------------------------------------------
+# chunk index derivation
+# --------------------------------------------------------------------------
+
+
+def derive_chunk_index(dcpl, shape, maxshape, superblock):
+    """Which chunk index libhdf5 picks, per H5D__layout_set_version/H5D__chunk_construct.
+
+    Neither h5py nor the h5 CLI tools report the stored index type, so this
+    mirrors the library's selection rules instead. Marked as derived in the
+    report.
+    """
+    # Layout message v4 (and with it the v1.10 index types) is only written
+    # when the file's low library bound is at least v110, which is exactly
+    # when the superblock is version 3.
+    if superblock < 3:
+        return "btree1"
+    n_unlim = sum(1 for d in maxshape if d is None)
+    if n_unlim >= 2:
+        return "btree2"
+    if n_unlim == 1:
+        return "earray"
+    chunk = dcpl.get_chunk()
+    if tuple(chunk) == tuple(shape) and tuple(shape) == tuple(maxshape):
+        return "single"
+    if dcpl.get_nfilters() == 0 and dcpl.get_alloc_time() == h5d.ALLOC_TIME_EARLY:
+        return "implicit"
+    return "farray"
+
+
+_FILTER_NAMES = {
+    1: "deflate",
+    2: "shuffle",
+    3: "fletcher32",
+    4: "szip",
+    5: "nbit",
+    6: "scaleoffset",
+    307: "bzip2",
+    32000: "lzf",
+    32001: "blosc",
+    32004: "lz4",
+    32008: "bshuf",
+    32015: "zstd",
+}
+
+
+def filters_str(dcpl):
+    parts = []
+    for i in range(dcpl.get_nfilters()):
+        code, flags, cd, _name_ = dcpl.get_filter(i)
+        parts.append(
+            "%s(%s)@%d"
+            % (
+                _FILTER_NAMES.get(code, str(code)),
+                "|".join(str(c) for c in cd),
+                flags,
+            )
+        )
+    return "[" + ",".join(parts) + "]"
+
+
+_LAYOUTS = {
+    h5d.COMPACT: "compact",
+    h5d.CONTIGUOUS: "contiguous",
+    h5d.CHUNKED: "chunked",
+}
+if hasattr(h5d, "VIRTUAL"):
+    _LAYOUTS[h5d.VIRTUAL] = "virtual"
+
+
+def external_str(dcpl):
+    """External file storage segments, `-` when the data lives in the file."""
+    count = dcpl.get_external_count()
+    if not count:
+        return "-"
+    parts = []
+    for i in range(count):
+        name, offset, size = dcpl.get_external(i)
+        parts.append("%s@%d+%d" % (esc(name), offset, size))
+    return "[" + ",".join(parts) + "]"
+
+
+def _bounds_str(sid):
+    try:
+        lo, hi = sid.get_select_bounds()
+    except Exception:
+        return "?"
+    return "%s-%s" % (dims_str(lo), dims_str(hi))
+
+
+def virtual_str(dcpl):
+    """Virtual dataset mappings, `-` when the dataset is not virtual."""
+    # get_virtual_count() raises on any other layout.
+    if not hasattr(h5d, "VIRTUAL") or dcpl.get_layout() != h5d.VIRTUAL:
+        return "-"
+    count = dcpl.get_virtual_count()
+    if not count:
+        return "-"
+    parts = []
+    for i in range(count):
+        parts.append(
+            "%s::%s %s->%s"
+            % (
+                esc(dcpl.get_virtual_filename(i)),
+                esc(dcpl.get_virtual_dsetname(i)),
+                _bounds_str(dcpl.get_virtual_srcspace(i)),
+                _bounds_str(dcpl.get_virtual_vspace(i)),
+            )
+        )
+    return "[" + ",".join(parts) + "]"
+
+
+def crt_order_str(flags):
+    """Creation-order tracking flags of a group or file creation plist."""
+    parts = []
+    if flags & h5p.CRT_ORDER_TRACKED:
+        parts.append("tracked")
+    if flags & h5p.CRT_ORDER_INDEXED:
+        parts.append("indexed")
+    return "+".join(parts) if parts else "-"
+
+
+# --------------------------------------------------------------------------
+# the dumper
+# --------------------------------------------------------------------------
+
+
+def oneline(exc):
+    return " ".join(str(exc).split())
+
+
+class Dumper:
+    def __init__(self, path):
+        self.path = path
+        self.out = []
+        self.superblock, self.userblock = read_superblock(path)
+
+    def emit(self, key, value):
+        self.out.append("%s\t%s" % (key, str(value).replace("\t", " ")))
+
+    def field(self, path, name, fn):
+        """Emit `path#name`, turning an oracle-side failure into ERROR(...)."""
+        try:
+            self.emit("%s#%s" % (path, name), fn())
+        except Exception as exc:
+            self.emit("%s#%s" % (path, name), "ERROR(%s): %s" % (name, oneline(exc)))
+
+    def run(self):
+        global _REF_FILE
+        self.emit("!canon", CANON_VERSION)
+        self.emit("#superblock", self.superblock)
+        self.emit("#userblock", self.userblock)
+        with h5py.File(self.path, "r") as f:
+            _REF_FILE = f
+            try:
+                self.dump_group("/", f, 0)
+            finally:
+                _REF_FILE = None
+        return "\n".join(self.out) + "\n"
+
+    # -- objects ----------------------------------------------------------
+
+    def dump_group(self, path, grp, depth):
+        self.emit("%s#kind" % path, "group")
+        # A File is a Group, but its `.id` is the file id, whose creation
+        # plist is the FCPL and does not carry the root group's own
+        # creation-order flags.
+        gid = grp["/"].id if isinstance(grp, h5py.File) else grp.id
+        self.field(
+            path, "linkorder", lambda: crt_order_str(
+                gid.get_create_plist().get_link_creation_order()
+            )
+        )
+        self.field(
+            path, "attrorder", lambda: crt_order_str(
+                gid.get_create_plist().get_attr_creation_order()
+            )
+        )
+        self.dump_attrs(path, grp)
+        if depth >= MAX_DEPTH:
+            self.emit("%s#truncated" % path, "depth")
+            return
+        for name in sorted(grp.keys()):
+            child = path.rstrip("/") + "/" + name
+            try:
+                link = grp.get(name, getlink=True)
+            except Exception as exc:
+                self.emit("%s#kind" % child, "ERROR(kind): %s" % oneline(exc))
+                continue
+            if isinstance(link, h5py.SoftLink):
+                self.emit("%s#kind" % child, "softlink")
+                self.emit("%s#target" % child, link.path)
+                continue
+            if isinstance(link, h5py.ExternalLink):
+                self.emit("%s#kind" % child, "extlink")
+                self.emit("%s#target" % child, "%s::%s" % (link.filename, link.path))
+                continue
+            try:
+                obj = grp[name]
+            except Exception as exc:
+                self.emit("%s#kind" % child, "ERROR(kind): %s" % oneline(exc))
+                continue
+            if isinstance(obj, h5py.Group):
+                self.dump_group(child, obj, depth + 1)
+            elif isinstance(obj, h5py.Dataset):
+                self.dump_dataset(child, obj)
+            elif isinstance(obj, h5py.Datatype):
+                self.emit("%s#kind" % child, "committed-datatype")
+                self.field(child, "dtype", lambda o=obj: canon_dtype(o.id))
+                self.field(child, "strpad", lambda o=obj: strpad_str(o.id))
+                self.dump_attrs(child, obj)
+            else:
+                self.emit("%s#kind" % child, "unknown")
+
+    def dump_dataset(self, path, dset):
+        self.emit("%s#kind" % path, "dataset")
+        dsid = dset.id
+        tid = dsid.get_type()
+        sid = dsid.get_space()
+        dcpl = dsid.get_create_plist()
+        space_type = sid.get_simple_extent_type()
+
+        self.field(path, "dtype", lambda: canon_dtype(tid))
+        self.field(path, "strpad", lambda: strpad_str(tid))
+
+        if space_type == h5s.NULL:
+            shape, maxshape = None, None
+            self.emit("%s#shape" % path, "null")
+            self.emit("%s#maxshape" % path, "null")
+        else:
+            shape = sid.get_simple_extent_dims()
+            maxdims = sid.get_simple_extent_dims(True)
+            maxshape = tuple(None if d == h5s.UNLIMITED else d for d in maxdims)
+            self.emit("%s#shape" % path, dims_str(shape))
+            self.emit("%s#maxshape" % path, maxdims_str(maxshape))
+
+        layout = _LAYOUTS.get(dcpl.get_layout(), "layout%d" % dcpl.get_layout())
+        self.emit("%s#layout" % path, layout)
+
+        if layout == "chunked":
+            self.emit("%s#chunk" % path, dims_str(dcpl.get_chunk()))
+            self.field(
+                path,
+                "chunkindex",
+                lambda: derive_chunk_index(dcpl, shape, maxshape, self.superblock),
+            )
+        else:
+            self.emit("%s#chunk" % path, "-")
+            self.emit("%s#chunkindex" % path, "-")
+
+        self.field(path, "external", lambda: external_str(dcpl))
+        self.field(path, "virtual", lambda: virtual_str(dcpl))
+        self.field(path, "filters", lambda: filters_str(dcpl))
+        self.field(path, "fillvalue", lambda: self.fill_value(dset, dcpl))
+        self.dump_attrs(path, dset)
+        self.field(path, "data", lambda: dataset_payload(dset))
+
+    def fill_value(self, dset, dcpl):
+        defined = dcpl.fill_value_defined()
+        if defined == h5d.FILL_VALUE_UNDEFINED:
+            return "undefined"
+        if defined == h5d.FILL_VALUE_DEFAULT:
+            return "default"
+        buf = np.zeros((1,), dtype=dset.dtype)
+        dcpl.get_fill_value(buf)
+        return "0x" + buf.tobytes().hex()
+
+    def dump_attrs(self, path, obj):
+        try:
+            names = sorted(obj.attrs.keys())
+        except Exception as exc:
+            self.emit("%s#nattrs" % path, "ERROR(nattrs): %s" % oneline(exc))
+            return
+        self.emit("%s#nattrs" % path, len(names))
+        # The object header's own attribute count, which is what H5Oget_info
+        # and therefore h5diff/h5repack trust. Iteration walks the messages
+        # and can disagree with it, so the two are separate observables.
+        self.field(
+            path,
+            "nattrs_hdr",
+            lambda o=obj: h5py.h5o.get_info(o.id).num_attrs,
+        )
+        for name in names:
+            key = "%s@%s" % (path, name)
+            try:
+                aid = h5py.h5a.open(obj.id, name.encode("utf-8"))
+            except Exception as exc:
+                self.emit("%s#dtype" % key, "ERROR(dtype): %s" % oneline(exc))
+                continue
+            tid = aid.get_type()
+            sid = aid.get_space()
+            self.field(key, "dtype", lambda t=tid: canon_dtype(t))
+            self.field(key, "strpad", lambda t=tid: strpad_str(t))
+            if sid.get_simple_extent_type() == h5s.NULL:
+                self.emit("%s#shape" % key, "null")
+            else:
+                self.emit("%s#shape" % key, dims_str(sid.get_simple_extent_dims()))
+            self.field(
+                key,
+                "value",
+                lambda o=obj, n=name, a=aid, t=tid, s=sid: attr_payload(o, n, a, t, s),
+            )
+
+
+_SIGNATURE = b"\x89HDF\r\n\x1a\n"
+
+
+def read_superblock(path):
+    """(superblock version, user block size).
+
+    A user block displaces the superblock to the first power-of-two offset at
+    or after 512 bytes, so the signature has to be searched for rather than
+    read at zero.
+    """
+    with open(path, "rb") as fh:
+        data = fh.read()
+    offset = 0
+    while offset < len(data):
+        if data[offset : offset + 8] == _SIGNATURE:
+            return data[offset + 8], offset
+        offset = 512 if offset == 0 else offset * 2
+    return "ERROR(superblock): no signature at any user-block offset", 0
+
+
+def dump(path):
+    return Dumper(path).run()
+
+
+def main(argv):
+    if len(argv) != 2:
+        sys.stderr.write("usage: canon.py <file.h5>\n")
+        return 64
+    try:
+        sys.stdout.write(dump(argv[1]))
+    except Exception:
+        traceback.print_exc()
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

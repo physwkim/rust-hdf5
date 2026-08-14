@@ -9,3 +9,4 @@ Cargo.lock
 /.claude/
 .DS_Store
 /kodex-out/
+/oracle/__pycache__/
