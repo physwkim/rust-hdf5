@@ -669,6 +669,26 @@ def gen_link_external(path):
         f["ext"] = h5py.ExternalLink(target.name, "/payload")
 
 
+def gen_link_external_read(path):
+    """A master file whose payload lives entirely in a sibling.
+
+    Every dataset is reached only by crossing a link, so the `resolved` field
+    is the whole content check: a reader that lists the links but never opens
+    the other file matches on `target` and diverges here. The two dangling
+    links pin the other half — a target file that is not there and a target
+    object that is not there both have to say so rather than read something.
+    """
+    target = path.parent / (path.stem + "_data.h5")
+    with h5py.File(target, "w") as g:
+        g.create_dataset("top", data=ramp("<f8"))
+        g.create_group("deep").create_dataset("inner", data=ramp("<i2"))
+    with h5py.File(path, "w") as f:
+        f["direct"] = h5py.ExternalLink(target.name, "/top")
+        f["nested"] = h5py.ExternalLink(target.name, "/deep/inner")
+        f["gone_object"] = h5py.ExternalLink(target.name, "/absent")
+        f["gone_file"] = h5py.ExternalLink("no_such_file.h5", "/top")
+
+
 def gen_links_dense(path):
     # v1.8 bounds, not "latest": dense link storage needs the v1.8 group
     # format, and stopping there keeps the v1.10 layout message out of the
@@ -702,6 +722,10 @@ LINK_CASES = [
     Case("link_external", "link", gen_link_external, None,
          "external link into a sibling file",
          ext_files=("_ext.h5",)),
+    Case("link_external_read", "link", gen_link_external_read, None,
+         "datasets read through external links, plus a dangling object and a "
+         "dangling file",
+         ext_files=("_data.h5",)),
     Case("links_dense", "link", gen_links_dense, "links_dense",
          "12 links in one group — dense link storage (fractal heap + v2 B-tree)"),
     Case("track_order", "group", gen_track_order, None,

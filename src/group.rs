@@ -135,6 +135,18 @@ impl H5Group {
         let full_name = match &*inner {
             H5FileInner::Reader(reader) => {
                 let group_path = full_name.trim_start_matches('/');
+                // A group handle lists and reads through the reader it was
+                // made from, and that reader is one file. Opening the target
+                // file directly is the way across; saying so beats handing
+                // back a handle whose listings would all come up empty.
+                if let Some(edge) = reader.external_edge(group_path) {
+                    return Err(Hdf5Error::Unsupported(format!(
+                        "'{}' resolves through the external link '{}' to '{}' in '{}'; \
+                         a group handle does not cross into another file — open '{}' \
+                         and start from there (datasets read through the link)",
+                        full_name, edge.link, edge.path, edge.file, edge.file
+                    )));
+                }
                 if !reader.has_group(group_path) {
                     return Err(Hdf5Error::NotFound(full_name));
                 }
@@ -381,9 +393,7 @@ impl H5Group {
         let inner = borrow_inner(&self.file_inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let ds_index = writer
-                    .dataset_index(&full_name)
-                    .ok_or_else(|| Hdf5Error::NotFound(full_name.clone()))?;
+                let ds_index = writer.open_dataset_index(&full_name)?;
                 writer.append_vlen_strings(ds_index, strings)?;
                 Ok(())
             }
@@ -411,9 +421,7 @@ impl H5Group {
         let inner = borrow_inner(&self.file_inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let index = writer
-                    .dataset_index(&full_name)
-                    .ok_or_else(|| Hdf5Error::NotFound(full_name.clone()))?;
+                let index = writer.open_dataset_index(&full_name)?;
                 let (shape, element_size, chunked, btree2, fixed_array) =
                     writer.dataset_handle_parts(index);
                 Ok(H5Dataset::new_writer(
@@ -560,8 +568,8 @@ impl H5Group {
         } else {
             format!("{}/{}", self.name.trim_start_matches('/'), name)
         };
-        let inner = borrow_inner(&self.file_inner);
-        match &*inner {
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
             H5FileInner::Reader(reader) => reader
                 .link_class(&full_name)
                 .cloned()
@@ -600,8 +608,8 @@ impl H5Group {
         } else {
             format!("{}/{}", self.name.trim_start_matches('/'), name)
         };
-        let inner = borrow_inner(&self.file_inner);
-        match &*inner {
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
             H5FileInner::Reader(reader) => {
                 Ok(reader.unreadable_reason(&full_name).map(str::to_string))
             }
@@ -765,8 +773,8 @@ impl H5Group {
 
     /// List this group's attribute names (read mode).
     pub fn attr_names(&self) -> Result<Vec<String>> {
-        let inner = borrow_inner(&self.file_inner);
-        match &*inner {
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
             H5FileInner::Reader(reader) => {
                 if self.name == "/" {
                     Ok(reader.root_attr_names())

@@ -1994,6 +1994,9 @@ impl Hdf5Writer {
     /// here are full paths, so they must be unique across the file (HDF5
     /// requires link names to be unique within their group).
     fn ensure_unique_dataset_name(&self, name: &str) -> IoResult<()> {
+        // A path *through* a carried external link belongs to the other file:
+        // creating it here would put a second link of that name in the group.
+        self.reject_external_traversal(name)?;
         let exists = self.dataset_refs().iter().any(|d| {
             let g = d.lock();
             !g.deleted && g.name == name
@@ -2042,6 +2045,7 @@ impl Hdf5Writer {
         if self.swmr_active {
             return Err(swmr_delete_error(name));
         }
+        self.reject_external_traversal(name)?;
         // The gate keeps the link list and child lists still while this
         // delete reads and rewrites them (create_lock → op → slot order,
         // the same as every creator).
@@ -2114,6 +2118,7 @@ impl Hdf5Writer {
         if self.swmr_active {
             return Err(swmr_delete_error(name));
         }
+        self.reject_external_traversal(name)?;
         // Same gate as `delete_dataset`: the pre-scan below and the
         // promotions must see a still link list and child lists.
         let _create = self.create_lock.lock();
@@ -2645,6 +2650,9 @@ impl Hdf5Writer {
         } else {
             format!("{}/{}", parent_path, name)
         };
+        // Same rule as dataset creation: a path through a carried external
+        // link names a group in the other file, which this writer cannot make.
+        self.reject_external_traversal(&full_name)?;
 
         let groups = self.group_refs();
         // Check for duplicates (ignore deleted groups)
@@ -2754,6 +2762,15 @@ impl Hdf5Writer {
                 "hard link name '{link_name}' must be a non-empty leaf name"
             )));
         }
+
+        // Neither end may sit across a carried external link: the target
+        // would be an object in the other file, and the link itself would be
+        // a name in a group this writer does not own.
+        self.reject_external_traversal(target_path)?;
+        self.reject_external_traversal(&format!(
+            "{}/{link_name}",
+            parent_group_path.trim_end_matches('/')
+        ))?;
 
         // Hold the create gate across the collision check and the hard-link
         // push so the two are atomic (see `create_lock`).
@@ -2963,6 +2980,47 @@ impl Hdf5Writer {
                 header.add_message(MSG_LINK, 0x00, link.encoded.clone());
             }
         }
+    }
+
+    /// Refuse a caller path that would have to leave this file through one of
+    /// the external links a reopened file brought in.
+    ///
+    /// The reader follows such a path into the file the link names; the writer
+    /// cannot, because it models one file and would have to write into
+    /// another. Saying which link stops the path — rather than reporting the
+    /// name as absent, or worse, creating a second link of that name beside
+    /// it — is the whole of what write mode does here.
+    pub(crate) fn reject_external_traversal(&self, path: &str) -> IoResult<()> {
+        let path = path.trim_start_matches('/');
+        let crossing = self.preserved_link_paths().into_iter().find(|(p, class)| {
+            matches!(class, crate::io::reader::LinkClass::External { .. })
+                && (path == p || path.starts_with(&format!("{p}/")))
+        });
+        match crossing {
+            None => Ok(()),
+            Some((link, crate::io::reader::LinkClass::External { file, path: target })) => {
+                Err(crate::io::IoError::Unsupported(format!(
+                    "'{path}' resolves through the external link '{link}' to '{target}' in \
+                     '{file}'; this writer carries external links through a rewrite but does \
+                     not open the file they name"
+                )))
+            }
+            // `find` matched on the External arm, so no other class reaches here.
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Resolve `name` to a live dataset index, reporting *why* it does not
+    /// resolve rather than collapsing every cause into absence.
+    ///
+    /// The write-mode counterpart of [`Hdf5Reader::open_dataset`]: the single
+    /// gate every by-name dataset lookup in write mode goes through.
+    ///
+    /// [`Hdf5Reader::open_dataset`]: crate::io::reader::Hdf5Reader::open_dataset
+    pub(crate) fn open_dataset_index(&self, name: &str) -> IoResult<usize> {
+        self.reject_external_traversal(name)?;
+        self.dataset_index(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))
     }
 
     /// Every link this writer is carrying but cannot express, by full path.

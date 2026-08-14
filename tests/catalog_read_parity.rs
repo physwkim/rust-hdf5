@@ -39,6 +39,23 @@ fn tmp(name: &str) -> std::path::PathBuf {
     ))
 }
 
+/// A fresh directory, for the cases whose subject *is* where a file sits:
+/// external links resolve their target relative to the directory holding the
+/// file that names them, so those fixtures cannot share one.
+fn tmp_dir(name: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "rust_hdf5_catalog_{}_{}_{}",
+        name,
+        std::process::id(),
+        n
+    ));
+    std::fs::create_dir_all(&dir).expect("failed to create fixture directory");
+    dir
+}
+
 /// Run `body` (top-level python statements) with `path` available as `PATH`,
 /// to write a fixture or to assert over one. A non-zero exit — including a
 /// failed `assert` — fails the test; python's traceback reaches test stderr.
@@ -171,9 +188,8 @@ fn dangling_soft_link_is_listed_and_reported_as_dangling() {
     std::fs::remove_file(&path).ok();
 }
 
-/// An external link is listed and its target file and path are readable
-/// through `link_class`; opening through it reports that this reader does not
-/// leave the file, which is a refusal, not an absence.
+/// An external link is listed, its target file and path are readable through
+/// `link_class`, and opening through it reads the dataset in the other file.
 #[test]
 fn external_link_is_listed_with_its_target() {
     let Some(py) = python() else { return };
@@ -209,13 +225,9 @@ fn external_link_is_listed_with_its_target() {
         }
         other => panic!("expected an external link, got {other:?}"),
     }
-    match file.dataset("ext").err() {
-        Some(Hdf5Error::Unsupported(why)) => {
-            assert!(why.contains("external link"), "{why}");
-            assert!(why.contains("/data"), "{why}");
-        }
-        other => panic!("expected an unsupported-feature error, got {other:?}"),
-    }
+    let ds = file.dataset("ext").unwrap();
+    assert_eq!(ds.shape(), vec![4]);
+    assert_eq!(ds.read_raw::<i32>().unwrap(), vec![0, 1, 2, 3]);
 
     std::fs::remove_file(&path).ok();
     std::fs::remove_file(&target).ok();
@@ -533,4 +545,370 @@ fn creating_over_a_preserved_link_name_is_refused() {
     file.close().unwrap();
 
     std::fs::remove_file(&path).ok();
+}
+
+/// An external link naming a bare file name resolves against the directory
+/// holding the file that names it — not the working directory — and the
+/// remainder of the path is traversed inside the target, including through a
+/// second external link.
+#[test]
+fn external_link_resolves_against_the_parent_directory_and_nests() {
+    let Some(py) = python() else { return };
+    let dir = tmp_dir("extlink_relative");
+    let (first, second, third) = (
+        dir.join("first.h5"),
+        dir.join("second.h5"),
+        dir.join("third.h5"),
+    );
+
+    h5py_write(
+        py,
+        &third,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f.create_dataset('end', data=np.arange(6, dtype='<f8'))\n",
+    );
+    // `libver='latest'` keeps this case about link following: at the default
+    // bound `deep` lands in symbol-table storage under a link-storage root,
+    // which is its own case (`a_group_keeps_its_children_when_its_storage_
+    // differs_from_its_parents`).
+    h5py_write(
+        py,
+        &second,
+        "with h5py.File(PATH, 'w', libver='latest') as f:\n\
+         \x20   f.create_group('deep').create_dataset('payload', data=np.arange(4, dtype='<i4'))\n\
+         \x20   f['onward'] = h5py.ExternalLink('third.h5', '/end')\n",
+    );
+    // Bare file names: only the parent directory rule can resolve them, since
+    // the test process runs from the crate root.
+    h5py_write(
+        py,
+        &first,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f['group'] = h5py.ExternalLink('second.h5', '/deep')\n\
+         \x20   f['chain'] = h5py.ExternalLink('second.h5', '/onward')\n",
+    );
+
+    let file = H5File::open(&first).unwrap();
+    // One hop, then a path continuing inside the target's group.
+    let ds = file.dataset("group/payload").unwrap();
+    assert_eq!(ds.read_raw::<i32>().unwrap(), vec![0, 1, 2, 3]);
+    // Two hops: first.h5 -> second.h5 -> third.h5.
+    let chained = file.dataset("chain").unwrap();
+    assert_eq!(chained.shape(), vec![6]);
+    assert_eq!(
+        chained.read_raw::<f64>().unwrap(),
+        vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    );
+    drop(file);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `HDF5_EXT_PREFIX` is searched before the parent file's own directory, so a
+/// target that moved out from beside its master is found again by setting it —
+/// and the failure without it names every path that was tried.
+#[test]
+fn external_link_target_is_found_through_hdf5_ext_prefix() {
+    let Some(py) = python() else { return };
+    let home = tmp_dir("extprefix_home");
+    let away = tmp_dir("extprefix_away");
+    let master = home.join("master.h5");
+    let target = away.join("moved.h5");
+
+    h5py_write(
+        py,
+        &target,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f.create_dataset('v', data=np.arange(3, dtype='<i4'))\n",
+    );
+    h5py_write(
+        py,
+        &master,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f['moved'] = h5py.ExternalLink('moved.h5', '/v')\n",
+    );
+
+    std::env::remove_var("HDF5_EXT_PREFIX");
+    let file = H5File::open(&master).unwrap();
+    match file.dataset("moved").err() {
+        Some(Hdf5Error::ExternalFileNotFound {
+            link,
+            file,
+            searched,
+        }) => {
+            assert_eq!(link, "moved");
+            assert_eq!(file, "moved.h5");
+            // The parent directory and the working directory were both tried.
+            assert!(
+                searched.iter().any(|p| p.contains("extprefix_home")),
+                "{searched:?}"
+            );
+            assert!(searched.iter().any(|p| p == "moved.h5"), "{searched:?}");
+        }
+        other => panic!("expected the target file to be reported missing, got {other:?}"),
+    }
+    drop(file);
+
+    // A two-component prefix list: the first misses, the second resolves.
+    std::env::set_var(
+        "HDF5_EXT_PREFIX",
+        format!("{}:{}", home.display(), away.display()),
+    );
+    let file = H5File::open(&master).unwrap();
+    assert_eq!(
+        file.dataset("moved").unwrap().read_raw::<i32>().unwrap(),
+        vec![0, 1, 2]
+    );
+    drop(file);
+    std::env::remove_var("HDF5_EXT_PREFIX");
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&away).ok();
+}
+
+/// A dangling external link is listed like any other, and says which half is
+/// missing: the file it names, or the object inside it.
+#[test]
+fn a_dangling_external_link_reports_the_file_or_the_object() {
+    let Some(py) = python() else { return };
+    let dir = tmp_dir("extlink_dangling");
+    let master = dir.join("master.h5");
+    let target = dir.join("target.h5");
+
+    h5py_write(
+        py,
+        &target,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f.create_dataset('there', data=np.arange(2, dtype='<i4'))\n",
+    );
+    h5py_write(
+        py,
+        &master,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f['no_file'] = h5py.ExternalLink('absent.h5', '/there')\n\
+         \x20   f['no_object'] = h5py.ExternalLink('target.h5', '/missing')\n",
+    );
+
+    std::env::remove_var("HDF5_EXT_PREFIX");
+    let file = H5File::open(&master).unwrap();
+    let root = file.root_group();
+    // Both dangle; both are still names the file holds.
+    assert_eq!(
+        root.link_names().unwrap(),
+        vec!["no_file".to_string(), "no_object".to_string()]
+    );
+    match file.dataset("no_file").err() {
+        Some(Hdf5Error::ExternalFileNotFound { file, .. }) => assert_eq!(file, "absent.h5"),
+        other => panic!("expected a missing target file, got {other:?}"),
+    }
+    match file.dataset("no_object").err() {
+        Some(Hdf5Error::DanglingLink { link, target }) => {
+            assert_eq!(link, "no_object");
+            assert_eq!(target, "target.h5::/missing");
+        }
+        other => panic!("expected a dangling link, got {other:?}"),
+    }
+    drop(file);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Two links naming one file share one open handle for the life of the
+/// parent `H5File`. Unlinking the target after the first read is what makes
+/// that observable: a second open would find nothing, a cached handle still
+/// reads.
+#[cfg(unix)]
+#[test]
+fn links_to_one_external_file_share_one_open_handle() {
+    let Some(py) = python() else { return };
+    let dir = tmp_dir("extlink_cache");
+    let master = dir.join("master.h5");
+    let target = dir.join("target.h5");
+
+    h5py_write(
+        py,
+        &target,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f.create_dataset('a', data=np.arange(2, dtype='<i4'))\n\
+         \x20   f.create_dataset('b', data=np.arange(3, dtype='<i4'))\n",
+    );
+    h5py_write(
+        py,
+        &master,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f['first'] = h5py.ExternalLink('target.h5', '/a')\n\
+         \x20   f['second'] = h5py.ExternalLink('target.h5', '/b')\n",
+    );
+
+    std::env::remove_var("HDF5_EXT_PREFIX");
+    let file = H5File::open(&master).unwrap();
+    assert_eq!(
+        file.dataset("first").unwrap().read_raw::<i32>().unwrap(),
+        vec![0, 1]
+    );
+    std::fs::remove_file(&target).unwrap();
+    assert_eq!(
+        file.dataset("second").unwrap().read_raw::<i32>().unwrap(),
+        vec![0, 1, 2]
+    );
+    drop(file);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Two files that link to each other are a cycle. Resolution stops at the
+/// same link bound libhdf5 uses and says so, rather than recursing until the
+/// stack or the file-descriptor table runs out.
+#[test]
+fn an_external_link_cycle_stops_at_the_link_bound() {
+    let Some(py) = python() else { return };
+    let dir = tmp_dir("extlink_cycle");
+    let (a, b) = (dir.join("a.h5"), dir.join("b.h5"));
+
+    h5py_write(
+        py,
+        &a,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f['loop'] = h5py.ExternalLink('b.h5', '/loop')\n",
+    );
+    h5py_write(
+        py,
+        &b,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f['loop'] = h5py.ExternalLink('a.h5', '/loop')\n",
+    );
+
+    std::env::remove_var("HDF5_EXT_PREFIX");
+    let file = H5File::open(&a).unwrap();
+    let err = file
+        .dataset("loop")
+        .err()
+        .expect("a link cycle must not resolve");
+    let text = format!("{err}");
+    assert!(text.contains("external links"), "{text}");
+    assert!(text.contains("cycle"), "{text}");
+    drop(file);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Write mode carries external links through a rewrite but never follows one:
+/// every write-side path that crosses one is refused by name, and the link
+/// itself survives the session intact.
+#[test]
+fn write_mode_refuses_every_path_through_an_external_link() {
+    let Some(py) = python() else { return };
+    let dir = tmp_dir("extlink_write");
+    let master = dir.join("master.h5");
+    let target = dir.join("target.h5");
+
+    h5py_write(
+        py,
+        &target,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f.create_group('g').create_dataset('d', data=np.arange(2, dtype='<i4'))\n",
+    );
+    h5py_write(
+        py,
+        &master,
+        "with h5py.File(PATH, 'w', libver='latest') as f:\n\
+         \x20   f.create_dataset('local', data=np.arange(2, dtype='<i4'))\n\
+         \x20   f['ext'] = h5py.ExternalLink('target.h5', '/g')\n",
+    );
+
+    let refused = |err: Option<Hdf5Error>, what: &str| match err {
+        Some(Hdf5Error::Unsupported(why)) => {
+            assert!(why.contains("external link 'ext'"), "{what}: {why}");
+        }
+        other => panic!("{what} must be refused by name, got {other:?}"),
+    };
+
+    {
+        let file = H5File::open_rw(&master).unwrap();
+        refused(file.dataset_writer("ext").err(), "reopening the link");
+        refused(
+            file.new_dataset::<i32>()
+                .shape([2usize])
+                .create("ext/new")
+                .err(),
+            "creating through the link",
+        );
+        refused(file.delete_dataset("ext").err(), "deleting the link");
+        refused(
+            file.delete_group("ext/g").err(),
+            "deleting through the link",
+        );
+        refused(
+            file.create_group("ext/sub").err(),
+            "creating a group through the link",
+        );
+        // Something unrelated still writes, and the link rides through it.
+        file.new_dataset::<i32>()
+            .shape([2usize])
+            .create("added")
+            .unwrap()
+            .write_raw(&[7i32, 8])
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    std::env::remove_var("HDF5_EXT_PREFIX");
+    let file = H5File::open(&master).unwrap();
+    match file.root_group().link_class("ext").unwrap() {
+        LinkClass::External { file, path } => {
+            assert_eq!(file, "target.h5");
+            assert_eq!(path, "/g");
+        }
+        other => panic!("the external link must survive the rewrite, got {other:?}"),
+    }
+    // And the reader still follows it after the writer touched the file.
+    assert_eq!(
+        file.dataset("ext/d").unwrap().read_raw::<i32>().unwrap(),
+        vec![0, 1]
+    );
+    drop(file);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A group handle belongs to one file, so a group path that crosses an
+/// external link is refused with the target named — the alternative is a
+/// handle whose every listing comes back empty.
+#[test]
+fn a_group_path_across_an_external_link_is_named_not_empty() {
+    let Some(py) = python() else { return };
+    let dir = tmp_dir("extlink_group");
+    let master = dir.join("master.h5");
+    let target = dir.join("target.h5");
+
+    h5py_write(
+        py,
+        &target,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f.create_group('g').create_dataset('d', data=np.arange(2, dtype='<i4'))\n",
+    );
+    h5py_write(
+        py,
+        &master,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f['ext'] = h5py.ExternalLink('target.h5', '/g')\n",
+    );
+
+    std::env::remove_var("HDF5_EXT_PREFIX");
+    let file = H5File::open(&master).unwrap();
+    match file.root_group().group("ext").err() {
+        Some(Hdf5Error::Unsupported(why)) => {
+            assert!(why.contains("target.h5"), "{why}");
+            assert!(why.contains("does not cross into another file"), "{why}");
+        }
+        other => panic!("expected a named refusal, got {other:?}"),
+    }
+    // The dataset under it still opens: the link is followed, the handle is not.
+    assert_eq!(
+        file.dataset("ext/d").unwrap().read_raw::<i32>().unwrap(),
+        vec![0, 1]
+    );
+    drop(file);
+
+    std::fs::remove_dir_all(&dir).ok();
 }

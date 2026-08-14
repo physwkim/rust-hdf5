@@ -22,9 +22,18 @@ pub enum Hdf5Error {
     /// [`NotFound`](Self::NotFound): the name is in the listing, the content
     /// is out of reach.
     Unsupported(String),
-    /// A soft link whose target does not exist. `H5Dopen` on a path through
-    /// such a link fails; the name itself is present in the listing.
+    /// A soft or external link whose target does not exist. `H5Dopen` on a
+    /// path through such a link fails; the name itself is present in the
+    /// listing. `target` is the link value: a path for a soft link,
+    /// `file::path` for an external one.
     DanglingLink { link: String, target: String },
+    /// An external link whose target *file* could not be opened, listing the
+    /// candidate paths that were tried.
+    ExternalFileNotFound {
+        link: String,
+        file: String,
+        searched: Vec<String>,
+    },
 }
 
 impl From<std::io::Error> for Hdf5Error {
@@ -41,13 +50,26 @@ impl From<crate::format::FormatError> for Hdf5Error {
 
 impl From<crate::io::IoError> for Hdf5Error {
     fn from(e: crate::io::IoError) -> Self {
-        // The two link/feature outcomes carry through as themselves so a
-        // caller can match on them; everything else keeps its existing shape.
+        // Every outcome that names *why* a lookup failed carries through as
+        // itself so a caller can match on it; everything else keeps its
+        // existing shape. `NotFound` is among them: a `?` on an I/O-layer
+        // lookup must not turn a plain absence into an opaque `IoLayer`,
+        // which is what forced callers to re-map it by hand.
         match e {
+            crate::io::IoError::NotFound(s) => Self::NotFound(s),
             crate::io::IoError::Unsupported(s) => Self::Unsupported(s),
             crate::io::IoError::DanglingLink { link, target } => {
                 Self::DanglingLink { link, target }
             }
+            crate::io::IoError::ExternalFileNotFound {
+                link,
+                file,
+                searched,
+            } => Self::ExternalFileNotFound {
+                link,
+                file,
+                searched,
+            },
             other => Self::IoLayer(other),
         }
     }
@@ -65,8 +87,19 @@ impl std::fmt::Display for Hdf5Error {
             Self::Unsupported(s) => write!(f, "unsupported: {}", s),
             Self::DanglingLink { link, target } => write!(
                 f,
-                "soft link '{}' points to '{}', which does not exist",
+                "link '{}' points to '{}', which does not exist",
                 link, target
+            ),
+            Self::ExternalFileNotFound {
+                link,
+                file,
+                searched,
+            } => write!(
+                f,
+                "external link '{}' names the file '{}', which could not be opened (tried: {})",
+                link,
+                file,
+                searched.join(", ")
             ),
         }
     }

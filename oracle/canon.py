@@ -21,7 +21,7 @@ import hdf5env  # noqa: F401  (must precede h5py; see the module docstring)
 import h5py
 from h5py import h5d, h5p, h5s, h5t
 
-CANON_VERSION = "2"
+CANON_VERSION = "3"
 RAW_LIMIT = 1024
 MAX_DEPTH = 32
 
@@ -373,6 +373,32 @@ def dataset_payload(dset):
     )
 
 
+def resolve_extlink(grp, name):
+    """What crossing an external link lands on, in one line.
+
+    `target` above is only the link's stored value, so a reader that never
+    opens the other file dumps exactly the same text as one that does. This
+    follows the link the way `H5Dopen` on a path through it does, and reports
+    the shape and payload digest of what it finds — the same functions the
+    dataset dump uses, so resolving to the wrong object or reading the wrong
+    bytes both show up here.
+    """
+    try:
+        obj = grp[name]
+    except Exception:
+        # Target file missing, target object missing, or the file is not
+        # readable: one answer, because a reader cannot tell them apart
+        # without reporting on the other file's behalf.
+        return "dangling"
+    if isinstance(obj, h5py.Dataset):
+        return "dataset %s %s" % (dims_str(obj.shape), dataset_payload(obj))
+    if isinstance(obj, h5py.Group):
+        return "group"
+    if isinstance(obj, h5py.Datatype):
+        return "committed-datatype"
+    return "unknown"
+
+
 def attr_payload(obj, name, aid, tid, sid):
     if sid.get_simple_extent_type() == h5s.NULL:
         return "empty"
@@ -579,6 +605,7 @@ class Dumper:
             if isinstance(link, h5py.ExternalLink):
                 self.emit("%s#kind" % child, "extlink")
                 self.emit("%s#target" % child, "%s::%s" % (link.filename, link.path))
+                self.emit("%s#resolved" % child, resolve_extlink(grp, name))
                 continue
             try:
                 obj = grp[name]

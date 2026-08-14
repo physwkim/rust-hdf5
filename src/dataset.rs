@@ -644,8 +644,8 @@ impl H5Dataset {
     pub fn datatype(&self) -> Result<DatatypeMessage> {
         match &self.info {
             DatasetInfo::Reader { name, .. } => {
-                let inner = borrow_inner(&self.file_inner);
-                match &*inner {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
                     H5FileInner::Reader(reader) => reader
                         .dataset_info(name)
                         .map(|info| info.datatype.clone())
@@ -663,8 +663,8 @@ impl H5Dataset {
     pub fn chunk_dims(&self) -> Option<Vec<usize>> {
         match &self.info {
             DatasetInfo::Reader { name, .. } => {
-                let inner = borrow_inner(&self.file_inner);
-                if let H5FileInner::Reader(reader) = &*inner {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                if let H5FileInner::Reader(reader) = &mut *inner {
                     if let Some(info) = reader.dataset_info(name) {
                         use crate::format::messages::data_layout::DataLayoutMessage;
                         let chunk_dims = match &info.layout {
@@ -694,8 +694,8 @@ impl H5Dataset {
         match &self.info {
             DatasetInfo::Writer { chunked, .. } => *chunked,
             DatasetInfo::Reader { name, .. } => {
-                let inner = borrow_inner(&self.file_inner);
-                match &*inner {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
                     H5FileInner::Reader(reader) => {
                         if let Some(info) = reader.dataset_info(name) {
                             use crate::format::messages::data_layout::DataLayoutMessage;
@@ -718,8 +718,8 @@ impl H5Dataset {
     pub fn attr_names(&self) -> Result<Vec<String>> {
         match &self.info {
             DatasetInfo::Reader { name, .. } => {
-                let inner = borrow_inner(&self.file_inner);
-                match &*inner {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
                     H5FileInner::Reader(reader) => Ok(reader.dataset_attr_names(name)?),
                     _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
                 }
@@ -734,8 +734,8 @@ impl H5Dataset {
     pub fn attr(&self, attr_name: &str) -> Result<crate::attribute::H5Attribute> {
         match &self.info {
             DatasetInfo::Reader { name, .. } => {
-                let inner = borrow_inner(&self.file_inner);
-                match &*inner {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
                     H5FileInner::Reader(reader) => {
                         let attr_msg = reader.dataset_attr(name, attr_name)?.clone();
                         Ok(crate::attribute::H5Attribute::new_reader(

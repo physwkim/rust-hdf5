@@ -560,9 +560,7 @@ impl H5File {
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let ds_index = writer
-                    .dataset_index(name)
-                    .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?;
+                let ds_index = writer.open_dataset_index(name)?;
                 writer.append_vlen_strings(ds_index, strings)?;
                 Ok(())
             }
@@ -613,16 +611,15 @@ impl H5File {
 
     /// Open an existing dataset by name (read mode).
     pub fn dataset(&self, name: &str) -> Result<H5Dataset> {
-        let inner = borrow_inner(&self.inner);
-        match &*inner {
+        // Mutable: a name that crosses an external link opens the file that
+        // link names, and the reader caches that handle for the next one.
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
             H5FileInner::Reader(reader) => {
                 // The reader's open gate reports *why* a name cannot be
                 // opened — a dangling soft link and an unsupported object are
                 // both present in the listing, and neither is an absence.
-                let info = reader.open_dataset(name).map_err(|e| match e {
-                    crate::io::IoError::NotFound(s) => Hdf5Error::NotFound(s),
-                    other => Hdf5Error::from(other),
-                })?;
+                let info = reader.open_dataset(name)?;
                 let shape: Vec<usize> = info.dataspace.dims.iter().map(|&d| d as usize).collect();
                 let element_size = info.datatype.element_size() as usize;
                 Ok(H5Dataset::new_reader(
@@ -657,9 +654,7 @@ impl H5File {
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let index = writer
-                    .dataset_index(name)
-                    .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?;
+                let index = writer.open_dataset_index(name)?;
                 let (shape, element_size, chunked, btree2, fixed_array) =
                     writer.dataset_handle_parts(index);
                 Ok(H5Dataset::new_writer(

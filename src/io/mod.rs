@@ -27,11 +27,22 @@ pub enum IoError {
     /// The object exists in the file but uses a feature this reader cannot
     /// decode. The string names the feature.
     Unsupported(String),
-    /// A soft link whose target does not exist — `H5Dopen`/`H5Gopen` on a
-    /// path through it fails, which is not the same as the name being absent.
+    /// A soft or external link whose target does not exist — `H5Dopen`/
+    /// `H5Gopen` on a path through it fails, which is not the same as the name
+    /// being absent. `target` is the link value: a path for a soft link,
+    /// `file::path` for an external one.
     DanglingLink {
         link: String,
         target: String,
+    },
+    /// An external link whose target *file* could not be opened. `searched`
+    /// lists the candidate paths tried, in the order
+    /// `H5F_prefix_open_file` tries them, so a link that resolved on one
+    /// machine and not another says where it looked.
+    ExternalFileNotFound {
+        link: String,
+        file: String,
+        searched: Vec<String>,
     },
 }
 
@@ -57,8 +68,19 @@ impl std::fmt::Display for IoError {
             Self::Unsupported(s) => write!(f, "unsupported: {}", s),
             Self::DanglingLink { link, target } => write!(
                 f,
-                "soft link '{}' points to '{}', which does not exist",
+                "link '{}' points to '{}', which does not exist",
                 link, target
+            ),
+            Self::ExternalFileNotFound {
+                link,
+                file,
+                searched,
+            } => write!(
+                f,
+                "external link '{}' names the file '{}', which could not be opened (tried: {})",
+                link,
+                file,
+                searched.join(", ")
             ),
         }
     }

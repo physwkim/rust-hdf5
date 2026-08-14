@@ -6,7 +6,7 @@
 //! Supports both legacy (v0/v1 superblock, v1 object headers, symbol tables)
 //! and modern (v2/v3 superblock, v2 object headers, link messages) formats.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::format::btree_v1::{BTreeV1Node, ChunkBTreeV1Node};
 use crate::format::bytes::read_le_uint as read_uint;
@@ -162,6 +162,40 @@ struct SoftLinkRef {
     target: String,
 }
 
+/// Where a path leaves this file: the external link it crosses, the file that
+/// link names, and the remainder of the path inside that file.
+pub(crate) struct ExternalEdge {
+    pub link: String,
+    pub file: String,
+    pub path: String,
+}
+
+impl ExternalEdge {
+    /// The error for "the link resolved to a file, but the object it names is
+    /// not in it" — the external counterpart of a dangling soft link.
+    fn dangling(&self) -> crate::io::IoError {
+        crate::io::IoError::DanglingLink {
+            link: self.link.clone(),
+            target: format!("{}::{}", self.file, self.path),
+        }
+    }
+}
+
+/// How a reader was opened, carried from the entry point to the per-superblock
+/// constructors: both facts an external link needs later (where to resolve a
+/// relative target from, and under which locking policy to open it) are fixed
+/// at open time and belong together.
+struct Origin {
+    path: PathBuf,
+    locking: crate::io::locking::FileLocking,
+}
+
+/// Bound on how many external links one path resolution may cross, matching
+/// libhdf5's `H5L_NUM_LINKS` (the `H5Pset_nlinks` default). Two files that
+/// link to each other form a cycle whose every hop opens a fresh target, so it
+/// is this count, not target identity, that terminates the walk.
+const MAX_EXTERNAL_HOPS: usize = 16;
+
 /// What path traversal produced.
 enum Traversal {
     /// A path in this file, after every group hard-link alias and soft link
@@ -309,6 +343,34 @@ pub struct Hdf5Reader {
     /// A listing is a listing of links, so this holds soft and external
     /// links as well as the hard links that name the objects above.
     links: std::collections::BTreeMap<String, LinkClass>,
+    /// The path this file was opened with. An external link resolves its
+    /// target relative to the directory holding it (libhdf5 keeps the same
+    /// thing as `H5F_EXTPATH`), so the reader has to remember where it came
+    /// from.
+    path: PathBuf,
+    /// The locking policy this file was opened under, reused verbatim for
+    /// every external target: libhdf5 hands `H5F_prefix_open_file` the
+    /// parent's file-access property list, so one `HDF5_USE_FILE_LOCKING`
+    /// setting (or one `H5FileOptions::locking` call) governs every file a
+    /// path touches, not just the first.
+    locking: crate::io::locking::FileLocking,
+    /// External-link target files, keyed by the resolved path that opened
+    /// them, so N links naming one file share one open handle.
+    ///
+    /// An entry is created the first time a path actually crosses the link and
+    /// lives until this reader is dropped — that is, for the life of the
+    /// `H5File` that owns it. A target's own external links are cached in that
+    /// target's map, so the first reader in a chain transitively holds the
+    /// whole chain open.
+    external: std::collections::BTreeMap<PathBuf, Box<Hdf5Reader>>,
+    /// What each external link's stored file name resolved to, keyed by that
+    /// name exactly as the link holds it.
+    ///
+    /// The search runs once per distinct name per reader and its answer is
+    /// then fixed: re-probing the filesystem on a later crossing would let one
+    /// link answer differently mid-session, and would fail to find the handle
+    /// it already holds once the target has been renamed or unlinked.
+    external_resolved: std::collections::BTreeMap<String, PathBuf>,
 }
 
 /// Total byte length of `dims.product() * element_size`, computed with
@@ -535,9 +597,13 @@ impl Hdf5Reader {
         let sb_buf = handle.read_at_most(0, 1024)?;
         let version = detect_superblock_version(&sb_buf)?;
 
+        let origin = Origin {
+            path: path.to_path_buf(),
+            locking,
+        };
         match version {
-            0 | 1 => Self::open_v0v1(handle, &sb_buf),
-            2 | 3 => Self::open_v2v3(handle, &sb_buf),
+            0 | 1 => Self::open_v0v1(handle, &sb_buf, origin),
+            2 | 3 => Self::open_v2v3(handle, &sb_buf, origin),
             v => Err(crate::io::IoError::Format(
                 crate::format::FormatError::InvalidVersion(v),
             )),
@@ -545,7 +611,7 @@ impl Hdf5Reader {
     }
 
     /// Open a file with v2/v3 superblock (existing code path).
-    fn open_v2v3(mut handle: FileHandle, sb_buf: &[u8]) -> IoResult<Self> {
+    fn open_v2v3(mut handle: FileHandle, sb_buf: &[u8], origin: Origin) -> IoResult<Self> {
         let sb = SuperblockV2V3::decode(sb_buf)?;
 
         let ctx = FormatContext {
@@ -590,11 +656,15 @@ impl Hdf5Reader {
             group_paths: catalog.group_paths,
             group_aliases: catalog.group_aliases,
             links: catalog.links,
+            path: origin.path,
+            locking: origin.locking,
+            external: Default::default(),
+            external_resolved: Default::default(),
         })
     }
 
     /// Open a file with v0/v1 superblock (legacy format).
-    fn open_v0v1(mut handle: FileHandle, sb_buf: &[u8]) -> IoResult<Self> {
+    fn open_v0v1(mut handle: FileHandle, sb_buf: &[u8], origin: Origin) -> IoResult<Self> {
         let sb = SuperblockV0V1::decode(sb_buf)?;
 
         let ctx = FormatContext {
@@ -683,6 +753,10 @@ impl Hdf5Reader {
             group_paths: catalog.group_paths,
             group_aliases: catalog.group_aliases,
             links: catalog.links,
+            path: origin.path,
+            locking: origin.locking,
+            external: Default::default(),
+            external_resolved: Default::default(),
         })
     }
 
@@ -1254,10 +1328,14 @@ impl Hdf5Reader {
 
     /// Why the dataset at `path` (no leading `/`) cannot be read, or `None`
     /// when it can be — or does not exist.
-    pub fn unreadable_reason(&self, path: &str) -> Option<&str> {
-        self.unreadable
-            .get(&self.canonical_path(path))
-            .map(String::as_str)
+    pub fn unreadable_reason(&mut self, path: &str) -> Option<&str> {
+        if self.external_edge(path).is_some() {
+            let (owner, local, _) = self.external_owner(path, MAX_EXTERNAL_HOPS).ok()?;
+            let local = owner.canonical_path(&local);
+            return owner.unreadable.get(&local).map(String::as_str);
+        }
+        let path = self.canonical_path(path);
+        self.unreadable.get(&path).map(String::as_str)
     }
 
     /// Every link record in the file, keyed by full path (no leading `/`).
@@ -1267,15 +1345,21 @@ impl Hdf5Reader {
 
     /// The class of the link at `path` (no leading `/`), or `None` when no
     /// link of that name exists. The path is traversed first, so a link
-    /// reached through a group hard link or a soft link resolves.
-    pub fn link_class(&self, path: &str) -> Option<&LinkClass> {
-        if let Some(class) = self.links.get(path) {
-            return Some(class);
+    /// reached through a group hard link, a soft link or an external link
+    /// resolves — an external link's own record is found before the
+    /// traversal crosses it, since a name matches its own link exactly.
+    pub fn link_class(&mut self, path: &str) -> Option<&LinkClass> {
+        let path = path.trim_start_matches('/');
+        if self.links.contains_key(path) {
+            return self.links.get(path);
         }
-        match self.traverse(path) {
-            Traversal::Path { path, .. } => self.links.get(&path),
-            Traversal::External { .. } => None,
+        if self.external_edge(path).is_some() {
+            let (owner, local, _) = self.external_owner(path, MAX_EXTERNAL_HOPS).ok()?;
+            let local = owner.canonical_path(&local);
+            return owner.links.get(&local);
         }
+        let path = self.canonical_path(path);
+        self.links.get(&path)
     }
 
     /// Follow a path (no leading `/`) the way `H5Dopen` / `H5Gopen` do:
@@ -1352,9 +1436,130 @@ impl Hdf5Reader {
         }
     }
 
-    /// Return metadata for a dataset by name. Like `H5Dopen`, the name
-    /// may pass through group hard links and soft links.
-    pub fn dataset_info(&self, name: &str) -> Option<&DatasetReadInfo> {
+    /// Where `name` leaves this file, or `None` when it resolves inside it.
+    ///
+    /// This is the one question every path-taking entry point asks before it
+    /// looks anything up: a name that crosses an external link is not this
+    /// file's to answer, and answering it from this file's catalog anyway is
+    /// how such a name came back as a plain absence.
+    pub(crate) fn external_edge(&self, name: &str) -> Option<ExternalEdge> {
+        match self.traverse(name) {
+            Traversal::Path { .. } => None,
+            Traversal::External { link, file, path } => Some(ExternalEdge { link, file, path }),
+        }
+    }
+
+    /// Candidate filesystem paths for an external link's target file, in the
+    /// order `H5F_prefix_open_file` tries them: an absolute name as given,
+    /// then each `HDF5_EXT_PREFIX` component, then the directory holding this
+    /// file, then the working directory. An absolute name that does not exist
+    /// falls back to its last component for the later attempts, as the C does.
+    ///
+    /// The one step of that order this does not implement is the link-access
+    /// property list's `H5Pset_elink_prefix`, which has no equivalent in this
+    /// crate's API yet; it would sit between the environment variable and this
+    /// file's directory.
+    fn external_candidates(&self, file: &str) -> Vec<PathBuf> {
+        let raw = Path::new(file);
+        let mut candidates = Vec::new();
+        if raw.is_absolute() {
+            candidates.push(raw.to_path_buf());
+        }
+        // Every attempt after an absolute miss uses the bare file name.
+        let base: &Path = if raw.is_absolute() {
+            Path::new(raw.file_name().unwrap_or(raw.as_os_str()))
+        } else {
+            raw
+        };
+        if let Ok(prefixes) = std::env::var("HDF5_EXT_PREFIX") {
+            candidates.extend(
+                prefixes
+                    .split(':')
+                    .filter(|p| !p.is_empty())
+                    .map(|p| Path::new(p).join(base)),
+            );
+        }
+        if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            candidates.push(dir.join(base));
+        }
+        candidates.push(base.to_path_buf());
+        candidates
+    }
+
+    /// Open one external link's target file, or hand back the handle a
+    /// previous link to the same resolved path already opened.
+    fn external_target(&mut self, link: &str, file: &str) -> IoResult<&mut Hdf5Reader> {
+        // The search runs once per link value; after that the answer is what
+        // this reader resolved it to, whatever the filesystem does next.
+        let resolved = match self.external_resolved.get(file) {
+            Some(resolved) => resolved.clone(),
+            None => {
+                let candidates = self.external_candidates(file);
+                let resolved = candidates
+                    .iter()
+                    .find(|p| p.is_file())
+                    .cloned()
+                    .ok_or_else(|| crate::io::IoError::ExternalFileNotFound {
+                        link: link.to_string(),
+                        file: file.to_string(),
+                        searched: candidates.iter().map(|p| p.display().to_string()).collect(),
+                    })?;
+                self.external_resolved
+                    .insert(file.to_string(), resolved.clone());
+                resolved
+            }
+        };
+        let locking = self.locking;
+        match self.external.entry(resolved) {
+            std::collections::btree_map::Entry::Occupied(e) => Ok(&mut **e.into_mut()),
+            std::collections::btree_map::Entry::Vacant(e) => {
+                let reader = Hdf5Reader::open_with_locking(e.key(), locking)?;
+                Ok(&mut **e.insert(Box::new(reader)))
+            }
+        }
+    }
+
+    /// The reader that owns `name`, the path of `name` inside it, and the last
+    /// external link crossed to get there.
+    ///
+    /// This is the single owner of cross-file resolution: it follows external
+    /// links until the remaining path resolves inside the reader it returns,
+    /// so callers do exactly one delegation and never have to re-check.
+    fn external_owner(
+        &mut self,
+        name: &str,
+        hops: usize,
+    ) -> IoResult<(&mut Self, String, Option<ExternalEdge>)> {
+        let path = name.trim_start_matches('/').to_string();
+        let Some(edge) = self.external_edge(&path) else {
+            return Ok((self, path, None));
+        };
+        if hops == 0 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "resolving '{name}' crossed more than {MAX_EXTERNAL_HOPS} external links \
+                 (libhdf5 stops at the same H5L_NUM_LINKS); the links may form a cycle"
+            )));
+        }
+        let target = self.external_target(&edge.link, &edge.file)?;
+        let (owner, path, deeper) = target.external_owner(&edge.path, hops - 1)?;
+        Ok((owner, path, deeper.or(Some(edge))))
+    }
+
+    /// Return metadata for a dataset by name. Like `H5Dopen`, the name may
+    /// pass through group hard links, soft links and external links.
+    pub fn dataset_info(&mut self, name: &str) -> Option<&DatasetReadInfo> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS).ok()?;
+            return owner.dataset_info_local(&path);
+        }
+        self.dataset_info_local(name)
+    }
+
+    /// [`dataset_info`](Self::dataset_info) restricted to this file: soft
+    /// links and group hard links resolve, an external link does not. Every
+    /// read path uses this, because by then the owning reader has already been
+    /// selected and the path is local to it.
+    fn dataset_info_local(&self, name: &str) -> Option<&DatasetReadInfo> {
         let name = self.canonical_path(name);
         self.datasets.iter().find(|d| d.name == name)
     }
@@ -1362,18 +1567,30 @@ impl Hdf5Reader {
     /// Open `name` as a dataset the way `H5Dopen` does, reporting *why* it
     /// cannot be opened instead of collapsing every cause into absence: a
     /// soft link whose target does not exist is a dangling link, and a path
-    /// through an external link leaves this file.
+    /// through an external link is resolved in the file that link names.
     ///
     /// This is the gate every typed dataset access goes through.
-    pub fn open_dataset(&self, name: &str) -> IoResult<&DatasetReadInfo> {
-        let (path, via) = match self.traverse(name) {
-            Traversal::Path { path, via } => (path, via),
-            Traversal::External { link, file, path } => {
-                return Err(crate::io::IoError::Unsupported(format!(
-                    "'{name}' resolves through the external link '{link}' to '{path}' in \
-                     '{file}'; this reader lists external links but does not follow them"
-                )));
-            }
+    pub fn open_dataset(&mut self, name: &str) -> IoResult<&DatasetReadInfo> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, edge) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return match owner.open_dataset_local(&path) {
+                // The name is absent in the target file, which makes the link
+                // that pointed there dangling — not the caller's path absent.
+                Err(crate::io::IoError::NotFound(_)) => {
+                    Err(edge.map_or_else(|| crate::io::IoError::NotFound(path), |e| e.dangling()))
+                }
+                other => other,
+            };
+        }
+        self.open_dataset_local(name)
+    }
+
+    /// [`open_dataset`](Self::open_dataset) restricted to this file.
+    fn open_dataset_local(&self, name: &str) -> IoResult<&DatasetReadInfo> {
+        let Traversal::Path { path, via } = self.traverse(name) else {
+            // `external_owner` only ever returns a reader in which the
+            // remaining path resolves locally, so no caller can land here.
+            return Err(crate::io::IoError::NotFound(name.to_string()));
         };
         if let Some(info) = self.datasets.iter().find(|d| d.name == path) {
             return Ok(info);
@@ -1390,7 +1607,7 @@ impl Hdf5Reader {
     }
 
     /// Return the attribute names of a dataset.
-    pub fn dataset_attr_names(&self, name: &str) -> IoResult<Vec<String>> {
+    pub fn dataset_attr_names(&mut self, name: &str) -> IoResult<Vec<String>> {
         let info = self
             .dataset_info(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
@@ -1398,7 +1615,7 @@ impl Hdf5Reader {
     }
 
     /// Return a specific attribute by dataset name and attribute name.
-    pub fn dataset_attr(&self, ds_name: &str, attr_name: &str) -> IoResult<&AttributeMessage> {
+    pub fn dataset_attr(&mut self, ds_name: &str, attr_name: &str) -> IoResult<&AttributeMessage> {
         let info = self
             .dataset_info(ds_name)
             .ok_or_else(|| crate::io::IoError::NotFound(ds_name.to_string()))?;
@@ -1424,7 +1641,22 @@ impl Hdf5Reader {
     /// Return the attribute names of a non-root group (path without a
     /// leading `/`, e.g. `"detector"` or `"entry/instrument"`; may pass
     /// through group hard links).
-    pub fn group_attr_names(&self, group_path: &str) -> Vec<String> {
+    pub fn group_attr_names(&mut self, group_path: &str) -> Vec<String> {
+        if self.external_edge(group_path).is_some() {
+            let Ok((owner, local, _)) = self.external_owner(group_path, MAX_EXTERNAL_HOPS) else {
+                return Vec::new();
+            };
+            // The empty remainder is the target file's root group, whose
+            // attributes are not in the per-group map.
+            if local.is_empty() {
+                return owner.root_attr_names();
+            }
+            return owner.group_attr_names_local(&local);
+        }
+        self.group_attr_names_local(group_path)
+    }
+
+    fn group_attr_names_local(&self, group_path: &str) -> Vec<String> {
         self.group_attributes
             .get(&self.canonical_path(group_path))
             .map(|v| v.iter().map(|a| a.name.clone()).collect())
@@ -1432,7 +1664,18 @@ impl Hdf5Reader {
     }
 
     /// Return a non-root group's attribute by name.
-    pub fn group_attr(&self, group_path: &str, name: &str) -> Option<&AttributeMessage> {
+    pub fn group_attr(&mut self, group_path: &str, name: &str) -> Option<&AttributeMessage> {
+        if self.external_edge(group_path).is_some() {
+            let (owner, local, _) = self.external_owner(group_path, MAX_EXTERNAL_HOPS).ok()?;
+            if local.is_empty() {
+                return owner.root_attr(name);
+            }
+            return owner.group_attr_local(&local, name);
+        }
+        self.group_attr_local(group_path, name)
+    }
+
+    fn group_attr_local(&self, group_path: &str, name: &str) -> Option<&AttributeMessage> {
         self.group_attributes
             .get(&self.canonical_path(group_path))?
             .iter()
@@ -1522,7 +1765,7 @@ impl Hdf5Reader {
     }
 
     /// Return the dimensions of a dataset.
-    pub fn dataset_shape(&self, name: &str) -> IoResult<Vec<u64>> {
+    pub fn dataset_shape(&mut self, name: &str) -> IoResult<Vec<u64>> {
         let info = self
             .dataset_info(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
@@ -1533,7 +1776,7 @@ impl Hdf5Reader {
     /// element_size`), with the datatype needed for the post-filter conversion.
     fn raw_size_and_datatype(&self, name: &str) -> IoResult<(DatatypeMessage, u64)> {
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let total = saturating_byte_len(&info.dataspace.dims, info.datatype.element_size() as u64);
         Ok((info.datatype.clone(), total))
@@ -1541,6 +1784,10 @@ impl Hdf5Reader {
 
     /// Read the raw bytes of a dataset.
     pub fn read_dataset_raw(&mut self, name: &str) -> IoResult<Vec<u8>> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.read_dataset_raw(&path);
+        }
         let (datatype, total) = self.raw_size_and_datatype(name)?;
         let mut data = alloc_tiled_fill(total as usize, None)?;
         self.read_dataset_raw_into_unconverted(name, &mut data)?;
@@ -1557,6 +1804,10 @@ impl Hdf5Reader {
     /// point for reading directly into a pinned/registered host buffer for an
     /// H2D transfer.
     pub fn read_dataset_raw_into(&mut self, name: &str, out: &mut [u8]) -> IoResult<()> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.read_dataset_raw_into(&path, out);
+        }
         let (datatype, total) = self.raw_size_and_datatype(name)?;
         if out.len() as u64 != total {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -1581,7 +1832,7 @@ impl Hdf5Reader {
     /// `out.len()` must equal `product(dims) * element_size`.
     fn read_dataset_raw_into_unconverted(&mut self, name: &str, out: &mut [u8]) -> IoResult<()> {
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
 
         // Clone to avoid borrow conflict with &mut self in read methods.
@@ -1742,7 +1993,7 @@ impl Hdf5Reader {
             single_chunk_filter,
         } = desc;
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
@@ -1962,7 +2213,7 @@ impl Hdf5Reader {
         use crate::format::chunk_index::fixed_array::*;
 
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
@@ -2198,7 +2449,7 @@ impl Hdf5Reader {
         use crate::format::chunk_index::btree_v2::*;
 
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
@@ -2389,7 +2640,7 @@ impl Hdf5Reader {
         output: &mut [u8],
     ) -> IoResult<()> {
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
@@ -2771,8 +3022,12 @@ impl Hdf5Reader {
     /// references. Both `read_vlen_strings` (UTF-8 view) and `read_vlen_bytes`
     /// (raw view) layer on top of this.
     fn read_vlen_objects(&mut self, name: &str) -> IoResult<Vec<Vec<u8>>> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.read_vlen_objects(&path);
+        }
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let layout = info.layout.clone();
@@ -3067,6 +3322,10 @@ impl Hdf5Reader {
     /// starts[d] is the first index along dim d, counts[d] is how many.
     /// Returns the selected data in row-major order.
     pub fn read_slice(&mut self, name: &str, starts: &[u64], counts: &[u64]) -> IoResult<Vec<u8>> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.read_slice(&path, starts, counts);
+        }
         let (datatype, out_bytes) = self.slice_size_and_datatype(name, counts)?;
         let mut data = alloc_tiled_fill(out_bytes as usize, None)?;
         self.read_slice_into_unconverted(name, starts, counts, &mut data)?;
@@ -3088,6 +3347,10 @@ impl Hdf5Reader {
         counts: &[u64],
         out: &mut [u8],
     ) -> IoResult<()> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.read_slice_into(&path, starts, counts, out);
+        }
         let (datatype, out_bytes) = self.slice_size_and_datatype(name, counts)?;
         if out.len() as u64 != out_bytes {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -3109,7 +3372,7 @@ impl Hdf5Reader {
         counts: &[u64],
     ) -> IoResult<(DatatypeMessage, u64)> {
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let out_bytes = saturating_byte_len(counts, info.datatype.element_size() as u64);
         Ok((info.datatype.clone(), out_bytes))
@@ -3133,7 +3396,7 @@ impl Hdf5Reader {
         out: &mut [u8],
     ) -> IoResult<()> {
         let info = self
-            .dataset_info(name)
+            .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;

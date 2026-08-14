@@ -27,9 +27,9 @@ use rust_hdf5::format::messages::datatype::{
 };
 use rust_hdf5::format::messages::filter::{Filter, FilterPipeline, FILTER_FLETCHER32};
 use rust_hdf5::types::VarLenUnicode;
-use rust_hdf5::{H5Dataset, H5File, H5Group, LinkClass};
+use rust_hdf5::{H5Dataset, H5File, H5Group, Hdf5Error, LinkClass};
 
-const CANON_VERSION: &str = "2";
+const CANON_VERSION: &str = "3";
 const RAW_LIMIT: usize = 1024;
 const MAX_DEPTH: usize = 32;
 
@@ -632,18 +632,45 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
                     ),
                 }
             }
-            // A soft or external link is reported by its value and never
-            // followed, exactly as canon.py reports it.
+            // A soft link is reported by its value and never followed here,
+            // exactly as canon.py reports it.
             Child::Soft(target) => {
                 d.emit(&format!("{cpath}#kind"), "softlink");
                 d.emit(&format!("{cpath}#target"), target);
             }
+            // An external link reports its value and then what crossing it
+            // lands on, so the dump distinguishes a reader that follows the
+            // link from one that only lists it.
             Child::External(efile, epath) => {
                 d.emit(&format!("{cpath}#kind"), "extlink");
                 d.emit(&format!("{cpath}#target"), format!("{efile}::{epath}"));
+                d.field(&cpath, "resolved", || resolve_extlink(file, &cpath));
             }
             Child::Unclassified(why) => d.emit(&format!("{cpath}#kind"), unsupported("kind", &why)),
         }
+    }
+}
+
+/// What crossing an external link lands on — canon.py's `resolve_extlink`.
+///
+/// `H5File::dataset` is the only public entry point that crosses a link, so a
+/// target that is a group answers as a capability gap rather than as `group`;
+/// that gap is real and is what the field is here to measure.
+fn resolve_extlink(file: &H5File, cpath: &str) -> std::result::Result<String, String> {
+    let lookup = cpath.trim_start_matches('/').to_string();
+    match guarded(|| file.dataset(&lookup)) {
+        Ok(Ok(ds)) => {
+            let dims = guarded(|| ds.shape()).map_err(|p| format!("panic: {p}"))?;
+            let dtype = guarded(|| ds.datatype()).ok().and_then(|r| r.ok());
+            let payload = dataset_payload(&ds, dtype.as_ref())?;
+            Ok(format!("dataset {} {}", dims_str(&dims), payload))
+        }
+        // A missing target file and a missing target object are one answer,
+        // as they are on the h5py side.
+        Ok(Err(Hdf5Error::DanglingLink { .. }))
+        | Ok(Err(Hdf5Error::ExternalFileNotFound { .. })) => Ok("dangling".into()),
+        Ok(Err(e)) => Err(oneline(e)),
+        Err(p) => Err(format!("panic: {p}")),
     }
 }
 
