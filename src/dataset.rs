@@ -2415,6 +2415,197 @@ impl H5Dataset {
         }
     }
 
+    /// Read a strided hyperslab as a typed vector — h5py's stepped slicing
+    /// (`ds[a:b:s]`) or the general `start`/`stride`/`count`/`block` form of
+    /// `H5Sselect_hyperslab`.
+    ///
+    /// One entry per dimension: `start[d]` is the first index, `stride[d]`
+    /// the spacing between selected blocks (all-`1` is the same selection
+    /// [`read_slice`](Self::read_slice) reads), `count[d]` how many blocks,
+    /// and `block[d]` how many contiguous elements each block covers. The
+    /// returned vector is row-major over `count[d] * block[d]` per
+    /// dimension — exactly the shape h5py's stepped slicing produces.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open("data.h5").unwrap();
+    /// let ds = file.dataset("series").unwrap(); // shape [100]
+    /// // Python: ds[0:100:2] — every other element.
+    /// let evens: Vec<f64> = ds.read_hyperslab(&[0], &[2], &[50], &[1]).unwrap();
+    /// ```
+    pub fn read_hyperslab<T: H5Type>(
+        &self,
+        start: &[usize],
+        stride: &[usize],
+        count: &[usize],
+        block: &[usize],
+    ) -> Result<Vec<T>> {
+        match &self.info {
+            DatasetInfo::Reader {
+                name, element_size, ..
+            } => {
+                if T::element_size() != *element_size {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "read type has element size {} but dataset has element size {}",
+                        T::element_size(),
+                        element_size,
+                    )));
+                }
+                let datatype = self.datatype()?;
+                let start_u64: Vec<u64> = start.iter().map(|&s| s as u64).collect();
+                let stride_u64: Vec<u64> = stride.iter().map(|&s| s as u64).collect();
+                let count_u64: Vec<u64> = count.iter().map(|&c| c as u64).collect();
+                let block_u64: Vec<u64> = block.iter().map(|&b| b as u64).collect();
+
+                let mut raw = {
+                    let mut inner = borrow_inner_mut(&self.file_inner);
+                    match &mut *inner {
+                        H5FileInner::Reader(reader) => reader.read_hyperslab(
+                            name,
+                            &start_u64,
+                            &stride_u64,
+                            &count_u64,
+                            &block_u64,
+                        )?,
+                        _ => {
+                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()))
+                        }
+                    }
+                };
+                to_host_byte_order(&mut raw, &datatype, T::element_size())?;
+
+                if raw.len() % T::element_size() != 0 {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "raw data size {} is not a multiple of element size {}",
+                        raw.len(),
+                        T::element_size(),
+                    )));
+                }
+
+                let count = raw.len() / T::element_size();
+                let mut result = Vec::<T>::with_capacity(count);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        raw.as_ptr(),
+                        result.as_mut_ptr() as *mut u8,
+                        raw.len(),
+                    );
+                    result.set_len(count);
+                }
+                Ok(result)
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read_hyperslab from a dataset in write mode".into(),
+            )),
+        }
+    }
+
+    /// Read a list of coordinates in one call, as a typed vector — h5py
+    /// fancy indexing with a coordinate list.
+    ///
+    /// `points[i]` is a coordinate with one entry per dimension. The
+    /// returned vector holds one element per point, in the same order as
+    /// `points`, regardless of the dataset's rank.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open("data.h5").unwrap();
+    /// let ds = file.dataset("grid").unwrap(); // shape [10, 10]
+    /// // Python: ds[np.array([[0, 0], [3, 4], [9, 9]])]
+    /// let picked: Vec<f64> = ds.read_points(&[vec![0, 0], vec![3, 4], vec![9, 9]]).unwrap();
+    /// ```
+    pub fn read_points<T: H5Type>(&self, points: &[Vec<usize>]) -> Result<Vec<T>> {
+        match &self.info {
+            DatasetInfo::Reader {
+                name, element_size, ..
+            } => {
+                if T::element_size() != *element_size {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "read type has element size {} but dataset has element size {}",
+                        T::element_size(),
+                        element_size,
+                    )));
+                }
+                let datatype = self.datatype()?;
+                let points_u64: Vec<Vec<u64>> = points
+                    .iter()
+                    .map(|p| p.iter().map(|&c| c as u64).collect())
+                    .collect();
+
+                let mut raw = {
+                    let mut inner = borrow_inner_mut(&self.file_inner);
+                    match &mut *inner {
+                        H5FileInner::Reader(reader) => reader.read_points(name, &points_u64)?,
+                        _ => {
+                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()))
+                        }
+                    }
+                };
+                to_host_byte_order(&mut raw, &datatype, T::element_size())?;
+
+                if raw.len() % T::element_size() != 0 {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "raw data size {} is not a multiple of element size {}",
+                        raw.len(),
+                        T::element_size(),
+                    )));
+                }
+
+                let count = raw.len() / T::element_size();
+                let mut result = Vec::<T>::with_capacity(count);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        raw.as_ptr(),
+                        result.as_mut_ptr() as *mut u8,
+                        raw.len(),
+                    );
+                    result.set_len(count);
+                }
+                Ok(result)
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read_points from a dataset in write mode".into(),
+            )),
+        }
+    }
+
+    /// Read one chunk's raw (still-filtered) bytes and its filter mask,
+    /// addressed by chunk-grid coordinates — the read half of
+    /// [`write_chunk_raw_at`](Self::write_chunk_raw_at) and the HDF5 "direct
+    /// chunk read" (`H5Dread_chunk`, formerly `H5DOread_chunk`; h5py's
+    /// `Dataset.id.read_direct_chunk`).
+    ///
+    /// The bytes are exactly what is stored on disk: filtered/compressed if
+    /// the dataset has a filter pipeline, with no decompression applied. The
+    /// returned `u32` is the chunk's filter mask: bit *i* set means filter
+    /// *i* of the pipeline was **not** applied to this particular chunk and
+    /// must be skipped when reversing it.
+    ///
+    /// `Err` if the dataset is not chunked, `chunk_coords` has the wrong
+    /// rank, or the chunk at those coordinates has never been written.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open("data.h5").unwrap();
+    /// let ds = file.dataset("frames").unwrap();
+    /// let (raw, filter_mask) = ds.read_chunk_raw_at(&[0, 0]).unwrap();
+    /// ```
+    pub fn read_chunk_raw_at(&self, chunk_coords: &[usize]) -> Result<(Vec<u8>, u32)> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let coords_u64: Vec<u64> = chunk_coords.iter().map(|&c| c as u64).collect();
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => Ok(reader.read_chunk_raw_at(name, &coords_u64)?),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read_chunk_raw_at from a dataset in write mode".into(),
+            )),
+        }
+    }
+
     /// Write a typed slice to a sub-region of the dataset.
     ///
     /// `starts` and `counts` define the N-dimensional selection, which must lie

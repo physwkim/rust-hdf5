@@ -72,6 +72,30 @@ fn read_back_with_h5py(py: &str, path: &std::path::Path, body: &str) {
     );
 }
 
+/// `read_back_with_h5py`, but returning `body`'s stdout instead of only
+/// checking the exit status — for a check that needs h5py's own computed
+/// answer (a stepped slice, a fancy-indexed pick, `read_direct_chunk`) rather
+/// than one a Rust-side formula can stand in for.
+fn capture_from_h5py(py: &str, path: &std::path::Path, body: &str) -> String {
+    let script = format!(
+        "import h5py, numpy as np, sys\nf = h5py.File(r'{}', 'r')\n{}",
+        path.display(),
+        body
+    );
+    let out = std::process::Command::new(py)
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("failed to spawn python");
+    assert!(
+        out.status.success(),
+        "h5py cross-check failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 /// Run `body` (top-level python statements) with a fresh file opened as `f` in
 /// write mode. The body should populate `f` and is followed by `f.close()`. A
 /// non-zero exit fails the test.
@@ -4280,5 +4304,152 @@ fn a_link_change_on_a_reopened_dataset_rewrites_its_reference_count() {
          assert sorted(f.keys()) == ['alpha'], sorted(f.keys())\n\
          assert list(f['alpha'][...]) == [0, 1, 2]\n",
     );
+    std::fs::remove_file(&path).ok();
+}
+
+/// SELREAD-1: `read_hyperslab`'s `start`/`stride`/`count`/`block` against an
+/// h5py-written dataset must match h5py's own stepped slicing, not a
+/// hand-derived formula — the expected values come from h5py evaluating
+/// `ds[1:5:2, 2:8:3]` itself.
+#[test]
+fn h5py_written_dataset_readable_by_strided_hyperslab_read() {
+    let Some(py) = python() else { return };
+    let path = tmp("hyperslab_read");
+    write_with_h5py(
+        py,
+        &path,
+        "f.create_dataset('grid', data=np.arange(48, dtype='<i4').reshape(6, 8))\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("grid").unwrap();
+    // Python: ds[1:5:2, 2:8:3] -- rows {1, 3}, columns {2, 5}.
+    let got: Vec<i32> = ds
+        .read_hyperslab(&[1, 2], &[2, 3], &[2, 2], &[1, 1])
+        .unwrap();
+    drop(file);
+    let want_csv = capture_from_h5py(
+        py,
+        &path,
+        "want = f['grid'][1:5:2, 2:8:3].reshape(-1)\n\
+         print(','.join(str(int(x)) for x in want))\n",
+    );
+    let want: Vec<i32> = want_csv.split(',').map(|s| s.parse().unwrap()).collect();
+    assert_eq!(got, want);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A non-unit `block` covers h5py's *general* hyperslab form (contiguous
+/// blocks of more than one element per step), which stepped slicing alone
+/// cannot express — `ds[1:5:2, 2:8:3]` above only ever has `block == 1`.
+#[test]
+fn h5py_written_dataset_readable_by_hyperslab_read_with_block_greater_than_one() {
+    let Some(py) = python() else { return };
+    let path = tmp("hyperslab_block");
+    write_with_h5py(
+        py,
+        &path,
+        "f.create_dataset('grid', data=np.arange(48, dtype='<i4').reshape(6, 8))\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("grid").unwrap();
+    // start=[0,1], stride=[3,4], count=[2,2], block=[2,3]: two 2x3 blocks
+    // along each axis, spaced 3 and 4 apart.
+    let got: Vec<i32> = ds
+        .read_hyperslab(&[0, 1], &[3, 4], &[2, 2], &[2, 3])
+        .unwrap();
+    drop(file);
+    let want_csv = capture_from_h5py(
+        py,
+        &path,
+        // h5py's own selector only accepts a 1D array per fancy-indexed axis
+        // (no broadcasting), so the row pick goes through h5py and the
+        // column pick is plain numpy indexing on the now in-memory result.
+        "want = f['grid'][[0, 1, 3, 4], :][:, [1, 2, 3, 5, 6, 7]].reshape(-1)\n\
+         print(','.join(str(int(x)) for x in want))\n",
+    );
+    let want: Vec<i32> = want_csv.split(',').map(|s| s.parse().unwrap()).collect();
+    assert_eq!(got, want);
+    std::fs::remove_file(&path).ok();
+}
+
+/// SELREAD-2: `read_points` against an h5py-written dataset must match
+/// h5py's own coordinate-list point selection (`H5Sselect_elements`, exposed
+/// as `Dataspace.select_elements`), element for element and in the same
+/// order. h5py's high-level `ds[...]` fancy indexing is *orthogonal*
+/// indexing (a cross product of per-axis picks), not this — so the
+/// comparison goes through the low-level selection API that actually models
+/// a coordinate list, matching `Selection::Points`.
+#[test]
+fn h5py_written_dataset_readable_by_point_selection_read() {
+    let Some(py) = python() else { return };
+    let path = tmp("points_read");
+    write_with_h5py(
+        py,
+        &path,
+        "f.create_dataset('grid', data=np.arange(100, dtype='<f8').reshape(10, 10))\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("grid").unwrap();
+    let points = vec![vec![0, 0], vec![3, 4], vec![9, 9], vec![5, 2], vec![0, 9]];
+    let got: Vec<f64> = ds.read_points(&points).unwrap();
+    drop(file);
+    let want_csv = capture_from_h5py(
+        py,
+        &path,
+        "ds = f['grid']\n\
+         coords = [(0, 0), (3, 4), (9, 9), (5, 2), (0, 9)]\n\
+         space = ds.id.get_space()\n\
+         space.select_elements(coords)\n\
+         mspace = h5py.h5s.create_simple((len(coords),))\n\
+         want = np.zeros((len(coords),), dtype='<f8')\n\
+         ds.id.read(mspace, space, want)\n\
+         print(','.join(repr(float(x)) for x in want))\n",
+    );
+    let want: Vec<f64> = want_csv.split(',').map(|s| s.parse().unwrap()).collect();
+    assert_eq!(got, want);
+    std::fs::remove_file(&path).ok();
+}
+
+/// SELREAD-3: `read_chunk_raw_at` on a chunked + deflated dataset must
+/// return exactly the bytes and filter mask h5py's own
+/// `Dataset.id.read_direct_chunk` reports for the same chunk — still
+/// compressed, with no decoding on either side.
+#[cfg(feature = "deflate")]
+#[test]
+fn h5py_written_deflated_chunk_matches_h5py_read_direct_chunk() {
+    let Some(py) = python() else { return };
+    let path = tmp("chunk_read_deflate");
+    write_with_h5py(
+        py,
+        &path,
+        "f.create_dataset(\n\
+         \x20   'grid', data=np.arange(64, dtype='<i4').reshape(8, 8),\n\
+         \x20   chunks=(4, 4), compression='gzip', compression_opts=6,\n\
+         )\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("grid").unwrap();
+    // Chunk-grid coordinates [1, 0]: the second row of chunks, first column.
+    let (got_bytes, got_mask) = ds.read_chunk_raw_at(&[1, 0]).unwrap();
+    drop(file);
+    let want = capture_from_h5py(
+        py,
+        &path,
+        // read_direct_chunk takes an element offset, not a chunk-grid index:
+        // chunk [1, 0] with chunk shape (4, 4) starts at element (4, 0).
+        "mask, data = f['grid'].id.read_direct_chunk((4, 0))\n\
+         print(data.hex())\n\
+         print(mask)\n",
+    );
+    let mut lines = want.lines();
+    let want_hex = lines.next().unwrap();
+    let want_mask: u32 = lines.next().unwrap().parse().unwrap();
+    assert!(lines.next().is_none());
+    let want_bytes: Vec<u8> = (0..want_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&want_hex[i..i + 2], 16).unwrap())
+        .collect();
+    assert_eq!(got_bytes, want_bytes);
+    assert_eq!(got_mask, want_mask);
     std::fs::remove_file(&path).ok();
 }
