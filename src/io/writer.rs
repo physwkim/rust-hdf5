@@ -32,7 +32,7 @@ use crate::format::messages::group_info::GroupInfoMessage;
 use crate::format::messages::link::LinkMessage;
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::*;
-use crate::format::object_header::{ObjectHeader, MAX_MESSAGE_SIZE};
+use crate::format::object_header::{ObjectHeader, ObjectTimes, MAX_MESSAGE_SIZE};
 use crate::format::superblock::*;
 use crate::format::{FormatContext, LibverBound, UNDEF_ADDR};
 
@@ -489,6 +489,12 @@ pub struct DatasetInfo {
     /// preserved from the file on reopen, and emitted verbatim at finalize.
     /// Contiguous datasets ignore it.
     pub layout_version: u8,
+    /// The four times this object's header stores, when it was created with
+    /// `H5Pset_obj_track_times(true)`. `None` for a dataset this writer
+    /// created — it offers no way to ask for times — and whatever the file
+    /// held for a reopened one, so a rewrite hands them back rather than
+    /// dropping the flag that announces them.
+    pub times: Option<ObjectTimes>,
 }
 
 impl DatasetInfo {
@@ -675,6 +681,29 @@ fn recover_track_order(
         links,
         attrs: header.attribute_creation_order(),
     }
+}
+
+/// The times a header being (re)written carries, given what the object had.
+///
+/// Every object header this writer emits is one it is writing *now*, which is
+/// what `H5O_touch_oh` is called for: an object that stores times gets its
+/// access and change time moved to now, and one that does not store them stays
+/// that way — the flag belongs to the object's creation property list, and a
+/// rewrite is not a creation.
+fn touched_times(times: Option<ObjectTimes>) -> Option<ObjectTimes> {
+    times.map(|t| t.touched(now_seconds()))
+}
+
+/// Seconds since the epoch, as an object header stores them (`H5_now`).
+///
+/// Saturates rather than wrapping: the field is a 32-bit count, and a clock
+/// past 2106 is better reported as the largest time the format can express
+/// than as a time in 1970. A clock before the epoch yields 0, which is what
+/// libhdf5 writes for "no time recorded".
+fn now_seconds() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX))
 }
 
 /// The dense storage an on-disk object header names: the fractal heap and the
@@ -979,6 +1008,9 @@ pub struct GroupInfo {
     /// finalize: a later change of policy must not rewrite an object already
     /// made.
     pub track_order: TrackOrder,
+    /// This group's stored times, on the same terms as
+    /// [`DatasetInfo::times`].
+    pub times: Option<ObjectTimes>,
 }
 
 /// One object's creation-order policy, with the two subsystems libhdf5 keeps
@@ -1140,6 +1172,10 @@ struct DatasetParts {
     /// read it from the writer instead would stamp this session's policy onto
     /// an object libhdf5 created under another.
     track_order: TrackOrder,
+    /// The times the on-disk header stores, for the same reason: whether an
+    /// object tracks them is settled when it is created, not when it is
+    /// rewritten.
+    times: Option<ObjectTimes>,
     /// The dense storage the rewrite supersedes and must free.
     dense: DenseCarry,
 }
@@ -1151,6 +1187,7 @@ struct GroupParts {
     attributes: Vec<AttributeEntry>,
     links: Vec<(crate::format::messages::link::LinkMessage, Vec<u8>)>,
     track_order: TrackOrder,
+    times: Option<ObjectTimes>,
     dense: DenseCarry,
 }
 
@@ -1174,6 +1211,7 @@ enum CollectedObject {
         header_size: usize,
         attributes: Vec<AttributeEntry>,
         track_order: TrackOrder,
+        times: Option<ObjectTimes>,
         dense: DenseCarry,
     },
 }
@@ -1252,10 +1290,11 @@ impl<'a> ReopenWalk<'a> {
             }
         };
 
-        // The policy and the storage the header declares, read once from the
-        // whole chain: both are properties of the object, not of any one
-        // message the loop below happens to reach.
+        // The policy, the times and the storage the header declares, read once
+        // from the whole chain: all three are properties of the object, not of
+        // any one message the loop below happens to reach.
         let track_order = recover_track_order(&header, ctx);
+        let times = header.times;
         let (dense_attrs, dense_links) = superseded_dense(&header, ctx);
 
         // Attributes come from the reader's collector rather than from the
@@ -1401,6 +1440,7 @@ impl<'a> ReopenWalk<'a> {
                     fill_value,
                     attributes,
                     track_order,
+                    times,
                     dense: DenseCarry {
                         attrs: dense_attrs,
                         links: dense_links,
@@ -1421,6 +1461,7 @@ impl<'a> ReopenWalk<'a> {
                 attributes,
                 links,
                 track_order,
+                times,
                 dense: DenseCarry {
                     attrs: dense_attrs,
                     links: dense_links,
@@ -1489,6 +1530,7 @@ impl<'a> ReopenWalk<'a> {
                             header_size: parts.header_size,
                             attributes: parts.attributes,
                             track_order: parts.track_order,
+                            times: parts.times,
                             dense: parts.dense,
                         },
                     ));
@@ -1528,6 +1570,7 @@ fn rebuild_dataset(
         fill_value,
         attributes: attrs,
         track_order,
+        times,
         dense: _,
     } = parts;
 
@@ -1562,6 +1605,7 @@ fn rebuild_dataset(
             DataLayoutMessage::ChunkedV4 { version, .. } => *version,
             _ => 4,
         },
+        times,
     };
 
     // Reconstruct storage-specific metadata
@@ -1980,6 +2024,10 @@ pub struct Hdf5Writer {
     /// [`create_with_options`](Self::create_with_options) — or, on reopen,
     /// from the header already on disk.
     root_track_order: TrackOrder,
+    /// The root group's stored times, on the same terms as
+    /// [`GroupInfo::times`]: whatever a reopened file's root header had, and
+    /// `None` for a file this writer created.
+    root_times: Option<ObjectTimes>,
     /// Hands out the creation sequence numbers that order a group's links.
     next_creation_seq: Slot<u64>,
     /// Object-reference elements waiting for their target's object header
@@ -2106,6 +2154,7 @@ impl Hdf5Writer {
             superseded_dense: Slot::new(None),
             track_order: TrackOrder::uniform(track_order),
             root_track_order: TrackOrder::uniform(track_order),
+            root_times: None,
             next_creation_seq: Slot::new(0),
             pending_object_references: Slot::new(Vec::new()),
         })
@@ -2451,6 +2500,7 @@ impl Hdf5Writer {
         let root_header_size = root.header_size;
         let root_attributes = root.attributes;
         let root_track_order = root.track_order;
+        let root_times = root.times;
         let root_dense = root.dense;
 
         walk.group(&root.links, "", 0)?;
@@ -2489,7 +2539,13 @@ impl Hdf5Writer {
         // link path — so finalize can free the block its rewrite supersedes —
         // plus the attributes the header carries, which the group registry
         // below must keep or finalize rewrites the group without them.
-        type GroupHeaderInfo = (u64, usize, Vec<AttributeEntry>, TrackOrder);
+        type GroupHeaderInfo = (
+            u64,
+            usize,
+            Vec<AttributeEntry>,
+            TrackOrder,
+            Option<ObjectTimes>,
+        );
         let mut group_headers: std::collections::HashMap<String, GroupHeaderInfo> =
             Default::default();
         // The dense storage each rebuilt dataset's header named, by registry
@@ -2509,10 +2565,14 @@ impl Hdf5Writer {
                     header_size,
                     attributes,
                     track_order,
+                    times,
                     dense,
                 } => {
                     group_dense.push((name.clone(), dense));
-                    group_headers.insert(name, (obj_addr, header_size, attributes, track_order));
+                    group_headers.insert(
+                        name,
+                        (obj_addr, header_size, attributes, track_order, times),
+                    );
                     continue;
                 }
                 CollectedObject::Dataset(parts) => *parts,
@@ -2580,16 +2640,22 @@ impl Hdf5Writer {
                     group_index_map.get(&parent_path).copied()
                 };
                 let gidx = groups.len();
-                let (obj_header_written_addr, obj_header_encoded_size, attributes, track_order) =
-                    group_headers.remove(path.trim_start_matches('/')).map_or(
-                        (None, 0, Vec::new(), TrackOrder::default()),
-                        |(addr, len, attrs, track)| (Some(addr), len, attrs, track),
-                    );
+                let (
+                    obj_header_written_addr,
+                    obj_header_encoded_size,
+                    attributes,
+                    track_order,
+                    times,
+                ) = group_headers.remove(path.trim_start_matches('/')).map_or(
+                    (None, 0, Vec::new(), TrackOrder::default(), None),
+                    |(addr, len, attrs, track, times)| (Some(addr), len, attrs, track, times),
+                );
                 groups.push(GroupInfo {
                     name: path.clone(),
                     parent,
                     creation_seq: 0,
                     track_order,
+                    times,
                     child_datasets: Vec::new(),
                     child_groups: Vec::new(),
                     obj_header_addr: 0,
@@ -2810,6 +2876,7 @@ impl Hdf5Writer {
             // The reopened file's own policy, so objects added in this
             // session are made the way the file already declares.
             root_track_order,
+            root_times,
             dense_attributes: Slot::new(HashMap::new()),
             dense_links: Slot::new(HashMap::new()),
             superseded_dense: Slot::new(superseded),
@@ -3680,6 +3747,7 @@ impl Hdf5Writer {
             parent: parent_idx,
             creation_seq: self.take_creation_seq(),
             track_order: self.track_order,
+            times: None,
             child_datasets: Vec::new(),
             child_groups: Vec::new(),
             obj_header_addr: 0,
@@ -4633,6 +4701,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version: 4,
+                times: None,
             },
         );
 
@@ -4674,6 +4743,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version: 4,
+                times: None,
             },
         );
 
@@ -4769,6 +4839,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
+                times: None,
                 fixed_array: None,
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
@@ -5858,6 +5929,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version: 4,
+                times: None,
                 chunked: None,
                 fixed_array: None,
                 btree_v2: None,
@@ -5964,6 +6036,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version: 4,
+                times: None,
                 chunked: None,
                 fixed_array: None,
                 btree_v2: None,
@@ -6095,6 +6168,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
+                times: None,
                 fixed_array: None,
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
@@ -7307,6 +7381,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
+                times: None,
                 chunked: None,
                 btree_v2: None,
                 fixed_array: Some(FixedArrayDatasetInfo {
@@ -7448,6 +7523,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
+                times: None,
                 chunked: None,
                 fixed_array: None,
                 btree_v2: Some(Bt2DatasetInfo {
@@ -7560,6 +7636,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
+                times: None,
                 fixed_array: None,
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
@@ -7669,6 +7746,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
+                times: None,
                 fixed_array: None,
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
@@ -9340,6 +9418,7 @@ impl Hdf5Writer {
         let ds = self.ds(index);
         let m = ds.lock();
         let mut header = ObjectHeader::new();
+        header.times = touched_times(m.times);
 
         // Dataspace message (type 0x01)
         let ds_msg = m.dataspace.encode(&self.ctx);
@@ -9444,11 +9523,12 @@ impl Hdf5Writer {
         // themselves, compact or dense.
         // Snapshot what the header needs, then drop the slot guard: the calls
         // below re-lock group slots (including this one).
-        let (attributes, track_order) = {
+        let (attributes, track_order, times) = {
             let grp = self.grp(group_idx);
             let g = grp.lock();
-            (g.attributes.clone(), g.track_order)
+            (g.attributes.clone(), g.track_order, g.times)
         };
+        header.times = touched_times(times);
 
         let links = self.group_links(LinkScope::Group(group_idx), track_order.links);
         self.emit_links(
@@ -9479,6 +9559,7 @@ impl Hdf5Writer {
 
     fn build_root_group_header(&self) -> ObjectHeader {
         let mut header = ObjectHeader::new();
+        header.times = touched_times(self.root_times);
 
         // Link Info (type 0x02) + Group Info (type 0x0A) + the links
         // themselves, compact or dense.

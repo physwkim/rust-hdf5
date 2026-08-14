@@ -70,12 +70,66 @@ pub struct ObjectHeaderMessage {
     pub data: Vec<u8>,
 }
 
+/// The four times a version-2 object header stores, in the order
+/// `H5O__cache_serialize` writes them: seconds since the epoch, as `H5_now`
+/// produces them.
+///
+/// Their presence *is* the `H5O_HDR_STORE_TIMES` flag — see
+/// [`ObjectHeader::times`] — so an object created with
+/// `H5Pset_obj_track_times(true)` cannot be encoded with the flag set and no
+/// times behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectTimes {
+    /// Access time (`oh->atime`).
+    pub access: u32,
+    /// Modification time (`oh->mtime`).
+    pub modification: u32,
+    /// Change time (`oh->ctime`).
+    pub change: u32,
+    /// Birth time (`oh->btime`).
+    pub birth: u32,
+}
+
+impl ObjectTimes {
+    /// All four set to `now` — what `H5O_create_ohdr` does for an object
+    /// created with timestamps enabled.
+    pub fn created_at(now: u32) -> Self {
+        Self {
+            access: now,
+            modification: now,
+            change: now,
+            birth: now,
+        }
+    }
+
+    /// These times after a real modification of the object.
+    ///
+    /// `H5O_touch_oh` moves access and change time to `now` for a version-2
+    /// header and leaves modification and birth time as they were — the
+    /// modification time is what its own `XXX` comment says is not updated
+    /// yet. Following it means a rewrite reports the same times libhdf5 would.
+    pub fn touched(self, now: u32) -> Self {
+        Self {
+            access: now,
+            change: now,
+            ..self
+        }
+    }
+}
+
 /// Object Header v2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectHeader {
     /// Header flags byte. Bits 0-1 control chunk0 size encoding. Other bits
-    /// control optional fields (timestamps, attr thresholds, creation order).
+    /// control optional fields (attr thresholds, creation order).
+    ///
+    /// Bit 5 (`H5O_HDR_STORE_TIMES`) is *not* held here: it is derived from
+    /// [`times`](Self::times) at encode and stripped at decode, so the flag and
+    /// the four values it announces cannot disagree. Setting it by hand here
+    /// does nothing — the encoder's flag byte comes from `times`.
     pub flags: u8,
+    /// The stored times, when this object tracks them.
+    pub times: Option<ObjectTimes>,
     /// The ordered list of header messages.
     pub messages: Vec<ObjectHeaderMessage>,
 }
@@ -88,6 +142,7 @@ impl ObjectHeader {
     pub fn new() -> Self {
         Self {
             flags: 0x02, // bits 0-1 = 2 => 4-byte chunk0 size
+            times: None,
             messages: Vec::new(),
         }
     }
@@ -146,6 +201,19 @@ impl ObjectHeader {
         )
     }
 
+    /// The flags byte as it reaches the file: everything [`flags`](Self::flags)
+    /// holds, with `H5O_HDR_STORE_TIMES` taken from
+    /// [`times`](Self::times) — the one place the two are joined, so a header
+    /// can neither claim times it does not have nor carry times it does not
+    /// declare.
+    fn encoded_flags(&self) -> u8 {
+        let base = self.flags & !FLAG_STORE_TIMESTAMPS;
+        match self.times {
+            Some(_) => base | FLAG_STORE_TIMESTAMPS,
+            None => base,
+        }
+    }
+
     /// Returns the number of bytes used to encode chunk0's data size, based on
     /// flags bits 0-1.
     fn chunk0_size_bytes(&self) -> usize {
@@ -201,7 +269,7 @@ impl ObjectHeader {
 
         // Estimate total size for pre-allocation
         let mut prefix_size: usize = 4 + 1 + 1; // OHDR + version + flags
-        if self.flags & FLAG_STORE_TIMESTAMPS != 0 {
+        if self.times.is_some() {
             prefix_size += 16; // 4 x u32
         }
         if self.flags & FLAG_NON_DEFAULT_ATTR_THRESHOLDS != 0 {
@@ -217,11 +285,13 @@ impl ObjectHeader {
         // Version
         buf.push(OHDR_VERSION);
         // Flags
-        buf.push(self.flags);
+        buf.push(self.encoded_flags());
 
-        // Optional timestamps (bit 5) -- for MVP we write zeros if enabled
-        if self.flags & FLAG_STORE_TIMESTAMPS != 0 {
-            buf.extend_from_slice(&[0u8; 16]);
+        // Optional timestamps (bit 5), in `H5O__cache_serialize` order.
+        if let Some(t) = self.times {
+            for field in [t.access, t.modification, t.change, t.birth] {
+                buf.extend_from_slice(&field.to_le_bytes());
+            }
         }
 
         // Optional attr storage thresholds (bit 4) -- write defaults if enabled
@@ -278,20 +348,33 @@ impl ObjectHeader {
             return Err(FormatError::InvalidVersion(version));
         }
 
-        let flags = buf[5];
+        // Bit 5 is stripped here and carried by `times` instead, so the two
+        // can only ever agree — see [`ObjectHeader::flags`].
+        let flags = buf[5] & !FLAG_STORE_TIMESTAMPS;
         let mut pos: usize = 6;
 
         // Optional timestamps (bit 5)
-        if flags & FLAG_STORE_TIMESTAMPS != 0 {
+        let times = if buf[5] & FLAG_STORE_TIMESTAMPS != 0 {
             if buf.len() < pos + 16 {
                 return Err(FormatError::BufferTooShort {
                     needed: pos + 16,
                     available: buf.len(),
                 });
             }
-            // Skip timestamps for now (MVP doesn't use them)
+            let read = |off: usize| {
+                u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+            };
+            let t = ObjectTimes {
+                access: read(pos),
+                modification: read(pos + 4),
+                change: read(pos + 8),
+                birth: read(pos + 12),
+            };
             pos += 16;
-        }
+            Some(t)
+        } else {
+            None
+        };
 
         // Optional attr storage thresholds (bit 4)
         if flags & FLAG_NON_DEFAULT_ATTR_THRESHOLDS != 0 {
@@ -405,7 +488,14 @@ impl ObjectHeader {
             });
         }
 
-        Ok((ObjectHeader { flags, messages }, total_consumed))
+        Ok((
+            ObjectHeader {
+                flags,
+                times,
+                messages,
+            },
+            total_consumed,
+        ))
     }
 }
 
@@ -517,6 +607,9 @@ impl ObjectHeader {
         Ok((
             ObjectHeader {
                 flags: 0x02, // default flags (not meaningful for v1)
+                // A v1 header keeps its modification time in a message
+                // (`H5O_MSG_MTIME`), never in the prefix.
+                times: None,
                 messages,
             },
             total_consumed,
@@ -698,6 +791,7 @@ mod tests {
     fn test_with_creation_order() {
         let mut hdr = ObjectHeader {
             flags: 0x02 | FLAG_ATTR_CREATION_ORDER_TRACKED,
+            times: None,
             messages: Vec::new(),
         };
         hdr.add_message(0x01, 0x00, vec![0xFF; 8]);
@@ -770,11 +864,82 @@ mod tests {
         assert_eq!(hdr.flags, 0x02);
     }
 
+    /// The four times survive a round trip in `H5O__cache_serialize` order,
+    /// and their presence is what sets `H5O_HDR_STORE_TIMES` in the file.
+    #[test]
+    fn stored_times_round_trip_and_set_the_flag() {
+        let mut hdr = ObjectHeader::new();
+        hdr.add_message(0x01, 0x00, vec![1, 2, 3]);
+        let without = hdr.encode().unwrap();
+
+        hdr.times = Some(ObjectTimes {
+            access: 0x0A0A_0A0A,
+            modification: 0x0B0B_0B0B,
+            change: 0x0C0C_0C0C,
+            birth: 0x0D0D_0D0D,
+        });
+        let with = hdr.encode().unwrap();
+
+        assert_eq!(with.len(), without.len() + 16);
+        assert_eq!(with[5] & FLAG_STORE_TIMESTAMPS, FLAG_STORE_TIMESTAMPS);
+        assert_eq!(&with[6..10], &0x0A0A_0A0Au32.to_le_bytes());
+        assert_eq!(&with[10..14], &0x0B0B_0B0Bu32.to_le_bytes());
+        assert_eq!(&with[14..18], &0x0C0C_0C0Cu32.to_le_bytes());
+        assert_eq!(&with[18..22], &0x0D0D_0D0Du32.to_le_bytes());
+
+        let (decoded, consumed) = ObjectHeader::decode(&with).expect("decode failed");
+        assert_eq!(consumed, with.len());
+        assert_eq!(decoded, hdr);
+    }
+
+    /// The flag cannot be set without the times behind it: bit 5 poked into
+    /// `flags` by hand is dropped at encode rather than announcing sixteen
+    /// bytes that are not there — the shape that made a rewrite emit zero
+    /// timestamps.
+    #[test]
+    fn the_timestamps_flag_is_never_written_without_times() {
+        let mut hdr = ObjectHeader::new();
+        hdr.flags |= FLAG_STORE_TIMESTAMPS;
+        hdr.add_message(0x01, 0x00, vec![1, 2, 3]);
+
+        let encoded = hdr.encode().unwrap();
+        assert_eq!(encoded[5] & FLAG_STORE_TIMESTAMPS, 0);
+        let (decoded, _) = ObjectHeader::decode(&encoded).expect("decode failed");
+        assert_eq!(decoded.times, None);
+        assert_eq!(decoded.flags & FLAG_STORE_TIMESTAMPS, 0);
+    }
+
+    /// `H5O_touch_oh` on a version-2 header moves access and change time to
+    /// now and leaves modification and birth time alone.
+    #[test]
+    fn touching_moves_access_and_change_time_only() {
+        let before = ObjectTimes {
+            access: 100,
+            modification: 200,
+            change: 300,
+            birth: 400,
+        };
+        assert_eq!(
+            before.touched(999),
+            ObjectTimes {
+                access: 999,
+                modification: 200,
+                change: 999,
+                birth: 400,
+            }
+        );
+        assert_eq!(
+            ObjectTimes::created_at(7).touched(7),
+            ObjectTimes::created_at(7)
+        );
+    }
+
     #[test]
     fn test_chunk0_size_1byte() {
         // flags bits 0-1 = 0 => 1-byte chunk0 size
         let mut hdr = ObjectHeader {
             flags: 0x00,
+            times: None,
             messages: Vec::new(),
         };
         hdr.add_message(0x01, 0x00, vec![42]);
@@ -790,6 +955,7 @@ mod tests {
         // flags bits 0-1 = 1 => 2-byte chunk0 size
         let mut hdr = ObjectHeader {
             flags: 0x01,
+            times: None,
             messages: Vec::new(),
         };
         hdr.add_message(0x01, 0x00, vec![1, 2, 3]);
@@ -805,6 +971,7 @@ mod tests {
         // flags bits 0-1 = 3 => 8-byte chunk0 size
         let mut hdr = ObjectHeader {
             flags: 0x03,
+            times: None,
             messages: Vec::new(),
         };
         hdr.add_message(0x01, 0x00, vec![0xDE, 0xAD]);

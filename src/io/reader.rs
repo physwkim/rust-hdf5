@@ -5508,6 +5508,7 @@ mod tests {
         };
         let header = ObjectHeader {
             flags: 0x02,
+            times: None,
             messages,
         };
         let attrs = collect_object_attributes(&mut handle, &ctx, &header);
