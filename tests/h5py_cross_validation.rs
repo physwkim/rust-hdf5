@@ -1398,14 +1398,18 @@ fn object_header_attribute_count_matches_h5py() {
     std::fs::remove_file(&path).ok();
 }
 
-/// An attribute at or past the object header message limit must never reach
-/// the file. The message size field is a `u16`, so writing one truncates the
-/// length modulo 65536 and every following message decodes from the middle of
-/// this one's payload — under a checksum that still matches, which is why
-/// libhdf5 reports the result as `bad flag combination for message` rather
-/// than as damage. The rest of the file must survive the refusal intact.
+/// An attribute past the object header message limit spills the object's
+/// whole attribute set to dense storage, the way `H5O__attr_create` does on
+/// `raw_size >= H5O_MESG_MAX_SIZE`. Writing it as a header message instead
+/// would truncate the length modulo 65536 — the size field is a `u16` — and
+/// every following message would decode from the middle of this one's
+/// payload, under a checksum that still matches.
+///
+/// `meta_size.attr` is libhdf5's own answer to "is this object dense": it
+/// reports the size of the name index and the fractal heap, and is zero for
+/// compact storage.
 #[test]
-fn oversized_attribute_refused_leaving_file_readable() {
+fn an_oversized_attribute_spills_the_object_to_dense_storage() {
     let Some(py) = python() else { return };
     let path = tmp("attr_oversized");
     let big: Vec<i32> = (0..25600).collect();
@@ -1419,77 +1423,148 @@ fn oversized_attribute_refused_leaving_file_readable() {
             .unwrap()
             .write_numeric(&7i32)
             .unwrap();
-
-        let err = ds
-            .new_attr::<i32>()
+        ds.new_attr::<i32>()
             .shape([25600])
             .create("big")
             .unwrap()
             .write_array(&big)
-            .expect_err("a 100 KiB attribute must be refused, not truncated");
-        assert!(err.to_string().contains("dense attribute storage"), "{err}");
-        let err = file
-            .set_attr_array_numeric("rootbig", &big)
-            .expect_err("a 100 KiB root attribute must be refused too");
-        assert!(err.to_string().contains("65535"), "{err}");
-
+            .unwrap();
+        file.set_attr_array_numeric("rootbig", &big).unwrap();
         file.close().unwrap();
     }
     read_back_with_h5py(
         py,
         &path,
-        "d = f['data']\n\
+        "import numpy as np\n\
+         d = f['data']\n\
          assert list(d[...]) == [1, 2, 3, 4], list(d[...])\n\
-         assert sorted(d.attrs.keys()) == ['gain'], sorted(d.attrs.keys())\n\
+         assert sorted(d.attrs.keys()) == ['big', 'gain'], sorted(d.attrs.keys())\n\
          assert d.attrs['gain'] == 7\n\
-         assert sorted(f.attrs.keys()) == [], sorted(f.attrs.keys())\n",
+         assert np.array_equal(d.attrs['big'], np.arange(25600, dtype='<i4'))\n\
+         assert np.array_equal(f.attrs['rootbig'], np.arange(25600, dtype='<i4'))\n\
+         for o in (d, f['/']):\n\
+         \x20   i = h5py.h5o.get_info(o.id)\n\
+         \x20   assert i.meta_size.attr.index_size > 0, i.meta_size.attr.index_size\n\
+         \x20   assert i.meta_size.attr.heap_size > 0, i.meta_size.attr.heap_size\n\
+         assert h5py.h5o.get_info(d.id).num_attrs == 2\n",
     );
+
+    // And this crate reads its own dense storage back.
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let mut names = ds.attr_names().unwrap();
+    names.sort();
+    assert_eq!(names, vec!["big".to_string(), "gain".to_string()]);
+    let read = ds.attr("big").unwrap().read_numeric_as::<i32>().unwrap();
+    assert_eq!(read, big);
+    std::fs::remove_file(&path).ok();
+}
+
+/// More attributes than `max_compact` (8) spills the set the same way, with
+/// no attribute large enough to force it on its own — the count rule of
+/// `H5O__attr_create`. Nine is the first count that converts; the eighth
+/// stays compact, so the object next to it pins the boundary.
+#[test]
+fn past_max_compact_the_attribute_set_goes_dense() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_dense_count");
+    {
+        let file = H5File::create(&path).unwrap();
+        let many = file.new_dataset::<i32>().shape([2]).create("many").unwrap();
+        many.write_raw(&[1, 2]).unwrap();
+        for i in 0..12i32 {
+            many.new_attr::<i32>()
+                .shape(())
+                .create(&format!("a{i}"))
+                .unwrap()
+                .write_numeric(&i)
+                .unwrap();
+        }
+        let few = file.new_dataset::<i32>().shape([2]).create("few").unwrap();
+        few.write_raw(&[3, 4]).unwrap();
+        for i in 0..8i32 {
+            few.new_attr::<i32>()
+                .shape(())
+                .create(&format!("b{i}"))
+                .unwrap()
+                .write_numeric(&i)
+                .unwrap();
+        }
+        let grp = file.create_group("grp").unwrap();
+        for i in 0..12i32 {
+            grp.set_attr_numeric(&format!("g{i}"), &i).unwrap();
+        }
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "many, few, grp = f['many'], f['few'], f['grp']\n\
+         assert sorted(many.attrs.keys()) == sorted('a%d' % i for i in range(12))\n\
+         assert all(many.attrs['a%d' % i] == i for i in range(12))\n\
+         assert all(grp.attrs['g%d' % i] == i for i in range(12))\n\
+         for o in (many, grp):\n\
+         \x20   i = h5py.h5o.get_info(o.id)\n\
+         \x20   assert i.num_attrs == 12, i.num_attrs\n\
+         \x20   assert i.meta_size.attr.index_size > 0, 'expected dense storage'\n\
+         i = h5py.h5o.get_info(few.id)\n\
+         assert i.num_attrs == 8, i.num_attrs\n\
+         assert i.meta_size.attr.index_size == 0, 'eight attributes stay compact'\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.dataset("many").unwrap().attr_names().unwrap();
+    names.sort();
+    let mut want: Vec<String> = (0..12).map(|i| format!("a{i}")).collect();
+    want.sort();
+    assert_eq!(names, want);
     std::fs::remove_file(&path).ok();
 }
 
 /// The append path takes the same attribute in through the other door: it
 /// rebuilds an object header from the attributes read out of it, so an
-/// attribute libhdf5 put in dense storage would come back as a compact
-/// message too large to encode. The refusal has to happen at open, before any
-/// write moves data past the allocation point the superblock still records —
-/// so the file is left byte-for-byte as it was.
+/// attribute libhdf5 put in dense storage has to go back out the same way.
+/// The root group's header is rewritten by every finalize, so this is the
+/// reopen that used to be refused outright — nothing else in the session
+/// touches the file, and the whole 100 KiB attribute has to survive it.
 #[test]
-fn reopen_refuses_oversized_dense_attribute_without_touching_the_file() {
+fn reopen_carries_a_libhdf5_dense_root_attribute_back_out_dense() {
     let Some(py) = python() else { return };
     let path = tmp("attr_oversized_reopen");
     write_with_h5py_libver(
         py,
         &path,
         Some("v108"),
-        "d = f.create_dataset('data', data=np.arange(8, dtype='<i4'))\n\
-         d.attrs.create('big', np.arange(25600, dtype='<i4'))\n",
-    );
-    let before = std::fs::read(&path).unwrap();
-
-    let err = match H5File::open_rw(&path) {
-        Ok(_) => panic!("reopen must refuse the oversized attribute"),
-        Err(e) => e,
-    };
-    assert!(err.to_string().contains("dense attribute storage"), "{err}");
-    assert_eq!(
-        std::fs::read(&path).unwrap(),
-        before,
-        "a refused reopen must leave the file byte-identical"
+        "f.create_dataset('data', data=np.arange(8, dtype='<i4'))\n\
+         f.attrs.create('big', np.arange(25600, dtype='<i4'))\n\
+         f.attrs['gain'] = np.int32(7)\n",
     );
 
-    // Read-only access is unaffected: the dense attribute still reads back.
-    let file = H5File::open(&path).unwrap();
-    let ds = file.dataset("data").unwrap();
-    let big = ds.attr("big").unwrap().read_numeric_as::<i32>().unwrap();
-    assert_eq!(big.len(), 25600);
-    assert_eq!(big[25599], 25599);
-    drop(file);
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.set_attr_numeric("added", &5i32).unwrap();
+        file.close().unwrap();
+    }
 
     read_back_with_h5py(
         py,
         &path,
-        "assert f['data'].attrs['big'].shape == (25600,)\n\
-         assert list(f['data'][...]) == list(range(8))\n",
+        "assert list(f['data'][...]) == list(range(8)), list(f['data'][...])\n\
+         assert f.attrs['big'].shape == (25600,), f.attrs['big'].shape\n\
+         assert f.attrs['big'][25599] == 25599\n\
+         assert f.attrs['gain'] == 7\n\
+         assert f.attrs['added'] == 5\n\
+         i = h5py.h5o.get_info(f['/'].id)\n\
+         assert i.num_attrs == 3, i.num_attrs\n\
+         assert i.meta_size.attr.index_size > 0, 'expected dense storage'\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.attr_names().unwrap();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["added".to_string(), "big".to_string(), "gain".to_string()]
     );
     std::fs::remove_file(&path).ok();
 }

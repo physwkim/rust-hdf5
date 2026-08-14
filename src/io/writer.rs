@@ -3,6 +3,7 @@
 //! Produces a valid HDF5 file with superblock v3, a root group object header,
 //! and datasets with contiguous or chunked storage. The output is readable by `h5dump`.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::format::chunk_index::btree_v2::Bt2ChunkIndex;
@@ -17,6 +18,7 @@ use crate::format::chunk_index::fixed_array::{
     FixedArrayDataBlock, FixedArrayFilteredChunkElement, FixedArrayHeader, FixedArrayPagedPrefix,
     FA_CLIENT_FILT_CHUNK,
 };
+use crate::format::dense_attr::build_dense_attributes;
 use crate::format::messages::attr_info::AttributeInfoMessage;
 use crate::format::messages::attribute::{AttributeEntry, AttributeMessage};
 use crate::format::messages::data_layout::{DataLayoutMessage, EarrayParams, FixedArrayParams};
@@ -573,53 +575,26 @@ fn swmr_attr_error(name: &str) -> crate::io::IoError {
     ))
 }
 
-/// An attribute whose encoded message will not fit an object header.
-///
-/// libhdf5 answers the same size by moving the attribute to dense storage
-/// (`H5O__attr_create`'s phase change on `raw_size >= H5O_MESG_MAX_SIZE`),
-/// which this writer cannot yet create. Refusing here keeps the failure at the
-/// call that caused it: the alternative, letting the value reach
-/// `ObjectHeader::encode`, reports it at `close()` with the whole file's worth
-/// of writes already done.
-fn oversized_attr_error(name: &str, encoded_size: usize) -> crate::io::IoError {
-    crate::io::IoError::InvalidState(format!(
-        "attribute '{name}' encodes to {encoded_size} bytes, over the \
-         {MAX_MESSAGE_SIZE}-byte limit an object header message can express; \
-         libhdf5 stores an attribute this large in dense attribute storage, \
-         which this writer cannot yet create"
-    ))
-}
-
 /// Take an object's attributes into the append session, or refuse the reopen.
 ///
 /// Append mode rebuilds every object header it touches out of the attributes
 /// read from it, so what this returns is what the object will still have when
-/// the session finalizes. Two things make that a loss rather than a rewrite,
-/// and both stop the open here:
+/// the session finalizes. An attribute set that could not be read whole —
+/// `ObjectAttributes::into_complete` refuses it — would come back as the part
+/// that did read, silently deleting the rest.
 ///
-/// An attribute libhdf5 kept in dense storage comes back as a compact message,
-/// and above [`MAX_MESSAGE_SIZE`] that message cannot be encoded at all. An
-/// attribute set that could not be read whole — `ObjectAttributes::
-/// into_complete` refuses it — would come back as the part that did read,
-/// silently deleting the rest.
+/// Left to surface at `finalize`, that failure would land after this session's
+/// chunk data and indices had already been written past the allocation point
+/// the superblock still records, leaving a file libhdf5 reads as truncated.
+/// Refusing the open leaves it untouched.
 ///
-/// Left to surface at `finalize`, either failure would land after this
-/// session's chunk data and indices had already been written past the
-/// allocation point the superblock still records, leaving a file libhdf5 reads
-/// as truncated. Refusing the open leaves it untouched.
+/// Size is no longer a reason to refuse: an attribute too large for a header
+/// message goes back out through dense storage, the form libhdf5 read it from.
 fn take_reopened_attributes(
     attrs: crate::io::reader::ObjectAttributes,
     owner: &str,
-    ctx: &FormatContext,
 ) -> IoResult<Vec<AttributeEntry>> {
-    let attrs = attrs.into_complete(owner)?;
-    for attr in &attrs {
-        let encoded_size = attr.encode(ctx).len();
-        if encoded_size > MAX_MESSAGE_SIZE {
-            return Err(oversized_attr_error(attr.name(), encoded_size));
-        }
-    }
-    Ok(attrs)
+    attrs.into_complete(owner)
 }
 
 /// One collection block with free space that a later vlen insert may
@@ -988,7 +963,30 @@ pub struct Hdf5Writer {
     /// The on-disk root header block a reopen found, `(addr, len)`, so
     /// finalize can free the block its rewrite supersedes.
     superseded_root_header: Option<(u64, u64)>,
+    /// Objects whose attributes this finalize spilled to dense storage, and
+    /// the `Attribute Info` message naming what was written for each.
+    ///
+    /// INVARIANT: an entry exists here only after every block of that
+    /// object's heap and name index is on disk, and only
+    /// [`prepare_dense_attributes`](Self::prepare_dense_attributes) may add
+    /// one. `emit_attributes` reads it and never builds — a header is sized
+    /// and then written by two separate `build_*_header` calls, so a build
+    /// that allocated would allocate twice and leave the sized-for blocks
+    /// stranded.
+    dense_attributes: Slot<HashMap<AttrScope, AttributeInfoMessage>>,
 }
+
+/// Which object's attribute list a prepared dense layout belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum AttrScope {
+    Root,
+    Group(usize),
+    Dataset(usize),
+}
+
+/// Attributes an object header keeps before libhdf5 spills the whole set to
+/// dense storage (`H5O_CRT_ATTR_MAX_COMPACT_DEF`).
+const MAX_COMPACT_ATTRS: usize = 8;
 
 impl Hdf5Writer {
     /// Create a new HDF5 file at `path` using the env-var-derived locking
@@ -1043,6 +1041,7 @@ impl Hdf5Writer {
             root_group_addr: None,
             root_group_encoded_size: 0,
             superseded_root_header: None,
+            dense_attributes: Slot::new(HashMap::new()),
         })
     }
 
@@ -1237,7 +1236,6 @@ impl Hdf5Writer {
         let root_attributes = take_reopened_attributes(
             crate::io::reader::collect_object_attributes(&mut handle, &ctx, &root_header),
             "/",
-            &ctx,
         )?;
 
         let mut link_entries: Vec<(String, u64)> = Vec::new();
@@ -1295,7 +1293,6 @@ impl Hdf5Writer {
             let attrs = take_reopened_attributes(
                 crate::io::reader::collect_object_attributes(&mut handle, &ctx, &ds_header),
                 name,
-                &ctx,
             )?;
 
             for msg in &ds_header.messages {
@@ -1831,6 +1828,7 @@ impl Hdf5Writer {
             root_group_addr: None,
             root_group_encoded_size: 0,
             superseded_root_header: Some((root_addr, root_header_size as u64)),
+            dense_attributes: Slot::new(HashMap::new()),
         })
     }
 
@@ -2922,8 +2920,23 @@ impl Hdf5Writer {
     /// count of its own: `H5A__get_ainfo` fills `nattrs` from the attribute
     /// messages the header loader actually saw, so compact storage needs
     /// nothing but the message's presence.
-    fn emit_attributes(&self, header: &mut ObjectHeader, attributes: &[AttributeEntry]) {
+    ///
+    /// When [`prepare_dense_attributes`](Self::prepare_dense_attributes) has
+    /// spilled `scope`'s attributes to a fractal heap, the same message names
+    /// that heap instead and *no* attribute message follows: the two storage
+    /// forms are exclusive (`H5O__attr_create` moves the whole set at once),
+    /// and a header carrying both would report every attribute twice.
+    fn emit_attributes(
+        &self,
+        header: &mut ObjectHeader,
+        scope: AttrScope,
+        attributes: &[AttributeEntry],
+    ) {
         if attributes.is_empty() {
+            return;
+        }
+        if let Some(ainfo) = self.dense_attributes.lock().get(&scope) {
+            header.add_message(MSG_ATTR_INFO, MSG_FLAG_DONTSHARE, ainfo.encode(&self.ctx));
             return;
         }
         let ainfo = AttributeInfoMessage::compact();
@@ -2931,6 +2944,76 @@ impl Hdf5Writer {
         for attr in attributes {
             header.add_message(MSG_ATTRIBUTE, 0x00, attr.encode(&self.ctx));
         }
+    }
+
+    /// Whether `attributes` must live in dense storage rather than in the
+    /// object header — the `H5O__attr_create` phase-change rule, applied to
+    /// the whole set at once because this writer builds each header from
+    /// scratch rather than inserting one attribute at a time.
+    ///
+    /// libhdf5 converts when the count *reaches* `max_compact` and another
+    /// attribute arrives, so a set of exactly `max_compact` is still compact;
+    /// and separately when one message would not fit the 16-bit size field an
+    /// object header message has.
+    fn attributes_need_dense(&self, attributes: &[AttributeEntry]) -> bool {
+        attributes.len() > MAX_COMPACT_ATTRS
+            || attributes
+                .iter()
+                .any(|a| a.encode(&self.ctx).len() > MAX_MESSAGE_SIZE)
+    }
+
+    /// Lay out and write dense attribute storage for every object that needs
+    /// it, recording the resulting `Attribute Info` message per object.
+    ///
+    /// The sole owner of that transition: it runs before any object header is
+    /// built, so `emit_attributes` never allocates. Every block is on disk
+    /// before the map naming it is populated, so a header written from that
+    /// map can only point at bytes that exist.
+    ///
+    /// `datasets` lists the datasets whose headers this finalize will
+    /// actually write. A reopened dataset that took no writes keeps its
+    /// original header — and with it whatever storage that header already
+    /// names — so building a heap for it would strand every block of it.
+    fn prepare_dense_attributes(&self, datasets: &[usize]) -> IoResult<()> {
+        let mut scopes: Vec<(AttrScope, Vec<AttributeEntry>)> = Vec::new();
+        {
+            let root = self.root_attributes.lock();
+            if self.attributes_need_dense(&root) {
+                scopes.push((AttrScope::Root, root.clone()));
+            }
+        }
+        for gi in 0..self.group_count() {
+            let grp = self.grp(gi);
+            let g = grp.lock();
+            if !g.deleted && self.attributes_need_dense(&g.attributes) {
+                scopes.push((AttrScope::Group(gi), g.attributes.clone()));
+            }
+        }
+        for &i in datasets {
+            let ds = self.ds(i);
+            let m = ds.lock();
+            if self.attributes_need_dense(&m.attributes) {
+                scopes.push((AttrScope::Dataset(i), m.attributes.clone()));
+            }
+        }
+
+        for (scope, attributes) in scopes {
+            // `close` after `start_swmr` finalizes a second time over the same
+            // attribute sets — SWMR refuses every attribute mutation — so
+            // rebuilding here would allocate a whole second heap and strand
+            // the one the published headers already name.
+            if self.dense_attributes.lock().contains_key(&scope) {
+                continue;
+            }
+            let dense = build_dense_attributes(&attributes, &self.ctx, &mut |len| {
+                self.allocator.allocate(len)
+            })?;
+            for block in &dense.blocks {
+                self.handle.write_at(block.addr, &block.image)?;
+            }
+            self.dense_attributes.lock().insert(scope, dense.ainfo);
+        }
+        Ok(())
     }
 
     /// Define a new contiguous dataset. Returns the dataset index (used with
@@ -3762,10 +3845,10 @@ impl Hdf5Writer {
         if self.swmr_active {
             return Err(swmr_attr_error(&attr.name));
         }
-        let encoded_size = attr.encode(&self.ctx).len();
-        if encoded_size > MAX_MESSAGE_SIZE {
-            return Err(oversized_attr_error(&attr.name, encoded_size));
-        }
+        // No size gate: an attribute whose message is too large for the
+        // 16-bit size field an object header message has spills the object's
+        // whole attribute set to dense storage at finalize, exactly as
+        // `H5O__attr_create` does. See `attributes_need_dense`.
         let entry = AttributeEntry::Readable(attr);
         let old = self.with_attr_list(target, |attrs| {
             if let Some(pos) = attrs.iter().position(|a| a.name() == entry.name()) {
@@ -7245,10 +7328,11 @@ impl Hdf5Writer {
 
         // 1. Write each dataset's object header (none for a dataset deleted
         // before start_swmr — its storage was freed at delete time).
-        for i in 0..self.dataset_count() {
-            if self.ds(i).lock().deleted {
-                continue;
-            }
+        let live: Vec<usize> = (0..self.dataset_count())
+            .filter(|&i| !self.ds(i).lock().deleted)
+            .collect();
+        self.prepare_dense_attributes(&live)?;
+        for i in live {
             let ds_header = self.build_dataset_header(i);
             let encoded = ds_header.encode()?;
             let encoded_size = encoded.len();
@@ -7383,42 +7467,47 @@ impl Hdf5Writer {
         let mut freed_headers = std::collections::HashSet::new();
 
         // 1. Write each dataset's object header (deleted datasets get none —
-        // their storage was already freed at delete time).
+        // their storage was already freed at delete time). Which datasets get
+        // one is settled first, because dense attribute storage is laid out
+        // only for headers this finalize actually rewrites.
+        let mut rewritten: Vec<usize> = Vec::new();
         for i in 0..self.dataset_count() {
             let ds = self.ds(i);
-            {
-                let mut m = ds.lock();
-                if m.deleted {
+            let mut m = ds.lock();
+            if m.deleted {
+                continue;
+            }
+            if m.obj_header_written_addr.is_some() {
+                // Existing dataset from append mode.
+                // If any chunk index took writes this session — or its
+                // extent changed without a chunk write — it was modified
+                // and needs a new object header.
+                let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0)
+                    || m.fixed_array.as_ref().is_some_and(|f| f.chunks_written > 0)
+                    || m.btree_v2.as_ref().is_some_and(|b| b.chunks_written > 0)
+                    || m.extent_dirty;
+                if !modified {
+                    // Keep the original object header address for the root group link.
+                    m.obj_header_addr = m.obj_header_written_addr.unwrap();
                     continue;
                 }
-                if m.obj_header_written_addr.is_some() {
-                    // Existing dataset from append mode.
-                    // If any chunk index took writes this session — or its
-                    // extent changed without a chunk write — it was modified
-                    // and needs a new object header.
-                    let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0)
-                        || m.fixed_array.as_ref().is_some_and(|f| f.chunks_written > 0)
-                        || m.btree_v2.as_ref().is_some_and(|b| b.chunks_written > 0)
-                        || m.extent_dirty;
-                    if !modified {
-                        // Keep the original object header address for the root group link.
-                        m.obj_header_addr = m.obj_header_written_addr.unwrap();
-                        continue;
+                if !self.swmr_active && m.obj_header_encoded_size > 0 {
+                    let old = m.obj_header_written_addr.take().unwrap();
+                    if freed_headers.insert(old) {
+                        self.allocator.free(old, m.obj_header_encoded_size as u64);
                     }
-                    if !self.swmr_active && m.obj_header_encoded_size > 0 {
-                        let old = m.obj_header_written_addr.take().unwrap();
-                        if freed_headers.insert(old) {
-                            self.allocator.free(old, m.obj_header_encoded_size as u64);
-                        }
-                        m.obj_header_encoded_size = 0;
-                    }
+                    m.obj_header_encoded_size = 0;
                 }
             }
+            rewritten.push(i);
+        }
+        self.prepare_dense_attributes(&rewritten)?;
+        for i in rewritten {
             let ds_header = self.build_dataset_header(i);
             let encoded = ds_header.encode()?;
             let addr = self.allocator.allocate(encoded.len() as u64);
             self.handle.write_at(addr, &encoded)?;
-            ds.lock().obj_header_addr = addr;
+            self.ds(i).lock().obj_header_addr = addr;
         }
 
         // 1b. Group object headers. A hard link can point to a group whose
@@ -7571,7 +7660,7 @@ impl Hdf5Writer {
         }
 
         // Attribute Info (type 0x15) + attribute messages (type 0x0C)
-        self.emit_attributes(&mut header, &m.attributes);
+        self.emit_attributes(&mut header, AttrScope::Dataset(index), &m.attributes);
 
         // Object Reference Count message (type 0x16): emitted only when
         // more than one hard link resolves to this dataset (computed above).
@@ -7640,7 +7729,7 @@ impl Hdf5Writer {
 
         // Attribute Info (type 0x15) + attributes (type 0x0C) -- e.g. NeXus
         // `NX_class`.
-        self.emit_attributes(&mut header, &attributes);
+        self.emit_attributes(&mut header, AttrScope::Group(group_idx), &attributes);
 
         // Object Reference Count message: emitted only when this group is
         // itself a hard-link target reached by more than one link.
@@ -7710,7 +7799,7 @@ impl Hdf5Writer {
 
         // Root-level attributes
         let root_attributes = self.root_attributes.lock();
-        self.emit_attributes(&mut header, &root_attributes);
+        self.emit_attributes(&mut header, AttrScope::Root, &root_attributes);
 
         header
     }
