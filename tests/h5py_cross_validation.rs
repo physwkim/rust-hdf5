@@ -2485,9 +2485,14 @@ fn undecodable_attribute_is_listed_with_a_reason() {
         assert_eq!(ds.attr_unreadable_reason("gain").unwrap(), None);
 
         // Typed access refuses with the same reason, and the readable
-        // attribute beside it is unaffected.
+        // attribute beside it is unaffected. The variant is the one an
+        // undecodable *dataset* message raises too — an object that is in the
+        // listing but out of reach has one error surface, not two.
         let err = ds.attr("ref").err().expect("attr('ref') must fail");
-        assert!(err.to_string().contains("VAX"), "{err}");
+        match &err {
+            rust_hdf5::Hdf5Error::Unsupported(msg) => assert!(msg.contains("VAX"), "{msg}"),
+            other => panic!("expected an unsupported-feature error, got {other:?}"),
+        }
         assert_eq!(ds.attr("gain").unwrap().read_numeric::<i32>().unwrap(), 7);
 
         let grp = file.root_group().group("g").unwrap();

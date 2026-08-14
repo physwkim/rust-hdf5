@@ -2427,11 +2427,11 @@ impl Hdf5Reader {
     ) -> IoResult<&'a AttributeMessage> {
         match attrs.entries.iter().find(|a| a.name() == name) {
             Some(AttributeEntry::Readable(attr)) => Ok(attr),
-            Some(AttributeEntry::Unreadable { reason, .. }) => Err(crate::io::IoError::Format(
-                crate::format::FormatError::UnsupportedFeature(format!(
+            Some(AttributeEntry::Unreadable { reason, .. }) => {
+                Err(crate::io::IoError::Unsupported(format!(
                     "attribute '{name}' on '{owner}' cannot be decoded: {reason}"
-                )),
-            )),
+                )))
+            }
             // Not among what was read — but the part that was not read could
             // hold it, so an incomplete set cannot answer "absent".
             None => match attrs.unreadable_reason() {
@@ -4893,10 +4893,15 @@ impl ObjectAttributes {
 }
 
 /// The one wording for "this object's attributes are not all here".
+///
+/// `Unsupported`, the same variant an undecodable dataset message raises: the
+/// name is in the listing and the content is out of reach, which is what the
+/// variant is for. Wrapping a `FormatError` here instead would put the same
+/// condition behind two different public variants.
 fn incomplete_error(owner: &str, reason: &str) -> crate::io::IoError {
-    crate::io::IoError::Format(crate::format::FormatError::UnsupportedFeature(format!(
+    crate::io::IoError::Unsupported(format!(
         "attributes of '{owner}' cannot be read whole: {reason}"
-    )))
+    ))
 }
 
 /// Every attribute attached to an object, whichever storage it uses.
