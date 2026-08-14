@@ -501,6 +501,89 @@ fn retype_floats_as_vax(path: &std::path::Path, expected: usize) {
     std::fs::write(path, &raw).unwrap();
 }
 
+/// Creation-order *values*, not just the tracking flags: a group written with
+/// `H5P_CRT_ORDER_TRACKED` records the index each link was created with, and
+/// h5py iterating in creation order reads them back. A rewrite that re-stamps
+/// them with discovery order returns the same names in a different order.
+#[test]
+fn link_creation_order_values_survive_a_reopen() {
+    let Some(py) = python() else { return };
+    let dir = tmp_dir("corder_values");
+    let (orig, work) = (dir.join("orig.h5"), dir.join("work.h5"));
+
+    // Creation order deliberately unlike name order, so the two are telling
+    // apart at all.
+    py_run(
+        py,
+        &orig,
+        &work,
+        "with h5py.File(ORIG, 'w', libver='latest', track_order=True) as f:\n\
+         \x20   g = f.create_group('g', track_order=True)\n\
+         \x20   for name in ('zeta', 'alpha', 'mid'):\n\
+         \x20       g.create_dataset(name, data=np.arange(2, dtype='<i4'))\n",
+    );
+    std::fs::copy(&orig, &work).unwrap();
+    reopen_and_add(&work);
+
+    py_run(
+        py,
+        &orig,
+        &work,
+        "with h5py.File(WORK, 'r') as f:\n\
+         \x20   order = list(f['g'].keys())\n\
+         \x20   assert sorted(order) == ['alpha', 'mid', 'zeta'], order\n\
+         \x20   print('CREATION ORDER:', order)\n",
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The same for attribute creation order, on a set past the compact limit so
+/// it is in dense storage. Still open, and pinned here: the reopen reads the
+/// set back through the hashed name index and re-stamps the creation indices
+/// in the order it walked, so libhdf5 iterates the rewritten set in that order
+/// instead of the one the attributes were created in. Every name and value is
+/// there — only the order the file records for them is this writer's.
+#[test]
+fn dense_attribute_creation_order_values_are_restamped_by_a_reopen() {
+    let Some(py) = python() else { return };
+    let dir = tmp_dir("corder_attrs");
+    let (orig, work) = (dir.join("orig.h5"), dir.join("work.h5"));
+
+    let created = "['a%02d' % i for i in (7, 3, 11, 0, 5, 9, 1, 8, 4, 10, 2, 6)]";
+    py_run(
+        py,
+        &orig,
+        &work,
+        &format!(
+            "with h5py.File(ORIG, 'w', libver='latest', track_order=True) as f:\n\
+             \x20   g = f.create_group('g', track_order=True)\n\
+             \x20   for i in (7, 3, 11, 0, 5, 9, 1, 8, 4, 10, 2, 6):\n\
+             \x20       g.attrs['a%02d' % i] = np.int32(i)\n\
+             with h5py.File(ORIG, 'r') as f:\n\
+             \x20   assert list(f['g'].attrs) == {created}, list(f['g'].attrs)\n"
+        ),
+    );
+    std::fs::copy(&orig, &work).unwrap();
+    reopen_and_add(&work);
+
+    py_run(
+        py,
+        &orig,
+        &work,
+        &format!(
+            "with h5py.File(WORK, 'r') as f:\n\
+             \x20   order = list(f['g'].attrs)\n\
+             \x20   assert sorted(order) == ['a%02d' % i for i in range(12)], order\n\
+             \x20   for i in range(12):\n\
+             \x20       assert f['g'].attrs['a%02d' % i] == i, i\n\
+             \x20   assert order != {created}, 'creation order now survives - close this'\n"
+        ),
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A preserved object still occupies its name. Asking for it by name says
 /// what it is rather than reporting it absent, and creating something of that
 /// name is refused — two link messages of one name in a group is an invalid
