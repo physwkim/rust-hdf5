@@ -1073,6 +1073,61 @@ fn numeric_conversion_reads_from_h5py_written_file() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A compound with an array-typed member forces libhdf5 to emit a *version 2*
+/// datatype message under the default libver bound. v2 still pads member names
+/// to a multiple of 8 bytes (only v3 dropped the padding), so decoding it with
+/// the v3 rule misplaces every member after the first.
+#[test]
+fn v2_compound_from_h5py_decodes_member_offsets() {
+    use rust_hdf5::format::messages::datatype::DatatypeMessage;
+
+    let Some(py) = python() else { return };
+    let path = tmp("v2_compound");
+    write_with_h5py(
+        py,
+        &path,
+        "dt = np.dtype([('alpha', '<i4'), ('beta', ('<f4', (2,)))])\n\
+         arr = np.zeros(3, dtype=dt)\n\
+         arr['alpha'] = [1, 2, 3]\n\
+         arr['beta'] = [[1.5, 2.5], [3.5, 4.5], [5.5, 6.5]]\n\
+         f.create_dataset('data', data=arr)\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let DatatypeMessage::Compound { size, members } = ds.datatype().unwrap() else {
+        panic!("expected a compound datatype");
+    };
+    assert_eq!(size, 12);
+    let shape: Vec<(&str, u32)> = members
+        .iter()
+        .map(|m| (m.name.as_str(), m.offset))
+        .collect();
+    assert_eq!(shape, vec![("alpha", 0), ("beta", 4)]);
+    assert_eq!(members[1].datatype.element_size(), 8);
+
+    // The member offsets are only right if the names were consumed with the
+    // padding rule, so check the values they address.
+    let raw = ds.read_raw_bytes().unwrap();
+    assert_eq!(raw.len(), 3 * 12);
+    let alpha: Vec<i32> = raw
+        .chunks_exact(12)
+        .map(|e| i32::from_le_bytes(e[0..4].try_into().unwrap()))
+        .collect();
+    assert_eq!(alpha, vec![1, 2, 3]);
+    let beta: Vec<f32> = raw
+        .chunks_exact(12)
+        .flat_map(|e| {
+            [
+                f32::from_le_bytes(e[4..8].try_into().unwrap()),
+                f32::from_le_bytes(e[8..12].try_into().unwrap()),
+            ]
+        })
+        .collect();
+    assert_eq!(beta, vec![1.5, 2.5, 3.5, 4.5, 5.5, 6.5]);
+    std::fs::remove_file(&path).ok();
+}
+
 /// `H5Attribute::read_numeric` must accept h5py's standard little-endian
 /// numeric attribute datatypes (the strict datatype check cannot be *too*
 /// strict), refuse a big-endian one, and `read_numeric_as` must convert it.

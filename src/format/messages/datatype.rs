@@ -29,6 +29,48 @@ fn read_uint_le(buf: &[u8], n: usize) -> u32 {
     u32::from_le_bytes(tmp)
 }
 
+/// Decode a compound- or enum-member name field starting at `pos`, returning
+/// the name and the position just past the field.
+///
+/// The name is null-terminated. Message versions 1 and 2 pad the field — the
+/// name plus its terminator — to a multiple of 8 bytes; version 3 dropped the
+/// padding and advances by exactly `strlen + 1`. Both the compound and the
+/// enum branch of libhdf5's `H5O__dtype_decode_helper` use this one rule
+/// (`H5Odtype.c`, "Version 3 of the datatype message eliminated the padding to
+/// multiple of 8 bytes"), so it lives here once rather than per class.
+fn decode_name_field(
+    buf: &[u8],
+    pos: usize,
+    version: u8,
+    what: &str,
+) -> FormatResult<(String, usize)> {
+    let mut end = pos;
+    while end < buf.len() && buf[end] != 0 {
+        end += 1;
+    }
+    if end >= buf.len() {
+        return Err(FormatError::InvalidData(format!(
+            "unterminated {what} member name"
+        )));
+    }
+    let name = String::from_utf8_lossy(&buf[pos..end]).to_string();
+    let field_len = end + 1 - pos; // name bytes plus the null terminator
+    let advance = if version >= 3 {
+        field_len
+    } else {
+        field_len.div_ceil(8) * 8
+    };
+    let next = pos + advance;
+    if next > buf.len() {
+        // The 8-byte padding of a v1/v2 name can run past a truncated buffer.
+        return Err(FormatError::BufferTooShort {
+            needed: next,
+            available: buf.len(),
+        });
+    }
+    Ok((name, next))
+}
+
 // Datatype class codes
 const CLASS_FIXED_POINT: u8 = 0;
 const CLASS_FLOATING_POINT: u8 = 1;
@@ -810,31 +852,13 @@ impl DatatypeMessage {
 
                 let mut members = Vec::with_capacity(num_members);
                 for _ in 0..num_members {
-                    // Name: null-terminated string
-                    let name_start = pos;
-                    while pos < buf.len() && buf[pos] != 0 {
-                        pos += 1;
-                    }
-                    if pos >= buf.len() {
-                        return Err(FormatError::InvalidData(
-                            "unterminated compound member name".into(),
-                        ));
-                    }
-                    let name = String::from_utf8_lossy(&buf[name_start..pos]).to_string();
-                    pos += 1; // skip null terminator
-
-                    // Version 1: names are padded to 8-byte boundary
-                    // (from the start of the name, including the null)
-                    if version == 1 {
-                        let name_field_len = pos - name_start;
-                        let padded = (name_field_len + 7) & !7;
-                        pos = name_start + padded;
-                    }
+                    let (name, next) = decode_name_field(buf, pos, version, "compound")?;
+                    pos = next;
 
                     // Byte offset. Versions 1 and 2 use a fixed 4-byte
                     // offset; version 3 uses limit_enc_size(size) bytes
                     // (H5VM_limit_enc_size / UINT32DECODE_VAR).
-                    let offset_nbytes = if version == 3 {
+                    let offset_nbytes = if version >= 3 {
                         limit_enc_size(size as u64)
                     } else {
                         4
@@ -891,25 +915,8 @@ impl DatatypeMessage {
                 // Member names (null-terminated, padded to 8-byte boundary for v1)
                 let mut names = Vec::with_capacity(num_members);
                 for _ in 0..num_members {
-                    let name_start = pos;
-                    while pos < buf.len() && buf[pos] != 0 {
-                        pos += 1;
-                    }
-                    if pos >= buf.len() {
-                        return Err(FormatError::InvalidData(
-                            "unterminated enum member name".into(),
-                        ));
-                    }
-                    let name = String::from_utf8_lossy(&buf[name_start..pos]).to_string();
-                    pos += 1; // skip null
-                              // Versions 1 & 2 pad the name field (including
-                              // the null) to an 8-byte boundary; version 3
-                              // advances by exactly the name length.
-                    if version < 3 {
-                        let name_field_len = pos - name_start;
-                        let padded = (name_field_len + 7) & !7;
-                        pos = name_start + padded;
-                    }
+                    let (name, next) = decode_name_field(buf, pos, version, "enum")?;
+                    pos = next;
                     names.push(name);
                 }
 
@@ -1453,6 +1460,68 @@ mod tests {
             ],
         );
         assert_eq!(msg.element_size(), 16);
+    }
+
+    /// A version-2 compound message as h5py writes it (default libver, one
+    /// array-typed member forces version 2): member names are padded to a
+    /// multiple of 8 bytes, exactly as in version 1. Decoding it with the
+    /// version-3 rule misreads the offset of every member.
+    ///
+    /// Byte image lifted from an h5py 3.15 file holding
+    /// `dtype([('alpha','<i4'), ('beta',('<f4',(2,)))])`.
+    #[test]
+    fn decode_v2_compound_pads_member_names() {
+        #[rustfmt::skip]
+        let msg: [u8; 84] = [
+            0x26, 0x02, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, // v2 compound, 2 members, 12 bytes
+            b'a', b'l', b'p', b'h', b'a', 0, 0, 0,          // "alpha" padded to 8
+            0x00, 0x00, 0x00, 0x00,                         // offset 0 (4 bytes in v1/v2)
+            0x10, 0x08, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, // i32
+            0x00, 0x00, 0x20, 0x00,
+            b'b', b'e', b't', b'a', 0, 0, 0, 0,             // "beta" padded to 8
+            0x04, 0x00, 0x00, 0x00,                         // offset 4
+            0x2a, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, // v2 array, 8 bytes
+            0x01, 0x00, 0x00, 0x00,                         // ndims 1 + 3 reserved
+            0x02, 0x00, 0x00, 0x00,                         // dim 2
+            0x00, 0x00, 0x00, 0x00,                         // permutation
+            0x11, 0x20, 0x1f, 0x00, 0x04, 0x00, 0x00, 0x00, // f32
+            0x00, 0x00, 0x20, 0x00, 0x17, 0x08, 0x00, 0x17,
+            0x7f, 0x00, 0x00, 0x00,
+        ];
+        let (decoded, consumed) = DatatypeMessage::decode(&msg, &ctx()).unwrap();
+        assert_eq!(consumed, msg.len());
+        assert_eq!(
+            decoded,
+            DatatypeMessage::compound(
+                12,
+                vec![
+                    CompoundMember {
+                        name: "alpha".to_string(),
+                        offset: 0,
+                        datatype: DatatypeMessage::i32_type(),
+                    },
+                    CompoundMember {
+                        name: "beta".to_string(),
+                        offset: 4,
+                        datatype: DatatypeMessage::array(vec![2], DatatypeMessage::f32_type()),
+                    },
+                ],
+            )
+        );
+    }
+
+    /// The v1/v2 name padding may not read past a truncated message.
+    #[test]
+    fn decode_v2_compound_name_padding_past_end_errors() {
+        let mut msg = vec![
+            0x26, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, // v2 compound, 1 member, 4 bytes
+        ];
+        msg.extend_from_slice(b"ab\0"); // name field would pad to 8 bytes
+        let err = DatatypeMessage::decode(&msg, &ctx()).unwrap_err();
+        assert!(
+            matches!(err, FormatError::BufferTooShort { .. }),
+            "expected BufferTooShort, got {err:?}"
+        );
     }
 
     #[test]
