@@ -411,9 +411,85 @@ impl DatatypeMessage {
     }
 }
 
+/// The IEEE 754 binary interchange formats this crate reinterprets.
+///
+/// A floating-point datatype message describes an arbitrary bit layout; only
+/// these three can be handed to a caller as a Rust float, so they are named
+/// once here rather than re-tested per call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IeeeFormat {
+    /// binary16 (half): 1 sign, 5 exponent, 10 mantissa bits, bias 15.
+    Binary16,
+    /// binary32 (`f32`).
+    Binary32,
+    /// binary64 (`f64`).
+    Binary64,
+}
+
 // ========================================================================= queries
 
 impl DatatypeMessage {
+    /// The IEEE 754 interchange format of a floating-point datatype, or `None`
+    /// for a float with any other bit layout (and for every other class).
+    ///
+    /// The whole layout is checked — width, bit offset and precision, sign,
+    /// exponent and mantissa positions, and the exponent bias — because a
+    /// float that differs anywhere cannot be reinterpreted, only converted.
+    pub fn ieee_format(&self) -> Option<IeeeFormat> {
+        let Self::FloatingPoint {
+            size,
+            sign_location,
+            bit_offset,
+            bit_precision,
+            exponent_location,
+            exponent_size,
+            mantissa_location,
+            mantissa_size,
+            exponent_bias,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if *bit_offset != 0 || u32::from(*bit_precision) != size * 8 {
+            return None;
+        }
+        let layout = (
+            *sign_location,
+            *exponent_location,
+            *exponent_size,
+            *mantissa_location,
+            *mantissa_size,
+            *exponent_bias,
+        );
+        match (size, layout) {
+            (2, (15, 10, 5, 0, 10, 15)) => Some(IeeeFormat::Binary16),
+            (4, (31, 23, 8, 0, 23, 127)) => Some(IeeeFormat::Binary32),
+            (8, (63, 52, 11, 0, 52, 1023)) => Some(IeeeFormat::Binary64),
+            _ => None,
+        }
+    }
+
+    /// IEEE 754 half precision, as h5py writes `numpy.float16`.
+    ///
+    /// Rust has no stable `f16`, so a dataset of these is read through
+    /// [`read_numeric_as`](crate::dataset::H5Dataset::read_numeric_as) as
+    /// `f32`, which represents every half exactly.
+    pub fn f16_type() -> Self {
+        Self::FloatingPoint {
+            size: 2,
+            byte_order: ByteOrder::LittleEndian,
+            sign_location: 15,
+            bit_offset: 0,
+            bit_precision: 16,
+            exponent_location: 10,
+            exponent_size: 5,
+            mantissa_location: 0,
+            mantissa_size: 10,
+            exponent_bias: 15,
+        }
+    }
+
     /// Returns the element size in bytes.
     ///
     /// For `VarLenString`, this returns the on-disk reference size assuming

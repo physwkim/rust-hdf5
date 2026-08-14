@@ -1157,45 +1157,11 @@ fn postdecompress(
 
 use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
 
-/// True if `dt` is a standard IEEE-754 binary32/binary64 layout (the only
-/// floating-point layouts the crate can faithfully reinterpret in place).
+/// True if `dt` is a floating-point type whose bit layout is an IEEE 754
+/// interchange format — the only float layouts that can be reinterpreted in
+/// place. [`DatatypeMessage::ieee_format`] is the single owner of that rule.
 fn is_standard_ieee_float(dt: &DatatypeMessage) -> bool {
-    match dt {
-        DatatypeMessage::FloatingPoint {
-            size,
-            sign_location,
-            bit_offset,
-            bit_precision,
-            exponent_location,
-            exponent_size,
-            mantissa_location,
-            mantissa_size,
-            exponent_bias,
-            ..
-        } => {
-            let bits = *size * 8;
-            let is_ieee32 = bits == 32
-                && *bit_offset == 0
-                && *bit_precision == 32
-                && *sign_location == 31
-                && *exponent_location == 23
-                && *exponent_size == 8
-                && *mantissa_location == 0
-                && *mantissa_size == 23
-                && *exponent_bias == 127;
-            let is_ieee64 = bits == 64
-                && *bit_offset == 0
-                && *bit_precision == 64
-                && *sign_location == 63
-                && *exponent_location == 52
-                && *exponent_size == 11
-                && *mantissa_location == 0
-                && *mantissa_size == 52
-                && *exponent_bias == 1023;
-            is_ieee32 || is_ieee64
-        }
-        _ => false,
-    }
+    dt.ieee_format().is_some()
 }
 
 /// True if the filter-pipeline / on-disk output for `dt` needs a post-filter

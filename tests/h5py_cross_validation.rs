@@ -1073,6 +1073,44 @@ fn numeric_conversion_reads_from_h5py_written_file() {
     std::fs::remove_file(&path).ok();
 }
 
+/// An IEEE half-precision (`numpy.float16`) dataset written by h5py: the raw
+/// image reads, and the values come back as exact `f32`s. Rust has no stable
+/// `f16`, so `read_numeric_as` is the typed path.
+#[test]
+fn float16_from_h5py_reads_as_f32() {
+    let Some(py) = python() else { return };
+    let path = tmp("float16");
+    write_with_h5py(
+        py,
+        &path,
+        "vals = np.array([0.0, -0.0, 1.0, -2.0, 1/3, 65504.0, np.inf, 6e-8], dtype='<f2')\n\
+         f.create_dataset('data', data=vals)\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.read_raw_bytes().unwrap().len(), 16);
+    let got = ds.read_numeric_as::<f32>().unwrap();
+    let expected: [f32; 8] = [
+        0.0,
+        -0.0,
+        1.0,
+        -2.0,
+        0.333_251_95,
+        65504.0,
+        f32::INFINITY,
+        5.960_464_5e-8, // 6e-8 rounds to the smallest half subnormal
+    ];
+    assert_eq!(got, expected);
+    assert!(got[1].is_sign_negative(), "-0.0 lost its sign");
+    // f64 widening goes through the same source, exactly.
+    assert_eq!(
+        ds.read_numeric_as::<f64>().unwrap()[4],
+        0.333_251_953_125_f64
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// libhdf5 tags datatype messages with version 4 once the file's low libver
 /// bound is v1.12 or later (`H5O_dtype_ver_bounds`). A v4 message is decoded
 /// exactly like a v3 one; rejecting the version dropped the dataset.

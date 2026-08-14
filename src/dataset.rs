@@ -2327,7 +2327,7 @@ pub(crate) mod numeric {
     //! attribute counterpart `H5Attribute::read_numeric_as`).
 
     use crate::error::{Hdf5Error, Result};
-    use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+    use crate::format::messages::datatype::{ByteOrder, DatatypeMessage, IeeeFormat};
 
     /// A source element, normalized: every standard integer width — u64::MAX
     /// included — fits in `i128` without loss.
@@ -2345,6 +2345,7 @@ pub(crate) mod numeric {
             signed: bool,
             byte_order: ByteOrder,
         },
+        F16(ByteOrder),
         F32(ByteOrder),
         F64(ByteOrder),
     }
@@ -2353,10 +2354,38 @@ pub(crate) mod numeric {
         fn element_size(self) -> usize {
             match self {
                 SourceKind::Int { size, .. } => size,
+                SourceKind::F16(_) => 2,
                 SourceKind::F32(_) => 4,
                 SourceKind::F64(_) => 8,
             }
         }
+    }
+
+    /// Widen an IEEE 754 binary16 bit pattern to `f32`, which represents every
+    /// half — including subnormals, infinities and NaN payloads — exactly.
+    ///
+    /// Rust has no stable `f16` to convert through.
+    fn f16_bits_to_f32(bits: u16) -> f32 {
+        let sign = u32::from(bits >> 15);
+        let exponent = u32::from((bits >> 10) & 0x1f);
+        let mantissa = u32::from(bits & 0x03ff);
+        if exponent == 0 {
+            // Zero and subnormals: the value is mantissa * 2^-24, which is a
+            // normal f32 for every mantissa, so the multiply is exact. Going
+            // through the sign separately keeps -0.0.
+            let magnitude = mantissa as f32 * (1.0 / 16_777_216.0);
+            return if sign == 1 { -magnitude } else { magnitude };
+        }
+        let out = if exponent == 0x1f {
+            // Infinity and NaN; shifting the mantissa maps the quiet bit onto
+            // f32's quiet bit and preserves the rest of the payload.
+            (sign << 31) | 0x7f80_0000 | (mantissa << 13)
+        } else {
+            // Normal: rebias the exponent (127 - 15) and left-align the
+            // mantissa.
+            (sign << 31) | ((exponent + 112) << 23) | (mantissa << 13)
+        };
+        f32::from_bits(out)
     }
 
     /// Map a datatype message to a supported numeric source shape.
@@ -2418,12 +2447,13 @@ pub(crate) mod numeric {
                 exponent_size,
                 mantissa_size,
                 ..
-            } => match (size, exponent_size, mantissa_size) {
-                (4, 8, 23) => Ok(SourceKind::F32(byte_order)),
-                (8, 11, 52) => Ok(SourceKind::F64(byte_order)),
-                _ => Err(Hdf5Error::TypeMismatch(format!(
+            } => match dt.ieee_format() {
+                Some(IeeeFormat::Binary16) => Ok(SourceKind::F16(byte_order)),
+                Some(IeeeFormat::Binary32) => Ok(SourceKind::F32(byte_order)),
+                Some(IeeeFormat::Binary64) => Ok(SourceKind::F64(byte_order)),
+                None => Err(Hdf5Error::TypeMismatch(format!(
                     "floating-point datatype (size {size}, exponent {exponent_size} bits, \
-                     mantissa {mantissa_size} bits) is not IEEE binary32 or binary64",
+                     mantissa {mantissa_size} bits) is not an IEEE 754 interchange format",
                 ))),
             },
             ref other => Err(Hdf5Error::TypeMismatch(format!(
@@ -2457,6 +2487,14 @@ pub(crate) mod numeric {
                     i128::from(zero_extended)
                 };
                 NumericSource::Int(value)
+            }
+            SourceKind::F16(byte_order) => {
+                let arr: [u8; 2] = bytes.try_into().unwrap();
+                let bits = match byte_order {
+                    ByteOrder::LittleEndian => u16::from_le_bytes(arr),
+                    ByteOrder::BigEndian => u16::from_be_bytes(arr),
+                };
+                NumericSource::F32(f16_bits_to_f32(bits))
             }
             SourceKind::F32(byte_order) => {
                 let arr: [u8; 4] = bytes.try_into().unwrap();
@@ -2570,6 +2608,84 @@ pub(crate) mod numeric {
                         .into(),
                 )),
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Every binary16 bit pattern class widens to the f32 with the same
+        /// value: zeros keep their sign, subnormals stay exact, infinities and
+        /// NaN payloads survive.
+        #[test]
+        fn f16_widening_is_exact() {
+            let cases: [(u16, f32); 10] = [
+                (0x0000, 0.0),
+                (0x3c00, 1.0),
+                (0xc000, -2.0),
+                (0x3555, 0.333_251_95),   // nearest half to 1/3
+                (0x0001, 5.960_464_5e-8), // smallest subnormal, 2^-24
+                (0x03ff, 6.097_555e-5),   // largest subnormal
+                (0x0400, 6.103_515_6e-5), // smallest normal
+                (0x7bff, 65504.0),        // largest finite
+                (0x7c00, f32::INFINITY),
+                (0xfc00, f32::NEG_INFINITY),
+            ];
+            for (bits, expected) in cases {
+                let got = f16_bits_to_f32(bits);
+                assert_eq!(got, expected, "0x{bits:04x} widened to {got}");
+            }
+
+            let neg_zero = f16_bits_to_f32(0x8000);
+            assert_eq!(neg_zero, 0.0);
+            assert!(neg_zero.is_sign_negative(), "-0.0 lost its sign");
+
+            let nan = f16_bits_to_f32(0x7e01);
+            assert!(nan.is_nan());
+            // The quiet bit and the payload land in f32's mantissa.
+            assert_eq!(nan.to_bits(), 0x7fc0_2000);
+        }
+
+        #[test]
+        fn f16_source_converts_and_honors_byte_order() {
+            let kind = classify(&DatatypeMessage::f16_type()).unwrap();
+            // 1.0, -2.0, 0.333..., 65504
+            let raw = [0x00, 0x3c, 0x00, 0xc0, 0x55, 0x35, 0xff, 0x7b];
+            assert_eq!(
+                convert::<f32>(kind, &raw).unwrap(),
+                vec![1.0, -2.0, 0.333_251_95, 65504.0]
+            );
+            assert_eq!(
+                convert::<f64>(kind, &raw).unwrap(),
+                vec![1.0, -2.0, 0.333_251_953_125, 65504.0]
+            );
+
+            let DatatypeMessage::FloatingPoint { .. } = DatatypeMessage::f16_type() else {
+                unreachable!()
+            };
+            let mut be = DatatypeMessage::f16_type();
+            if let DatatypeMessage::FloatingPoint { byte_order, .. } = &mut be {
+                *byte_order = ByteOrder::BigEndian;
+            }
+            let be_kind = classify(&be).unwrap();
+            assert_eq!(convert::<f32>(be_kind, &[0x3c, 0x00]).unwrap(), vec![1.0]);
+        }
+
+        /// A float whose layout is not an interchange format is refused, not
+        /// reinterpreted.
+        #[test]
+        fn non_ieee_float_is_refused() {
+            let mut odd = DatatypeMessage::f32_type();
+            if let DatatypeMessage::FloatingPoint { exponent_bias, .. } = &mut odd {
+                *exponent_bias = 63;
+            }
+            assert!(odd.ieee_format().is_none());
+            let err = classify(&odd).err().expect("non-IEEE float was accepted");
+            assert!(
+                err.to_string().contains("IEEE 754 interchange format"),
+                "unexpected error: {err}"
+            );
         }
     }
 }
