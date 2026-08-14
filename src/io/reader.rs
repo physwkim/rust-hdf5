@@ -37,6 +37,7 @@ use crate::format::reference::{
     decode_object_element, decode_region_element, decode_region_heap_object, decode_revised_body,
     decode_revised_element, Reference, ReferenceTarget, RevisedElement,
 };
+use crate::format::selection::{Hyperslab, RegularHyperslab, Selection};
 use crate::format::sohm::SohmMasterTable;
 use crate::format::superblock::{
     detect_superblock_version, SuperblockV0V1, SuperblockV2V3, SymbolTableCache,
@@ -4804,6 +4805,101 @@ impl Hdf5Reader {
             }
         }
         Ok(())
+    }
+
+    /// Read a strided hyperslab — h5py's stepped slicing (`ds[a:b:s]`) or
+    /// the general `start`/`stride`/`count`/`block` form of
+    /// `H5Sselect_hyperslab` — into a returned buffer.
+    ///
+    /// One tuple per dimension: `start[d]` is the first index, `stride[d]`
+    /// the spacing between selected blocks (`1` = the classic contiguous
+    /// selection [`read_slice`](Self::read_slice) reads), `count[d]` how
+    /// many blocks, and `block[d]` how many contiguous elements each block
+    /// covers. The returned buffer is row-major over `count[d] * block[d]`
+    /// per dimension — exactly the shape h5py's stepped slicing produces.
+    ///
+    /// Built on the same selection-decomposition primitives the virtual
+    /// dataset reader uses for its per-mapping scatter
+    /// ([`Selection::to_boxes`], [`copy_matched_boxes`]) rather than a
+    /// second box walker: the requested selection and a densely-packed
+    /// "output" selection sharing the same `count` decompose into the same
+    /// number of same-shaped boxes in the same row-major order, so each
+    /// source box is read with the ordinary per-layout selective read
+    /// ([`read_slice_into_unconverted`](Self::read_slice_into_unconverted))
+    /// and scattered straight into its matching output box.
+    pub fn read_hyperslab(
+        &mut self,
+        name: &str,
+        start: &[u64],
+        stride: &[u64],
+        count: &[u64],
+        block: &[u64],
+    ) -> IoResult<Vec<u8>> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.read_hyperslab(&path, start, stride, count, block);
+        }
+        let info = self
+            .dataset_info_local(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let dims = info.dataspace.dims.clone();
+        let datatype = info.datatype.clone();
+        let element_size = datatype.element_size() as u64;
+        let rank = dims.len();
+
+        if start.len() != rank || stride.len() != rank || count.len() != rank || block.len() != rank
+        {
+            return Err(crate::io::IoError::InvalidState(
+                "start/stride/count/block length must match dataset rank".into(),
+            ));
+        }
+        if stride.contains(&0) {
+            return Err(crate::io::IoError::InvalidState(
+                "hyperslab stride must be nonzero in every dimension".into(),
+            ));
+        }
+
+        let src_sel = Selection::Hyperslab {
+            rank,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: start.to_vec(),
+                stride: stride.to_vec(),
+                count: count.to_vec(),
+                block: block.to_vec(),
+            }),
+        };
+        let out_dims: Vec<u64> = (0..rank)
+            .map(|d| count[d].saturating_mul(block[d]))
+            .collect();
+        // A densely-packed selection sharing the same `count`: its boxes
+        // decompose in the same row-major order as `src_sel`'s (the nested
+        // loop `Selection::to_boxes` drives is indexed purely by `count`),
+        // so `src_boxes[i]` and `dst_boxes[i]` are always the same logical
+        // block, letting `copy_matched_boxes` pair them positionally.
+        let dst_sel = Selection::Hyperslab {
+            rank,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: vec![0u64; rank],
+                stride: block.to_vec(),
+                count: count.to_vec(),
+                block: block.to_vec(),
+            }),
+        };
+        let src_boxes = src_sel.to_boxes(&dims)?;
+        let dst_boxes = dst_sel.to_boxes(&out_dims)?;
+
+        let total = saturating_byte_len(&out_dims, element_size) as usize;
+        let mut out = alloc_tiled_fill(total, None)?;
+        copy_matched_boxes(
+            |bstart, bcount, buf| self.read_slice_into_unconverted(name, bstart, bcount, buf, 0),
+            &src_boxes,
+            &dst_boxes,
+            &out_dims,
+            element_size,
+            &mut out,
+        )?;
+        Self::apply_post_filter_conversion(&mut out, &datatype)?;
+        Ok(out)
     }
 }
 

@@ -2165,6 +2165,91 @@ impl H5Dataset {
         }
     }
 
+    /// Read a strided hyperslab as a typed vector — h5py's stepped slicing
+    /// (`ds[a:b:s]`) or the general `start`/`stride`/`count`/`block` form of
+    /// `H5Sselect_hyperslab`.
+    ///
+    /// One entry per dimension: `start[d]` is the first index, `stride[d]`
+    /// the spacing between selected blocks (all-`1` is the same selection
+    /// [`read_slice`](Self::read_slice) reads), `count[d]` how many blocks,
+    /// and `block[d]` how many contiguous elements each block covers. The
+    /// returned vector is row-major over `count[d] * block[d]` per
+    /// dimension — exactly the shape h5py's stepped slicing produces.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open("data.h5").unwrap();
+    /// let ds = file.dataset("series").unwrap(); // shape [100]
+    /// // Python: ds[0:100:2] — every other element.
+    /// let evens: Vec<f64> = ds.read_hyperslab(&[0], &[2], &[50], &[1]).unwrap();
+    /// ```
+    pub fn read_hyperslab<T: H5Type>(
+        &self,
+        start: &[usize],
+        stride: &[usize],
+        count: &[usize],
+        block: &[usize],
+    ) -> Result<Vec<T>> {
+        match &self.info {
+            DatasetInfo::Reader {
+                name, element_size, ..
+            } => {
+                if T::element_size() != *element_size {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "read type has element size {} but dataset has element size {}",
+                        T::element_size(),
+                        element_size,
+                    )));
+                }
+                let datatype = self.datatype()?;
+                let start_u64: Vec<u64> = start.iter().map(|&s| s as u64).collect();
+                let stride_u64: Vec<u64> = stride.iter().map(|&s| s as u64).collect();
+                let count_u64: Vec<u64> = count.iter().map(|&c| c as u64).collect();
+                let block_u64: Vec<u64> = block.iter().map(|&b| b as u64).collect();
+
+                let mut raw = {
+                    let mut inner = borrow_inner_mut(&self.file_inner);
+                    match &mut *inner {
+                        H5FileInner::Reader(reader) => reader.read_hyperslab(
+                            name,
+                            &start_u64,
+                            &stride_u64,
+                            &count_u64,
+                            &block_u64,
+                        )?,
+                        _ => {
+                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()))
+                        }
+                    }
+                };
+                to_host_byte_order(&mut raw, &datatype, T::element_size())?;
+
+                if raw.len() % T::element_size() != 0 {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "raw data size {} is not a multiple of element size {}",
+                        raw.len(),
+                        T::element_size(),
+                    )));
+                }
+
+                let count = raw.len() / T::element_size();
+                let mut result = Vec::<T>::with_capacity(count);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        raw.as_ptr(),
+                        result.as_mut_ptr() as *mut u8,
+                        raw.len(),
+                    );
+                    result.set_len(count);
+                }
+                Ok(result)
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read_hyperslab from a dataset in write mode".into(),
+            )),
+        }
+    }
+
     /// Write a typed slice to a sub-region of the dataset.
     ///
     /// `starts` and `counts` define the N-dimensional selection, which must lie
