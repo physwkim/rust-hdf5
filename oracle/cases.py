@@ -704,6 +704,21 @@ def _libver_case(name, libver, rust, note):
     return Case(name, "superblock", gen, rust, note)
 
 
+def gen_userblock(path):
+    """A 512-byte userblock in front of the superblock.
+
+    The block is filled with text afterwards, as an application that keeps a
+    script or a header there would: the reader has to find the superblock at
+    512 rather than at 0, and must not mistake the block's bytes for metadata.
+    """
+    with h5py.File(path, "w", userblock_size=512) as f:
+        f.create_dataset("data", data=ramp("<i4"))
+        f.create_group("g")
+    prefix = b"#!/bin/sh\n# userblock\n"
+    with open(path, "r+b") as fh:
+        fh.write(prefix + b"#" * (512 - len(prefix) - 1) + b"\n")
+
+
 LIBVER_CASES = [
     _libver_case("libver_earliest", "earliest", "libver_earliest",
                  "libver earliest — superblock v0, symbol-table groups"),
@@ -711,6 +726,9 @@ LIBVER_CASES = [
     _libver_case("libver_v110", ("v110", "v110"), None, "libver v1.10 bounds"),
     _libver_case("libver_latest", "latest", "libver_latest",
                  "libver latest — superblock v3, new-style groups"),
+    # No rust writer arm: the public API cannot ask for a userblock.
+    Case("userblock", "superblock", gen_userblock, None,
+         "512-byte userblock — the superblock, and every address, is based at 512"),
 ]
 
 

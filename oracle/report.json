@@ -5,7 +5,7 @@
   "numpy_version": "1.26.4",
   "python": "/home/stevek/micromamba/envs/tomo/bin/python",
   "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-sbext-040abf4b-1/target/release/oracle_probe",
-  "cases": 75
+  "cases": 76
  },
  "results": [
   {
@@ -6760,6 +6760,90 @@
    }
   },
   {
+   "case": "userblock",
+   "group": "superblock",
+   "note": "512-byte userblock \u2014 the superblock, and every address, is based at 512",
+   "rust_case": null,
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
+     },
+     {
+      "key": "/data#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/data#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/data#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "contiguous",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/data#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[8]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/data#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/g#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
+     }
+    ],
+    "oracle_errors": [
+     {
+      "key": "#superblock",
+      "ref": "ERROR(superblock): bad signature"
+     }
+    ],
+    "matched": 11,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "UNSUPPORTED-API",
+    "detail": "no rust writer arm: the public API cannot express this case",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": null,
+    "h5dump_rc": null
+   }
+  },
+  {
    "case": "swmr_created",
    "group": "swmr",
    "note": "file created through the SWMR writer path and appended frame by frame",
@@ -7821,6 +7905,7 @@
     "link_external",
     "libver_v108",
     "libver_v110",
+    "userblock",
     "sohm_list",
     "sohm_btree",
     "ochk_root"
@@ -7901,6 +7986,7 @@
     "libver_v108",
     "libver_v110",
     "libver_latest",
+    "userblock",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -8060,6 +8146,7 @@
     "attr_on_root",
     "libver_earliest",
     "libver_v108",
+    "userblock",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -8137,6 +8224,7 @@
     "attr_on_root",
     "libver_earliest",
     "libver_v108",
+    "userblock",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -8214,6 +8302,7 @@
     "attr_on_root",
     "libver_earliest",
     "libver_v108",
+    "userblock",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -8291,6 +8380,7 @@
     "attr_on_root",
     "libver_earliest",
     "libver_v108",
+    "userblock",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -8353,6 +8443,7 @@
     "attr_on_root",
     "libver_earliest",
     "libver_v108",
+    "userblock",
     "sohm_list",
     "sohm_btree",
     "ochk_root"

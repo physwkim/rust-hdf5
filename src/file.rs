@@ -397,6 +397,18 @@ impl H5File {
         }
     }
 
+    /// Size in bytes of the userblock this file was written with — the
+    /// application-owned prefix the superblock follows (`H5Pget_userblock`).
+    /// Zero for a file without one, and for a file this handle has open for
+    /// writing (the writer never places a userblock).
+    pub fn userblock_size(&self) -> u64 {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => reader.userblock_size(),
+            _ => 0,
+        }
+    }
+
     /// Check if the file is in write/append mode.
     pub fn is_writable(&self) -> bool {
         let inner = borrow_inner(&self.inner);

@@ -378,8 +378,11 @@ impl Hdf5Reader {
     pub fn open_mmap(path: &Path) -> IoResult<(Self, MmapFileHandle)> {
         // Open normally first to parse metadata
         let reader = Self::open(path)?;
-        // Also open an mmap handle for zero-copy data access
-        let mmap = MmapFileHandle::open(path)?;
+        // Also open an mmap handle for zero-copy data access, in the same
+        // address space the reader located the superblock in — otherwise every
+        // address read through the mmap would be short by the userblock.
+        let mut mmap = MmapFileHandle::open(path)?;
+        mmap.set_base(reader.userblock_size());
         Ok((reader, mmap))
     }
 
@@ -419,7 +422,18 @@ impl Hdf5Reader {
         path: &Path,
         locking: crate::io::locking::FileLocking,
     ) -> IoResult<Self> {
-        let handle = FileHandle::open_read_with_locking(path, locking)?;
+        let mut handle = FileHandle::open_read_with_locking(path, locking)?;
+
+        // The superblock is not necessarily at the start of the file: a
+        // userblock precedes it, and `H5FD_locate_signature` finds it by
+        // probing offset 0 and then every power of two from 512 up. The offset
+        // it is found at is where HDF5 addresses are measured from, so it
+        // becomes the handle's base address and every later offset — including
+        // the superblock read just below — is relative to it.
+        let super_addr = handle
+            .locate_signature()?
+            .ok_or(crate::format::FormatError::InvalidSignature)?;
+        handle.set_base(super_addr);
 
         // Read enough bytes to detect the superblock version and parse it.
         let sb_buf = handle.read_at_most(0, 1024)?;
@@ -1742,6 +1756,13 @@ impl Hdf5Reader {
     /// fields are `None` for a file without an extension.
     pub fn superblock_extension(&self) -> &SuperblockExtension {
         &self.ext
+    }
+
+    /// Size in bytes of the userblock preceding the superblock: the offset the
+    /// signature was found at, which is also the file's base address. Zero for
+    /// a file without a userblock.
+    pub fn userblock_size(&self) -> u64 {
+        self.handle.base()
     }
 
     /// The v1 B-tree split ranks in force for this file, after the superblock
