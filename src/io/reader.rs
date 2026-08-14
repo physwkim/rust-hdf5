@@ -25,6 +25,7 @@ use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::link::LinkMessage;
 use crate::format::messages::link::LinkTarget;
 use crate::format::messages::link_info::LinkInfoMessage;
+use crate::format::messages::virtual_mapping::VirtualMappingList;
 use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
 use crate::format::superblock::{detect_superblock_version, SuperblockV0V1, SuperblockV2V3};
@@ -140,6 +141,12 @@ pub struct DatasetReadInfo {
     /// an undefined address in that case (H5Dlayout.c overrides the
     /// layout's storage ops whenever this message is present).
     pub external_files: Vec<ExternalFileSegment>,
+    /// Virtual dataset source/virtual mappings (H5D_VIRTUAL), resolved from
+    /// the global heap object `layout`'s `Virtual` variant points at.
+    /// `Some` only when `layout` is `DataLayoutMessage::Virtual` and it
+    /// names a mapping list (`heap_index != 0`); `None` for every other
+    /// layout, and for a virtual dataset that has no mappings yet.
+    pub virtual_mappings: Option<VirtualMappingList>,
 }
 
 /// Internal enum to represent what we know about the root group from the
@@ -335,6 +342,41 @@ fn read_external_file_bytes(
         slot_idx += 1;
     }
     Ok(())
+}
+
+/// Read and decode the global-heap collection at `addr`, applying the
+/// validation of libhdf5's `H5HG__cache_heap_deserialize`: the `GCOL`
+/// signature must be present and the declared size at least `H5HG_MINSIZE`
+/// (4096 bytes). There is no upper size cap — libhdf5 has none, and this
+/// crate's writers put a whole write call's strings into one collection,
+/// which a cap would turn into silent data loss.
+///
+/// A free function (not a method) so both [`Hdf5Reader::read_heap_collection`]
+/// and the static dataset-open path (which only has a `&mut FileHandle`, not
+/// a full `&mut Hdf5Reader`) share the one implementation.
+fn read_heap_collection_from(
+    handle: &mut FileHandle,
+    ctx: &FormatContext,
+    addr: u64,
+) -> IoResult<GlobalHeapCollection> {
+    let ss = ctx.sizeof_size as usize;
+    let header_len = 4 + 1 + 3 + ss;
+    let header_buf = handle.read_at_most(addr, header_len)?;
+    if header_buf.len() < header_len || header_buf[0..4] != *b"GCOL" {
+        return Err(crate::io::IoError::InvalidState(format!(
+            "bad global heap collection signature at address {addr:#x}"
+        )));
+    }
+    let declared = read_uint(&header_buf[8..], ss) as usize;
+    if declared < 4096 {
+        return Err(crate::io::IoError::InvalidState(format!(
+            "global heap collection at address {addr:#x} declares size {declared}, \
+             below the 4096-byte minimum"
+        )));
+    }
+    let heap_buf = handle.read_at(addr, declared)?;
+    let (coll, _) = GlobalHeapCollection::decode(&heap_buf, ctx)?;
+    Ok(coll)
 }
 
 /// One chunk's on-disk read request, built by a read path before any I/O.
@@ -1378,6 +1420,21 @@ impl Hdf5Reader {
             None => Vec::new(),
         };
 
+        let virtual_mappings = match &layout {
+            Some(DataLayoutMessage::Virtual {
+                heap_address,
+                heap_index,
+                ..
+            }) if *heap_index != 0 => Some(Self::resolve_virtual_mappings(
+                handle,
+                ctx,
+                *heap_address,
+                *heap_index,
+                name,
+            )?),
+            _ => None,
+        };
+
         if let (Some(dt), Some(ds), Some(dl)) = (datatype, dataspace, layout) {
             Ok(Some(DatasetReadInfo {
                 name: name.to_string(),
@@ -1388,10 +1445,44 @@ impl Hdf5Reader {
                 attributes,
                 fill_value,
                 external_files,
+                virtual_mappings,
             }))
         } else {
             Ok(None)
         }
+    }
+
+    /// Resolve a virtual dataset's mapping list from the global heap object
+    /// its layout message points at (`H5D__virtual_load_layout`,
+    /// H5Dvirtual.c). Like the external-file-list decode above, a failure
+    /// here must not fall back to silently treating the dataset as having
+    /// no data: a `Virtual` layout carries no data address of its own, so a
+    /// dropped mapping list would read back as all-fill with no error.
+    fn resolve_virtual_mappings(
+        handle: &mut FileHandle,
+        ctx: &FormatContext,
+        heap_address: u64,
+        heap_index: u32,
+        name: &str,
+    ) -> IoResult<VirtualMappingList> {
+        let coll = read_heap_collection_from(handle, ctx, heap_address)?;
+        let idx = u16::try_from(heap_index).map_err(|_| {
+            crate::io::IoError::InvalidState(format!(
+                "dataset {name:?} virtual mapping heap index {heap_index} does not fit \
+                 the 16-bit on-disk field"
+            ))
+        })?;
+        let obj = coll.get_object(idx).ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!(
+                "dataset {name:?} virtual mapping list object {idx} not found in the \
+                 global heap collection at address {heap_address:#x}"
+            ))
+        })?;
+        VirtualMappingList::decode(obj, ctx).map_err(|e| {
+            crate::io::IoError::InvalidState(format!(
+                "dataset {name:?} has a malformed virtual dataset mapping list: {e}"
+            ))
+        })
     }
 
     /// Resolve every external-file slot's name through the local heap the
@@ -1535,24 +1626,7 @@ impl Hdf5Reader {
     /// has none, and this crate's writers put a whole write call's strings
     /// into one collection, which a cap would turn into silent data loss.
     fn read_heap_collection(&mut self, addr: u64) -> IoResult<GlobalHeapCollection> {
-        let ss = self.ctx.sizeof_size as usize;
-        let header_len = 4 + 1 + 3 + ss;
-        let header_buf = self.handle.read_at_most(addr, header_len)?;
-        if header_buf.len() < header_len || header_buf[0..4] != *b"GCOL" {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "bad global heap collection signature at address {addr:#x}"
-            )));
-        }
-        let declared = read_uint(&header_buf[8..], ss) as usize;
-        if declared < 4096 {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "global heap collection at address {addr:#x} declares size {declared}, \
-                 below the 4096-byte minimum"
-            )));
-        }
-        let heap_buf = self.handle.read_at(addr, declared)?;
-        let (coll, _) = GlobalHeapCollection::decode(&heap_buf, &self.ctx)?;
-        Ok(coll)
+        read_heap_collection_from(&mut self.handle, &self.ctx, addr)
     }
 
     /// Decode an attribute's value as a string, resolving a variable-length
@@ -1731,6 +1805,11 @@ impl Hdf5Reader {
                     ChunkTarget::Full,
                     out,
                 )?;
+            }
+            DataLayoutMessage::Virtual { .. } => {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "dataset {name:?}: virtual dataset read is not yet implemented"
+                )));
             }
         }
         Ok(())
@@ -3460,6 +3539,11 @@ impl Hdf5Reader {
                     ChunkTarget::Slice { starts, counts },
                     out,
                 )?;
+            }
+            DataLayoutMessage::Virtual { .. } => {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "dataset {name:?}: virtual dataset read is not yet implemented"
+                )));
             }
         }
         Ok(())
