@@ -7,7 +7,8 @@
 
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
-    ByteOrder, DatatypeMessage, H5File, H5FileOptions, PointSelection, Reference, Selection,
+    ByteOrder, DatatypeMessage, H5File, H5FileOptions, Hyperslab, HyperslabBlock, PointSelection,
+    Reference, Selection,
 };
 
 /// Interpreters tried in order when `RUST_HDF5_TEST_PYTHON` is unset. The
@@ -3285,6 +3286,127 @@ fn object_references_written_by_rust_dereference_in_h5py() {
         got.iter().map(|r| r.path()).collect::<Vec<_>>(),
         vec![Some("/target"), Some("/grp"), Some("/"), None, None]
     );
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}
+
+/// Region references rust writes are real `H5R_DATASET_REGION1` elements:
+/// h5py dereferences them to the target dataset and slices it with the
+/// selection the heap object carries, for a hyperslab and for a point list.
+#[test]
+fn region_references_written_by_rust_dereference_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("ref_region_write");
+    let file = H5File::create(&path).unwrap();
+    let target = file
+        .new_dataset::<i32>()
+        .shape([8])
+        .create("target")
+        .unwrap();
+    target.write_raw(&(0..8i32).collect::<Vec<_>>()).unwrap();
+    let matrix = file
+        .new_dataset::<i32>()
+        .shape([4, 6])
+        .create("matrix")
+        .unwrap();
+    matrix.write_raw(&(0..24i32).collect::<Vec<_>>()).unwrap();
+    let refs = file
+        .new_dataset::<u64>()
+        .region_references()
+        .shape([4])
+        .create("refs")
+        .unwrap();
+    let block = |start: Vec<u64>, end: Vec<u64>| Selection::Hyperslab {
+        rank: start.len(),
+        form: Hyperslab::Blocks(vec![HyperslabBlock { start, end }]),
+    };
+    refs.write_region_references(&[
+        ("/target", block(vec![0], vec![2])),
+        ("matrix", block(vec![1, 2], vec![2, 4])),
+        (
+            "/matrix",
+            Selection::Points(PointSelection {
+                rank: 2,
+                points: vec![vec![0, 1], vec![3, 5]],
+            }),
+        ),
+    ])
+    .unwrap();
+    file.close().unwrap();
+
+    read_back_with_h5py(
+        py,
+        &path,
+        "r = f['refs']\n\
+         assert r.dtype == h5py.regionref_dtype, r.dtype\n\
+         t = f[r[0]]\n\
+         assert t.name == '/target', t.name\n\
+         assert (t[r[0]] == [0, 1, 2]).all(), t[r[0]]\n\
+         m = f[r[1]]\n\
+         assert m.name == '/matrix', m.name\n\
+         assert (m[r[1]] == [[8, 9, 10], [14, 15, 16]]).all(), m[r[1]]\n\
+         assert (f[r[2]][r[2]] == [1, 23]).all(), f[r[2]][r[2]]\n\
+         lo, hi = h5py.h5r.get_region(r[2], m.id).get_select_bounds()\n\
+         assert (lo, hi) == ((0, 1), (3, 5)), (lo, hi)\n\
+         assert not bool(r[3]), 'unwritten element must be a null reference'\n",
+    );
+
+    // The same file reads back through this crate.
+    let file = H5File::open(&path).unwrap();
+    let got = file.dataset("refs").unwrap().read_references().unwrap();
+    assert_eq!(
+        got.iter().map(|r| r.path()).collect::<Vec<_>>(),
+        vec![Some("/target"), Some("/matrix"), Some("/matrix"), None]
+    );
+    assert_eq!(got[0].bounds(), Some((vec![0], vec![2])));
+    assert_eq!(got[1].bounds(), Some((vec![1, 2], vec![2, 4])));
+    assert_eq!(
+        got[2].selection(),
+        Some(&Selection::Points(PointSelection {
+            rank: 2,
+            points: vec![vec![0, 1], vec![3, 5]],
+        }))
+    );
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}
+
+/// A region reference names a dataset and a selection that dataset's extent
+/// admits; both rules are enforced at the call, not at finalize.
+#[test]
+fn a_region_reference_outside_the_target_is_refused() {
+    let path = tmp("ref_region_invalid");
+    let file = H5File::create(&path).unwrap();
+    file.new_dataset::<i32>()
+        .shape([8])
+        .create("target")
+        .unwrap();
+    file.create_group("grp").unwrap();
+    let refs = file
+        .new_dataset::<u64>()
+        .region_references()
+        .shape([1])
+        .create("refs")
+        .unwrap();
+    let block = |start: Vec<u64>, end: Vec<u64>| Selection::Hyperslab {
+        rank: start.len(),
+        form: Hyperslab::Blocks(vec![HyperslabBlock { start, end }]),
+    };
+    let err = refs
+        .write_region_references(&[("/grp", block(vec![0], vec![2]))])
+        .expect_err("a group is not a region target")
+        .to_string();
+    assert!(err.contains("/grp"), "got: {err}");
+    let err = refs
+        .write_region_references(&[("/target", block(vec![4], vec![9]))])
+        .expect_err("the selection runs past the extent")
+        .to_string();
+    assert!(err.contains("extent"), "got: {err}");
+    let err = refs
+        .write_region_references(&[("/target", block(vec![0, 0], vec![1, 1]))])
+        .expect_err("the selection has the wrong rank")
+        .to_string();
+    assert!(err.contains("rank"), "got: {err}");
     file.close().unwrap();
     std::fs::remove_file(&path).ok();
 }
