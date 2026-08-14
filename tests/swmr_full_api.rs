@@ -138,6 +138,41 @@ fn string_dataset_writers_declare_their_character_set() {
     cleanup(&path);
 }
 
+/// The SWMR typed reads reinterpret the element image like `read_raw` does,
+/// so they owe the same byte-order conversion: a big-endian dataset read as
+/// `u32` must give the stored values, not their byte-reversed images.
+#[test]
+fn big_endian_dataset_reads_as_values() {
+    use rust_hdf5::{ByteOrder, DatatypeMessage, H5File};
+
+    let path = unique_tmp("big_endian");
+    let values: [u32; 4] = [1, 0x0102_0304, 0xdead_beef, u32::MAX];
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<u32>()
+            .datatype(DatatypeMessage::FixedPoint {
+                size: 4,
+                byte_order: ByteOrder::BigEndian,
+                signed: false,
+                bit_offset: 0,
+                bit_precision: 32,
+            })
+            .shape([values.len()])
+            .create("be")
+            .unwrap();
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_be_bytes()).collect();
+        ds.write_raw_bytes(&bytes).unwrap();
+        file.close().unwrap();
+    }
+
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.read_dataset::<u32>("be").unwrap(), values);
+    assert_eq!(r.read_slice::<u32>("be", &[1], &[2]).unwrap(), values[1..3]);
+
+    cleanup(&path);
+}
+
 /// `read_slice` fetches one frame of a streaming dataset without reading
 /// the whole stream.
 #[test]

@@ -524,6 +524,45 @@ impl DatatypeMessage {
         }
     }
 
+    /// The byte order of this type when its whole element image is one
+    /// scalar, so reversing the element's bytes converts it between orders.
+    ///
+    /// `None` for a composite (compound, array, vlen) whose members each
+    /// carry their own order, and for a type that has no byte order at all
+    /// (string, opaque). Use [`contains_byte_order`](Self::contains_byte_order)
+    /// to ask what a composite stores.
+    pub fn scalar_byte_order(&self) -> Option<ByteOrder> {
+        match self {
+            Self::FixedPoint { byte_order, .. }
+            | Self::FloatingPoint { byte_order, .. }
+            | Self::BitField { byte_order, .. } => Some(*byte_order),
+            // An enum's values are its base type's, stored in its order.
+            Self::Enum { base, .. } => base.scalar_byte_order(),
+            _ => None,
+        }
+    }
+
+    /// True when any scalar anywhere in this type tree stores `order`.
+    ///
+    /// The question a caller reinterpreting a raw element image asks of a
+    /// composite type: a compound with one big-endian member cannot be handed
+    /// to a host that reads little-endian, however its other members are
+    /// stored.
+    pub fn contains_byte_order(&self, order: ByteOrder) -> bool {
+        match self {
+            Self::FixedPoint { byte_order, .. }
+            | Self::FloatingPoint { byte_order, .. }
+            | Self::BitField { byte_order, .. } => *byte_order == order,
+            Self::Enum { base, .. } | Self::Array { base, .. } | Self::VarLenSequence { base } => {
+                base.contains_byte_order(order)
+            }
+            Self::Compound { members, .. } => members
+                .iter()
+                .any(|m| m.datatype.contains_byte_order(order)),
+            Self::Opaque { .. } | Self::FixedString { .. } | Self::VarLenString { .. } => false,
+        }
+    }
+
     /// Returns the element size in bytes.
     ///
     /// For `VarLenString`, this returns the on-disk reference size assuming

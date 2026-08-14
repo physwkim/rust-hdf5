@@ -7,7 +7,7 @@
 use crate::attribute::AttrBuilder;
 use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
-use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
 use crate::types::H5Type;
 
 // ---------------------------------------------------------------------------
@@ -481,6 +481,56 @@ enum ChunkBytes<'a> {
     /// Bytes already in their stored form, with `filter_mask` naming the
     /// filters that were skipped.
     Prefiltered { data: &'a [u8], filter_mask: u32 },
+}
+
+/// The byte order this build reads and writes natively.
+pub(crate) const HOST_BYTE_ORDER: ByteOrder = if cfg!(target_endian = "big") {
+    ByteOrder::BigEndian
+} else {
+    ByteOrder::LittleEndian
+};
+
+/// Put a raw element image into host byte order, in place, for a typed read.
+///
+/// The single owner of byte order for every path that reinterprets the
+/// on-disk image as `T` — `read_raw`, `read_slice`, `read_raw_into`,
+/// `read_slice_into` and their SWMR counterparts. Reinterpretation only
+/// yields the stored value when the stored order is the host's, so a type
+/// whose whole element is one scalar is swapped here.
+///
+/// A composite element cannot be swapped as a unit: its members have their
+/// own orders and offsets. One that stores anything in the foreign order is
+/// refused, because no reinterpretation of those bytes is the stored value;
+/// [`H5Dataset::read_raw_bytes`] hands over the image for the caller to
+/// decode member by member.
+///
+/// `width` is the element size, already checked equal to `T::element_size()`.
+pub(crate) fn to_host_byte_order(
+    bytes: &mut [u8],
+    datatype: &DatatypeMessage,
+    width: usize,
+) -> Result<()> {
+    let foreign = match HOST_BYTE_ORDER {
+        ByteOrder::LittleEndian => ByteOrder::BigEndian,
+        ByteOrder::BigEndian => ByteOrder::LittleEndian,
+    };
+    match datatype.scalar_byte_order() {
+        Some(order) if order == foreign && width > 1 => {
+            for elem in bytes.chunks_exact_mut(width) {
+                elem.reverse();
+            }
+        }
+        Some(_) => {}
+        None if datatype.contains_byte_order(foreign) => {
+            return Err(Hdf5Error::TypeMismatch(format!(
+                "dataset datatype {datatype} stores {foreign:?} values, which a typed read \
+                 cannot reinterpret element by element; read_raw_bytes() returns the image \
+                 to decode member by member"
+            )))
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 /// Strip a fixed-string element's padding, leaving the bytes that carry the
@@ -1748,10 +1798,11 @@ impl H5Dataset {
                         element_size,
                     )));
                 }
+                let datatype = self.datatype()?;
                 let starts_u64: Vec<u64> = starts.iter().map(|&s| s as u64).collect();
                 let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
 
-                let raw = {
+                let mut raw = {
                     let mut inner = borrow_inner_mut(&self.file_inner);
                     match &mut *inner {
                         H5FileInner::Reader(reader) => {
@@ -1762,6 +1813,7 @@ impl H5Dataset {
                         }
                     }
                 };
+                to_host_byte_order(&mut raw, &datatype, T::element_size())?;
 
                 if raw.len() % T::element_size() != 0 {
                     return Err(Hdf5Error::TypeMismatch(format!(
@@ -2036,7 +2088,8 @@ impl H5Dataset {
                     )));
                 }
 
-                let raw = {
+                let datatype = self.datatype()?;
+                let mut raw = {
                     let mut inner = borrow_inner_mut(&self.file_inner);
                     match &mut *inner {
                         H5FileInner::Reader(reader) => reader.read_dataset_raw(name)?,
@@ -2045,6 +2098,7 @@ impl H5Dataset {
                         }
                     }
                 };
+                to_host_byte_order(&mut raw, &datatype, T::element_size())?;
 
                 if raw.len() % T::element_size() != 0 {
                     return Err(Hdf5Error::TypeMismatch(format!(
@@ -2221,6 +2275,7 @@ impl H5Dataset {
                         element_size,
                     )));
                 }
+                let datatype = self.datatype()?;
                 // Safety: `T: H5Type` is a `Copy` POD numeric with a defined
                 // byte representation; every bit pattern the read writes is a
                 // valid `T`. The byte view borrows `out` exclusively for this
@@ -2230,11 +2285,16 @@ impl H5Dataset {
                 let bytes = unsafe {
                     std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, byte_len)
                 };
-                let mut inner = borrow_inner_mut(&self.file_inner);
-                match &mut *inner {
-                    H5FileInner::Reader(reader) => Ok(reader.read_dataset_raw_into(name, bytes)?),
-                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                {
+                    let mut inner = borrow_inner_mut(&self.file_inner);
+                    match &mut *inner {
+                        H5FileInner::Reader(reader) => reader.read_dataset_raw_into(name, bytes)?,
+                        _ => {
+                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()))
+                        }
+                    }
                 }
+                to_host_byte_order(bytes, &datatype, T::element_size())
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "cannot read from a dataset in write mode".into(),
@@ -2277,6 +2337,7 @@ impl H5Dataset {
                         element_size,
                     )));
                 }
+                let datatype = self.datatype()?;
                 let starts_u64: Vec<u64> = starts.iter().map(|&s| s as u64).collect();
                 let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
                 // Safety: see `read_raw_into` — `T: H5Type` POD, exclusive
@@ -2285,13 +2346,18 @@ impl H5Dataset {
                 let bytes = unsafe {
                     std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, byte_len)
                 };
-                let mut inner = borrow_inner_mut(&self.file_inner);
-                match &mut *inner {
-                    H5FileInner::Reader(reader) => {
-                        Ok(reader.read_slice_into(name, &starts_u64, &counts_u64, bytes)?)
+                {
+                    let mut inner = borrow_inner_mut(&self.file_inner);
+                    match &mut *inner {
+                        H5FileInner::Reader(reader) => {
+                            reader.read_slice_into(name, &starts_u64, &counts_u64, bytes)?
+                        }
+                        _ => {
+                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()))
+                        }
                     }
-                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
                 }
+                to_host_byte_order(bytes, &datatype, T::element_size())
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "cannot read from a dataset in write mode".into(),
@@ -5042,7 +5108,7 @@ mod tests {
 
     // ---- issue #5: runtime-width fixed-string reading ----------------------
 
-    use crate::format::messages::datatype::DatatypeMessage;
+    use crate::format::messages::datatype::{CompoundMember, DatatypeMessage};
 
     /// Build a 1-D fixed-string dataset of `width` bytes per element from raw
     /// element images, optionally chunked and deflated.
@@ -5188,6 +5254,77 @@ mod tests {
             assert!(err.contains(want), "got: {err}");
             std::fs::remove_file(&path).ok();
         }
+    }
+
+    /// The typed read paths reinterpret the element image, so the stored order
+    /// has to be the host's first. A scalar is swapped; a composite cannot be
+    /// (its members have their own orders and offsets) and is refused.
+    #[test]
+    fn to_host_byte_order_converts_scalars_and_refuses_composites() {
+        use crate::dataset::{to_host_byte_order, HOST_BYTE_ORDER};
+        use crate::format::messages::datatype::ByteOrder;
+
+        let foreign = match HOST_BYTE_ORDER {
+            ByteOrder::LittleEndian => ByteOrder::BigEndian,
+            ByteOrder::BigEndian => ByteOrder::LittleEndian,
+        };
+        let int = |order, size| DatatypeMessage::FixedPoint {
+            size,
+            byte_order: order,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: (size * 8) as u16,
+        };
+
+        // Foreign order: each element is reversed, elementwise.
+        let mut buf = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        to_host_byte_order(&mut buf, &int(foreign, 4), 4).unwrap();
+        assert_eq!(buf, [4, 3, 2, 1, 8, 7, 6, 5]);
+
+        // Host order: untouched.
+        let mut buf = [1u8, 2, 3, 4];
+        to_host_byte_order(&mut buf, &int(HOST_BYTE_ORDER, 4), 4).unwrap();
+        assert_eq!(buf, [1, 2, 3, 4]);
+
+        // One byte wide: no order to convert.
+        let mut buf = [1u8, 2, 3, 4];
+        to_host_byte_order(&mut buf, &int(foreign, 1), 1).unwrap();
+        assert_eq!(buf, [1, 2, 3, 4]);
+
+        // An enum stores its values in its base type's order.
+        let mut buf = [1u8, 2];
+        let enumeration = DatatypeMessage::Enum {
+            base: Box::new(int(foreign, 2)),
+            members: Vec::new(),
+        };
+        to_host_byte_order(&mut buf, &enumeration, 2).unwrap();
+        assert_eq!(buf, [2, 1]);
+
+        // A string has no byte order at all.
+        let mut buf = *b"abcd";
+        to_host_byte_order(&mut buf, &DatatypeMessage::fixed_string(4), 4).unwrap();
+        assert_eq!(&buf, b"abcd");
+
+        // A compound whose members are all host-order is reinterpretable.
+        let compound = |order| DatatypeMessage::Compound {
+            size: 4,
+            members: vec![CompoundMember {
+                name: "x".into(),
+                offset: 0,
+                datatype: int(order, 4),
+            }],
+        };
+        let mut buf = [1u8, 2, 3, 4];
+        to_host_byte_order(&mut buf, &compound(HOST_BYTE_ORDER), 4).unwrap();
+        assert_eq!(buf, [1, 2, 3, 4]);
+
+        // One that is not says so, rather than handing back the raw bytes.
+        let mut buf = [1u8, 2, 3, 4];
+        let err = to_host_byte_order(&mut buf, &compound(foreign), 4)
+            .expect_err("a foreign-order compound was reinterpreted")
+            .to_string();
+        assert!(err.contains("read_raw_bytes"), "got: {err}");
+        assert_eq!(buf, [1, 2, 3, 4], "the refused image is left alone");
     }
 
     /// The declared character set is enforced: a byte that cannot be decoded is

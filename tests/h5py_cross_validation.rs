@@ -1455,3 +1455,80 @@ fn vlen_string_pad_from_h5py_is_decoded() {
     }
     std::fs::remove_file(&path).ok();
 }
+
+/// Big-endian datasets: the typed read paths reinterpret the on-disk element
+/// image as `T`, which is the stored value only after the byte order is put
+/// into the host's. Every one of them is checked here, because each copies
+/// the image on its own.
+#[test]
+fn big_endian_datasets_from_h5py_read_as_values() {
+    let Some(py) = python() else { return };
+    let path = tmp("big_endian");
+    write_with_h5py(
+        py,
+        &path,
+        "f.create_dataset('u32', data=np.arange(8, dtype='>u4') * 65537)\n\
+         f.create_dataset('f64', data=np.array([1.5, -2.25, 3e300, 0.0], dtype='>f8'))\n\
+         f.create_dataset('i16', data=np.array([-1, 2, -32768, 32767], dtype='>i2'))\n\
+         f.create_dataset('u8', data=np.arange(4, dtype='u1'))\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+
+    let u32s: Vec<u32> = (0..8u32).map(|i| i * 65537).collect();
+    let ds = file.dataset("u32").unwrap();
+    assert_eq!(ds.read_raw::<u32>().unwrap(), u32s);
+    assert_eq!(ds.read_slice::<u32>(&[2], &[3]).unwrap(), u32s[2..5]);
+    let mut into = vec![0u32; 8];
+    ds.read_raw_into(&mut into).unwrap();
+    assert_eq!(into, u32s);
+    let mut slice_into = vec![0u32; 3];
+    ds.read_slice_into(&mut slice_into, &[2], &[3]).unwrap();
+    assert_eq!(slice_into, u32s[2..5]);
+    // The datatype-aware path already converted; both agree now.
+    assert_eq!(
+        ds.read_numeric_as::<u64>().unwrap(),
+        u32s.iter().map(|&v| v as u64).collect::<Vec<_>>()
+    );
+
+    let f64s = vec![1.5f64, -2.25, 3e300, 0.0];
+    let ds = file.dataset("f64").unwrap();
+    assert_eq!(ds.read_raw::<f64>().unwrap(), f64s);
+    assert_eq!(ds.read_slice::<f64>(&[1], &[2]).unwrap(), f64s[1..3]);
+
+    let ds = file.dataset("i16").unwrap();
+    assert_eq!(ds.read_raw::<i16>().unwrap(), vec![-1i16, 2, -32768, 32767]);
+
+    // A single-byte type has no order to convert.
+    assert_eq!(
+        file.dataset("u8").unwrap().read_raw::<u8>().unwrap(),
+        vec![0u8, 1, 2, 3]
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A compound element cannot be swapped as a unit, so a typed read of one
+/// that stores big-endian members is refused instead of returning the bytes
+/// as if they were host order. Its raw image is still available.
+#[test]
+fn big_endian_compound_from_h5py_is_refused_by_typed_reads() {
+    let Some(py) = python() else { return };
+    let path = tmp("big_endian_compound");
+    write_with_h5py(
+        py,
+        &path,
+        "dt = np.dtype([('x', '>i4'), ('y', '>i4')])\n\
+         f.create_dataset('recs', data=np.array([(1, 2), (3, 4)], dtype=dt))\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("recs").unwrap();
+    let err = ds
+        .read_raw::<u64>()
+        .expect_err("a big-endian compound was reinterpreted as a host-order u64")
+        .to_string();
+    assert!(err.contains("read_raw_bytes"), "got: {err}");
+    assert_eq!(ds.read_raw_bytes().unwrap().len(), 16);
+    std::fs::remove_file(&path).ok();
+}
