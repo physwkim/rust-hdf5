@@ -102,6 +102,39 @@ pub fn fixed_string_content(elem: &[u8], padding: u8) -> Option<&[u8]> {
     Some(&elem[..end])
 }
 
+/// The byte order an atomic class declares in its bit field.
+///
+/// `H5O__dtype_decode_helper` reads bit 0 for every atomic class — set is
+/// big-endian, clear little-endian. A floating-point message of version 3 or
+/// later also gives bit 6 a meaning: with bit 0 it is `H5T_ORDER_VAX`, and
+/// without it libhdf5 fails the message with "bad byte order for datatype
+/// message". No other class reads bit 6, and neither does a v1/v2 float, so
+/// `reads_vax_bit` says which rule applies.
+///
+/// VAX is a distinct middle-endian layout, not a permutation of the two
+/// orders this crate stores: `H5T_VAX_F8` carries its own exponent bias
+/// (0x401) over otherwise IEEE-shaped fields. Decoding one as little- or
+/// big-endian would hand back numbers the file does not hold, so it is named
+/// and refused instead.
+fn atomic_byte_order(flags0: u8, reads_vax_bit: bool) -> FormatResult<ByteOrder> {
+    let big_endian = (flags0 & 0x01) != 0;
+    if reads_vax_bit && (flags0 & 0x40) != 0 {
+        if !big_endian {
+            return Err(FormatError::InvalidData(
+                "bad byte order for datatype message: bit 6 is set without bit 0".into(),
+            ));
+        }
+        return Err(FormatError::UnsupportedFeature(
+            "VAX byte order (H5T_ORDER_VAX)".into(),
+        ));
+    }
+    Ok(if big_endian {
+        ByteOrder::BigEndian
+    } else {
+        ByteOrder::LittleEndian
+    })
+}
+
 // Datatype class codes
 const CLASS_FIXED_POINT: u8 = 0;
 const CLASS_FLOATING_POINT: u8 = 1;
@@ -994,11 +1027,7 @@ impl DatatypeMessage {
                         available: buf.len(),
                     });
                 }
-                let byte_order = if (flags0 & 0x01) != 0 {
-                    ByteOrder::BigEndian
-                } else {
-                    ByteOrder::LittleEndian
-                };
+                let byte_order = atomic_byte_order(flags0, false)?;
                 let signed = (flags0 & 0x08) != 0;
 
                 let bit_offset = u16::from_le_bytes([buf[8], buf[9]]);
@@ -1022,11 +1051,8 @@ impl DatatypeMessage {
                         available: buf.len(),
                     });
                 }
-                let byte_order = if (flags0 & 0x01) != 0 {
-                    ByteOrder::BigEndian
-                } else {
-                    ByteOrder::LittleEndian
-                };
+                // Only a v3-or-later float gives bit 6 the VAX meaning.
+                let byte_order = atomic_byte_order(flags0, version >= 3)?;
                 let sign_location = flags1;
 
                 let bit_offset = u16::from_le_bytes([buf[8], buf[9]]);
@@ -1062,11 +1088,7 @@ impl DatatypeMessage {
                         available: buf.len(),
                     });
                 }
-                let byte_order = if (flags0 & 0x01) != 0 {
-                    ByteOrder::BigEndian
-                } else {
-                    ByteOrder::LittleEndian
-                };
+                let byte_order = atomic_byte_order(flags0, false)?;
                 Ok((
                     Self::BitField {
                         size,
@@ -1874,6 +1896,72 @@ mod tests {
         let err = DatatypeMessage::decode(&v1, &ctx()).unwrap_err();
         assert!(
             matches!(err, FormatError::InvalidVersion(1)),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    // ---- byte order ----
+
+    /// The message libhdf5 writes for `H5T_VAX_F8`: version 3, class 1, both
+    /// bit 0 and bit 6 set, and the VAX exponent bias 0x401 (`H5T.c`,
+    /// `H5T_INIT_TYPE_DOUBLEVAX_CORE`). `H5Tdecode` in 1.14.6 reads these 20
+    /// bytes back as `H5T_ORDER_VAX`, size 8, ebias 1025, fields
+    /// (63, 52, 11, 0, 52), and re-encodes them byte for byte.
+    const VAX_F8_MESSAGE: [u8; 20] = [
+        0x31, 0x61, 0x3F, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x34, 0x0B, 0x00,
+        0x34, 0x01, 0x04, 0x00, 0x00,
+    ];
+
+    /// VAX is a middle-endian layout with its own bias, not a permutation of
+    /// the two orders this crate stores, so it is named and refused instead of
+    /// decoded as the big-endian its bit 0 alone would say.
+    #[test]
+    fn decode_rejects_vax_byte_order() {
+        let err = DatatypeMessage::decode(&VAX_F8_MESSAGE, &ctx()).unwrap_err();
+        assert!(
+            matches!(&err, FormatError::UnsupportedFeature(m) if m.contains("VAX")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Bit 6 is the VAX flag only for a floating-point message of version 3 or
+    /// later — `H5O__dtype_decode_helper` reads it nowhere else. A v1 float
+    /// carrying the same bits is big-endian, which is exactly what libhdf5
+    /// makes of the file h5py writes from `NATIVE_DOUBLE.set_order(ORDER_VAX)`:
+    /// h5dump 1.14.6 prints `H5T_IEEE_F64BE` for it.
+    #[test]
+    fn bit_6_is_vax_only_for_a_version_3_float() {
+        let mut v1 = VAX_F8_MESSAGE;
+        v1[0] = 0x11;
+        let (decoded, _) = DatatypeMessage::decode(&v1, &ctx()).unwrap();
+        assert_eq!(decoded.scalar_byte_order(), Some(ByteOrder::BigEndian));
+
+        // An integer and a bit field give bit 6 no meaning at any version.
+        for msg in [
+            DatatypeMessage::i32_type(),
+            DatatypeMessage::BitField {
+                size: 1,
+                byte_order: ByteOrder::BigEndian,
+                bit_offset: 0,
+                bit_precision: 8,
+            },
+        ] {
+            let mut bytes = msg.encode(&ctx());
+            bytes[1] |= 0x41;
+            let (decoded, _) = DatatypeMessage::decode(&bytes, &ctx()).unwrap();
+            assert_eq!(decoded.scalar_byte_order(), Some(ByteOrder::BigEndian));
+        }
+    }
+
+    /// Bit 6 without bit 0 is not a byte order at all; libhdf5 fails the
+    /// message with "bad byte order for datatype message" rather than pick one.
+    #[test]
+    fn decode_rejects_the_vax_bit_without_the_big_endian_bit() {
+        let mut msg = VAX_F8_MESSAGE;
+        msg[1] &= !0x01;
+        let err = DatatypeMessage::decode(&msg, &ctx()).unwrap_err();
+        assert!(
+            matches!(&err, FormatError::InvalidData(m) if m.contains("bad byte order")),
             "unexpected error: {err:?}"
         );
     }
