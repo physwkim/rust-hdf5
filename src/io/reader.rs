@@ -111,7 +111,7 @@ pub struct DatasetReadInfo {
     /// Filter pipeline for compressed chunks (None = uncompressed).
     pub filter_pipeline: Option<FilterPipeline>,
     /// Attributes attached to this dataset.
-    pub attributes: Vec<AttributeEntry>,
+    pub attributes: ObjectAttributes,
     /// User-defined fill value bytes (one element wide), decoded from the
     /// fill-value message when `fill_defined == 2`. `None` => default
     /// zero-fill. Applied to unallocated chunks and unwritten regions.
@@ -144,9 +144,9 @@ pub struct Hdf5Reader {
     root_group_info: RootGroupInfo,
     datasets: Vec<DatasetReadInfo>,
     /// Attributes on the root group (file-level attributes).
-    root_attributes: Vec<AttributeEntry>,
+    root_attributes: ObjectAttributes,
     /// Attributes on non-root groups, keyed by group path (no leading `/`).
-    group_attributes: std::collections::HashMap<String, Vec<AttributeEntry>>,
+    group_attributes: std::collections::HashMap<String, ObjectAttributes>,
     /// Every non-root group path the discovery walk traversed into (no
     /// leading `/`), regardless of whether the group has datasets or
     /// attributes. Built from actual link records, so empty groups,
@@ -455,7 +455,7 @@ impl Hdf5Reader {
         // Collect the root group's own attributes.
         let root_attributes = match root_hdr {
             Some(ref h) => collect_object_attributes(&mut handle, &ctx, h),
-            None => Vec::new(),
+            None => ObjectAttributes::default(),
         };
 
         // A v0/v1-superblock file whose root group has migrated to link
@@ -548,7 +548,7 @@ impl Hdf5Reader {
         ctx: &FormatContext,
     ) -> IoResult<(
         Vec<DatasetReadInfo>,
-        std::collections::HashMap<String, Vec<AttributeEntry>>,
+        std::collections::HashMap<String, ObjectAttributes>,
         std::collections::BTreeSet<String>,
         std::collections::HashMap<String, String>,
     )> {
@@ -582,7 +582,7 @@ impl Hdf5Reader {
         header: &ObjectHeader,
         ctx: &FormatContext,
         prefix: &str,
-        group_attrs: &mut std::collections::HashMap<String, Vec<AttributeEntry>>,
+        group_attrs: &mut std::collections::HashMap<String, ObjectAttributes>,
         group_paths: &mut std::collections::BTreeSet<String>,
         visited: &mut std::collections::HashMap<u64, String>,
         aliases: &mut std::collections::HashMap<String, String>,
@@ -670,7 +670,7 @@ impl Hdf5Reader {
                         // Capture group attributes (e.g. the NeXus `NX_class`
                         // marker), keyed by path.
                         let attrs = collect_object_attributes(handle, ctx, &child_header);
-                        if !attrs.is_empty() {
+                        if !attrs.is_absent() {
                             group_attrs.insert(full_name.clone(), attrs);
                         }
                         // Descend at most once per object header (cycle
@@ -764,7 +764,7 @@ impl Hdf5Reader {
         root_obj_addr: u64,
     ) -> IoResult<(
         Vec<DatasetReadInfo>,
-        std::collections::HashMap<String, Vec<AttributeEntry>>,
+        std::collections::HashMap<String, ObjectAttributes>,
         std::collections::BTreeSet<String>,
         std::collections::HashMap<String, String>,
     )> {
@@ -807,7 +807,7 @@ impl Hdf5Reader {
         datasets: &mut Vec<DatasetReadInfo>,
         visited: &mut std::collections::HashMap<u64, String>,
         aliases: &mut std::collections::HashMap<String, String>,
-        group_attrs: &mut std::collections::HashMap<String, Vec<AttributeEntry>>,
+        group_attrs: &mut std::collections::HashMap<String, ObjectAttributes>,
         group_paths: &mut std::collections::BTreeSet<String>,
     ) -> IoResult<()> {
         // Bound legacy-group nesting depth on a hostile/corrupt file.
@@ -899,7 +899,7 @@ impl Hdf5Reader {
                 // Collect this subgroup's attributes (e.g. NeXus NX_class).
                 {
                     let attrs = collect_object_attributes(handle, ctx, &hdr);
-                    if !attrs.is_empty() {
+                    if !attrs.is_absent() {
                         group_attrs.insert(full_name.clone(), attrs);
                     }
                 }
@@ -1229,31 +1229,41 @@ impl Hdf5Reader {
 
     /// Resolve one entry of an attribute list.
     ///
-    /// The three cases an attribute list can answer are kept apart here rather
-    /// than at each call site: decoded, present but undecodable, absent. A
-    /// caller that collapsed the middle case into the last would report an
-    /// attribute the file contains as one it does not.
+    /// The cases an attribute list can answer are kept apart here rather than
+    /// at each call site: decoded, present but undecodable, absent from a set
+    /// known to be whole, and absent from a set that was never read whole. A
+    /// caller that collapsed any of the middle cases into the last would
+    /// report an attribute the file contains as one it does not.
     fn resolve_attr<'a>(
-        attrs: &'a [AttributeEntry],
+        attrs: &'a ObjectAttributes,
         owner: &str,
         name: &str,
     ) -> IoResult<&'a AttributeMessage> {
-        match attrs.iter().find(|a| a.name() == name) {
+        match attrs.entries.iter().find(|a| a.name() == name) {
             Some(AttributeEntry::Readable(attr)) => Ok(attr),
             Some(AttributeEntry::Unreadable { reason, .. }) => Err(crate::io::IoError::Format(
                 crate::format::FormatError::UnsupportedFeature(format!(
                     "attribute '{name}' on '{owner}' cannot be decoded: {reason}"
                 )),
             )),
-            None => Err(crate::io::IoError::NotFound(format!("{owner}:{name}"))),
+            // Not among what was read — but the part that was not read could
+            // hold it, so an incomplete set cannot answer "absent".
+            None => match attrs.unreadable_reason() {
+                Some(reason) => Err(incomplete_error(owner, reason)),
+                None => Err(crate::io::IoError::NotFound(format!("{owner}:{name}"))),
+            },
         }
     }
 
     /// Why the attribute `name` in `attrs` cannot be read, or `None` when it
     /// can be — or is not there at all, which the accessors above report as
     /// `NotFound`.
-    fn attr_reason<'a>(attrs: &'a [AttributeEntry], name: &str) -> Option<&'a str> {
-        attrs.iter().find(|a| a.name() == name)?.unreadable_reason()
+    fn attr_reason<'a>(attrs: &'a ObjectAttributes, name: &str) -> Option<&'a str> {
+        attrs
+            .entries
+            .iter()
+            .find(|a| a.name() == name)?
+            .unreadable_reason()
     }
 
     /// Why a dataset's attribute cannot be read, or `None` when it can be.
@@ -1276,17 +1286,42 @@ impl Hdf5Reader {
         )
     }
 
+    /// Why a dataset's attributes cannot be listed at all, or `None` when the
+    /// set is whole. Object scope, unlike
+    /// [`Self::dataset_attr_unreadable_reason`]: the failure belongs to no
+    /// single name.
+    pub fn dataset_attrs_unreadable_reason(&self, ds_name: &str) -> Option<&str> {
+        self.dataset_info(ds_name)?.attributes.unreadable_reason()
+    }
+
+    /// Why the root group's attributes cannot be listed at all, or `None` when
+    /// the set is whole.
+    pub fn root_attrs_unreadable_reason(&self) -> Option<&str> {
+        self.root_attributes.unreadable_reason()
+    }
+
+    /// Why a non-root group's attributes cannot be listed at all, or `None`
+    /// when the set is whole.
+    pub fn group_attrs_unreadable_reason(&self, group_path: &str) -> Option<&str> {
+        self.group_attributes
+            .get(&self.canonical_path(group_path))?
+            .unreadable_reason()
+    }
+
     /// Return the attribute names of a dataset.
     ///
     /// Includes attributes this crate cannot decode: the object header carries
     /// them, so the listing does too. [`Self::dataset_attr`] says why one of
-    /// those cannot be read.
+    /// those cannot be read. An object whose attribute set could not be read
+    /// whole has no listing to give and returns the reason instead — see
+    /// [`Self::dataset_attrs_unreadable_reason`].
     pub fn dataset_attr_names(&self, name: &str) -> IoResult<Vec<String>> {
         let info = self
             .dataset_info(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         Ok(info
             .attributes
+            .complete(name)?
             .iter()
             .map(|a| a.name().to_string())
             .collect())
@@ -1302,11 +1337,13 @@ impl Hdf5Reader {
 
     /// Return the names of root-level (file) attributes, undecodable ones
     /// included — see [`Self::dataset_attr_names`].
-    pub fn root_attr_names(&self) -> Vec<String> {
-        self.root_attributes
+    pub fn root_attr_names(&self) -> IoResult<Vec<String>> {
+        Ok(self
+            .root_attributes
+            .complete("/")?
             .iter()
             .map(|a| a.name().to_string())
-            .collect()
+            .collect())
     }
 
     /// Return a root-level attribute by name.
@@ -1318,21 +1355,24 @@ impl Hdf5Reader {
     /// leading `/`, e.g. `"detector"` or `"entry/instrument"`; may pass
     /// through group hard links). Undecodable attributes included — see
     /// [`Self::dataset_attr_names`].
-    pub fn group_attr_names(&self, group_path: &str) -> Vec<String> {
-        self.group_attributes
-            .get(&self.canonical_path(group_path))
-            .map(|v| v.iter().map(|a| a.name().to_string()).collect())
-            .unwrap_or_default()
+    pub fn group_attr_names(&self, group_path: &str) -> IoResult<Vec<String>> {
+        let Some(attrs) = self.group_attributes.get(&self.canonical_path(group_path)) else {
+            return Ok(Vec::new());
+        };
+        Ok(attrs
+            .complete(group_path)?
+            .iter()
+            .map(|a| a.name().to_string())
+            .collect())
     }
 
     /// Return a non-root group's attribute by name.
     pub fn group_attr(&self, group_path: &str, name: &str) -> IoResult<&AttributeMessage> {
-        let attrs = self
-            .group_attributes
-            .get(&self.canonical_path(group_path))
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        Self::resolve_attr(attrs, group_path, name)
+        match self.group_attributes.get(&self.canonical_path(group_path)) {
+            Some(attrs) => Self::resolve_attr(attrs, group_path, name),
+            // No entry at all: the walk found nothing to record on this group.
+            None => Err(crate::io::IoError::NotFound(format!("{group_path}:{name}"))),
+        }
     }
 
     /// Return every non-root group path the discovery walk traversed into
@@ -3099,6 +3139,81 @@ pub(crate) struct HandleBlockReader<'a> {
     pub(crate) handle: &'a mut FileHandle,
 }
 
+/// One object's attribute set, or the reason it could not be read whole.
+///
+/// [`AttributeEntry`] carries a per-attribute failure, which needs a name to
+/// hang on. Two failures have none. A dense set is indexed by name *hash*, so
+/// a heap or index that will not read yields no names at all; and an attribute
+/// message too damaged to yield its own name cannot be listed under one
+/// either. The only listing that can report those honestly is the object's, so
+/// this type carries the object-scope reason beside the entries, and every
+/// accessor that would present the set as whole returns the reason instead.
+///
+/// The entries are deliberately unreachable while the set is incomplete: the
+/// only way out is [`Self::into_complete`], which refuses. That is what keeps
+/// the writer from rebuilding an object header out of a partial set and
+/// deleting the attributes it never saw.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ObjectAttributes {
+    entries: Vec<AttributeEntry>,
+    incomplete: Option<String>,
+}
+
+impl ObjectAttributes {
+    /// Record an attribute this collector could name.
+    fn push(&mut self, entry: AttributeEntry) {
+        self.entries.push(entry);
+    }
+
+    /// Record that part of the set could not be read. The first reason stands:
+    /// it is the one that explains the earliest missing attributes.
+    fn mark_incomplete(&mut self, reason: String) {
+        if self.incomplete.is_none() {
+            self.incomplete = Some(reason);
+        }
+    }
+
+    /// Why this object's attributes cannot be listed, or `None` when the set
+    /// is whole. Individual entries in a whole set may still be undecodable —
+    /// [`AttributeEntry::unreadable_reason`] answers for those.
+    pub fn unreadable_reason(&self) -> Option<&str> {
+        self.incomplete.as_deref()
+    }
+
+    /// Nothing worth recording: no attribute read, and no failure to report.
+    pub(crate) fn is_absent(&self) -> bool {
+        self.entries.is_empty() && self.incomplete.is_none()
+    }
+
+    /// The entries, once the set is known to be whole.
+    ///
+    /// The sole route from an `ObjectAttributes` to an owned entry list. A
+    /// caller that rewrites the object header — the append path — must take
+    /// this route, so an unread set stops the rewrite instead of erasing the
+    /// attributes behind it.
+    pub(crate) fn into_complete(self, owner: &str) -> IoResult<Vec<AttributeEntry>> {
+        match self.incomplete {
+            Some(reason) => Err(incomplete_error(owner, &reason)),
+            None => Ok(self.entries),
+        }
+    }
+
+    /// The entries, once the set is known to be whole, borrowed.
+    fn complete(&self, owner: &str) -> IoResult<&[AttributeEntry]> {
+        match &self.incomplete {
+            Some(reason) => Err(incomplete_error(owner, reason)),
+            None => Ok(&self.entries),
+        }
+    }
+}
+
+/// The one wording for "this object's attributes are not all here".
+fn incomplete_error(owner: &str, reason: &str) -> crate::io::IoError {
+    crate::io::IoError::Format(crate::format::FormatError::UnsupportedFeature(format!(
+        "attributes of '{owner}' cannot be read whole: {reason}"
+    )))
+}
+
 /// Every attribute attached to an object, whichever storage it uses.
 ///
 /// This is the only place attributes are pulled off an object header — reader
@@ -3110,33 +3225,38 @@ pub(crate) struct HandleBlockReader<'a> {
 /// reports zero attributes for a dense object: a silent loss on read, and a
 /// silent deletion when the writer rebuilds that object's header from what it
 /// collected.
+///
 /// An attribute this crate cannot decode is kept, named, with the reason
 /// attached: a listing that omitted it would report a file that does not
-/// contain it. Only a message too damaged to yield a name is dropped, and only
-/// because there is then nothing to list it under.
+/// contain it. What cannot be named at all — a damaged attribute message, an
+/// attribute info message that will not decode, a dense set whose heap or name
+/// index will not read — marks the whole set incomplete, so the object reports
+/// the failure rather than a short list.
 pub(crate) fn collect_object_attributes(
     handle: &mut FileHandle,
     ctx: &FormatContext,
     header: &ObjectHeader,
-) -> Vec<AttributeEntry> {
-    let mut attrs = Vec::new();
+) -> ObjectAttributes {
+    let mut attrs = ObjectAttributes::default();
     for msg in &header.messages {
         match msg.msg_type {
-            MSG_ATTRIBUTE => {
-                if let Ok(entry) = AttributeEntry::parse(&msg.data, ctx) {
-                    attrs.push(entry);
-                }
-            }
-            MSG_ATTR_INFO => {
-                if let Ok((info, _)) = AttributeInfoMessage::decode(&msg.data, ctx) {
+            MSG_ATTRIBUTE => match AttributeEntry::parse(&msg.data, ctx) {
+                Ok(entry) => attrs.push(entry),
+                Err(e) => attrs.mark_incomplete(format!("an attribute message is unreadable: {e}")),
+            },
+            MSG_ATTR_INFO => match AttributeInfoMessage::decode(&msg.data, ctx) {
+                Ok((info, _)) => {
                     let mut br = HandleBlockReader { handle };
-                    if let Ok(dense) =
-                        crate::format::dense_attr::read_dense_attributes(&info, ctx, &mut br)
-                    {
-                        attrs.extend(dense);
+                    match crate::format::dense_attr::read_dense_attributes(&info, ctx, &mut br) {
+                        Ok(dense) => attrs.entries.extend(dense),
+                        Err(e) => attrs
+                            .mark_incomplete(format!("dense attribute storage is unreadable: {e}")),
                     }
                 }
-            }
+                Err(e) => {
+                    attrs.mark_incomplete(format!("the attribute info message is unreadable: {e}"))
+                }
+            },
             _ => {}
         }
     }
@@ -3681,6 +3801,80 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Run the collector against a header built by hand. The handle is only
+    /// touched when a message sends the collector to the heap, which none of
+    /// these do, so an empty file is enough of a file.
+    fn collect_from(
+        messages: Vec<crate::format::object_header::ObjectHeaderMessage>,
+    ) -> Result<Vec<String>, String> {
+        let path = temp_path("collect");
+        std::fs::File::create(&path).unwrap();
+        let mut handle = FileHandle::open_read(&path).unwrap();
+        let ctx = FormatContext {
+            sizeof_addr: 8,
+            sizeof_size: 8,
+        };
+        let header = ObjectHeader {
+            flags: 0x02,
+            messages,
+        };
+        let attrs = collect_object_attributes(&mut handle, &ctx, &header);
+        drop(handle);
+        let _ = std::fs::remove_file(&path);
+        attrs
+            .complete("obj")
+            .map(|e| e.iter().map(|a| a.name().to_string()).collect())
+            .map_err(|e| e.to_string())
+    }
+
+    fn msg(msg_type: u8, data: Vec<u8>) -> crate::format::object_header::ObjectHeaderMessage {
+        crate::format::object_header::ObjectHeaderMessage {
+            msg_type,
+            flags: 0,
+            data,
+        }
+    }
+
+    /// An attribute info message that will not decode takes the object's whole
+    /// attribute set with it — the dense storage it names is where the
+    /// attributes are. The listing must say so rather than come back short.
+    #[test]
+    fn an_undecodable_attribute_info_message_fails_the_listing() {
+        // Version 9: `H5O_AINFO_VERSION_0` is the only one that exists.
+        let err = collect_from(vec![msg(MSG_ATTR_INFO, vec![9, 0])]).unwrap_err();
+        assert!(
+            err.contains("attributes of 'obj' cannot be read whole")
+                && err.contains("attribute info message"),
+            "{err}"
+        );
+    }
+
+    /// An attribute message damaged past its own name has no name to be listed
+    /// under, so it too is an object-level failure — the one case
+    /// [`AttributeEntry::parse`] cannot name.
+    #[test]
+    fn an_unnameable_attribute_message_fails_the_listing() {
+        let err = collect_from(vec![msg(MSG_ATTRIBUTE, vec![1, 0, 0])]).unwrap_err();
+        assert!(
+            err.contains("attributes of 'obj' cannot be read whole")
+                && err.contains("attribute message"),
+            "{err}"
+        );
+    }
+
+    /// The failure is the object's, not one name's: a set that reads whole
+    /// still lists, and a compact attribute info message is not dense storage.
+    #[test]
+    fn a_whole_attribute_set_still_lists() {
+        let ctx = FormatContext {
+            sizeof_addr: 8,
+            sizeof_size: 8,
+        };
+        let ainfo = crate::format::messages::attr_info::AttributeInfoMessage::compact();
+        let names = collect_from(vec![msg(MSG_ATTR_INFO, ainfo.encode(&ctx))]).unwrap();
+        assert!(names.is_empty(), "{names:?}");
     }
 }
 

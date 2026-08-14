@@ -362,7 +362,7 @@ impl H5File {
     pub fn attr_names(&self) -> Result<Vec<String>> {
         let inner = borrow_inner(&self.inner);
         match &*inner {
-            H5FileInner::Reader(reader) => Ok(reader.root_attr_names()),
+            H5FileInner::Reader(reader) => Ok(reader.root_attr_names()?),
             _ => Ok(vec![]),
         }
     }
@@ -374,6 +374,19 @@ impl H5File {
         match &*inner {
             H5FileInner::Reader(reader) => {
                 Ok(reader.root_attr_unreadable_reason(name).map(str::to_string))
+            }
+            _ => Err(Hdf5Error::InvalidState("not in read mode".into())),
+        }
+    }
+
+    /// Why the file-level attribute *set* cannot be listed, or `None` when it
+    /// can be. See
+    /// [`H5Dataset::attrs_unreadable_reason`](crate::H5Dataset::attrs_unreadable_reason).
+    pub fn attrs_unreadable_reason(&self) -> Result<Option<String>> {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => {
+                Ok(reader.root_attrs_unreadable_reason().map(str::to_string))
             }
             _ => Err(Hdf5Error::InvalidState("not in read mode".into())),
         }

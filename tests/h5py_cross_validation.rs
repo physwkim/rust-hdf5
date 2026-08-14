@@ -1578,3 +1578,99 @@ fn undecodable_attribute_is_listed_with_a_reason() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// A dense attribute set that will not read is the object's failure to report.
+///
+/// The name index stores hashes, not names, so a heap or index this crate
+/// cannot walk leaves nothing to list and nothing to hang a per-attribute
+/// reason on. The collector used to swallow that whole and hand back an empty
+/// list: the object then looked like one with no attributes, and the append
+/// path rebuilt its header from that emptiness — deleting on disk the
+/// attributes it had never read. Now the listing carries the failure, and the
+/// reopen refuses.
+#[test]
+fn an_unreadable_dense_attribute_set_is_reported_on_the_object() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_dense_corrupt");
+    // Ten attributes on `g` cross `max_compact` (8), so libhdf5 moves them to
+    // dense storage; the dataset and the root group stay compact.
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v108"),
+        "d = f.create_dataset('data', data=np.arange(4, dtype='<i4'))\n\
+         d.attrs['gain'] = np.int32(7)\n\
+         f.attrs['top'] = 'root'\n\
+         g = f.create_group('g')\n\
+         for i in range(9):\n\
+        \x20    g.attrs['a%02d' % i] = np.int32(i)\n\
+         g.attrs['keep'] = 'yes'\n",
+    );
+
+    // Break the name index the attribute info message points at. The B-tree
+    // header lives outside the object header, so this corrupts the attribute
+    // set without disturbing the header checksum that guards the group's
+    // links — exactly the shape of damage that used to read back as "no
+    // attributes".
+    let mut raw = std::fs::read(&path).unwrap();
+    let hits: Vec<usize> = (0..raw.len() - 4)
+        .filter(|&i| &raw[i..i + 4] == b"BTHD")
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "fixture must hold exactly one v2 B-tree, the attribute name index"
+    );
+    raw[hits[0]..hits[0] + 4].copy_from_slice(b"XXXX");
+    std::fs::write(&path, &raw).unwrap();
+
+    {
+        let file = H5File::open(&path).unwrap();
+        let grp = file.root_group().group("g").unwrap();
+
+        let err = grp
+            .attr_names()
+            .expect_err("an unreadable attribute set must not list as empty")
+            .to_string();
+        assert!(
+            err.contains("attributes of 'g' cannot be read whole"),
+            "{err}"
+        );
+        assert!(err.contains("dense attribute storage"), "{err}");
+
+        let why = grp
+            .attrs_unreadable_reason()
+            .unwrap()
+            .expect("the object must say why its attributes cannot be listed");
+        assert!(why.contains("dense attribute storage"), "{why}");
+
+        // A name lookup cannot answer "absent" out of a set that was never
+        // read whole: `keep` is in there somewhere.
+        let err = grp.attr_string("keep").expect_err("must not be NotFound");
+        assert!(err.to_string().contains("cannot be read whole"), "{err}");
+
+        // Objects whose attributes did read are unaffected.
+        assert_eq!(file.attr_names().unwrap(), vec!["top".to_string()]);
+        assert_eq!(file.attrs_unreadable_reason().unwrap(), None);
+        let ds = file.dataset("data").unwrap();
+        assert_eq!(ds.attr_names().unwrap(), vec!["gain".to_string()]);
+        assert_eq!(ds.attrs_unreadable_reason().unwrap(), None);
+        file.close().unwrap();
+    }
+
+    // The append path rebuilds object headers out of the attributes it read,
+    // so a set it could not read whole must stop the open — before any of this
+    // session's bytes land in the file.
+    let before = std::fs::read(&path).unwrap();
+    let err = match H5File::open_rw(&path) {
+        Ok(_) => panic!("open_rw must refuse a file with an unreadable attribute set"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("cannot be read whole"), "{err}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "a refused reopen must leave the file byte-identical"
+    );
+    std::fs::remove_file(&path).ok();
+}

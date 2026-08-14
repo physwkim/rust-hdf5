@@ -640,9 +640,9 @@ impl H5Group {
         match &*inner {
             H5FileInner::Reader(reader) => {
                 if self.name == "/" {
-                    Ok(reader.root_attr_names())
+                    Ok(reader.root_attr_names()?)
                 } else {
-                    Ok(reader.group_attr_names(self.name.trim_start_matches('/')))
+                    Ok(reader.group_attr_names(self.name.trim_start_matches('/'))?)
                 }
             }
             _ => Err(Hdf5Error::InvalidState(
@@ -667,6 +667,30 @@ impl H5Group {
             .map(str::to_string)),
             _ => Err(Hdf5Error::InvalidState(
                 "attr_unreadable_reason is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Why this group's attribute *set* cannot be listed, or `None` when it
+    /// can be.
+    ///
+    /// The object-scope counterpart of
+    /// [`attr_unreadable_reason`](Self::attr_unreadable_reason): a failure
+    /// that belongs to no single name — a dense set whose heap or name index
+    /// will not read — leaves nothing to list, so
+    /// [`attr_names`](Self::attr_names) returns it as an error and this
+    /// reports it without one.
+    pub fn attrs_unreadable_reason(&self) -> Result<Option<String>> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_attrs_unreadable_reason()
+            } else {
+                reader.group_attrs_unreadable_reason(self.name.trim_start_matches('/'))
+            }
+            .map(str::to_string)),
+            _ => Err(Hdf5Error::InvalidState(
+                "attrs_unreadable_reason is only available in read mode".into(),
             )),
         }
     }

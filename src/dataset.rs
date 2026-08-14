@@ -754,6 +754,32 @@ impl H5Dataset {
         }
     }
 
+    /// Why this dataset's attribute *set* cannot be listed, or `None` when it
+    /// can be.
+    ///
+    /// The object-scope counterpart of
+    /// [`attr_unreadable_reason`](Self::attr_unreadable_reason). A dense
+    /// attribute set is indexed by name hash, so a heap or index that will not
+    /// read yields no names to hang a per-attribute reason on;
+    /// [`attr_names`](Self::attr_names) then returns the failure rather than a
+    /// short list, and this reports it without an attribute name.
+    pub fn attrs_unreadable_reason(&self) -> Result<Option<String>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Reader(reader) => Ok(reader
+                        .dataset_attrs_unreadable_reason(name)
+                        .map(str::to_string)),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "attrs_unreadable_reason not available in write mode".into(),
+            )),
+        }
+    }
+
     /// Open an attribute by name (read mode only).
     pub fn attr(&self, attr_name: &str) -> Result<crate::attribute::H5Attribute> {
         match &self.info {

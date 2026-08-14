@@ -585,23 +585,36 @@ fn oversized_attr_error(name: &str, encoded_size: usize) -> crate::io::IoError {
     ))
 }
 
-/// Refuse to reopen a file holding an attribute the writer could not put back.
+/// Take an object's attributes into the append session, or refuse the reopen.
 ///
 /// Append mode rebuilds every object header it touches out of the attributes
-/// read from it, so an attribute libhdf5 kept in dense storage comes back as a
-/// compact message — and above [`MAX_MESSAGE_SIZE`] that message cannot be
-/// encoded at all. Left to surface at `finalize`, the failure would land after
-/// this session's chunk data and indices had already been written past the
+/// read from it, so what this returns is what the object will still have when
+/// the session finalizes. Two things make that a loss rather than a rewrite,
+/// and both stop the open here:
+///
+/// An attribute libhdf5 kept in dense storage comes back as a compact message,
+/// and above [`MAX_MESSAGE_SIZE`] that message cannot be encoded at all. An
+/// attribute set that could not be read whole — `ObjectAttributes::
+/// into_complete` refuses it — would come back as the part that did read,
+/// silently deleting the rest.
+///
+/// Left to surface at `finalize`, either failure would land after this
+/// session's chunk data and indices had already been written past the
 /// allocation point the superblock still records, leaving a file libhdf5 reads
 /// as truncated. Refusing the open leaves it untouched.
-fn check_reopened_attributes(attrs: &[AttributeEntry], ctx: &FormatContext) -> IoResult<()> {
-    for attr in attrs {
+fn take_reopened_attributes(
+    attrs: crate::io::reader::ObjectAttributes,
+    owner: &str,
+    ctx: &FormatContext,
+) -> IoResult<Vec<AttributeEntry>> {
+    let attrs = attrs.into_complete(owner)?;
+    for attr in &attrs {
         let encoded_size = attr.encode(ctx).len();
         if encoded_size > MAX_MESSAGE_SIZE {
             return Err(oversized_attr_error(attr.name(), encoded_size));
         }
     }
-    Ok(())
+    Ok(attrs)
 }
 
 /// One collection block with free space that a later vlen insert may
@@ -1216,9 +1229,11 @@ impl Hdf5Writer {
         // Collect existing root-level attributes. Through the shared collector
         // so a root group using dense storage is carried forward rather than
         // erased by the header rewrite at finalize.
-        let root_attributes =
-            crate::io::reader::collect_object_attributes(&mut handle, &ctx, &root_header);
-        check_reopened_attributes(&root_attributes, &ctx)?;
+        let root_attributes = take_reopened_attributes(
+            crate::io::reader::collect_object_attributes(&mut handle, &ctx, &root_header),
+            "/",
+            &ctx,
+        )?;
 
         let mut link_entries: Vec<(String, u64)> = Vec::new();
         let mut visited_groups = std::collections::HashSet::new();
@@ -1272,8 +1287,11 @@ impl Hdf5Writer {
             let mut layout = None;
             let mut fp = None;
             let mut fill_value = None;
-            let attrs = crate::io::reader::collect_object_attributes(&mut handle, &ctx, &ds_header);
-            check_reopened_attributes(&attrs, &ctx)?;
+            let attrs = take_reopened_attributes(
+                crate::io::reader::collect_object_attributes(&mut handle, &ctx, &ds_header),
+                name,
+                &ctx,
+            )?;
 
             for msg in &ds_header.messages {
                 match msg.msg_type {
