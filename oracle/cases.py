@@ -779,7 +779,7 @@ LINK_CASES = [
     Case("link_hard", "link", gen_link_hard, "link_hard",
          "two names for one object"),
     Case("link_soft", "link", gen_link_soft, "link_soft", "soft link to /orig"),
-    Case("link_external", "link", gen_link_external, None,
+    Case("link_external", "link", gen_link_external, "link_external",
          "external link into a sibling file",
          ext_files=("_ext.h5",)),
     Case("link_external_read", "link", gen_link_external_read, None,

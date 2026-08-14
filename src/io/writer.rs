@@ -3923,6 +3923,23 @@ impl Hdf5Writer {
                 "link name '{link_name}' must be a non-empty leaf name"
             )));
         }
+        // `H5Lcreate_external` refuses an empty file or object name, and
+        // stores the object path normalized; a link written here and one
+        // libhdf5 writes from the same arguments then hold the same bytes.
+        let target = match target {
+            LinkTarget::External { file, path } => {
+                if file.is_empty() || path.is_empty() {
+                    return Err(crate::io::IoError::InvalidState(
+                        "an external link needs both a file name and an object path".into(),
+                    ));
+                }
+                LinkTarget::External {
+                    file,
+                    path: crate::format::messages::link::normalize_object_path(&path),
+                }
+            }
+            other => other,
+        };
         // The link itself would be a name in a group that lives in another
         // file; its *value* may name anything, including a path this writer
         // cannot follow, because nothing follows it here.

@@ -1825,6 +1825,37 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "link_external" => {
+            // The reference builds the sibling's name from this file's stem,
+            // and stores the bare file name so the link resolves against the
+            // directory holding the master.
+            let target = std::path::Path::new(path).with_file_name(format!(
+                "{}_ext.h5",
+                std::path::Path::new(path)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            ));
+            let ext = H5File::create(&target)?;
+            ext.new_dataset::<i32>()
+                .shape([8usize])
+                .create("payload")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            ext.close()?;
+
+            let file = H5File::create(path)?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("orig")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.create_external_link(
+                "ext",
+                &target.file_name().unwrap_or_default().to_string_lossy(),
+                "/payload",
+            )?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "links_dense" => {
             // The reference makes `g` with `track_order=True`, so the dense
             // storage it spills into carries a creation-order index beside

@@ -143,6 +143,38 @@ impl H5Group {
         )
     }
 
+    /// Create an external link — `H5Lcreate_external`, h5py's
+    /// `h5py.ExternalLink`.
+    ///
+    /// The link names `target_path` inside `target_file`; neither is opened
+    /// here, and libhdf5 resolves `target_file` against the directory holding
+    /// *this* file, so a relative name is the portable form. As with
+    /// [`create_soft_link`](Self::create_soft_link) the link may dangle: a
+    /// file that is not there and an object that is not there are both legal.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    ///
+    /// let file = H5File::create("master.h5").unwrap();
+    /// file.root_group()
+    ///     .create_external_link("ext", "payload.h5", "/data")
+    ///     .unwrap();
+    /// ```
+    pub fn create_external_link(
+        &self,
+        link_name: &str,
+        target_file: &str,
+        target_path: &str,
+    ) -> Result<()> {
+        self.create_symbolic_link(
+            link_name,
+            LinkTarget::External {
+                file: target_file.to_string(),
+                path: target_path.to_string(),
+            },
+        )
+    }
+
     /// Both symbolic-link constructors, behind one writer-mode check.
     fn create_symbolic_link(&self, link_name: &str, target: LinkTarget) -> Result<()> {
         let inner = borrow_inner(&self.file_inner);

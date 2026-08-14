@@ -279,6 +279,25 @@ impl H5File {
         self.root_group().create_soft_link(link_name, target_path)
     }
 
+    /// Create an external link in the root of the file.
+    ///
+    /// See [`H5Group::create_external_link`](crate::group::H5Group::create_external_link).
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    /// let file = H5File::create("master.h5").unwrap();
+    /// file.create_external_link("ext", "payload.h5", "/data").unwrap();
+    /// ```
+    pub fn create_external_link(
+        &self,
+        link_name: &str,
+        target_file: &str,
+        target_path: &str,
+    ) -> Result<()> {
+        self.root_group()
+            .create_external_link(link_name, target_file, target_path)
+    }
+
     /// Start building a new dataset with the given element type.
     ///
     /// This returns a fluent builder. Call `.shape(...)` to set dimensions and

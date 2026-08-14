@@ -1892,6 +1892,94 @@ fn soft_links_read_back_through_h5py() {
     std::fs::remove_file(&path).ok();
 }
 
+/// An external link is a user-defined link of class 64 whose value is a
+/// version/flags byte, the NUL-terminated file name and the NUL-terminated
+/// object path. h5py must report `ExternalLink` with both halves and open the
+/// object through it; libhdf5 resolves the file name against the directory
+/// holding this file, so the bare name is what gets stored. The object path
+/// is normalized on the way in, the way `H5Lcreate_external` normalizes it.
+#[test]
+fn external_links_read_back_through_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("link_external");
+    let target = path.with_file_name(format!(
+        "{}_ext.h5",
+        path.file_stem().unwrap().to_string_lossy()
+    ));
+    let target_name = target.file_name().unwrap().to_string_lossy().to_string();
+    {
+        let ext = H5File::create(&target).unwrap();
+        ext.create_group("deep")
+            .unwrap()
+            .new_dataset::<i32>()
+            .shape([8])
+            .create("payload")
+            .unwrap()
+            .write_raw(&(0..8i32).collect::<Vec<_>>())
+            .unwrap();
+        ext.close().unwrap();
+
+        let file = H5File::create(&path).unwrap();
+        file.create_external_link("ext", &target_name, "/deep/payload")
+            .unwrap();
+        // Duplicate and trailing slashes do not survive `H5G_normalize`.
+        file.create_external_link("messy", &target_name, "//deep///payload/")
+            .unwrap();
+        file.create_external_link("gone_object", &target_name, "/absent")
+            .unwrap();
+        file.create_external_link("gone_file", "no_such_file.h5", "/deep/payload")
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        &format!(
+            "l = f.get('ext', getlink=True)\n\
+             assert isinstance(l, h5py.ExternalLink), l\n\
+             assert l.filename == {name:?}, l.filename\n\
+             assert l.path == '/deep/payload', l.path\n\
+             assert list(f['ext'][:]) == list(range(8))\n\
+             m = f.get('messy', getlink=True)\n\
+             assert m.path == '/deep/payload', m.path\n\
+             assert list(f['messy'][:]) == list(range(8))\n\
+             assert sorted(f.keys()) == ['ext', 'gone_file', 'gone_object', 'messy']\n\
+             for dangling in ('gone_object', 'gone_file'):\n\
+             \x20   try:\n\
+             \x20       f[dangling]\n\
+             \x20       raise AssertionError('%s must not resolve' % dangling)\n\
+             \x20   except KeyError:\n\
+             \x20       pass\n",
+            name = target_name
+        ),
+    );
+
+    // And this crate reads its own external links back, following the one
+    // that resolves into the other file.
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(
+        file.root_group().link_class("ext").unwrap(),
+        rust_hdf5::LinkClass::External {
+            file: target_name.clone(),
+            path: "/deep/payload".into()
+        }
+    );
+    assert_eq!(
+        file.root_group().link_class("messy").unwrap(),
+        rust_hdf5::LinkClass::External {
+            file: target_name,
+            path: "/deep/payload".into()
+        }
+    );
+    assert_eq!(
+        file.dataset("ext").unwrap().read_raw::<i32>().unwrap(),
+        (0..8i32).collect::<Vec<_>>()
+    );
+    drop(file);
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&target).ok();
+}
+
 /// The phase change counts links, not objects: a group whose set crosses
 /// `max_compact` on the strength of its soft links spills the whole set into
 /// a fractal heap, and every soft link has to come back out of it with its
