@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Canonical h5py-side dump of an HDF5 file — the reference half of the oracle.
 
-Emits the `!canon 1` format described in oracle/CANON.md. The rust-hdf5 side
+Emits the `!canon 2` format described in oracle/CANON.md. The rust-hdf5 side
 (`src/bin/oracle_probe.rs`, `dump` subcommand) emits the same format from the
 same file, so the two are comparable line by line and field by field.
 
@@ -16,10 +16,12 @@ import traceback
 
 import numpy as np
 
-import h5py
-from h5py import h5d, h5s, h5t
+import hdf5env  # noqa: F401  (must precede h5py; see the module docstring)
 
-CANON_VERSION = "1"
+import h5py
+from h5py import h5d, h5p, h5s, h5t
+
+CANON_VERSION = "2"
 RAW_LIMIT = 1024
 MAX_DEPTH = 32
 
@@ -135,7 +137,8 @@ def canon_dtype(tid):
     if cls == h5t.STRING:
         cset = _CSET.get(tid.get_cset(), "cset%d" % tid.get_cset())
         if tid.is_variable_str():
-            # strpad is deliberately omitted; see oracle/CANON.md.
+            # The pad of a variable-length string travels in the separate
+            # `strpad` field, not inline here; see oracle/CANON.md.
             return "vstr,cset=%s" % cset
         pad = _STRPAD.get(tid.get_strpad(), "pad%d" % tid.get_strpad())
         return "str[%d],pad=%s,cset=%s" % (size, pad, cset)
@@ -219,6 +222,36 @@ def has_heap_type(tid):
             has_heap_type(tid.get_member_type(i)) for i in range(tid.get_nmembers())
         )
     return False
+
+
+def vlen_strpads(tid, where=""):
+    """`where=pad` for every variable-length string in the type tree.
+
+    A fixed string carries its pad inline in the dtype, where both sides
+    agree. A variable-length one cannot, so it is reported here. `where` is
+    the position in the type tree: `.` is the type itself, `.m` a compound
+    member, `[]` an array element, `()` a vlen element.
+    """
+    cls = tid.get_class()
+    if cls == h5t.STRING and tid.is_variable_str():
+        pad = _STRPAD.get(tid.get_strpad(), "pad%d" % tid.get_strpad())
+        return ["%s=%s" % (where or ".", pad)]
+    if cls == h5t.ARRAY:
+        return vlen_strpads(tid.get_super(), where + "[]")
+    if cls == h5t.VLEN:
+        return vlen_strpads(tid.get_super(), where + "()")
+    if cls == h5t.COMPOUND:
+        out = []
+        for i in range(tid.get_nmembers()):
+            name = tid.get_member_name(i).decode("utf-8", "replace")
+            out.extend(vlen_strpads(tid.get_member_type(i), where + "." + name))
+        return out
+    return []
+
+
+def strpad_str(tid):
+    pads = vlen_strpads(tid)
+    return ";".join(pads) if pads else "-"
 
 
 def render_elem(value, tid):
@@ -420,6 +453,58 @@ if hasattr(h5d, "VIRTUAL"):
     _LAYOUTS[h5d.VIRTUAL] = "virtual"
 
 
+def external_str(dcpl):
+    """External file storage segments, `-` when the data lives in the file."""
+    count = dcpl.get_external_count()
+    if not count:
+        return "-"
+    parts = []
+    for i in range(count):
+        name, offset, size = dcpl.get_external(i)
+        parts.append("%s@%d+%d" % (esc(name), offset, size))
+    return "[" + ",".join(parts) + "]"
+
+
+def _bounds_str(sid):
+    try:
+        lo, hi = sid.get_select_bounds()
+    except Exception:
+        return "?"
+    return "%s-%s" % (dims_str(lo), dims_str(hi))
+
+
+def virtual_str(dcpl):
+    """Virtual dataset mappings, `-` when the dataset is not virtual."""
+    # get_virtual_count() raises on any other layout.
+    if not hasattr(h5d, "VIRTUAL") or dcpl.get_layout() != h5d.VIRTUAL:
+        return "-"
+    count = dcpl.get_virtual_count()
+    if not count:
+        return "-"
+    parts = []
+    for i in range(count):
+        parts.append(
+            "%s::%s %s->%s"
+            % (
+                esc(dcpl.get_virtual_filename(i)),
+                esc(dcpl.get_virtual_dsetname(i)),
+                _bounds_str(dcpl.get_virtual_srcspace(i)),
+                _bounds_str(dcpl.get_virtual_vspace(i)),
+            )
+        )
+    return "[" + ",".join(parts) + "]"
+
+
+def crt_order_str(flags):
+    """Creation-order tracking flags of a group or file creation plist."""
+    parts = []
+    if flags & h5p.CRT_ORDER_TRACKED:
+        parts.append("tracked")
+    if flags & h5p.CRT_ORDER_INDEXED:
+        parts.append("indexed")
+    return "+".join(parts) if parts else "-"
+
+
 # --------------------------------------------------------------------------
 # the dumper
 # --------------------------------------------------------------------------
@@ -433,7 +518,7 @@ class Dumper:
     def __init__(self, path):
         self.path = path
         self.out = []
-        self.superblock = read_superblock_version(path)
+        self.superblock, self.userblock = read_superblock(path)
 
     def emit(self, key, value):
         self.out.append("%s\t%s" % (key, str(value).replace("\t", " ")))
@@ -449,6 +534,7 @@ class Dumper:
         global _REF_FILE
         self.emit("!canon", CANON_VERSION)
         self.emit("#superblock", self.superblock)
+        self.emit("#userblock", self.userblock)
         with h5py.File(self.path, "r") as f:
             _REF_FILE = f
             try:
@@ -461,6 +547,20 @@ class Dumper:
 
     def dump_group(self, path, grp, depth):
         self.emit("%s#kind" % path, "group")
+        # A File is a Group, but its `.id` is the file id, whose creation
+        # plist is the FCPL and does not carry the root group's own
+        # creation-order flags.
+        gid = grp["/"].id if isinstance(grp, h5py.File) else grp.id
+        self.field(
+            path, "linkorder", lambda: crt_order_str(
+                gid.get_create_plist().get_link_creation_order()
+            )
+        )
+        self.field(
+            path, "attrorder", lambda: crt_order_str(
+                gid.get_create_plist().get_attr_creation_order()
+            )
+        )
         self.dump_attrs(path, grp)
         if depth >= MAX_DEPTH:
             self.emit("%s#truncated" % path, "depth")
@@ -492,6 +592,7 @@ class Dumper:
             elif isinstance(obj, h5py.Datatype):
                 self.emit("%s#kind" % child, "committed-datatype")
                 self.field(child, "dtype", lambda o=obj: canon_dtype(o.id))
+                self.field(child, "strpad", lambda o=obj: strpad_str(o.id))
                 self.dump_attrs(child, obj)
             else:
                 self.emit("%s#kind" % child, "unknown")
@@ -505,6 +606,7 @@ class Dumper:
         space_type = sid.get_simple_extent_type()
 
         self.field(path, "dtype", lambda: canon_dtype(tid))
+        self.field(path, "strpad", lambda: strpad_str(tid))
 
         if space_type == h5s.NULL:
             shape, maxshape = None, None
@@ -531,6 +633,8 @@ class Dumper:
             self.emit("%s#chunk" % path, "-")
             self.emit("%s#chunkindex" % path, "-")
 
+        self.field(path, "external", lambda: external_str(dcpl))
+        self.field(path, "virtual", lambda: virtual_str(dcpl))
         self.field(path, "filters", lambda: filters_str(dcpl))
         self.field(path, "fillvalue", lambda: self.fill_value(dset, dcpl))
         self.dump_attrs(path, dset)
@@ -571,6 +675,7 @@ class Dumper:
             tid = aid.get_type()
             sid = aid.get_space()
             self.field(key, "dtype", lambda t=tid: canon_dtype(t))
+            self.field(key, "strpad", lambda t=tid: strpad_str(t))
             if sid.get_simple_extent_type() == h5s.NULL:
                 self.emit("%s#shape" % key, "null")
             else:
@@ -582,13 +687,24 @@ class Dumper:
             )
 
 
-def read_superblock_version(path):
-    """Superblock version byte — the one observable that pins the libver bound."""
+_SIGNATURE = b"\x89HDF\r\n\x1a\n"
+
+
+def read_superblock(path):
+    """(superblock version, user block size).
+
+    A user block displaces the superblock to the first power-of-two offset at
+    or after 512 bytes, so the signature has to be searched for rather than
+    read at zero.
+    """
     with open(path, "rb") as fh:
-        head = fh.read(16)
-    if head[:8] != b"\x89HDF\r\n\x1a\n":
-        return "ERROR(superblock): bad signature"
-    return head[8]
+        data = fh.read()
+    offset = 0
+    while offset < len(data):
+        if data[offset : offset + 8] == _SIGNATURE:
+            return data[offset + 8], offset
+        offset = 512 if offset == 0 else offset * 2
+    return "ERROR(superblock): no signature at any user-block offset", 0
 
 
 def dump(path):

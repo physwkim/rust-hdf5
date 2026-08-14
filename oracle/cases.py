@@ -344,6 +344,16 @@ def gen_vlen_bytes(path):
         ds[2] = np.array([255], dtype="u1")
 
 
+def gen_named_datatype(path):
+    with h5py.File(path, "w") as f:
+        f["t"] = np.dtype("<i4")
+        f.create_dataset("data", data=ramp("<i4"))
+        # A dataset created from the committed TypeID stores a *shared*
+        # datatype message pointing at /t rather than a datatype of its own.
+        sid = h5s.create_simple((N,))
+        lowlevel_dataset(f, "shared", f["t"].id, sid, ramp("<i4"))
+
+
 COMPOSITE_CASES = [
     Case("compound_simple", "dtype-composite", gen_compound_simple, "compound_simple",
          "two f32 members, no padding"),
@@ -368,6 +378,8 @@ COMPOSITE_CASES = [
          "variable-length i32 sequences"),
     Case("vlen_bytes", "dtype-composite", gen_vlen_bytes, "vlen_bytes",
          "variable-length u8 sequences"),
+    Case("named_datatype", "dtype-composite", gen_named_datatype, None,
+         "committed datatype object, and a dataset that shares it"),
 ]
 
 
@@ -445,6 +457,46 @@ def gen_chunkidx_earray_unlim_inner(path):
         ds[...] = ramp("<i4", 16).reshape(4, 4)
 
 
+def gen_layout_contiguous_v108(path):
+    with h5py.File(path, "w", libver=("v108", "v108")) as f:
+        f.create_dataset("data", data=ramp("<i4", 16))
+
+
+def gen_layout_chunked_v108(path):
+    with h5py.File(path, "w", libver=("v108", "v108")) as f:
+        ds = f.create_dataset("data", (16,), chunks=(16,), dtype="<i4")
+        ds[...] = ramp("<i4", 16)
+
+
+def gen_chunkidx_earray_dim1(path):
+    # The extensible dimension is the fastest-changing one, so the chunk
+    # coordinate the index is keyed on is not the first.
+    with h5py.File(path, "w", libver="latest") as f:
+        ds = f.create_dataset(
+            "data", (4, 4), maxshape=(4, None), chunks=(2, 4), dtype="<i4"
+        )
+        ds[...] = ramp("<i4", 16).reshape(4, 4)
+
+
+def gen_external_storage(path):
+    raw = path.parent / (path.stem + "_ext.raw")
+    raw.write_bytes(ramp("<i4", 16).tobytes())
+    with h5py.File(path, "w") as f:
+        f.create_dataset(
+            "data", shape=(16,), dtype="<i4", external=[(raw.name, 0, 64)]
+        )
+
+
+def gen_vds(path):
+    src = path.parent / (path.stem + "_src.h5")
+    with h5py.File(src, "w") as g:
+        g.create_dataset("src", data=ramp("<i4", 16))
+    layout = h5py.VirtualLayout(shape=(16,), dtype="<i4")
+    layout[...] = h5py.VirtualSource(src.name, "src", shape=(16,))
+    with h5py.File(path, "w") as f:
+        f.create_virtual_dataset("vds", layout)
+
+
 def gen_chunkidx_btree2(path):
     with h5py.File(path, "w", libver="latest") as f:
         ds = f.create_dataset(
@@ -477,6 +529,19 @@ LAYOUT_CASES = [
          "extensible-array index — the unlimited dimension is dim 1, not dim 0"),
     Case("chunkidx_btree2", "layout", gen_chunkidx_btree2, "chunkidx_btree2",
          "version-2 B-tree index — two unlimited dimensions"),
+    Case("layout_contiguous_v108", "layout", gen_layout_contiguous_v108, None,
+         "contiguous layout under v1.8 bounds — the v1.10 pair's control"),
+    Case("layout_chunked_v108", "layout", gen_layout_chunked_v108, None,
+         "chunked layout under v1.8 bounds"),
+    Case("chunkidx_earray_dim1", "layout", gen_chunkidx_earray_dim1,
+         "chunkidx_earray_dim1",
+         "extensible-array index whose unlimited dimension is not the first"),
+    Case("external_storage", "layout", gen_external_storage, None,
+         "contiguous data held in an external raw file",
+         ext_files=("_ext.raw",)),
+    Case("vds", "layout", gen_vds, None,
+         "virtual dataset mapped onto a dataset in a sibling file",
+         ext_files=("_src.h5",)),
 ]
 
 
@@ -625,6 +690,20 @@ def gen_links_dense(path):
             g.create_dataset("d%02d" % i, data=np.array([i], dtype="<i4"))
 
 
+def gen_track_order(path):
+    # Creation-order tracking adds a second index (a v2 B-tree keyed on
+    # creation order) beside the name index, on both links and attributes.
+    with h5py.File(path, "w", track_order=True) as f:
+        for name in ("zebra", "apple", "mango"):
+            f.create_group(name)
+        for i, key in enumerate(("zeta", "alpha", "mu")):
+            f.attrs.create(key, np.int32(i))
+        g = f.create_group("g", track_order=True)
+        g.create_dataset("data", data=ramp("<i4"))
+        g.attrs.create("second", np.int32(2))
+        g.attrs.create("first", np.int32(1))
+
+
 LINK_CASES = [
     Case("groups_nested", "group", gen_groups_nested, "groups_nested",
          "three levels of nested groups plus an empty leaf group"),
@@ -636,6 +715,8 @@ LINK_CASES = [
          ext_files=("_ext.h5",)),
     Case("links_dense", "link", gen_links_dense, "links_dense",
          "12 links in one group — dense link storage (fractal heap + v2 B-tree)"),
+    Case("track_order", "group", gen_track_order, None,
+         "creation-order indices on links and attributes"),
 ]
 
 
@@ -684,6 +765,14 @@ def gen_attr_on_root(path):
         f.create_dataset("data", data=ramp("<i4"))
 
 
+def gen_attr_large(path):
+    # One attribute past the 64 KiB object-header message limit: the value
+    # spills to dense storage no matter how few attributes there are.
+    with h5py.File(path, "w", libver=("v108", "v108")) as f:
+        ds = f.create_dataset("data", data=ramp("<i4"))
+        ds.attrs.create("big", np.arange(25600, dtype="<i4"))
+
+
 ATTR_CASES = [
     Case("attr_scalar_num", "attribute", gen_attr_scalar_num, "attr_scalar_num",
          "scalar f64 and i32 attributes"),
@@ -695,6 +784,8 @@ ATTR_CASES = [
          "12 attributes — dense attribute storage"),
     Case("attr_on_root", "attribute", gen_attr_on_root, "attr_on_root",
          "attributes on the root group"),
+    Case("attr_large", "attribute", gen_attr_large, "attr_large",
+         "single 100 KiB attribute — dense storage forced by size, not count"),
 ]
 
 
@@ -712,6 +803,17 @@ def _libver_case(name, libver, rust, note):
     return Case(name, "superblock", gen, rust, note)
 
 
+def gen_userblock(path):
+    with h5py.File(path, "w", userblock_size=512) as f:
+        f.create_dataset("data", data=ramp("<i4"))
+        f.create_group("g")
+    # The user block is the caller's to fill; libhdf5 only reserves it. Every
+    # address in the file is relative to its end, so a reader that assumes the
+    # superblock starts at offset 0 cannot open this.
+    with open(path, "r+b") as fh:
+        fh.write(b"oracle user block\n")
+
+
 LIBVER_CASES = [
     _libver_case("libver_earliest", "earliest", "libver_earliest",
                  "libver earliest — superblock v0, symbol-table groups"),
@@ -719,6 +821,12 @@ LIBVER_CASES = [
     _libver_case("libver_v110", ("v110", "v110"), None, "libver v1.10 bounds"),
     _libver_case("libver_latest", "latest", "libver_latest",
                  "libver latest — superblock v3, new-style groups"),
+    # Superblock v1 is not reachable from h5py 3.15: it is produced only by a
+    # non-default B-tree K value (H5Pset_sym_k / H5Pset_istore_k), and neither
+    # is wrapped on PropFCID. v0, v2 and v3 are covered by the four cases
+    # above; the user block below is the remaining v0 variant.
+    Case("userblock", "superblock", gen_userblock, None,
+         "512-byte user block — the superblock does not start at offset 0"),
 ]
 
 

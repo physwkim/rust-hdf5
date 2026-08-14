@@ -29,7 +29,7 @@ use rust_hdf5::format::messages::filter::{Filter, FilterPipeline, FILTER_FLETCHE
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{H5Dataset, H5File, H5Group};
 
-const CANON_VERSION: &str = "1";
+const CANON_VERSION: &str = "2";
 const RAW_LIMIT: usize = 1024;
 const MAX_DEPTH: usize = 32;
 
@@ -289,6 +289,37 @@ fn has_heap_type(dt: &DatatypeMessage) -> bool {
     }
 }
 
+/// True when the type tree contains a variable-length string anywhere.
+///
+/// `DatatypeMessage::VarLenString` models only the character set, so wherever
+/// this holds the `strpad` field cannot be answered from the public API.
+fn has_vlen_string(dt: &DatatypeMessage) -> bool {
+    match dt {
+        DatatypeMessage::VarLenString { .. } => true,
+        DatatypeMessage::VarLenSequence { base } | DatatypeMessage::Array { base, .. } => {
+            has_vlen_string(base)
+        }
+        DatatypeMessage::Compound { members, .. } => {
+            members.iter().any(|m| has_vlen_string(&m.datatype))
+        }
+        _ => false,
+    }
+}
+
+/// The `strpad` field: `-` when no variable-length string is involved, and
+/// otherwise the marker, because the parsed message has dropped the pad.
+fn strpad_field(dtype: Option<&DatatypeMessage>) -> std::result::Result<String, String> {
+    match dtype {
+        Some(dt) if has_vlen_string(dt) => Err(
+            "DatatypeMessage::VarLenString models only the character set, so the \
+             string pad of a variable-length string is not retained"
+                .into(),
+        ),
+        Some(_) => Ok("-".into()),
+        None => Err("datatype unavailable, so the string pad cannot be classified".into()),
+    }
+}
+
 // ===========================================================================
 // SHA-256 (no external crates are allowed in this repository)
 // ===========================================================================
@@ -443,6 +474,10 @@ fn dump_file(path: &str) -> std::result::Result<String, String> {
         "#superblock",
         unsupported("superblock", "H5File exposes no superblock/libver accessor"),
     );
+    d.emit(
+        "#userblock",
+        unsupported("userblock", "H5File exposes no user block accessor"),
+    );
 
     let file = match guarded(|| H5File::open(path)) {
         Ok(Ok(f)) => f,
@@ -457,6 +492,12 @@ fn dump_file(path: &str) -> std::result::Result<String, String> {
 
 fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: usize) {
     d.emit(&format!("{path}#kind"), "group");
+    d.field(path, "linkorder", || {
+        Err("H5Group exposes no link creation-order tracking flags".into())
+    });
+    d.field(path, "attrorder", || {
+        Err("H5Group exposes no attribute creation-order tracking flags".into())
+    });
     dump_group_attrs(d, path, group);
 
     if depth >= MAX_DEPTH {
@@ -535,6 +576,10 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
 
     let is_null = guarded(|| ds.is_null()).unwrap_or(false);
 
+    d.field(path, "strpad", || strpad_field(dtype.as_ref()));
+
+    // H5Dataset::shape() returns Vec<usize>, so a scalar dataspace and a NULL
+    // dataspace are both the empty vector and cannot be told apart.
     d.field(path, "shape", || {
         if is_null {
             return Ok("null".into());
@@ -578,6 +623,14 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
         } else {
             Ok("-".into())
         }
+    });
+
+    d.field(path, "external", || {
+        Err("H5Dataset exposes no external file list accessor".into())
+    });
+
+    d.field(path, "virtual", || {
+        Err("H5Dataset exposes no virtual mapping accessor".into())
     });
 
     d.field(path, "filters", || {
@@ -686,6 +739,8 @@ fn dump_dataset_attrs(d: &mut Dump, path: &str, ds: &H5Dataset) {
             None => Err("H5Attribute::datatype() failed or is unavailable".into()),
         });
 
+        d.field(&key, "strpad", || strpad_field(dtype.as_ref()));
+
         d.field(&key, "shape", || {
             Err("H5Attribute exposes no shape() accessor".into())
         });
@@ -757,6 +812,10 @@ fn dump_group_attrs(d: &mut Dump, path: &str, group: &H5Group) {
         d.emit(
             &format!("{key}#dtype"),
             unsupported("dtype", "H5Group has no attr() handle in read mode"),
+        );
+        d.emit(
+            &format!("{key}#strpad"),
+            unsupported("strpad", "H5Group has no attr() handle in read mode"),
         );
         d.emit(
             &format!("{key}#shape"),
@@ -1190,6 +1249,18 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "chunkidx_earray_dim1" => {
+            let file = H5File::create(path)?;
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([4usize, 4])
+                .chunk(&[2, 4])
+                .max_shape(&[Some(4), None])
+                .create("data")?;
+            ds.write_raw(&ramp_n::<i32>(16))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "chunkidx_btree2" => {
             let file = H5File::create(path)?;
             let ds = file
@@ -1356,6 +1427,18 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 .shape([2usize, 3])
                 .create("matrix")?
                 .write_array(&matrix)?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "attr_large" => {
+            let file = H5File::create(path)?;
+            let ds = file.new_dataset::<i32>().shape([8usize]).create("data")?;
+            ds.write_raw(&ramp_n::<i32>(8))?;
+            let big: Vec<i32> = (0..25600i32).collect();
+            ds.new_attr::<i32>()
+                .shape([25600usize])
+                .create("big")?
+                .write_array(&big)?;
             file.close()?;
             Ok(Ok(()))
         }
