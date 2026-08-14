@@ -33,6 +33,7 @@ use crate::format::messages::link::{LinkMessage, LinkTarget};
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::*;
 use crate::format::object_header::{ObjectHeader, ObjectTimes, MAX_MESSAGE_SIZE};
+use crate::format::selection::Selection;
 use crate::format::sohm::SharedMessagePointer;
 use crate::format::superblock::*;
 use crate::format::{FormatContext, LibverBound, ObjectFormat, UNDEF_ADDR};
@@ -2295,6 +2296,8 @@ pub struct Hdf5Writer {
     /// Object-reference elements waiting for their target's object header
     /// address, which only exists once finalize has placed every header.
     pending_object_references: Slot<Vec<PendingObjectReference>>,
+    /// Region-reference heap objects waiting for the same address.
+    pending_region_references: Slot<Vec<PendingRegionReference>>,
     /// Set when this writer reopened a version-0/1 file, and never otherwise.
     /// See [`LegacyFile`]; [`object_format`](Self::object_format) is the only
     /// reader of whether it is there.
@@ -2341,6 +2344,50 @@ pub(crate) struct PendingObjectReference {
     element: u64,
     /// Path of the object the element names; `/` is the root group.
     target: String,
+}
+
+/// One region-reference heap object written before its target's address could
+/// be known.
+///
+/// The *element* of a `H5R_DATASET_REGION1` is final at write time — it is the
+/// global-heap id of the object the write inserted. What waits is the leading
+/// `sizeof_addr` bytes of that heap object, the target's object header address
+/// (`H5R__encode_token_region_compat` puts the token there, the serialized
+/// selection after it), which [`Hdf5Writer::apply_region_reference_fixups`]
+/// stamps in.
+pub(crate) struct PendingRegionReference {
+    /// Address of the global-heap collection holding the object.
+    collection: u64,
+    /// The object's index within that collection.
+    index: u16,
+    /// Path of the dataset the selection is over.
+    target: String,
+}
+
+/// Refuse a region-reference selection the target dataset's extent does not
+/// admit — libhdf5's `H5S_select_valid`, which `H5Rcreate` applies before it
+/// serializes anything.
+///
+/// The rank check comes from [`Selection::to_boxes`], which also refuses a
+/// regular hyperslab with an unlimited count or block; a region reference has
+/// no growable extent to resolve one against.
+fn validate_region_selection(selection: &Selection, dims: &[u64], path: &str) -> IoResult<()> {
+    let boxes = selection.to_boxes(dims).map_err(|e| {
+        crate::io::IoError::InvalidState(format!("region reference over '{path}': {e}"))
+    })?;
+    for (start, count) in boxes {
+        for (d, (&s, &c)) in start.iter().zip(&count).enumerate() {
+            if s.checked_add(c).is_none_or(|end| end > dims[d]) {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "region reference over '{path}' selects {s}..{} in dimension {d}, \
+                     outside the dataset's extent of {}",
+                    s.saturating_add(c),
+                    dims[d]
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What a reopen found already on disk in dense form, by the scope whose
@@ -2487,6 +2534,7 @@ impl Hdf5Writer {
             root_times: None,
             next_creation_seq: Slot::new(0),
             pending_object_references: Slot::new(Vec::new()),
+            pending_region_references: Slot::new(Vec::new()),
             // A file this crate creates is always the modern generation.
             legacy: None,
         })
@@ -3401,6 +3449,7 @@ impl Hdf5Writer {
             track_order: root_track_order,
             next_creation_seq: Slot::new(creation_seq),
             pending_object_references: Slot::new(Vec::new()),
+            pending_region_references: Slot::new(Vec::new()),
             legacy,
         };
         // The link graph is complete only now, so this is the first point the
@@ -4900,6 +4949,187 @@ impl Hdf5Writer {
             self.handle.write_at(at, &addr.to_le_bytes()[..width])?;
         }
         Ok(())
+    }
+
+    /// Store region references over `targets` into the elements of dataset
+    /// `index` starting at `start`.
+    ///
+    /// Each target is the path of a dataset and a selection over it. What the
+    /// element holds is a global-heap id — collection address then object index
+    /// (`H5R__encode_heap`) — and the heap object it names is the target's
+    /// object header address followed by the serialized selection
+    /// (`H5R__encode_token_region_compat`). Both the object and the element are
+    /// written here; only the address inside the object waits for
+    /// [`Self::apply_region_reference_fixups`]. Elements never written keep the
+    /// zero image libhdf5 reads back as a null reference.
+    pub fn write_region_references(
+        &self,
+        index: usize,
+        start: u64,
+        targets: &[(&str, Selection)],
+    ) -> IoResult<()> {
+        let (elements, data_addr, indexed) = {
+            let ds = self.ds(index);
+            let m = ds.lock();
+            match &m.datatype {
+                DatatypeMessage::Reference {
+                    kind: ReferenceKind::DatasetRegion1,
+                    ..
+                } => {}
+                other => {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "dataset '{}' has datatype {other}, not a region reference",
+                        m.name
+                    )))
+                }
+            }
+            let elements = m
+                .dataspace
+                .dims
+                .iter()
+                .fold(1u64, |a, &d| a.saturating_mul(d));
+            let indexed = m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
+            (elements, m.data_addr, indexed)
+        };
+        if indexed || data_addr == UNDEF_ADDR {
+            return Err(crate::io::IoError::InvalidState(
+                "region references are stamped into contiguous storage; \
+                 create the dataset without chunking"
+                    .into(),
+            ));
+        }
+        let end = start.saturating_add(targets.len() as u64);
+        if end > elements {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "elements {start}..{end} are outside the dataset's {elements}"
+            )));
+        }
+
+        // Build every heap object before inserting any: a path that names no
+        // dataset, or a selection its extent does not admit, is reported at the
+        // call that got it wrong rather than after half the batch is on disk.
+        let sa = self.ctx.sizeof_addr as usize;
+        let mut blobs = Vec::with_capacity(targets.len());
+        for (path, selection) in targets {
+            let target = self.region_reference_target(path)?;
+            let dims = self.ds(target).lock().dataspace.dims.clone();
+            validate_region_selection(selection, &dims, path)?;
+            let mut blob = vec![0u8; sa];
+            blob.extend_from_slice(&selection.encode()?);
+            blobs.push(blob);
+        }
+        let items: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
+        let placements = self.insert_vlen_objects(&items)?;
+
+        let width = (sa + 4) as u64;
+        let mut pending = self.pending_region_references.lock();
+        for (i, &(collection, obj_index)) in placements.iter().enumerate() {
+            let mut elem = Vec::with_capacity(width as usize);
+            elem.extend_from_slice(&collection.to_le_bytes()[..sa]);
+            elem.extend_from_slice(&u32::from(obj_index).to_le_bytes());
+            self.handle
+                .write_at(data_addr + (start + i as u64) * width, &elem)?;
+            pending.push(PendingRegionReference {
+                collection,
+                index: obj_index,
+                target: targets[i].0.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The dataset a region reference's path names.
+    ///
+    /// A region reference names a *dataset*: `H5Rcreate` with
+    /// `H5R_DATASET_REGION` takes the dataspace of one, and every reader
+    /// dereferences it as one. A path that resolves to a group — or to the root
+    /// group, which has no registry slot — is refused here rather than stored
+    /// as a reference nothing can dereference.
+    fn region_reference_target(&self, path: &str) -> IoResult<usize> {
+        match self.object_reference_target(path)? {
+            Some(HardLinkTarget::Dataset(i)) => Ok(i),
+            _ => Err(crate::io::IoError::InvalidState(format!(
+                "region reference target '{path}' is not a dataset"
+            ))),
+        }
+    }
+
+    /// Stamp every pending region reference's heap object with its target's
+    /// object header address.
+    ///
+    /// The object was inserted with that field zeroed, so its size does not
+    /// change here: each collection is read once, patched, and rewritten at its
+    /// own declared size, which leaves every element's heap id valid.
+    fn apply_region_reference_fixups(&mut self) -> IoResult<()> {
+        use crate::format::global_heap::GlobalHeapCollection;
+
+        // Snapshot rather than drain, for the same reason the object-reference
+        // pass does: a SWMR session finalizes twice and the close-time finalize
+        // rebuilds every header at a fresh address.
+        let pending: Vec<(u64, u16, String)> = self
+            .pending_region_references
+            .lock()
+            .iter()
+            .map(|p| (p.collection, p.index, p.target.clone()))
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let sa = self.ctx.sizeof_addr as usize;
+        // Group by collection so one holding several region references is read
+        // and rewritten once.
+        let mut per_collection: std::collections::BTreeMap<u64, Vec<(u16, u64)>> =
+            Default::default();
+        for (collection, index, target) in &pending {
+            let target = self.region_reference_target(target)?;
+            let addr = self.ds(target).lock().obj_header_addr;
+            per_collection
+                .entry(*collection)
+                .or_default()
+                .push((*index, addr));
+        }
+        for (collection, patches) in per_collection {
+            // A collection is at least 4096 bytes (H5HG_MINALLOC) and most are
+            // exactly that, so one read usually covers the whole image.
+            let mut image = self.handle.read_at_most(collection, 4096)?;
+            let declared = GlobalHeapCollection::decode_size(&image, &self.ctx)?;
+            if declared > image.len() {
+                image = self.handle.read_at(collection, declared)?;
+            }
+            let (mut gcol, _) = GlobalHeapCollection::decode(&image[..declared], &self.ctx)?;
+            for (index, addr) in patches {
+                let token = gcol
+                    .objects
+                    .iter_mut()
+                    .find(|o| o.index == index)
+                    .and_then(|o| o.data.get_mut(..sa))
+                    .ok_or_else(|| {
+                        crate::io::IoError::InvalidState(format!(
+                            "object {index} of global heap collection {collection:#x} is no \
+                             longer the region reference written into it"
+                        ))
+                    })?;
+                token.copy_from_slice(&addr.to_le_bytes()[..sa]);
+            }
+            let rewritten = gcol.encode_at_size(&self.ctx, declared)?;
+            self.handle.write_at(collection, &rewritten)?;
+        }
+        Ok(())
+    }
+
+    /// Stamp every reference written this session with its target's object
+    /// header address.
+    ///
+    /// INVARIANT: no file is closed holding a reference whose target address is
+    /// still the placeholder its write left. Both finalize paths call this once
+    /// every dataset, group and root header has an address and before the
+    /// superblock is written, and this is the only caller of the per-kind
+    /// passes — so a reference kind added later is stamped at both finalize
+    /// sites or at neither. A target that no longer resolves fails the finalize
+    /// rather than leaving a placeholder behind.
+    fn apply_reference_fixups(&mut self) -> IoResult<()> {
+        self.apply_object_reference_fixups()?;
+        self.apply_region_reference_fixups()
     }
 
     /// Append every user-created hard link whose parent group is `parent`
@@ -10484,8 +10714,8 @@ impl Hdf5Writer {
         self.root_group_addr = Some(root_addr);
         self.root_group_encoded_size = root_encoded_size;
 
-        // 2b. Stamp object references now that every header has an address.
-        self.apply_object_reference_fixups()?;
+        // 2b. Stamp references now that every header has an address.
+        self.apply_reference_fixups()?;
 
         // 3. Write superblock with SWMR flags.
         self.write_superblock(FLAG_WRITE_ACCESS | FLAG_SWMR_WRITE)?;
@@ -10687,9 +10917,9 @@ impl Hdf5Writer {
         self.handle.write_at(root_addr, &root_encoded)?;
         self.root_group_addr = Some(root_addr);
 
-        // 2b. Every object header now has an address, so the object
-        // references waiting on one can be stamped into their datasets.
-        self.apply_object_reference_fixups()?;
+        // 2b. Every object header now has an address, so the references
+        // waiting on one can be stamped.
+        self.apply_reference_fixups()?;
 
         // 3. Write superblock at offset 0.
         self.write_superblock(0)?;
