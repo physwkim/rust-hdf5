@@ -5969,28 +5969,41 @@ mod tests {
     }
 
     /// An unlimited dimension other than 0 has no fixed linear slot without
-    /// libhdf5's extensible-array swizzling, which is not implemented;
-    /// creating the geometry silently re-indexed chunks on every extend, so
-    /// it is rejected at create.
+    /// libhdf5's extensible-array swizzling; `chunk_grid::linear_index` now
+    /// implements that swizzle for any dimension, so this creates cleanly
+    /// and every extend keeps writing new chunks to new slots, never
+    /// re-addressing one already on disk.
     #[test]
-    fn builder_rejects_an_unlimited_inner_dimension() {
+    fn builder_accepts_an_unlimited_inner_dimension() {
         let path = temp_path("unlimited_inner_dim");
         let file = H5File::create(&path).unwrap();
-        let err = match file
+        let ds = file
             .new_dataset::<i32>()
             .shape([4, 0])
             .chunk(&[2, 2])
             .max_shape(&[Some(4), None])
             .create("d")
-        {
-            Ok(_) => panic!("create accepted an unlimited inner dimension"),
-            Err(e) => e,
-        };
-        assert!(
-            err.to_string().contains("not the first"),
-            "unexpected error: {err}"
-        );
+            .unwrap();
+        assert_eq!(ds.shape(), vec![4, 0]);
+
+        // Write, then extend and write again: if the linear index were
+        // recomputed from the *current* extent instead of the maximum one,
+        // the second extend would shift every slot number and the first
+        // write's chunks would decode under the wrong coordinates below.
+        ds.extend(&[4, 2]).unwrap();
+        ds.write_slice(&[0, 0], &[4, 2], &[1, 2, 3, 4, 5, 6, 7, 8])
+            .unwrap();
+        ds.extend(&[4, 4]).unwrap();
+        ds.write_slice(&[0, 2], &[4, 2], &[9, 10, 11, 12, 13, 14, 15, 16])
+            .unwrap();
+
         file.close().unwrap();
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("d").unwrap();
+        assert_eq!(
+            ds.read_slice::<i32>(&[0, 0], &[4, 4]).unwrap(),
+            vec![1, 2, 9, 10, 3, 4, 11, 12, 5, 6, 13, 14, 7, 8, 15, 16]
+        );
         std::fs::remove_file(&path).ok();
     }
 

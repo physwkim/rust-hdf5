@@ -722,20 +722,26 @@ fn validate_chunk_geometry(dims: &[u64], max_dims: &[u64], chunk_dims: &[u64]) -
     Ok(())
 }
 
-/// An extensible-array index linearizes chunk coordinates, which requires
-/// every unlimited dimension to be dimension 0: any later dimension is a
-/// multiplier in the row-major index and must be finite. libhdf5 supports
-/// other positions by swizzling the unlimited dimension to the slowest one
-/// (H5Dearray.c), which this crate does not implement.
-fn ensure_unlimited_is_leading(max_dims: &[u64]) -> IoResult<()> {
-    for (d, &m) in max_dims.iter().enumerate().skip(1) {
-        if m == u64::MAX {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "unlimited dimension {d} is not the first: extensible-array \
-                 swizzling is not supported; reorder the dimensions so the \
-                 unlimited one comes first"
-            )));
-        }
+/// An extensible-array index requires at most one unlimited dimension —
+/// `H5D__chunk_construct` (H5Dchunk.c) only selects this index for exactly
+/// one — at any position: `chunk_grid::linear_index` seeds the unlimited
+/// dimension into the slot no down-chunks multiplier touches, the same
+/// address libhdf5 reaches by swizzling it to the slowest position
+/// (`H5VM_swizzle_coords`, H5Dearray.c). Two or more unlimited dimensions
+/// have no finite grid at all; that shape needs a v2 B-tree index instead.
+fn ensure_at_most_one_unlimited(max_dims: &[u64]) -> IoResult<()> {
+    let unlimited: Vec<usize> = max_dims
+        .iter()
+        .enumerate()
+        .filter(|&(_, &m)| m == u64::MAX)
+        .map(|(d, _)| d)
+        .collect();
+    if unlimited.len() > 1 {
+        return Err(crate::io::IoError::InvalidState(format!(
+            "an extensible-array index supports at most one unlimited dimension, \
+             but dimensions {unlimited:?} are all unlimited; a v2 B-tree index \
+             handles two or more"
+        )));
     }
     Ok(())
 }
@@ -2975,7 +2981,7 @@ impl Hdf5Writer {
         let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
-        ensure_unlimited_is_leading(max_dims)?;
+        ensure_at_most_one_unlimited(max_dims)?;
         let chunk_bytes = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
         let layout_version = self.chunk_layout_version(false, chunk_bytes);
         let earray_params = EarrayParams::default_params();
@@ -5678,7 +5684,7 @@ impl Hdf5Writer {
         let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
-        ensure_unlimited_is_leading(max_dims)?;
+        ensure_at_most_one_unlimited(max_dims)?;
         let element_size = datatype.element_size() as u64;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
         let layout_version = self.chunk_layout_version(true, chunk_bytes);
@@ -5789,7 +5795,7 @@ impl Hdf5Writer {
         let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
-        ensure_unlimited_is_leading(max_dims)?;
+        ensure_at_most_one_unlimited(max_dims)?;
         let element_size = datatype.element_size() as u64;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
         let layout_version = self.chunk_layout_version(true, chunk_bytes);
@@ -7765,6 +7771,29 @@ mod tests {
             "unexpected error: {err}"
         );
 
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `create_chunked_dataset` builds an extensible-array index unconditionally
+    /// (the caller — the high-level dataset API — is the one that decides when
+    /// two-or-more unlimited dimensions should go to a v2 B-tree instead), so
+    /// its own guard is the last line of defense against a shape that index
+    /// can't represent at all.
+    #[test]
+    fn create_chunked_dataset_rejects_two_unlimited_dimensions() {
+        let path = temp_path("earray_two_unlimited");
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let err = writer
+            .create_chunked_dataset(
+                "d",
+                DatatypeMessage::i32_type(),
+                &[4, 4],
+                &[u64::MAX, u64::MAX],
+                &[2, 2],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("at most one unlimited"), "{err}");
         writer.close().unwrap();
         std::fs::remove_file(&path).ok();
     }

@@ -1178,6 +1178,18 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         "chunkidx_single" => chunked_ramp(path, 8, &[8], &[Some(8)]),
         "chunkidx_farray" => chunked_ramp(path, 16, &[4], &[Some(16)]),
         "chunkidx_earray" => chunked_ramp(path, 16, &[4], &[None]),
+        "chunkidx_earray_unlim_inner" => {
+            let file = H5File::create(path)?;
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([4usize, 4])
+                .chunk(&[2, 2])
+                .max_shape(&[Some(4), None])
+                .create("data")?;
+            ds.write_raw(&ramp_n::<i32>(16))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "chunkidx_btree2" => {
             let file = H5File::create(path)?;
             let ds = file

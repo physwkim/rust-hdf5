@@ -5,7 +5,7 @@
   "numpy_version": "1.26.4",
   "python": "/home/stevek/micromamba/envs/tomo/bin/python",
   "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-space-500431fd-1/target/release/oracle_probe",
-  "cases": 72
+  "cases": 73
  },
  "results": [
   {
@@ -3639,6 +3639,85 @@
    }
   },
   {
+   "case": "chunkidx_earray_unlim_inner",
+   "group": "layout",
+   "note": "extensible-array index \u2014 the unlimited dimension is dim 1, not dim 0",
+   "rust_case": "chunkidx_earray_unlim_inner",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "#superblock",
+      "kind": "unsupported",
+      "field": "superblock",
+      "structural": true,
+      "ref": "3",
+      "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
+     },
+     {
+      "key": "/#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
+     },
+     {
+      "key": "/data#chunkindex",
+      "kind": "unsupported",
+      "field": "chunkindex",
+      "structural": true,
+      "ref": "earray",
+      "probe": "UNSUPPORTED(chunkindex): H5Dataset exposes no chunk index type"
+     },
+     {
+      "key": "/data#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/data#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/data#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[4,U]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/data#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 9,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
    "case": "chunkidx_btree2",
    "group": "layout",
    "note": "version-2 B-tree index \u2014 two unlimited dimensions",
@@ -7050,6 +7129,7 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "filter_deflate",
     "filter_shuffle",
@@ -7129,6 +7209,7 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "filter_deflate",
     "filter_shuffle",
@@ -7205,6 +7286,7 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "filter_deflate",
     "filter_shuffle",
@@ -7279,6 +7361,7 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "filter_deflate",
     "filter_shuffle",
@@ -7353,6 +7436,7 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "filter_deflate",
     "filter_shuffle",
@@ -7427,6 +7511,7 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "filter_deflate",
     "filter_shuffle",
@@ -7523,6 +7608,7 @@
     "chunkidx_implicit",
     "chunkidx_farray",
     "chunkidx_earray",
+    "chunkidx_earray_unlim_inner",
     "chunkidx_btree2",
     "filter_deflate",
     "filter_shuffle",

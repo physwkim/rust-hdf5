@@ -437,6 +437,14 @@ def gen_chunkidx_earray(path):
         ds[...] = ramp("<i4", 16)
 
 
+def gen_chunkidx_earray_unlim_inner(path):
+    with h5py.File(path, "w", libver="latest") as f:
+        ds = f.create_dataset(
+            "data", (4, 4), maxshape=(4, None), chunks=(2, 2), dtype="<i4"
+        )
+        ds[...] = ramp("<i4", 16).reshape(4, 4)
+
+
 def gen_chunkidx_btree2(path):
     with h5py.File(path, "w", libver="latest") as f:
         ds = f.create_dataset(
@@ -464,6 +472,9 @@ LAYOUT_CASES = [
          "fixed-array index"),
     Case("chunkidx_earray", "layout", gen_chunkidx_earray, "chunkidx_earray",
          "extensible-array index — one unlimited dimension"),
+    Case("chunkidx_earray_unlim_inner", "layout", gen_chunkidx_earray_unlim_inner,
+         "chunkidx_earray_unlim_inner",
+         "extensible-array index — the unlimited dimension is dim 1, not dim 0"),
     Case("chunkidx_btree2", "layout", gen_chunkidx_btree2, "chunkidx_btree2",
          "version-2 B-tree index — two unlimited dimensions"),
 ]
