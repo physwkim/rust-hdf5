@@ -89,12 +89,12 @@ fn reopen_and_add(work: &std::path::Path) {
     file.close().expect("close");
 }
 
-/// Three objects this writer models as nothing: a dataset with an opaque
-/// datatype (the message does not decode), a dataset built on a committed
-/// type (its datatype message is a *reference*, and decoding those bytes as a
-/// type answers something else), and the committed type itself. All three
-/// were rewritten as empty groups, which orphaned their data and destroyed
-/// the type.
+/// Four objects this writer models as nothing: a dataset in VAX byte order
+/// (the datatype message decodes to an order this crate does not store), a
+/// dataset with an opaque datatype, a dataset built on a committed type (its
+/// datatype message is a *reference*, and decoding those bytes as a type
+/// answers something else), and the committed type itself. All were rewritten
+/// as empty groups, which orphaned their data and destroyed the type.
 #[test]
 fn an_object_the_writer_cannot_model_keeps_its_bytes_through_a_reopen() {
     let Some(py) = python() else { return };
@@ -109,11 +109,13 @@ fn an_object_the_writer_cannot_model_keeps_its_bytes_through_a_reopen() {
          with h5py.File(ORIG, 'w', libver='latest') as f:\n\
          \x20   f.create_dataset('plain', data=np.arange(4, dtype='<i4'))\n\
          \x20   f.create_dataset('opaque', data=np.arange(4, dtype='u1').view('V4'))\n\
+         \x20   f.create_dataset('vax', data=np.arange(4, dtype='<f4'))\n\
          \x20   f['t'] = np.dtype('<i4')\n\
          \x20   sid = h5s.create_simple((4,))\n\
          \x20   dsid = h5d.create(f.id, b'shared', f['t'].id, sid)\n\
          \x20   dsid.write(h5s.ALL, h5s.ALL, np.arange(4, dtype='<i4'))\n",
     );
+    retype_floats_as_vax(&orig, 1);
     std::fs::copy(&orig, &work).unwrap();
     reopen_and_add(&work);
 
@@ -124,8 +126,8 @@ fn an_object_the_writer_cannot_model_keeps_its_bytes_through_a_reopen() {
         &format!(
             "{HEADER_IDENTITY}\
              with h5py.File(WORK, 'r') as f:\n\
-             \x20   assert sorted(f.keys()) == ['added', 'opaque', 'plain', 'shared', 't'], \
-             sorted(f.keys())\n\
+             \x20   assert sorted(f.keys()) == \
+             ['added', 'opaque', 'plain', 'shared', 't', 'vax'], sorted(f.keys())\n\
              \x20   assert isinstance(f['opaque'], h5py.Dataset), type(f['opaque'])\n\
              \x20   assert f['opaque'].dtype == np.dtype('V4'), f['opaque'].dtype\n\
              \x20   assert isinstance(f['t'], h5py.Datatype), type(f['t'])\n\
@@ -134,7 +136,7 @@ fn an_object_the_writer_cannot_model_keeps_its_bytes_through_a_reopen() {
              \x20   assert list(f['shared'][...]) == [0, 1, 2, 3], list(f['shared'][...])\n\
              \x20   assert list(f['plain'][...]) == [0, 1, 2, 3]\n\
              \x20   assert list(f['added'][...]) == [7, 8]\n\
-             for name in ('opaque', 't', 'shared'):\n\
+             for name in ('opaque', 't', 'shared', 'vax'):\n\
              \x20   assert_untouched(name)\n"
         ),
     );

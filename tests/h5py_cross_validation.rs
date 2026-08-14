@@ -1600,6 +1600,97 @@ fn object_header_attribute_count_matches_h5py() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A rewrite that dirties an object header must carry the Attribute Info
+/// message with it. `H5O__attr_count_real` answers `num_attrs` from that
+/// message alone, so an object whose attributes are rewritten without it reads
+/// back as having none — the compact `ainfo` (`0x15`) message going missing on
+/// a dirty rewrite is what catalog measured, and the writer's own AINFO
+/// emission is what closes it. The attributes here are libhdf5's, not this
+/// writer's, so the message has to survive the reopen collector as well.
+#[test]
+fn ainfo_survives_a_dirty_rewrite() {
+    let Some(py) = python() else { return };
+    let path = tmp("ainfo_dirty_rewrite");
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v108"),
+        "f.attrs['root'] = np.int32(1)\n\
+         g = f.create_group('grp')\n\
+         g.attrs['NX_class'] = 'NXentry'\n\
+         g.attrs['depth'] = np.int32(2)\n\
+         d = f.create_dataset('d', data=np.arange(4, dtype='<i4'), track_times=True)\n\
+         d.attrs['gain'] = np.int32(7)\n",
+    );
+    let timestamped_before = headers_with_timestamps(&path);
+
+    // Every one of the three objects is dirtied: the root gains a link, the
+    // group and the dataset each gain an attribute, so no header reaches the
+    // check by having been left alone.
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        let added = file
+            .new_dataset::<i32>()
+            .shape([2])
+            .create("added")
+            .unwrap();
+        added.write_raw(&[8, 9]).unwrap();
+        file.root_group()
+            .group("grp")
+            .unwrap()
+            .set_attr_numeric("added_depth", &3i32)
+            .unwrap();
+        file.dataset_writer("d")
+            .unwrap()
+            .new_attr::<i32>()
+            .shape(())
+            .create("added_gain")
+            .unwrap()
+            .write_numeric(&11i32)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    read_back_with_h5py(
+        py,
+        &path,
+        "def n(o):\n\
+         \x20   return h5py.h5o.get_info(o.id).num_attrs\n\
+         assert n(f['/']) == 1, n(f['/'])\n\
+         assert n(f['grp']) == 3, n(f['grp'])\n\
+         assert n(f['d']) == 2, n(f['d'])\n\
+         assert f.attrs['root'] == 1\n\
+         assert f['grp'].attrs['NX_class'] == 'NXentry'\n\
+         assert f['grp'].attrs['depth'] == 2\n\
+         assert f['grp'].attrs['added_depth'] == 3\n\
+         assert f['d'].attrs['gain'] == 7\n\
+         assert f['d'].attrs['added_gain'] == 11\n\
+         assert list(f['added'][...]) == [8, 9]\n",
+    );
+    // The other half of the same measurement, still open: the writer builds
+    // every rewritten header from `ObjectHeader::new`, whose flags carry no
+    // `H5O_HDR_STORE_TIMES` bit and whose encoder would write zero timestamps
+    // if they did, so a header libhdf5 wrote with times comes back without
+    // them. Pinned rather than asserted-away: closing it must flip this line.
+    assert_eq!(timestamped_before, 1);
+    assert_eq!(
+        headers_with_timestamps(&path),
+        0,
+        "the rewrite is expected to drop the timestamps flag until the writer carries it"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// Count the version-2 object headers in `path` whose flags carry the
+/// timestamps bit (`H5O_HDR_STORE_TIMES`, `0x20`).
+fn headers_with_timestamps(path: &std::path::Path) -> usize {
+    let raw = std::fs::read(path).unwrap();
+    (0..raw.len() - 6)
+        .filter(|&i| &raw[i..i + 4] == b"OHDR" && raw[i + 4] == 2 && raw[i + 5] & 0x20 != 0)
+        .count()
+}
+
 /// An attribute past the object header message limit spills the object's
 /// whole attribute set to dense storage, the way `H5O__attr_create` does on
 /// `raw_size >= H5O_MESG_MAX_SIZE`. Writing it as a header message instead
