@@ -539,13 +539,14 @@ fn link_creation_order_values_survive_a_reopen() {
 }
 
 /// The same for attribute creation order, on a set past the compact limit so
-/// it is in dense storage. Still open, and pinned here: the reopen reads the
-/// set back through the hashed name index and re-stamps the creation indices
-/// in the order it walked, so libhdf5 iterates the rewritten set in that order
-/// instead of the one the attributes were created in. Every name and value is
-/// there — only the order the file records for them is this writer's.
+/// it is in dense storage. The reopen reads the set back through the hashed
+/// name index — an order that has nothing to do with creation — so the index
+/// each attribute carries has to come out of the file with it, not from the
+/// position the walk put it in. `H5Aget_info` reports the values themselves,
+/// so both the order and the numbers are checked, along with the `max_corder`
+/// that must stay one past the largest of them.
 #[test]
-fn dense_attribute_creation_order_values_are_restamped_by_a_reopen() {
+fn dense_attribute_creation_order_values_survive_a_reopen() {
     let Some(py) = python() else { return };
     let dir = tmp_dir("corder_attrs");
     let (orig, work) = (dir.join("orig.h5"), dir.join("work.h5"));
@@ -572,12 +573,23 @@ fn dense_attribute_creation_order_values_are_restamped_by_a_reopen() {
         &orig,
         &work,
         &format!(
-            "with h5py.File(WORK, 'r') as f:\n\
+            "def corders(path):\n\
+             \x20   with h5py.File(path, 'r') as f:\n\
+             \x20       gid = f['g'].id\n\
+             \x20       info = [h5py.h5a.get_info(gid, name=n.encode()) \
+             for n in sorted(f['g'].attrs)]\n\
+             \x20       assert all(i.corder_valid for i in info), info\n\
+             \x20       return {{n: i.corder for n, i in zip(sorted(f['g'].attrs), info)}}\n\
+             expect = {{'a%02d' % v: k for k, v in \
+             enumerate((7, 3, 11, 0, 5, 9, 1, 8, 4, 10, 2, 6))}}\n\
+             with h5py.File(WORK, 'r') as f:\n\
              \x20   order = list(f['g'].attrs)\n\
              \x20   assert sorted(order) == ['a%02d' % i for i in range(12)], order\n\
              \x20   for i in range(12):\n\
              \x20       assert f['g'].attrs['a%02d' % i] == i, i\n\
-             \x20   assert order != {created}, 'creation order now survives - close this'\n"
+             \x20   assert order == {created}, order\n\
+             assert corders(ORIG) == expect, corders(ORIG)\n\
+             assert corders(WORK) == expect, corders(WORK)\n"
         ),
     );
 

@@ -21,7 +21,7 @@ use crate::format::chunk_index::fixed_array::{
 use crate::format::creation_order::CreationOrder;
 use crate::format::dense_attr::build_dense_attributes;
 use crate::format::dense_link::build_dense_links;
-use crate::format::messages::attr_info::AttributeInfoMessage;
+use crate::format::messages::attr_info::{next_creation_index, AttributeInfoMessage};
 use crate::format::messages::attribute::{AttributeEntry, AttributeMessage};
 use crate::format::messages::data_layout::{DataLayoutMessage, EarrayParams, FixedArrayParams};
 use crate::format::messages::dataspace::{DataspaceClass, DataspaceMessage};
@@ -628,6 +628,27 @@ fn swmr_attr_error(name: &str) -> crate::io::IoError {
     ))
 }
 
+/// Where an attribute arriving at [`Hdf5Writer::insert_attribute`] came from.
+///
+/// The variable-length setters have to evict before they allocate — the
+/// free-before-alloc order — so by the time the replacement is inserted the
+/// list no longer holds the entry it replaces, and the ordinary "already
+/// present, so keep its index" test cannot see it. `H5A__attr_write` does not
+/// create the attribute again, so the index travels with the eviction rather
+/// than being stamped afresh; without it a rewritten attribute takes the set's
+/// running maximum and moves to the end of the creation order.
+#[derive(Debug, Clone, Copy)]
+enum AttrOrigin {
+    /// A new attribute, which takes the set's next creation index.
+    Created,
+    /// A value written over an attribute this writer has just evicted, which
+    /// keeps that attribute's creation index — `None` when the object tracks
+    /// no order, and so records none. An eviction that found nothing to remove
+    /// answers `Created`: what follows it is a create like any other.
+    Rewritten(Option<u16>),
+}
+use AttrOrigin::{Created, Rewritten};
+
 /// Take an object's attributes into the append session, or refuse the reopen.
 ///
 /// Append mode rebuilds every object header it touches out of the attributes
@@ -643,11 +664,21 @@ fn swmr_attr_error(name: &str) -> crate::io::IoError {
 ///
 /// Size is no longer a reason to refuse: an attribute too large for a header
 /// message goes back out through dense storage, the form libhdf5 read it from.
+///
+/// The set comes back in creation-index order, which is the order the registry
+/// holds attributes in for an object made in this session too. A dense set is
+/// read through the name index, so the order it arrives in is the order a hash
+/// walk took; sorting here is what makes "the list is in creation order" true
+/// of a reopened object as well, without any later stage having to know which
+/// storage form the attributes came out of. Attributes of an untracked object
+/// carry no index and keep the order they were read in.
 fn take_reopened_attributes(
     attrs: crate::io::reader::ObjectAttributes,
     owner: &str,
 ) -> IoResult<Vec<AttributeEntry>> {
-    attrs.into_complete(owner)
+    let mut attrs = attrs.into_complete(owner)?;
+    attrs.sort_by_key(|a| a.creation_index());
+    Ok(attrs)
 }
 
 /// The creation-order policy an on-disk object header declares — the single
@@ -4530,9 +4561,7 @@ impl Hdf5Writer {
         }
         let mut ainfo = AttributeInfoMessage::compact();
         if order.is_tracked() {
-            // Post-increment, as `H5O__attr_create` does: after n attributes
-            // the running maximum is n.
-            ainfo.max_creation_index = Some(attributes.len() as u16);
+            ainfo.max_creation_index = Some(next_creation_index(attributes));
         }
         if order.is_indexed() {
             // Compact storage has no index B-tree, but the message still
@@ -4541,14 +4570,16 @@ impl Hdf5Writer {
             ainfo.creation_order_btree_address = Some(UNDEF_ADDR);
         }
         header.add_message(MSG_ATTR_INFO, MSG_FLAG_DONTSHARE, ainfo.encode(&self.ctx));
-        // The list is in creation order, so an attribute's position in it is
-        // the creation index libhdf5 would have stamped on its message.
-        for (i, attr) in attributes.iter().enumerate() {
+        // Each attribute states its own creation index — the one it was
+        // created with here, or the one the file it was read from records. An
+        // attribute with none belongs to an object that tracks no order, where
+        // the field is not encoded at all.
+        for attr in attributes {
             header.add_message_indexed(
                 MSG_ATTRIBUTE,
                 0x00,
                 attr.encode_at(&self.ctx, self.libver),
-                i as u16,
+                attr.creation_index().unwrap_or(0),
             );
         }
     }
@@ -5522,6 +5553,17 @@ impl Hdf5Writer {
     /// and a replacement's superseded vlen value could never be reclaimed,
     /// since a streaming reader may hold its heap references.
     pub fn set_attribute(&self, target: AttrTarget<'_>, attr: AttributeMessage) -> IoResult<()> {
+        self.insert_attribute(target, attr, Created)
+    }
+
+    /// The body of [`set_attribute`](Self::set_attribute), told whether the
+    /// attribute it is inserting is genuinely new — see [`AttrOrigin`].
+    fn insert_attribute(
+        &self,
+        target: AttrTarget<'_>,
+        attr: AttributeMessage,
+        origin: AttrOrigin,
+    ) -> IoResult<()> {
         if self.swmr_active {
             return Err(swmr_attr_error(&attr.name));
         }
@@ -5529,11 +5571,22 @@ impl Hdf5Writer {
         // 16-bit size field an object header message has spills the object's
         // whole attribute set to dense storage at finalize, exactly as
         // `H5O__attr_create` does. See `attributes_need_dense`.
-        let entry = AttributeEntry::Readable(attr);
+        let mut entry = AttributeEntry::from(attr);
         let old = self.with_attr_list(target, |attrs| {
             if let Some(pos) = attrs.iter().position(|a| a.name() == entry.name()) {
+                // `H5O__attr_write` replaces an existing attribute's value and
+                // leaves its `crt_idx` alone: the attribute was not created
+                // again, so its creation index does not move.
+                entry.set_creation_index(attrs[pos].creation_index());
                 Some(std::mem::replace(&mut attrs[pos], entry))
             } else {
+                // `H5O__attr_create` stamps the set's running maximum onto the
+                // new attribute and post-increments it — but only a create
+                // reaches for it.
+                entry.set_creation_index(match origin {
+                    Created => Some(next_creation_index(attrs)),
+                    Rewritten(kept) => kept,
+                });
                 attrs.push(entry);
                 None
             }
@@ -5560,9 +5613,9 @@ impl Hdf5Writer {
         name: &str,
         value: &str,
     ) -> IoResult<()> {
-        self.evict_attr(target, name)?;
+        let origin = self.evict_attr(target, name)?;
         let attr = self.vlen_string_attribute(name, value)?;
-        self.set_attribute(target, attr)
+        self.insert_attribute(target, attr, origin)
     }
 
     /// The array counterpart of
@@ -5574,15 +5627,19 @@ impl Hdf5Writer {
         values: &[&str],
         dims: &[u64],
     ) -> IoResult<()> {
-        self.evict_attr(target, name)?;
+        let origin = self.evict_attr(target, name)?;
         let attr = self.vlen_string_array_attribute(name, values, dims)?;
-        self.set_attribute(target, attr)
+        self.insert_attribute(target, attr, origin)
     }
 
     /// Take the attribute `name` off `target`'s list, releasing its heap
     /// objects. No-op when absent. Refused under SWMR — see
     /// [`set_attribute`](Self::set_attribute).
-    fn evict_attr(&self, target: AttrTarget<'_>, name: &str) -> IoResult<()> {
+    ///
+    /// What it answers is what the insert that follows it must be told: an
+    /// attribute that was there is being rewritten and keeps its creation
+    /// index, and one that was not is created.
+    fn evict_attr(&self, target: AttrTarget<'_>, name: &str) -> IoResult<AttrOrigin> {
         if self.swmr_active {
             return Err(swmr_attr_error(name));
         }
@@ -5593,8 +5650,12 @@ impl Hdf5Writer {
                 .map(|pos| attrs.remove(pos))
         })?;
         match old {
-            Some(old) => self.release_attr_vlen(&old),
-            None => Ok(()),
+            Some(old) => {
+                let origin = Rewritten(old.creation_index());
+                self.release_attr_vlen(&old)?;
+                Ok(origin)
+            }
+            None => Ok(Created),
         }
     }
 

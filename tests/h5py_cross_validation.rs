@@ -2068,6 +2068,48 @@ fn creation_order_tracking_is_captured_per_object() {
     std::fs::remove_file(&path).ok();
 }
 
+/// Overwriting an attribute is a write, not a create: `H5A__attr_write` puts
+/// the new value under the existing `crt_idx` and leaves the running maximum
+/// alone. The variable-length setters take the old attribute off the list
+/// before allocating the new value's heap objects — the free-before-alloc
+/// order — so the index has to travel with the eviction, or the replacement
+/// is stamped as the newest attribute and moves to the end of the order.
+#[test]
+fn overwriting_an_attribute_keeps_its_creation_index() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_overwrite_corder");
+    {
+        let file = H5FileOptions::new()
+            .track_order(true)
+            .create(&path)
+            .unwrap();
+        let g = file.create_group("g").unwrap();
+        for (i, name) in ["zeta", "alpha", "mu"].iter().enumerate() {
+            g.set_attr_string(name, &format!("v{i}")).unwrap();
+        }
+        // The oldest two are rewritten, so an index taken from the position an
+        // eviction left the attribute in puts them last instead of first.
+        g.set_attr_string("zeta", "rewritten").unwrap();
+        g.set_attr_string_array("alpha", &["a", "b"]).unwrap();
+        // A numeric value over a variable-length one takes the other branch of
+        // the same replacement, and must keep the index just the same.
+        g.set_attr_numeric("mu", &7i32).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "g = f['g']\n\
+         assert list(g.attrs) == ['zeta', 'alpha', 'mu'], list(g.attrs)\n\
+         corder = [h5py.h5a.get_info(g.id, name=n.encode()).corder for n in g.attrs]\n\
+         assert corder == [0, 1, 2], corder\n\
+         assert g.attrs['zeta'] == 'rewritten', g.attrs['zeta']\n\
+         assert list(g.attrs['alpha']) == ['a', 'b'], list(g.attrs['alpha'])\n\
+         assert g.attrs['mu'] == 7, g.attrs['mu']\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// Tracking survives the phase change: a group past `max_compact` keeps a
 /// creation-order index beside the name index in its dense storage, so
 /// libhdf5 still iterates the twelve links in creation order.

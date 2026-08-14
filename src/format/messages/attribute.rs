@@ -326,7 +326,8 @@ impl AttributeHeader {
     }
 }
 
-/// One attribute as an object header holds it.
+/// One attribute as an object header holds it: the message, plus the creation
+/// index the file records for it.
 ///
 /// [`AttributeMessage::decode`] fails on a payload this crate cannot model —
 /// an object-reference datatype, say — but the name sits ahead of the datatype
@@ -334,8 +335,26 @@ impl AttributeHeader {
 /// unreadable case in the same list is what lets a listing answer "this object
 /// has an attribute named X that I cannot read" instead of answering as though
 /// X were not there.
+///
+/// The creation index is a property of the attribute, exactly as its name is —
+/// `H5A_shared_t::crt_idx`, stored in the object header message envelope when
+/// the set is compact and in the index records when it is dense. Keeping it
+/// here is what stops a rewrite from re-deriving it from the position an
+/// attribute happens to occupy in a list: a dense set is read back in name-hash
+/// order, so a position-derived index re-stamps the whole set with the order
+/// the hash walk took.
 #[derive(Debug, Clone, PartialEq)]
-pub enum AttributeEntry {
+pub struct AttributeEntry {
+    body: AttributeBody,
+    /// The index this attribute was created with, when its object tracks
+    /// creation order. `None` when the object does not, which is what
+    /// `H5O_MAX_CRT_ORDER_IDX` says on disk.
+    creation_index: Option<u16>,
+}
+
+/// The message an [`AttributeEntry`] carries, decoded or not.
+#[derive(Debug, Clone, PartialEq)]
+enum AttributeBody {
     /// Decoded, and usable through the typed accessors.
     Readable(AttributeMessage),
     /// Named, with the reason it could not be decoded and the message payload
@@ -349,48 +368,76 @@ pub enum AttributeEntry {
 }
 
 impl AttributeEntry {
-    /// Parse one attribute message.
+    /// Parse one attribute message. The entry carries no creation index —
+    /// only the envelope or index record it came out of knows one, so the
+    /// caller that has it attaches it with
+    /// [`with_creation_index`](Self::with_creation_index).
     ///
     /// Total over every message whose envelope and name parse: a payload this
-    /// crate cannot decode becomes [`Unreadable`](Self::Unreadable), never an
-    /// absence. Only a message too damaged to yield a name at all is an error,
-    /// because there is then no name to report.
+    /// crate cannot decode is named, never an absence. Only a message too
+    /// damaged to yield a name at all is an error, because there is then no
+    /// name to report.
     pub fn parse(buf: &[u8], ctx: &FormatContext) -> FormatResult<Self> {
-        match AttributeMessage::decode(buf, ctx) {
-            Ok((attr, _)) => Ok(Self::Readable(attr)),
+        let body = match AttributeMessage::decode(buf, ctx) {
+            Ok((attr, _)) => AttributeBody::Readable(attr),
             Err(payload_err) => {
                 let header = AttributeHeader::decode(buf)?;
-                Ok(Self::Unreadable {
+                AttributeBody::Unreadable {
                     name: header.name,
                     raw: buf.to_vec(),
                     reason: payload_err.to_string(),
-                })
+                }
             }
-        }
+        };
+        Ok(Self {
+            body,
+            creation_index: None,
+        })
+    }
+
+    /// This entry with `creation_index` attached.
+    pub fn with_creation_index(mut self, creation_index: Option<u16>) -> Self {
+        self.creation_index = creation_index;
+        self
+    }
+
+    /// Attach `creation_index` in place.
+    pub fn set_creation_index(&mut self, creation_index: Option<u16>) {
+        self.creation_index = creation_index;
+    }
+
+    /// The index this attribute was created with, or `None` when its object
+    /// does not track creation order.
+    pub fn creation_index(&self) -> Option<u16> {
+        self.creation_index
     }
 
     /// The attribute's name, whether or not its payload decoded.
     pub fn name(&self) -> &str {
-        match self {
-            Self::Readable(attr) => &attr.name,
-            Self::Unreadable { name, .. } => name,
+        match &self.body {
+            AttributeBody::Readable(attr) => &attr.name,
+            AttributeBody::Unreadable { name, .. } => name,
+        }
+    }
+
+    /// The decoded message, or the reason there is none — exactly one of the
+    /// two, so a caller reporting the failure never needs a branch for an
+    /// attribute that is neither.
+    pub fn decoded(&self) -> Result<&AttributeMessage, &str> {
+        match &self.body {
+            AttributeBody::Readable(attr) => Ok(attr),
+            AttributeBody::Unreadable { reason, .. } => Err(reason),
         }
     }
 
     /// The decoded message, or `None` when only the name is known.
     pub fn readable(&self) -> Option<&AttributeMessage> {
-        match self {
-            Self::Readable(attr) => Some(attr),
-            Self::Unreadable { .. } => None,
-        }
+        self.decoded().ok()
     }
 
     /// Why this attribute cannot be read, or `None` when it can be.
     pub fn unreadable_reason(&self) -> Option<&str> {
-        match self {
-            Self::Readable(_) => None,
-            Self::Unreadable { reason, .. } => Some(reason),
-        }
+        self.decoded().err()
     }
 
     /// The message payload to write back into an object header.
@@ -406,16 +453,19 @@ impl AttributeEntry {
     /// message inside a readable attribute follows it. An unreadable one is
     /// bytes, and bytes have no version to choose.
     pub fn encode_at(&self, ctx: &FormatContext, libver: LibverBound) -> Vec<u8> {
-        match self {
-            Self::Readable(attr) => attr.encode_at(ctx, libver),
-            Self::Unreadable { raw, .. } => raw.clone(),
+        match &self.body {
+            AttributeBody::Readable(attr) => attr.encode_at(ctx, libver),
+            AttributeBody::Unreadable { raw, .. } => raw.clone(),
         }
     }
 }
 
 impl From<AttributeMessage> for AttributeEntry {
     fn from(attr: AttributeMessage) -> Self {
-        Self::Readable(attr)
+        Self {
+            body: AttributeBody::Readable(attr),
+            creation_index: None,
+        }
     }
 }
 
