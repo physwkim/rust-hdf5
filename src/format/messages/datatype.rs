@@ -346,8 +346,30 @@ impl ReferenceKind {
     /// Whether this kind's elements are 1.12 opaque tokens, which carry the
     /// encoding version in the bit field's second nibble.
     pub fn is_revised(self) -> bool {
-        matches!(self, Self::Object2 | Self::DatasetRegion2 | Self::Attr)
+        self.old_style().is_none()
     }
+
+    /// The pre-1.12 kind this is, or `None` for the 1.12 encodings.
+    ///
+    /// Element decoding takes an [`OldReferenceKind`], so a caller that has
+    /// passed this gate cannot then be handed a token it has no way to read.
+    pub fn old_style(self) -> Option<OldReferenceKind> {
+        match self {
+            Self::Object1 => Some(OldReferenceKind::Object),
+            Self::DatasetRegion1 => Some(OldReferenceKind::DatasetRegion),
+            Self::Object2 | Self::DatasetRegion2 | Self::Attr => None,
+        }
+    }
+}
+
+/// The two pre-1.12 reference kinds — the ones whose elements name a file
+/// address this crate can follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OldReferenceKind {
+    /// `H5R_OBJECT1`.
+    Object,
+    /// `H5R_DATASET_REGION1`.
+    DatasetRegion,
 }
 
 // ========================================================================= factory methods

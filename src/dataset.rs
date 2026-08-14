@@ -2077,16 +2077,19 @@ impl H5Dataset {
     /// Read a reference dataset's elements, each resolved to the object it
     /// names.
     ///
-    /// h5py's `Reference` — the pre-1.12 `H5R_OBJECT1` element, an object
-    /// header address — comes back as [`Reference::Object`] carrying the
-    /// target's absolute path, and an unset element as [`Reference::Null`].
-    /// Any other reference kind is refused by name.
+    /// Both pre-1.12 reference kinds are read — h5py's `Reference` (an object
+    /// header address) and its `RegionReference` (a heap id whose heap object
+    /// holds the target plus a serialized selection). An object reference
+    /// comes back as [`Reference::Object`] carrying the target's path;
+    /// a region reference as [`Reference::Region`], whose
+    /// [`bounds`](Reference::bounds) is the selection's bounding box —
+    /// libhdf5's `H5Sget_select_bounds`.
     ///
     /// ```no_run
     /// # use rust_hdf5::H5File;
     /// let file = H5File::open("refs.h5").unwrap();
     /// for r in file.dataset("refs").unwrap().read_references().unwrap() {
-    ///     println!("{:?}", r.path());
+    ///     println!("{:?} {:?}", r.path(), r.bounds());
     /// }
     /// ```
     pub fn read_references(&self) -> Result<Vec<Reference>> {

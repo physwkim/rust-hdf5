@@ -313,16 +313,33 @@ fn renders_as_values(dt: &DatatypeMessage) -> bool {
 }
 
 /// One reference element in the form `oracle/canon.py`'s `render_ref` prints:
-/// the target's path. An address the reader could not name is printed as the
-/// address, which compares unequal to h5py's path — a difference, not a silent
-/// match.
+/// the target's path, plus the selection's bounding box for a region
+/// reference. An address the reader could not name is printed as the address,
+/// which compares unequal to h5py's path — a difference, not a silent match.
 fn render_ref(r: &Reference) -> String {
+    fn target(path: &Option<String>, address: u64) -> String {
+        path.clone().unwrap_or_else(|| format!("<{address:#x}>"))
+    }
+    fn coords(dims: &[u64]) -> String {
+        let parts: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
+        format!("[{}]", parts.join(","))
+    }
     match r {
         Reference::Null => "objref:null".to_string(),
-        Reference::Object { address, path } => format!(
-            "objref:{}",
-            path.clone().unwrap_or_else(|| format!("<{address:#x}>"))
-        ),
+        Reference::Object { address, path } => format!("objref:{}", target(path, *address)),
+        Reference::Region {
+            address,
+            path,
+            selection,
+        } => match selection.bounds() {
+            Some((lo, hi)) => format!(
+                "regref:{}:{}-{}",
+                target(path, *address),
+                coords(&lo),
+                coords(&hi)
+            ),
+            None => format!("regref:{}:unbounded", target(path, *address)),
+        },
     }
 }
 

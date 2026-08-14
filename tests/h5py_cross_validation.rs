@@ -6,7 +6,7 @@
 //! skip (pass) when neither is present, so CI without h5py is green.
 
 use rust_hdf5::types::VarLenUnicode;
-use rust_hdf5::{ByteOrder, DatatypeMessage, H5File, Reference};
+use rust_hdf5::{ByteOrder, DatatypeMessage, H5File, Reference, RegionSelection};
 
 const TEST_PYTHON: &str = "/Users/stevek/mamba/envs/bs2026.1/bin/python";
 
@@ -1710,6 +1710,52 @@ fn object_references_written_by_h5py_resolve_to_paths() {
         .unwrap();
     assert_eq!(attr.len(), 1);
     assert_eq!(attr[0].path(), Some("/grp"));
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}
+
+/// h5py's `RegionReference` — `H5R_DATASET_REGION1`, a global-heap id whose
+/// heap object is the target address plus a serialized selection — resolves to
+/// the target's path and to the selection's bounding box, matching what
+/// `H5Sget_select_bounds` reports for the same selection.
+#[test]
+fn region_references_written_by_h5py_report_their_bounds() {
+    let Some(py) = python() else { return };
+    let path = tmp("ref_region_read");
+    write_with_h5py(
+        py,
+        &path,
+        "t = f.create_dataset('target', data=np.arange(8, dtype='<i4'))\n\
+         m = f.create_dataset('matrix', data=np.arange(24, dtype='<i4').reshape(4, 6))\n\
+         r = f.create_dataset('refs', (4,), dtype=h5py.regionref_dtype)\n\
+         r[0] = t.regionref[0:3]\n\
+         r[1] = t.regionref[4:8]\n\
+         r[2] = m.regionref[1:3, 2:5]\n\
+         sp = m.id.get_space()\n\
+         sp.select_elements([(0, 1), (3, 5)])\n\
+         r[3] = h5py.h5r.create(f.id, b'/matrix', h5py.h5r.DATASET_REGION, sp)\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let refs = file.dataset("refs").unwrap().read_references().unwrap();
+    assert_eq!(
+        refs.iter().map(|r| r.path()).collect::<Vec<_>>(),
+        vec![
+            Some("/target"),
+            Some("/target"),
+            Some("/matrix"),
+            Some("/matrix")
+        ]
+    );
+    assert_eq!(refs[0].bounds(), Some((vec![0], vec![2])));
+    assert_eq!(refs[1].bounds(), Some((vec![4], vec![7])));
+    assert_eq!(refs[2].bounds(), Some((vec![1, 2], vec![2, 4])));
+    // Fancy indexing is a point selection, whose bounds cover both points.
+    assert_eq!(refs[3].bounds(), Some((vec![0, 1], vec![3, 5])));
+    assert_eq!(
+        refs[3].selection(),
+        Some(&RegionSelection::Points(vec![vec![0, 1], vec![3, 5]]))
+    );
     file.close().unwrap();
     std::fs::remove_file(&path).ok();
 }
