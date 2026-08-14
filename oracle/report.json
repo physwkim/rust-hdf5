@@ -4,7 +4,7 @@
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
   "python": "/home/stevek/micromamba/envs/tomo/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-integrator-385d5684-1/target/release/oracle_probe",
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-refs-9d73454b-1/target/release/oracle_probe",
   "cases": 91
  },
  "results": [
@@ -5517,12 +5517,27 @@
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "UNSUPPORTED-API: region references need a selection serializer on the write side",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "metadata_diffs": [
+     {
+      "key": "#superblock",
+      "field": "superblock",
+      "ref": "0",
+      "rust": "2",
+      "expected": null
+     },
+     {
+      "key": "/#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
@@ -17820,14 +17835,6 @@
    "example": ""
   },
   {
-   "kind": "write-unsupported",
-   "signature": "region references need a selection serializer on the write side",
-   "cases": [
-    "ref_region"
-   ],
-   "example": ""
-  },
-  {
    "kind": "structural",
    "signature": "attrorder \u2014 H5Group exposes no attribute creation-order tracking flags",
    "cases": [
@@ -19432,6 +19439,7 @@
     "opaque",
     "bitfield",
     "ref_object",
+    "ref_region",
     "vlen_numeric",
     "vlen_bytes",
     "layout_contiguous",
@@ -19501,6 +19509,7 @@
     "opaque",
     "bitfield",
     "ref_object",
+    "ref_region",
     "vlen_numeric",
     "vlen_bytes",
     "layout_contiguous",

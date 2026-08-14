@@ -28,8 +28,8 @@ use rust_hdf5::format::messages::datatype::{
 use rust_hdf5::format::messages::filter::{Filter, FilterPipeline, FILTER_FLETCHER32};
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
-    H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error,
-    LibverBound, LinkClass, Reference,
+    H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error, Hyperslab,
+    HyperslabBlock, LibverBound, LinkClass, Reference, Selection,
 };
 
 const CANON_VERSION: &str = "3";
@@ -1637,9 +1637,27 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
-        "ref_region" => Ok(unsup(
-            "region references need a selection serializer on the write side",
-        )),
+        "ref_region" => {
+            let file = H5File::create(path)?;
+            let target = file.new_dataset::<i32>().shape([8]).create("target")?;
+            target.write_raw(&ramp_n::<i32>(8))?;
+            let refs = file
+                .new_dataset::<u64>()
+                .region_references()
+                .shape([2])
+                .create("refs")?;
+            // The two slices h5py's `t.regionref[0:3]` and `[4:8]` select.
+            let slice = |start: u64, end: u64| Selection::Hyperslab {
+                rank: 1,
+                form: Hyperslab::Blocks(vec![HyperslabBlock {
+                    start: vec![start],
+                    end: vec![end],
+                }]),
+            };
+            refs.write_region_references(&[("/target", slice(0, 2)), ("/target", slice(4, 7))])?;
+            file.close()?;
+            Ok(Ok(()))
+        }
 
         // ---- layouts and chunk indexes ----------------------------------
         "layout_contiguous" => simple_ramp::<i32>(path, ramp_n::<i32>(16)),
