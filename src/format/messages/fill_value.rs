@@ -82,6 +82,34 @@ impl FillValueMessage {
 
     /// Encode as a version-3 fill-value message (`H5O__fill_new_encode`).
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_for(crate::format::ObjectFormat::Modern)
+    }
+
+    /// Encode at the version a file of this `format` calls for
+    /// (`H5O__fill_new_encode`, H5Ofill.c:409).
+    ///
+    /// Version 2 spells out allocation time, write time and definedness as
+    /// three bytes instead of packing them into flags, and — the part a
+    /// version-3 reader must not assume — always writes the four-byte size
+    /// field when the value is defined, even when the size is zero. That
+    /// `defined = 1, size = 0` shape is what libhdf5 writes for the default
+    /// fill of a contiguous dataset in a classic file.
+    pub fn encode_for(&self, format: crate::format::ObjectFormat) -> Vec<u8> {
+        if format.fill_value_version() < VERSION {
+            let mut buf = Vec::with_capacity(12);
+            buf.push(format.fill_value_version());
+            buf.push(self.alloc_time);
+            buf.push(self.fill_write_time);
+            if self.fill_defined == 0 {
+                buf.push(0);
+                return buf;
+            }
+            buf.push(1);
+            let value = self.fill_value.as_deref().unwrap_or(&[]);
+            buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            buf.extend_from_slice(value);
+            return buf;
+        }
         let mut buf = Vec::with_capacity(10);
         buf.push(VERSION);
 
@@ -485,5 +513,40 @@ mod tests {
         );
         // Partial tail when total is not a multiple of the pattern width.
         assert_eq!(tiled_fill(5, Some(&[1, 2])), vec![1, 2, 1, 2, 1]);
+    }
+
+    /// The 8 bytes libhdf5 1.14.6 wrote for the default fill of a contiguous
+    /// dataset in a default (superblock-0) file: version 2, and the size field
+    /// present-but-zero that a version-3 reader never sees.
+    #[test]
+    fn a_legacy_fill_value_matches_the_bytes_libhdf5_wrote() {
+        let fv = FillValueMessage {
+            alloc_time: 2,
+            fill_write_time: 2,
+            fill_defined: 1,
+            fill_value: None,
+        };
+        let buf = fv.encode_for(crate::format::ObjectFormat::Legacy);
+        assert_eq!(buf, vec![0x02, 0x02, 0x02, 0x01, 0, 0, 0, 0]);
+        let (back, consumed) = FillValueMessage::decode(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(back, fv);
+    }
+
+    #[test]
+    fn a_legacy_user_fill_value_round_trips() {
+        let fv = FillValueMessage::with_value(vec![7, 0, 0, 0]);
+        let buf = fv.encode_for(crate::format::ObjectFormat::Legacy);
+        assert_eq!(&buf[..4], &[0x02, 0x02, 0x00, 0x01]);
+        let (back, _) = FillValueMessage::decode(&buf).unwrap();
+        assert_eq!(back, fv);
+    }
+
+    #[test]
+    fn a_legacy_undefined_fill_value_writes_no_size() {
+        let buf = FillValueMessage::undefined().encode_for(crate::format::ObjectFormat::Legacy);
+        assert_eq!(buf, vec![0x02, 0x02, 0x01, 0x00]);
+        let (back, _) = FillValueMessage::decode(&buf).unwrap();
+        assert_eq!(back, FillValueMessage::undefined());
     }
 }

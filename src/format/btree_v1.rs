@@ -65,11 +65,7 @@ impl Default for BTreeV1Config {
     }
 }
 
-/// A symbol-table entry's on-disk size: name offset, object header address,
-/// cache type, reserved word and the 16-byte scratch pad.
-fn symbol_table_entry_size(sizeof_addr: usize, sizeof_size: usize) -> usize {
-    sizeof_size + sizeof_addr + 4 + 4 + 16
-}
+use crate::format::superblock::symbol_table_entry_size;
 
 impl BTreeV1Config {
     /// Maximum entries a symbol table node (SNOD) may declare.

@@ -103,8 +103,62 @@ impl AttributeMessage {
     /// Encode the attribute message for a file whose low libver bound is
     /// `libver`, which the datatype message inside it follows.
     pub fn encode_at(&self, ctx: &FormatContext, libver: LibverBound) -> Vec<u8> {
+        self.encode_for(ctx, libver, crate::format::ObjectFormat::Modern)
+    }
+
+    /// Encode a version-1 attribute message (`H5O__attr_encode`, H5Oattr.c).
+    ///
+    /// Version 1 has no flags byte and no name character set: byte 1 is
+    /// reserved, and the three size fields are followed by the name, the
+    /// datatype and the dataspace each padded out to a multiple of eight
+    /// bytes. The size fields record the *unpadded* lengths, so a decoder that
+    /// forgets the padding walks into the middle of the next field — which is
+    /// why the version is not something a writer may pick freely.
+    fn encode_v1(&self, ctx: &FormatContext, libver: LibverBound) -> Vec<u8> {
+        /// `H5O_ALIGN_OLD`, which version 1 of this message applies to each of
+        /// its three variable-length fields.
+        fn pad_to_8(buf: &mut Vec<u8>) {
+            let padded = (buf.len() + 7) & !7;
+            buf.resize(padded, 0);
+        }
+
         let encoded_dt = self.datatype.encode_at(ctx, libver);
-        let encoded_ds = self.dataspace.encode(ctx);
+        let encoded_ds = self
+            .dataspace
+            .encode_for(ctx, crate::format::ObjectFormat::Legacy);
+        let name_bytes = self.name.as_bytes();
+        let name_size = name_bytes.len() + 1;
+
+        let mut buf = Vec::with_capacity(8 + name_size + encoded_dt.len() + encoded_ds.len() + 24);
+        buf.push(1); // version
+        buf.push(0); // reserved
+        buf.extend_from_slice(&(name_size as u16).to_le_bytes());
+        buf.extend_from_slice(&(encoded_dt.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&(encoded_ds.len() as u16).to_le_bytes());
+        buf.extend_from_slice(name_bytes);
+        buf.push(0);
+        pad_to_8(&mut buf);
+        buf.extend_from_slice(&encoded_dt);
+        pad_to_8(&mut buf);
+        buf.extend_from_slice(&encoded_ds);
+        pad_to_8(&mut buf);
+        buf.extend_from_slice(&self.data);
+        buf
+    }
+
+    /// Encode the attribute message at the version a file of this `format`
+    /// calls for, with the datatype inside it at `libver`.
+    pub fn encode_for(
+        &self,
+        ctx: &FormatContext,
+        libver: LibverBound,
+        format: crate::format::ObjectFormat,
+    ) -> Vec<u8> {
+        if format.attribute_version() == 1 {
+            return self.encode_v1(ctx, libver);
+        }
+        let encoded_dt = self.datatype.encode_at(ctx, libver);
+        let encoded_ds = self.dataspace.encode_for(ctx, format);
 
         // Name with null terminator
         let name_bytes = self.name.as_bytes();
@@ -406,8 +460,18 @@ impl AttributeEntry {
     /// message inside a readable attribute follows it. An unreadable one is
     /// bytes, and bytes have no version to choose.
     pub fn encode_at(&self, ctx: &FormatContext, libver: LibverBound) -> Vec<u8> {
+        self.encode_for(ctx, libver, crate::format::ObjectFormat::Modern)
+    }
+
+    /// The same, at the message version `format` calls for.
+    pub fn encode_for(
+        &self,
+        ctx: &FormatContext,
+        libver: LibverBound,
+        format: crate::format::ObjectFormat,
+    ) -> Vec<u8> {
         match self {
-            Self::Readable(attr) => attr.encode_at(ctx, libver),
+            Self::Readable(attr) => attr.encode_for(ctx, libver, format),
             Self::Unreadable { raw, .. } => raw.clone(),
         }
     }
@@ -516,5 +580,64 @@ mod tests {
         assert_eq!(decoded.data.len(), 6);
         assert_eq!(&decoded.data[..5], "caf\u{00e9}".as_bytes());
         assert_eq!(decoded.data[5], 0);
+    }
+
+    /// The 48 bytes libhdf5 1.14.6 wrote for `f.attrs["ra"] = 42` on the root
+    /// group of a default (superblock-0) file. Version 1 pads the name, the
+    /// datatype and the dataspace each out to eight bytes while the size
+    /// fields keep the unpadded lengths, so the byte comparison is the only
+    /// thing that catches a padding rule applied in the wrong place.
+    #[test]
+    fn a_legacy_attribute_matches_the_bytes_libhdf5_wrote() {
+        let ctx = FormatContext::default_v3();
+        let attr = AttributeMessage::scalar_numeric(
+            "ra",
+            DatatypeMessage::i64_type(),
+            42i64.to_le_bytes().to_vec(),
+        );
+        let buf = attr.encode_for(
+            &ctx,
+            LibverBound::Earliest,
+            crate::format::ObjectFormat::Legacy,
+        );
+        assert_eq!(
+            buf,
+            vec![
+                0x01, 0x00, 0x03, 0x00, 0x0c, 0x00, 0x08, 0x00, 0x72, 0x61, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x10, 0x08, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2a, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ]
+        );
+        let (back, consumed) = AttributeMessage::decode(&buf, &ctx).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(back.name, "ra");
+        assert_eq!(back.data, 42i64.to_le_bytes().to_vec());
+    }
+
+    /// A name whose padded length differs from the datatype's, so a decoder
+    /// that pads one field and not the other lands mid-value.
+    #[test]
+    fn a_legacy_attribute_round_trips_at_every_field_padding() {
+        let ctx = FormatContext::default_v3();
+        for name in ["a", "ab", "abcdefg", "abcdefgh", "abcdefghi"] {
+            let attr = AttributeMessage::array_numeric(
+                name,
+                DatatypeMessage::i32_type(),
+                &[3],
+                vec![1u8, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0],
+            );
+            let buf = attr.encode_for(
+                &ctx,
+                LibverBound::Earliest,
+                crate::format::ObjectFormat::Legacy,
+            );
+            assert_eq!(buf[0], 1, "{name}");
+            let (back, consumed) = AttributeMessage::decode(&buf, &ctx).unwrap();
+            assert_eq!(consumed, buf.len(), "{name}");
+            assert_eq!(back.name, name);
+            assert_eq!(back.data, attr.data, "{name}");
+            assert_eq!(back.dataspace.dims, vec![3], "{name}");
+        }
     }
 }
