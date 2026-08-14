@@ -932,6 +932,7 @@ impl H5File {
 pub struct H5FileOptions {
     locking: Option<FileLocking>,
     track_order: bool,
+    libver: LibverBound,
 }
 
 impl H5FileOptions {
@@ -971,6 +972,32 @@ impl H5FileOptions {
         self
     }
 
+    /// Create the file under a library-version low bound — h5py's
+    /// `File(path, "w", libver=("v108", "v108"))`, libhdf5's
+    /// `H5Pset_libver_bounds` `low` argument.
+    ///
+    /// The bound decides the superblock version the file is written with
+    /// ([`LibverBound::superblock_version`]) as well as the message versions
+    /// of the objects created in it, so unlike
+    /// [`H5File::set_libver_bound`] — which only reaches objects created
+    /// after the call — it applies to the file itself.
+    ///
+    /// Only [`create`](Self::create) reads this; an existing file keeps the
+    /// superblock it already has.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::{H5File, LibverBound};
+    /// let file = H5File::options()
+    ///     .libver(LibverBound::V110)
+    ///     .create("v110.h5")
+    ///     .unwrap();
+    /// # let _ = file;
+    /// ```
+    pub fn libver(mut self, libver: LibverBound) -> Self {
+        self.libver = libver;
+        self
+    }
+
     fn resolved_locking(&self) -> FileLocking {
         match self.locking {
             Some(p) => p,
@@ -982,8 +1009,11 @@ impl H5FileOptions {
     pub fn create<P: AsRef<Path>>(self, path: P) -> Result<H5File> {
         let writer = Hdf5Writer::create_with_options(
             path.as_ref(),
-            self.resolved_locking(),
-            self.track_order,
+            crate::io::writer::FileCreateOptions {
+                locking: self.resolved_locking(),
+                track_order: self.track_order,
+                libver: self.libver,
+            },
         )?;
         Ok(H5File {
             inner: new_shared(H5FileInner::Writer(writer)),

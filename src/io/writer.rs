@@ -1987,6 +1987,27 @@ pub struct Hdf5Writer {
     pending_object_references: Slot<Vec<PendingObjectReference>>,
 }
 
+/// The file-creation properties a brand-new file is made with.
+///
+/// libhdf5 splits these across the file creation and file access property
+/// lists (`H5Pset_userblock`, `H5Pset_link_creation_order`,
+/// `H5Pset_libver_bounds`, the locking property); what they have in common is
+/// that they are read once, when the file is created, and cannot be changed
+/// afterwards without rewriting it. Options that *can* change mid-session —
+/// the bound for objects created later, the creation-order policy for later
+/// objects — have their own setters.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileCreateOptions {
+    /// OS-level locking policy for the new file.
+    pub locking: crate::io::locking::FileLocking,
+    /// Creation-order policy for the root group, and the default for every
+    /// object created afterwards; see [`Hdf5Writer::set_track_order`].
+    pub track_order: bool,
+    /// The file's low library-version bound; see
+    /// [`Hdf5Writer::set_libver_bound`].
+    pub libver: LibverBound,
+}
+
 /// One object-reference element written before its value could be known.
 ///
 /// An `H5R_OBJECT1` element is the target's object header address, and
@@ -2057,20 +2078,22 @@ impl Hdf5Writer {
         path: &Path,
         locking: crate::io::locking::FileLocking,
     ) -> IoResult<Self> {
-        Self::create_with_options(path, locking, false)
+        Self::create_with_options(
+            path,
+            FileCreateOptions {
+                locking,
+                ..Default::default()
+            },
+        )
     }
 
-    /// Create a new HDF5 file at `path` with an explicit locking policy and
-    /// creation-order policy.
-    ///
-    /// `track_order` is the policy the root group is created under and the
-    /// default for every object created afterwards; see
-    /// [`set_track_order`](Self::set_track_order).
-    pub fn create_with_options(
-        path: &Path,
-        locking: crate::io::locking::FileLocking,
-        track_order: bool,
-    ) -> IoResult<Self> {
+    /// Create a new HDF5 file at `path` with explicit file-creation options.
+    pub fn create_with_options(path: &Path, options: FileCreateOptions) -> IoResult<Self> {
+        let FileCreateOptions {
+            locking,
+            track_order,
+            libver,
+        } = options;
         let handle = FileHandle::create_with_locking(path, locking)?;
         let ctx = FormatContext::default_v3();
 
@@ -2090,7 +2113,7 @@ impl Hdf5Writer {
             preserved_links: Slot::new(Vec::new()),
             root_attributes: Slot::new(Vec::new()),
             create_lock: Slot::new(()),
-            libver: LibverBound::Earliest,
+            libver,
             closed: false,
             swmr_active: false,
             cwfs: Slot::new(Vec::new()),
@@ -8967,18 +8990,20 @@ impl Hdf5Writer {
     ///   B-tree, all reached through a version-4 or -5 data layout message —
     ///   raises the bound to V110 (`H5O_layout_ver_bounds`, H5Dlayout.c:44),
     ///   hence version 3.
-    /// * SWMR writes version 3 outright (H5Fsuper.c:1129), and so does the
-    ///   2.0 format [`set_libver_latest`](Self::set_libver_latest) asks for.
+    /// * SWMR writes version 3 outright (H5Fsuper.c:1129).
+    /// * The bound the file was created with contributes
+    ///   [`LibverBound::superblock_version`] directly, so `V110` and newer —
+    ///   including the 2.0 format [`set_libver_latest`](Self::set_libver_latest)
+    ///   asks for — reach version 3 whatever the content is.
     ///
     /// A reopened file starts from the version it already carries, so an
     /// append that adds nothing newer leaves that version alone.
     fn superblock_version_for(&self, flags: u8) -> u8 {
-        let mut version = self.superblock_version_base.max(SUPERBLOCK_V2);
-        if self.libver == LibverBound::V200
-            || self.swmr_active
-            || flags & FLAG_SWMR_WRITE != 0
-            || self.has_chunked_dataset()
-        {
+        let mut version = self
+            .superblock_version_base
+            .max(SUPERBLOCK_V2)
+            .max(self.libver.superblock_version());
+        if self.swmr_active || flags & FLAG_SWMR_WRITE != 0 || self.has_chunked_dataset() {
             version = version.max(SUPERBLOCK_V3);
         }
         version
