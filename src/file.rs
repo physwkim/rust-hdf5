@@ -192,6 +192,31 @@ impl H5File {
         }
     }
 
+    /// Record creation order for the links and the attributes of every
+    /// object created after this call — the equivalent of h5py's
+    /// `h5py.get_config().track_order = True`, i.e. `H5Pset_link_creation_order`
+    /// and `H5Pset_attr_creation_order` set to
+    /// `H5P_CRT_ORDER_TRACKED | H5P_CRT_ORDER_INDEXED` on the creation
+    /// property lists those objects are made with.
+    ///
+    /// Creation-order tracking belongs to the object, so groups and datasets
+    /// made before this call keep the policy they were made under — the same
+    /// split h5py has between its global config and each object's property
+    /// list. The root group is created with the file; configure it with
+    /// [`H5FileOptions::track_order`], h5py's `File(..., track_order=True)`.
+    ///
+    /// Off by default. Errors in read mode.
+    pub fn set_track_order(&self, track: bool) -> Result<()> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                writer.set_track_order(track);
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
+        }
+    }
+
     /// Return a handle to the root group.
     ///
     /// The root group can be used to create datasets and sub-groups.
@@ -787,6 +812,7 @@ impl H5File {
 #[derive(Debug, Default, Clone)]
 pub struct H5FileOptions {
     locking: Option<FileLocking>,
+    track_order: bool,
 }
 
 impl H5FileOptions {
@@ -814,6 +840,18 @@ impl H5FileOptions {
         self.locking(FileLocking::BestEffort)
     }
 
+    /// Create the file's root group with creation-order tracking, and make
+    /// that the policy for objects created in it — h5py's
+    /// `File(path, "w", track_order=True)`.
+    ///
+    /// Only [`create`](Self::create) reads this; opening an existing file
+    /// takes the policy from the root group already on disk. Change it for
+    /// later objects with [`H5File::set_track_order`].
+    pub fn track_order(mut self, track: bool) -> Self {
+        self.track_order = track;
+        self
+    }
+
     fn resolved_locking(&self) -> FileLocking {
         match self.locking {
             Some(p) => p,
@@ -823,7 +861,11 @@ impl H5FileOptions {
 
     /// Create a new HDF5 file at `path` with the configured options.
     pub fn create<P: AsRef<Path>>(self, path: P) -> Result<H5File> {
-        let writer = Hdf5Writer::create_with_locking(path.as_ref(), self.resolved_locking())?;
+        let writer = Hdf5Writer::create_with_options(
+            path.as_ref(),
+            self.resolved_locking(),
+            self.track_order,
+        )?;
         Ok(H5File {
             inner: new_shared(H5FileInner::Writer(writer)),
         })

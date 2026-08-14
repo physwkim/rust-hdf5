@@ -19,7 +19,7 @@
 
 use crate::format::checksum::checksum_metadata;
 use crate::format::chunk_index::btree_v2::{
-    collect_btree_v2_records, Bt2Header, Bt2Tree, BT2_TYPE_ATTR_NAME,
+    collect_btree_v2_records, Bt2Header, Bt2Tree, BT2_TYPE_ATTR_CORDER, BT2_TYPE_ATTR_NAME,
 };
 use crate::format::fractal_heap::{
     collect_managed_blocks, read_heap_object, FractalHeapHeader, HeapId, HeapParams,
@@ -38,7 +38,12 @@ const FHEAP_ID_LEN: usize = 8;
 /// 17 bytes on disk (`H5A__dense_btree2_name_encode`).
 const NAME_RECORD_LEN: usize = FHEAP_ID_LEN + 1 + 4 + 4;
 
-/// Node size of the name index (`H5A_NAME_BT2_NODE_SIZE`).
+/// A creation-order-index record: heap ID, message flags, creation order.
+/// 13 bytes on disk (`H5A__dense_btree2_corder_encode`).
+const CORDER_RECORD_LEN: usize = FHEAP_ID_LEN + 1 + 4;
+
+/// Node size of either index (`H5A_NAME_BT2_NODE_SIZE`,
+/// `H5A_CORDER_BT2_NODE_SIZE`).
 const NAME_BT2_NODE_SIZE: u32 = 512;
 
 /// The hash a name is indexed under (`H5A__dense_insert`).
@@ -131,6 +136,7 @@ pub struct DenseAttributeStorage {
 pub fn build_dense_attributes(
     attrs: &[AttributeEntry],
     ctx: &FormatContext,
+    track_order: bool,
     alloc: &mut dyn FnMut(u64) -> u64,
 ) -> FormatResult<DenseAttributeStorage> {
     let objects: Vec<Vec<u8>> = attrs.iter().map(|a| a.encode(ctx)).collect();
@@ -146,23 +152,85 @@ pub fn build_dense_attributes(
             .then_with(|| attrs[a].name().cmp(attrs[b].name()))
     });
 
+    // `attrs` is in creation order, so an attribute's index in it is the
+    // creation index `H5O__attr_create` would have stamped on it. Without
+    // tracking every record carries the "no creation index" sentinel
+    // `H5O_MAX_CRT_ORDER_IDX` the library writes in that case.
+    let corder = |i: usize| -> u32 {
+        if track_order {
+            i as u32
+        } else {
+            u32::from(MAX_CREATION_ORDER_INDEX)
+        }
+    };
+
     let mut records = Vec::with_capacity(order.len() * NAME_RECORD_LEN);
     for &i in &order {
         records.extend_from_slice(&heap.ids[i]);
-        // Nothing here is a shared (SOHM) message, and creation order is not
-        // tracked, so every record carries the "no creation index" sentinel
-        // `H5O_MAX_CRT_ORDER_IDX` the library writes in that case.
+        // Nothing here is a shared (SOHM) message.
         records.push(0);
-        records.extend_from_slice(&u32::from(MAX_CREATION_ORDER_INDEX).to_le_bytes());
+        records.extend_from_slice(&corder(i).to_le_bytes());
         records.extend_from_slice(&name_hash(attrs[i].name()).to_le_bytes());
     }
 
-    let tree = Bt2Tree::build(
+    let mut blocks = heap.blocks;
+    let bt2_addr = build_index(
         BT2_TYPE_ATTR_NAME,
         NAME_RECORD_LEN as u16,
+        &records,
+        ctx,
+        alloc,
+        &mut blocks,
+    );
+
+    // The creation-order index, when it is asked for. Its records are already
+    // in key order: the creation index of `attrs[i]` is `i`.
+    let corder_bt2_addr = track_order.then(|| {
+        let mut records = Vec::with_capacity(attrs.len() * CORDER_RECORD_LEN);
+        for i in 0..attrs.len() {
+            records.extend_from_slice(&heap.ids[i]);
+            records.push(0);
+            records.extend_from_slice(&corder(i).to_le_bytes());
+        }
+        build_index(
+            BT2_TYPE_ATTR_CORDER,
+            CORDER_RECORD_LEN as u16,
+            &records,
+            ctx,
+            alloc,
+            &mut blocks,
+        )
+    });
+
+    Ok(DenseAttributeStorage {
+        ainfo: AttributeInfoMessage {
+            // `H5O__attr_create` post-increments, so after n attributes the
+            // running maximum is n.
+            max_creation_index: track_order.then_some(attrs.len() as u16),
+            fractal_heap_address: heap.header_addr,
+            name_btree_address: bt2_addr,
+            creation_order_btree_address: corder_bt2_addr,
+        },
+        blocks,
+    })
+}
+
+/// Bulk-load one v2 B-tree, allocate its header and nodes, and append their
+/// images to `blocks`. Returns the header address.
+fn build_index(
+    record_type: u8,
+    record_size: u16,
+    records: &[u8],
+    ctx: &FormatContext,
+    alloc: &mut dyn FnMut(u64) -> u64,
+    blocks: &mut Vec<HeapBlock>,
+) -> u64 {
+    let tree = Bt2Tree::build(
+        record_type,
+        record_size,
         NAME_BT2_NODE_SIZE,
         ctx.sizeof_addr,
-        &records,
+        records,
     );
     let bt2_addr = alloc(tree.header(UNDEF_ADDR).encoded_size(ctx) as u64);
     let node_addrs: Vec<u64> = tree
@@ -170,8 +238,6 @@ pub fn build_dense_attributes(
         .iter()
         .map(|_| alloc(tree.node_size as u64))
         .collect();
-
-    let mut blocks = heap.blocks;
     for (image, &addr) in tree.encode(ctx, &node_addrs).into_iter().zip(&node_addrs) {
         blocks.push(HeapBlock {
             addr,
@@ -186,16 +252,7 @@ pub fn build_dense_attributes(
         len: image.len() as u64,
         image,
     });
-
-    Ok(DenseAttributeStorage {
-        ainfo: AttributeInfoMessage {
-            max_creation_index: None,
-            fractal_heap_address: heap.header_addr,
-            name_btree_address: bt2_addr,
-            creation_order_btree_address: None,
-        },
-        blocks,
-    })
+    bt2_addr
 }
 
 #[cfg(test)]
@@ -272,7 +329,8 @@ mod tests {
     /// back through the dense reader.
     fn round_trip(attrs: &[AttributeEntry]) -> (MemFile, Vec<AttributeEntry>) {
         let mut file = MemFile::new();
-        let dense = build_dense_attributes(attrs, &ctx(), &mut |len| file.alloc(len)).unwrap();
+        let dense =
+            build_dense_attributes(attrs, &ctx(), false, &mut |len| file.alloc(len)).unwrap();
         for block in &dense.blocks {
             assert_eq!(block.len as usize, block.image.len(), "block len vs image");
             let at = block.addr as usize;
@@ -338,13 +396,69 @@ mod tests {
         assert!(read.is_empty());
     }
 
+    /// Tracking on: the name records carry the real creation index instead
+    /// of the "not tracked" sentinel, a second v2 B-tree of type 9 orders the
+    /// same heap IDs by it, and the `Attribute Info` message announces both.
+    #[test]
+    fn a_tracked_object_gets_a_creation_order_index() {
+        // Names deliberately reverse the creation order, so an index built
+        // from the name ordering would show up here.
+        let attrs: Vec<AttributeEntry> = (0..12u32)
+            .map(|i| numeric(&format!("a{:02}", 11 - i), i as i32))
+            .collect();
+        let mut file = MemFile::new();
+        let dense =
+            build_dense_attributes(&attrs, &ctx(), true, &mut |len| file.alloc(len)).unwrap();
+        for block in &dense.blocks {
+            let at = block.addr as usize;
+            file.bytes[at..at + block.image.len()].copy_from_slice(&block.image);
+        }
+        assert_eq!(dense.ainfo.max_creation_index, Some(12));
+
+        // Reading still works through the name index.
+        let read = read_dense_attributes(&dense.ainfo, &ctx(), &mut file).unwrap();
+        assert_eq!(read.len(), attrs.len());
+
+        let addr = dense
+            .ainfo
+            .creation_order_btree_address
+            .expect("tracked attributes must carry a creation-order index");
+        let bt2 = Bt2Header::decode(&file.read_block(addr, 256).unwrap(), &ctx()).unwrap();
+        assert_eq!(bt2.record_type, BT2_TYPE_ATTR_CORDER);
+        assert_eq!(bt2.record_size as usize, CORDER_RECORD_LEN);
+
+        let records = collect_btree_v2_records(&bt2, &ctx(), &mut file).unwrap();
+        let corders: Vec<u32> = records
+            .chunks_exact(CORDER_RECORD_LEN)
+            .map(|r| u32::from_le_bytes(r[FHEAP_ID_LEN + 1..CORDER_RECORD_LEN].try_into().unwrap()))
+            .collect();
+        assert_eq!(corders, (0..12u32).collect::<Vec<_>>());
+
+        // The name index carries the same creation indices, not the sentinel.
+        let name_bt2 = Bt2Header::decode(
+            &file
+                .read_block(dense.ainfo.name_btree_address, 256)
+                .unwrap(),
+            &ctx(),
+        )
+        .unwrap();
+        let name_records = collect_btree_v2_records(&name_bt2, &ctx(), &mut file).unwrap();
+        let mut seen: Vec<u32> = name_records
+            .chunks_exact(NAME_RECORD_LEN)
+            .map(|r| u32::from_le_bytes(r[FHEAP_ID_LEN + 1..FHEAP_ID_LEN + 5].try_into().unwrap()))
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..12u32).collect::<Vec<_>>());
+    }
+
     #[test]
     fn name_records_are_ordered_by_hash() {
         // Enough attributes that the index is more than one leaf, so a
         // misordered bulk load would put a record under the wrong subtree.
         let attrs: Vec<AttributeEntry> = (0..64).map(|i| numeric(&format!("a{i}"), i)).collect();
         let mut file = MemFile::new();
-        let dense = build_dense_attributes(&attrs, &ctx(), &mut |len| file.alloc(len)).unwrap();
+        let dense =
+            build_dense_attributes(&attrs, &ctx(), false, &mut |len| file.alloc(len)).unwrap();
         for block in &dense.blocks {
             let at = block.addr as usize;
             file.bytes[at..at + block.image.len()].copy_from_slice(&block.image);

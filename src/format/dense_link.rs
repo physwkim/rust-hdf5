@@ -18,7 +18,7 @@
 
 use crate::format::checksum::checksum_metadata;
 use crate::format::chunk_index::btree_v2::{
-    collect_btree_v2_records, Bt2Header, Bt2Tree, BT2_TYPE_GRP_NAME,
+    collect_btree_v2_records, Bt2Header, Bt2Tree, BT2_TYPE_GRP_CORDER, BT2_TYPE_GRP_NAME,
 };
 use crate::format::fractal_heap::{
     collect_managed_blocks, read_heap_object, FractalHeapHeader, HeapId, HeapParams,
@@ -36,7 +36,12 @@ const FHEAP_ID_LEN: usize = 7;
 /// (`H5G__dense_btree2_name_encode`).
 const NAME_RECORD_LEN: usize = 4 + FHEAP_ID_LEN;
 
-/// Node size of the name index (`H5G_NAME_BT2_NODE_SIZE`).
+/// A creation-order-index record: creation order, then heap ID. 15 bytes on
+/// disk (`H5G__dense_btree2_corder_encode`).
+const CORDER_RECORD_LEN: usize = 8 + FHEAP_ID_LEN;
+
+/// Node size of either index (`H5G_NAME_BT2_NODE_SIZE`,
+/// `H5G_CORDER_BT2_NODE_SIZE`).
 const NAME_BT2_NODE_SIZE: u32 = 512;
 
 /// The hash a link name is indexed under (`H5G__dense_insert`).
@@ -146,12 +151,67 @@ pub fn build_dense_links(
         records.extend_from_slice(&heap.ids[i]);
     }
 
-    let tree = Bt2Tree::build(
+    let mut blocks = heap.blocks;
+    let bt2_addr = build_index(
         BT2_TYPE_GRP_NAME,
         NAME_RECORD_LEN as u16,
+        &records,
+        ctx,
+        alloc,
+        &mut blocks,
+    );
+
+    // The creation-order index exists exactly when the links carry a creation
+    // order — the messages themselves are the authority, so no separate flag
+    // can disagree with what was written into the heap.
+    let corders: Option<Vec<i64>> = links.iter().map(|l| l.creation_order).collect();
+    let corder_bt2_addr = corders.as_ref().map(|corders| {
+        let mut order: Vec<usize> = (0..links.len()).collect();
+        order.sort_by_key(|&i| corders[i]);
+        let mut records = Vec::with_capacity(order.len() * CORDER_RECORD_LEN);
+        for &i in &order {
+            records.extend_from_slice(&corders[i].to_le_bytes());
+            records.extend_from_slice(&heap.ids[i]);
+        }
+        build_index(
+            BT2_TYPE_GRP_CORDER,
+            CORDER_RECORD_LEN as u16,
+            &records,
+            ctx,
+            alloc,
+            &mut blocks,
+        )
+    });
+
+    Ok(DenseLinkStorage {
+        linfo: LinkInfoMessage {
+            // `H5G_obj_insert` post-increments, so after n links the running
+            // maximum is n.
+            max_creation_order: corders.map(|c| c.len() as u64),
+            fractal_heap_address: heap.header_addr,
+            name_btree_address: bt2_addr,
+            creation_order_btree_address: corder_bt2_addr,
+        },
+        blocks,
+    })
+}
+
+/// Bulk-load one v2 B-tree, allocate its header and nodes, and append their
+/// images to `blocks`. Returns the header address.
+fn build_index(
+    record_type: u8,
+    record_size: u16,
+    records: &[u8],
+    ctx: &FormatContext,
+    alloc: &mut dyn FnMut(u64) -> u64,
+    blocks: &mut Vec<HeapBlock>,
+) -> u64 {
+    let tree = Bt2Tree::build(
+        record_type,
+        record_size,
         NAME_BT2_NODE_SIZE,
         ctx.sizeof_addr,
-        &records,
+        records,
     );
     let bt2_addr = alloc(tree.header(UNDEF_ADDR).encoded_size(ctx) as u64);
     let node_addrs: Vec<u64> = tree
@@ -159,8 +219,6 @@ pub fn build_dense_links(
         .iter()
         .map(|_| alloc(tree.node_size as u64))
         .collect();
-
-    let mut blocks = heap.blocks;
     for (image, &addr) in tree.encode(ctx, &node_addrs).into_iter().zip(&node_addrs) {
         blocks.push(HeapBlock {
             addr,
@@ -175,16 +233,7 @@ pub fn build_dense_links(
         len: image.len() as u64,
         image,
     });
-
-    Ok(DenseLinkStorage {
-        linfo: LinkInfoMessage {
-            max_creation_order: None,
-            fractal_heap_address: heap.header_addr,
-            name_btree_address: bt2_addr,
-            creation_order_btree_address: None,
-        },
-        blocks,
-    })
+    bt2_addr
 }
 
 #[cfg(test)]
@@ -339,6 +388,52 @@ mod tests {
             hashes.windows(2).all(|w| w[0] <= w[1]),
             "name index is not hash-ordered: {hashes:?}"
         );
+    }
+
+    /// Tracking on: the corder index is a second v2 B-tree of type 6, its
+    /// records are ordered by creation order (not by name hash), and the
+    /// `Link Info` message announces both the index and the post-incremented
+    /// maximum.
+    #[test]
+    fn a_tracked_group_gets_a_creation_order_index() {
+        // Names deliberately reverse the creation order, so an index built
+        // from the name ordering would show up here.
+        let links: Vec<LinkMessage> = (0..12u32)
+            .map(|i| {
+                LinkMessage::hard(&format!("d{:02}", 11 - i), 0x400 + i as u64 * 8)
+                    .with_creation_order(i as i64)
+            })
+            .collect();
+        let (mut file, dense, read) = round_trip(&links);
+        assert_eq!(read.len(), links.len());
+        assert_eq!(dense.linfo.max_creation_order, Some(12));
+
+        let addr = dense
+            .linfo
+            .creation_order_btree_address
+            .expect("tracked links must carry a creation-order index");
+        let bt2 = Bt2Header::decode(&file.read_block(addr, 256).unwrap(), &ctx()).unwrap();
+        assert_eq!(bt2.record_type, BT2_TYPE_GRP_CORDER);
+        assert_eq!(bt2.record_size as usize, CORDER_RECORD_LEN);
+
+        let records = collect_btree_v2_records(&bt2, &ctx(), &mut file).unwrap();
+        let corders: Vec<i64> = records
+            .chunks_exact(CORDER_RECORD_LEN)
+            .map(|r| i64::from_le_bytes(r[0..8].try_into().unwrap()))
+            .collect();
+        assert_eq!(corders, (0..12i64).collect::<Vec<_>>());
+    }
+
+    /// Tracking off: no second index, no maximum. The link messages are the
+    /// only authority, so nothing else can turn it on.
+    #[test]
+    fn an_untracked_group_gets_no_creation_order_index() {
+        let links: Vec<LinkMessage> = (0..12)
+            .map(|i| LinkMessage::hard(&format!("d{i:02}"), 0x400 + i as u64 * 8))
+            .collect();
+        let (_file, dense, _read) = round_trip(&links);
+        assert_eq!(dense.linfo.creation_order_btree_address, None);
+        assert_eq!(dense.linfo.max_creation_order, None);
     }
 
     #[test]

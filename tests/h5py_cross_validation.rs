@@ -6,7 +6,7 @@
 //! skip (pass) when neither is present, so CI without h5py is green.
 
 use rust_hdf5::types::VarLenUnicode;
-use rust_hdf5::H5File;
+use rust_hdf5::{H5File, H5FileOptions};
 
 /// Interpreters tried in order when `RUST_HDF5_TEST_PYTHON` is unset. The
 /// second is the same environment the parity oracle pins
@@ -1530,6 +1530,121 @@ fn past_max_compact_the_link_set_goes_dense() {
     assert_eq!(
         file.dataset("many/d07").unwrap().read_raw::<i32>().unwrap(),
         vec![7]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// Creation-order tracking is a property of the object, captured from the
+/// file's policy when it is created: `H5Pget_link_creation_order` and
+/// `H5Pget_attr_creation_order` report TRACKED|INDEXED for the root group and
+/// for a group made while the policy is on, and nothing for one made while it
+/// is off. With it on, libhdf5 iterates links and attributes in the order
+/// this crate created them rather than alphabetically.
+#[test]
+fn creation_order_tracking_is_captured_per_object() {
+    let Some(py) = python() else { return };
+    let path = tmp("track_order_per_object");
+    {
+        let file = H5FileOptions::new()
+            .track_order(true)
+            .create(&path)
+            .unwrap();
+        file.set_track_order(false).unwrap();
+        let plain = file.create_group("plain").unwrap();
+        plain.create_group("beta").unwrap();
+        plain.create_group("alpha").unwrap();
+
+        file.set_track_order(true).unwrap();
+        let tracked = file.create_group("tracked").unwrap();
+        for name in ["zebra", "apple", "mango"] {
+            tracked.create_group(name).unwrap();
+        }
+        for (i, key) in ["zeta", "alpha", "mu"].iter().enumerate() {
+            tracked.set_attr_numeric(key, &(i as i32)).unwrap();
+        }
+        // The root group was created under the file's own policy.
+        file.set_attr_numeric("last", &9i32).unwrap();
+        file.set_attr_numeric("first", &1i32).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "from h5py import h5p\n\
+         TI = h5p.CRT_ORDER_TRACKED | h5p.CRT_ORDER_INDEXED\n\
+         def flags(g):\n\
+         \x20   c = g.id.get_create_plist()\n\
+         \x20   return (c.get_link_creation_order(), c.get_attr_creation_order())\n\
+         assert flags(f['/']) == (TI, TI), flags(f['/'])\n\
+         assert flags(f['tracked']) == (TI, TI), flags(f['tracked'])\n\
+         assert flags(f['plain']) == (0, 0), flags(f['plain'])\n\
+         assert list(f['tracked'].keys()) == ['zebra', 'apple', 'mango']\n\
+         assert list(f['tracked'].attrs) == ['zeta', 'alpha', 'mu']\n\
+         assert list(f.attrs) == ['last', 'first']\n\
+         assert list(f.keys()) == ['plain', 'tracked']\n\
+         assert list(f['plain'].keys()) == ['alpha', 'beta']\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// Tracking survives the phase change: a group past `max_compact` keeps a
+/// creation-order index beside the name index in its dense storage, so
+/// libhdf5 still iterates the twelve links in creation order.
+#[test]
+fn a_tracked_group_keeps_creation_order_through_the_phase_change() {
+    let Some(py) = python() else { return };
+    let path = tmp("track_order_dense");
+    {
+        let file = H5FileOptions::new()
+            .track_order(true)
+            .create(&path)
+            .unwrap();
+        let g = file.create_group("g").unwrap();
+        // Names reverse the creation order, so name order and creation order
+        // cannot be confused for one another.
+        for i in 0..12i32 {
+            g.new_dataset::<i32>()
+                .shape([1])
+                .create(&format!("d{:02}", 11 - i))
+                .unwrap()
+                .write_raw(&[i])
+                .unwrap();
+        }
+        for i in 0..12i32 {
+            g.set_attr_numeric(&format!("a{:02}", 11 - i), &i).unwrap();
+        }
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "from h5py import h5p\n\
+         TI = h5p.CRT_ORDER_TRACKED | h5p.CRT_ORDER_INDEXED\n\
+         g = f['g']\n\
+         c = g.id.get_create_plist()\n\
+         assert (c.get_link_creation_order(), c.get_attr_creation_order()) == (TI, TI)\n\
+         info = h5py.h5o.get_info(g.id)\n\
+         assert info.meta_size.obj.index_size > 0, 'expected dense links'\n\
+         assert info.meta_size.attr.index_size > 0, 'expected dense attributes'\n\
+         want = ['d%02d' % (11 - i) for i in range(12)]\n\
+         assert list(g.keys()) == want, list(g.keys())\n\
+         assert list(g.attrs) == ['a%02d' % (11 - i) for i in range(12)]\n\
+         assert all(g['d%02d' % (11 - i)][0] == i for i in range(12))\n\
+         assert all(g.attrs['a%02d' % (11 - i)] == i for i in range(12))\n",
+    );
+
+    // And this crate reads its own tracked dense storage back.
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.dataset_names();
+    names.sort();
+    let mut want: Vec<String> = (0..12).map(|i| format!("g/d{i:02}")).collect();
+    want.sort();
+    assert_eq!(names, want);
+    let mut attrs = file.root_group().group("g").unwrap().attr_names().unwrap();
+    attrs.sort();
+    assert_eq!(
+        attrs,
+        (0..12).map(|i| format!("a{i:02}")).collect::<Vec<_>>()
     );
     std::fs::remove_file(&path).ok();
 }

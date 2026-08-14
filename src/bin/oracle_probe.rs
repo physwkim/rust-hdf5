@@ -27,7 +27,7 @@ use rust_hdf5::format::messages::datatype::{
 };
 use rust_hdf5::format::messages::filter::{Filter, FilterPipeline, FILTER_FLETCHER32};
 use rust_hdf5::types::VarLenUnicode;
-use rust_hdf5::{H5Dataset, H5File, H5Group};
+use rust_hdf5::{H5Dataset, H5File, H5FileOptions, H5Group};
 
 const CANON_VERSION: &str = "2";
 const RAW_LIMIT: usize = 1024;
@@ -1380,7 +1380,11 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "links_dense" => {
+            // The reference makes `g` with `track_order=True`, so the dense
+            // storage it spills into carries a creation-order index beside
+            // the name index.
             let file = H5File::create(path)?;
+            file.set_track_order(true)?;
             let g = file.root_group().create_group("g")?;
             for i in 0..12i32 {
                 g.new_dataset::<i32>()
@@ -1388,6 +1392,31 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                     .create(&format!("d{i:02}"))?
                     .write_raw(&[i])?;
             }
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "track_order" => {
+            // h5py's `File(track_order=True)` is a file-creation property, so
+            // it reaches the root group only; the three plain `create_group`
+            // calls take h5py's default policy, and `g` turns it back on for
+            // itself.
+            let file = H5FileOptions::new().track_order(true).create(path)?;
+            file.set_track_order(false)?;
+            let root = file.root_group();
+            for name in ["zebra", "apple", "mango"] {
+                root.create_group(name)?;
+            }
+            for (i, key) in ["zeta", "alpha", "mu"].iter().enumerate() {
+                file.set_attr_numeric(key, &(i as i32))?;
+            }
+            file.set_track_order(true)?;
+            let g = root.create_group("g")?;
+            g.new_dataset::<i32>()
+                .shape([8usize])
+                .create("data")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            g.set_attr_numeric("second", &2i32)?;
+            g.set_attr_numeric("first", &1i32)?;
             file.close()?;
             Ok(Ok(()))
         }

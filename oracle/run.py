@@ -111,22 +111,6 @@ EXPECTED_DEVIATIONS = [
                "dimension in a v3 file selects the extensible array",
     },
     {
-        "id": "creation-order-not-tracked",
-        "field": "linkorder",
-        "ref": "tracked+indexed",
-        "rust": "-",
-        "why": "the public API has no creation-order option, so the writer "
-               "records name order only; every link and attribute is still "
-               "present and reads back identically",
-    },
-    {
-        "id": "creation-order-not-tracked-attrs",
-        "field": "attrorder",
-        "ref": "tracked+indexed",
-        "rust": "-",
-        "why": "the attribute half of creation-order-not-tracked",
-    },
-    {
         "id": "new-style-groups-always",
         "field": "linkstore",
         "ref": "symtab",

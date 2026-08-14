@@ -1084,6 +1084,11 @@ impl Hdf5Reader {
                 let msg_type = cont_buf[pos];
                 let data_size = u16::from_le_bytes([cont_buf[pos + 1], cont_buf[pos + 2]]) as usize;
                 let msg_flags = cont_buf[pos + 3];
+                let creation_index = if track_creation_order {
+                    u16::from_le_bytes([cont_buf[pos + 4], cont_buf[pos + 5]])
+                } else {
+                    0
+                };
                 pos += hdr_size;
                 if pos + data_size > msgs_end {
                     break;
@@ -1092,6 +1097,7 @@ impl Hdf5Reader {
                     out.push(crate::format::object_header::ObjectHeaderMessage {
                         msg_type,
                         flags: msg_flags,
+                        creation_index,
                         data: cont_buf[pos..pos + data_size].to_vec(),
                     });
                 }
@@ -1112,6 +1118,8 @@ impl Hdf5Reader {
                     out.push(crate::format::object_header::ObjectHeaderMessage {
                         msg_type: msg_type as u8,
                         flags: msg_flags,
+                        // A version-1 message envelope has no creation index.
+                        creation_index: 0,
                         data: cont_buf[pos..pos + data_size].to_vec(),
                     });
                 }
@@ -3834,6 +3842,7 @@ mod tests {
             msg_type,
             flags: 0,
             data,
+            creation_index: 0,
         }
     }
 

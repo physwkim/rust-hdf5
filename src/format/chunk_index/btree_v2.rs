@@ -49,9 +49,15 @@ pub const BT2_TYPE_FHEAP_HUGE_INDIR: u8 = 1;
 /// Record type: name index for dense link storage in groups
 /// (`H5B2_GRP_DENSE_NAME_ID`).
 pub const BT2_TYPE_GRP_NAME: u8 = 5;
+/// Record type: creation-order index for dense link storage in groups
+/// (`H5B2_GRP_DENSE_CORDER_ID`).
+pub const BT2_TYPE_GRP_CORDER: u8 = 6;
 /// Record type: name index for dense attribute storage
 /// (`H5B2_ATTR_DENSE_NAME_ID`).
 pub const BT2_TYPE_ATTR_NAME: u8 = 8;
+/// Record type: creation-order index for dense attribute storage
+/// (`H5B2_ATTR_DENSE_CORDER_ID`).
+pub const BT2_TYPE_ATTR_CORDER: u8 = 9;
 /// Record type: unfiltered chunks (non-filtered chunked datasets).
 pub const BT2_TYPE_CHUNK_UNFILT: u8 = 10;
 /// Record type: filtered chunks (filtered chunked datasets).

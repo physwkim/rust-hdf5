@@ -464,6 +464,13 @@ pub struct DatasetInfo {
     /// touching the dataset's storage — an attribute set or removed, a fill
     /// value defined. See [`header_stale`](DatasetInfo::header_stale).
     pub header_dirty: bool,
+    /// When the link naming this dataset was created; see
+    /// [`GroupInfo::creation_seq`].
+    pub creation_seq: u64,
+    /// Whether this dataset records creation order for its attributes — the
+    /// file's creation-order policy captured when the dataset was created,
+    /// the way libhdf5 captures the DCPL. See [`GroupInfo::track_order`].
+    pub track_order: bool,
     /// User-defined fill value bytes (exactly one element wide). `None`
     /// means default zero-fill; `Some` is emitted as a `fill_defined = 2`
     /// fill-value message in the dataset object header.
@@ -885,6 +892,16 @@ pub struct GroupInfo {
     pub deleted: bool,
     /// Attributes attached to this group (e.g. NeXus `NX_class`).
     pub attributes: Vec<AttributeEntry>,
+    /// When the link naming this group was created, on the writer's single
+    /// monotonic sequence. Groups, datasets and hard links share it, so a
+    /// parent can order its links the way they were actually made.
+    pub creation_seq: u64,
+    /// Whether this group records creation order for its links and its
+    /// attributes. Creation-order tracking is a property of the object's
+    /// creation property list in libhdf5, so it is captured here when the
+    /// group is created rather than read from the writer at finalize: a
+    /// later change of policy must not rewrite an object already made.
+    pub track_order: bool,
 }
 
 /// The object a [`HardLink`] resolves to.
@@ -910,6 +927,8 @@ pub struct HardLink {
     pub name: String,
     /// Object this link resolves to.
     pub target: HardLinkTarget,
+    /// When this link was created; see [`GroupInfo::creation_seq`].
+    pub creation_seq: u64,
 }
 
 /// Encode an Object Reference Count message (type 0x16) body: a version
@@ -1013,6 +1032,19 @@ pub struct Hdf5Writer {
     /// heap and name index is on disk, and only
     /// [`prepare_dense_links`](Self::prepare_dense_links) may add one.
     dense_links: Slot<HashMap<LinkScope, LinkInfoMessage>>,
+    /// The creation-order policy in force: whether an object created from
+    /// now on records creation order for its links and its attributes. The
+    /// h5py `track_order` analogue; see
+    /// [`set_track_order`](Self::set_track_order). Each object captures this
+    /// at creation, so changing it never rewrites an object already made.
+    track_order: bool,
+    /// The root group's own captured policy. The root is created with the
+    /// file, so its value comes from
+    /// [`create_with_options`](Self::create_with_options) — or, on reopen,
+    /// from the header already on disk.
+    root_track_order: bool,
+    /// Hands out the creation sequence numbers that order a group's links.
+    next_creation_seq: Slot<u64>,
 }
 
 /// Which object's attribute list a prepared dense layout belongs to.
@@ -1057,6 +1089,20 @@ impl Hdf5Writer {
         path: &Path,
         locking: crate::io::locking::FileLocking,
     ) -> IoResult<Self> {
+        Self::create_with_options(path, locking, false)
+    }
+
+    /// Create a new HDF5 file at `path` with an explicit locking policy and
+    /// creation-order policy.
+    ///
+    /// `track_order` is the policy the root group is created under and the
+    /// default for every object created afterwards; see
+    /// [`set_track_order`](Self::set_track_order).
+    pub fn create_with_options(
+        path: &Path,
+        locking: crate::io::locking::FileLocking,
+        track_order: bool,
+    ) -> IoResult<Self> {
         let handle = FileHandle::create_with_locking(path, locking)?;
         let ctx = FormatContext::default_v3();
 
@@ -1094,6 +1140,9 @@ impl Hdf5Writer {
             superseded_root_header: None,
             dense_attributes: Slot::new(HashMap::new()),
             dense_links: Slot::new(HashMap::new()),
+            track_order,
+            root_track_order: track_order,
+            next_creation_seq: Slot::new(0),
         })
     }
 
@@ -1105,6 +1154,20 @@ impl Hdf5Writer {
     /// 1.14-based h5py wheels — reject version 5.
     pub fn set_libver_latest(&mut self, latest: bool) {
         self.libver_latest = latest;
+    }
+
+    /// Track and index creation order for the links and the attributes of
+    /// every object created after this call — the equivalent of setting
+    /// `H5Pset_link_creation_order` and `H5Pset_attr_creation_order` to
+    /// `H5P_CRT_ORDER_TRACKED | H5P_CRT_ORDER_INDEXED` on the creation
+    /// property lists those objects are made with.
+    ///
+    /// Objects already created keep the policy they were made under, exactly
+    /// as libhdf5 keeps what their creation property list said. The root
+    /// group is created with the file, so its policy comes from
+    /// [`create_with_options`](Self::create_with_options) instead.
+    pub fn set_track_order(&mut self, track: bool) {
+        self.track_order = track;
     }
 
     /// Layout message version for a new chunked dataset — the
@@ -1218,6 +1281,19 @@ impl Hdf5Writer {
     /// Snapshot the hard-link list (the lock is held only for the clone), so
     /// callers can resolve each link's target/parent — which locks dataset and
     /// group slots — without holding the hard-link lock.
+    /// The next creation sequence number.
+    ///
+    /// One monotonic counter for datasets, groups and hard links alike: a
+    /// group orders its links by it, so an interleaved run of `create_group`
+    /// and `create_dataset` comes back out in the order it was made rather
+    /// than grouped by kind.
+    fn take_creation_seq(&self) -> u64 {
+        let mut next = self.next_creation_seq.lock();
+        let seq = *next;
+        *next += 1;
+        seq
+    }
+
     pub(crate) fn hard_links_vec(&self) -> Vec<HardLink> {
         self.hard_links.lock().clone()
     }
@@ -1324,7 +1400,7 @@ impl Hdf5Writer {
         // link path — so finalize can free the block its rewrite supersedes —
         // plus the attributes the header carries, which the group registry
         // below must keep or finalize rewrites the group without them.
-        type GroupHeaderInfo = (u64, usize, Vec<AttributeEntry>);
+        type GroupHeaderInfo = (u64, usize, Vec<AttributeEntry>, bool);
         let mut group_headers: std::collections::HashMap<String, GroupHeaderInfo> =
             Default::default();
         for (name, obj_addr) in &link_entries {
@@ -1388,7 +1464,15 @@ impl Hdf5Writer {
                     // Not a dataset — a group's header. Remember its block so
                     // finalize can free what its rewrite supersedes, and its
                     // attributes so the registry rebuild keeps them.
-                    group_headers.insert(name.clone(), (*obj_addr, ds_header_size, attrs));
+                    group_headers.insert(
+                        name.clone(),
+                        (
+                            *obj_addr,
+                            ds_header_size,
+                            attrs,
+                            ds_header.has_creation_order(),
+                        ),
+                    );
                     continue;
                 }
             };
@@ -1411,6 +1495,11 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                creation_seq: 0,
+                // Recovered from the header this reopen is about to rewrite:
+                // creation-order tracking belongs to the object, so a reopen
+                // must not silently drop what the file already declares.
+                track_order: ds_header.has_creation_order(),
                 fill_value,
                 // Preserve the on-disk layout version so finalize re-encodes
                 // what it read: a v5 file reopened and appended to must not be
@@ -1767,14 +1856,17 @@ impl Hdf5Writer {
                     group_index_map.get(&parent_path).copied()
                 };
                 let gidx = groups.len();
-                let (obj_header_written_addr, obj_header_encoded_size, attributes) = group_headers
-                    .remove(path.trim_start_matches('/'))
-                    .map_or((None, 0, Vec::new()), |(addr, len, attrs)| {
-                        (Some(addr), len, attrs)
-                    });
+                let (obj_header_written_addr, obj_header_encoded_size, attributes, track_order) =
+                    group_headers
+                        .remove(path.trim_start_matches('/'))
+                        .map_or((None, 0, Vec::new(), false), |(addr, len, attrs, track)| {
+                            (Some(addr), len, attrs, track)
+                        });
                 groups.push(GroupInfo {
                     name: path.clone(),
                     parent,
+                    creation_seq: 0,
+                    track_order,
                     child_datasets: Vec::new(),
                     child_groups: Vec::new(),
                     obj_header_addr: 0,
@@ -1848,7 +1940,28 @@ impl Hdf5Writer {
                 parent,
                 name: link_name,
                 target,
+                creation_seq: 0,
             });
+        }
+
+        // Stamp the creation sequence a reopened file cannot supply. Nothing
+        // on disk says which link was made first unless the group tracked
+        // creation order, and this reader does not carry that back out, so
+        // discovery order is what there is: datasets, then groups, then the
+        // hard links found beside them — the order the writer emitted links
+        // in before it ordered them at all.
+        let mut creation_seq = 0u64;
+        for d in &mut existing_datasets {
+            d.creation_seq = creation_seq;
+            creation_seq += 1;
+        }
+        for g in &mut groups {
+            g.creation_seq = creation_seq;
+            creation_seq += 1;
+        }
+        for l in &mut hard_links {
+            l.creation_seq = creation_seq;
+            creation_seq += 1;
         }
 
         let allocator = FileAllocator::new(file_size);
@@ -1881,8 +1994,13 @@ impl Hdf5Writer {
             root_group_addr: None,
             root_group_encoded_size: 0,
             superseded_root_header: Some((root_addr, root_header_size as u64)),
+            // The reopened file's own policy, so objects added in this
+            // session are made the way the file already declares.
+            root_track_order: root_header.has_creation_order(),
             dense_attributes: Slot::new(HashMap::new()),
             dense_links: Slot::new(HashMap::new()),
+            track_order: root_header.has_creation_order(),
+            next_creation_seq: Slot::new(creation_seq),
         })
     }
 
@@ -2702,6 +2820,8 @@ impl Hdf5Writer {
         let group_idx = self.push_group(GroupInfo {
             name: full_name,
             parent: parent_idx,
+            creation_seq: self.take_creation_seq(),
+            track_order: self.track_order,
             child_datasets: Vec::new(),
             child_groups: Vec::new(),
             obj_header_addr: 0,
@@ -2852,6 +2972,7 @@ impl Hdf5Writer {
             parent,
             name: link_name.to_string(),
             target,
+            creation_seq: self.take_creation_seq(),
         });
         Ok(())
     }
@@ -2947,7 +3068,7 @@ impl Hdf5Writer {
     /// Append every user-created hard link whose parent group is `parent`
     /// (`None` == the root group). Called while collecting a group's links,
     /// once every object's header address has been assigned.
-    fn push_hard_links(&self, links: &mut Vec<LinkMessage>, parent: Option<usize>) {
+    fn push_hard_links(&self, links: &mut Vec<(u64, LinkMessage)>, parent: Option<usize>) {
         for link in self.hard_links_vec() {
             if link.parent != parent || !self.hard_link_emitted(&link) {
                 continue;
@@ -2956,19 +3077,21 @@ impl Hdf5Writer {
                 HardLinkTarget::Dataset(i) => self.ds(i).lock().obj_header_addr,
                 HardLinkTarget::Group(i) => self.grp(i).lock().obj_header_addr,
             };
-            links.push(LinkMessage::hard(&link.name, addr));
+            links.push((link.creation_seq, LinkMessage::hard(&link.name, addr)));
         }
     }
 
-    /// The single owner of "which links does this group hold": child datasets,
-    /// child groups, then user-created hard links.
+    /// The single owner of "which links does this group hold", in the order
+    /// they were created and, when the file tracks creation order, stamped
+    /// with it.
     ///
     /// Both the compact form (one `MSG_LINK` per link) and the dense form (the
     /// same messages inside a fractal heap) are built from this one list, so
-    /// the phase-change decision and the storage it selects can never disagree
-    /// about what the group contains.
-    fn group_links(&self, scope: LinkScope) -> Vec<LinkMessage> {
-        let mut links = Vec::new();
+    /// the phase-change decision, the storage it selects and the creation
+    /// order recorded in either can never disagree about what the group
+    /// contains.
+    fn group_links(&self, scope: LinkScope, track_order: bool) -> Vec<LinkMessage> {
+        let mut links: Vec<(u64, LinkMessage)> = Vec::new();
         match scope {
             LinkScope::Root => {
                 // Datasets that belong to a subgroup are that group's links,
@@ -2989,7 +3112,10 @@ impl Hdf5Writer {
                     if m.deleted || datasets_in_subgroups.contains(&i) {
                         continue;
                     }
-                    links.push(LinkMessage::hard(&m.name, m.obj_header_addr));
+                    links.push((
+                        m.creation_seq,
+                        LinkMessage::hard(&m.name, m.obj_header_addr),
+                    ));
                 }
                 for grp in self.group_refs() {
                     let g = grp.lock();
@@ -2997,7 +3123,10 @@ impl Hdf5Writer {
                         continue;
                     }
                     let leaf_name = g.name.rsplit('/').next().unwrap_or(&g.name);
-                    links.push(LinkMessage::hard(leaf_name, g.obj_header_addr));
+                    links.push((
+                        g.creation_seq,
+                        LinkMessage::hard(leaf_name, g.obj_header_addr),
+                    ));
                 }
                 self.push_hard_links(&mut links, None);
             }
@@ -3017,7 +3146,10 @@ impl Hdf5Writer {
                         continue;
                     }
                     let leaf_name = m.name.rsplit('/').next().unwrap_or(&m.name);
-                    links.push(LinkMessage::hard(leaf_name, m.obj_header_addr));
+                    links.push((
+                        m.creation_seq,
+                        LinkMessage::hard(leaf_name, m.obj_header_addr),
+                    ));
                 }
                 for child_idx in child_groups {
                     let child_grp = self.grp(child_idx);
@@ -3026,12 +3158,30 @@ impl Hdf5Writer {
                         continue;
                     }
                     let leaf_name = g.name.rsplit('/').next().unwrap_or(&g.name);
-                    links.push(LinkMessage::hard(leaf_name, g.obj_header_addr));
+                    links.push((
+                        g.creation_seq,
+                        LinkMessage::hard(leaf_name, g.obj_header_addr),
+                    ));
                 }
                 self.push_hard_links(&mut links, Some(group_idx));
             }
         }
+        // Creation order, not order by kind: a run of create_group and
+        // create_dataset draws from one counter, so this is the order the
+        // caller made them in. `H5G_obj_insert` numbers from zero within the
+        // group, so the rank here is the link's creation order.
+        links.sort_by_key(|(seq, _)| *seq);
         links
+            .into_iter()
+            .enumerate()
+            .map(|(rank, (_, link))| {
+                if track_order {
+                    link.with_creation_order(rank as i64)
+                } else {
+                    link
+                }
+            })
+            .collect()
     }
 
     /// Whether `links` must live in dense storage rather than in the group's
@@ -3068,14 +3218,28 @@ impl Hdf5Writer {
     /// of bytes, and the write pass that runs after it emits the real heap and
     /// index addresses. It is the same two-pass rule the child link addresses
     /// already follow.
-    fn emit_links(&self, header: &mut ObjectHeader, scope: LinkScope, links: &[LinkMessage]) {
+    fn emit_links(
+        &self,
+        header: &mut ObjectHeader,
+        scope: LinkScope,
+        links: &[LinkMessage],
+        track_order: bool,
+    ) {
         let dense = self.links_need_dense(links);
-        let link_info = self
-            .dense_links
-            .lock()
-            .get(&scope)
-            .cloned()
-            .unwrap_or_else(LinkInfoMessage::compact);
+        let link_info = self.dense_links.lock().get(&scope).cloned();
+        let link_info = link_info.unwrap_or_else(|| {
+            let mut info = LinkInfoMessage::compact();
+            if track_order {
+                // `H5G__obj_insert` post-increments `max_corder`, so a group
+                // holding n links reports n. The index address stays
+                // undefined while the links live in the header, but the
+                // message must still carry the field: `H5Pget_link_creation_order`
+                // reads INDEXED off this flag, not off the address.
+                info.max_creation_order = Some(links.len() as u64);
+                info.creation_order_btree_address = Some(UNDEF_ADDR);
+            }
+            info
+        });
         header.add_message(MSG_LINK_INFO, 0x00, link_info.encode(&self.ctx));
         header.add_message(MSG_GROUP_INFO, 0x00, GroupInfoMessage::default().encode());
         if dense {
@@ -3095,15 +3259,20 @@ impl Hdf5Writer {
     fn prepare_dense_links(&self) -> IoResult<()> {
         let mut scopes: Vec<(LinkScope, Vec<LinkMessage>)> = Vec::new();
         for gi in 0..self.group_count() {
-            if self.grp(gi).lock().deleted {
+            let (deleted, track_order) = {
+                let grp = self.grp(gi);
+                let g = grp.lock();
+                (g.deleted, g.track_order)
+            };
+            if deleted {
                 continue;
             }
-            let links = self.group_links(LinkScope::Group(gi));
+            let links = self.group_links(LinkScope::Group(gi), track_order);
             if self.links_need_dense(&links) {
                 scopes.push((LinkScope::Group(gi), links));
             }
         }
-        let root_links = self.group_links(LinkScope::Root);
+        let root_links = self.group_links(LinkScope::Root, self.root_track_order);
         if self.links_need_dense(&root_links) {
             scopes.push((LinkScope::Root, root_links));
         }
@@ -3148,7 +3317,15 @@ impl Hdf5Writer {
         header: &mut ObjectHeader,
         scope: AttrScope,
         attributes: &[AttributeEntry],
+        track_order: bool,
     ) {
+        if track_order {
+            // `H5Pget_attr_creation_order` reads the object header's own flags,
+            // not the Attribute Info message, so this is what makes the object
+            // report creation-ordered attributes — and it widens every message
+            // envelope by the creation index below.
+            header.track_attribute_creation_order();
+        }
         if attributes.is_empty() {
             return;
         }
@@ -3156,10 +3333,20 @@ impl Hdf5Writer {
             header.add_message(MSG_ATTR_INFO, MSG_FLAG_DONTSHARE, ainfo.encode(&self.ctx));
             return;
         }
-        let ainfo = AttributeInfoMessage::compact();
+        let mut ainfo = AttributeInfoMessage::compact();
+        if track_order {
+            // Post-increment, as `H5O__attr_create` does: after n attributes
+            // the running maximum is n. Compact storage has no index B-tree,
+            // but the message still announces one so that its flags match the
+            // header's (`H5O__attr_create` asserts they agree).
+            ainfo.max_creation_index = Some(attributes.len() as u16);
+            ainfo.creation_order_btree_address = Some(UNDEF_ADDR);
+        }
         header.add_message(MSG_ATTR_INFO, MSG_FLAG_DONTSHARE, ainfo.encode(&self.ctx));
-        for attr in attributes {
-            header.add_message(MSG_ATTRIBUTE, 0x00, attr.encode(&self.ctx));
+        // The list is in creation order, so an attribute's position in it is
+        // the creation index libhdf5 would have stamped on its message.
+        for (i, attr) in attributes.iter().enumerate() {
+            header.add_message_indexed(MSG_ATTRIBUTE, 0x00, attr.encode(&self.ctx), i as u16);
         }
     }
 
@@ -3192,29 +3379,29 @@ impl Hdf5Writer {
     /// original header — and with it whatever storage that header already
     /// names — so building a heap for it would strand every block of it.
     fn prepare_dense_attributes(&self, datasets: &[usize]) -> IoResult<()> {
-        let mut scopes: Vec<(AttrScope, Vec<AttributeEntry>)> = Vec::new();
+        let mut scopes: Vec<(AttrScope, Vec<AttributeEntry>, bool)> = Vec::new();
         {
             let root = self.root_attributes.lock();
             if self.attributes_need_dense(&root) {
-                scopes.push((AttrScope::Root, root.clone()));
+                scopes.push((AttrScope::Root, root.clone(), self.root_track_order));
             }
         }
         for gi in 0..self.group_count() {
             let grp = self.grp(gi);
             let g = grp.lock();
             if !g.deleted && self.attributes_need_dense(&g.attributes) {
-                scopes.push((AttrScope::Group(gi), g.attributes.clone()));
+                scopes.push((AttrScope::Group(gi), g.attributes.clone(), g.track_order));
             }
         }
         for &i in datasets {
             let ds = self.ds(i);
             let m = ds.lock();
             if self.attributes_need_dense(&m.attributes) {
-                scopes.push((AttrScope::Dataset(i), m.attributes.clone()));
+                scopes.push((AttrScope::Dataset(i), m.attributes.clone(), m.track_order));
             }
         }
 
-        for (scope, attributes) in scopes {
+        for (scope, attributes, track_order) in scopes {
             // `close` after `start_swmr` finalizes a second time over the same
             // attribute sets — SWMR refuses every attribute mutation — so
             // rebuilding here would allocate a whole second heap and strand
@@ -3222,7 +3409,7 @@ impl Hdf5Writer {
             if self.dense_attributes.lock().contains_key(&scope) {
                 continue;
             }
-            let dense = build_dense_attributes(&attributes, &self.ctx, &mut |len| {
+            let dense = build_dense_attributes(&attributes, &self.ctx, track_order, &mut |len| {
                 self.allocator.allocate(len)
             })?;
             for block in &dense.blocks {
@@ -3287,6 +3474,8 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_order: self.track_order,
                 fill_value: None,
                 layout_version: 4,
             },
@@ -3377,6 +3566,8 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_order: self.track_order,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -4450,6 +4641,8 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_order: self.track_order,
                 fill_value: None,
                 layout_version: 4,
                 chunked: None,
@@ -4521,6 +4714,8 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_order: self.track_order,
                 fill_value: None,
                 layout_version: 4,
                 chunked: None,
@@ -4647,6 +4842,8 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_order: self.track_order,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -5854,6 +6051,8 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_order: self.track_order,
                 fill_value: None,
                 layout_version,
                 chunked: None,
@@ -5990,6 +6189,8 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_order: self.track_order,
                 fill_value: None,
                 layout_version,
                 chunked: None,
@@ -6097,6 +6298,8 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_order: self.track_order,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -6201,6 +6404,8 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_order: self.track_order,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -7889,7 +8094,12 @@ impl Hdf5Writer {
         }
 
         // Attribute Info (type 0x15) + attribute messages (type 0x0C)
-        self.emit_attributes(&mut header, AttrScope::Dataset(index), &m.attributes);
+        self.emit_attributes(
+            &mut header,
+            AttrScope::Dataset(index),
+            &m.attributes,
+            m.track_order,
+        );
 
         // Object Reference Count message (type 0x16): emitted only when
         // more than one hard link resolves to this dataset (computed above).
@@ -7906,20 +8116,30 @@ impl Hdf5Writer {
 
         // Link Info (type 0x02) + Group Info (type 0x0A) + the links
         // themselves, compact or dense.
-        let links = self.group_links(LinkScope::Group(group_idx));
-        self.emit_links(&mut header, LinkScope::Group(group_idx), &links);
-
-        // Snapshot the attributes, then drop the slot guard: emit_attributes
-        // and object_link_count below re-lock group slots (including this one).
-        let attributes = {
+        // Snapshot what the header needs, then drop the slot guard: the calls
+        // below re-lock group slots (including this one).
+        let (attributes, track_order) = {
             let grp = self.grp(group_idx);
             let g = grp.lock();
-            g.attributes.clone()
+            (g.attributes.clone(), g.track_order)
         };
+
+        let links = self.group_links(LinkScope::Group(group_idx), track_order);
+        self.emit_links(
+            &mut header,
+            LinkScope::Group(group_idx),
+            &links,
+            track_order,
+        );
 
         // Attribute Info (type 0x15) + attributes (type 0x0C) -- e.g. NeXus
         // `NX_class`.
-        self.emit_attributes(&mut header, AttrScope::Group(group_idx), &attributes);
+        self.emit_attributes(
+            &mut header,
+            AttrScope::Group(group_idx),
+            &attributes,
+            track_order,
+        );
 
         // Object Reference Count message: emitted only when this group is
         // itself a hard-link target reached by more than one link.
@@ -7936,12 +8156,17 @@ impl Hdf5Writer {
 
         // Link Info (type 0x02) + Group Info (type 0x0A) + the links
         // themselves, compact or dense.
-        let links = self.group_links(LinkScope::Root);
-        self.emit_links(&mut header, LinkScope::Root, &links);
+        let links = self.group_links(LinkScope::Root, self.root_track_order);
+        self.emit_links(&mut header, LinkScope::Root, &links, self.root_track_order);
 
         // Root-level attributes
         let root_attributes = self.root_attributes.lock();
-        self.emit_attributes(&mut header, AttrScope::Root, &root_attributes);
+        self.emit_attributes(
+            &mut header,
+            AttrScope::Root,
+            &root_attributes,
+            self.root_track_order,
+        );
 
         header
     }

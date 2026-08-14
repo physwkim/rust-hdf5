@@ -704,7 +704,7 @@ LINK_CASES = [
          ext_files=("_ext.h5",)),
     Case("links_dense", "link", gen_links_dense, "links_dense",
          "12 links in one group — dense link storage (fractal heap + v2 B-tree)"),
-    Case("track_order", "group", gen_track_order, None,
+    Case("track_order", "group", gen_track_order, "track_order",
          "creation-order indices on links and attributes"),
 ]
 

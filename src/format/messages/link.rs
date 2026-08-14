@@ -42,6 +42,10 @@ pub enum LinkTarget {
 pub struct LinkMessage {
     pub name: String,
     pub target: LinkTarget,
+    /// Creation order within the parent group, present only when the group
+    /// tracks it (`H5O_LINK_STORE_CORDER`). `H5G_obj_insert` stamps it from
+    /// the Link Info message's running maximum.
+    pub creation_order: Option<i64>,
 }
 
 impl LinkMessage {
@@ -50,6 +54,7 @@ impl LinkMessage {
         Self {
             name: name.to_string(),
             target: LinkTarget::Hard { address },
+            creation_order: None,
         }
     }
 
@@ -60,7 +65,14 @@ impl LinkMessage {
             target: LinkTarget::Soft {
                 target: target.to_string(),
             },
+            creation_order: None,
         }
+    }
+
+    /// The same link, stamped with its creation order.
+    pub fn with_creation_order(mut self, corder: i64) -> Self {
+        self.creation_order = Some(corder);
+        self
     }
 
     // ------------------------------------------------------------------ encode
@@ -85,6 +97,9 @@ impl LinkMessage {
         let mut flags: u8 = name_len_code & FLAG_NAME_LEN_MASK;
         flags |= FLAG_LINK_TYPE; // always include link type for clarity
         flags |= FLAG_CHARSET; // always include charset (UTF-8)
+        if self.creation_order.is_some() {
+            flags |= FLAG_CREATION_ORDER;
+        }
 
         let mut buf = Vec::with_capacity(32);
         buf.push(VERSION);
@@ -92,6 +107,11 @@ impl LinkMessage {
 
         // link type
         buf.push(link_type);
+
+        // creation order, before the charset byte (`H5O__link_encode`)
+        if let Some(corder) = self.creation_order {
+            buf.extend_from_slice(&corder.to_le_bytes());
+        }
 
         // charset: 1 = UTF-8
         buf.push(1u8);
@@ -157,11 +177,15 @@ impl LinkMessage {
         };
 
         // creation order — an 8-byte signed integer (H5Olink.c INT64DECODE),
-        // not 4. We don't store it, but the width must be skipped exactly.
-        if has_creation_order {
+        // not 4.
+        let creation_order = if has_creation_order {
             check_len(buf, pos, 8)?;
+            let v = i64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
             pos += 8;
-        }
+            Some(v)
+        } else {
+            None
+        };
 
         // charset
         if has_charset {
@@ -218,7 +242,14 @@ impl LinkMessage {
             }
         };
 
-        Ok((Self { name, target }, pos))
+        Ok((
+            Self {
+                name,
+                target,
+                creation_order,
+            },
+            pos,
+        ))
     }
 }
 
@@ -349,6 +380,33 @@ mod tests {
     fn version_byte() {
         let encoded = LinkMessage::hard("x", 0).encode(&ctx8());
         assert_eq!(encoded[0], 1);
+    }
+
+    #[test]
+    fn roundtrip_with_creation_order() {
+        let msg = LinkMessage::hard("d00", 0x1000).with_creation_order(7);
+        let encoded = msg.encode(&ctx8());
+        // The flag byte announces it, and the value costs eight bytes.
+        assert_eq!(encoded[1] & FLAG_CREATION_ORDER, FLAG_CREATION_ORDER);
+        assert_eq!(
+            encoded.len(),
+            LinkMessage::hard("d00", 0x1000).encode(&ctx8()).len() + 8
+        );
+        let (decoded, consumed) = LinkMessage::decode(&encoded, &ctx8()).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, msg);
+        assert_eq!(decoded.creation_order, Some(7));
+    }
+
+    /// The creation order sits between the link type and the charset byte, so
+    /// a decoder that skipped the wrong span would misread the name.
+    #[test]
+    fn creation_order_precedes_the_charset_byte() {
+        let msg = LinkMessage::soft("alias", "/orig").with_creation_order(-3);
+        let encoded = msg.encode(&ctx8());
+        assert_eq!(&encoded[3..11], &(-3i64).to_le_bytes());
+        assert_eq!(encoded[11], 1, "charset follows the creation order");
+        assert_eq!(LinkMessage::decode(&encoded, &ctx8()).unwrap().0, msg);
     }
 
     #[test]

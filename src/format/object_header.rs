@@ -49,7 +49,7 @@ pub const MAX_MESSAGE_SIZE: usize = u16::MAX as usize;
 // Flag bit masks
 const FLAG_SIZE_MASK: u8 = 0x03;
 const FLAG_ATTR_CREATION_ORDER_TRACKED: u8 = 0x04;
-// const FLAG_ATTR_CREATION_ORDER_INDEXED: u8 = 0x08; // bit 3
+const FLAG_ATTR_CREATION_ORDER_INDEXED: u8 = 0x08;
 const FLAG_NON_DEFAULT_ATTR_THRESHOLDS: u8 = 0x10;
 const FLAG_STORE_TIMESTAMPS: u8 = 0x20;
 
@@ -60,6 +60,11 @@ pub struct ObjectHeaderMessage {
     pub msg_type: u8,
     /// Per-message flags (bit 0 = constant, bit 1 = shared, etc.)
     pub flags: u8,
+    /// Creation index, written only when the header tracks attribute creation
+    /// order (flags bit 2). Only the attribute message class has one in
+    /// libhdf5 — `H5O_msg_class_t::get_crt_index` is null for every other
+    /// type, leaving the field zero (`H5O_msg_append_real`).
+    pub creation_index: u16,
     /// Raw message payload.
     pub data: Vec<u8>,
 }
@@ -88,11 +93,38 @@ impl ObjectHeader {
 
     /// Append a message to the object header.
     pub fn add_message(&mut self, msg_type: u8, flags: u8, data: Vec<u8>) {
+        self.add_message_indexed(msg_type, flags, data, 0);
+    }
+
+    /// Append a message carrying a creation index.
+    ///
+    /// The index reaches the file only when the header's flags bit 2 says the
+    /// creation order is tracked; libhdf5 does not encode the field otherwise
+    /// (`H5O_SIZEOF_MSGHDR_OH`).
+    pub fn add_message_indexed(
+        &mut self,
+        msg_type: u8,
+        flags: u8,
+        data: Vec<u8>,
+        creation_index: u16,
+    ) {
         self.messages.push(ObjectHeaderMessage {
             msg_type,
             flags,
+            creation_index,
             data,
         });
+    }
+
+    /// Track (and index) attribute creation order on this header.
+    ///
+    /// `H5Pget_attr_creation_order` reads these two bits back out of the
+    /// header, not out of the Attribute Info message (`H5Pocpl.c`), so they
+    /// are what makes an object report its attributes as creation-ordered.
+    /// Setting them also widens every message envelope by the two-byte
+    /// creation index.
+    pub fn track_attribute_creation_order(&mut self) {
+        self.flags |= FLAG_ATTR_CREATION_ORDER_TRACKED | FLAG_ATTR_CREATION_ORDER_INDEXED;
     }
 
     /// Returns the number of bytes used to encode chunk0's data size, based on
@@ -108,7 +140,7 @@ impl ObjectHeader {
     }
 
     /// Whether attribute creation order tracking is enabled (flags bit 2).
-    fn has_creation_order(&self) -> bool {
+    pub fn has_creation_order(&self) -> bool {
         self.flags & FLAG_ATTR_CREATION_ORDER_TRACKED != 0
     }
 
@@ -192,9 +224,7 @@ impl ObjectHeader {
             buf.extend_from_slice(&(msg.data.len() as u16).to_le_bytes());
             buf.push(msg.flags);
             if self.has_creation_order() {
-                // We don't track actual creation order values in the MVP --
-                // write 0.
-                buf.extend_from_slice(&0u16.to_le_bytes());
+                buf.extend_from_slice(&msg.creation_index.to_le_bytes());
             }
             buf.extend_from_slice(&msg.data);
         }
@@ -330,10 +360,13 @@ impl ObjectHeader {
             let msg_flags = buf[pos + 3];
             pos += 4;
 
-            if has_creation_order {
-                // Skip creation_order for now
+            let creation_index = if has_creation_order {
+                let v = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
                 pos += 2;
-            }
+                v
+            } else {
+                0
+            };
 
             if pos + msg_data_size > messages_end {
                 return Err(FormatError::InvalidData(format!(
@@ -348,6 +381,7 @@ impl ObjectHeader {
             messages.push(ObjectHeaderMessage {
                 msg_type,
                 flags: msg_flags,
+                creation_index,
                 data,
             });
         }
@@ -455,6 +489,8 @@ impl ObjectHeader {
             messages.push(ObjectHeaderMessage {
                 msg_type: msg_type as u8,
                 flags: msg_flags,
+                // A version-1 message envelope has no creation index.
+                creation_index: 0,
                 data,
             });
         }
@@ -654,6 +690,32 @@ mod tests {
         assert_eq!(decoded.messages.len(), 2);
         assert_eq!(decoded.messages[0].data, vec![0xFF; 8]);
         assert_eq!(decoded.messages[1].data, vec![0xEE; 4]);
+    }
+
+    /// The per-message creation index survives a round trip, and lands where
+    /// libhdf5 puts it: right after the message flags byte, ahead of the
+    /// message data.
+    #[test]
+    fn a_tracked_header_round_trips_each_message_creation_index() {
+        let mut hdr = ObjectHeader::new();
+        hdr.track_attribute_creation_order();
+        hdr.add_message_indexed(0x0C, 0x00, vec![0xAA; 6], 0);
+        hdr.add_message_indexed(0x0C, 0x00, vec![0xBB; 6], 1);
+        hdr.add_message_indexed(0x0C, 0x00, vec![0xCC; 6], 2);
+
+        let encoded = hdr.encode().unwrap();
+        let (decoded, consumed) = ObjectHeader::decode(&encoded).expect("decode failed");
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, hdr);
+        let indices: Vec<u16> = decoded.messages.iter().map(|m| m.creation_index).collect();
+        assert_eq!(indices, vec![0, 1, 2]);
+
+        // Off: no index is written, and every message decodes with 0.
+        let mut plain = ObjectHeader::new();
+        plain.add_message(0x0C, 0x00, vec![0xAA; 6]);
+        assert!(plain.encode().unwrap().len() < encoded.len());
+        let (plain_back, _) = ObjectHeader::decode(&plain.encode().unwrap()).unwrap();
+        assert_eq!(plain_back.messages[0].creation_index, 0);
     }
 
     #[test]
