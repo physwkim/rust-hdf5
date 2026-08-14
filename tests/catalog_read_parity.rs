@@ -912,3 +912,84 @@ fn a_group_path_across_an_external_link_is_named_not_empty() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Which storage a group uses — `Link` messages or the legacy symbol table —
+/// is a property of that group, not of the file. One link the old format
+/// cannot express (an external link) or one creation-order-tracked group
+/// migrates just that group, so a mixed file is what h5py writes by default,
+/// not a curiosity. Walking a group the way its *parent* is stored finds no
+/// children at all, which listed the group and dropped its whole subtree.
+/// Both directions of the mismatch are here.
+#[test]
+fn a_group_keeps_its_children_when_its_storage_differs_from_its_parents() {
+    let Some(py) = python() else { return };
+
+    // Symbol-table child under a link-storage root: `track_order` on the file
+    // migrates the root, `legacy` is created without it and stays behind.
+    let modern_root = tmp("mixed_modern_root");
+    h5py_write(
+        py,
+        &modern_root,
+        "with h5py.File(PATH, 'w', track_order=True) as f:\n\
+         \x20   g = f.create_group('legacy')\n\
+         \x20   g.create_dataset('a', data=np.arange(3, dtype='<i4'))\n\
+         \x20   g.create_group('inner').create_dataset('c', data=np.arange(5, dtype='<i4'))\n",
+    );
+
+    let file = H5File::open(&modern_root).unwrap();
+    assert_eq!(
+        file.dataset_names(),
+        vec!["legacy/a".to_string(), "legacy/inner/c".to_string()]
+    );
+    let legacy = file.root_group().group("legacy").unwrap();
+    assert_eq!(
+        legacy.link_names().unwrap(),
+        vec!["a".to_string(), "inner".to_string()]
+    );
+    assert_eq!(
+        file.dataset("legacy/inner/c")
+            .unwrap()
+            .read_raw::<i32>()
+            .unwrap(),
+        vec![0, 1, 2, 3, 4]
+    );
+    drop(file);
+    std::fs::remove_file(&modern_root).ok();
+
+    // Link-storage child under a symbol-table root: the root keeps the default
+    // format, `modern` asks for creation-order tracking and migrates.
+    let legacy_root = tmp("mixed_legacy_root");
+    h5py_write(
+        py,
+        &legacy_root,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f.create_group('legacy').create_dataset('a', data=np.arange(3, dtype='<i4'))\n\
+         \x20   n = f.create_group('modern', track_order=True)\n\
+         \x20   n.create_dataset('b', data=np.arange(4, dtype='<i4'))\n\
+         \x20   n.create_group('inner').create_dataset('c', data=np.arange(5, dtype='<i4'))\n",
+    );
+
+    let file = H5File::open(&legacy_root).unwrap();
+    assert_eq!(
+        file.dataset_names(),
+        vec![
+            "legacy/a".to_string(),
+            "modern/b".to_string(),
+            "modern/inner/c".to_string()
+        ]
+    );
+    let modern = file.root_group().group("modern").unwrap();
+    assert_eq!(
+        modern.link_names().unwrap(),
+        vec!["b".to_string(), "inner".to_string()]
+    );
+    assert_eq!(
+        file.dataset("modern/inner/c")
+            .unwrap()
+            .read_raw::<i32>()
+            .unwrap(),
+        vec![0, 1, 2, 3, 4]
+    );
+    drop(file);
+    std::fs::remove_file(&legacy_root).ok();
+}

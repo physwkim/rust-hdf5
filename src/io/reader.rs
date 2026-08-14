@@ -270,6 +270,284 @@ struct Catalog {
     links: std::collections::BTreeMap<String, LinkClass>,
 }
 
+/// The state one catalog walk threads through every group it visits.
+///
+/// A group stores its children either as `Link` messages in its object header
+/// (with dense overflow in a fractal heap) or in the legacy symbol-table
+/// B-tree plus local heap — and *which* it uses is a property of that group
+/// alone. One file mixes the two freely: writing a single link that the old
+/// format cannot express (an external link, a creation-order-tracked group)
+/// migrates just that group, leaving its parent and its children where they
+/// were. Walking a group in the format its *parent* used therefore finds no
+/// children at all and reports an empty group, which is why the two storages
+/// share one walker here: [`CatalogWalk::group`] asks each object header what
+/// it declares, and [`CatalogWalk::child`] is the single place a child is
+/// classified, recorded and descended into.
+struct CatalogWalk<'a> {
+    handle: &'a mut FileHandle,
+    ctx: &'a FormatContext,
+    catalog: Catalog,
+    /// Object headers already descended into, keyed to the first path that
+    /// reached them: a later path to the same header is a group hard link,
+    /// recorded in `group_aliases` so lookups resolve through it instead of
+    /// walking (and cycling) a second time.
+    visited: std::collections::HashMap<u64, String>,
+}
+
+impl<'a> CatalogWalk<'a> {
+    /// Bound group nesting on a hostile or corrupt file.
+    const MAX_DEPTH: usize = 256;
+
+    /// Start a walk at the root group's object header address, seeded so a
+    /// hard link cycling back to the root is not descended into again.
+    fn new(handle: &'a mut FileHandle, ctx: &'a FormatContext, root_addr: u64) -> Self {
+        let mut visited = std::collections::HashMap::new();
+        visited.insert(root_addr, String::new());
+        Self {
+            handle,
+            ctx,
+            catalog: Catalog::default(),
+            visited,
+        }
+    }
+
+    fn finish(self) -> Catalog {
+        self.catalog
+    }
+
+    /// Enumerate one group's children, choosing the storage from what this
+    /// group's own header declares.
+    ///
+    /// `stab` is the symbol-table scratch-pad copy from the entry that named
+    /// this group (the superblock's root entry, or the parent's symbol-table
+    /// entry), which is the only source of those addresses when the header
+    /// itself did not decode. `header` is `None` in exactly that case.
+    fn group(
+        &mut self,
+        header: Option<&ObjectHeader>,
+        prefix: &str,
+        depth: usize,
+        stab: Option<(u64, u64)>,
+    ) -> IoResult<()> {
+        if depth > Self::MAX_DEPTH {
+            return Ok(());
+        }
+        let link_storage = header.filter(|h| {
+            h.messages
+                .iter()
+                .any(|m| m.msg_type == MSG_LINK || m.msg_type == MSG_LINK_INFO)
+        });
+        if let Some(h) = link_storage {
+            return self.links(h, prefix, depth);
+        }
+        // Symbol-table storage: the scratch-pad copy wins when it is set,
+        // otherwise the addresses come from the group's own `stab` message.
+        let (btree_addr, heap_addr) = match stab {
+            Some(pair) if pair.0 != UNDEF_ADDR && pair.1 != UNDEF_ADDR => pair,
+            _ => header.map_or((UNDEF_ADDR, UNDEF_ADDR), |h| {
+                Hdf5Reader::stab_from_header(h, self.ctx)
+            }),
+        };
+        if btree_addr != UNDEF_ADDR && heap_addr != UNDEF_ADDR {
+            self.btree(btree_addr, heap_addr, prefix, depth)?;
+        }
+        Ok(())
+    }
+
+    /// Enumerate a group that stores its children as `Link` messages.
+    fn links(&mut self, header: &ObjectHeader, prefix: &str, depth: usize) -> IoResult<()> {
+        // Collect every link in this group: inline `Link` messages plus, for
+        // groups using dense storage, links held in a fractal heap referenced
+        // by the `Link Info` message.
+        //
+        // A link message that does not decode has no name to report the
+        // failure against, and a `Link Info` message that does not decode
+        // hides a whole group's dense storage. Either way the listing would
+        // come back silently short, so both are errors: a listing this
+        // reader cannot complete must not present itself as complete.
+        let mut links: Vec<LinkMessage> = Vec::new();
+        for msg in &header.messages {
+            if msg.msg_type == MSG_LINK {
+                let (link, _) = LinkMessage::decode(&msg.data, self.ctx)?;
+                links.push(link);
+            } else if msg.msg_type == MSG_LINK_INFO {
+                let (info, _) = LinkInfoMessage::decode(&msg.data, self.ctx)?;
+                if info.fractal_heap_address != UNDEF_ADDR {
+                    let dense = Hdf5Reader::read_dense_links(
+                        self.handle,
+                        self.ctx,
+                        info.fractal_heap_address,
+                    )?;
+                    links.extend(dense);
+                }
+            }
+        }
+
+        for link in &links {
+            let full_name = join_path(prefix, &link.name);
+            // Every link is a listing entry whatever it points at; only a
+            // hard link names an object in this file to descend into.
+            self.catalog
+                .links
+                .insert(full_name.clone(), LinkClass::from_target(&link.target));
+            let LinkTarget::Hard { address } = &link.target else {
+                continue;
+            };
+            self.child(full_name, *address, depth, None)?;
+        }
+        Ok(())
+    }
+
+    /// Enumerate a group that stores its children in a symbol-table B-tree
+    /// plus local heap.
+    fn btree(
+        &mut self,
+        btree_addr: u64,
+        heap_addr: u64,
+        prefix: &str,
+        depth: usize,
+    ) -> IoResult<()> {
+        let sa = self.ctx.sizeof_addr as usize;
+        let ss = self.ctx.sizeof_size as usize;
+
+        // Read the local heap header + data for this group.
+        let heap_hdr_buf = self.handle.read_at_most(heap_addr, 64)?;
+        let heap_hdr = LocalHeapHeader::decode(&heap_hdr_buf, sa, ss)?;
+        let heap_data = self
+            .handle
+            .read_at(heap_hdr.data_addr, heap_hdr.data_size as usize)?;
+
+        // Collect all SNOD addresses by walking the B-tree.
+        let mut snod_tree_visited = std::collections::HashSet::new();
+        let snod_addrs = Hdf5Reader::collect_snod_addresses(
+            self.handle,
+            btree_addr,
+            sa,
+            ss,
+            0,
+            &mut snod_tree_visited,
+        )?;
+
+        for snod_addr in snod_addrs {
+            let snod_buf = self.handle.read_at_most(snod_addr, 8192)?;
+            let snod = SymbolTableNode::decode(&snod_buf, sa, ss)?;
+
+            for entry in &snod.entries {
+                let name = local_heap_get_string(&heap_data, entry.name_offset)?;
+                // Skip empty names (root group self-reference).
+                if name.is_empty() {
+                    continue;
+                }
+                let full_name = join_path(prefix, &name);
+
+                // A `H5G_CACHED_SLINK` entry is a soft link: it names no
+                // object at all, and its value string lives in this group's
+                // local heap. Record the link and move on — reading its
+                // undefined object-header address is what used to drop it.
+                if let SymbolTableCache::SoftLink { value_offset } = entry.cache {
+                    let target = local_heap_get_string(&heap_data, value_offset as u64)?;
+                    self.catalog
+                        .links
+                        .insert(full_name, LinkClass::Soft { path: target });
+                    continue;
+                }
+                self.catalog
+                    .links
+                    .insert(full_name.clone(), LinkClass::Hard);
+                self.child(
+                    full_name,
+                    entry.obj_header_addr,
+                    depth,
+                    entry.cached_symbol_table(),
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Record one child of a group and, when it is itself a group, descend.
+    ///
+    /// Both storages end here, so a child is classified, catalogued and
+    /// cycle-guarded the same way whichever way its name was found.
+    fn child(
+        &mut self,
+        full_name: String,
+        addr: u64,
+        depth: usize,
+        stab: Option<(u64, u64)>,
+    ) -> IoResult<()> {
+        // The entry names an object, so the object is in the listing whatever
+        // comes of reading it: a header that does not decode (a stale link
+        // left by a deletion, say) is reported against this name, never
+        // dropped from it.
+        let header = match Hdf5Reader::read_object_header_full(self.handle, self.ctx, addr) {
+            Ok(h) => h,
+            Err(e) => {
+                self.catalog
+                    .unreadable
+                    .insert(full_name, format!("its object header does not decode: {e}"));
+                return Ok(());
+            }
+        };
+        match Hdf5Reader::classify_object(&header, self.ctx, &full_name) {
+            ObjectKind::Dataset(info) => {
+                self.catalog.datasets.push(*info);
+                return Ok(());
+            }
+            ObjectKind::UnreadableDataset(why) => {
+                self.catalog.unreadable.insert(full_name, why);
+                return Ok(());
+            }
+            // A committed (named) datatype is neither a group nor a dataset,
+            // so it must not be recorded as either; the link record above
+            // already carries its name.
+            ObjectKind::CommittedDatatype => return Ok(()),
+            ObjectKind::Group => {}
+        }
+
+        // It is a group. Record its path from the actual link record — before
+        // the cycle check, so a hard-link alias of an already-visited group
+        // still appears — whether or not it holds datasets or attributes.
+        self.catalog.group_paths.insert(full_name.clone());
+        // Capture group attributes (e.g. the NeXus `NX_class` marker), keyed
+        // by path.
+        let mut attrs = Vec::new();
+        for m in &header.messages {
+            if m.msg_type == MSG_ATTRIBUTE {
+                if let Ok((a, _)) = AttributeMessage::decode(&m.data, self.ctx) {
+                    attrs.push(a);
+                }
+            }
+        }
+        if !attrs.is_empty() {
+            self.catalog
+                .group_attributes
+                .insert(full_name.clone(), attrs);
+        }
+
+        // Descend at most once per object header (cycle guard); a second path
+        // to it is a group hard link — record the alias for lookups instead.
+        if let Some(first) = self.visited.get(&addr) {
+            let first = first.clone();
+            self.catalog.group_aliases.insert(full_name, first);
+            return Ok(());
+        }
+        self.visited.insert(addr, full_name.clone());
+        self.group(Some(&header), &full_name, depth + 1, stab)
+    }
+}
+
+/// Join a group path prefix and a child name, with no leading `/` on a
+/// root-level name.
+fn join_path(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", prefix, name)
+    }
+}
+
 /// What an object header describes.
 ///
 /// libhdf5 decides an object's class from *which* messages the header holds
@@ -623,13 +901,14 @@ impl Hdf5Reader {
         let root_header =
             Self::read_object_header_full(&mut handle, &ctx, sb.root_group_object_header_address)?;
 
-        // Walk link messages to discover datasets, group attributes, and
+        // Walk the root group to discover datasets, group attributes, and
         // every group path that exists.
-        let catalog = Self::build_catalog_from_links(
+        let catalog = Self::build_catalog(
             &mut handle,
-            &root_header,
-            sb.root_group_object_header_address,
             &ctx,
+            Some(&root_header),
+            sb.root_group_object_header_address,
+            None,
         )?;
 
         // Collect root group attributes
@@ -693,49 +972,18 @@ impl Hdf5Reader {
         }
 
         // A v0/v1-superblock file whose root group has migrated to link
-        // storage (more than ~8 objects) carries `Link` / `Link Info`
-        // messages in its object header; the superblock symbol-table
-        // scratch-pad is then stale. Prefer the link-based walk when those
-        // messages are present, and fall back to the symbol-table B-tree.
-        let has_links = root_hdr.as_ref().is_some_and(|h| {
-            h.messages
-                .iter()
-                .any(|m| m.msg_type == MSG_LINK || m.msg_type == MSG_LINK_INFO)
-        });
-
-        let catalog = if has_links {
-            Self::build_catalog_from_links(
-                &mut handle,
-                root_hdr.as_ref().unwrap(),
-                root_obj_addr,
-                &ctx,
-            )?
-        } else {
-            // Symbol-table storage: the STE scratch-pad caches the B-tree
-            // and local heap; otherwise read them from the object header.
-            let (btree_addr, heap_addr) = match ste_stab {
-                Some(pair) => pair,
-                None => {
-                    // Read the symbol-table message from the already-loaded
-                    // full root header (which followed continuation blocks).
-                    root_hdr
-                        .as_ref()
-                        .map(|h| Self::stab_from_header(h, &ctx))
-                        .unwrap_or((UNDEF_ADDR, UNDEF_ADDR))
-                }
-            };
-            if btree_addr != UNDEF_ADDR && heap_addr != UNDEF_ADDR {
-                Self::build_catalog_from_btree(
-                    &mut handle,
-                    &ctx,
-                    btree_addr,
-                    heap_addr,
-                    root_obj_addr,
-                )?
-            } else {
-                Catalog::default()
-            }
-        };
+        // storage (more than ~8 objects, or one link the old format cannot
+        // express) carries `Link` / `Link Info` messages in its object
+        // header, and the superblock symbol-table scratch-pad is then stale.
+        // The walk picks the storage from the header for that reason, taking
+        // the scratch-pad only as the symbol-table addresses.
+        let catalog = Self::build_catalog(
+            &mut handle,
+            &ctx,
+            root_hdr.as_ref(),
+            root_obj_addr,
+            ste_stab,
+        )?;
 
         Ok(Self {
             handle,
@@ -774,142 +1022,21 @@ impl Hdf5Reader {
         (UNDEF_ADDR, UNDEF_ADDR)
     }
 
-    /// Build the file catalog by walking link messages in a v2 object header.
-    /// Recursively descends into groups, prefixing names with the group path.
-    fn build_catalog_from_links(
+    /// Build the file catalog for a whole file, starting at its root group.
+    ///
+    /// `root_header` is `None` only when the root object header did not
+    /// decode; `root_stab` then carries the superblock symbol-table entry's
+    /// cached B-tree and local heap, which is enough to list a legacy file.
+    fn build_catalog(
         handle: &mut FileHandle,
-        root_header: &ObjectHeader,
+        ctx: &FormatContext,
+        root_header: Option<&ObjectHeader>,
         root_addr: u64,
-        ctx: &FormatContext,
+        root_stab: Option<(u64, u64)>,
     ) -> IoResult<Catalog> {
-        let mut catalog = Catalog::default();
-        // Object headers already descended into, keyed to the first path
-        // that reached them: a later path to the same header is a group
-        // hard link, recorded in `aliases` so lookups can resolve through
-        // it instead of walking (and cycling) a second time.
-        let mut visited = std::collections::HashMap::new();
-        // Seed the root object header so a hard link cycling back to the
-        // root is not descended into a second time.
-        visited.insert(root_addr, String::new());
-        Self::walk_links_recursive(handle, root_header, ctx, "", &mut catalog, &mut visited)?;
-        Ok(catalog)
-    }
-
-    fn walk_links_recursive(
-        handle: &mut FileHandle,
-        header: &ObjectHeader,
-        ctx: &FormatContext,
-        prefix: &str,
-        catalog: &mut Catalog,
-        visited: &mut std::collections::HashMap<u64, String>,
-    ) -> IoResult<()> {
-        // Bound recursion depth on a hostile/corrupt file.
-        const MAX_GROUP_DEPTH: usize = 256;
-        let depth = if prefix.is_empty() {
-            0
-        } else {
-            prefix.matches('/').count() + 1
-        };
-        if depth > MAX_GROUP_DEPTH {
-            return Ok(());
-        }
-
-        // Collect every link in this group: inline `Link` messages plus, for
-        // groups using dense storage, links held in a fractal heap referenced
-        // by the `Link Info` message.
-        //
-        // A link message that does not decode has no name to report the
-        // failure against, and a `Link Info` message that does not decode
-        // hides a whole group's dense storage. Either way the listing would
-        // come back silently short, so both are errors: a listing this
-        // reader cannot complete must not present itself as complete.
-        let mut links: Vec<LinkMessage> = Vec::new();
-        for msg in &header.messages {
-            if msg.msg_type == MSG_LINK {
-                let (link, _) = LinkMessage::decode(&msg.data, ctx)?;
-                links.push(link);
-            } else if msg.msg_type == MSG_LINK_INFO {
-                let (info, _) = LinkInfoMessage::decode(&msg.data, ctx)?;
-                if info.fractal_heap_address != UNDEF_ADDR {
-                    let dense = Self::read_dense_links(handle, ctx, info.fractal_heap_address)?;
-                    links.extend(dense);
-                }
-            }
-        }
-
-        for link in &links {
-            let full_name = if prefix.is_empty() {
-                link.name.clone()
-            } else {
-                format!("{}/{}", prefix, link.name)
-            };
-
-            // Every link is a listing entry whatever it points at; only a
-            // hard link names an object in this file to descend into.
-            catalog
-                .links
-                .insert(full_name.clone(), LinkClass::from_target(&link.target));
-            let LinkTarget::Hard { address } = &link.target else {
-                continue;
-            };
-
-            // The link names an object, so the object is in the listing
-            // whatever comes of reading it: a header that does not decode
-            // (a stale link left by a deletion, say) is reported against
-            // this name, never dropped from it.
-            let child_header = match Self::read_object_header_full(handle, ctx, *address) {
-                Ok(h) => h,
-                Err(e) => {
-                    catalog
-                        .unreadable
-                        .insert(full_name, format!("its object header does not decode: {e}"));
-                    continue;
-                }
-            };
-            match Self::classify_object(&child_header, ctx, &full_name) {
-                ObjectKind::Dataset(info) => {
-                    catalog.datasets.push(*info);
-                    continue;
-                }
-                ObjectKind::UnreadableDataset(why) => {
-                    catalog.unreadable.insert(full_name, why);
-                    continue;
-                }
-                // A committed (named) datatype is neither a group nor a
-                // dataset, so it must not be recorded as either; the link
-                // record above already carries its name.
-                ObjectKind::CommittedDatatype => continue,
-                ObjectKind::Group => {}
-            }
-            // It is a group. Record its path from the actual link record —
-            // before the cycle check, so a hard-link alias of an
-            // already-visited group still appears — whether or not it
-            // contains datasets or attributes.
-            catalog.group_paths.insert(full_name.clone());
-            // Capture group attributes (e.g. the NeXus `NX_class` marker),
-            // keyed by path.
-            let mut attrs = Vec::new();
-            for m in &child_header.messages {
-                if m.msg_type == MSG_ATTRIBUTE {
-                    if let Ok((a, _)) = AttributeMessage::decode(&m.data, ctx) {
-                        attrs.push(a);
-                    }
-                }
-            }
-            if !attrs.is_empty() {
-                catalog.group_attributes.insert(full_name.clone(), attrs);
-            }
-            // Descend at most once per object header (cycle guard); a second
-            // path to it is a group hard link — record the alias for lookups
-            // instead.
-            if let Some(first) = visited.get(address) {
-                catalog.group_aliases.insert(full_name, first.clone());
-                continue;
-            }
-            visited.insert(*address, full_name.clone());
-            Self::walk_links_recursive(handle, &child_header, ctx, &full_name, catalog, visited)?;
-        }
-        Ok(())
+        let mut walk = CatalogWalk::new(handle, ctx, root_addr);
+        walk.group(root_header, "", 0, root_stab)?;
+        Ok(walk.finish())
     }
 
     /// Read every link stored in a group's dense (fractal-heap) link storage.
@@ -968,186 +1095,6 @@ impl Hdf5Reader {
         }
 
         Ok(links)
-    }
-
-    /// Build the file catalog by walking the B-tree v1 + local heap (legacy
-    /// format).
-    ///
-    /// Recurses into subgroups: a symbol-table entry that caches its child
-    /// group's B-tree and local heap uses those; for other entries the child
-    /// object header is read for a symbol-table message. Discovered names are
-    /// prefixed with the group path.
-    fn build_catalog_from_btree(
-        handle: &mut FileHandle,
-        ctx: &FormatContext,
-        btree_addr: u64,
-        heap_addr: u64,
-        root_obj_addr: u64,
-    ) -> IoResult<Catalog> {
-        let mut catalog = Catalog::default();
-        // First path per descended object header + the group-hard-link
-        // aliases met later, as in `build_catalog_from_links`.
-        let mut visited = std::collections::HashMap::new();
-        // Seed the root object header so a hard link cycling back to the
-        // root group is not descended into a second time.
-        visited.insert(root_obj_addr, String::new());
-        Self::walk_btree_recursive(
-            handle,
-            ctx,
-            btree_addr,
-            heap_addr,
-            "",
-            0,
-            &mut catalog,
-            &mut visited,
-        )?;
-        Ok(catalog)
-    }
-
-    /// Recursive worker for `build_catalog_from_btree`. `prefix` is the
-    /// path of the group being scanned; `depth` bounds recursion.
-    #[allow(clippy::too_many_arguments)]
-    fn walk_btree_recursive(
-        handle: &mut FileHandle,
-        ctx: &FormatContext,
-        btree_addr: u64,
-        heap_addr: u64,
-        prefix: &str,
-        depth: usize,
-        catalog: &mut Catalog,
-        visited: &mut std::collections::HashMap<u64, String>,
-    ) -> IoResult<()> {
-        // Bound legacy-group nesting depth on a hostile/corrupt file.
-        const MAX_GROUP_DEPTH: usize = 256;
-        if depth > MAX_GROUP_DEPTH {
-            return Ok(());
-        }
-        if btree_addr == UNDEF_ADDR || heap_addr == UNDEF_ADDR {
-            return Ok(());
-        }
-
-        let sa = ctx.sizeof_addr as usize;
-        let ss = ctx.sizeof_size as usize;
-
-        // Read the local heap header + data for this group.
-        let heap_hdr_buf = handle.read_at_most(heap_addr, 64)?;
-        let heap_hdr = LocalHeapHeader::decode(&heap_hdr_buf, sa, ss)?;
-        let heap_data = handle.read_at(heap_hdr.data_addr, heap_hdr.data_size as usize)?;
-
-        // Collect all SNOD addresses by walking the B-tree.
-        let mut snod_tree_visited = std::collections::HashSet::new();
-        let snod_addrs =
-            Self::collect_snod_addresses(handle, btree_addr, sa, ss, 0, &mut snod_tree_visited)?;
-
-        for snod_addr in snod_addrs {
-            let snod_buf = handle.read_at_most(snod_addr, 8192)?;
-            let snod = SymbolTableNode::decode(&snod_buf, sa, ss)?;
-
-            for entry in &snod.entries {
-                let name = local_heap_get_string(&heap_data, entry.name_offset)?;
-                // Skip empty names (root group self-reference).
-                if name.is_empty() {
-                    continue;
-                }
-                let full_name = if prefix.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{}/{}", prefix, name)
-                };
-
-                // A `H5G_CACHED_SLINK` entry is a soft link: it names no
-                // object at all, and its value string lives in this group's
-                // local heap. Record the link and move on — reading its
-                // undefined object-header address is what used to drop it.
-                if let SymbolTableCache::SoftLink { value_offset } = entry.cache {
-                    let target = local_heap_get_string(&heap_data, value_offset as u64)?;
-                    catalog
-                        .links
-                        .insert(full_name, LinkClass::Soft { path: target });
-                    continue;
-                }
-                catalog.links.insert(full_name.clone(), LinkClass::Hard);
-
-                // The entry names an object, so the object is in the
-                // listing whatever comes of reading it — the same rule the
-                // link-message walk applies.
-                let hdr = match Self::read_object_header_full(handle, ctx, entry.obj_header_addr) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        catalog
-                            .unreadable
-                            .insert(full_name, format!("its object header does not decode: {e}"));
-                        continue;
-                    }
-                };
-                match Self::classify_object(&hdr, ctx, &full_name) {
-                    ObjectKind::Dataset(info) => {
-                        catalog.datasets.push(*info);
-                        continue;
-                    }
-                    ObjectKind::UnreadableDataset(why) => {
-                        catalog.unreadable.insert(full_name, why);
-                        continue;
-                    }
-                    ObjectKind::CommittedDatatype => continue,
-                    ObjectKind::Group => {}
-                }
-
-                // It is a subgroup. Record its path from the actual
-                // symbol-table entry, whether or not it has datasets or
-                // attributes.
-                catalog.group_paths.insert(full_name.clone());
-
-                // Break cycles: descend into each group object header at
-                // most once. A second path to it is a group hard link —
-                // record the alias for lookups instead.
-                if let Some(first) = visited.get(&entry.obj_header_addr) {
-                    catalog.group_aliases.insert(full_name, first.clone());
-                    continue;
-                }
-                visited.insert(entry.obj_header_addr, full_name.clone());
-
-                // Collect this subgroup's attributes (e.g. NeXus NX_class).
-                {
-                    let mut attrs = Vec::new();
-                    for m in &hdr.messages {
-                        if m.msg_type == MSG_ATTRIBUTE {
-                            if let Ok((a, _)) = AttributeMessage::decode(&m.data, ctx) {
-                                attrs.push(a);
-                            }
-                        }
-                    }
-                    if !attrs.is_empty() {
-                        catalog.group_attributes.insert(full_name.clone(), attrs);
-                    }
-                }
-
-                // Find its B-tree + local heap and recurse, prefixing names
-                // with the group path.
-                let (sub_btree, sub_heap) = match entry.cached_symbol_table() {
-                    // Scratch-pad caches the subgroup's symbol-table info.
-                    Some(pair) => pair,
-                    // No scratch pad — take the symbol-table message from
-                    // the child object header already read above.
-                    None => Self::stab_from_header(&hdr, ctx),
-                };
-
-                if sub_btree != UNDEF_ADDR && sub_heap != UNDEF_ADDR {
-                    Self::walk_btree_recursive(
-                        handle,
-                        ctx,
-                        sub_btree,
-                        sub_heap,
-                        &full_name,
-                        depth + 1,
-                        catalog,
-                        visited,
-                    )?;
-                }
-            }
-        }
-
-        Ok(())
     }
 
     /// Recursively walk a B-tree v1 to collect leaf-level SNOD addresses.
@@ -1949,11 +1896,12 @@ impl Hdf5Reader {
 
         // Re-scan datasets, group attributes, group paths, and link records
         // from link messages.
-        let catalog = Self::build_catalog_from_links(
+        let catalog = Self::build_catalog(
             &mut self.handle,
-            &root_header,
-            sb.root_group_object_header_address,
             &ctx,
+            Some(&root_header),
+            sb.root_group_object_header_address,
+            None,
         )?;
 
         self._eof = sb.end_of_file_address;

@@ -713,6 +713,30 @@ def gen_track_order(path):
         g.attrs.create("first", np.int32(1))
 
 
+def gen_group_storage_modern_root(path):
+    """A symbol-table group, holding children, under a link-message root.
+
+    `track_order` migrates the group that asks for it and nothing else, so one
+    h5py call writes a root using link messages over a child still using the
+    legacy symbol table. A reader that walks a group the way its parent is
+    stored lists `legacy` and finds none of its children.
+    """
+    with h5py.File(path, "w", track_order=True) as f:
+        legacy = f.create_group("legacy")
+        legacy.create_dataset("a", data=ramp("<i4"))
+        legacy.create_group("inner").create_dataset("c", data=ramp("<i2"))
+
+
+def gen_group_storage_legacy_root(path):
+    """The same mismatch the other way up: a link-message group, holding
+    children, under a symbol-table root."""
+    with h5py.File(path, "w") as f:
+        f.create_group("legacy").create_dataset("a", data=ramp("<i4"))
+        modern = f.create_group("modern", track_order=True)
+        modern.create_dataset("b", data=ramp("<f8"))
+        modern.create_group("inner").create_dataset("c", data=ramp("<i2"))
+
+
 LINK_CASES = [
     Case("groups_nested", "group", gen_groups_nested, "groups_nested",
          "three levels of nested groups plus an empty leaf group"),
@@ -730,6 +754,10 @@ LINK_CASES = [
          "12 links in one group — dense link storage (fractal heap + v2 B-tree)"),
     Case("track_order", "group", gen_track_order, None,
          "creation-order indices on links and attributes"),
+    Case("group_storage_modern_root", "group", gen_group_storage_modern_root, None,
+         "symbol-table group with children under a link-message root"),
+    Case("group_storage_legacy_root", "group", gen_group_storage_legacy_root, None,
+         "link-message group with children under a symbol-table root"),
 ]
 
 
