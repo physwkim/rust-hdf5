@@ -249,6 +249,203 @@ impl Selection {
             }
         }
     }
+
+    /// Encode this selection into its `H5S_select_serialize` wire form
+    /// (H5Sselect.c and the per-type callbacks in H5Sall.c/H5Snone.c/
+    /// H5Spoint.c/H5Shyper.c).
+    ///
+    /// This module has no file context (no libver bounds), so it always
+    /// targets the version libhdf5 itself picks for the *default* low
+    /// format-version bound (`H5F_LIBVER_V18`, `H5F_ACS_LIBVER_LOW_BOUND_DEF`
+    /// in H5Pfapl.c) with no huge counts or coordinates: version 1 for
+    /// points, and version 1 (the block-list wire form) for hyperslabs —
+    /// `H5S__hyper_get_version_enc_size` picks version 1 for *any*
+    /// hyperslab (regular or not) whenever the low bound is below
+    /// `H5F_LIBVER_V112`, so [`Hyperslab::Regular`] is decomposed into
+    /// blocks first ([`Selection::to_boxes`]'s own expansion) rather than
+    /// written with the version-2/3 REGULAR flag. Confirmed byte-for-byte
+    /// against libhdf5-captured `H5Sencode2` images — see
+    /// `selection_matches_libhdf5_image` in this module's tests.
+    ///
+    /// A selection that cannot be expressed in that version-1, 4-byte-wide
+    /// form — more than `u32::MAX` points/blocks, or a coordinate that
+    /// does not fit `u32` — is [`FormatError::UnsupportedFeature`], not
+    /// silently truncated.
+    pub fn encode(&self) -> FormatResult<Vec<u8>> {
+        match self {
+            Self::None => Ok(encode_all_none(SEL_NONE)),
+            Self::All => Ok(encode_all_none(SEL_ALL)),
+            Self::Points(ps) => encode_points(ps),
+            Self::Hyperslab { rank, form } => encode_hyperslab(*rank, form),
+        }
+    }
+}
+
+/// Cast a decoded/caller-supplied coordinate down to the 4-byte width
+/// this module's version-1-only [`Selection::encode`] writes.
+fn to_u32(v: u64) -> FormatResult<u32> {
+    u32::try_from(v).map_err(|_| {
+        FormatError::UnsupportedFeature(format!(
+            "value {v} exceeds the 4-byte encoding Selection::encode targets (version 1, \
+             matching libhdf5's default H5F_LIBVER_V18 low format-version bound)"
+        ))
+    })
+}
+
+fn encode_all_none(sel_type: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16);
+    buf.extend_from_slice(&sel_type.to_le_bytes());
+    buf.extend_from_slice(&ALL_NONE_VERSION.to_le_bytes());
+    buf.extend_from_slice(&[0u8; 8]);
+    buf
+}
+
+fn encode_points(ps: &PointSelection) -> FormatResult<Vec<u8>> {
+    if ps.rank == 0 || ps.rank > MAX_RANK {
+        return Err(FormatError::InvalidData(format!(
+            "invalid point selection rank {}",
+            ps.rank
+        )));
+    }
+    for p in &ps.points {
+        if p.len() != ps.rank {
+            return Err(FormatError::InvalidData(format!(
+                "point selection coordinate length {} does not match rank {}",
+                p.len(),
+                ps.rank
+            )));
+        }
+    }
+    let num_points: u32 = ps.points.len().try_into().map_err(|_| {
+        FormatError::UnsupportedFeature(format!(
+            "point selection has {} points, too many for version-1 encode (u32 count)",
+            ps.points.len()
+        ))
+    })?;
+    let rank_u32 = ps.rank as u32;
+    let payload_bytes: u32 = num_points
+        .checked_mul(4)
+        .and_then(|v| v.checked_mul(rank_u32))
+        .ok_or_else(|| {
+            FormatError::UnsupportedFeature(
+                "point selection payload too large for version-1 encode".into(),
+            )
+        })?;
+    let len = 8u32.checked_add(payload_bytes).ok_or_else(|| {
+        FormatError::UnsupportedFeature(
+            "point selection payload too large for version-1 encode".into(),
+        )
+    })?;
+
+    let mut buf = Vec::with_capacity(24 + payload_bytes as usize);
+    buf.extend_from_slice(&SEL_POINTS.to_le_bytes());
+    buf.extend_from_slice(&POINT_VERSION_1.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes()); // padding
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(&rank_u32.to_le_bytes());
+    buf.extend_from_slice(&num_points.to_le_bytes());
+    for p in &ps.points {
+        for &c in p {
+            buf.extend_from_slice(&to_u32(c)?.to_le_bytes());
+        }
+    }
+    Ok(buf)
+}
+
+/// Normalize either wire form of a hyperslab selection into an explicit
+/// block list — the form [`encode_hyperslab`] writes regardless of which
+/// form `form` holds (see [`Selection::encode`]'s doc comment for why).
+fn hyperslab_to_block_list(rank: usize, form: &Hyperslab) -> FormatResult<Vec<HyperslabBlock>> {
+    match form {
+        Hyperslab::Blocks(blocks) => {
+            for b in blocks {
+                if b.start.len() != rank || b.end.len() != rank {
+                    return Err(FormatError::InvalidData(format!(
+                        "hyperslab block coordinate length does not match rank {rank}"
+                    )));
+                }
+            }
+            Ok(blocks.clone())
+        }
+        Hyperslab::Regular(r) => {
+            if r.start.len() != rank
+                || r.stride.len() != rank
+                || r.count.len() != rank
+                || r.block.len() != rank
+            {
+                return Err(FormatError::InvalidData(format!(
+                    "regular hyperslab field length does not match rank {rank}"
+                )));
+            }
+            regular_hyperslab_to_boxes(r)?
+                .into_iter()
+                .map(|(start, count)| {
+                    let end = start
+                        .iter()
+                        .zip(&count)
+                        .map(|(&s, &c)| {
+                            s.checked_add(c - 1).ok_or_else(|| {
+                                FormatError::InvalidData(
+                                    "hyperslab box coordinate overflows".into(),
+                                )
+                            })
+                        })
+                        .collect::<FormatResult<Vec<u64>>>()?;
+                    Ok(HyperslabBlock { start, end })
+                })
+                .collect()
+        }
+    }
+}
+
+fn encode_hyperslab(rank: usize, form: &Hyperslab) -> FormatResult<Vec<u8>> {
+    if rank == 0 || rank > MAX_RANK {
+        return Err(FormatError::InvalidData(format!(
+            "invalid hyperslab selection rank {rank}"
+        )));
+    }
+    let blocks = hyperslab_to_block_list(rank, form)?;
+    let num_blocks: u32 = blocks.len().try_into().map_err(|_| {
+        FormatError::UnsupportedFeature(format!(
+            "hyperslab selection has {} blocks, too many for version-1 encode (u32 count)",
+            blocks.len()
+        ))
+    })?;
+    let rank_u32 = rank as u32;
+
+    let mut coords: Vec<u32> = Vec::with_capacity(blocks.len() * rank * 2);
+    for b in &blocks {
+        for &s in &b.start {
+            coords.push(to_u32(s)?);
+        }
+        for &e in &b.end {
+            coords.push(to_u32(e)?);
+        }
+    }
+
+    let block_payload = 8u32
+        .checked_mul(rank_u32)
+        .and_then(|v| v.checked_mul(num_blocks))
+        .ok_or_else(|| {
+            FormatError::UnsupportedFeature(
+                "hyperslab selection too large for version-1 encode".into(),
+            )
+        })?;
+    let len = 8u32.checked_add(block_payload).ok_or_else(|| {
+        FormatError::UnsupportedFeature("hyperslab selection too large for version-1 encode".into())
+    })?;
+
+    let mut buf = Vec::with_capacity(24 + coords.len() * 4);
+    buf.extend_from_slice(&SEL_HYPERSLABS.to_le_bytes());
+    buf.extend_from_slice(&HYPER_VERSION_1.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes()); // padding
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(&rank_u32.to_le_bytes());
+    buf.extend_from_slice(&num_blocks.to_le_bytes());
+    for v in coords {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    Ok(buf)
 }
 
 /// Cap on the number of boxes [`Selection::to_boxes`] will materialize for
@@ -1206,6 +1403,314 @@ mod tests {
             }),
         };
         let err = sel.to_boxes(&[u64::MAX, u64::MAX]).unwrap_err();
+        assert!(matches!(err, FormatError::UnsupportedFeature(_)));
+    }
+
+    // ------------------------------------------------------------------ encode
+
+    /// Every fixture in `tests/fixtures/gen_selection_images.c`, matched
+    /// byte-for-byte against `Selection::encode()` of the equivalent
+    /// value — not just decode(encode(x)) == x, but the exact bytes
+    /// libhdf5 1.14.6 itself wrote.
+    ///
+    /// A [`Hyperslab::Regular`] case's `decoded` value is its own
+    /// Blocks-normalized equivalent, not the original `Regular` selection:
+    /// regularity does not survive a real version-1 round trip either —
+    /// libhdf5's own decode never reconstructs a REGULAR pattern from a
+    /// block list, since the version-1 wire form has no flags byte to
+    /// carry that information at all.
+    #[test]
+    fn selection_matches_libhdf5_image() {
+        let cases: Vec<(&[u8], Selection, Selection)> = vec![
+            (
+                include_bytes!("../../tests/fixtures/all_v1.bin"),
+                Selection::All,
+                Selection::All,
+            ),
+            (
+                include_bytes!("../../tests/fixtures/none_v1.bin"),
+                Selection::None,
+                Selection::None,
+            ),
+            (
+                include_bytes!("../../tests/fixtures/hyperslab_single_block_v1.bin"),
+                Selection::Hyperslab {
+                    rank: 1,
+                    form: Hyperslab::Blocks(vec![HyperslabBlock {
+                        start: vec![4],
+                        end: vec![11],
+                    }]),
+                },
+                Selection::Hyperslab {
+                    rank: 1,
+                    form: Hyperslab::Blocks(vec![HyperslabBlock {
+                        start: vec![4],
+                        end: vec![11],
+                    }]),
+                },
+            ),
+            (
+                include_bytes!("../../tests/fixtures/hyperslab_regular_3blocks_v1.bin"),
+                // start=0, stride=5, count=3, block=2 — the exact Regular
+                // form the C generator built via H5Sselect_hyperslab; the
+                // captured image is nonetheless the version-1 block list
+                // (see Selection::encode's doc comment), so encoding this
+                // Regular value must reproduce those blocks byte-for-byte.
+                Selection::Hyperslab {
+                    rank: 1,
+                    form: Hyperslab::Regular(RegularHyperslab {
+                        start: vec![0],
+                        stride: vec![5],
+                        count: vec![3],
+                        block: vec![2],
+                    }),
+                },
+                Selection::Hyperslab {
+                    rank: 1,
+                    form: Hyperslab::Blocks(vec![
+                        HyperslabBlock {
+                            start: vec![0],
+                            end: vec![1],
+                        },
+                        HyperslabBlock {
+                            start: vec![5],
+                            end: vec![6],
+                        },
+                        HyperslabBlock {
+                            start: vec![10],
+                            end: vec![11],
+                        },
+                    ]),
+                },
+            ),
+            (
+                include_bytes!("../../tests/fixtures/hyperslab_2d_regular_v1.bin"),
+                Selection::Hyperslab {
+                    rank: 2,
+                    form: Hyperslab::Regular(RegularHyperslab {
+                        start: vec![0, 0],
+                        stride: vec![4, 4],
+                        count: vec![2, 2],
+                        block: vec![2, 2],
+                    }),
+                },
+                Selection::Hyperslab {
+                    rank: 2,
+                    form: Hyperslab::Blocks(vec![
+                        HyperslabBlock {
+                            start: vec![0, 0],
+                            end: vec![1, 1],
+                        },
+                        HyperslabBlock {
+                            start: vec![0, 4],
+                            end: vec![1, 5],
+                        },
+                        HyperslabBlock {
+                            start: vec![4, 0],
+                            end: vec![5, 1],
+                        },
+                        HyperslabBlock {
+                            start: vec![4, 4],
+                            end: vec![5, 5],
+                        },
+                    ]),
+                },
+            ),
+            (
+                include_bytes!("../../tests/fixtures/points4_v1.bin"),
+                Selection::Points(PointSelection {
+                    rank: 1,
+                    points: vec![vec![1], vec![3], vec![7], vec![15]],
+                }),
+                Selection::Points(PointSelection {
+                    rank: 1,
+                    points: vec![vec![1], vec![3], vec![7], vec![15]],
+                }),
+            ),
+        ];
+
+        for (blob, sel, want_decoded) in cases {
+            let expected = strip_h5sencode_envelope(blob);
+            let encoded = sel.encode().unwrap();
+            assert_eq!(
+                encoded, expected,
+                "encode() mismatch for {sel:?}: got {encoded:02x?}, want {expected:02x?}"
+            );
+
+            // And the image itself decodes back to the expected value, so
+            // decode/encode agree on both ends of the wire, not just this
+            // module's own encode output.
+            let (decoded, consumed) = Selection::decode(expected).unwrap();
+            assert_eq!(consumed, expected.len());
+            assert_eq!(decoded, want_decoded);
+        }
+    }
+
+    /// decode(encode(x)) == x for [`Selection`] variants whose wire form
+    /// is lossless (everything but [`Hyperslab::Regular`], which the
+    /// version-1 wire form always normalizes into a block list — see
+    /// `selection_matches_libhdf5_image`).
+    #[test]
+    fn encode_decode_round_trips() {
+        let values = vec![
+            Selection::None,
+            Selection::All,
+            Selection::Points(PointSelection {
+                rank: 2,
+                points: vec![vec![0, 0], vec![3, 5], vec![9, 1]],
+            }),
+            Selection::Hyperslab {
+                rank: 2,
+                form: Hyperslab::Blocks(vec![
+                    HyperslabBlock {
+                        start: vec![0, 0],
+                        end: vec![1, 1],
+                    },
+                    HyperslabBlock {
+                        start: vec![4, 4],
+                        end: vec![5, 6],
+                    },
+                ]),
+            },
+        ];
+        for sel in values {
+            let encoded = sel.encode().unwrap();
+            let (decoded, consumed) = Selection::decode(&encoded).unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(decoded, sel);
+        }
+    }
+
+    /// A [`Hyperslab::Regular`] value's round trip lands on its
+    /// Blocks-normalized equivalent, not the original value — this is the
+    /// same lossy-regularity behavior real libhdf5 has under the version-1
+    /// wire form (no flags byte to carry a REGULAR marker at all).
+    #[test]
+    fn encode_decode_round_trips_regular_hyperslab_to_its_block_list() {
+        let sel = Selection::Hyperslab {
+            rank: 2,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: vec![1, 2],
+                stride: vec![3, 3],
+                count: vec![2, 3],
+                block: vec![1, 2],
+            }),
+        };
+        let encoded = sel.encode().unwrap();
+        let (decoded, consumed) = Selection::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        let Selection::Hyperslab {
+            form: Hyperslab::Blocks(blocks),
+            ..
+        } = decoded
+        else {
+            panic!("expected a decoded block list");
+        };
+        // 2 * 3 = 6 blocks, one per (start[d] + idx[d]*stride[d]) grid
+        // point, each block[0]=1 x block[1]=2 wide.
+        assert_eq!(blocks.len(), 6);
+        assert_eq!(blocks[0].start, vec![1, 2]);
+        assert_eq!(blocks[0].end, vec![1, 3]);
+        assert_eq!(blocks[5].start, vec![4, 8]);
+        assert_eq!(blocks[5].end, vec![4, 9]);
+    }
+
+    #[test]
+    fn encode_points_rejects_zero_rank() {
+        let sel = Selection::Points(PointSelection {
+            rank: 0,
+            points: vec![],
+        });
+        let err = sel.encode().unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)));
+    }
+
+    #[test]
+    fn encode_points_rejects_coordinate_length_mismatch() {
+        let sel = Selection::Points(PointSelection {
+            rank: 2,
+            points: vec![vec![1, 2, 3]],
+        });
+        let err = sel.encode().unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)));
+    }
+
+    #[test]
+    fn encode_points_rejects_coordinate_over_u32() {
+        let sel = Selection::Points(PointSelection {
+            rank: 1,
+            points: vec![vec![1u64 << 40]],
+        });
+        let err = sel.encode().unwrap_err();
+        assert!(matches!(err, FormatError::UnsupportedFeature(_)));
+    }
+
+    #[test]
+    fn encode_hyperslab_rejects_zero_rank() {
+        let sel = Selection::Hyperslab {
+            rank: 0,
+            form: Hyperslab::Blocks(vec![]),
+        };
+        let err = sel.encode().unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)));
+    }
+
+    #[test]
+    fn encode_hyperslab_rejects_block_length_mismatch() {
+        let sel = Selection::Hyperslab {
+            rank: 2,
+            form: Hyperslab::Blocks(vec![HyperslabBlock {
+                start: vec![0],
+                end: vec![1],
+            }]),
+        };
+        let err = sel.encode().unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)));
+    }
+
+    #[test]
+    fn encode_hyperslab_rejects_regular_field_length_mismatch() {
+        let sel = Selection::Hyperslab {
+            rank: 2,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: vec![0],
+                stride: vec![1],
+                count: vec![1],
+                block: vec![1],
+            }),
+        };
+        let err = sel.encode().unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)));
+    }
+
+    #[test]
+    fn encode_hyperslab_rejects_block_coordinate_over_u32() {
+        let sel = Selection::Hyperslab {
+            rank: 1,
+            form: Hyperslab::Blocks(vec![HyperslabBlock {
+                start: vec![0],
+                end: vec![1u64 << 40],
+            }]),
+        };
+        let err = sel.encode().unwrap_err();
+        assert!(matches!(err, FormatError::UnsupportedFeature(_)));
+    }
+
+    /// A Regular form's UNLIMITED count cannot become a finite block list
+    /// (the same reason [`Selection::to_boxes`] rejects it) — encode must
+    /// surface that as a clean error, not silently drop the dimension.
+    #[test]
+    fn encode_hyperslab_rejects_regular_unlimited_count() {
+        let sel = Selection::Hyperslab {
+            rank: 1,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: vec![0],
+                stride: vec![1],
+                count: vec![UNLIMITED],
+                block: vec![1],
+            }),
+        };
+        let err = sel.encode().unwrap_err();
         assert!(matches!(err, FormatError::UnsupportedFeature(_)));
     }
 }
