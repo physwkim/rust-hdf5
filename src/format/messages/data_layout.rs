@@ -1,7 +1,7 @@
 //! Data layout message (type 0x08) — describes how raw data is stored.
 //!
-//! Binary layout (version 3):
-//!   Byte 0: version = 3
+//! Binary layout (versions 3, 4 and 5):
+//!   Byte 0: version = 3, 4 or 5
 //!   Byte 1: layout class (0=compact, 1=contiguous, 2=chunked)
 //!
 //!   Contiguous (class 1):
@@ -11,6 +11,11 @@
 //!   Compact (class 0):
 //!     compact_size: u16 LE
 //!     data:         compact_size bytes
+//!
+//! The compact and contiguous bodies are identical in all three versions —
+//! `H5O__layout_decode` reads them without consulting the version — so a
+//! contiguous dataset written under `libver` v1.10 bounds (version 4) decodes
+//! exactly like the version-3 one written under the default bounds.
 //!
 //! Binary layout (version 3, chunked):
 //!   Byte 0: version = 3
@@ -34,6 +39,12 @@
 use crate::format::bytes::{read_le_addr as read_addr, read_le_uint as read_size};
 use crate::format::{FormatContext, FormatError, FormatResult, UNDEF_ADDR};
 
+/// Oldest layout message version libhdf5 accepts (`H5O_LAYOUT_VERSION_1`).
+/// Versions 1 and 2 put the dimensionality ahead of the storage class and
+/// omit the contiguous data size, which the dataset code has to derive from
+/// the dataspace; this decoder does not model that shape.
+const VERSION_1: u8 = 1;
+const VERSION_2: u8 = 2;
 const VERSION_3: u8 = 3;
 const VERSION_4: u8 = 4;
 /// Layout message version 5: structurally identical to version 4; it only
@@ -462,8 +473,25 @@ impl DataLayoutMessage {
         let version = buf[0];
         let class = buf[1];
 
-        match (version, class) {
-            (VERSION_3, CLASS_CONTIGUOUS) => {
+        // libhdf5 validates the version once and then reads the body by
+        // storage class (`H5O__layout_decode`); only the chunked body differs
+        // between version 3 and versions 4/5. Enumerating (version, class)
+        // pairs instead made every version this decoder had not been taught
+        // about look like a bad version — which is how a perfectly ordinary
+        // contiguous dataset in a v1.10 file (layout version 4) came back as
+        // `InvalidVersion` and vanished from the catalog.
+        match version {
+            VERSION_1 | VERSION_2 => {
+                return Err(FormatError::UnsupportedFeature(format!(
+                    "data layout message version {version}"
+                )))
+            }
+            VERSION_3 | VERSION_4 | VERSION_5 => {}
+            v => return Err(FormatError::InvalidVersion(v)),
+        }
+
+        match class {
+            CLASS_CONTIGUOUS => {
                 let sa = ctx.sizeof_addr as usize;
                 let ss = ctx.sizeof_size as usize;
                 let mut pos = 2;
@@ -480,7 +508,7 @@ impl DataLayoutMessage {
                 pos += ss;
                 Ok((Self::Contiguous { address, size }, pos))
             }
-            (VERSION_3, CLASS_COMPACT) => {
+            CLASS_COMPACT => {
                 let mut pos = 2;
                 if buf.len() < pos + 2 {
                     return Err(FormatError::BufferTooShort {
@@ -500,7 +528,7 @@ impl DataLayoutMessage {
                 pos += compact_size;
                 Ok((Self::Compact { data }, pos))
             }
-            (VERSION_3, CLASS_CHUNKED) => {
+            CLASS_CHUNKED if version == VERSION_3 => {
                 // version(1) + class(1) + ndims(1) + b_tree_addr(sa)
                 // + ndims * 4-byte dimension sizes.
                 let sa = ctx.sizeof_addr as usize;
@@ -560,7 +588,7 @@ impl DataLayoutMessage {
                     pos,
                 ))
             }
-            (VERSION_4 | VERSION_5, CLASS_CHUNKED) => {
+            CLASS_CHUNKED => {
                 let sa = ctx.sizeof_addr as usize;
                 let mut pos = 2;
 
@@ -760,11 +788,10 @@ impl DataLayoutMessage {
                     pos,
                 ))
             }
-            (VERSION_3, other) => Err(FormatError::UnsupportedFeature(format!(
+            other => Err(FormatError::UnsupportedFeature(format!(
                 "data layout class {}",
                 other
             ))),
-            (v, _) => Err(FormatError::InvalidVersion(v)),
         }
     }
 }
@@ -872,23 +899,82 @@ mod tests {
         assert_eq!(decoded, msg);
     }
 
+    /// Versions 1 and 2 are legal layout versions libhdf5 still reads, so
+    /// they are reported as an unsupported feature (which the catalog surfaces
+    /// by name) rather than as a bad version.
     #[test]
-    fn decode_bad_version() {
-        let buf = [2u8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let err = DataLayoutMessage::decode(&buf, &ctx8()).unwrap_err();
-        match err {
-            FormatError::InvalidVersion(2) => {}
-            other => panic!("unexpected error: {:?}", other),
+    fn decode_legacy_version_is_unsupported_not_invalid() {
+        for version in [1u8, 2] {
+            let mut buf = vec![version, 1];
+            buf.extend_from_slice(&[0u8; 16]);
+            let err = DataLayoutMessage::decode(&buf, &ctx8()).unwrap_err();
+            match err {
+                FormatError::UnsupportedFeature(ref s) => {
+                    assert!(s.contains(&version.to_string()), "{s}")
+                }
+                other => panic!("unexpected error for version {version}: {other:?}"),
+            }
         }
     }
 
     #[test]
-    fn decode_unsupported_class() {
-        let buf = [3u8, 3]; // class 3 = unknown
-        let err = DataLayoutMessage::decode(&buf, &ctx8()).unwrap_err();
-        match err {
-            FormatError::UnsupportedFeature(_) => {}
-            other => panic!("unexpected error: {:?}", other),
+    fn decode_bad_version() {
+        for version in [0u8, 6, 255] {
+            let mut buf = vec![version, 1];
+            buf.extend_from_slice(&[0u8; 16]);
+            let err = DataLayoutMessage::decode(&buf, &ctx8()).unwrap_err();
+            match err {
+                FormatError::InvalidVersion(v) if v == version => {}
+                other => panic!("unexpected error for version {version}: {other:?}"),
+            }
+        }
+    }
+
+    /// The bug this guards: h5py writing under `libver=("v110","v110")` emits
+    /// a *version 4* contiguous layout message whose body is byte-identical to
+    /// the version-3 one. Rejecting it dropped the dataset from the catalog
+    /// entirely, while a chunked dataset in the same file listed fine.
+    #[test]
+    fn decode_contiguous_and_compact_at_every_modern_version() {
+        for version in [3u8, 4, 5] {
+            let mut contig = vec![version, CLASS_CONTIGUOUS];
+            contig.extend_from_slice(&0x800u64.to_le_bytes());
+            contig.extend_from_slice(&64u64.to_le_bytes());
+            let (decoded, consumed) = DataLayoutMessage::decode(&contig, &ctx8()).unwrap();
+            assert_eq!(consumed, contig.len());
+            assert_eq!(
+                decoded,
+                DataLayoutMessage::Contiguous {
+                    address: 0x800,
+                    size: 64
+                }
+            );
+
+            let payload = [1u8, 2, 3, 4];
+            let mut compact = vec![version, CLASS_COMPACT];
+            compact.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+            compact.extend_from_slice(&payload);
+            let (decoded, consumed) = DataLayoutMessage::decode(&compact, &ctx8()).unwrap();
+            assert_eq!(consumed, compact.len());
+            assert_eq!(
+                decoded,
+                DataLayoutMessage::Compact {
+                    data: payload.to_vec()
+                }
+            );
+        }
+    }
+
+    /// The virtual-dataset class is not implemented, but it must report itself
+    /// as an unsupported *class* at every version, not as a bad version.
+    #[test]
+    fn decode_virtual_class_is_unsupported_at_every_modern_version() {
+        for version in [3u8, 4, 5] {
+            let buf = [version, 3];
+            match DataLayoutMessage::decode(&buf, &ctx8()).unwrap_err() {
+                FormatError::UnsupportedFeature(ref s) => assert!(s.contains("class 3"), "{s}"),
+                other => panic!("unexpected error for version {version}: {other:?}"),
+            }
         }
     }
 
