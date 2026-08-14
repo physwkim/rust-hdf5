@@ -498,6 +498,13 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
     d.field(path, "attrorder", || {
         Err("H5Group exposes no attribute creation-order tracking flags".into())
     });
+    d.emit(
+        &format!("{path}#linkstore"),
+        unsupported(
+            "linkstore",
+            "H5Group exposes no compact/dense link storage accessor",
+        ),
+    );
     dump_group_attrs(d, path, group);
 
     if depth >= MAX_DEPTH {

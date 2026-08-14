@@ -1460,6 +1460,80 @@ fn an_oversized_attribute_spills_the_object_to_dense_storage() {
     std::fs::remove_file(&path).ok();
 }
 
+/// More links than `max_compact` (8) moves a group's whole link set out of
+/// the object header and into a fractal heap plus a name index — the
+/// `H5G_obj_insert` phase change. Nine is the first count that converts; the
+/// eighth stays compact, so the sibling group next to it pins the boundary,
+/// and the root group carries the same rule.
+#[test]
+fn past_max_compact_the_link_set_goes_dense() {
+    let Some(py) = python() else { return };
+    let path = tmp("links_dense_count");
+    {
+        let file = H5File::create(&path).unwrap();
+        let many = file.create_group("many").unwrap();
+        for i in 0..12i32 {
+            many.new_dataset::<i32>()
+                .shape([1])
+                .create(&format!("d{i:02}"))
+                .unwrap()
+                .write_raw(&[i])
+                .unwrap();
+        }
+        let few = file.create_group("few").unwrap();
+        for i in 0..8i32 {
+            few.new_dataset::<i32>()
+                .shape([1])
+                .create(&format!("e{i:02}"))
+                .unwrap()
+                .write_raw(&[i])
+                .unwrap();
+        }
+        // The root group holds `many`, `few` and these ten datasets: twelve
+        // links, past the same threshold.
+        for i in 0..10i32 {
+            file.new_dataset::<i32>()
+                .shape([1])
+                .create(&format!("r{i:02}"))
+                .unwrap()
+                .write_raw(&[i])
+                .unwrap();
+        }
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "many, few = f['many'], f['few']\n\
+         assert sorted(many.keys()) == sorted('d%02d' % i for i in range(12))\n\
+         assert all(many['d%02d' % i][0] == i for i in range(12))\n\
+         assert sorted(few.keys()) == sorted('e%02d' % i for i in range(8))\n\
+         assert all(few['e%02d' % i][0] == i for i in range(8))\n\
+         assert all(f['r%02d' % i][0] == i for i in range(10))\n\
+         for g in (many, f['/']):\n\
+         \x20   i = h5py.h5o.get_info(g.id)\n\
+         \x20   assert i.meta_size.obj.index_size > 0, 'expected dense links'\n\
+         \x20   assert i.meta_size.obj.heap_size > 0, i.meta_size.obj.heap_size\n\
+         i = h5py.h5o.get_info(few.id)\n\
+         assert i.meta_size.obj.index_size == 0, 'eight links stay compact'\n",
+    );
+
+    // And this crate reads its own dense link storage back.
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.dataset_names();
+    names.sort();
+    let mut want: Vec<String> = (0..12).map(|i| format!("many/d{i:02}")).collect();
+    want.extend((0..8).map(|i| format!("few/e{i:02}")));
+    want.extend((0..10).map(|i| format!("r{i:02}")));
+    want.sort();
+    assert_eq!(names, want);
+    assert_eq!(
+        file.dataset("many/d07").unwrap().read_raw::<i32>().unwrap(),
+        vec![7]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// More attributes than `max_compact` (8) spills the set the same way, with
 /// no attribute large enough to force it on its own — the count rule of
 /// `H5O__attr_create`. Nine is the first count that converts; the eighth

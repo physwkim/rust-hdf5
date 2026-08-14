@@ -82,6 +82,7 @@ B_TOLERATED_FIELDS = {
     "maxshape",
     "linkorder",
     "attrorder",
+    "linkstore",
 }
 
 # Direction-B metadata deviations that are known, understood and stable: the
@@ -124,6 +125,16 @@ EXPECTED_DEVIATIONS = [
         "ref": "tracked+indexed",
         "rust": "-",
         "why": "the attribute half of creation-order-not-tracked",
+    },
+    {
+        "id": "new-style-groups-always",
+        "field": "linkstore",
+        "ref": "symtab",
+        "rust": "compact",
+        "why": "the writer emits a version-2 object header for every group, so "
+               "links libhdf5 would keep in a symbol table are stored as link "
+               "messages; follows from superblock-always-v3, and the phase "
+               "change past max_compact still moves them to dense storage",
     },
     {
         "id": "filter-flags-zero",
@@ -178,6 +189,7 @@ STRUCTURAL_FIELDS = {
     "fillvalue",
     "nattrs_hdr",
     "attrstore",
+    "linkstore",
     "linkorder",
     "attrorder",
 }

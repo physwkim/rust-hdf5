@@ -19,6 +19,7 @@ use crate::format::chunk_index::fixed_array::{
     FA_CLIENT_FILT_CHUNK,
 };
 use crate::format::dense_attr::build_dense_attributes;
+use crate::format::dense_link::build_dense_links;
 use crate::format::messages::attr_info::AttributeInfoMessage;
 use crate::format::messages::attribute::{AttributeEntry, AttributeMessage};
 use crate::format::messages::data_layout::{DataLayoutMessage, EarrayParams, FixedArrayParams};
@@ -1005,6 +1006,13 @@ pub struct Hdf5Writer {
     /// that allocated would allocate twice and leave the sized-for blocks
     /// stranded.
     dense_attributes: Slot<HashMap<AttrScope, AttributeInfoMessage>>,
+    /// Groups whose links this finalize spilled to dense storage, and the
+    /// `Link Info` message naming what was written for each.
+    ///
+    /// INVARIANT: an entry exists here only after every block of that group's
+    /// heap and name index is on disk, and only
+    /// [`prepare_dense_links`](Self::prepare_dense_links) may add one.
+    dense_links: Slot<HashMap<LinkScope, LinkInfoMessage>>,
 }
 
 /// Which object's attribute list a prepared dense layout belongs to.
@@ -1015,9 +1023,21 @@ pub(crate) enum AttrScope {
     Dataset(usize),
 }
 
+/// Which group's link list a prepared dense layout belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum LinkScope {
+    Root,
+    Group(usize),
+}
+
 /// Attributes an object header keeps before libhdf5 spills the whole set to
 /// dense storage (`H5O_CRT_ATTR_MAX_COMPACT_DEF`).
 const MAX_COMPACT_ATTRS: usize = 8;
+
+/// Links a group header keeps before libhdf5 spills the whole set to dense
+/// storage (`H5G_CRT_GINFO_MAX_COMPACT`). This writer emits no phase-change
+/// values in the Group Info message, so the default is what applies.
+const MAX_COMPACT_LINKS: usize = 8;
 
 impl Hdf5Writer {
     /// Create a new HDF5 file at `path` using the env-var-derived locking
@@ -1073,6 +1093,7 @@ impl Hdf5Writer {
             root_group_encoded_size: 0,
             superseded_root_header: None,
             dense_attributes: Slot::new(HashMap::new()),
+            dense_links: Slot::new(HashMap::new()),
         })
     }
 
@@ -1861,6 +1882,7 @@ impl Hdf5Writer {
             root_group_encoded_size: 0,
             superseded_root_header: Some((root_addr, root_header_size as u64)),
             dense_attributes: Slot::new(HashMap::new()),
+            dense_links: Slot::new(HashMap::new()),
         })
     }
 
@@ -2922,11 +2944,10 @@ impl Hdf5Writer {
             .count() as u32
     }
 
-    /// Append a `MSG_LINK` message for every user-created hard link whose
-    /// parent group is `parent` (`None` == the root group). Called while
-    /// building group object headers, once every object's header address
-    /// has been assigned.
-    fn emit_hard_links(&self, header: &mut ObjectHeader, parent: Option<usize>) {
+    /// Append every user-created hard link whose parent group is `parent`
+    /// (`None` == the root group). Called while collecting a group's links,
+    /// once every object's header address has been assigned.
+    fn push_hard_links(&self, links: &mut Vec<LinkMessage>, parent: Option<usize>) {
         for link in self.hard_links_vec() {
             if link.parent != parent || !self.hard_link_emitted(&link) {
                 continue;
@@ -2935,9 +2956,173 @@ impl Hdf5Writer {
                 HardLinkTarget::Dataset(i) => self.ds(i).lock().obj_header_addr,
                 HardLinkTarget::Group(i) => self.grp(i).lock().obj_header_addr,
             };
-            let msg = LinkMessage::hard(&link.name, addr);
-            header.add_message(MSG_LINK, 0x00, msg.encode(&self.ctx));
+            links.push(LinkMessage::hard(&link.name, addr));
         }
+    }
+
+    /// The single owner of "which links does this group hold": child datasets,
+    /// child groups, then user-created hard links.
+    ///
+    /// Both the compact form (one `MSG_LINK` per link) and the dense form (the
+    /// same messages inside a fractal heap) are built from this one list, so
+    /// the phase-change decision and the storage it selects can never disagree
+    /// about what the group contains.
+    fn group_links(&self, scope: LinkScope) -> Vec<LinkMessage> {
+        let mut links = Vec::new();
+        match scope {
+            LinkScope::Root => {
+                // Datasets that belong to a subgroup are that group's links,
+                // not the root's. Each group slot is locked one at a time.
+                let mut datasets_in_subgroups: std::collections::HashSet<usize> =
+                    std::collections::HashSet::new();
+                for grp in self.group_refs() {
+                    let g = grp.lock();
+                    if g.deleted {
+                        continue;
+                    }
+                    datasets_in_subgroups.extend(g.child_datasets.iter().copied());
+                }
+                // `dataset_refs` preserves registry order, so `enumerate`
+                // yields each dataset's true index.
+                for (i, ds) in self.dataset_refs().into_iter().enumerate() {
+                    let m = ds.lock();
+                    if m.deleted || datasets_in_subgroups.contains(&i) {
+                        continue;
+                    }
+                    links.push(LinkMessage::hard(&m.name, m.obj_header_addr));
+                }
+                for grp in self.group_refs() {
+                    let g = grp.lock();
+                    if g.deleted || g.parent.is_some() {
+                        continue;
+                    }
+                    let leaf_name = g.name.rsplit('/').next().unwrap_or(&g.name);
+                    links.push(LinkMessage::hard(leaf_name, g.obj_header_addr));
+                }
+                self.push_hard_links(&mut links, None);
+            }
+            LinkScope::Group(group_idx) => {
+                // Snapshot the child lists, then drop the slot guard: the
+                // per-child reads below re-lock dataset and group slots
+                // (including this one).
+                let (child_datasets, child_groups) = {
+                    let grp = self.grp(group_idx);
+                    let g = grp.lock();
+                    (g.child_datasets.clone(), g.child_groups.clone())
+                };
+                for ds_idx in child_datasets {
+                    let ds = self.ds(ds_idx);
+                    let m = ds.lock();
+                    if m.deleted {
+                        continue;
+                    }
+                    let leaf_name = m.name.rsplit('/').next().unwrap_or(&m.name);
+                    links.push(LinkMessage::hard(leaf_name, m.obj_header_addr));
+                }
+                for child_idx in child_groups {
+                    let child_grp = self.grp(child_idx);
+                    let g = child_grp.lock();
+                    if g.deleted {
+                        continue;
+                    }
+                    let leaf_name = g.name.rsplit('/').next().unwrap_or(&g.name);
+                    links.push(LinkMessage::hard(leaf_name, g.obj_header_addr));
+                }
+                self.push_hard_links(&mut links, Some(group_idx));
+            }
+        }
+        links
+    }
+
+    /// Whether `links` must live in dense storage rather than in the group's
+    /// object header — the `H5G_obj_insert` phase-change rule, applied to the
+    /// whole set at once because this writer builds each header from scratch
+    /// rather than inserting one link at a time.
+    ///
+    /// libhdf5 converts when the count *reaches* `max_compact` and another
+    /// link arrives, so a set of exactly `max_compact` is still compact; and
+    /// separately when one message would not fit the 16-bit size field an
+    /// object header message has.
+    ///
+    /// The answer depends only on the link names and kinds, never on the
+    /// addresses they point at, which is what lets a group header be sized
+    /// before [`prepare_dense_links`](Self::prepare_dense_links) has run.
+    fn links_need_dense(&self, links: &[LinkMessage]) -> bool {
+        links.len() > MAX_COMPACT_LINKS
+            || links
+                .iter()
+                .any(|l| l.encode(&self.ctx).len() > MAX_MESSAGE_SIZE)
+    }
+
+    /// The single owner of link emission into a group object header: the Link
+    /// Info and Group Info messages, and then either one `MSG_LINK` per link
+    /// or nothing at all when the set has spilled to dense storage.
+    ///
+    /// The two storage forms are exclusive (`H5G_obj_insert` moves the whole
+    /// set at once), and a header carrying both would report every link twice.
+    ///
+    /// A group whose links are dense but not yet laid out gets a compact Link
+    /// Info message here. That is deliberate: the message encodes to the same
+    /// length either way — two addresses, defined or not — so the sizing pass
+    /// that runs before `prepare_dense_links` still reserves the right number
+    /// of bytes, and the write pass that runs after it emits the real heap and
+    /// index addresses. It is the same two-pass rule the child link addresses
+    /// already follow.
+    fn emit_links(&self, header: &mut ObjectHeader, scope: LinkScope, links: &[LinkMessage]) {
+        let dense = self.links_need_dense(links);
+        let link_info = self
+            .dense_links
+            .lock()
+            .get(&scope)
+            .cloned()
+            .unwrap_or_else(LinkInfoMessage::compact);
+        header.add_message(MSG_LINK_INFO, 0x00, link_info.encode(&self.ctx));
+        header.add_message(MSG_GROUP_INFO, 0x00, GroupInfoMessage::default().encode());
+        if dense {
+            return;
+        }
+        for link in links {
+            header.add_message(MSG_LINK, 0x00, link.encode(&self.ctx));
+        }
+    }
+
+    /// Lay out and write dense link storage for every group that needs it,
+    /// recording the resulting `Link Info` message per group.
+    ///
+    /// The sole owner of that transition. It must run after every object
+    /// header address is assigned — the heap holds encoded link messages, and
+    /// those name their targets — and before any group header is written.
+    fn prepare_dense_links(&self) -> IoResult<()> {
+        let mut scopes: Vec<(LinkScope, Vec<LinkMessage>)> = Vec::new();
+        for gi in 0..self.group_count() {
+            if self.grp(gi).lock().deleted {
+                continue;
+            }
+            let links = self.group_links(LinkScope::Group(gi));
+            if self.links_need_dense(&links) {
+                scopes.push((LinkScope::Group(gi), links));
+            }
+        }
+        let root_links = self.group_links(LinkScope::Root);
+        if self.links_need_dense(&root_links) {
+            scopes.push((LinkScope::Root, root_links));
+        }
+
+        for (scope, links) in scopes {
+            // `close` after `start_swmr` finalizes a second time over the same
+            // groups, so rebuilding here would allocate a whole second heap
+            // and strand the one the published headers already name.
+            if self.dense_links.lock().contains_key(&scope) {
+                continue;
+            }
+            let dense =
+                build_dense_links(&links, &self.ctx, &mut |len| self.allocator.allocate(len))?;
+            for block in &dense.blocks {
+                self.handle.write_at(block.addr, &block.image)?;
+            }
+            self.dense_links.lock().insert(scope, dense.linfo);
+        }
+        Ok(())
     }
 
     /// The single owner of attribute emission into an object header: appends
@@ -7403,6 +7588,10 @@ impl Hdf5Writer {
             let size = self.build_group_header(gi).encode()?.len() as u64;
             self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
         }
+        // Every object header now has an address, so a link message names its
+        // real target; and no group header has been written yet, so the Link
+        // Info messages this lays out are the ones that reach the file.
+        self.prepare_dense_links()?;
         for gi in 0..self.group_count() {
             if self.grp(gi).lock().deleted {
                 continue;
@@ -7571,6 +7760,10 @@ impl Hdf5Writer {
             let size = self.build_group_header(gi).encode()?.len() as u64;
             self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
         }
+        // Every object header now has an address, so a link message names its
+        // real target; and no group header has been written yet, so the Link
+        // Info messages this lays out are the ones that reach the file.
+        self.prepare_dense_links()?;
         for gi in 0..self.group_count() {
             if self.grp(gi).lock().deleted {
                 continue;
@@ -7711,57 +7904,18 @@ impl Hdf5Writer {
     fn build_group_header(&self, group_idx: usize) -> ObjectHeader {
         let mut header = ObjectHeader::new();
 
-        // Link Info message (type 0x02) -- compact storage
-        let link_info = LinkInfoMessage::compact();
-        let li_msg = link_info.encode(&self.ctx);
-        header.add_message(MSG_LINK_INFO, 0x00, li_msg);
+        // Link Info (type 0x02) + Group Info (type 0x0A) + the links
+        // themselves, compact or dense.
+        let links = self.group_links(LinkScope::Group(group_idx));
+        self.emit_links(&mut header, LinkScope::Group(group_idx), &links);
 
-        // Group Info message (type 0x0A) -- defaults
-        let group_info = GroupInfoMessage::default();
-        let gi_msg = group_info.encode();
-        header.add_message(MSG_GROUP_INFO, 0x00, gi_msg);
-
-        // Snapshot the group's child lists and attributes, then drop the slot
-        // guard: the per-child reads and emit_hard_links/object_link_count
-        // below re-lock dataset and group slots (including this one).
-        let (child_datasets, child_groups, attributes) = {
+        // Snapshot the attributes, then drop the slot guard: emit_attributes
+        // and object_link_count below re-lock group slots (including this one).
+        let attributes = {
             let grp = self.grp(group_idx);
             let g = grp.lock();
-            (
-                g.child_datasets.clone(),
-                g.child_groups.clone(),
-                g.attributes.clone(),
-            )
+            g.attributes.clone()
         };
-
-        // Link messages for child datasets (skip deleted)
-        for ds_idx in child_datasets {
-            let ds = self.ds(ds_idx);
-            let m = ds.lock();
-            if m.deleted {
-                continue;
-            }
-            let leaf_name = m.name.rsplit('/').next().unwrap_or(&m.name);
-            let link = LinkMessage::hard(leaf_name, m.obj_header_addr);
-            let link_msg = link.encode(&self.ctx);
-            header.add_message(MSG_LINK, 0x00, link_msg);
-        }
-
-        // Link messages for child groups (skip deleted)
-        for child_idx in child_groups {
-            let child_grp = self.grp(child_idx);
-            let g = child_grp.lock();
-            if g.deleted {
-                continue;
-            }
-            let leaf_name = g.name.rsplit('/').next().unwrap_or(&g.name);
-            let link = LinkMessage::hard(leaf_name, g.obj_header_addr);
-            let link_msg = link.encode(&self.ctx);
-            header.add_message(MSG_LINK, 0x00, link_msg);
-        }
-
-        // User-created hard links whose parent is this group.
-        self.emit_hard_links(&mut header, Some(group_idx));
 
         // Attribute Info (type 0x15) + attributes (type 0x0C) -- e.g. NeXus
         // `NX_class`.
@@ -7780,58 +7934,10 @@ impl Hdf5Writer {
     fn build_root_group_header(&self) -> ObjectHeader {
         let mut header = ObjectHeader::new();
 
-        // Link Info message (type 0x02) — compact storage
-        let link_info = LinkInfoMessage::compact();
-        let li_msg = link_info.encode(&self.ctx);
-        header.add_message(MSG_LINK_INFO, 0x00, li_msg);
-
-        // Group Info message (type 0x0A) — defaults
-        let group_info = GroupInfoMessage::default();
-        let gi_msg = group_info.encode();
-        header.add_message(MSG_GROUP_INFO, 0x00, gi_msg);
-
-        // Collect dataset indices that belong to a subgroup (not the root
-        // group). Each group slot is locked one at a time, then released.
-        let mut datasets_in_subgroups: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
-        for grp in self.group_refs() {
-            let g = grp.lock();
-            if g.deleted {
-                continue;
-            }
-            datasets_in_subgroups.extend(g.child_datasets.iter().copied());
-        }
-
-        // Link messages for root-level datasets. `dataset_refs` preserves
-        // registry order, so `enumerate` yields each dataset's true index.
-        for (i, ds) in self.dataset_refs().into_iter().enumerate() {
-            let m = ds.lock();
-            if m.deleted {
-                continue;
-            }
-            if !datasets_in_subgroups.contains(&i) {
-                let link = LinkMessage::hard(&m.name, m.obj_header_addr);
-                let link_msg = link.encode(&self.ctx);
-                header.add_message(MSG_LINK, 0x00, link_msg);
-            }
-        }
-
-        // Link messages for root-level groups (those with no parent)
-        for grp in self.group_refs() {
-            let g = grp.lock();
-            if g.deleted {
-                continue;
-            }
-            if g.parent.is_none() {
-                let leaf_name = g.name.rsplit('/').next().unwrap_or(&g.name);
-                let link = LinkMessage::hard(leaf_name, g.obj_header_addr);
-                let link_msg = link.encode(&self.ctx);
-                header.add_message(MSG_LINK, 0x00, link_msg);
-            }
-        }
-
-        // User-created hard links in the root group.
-        self.emit_hard_links(&mut header, None);
+        // Link Info (type 0x02) + Group Info (type 0x0A) + the links
+        // themselves, compact or dense.
+        let links = self.group_links(LinkScope::Root);
+        self.emit_links(&mut header, LinkScope::Root, &links);
 
         // Root-level attributes
         let root_attributes = self.root_attributes.lock();

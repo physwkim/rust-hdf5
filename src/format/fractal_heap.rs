@@ -491,6 +491,25 @@ impl HeapParams {
             max_man_size: 4 * 1024,
         }
     }
+
+    /// The parameters `H5G__dense_create` uses for a group's links
+    /// (`H5G_FHEAP_*`, `H5Gdense.c`).
+    ///
+    /// A 32-bit heap address space and a 4 KiB `max_man_size` make the heap ID
+    /// 1 + 4 + 2 = 7 bytes, which is what `H5G_DENSE_FHEAP_ID_LEN` asserts and
+    /// what the name index's records carry.
+    pub fn group_links() -> Self {
+        Self {
+            id_len: 7,
+            table_width: 4,
+            start_block_size: 512,
+            max_direct_size: 64 * 1024,
+            max_heap_size_bits: 32,
+            start_root_rows: 1,
+            checksum_dblocks: true,
+            max_man_size: 4 * 1024,
+        }
+    }
 }
 
 /// One managed direct block, kept whole so that a heap offset can be resolved

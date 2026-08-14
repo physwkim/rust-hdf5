@@ -46,6 +46,9 @@ pub const BT2_MERGE_PERCENT: u8 = 40;
 /// Record type: indirectly accessed, unfiltered "huge" fractal heap objects
 /// (`H5B2_FHEAP_HUGE_INDIR_ID`).
 pub const BT2_TYPE_FHEAP_HUGE_INDIR: u8 = 1;
+/// Record type: name index for dense link storage in groups
+/// (`H5B2_GRP_DENSE_NAME_ID`).
+pub const BT2_TYPE_GRP_NAME: u8 = 5;
 /// Record type: name index for dense attribute storage
 /// (`H5B2_ATTR_DENSE_NAME_ID`).
 pub const BT2_TYPE_ATTR_NAME: u8 = 8;

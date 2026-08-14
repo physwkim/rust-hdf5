@@ -495,6 +495,24 @@ def virtual_str(dcpl):
     return "[" + ",".join(parts) + "]"
 
 
+def link_storage_str(gid):
+    """How a group stores its links: `symtab`, `compact` or `dense`.
+
+    libhdf5 exposes `H5G_info_t.storage_type` for exactly this, but h5py has
+    no binding for `H5Gget_info`, so it is reconstructed from what h5py does
+    expose. A version-1 object header is the pre-1.8 group format — a symbol
+    table with its own v1 B-tree and local heap. On a version-2 header the
+    links are messages until `H5G_obj_insert`'s phase change moves the whole
+    set into a fractal heap plus a name index, which is when libhdf5 starts
+    sizing them. The sizes themselves are not observables: a bulk-loaded index
+    and heap are legitimately smaller than ones grown insert by insert.
+    """
+    info = h5py.h5o.get_info(gid)
+    if info.hdr.version < 2:
+        return "symtab"
+    return "dense" if info.meta_size.obj.index_size else "compact"
+
+
 def crt_order_str(flags):
     """Creation-order tracking flags of a group or file creation plist."""
     parts = []
@@ -561,6 +579,7 @@ class Dumper:
                 gid.get_create_plist().get_attr_creation_order()
             )
         )
+        self.field(path, "linkstore", lambda: link_storage_str(gid))
         self.dump_attrs(path, grp)
         if depth >= MAX_DEPTH:
             self.emit("%s#truncated" % path, "depth")

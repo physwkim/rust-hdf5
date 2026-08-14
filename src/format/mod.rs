@@ -9,6 +9,7 @@ pub(crate) mod bytes;
 pub mod checksum;
 pub mod chunk_index;
 pub mod dense_attr;
+pub mod dense_link;
 pub mod fractal_heap;
 pub mod fractal_heap_write;
 pub mod global_heap;
