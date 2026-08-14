@@ -983,13 +983,16 @@ pub fn reverse_scaleoffset(data: &[u8], cd_values: &[u32]) -> FormatResult<Vec<u
     // For integer types, scale_factor < 0 is reset to 0 by the library.
     let int_scalefactor = if scale_factor < 0 { 0 } else { scale_factor };
     if dtype_class == SO_CLS_INTEGER && int_scalefactor as usize == size * 8 {
-        // No processing: payload after the header is the raw data.
-        if data.len() < SO_BUF_OFFSET + size_out {
+        // A user-set minimum-bit count equal to full precision makes the
+        // filter a no-op in both directions (`HGOTO_DONE(nbytes)`, before the
+        // forward/reverse split in `H5Z__filter_scaleoffset`): the chunk is
+        // the raw element buffer, with no parameter header in front of it.
+        if data.len() < size_out {
             return Err(FormatError::InvalidData(
                 "scaleoffset: buffer too short".into(),
             ));
         }
-        return Ok(data[SO_BUF_OFFSET..SO_BUF_OFFSET + size_out].to_vec());
+        return Ok(data[..size_out].to_vec());
     }
 
     // Read minbits + minval from the 21-byte header (always little-endian).

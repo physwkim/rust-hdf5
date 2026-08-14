@@ -159,6 +159,24 @@ fn scaleoffset_integer() {
     assert_eq!(out, expected);
 }
 
+/// A user-set minimum-bit count equal to the datatype's full precision
+/// (h5py's `scaleoffset=32` on an `i4`) makes the filter a no-op:
+/// `H5Z__filter_scaleoffset` returns before the forward/reverse split, so the
+/// stored chunk is the raw element buffer with no parameter header. The
+/// capture is libhdf5 1.14.6's own output for `np.arange(1000, 1008)`.
+#[test]
+fn scaleoffset_integer_full_precision_has_no_header() {
+    let chunk = hex("e8030000e9030000ea030000eb030000ec030000ed030000ee030000ef030000");
+    assert_eq!(chunk.len(), 8 * 4, "no 21-byte header is stored");
+    let cd = vec![
+        2, 32, 8, 0, 4, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1818321779, 1717989221, 7628147, 0,
+    ];
+    let pl = pipeline(FILTER_SCALEOFFSET, cd);
+    let out = reverse_filters(&pl, &chunk).expect("scaleoffset full-precision reverse");
+    let expected: Vec<u8> = (1000..1008i32).flat_map(i32::to_le_bytes).collect();
+    assert_eq!(out, expected);
+}
+
 #[test]
 fn scaleoffset_float64() {
     // float64 D-scale, 3 decimal digits, fill value defined (= 0.0).
