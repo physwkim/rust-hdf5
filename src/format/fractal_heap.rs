@@ -548,15 +548,87 @@ impl ManagedBlock {
     }
 }
 
+/// One walk of a heap's doubling table.
+#[derive(Debug, Default)]
+struct HeapWalk {
+    /// Every managed direct block reached, in walk order.
+    blocks: Vec<ManagedBlock>,
+    /// File extent of every block the walk descended through — indirect and
+    /// direct alike — at the size the doubling table allocated it, which is
+    /// what a caller freeing the heap must return. Taken from the table
+    /// rather than from the bytes read back, so a block that reads short at
+    /// end of file is still freed whole.
+    extents: Vec<(u64, u64)>,
+}
+
 /// Walk a fractal heap and return every managed direct block.
 pub fn collect_managed_blocks<R: BlockReader>(
     header: &FractalHeapHeader,
     ctx: &FormatContext,
     reader: &mut R,
 ) -> FormatResult<Vec<ManagedBlock>> {
-    let mut blocks = Vec::new();
-    if header.table_addr == UNDEF_ADDR || header.man_nobjs == 0 {
-        return Ok(blocks);
+    if header.man_nobjs == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(walk_doubling_table(header, ctx, reader)?.blocks)
+}
+
+/// Every file extent a fractal heap occupies: its header block, the indirect
+/// and direct blocks of its doubling table, each "huge" object, and the v2
+/// B-tree that indexes those.
+///
+/// The single place that knows a heap's on-disk footprint, so that freeing one
+/// enumerates the same blocks its writer allocated rather than re-deriving
+/// them. A heap whose objects this crate can read is one whose extents it can
+/// name; the cases it cannot (a filtered heap, or huge IDs that carry the
+/// address inside the ID so the heap alone cannot list them) are refused here
+/// rather than silently under-reported.
+pub fn collect_heap_extents<R: BlockReader>(
+    heap_addr: u64,
+    ctx: &FormatContext,
+    reader: &mut R,
+) -> FormatResult<Vec<(u64, u64)>> {
+    use crate::format::chunk_index::btree_v2::collect_btree_v2_extents;
+
+    // The header's on-disk size depends only on the address/length widths, so
+    // a generous prefix read covers it. `decode` verifies the checksum over
+    // exactly `encoded_size` bytes, so a header that decodes is one whose
+    // block is that long — a filtered heap's longer header fails there.
+    let buf = reader.read_block(heap_addr, 512)?;
+    let header = FractalHeapHeader::decode(&buf, ctx)?;
+
+    let mut extents = vec![(heap_addr, FractalHeapHeader::encoded_size(ctx) as u64)];
+    extents.extend(walk_doubling_table(&header, ctx, reader)?.extents);
+
+    if header.huge_nobjs > 0 {
+        if header.huge_ids_direct {
+            // The addresses live only inside the heap IDs, which are held by
+            // whichever index references this heap — not by the heap. No
+            // object-header client creates such a heap (their 8-byte IDs are
+            // too narrow), so this is unreachable rather than a gap.
+            return Err(FormatError::UnsupportedFeature(
+                "freeing a fractal heap whose huge-object IDs are direct".into(),
+            ));
+        }
+        for (addr, len, _id) in huge_object_records(&header, ctx, reader)? {
+            extents.push((addr, len));
+        }
+        extents.extend(collect_btree_v2_extents(header.huge_bt2_addr, ctx, reader)?);
+    }
+
+    Ok(extents)
+}
+
+/// Walk the doubling table from its root block, collecting the managed direct
+/// blocks and the file extent of every block visited.
+fn walk_doubling_table<R: BlockReader>(
+    header: &FractalHeapHeader,
+    ctx: &FormatContext,
+    reader: &mut R,
+) -> FormatResult<HeapWalk> {
+    let mut walk = HeapWalk::default();
+    if header.table_addr == UNDEF_ADDR {
+        return Ok(walk);
     }
 
     let mut block_budget = MAX_BLOCKS;
@@ -569,7 +641,7 @@ pub fn collect_managed_blocks<R: BlockReader>(
             reader,
             header.table_addr,
             header.start_block_size as usize,
-            &mut blocks,
+            &mut walk,
             &mut block_budget,
         )?;
     } else {
@@ -579,13 +651,13 @@ pub fn collect_managed_blocks<R: BlockReader>(
             reader,
             header.table_addr,
             header.curr_root_rows as u32,
-            &mut blocks,
+            &mut walk,
             &mut block_budget,
             0,
         )?;
     }
 
-    Ok(blocks)
+    Ok(walk)
 }
 
 /// Walk a fractal heap and return the raw payload bytes of every managed
@@ -761,6 +833,26 @@ fn lookup_huge_object<R: BlockReader>(
     ctx: &FormatContext,
     reader: &mut R,
 ) -> FormatResult<(u64, u64)> {
+    for (addr, len, id) in huge_object_records(header, ctx, reader)? {
+        if id == target_id {
+            return Ok((addr, len));
+        }
+    }
+    Err(FormatError::InvalidData(format!(
+        "huge object ID {target_id} is not in the heap's huge-object B-tree"
+    )))
+}
+
+/// Every "huge" object the heap's huge-object B-tree records, as
+/// `(address, length, id)`.
+///
+/// One decode of that index serves both readers: resolving a single ID to its
+/// object, and listing every object so the heap's file space can be freed.
+fn huge_object_records<R: BlockReader>(
+    header: &FractalHeapHeader,
+    ctx: &FormatContext,
+    reader: &mut R,
+) -> FormatResult<Vec<(u64, u64, u64)>> {
     use crate::format::chunk_index::btree_v2::{collect_btree_v2_records, Bt2Header};
 
     if header.huge_bt2_addr == UNDEF_ADDR {
@@ -788,15 +880,16 @@ fn lookup_huge_object<R: BlockReader>(
             "huge-object B-tree record is too small for address+length+ID".into(),
         ));
     }
-    for rec in records.chunks_exact(rec_size) {
-        let id = read_uint(&rec[sa + ss..], ss);
-        if id == target_id {
-            return Ok((read_uint(rec, sa), read_uint(&rec[sa..], ss)));
-        }
-    }
-    Err(FormatError::InvalidData(format!(
-        "huge object ID {target_id} is not in the heap's huge-object B-tree"
-    )))
+    Ok(records
+        .chunks_exact(rec_size)
+        .map(|rec| {
+            (
+                read_uint(rec, sa),
+                read_uint(&rec[sa..], ss),
+                read_uint(&rec[sa + ss..], ss),
+            )
+        })
+        .collect())
 }
 
 /// Recursively walk an indirect block, descending into child direct and
@@ -808,7 +901,7 @@ fn walk_indirect_block<R: BlockReader>(
     reader: &mut R,
     addr: u64,
     nrows: u32,
-    blocks: &mut Vec<ManagedBlock>,
+    walk: &mut HeapWalk,
     budget: &mut usize,
     depth: usize,
 ) -> FormatResult<()> {
@@ -853,6 +946,7 @@ fn walk_indirect_block<R: BlockReader>(
         + dir_entries * per_dir_entry
         + indir_entries * sa
         + 4;
+    walk.extents.push((addr, block_len as u64));
 
     let buf = reader.read_block(addr, block_len)?;
     need(&buf, 0, block_len)?;
@@ -904,7 +998,7 @@ fn walk_indirect_block<R: BlockReader>(
                 .get(row)
                 .copied()
                 .unwrap_or(header.start_block_size) as usize;
-            read_direct_block(header, ctx, reader, child_addr, size, blocks, budget)?;
+            read_direct_block(header, ctx, reader, child_addr, size, walk, budget)?;
         } else {
             // Indirect-block child. Its row count is derived from the row's
             // block size (see H5HFhdr.c / H5HF__dtable_size_to_rows).
@@ -920,7 +1014,7 @@ fn walk_indirect_block<R: BlockReader>(
                 reader,
                 child_addr,
                 child_nrows,
-                blocks,
+                walk,
                 budget,
                 depth + 1,
             )?;
@@ -946,7 +1040,7 @@ fn read_direct_block<R: BlockReader>(
     reader: &mut R,
     addr: u64,
     size: usize,
-    blocks: &mut Vec<ManagedBlock>,
+    walk: &mut HeapWalk,
     budget: &mut usize,
 ) -> FormatResult<()> {
     if addr == UNDEF_ADDR || size == 0 {
@@ -958,6 +1052,7 @@ fn read_direct_block<R: BlockReader>(
         ));
     }
     *budget -= 1;
+    walk.extents.push((addr, size as u64));
 
     let sa = ctx.sizeof_addr as usize;
     let buf = reader.read_block(addr, size)?;
@@ -1018,7 +1113,7 @@ fn read_direct_block<R: BlockReader>(
     // is what a managed heap ID is relative to.
     let heap_offset = read_uint(&buf[4 + 1 + sa..], header.heap_off_size as usize);
 
-    blocks.push(ManagedBlock {
+    walk.blocks.push(ManagedBlock {
         heap_offset,
         payload_start,
         image: buf,

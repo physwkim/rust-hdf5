@@ -3143,8 +3143,12 @@ impl Hdf5Reader {
 
 /// Adapts a `FileHandle` to the `BlockReader` trait used by the fractal-heap
 /// walker, so heap blocks can be fetched from the open file.
+///
+/// The handle is shared, not exclusive: every read goes through
+/// `FileHandle::read_at_most`, which takes `&self`, so the writer can walk a
+/// structure it is about to free while holding only `&self` itself.
 pub(crate) struct HandleBlockReader<'a> {
-    pub(crate) handle: &'a mut FileHandle,
+    pub(crate) handle: &'a FileHandle,
 }
 
 /// One object's attribute set, or the reason it could not be read whole.

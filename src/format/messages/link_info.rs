@@ -52,6 +52,11 @@ impl LinkInfoMessage {
         }
     }
 
+    /// Whether the group's links live in dense (fractal-heap) storage.
+    pub fn is_dense(&self) -> bool {
+        self.fractal_heap_address != UNDEF_ADDR
+    }
+
     /// The group's link creation-order policy, as this message declares it.
     ///
     /// This message — not the object header's flag bits, which speak only for

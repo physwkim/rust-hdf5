@@ -677,6 +677,35 @@ fn recover_track_order(
     }
 }
 
+/// The dense storage an on-disk object header names: the fractal heap and the
+/// indices its `Attribute Info` and `Link Info` messages point at.
+///
+/// A rewrite of that header lays fresh storage out and stops naming this, so
+/// what this returns is exactly what the rewrite supersedes and must free.
+/// Compact storage names no heap and yields `None` — there is nothing to free
+/// and nothing that could be freed twice.
+fn superseded_dense(
+    header: &crate::format::object_header::ObjectHeader,
+    ctx: &FormatContext,
+) -> (Option<AttributeInfoMessage>, Option<LinkInfoMessage>) {
+    let decode = |msg_type: u8| {
+        header
+            .messages
+            .iter()
+            .find(|m| m.msg_type == msg_type)
+            .map(|m| m.data.as_slice())
+    };
+    let attrs = decode(crate::format::messages::MSG_ATTR_INFO)
+        .and_then(|d| AttributeInfoMessage::decode(d, ctx).ok())
+        .map(|(info, _)| info)
+        .filter(|info| info.is_dense());
+    let links = decode(crate::format::messages::MSG_LINK_INFO)
+        .and_then(|d| LinkInfoMessage::decode(d, ctx).ok())
+        .map(|(info, _)| info)
+        .filter(|info| info.is_dense());
+    (attrs, links)
+}
+
 /// One collection block with free space that a later vlen insert may
 /// fill — an entry in the writer's CWFS list (libhdf5 `f->shared->cwfs`).
 struct CwfsEntry {
@@ -1108,6 +1137,20 @@ pub struct Hdf5Writer {
     /// heap and name index is on disk, and only
     /// [`prepare_dense_links`](Self::prepare_dense_links) may add one.
     dense_links: Slot<HashMap<LinkScope, LinkInfoMessage>>,
+    /// The dense storage the reopened object headers already name — the heaps
+    /// and indices this session's rewrites and deletes supersede.
+    ///
+    /// `None` for a file this session created: every block such a file will
+    /// hold was allocated here, so there is nothing on disk to supersede and
+    /// nothing to allocate for the bookkeeping either.
+    ///
+    /// INVARIANT: every entry is freed exactly once, by
+    /// [`release_superseded_dense_attrs`](Self::release_superseded_dense_attrs)
+    /// or [`release_superseded_dense_links`](Self::release_superseded_dense_links),
+    /// which remove it as they free. Nothing else may remove one: an entry
+    /// that leaves without reaching the allocator is a leaked heap, and one
+    /// that reaches it twice hands the same blocks to two objects.
+    superseded_dense: Slot<Option<Box<SupersededDense>>>,
     /// The creation-order policy in force: whether an object created from
     /// now on records creation order for its links and its attributes. The
     /// h5py `track_order` analogue; see
@@ -1121,6 +1164,19 @@ pub struct Hdf5Writer {
     root_track_order: TrackOrder,
     /// Hands out the creation sequence numbers that order a group's links.
     next_creation_seq: Slot<u64>,
+}
+
+/// What a reopen found already on disk in dense form, by the scope whose
+/// header names it.
+///
+/// Both halves together because they are found together — one walk of the
+/// reopened headers fills both — and released together only in the delete
+/// path; a finalize supersedes attribute storage before it lays object
+/// headers out and link storage after, so each half has its own owner.
+#[derive(Debug, Default)]
+struct SupersededDense {
+    attrs: HashMap<AttrScope, AttributeInfoMessage>,
+    links: HashMap<LinkScope, LinkInfoMessage>,
 }
 
 /// Which object's attribute list a prepared dense layout belongs to.
@@ -1216,6 +1272,7 @@ impl Hdf5Writer {
             superseded_root_header: None,
             dense_attributes: Slot::new(HashMap::new()),
             dense_links: Slot::new(HashMap::new()),
+            superseded_dense: Slot::new(None),
             track_order: TrackOrder::uniform(track_order),
             root_track_order: TrackOrder::uniform(track_order),
             next_creation_seq: Slot::new(0),
@@ -1530,6 +1587,12 @@ impl Hdf5Writer {
         type GroupHeaderInfo = (u64, usize, Vec<AttributeEntry>, TrackOrder);
         let mut group_headers: std::collections::HashMap<String, GroupHeaderInfo> =
             Default::default();
+        // The dense storage each reopened header already names, keyed the only
+        // way it can be here — by dataset index, and by link path for groups,
+        // whose registry indices are not assigned until further down.
+        type DenseStorage = (Option<AttributeInfoMessage>, Option<LinkInfoMessage>);
+        let mut dataset_dense: Vec<(usize, AttributeInfoMessage)> = Vec::new();
+        let mut group_dense: std::collections::HashMap<String, DenseStorage> = Default::default();
         for (name, obj_addr) in &link_entries {
             // Read the dataset's full object header (to EOF — see above).
             let ds_buf =
@@ -1600,6 +1663,7 @@ impl Hdf5Writer {
                             recover_track_order(&ds_header, &ctx),
                         ),
                     );
+                    group_dense.insert(name.clone(), superseded_dense(&ds_header, &ctx));
                     continue;
                 }
             };
@@ -1941,6 +2005,9 @@ impl Hdf5Writer {
                 _ => {}
             }
 
+            if let (Some(ainfo), _) = superseded_dense(&ds_header, &ctx) {
+                dataset_dense.push((existing_datasets.len(), ainfo));
+            }
             existing_datasets.push(info);
         }
 
@@ -2092,6 +2159,38 @@ impl Hdf5Writer {
 
         let allocator = FileAllocator::new(file_size);
 
+        // Now that every object has its registry index, key the dense storage
+        // found on disk by the scope that will supersede it. A group the link
+        // walk saw but never registered is not rewritten either, so leaving it
+        // out is what keeps its storage referenced.
+        let (root_dense_attrs, root_dense_links) = superseded_dense(&root_header, &ctx);
+        let mut superseded = SupersededDense {
+            attrs: dataset_dense
+                .into_iter()
+                .map(|(di, ainfo)| (AttrScope::Dataset(di), ainfo))
+                .collect(),
+            links: HashMap::new(),
+        };
+        superseded
+            .attrs
+            .extend(root_dense_attrs.map(|a| (AttrScope::Root, a)));
+        superseded
+            .links
+            .extend(root_dense_links.map(|l| (LinkScope::Root, l)));
+        for (name, (ainfo, linfo)) in group_dense {
+            let Some(&gidx) = group_index_map.get(&format!("/{name}")) else {
+                continue;
+            };
+            superseded
+                .attrs
+                .extend(ainfo.map(|a| (AttrScope::Group(gidx), a)));
+            superseded
+                .links
+                .extend(linfo.map(|l| (LinkScope::Group(gidx), l)));
+        }
+        let superseded = (!superseded.attrs.is_empty() || !superseded.links.is_empty())
+            .then(|| Box::new(superseded));
+
         // Wrap the reconstructed plain vecs into the per-slot registry. The
         // reconstruction logic above runs single-threaded on local `Vec`s;
         // only the final hand-off needs the `Shared<Slot<_>>` shape.
@@ -2125,6 +2224,7 @@ impl Hdf5Writer {
             root_track_order: recover_track_order(&root_header, &ctx),
             dense_attributes: Slot::new(HashMap::new()),
             dense_links: Slot::new(HashMap::new()),
+            superseded_dense: Slot::new(superseded),
             track_order: recover_track_order(&root_header, &ctx),
             next_creation_seq: Slot::new(creation_seq),
         })
@@ -2691,6 +2791,7 @@ impl Hdf5Writer {
         for attr in &attrs {
             self.release_attr_vlen(attr)?;
         }
+        self.release_superseded_dense_attrs(AttrScope::Dataset(index))?;
         if let Some((addr, size)) = header_block {
             self.allocator.free(addr, size);
         }
@@ -2717,8 +2818,107 @@ impl Hdf5Writer {
         for attr in &attrs {
             self.release_attr_vlen(attr)?;
         }
+        self.release_superseded_dense_attrs(AttrScope::Group(gidx))?;
+        self.release_superseded_dense_links(LinkScope::Group(gidx))?;
         if let Some((addr, size)) = header_block {
             self.allocator.free(addr, size);
+        }
+        Ok(())
+    }
+
+    /// Free the dense attribute storage a reopened header names, once, when
+    /// this session stops naming it — because the header is being rewritten
+    /// around fresh storage, or because the object was deleted.
+    ///
+    /// The single owner of that transition: nothing else removes an attribute
+    /// entry from [`superseded_dense`](Self::superseded_dense), and this
+    /// removes it as it frees, so no heap is freed twice or left half freed.
+    /// An object whose storage was compact, or whose header this session
+    /// keeps, has no entry and nothing happens.
+    ///
+    /// Never under SWMR: a live reader may still be walking the storage the
+    /// published headers name, the same rule the superseded-header and
+    /// relocated-chunk paths follow. The entry stays in place, unfreed.
+    fn release_superseded_dense_attrs(&self, scope: AttrScope) -> IoResult<()> {
+        if self.swmr_active {
+            return Ok(());
+        }
+        let taken = self
+            .superseded_dense
+            .lock()
+            .as_mut()
+            .and_then(|s| s.attrs.remove(&scope));
+        let Some(ainfo) = taken else {
+            return Ok(());
+        };
+        self.release_dense_storage(
+            ainfo.fractal_heap_address,
+            ainfo.name_btree_address,
+            ainfo.creation_order_btree_address,
+        )
+    }
+
+    /// The link counterpart of
+    /// [`release_superseded_dense_attrs`](Self::release_superseded_dense_attrs),
+    /// under the same invariant and the same SWMR rule. Split from it because
+    /// the two are superseded at different points of a finalize: attribute
+    /// storage before the object headers are laid out, link storage after
+    /// every one of them has an address.
+    fn release_superseded_dense_links(&self, scope: LinkScope) -> IoResult<()> {
+        if self.swmr_active {
+            return Ok(());
+        }
+        let taken = self
+            .superseded_dense
+            .lock()
+            .as_mut()
+            .and_then(|s| s.links.remove(&scope));
+        let Some(linfo) = taken else {
+            return Ok(());
+        };
+        self.release_dense_storage(
+            linfo.fractal_heap_address,
+            linfo.name_btree_address,
+            linfo.creation_order_btree_address,
+        )
+    }
+
+    /// Return one dense storage's file space to the allocator: the fractal
+    /// heap in full, its name index, and the creation-order index when the
+    /// object had one.
+    ///
+    /// The extents come from walking the structures themselves rather than
+    /// from re-deriving what a writer would have allocated, so storage
+    /// libhdf5 laid out is freed as accurately as storage this crate wrote.
+    /// Every walk here already ran once this session — the reopen read every
+    /// attribute out of this heap through the same index — so a failure means
+    /// the file changed underneath us, and surfacing it beats freeing a
+    /// partial extent list.
+    fn release_dense_storage(
+        &self,
+        heap_addr: u64,
+        name_bt2_addr: u64,
+        corder_bt2_addr: Option<u64>,
+    ) -> IoResult<()> {
+        use crate::format::chunk_index::btree_v2::collect_btree_v2_extents;
+        use crate::format::fractal_heap::collect_heap_extents;
+
+        let mut reader = crate::io::reader::HandleBlockReader {
+            handle: &self.handle,
+        };
+        let mut extents = Vec::new();
+        if heap_addr != UNDEF_ADDR {
+            extents.extend(collect_heap_extents(heap_addr, &self.ctx, &mut reader)?);
+        }
+        for addr in [Some(name_bt2_addr), corder_bt2_addr]
+            .into_iter()
+            .flatten()
+            .filter(|&a| a != UNDEF_ADDR)
+        {
+            extents.extend(collect_btree_v2_extents(addr, &self.ctx, &mut reader)?);
+        }
+        for (addr, len) in extents {
+            self.allocator.free(addr, len);
         }
         Ok(())
     }
@@ -3377,6 +3577,11 @@ impl Hdf5Writer {
     /// The sole owner of that transition. It must run after every object
     /// header address is assigned — the heap holds encoded link messages, and
     /// those name their targets — and before any group header is written.
+    ///
+    /// Every group whose header this finalize rewrites passes through here,
+    /// dense or not: the storage a reopened header named is superseded by the
+    /// rewrite whichever form the new link set takes, and freeing it first is
+    /// what lets the replacement reuse those blocks.
     fn prepare_dense_links(&self) -> IoResult<()> {
         let mut scopes: Vec<(LinkScope, Vec<LinkMessage>, CreationOrder)> = Vec::new();
         for gi in 0..self.group_count() {
@@ -3388,12 +3593,14 @@ impl Hdf5Writer {
             if deleted {
                 continue;
             }
+            self.release_superseded_dense_links(LinkScope::Group(gi))?;
             let links = self.group_links(LinkScope::Group(gi), order);
             if self.links_need_dense(&links) {
                 scopes.push((LinkScope::Group(gi), links, order));
             }
         }
         let root_order = self.root_track_order.links;
+        self.release_superseded_dense_links(LinkScope::Root)?;
         let root_links = self.group_links(LinkScope::Root, root_order);
         if self.links_need_dense(&root_links) {
             scopes.push((LinkScope::Root, root_links, root_order));
@@ -3502,18 +3709,29 @@ impl Hdf5Writer {
     /// actually write. A reopened dataset that took no writes keeps its
     /// original header — and with it whatever storage that header already
     /// names — so building a heap for it would strand every block of it.
+    ///
+    /// That list is also what makes freeing safe: every object named here has
+    /// its header rewritten, so the dense storage a reopen found on it is
+    /// superseded whether or not the new attribute set is dense again, and
+    /// freeing it before the replacement is laid out is what lets the
+    /// replacement reuse the same blocks.
     fn prepare_dense_attributes(&self, datasets: &[usize]) -> IoResult<()> {
         let mut scopes: Vec<(AttrScope, Vec<AttributeEntry>, CreationOrder)> = Vec::new();
         {
+            self.release_superseded_dense_attrs(AttrScope::Root)?;
             let root = self.root_attributes.lock();
             if self.attributes_need_dense(&root) {
                 scopes.push((AttrScope::Root, root.clone(), self.root_track_order.attrs));
             }
         }
         for gi in 0..self.group_count() {
+            if self.grp(gi).lock().deleted {
+                continue;
+            }
+            self.release_superseded_dense_attrs(AttrScope::Group(gi))?;
             let grp = self.grp(gi);
             let g = grp.lock();
-            if !g.deleted && self.attributes_need_dense(&g.attributes) {
+            if self.attributes_need_dense(&g.attributes) {
                 scopes.push((
                     AttrScope::Group(gi),
                     g.attributes.clone(),
@@ -3522,6 +3740,7 @@ impl Hdf5Writer {
             }
         }
         for &i in datasets {
+            self.release_superseded_dense_attrs(AttrScope::Dataset(i))?;
             let ds = self.ds(i);
             let m = ds.lock();
             if self.attributes_need_dense(&m.attributes) {
@@ -8345,6 +8564,180 @@ mod tests {
             tag,
             n
         ))
+    }
+
+    /// A group past the link phase change keeps its links in a fractal heap
+    /// with a v2 B-tree name index. The reopen that rewrites that group's
+    /// header lays a fresh pair out, so both blocks the old header named must
+    /// come back to the allocator — every block of the heap, and the index
+    /// header with its nodes.
+    ///
+    /// Asserted on the free list rather than on the file size: a reopen does
+    /// not yet carry dense links forward, so the rewritten group's links (and
+    /// the datasets they name) are dropped, and the file size that follows
+    /// says more about that than about this.
+    #[test]
+    fn a_reopen_frees_the_dense_link_storage_its_rewrite_supersedes() {
+        let path = temp_path("dense_link_reclaim");
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        writer.create_group("/", "run").unwrap();
+        for i in 0..12 {
+            writer
+                .create_dataset(&format!("run/d{i:02}"), DatatypeMessage::i32_type(), &[2])
+                .unwrap();
+        }
+        writer.close().unwrap();
+
+        let writer = Hdf5Writer::open_append(&path).unwrap();
+        let gidx = (0..writer.group_count())
+            .find(|&g| writer.grp(g).lock().name == "/run")
+            .expect("the reopen registered the group");
+        let linfo = writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .and_then(|s| s.links.get(&LinkScope::Group(gidx)).cloned())
+            .expect("the reopen recorded the group's dense link storage");
+        assert_ne!(linfo.fractal_heap_address, UNDEF_ADDR);
+        assert_ne!(linfo.name_btree_address, UNDEF_ADDR);
+
+        writer
+            .release_superseded_dense_links(LinkScope::Group(gidx))
+            .unwrap();
+        let freed = writer.allocator.free_blocks();
+        let covers = |addr: u64| {
+            freed
+                .iter()
+                .any(|&(a, len)| addr >= a && addr < a.saturating_add(len))
+        };
+        assert!(covers(linfo.fractal_heap_address), "heap header: {freed:?}");
+        assert!(covers(linfo.name_btree_address), "name index: {freed:?}");
+
+        // And exactly once: the entry is gone, so the finalize that follows
+        // cannot hand the same blocks back a second time.
+        assert!(writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .is_none_or(|s| s.links.is_empty()));
+        writer
+            .release_superseded_dense_links(LinkScope::Group(gidx))
+            .unwrap();
+        assert_eq!(writer.allocator.free_blocks(), freed);
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The rewrite frees what it supersedes even when the replacement is not
+    /// dense at all. An attribute set that drops back under `max_compact`
+    /// goes into the object header, so nothing names the old heap any more —
+    /// and a free driven by "the new set needs dense storage" would never
+    /// reach this one.
+    #[test]
+    fn a_rewrite_that_drops_out_of_dense_storage_still_frees_it() {
+        let path = temp_path("dense_attr_to_compact");
+        let numeric = |name: &str| {
+            AttributeMessage::scalar_numeric(
+                name,
+                DatatypeMessage::i32_type(),
+                7i32.to_le_bytes().to_vec(),
+            )
+        };
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        for i in 0..12 {
+            writer
+                .add_root_attribute(numeric(&format!("a{i:02}")))
+                .unwrap();
+        }
+        writer.close().unwrap();
+
+        let writer = Hdf5Writer::open_append(&path).unwrap();
+        let ainfo = writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .and_then(|s| s.attrs.get(&AttrScope::Root).cloned())
+            .expect("the reopen recorded the root's dense attribute storage");
+        for i in 0..10 {
+            writer
+                .evict_attr(AttrTarget::Root, &format!("a{i:02}"))
+                .unwrap();
+        }
+        assert!(!writer.attributes_need_dense(&writer.root_attributes.lock()));
+
+        writer.prepare_dense_attributes(&[]).unwrap();
+        let freed = writer.allocator.free_blocks();
+        let covers = |addr: u64| {
+            freed
+                .iter()
+                .any(|&(a, len)| addr >= a && addr < a.saturating_add(len))
+        };
+        assert!(covers(ainfo.fractal_heap_address), "heap header: {freed:?}");
+        assert!(covers(ainfo.name_btree_address), "name index: {freed:?}");
+        assert!(writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .is_none_or(|s| s.attrs.is_empty()));
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Deleting a reopened object supersedes its dense storage as surely as
+    /// rewriting one does: nothing in the finalized file names the heap, so
+    /// the delete owner frees it through the same entry.
+    #[test]
+    fn deleting_a_reopened_group_frees_its_dense_attribute_storage() {
+        let path = temp_path("dense_attr_delete");
+        let numeric = |name: &str| {
+            AttributeMessage::scalar_numeric(
+                name,
+                DatatypeMessage::i32_type(),
+                7i32.to_le_bytes().to_vec(),
+            )
+        };
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        writer.create_group("/", "run").unwrap();
+        for i in 0..12 {
+            writer
+                .set_attribute(AttrTarget::Group("/run"), numeric(&format!("a{i:02}")))
+                .unwrap();
+        }
+        writer.close().unwrap();
+
+        let writer = Hdf5Writer::open_append(&path).unwrap();
+        let gidx = (0..writer.group_count())
+            .find(|&g| writer.grp(g).lock().name == "/run")
+            .expect("the reopen registered the group");
+        let ainfo = writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .and_then(|s| s.attrs.get(&AttrScope::Group(gidx)).cloned())
+            .expect("the reopen recorded the group's dense attribute storage");
+
+        writer.delete_group("/run").unwrap();
+        let freed = writer.allocator.free_blocks();
+        let covers = |addr: u64| {
+            freed
+                .iter()
+                .any(|&(a, len)| addr >= a && addr < a.saturating_add(len))
+        };
+        assert!(covers(ainfo.fractal_heap_address), "heap header: {freed:?}");
+        assert!(covers(ainfo.name_btree_address), "name index: {freed:?}");
+        assert!(writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .is_none_or(|s| s.attrs.is_empty()));
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
     }
 
     /// The charset rule is one owner shared by every vlen string writer:

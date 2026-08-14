@@ -1902,6 +1902,55 @@ fn reopen_carries_a_libhdf5_dense_root_attribute_back_out_dense() {
     std::fs::remove_file(&path).ok();
 }
 
+/// The heap and index a reopen supersedes have to be freed at the size
+/// *libhdf5* allocated them, which is not the layout this crate would have
+/// chosen: libhdf5 picks its own starting block size and doubling-table shape,
+/// and puts the 70 KiB attribute in the heap as a "huge" object behind a
+/// second v2 B-tree. Walking the real structure is what makes the extents
+/// right, so the check is a settled file size across reopen cycles with h5py
+/// reading the whole set back after each one.
+#[test]
+fn reopening_libhdf5_dense_attributes_reuses_the_heap_it_replaces() {
+    let Some(py) = python() else { return };
+    let size_after = |sessions: usize| {
+        let path = tmp(&format!("attr_dense_libhdf5_reopen_{sessions}"));
+        write_with_h5py_libver(
+            py,
+            &path,
+            Some("v108"),
+            "g = f.create_group('run')\n\
+             d = f.create_dataset('temp', data=np.arange(8, dtype='<f4'))\n\
+             for i in range(12):\n\
+             \x20   f.attrs['root%02d' % i] = np.int32(i)\n\
+             \x20   g.attrs['grp%02d' % i] = np.int32(i)\n\
+             \x20   d.attrs['ds%02d' % i] = np.int32(i)\n\
+             f.attrs['huge'] = np.arange(17500, dtype='<i4')\n",
+        );
+        for _ in 0..sessions {
+            let file = H5File::options().no_locking().open_rw(&path).unwrap();
+            // Nothing is added: carrying the sets forward is by itself enough
+            // to supersede all three heaps.
+            file.close().unwrap();
+            read_back_with_h5py(
+                py,
+                &path,
+                "assert f.attrs['huge'].shape == (17500,), f.attrs['huge'].shape\n\
+                 assert f.attrs['huge'][17499] == 17499\n\
+                 assert list(f['temp'][...]) == list(range(8)), list(f['temp'][...])\n\
+                 for o, n in ((f['/'], 13), (f['run'], 12), (f['temp'], 12)):\n\
+                 \x20   i = h5py.h5o.get_info(o.id)\n\
+                 \x20   assert i.num_attrs == n, (o.name, i.num_attrs)\n\
+                 \x20   assert i.meta_size.attr.index_size > 0, (o.name, 'expected dense')\n",
+            );
+        }
+        let n = std::fs::metadata(&path).unwrap().len();
+        std::fs::remove_file(&path).ok();
+        n
+    };
+
+    assert_eq!(size_after(10), size_after(2), "10 reopen cycles against 2");
+}
+
 /// Dense storage this crate wrote has to be readable by the crate's own
 /// append path, not just by libhdf5: the reopen reads the set back out of the
 /// heap and name index it wrote, adds to it, and lays a fresh one down.
