@@ -34,8 +34,11 @@ pub const MSG_ATTR_INFO: u8 = 0x15;
 pub const MSG_OBJ_REF_COUNT: u8 = 0x16;
 pub const MSG_FILE_SPACE_INFO: u8 = 0x17;
 
-// Object header message flags
+// Object header message flags (the `flags` byte of the message envelope)
 /// `H5O_MSG_FLAG_SHARED`: the message body is not the message, it is a
 /// pointer to where the body is really stored (SOHM heap or another object
 /// header). Decoding the body literally silently yields nonsense.
 pub const MSG_FLAG_SHARED: u8 = 0x02;
+/// `H5O_MSG_FLAG_DONTSHARE`: the message must never be moved to the shared
+/// message heap.
+pub const MSG_FLAG_DONTSHARE: u8 = 0x04;

@@ -225,7 +225,6 @@ impl<T: H5Type> DatasetBuilder<T> {
         } else {
             name.to_string()
         };
-        let group_path = self.group_path.clone();
         let fill_value = self.fill_value.clone();
 
         let dims_u64: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
@@ -348,11 +347,6 @@ impl<T: H5Type> DatasetBuilder<T> {
                                 &full_name, datatype, &dims_u64, &max_u64, &chunk_u64,
                             )?
                         };
-                        if let Some(ref gp) = group_path {
-                            if gp != "/" {
-                                writer.assign_dataset_to_group(gp, idx)?;
-                            }
-                        }
                         if let Some(ref fv) = fill_value {
                             writer.set_dataset_fill_value(idx, fv.clone())?;
                         }
@@ -387,11 +381,6 @@ impl<T: H5Type> DatasetBuilder<T> {
                 match &*inner {
                     H5FileInner::Writer(writer) => {
                         let idx = writer.create_dataset(&full_name, datatype, &dims_u64)?;
-                        if let Some(ref gp) = group_path {
-                            if gp != "/" {
-                                writer.assign_dataset_to_group(gp, idx)?;
-                            }
-                        }
                         if let Some(ref fv) = fill_value {
                             writer.set_dataset_fill_value(idx, fv.clone())?;
                         }
@@ -726,6 +715,56 @@ impl H5Dataset {
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "attr_names not available in write mode".into(),
+            )),
+        }
+    }
+
+    /// Why the attribute `attr_name` on this dataset cannot be read, or `None`
+    /// when it can be.
+    ///
+    /// An attribute whose message this crate cannot decode is still listed by
+    /// [`attr_names`](Self::attr_names) — the object header carries it — and
+    /// this says what stands in the way. Opening it through
+    /// [`attr`](Self::attr) fails with the same text.
+    pub fn attr_unreadable_reason(&self, attr_name: &str) -> Result<Option<String>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => Ok(reader
+                        .dataset_attr_unreadable_reason(name, attr_name)
+                        .map(str::to_string)),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "attr_unreadable_reason not available in write mode".into(),
+            )),
+        }
+    }
+
+    /// Why this dataset's attribute *set* cannot be listed, or `None` when it
+    /// can be.
+    ///
+    /// The object-scope counterpart of
+    /// [`attr_unreadable_reason`](Self::attr_unreadable_reason). A dense
+    /// attribute set is indexed by name hash, so a heap or index that will not
+    /// read yields no names to hang a per-attribute reason on;
+    /// [`attr_names`](Self::attr_names) then returns the failure rather than a
+    /// short list, and this reports it without an attribute name.
+    pub fn attrs_unreadable_reason(&self) -> Result<Option<String>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => Ok(reader
+                        .dataset_attrs_unreadable_reason(name)
+                        .map(str::to_string)),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "attrs_unreadable_reason not available in write mode".into(),
             )),
         }
     }

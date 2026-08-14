@@ -19,7 +19,9 @@
 //! given a pointer to parse.
 
 use crate::format::bytes::read_le_uint as read_uint;
-use crate::format::fractal_heap::{self, BlockReader, FractalHeapHeader};
+use crate::format::fractal_heap::{
+    collect_managed_blocks, read_heap_object, FractalHeapHeader, HeapId,
+};
 use crate::format::messages::datatype::DatatypeMessage;
 use crate::format::messages::shared::MSG_FLAG_SHARED;
 use crate::format::messages::{
@@ -27,6 +29,7 @@ use crate::format::messages::{
 };
 use crate::format::object_header::{ObjectHeader, ObjectHeaderMessage};
 use crate::format::sohm::{SharedLocation, SharedMessagePointer};
+use crate::format::BlockReader;
 use crate::format::{FormatError, UNDEF_ADDR};
 use crate::io::file_handle::FileHandle;
 use crate::io::{FileMeta, IoResult};
@@ -243,11 +246,13 @@ fn resolve_shared_body(
             let hdr_buf = handle.read_at_most(heap_addr, 512)?;
             let fh_header = FractalHeapHeader::decode(&hdr_buf, &meta.ctx)?;
             let mut br = HandleBlockReader { handle };
-            Ok(fractal_heap::read_managed_object(
-                &fh_header,
-                &meta.ctx,
-                &mut br,
-                &ptr.heap_id,
+            // The same heap-ID reader dense links and dense attributes use: a
+            // shared message can be managed, tiny or huge exactly as any other
+            // heap object can, and the ID says which.
+            let id = HeapId::parse(&ptr.heap_id, &fh_header, &meta.ctx)?;
+            let blocks = collect_managed_blocks(&fh_header, &meta.ctx, &mut br)?;
+            Ok(read_heap_object(
+                &id, &fh_header, &meta.ctx, &blocks, &mut br,
             )?)
         }
         SharedLocation::Committed => {
@@ -414,6 +419,11 @@ fn parse_continuation_block(
             let msg_type = cont_buf[pos];
             let data_size = u16::from_le_bytes([cont_buf[pos + 1], cont_buf[pos + 2]]) as usize;
             let msg_flags = cont_buf[pos + 3];
+            let creation_index = if track_creation_order {
+                u16::from_le_bytes([cont_buf[pos + 4], cont_buf[pos + 5]])
+            } else {
+                0
+            };
             pos += hdr_size;
             if pos + data_size > msgs_end {
                 break;
@@ -422,6 +432,7 @@ fn parse_continuation_block(
                 out.push(ObjectHeaderMessage {
                     msg_type,
                     flags: msg_flags,
+                    creation_index,
                     data: cont_buf[pos..pos + data_size].to_vec(),
                 });
             }
@@ -442,6 +453,8 @@ fn parse_continuation_block(
                 out.push(ObjectHeaderMessage {
                     msg_type: msg_type as u8,
                     flags: msg_flags,
+                    // A version-1 message envelope has no creation index.
+                    creation_index: 0,
                     data: cont_buf[pos..pos + data_size].to_vec(),
                 });
             }

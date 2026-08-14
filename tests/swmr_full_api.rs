@@ -85,7 +85,11 @@ fn metadata_datasets_and_attributes_round_trip() {
         r.group_attr_string("/entry", "NX_class").unwrap(),
         "NXentry"
     );
-    assert!(r.group_attr_names("/entry").iter().any(|n| n == "version"));
+    assert!(r
+        .group_attr_names("/entry")
+        .unwrap()
+        .iter()
+        .any(|n| n == "version"));
     assert_eq!(
         r.group_attr_string("/", "file_name").unwrap(),
         "metadata.h5"

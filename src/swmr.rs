@@ -695,13 +695,13 @@ impl SwmrFileReader {
 
     /// Names of the attributes on a group, or on the root group when
     /// `group_path` is `"/"`. A leading `/` is tolerated.
-    pub fn group_attr_names(&mut self, group_path: &str) -> Vec<String> {
-        if group_path == "/" {
-            self.reader.root_attr_names()
+    pub fn group_attr_names(&mut self, group_path: &str) -> Result<Vec<String>> {
+        Ok(if group_path == "/" {
+            self.reader.root_attr_names()?
         } else {
             self.reader
-                .group_attr_names(group_path.trim_start_matches('/'))
-        }
+                .group_attr_names(group_path.trim_start_matches('/'))?
+        })
     }
 
     /// Read a group's attribute as a string (the NeXus `NX_class` etc.), or
@@ -712,8 +712,7 @@ impl SwmrFileReader {
         } else {
             self.reader
                 .group_attr(group_path.trim_start_matches('/'), attr)
-        }
-        .ok_or_else(|| crate::error::Hdf5Error::NotFound(attr.to_string()))?
+        }?
         .clone();
         Ok(self.reader.attr_string_value(&a)?)
     }

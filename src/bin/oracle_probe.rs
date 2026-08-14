@@ -27,7 +27,9 @@ use rust_hdf5::format::messages::datatype::{
 };
 use rust_hdf5::format::messages::filter::{Filter, FilterPipeline, FILTER_FLETCHER32};
 use rust_hdf5::types::VarLenUnicode;
-use rust_hdf5::{H5Attribute, H5Dataset, H5File, H5Group, H5NamedDatatype, Hdf5Error, LinkClass};
+use rust_hdf5::{
+    H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error, LinkClass,
+};
 
 const CANON_VERSION: &str = "3";
 const RAW_LIMIT: usize = 1024;
@@ -511,6 +513,13 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
     d.field(path, "attrorder", || {
         Err("H5Group exposes no attribute creation-order tracking flags".into())
     });
+    d.emit(
+        &format!("{path}#linkstore"),
+        unsupported(
+            "linkstore",
+            "H5Group exposes no compact/dense link storage accessor",
+        ),
+    );
     dump_group_attrs(d, path, group);
 
     if depth >= MAX_DEPTH {
@@ -899,6 +908,13 @@ fn dump_object_attrs<T: AttrSource>(d: &mut Dump, path: &str, ds: &T) {
         &format!("{path}#nattrs_hdr"),
         unsupported("nattrs_hdr", T::nattrs_hdr_gap()),
     );
+    d.emit(
+        &format!("{path}#attrstore"),
+        unsupported(
+            "attrstore",
+            "H5Dataset exposes no compact/dense attribute storage accessor",
+        ),
+    );
 
     for name in names {
         let key = format!("{path}@{name}");
@@ -979,6 +995,13 @@ fn dump_group_attrs(d: &mut Dump, path: &str, group: &H5Group) {
         unsupported(
             "nattrs_hdr",
             "H5Group exposes no object-header attribute count",
+        ),
+    );
+    d.emit(
+        &format!("{path}#attrstore"),
+        unsupported(
+            "attrstore",
+            "H5Group exposes no compact/dense attribute storage accessor",
         ),
     );
 
@@ -1542,7 +1565,11 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "links_dense" => {
+            // The reference makes `g` with `track_order=True`, so the dense
+            // storage it spills into carries a creation-order index beside
+            // the name index.
             let file = H5File::create(path)?;
+            file.set_track_order(true)?;
             let g = file.root_group().create_group("g")?;
             for i in 0..12i32 {
                 g.new_dataset::<i32>()
@@ -1550,6 +1577,31 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                     .create(&format!("d{i:02}"))?
                     .write_raw(&[i])?;
             }
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "track_order" => {
+            // h5py's `File(track_order=True)` is a file-creation property, so
+            // it reaches the root group only; the three plain `create_group`
+            // calls take h5py's default policy, and `g` turns it back on for
+            // itself.
+            let file = H5FileOptions::new().track_order(true).create(path)?;
+            file.set_track_order(false)?;
+            let root = file.root_group();
+            for name in ["zebra", "apple", "mango"] {
+                root.create_group(name)?;
+            }
+            for (i, key) in ["zeta", "alpha", "mu"].iter().enumerate() {
+                file.set_attr_numeric(key, &(i as i32))?;
+            }
+            file.set_track_order(true)?;
+            let g = root.create_group("g")?;
+            g.new_dataset::<i32>()
+                .shape([8usize])
+                .create("data")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            g.set_attr_numeric("second", &2i32)?;
+            g.set_attr_numeric("first", &1i32)?;
             file.close()?;
             Ok(Ok(()))
         }
@@ -1591,6 +1643,10 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             let ds = file.new_dataset::<i32>().shape([8usize]).create("data")?;
             ds.write_raw(&ramp_n::<i32>(8))?;
             let big: Vec<i32> = (0..25600i32).collect();
+            // An attribute this large has no compact form: the object header
+            // message size field is a u16. The writer answers the way
+            // `H5O__attr_create` does and spills the object's whole attribute
+            // set to dense storage.
             ds.new_attr::<i32>()
                 .shape([25600usize])
                 .create("big")?
@@ -1622,6 +1678,22 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                     .create(&format!("a{i:02}"))?
                     .write_numeric(&i)?;
             }
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "attrs_dense_group" => {
+            let file = H5File::create(path)?;
+            let g = file.root_group().create_group("g")?;
+            for i in 0..12i32 {
+                g.set_attr_numeric(&format!("g{i:02}"), &i)?;
+            }
+            for i in 0..12i32 {
+                file.set_attr_numeric(&format!("r{i:02}"), &i)?;
+            }
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("data")?
+                .write_raw(&ramp_n::<i32>(8))?;
             file.close()?;
             Ok(Ok(()))
         }

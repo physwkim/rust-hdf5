@@ -82,6 +82,7 @@ B_TOLERATED_FIELDS = {
     "maxshape",
     "linkorder",
     "attrorder",
+    "linkstore",
 }
 
 # Direction-B metadata deviations that are known, understood and stable: the
@@ -110,20 +111,14 @@ EXPECTED_DEVIATIONS = [
                "dimension in a v3 file selects the extensible array",
     },
     {
-        "id": "creation-order-not-tracked",
-        "field": "linkorder",
-        "ref": "tracked+indexed",
-        "rust": "-",
-        "why": "the public API has no creation-order option, so the writer "
-               "records name order only; every link and attribute is still "
-               "present and reads back identically",
-    },
-    {
-        "id": "creation-order-not-tracked-attrs",
-        "field": "attrorder",
-        "ref": "tracked+indexed",
-        "rust": "-",
-        "why": "the attribute half of creation-order-not-tracked",
+        "id": "new-style-groups-always",
+        "field": "linkstore",
+        "ref": "symtab",
+        "rust": "compact",
+        "why": "the writer emits a version-2 object header for every group, so "
+               "links libhdf5 would keep in a symbol table are stored as link "
+               "messages; follows from superblock-always-v3, and the phase "
+               "change past max_compact still moves them to dense storage",
     },
     {
         "id": "filter-flags-zero",
@@ -177,6 +172,8 @@ STRUCTURAL_FIELDS = {
     "filters",
     "fillvalue",
     "nattrs_hdr",
+    "attrstore",
+    "linkstore",
     "linkorder",
     "attrorder",
 }

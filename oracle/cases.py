@@ -755,7 +755,7 @@ LINK_CASES = [
          ext_files=("_data.h5",)),
     Case("links_dense", "link", gen_links_dense, "links_dense",
          "12 links in one group — dense link storage (fractal heap + v2 B-tree)"),
-    Case("track_order", "group", gen_track_order, None,
+    Case("track_order", "group", gen_track_order, "track_order",
          "creation-order indices on links and attributes"),
     Case("group_storage_modern_root", "group", gen_group_storage_modern_root, None,
          "symbol-table group with children under a link-message root"),
@@ -802,6 +802,19 @@ def gen_attrs_dense(path):
             ds.attrs.create("a%02d" % i, np.int32(i))
 
 
+def gen_attrs_dense_group(path):
+    # The same phase change on a group and on the root group, where the
+    # attributes share their object header with the link messages rather than
+    # with a dataset's layout.
+    with h5py.File(path, "w", libver=("v108", "v108")) as f:
+        g = f.create_group("g")
+        for i in range(12):
+            g.attrs.create("g%02d" % i, np.int32(i))
+        for i in range(12):
+            f.attrs.create("r%02d" % i, np.int32(i))
+        f.create_dataset("data", data=ramp("<i4"))
+
+
 def gen_attr_on_root(path):
     with h5py.File(path, "w") as f:
         f.attrs.create("title", "root", dtype=h5py.string_dtype("utf-8"))
@@ -826,6 +839,9 @@ ATTR_CASES = [
          "vlen UTF-8 string attributes on a dataset and a group"),
     Case("attrs_dense", "attribute", gen_attrs_dense, "attrs_dense",
          "12 attributes — dense attribute storage"),
+    Case("attrs_dense_group", "attribute", gen_attrs_dense_group,
+         "attrs_dense_group",
+         "12 attributes on a group and on the root — dense storage"),
     Case("attr_on_root", "attribute", gen_attr_on_root, "attr_on_root",
          "attributes on the root group"),
     Case("attr_large", "attribute", gen_attr_large, "attr_large",

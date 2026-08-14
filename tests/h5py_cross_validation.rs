@@ -6,21 +6,32 @@
 //! skip (pass) when neither is present, so CI without h5py is green.
 
 use rust_hdf5::types::VarLenUnicode;
-use rust_hdf5::H5File;
+use rust_hdf5::{H5File, H5FileOptions};
 
-const TEST_PYTHON: &str = "/Users/stevek/mamba/envs/bs2026.1/bin/python";
+/// Interpreters tried in order when `RUST_HDF5_TEST_PYTHON` is unset. The
+/// second is the same environment the parity oracle pins
+/// (`oracle/run.py::DEFAULT_PYTHON`), so a checkout that can run the oracle can
+/// run these cross-checks too.
+const TEST_PYTHONS: [&str; 2] = [
+    "/Users/stevek/mamba/envs/bs2026.1/bin/python",
+    "/home/stevek/micromamba/envs/tomo/bin/python",
+];
 
 fn python() -> Option<&'static str> {
     static PY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     PY.get_or_init(|| {
-        let candidate =
-            std::env::var("RUST_HDF5_TEST_PYTHON").unwrap_or_else(|_| TEST_PYTHON.to_string());
-        if std::path::Path::new(&candidate).exists() {
-            Some(candidate)
-        } else {
-            eprintln!("skipping h5py cross-check: {candidate} not present");
-            None
+        let candidates: Vec<String> = match std::env::var("RUST_HDF5_TEST_PYTHON") {
+            Ok(p) => vec![p],
+            Err(_) => TEST_PYTHONS.iter().map(|p| p.to_string()).collect(),
+        };
+        let found = candidates
+            .iter()
+            .find(|c| std::path::Path::new(c).exists())
+            .cloned();
+        if found.is_none() {
+            eprintln!("skipping h5py cross-check: none of {candidates:?} present");
         }
+        found
     })
     .as_deref()
 }
@@ -62,17 +73,42 @@ fn read_back_with_h5py(py: &str, path: &std::path::Path, body: &str) {
 /// write mode. The body should populate `f` and is followed by `f.close()`. A
 /// non-zero exit fails the test.
 fn write_with_h5py(py: &str, path: &std::path::Path, body: &str) {
+    write_with_h5py_libver(py, path, None, body);
+}
+
+/// `write_with_h5py`, pinning the library version bounds (e.g. `"v108"`).
+///
+/// Needed for anything that depends on a version-2 object header: dense
+/// attribute storage only exists there, and h5py's default lower bound is
+/// `earliest`, which pins the header to version 1.
+fn write_with_h5py_libver(
+    py: &str,
+    path: &std::path::Path,
+    libver: Option<&str>,
+    body: &str,
+) -> String {
+    let libver_arg = match libver {
+        Some(v) => format!(", libver=('{v}', '{v}')"),
+        None => String::new(),
+    };
     let script = format!(
-        "import h5py, numpy as np, sys\nf = h5py.File(r'{}', 'w')\n{}\nf.close()\n",
+        "import h5py, numpy as np, sys\nf = h5py.File(r'{}', 'w'{})\n{}\nf.close()\n",
         path.display(),
+        libver_arg,
         body
     );
-    let status = std::process::Command::new(py)
+    let out = std::process::Command::new(py)
         .arg("-c")
         .arg(&script)
-        .status()
+        .output()
         .expect("failed to spawn python");
-    assert!(status.success(), "h5py write failed for {}", path.display());
+    assert!(
+        out.status.success(),
+        "h5py write failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// F1: a vlen-string dataset created via the group helper returns a handle, so
@@ -1187,4 +1223,1277 @@ fn packed_shared_collection_readable_by_h5py() {
          assert list(f['tags'][...]) == [b'red', b'green']\n",
     );
     std::fs::remove_file(&path).ok();
+}
+
+/// An object with more attributes than the object header's compact threshold
+/// keeps every one of them in a fractal heap named by the `Attribute Info`
+/// message, with nothing left in the header itself. Reading only the header's
+/// attribute messages therefore reports zero attributes, which is what the
+/// dense-storage read path exists to prevent.
+///
+/// h5py's default lower libver bound pins the object header to version 1,
+/// where dense attribute storage does not exist — hence the explicit v108
+/// bounds.
+#[test]
+fn dense_attributes_written_by_h5py_read_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("attrs_dense");
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v108"),
+        "d = f.create_dataset('data', data=np.arange(8, dtype='<i4'))\n\
+         g = f.create_group('grp')\n\
+         for i in range(12):\n\
+         \x20   d.attrs.create('a%02d' % i, np.int32(i))\n\
+         for i in range(12):\n\
+         \x20   g.attrs.create('b%02d' % i, np.int64(100 + i))\n\
+         for i in range(12):\n\
+         \x20   f.attrs.create('r%02d' % i, np.int32(1000 + i))\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+
+    let ds = file.dataset("data").unwrap();
+    let mut names = ds.attr_names().unwrap();
+    names.sort();
+    let expected: Vec<String> = (0..12).map(|i| format!("a{i:02}")).collect();
+    assert_eq!(names, expected, "dense dataset attributes");
+    for i in 0..12i32 {
+        let a = ds.attr(&format!("a{i:02}")).unwrap();
+        assert_eq!(a.read_numeric::<i32>().unwrap(), i);
+    }
+
+    // The same storage on a subgroup and on the root group.
+    let root = file.root_group();
+    let grp = root.group("grp").unwrap();
+    let mut gnames = grp.attr_names().unwrap();
+    gnames.sort();
+    let gexpected: Vec<String> = (0..12).map(|i| format!("b{i:02}")).collect();
+    assert_eq!(gnames, gexpected, "dense group attributes");
+
+    let mut rnames = root.attr_names().unwrap();
+    rnames.sort();
+    let rexpected: Vec<String> = (0..12).map(|i| format!("r{i:02}")).collect();
+    assert_eq!(rnames, rexpected, "dense root-group attributes");
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// An attribute at or above the heap's `max_man_size` (4 KiB) does not fit a
+/// managed block, so libhdf5 stores it as a "huge" object addressed through
+/// the heap's own v2 B-tree. Reading it exercises a different heap-ID branch
+/// than the small dense attributes above.
+#[test]
+fn huge_dense_attribute_written_by_h5py_read_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_huge");
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v108"),
+        "d = f.create_dataset('data', data=np.arange(8, dtype='<i4'))\n\
+         d.attrs.create('big', np.arange(25600, dtype='<i4'))\n\
+         d.attrs.create('small', np.int32(5))\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let mut names = ds.attr_names().unwrap();
+    names.sort();
+    assert_eq!(names, vec!["big".to_string(), "small".to_string()]);
+    let big = ds.attr("big").unwrap().read_numeric_as::<i32>().unwrap();
+    assert_eq!(big.len(), 25600);
+    assert_eq!(big[0], 0);
+    assert_eq!(big[25599], 25599);
+    assert_eq!(ds.attr("small").unwrap().read_numeric::<i32>().unwrap(), 5);
+    std::fs::remove_file(&path).ok();
+}
+
+/// Opening an h5py-written file for append and touching a group rewrites that
+/// group's object header from the attributes the writer collected. Collecting
+/// only the header's attribute messages would rebuild a dense-storage group
+/// without any of its attributes — a silent deletion of data the caller never
+/// asked to change.
+#[test]
+fn rust_append_preserves_h5py_dense_attributes() {
+    let Some(py) = python() else { return };
+    let path = tmp("dense_append");
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v108"),
+        "g = f.create_group('grp')\n\
+         for i in range(12):\n\
+         \x20   g.attrs.create('b%02d' % i, np.int32(i))\n\
+         for i in range(12):\n\
+         \x20   f.attrs.create('r%02d' % i, np.int32(100 + i))\n\
+         f.create_dataset('d', data=np.arange(4, dtype='<i4'))\n",
+    );
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.root_group()
+            .group("grp")
+            .unwrap()
+            .set_attr_string("added", "x")
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "names = sorted(f['grp'].attrs.keys())\n\
+         assert names == ['added'] + ['b%02d' % i for i in range(12)], names\n\
+         for i in range(12):\n\
+         \x20   assert f['grp'].attrs['b%02d' % i] == i\n\
+         rnames = sorted(f.attrs.keys())\n\
+         assert rnames == ['r%02d' % i for i in range(12)], rnames\n\
+         assert list(f['d'][...]) == [0, 1, 2, 3]\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// `H5Oget_info().num_attrs` on a version-2 object header is derived from the
+/// Attribute Info message alone (`H5O__attr_count_real`), so a header that
+/// carries attribute messages without it reports zero attributes to libhdf5
+/// even though `H5Aiterate2` still yields every one. Every object the writer
+/// emits — dataset, subgroup, root group — must agree with its own attribute
+/// list; an object with no attributes must carry no Attribute Info message,
+/// which libhdf5 asserts (`ainfo.nattrs > 0`) whenever the message is present.
+#[test]
+fn object_header_attribute_count_matches_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("nattrs_hdr");
+    {
+        let file = H5File::create(&path).unwrap();
+        file.set_attr_numeric("version", &3i64).unwrap();
+        let grp = file.root_group().create_group("grp").unwrap();
+        grp.set_attr_string("NX_class", "NXentry").unwrap();
+        grp.set_attr_numeric("depth", &2i32).unwrap();
+        let ds = file.new_dataset::<i32>().shape([4]).create("data").unwrap();
+        ds.write_raw(&[1, 2, 3, 4]).unwrap();
+        ds.new_attr::<i32>()
+            .shape(())
+            .create("gain")
+            .unwrap()
+            .write_numeric(&7i32)
+            .unwrap();
+        let bare = file.new_dataset::<i32>().shape([2]).create("bare").unwrap();
+        bare.write_raw(&[5, 6]).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "def n(o):\n\
+         \x20   return h5py.h5o.get_info(o.id).num_attrs\n\
+         assert n(f['/']) == 1, n(f['/'])\n\
+         assert n(f['grp']) == 2, n(f['grp'])\n\
+         assert n(f['data']) == 1, n(f['data'])\n\
+         assert n(f['bare']) == 0, n(f['bare'])\n\
+         assert sorted(f.attrs.keys()) == ['version'], sorted(f.attrs.keys())\n\
+         assert sorted(f['grp'].attrs.keys()) == ['NX_class', 'depth']\n\
+         assert f['data'].attrs['gain'] == 7\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// An attribute past the object header message limit spills the object's
+/// whole attribute set to dense storage, the way `H5O__attr_create` does on
+/// `raw_size >= H5O_MESG_MAX_SIZE`. Writing it as a header message instead
+/// would truncate the length modulo 65536 — the size field is a `u16` — and
+/// every following message would decode from the middle of this one's
+/// payload, under a checksum that still matches.
+///
+/// `meta_size.attr` is libhdf5's own answer to "is this object dense": it
+/// reports the size of the name index and the fractal heap, and is zero for
+/// compact storage.
+#[test]
+fn an_oversized_attribute_spills_the_object_to_dense_storage() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_oversized");
+    let big: Vec<i32> = (0..25600).collect();
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file.new_dataset::<i32>().shape([4]).create("data").unwrap();
+        ds.write_raw(&[1, 2, 3, 4]).unwrap();
+        ds.new_attr::<i32>()
+            .shape(())
+            .create("gain")
+            .unwrap()
+            .write_numeric(&7i32)
+            .unwrap();
+        ds.new_attr::<i32>()
+            .shape([25600])
+            .create("big")
+            .unwrap()
+            .write_array(&big)
+            .unwrap();
+        file.set_attr_array_numeric("rootbig", &big).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "import numpy as np\n\
+         d = f['data']\n\
+         assert list(d[...]) == [1, 2, 3, 4], list(d[...])\n\
+         assert sorted(d.attrs.keys()) == ['big', 'gain'], sorted(d.attrs.keys())\n\
+         assert d.attrs['gain'] == 7\n\
+         assert np.array_equal(d.attrs['big'], np.arange(25600, dtype='<i4'))\n\
+         assert np.array_equal(f.attrs['rootbig'], np.arange(25600, dtype='<i4'))\n\
+         for o in (d, f['/']):\n\
+         \x20   i = h5py.h5o.get_info(o.id)\n\
+         \x20   assert i.meta_size.attr.index_size > 0, i.meta_size.attr.index_size\n\
+         \x20   assert i.meta_size.attr.heap_size > 0, i.meta_size.attr.heap_size\n\
+         assert h5py.h5o.get_info(d.id).num_attrs == 2\n",
+    );
+
+    // And this crate reads its own dense storage back.
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let mut names = ds.attr_names().unwrap();
+    names.sort();
+    assert_eq!(names, vec!["big".to_string(), "gain".to_string()]);
+    let read = ds.attr("big").unwrap().read_numeric_as::<i32>().unwrap();
+    assert_eq!(read, big);
+    std::fs::remove_file(&path).ok();
+}
+
+/// More links than `max_compact` (8) moves a group's whole link set out of
+/// the object header and into a fractal heap plus a name index — the
+/// `H5G_obj_insert` phase change. Nine is the first count that converts; the
+/// eighth stays compact, so the sibling group next to it pins the boundary,
+/// and the root group carries the same rule.
+#[test]
+fn past_max_compact_the_link_set_goes_dense() {
+    let Some(py) = python() else { return };
+    let path = tmp("links_dense_count");
+    {
+        let file = H5File::create(&path).unwrap();
+        let many = file.create_group("many").unwrap();
+        for i in 0..12i32 {
+            many.new_dataset::<i32>()
+                .shape([1])
+                .create(&format!("d{i:02}"))
+                .unwrap()
+                .write_raw(&[i])
+                .unwrap();
+        }
+        let few = file.create_group("few").unwrap();
+        for i in 0..8i32 {
+            few.new_dataset::<i32>()
+                .shape([1])
+                .create(&format!("e{i:02}"))
+                .unwrap()
+                .write_raw(&[i])
+                .unwrap();
+        }
+        // The root group holds `many`, `few` and these ten datasets: twelve
+        // links, past the same threshold.
+        for i in 0..10i32 {
+            file.new_dataset::<i32>()
+                .shape([1])
+                .create(&format!("r{i:02}"))
+                .unwrap()
+                .write_raw(&[i])
+                .unwrap();
+        }
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "many, few = f['many'], f['few']\n\
+         assert sorted(many.keys()) == sorted('d%02d' % i for i in range(12))\n\
+         assert all(many['d%02d' % i][0] == i for i in range(12))\n\
+         assert sorted(few.keys()) == sorted('e%02d' % i for i in range(8))\n\
+         assert all(few['e%02d' % i][0] == i for i in range(8))\n\
+         assert all(f['r%02d' % i][0] == i for i in range(10))\n\
+         for g in (many, f['/']):\n\
+         \x20   i = h5py.h5o.get_info(g.id)\n\
+         \x20   assert i.meta_size.obj.index_size > 0, 'expected dense links'\n\
+         \x20   assert i.meta_size.obj.heap_size > 0, i.meta_size.obj.heap_size\n\
+         i = h5py.h5o.get_info(few.id)\n\
+         assert i.meta_size.obj.index_size == 0, 'eight links stay compact'\n",
+    );
+
+    // And this crate reads its own dense link storage back.
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.dataset_names();
+    names.sort();
+    let mut want: Vec<String> = (0..12).map(|i| format!("many/d{i:02}")).collect();
+    want.extend((0..8).map(|i| format!("few/e{i:02}")));
+    want.extend((0..10).map(|i| format!("r{i:02}")));
+    want.sort();
+    assert_eq!(names, want);
+    assert_eq!(
+        file.dataset("many/d07").unwrap().read_raw::<i32>().unwrap(),
+        vec![7]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A path-like dataset name resolves through real groups instead of becoming
+/// a link whose name contains a `/`. HDF5 link names are single path
+/// components, so libhdf5's own traversal cannot reconstruct such a name:
+/// `h5o.visit` fails outright and `h5dump` errors on the file. A missing
+/// intermediate is refused rather than created, matching the default link
+/// creation property list.
+#[test]
+fn a_path_like_dataset_name_lands_in_the_group_it_names() {
+    let Some(py) = python() else { return };
+    let path = tmp("path_like_names");
+    {
+        let file = H5File::create(&path).unwrap();
+        let outer = file.create_group("outer").unwrap();
+        // A group named by path lands in the group it names, too.
+        outer.create_group("inner").unwrap();
+        file.create_group("outer/inner/nested").unwrap();
+
+        // Created from the file with the whole path in the name...
+        file.new_dataset::<i32>()
+            .shape([3usize])
+            .create("outer/late")
+            .unwrap()
+            .write_raw(&[1, 2, 3])
+            .unwrap();
+        // ...two levels deep...
+        file.new_dataset::<i32>()
+            .shape([3usize])
+            .create("outer/inner/deep")
+            .unwrap()
+            .write_raw(&[4, 5, 6])
+            .unwrap();
+        // ...and from a group handle, with a path in the name again.
+        outer
+            .new_dataset::<i32>()
+            .shape([3usize])
+            .create("inner/relative")
+            .unwrap()
+            .write_raw(&[7, 8, 9])
+            .unwrap();
+        file.write_vlen_strings("outer/notes", &["n0", "n1"])
+            .unwrap();
+
+        // A component that names no group is refused, not invented.
+        let err = match file
+            .new_dataset::<i32>()
+            .shape([1usize])
+            .create("nowhere/x")
+        {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a missing intermediate group must not be invented"),
+        };
+        assert!(err.contains("group '/nowhere' does not exist"), "{err}");
+        let err = match file.create_group("nowhere/y") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a missing intermediate group must not be invented"),
+        };
+        assert!(err.contains("group '/nowhere' does not exist"), "{err}");
+
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "seen = {}\n\
+         f.visititems(lambda n, o: seen.__setitem__(n, type(o).__name__))\n\
+         assert seen == {'outer': 'Group', 'outer/inner': 'Group',\n\
+         \x20   'outer/inner/nested': 'Group',\n\
+         \x20   'outer/late': 'Dataset', 'outer/notes': 'Dataset',\n\
+         \x20   'outer/inner/deep': 'Dataset',\n\
+         \x20   'outer/inner/relative': 'Dataset'}, seen\n\
+         assert list(f.keys()) == ['outer'], list(f.keys())\n\
+         assert sorted(f['outer'].keys()) == ['inner', 'late', 'notes']\n\
+         assert sorted(f['outer/inner'].keys()) == ['deep', 'nested', 'relative']\n\
+         assert (f['outer/late'][...] == [1, 2, 3]).all()\n\
+         assert (f['outer/inner/deep'][...] == [4, 5, 6]).all()\n\
+         assert (f['outer/inner/relative'][...] == [7, 8, 9]).all()\n\
+         assert [s.decode() for s in f['outer/notes'][...]] == ['n0', 'n1']\n",
+    );
+
+    // And this crate reads the same hierarchy back.
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.dataset_names();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "outer/inner/deep",
+            "outer/inner/relative",
+            "outer/late",
+            "outer/notes",
+        ]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A dense attribute set big enough to overrun the fractal heap's direct
+/// rows: past ~504 KiB of managed objects the doubling table's next row holds
+/// child *indirect* blocks, and libhdf5 must find every attribute through
+/// them. 130 attributes of 3800 bytes clear that boundary with each message
+/// still under `max_man_size`, so none of them escapes to huge storage.
+#[test]
+fn a_dense_attribute_set_past_the_direct_rows_is_readable_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("heap_indirect_blocks");
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file.new_dataset::<i32>().shape([4]).create("data").unwrap();
+        ds.write_raw(&[0, 1, 2, 3]).unwrap();
+        for a in 0..130i32 {
+            let values: Vec<i32> = (0..950).map(|i| a * 1000 + i).collect();
+            ds.new_attr::<i32>()
+                .shape([950])
+                .create(&format!("a{a:03}"))
+                .unwrap()
+                .write_array(&values)
+                .unwrap();
+        }
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "ds = f['data']\n\
+         info = h5py.h5o.get_info(ds.id)\n\
+         assert info.meta_size.attr.heap_size > 500 * 1024, info.meta_size.attr.heap_size\n\
+         assert len(ds.attrs) == 130, len(ds.attrs)\n\
+         for a in range(130):\n\
+         \x20   v = ds.attrs['a%03d' % a]\n\
+         \x20   assert v.shape == (950,), v.shape\n\
+         \x20   assert (v == np.arange(950) + a * 1000).all(), a\n",
+    );
+
+    // And this crate reads its own indirect-block heap back.
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let mut names = ds.attr_names().unwrap();
+    names.sort();
+    assert_eq!(
+        names,
+        (0..130).map(|a| format!("a{a:03}")).collect::<Vec<_>>()
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// Creation-order tracking is a property of the object, captured from the
+/// file's policy when it is created: `H5Pget_link_creation_order` and
+/// `H5Pget_attr_creation_order` report TRACKED|INDEXED for the root group and
+/// for a group made while the policy is on, and nothing for one made while it
+/// is off. With it on, libhdf5 iterates links and attributes in the order
+/// this crate created them rather than alphabetically.
+#[test]
+fn creation_order_tracking_is_captured_per_object() {
+    let Some(py) = python() else { return };
+    let path = tmp("track_order_per_object");
+    {
+        let file = H5FileOptions::new()
+            .track_order(true)
+            .create(&path)
+            .unwrap();
+        file.set_track_order(false).unwrap();
+        let plain = file.create_group("plain").unwrap();
+        plain.create_group("beta").unwrap();
+        plain.create_group("alpha").unwrap();
+
+        file.set_track_order(true).unwrap();
+        let tracked = file.create_group("tracked").unwrap();
+        for name in ["zebra", "apple", "mango"] {
+            tracked.create_group(name).unwrap();
+        }
+        for (i, key) in ["zeta", "alpha", "mu"].iter().enumerate() {
+            tracked.set_attr_numeric(key, &(i as i32)).unwrap();
+        }
+        // The root group was created under the file's own policy.
+        file.set_attr_numeric("last", &9i32).unwrap();
+        file.set_attr_numeric("first", &1i32).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "from h5py import h5p\n\
+         TI = h5p.CRT_ORDER_TRACKED | h5p.CRT_ORDER_INDEXED\n\
+         def flags(g):\n\
+         \x20   c = g.id.get_create_plist()\n\
+         \x20   return (c.get_link_creation_order(), c.get_attr_creation_order())\n\
+         assert flags(f['/']) == (TI, TI), flags(f['/'])\n\
+         assert flags(f['tracked']) == (TI, TI), flags(f['tracked'])\n\
+         assert flags(f['plain']) == (0, 0), flags(f['plain'])\n\
+         assert list(f['tracked'].keys()) == ['zebra', 'apple', 'mango']\n\
+         assert list(f['tracked'].attrs) == ['zeta', 'alpha', 'mu']\n\
+         assert list(f.attrs) == ['last', 'first']\n\
+         assert list(f.keys()) == ['plain', 'tracked']\n\
+         assert list(f['plain'].keys()) == ['alpha', 'beta']\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// Tracking survives the phase change: a group past `max_compact` keeps a
+/// creation-order index beside the name index in its dense storage, so
+/// libhdf5 still iterates the twelve links in creation order.
+#[test]
+fn a_tracked_group_keeps_creation_order_through_the_phase_change() {
+    let Some(py) = python() else { return };
+    let path = tmp("track_order_dense");
+    {
+        let file = H5FileOptions::new()
+            .track_order(true)
+            .create(&path)
+            .unwrap();
+        let g = file.create_group("g").unwrap();
+        // Names reverse the creation order, so name order and creation order
+        // cannot be confused for one another.
+        for i in 0..12i32 {
+            g.new_dataset::<i32>()
+                .shape([1])
+                .create(&format!("d{:02}", 11 - i))
+                .unwrap()
+                .write_raw(&[i])
+                .unwrap();
+        }
+        for i in 0..12i32 {
+            g.set_attr_numeric(&format!("a{:02}", 11 - i), &i).unwrap();
+        }
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "from h5py import h5p\n\
+         TI = h5p.CRT_ORDER_TRACKED | h5p.CRT_ORDER_INDEXED\n\
+         g = f['g']\n\
+         c = g.id.get_create_plist()\n\
+         assert (c.get_link_creation_order(), c.get_attr_creation_order()) == (TI, TI)\n\
+         info = h5py.h5o.get_info(g.id)\n\
+         assert info.meta_size.obj.index_size > 0, 'expected dense links'\n\
+         assert info.meta_size.attr.index_size > 0, 'expected dense attributes'\n\
+         want = ['d%02d' % (11 - i) for i in range(12)]\n\
+         assert list(g.keys()) == want, list(g.keys())\n\
+         assert list(g.attrs) == ['a%02d' % (11 - i) for i in range(12)]\n\
+         assert all(g['d%02d' % (11 - i)][0] == i for i in range(12))\n\
+         assert all(g.attrs['a%02d' % (11 - i)] == i for i in range(12))\n",
+    );
+
+    // And this crate reads its own tracked dense storage back.
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.dataset_names();
+    names.sort();
+    let mut want: Vec<String> = (0..12).map(|i| format!("g/d{i:02}")).collect();
+    want.sort();
+    assert_eq!(names, want);
+    let mut attrs = file.root_group().group("g").unwrap().attr_names().unwrap();
+    attrs.sort();
+    assert_eq!(
+        attrs,
+        (0..12).map(|i| format!("a{i:02}")).collect::<Vec<_>>()
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// More attributes than `max_compact` (8) spills the set the same way, with
+/// no attribute large enough to force it on its own — the count rule of
+/// `H5O__attr_create`. Nine is the first count that converts; the eighth
+/// stays compact, so the object next to it pins the boundary.
+#[test]
+fn past_max_compact_the_attribute_set_goes_dense() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_dense_count");
+    {
+        let file = H5File::create(&path).unwrap();
+        let many = file.new_dataset::<i32>().shape([2]).create("many").unwrap();
+        many.write_raw(&[1, 2]).unwrap();
+        for i in 0..12i32 {
+            many.new_attr::<i32>()
+                .shape(())
+                .create(&format!("a{i}"))
+                .unwrap()
+                .write_numeric(&i)
+                .unwrap();
+        }
+        let few = file.new_dataset::<i32>().shape([2]).create("few").unwrap();
+        few.write_raw(&[3, 4]).unwrap();
+        for i in 0..8i32 {
+            few.new_attr::<i32>()
+                .shape(())
+                .create(&format!("b{i}"))
+                .unwrap()
+                .write_numeric(&i)
+                .unwrap();
+        }
+        let grp = file.create_group("grp").unwrap();
+        for i in 0..12i32 {
+            grp.set_attr_numeric(&format!("g{i}"), &i).unwrap();
+        }
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "many, few, grp = f['many'], f['few'], f['grp']\n\
+         assert sorted(many.attrs.keys()) == sorted('a%d' % i for i in range(12))\n\
+         assert all(many.attrs['a%d' % i] == i for i in range(12))\n\
+         assert all(grp.attrs['g%d' % i] == i for i in range(12))\n\
+         for o in (many, grp):\n\
+         \x20   i = h5py.h5o.get_info(o.id)\n\
+         \x20   assert i.num_attrs == 12, i.num_attrs\n\
+         \x20   assert i.meta_size.attr.index_size > 0, 'expected dense storage'\n\
+         i = h5py.h5o.get_info(few.id)\n\
+         assert i.num_attrs == 8, i.num_attrs\n\
+         assert i.meta_size.attr.index_size == 0, 'eight attributes stay compact'\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.dataset("many").unwrap().attr_names().unwrap();
+    names.sort();
+    let mut want: Vec<String> = (0..12).map(|i| format!("a{i}")).collect();
+    want.sort();
+    assert_eq!(names, want);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The append path takes the same attribute in through the other door: it
+/// rebuilds an object header from the attributes read out of it, so an
+/// attribute libhdf5 put in dense storage has to go back out the same way.
+/// The root group's header is rewritten by every finalize, so this is the
+/// reopen that used to be refused outright — nothing else in the session
+/// touches the file, and the whole 100 KiB attribute has to survive it.
+#[test]
+fn reopen_carries_a_libhdf5_dense_root_attribute_back_out_dense() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_oversized_reopen");
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v108"),
+        "f.create_dataset('data', data=np.arange(8, dtype='<i4'))\n\
+         f.attrs.create('big', np.arange(25600, dtype='<i4'))\n\
+         f.attrs['gain'] = np.int32(7)\n",
+    );
+
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.set_attr_numeric("added", &5i32).unwrap();
+        file.close().unwrap();
+    }
+
+    read_back_with_h5py(
+        py,
+        &path,
+        "assert list(f['data'][...]) == list(range(8)), list(f['data'][...])\n\
+         assert f.attrs['big'].shape == (25600,), f.attrs['big'].shape\n\
+         assert f.attrs['big'][25599] == 25599\n\
+         assert f.attrs['gain'] == 7\n\
+         assert f.attrs['added'] == 5\n\
+         i = h5py.h5o.get_info(f['/'].id)\n\
+         assert i.num_attrs == 3, i.num_attrs\n\
+         assert i.meta_size.attr.index_size > 0, 'expected dense storage'\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.attr_names().unwrap();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["added".to_string(), "big".to_string(), "gain".to_string()]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// The heap and index a reopen supersedes have to be freed at the size
+/// *libhdf5* allocated them, which is not the layout this crate would have
+/// chosen: libhdf5 picks its own starting block size and doubling-table shape,
+/// and puts the 70 KiB attribute in the heap as a "huge" object behind a
+/// second v2 B-tree. Walking the real structure is what makes the extents
+/// right, so the check is a settled file size across reopen cycles with h5py
+/// reading the whole set back after each one.
+#[test]
+fn reopening_libhdf5_dense_attributes_reuses_the_heap_it_replaces() {
+    let Some(py) = python() else { return };
+    let size_after = |sessions: usize| {
+        let path = tmp(&format!("attr_dense_libhdf5_reopen_{sessions}"));
+        write_with_h5py_libver(
+            py,
+            &path,
+            Some("v108"),
+            "g = f.create_group('run')\n\
+             d = f.create_dataset('temp', data=np.arange(8, dtype='<f4'))\n\
+             for i in range(12):\n\
+             \x20   f.attrs['root%02d' % i] = np.int32(i)\n\
+             \x20   g.attrs['grp%02d' % i] = np.int32(i)\n\
+             \x20   d.attrs['ds%02d' % i] = np.int32(i)\n\
+             f.attrs['huge'] = np.arange(17500, dtype='<i4')\n",
+        );
+        for _ in 0..sessions {
+            let file = H5File::options().no_locking().open_rw(&path).unwrap();
+            // Nothing is added: carrying the sets forward is by itself enough
+            // to supersede all three heaps.
+            file.close().unwrap();
+            read_back_with_h5py(
+                py,
+                &path,
+                "assert f.attrs['huge'].shape == (17500,), f.attrs['huge'].shape\n\
+                 assert f.attrs['huge'][17499] == 17499\n\
+                 assert list(f['temp'][...]) == list(range(8)), list(f['temp'][...])\n\
+                 for o, n in ((f['/'], 13), (f['run'], 12), (f['temp'], 12)):\n\
+                 \x20   i = h5py.h5o.get_info(o.id)\n\
+                 \x20   assert i.num_attrs == n, (o.name, i.num_attrs)\n\
+                 \x20   assert i.meta_size.attr.index_size > 0, (o.name, 'expected dense')\n",
+            );
+        }
+        let n = std::fs::metadata(&path).unwrap().len();
+        std::fs::remove_file(&path).ok();
+        n
+    };
+
+    assert_eq!(size_after(10), size_after(2), "10 reopen cycles against 2");
+}
+
+/// Dense storage this crate wrote has to be readable by the crate's own
+/// append path, not just by libhdf5: the reopen reads the set back out of the
+/// heap and name index it wrote, adds to it, and lays a fresh one down.
+#[test]
+fn rust_written_dense_attributes_survive_a_rust_reopen() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_dense_rust_reopen");
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file.new_dataset::<i32>().shape([2]).create("data").unwrap();
+        ds.write_raw(&[1, 2]).unwrap();
+        for i in 0..12i32 {
+            ds.new_attr::<i32>()
+                .shape(())
+                .create(&format!("a{i:02}"))
+                .unwrap()
+                .write_numeric(&i)
+                .unwrap();
+        }
+        file.close().unwrap();
+    }
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        let ds = file.dataset_writer("data").unwrap();
+        ds.new_attr::<i32>()
+            .shape(())
+            .create("late")
+            .unwrap()
+            .write_numeric(&99i32)
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "d = f['data']\n\
+         assert all(d.attrs['a%02d' % i] == i for i in range(12))\n\
+         assert d.attrs['late'] == 99, d.attrs['late']\n\
+         i = h5py.h5o.get_info(d.id)\n\
+         assert i.num_attrs == 13, i.num_attrs\n\
+         assert i.meta_size.attr.index_size > 0, 'expected dense storage'\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A reopened *group*'s attributes go back out through a header this writer
+/// rebuilds from scratch on every finalize, so a dense set has to survive a
+/// session that never mentions the group at all.
+#[test]
+fn reopen_carries_a_libhdf5_dense_group_attribute_back_out_dense() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_dense_group_reopen");
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v108"),
+        "g = f.create_group('g')\n\
+         for i in range(12):\n\
+         \x20   g.attrs.create('g%02d' % i, np.int32(i))\n\
+         g.attrs.create('big', np.arange(25600, dtype='<i4'))\n\
+         f.create_dataset('data', data=np.arange(8, dtype='<i4'))\n",
+    );
+
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.set_attr_numeric("touched", &1i32).unwrap();
+        file.close().unwrap();
+    }
+
+    read_back_with_h5py(
+        py,
+        &path,
+        "g = f['g']\n\
+         assert all(g.attrs['g%02d' % i] == i for i in range(12))\n\
+         assert g.attrs['big'].shape == (25600,), g.attrs['big'].shape\n\
+         assert g.attrs['big'][25599] == 25599\n\
+         assert list(f['data'][...]) == list(range(8))\n\
+         i = h5py.h5o.get_info(g.id)\n\
+         assert i.num_attrs == 13, i.num_attrs\n\
+         assert i.meta_size.attr.index_size > 0, 'expected dense storage'\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let names = file.root_group().group("g").unwrap().attr_names().unwrap();
+    assert_eq!(names.len(), 13, "{names:?}");
+    std::fs::remove_file(&path).ok();
+}
+
+/// An attribute set on a *reopened dataset* is a header change the chunk-write
+/// counters cannot see, so finalize used to keep the dataset's original header
+/// and discard the attribute — no error, no trace. Both the replacement of an
+/// existing value and the addition of a new one have to reach the file, and
+/// the spill to dense storage has to fire for the reopened set as well.
+#[test]
+fn attributes_set_on_a_reopened_dataset_reach_the_file() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_reopen_dataset");
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v108"),
+        "d = f.create_dataset('data', data=np.arange(8, dtype='<i4'))\n\
+         d.attrs['gain'] = np.int32(7)\n",
+    );
+
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        let ds = file.dataset_writer("data").unwrap();
+        ds.new_attr::<i32>()
+            .shape(())
+            .create("gain")
+            .unwrap()
+            .write_numeric(&42i32)
+            .unwrap();
+        // Past max_compact, so the reopened set spills to dense storage too.
+        for i in 0..10i32 {
+            ds.new_attr::<i32>()
+                .shape(())
+                .create(&format!("added{i}"))
+                .unwrap()
+                .write_numeric(&i)
+                .unwrap();
+        }
+        file.close().unwrap();
+    }
+
+    read_back_with_h5py(
+        py,
+        &path,
+        "d = f['data']\n\
+         assert list(d[...]) == list(range(8)), list(d[...])\n\
+         assert d.attrs['gain'] == 42, d.attrs['gain']\n\
+         assert all(d.attrs['added%d' % i] == i for i in range(10))\n\
+         i = h5py.h5o.get_info(d.id)\n\
+         assert i.num_attrs == 11, i.num_attrs\n\
+         assert i.meta_size.attr.index_size > 0, 'expected dense storage'\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// An attribute this crate cannot decode must be listed, not dropped.
+///
+/// An object-reference datatype (class 7) is one `DatatypeMessage::decode`
+/// refuses, and the attribute message that carries it was silently discarded:
+/// `attr_names()` then described a file that did not contain the attribute,
+/// and a header rewrite deleted it for real. The name sits ahead of the
+/// datatype in the message, so it is knowable either way — the listing keeps
+/// it, `attr_unreadable_reason` says what stands in the way, and typed access
+/// fails with the same text.
+#[test]
+fn undecodable_attribute_is_listed_with_a_reason() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_undecodable");
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v108"),
+        "d = f.create_dataset('data', data=np.arange(8, dtype='<i4'))\n\
+         g = f.create_group('g')\n\
+         d.attrs['gain'] = np.int32(7)\n\
+         d.attrs.create('ref', d.ref, dtype=h5py.ref_dtype)\n\
+         g.attrs['label'] = 'ok'\n\
+         g.attrs.create('gref', d.ref, dtype=h5py.ref_dtype)\n",
+    );
+    {
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("data").unwrap();
+        let mut names = ds.attr_names().unwrap();
+        names.sort();
+        assert_eq!(names, vec!["gain".to_string(), "ref".to_string()]);
+
+        let why = ds
+            .attr_unreadable_reason("ref")
+            .unwrap()
+            .expect("a reference attribute must report why it cannot be read");
+        assert!(why.contains("datatype class 7"), "{why}");
+        assert_eq!(ds.attr_unreadable_reason("gain").unwrap(), None);
+
+        // Typed access refuses with the same reason, and the readable
+        // attribute beside it is unaffected.
+        let err = ds.attr("ref").err().expect("attr('ref') must fail");
+        assert!(err.to_string().contains("datatype class 7"), "{err}");
+        assert_eq!(ds.attr("gain").unwrap().read_numeric::<i32>().unwrap(), 7);
+
+        let grp = file.root_group().group("g").unwrap();
+        let mut gnames = grp.attr_names().unwrap();
+        gnames.sort();
+        assert_eq!(gnames, vec!["gref".to_string(), "label".to_string()]);
+        assert!(grp
+            .attr_unreadable_reason("gref")
+            .unwrap()
+            .is_some_and(|w| w.contains("datatype class 7")));
+        assert_eq!(grp.attr_unreadable_reason("label").unwrap(), None);
+        assert_eq!(grp.attr_string("label").unwrap(), "ok");
+
+        // An attribute that is genuinely absent stays absent, not unreadable.
+        assert_eq!(ds.attr_unreadable_reason("nope").unwrap(), None);
+        assert!(ds.attr("nope").is_err());
+    }
+
+    // A header rewrite must put back what it could not decode: the writer
+    // re-emits the message bytes verbatim rather than dropping the attribute.
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.root_group()
+            .group("g")
+            .unwrap()
+            .set_attr_string("added", "x")
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "g = f['g']\n\
+         assert sorted(g.attrs.keys()) == ['added', 'gref', 'label'], sorted(g.attrs.keys())\n\
+         assert f[g.attrs['gref']].name == '/data', f[g.attrs['gref']].name\n\
+         assert g.attrs['label'] == 'ok'\n\
+         d = f['data']\n\
+         assert sorted(d.attrs.keys()) == ['gain', 'ref'], sorted(d.attrs.keys())\n\
+         assert f[d.attrs['ref']].name == '/data'\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A dense attribute set that will not read is the object's failure to report.
+///
+/// The name index stores hashes, not names, so a heap or index this crate
+/// cannot walk leaves nothing to list and nothing to hang a per-attribute
+/// reason on. The collector used to swallow that whole and hand back an empty
+/// list: the object then looked like one with no attributes, and the append
+/// path rebuilt its header from that emptiness — deleting on disk the
+/// attributes it had never read. Now the listing carries the failure, and the
+/// reopen keeps the object exactly as it found it.
+#[test]
+fn an_unreadable_dense_attribute_set_is_reported_on_the_object() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_dense_corrupt");
+    // Ten attributes on `g` cross `max_compact` (8), so libhdf5 moves them to
+    // dense storage; the dataset and the root group stay compact.
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v108"),
+        "d = f.create_dataset('data', data=np.arange(4, dtype='<i4'))\n\
+         d.attrs['gain'] = np.int32(7)\n\
+         f.attrs['top'] = 'root'\n\
+         g = f.create_group('g')\n\
+         for i in range(9):\n\
+        \x20    g.attrs['a%02d' % i] = np.int32(i)\n\
+         g.attrs['keep'] = 'yes'\n",
+    );
+
+    // Break the name index the attribute info message points at. The B-tree
+    // header lives outside the object header, so this corrupts the attribute
+    // set without disturbing the header checksum that guards the group's
+    // links — exactly the shape of damage that used to read back as "no
+    // attributes".
+    let mut raw = std::fs::read(&path).unwrap();
+    let hits: Vec<usize> = (0..raw.len() - 4)
+        .filter(|&i| &raw[i..i + 4] == b"BTHD")
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "fixture must hold exactly one v2 B-tree, the attribute name index"
+    );
+    raw[hits[0]..hits[0] + 4].copy_from_slice(b"XXXX");
+    std::fs::write(&path, &raw).unwrap();
+
+    {
+        let file = H5File::open(&path).unwrap();
+        let grp = file.root_group().group("g").unwrap();
+
+        let err = grp
+            .attr_names()
+            .expect_err("an unreadable attribute set must not list as empty")
+            .to_string();
+        assert!(
+            err.contains("attributes of 'g' cannot be read whole"),
+            "{err}"
+        );
+        assert!(err.contains("dense attribute storage"), "{err}");
+
+        let why = grp
+            .attrs_unreadable_reason()
+            .unwrap()
+            .expect("the object must say why its attributes cannot be listed");
+        assert!(why.contains("dense attribute storage"), "{why}");
+
+        // A name lookup cannot answer "absent" out of a set that was never
+        // read whole: `keep` is in there somewhere.
+        let err = grp.attr_string("keep").expect_err("must not be NotFound");
+        assert!(err.to_string().contains("cannot be read whole"), "{err}");
+
+        // Objects whose attributes did read are unaffected.
+        assert_eq!(file.attr_names().unwrap(), vec!["top".to_string()]);
+        assert_eq!(file.attrs_unreadable_reason().unwrap(), None);
+        let ds = file.dataset("data").unwrap();
+        assert_eq!(ds.attr_names().unwrap(), vec!["gain".to_string()]);
+        assert_eq!(ds.attrs_unreadable_reason().unwrap(), None);
+        file.close().unwrap();
+    }
+
+    // The append path rebuilds object headers out of the attributes it read,
+    // so an object whose set it could not read whole is kept exactly as the
+    // file has it: its header is never rewritten, its dense storage never
+    // freed, and every write-side path into it is refused by name. The rest
+    // of the file stays appendable — one damaged object is not a damaged
+    // file.
+    let before = std::fs::read(&path).unwrap();
+    {
+        let file = H5File::open_rw(&path).expect("one unreadable object must not stop the open");
+        let err = match file.new_dataset::<i32>().shape([2usize]).create("g/late") {
+            Ok(_) => panic!("creating inside a preserved object must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("kept exactly as it found it"), "{err}");
+        file.new_dataset::<i32>()
+            .shape([2usize])
+            .create("added")
+            .expect("the rest of the file is still appendable")
+            .write_raw(&[7i32, 8])
+            .expect("write");
+        file.close().unwrap();
+    }
+    let after = std::fs::read(&path).unwrap();
+    assert_eq!(
+        after[..before.len().min(after.len())].len(),
+        before.len(),
+        "the session appends; it must not truncate"
+    );
+
+    // The proof the header was not rebuilt from the emptiness it read: the
+    // object still names the same dense storage, and still reports the same
+    // failure.
+    let file = H5File::open(&path).unwrap();
+    let grp = file.root_group().group("g").unwrap();
+    let why = grp
+        .attrs_unreadable_reason()
+        .unwrap()
+        .expect("the preserved object must still name its unreadable set");
+    assert!(why.contains("dense attribute storage"), "{why}");
+    assert_eq!(
+        file.dataset("added").unwrap().read_raw::<i32>().unwrap(),
+        vec![7, 8]
+    );
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}
+
+/// Run `script` as-is. Needed where the file has to be created through the
+/// low-level property lists, which `h5py.File` cannot express.
+fn run_python(py: &str, script: &str) {
+    let out = std::process::Command::new(py)
+        .arg("-c")
+        .arg(script)
+        .output()
+        .expect("failed to spawn python");
+    assert!(
+        out.status.success(),
+        "python failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The creation-order policy `path`'s group at `group_path` declares on disk,
+/// as `(links, attrs)` — read straight out of the bytes rather than through
+/// any library, so the assertion is on what was written.
+fn on_disk_creation_order(
+    path: &std::path::Path,
+    group_path: &str,
+) -> (
+    rust_hdf5::format::creation_order::CreationOrder,
+    rust_hdf5::format::creation_order::CreationOrder,
+) {
+    use rust_hdf5::format::creation_order::CreationOrder;
+    use rust_hdf5::format::messages::link::{LinkMessage, LinkTarget};
+    use rust_hdf5::format::messages::link_info::LinkInfoMessage;
+    use rust_hdf5::format::messages::{MSG_LINK, MSG_LINK_INFO};
+    use rust_hdf5::format::object_header::ObjectHeader;
+    use rust_hdf5::format::superblock::SuperblockV2V3;
+    use rust_hdf5::format::FormatContext;
+
+    let bytes = std::fs::read(path).unwrap();
+    let sb = SuperblockV2V3::decode(&bytes).unwrap();
+    let ctx = FormatContext {
+        sizeof_addr: sb.sizeof_offsets,
+        sizeof_size: sb.sizeof_lengths,
+    };
+    let mut addr = sb.root_group_object_header_address;
+    let mut header = ObjectHeader::decode(&bytes[addr as usize..]).unwrap().0;
+    for component in group_path.split('/').filter(|c| !c.is_empty()) {
+        addr = header
+            .messages
+            .iter()
+            .filter(|m| m.msg_type == MSG_LINK)
+            .filter_map(|m| LinkMessage::decode(&m.data, &ctx).ok())
+            .find_map(|(l, _)| match l.target {
+                LinkTarget::Hard { address } if l.name == component => Some(address),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no link '{component}' in {group_path}"));
+        header = ObjectHeader::decode(&bytes[addr as usize..]).unwrap().0;
+    }
+    let links = header
+        .messages
+        .iter()
+        .find(|m| m.msg_type == MSG_LINK_INFO)
+        .and_then(|m| LinkInfoMessage::decode(&m.data, &ctx).ok())
+        .map(|(i, _)| i.creation_order())
+        .unwrap_or(CreationOrder::Untracked);
+    (links, header.attribute_creation_order())
+}
+
+/// A file may track link creation order without tracking attribute creation
+/// order, or the reverse: `H5Pset_link_creation_order` writes the Link Info
+/// message's flags and `H5Pset_attr_creation_order` writes the object
+/// header's own flags, and libhdf5 reads each back from its own place. A
+/// reopen that rewrites those headers has to recover the two independently —
+/// inferring both from the header bits gave a one-of-two file both or neither.
+///
+/// The fixture is deliberately small. A libhdf5 object header that outgrows
+/// its first chunk continues into an OCHK block, and this crate's reopen walk
+/// still stops at chunk 0, so a larger fixture would lose links and
+/// attributes to that separate defect instead of testing this one.
+#[test]
+fn each_creation_order_subsystem_survives_a_reopen_rewrite_on_its_own() {
+    use rust_hdf5::format::creation_order::CreationOrder;
+    let Some(py) = python() else { return };
+
+    for &(name, links, attrs) in &[
+        ("none", false, false),
+        ("links", true, false),
+        ("attrs", false, true),
+        ("both", true, true),
+    ] {
+        let path = tmp(&format!("creation_order_{name}"));
+        // h5py's `File(track_order=...)` sets both subsystems at once, which
+        // is exactly the case that cannot tell them apart, so the split
+        // combinations go through the low-level property lists.
+        run_python(
+            py,
+            &format!(
+                "import h5py, numpy as np\n\
+                 T = h5py.h5p.CRT_ORDER_TRACKED | h5py.h5p.CRT_ORDER_INDEXED\n\
+                 fapl = h5py.h5p.create(h5py.h5p.FILE_ACCESS)\n\
+                 fapl.set_libver_bounds(h5py.h5f.LIBVER_V18, h5py.h5f.LIBVER_V18)\n\
+                 fcpl = h5py.h5p.create(h5py.h5p.FILE_CREATE)\n\
+                 gcpl = h5py.h5p.create(h5py.h5p.GROUP_CREATE)\n\
+                 for p in (fcpl, gcpl):\n\
+                 \x20   p.set_link_creation_order(T if {links} else 0)\n\
+                 \x20   p.set_attr_creation_order(T if {attrs} else 0)\n\
+                 fid = h5py.h5f.create(rb'{path}', h5py.h5f.ACC_TRUNC, fcpl=fcpl, fapl=fapl)\n\
+                 f = h5py.File(fid)\n\
+                 f.attrs['x'] = np.int32(5)\n\
+                 g = h5py.Group(h5py.h5g.create(f.id, b'g', gcpl=gcpl))\n\
+                 g.attrs['y'] = np.int32(6)\n\
+                 g.create_dataset('c', data=np.arange(4, dtype='<i4'))\n\
+                 f.close()\n",
+                links = if links { "True" } else { "False" },
+                attrs = if attrs { "True" } else { "False" },
+                path = path.display(),
+            ),
+        );
+
+        let order = |on: bool| {
+            if on {
+                CreationOrder::Indexed
+            } else {
+                CreationOrder::Untracked
+            }
+        };
+        let want = (order(links), order(attrs));
+        assert_eq!(
+            on_disk_creation_order(&path, "/"),
+            want,
+            "{name}: as written"
+        );
+        assert_eq!(
+            on_disk_creation_order(&path, "g"),
+            want,
+            "{name}: /g as written"
+        );
+
+        // Reopening and adding an object to each group rewrites both headers
+        // from whatever state the reopen recovered.
+        {
+            let file = H5File::open_rw(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([1])
+                .create("added")
+                .unwrap()
+                .write_raw(&[99])
+                .unwrap();
+            file.root_group()
+                .group("g")
+                .unwrap()
+                .new_dataset::<i32>()
+                .shape([1])
+                .create("added2")
+                .unwrap()
+                .write_raw(&[98])
+                .unwrap();
+            file.close().unwrap();
+        }
+
+        assert_eq!(
+            on_disk_creation_order(&path, "/"),
+            want,
+            "{name}: root after the rust rewrite"
+        );
+        assert_eq!(
+            on_disk_creation_order(&path, "g"),
+            want,
+            "{name}: /g after the rust rewrite"
+        );
+
+        // And libhdf5 agrees, reading the same bits through its own API. The
+        // link *order* a reopen re-stamps is discovery order rather than what
+        // the file recorded — a separate gap from the policy flags this test
+        // pins — so the names are compared as a set.
+        read_back_with_h5py(
+            py,
+            &path,
+            &format!(
+                "from h5py import h5p\n\
+                 T = h5p.CRT_ORDER_TRACKED | h5p.CRT_ORDER_INDEXED\n\
+                 want = (T if {links} else 0, T if {attrs} else 0)\n\
+                 for g in (f['/'], f['g']):\n\
+                 \x20   c = g.id.get_create_plist()\n\
+                 \x20   got = (c.get_link_creation_order(), c.get_attr_creation_order())\n\
+                 \x20   assert got == want, (g.name, got, want)\n\
+                 assert sorted(f.keys()) == ['added', 'g'], list(f.keys())\n\
+                 assert sorted(f['g'].keys()) == ['added2', 'c'], list(f['g'].keys())\n\
+                 assert dict(f.attrs) == {{'x': 5}}, dict(f.attrs)\n\
+                 assert dict(f['g'].attrs) == {{'y': 6}}, dict(f['g'].attrs)\n\
+                 assert list(f['g']['c'][...]) == [0, 1, 2, 3], list(f['g']['c'][...])\n\
+                 assert f['added'][0] == 99 and f['g']['added2'][0] == 98\n",
+                links = if links { "True" } else { "False" },
+                attrs = if attrs { "True" } else { "False" },
+            ),
+        );
+        std::fs::remove_file(&path).ok();
+    }
 }

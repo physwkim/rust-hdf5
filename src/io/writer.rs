@@ -3,6 +3,7 @@
 //! Produces a valid HDF5 file with superblock v3, a root group object header,
 //! and datasets with contiguous or chunked storage. The output is readable by `h5dump`.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::format::chunk_index::btree_v2::Bt2ChunkIndex;
@@ -17,7 +18,11 @@ use crate::format::chunk_index::fixed_array::{
     FixedArrayDataBlock, FixedArrayFilteredChunkElement, FixedArrayHeader, FixedArrayPagedPrefix,
     FA_CLIENT_FILT_CHUNK,
 };
-use crate::format::messages::attribute::AttributeMessage;
+use crate::format::creation_order::CreationOrder;
+use crate::format::dense_attr::build_dense_attributes;
+use crate::format::dense_link::build_dense_links;
+use crate::format::messages::attr_info::AttributeInfoMessage;
+use crate::format::messages::attribute::{AttributeEntry, AttributeMessage};
 use crate::format::messages::data_layout::{DataLayoutMessage, EarrayParams, FixedArrayParams};
 use crate::format::messages::dataspace::DataspaceMessage;
 use crate::format::messages::datatype::DatatypeMessage;
@@ -27,7 +32,7 @@ use crate::format::messages::group_info::GroupInfoMessage;
 use crate::format::messages::link::LinkMessage;
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::*;
-use crate::format::object_header::ObjectHeader;
+use crate::format::object_header::{ObjectHeader, MAX_MESSAGE_SIZE};
 use crate::format::superblock::*;
 use crate::format::{FormatContext, UNDEF_ADDR};
 
@@ -100,14 +105,16 @@ fn collect_bt2_nodes(
             geo.max_nrec_size,
             geo.child_total_size(depth),
         )?;
-        records.extend_from_slice(&node.record_data);
+        // In-order: an internal node's records separate its children, so each
+        // one belongs between the subtrees on either side of it.
         let children: Vec<(u64, u16)> = node
             .child_addrs
             .iter()
             .zip(node.child_nrecords.iter())
             .map(|(&a, &n)| (a, n))
             .collect();
-        for (child_addr, child_nrec) in children {
+        let rec = record_size as usize;
+        for (i, (child_addr, child_nrec)) in children.into_iter().enumerate() {
             collect_bt2_nodes(
                 handle,
                 ctx,
@@ -120,6 +127,9 @@ fn collect_bt2_nodes(
                 records,
                 node_addrs,
             )?;
+            if let Some(record) = node.record_data.get(i * rec..(i + 1) * rec) {
+                records.extend_from_slice(record);
+            }
         }
     }
     Ok(())
@@ -316,6 +326,12 @@ pub(crate) struct CreateGuard<'a> {
     _gate: std::sync::MutexGuard<'a, ()>,
     /// The dataset name with every group hard link in it resolved.
     pub(crate) name: String,
+    /// The group that will hold the new dataset's link, resolved from the
+    /// path components of `name`; `None` is the root group. Carried here so
+    /// [`Hdf5Writer::push_dataset`] registers the child itself and no creator
+    /// can leave a dataset whose name says one thing and whose parent group
+    /// says another.
+    pub(crate) parent: Option<usize>,
 }
 
 /// Reference-counted shared pointer, feature-selected. The single-thread
@@ -436,7 +452,7 @@ pub struct DatasetInfo {
     /// Appended frames not yet written to chunks, `None` when empty.
     pub append: Option<AppendBuffer>,
     /// Attributes attached to this dataset.
-    pub attributes: Vec<AttributeMessage>,
+    pub attributes: Vec<AttributeEntry>,
     /// File offset where the dataset object header was written (for SWMR in-place rewrites).
     pub obj_header_written_addr: Option<u64>,
     /// Encoded size of the dataset object header (for verifying in-place rewrites fit).
@@ -451,6 +467,18 @@ pub struct DatasetInfo {
     /// session that only changed the extent would keep the old on-disk
     /// header — silently dropping the new shape.
     pub extent_dirty: bool,
+    /// Something the object header encodes changed this session without
+    /// touching the dataset's storage — an attribute set or removed, a fill
+    /// value defined. See [`header_stale`](DatasetInfo::header_stale).
+    pub header_dirty: bool,
+    /// When the link naming this dataset was created; see
+    /// [`GroupInfo::creation_seq`].
+    pub creation_seq: u64,
+    /// How this dataset records creation order for its attributes — the
+    /// file's creation-order policy captured when the dataset was created,
+    /// the way libhdf5 captures the DCPL. A dataset holds no links, so only
+    /// the attribute half of [`TrackOrder`] applies to it.
+    pub track_attr_order: CreationOrder,
     /// User-defined fill value bytes (exactly one element wide). `None`
     /// means default zero-fill; `Some` is emitted as a `fill_defined = 2`
     /// fill-value message in the dataset object header.
@@ -461,6 +489,33 @@ pub struct DatasetInfo {
     /// preserved from the file on reopen, and emitted verbatim at finalize.
     /// Contiguous datasets ignore it.
     pub layout_version: u8,
+}
+
+impl DatasetInfo {
+    /// Whether this session wrote chunk data or changed the extent, so the
+    /// dataset's index structures have to be re-flushed.
+    fn storage_dirty(&self) -> bool {
+        self.chunked.as_ref().is_some_and(|c| c.chunks_written > 0)
+            || self
+                .fixed_array
+                .as_ref()
+                .is_some_and(|f| f.chunks_written > 0)
+            || self.btree_v2.as_ref().is_some_and(|b| b.chunks_written > 0)
+            || self.extent_dirty
+    }
+
+    /// Whether a reopened dataset's on-disk object header no longer describes
+    /// it.
+    ///
+    /// INVARIANT: every mutation of something `build_dataset_header` encodes
+    /// must show up here. Finalize keeps the original header when this is
+    /// false, so a change this misses is not deferred — it is discarded, with
+    /// no error to say so. Attributes were the case that proved it: they are
+    /// invisible to the chunk-write counters, so an attribute set on a
+    /// reopened dataset vanished at close.
+    fn header_stale(&self) -> bool {
+        self.storage_dirty() || self.header_dirty
+    }
 }
 
 /// Runtime metadata for a chunked dataset.
@@ -565,6 +620,90 @@ fn swmr_attr_error(name: &str) -> crate::io::IoError {
          value's heap storage could never be reclaimed; set attributes before \
          start_swmr (libhdf5 forbids attribute changes during SWMR writes too)"
     ))
+}
+
+/// Take an object's attributes into the append session, or refuse the reopen.
+///
+/// Append mode rebuilds every object header it touches out of the attributes
+/// read from it, so what this returns is what the object will still have when
+/// the session finalizes. An attribute set that could not be read whole —
+/// `ObjectAttributes::into_complete` refuses it — would come back as the part
+/// that did read, silently deleting the rest.
+///
+/// Left to surface at `finalize`, that failure would land after this session's
+/// chunk data and indices had already been written past the allocation point
+/// the superblock still records, leaving a file libhdf5 reads as truncated.
+/// Refusing the open leaves it untouched.
+///
+/// Size is no longer a reason to refuse: an attribute too large for a header
+/// message goes back out through dense storage, the form libhdf5 read it from.
+fn take_reopened_attributes(
+    attrs: crate::io::reader::ObjectAttributes,
+    owner: &str,
+) -> IoResult<Vec<AttributeEntry>> {
+    attrs.into_complete(owner)
+}
+
+/// The creation-order policy an on-disk object header declares — the single
+/// owner of the recovery rule, used for the root group, every reopened group
+/// and (through its attribute half) every reopened dataset.
+///
+/// The two halves come from two different places, and reading one for both is
+/// how a file that sets only one of them came back with both or neither:
+///
+///   * links — the `Link Info` message's flag bits, which is what
+///     `H5Pget_link_creation_order` reads (`H5G__get_create_plist`). A group
+///     with no such message (or one this crate cannot decode) tracks nothing;
+///     so does every dataset, which has no links to order.
+///   * attributes — the object header's own flag bits, which is what
+///     `H5Pget_attr_creation_order` reads (`H5Pocpl.c`). The `Attribute Info`
+///     message carries the same two bits, but the header is the authority
+///     libhdf5 consults, and it is present even when the object has no
+///     attributes yet.
+fn recover_track_order(
+    header: &crate::format::object_header::ObjectHeader,
+    ctx: &FormatContext,
+) -> TrackOrder {
+    let links = header
+        .messages
+        .iter()
+        .find(|m| m.msg_type == crate::format::messages::MSG_LINK_INFO)
+        .and_then(|m| LinkInfoMessage::decode(&m.data, ctx).ok())
+        .map(|(info, _)| info.creation_order())
+        .unwrap_or_default();
+    TrackOrder {
+        links,
+        attrs: header.attribute_creation_order(),
+    }
+}
+
+/// The dense storage an on-disk object header names: the fractal heap and the
+/// indices its `Attribute Info` and `Link Info` messages point at.
+///
+/// A rewrite of that header lays fresh storage out and stops naming this, so
+/// what this returns is exactly what the rewrite supersedes and must free.
+/// Compact storage names no heap and yields `None` — there is nothing to free
+/// and nothing that could be freed twice.
+fn superseded_dense(
+    header: &crate::format::object_header::ObjectHeader,
+    ctx: &FormatContext,
+) -> (Option<AttributeInfoMessage>, Option<LinkInfoMessage>) {
+    let decode = |msg_type: u8| {
+        header
+            .messages
+            .iter()
+            .find(|m| m.msg_type == msg_type)
+            .map(|m| m.data.as_slice())
+    };
+    let attrs = decode(crate::format::messages::MSG_ATTR_INFO)
+        .and_then(|d| AttributeInfoMessage::decode(d, ctx).ok())
+        .map(|(info, _)| info)
+        .filter(|info| info.is_dense());
+    let links = decode(crate::format::messages::MSG_LINK_INFO)
+        .and_then(|d| LinkInfoMessage::decode(d, ctx).ok())
+        .map(|(info, _)| info)
+        .filter(|info| info.is_dense());
+    (attrs, links)
 }
 
 /// One collection block with free space that a later vlen insert may
@@ -822,7 +961,52 @@ pub struct GroupInfo {
     /// Soft-deleted: excluded from finalize output.
     pub deleted: bool,
     /// Attributes attached to this group (e.g. NeXus `NX_class`).
-    pub attributes: Vec<AttributeMessage>,
+    pub attributes: Vec<AttributeEntry>,
+    /// When the link naming this group was created, on the writer's single
+    /// monotonic sequence. Groups, datasets and hard links share it, so a
+    /// parent can order its links the way they were actually made.
+    pub creation_seq: u64,
+    /// How this group records creation order for its links and, separately,
+    /// for its attributes. Creation-order tracking is a property of the
+    /// object's creation property list in libhdf5, so it is captured here
+    /// when the group is created rather than read from the writer at
+    /// finalize: a later change of policy must not rewrite an object already
+    /// made.
+    pub track_order: TrackOrder,
+}
+
+/// One object's creation-order policy, with the two subsystems libhdf5 keeps
+/// apart kept apart here too.
+///
+/// `H5Pset_link_creation_order` and `H5Pset_attr_creation_order` are separate
+/// calls reading back out of separate places on disk — the Link Info message
+/// and the object header's own flag bits — and a file may set either alone.
+/// Carrying them as one flag made a reopen give a one-of-two file both or
+/// neither.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrackOrder {
+    /// Creation order of the links this group holds. Meaningless for a
+    /// dataset, which is why `DatasetInfo` keeps only the attribute half.
+    pub links: CreationOrder,
+    /// Creation order of the attributes attached to this object.
+    pub attrs: CreationOrder,
+}
+
+impl TrackOrder {
+    /// The policy the crate's single `track_order` knob selects: both
+    /// subsystems tracked *and* indexed, or neither — the pair h5py's
+    /// `File(track_order=True)` writes.
+    pub fn uniform(track: bool) -> Self {
+        let order = if track {
+            CreationOrder::Indexed
+        } else {
+            CreationOrder::Untracked
+        };
+        Self {
+            links: order,
+            attrs: order,
+        }
+    }
 }
 
 /// The object a [`HardLink`] resolves to.
@@ -848,6 +1032,8 @@ pub struct HardLink {
     pub name: String,
     /// Object this link resolves to.
     pub target: HardLinkTarget,
+    /// When this link was created; see [`GroupInfo::creation_seq`].
+    pub creation_seq: u64,
 }
 
 /// A link a reopened file already held that this writer cannot express.
@@ -943,15 +1129,34 @@ struct DatasetParts {
     layout: crate::format::messages::data_layout::DataLayoutMessage,
     filter_pipeline: Option<FilterPipeline>,
     fill_value: Option<Vec<u8>>,
-    attributes: Vec<crate::format::messages::attribute::AttributeMessage>,
+    attributes: Vec<AttributeEntry>,
+    /// The creation-order policy the on-disk header declares; a rewrite that
+    /// read it from the writer instead would stamp this session's policy onto
+    /// an object libhdf5 created under another.
+    track_order: TrackOrder,
+    /// The dense storage the rewrite supersedes and must free.
+    dense: DenseCarry,
 }
 
 /// The same for a group, plus the links it holds — decoded once, with the
 /// bytes they came from, so the walk and the rewrite agree on its contents.
 struct GroupParts {
     header_size: usize,
-    attributes: Vec<crate::format::messages::attribute::AttributeMessage>,
+    attributes: Vec<AttributeEntry>,
     links: Vec<(crate::format::messages::link::LinkMessage, Vec<u8>)>,
+    track_order: TrackOrder,
+    dense: DenseCarry,
+}
+
+/// The dense storage one reopened object's header names, which the rewrite of
+/// that header stops naming and therefore has to free. Both halves are read
+/// back before this is built — a heap that could not be read makes the object
+/// [`ObjectPlan::Preserve`], so nothing here describes storage whose contents
+/// were lost.
+#[derive(Default)]
+struct DenseCarry {
+    attrs: Option<AttributeInfoMessage>,
+    links: Option<LinkInfoMessage>,
 }
 
 /// A modelled object, as the walk hands it to the registry rebuild. A group's
@@ -961,7 +1166,9 @@ enum CollectedObject {
     Dataset(Box<DatasetParts>),
     Group {
         header_size: usize,
-        attributes: Vec<crate::format::messages::attribute::AttributeMessage>,
+        attributes: Vec<AttributeEntry>,
+        track_order: TrackOrder,
+        dense: DenseCarry,
     },
 }
 
@@ -1005,16 +1212,14 @@ impl<'a> ReopenWalk<'a> {
     fn plan(&mut self, addr: u64) -> IoResult<ObjectPlan> {
         let (handle, meta, file_size) = (&mut *self.handle, self.meta, self.file_size);
         let ctx = &meta.ctx;
-        use crate::format::messages::attr_info::AttrInfoMessage;
-        use crate::format::messages::attribute::AttributeMessage;
         use crate::format::messages::data_layout::DataLayoutMessage;
         use crate::format::messages::dataspace::DataspaceMessage;
         use crate::format::messages::link::LinkMessage;
         use crate::format::messages::link_info::LinkInfoMessage;
         use crate::format::messages::shared::MSG_FLAG_SHARED;
         use crate::format::messages::{
-            MSG_ATTRIBUTE, MSG_ATTR_INFO, MSG_DATASPACE, MSG_DATATYPE, MSG_DATA_LAYOUT,
-            MSG_FILL_VALUE, MSG_FILTER_PIPELINE, MSG_LINK, MSG_LINK_INFO,
+            MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE, MSG_DATA_LAYOUT, MSG_FILL_VALUE,
+            MSG_FILTER_PIPELINE, MSG_LINK, MSG_LINK_INFO,
         };
 
         // Chunk 0 only, for its encoded size: that is the block the rewrite
@@ -1041,12 +1246,34 @@ impl<'a> ReopenWalk<'a> {
             }
         };
 
+        // The policy and the storage the header declares, read once from the
+        // whole chain: both are properties of the object, not of any one
+        // message the loop below happens to reach.
+        let track_order = recover_track_order(&header, ctx);
+        let (dense_attrs, dense_links) = superseded_dense(&header, ctx);
+
+        // Attributes come from the reader's collector rather than from the
+        // loop below, so compact, dense and shared attributes all reach the
+        // rewrite by the one path that knows how to read each of them. An
+        // object whose set did not read whole is preserved: a short set here
+        // would be a rewrite deleting the attributes it could not read.
+        let attributes = match take_reopened_attributes(
+            crate::io::reader::collect_object_attributes(handle, ctx, &header),
+            &format!("the object at {addr:#x}"),
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                return Ok(ObjectPlan::Preserve(format!(
+                    "its attributes do not read back whole: {e}"
+                )))
+            }
+        };
+
         let mut datatype = None;
         let mut dataspace = None;
         let mut layout = None;
         let mut filter_pipeline = None;
         let mut fill_value = None;
-        let mut attributes = Vec::new();
         let mut links = Vec::new();
         // A datatype, dataspace or layout message says the object is not a
         // group, whether or not the three a dataset needs are all there.
@@ -1118,42 +1345,39 @@ impl<'a> ReopenWalk<'a> {
                         fill_value = fv.fill_value;
                     }
                 }
-                MSG_ATTRIBUTE => {
-                    let (a, _) = consume!(AttributeMessage::decode(&msg.data, ctx), "attribute");
-                    attributes.push(a);
-                }
                 MSG_LINK => {
                     let (l, _) = consume!(LinkMessage::decode(&msg.data, ctx), "link");
                     links.push((l, msg.data.clone()));
                 }
                 MSG_LINK_INFO => {
                     let (li, _) = consume!(LinkInfoMessage::decode(&msg.data, ctx), "link info");
-                    // Dense storage: the names are in a fractal heap this
-                    // writer does not read, so a rewrite from the messages
-                    // alone would emit the group without its children.
+                    // Once a group holds enough links libhdf5 moves them into
+                    // the fractal heap this message names and writes no `Link`
+                    // messages at all. Reading them back is what makes the
+                    // rewrite emit the group with its children; a rewrite from
+                    // the header messages alone emitted it empty, orphaning
+                    // every object below it.
                     if li.fractal_heap_address != UNDEF_ADDR {
-                        return Ok(ObjectPlan::Preserve(
-                            "its links are in a fractal heap (dense link storage), which this \
-                             writer does not read"
-                                .into(),
-                        ));
-                    }
-                }
-                MSG_ATTR_INFO => {
-                    // Same for attributes: once there are enough of them
-                    // libhdf5 moves them into the heap this message names and
-                    // writes no attribute messages at all, so a rewrite from
-                    // the messages alone emits the object without them. While
-                    // the message only tracks creation order the attributes
-                    // are still messages, and it says so.
-                    let (ai, _) =
-                        consume!(AttrInfoMessage::decode(&msg.data, ctx), "attribute info");
-                    if ai.fractal_heap_address != UNDEF_ADDR {
-                        return Ok(ObjectPlan::Preserve(
-                            "its attributes are in a fractal heap (dense attribute storage), \
-                             which this writer does not read"
-                                .into(),
-                        ));
+                        let dense = match crate::io::reader::Hdf5Reader::read_dense_links(
+                            handle,
+                            ctx,
+                            li.fractal_heap_address,
+                        ) {
+                            Ok(l) => l,
+                            Err(e) => {
+                                return Ok(ObjectPlan::Preserve(format!(
+                                    "its dense link storage does not read: {e}"
+                                )))
+                            }
+                        };
+                        // Re-encoded rather than carried as bytes: a heap
+                        // object is not a header message, so there are no
+                        // message bytes to carry. The encoding round-trips
+                        // through the same decoder that just read it.
+                        links.extend(dense.into_iter().map(|l| {
+                            let bytes = l.encode(ctx);
+                            (l, bytes)
+                        }));
                     }
                 }
                 _ => {}
@@ -1170,6 +1394,11 @@ impl<'a> ReopenWalk<'a> {
                     filter_pipeline,
                     fill_value,
                     attributes,
+                    track_order,
+                    dense: DenseCarry {
+                        attrs: dense_attrs,
+                        links: dense_links,
+                    },
                 })))
             }
             // A committed (named) datatype has a datatype message and neither
@@ -1185,6 +1414,11 @@ impl<'a> ReopenWalk<'a> {
                 header_size,
                 attributes,
                 links,
+                track_order,
+                dense: DenseCarry {
+                    attrs: dense_attrs,
+                    links: dense_links,
+                },
             })),
         }
     }
@@ -1248,6 +1482,8 @@ impl<'a> ReopenWalk<'a> {
                         CollectedObject::Group {
                             header_size: parts.header_size,
                             attributes: parts.attributes,
+                            track_order: parts.track_order,
+                            dense: parts.dense,
                         },
                     ));
                     // Recurse only into a group's header we have not entered
@@ -1285,6 +1521,8 @@ fn rebuild_dataset(
         filter_pipeline: fp,
         fill_value,
         attributes: attrs,
+        track_order,
+        dense: _,
     } = parts;
 
     let mut info = DatasetInfo {
@@ -1304,6 +1542,11 @@ fn rebuild_dataset(
         filter_pipeline: fp,
         deleted: false,
         extent_dirty: false,
+        header_dirty: false,
+        // Stamped by the caller, which knows the order the walk met each
+        // object; the rebuild sees one dataset at a time.
+        creation_seq: 0,
+        track_attr_order: track_order.attrs,
         fill_value,
         // Preserve the on-disk layout version so finalize re-encodes
         // what it read: a v5 file reopened and appended to must not be
@@ -1633,7 +1876,7 @@ pub struct Hdf5Writer {
     /// a freshly created file; see [`PreservedLink`].
     pub(crate) preserved_links: Slot<Vec<PreservedLink>>,
     /// Attributes attached to the root group (file-level attributes).
-    pub(crate) root_attributes: Slot<Vec<crate::format::messages::attribute::AttributeMessage>>,
+    pub(crate) root_attributes: Slot<Vec<crate::format::messages::attribute::AttributeEntry>>,
     /// Serializes object creation so name-uniqueness check and registry insert
     /// happen atomically.
     ///
@@ -1687,7 +1930,89 @@ pub struct Hdf5Writer {
     /// written with. [`superblock_version_for`](Self::superblock_version_for)
     /// raises it to what the content needs.
     superblock_version_base: u8,
+    /// Objects whose attributes this finalize spilled to dense storage, and
+    /// the `Attribute Info` message naming what was written for each.
+    ///
+    /// INVARIANT: an entry exists here only after every block of that
+    /// object's heap and name index is on disk, and only
+    /// [`prepare_dense_attributes`](Self::prepare_dense_attributes) may add
+    /// one. `emit_attributes` reads it and never builds — a header is sized
+    /// and then written by two separate `build_*_header` calls, so a build
+    /// that allocated would allocate twice and leave the sized-for blocks
+    /// stranded.
+    dense_attributes: Slot<HashMap<AttrScope, AttributeInfoMessage>>,
+    /// Groups whose links this finalize spilled to dense storage, and the
+    /// `Link Info` message naming what was written for each.
+    ///
+    /// INVARIANT: an entry exists here only after every block of that group's
+    /// heap and name index is on disk, and only
+    /// [`prepare_dense_links`](Self::prepare_dense_links) may add one.
+    dense_links: Slot<HashMap<LinkScope, LinkInfoMessage>>,
+    /// The dense storage the reopened object headers already name — the heaps
+    /// and indices this session's rewrites and deletes supersede.
+    ///
+    /// `None` for a file this session created: every block such a file will
+    /// hold was allocated here, so there is nothing on disk to supersede and
+    /// nothing to allocate for the bookkeeping either.
+    ///
+    /// INVARIANT: every entry is freed exactly once, by
+    /// [`release_superseded_dense_attrs`](Self::release_superseded_dense_attrs)
+    /// or [`release_superseded_dense_links`](Self::release_superseded_dense_links),
+    /// which remove it as they free. Nothing else may remove one: an entry
+    /// that leaves without reaching the allocator is a leaked heap, and one
+    /// that reaches it twice hands the same blocks to two objects.
+    superseded_dense: Slot<Option<Box<SupersededDense>>>,
+    /// The creation-order policy in force: whether an object created from
+    /// now on records creation order for its links and its attributes. The
+    /// h5py `track_order` analogue; see
+    /// [`set_track_order`](Self::set_track_order). Each object captures this
+    /// at creation, so changing it never rewrites an object already made.
+    track_order: TrackOrder,
+    /// The root group's own captured policy. The root is created with the
+    /// file, so its value comes from
+    /// [`create_with_options`](Self::create_with_options) — or, on reopen,
+    /// from the header already on disk.
+    root_track_order: TrackOrder,
+    /// Hands out the creation sequence numbers that order a group's links.
+    next_creation_seq: Slot<u64>,
 }
+
+/// What a reopen found already on disk in dense form, by the scope whose
+/// header names it.
+///
+/// Both halves together because they are found together — one walk of the
+/// reopened headers fills both — and released together only in the delete
+/// path; a finalize supersedes attribute storage before it lays object
+/// headers out and link storage after, so each half has its own owner.
+#[derive(Debug, Default)]
+struct SupersededDense {
+    attrs: HashMap<AttrScope, AttributeInfoMessage>,
+    links: HashMap<LinkScope, LinkInfoMessage>,
+}
+
+/// Which object's attribute list a prepared dense layout belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum AttrScope {
+    Root,
+    Group(usize),
+    Dataset(usize),
+}
+
+/// Which group's link list a prepared dense layout belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum LinkScope {
+    Root,
+    Group(usize),
+}
+
+/// Attributes an object header keeps before libhdf5 spills the whole set to
+/// dense storage (`H5O_CRT_ATTR_MAX_COMPACT_DEF`).
+const MAX_COMPACT_ATTRS: usize = 8;
+
+/// Links a group header keeps before libhdf5 spills the whole set to dense
+/// storage (`H5G_CRT_GINFO_MAX_COMPACT`). This writer emits no phase-change
+/// values in the Group Info message, so the default is what applies.
+const MAX_COMPACT_LINKS: usize = 8;
 
 impl Hdf5Writer {
     /// Create a new HDF5 file at `path` using the env-var-derived locking
@@ -1706,6 +2031,20 @@ impl Hdf5Writer {
     pub fn create_with_locking(
         path: &Path,
         locking: crate::io::locking::FileLocking,
+    ) -> IoResult<Self> {
+        Self::create_with_options(path, locking, false)
+    }
+
+    /// Create a new HDF5 file at `path` with an explicit locking policy and
+    /// creation-order policy.
+    ///
+    /// `track_order` is the policy the root group is created under and the
+    /// default for every object created afterwards; see
+    /// [`set_track_order`](Self::set_track_order).
+    pub fn create_with_options(
+        path: &Path,
+        locking: crate::io::locking::FileLocking,
+        track_order: bool,
     ) -> IoResult<Self> {
         let handle = FileHandle::create_with_locking(path, locking)?;
         let ctx = FormatContext::default_v3();
@@ -1737,6 +2076,12 @@ impl Hdf5Writer {
             // structures allow, and finalize raises it if the content needs
             // a newer one.
             superblock_version_base: SUPERBLOCK_V2,
+            dense_attributes: Slot::new(HashMap::new()),
+            dense_links: Slot::new(HashMap::new()),
+            superseded_dense: Slot::new(None),
+            track_order: TrackOrder::uniform(track_order),
+            root_track_order: TrackOrder::uniform(track_order),
+            next_creation_seq: Slot::new(0),
         })
     }
 
@@ -1748,6 +2093,20 @@ impl Hdf5Writer {
     /// 1.14-based h5py wheels — reject version 5.
     pub fn set_libver_latest(&mut self, latest: bool) {
         self.libver_latest = latest;
+    }
+
+    /// Track and index creation order for the links and the attributes of
+    /// every object created after this call — the equivalent of setting
+    /// `H5Pset_link_creation_order` and `H5Pset_attr_creation_order` to
+    /// `H5P_CRT_ORDER_TRACKED | H5P_CRT_ORDER_INDEXED` on the creation
+    /// property lists those objects are made with.
+    ///
+    /// Objects already created keep the policy they were made under, exactly
+    /// as libhdf5 keeps what their creation property list said. The root
+    /// group is created with the file, so its policy comes from
+    /// [`create_with_options`](Self::create_with_options) instead.
+    pub fn set_track_order(&mut self, track: bool) {
+        self.track_order = TrackOrder::uniform(track);
     }
 
     /// Layout message version for a new chunked dataset — the
@@ -1821,8 +2180,60 @@ impl Hdf5Writer {
         // entry every creator passes — keeps alias forms out of the
         // registry.
         let name = self.canonical_dataset_path(name);
+        // A path that leaves this file, or that runs into an object the
+        // reopen kept verbatim, is refused here rather than at each creator:
+        // this is the one gate every creation passes, so a creator added
+        // later cannot forget the check. Both run before the parent lookup,
+        // which would otherwise report the group such a path names as absent
+        // instead of naming what stops the path. Uniqueness comes first among
+        // them: a name already in the file is taken whatever holds it.
+        self.reject_external_traversal(&name)?;
         self.ensure_unique_dataset_name(&name)?;
-        Ok(CreateGuard { _gate: gate, name })
+        self.reject_preserved_object(&name)?;
+        let (parent, _leaf) = self.split_parent(&name)?;
+        Ok(CreateGuard {
+            _gate: gate,
+            name,
+            parent,
+        })
+    }
+
+    /// Split an object path into the group that will hold its link and the
+    /// leaf link name, resolving every component through the group registry.
+    ///
+    /// `path` is the registry form — no leading `/`, e.g. `"grp/sub/late"`.
+    /// This is what keeps a `/` out of a link name: HDF5 link names are
+    /// single path components (`H5G_traverse` splits on `/` before it ever
+    /// reaches `H5L_link`), so a name that carries a path must name a group
+    /// that exists, or be refused.
+    ///
+    /// A missing component is an error rather than an implicit group: the
+    /// default link creation property list has `H5Pset_create_intermediate_group`
+    /// off, and this writer exposes no property list to turn it on with.
+    fn split_parent(&self, path: &str) -> IoResult<(Option<usize>, String)> {
+        let (parent_path, leaf) = path.rsplit_once('/').unwrap_or(("", path));
+        if leaf.is_empty() {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "'{path}' does not end in a link name"
+            )));
+        }
+        if parent_path.is_empty() {
+            return Ok((None, leaf.to_string()));
+        }
+        let abs = format!("/{parent_path}");
+        let groups = self.group_refs();
+        let idx = groups
+            .iter()
+            .position(|g| {
+                let gg = g.lock();
+                gg.name == abs && !gg.deleted
+            })
+            .ok_or_else(|| {
+                crate::io::IoError::NotFound(format!(
+                    "cannot create '{path}': group '{abs}' does not exist"
+                ))
+            })?;
+        Ok((Some(idx), leaf.to_string()))
     }
 
     /// Push a freshly-built dataset into the registry and return its index.
@@ -1830,10 +2241,18 @@ impl Hdf5Writer {
     /// in-flight write that already cloned its own [`DatasetRef`] out.
     /// The [`CreateGuard`] proves the caller entered through
     /// [`Self::begin_create`] and still holds the gate.
-    pub(crate) fn push_dataset(&self, _create: &CreateGuard<'_>, info: DatasetInfo) -> usize {
-        let mut reg = self.datasets.lock();
-        let idx = reg.len();
-        reg.push(Shared::new(DatasetCell::new(info)));
+    pub(crate) fn push_dataset(&self, create: &CreateGuard<'_>, info: DatasetInfo) -> usize {
+        let idx = {
+            let mut reg = self.datasets.lock();
+            let idx = reg.len();
+            reg.push(Shared::new(DatasetCell::new(info)));
+            idx
+        };
+        // The spine guard is dropped before the group slot is taken: the lock
+        // order is spine -> slot and never the reverse.
+        if let Some(pidx) = create.parent {
+            self.grp(pidx).lock().child_datasets.push(idx);
+        }
         idx
     }
 
@@ -1861,6 +2280,19 @@ impl Hdf5Writer {
     /// Snapshot the hard-link list (the lock is held only for the clone), so
     /// callers can resolve each link's target/parent — which locks dataset and
     /// group slots — without holding the hard-link lock.
+    /// The next creation sequence number.
+    ///
+    /// One monotonic counter for datasets, groups and hard links alike: a
+    /// group orders its links by it, so an interleaved run of `create_group`
+    /// and `create_dataset` comes back out in the order it was made rather
+    /// than grouped by kind.
+    fn take_creation_seq(&self) -> u64 {
+        let mut next = self.next_creation_seq.lock();
+        let seq = *next;
+        *next += 1;
+        seq
+    }
+
     pub(crate) fn hard_links_vec(&self) -> Vec<HardLink> {
         self.hard_links.lock().clone()
     }
@@ -1884,8 +2316,6 @@ impl Hdf5Writer {
         path: &Path,
         locking: crate::io::locking::FileLocking,
     ) -> IoResult<Self> {
-        use crate::format::messages::attribute::AttributeMessage;
-
         let mut handle = FileHandle::open_readwrite_with_locking(path, locking)?;
         // The same `H5FD_locate_signature` search the read path makes, through
         // the same handle mechanism: the offset it finds is the file's base
@@ -1951,7 +2381,6 @@ impl Hdf5Writer {
                  index(es), which this crate can read but not write"
             )));
         }
-
         // Discover links from root group (and subgroups recursively). Every
         // object is classified before it is registered, and the root is the
         // one object with no alternative: its header must be rewritten to
@@ -1979,6 +2408,8 @@ impl Hdf5Writer {
         // Chunk 0 is the block the rewrite supersedes.
         let root_header_size = root.header_size;
         let root_attributes = root.attributes;
+        let root_track_order = root.track_order;
+        let root_dense = root.dense;
 
         walk.group(&root.links, "", 0)?;
         let collected = walk.finish();
@@ -2016,9 +2447,15 @@ impl Hdf5Writer {
         // link path — so finalize can free the block its rewrite supersedes —
         // plus the attributes the header carries, which the group registry
         // below must keep or finalize rewrites the group without them.
-        type GroupHeaderInfo = (u64, usize, Vec<AttributeMessage>);
+        type GroupHeaderInfo = (u64, usize, Vec<AttributeEntry>, TrackOrder);
         let mut group_headers: std::collections::HashMap<String, GroupHeaderInfo> =
             Default::default();
+        // The dense storage each rebuilt dataset's header named, by registry
+        // index, so finalize frees exactly what its rewrite supersedes. Keyed
+        // after the rebuild succeeded: a preserved dataset keeps its header,
+        // and freeing the heap that header still names would strand it.
+        let mut dataset_dense: Vec<(usize, AttributeInfoMessage)> = Vec::new();
+        let mut group_dense: Vec<(String, DenseCarry)> = Vec::new();
         for (entry, object) in link_entries {
             let HardEntry {
                 path: name,
@@ -2029,14 +2466,23 @@ impl Hdf5Writer {
                 CollectedObject::Group {
                     header_size,
                     attributes,
+                    track_order,
+                    dense,
                 } => {
-                    group_headers.insert(name, (obj_addr, header_size, attributes));
+                    group_dense.push((name.clone(), dense));
+                    group_headers.insert(name, (obj_addr, header_size, attributes, track_order));
                     continue;
                 }
                 CollectedObject::Dataset(parts) => *parts,
             };
+            let dense_attrs = parts.dense.attrs.clone();
             match rebuild_dataset(&mut handle, &ctx, name.clone(), obj_addr, parts) {
-                Ok(info) => existing_datasets.push(info),
+                Ok(info) => {
+                    if let Some(ainfo) = dense_attrs {
+                        dataset_dense.push((existing_datasets.len(), ainfo));
+                    }
+                    existing_datasets.push(info);
+                }
                 // Kept by its bytes for the same reason a header this walk
                 // could not decode is: the rewrite would otherwise emit an
                 // object whose chunk index no longer names its chunks.
@@ -2092,14 +2538,16 @@ impl Hdf5Writer {
                     group_index_map.get(&parent_path).copied()
                 };
                 let gidx = groups.len();
-                let (obj_header_written_addr, obj_header_encoded_size, attributes) = group_headers
-                    .remove(path.trim_start_matches('/'))
-                    .map_or((None, 0, Vec::new()), |(addr, len, attrs)| {
-                        (Some(addr), len, attrs)
-                    });
+                let (obj_header_written_addr, obj_header_encoded_size, attributes, track_order) =
+                    group_headers.remove(path.trim_start_matches('/')).map_or(
+                        (None, 0, Vec::new(), TrackOrder::default()),
+                        |(addr, len, attrs, track)| (Some(addr), len, attrs, track),
+                    );
                 groups.push(GroupInfo {
                     name: path.clone(),
                     parent,
+                    creation_seq: 0,
+                    track_order,
                     child_datasets: Vec::new(),
                     child_groups: Vec::new(),
                     obj_header_addr: 0,
@@ -2195,6 +2643,7 @@ impl Hdf5Writer {
                 parent,
                 name: link_name,
                 target,
+                creation_seq: 0,
             });
         }
 
@@ -2230,7 +2679,58 @@ impl Hdf5Writer {
             });
         }
 
+        // Stamp the creation sequence a reopened file cannot supply. Nothing
+        // on disk says which link was made first unless the group tracked
+        // creation order, and this reader does not carry that back out, so
+        // discovery order is what there is: datasets, then groups, then the
+        // hard links found beside them — the order the writer emitted links
+        // in before it ordered them at all.
+        let mut creation_seq = 0u64;
+        for d in &mut existing_datasets {
+            d.creation_seq = creation_seq;
+            creation_seq += 1;
+        }
+        for g in &mut groups {
+            g.creation_seq = creation_seq;
+            creation_seq += 1;
+        }
+        for l in &mut hard_links {
+            l.creation_seq = creation_seq;
+            creation_seq += 1;
+        }
+
         let allocator = FileAllocator::new(file_size);
+
+        // Now that every object has its registry index, key the dense storage
+        // found on disk by the scope that will supersede it. A group the link
+        // walk saw but never registered is not rewritten either, so leaving it
+        // out is what keeps its storage referenced.
+        let mut superseded = SupersededDense {
+            attrs: dataset_dense
+                .into_iter()
+                .map(|(di, ainfo)| (AttrScope::Dataset(di), ainfo))
+                .collect(),
+            links: HashMap::new(),
+        };
+        superseded
+            .attrs
+            .extend(root_dense.attrs.map(|a| (AttrScope::Root, a)));
+        superseded
+            .links
+            .extend(root_dense.links.map(|l| (LinkScope::Root, l)));
+        for (name, dense) in group_dense {
+            let Some(&gidx) = group_index_map.get(&format!("/{name}")) else {
+                continue;
+            };
+            superseded
+                .attrs
+                .extend(dense.attrs.map(|a| (AttrScope::Group(gidx), a)));
+            superseded
+                .links
+                .extend(dense.links.map(|l| (LinkScope::Group(gidx), l)));
+        }
+        let superseded = (!superseded.attrs.is_empty() || !superseded.links.is_empty())
+            .then(|| Box::new(superseded));
 
         // Wrap the reconstructed plain vecs into the per-slot registry. The
         // reconstruction logic above runs single-threaded on local `Vec`s;
@@ -2265,6 +2765,14 @@ impl Hdf5Writer {
             // adds nothing needing a newer one hands the file back as it
             // found it. (v0/v1 was refused above, so this is 2 or 3.)
             superblock_version_base: sb.version,
+            // The reopened file's own policy, so objects added in this
+            // session are made the way the file already declares.
+            root_track_order,
+            dense_attributes: Slot::new(HashMap::new()),
+            dense_links: Slot::new(HashMap::new()),
+            superseded_dense: Slot::new(superseded),
+            track_order: root_track_order,
+            next_creation_seq: Slot::new(creation_seq),
         })
     }
 
@@ -2778,6 +3286,7 @@ impl Hdf5Writer {
         for attr in &attrs {
             self.release_attr_vlen(attr)?;
         }
+        self.release_superseded_dense_attrs(AttrScope::Dataset(index))?;
         if let Some((addr, size)) = header_block {
             self.allocator.free(addr, size);
         }
@@ -2804,8 +3313,107 @@ impl Hdf5Writer {
         for attr in &attrs {
             self.release_attr_vlen(attr)?;
         }
+        self.release_superseded_dense_attrs(AttrScope::Group(gidx))?;
+        self.release_superseded_dense_links(LinkScope::Group(gidx))?;
         if let Some((addr, size)) = header_block {
             self.allocator.free(addr, size);
+        }
+        Ok(())
+    }
+
+    /// Free the dense attribute storage a reopened header names, once, when
+    /// this session stops naming it — because the header is being rewritten
+    /// around fresh storage, or because the object was deleted.
+    ///
+    /// The single owner of that transition: nothing else removes an attribute
+    /// entry from [`superseded_dense`](Self::superseded_dense), and this
+    /// removes it as it frees, so no heap is freed twice or left half freed.
+    /// An object whose storage was compact, or whose header this session
+    /// keeps, has no entry and nothing happens.
+    ///
+    /// Never under SWMR: a live reader may still be walking the storage the
+    /// published headers name, the same rule the superseded-header and
+    /// relocated-chunk paths follow. The entry stays in place, unfreed.
+    fn release_superseded_dense_attrs(&self, scope: AttrScope) -> IoResult<()> {
+        if self.swmr_active {
+            return Ok(());
+        }
+        let taken = self
+            .superseded_dense
+            .lock()
+            .as_mut()
+            .and_then(|s| s.attrs.remove(&scope));
+        let Some(ainfo) = taken else {
+            return Ok(());
+        };
+        self.release_dense_storage(
+            ainfo.fractal_heap_address,
+            ainfo.name_btree_address,
+            ainfo.creation_order_btree_address,
+        )
+    }
+
+    /// The link counterpart of
+    /// [`release_superseded_dense_attrs`](Self::release_superseded_dense_attrs),
+    /// under the same invariant and the same SWMR rule. Split from it because
+    /// the two are superseded at different points of a finalize: attribute
+    /// storage before the object headers are laid out, link storage after
+    /// every one of them has an address.
+    fn release_superseded_dense_links(&self, scope: LinkScope) -> IoResult<()> {
+        if self.swmr_active {
+            return Ok(());
+        }
+        let taken = self
+            .superseded_dense
+            .lock()
+            .as_mut()
+            .and_then(|s| s.links.remove(&scope));
+        let Some(linfo) = taken else {
+            return Ok(());
+        };
+        self.release_dense_storage(
+            linfo.fractal_heap_address,
+            linfo.name_btree_address,
+            linfo.creation_order_btree_address,
+        )
+    }
+
+    /// Return one dense storage's file space to the allocator: the fractal
+    /// heap in full, its name index, and the creation-order index when the
+    /// object had one.
+    ///
+    /// The extents come from walking the structures themselves rather than
+    /// from re-deriving what a writer would have allocated, so storage
+    /// libhdf5 laid out is freed as accurately as storage this crate wrote.
+    /// Every walk here already ran once this session — the reopen read every
+    /// attribute out of this heap through the same index — so a failure means
+    /// the file changed underneath us, and surfacing it beats freeing a
+    /// partial extent list.
+    fn release_dense_storage(
+        &self,
+        heap_addr: u64,
+        name_bt2_addr: u64,
+        corder_bt2_addr: Option<u64>,
+    ) -> IoResult<()> {
+        use crate::format::chunk_index::btree_v2::collect_btree_v2_extents;
+        use crate::format::fractal_heap::collect_heap_extents;
+
+        let mut reader = crate::io::reader::HandleBlockReader {
+            handle: &self.handle,
+        };
+        let mut extents = Vec::new();
+        if heap_addr != UNDEF_ADDR {
+            extents.extend(collect_heap_extents(heap_addr, &self.ctx, &mut reader)?);
+        }
+        for addr in [Some(name_bt2_addr), corder_bt2_addr]
+            .into_iter()
+            .flatten()
+            .filter(|&a| a != UNDEF_ADDR)
+        {
+            extents.extend(collect_btree_v2_extents(addr, &self.ctx, &mut reader)?);
+        }
+        for (addr, len) in extents {
+            self.allocator.free(addr, len);
         }
         Ok(())
     }
@@ -2987,6 +3595,9 @@ impl Hdf5Writer {
         // Same rule as dataset creation: a path through a carried external
         // link names a group in the other file, which this writer cannot make.
         self.reject_external_traversal(&full_name)?;
+        // `name` may itself carry path components; resolving the whole thing
+        // is what keeps a '/' out of the link this group will be reached by.
+        let (parent_idx, _leaf) = self.split_parent(full_name.trim_start_matches('/'))?;
 
         let groups = self.group_refs();
         // Check for duplicates (ignore deleted groups)
@@ -3012,30 +3623,11 @@ impl Hdf5Writer {
             )));
         }
 
-        // Find parent group index (None means it's a root-level group). Indices
-        // are append-only, so a parent found in the snapshot stays valid even
-        // if another thread pushes a new group concurrently.
-        let parent_idx = if parent_path == "/" {
-            None
-        } else {
-            let idx = groups
-                .iter()
-                .position(|g| {
-                    let gg = g.lock();
-                    gg.name == parent_path && !gg.deleted
-                })
-                .ok_or_else(|| {
-                    crate::io::IoError::NotFound(format!(
-                        "parent group '{}' not found",
-                        parent_path
-                    ))
-                })?;
-            Some(idx)
-        };
-
         let group_idx = self.push_group(GroupInfo {
             name: full_name,
             parent: parent_idx,
+            creation_seq: self.take_creation_seq(),
+            track_order: self.track_order,
             child_datasets: Vec::new(),
             child_groups: Vec::new(),
             obj_header_addr: 0,
@@ -3070,6 +3662,12 @@ impl Hdf5Writer {
             .ok_or_else(|| {
                 crate::io::IoError::NotFound(format!("group '{}' not found", group_path))
             })?;
+        // A move, not an addition: the create gate has already placed every
+        // dataset from the path components of its name, so appending here
+        // would leave one dataset linked from two groups at once.
+        for g in &groups {
+            g.lock().child_datasets.retain(|&d| d != ds_index);
+        }
         groups[group_idx].lock().child_datasets.push(ds_index);
         Ok(())
     }
@@ -3195,6 +3793,7 @@ impl Hdf5Writer {
             parent,
             name: link_name.to_string(),
             target,
+            creation_seq: self.take_creation_seq(),
         });
         Ok(())
     }
@@ -3287,11 +3886,10 @@ impl Hdf5Writer {
             .count() as u32
     }
 
-    /// Append a `MSG_LINK` message for every user-created hard link whose
-    /// parent group is `parent` (`None` == the root group). Called while
-    /// building group object headers, once every object's header address
-    /// has been assigned.
-    fn emit_hard_links(&self, header: &mut ObjectHeader, parent: Option<usize>) {
+    /// Append every user-created hard link whose parent group is `parent`
+    /// (`None` == the root group). Called while collecting a group's links,
+    /// once every object's header address has been assigned.
+    fn push_hard_links(&self, links: &mut Vec<(u64, LinkMessage)>, parent: Option<usize>) {
         for link in self.hard_links_vec() {
             if link.parent != parent || !self.hard_link_emitted(&link) {
                 continue;
@@ -3300,19 +3898,7 @@ impl Hdf5Writer {
                 HardLinkTarget::Dataset(i) => self.ds(i).lock().obj_header_addr,
                 HardLinkTarget::Group(i) => self.grp(i).lock().obj_header_addr,
             };
-            let msg = LinkMessage::hard(&link.name, addr);
-            header.add_message(MSG_LINK, 0x00, msg.encode(&self.ctx));
-        }
-    }
-
-    /// Re-emit the links of a reopened file that this writer cannot express,
-    /// verbatim. Every header rewrite goes through the two group-header
-    /// builders, and both call this, so no rewrite can drop them.
-    fn emit_preserved_links(&self, header: &mut ObjectHeader, parent: Option<usize>) {
-        for link in self.preserved_links.lock().iter() {
-            if link.parent == parent {
-                header.add_message(MSG_LINK, 0x00, link.encoded.clone());
-            }
+            links.push((link.creation_seq, LinkMessage::hard(&link.name, addr)));
         }
     }
 
@@ -3411,6 +3997,406 @@ impl Hdf5Writer {
         }
     }
 
+    /// The single owner of "which links does this group hold", in the order
+    /// they were created and, when the file tracks creation order, stamped
+    /// with it.
+    ///
+    /// Both the compact form (one `MSG_LINK` per link) and the dense form (the
+    /// same messages inside a fractal heap) are built from this one list, so
+    /// the phase-change decision, the storage it selects and the creation
+    /// order recorded in either can never disagree about what the group
+    /// contains.
+    fn group_links(&self, scope: LinkScope, order: CreationOrder) -> Vec<LinkMessage> {
+        let mut links: Vec<(u64, LinkMessage)> = Vec::new();
+        match scope {
+            LinkScope::Root => {
+                // Datasets that belong to a subgroup are that group's links,
+                // not the root's. Each group slot is locked one at a time.
+                let mut datasets_in_subgroups: std::collections::HashSet<usize> =
+                    std::collections::HashSet::new();
+                for grp in self.group_refs() {
+                    let g = grp.lock();
+                    if g.deleted {
+                        continue;
+                    }
+                    datasets_in_subgroups.extend(g.child_datasets.iter().copied());
+                }
+                // `dataset_refs` preserves registry order, so `enumerate`
+                // yields each dataset's true index.
+                for (i, ds) in self.dataset_refs().into_iter().enumerate() {
+                    let m = ds.lock();
+                    if m.deleted || datasets_in_subgroups.contains(&i) {
+                        continue;
+                    }
+                    // The leaf, never the registry path: a link name is one
+                    // path component, and `H5G_traverse` would split a '/'
+                    // in it before `H5L_link` ever saw the name.
+                    let leaf_name = m.name.rsplit('/').next().unwrap_or(&m.name);
+                    links.push((
+                        m.creation_seq,
+                        LinkMessage::hard(leaf_name, m.obj_header_addr),
+                    ));
+                }
+                for grp in self.group_refs() {
+                    let g = grp.lock();
+                    if g.deleted || g.parent.is_some() {
+                        continue;
+                    }
+                    let leaf_name = g.name.rsplit('/').next().unwrap_or(&g.name);
+                    links.push((
+                        g.creation_seq,
+                        LinkMessage::hard(leaf_name, g.obj_header_addr),
+                    ));
+                }
+                self.push_hard_links(&mut links, None);
+            }
+            LinkScope::Group(group_idx) => {
+                // Snapshot the child lists, then drop the slot guard: the
+                // per-child reads below re-lock dataset and group slots
+                // (including this one).
+                let (child_datasets, child_groups) = {
+                    let grp = self.grp(group_idx);
+                    let g = grp.lock();
+                    (g.child_datasets.clone(), g.child_groups.clone())
+                };
+                for ds_idx in child_datasets {
+                    let ds = self.ds(ds_idx);
+                    let m = ds.lock();
+                    if m.deleted {
+                        continue;
+                    }
+                    let leaf_name = m.name.rsplit('/').next().unwrap_or(&m.name);
+                    links.push((
+                        m.creation_seq,
+                        LinkMessage::hard(leaf_name, m.obj_header_addr),
+                    ));
+                }
+                for child_idx in child_groups {
+                    let child_grp = self.grp(child_idx);
+                    let g = child_grp.lock();
+                    if g.deleted {
+                        continue;
+                    }
+                    let leaf_name = g.name.rsplit('/').next().unwrap_or(&g.name);
+                    links.push((
+                        g.creation_seq,
+                        LinkMessage::hard(leaf_name, g.obj_header_addr),
+                    ));
+                }
+                self.push_hard_links(&mut links, Some(group_idx));
+            }
+        }
+        // Creation order, not order by kind: a run of create_group and
+        // create_dataset draws from one counter, so this is the order the
+        // caller made them in. `H5G_obj_insert` numbers from zero within the
+        // group, so the rank here is the link's creation order.
+        links.sort_by_key(|(seq, _)| *seq);
+        links
+            .into_iter()
+            .enumerate()
+            .map(|(rank, (_, link))| {
+                if order.is_tracked() {
+                    link.with_creation_order(rank as i64)
+                } else {
+                    link
+                }
+            })
+            .collect()
+    }
+
+    /// Whether `links` must live in dense storage rather than in the group's
+    /// object header — the `H5G_obj_insert` phase-change rule, applied to the
+    /// whole set at once because this writer builds each header from scratch
+    /// rather than inserting one link at a time.
+    ///
+    /// libhdf5 converts when the count *reaches* `max_compact` and another
+    /// link arrives, so a set of exactly `max_compact` is still compact; and
+    /// separately when one message would not fit the 16-bit size field an
+    /// object header message has.
+    ///
+    /// The answer depends only on the link names and kinds, never on the
+    /// addresses they point at, which is what lets a group header be sized
+    /// before [`prepare_dense_links`](Self::prepare_dense_links) has run.
+    fn links_need_dense(&self, links: &[LinkMessage]) -> bool {
+        links.len() > MAX_COMPACT_LINKS
+            || links
+                .iter()
+                .any(|l| l.encode(&self.ctx).len() > MAX_MESSAGE_SIZE)
+    }
+
+    /// The single owner of link emission into a group object header: the Link
+    /// Info and Group Info messages, and then either one `MSG_LINK` per link
+    /// or nothing at all when the set has spilled to dense storage.
+    ///
+    /// The two storage forms are exclusive (`H5G_obj_insert` moves the whole
+    /// set at once), and a header carrying both would report every link twice.
+    ///
+    /// A group whose links are dense but not yet laid out gets a compact Link
+    /// Info message here. That is deliberate: the message encodes to the same
+    /// length either way — two addresses, defined or not — so the sizing pass
+    /// that runs before `prepare_dense_links` still reserves the right number
+    /// of bytes, and the write pass that runs after it emits the real heap and
+    /// index addresses. It is the same two-pass rule the child link addresses
+    /// already follow.
+    fn emit_links(
+        &self,
+        header: &mut ObjectHeader,
+        scope: LinkScope,
+        links: &[LinkMessage],
+        order: CreationOrder,
+    ) {
+        // Links a reopen carried through verbatim because this writer cannot
+        // express them. They are emitted here rather than by a second caller
+        // so that no header-rewrite path can drop them, and their presence
+        // pins the group to compact storage: dense storage would have to
+        // re-encode each link into the heap, which is exactly the byte
+        // fidelity preserving them is for.
+        let preserved = self.preserved_links_for(scope);
+        let dense = preserved.is_empty() && self.links_need_dense(links);
+        let link_info = self.dense_links.lock().get(&scope).cloned();
+        let link_info = link_info.unwrap_or_else(|| {
+            let mut info = LinkInfoMessage::compact();
+            if order.is_tracked() {
+                // `H5G__obj_insert` post-increments `max_corder`, so a group
+                // holding n links reports n.
+                info.max_creation_order = Some(links.len() as u64);
+            }
+            if order.is_indexed() {
+                // The index address stays undefined while the links live in
+                // the header, but the message must still carry the field:
+                // `H5Pget_link_creation_order` reads INDEXED off this flag,
+                // not off the address.
+                info.creation_order_btree_address = Some(UNDEF_ADDR);
+            }
+            info
+        });
+        header.add_message(MSG_LINK_INFO, 0x00, link_info.encode(&self.ctx));
+        header.add_message(MSG_GROUP_INFO, 0x00, GroupInfoMessage::default().encode());
+        if dense {
+            return;
+        }
+        for link in links {
+            header.add_message(MSG_LINK, 0x00, link.encode(&self.ctx));
+        }
+        for encoded in preserved {
+            header.add_message(MSG_LINK, 0x00, encoded);
+        }
+    }
+
+    /// The verbatim link bodies a reopen carried into `scope`.
+    fn preserved_links_for(&self, scope: LinkScope) -> Vec<Vec<u8>> {
+        let parent = match scope {
+            LinkScope::Root => None,
+            LinkScope::Group(i) => Some(i),
+        };
+        self.preserved_links
+            .lock()
+            .iter()
+            .filter(|l| l.parent == parent)
+            .map(|l| l.encoded.clone())
+            .collect()
+    }
+
+    /// Lay out and write dense link storage for every group that needs it,
+    /// recording the resulting `Link Info` message per group.
+    ///
+    /// The sole owner of that transition. It must run after every object
+    /// header address is assigned — the heap holds encoded link messages, and
+    /// those name their targets — and before any group header is written.
+    ///
+    /// Every group whose header this finalize rewrites passes through here,
+    /// dense or not: the storage a reopened header named is superseded by the
+    /// rewrite whichever form the new link set takes, and freeing it first is
+    /// what lets the replacement reuse those blocks.
+    fn prepare_dense_links(&self) -> IoResult<()> {
+        let mut scopes: Vec<(LinkScope, Vec<LinkMessage>, CreationOrder)> = Vec::new();
+        for gi in 0..self.group_count() {
+            let (deleted, order) = {
+                let grp = self.grp(gi);
+                let g = grp.lock();
+                (g.deleted, g.track_order.links)
+            };
+            if deleted {
+                continue;
+            }
+            self.release_superseded_dense_links(LinkScope::Group(gi))?;
+            let links = self.group_links(LinkScope::Group(gi), order);
+            if self.links_need_dense(&links) {
+                scopes.push((LinkScope::Group(gi), links, order));
+            }
+        }
+        let root_order = self.root_track_order.links;
+        self.release_superseded_dense_links(LinkScope::Root)?;
+        let root_links = self.group_links(LinkScope::Root, root_order);
+        if self.links_need_dense(&root_links) {
+            scopes.push((LinkScope::Root, root_links, root_order));
+        }
+
+        for (scope, links, order) in scopes {
+            // `close` after `start_swmr` finalizes a second time over the same
+            // groups, so rebuilding here would allocate a whole second heap
+            // and strand the one the published headers already name.
+            if self.dense_links.lock().contains_key(&scope) {
+                continue;
+            }
+            let dense = build_dense_links(&links, &self.ctx, order, &mut |len| {
+                self.allocator.allocate(len)
+            })?;
+            for block in &dense.blocks {
+                self.handle.write_at(block.addr, &block.image)?;
+            }
+            self.dense_links.lock().insert(scope, dense.linfo);
+        }
+        Ok(())
+    }
+
+    /// The single owner of attribute emission into an object header: appends
+    /// the Attribute Info message and then one `MSG_ATTRIBUTE` per attribute.
+    ///
+    /// On a version-2 object header the two are inseparable.
+    /// `H5O__attr_count_real` derives `H5Oget_info().num_attrs` from the
+    /// Attribute Info message alone — with no such message the count reads as
+    /// zero however many attribute messages follow, which is what made every
+    /// rust-written file report `num_attrs == 0` to libhdf5 while
+    /// `H5Aiterate2` still yielded the attributes. The message carries no
+    /// count of its own: `H5A__get_ainfo` fills `nattrs` from the attribute
+    /// messages the header loader actually saw, so compact storage needs
+    /// nothing but the message's presence.
+    ///
+    /// When [`prepare_dense_attributes`](Self::prepare_dense_attributes) has
+    /// spilled `scope`'s attributes to a fractal heap, the same message names
+    /// that heap instead and *no* attribute message follows: the two storage
+    /// forms are exclusive (`H5O__attr_create` moves the whole set at once),
+    /// and a header carrying both would report every attribute twice.
+    fn emit_attributes(
+        &self,
+        header: &mut ObjectHeader,
+        scope: AttrScope,
+        attributes: &[AttributeEntry],
+        order: CreationOrder,
+    ) {
+        // `H5Pget_attr_creation_order` reads the object header's own flags,
+        // not the Attribute Info message, so this is what makes the object
+        // report creation-ordered attributes — and tracking widens every
+        // message envelope by the creation index below.
+        header.set_attribute_creation_order(order);
+        if attributes.is_empty() {
+            return;
+        }
+        if let Some(ainfo) = self.dense_attributes.lock().get(&scope) {
+            header.add_message(MSG_ATTR_INFO, MSG_FLAG_DONTSHARE, ainfo.encode(&self.ctx));
+            return;
+        }
+        let mut ainfo = AttributeInfoMessage::compact();
+        if order.is_tracked() {
+            // Post-increment, as `H5O__attr_create` does: after n attributes
+            // the running maximum is n.
+            ainfo.max_creation_index = Some(attributes.len() as u16);
+        }
+        if order.is_indexed() {
+            // Compact storage has no index B-tree, but the message still
+            // announces one so that its flags match the header's
+            // (`H5O__attr_create` asserts they agree).
+            ainfo.creation_order_btree_address = Some(UNDEF_ADDR);
+        }
+        header.add_message(MSG_ATTR_INFO, MSG_FLAG_DONTSHARE, ainfo.encode(&self.ctx));
+        // The list is in creation order, so an attribute's position in it is
+        // the creation index libhdf5 would have stamped on its message.
+        for (i, attr) in attributes.iter().enumerate() {
+            header.add_message_indexed(MSG_ATTRIBUTE, 0x00, attr.encode(&self.ctx), i as u16);
+        }
+    }
+
+    /// Whether `attributes` must live in dense storage rather than in the
+    /// object header — the `H5O__attr_create` phase-change rule, applied to
+    /// the whole set at once because this writer builds each header from
+    /// scratch rather than inserting one attribute at a time.
+    ///
+    /// libhdf5 converts when the count *reaches* `max_compact` and another
+    /// attribute arrives, so a set of exactly `max_compact` is still compact;
+    /// and separately when one message would not fit the 16-bit size field an
+    /// object header message has.
+    fn attributes_need_dense(&self, attributes: &[AttributeEntry]) -> bool {
+        attributes.len() > MAX_COMPACT_ATTRS
+            || attributes
+                .iter()
+                .any(|a| a.encode(&self.ctx).len() > MAX_MESSAGE_SIZE)
+    }
+
+    /// Lay out and write dense attribute storage for every object that needs
+    /// it, recording the resulting `Attribute Info` message per object.
+    ///
+    /// The sole owner of that transition: it runs before any object header is
+    /// built, so `emit_attributes` never allocates. Every block is on disk
+    /// before the map naming it is populated, so a header written from that
+    /// map can only point at bytes that exist.
+    ///
+    /// `datasets` lists the datasets whose headers this finalize will
+    /// actually write. A reopened dataset that took no writes keeps its
+    /// original header — and with it whatever storage that header already
+    /// names — so building a heap for it would strand every block of it.
+    ///
+    /// That list is also what makes freeing safe: every object named here has
+    /// its header rewritten, so the dense storage a reopen found on it is
+    /// superseded whether or not the new attribute set is dense again, and
+    /// freeing it before the replacement is laid out is what lets the
+    /// replacement reuse the same blocks.
+    fn prepare_dense_attributes(&self, datasets: &[usize]) -> IoResult<()> {
+        let mut scopes: Vec<(AttrScope, Vec<AttributeEntry>, CreationOrder)> = Vec::new();
+        {
+            self.release_superseded_dense_attrs(AttrScope::Root)?;
+            let root = self.root_attributes.lock();
+            if self.attributes_need_dense(&root) {
+                scopes.push((AttrScope::Root, root.clone(), self.root_track_order.attrs));
+            }
+        }
+        for gi in 0..self.group_count() {
+            if self.grp(gi).lock().deleted {
+                continue;
+            }
+            self.release_superseded_dense_attrs(AttrScope::Group(gi))?;
+            let grp = self.grp(gi);
+            let g = grp.lock();
+            if self.attributes_need_dense(&g.attributes) {
+                scopes.push((
+                    AttrScope::Group(gi),
+                    g.attributes.clone(),
+                    g.track_order.attrs,
+                ));
+            }
+        }
+        for &i in datasets {
+            self.release_superseded_dense_attrs(AttrScope::Dataset(i))?;
+            let ds = self.ds(i);
+            let m = ds.lock();
+            if self.attributes_need_dense(&m.attributes) {
+                scopes.push((
+                    AttrScope::Dataset(i),
+                    m.attributes.clone(),
+                    m.track_attr_order,
+                ));
+            }
+        }
+
+        for (scope, attributes, order) in scopes {
+            // `close` after `start_swmr` finalizes a second time over the same
+            // attribute sets — SWMR refuses every attribute mutation — so
+            // rebuilding here would allocate a whole second heap and strand
+            // the one the published headers already name.
+            if self.dense_attributes.lock().contains_key(&scope) {
+                continue;
+            }
+            let dense = build_dense_attributes(&attributes, &self.ctx, order, &mut |len| {
+                self.allocator.allocate(len)
+            })?;
+            for block in &dense.blocks {
+                self.handle.write_at(block.addr, &block.image)?;
+            }
+            self.dense_attributes.lock().insert(scope, dense.ainfo);
+        }
+        Ok(())
+    }
+
     /// Define a new contiguous dataset. Returns the dataset index (used with
     /// `write_dataset_raw`).
     ///
@@ -3464,6 +4450,9 @@ impl Hdf5Writer {
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version: 4,
             },
@@ -3553,6 +4542,9 @@ impl Hdf5Writer {
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -4240,11 +5232,16 @@ impl Hdf5Writer {
         if self.swmr_active {
             return Err(swmr_attr_error(&attr.name));
         }
+        // No size gate: an attribute whose message is too large for the
+        // 16-bit size field an object header message has spills the object's
+        // whole attribute set to dense storage at finalize, exactly as
+        // `H5O__attr_create` does. See `attributes_need_dense`.
+        let entry = AttributeEntry::Readable(attr);
         let old = self.with_attr_list(target, |attrs| {
-            if let Some(pos) = attrs.iter().position(|a| a.name == attr.name) {
-                Some(std::mem::replace(&mut attrs[pos], attr))
+            if let Some(pos) = attrs.iter().position(|a| a.name() == entry.name()) {
+                Some(std::mem::replace(&mut attrs[pos], entry))
             } else {
-                attrs.push(attr);
+                attrs.push(entry);
                 None
             }
         })?;
@@ -4299,7 +5296,7 @@ impl Hdf5Writer {
         let old = self.with_attr_list(target, |attrs| {
             attrs
                 .iter()
-                .position(|a| a.name == name)
+                .position(|a| a.name() == name)
                 .map(|pos| attrs.remove(pos))
         })?;
         match old {
@@ -4316,8 +5313,14 @@ impl Hdf5Writer {
     /// class stores its value inline in the message. Per-object removal
     /// keeps collections shared with other refs (libhdf5-written files)
     /// intact.
-    fn release_attr_vlen(&self, old: &AttributeMessage) -> IoResult<()> {
+    fn release_attr_vlen(&self, old: &AttributeEntry) -> IoResult<()> {
         use crate::format::messages::datatype::DatatypeMessage;
+        // An attribute whose message this crate could not decode keeps
+        // whatever heap space it references: releasing objects named by bytes
+        // we cannot interpret would free storage that is still live.
+        let Some(old) = old.readable() else {
+            return Ok(());
+        };
         if matches!(
             old.datatype,
             DatatypeMessage::VarLenString { .. } | DatatypeMessage::VarLenSequence { .. }
@@ -4332,7 +5335,7 @@ impl Hdf5Writer {
     fn with_attr_list<R>(
         &self,
         target: AttrTarget<'_>,
-        f: impl FnOnce(&mut Vec<AttributeMessage>) -> R,
+        f: impl FnOnce(&mut Vec<AttributeEntry>) -> R,
     ) -> IoResult<R> {
         match target {
             AttrTarget::Root => Ok(f(&mut self.root_attributes.lock())),
@@ -4355,7 +5358,12 @@ impl Hdf5Writer {
                         "dataset index {index} out of range (have {count})"
                     )));
                 }
-                Ok(f(&mut self.ds(index).lock().attributes))
+                let ds = self.ds(index);
+                let mut m = ds.lock();
+                // Every caller of this mutates the list, and a reopened
+                // dataset's header is rewritten only when it is marked stale.
+                m.header_dirty = true;
+                Ok(f(&mut m.attributes))
             }
         }
     }
@@ -4609,6 +5617,9 @@ impl Hdf5Writer {
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version: 4,
                 chunked: None,
@@ -4679,6 +5690,9 @@ impl Hdf5Writer {
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version: 4,
                 chunked: None,
@@ -4804,6 +5818,9 @@ impl Hdf5Writer {
                 filter_pipeline: Some(pipeline),
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -5441,6 +6458,7 @@ impl Hdf5Writer {
             )));
         }
         ds.fill_value = Some(bytes);
+        ds.header_dirty = true;
 
         // For a contiguous dataset the fill-value message declares
         // fill-on-allocation, but contiguous storage has no per-chunk
@@ -6009,6 +7027,9 @@ impl Hdf5Writer {
                 filter_pipeline: pipeline,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
                 chunked: None,
@@ -6144,6 +7165,9 @@ impl Hdf5Writer {
                 filter_pipeline: pipeline,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
                 chunked: None,
@@ -6250,6 +7274,9 @@ impl Hdf5Writer {
                 filter_pipeline: Some(FilterPipeline::deflate(compression_level)),
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -6353,6 +7380,9 @@ impl Hdf5Writer {
                 filter_pipeline: Some(pipeline),
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -7730,7 +8760,7 @@ impl Hdf5Writer {
         };
 
         let header = self.build_dataset_header(index);
-        let encoded = header.encode();
+        let encoded = header.encode()?;
 
         if encoded.len() > original_size {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -7770,12 +8800,13 @@ impl Hdf5Writer {
 
         // 1. Write each dataset's object header (none for a dataset deleted
         // before start_swmr — its storage was freed at delete time).
-        for i in 0..self.dataset_count() {
-            if self.ds(i).lock().deleted {
-                continue;
-            }
+        let live: Vec<usize> = (0..self.dataset_count())
+            .filter(|&i| !self.ds(i).lock().deleted)
+            .collect();
+        self.prepare_dense_attributes(&live)?;
+        for i in live {
             let ds_header = self.build_dataset_header(i);
-            let encoded = ds_header.encode();
+            let encoded = ds_header.encode()?;
             let encoded_size = encoded.len();
             let addr = self.allocator.allocate(encoded_size as u64);
             self.handle.write_at(addr, &encoded)?;
@@ -7794,21 +8825,25 @@ impl Hdf5Writer {
             if self.grp(gi).lock().deleted {
                 continue;
             }
-            let size = self.build_group_header(gi).encode().len() as u64;
+            let size = self.build_group_header(gi).encode()?.len() as u64;
             self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
         }
+        // Every object header now has an address, so a link message names its
+        // real target; and no group header has been written yet, so the Link
+        // Info messages this lays out are the ones that reach the file.
+        self.prepare_dense_links()?;
         for gi in 0..self.group_count() {
             if self.grp(gi).lock().deleted {
                 continue;
             }
-            let encoded = self.build_group_header(gi).encode();
+            let encoded = self.build_group_header(gi).encode()?;
             let addr = self.grp(gi).lock().obj_header_addr;
             self.handle.write_at(addr, &encoded)?;
         }
 
         // 2. Write root group object header.
         let root_header = self.build_root_group_header();
-        let root_encoded = root_header.encode();
+        let root_encoded = root_header.encode()?;
         let root_encoded_size = root_encoded.len();
         let root_addr = self.allocator.allocate(root_encoded_size as u64);
         self.handle.write_at(root_addr, &root_encoded)?;
@@ -7879,14 +8914,8 @@ impl Hdf5Writer {
                 if m.deleted {
                     continue;
                 }
-                if m.obj_header_written_addr.is_some() {
-                    let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0)
-                        || m.fixed_array.as_ref().is_some_and(|f| f.chunks_written > 0)
-                        || m.btree_v2.as_ref().is_some_and(|b| b.chunks_written > 0)
-                        || m.extent_dirty;
-                    if !modified {
-                        continue;
-                    }
+                if m.obj_header_written_addr.is_some() && !m.storage_dirty() {
+                    continue;
                 }
                 let is_indexed =
                     m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
@@ -7908,42 +8937,42 @@ impl Hdf5Writer {
         let mut freed_headers = std::collections::HashSet::new();
 
         // 1. Write each dataset's object header (deleted datasets get none —
-        // their storage was already freed at delete time).
+        // their storage was already freed at delete time). Which datasets get
+        // one is settled first, because dense attribute storage is laid out
+        // only for headers this finalize actually rewrites.
+        let mut rewritten: Vec<usize> = Vec::new();
         for i in 0..self.dataset_count() {
             let ds = self.ds(i);
-            {
-                let mut m = ds.lock();
-                if m.deleted {
+            let mut m = ds.lock();
+            if m.deleted {
+                continue;
+            }
+            if m.obj_header_written_addr.is_some() {
+                // An existing dataset from append mode keeps its header — and
+                // everything that header names — unless this session changed
+                // what the header says.
+                if !m.header_stale() {
+                    // Keep the original object header address for the root group link.
+                    m.obj_header_addr = m.obj_header_written_addr.unwrap();
                     continue;
                 }
-                if m.obj_header_written_addr.is_some() {
-                    // Existing dataset from append mode.
-                    // If any chunk index took writes this session — or its
-                    // extent changed without a chunk write — it was modified
-                    // and needs a new object header.
-                    let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0)
-                        || m.fixed_array.as_ref().is_some_and(|f| f.chunks_written > 0)
-                        || m.btree_v2.as_ref().is_some_and(|b| b.chunks_written > 0)
-                        || m.extent_dirty;
-                    if !modified {
-                        // Keep the original object header address for the root group link.
-                        m.obj_header_addr = m.obj_header_written_addr.unwrap();
-                        continue;
+                if !self.swmr_active && m.obj_header_encoded_size > 0 {
+                    let old = m.obj_header_written_addr.take().unwrap();
+                    if freed_headers.insert(old) {
+                        self.allocator.free(old, m.obj_header_encoded_size as u64);
                     }
-                    if !self.swmr_active && m.obj_header_encoded_size > 0 {
-                        let old = m.obj_header_written_addr.take().unwrap();
-                        if freed_headers.insert(old) {
-                            self.allocator.free(old, m.obj_header_encoded_size as u64);
-                        }
-                        m.obj_header_encoded_size = 0;
-                    }
+                    m.obj_header_encoded_size = 0;
                 }
             }
+            rewritten.push(i);
+        }
+        self.prepare_dense_attributes(&rewritten)?;
+        for i in rewritten {
             let ds_header = self.build_dataset_header(i);
-            let encoded = ds_header.encode();
+            let encoded = ds_header.encode()?;
             let addr = self.allocator.allocate(encoded.len() as u64);
             self.handle.write_at(addr, &encoded)?;
-            ds.lock().obj_header_addr = addr;
+            self.ds(i).lock().obj_header_addr = addr;
         }
 
         // 1b. Group object headers. A hard link can point to a group whose
@@ -7968,14 +8997,18 @@ impl Hdf5Writer {
             if self.grp(gi).lock().deleted {
                 continue;
             }
-            let size = self.build_group_header(gi).encode().len() as u64;
+            let size = self.build_group_header(gi).encode()?.len() as u64;
             self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
         }
+        // Every object header now has an address, so a link message names its
+        // real target; and no group header has been written yet, so the Link
+        // Info messages this lays out are the ones that reach the file.
+        self.prepare_dense_links()?;
         for gi in 0..self.group_count() {
             if self.grp(gi).lock().deleted {
                 continue;
             }
-            let encoded = self.build_group_header(gi).encode();
+            let encoded = self.build_group_header(gi).encode()?;
             let addr = self.grp(gi).lock().obj_header_addr;
             self.handle.write_at(addr, &encoded)?;
         }
@@ -7989,7 +9022,7 @@ impl Hdf5Writer {
             }
         }
         let root_header = self.build_root_group_header();
-        let root_encoded = root_header.encode();
+        let root_encoded = root_header.encode()?;
         let root_addr = self.allocator.allocate(root_encoded.len() as u64);
         self.handle.write_at(root_addr, &root_encoded)?;
         self.root_group_addr = Some(root_addr);
@@ -8095,11 +9128,13 @@ impl Hdf5Writer {
             }
         }
 
-        // Attribute messages (type 0x0C)
-        for attr in &m.attributes {
-            let attr_msg = attr.encode(&self.ctx);
-            header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
-        }
+        // Attribute Info (type 0x15) + attribute messages (type 0x0C)
+        self.emit_attributes(
+            &mut header,
+            AttrScope::Dataset(index),
+            &m.attributes,
+            m.track_attr_order,
+        );
 
         // Object Reference Count message (type 0x16): emitted only when
         // more than one hard link resolves to this dataset (computed above).
@@ -8114,65 +9149,32 @@ impl Hdf5Writer {
     fn build_group_header(&self, group_idx: usize) -> ObjectHeader {
         let mut header = ObjectHeader::new();
 
-        // Link Info message (type 0x02) -- compact storage
-        let link_info = LinkInfoMessage::compact();
-        let li_msg = link_info.encode(&self.ctx);
-        header.add_message(MSG_LINK_INFO, 0x00, li_msg);
-
-        // Group Info message (type 0x0A) -- defaults
-        let group_info = GroupInfoMessage::default();
-        let gi_msg = group_info.encode();
-        header.add_message(MSG_GROUP_INFO, 0x00, gi_msg);
-
-        // Snapshot the group's child lists and attributes, then drop the slot
-        // guard: the per-child reads and emit_hard_links/object_link_count
-        // below re-lock dataset and group slots (including this one).
-        let (child_datasets, child_groups, attributes) = {
+        // Link Info (type 0x02) + Group Info (type 0x0A) + the links
+        // themselves, compact or dense.
+        // Snapshot what the header needs, then drop the slot guard: the calls
+        // below re-lock group slots (including this one).
+        let (attributes, track_order) = {
             let grp = self.grp(group_idx);
             let g = grp.lock();
-            (
-                g.child_datasets.clone(),
-                g.child_groups.clone(),
-                g.attributes.clone(),
-            )
+            (g.attributes.clone(), g.track_order)
         };
 
-        // Link messages for child datasets (skip deleted)
-        for ds_idx in child_datasets {
-            let ds = self.ds(ds_idx);
-            let m = ds.lock();
-            if m.deleted {
-                continue;
-            }
-            let leaf_name = m.name.rsplit('/').next().unwrap_or(&m.name);
-            let link = LinkMessage::hard(leaf_name, m.obj_header_addr);
-            let link_msg = link.encode(&self.ctx);
-            header.add_message(MSG_LINK, 0x00, link_msg);
-        }
+        let links = self.group_links(LinkScope::Group(group_idx), track_order.links);
+        self.emit_links(
+            &mut header,
+            LinkScope::Group(group_idx),
+            &links,
+            track_order.links,
+        );
 
-        // Link messages for child groups (skip deleted)
-        for child_idx in child_groups {
-            let child_grp = self.grp(child_idx);
-            let g = child_grp.lock();
-            if g.deleted {
-                continue;
-            }
-            let leaf_name = g.name.rsplit('/').next().unwrap_or(&g.name);
-            let link = LinkMessage::hard(leaf_name, g.obj_header_addr);
-            let link_msg = link.encode(&self.ctx);
-            header.add_message(MSG_LINK, 0x00, link_msg);
-        }
-
-        // User-created hard links whose parent is this group, then the links
-        // a reopen carried through that this writer cannot express.
-        self.emit_hard_links(&mut header, Some(group_idx));
-        self.emit_preserved_links(&mut header, Some(group_idx));
-
-        // Attribute messages (type 0x0C) -- e.g. NeXus `NX_class`.
-        for attr in &attributes {
-            let attr_msg = attr.encode(&self.ctx);
-            header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
-        }
+        // Attribute Info (type 0x15) + attributes (type 0x0C) -- e.g. NeXus
+        // `NX_class`.
+        self.emit_attributes(
+            &mut header,
+            AttrScope::Group(group_idx),
+            &attributes,
+            track_order.attrs,
+        );
 
         // Object Reference Count message: emitted only when this group is
         // itself a hard-link target reached by more than one link.
@@ -8187,66 +9189,24 @@ impl Hdf5Writer {
     fn build_root_group_header(&self) -> ObjectHeader {
         let mut header = ObjectHeader::new();
 
-        // Link Info message (type 0x02) — compact storage
-        let link_info = LinkInfoMessage::compact();
-        let li_msg = link_info.encode(&self.ctx);
-        header.add_message(MSG_LINK_INFO, 0x00, li_msg);
-
-        // Group Info message (type 0x0A) — defaults
-        let group_info = GroupInfoMessage::default();
-        let gi_msg = group_info.encode();
-        header.add_message(MSG_GROUP_INFO, 0x00, gi_msg);
-
-        // Collect dataset indices that belong to a subgroup (not the root
-        // group). Each group slot is locked one at a time, then released.
-        let mut datasets_in_subgroups: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
-        for grp in self.group_refs() {
-            let g = grp.lock();
-            if g.deleted {
-                continue;
-            }
-            datasets_in_subgroups.extend(g.child_datasets.iter().copied());
-        }
-
-        // Link messages for root-level datasets. `dataset_refs` preserves
-        // registry order, so `enumerate` yields each dataset's true index.
-        for (i, ds) in self.dataset_refs().into_iter().enumerate() {
-            let m = ds.lock();
-            if m.deleted {
-                continue;
-            }
-            if !datasets_in_subgroups.contains(&i) {
-                let link = LinkMessage::hard(&m.name, m.obj_header_addr);
-                let link_msg = link.encode(&self.ctx);
-                header.add_message(MSG_LINK, 0x00, link_msg);
-            }
-        }
-
-        // Link messages for root-level groups (those with no parent)
-        for grp in self.group_refs() {
-            let g = grp.lock();
-            if g.deleted {
-                continue;
-            }
-            if g.parent.is_none() {
-                let leaf_name = g.name.rsplit('/').next().unwrap_or(&g.name);
-                let link = LinkMessage::hard(leaf_name, g.obj_header_addr);
-                let link_msg = link.encode(&self.ctx);
-                header.add_message(MSG_LINK, 0x00, link_msg);
-            }
-        }
-
-        // User-created hard links in the root group, then the links a reopen
-        // carried through that this writer cannot express.
-        self.emit_hard_links(&mut header, None);
-        self.emit_preserved_links(&mut header, None);
+        // Link Info (type 0x02) + Group Info (type 0x0A) + the links
+        // themselves, compact or dense.
+        let links = self.group_links(LinkScope::Root, self.root_track_order.links);
+        self.emit_links(
+            &mut header,
+            LinkScope::Root,
+            &links,
+            self.root_track_order.links,
+        );
 
         // Root-level attributes
-        for attr in self.root_attributes.lock().iter() {
-            let attr_msg = attr.encode(&self.ctx);
-            header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
-        }
+        let root_attributes = self.root_attributes.lock();
+        self.emit_attributes(
+            &mut header,
+            AttrScope::Root,
+            &root_attributes,
+            self.root_track_order.attrs,
+        );
 
         header
     }
@@ -8288,6 +9248,180 @@ mod tests {
             tag,
             n
         ))
+    }
+
+    /// A group past the link phase change keeps its links in a fractal heap
+    /// with a v2 B-tree name index. The reopen that rewrites that group's
+    /// header lays a fresh pair out, so both blocks the old header named must
+    /// come back to the allocator — every block of the heap, and the index
+    /// header with its nodes.
+    ///
+    /// Asserted on the free list rather than on the file size: a reopen does
+    /// not yet carry dense links forward, so the rewritten group's links (and
+    /// the datasets they name) are dropped, and the file size that follows
+    /// says more about that than about this.
+    #[test]
+    fn a_reopen_frees_the_dense_link_storage_its_rewrite_supersedes() {
+        let path = temp_path("dense_link_reclaim");
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        writer.create_group("/", "run").unwrap();
+        for i in 0..12 {
+            writer
+                .create_dataset(&format!("run/d{i:02}"), DatatypeMessage::i32_type(), &[2])
+                .unwrap();
+        }
+        writer.close().unwrap();
+
+        let writer = Hdf5Writer::open_append(&path).unwrap();
+        let gidx = (0..writer.group_count())
+            .find(|&g| writer.grp(g).lock().name == "/run")
+            .expect("the reopen registered the group");
+        let linfo = writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .and_then(|s| s.links.get(&LinkScope::Group(gidx)).cloned())
+            .expect("the reopen recorded the group's dense link storage");
+        assert_ne!(linfo.fractal_heap_address, UNDEF_ADDR);
+        assert_ne!(linfo.name_btree_address, UNDEF_ADDR);
+
+        writer
+            .release_superseded_dense_links(LinkScope::Group(gidx))
+            .unwrap();
+        let freed = writer.allocator.free_blocks();
+        let covers = |addr: u64| {
+            freed
+                .iter()
+                .any(|&(a, len)| addr >= a && addr < a.saturating_add(len))
+        };
+        assert!(covers(linfo.fractal_heap_address), "heap header: {freed:?}");
+        assert!(covers(linfo.name_btree_address), "name index: {freed:?}");
+
+        // And exactly once: the entry is gone, so the finalize that follows
+        // cannot hand the same blocks back a second time.
+        assert!(writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .is_none_or(|s| s.links.is_empty()));
+        writer
+            .release_superseded_dense_links(LinkScope::Group(gidx))
+            .unwrap();
+        assert_eq!(writer.allocator.free_blocks(), freed);
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The rewrite frees what it supersedes even when the replacement is not
+    /// dense at all. An attribute set that drops back under `max_compact`
+    /// goes into the object header, so nothing names the old heap any more —
+    /// and a free driven by "the new set needs dense storage" would never
+    /// reach this one.
+    #[test]
+    fn a_rewrite_that_drops_out_of_dense_storage_still_frees_it() {
+        let path = temp_path("dense_attr_to_compact");
+        let numeric = |name: &str| {
+            AttributeMessage::scalar_numeric(
+                name,
+                DatatypeMessage::i32_type(),
+                7i32.to_le_bytes().to_vec(),
+            )
+        };
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        for i in 0..12 {
+            writer
+                .add_root_attribute(numeric(&format!("a{i:02}")))
+                .unwrap();
+        }
+        writer.close().unwrap();
+
+        let writer = Hdf5Writer::open_append(&path).unwrap();
+        let ainfo = writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .and_then(|s| s.attrs.get(&AttrScope::Root).cloned())
+            .expect("the reopen recorded the root's dense attribute storage");
+        for i in 0..10 {
+            writer
+                .evict_attr(AttrTarget::Root, &format!("a{i:02}"))
+                .unwrap();
+        }
+        assert!(!writer.attributes_need_dense(&writer.root_attributes.lock()));
+
+        writer.prepare_dense_attributes(&[]).unwrap();
+        let freed = writer.allocator.free_blocks();
+        let covers = |addr: u64| {
+            freed
+                .iter()
+                .any(|&(a, len)| addr >= a && addr < a.saturating_add(len))
+        };
+        assert!(covers(ainfo.fractal_heap_address), "heap header: {freed:?}");
+        assert!(covers(ainfo.name_btree_address), "name index: {freed:?}");
+        assert!(writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .is_none_or(|s| s.attrs.is_empty()));
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Deleting a reopened object supersedes its dense storage as surely as
+    /// rewriting one does: nothing in the finalized file names the heap, so
+    /// the delete owner frees it through the same entry.
+    #[test]
+    fn deleting_a_reopened_group_frees_its_dense_attribute_storage() {
+        let path = temp_path("dense_attr_delete");
+        let numeric = |name: &str| {
+            AttributeMessage::scalar_numeric(
+                name,
+                DatatypeMessage::i32_type(),
+                7i32.to_le_bytes().to_vec(),
+            )
+        };
+
+        let writer = Hdf5Writer::create(&path).unwrap();
+        writer.create_group("/", "run").unwrap();
+        for i in 0..12 {
+            writer
+                .set_attribute(AttrTarget::Group("/run"), numeric(&format!("a{i:02}")))
+                .unwrap();
+        }
+        writer.close().unwrap();
+
+        let writer = Hdf5Writer::open_append(&path).unwrap();
+        let gidx = (0..writer.group_count())
+            .find(|&g| writer.grp(g).lock().name == "/run")
+            .expect("the reopen registered the group");
+        let ainfo = writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .and_then(|s| s.attrs.get(&AttrScope::Group(gidx)).cloned())
+            .expect("the reopen recorded the group's dense attribute storage");
+
+        writer.delete_group("/run").unwrap();
+        let freed = writer.allocator.free_blocks();
+        let covers = |addr: u64| {
+            freed
+                .iter()
+                .any(|&(a, len)| addr >= a && addr < a.saturating_add(len))
+        };
+        assert!(covers(ainfo.fractal_heap_address), "heap header: {freed:?}");
+        assert!(covers(ainfo.name_btree_address), "name index: {freed:?}");
+        assert!(writer
+            .superseded_dense
+            .lock()
+            .as_ref()
+            .is_none_or(|s| s.attrs.is_empty()));
+
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
     }
 
     /// The charset rule is one owner shared by every vlen string writer:
@@ -9954,7 +11088,6 @@ mod tests {
         let ds_g0 = writer
             .create_dataset("group1/data", DatatypeMessage::i32_type(), &[3])
             .unwrap();
-        writer.assign_dataset_to_group("/group1", ds_g0).unwrap();
         let raw_g0: Vec<u8> = [10i32, 20, 30]
             .iter()
             .flat_map(|v| v.to_le_bytes())
@@ -9963,9 +11096,6 @@ mod tests {
 
         let ds_g1 = writer
             .create_dataset("group1/sub/values", DatatypeMessage::u8_type(), &[4])
-            .unwrap();
-        writer
-            .assign_dataset_to_group("/group1/sub", ds_g1)
             .unwrap();
         writer.write_dataset_raw(ds_g1, &[1u8, 2, 3, 4]).unwrap();
 

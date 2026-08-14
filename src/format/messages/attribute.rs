@@ -150,73 +150,13 @@ impl AttributeMessage {
     /// - v2: 8-byte header, no alignment padding
     /// - v3: 9-byte header (adds charset byte), no alignment padding
     pub fn decode(buf: &[u8], ctx: &FormatContext) -> FormatResult<(Self, usize)> {
-        if buf.len() < 8 {
-            return Err(FormatError::BufferTooShort {
-                needed: 8,
-                available: buf.len(),
-            });
-        }
-
-        let version = buf[0];
-        if !(1..=ATTR_VERSION).contains(&version) {
-            return Err(FormatError::InvalidVersion(version));
-        }
-
-        // Byte 1 says whether the datatype and dataspace that follow are
-        // bodies or references (`H5O_ATTR_FLAG_TYPE_SHARED` /
-        // `H5O_ATTR_FLAG_SPACE_SHARED`). A reference decoded as a body reads
-        // its version byte as the body's, which invents a type rather than
-        // failing, so an attribute that carries one is named here instead.
-        // Resolving it needs the file the reference points into, which a
-        // message decoder does not have.
-        const ATTR_FLAG_TYPE_SHARED: u8 = 0x01;
-        const ATTR_FLAG_SPACE_SHARED: u8 = 0x02;
-        let flags = buf[1];
-        if flags & (ATTR_FLAG_TYPE_SHARED | ATTR_FLAG_SPACE_SHARED) != 0 {
-            let what = if flags & ATTR_FLAG_TYPE_SHARED != 0 {
-                "datatype"
-            } else {
-                "dataspace"
-            };
-            return Err(FormatError::UnsupportedFeature(format!(
-                "attribute whose {what} is a shared-message reference"
-            )));
-        }
-        let name_size = u16::from_le_bytes([buf[2], buf[3]]) as usize;
-        let datatype_size = u16::from_le_bytes([buf[4], buf[5]]) as usize;
-        let dataspace_size = u16::from_le_bytes([buf[6], buf[7]]) as usize;
-
-        let mut pos = if version >= 3 {
-            // v3 has charset byte at offset 8
-            9
-        } else {
-            // v1, v2: no charset byte
-            8
-        };
-
-        // v1 pads each field to 8-byte alignment
-        let align = if version == 1 { 8 } else { 1 };
-
-        // Name
-        let needed = pos + name_size;
-        if buf.len() < needed {
-            return Err(FormatError::BufferTooShort {
-                needed,
-                available: buf.len(),
-            });
-        }
-        // Strip trailing null
-        let name_end = if name_size > 0 && buf[pos + name_size - 1] == 0 {
-            pos + name_size - 1
-        } else {
-            pos + name_size
-        };
-        let name = String::from_utf8_lossy(&buf[pos..name_end]).to_string();
-        pos += name_size;
-        // v1 alignment
-        if align > 1 {
-            pos = (pos + align - 1) & !(align - 1);
-        }
+        let AttributeHeader {
+            name,
+            datatype_size,
+            dataspace_size,
+            align,
+            mut pos,
+        } = AttributeHeader::decode(buf)?;
 
         // Datatype
         let needed = pos + datatype_size;
@@ -280,6 +220,189 @@ impl AttributeMessage {
             },
             pos,
         ))
+    }
+}
+
+/// The part of an attribute message that identifies it: the envelope and the
+/// name, both of which sit ahead of the datatype.
+///
+/// Split out because that ordering is what makes an undecodable attribute
+/// nameable — see [`AttributeEntry::parse`].
+struct AttributeHeader {
+    name: String,
+    datatype_size: usize,
+    dataspace_size: usize,
+    /// Field alignment: 8 for version 1, 1 for versions 2 and 3.
+    align: usize,
+    /// Offset just past the (aligned) name, where the datatype begins.
+    pos: usize,
+}
+
+impl AttributeHeader {
+    fn decode(buf: &[u8]) -> FormatResult<Self> {
+        if buf.len() < 8 {
+            return Err(FormatError::BufferTooShort {
+                needed: 8,
+                available: buf.len(),
+            });
+        }
+
+        let version = buf[0];
+        if !(1..=ATTR_VERSION).contains(&version) {
+            return Err(FormatError::InvalidVersion(version));
+        }
+
+        // Byte 1 says whether the datatype and dataspace that follow are
+        // bodies or references (`H5O_ATTR_FLAG_TYPE_SHARED` /
+        // `H5O_ATTR_FLAG_SPACE_SHARED`). A reference decoded as a body reads
+        // its version byte as the body's, which invents a type rather than
+        // failing, so an attribute that carries one is named here instead.
+        // Resolving it needs the file the reference points into, which a
+        // message decoder does not have — an attribute read out of an object
+        // header has been resolved before it gets here, one read out of dense
+        // storage has not.
+        const ATTR_FLAG_TYPE_SHARED: u8 = 0x01;
+        const ATTR_FLAG_SPACE_SHARED: u8 = 0x02;
+        let flags = buf[1];
+        if flags & (ATTR_FLAG_TYPE_SHARED | ATTR_FLAG_SPACE_SHARED) != 0 {
+            let what = if flags & ATTR_FLAG_TYPE_SHARED != 0 {
+                "datatype"
+            } else {
+                "dataspace"
+            };
+            return Err(FormatError::UnsupportedFeature(format!(
+                "attribute whose {what} is a shared-message reference"
+            )));
+        }
+        let name_size = u16::from_le_bytes([buf[2], buf[3]]) as usize;
+        let datatype_size = u16::from_le_bytes([buf[4], buf[5]]) as usize;
+        let dataspace_size = u16::from_le_bytes([buf[6], buf[7]]) as usize;
+
+        let mut pos = if version >= 3 {
+            // v3 has charset byte at offset 8
+            9
+        } else {
+            // v1, v2: no charset byte
+            8
+        };
+
+        // v1 pads each field to 8-byte alignment
+        let align = if version == 1 { 8 } else { 1 };
+
+        // Name
+        let needed = pos + name_size;
+        if buf.len() < needed {
+            return Err(FormatError::BufferTooShort {
+                needed,
+                available: buf.len(),
+            });
+        }
+        // Strip trailing null
+        let name_end = if name_size > 0 && buf[pos + name_size - 1] == 0 {
+            pos + name_size - 1
+        } else {
+            pos + name_size
+        };
+        let name = String::from_utf8_lossy(&buf[pos..name_end]).to_string();
+        pos += name_size;
+        // v1 alignment
+        if align > 1 {
+            pos = (pos + align - 1) & !(align - 1);
+        }
+
+        Ok(Self {
+            name,
+            datatype_size,
+            dataspace_size,
+            align,
+            pos,
+        })
+    }
+}
+
+/// One attribute as an object header holds it.
+///
+/// [`AttributeMessage::decode`] fails on a payload this crate cannot model —
+/// an object-reference datatype, say — but the name sits ahead of the datatype
+/// in the message, so such an attribute is still identifiable. Carrying the
+/// unreadable case in the same list is what lets a listing answer "this object
+/// has an attribute named X that I cannot read" instead of answering as though
+/// X were not there.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttributeEntry {
+    /// Decoded, and usable through the typed accessors.
+    Readable(AttributeMessage),
+    /// Named, with the reason it could not be decoded and the message payload
+    /// verbatim — so a header rewrite puts back exactly what it read rather
+    /// than dropping what it could not model.
+    Unreadable {
+        name: String,
+        raw: Vec<u8>,
+        reason: String,
+    },
+}
+
+impl AttributeEntry {
+    /// Parse one attribute message.
+    ///
+    /// Total over every message whose envelope and name parse: a payload this
+    /// crate cannot decode becomes [`Unreadable`](Self::Unreadable), never an
+    /// absence. Only a message too damaged to yield a name at all is an error,
+    /// because there is then no name to report.
+    pub fn parse(buf: &[u8], ctx: &FormatContext) -> FormatResult<Self> {
+        match AttributeMessage::decode(buf, ctx) {
+            Ok((attr, _)) => Ok(Self::Readable(attr)),
+            Err(payload_err) => {
+                let header = AttributeHeader::decode(buf)?;
+                Ok(Self::Unreadable {
+                    name: header.name,
+                    raw: buf.to_vec(),
+                    reason: payload_err.to_string(),
+                })
+            }
+        }
+    }
+
+    /// The attribute's name, whether or not its payload decoded.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Readable(attr) => &attr.name,
+            Self::Unreadable { name, .. } => name,
+        }
+    }
+
+    /// The decoded message, or `None` when only the name is known.
+    pub fn readable(&self) -> Option<&AttributeMessage> {
+        match self {
+            Self::Readable(attr) => Some(attr),
+            Self::Unreadable { .. } => None,
+        }
+    }
+
+    /// Why this attribute cannot be read, or `None` when it can be.
+    pub fn unreadable_reason(&self) -> Option<&str> {
+        match self {
+            Self::Readable(_) => None,
+            Self::Unreadable { reason, .. } => Some(reason),
+        }
+    }
+
+    /// The message payload to write back into an object header.
+    ///
+    /// An unreadable attribute returns the bytes it was read from: re-encoding
+    /// is impossible without a decoded form, and dropping it would delete an
+    /// attribute the caller never asked to change.
+    pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
+        match self {
+            Self::Readable(attr) => attr.encode(ctx),
+            Self::Unreadable { raw, .. } => raw.clone(),
+        }
+    }
+}
+
+impl From<AttributeMessage> for AttributeEntry {
+    fn from(attr: AttributeMessage) -> Self {
+        Self::Readable(attr)
     }
 }
 

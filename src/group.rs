@@ -227,9 +227,6 @@ impl H5Group {
         match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_string_dataset(&full_name, strings)?;
-                if self.name != "/" {
-                    writer.assign_dataset_to_group(&self.name, idx)?;
-                }
                 let (shape, element_size, chunked, btree2, fixed_array) =
                     writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
@@ -268,9 +265,6 @@ impl H5Group {
         match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_bytes_dataset(&full_name, items)?;
-                if self.name != "/" {
-                    writer.assign_dataset_to_group(&self.name, idx)?;
-                }
                 let (shape, element_size, chunked, btree2, fixed_array) =
                     writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
@@ -314,9 +308,6 @@ impl H5Group {
                 let idx = writer.create_vlen_string_dataset_compressed(
                     &full_name, strings, chunk_size, pipeline,
                 )?;
-                if self.name != "/" {
-                    writer.assign_dataset_to_group(&self.name, idx)?;
-                }
                 let (shape, element_size, chunked, btree2, fixed_array) =
                     writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
@@ -359,9 +350,6 @@ impl H5Group {
             H5FileInner::Writer(writer) => {
                 let idx = writer
                     .create_appendable_vlen_string_dataset(&full_name, chunk_size, pipeline)?;
-                if self.name != "/" {
-                    writer.assign_dataset_to_group(&self.name, idx)?;
-                }
                 let (shape, element_size, chunked, btree2, fixed_array) =
                     writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
@@ -839,13 +827,57 @@ impl H5Group {
         match &mut *inner {
             H5FileInner::Reader(reader) => {
                 if self.name == "/" {
-                    Ok(reader.root_attr_names())
+                    Ok(reader.root_attr_names()?)
                 } else {
-                    Ok(reader.group_attr_names(self.name.trim_start_matches('/')))
+                    Ok(reader.group_attr_names(self.name.trim_start_matches('/'))?)
                 }
             }
             _ => Err(Hdf5Error::InvalidState(
                 "attr_names is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Why this group's attribute `name` cannot be read, or `None` when it
+    /// can be. The attribute counterpart of
+    /// [`unreadable_reason`](Self::unreadable_reason)'s shape for datasets:
+    /// an attribute this crate cannot decode stays in
+    /// [`attr_names`](Self::attr_names) and answers here.
+    pub fn attr_unreadable_reason(&self, name: &str) -> Result<Option<String>> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_attr_unreadable_reason(name)
+            } else {
+                reader.group_attr_unreadable_reason(self.name.trim_start_matches('/'), name)
+            }
+            .map(str::to_string)),
+            _ => Err(Hdf5Error::InvalidState(
+                "attr_unreadable_reason is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Why this group's attribute *set* cannot be listed, or `None` when it
+    /// can be.
+    ///
+    /// The object-scope counterpart of
+    /// [`attr_unreadable_reason`](Self::attr_unreadable_reason): a failure
+    /// that belongs to no single name — a dense set whose heap or name index
+    /// will not read — leaves nothing to list, so
+    /// [`attr_names`](Self::attr_names) returns it as an error and this
+    /// reports it without one.
+    pub fn attrs_unreadable_reason(&self) -> Result<Option<String>> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_attrs_unreadable_reason()
+            } else {
+                reader.group_attrs_unreadable_reason(self.name.trim_start_matches('/'))
+            }
+            .map(str::to_string)),
+            _ => Err(Hdf5Error::InvalidState(
+                "attrs_unreadable_reason is only available in read mode".into(),
             )),
         }
     }
@@ -859,8 +891,7 @@ impl H5Group {
                     reader.root_attr(name)
                 } else {
                     reader.group_attr(self.name.trim_start_matches('/'), name)
-                }
-                .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?
+                }?
                 .clone();
                 Ok(reader.attr_string_value(&attr)?)
             }
