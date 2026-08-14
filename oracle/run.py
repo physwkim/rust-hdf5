@@ -177,9 +177,9 @@ STRUCTURAL_FIELDS = {
     "linkorder",
     "attrorder",
 }
-# `strpad` is deliberately NOT structural: the probe answers it for every type
-# except a variable-length string, so an UNSUPPORTED there is a gap in the
-# datatype model for that one class, not a missing accessor.
+# `strpad` is deliberately NOT structural: it is a datatype detail the probe
+# answers from the decoded type, so a disagreement there is a modelling gap in
+# one class, not a missing accessor.
 
 
 def parse_dump(text):
@@ -865,10 +865,9 @@ def write_report(results, gaps, meta, md_path, json_path):
     L.append("")
     L.append(
         "- The string pad of a *variable-length* string is reported in the "
-        "separate `strpad` field rather than inline in `dtype`, because "
-        "`DatatypeMessage::VarLenString` models only the character set and the "
-        "reader therefore answers `UNSUPPORTED(strpad)`. A fixed string keeps "
-        "its pad inline, where both sides agree."
+        "separate `strpad` field rather than inline in `dtype`; a fixed string "
+        "keeps its pad inline. Both sides answer both forms — the split is a "
+        "layout choice of this format, not a gap."
     )
     L.append(
         "- `chunkindex` is derived on the libhdf5 side from the DCPL and the "

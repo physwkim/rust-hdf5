@@ -138,10 +138,9 @@ Float parameters are appended only when they deviate from IEEE 754 for that
 width (sign/exponent/mantissa positions and sizes, exponent bias, bit offset,
 bit precision).
 
-A fixed string carries its pad inline (`pad=null`), where both sides agree.
-`vstr` does not: rust-hdf5's `DatatypeMessage::VarLenString` models only the
-character set, so the pad travels in the separate `strpad` field, where the
-rust side answers `UNSUPPORTED(strpad)` and the gap is visible as a gap.
+A fixed string carries its pad inline (`pad=null`). `vstr` does not: its pad
+travels in the separate `strpad` field, so that a type tree holding several
+variable-length strings names the pad of each. Both sides answer both forms.
 
 `strpad` names each variable-length string by its position in the type tree:
 `.` is the type itself, `.m` a compound member, `[]` an array element, `()` a
