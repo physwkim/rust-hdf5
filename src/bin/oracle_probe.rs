@@ -1907,6 +1907,39 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "link_external_read" => {
+            // The whole payload lives in the sibling; the master holds only
+            // links, two of which are deliberately dangling — a target object
+            // that is not there and a target file that is not there.
+            let target = std::path::Path::new(path).with_file_name(format!(
+                "{}_data.h5",
+                std::path::Path::new(path)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            ));
+            let data = H5File::create(&target)?;
+            data.new_dataset::<f64>()
+                .shape([8usize])
+                .create("top")?
+                .write_raw(&(0..8).map(|i| i as f64).collect::<Vec<_>>())?;
+            data.root_group()
+                .create_group("deep")?
+                .new_dataset::<i16>()
+                .shape([8usize])
+                .create("inner")?
+                .write_raw(&ramp_n::<i16>(8))?;
+            data.close()?;
+
+            let name = target.file_name().unwrap_or_default().to_string_lossy();
+            let file = H5File::create(path)?;
+            file.create_external_link("direct", &name, "/top")?;
+            file.create_external_link("nested", &name, "/deep/inner")?;
+            file.create_external_link("gone_object", &name, "/absent")?;
+            file.create_external_link("gone_file", "no_such_file.h5", "/top")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "links_dense" => {
             // The reference makes `g` with `track_order=True`, so the dense
             // storage it spills into carries a creation-order index beside

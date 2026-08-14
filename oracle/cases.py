@@ -785,7 +785,8 @@ LINK_CASES = [
     Case("link_external", "link", gen_link_external, "link_external",
          "external link into a sibling file",
          ext_files=("_ext.h5",)),
-    Case("link_external_read", "link", gen_link_external_read, None,
+    Case("link_external_read", "link", gen_link_external_read,
+         "link_external_read",
          "datasets read through external links, plus a dangling object and a "
          "dangling file",
          ext_files=("_data.h5",)),
