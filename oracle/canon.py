@@ -665,6 +665,21 @@ class Dumper:
             "nattrs_hdr",
             lambda o=obj: h5py.h5o.get_info(o.id).num_attrs,
         )
+        # Compact vs dense storage. libhdf5 sizes the name index and the
+        # fractal heap only when the whole set has moved out of the object
+        # header, so a nonzero index size is `H5O__attr_create`'s phase change
+        # having fired. The sizes themselves are not observables: a bulk-loaded
+        # index and heap are legitimately smaller than ones grown insert by
+        # insert.
+        self.field(
+            path,
+            "attrstore",
+            lambda o=obj: (
+                "dense"
+                if h5py.h5o.get_info(o.id).meta_size.attr.index_size
+                else "compact"
+            ),
+        )
         for name in names:
             key = "%s@%s" % (path, name)
             try:

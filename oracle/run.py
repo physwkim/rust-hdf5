@@ -177,6 +177,7 @@ STRUCTURAL_FIELDS = {
     "filters",
     "fillvalue",
     "nattrs_hdr",
+    "attrstore",
     "linkorder",
     "attrorder",
 }

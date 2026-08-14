@@ -1569,6 +1569,94 @@ fn reopen_carries_a_libhdf5_dense_root_attribute_back_out_dense() {
     std::fs::remove_file(&path).ok();
 }
 
+/// Dense storage this crate wrote has to be readable by the crate's own
+/// append path, not just by libhdf5: the reopen reads the set back out of the
+/// heap and name index it wrote, adds to it, and lays a fresh one down.
+#[test]
+fn rust_written_dense_attributes_survive_a_rust_reopen() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_dense_rust_reopen");
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file.new_dataset::<i32>().shape([2]).create("data").unwrap();
+        ds.write_raw(&[1, 2]).unwrap();
+        for i in 0..12i32 {
+            ds.new_attr::<i32>()
+                .shape(())
+                .create(&format!("a{i:02}"))
+                .unwrap()
+                .write_numeric(&i)
+                .unwrap();
+        }
+        file.close().unwrap();
+    }
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        let ds = file.dataset_writer("data").unwrap();
+        ds.new_attr::<i32>()
+            .shape(())
+            .create("late")
+            .unwrap()
+            .write_numeric(&99i32)
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "d = f['data']\n\
+         assert all(d.attrs['a%02d' % i] == i for i in range(12))\n\
+         assert d.attrs['late'] == 99, d.attrs['late']\n\
+         i = h5py.h5o.get_info(d.id)\n\
+         assert i.num_attrs == 13, i.num_attrs\n\
+         assert i.meta_size.attr.index_size > 0, 'expected dense storage'\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A reopened *group*'s attributes go back out through a header this writer
+/// rebuilds from scratch on every finalize, so a dense set has to survive a
+/// session that never mentions the group at all.
+#[test]
+fn reopen_carries_a_libhdf5_dense_group_attribute_back_out_dense() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_dense_group_reopen");
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v108"),
+        "g = f.create_group('g')\n\
+         for i in range(12):\n\
+         \x20   g.attrs.create('g%02d' % i, np.int32(i))\n\
+         g.attrs.create('big', np.arange(25600, dtype='<i4'))\n\
+         f.create_dataset('data', data=np.arange(8, dtype='<i4'))\n",
+    );
+
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.set_attr_numeric("touched", &1i32).unwrap();
+        file.close().unwrap();
+    }
+
+    read_back_with_h5py(
+        py,
+        &path,
+        "g = f['g']\n\
+         assert all(g.attrs['g%02d' % i] == i for i in range(12))\n\
+         assert g.attrs['big'].shape == (25600,), g.attrs['big'].shape\n\
+         assert g.attrs['big'][25599] == 25599\n\
+         assert list(f['data'][...]) == list(range(8))\n\
+         i = h5py.h5o.get_info(g.id)\n\
+         assert i.num_attrs == 13, i.num_attrs\n\
+         assert i.meta_size.attr.index_size > 0, 'expected dense storage'\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let names = file.root_group().group("g").unwrap().attr_names().unwrap();
+    assert_eq!(names.len(), 13, "{names:?}");
+    std::fs::remove_file(&path).ok();
+}
+
 /// An attribute set on a *reopened dataset* is a header change the chunk-write
 /// counters cannot see, so finalize used to keep the dataset's original header
 /// and discard the attribute — no error, no trace. Both the replacement of an

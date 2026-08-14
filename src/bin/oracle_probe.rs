@@ -714,6 +714,13 @@ fn dump_dataset_attrs(d: &mut Dump, path: &str, ds: &H5Dataset) {
             "H5Dataset exposes no object-header attribute count",
         ),
     );
+    d.emit(
+        &format!("{path}#attrstore"),
+        unsupported(
+            "attrstore",
+            "H5Dataset exposes no compact/dense attribute storage accessor",
+        ),
+    );
 
     for name in names {
         let key = format!("{path}@{name}");
@@ -796,6 +803,13 @@ fn dump_group_attrs(d: &mut Dump, path: &str, group: &H5Group) {
         unsupported(
             "nattrs_hdr",
             "H5Group exposes no object-header attribute count",
+        ),
+    );
+    d.emit(
+        &format!("{path}#attrstore"),
+        unsupported(
+            "attrstore",
+            "H5Group exposes no compact/dense attribute storage accessor",
         ),
     );
 
@@ -1443,6 +1457,22 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                     .create(&format!("a{i:02}"))?
                     .write_numeric(&i)?;
             }
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "attrs_dense_group" => {
+            let file = H5File::create(path)?;
+            let g = file.root_group().create_group("g")?;
+            for i in 0..12i32 {
+                g.set_attr_numeric(&format!("g{i:02}"), &i)?;
+            }
+            for i in 0..12i32 {
+                file.set_attr_numeric(&format!("r{i:02}"), &i)?;
+            }
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("data")?
+                .write_raw(&ramp_n::<i32>(8))?;
             file.close()?;
             Ok(Ok(()))
         }
