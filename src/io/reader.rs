@@ -221,6 +221,11 @@ fn resolve_link_value(link_path: &str, value: &str) -> String {
 #[derive(Default)]
 struct Catalog {
     datasets: Vec<DatasetReadInfo>,
+    /// Dataset-shaped objects this crate cannot read, keyed by path; the
+    /// value names what stopped it. They are listed exactly like readable
+    /// datasets — the name is in the file either way — and refuse typed
+    /// access with that reason.
+    unreadable: std::collections::BTreeMap<String, String>,
     /// Attributes on non-root groups, keyed by group path.
     group_attributes: std::collections::HashMap<String, Vec<AttributeMessage>>,
     /// Every non-root group path the walk traversed into.
@@ -229,6 +234,30 @@ struct Catalog {
     group_aliases: std::collections::HashMap<String, String>,
     /// Every link record seen, keyed by its full path (no leading `/`).
     links: std::collections::BTreeMap<String, LinkClass>,
+}
+
+/// What an object header describes.
+///
+/// libhdf5 decides an object's class from *which* messages the header holds
+/// (`H5O_obj_class`) and only then reads their contents; the two questions are
+/// separate, and answering them with one `Option<DatasetReadInfo>` is what let
+/// a dataset whose datatype this crate cannot decode leave the catalog as if
+/// the file did not contain it. Each outcome now has its own name, so no
+/// caller can turn "unreadable" back into "absent".
+enum ObjectKind {
+    /// A dataset: it carries a datatype, a dataspace and a data layout, and
+    /// every message the payload depends on decoded.
+    Dataset(Box<DatasetReadInfo>),
+    /// A dataset whose payload depends on a message this crate cannot decode.
+    /// The string names what stopped it and reaches the caller of any typed
+    /// access to the name.
+    UnreadableDataset(String),
+    /// A group: it carries link, link-info, symbol-table or group-info
+    /// storage, or none of the messages that identify anything else.
+    Group,
+    /// A committed (named) datatype object: a datatype message with neither
+    /// group storage nor the dataspace/layout pair a dataset needs.
+    CommittedDatatype,
 }
 
 /// Internal enum to represent what we know about the root group from the
@@ -256,6 +285,11 @@ pub struct Hdf5Reader {
     #[allow(dead_code)]
     root_group_info: RootGroupInfo,
     datasets: Vec<DatasetReadInfo>,
+    /// Dataset-shaped objects this crate cannot read, keyed by path (no
+    /// leading `/`), the value naming what stopped it. They are listed with
+    /// the readable datasets and refuse typed access with that reason: an
+    /// object the file contains is never reported as one it does not.
+    unreadable: std::collections::BTreeMap<String, String>,
     /// Attributes on the root group (file-level attributes).
     root_attributes: Vec<AttributeMessage>,
     /// Attributes on non-root groups, keyed by group path (no leading `/`).
@@ -550,6 +584,7 @@ impl Hdf5Reader {
                 root_group_object_header_address: sb.root_group_object_header_address,
             },
             datasets: catalog.datasets,
+            unreadable: catalog.unreadable,
             root_attributes,
             group_attributes: catalog.group_attributes,
             group_paths: catalog.group_paths,
@@ -642,6 +677,7 @@ impl Hdf5Reader {
                 heap_addr: ste_heap_addr,
             },
             datasets: catalog.datasets,
+            unreadable: catalog.unreadable,
             root_attributes,
             group_attributes: catalog.group_attributes,
             group_paths: catalog.group_paths,
@@ -707,18 +743,22 @@ impl Hdf5Reader {
         // Collect every link in this group: inline `Link` messages plus, for
         // groups using dense storage, links held in a fractal heap referenced
         // by the `Link Info` message.
+        //
+        // A link message that does not decode has no name to report the
+        // failure against, and a `Link Info` message that does not decode
+        // hides a whole group's dense storage. Either way the listing would
+        // come back silently short, so both are errors: a listing this
+        // reader cannot complete must not present itself as complete.
         let mut links: Vec<LinkMessage> = Vec::new();
         for msg in &header.messages {
             if msg.msg_type == MSG_LINK {
-                if let Ok((link, _)) = LinkMessage::decode(&msg.data, ctx) {
-                    links.push(link);
-                }
+                let (link, _) = LinkMessage::decode(&msg.data, ctx)?;
+                links.push(link);
             } else if msg.msg_type == MSG_LINK_INFO {
-                if let Ok((info, _)) = LinkInfoMessage::decode(&msg.data, ctx) {
-                    if info.fractal_heap_address != UNDEF_ADDR {
-                        let dense = Self::read_dense_links(handle, ctx, info.fractal_heap_address)?;
-                        links.extend(dense);
-                    }
+                let (info, _) = LinkInfoMessage::decode(&msg.data, ctx)?;
+                if info.fractal_heap_address != UNDEF_ADDR {
+                    let dense = Self::read_dense_links(handle, ctx, info.fractal_heap_address)?;
+                    links.extend(dense);
                 }
             }
         }
@@ -739,38 +779,33 @@ impl Hdf5Reader {
                 continue;
             };
 
-            // Try to read as a dataset. A target whose object header
-            // fails to decode (e.g. a stale link left by a deletion) is
-            // skipped rather than aborting the whole file open.
-            match Self::read_dataset_from_object_header(handle, ctx, *address, &full_name) {
-                Ok(Some(info)) => {
-                    catalog.datasets.push(info);
-                    continue;
-                }
-                Err(_) => continue,
-                Ok(None) => {}
-            }
-            // Not a dataset. Read the object header to classify it.
+            // The link names an object, so the object is in the listing
+            // whatever comes of reading it: a header that does not decode
+            // (a stale link left by a deletion, say) is reported against
+            // this name, never dropped from it.
             let child_header = match Self::read_object_header_full(handle, ctx, *address) {
                 Ok(h) => h,
-                Err(_) => continue,
+                Err(e) => {
+                    catalog
+                        .unreadable
+                        .insert(full_name, format!("its object header does not decode: {e}"));
+                    continue;
+                }
             };
-            // A committed (named) datatype object has a datatype message
-            // and no group-storage message — it is neither a group nor a
-            // dataset, so it must not be recorded as a group.
-            let is_group = child_header.messages.iter().any(|m| {
-                m.msg_type == MSG_LINK
-                    || m.msg_type == MSG_LINK_INFO
-                    || m.msg_type == MSG_SYMBOL_TABLE
-                    || m.msg_type == MSG_GROUP_INFO
-            });
-            if !is_group
-                && child_header
-                    .messages
-                    .iter()
-                    .any(|m| m.msg_type == MSG_DATATYPE)
-            {
-                continue;
+            match Self::classify_object(&child_header, ctx, &full_name) {
+                ObjectKind::Dataset(info) => {
+                    catalog.datasets.push(*info);
+                    continue;
+                }
+                ObjectKind::UnreadableDataset(why) => {
+                    catalog.unreadable.insert(full_name, why);
+                    continue;
+                }
+                // A committed (named) datatype is neither a group nor a
+                // dataset, so it must not be recorded as either; the link
+                // record above already carries its name.
+                ObjectKind::CommittedDatatype => continue,
+                ObjectKind::Group => {}
             }
             // It is a group. Record its path from the actual link record —
             // before the cycle check, so a hard-link alias of an
@@ -816,18 +851,12 @@ impl Hdf5Reader {
         // Read the fractal heap header. Its on-disk size depends only on the
         // address/length widths, so a generous prefix read covers it.
         let hdr_buf = handle.read_at_most(fractal_heap_addr, 512)?;
-        let fh_header = match FractalHeapHeader::decode(&hdr_buf, ctx) {
-            Ok(h) => h,
-            Err(_) => return Ok(Vec::new()),
-        };
+        let fh_header = FractalHeapHeader::decode(&hdr_buf, ctx)?;
 
         // Walk the heap's managed blocks; each block hands back a payload
         // region holding one or more packed encoded `Link` messages.
         let mut br = HandleBlockReader { handle };
-        let payloads = match fractal_heap::collect_managed_objects(&fh_header, ctx, &mut br) {
-            Ok(p) => p,
-            Err(_) => return Ok(Vec::new()),
-        };
+        let payloads = fractal_heap::collect_managed_objects(&fh_header, ctx, &mut br)?;
 
         let mut links = Vec::new();
         for payload in payloads {
@@ -848,6 +877,20 @@ impl Hdf5Reader {
                     _ => break,
                 }
             }
+        }
+
+        // That scan stops at the first byte that does not begin a link, which
+        // is how trailing free space in a direct block ends it — and would
+        // equally swallow a link the scan could not read. The heap header
+        // counts its managed objects, so a short scan is detectable, and a
+        // group listing that is short is the loss this guards against.
+        if links.len() < fh_header.man_nobjs as usize {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dense link storage at address {fractal_heap_addr:#x} holds {} managed \
+                 objects but only {} decoded as links",
+                fh_header.man_nobjs,
+                links.len()
+            )));
         }
 
         Ok(links)
@@ -951,38 +994,29 @@ impl Hdf5Reader {
                 }
                 catalog.links.insert(full_name.clone(), LinkClass::Hard);
 
-                // Try to read this entry as a dataset. A target whose
-                // object header fails to decode is skipped, not fatal.
-                match Self::read_dataset_from_object_header(
-                    handle,
-                    ctx,
-                    entry.obj_header_addr,
-                    &full_name,
-                ) {
-                    Ok(Some(info)) => {
-                        catalog.datasets.push(info);
-                        continue;
-                    }
-                    Err(_) => continue,
-                    Ok(None) => {}
-                }
-
-                // Not a dataset. Read the object header to classify it.
+                // The entry names an object, so the object is in the
+                // listing whatever comes of reading it — the same rule the
+                // link-message walk applies.
                 let hdr = match Self::read_object_header_full(handle, ctx, entry.obj_header_addr) {
                     Ok(h) => h,
-                    Err(_) => continue,
+                    Err(e) => {
+                        catalog
+                            .unreadable
+                            .insert(full_name, format!("its object header does not decode: {e}"));
+                        continue;
+                    }
                 };
-                // A committed (named) datatype object has a datatype message
-                // and no group-storage message — it is neither group nor
-                // dataset and must not be recorded as a group.
-                let is_group = hdr.messages.iter().any(|m| {
-                    m.msg_type == MSG_LINK
-                        || m.msg_type == MSG_LINK_INFO
-                        || m.msg_type == MSG_SYMBOL_TABLE
-                        || m.msg_type == MSG_GROUP_INFO
-                });
-                if !is_group && hdr.messages.iter().any(|m| m.msg_type == MSG_DATATYPE) {
-                    continue;
+                match Self::classify_object(&hdr, ctx, &full_name) {
+                    ObjectKind::Dataset(info) => {
+                        catalog.datasets.push(*info);
+                        continue;
+                    }
+                    ObjectKind::UnreadableDataset(why) => {
+                        catalog.unreadable.insert(full_name, why);
+                        continue;
+                    }
+                    ObjectKind::CommittedDatatype => continue,
+                    ObjectKind::Group => {}
                 }
 
                 // It is a subgroup. Record its path from the actual
@@ -1227,16 +1261,36 @@ impl Hdf5Reader {
         }
     }
 
-    /// Read a dataset's object header and extract metadata. Returns None if
-    /// the object is not a dataset (e.g., it's a group).
-    fn read_dataset_from_object_header(
-        handle: &mut FileHandle,
-        ctx: &FormatContext,
-        addr: u64,
-        name: &str,
-    ) -> IoResult<Option<DatasetReadInfo>> {
-        // Read the object header, following continuation blocks (v1 and v2).
-        let header = Self::read_object_header_full(handle, ctx, addr)?;
+    /// Classify one object from its (already read) header, and decode the
+    /// dataset metadata while doing so.
+    ///
+    /// The class comes from which messages are present, never from whether
+    /// they decode: an object holding a datatype, a dataspace and a data
+    /// layout is a dataset even when this crate cannot decode one of them,
+    /// and it says so as [`ObjectKind::UnreadableDataset`] rather than
+    /// vanishing.
+    ///
+    /// Only the messages the payload depends on can make a dataset
+    /// unreadable. A failed *attribute* decode leaves the dataset itself
+    /// readable, so it does not.
+    fn classify_object(header: &ObjectHeader, ctx: &FormatContext, name: &str) -> ObjectKind {
+        let present = |t: u8| header.messages.iter().any(|m| m.msg_type == t);
+        let is_group = present(MSG_LINK)
+            || present(MSG_LINK_INFO)
+            || present(MSG_SYMBOL_TABLE)
+            || present(MSG_GROUP_INFO);
+        if is_group {
+            return ObjectKind::Group;
+        }
+        let is_dataset =
+            present(MSG_DATATYPE) && present(MSG_DATASPACE) && present(MSG_DATA_LAYOUT);
+        if !is_dataset {
+            return if present(MSG_DATATYPE) {
+                ObjectKind::CommittedDatatype
+            } else {
+                ObjectKind::Group
+            };
+        }
 
         let mut datatype = None;
         let mut dataspace = None;
@@ -1244,38 +1298,50 @@ impl Hdf5Reader {
         let mut filter_pipeline = None;
         let mut fill_value = None;
         let mut attributes = Vec::new();
+        // The first message that did not decode, kept verbatim: it is the
+        // answer a caller gets when it asks for this dataset.
+        let mut blocked: Option<String> = None;
+        let mut block = |what: &str, e: crate::format::FormatError| {
+            if blocked.is_none() {
+                blocked = Some(format!("its {what} message does not decode: {e}"));
+            }
+        };
 
         for msg in &header.messages {
             match msg.msg_type {
-                MSG_DATATYPE => {
-                    if let Ok((dt, _)) = DatatypeMessage::decode(&msg.data, ctx) {
-                        datatype = Some(dt);
-                    }
-                }
-                MSG_DATASPACE => {
-                    if let Ok((ds, _)) = DataspaceMessage::decode(&msg.data, ctx) {
-                        dataspace = Some(ds);
-                    }
-                }
-                MSG_DATA_LAYOUT => {
-                    if let Ok((dl, _)) = DataLayoutMessage::decode(&msg.data, ctx) {
-                        layout = Some(dl);
-                    }
-                }
-                MSG_FILTER_PIPELINE => {
-                    if let Ok((fp, _)) = FilterPipeline::decode(&msg.data) {
+                MSG_DATATYPE => match DatatypeMessage::decode(&msg.data, ctx) {
+                    Ok((dt, _)) => datatype = Some(dt),
+                    Err(e) => block("datatype", e),
+                },
+                MSG_DATASPACE => match DataspaceMessage::decode(&msg.data, ctx) {
+                    Ok((ds, _)) => dataspace = Some(ds),
+                    Err(e) => block("dataspace", e),
+                },
+                MSG_DATA_LAYOUT => match DataLayoutMessage::decode(&msg.data, ctx) {
+                    Ok((dl, _)) => layout = Some(dl),
+                    Err(e) => block("data layout", e),
+                },
+                // A filter pipeline that does not decode would leave the raw
+                // chunk bytes to be handed back as if they were never
+                // filtered, and an undecodable fill value would leave
+                // unwritten regions reading as zeros. Both change the data a
+                // read returns, so both block the dataset.
+                MSG_FILTER_PIPELINE => match FilterPipeline::decode(&msg.data) {
+                    Ok((fp, _)) => {
                         if !fp.filters.is_empty() {
                             filter_pipeline = Some(fp);
                         }
                     }
-                }
-                MSG_FILL_VALUE => {
-                    if let Ok((fv, _)) = FillValueMessage::decode(&msg.data) {
+                    Err(e) => block("filter pipeline", e),
+                },
+                MSG_FILL_VALUE => match FillValueMessage::decode(&msg.data) {
+                    Ok((fv, _)) => {
                         if fv.fill_defined == 2 {
                             fill_value = fv.fill_value;
                         }
                     }
-                }
+                    Err(e) => block("fill value", e),
+                },
                 MSG_ATTRIBUTE => {
                     if let Ok((attr, _)) = AttributeMessage::decode(&msg.data, ctx) {
                         attributes.push(attr);
@@ -1285,8 +1351,11 @@ impl Hdf5Reader {
             }
         }
 
-        if let (Some(dt), Some(ds), Some(dl)) = (datatype, dataspace, layout) {
-            Ok(Some(DatasetReadInfo {
+        if let Some(why) = blocked {
+            return ObjectKind::UnreadableDataset(why);
+        }
+        match (datatype, dataspace, layout) {
+            (Some(dt), Some(ds), Some(dl)) => ObjectKind::Dataset(Box::new(DatasetReadInfo {
                 name: name.to_string(),
                 datatype: dt,
                 dataspace: ds,
@@ -1294,15 +1363,35 @@ impl Hdf5Reader {
                 filter_pipeline,
                 attributes,
                 fill_value,
-            }))
-        } else {
-            Ok(None)
+            })),
+            // The three messages are present and none of them reported an
+            // error, so this is unreachable; report it as unreadable rather
+            // than dropping the name on an invariant this function owns.
+            _ => ObjectKind::UnreadableDataset(
+                "its datatype, dataspace and data layout messages decoded but did not all \
+                 produce a value"
+                    .into(),
+            ),
         }
     }
 
-    /// Return the names of all datasets in the root group.
+    /// Every dataset in the file, by path (no leading `/`).
+    ///
+    /// A dataset this crate cannot read is still a dataset the file
+    /// contains, so it is listed here alongside the readable ones and
+    /// answers [`Self::unreadable_reason`]; opening it reports that reason.
     pub fn dataset_names(&self) -> Vec<&str> {
-        self.datasets.iter().map(|d| d.name.as_str()).collect()
+        let mut names: Vec<&str> = self.datasets.iter().map(|d| d.name.as_str()).collect();
+        names.extend(self.unreadable.keys().map(String::as_str));
+        names
+    }
+
+    /// Why the dataset at `path` (no leading `/`) cannot be read, or `None`
+    /// when it can be — or does not exist.
+    pub fn unreadable_reason(&self, path: &str) -> Option<&str> {
+        self.unreadable
+            .get(&self.canonical_path(path))
+            .map(String::as_str)
     }
 
     /// Every link record in the file, keyed by full path (no leading `/`).
@@ -1422,6 +1511,11 @@ impl Hdf5Reader {
         };
         if let Some(info) = self.datasets.iter().find(|d| d.name == path) {
             return Ok(info);
+        }
+        if let Some(why) = self.unreadable.get(&path) {
+            return Err(crate::io::IoError::Unsupported(format!(
+                "'{name}' is a dataset this crate cannot read: {why}"
+            )));
         }
         if let Some(SoftLinkRef { link, target }) = via {
             return Err(crate::io::IoError::DanglingLink { link, target });
@@ -1748,6 +1842,7 @@ impl Hdf5Reader {
         self._eof = sb.end_of_file_address;
         self.ctx = ctx;
         self.datasets = catalog.datasets;
+        self.unreadable = catalog.unreadable;
         self.group_attributes = catalog.group_attributes;
         self.group_paths = catalog.group_paths;
         self.group_aliases = catalog.group_aliases;

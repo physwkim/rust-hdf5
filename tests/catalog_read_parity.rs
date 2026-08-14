@@ -295,3 +295,84 @@ fn contiguous_lists_at_every_libver_bound() {
         std::fs::remove_file(&path).ok();
     }
 }
+
+/// One dataset per message this crate cannot decode: an opaque datatype, an
+/// object-reference datatype, a shared (committed) datatype, and a virtual
+/// data layout. Each is a dataset the file plainly contains, so each must be
+/// listed by name and must say what stands in the way — the catalog walk used
+/// to drop all four on the floor and report an empty file.
+#[test]
+fn a_dataset_whose_message_does_not_decode_is_listed_and_says_why() {
+    let Some(py) = python() else { return };
+    // (name, h5py statements, the word the reason must name)
+    let cases: [(&str, &str, &str); 4] = [
+        (
+            "opaque",
+            "f.create_dataset('x', data=np.arange(4, dtype='u1').view('V4'))",
+            "datatype",
+        ),
+        (
+            "objref",
+            "f.create_dataset('t', data=np.arange(4, dtype='<i4'))\n\
+             \x20   f.create_dataset('x', data=[f['t'].ref], dtype=h5py.ref_dtype)",
+            "datatype",
+        ),
+        (
+            "committed",
+            "f['dt'] = np.dtype('<i4')\n\
+             \x20   f.create_dataset('x', (4,), dtype=f['dt'])",
+            "datatype",
+        ),
+        (
+            "virtual",
+            "src = np.arange(4, dtype='<i4')\n\
+             \x20   f.create_dataset('src', data=src)\n\
+             \x20   layout = h5py.VirtualLayout(shape=(4,), dtype='<i4')\n\
+             \x20   layout[...] = h5py.VirtualSource(f['src'])\n\
+             \x20   f.create_virtual_dataset('x', layout)",
+            "data layout",
+        ),
+    ];
+
+    for (case, body, blame) in cases {
+        let path = tmp(&format!("undecodable_{case}"));
+        h5py_write(
+            py,
+            &path,
+            &format!(
+                "with h5py.File(PATH, 'w') as f:\n\
+                 \x20   {body}\n\
+                 \x20   f.create_dataset('ok', data=np.arange(4, dtype='<i4'))\n"
+            ),
+        );
+
+        let file = H5File::open(&path).unwrap();
+        let root = file.root_group();
+        let names = root.dataset_names().unwrap();
+        assert!(names.contains(&"x".to_string()), "{case}: listed {names:?}");
+        assert!(
+            names.contains(&"ok".to_string()),
+            "{case}: listed {names:?}"
+        );
+
+        let why = root
+            .unreadable_reason("x")
+            .unwrap()
+            .unwrap_or_else(|| panic!("{case}: 'x' reports no reason"));
+        assert!(why.contains(blame), "{case}: {why}");
+        assert_eq!(root.unreadable_reason("ok").unwrap(), None, "{case}");
+
+        match file.dataset("x").err() {
+            Some(Hdf5Error::Unsupported(msg)) => assert!(msg.contains(blame), "{case}: {msg}"),
+            other => panic!("{case}: expected an unsupported-feature error, got {other:?}"),
+        }
+        // The unreadable object must not cost the readable one.
+        assert_eq!(
+            file.dataset("ok").unwrap().read_raw::<i32>().unwrap(),
+            (0..4).collect::<Vec<i32>>(),
+            "{case}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+}

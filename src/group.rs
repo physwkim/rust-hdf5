@@ -566,6 +566,32 @@ impl H5Group {
         }
     }
 
+    /// Why the dataset `name` in this group cannot be read, or `None` when it
+    /// can be.
+    ///
+    /// A dataset whose datatype (or any other message its payload depends on)
+    /// this crate cannot decode is still listed by
+    /// [`dataset_names`](Self::dataset_names) — the file contains it — and
+    /// this says what stands in the way. Opening it through
+    /// [`H5File::dataset`](crate::H5File::dataset) fails with
+    /// [`Hdf5Error::Unsupported`] carrying the same text.
+    pub fn unreadable_reason(&self, name: &str) -> Result<Option<String>> {
+        let full_name = if self.name == "/" {
+            name.to_string()
+        } else {
+            format!("{}/{}", self.name.trim_start_matches('/'), name)
+        };
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => {
+                Ok(reader.unreadable_reason(&full_name).map(str::to_string))
+            }
+            // The writer only holds datasets it built itself.
+            H5FileInner::Writer(_) => Ok(None),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
     /// Add (or replace) a string attribute on this group.
     ///
     /// This is the standard way to mark a NeXus class, e.g.
