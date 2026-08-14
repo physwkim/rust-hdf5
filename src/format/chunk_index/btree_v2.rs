@@ -14,7 +14,7 @@
 
 use crate::format::bytes::{read_le_addr as read_addr, read_le_uint as read_size};
 use crate::format::checksum::checksum_metadata;
-use crate::format::{FormatContext, FormatError, FormatResult, UNDEF_ADDR};
+use crate::format::{BlockReader, FormatContext, FormatError, FormatResult, UNDEF_ADDR};
 
 /// Signature for the B-tree v2 header.
 pub const BTHD_SIGNATURE: [u8; 4] = *b"BTHD";
@@ -43,6 +43,12 @@ pub const BT2_SPLIT_PERCENT: u8 = 100;
 /// Percentage below which a node is merged (`H5D_BT2_MERGE_PERC`).
 pub const BT2_MERGE_PERCENT: u8 = 40;
 
+/// Record type: indirectly accessed, unfiltered "huge" fractal heap objects
+/// (`H5B2_FHEAP_HUGE_INDIR_ID`).
+pub const BT2_TYPE_FHEAP_HUGE_INDIR: u8 = 1;
+/// Record type: name index for dense attribute storage
+/// (`H5B2_ATTR_DENSE_NAME_ID`).
+pub const BT2_TYPE_ATTR_NAME: u8 = 8;
 /// Record type: unfiltered chunks (non-filtered chunked datasets).
 pub const BT2_TYPE_CHUNK_UNFILT: u8 = 10;
 /// Record type: filtered chunks (filtered chunked datasets).
@@ -666,6 +672,96 @@ impl Bt2Geometry {
             0
         }
     }
+}
+
+// ==========================================================================
+// Whole-tree record walk
+// ==========================================================================
+
+/// Read every record in a v2 B-tree, in tree order, as one packed byte run of
+/// `header.record_size`-byte records.
+///
+/// Record-type agnostic: the caller decodes the bytes according to
+/// `header.record_type`. Both v2 B-tree users — the chunk index and the dense
+/// link/attribute name index — go through this one walker so the node geometry
+/// is derived in a single place.
+pub fn collect_btree_v2_records<R: BlockReader>(
+    header: &Bt2Header,
+    ctx: &FormatContext,
+    reader: &mut R,
+) -> FormatResult<Vec<u8>> {
+    let mut out = Vec::new();
+    if header.root_node_addr == UNDEF_ADDR || header.total_num_records == 0 {
+        return Ok(out);
+    }
+    let geo = Bt2Geometry::new(
+        header.node_size,
+        header.record_size,
+        header.depth,
+        ctx.sizeof_addr,
+    );
+    collect_node(
+        reader,
+        ctx,
+        &geo,
+        header.root_node_addr,
+        header.depth,
+        header.num_records_in_root,
+        header.record_size,
+        header.node_size,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_node<R: BlockReader>(
+    reader: &mut R,
+    ctx: &FormatContext,
+    geo: &Bt2Geometry,
+    addr: u64,
+    depth: u16,
+    nrec: u16,
+    record_size: u16,
+    node_size: u32,
+    out: &mut Vec<u8>,
+) -> FormatResult<()> {
+    let buf = reader.read_block(addr, node_size as usize)?;
+    if depth == 0 {
+        let leaf = Bt2LeafNode::decode(&buf, nrec, record_size)?;
+        out.extend_from_slice(&leaf.record_data);
+        return Ok(());
+    }
+    let node = Bt2InternalNode::decode(
+        &buf,
+        ctx,
+        depth,
+        nrec,
+        record_size,
+        geo.max_nrec_size,
+        geo.child_total_size(depth),
+    )?;
+    out.extend_from_slice(&node.record_data);
+    let children: Vec<(u64, u16)> = node
+        .child_addrs
+        .iter()
+        .zip(node.child_nrecords.iter())
+        .map(|(&a, &n)| (a, n))
+        .collect();
+    for (child_addr, child_nrec) in children {
+        collect_node(
+            reader,
+            ctx,
+            geo,
+            child_addr,
+            depth - 1,
+            child_nrec,
+            record_size,
+            node_size,
+            out,
+        )?;
+    }
+    Ok(())
 }
 
 // ==========================================================================

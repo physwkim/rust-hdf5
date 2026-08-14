@@ -10,11 +10,12 @@ use std::path::Path;
 
 use crate::format::btree_v1::{BTreeV1Node, ChunkBTreeV1Node};
 use crate::format::bytes::read_le_uint as read_uint;
-use crate::format::fractal_heap::{self, BlockReader, FractalHeapHeader};
+use crate::format::fractal_heap::{self, FractalHeapHeader};
 use crate::format::global_heap::{
     decode_vlen_reference, vlen_reference_size, GlobalHeapCollection,
 };
 use crate::format::local_heap::{local_heap_get_string, LocalHeapHeader};
+use crate::format::messages::attr_info::AttributeInfoMessage;
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::data_layout::{self, DataLayoutMessage};
 use crate::format::messages::dataspace::DataspaceMessage;
@@ -28,7 +29,7 @@ use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
 use crate::format::superblock::{detect_superblock_version, SuperblockV0V1, SuperblockV2V3};
 use crate::format::symbol_table::SymbolTableNode;
-use crate::format::{FormatContext, UNDEF_ADDR};
+use crate::format::{BlockReader, FormatContext, UNDEF_ADDR};
 
 use crate::io::file_handle::FileHandle;
 #[cfg(feature = "mmap")]
@@ -416,14 +417,7 @@ impl Hdf5Reader {
             )?;
 
         // Collect root group attributes
-        let mut root_attributes = Vec::new();
-        for msg in &root_header.messages {
-            if msg.msg_type == MSG_ATTRIBUTE {
-                if let Ok((attr, _)) = AttributeMessage::decode(&msg.data, &ctx) {
-                    root_attributes.push(attr);
-                }
-            }
-        }
+        let root_attributes = collect_object_attributes(&mut handle, &ctx, &root_header);
 
         Ok(Self {
             handle,
@@ -459,16 +453,10 @@ impl Hdf5Reader {
         let root_hdr = Self::read_object_header_full(&mut handle, &ctx, root_obj_addr).ok();
 
         // Collect the root group's own attributes.
-        let mut root_attributes = Vec::new();
-        if let Some(ref h) = root_hdr {
-            for m in &h.messages {
-                if m.msg_type == MSG_ATTRIBUTE {
-                    if let Ok((a, _)) = AttributeMessage::decode(&m.data, &ctx) {
-                        root_attributes.push(a);
-                    }
-                }
-            }
-        }
+        let root_attributes = match root_hdr {
+            Some(ref h) => collect_object_attributes(&mut handle, &ctx, h),
+            None => Vec::new(),
+        };
 
         // A v0/v1-superblock file whose root group has migrated to link
         // storage (more than ~8 objects) carries `Link` / `Link Info`
@@ -681,14 +669,7 @@ impl Hdf5Reader {
                     {
                         // Capture group attributes (e.g. the NeXus `NX_class`
                         // marker), keyed by path.
-                        let mut attrs = Vec::new();
-                        for m in &child_header.messages {
-                            if m.msg_type == MSG_ATTRIBUTE {
-                                if let Ok((a, _)) = AttributeMessage::decode(&m.data, ctx) {
-                                    attrs.push(a);
-                                }
-                            }
-                        }
+                        let attrs = collect_object_attributes(handle, ctx, &child_header);
                         if !attrs.is_empty() {
                             group_attrs.insert(full_name.clone(), attrs);
                         }
@@ -917,14 +898,7 @@ impl Hdf5Reader {
 
                 // Collect this subgroup's attributes (e.g. NeXus NX_class).
                 {
-                    let mut attrs = Vec::new();
-                    for m in &hdr.messages {
-                        if m.msg_type == MSG_ATTRIBUTE {
-                            if let Ok((a, _)) = AttributeMessage::decode(&m.data, ctx) {
-                                attrs.push(a);
-                            }
-                        }
-                    }
+                    let attrs = collect_object_attributes(handle, ctx, &hdr);
                     if !attrs.is_empty() {
                         group_attrs.insert(full_name.clone(), attrs);
                     }
@@ -1163,7 +1137,6 @@ impl Hdf5Reader {
         let mut layout = None;
         let mut filter_pipeline = None;
         let mut fill_value = None;
-        let mut attributes = Vec::new();
 
         for msg in &header.messages {
             match msg.msg_type {
@@ -1196,16 +1169,12 @@ impl Hdf5Reader {
                         }
                     }
                 }
-                MSG_ATTRIBUTE => {
-                    if let Ok((attr, _)) = AttributeMessage::decode(&msg.data, ctx) {
-                        attributes.push(attr);
-                    }
-                }
                 _ => {}
             }
         }
 
         if let (Some(dt), Some(ds), Some(dl)) = (datatype, dataspace, layout) {
+            let attributes = collect_object_attributes(handle, ctx, &header);
             Ok(Some(DatasetReadInfo {
                 name: name.to_string(),
                 datatype: dt,
@@ -2088,21 +2057,13 @@ impl Hdf5Reader {
 
         // Walk the B-tree to any depth, collecting every record's raw bytes
         // from the internal nodes and leaves.
-        let geo = Bt2Geometry::new(
-            bt2_hdr.node_size,
-            bt2_hdr.record_size,
-            bt2_hdr.depth,
-            self.ctx.sizeof_addr,
-        );
-        let mut record_bytes: Vec<u8> = Vec::new();
-        self.collect_bt2_records(
-            bt2_hdr.root_node_addr,
-            bt2_hdr.depth,
-            bt2_hdr.num_records_in_root,
-            bt2_hdr.record_size,
-            bt2_hdr.node_size,
-            &geo,
-            &mut record_bytes,
+        let ctx = self.ctx;
+        let record_bytes = collect_btree_v2_records(
+            &bt2_hdr,
+            &ctx,
+            &mut HandleBlockReader {
+                handle: &mut self.handle,
+            },
         )?;
         let total_records = if bt2_hdr.record_size > 0 {
             record_bytes.len() / bt2_hdr.record_size as usize
@@ -2184,59 +2145,6 @@ impl Hdf5Reader {
             }
         }
 
-        Ok(())
-    }
-
-    /// Recursively walk a v2 B-tree, appending every node's raw record bytes
-    /// (internal nodes and leaves alike) to `out`.
-    #[allow(clippy::too_many_arguments)]
-    fn collect_bt2_records(
-        &mut self,
-        addr: u64,
-        depth: u16,
-        nrec: u16,
-        record_size: u16,
-        node_size: u32,
-        geo: &crate::format::chunk_index::btree_v2::Bt2Geometry,
-        out: &mut Vec<u8>,
-    ) -> IoResult<()> {
-        use crate::format::chunk_index::btree_v2::{Bt2InternalNode, Bt2LeafNode};
-
-        let buf = self.handle.read_at_most(addr, node_size as usize)?;
-        if depth == 0 {
-            let leaf = Bt2LeafNode::decode(&buf, nrec, record_size)?;
-            out.extend_from_slice(&leaf.record_data);
-        } else {
-            let node = Bt2InternalNode::decode(
-                &buf,
-                &self.ctx,
-                depth,
-                nrec,
-                record_size,
-                geo.max_nrec_size,
-                geo.child_total_size(depth),
-            )?;
-            out.extend_from_slice(&node.record_data);
-            // Collect (addr, nrec) up front so the node borrow is released
-            // before recursing.
-            let children: Vec<(u64, u16)> = node
-                .child_addrs
-                .iter()
-                .zip(node.child_nrecords.iter())
-                .map(|(&a, &n)| (a, n))
-                .collect();
-            for (child_addr, child_nrec) in children {
-                self.collect_bt2_records(
-                    child_addr,
-                    depth - 1,
-                    child_nrec,
-                    record_size,
-                    node_size,
-                    geo,
-                    out,
-                )?;
-            }
-        }
         Ok(())
     }
 
@@ -3129,15 +3037,58 @@ impl Hdf5Reader {
 
 /// Adapts a `FileHandle` to the `BlockReader` trait used by the fractal-heap
 /// walker, so heap blocks can be fetched from the open file.
-struct HandleBlockReader<'a> {
-    handle: &'a mut FileHandle,
+pub(crate) struct HandleBlockReader<'a> {
+    pub(crate) handle: &'a mut FileHandle,
+}
+
+/// Every attribute attached to an object, whichever storage it uses.
+///
+/// This is the only place attributes are pulled off an object header — reader
+/// and writer alike. Compact storage keeps them as `Attribute` messages in the
+/// header itself; once an object crosses the phase-change threshold libhdf5
+/// moves *all* of them into a fractal heap named by the `Attribute Info`
+/// message and leaves no attribute message behind
+/// (`H5Oattribute.c::H5O__attr_create`). Scanning only the messages therefore
+/// reports zero attributes for a dense object: a silent loss on read, and a
+/// silent deletion when the writer rebuilds that object's header from what it
+/// collected.
+pub(crate) fn collect_object_attributes(
+    handle: &mut FileHandle,
+    ctx: &FormatContext,
+    header: &ObjectHeader,
+) -> Vec<AttributeMessage> {
+    let mut attrs = Vec::new();
+    for msg in &header.messages {
+        match msg.msg_type {
+            MSG_ATTRIBUTE => {
+                if let Ok((attr, _)) = AttributeMessage::decode(&msg.data, ctx) {
+                    attrs.push(attr);
+                }
+            }
+            MSG_ATTR_INFO => {
+                if let Ok((info, _)) = AttributeInfoMessage::decode(&msg.data, ctx) {
+                    let mut br = HandleBlockReader { handle };
+                    if let Ok(dense) =
+                        crate::format::dense_attr::read_dense_attributes(&info, ctx, &mut br)
+                    {
+                        attrs.extend(dense);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    attrs
 }
 
 impl BlockReader for HandleBlockReader<'_> {
     fn read_block(&mut self, offset: u64, len: usize) -> crate::format::FormatResult<Vec<u8>> {
-        self.handle.read_at(offset, len).map_err(|e| {
+        // `read_at_most`, not `read_at`: a metadata block allocated at the end
+        // of the file can be shorter on disk than its nominal size, and every
+        // decoder re-checks the length it needs.
+        self.handle.read_at_most(offset, len).map_err(|e| {
             crate::format::FormatError::InvalidData(format!(
-                "fractal heap block read failed at {:#x}: {}",
+                "metadata block read failed at {:#x}: {}",
                 offset, e
             ))
         })

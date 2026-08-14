@@ -1177,17 +1177,11 @@ impl Hdf5Writer {
         let (root_header, root_header_size) =
             crate::format::object_header::ObjectHeader::decode(&root_buf)?;
 
-        // Collect existing root-level attributes
-        let mut root_attributes = Vec::new();
-        for msg in &root_header.messages {
-            if msg.msg_type == crate::format::messages::MSG_ATTRIBUTE {
-                if let Ok((a, _)) =
-                    crate::format::messages::attribute::AttributeMessage::decode(&msg.data, &ctx)
-                {
-                    root_attributes.push(a);
-                }
-            }
-        }
+        // Collect existing root-level attributes. Through the shared collector
+        // so a root group using dense storage is carried forward rather than
+        // erased by the header rewrite at finalize.
+        let root_attributes =
+            crate::io::reader::collect_object_attributes(&mut handle, &ctx, &root_header);
 
         let mut link_entries: Vec<(String, u64)> = Vec::new();
         let mut visited_groups = std::collections::HashSet::new();
@@ -1241,7 +1235,7 @@ impl Hdf5Writer {
             let mut layout = None;
             let mut fp = None;
             let mut fill_value = None;
-            let mut attrs = Vec::new();
+            let attrs = crate::io::reader::collect_object_attributes(&mut handle, &ctx, &ds_header);
 
             for msg in &ds_header.messages {
                 match msg.msg_type {
@@ -1272,11 +1266,6 @@ impl Hdf5Writer {
                             if fv.fill_defined == 2 {
                                 fill_value = fv.fill_value;
                             }
-                        }
-                    }
-                    crate::format::messages::MSG_ATTRIBUTE => {
-                        if let Ok((a, _)) = AttributeMessage::decode(&msg.data, &ctx) {
-                            attrs.push(a);
                         }
                     }
                     _ => {}

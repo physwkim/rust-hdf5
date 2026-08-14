@@ -8,6 +8,7 @@ pub mod btree_v1;
 pub(crate) mod bytes;
 pub mod checksum;
 pub mod chunk_index;
+pub mod dense_attr;
 pub mod fractal_heap;
 pub mod global_heap;
 pub mod local_heap;
@@ -36,6 +37,16 @@ impl FormatContext {
 
 /// UNDEF address constant
 pub const UNDEF_ADDR: u64 = u64::MAX;
+
+/// Fetches arbitrary file regions for the structure walkers that cannot hold a
+/// file handle themselves (fractal heap, v2 B-tree, dense attribute storage).
+pub trait BlockReader {
+    /// Read up to `len` bytes starting at `offset`. Returning fewer bytes is
+    /// only permitted at end of file; every caller re-checks the length it
+    /// actually needs, so a short read surfaces as `BufferTooShort` rather
+    /// than a misparse.
+    fn read_block(&mut self, offset: u64, len: usize) -> FormatResult<Vec<u8>>;
+}
 
 /// Encode/decode error
 #[derive(Debug)]

@@ -8,19 +8,30 @@
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::H5File;
 
-const TEST_PYTHON: &str = "/Users/stevek/mamba/envs/bs2026.1/bin/python";
+/// Interpreters tried in order when `RUST_HDF5_TEST_PYTHON` is unset. The
+/// second is the same environment the parity oracle pins
+/// (`oracle/run.py::DEFAULT_PYTHON`), so a checkout that can run the oracle can
+/// run these cross-checks too.
+const TEST_PYTHONS: [&str; 2] = [
+    "/Users/stevek/mamba/envs/bs2026.1/bin/python",
+    "/home/stevek/micromamba/envs/tomo/bin/python",
+];
 
 fn python() -> Option<&'static str> {
     static PY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     PY.get_or_init(|| {
-        let candidate =
-            std::env::var("RUST_HDF5_TEST_PYTHON").unwrap_or_else(|_| TEST_PYTHON.to_string());
-        if std::path::Path::new(&candidate).exists() {
-            Some(candidate)
-        } else {
-            eprintln!("skipping h5py cross-check: {candidate} not present");
-            None
+        let candidates: Vec<String> = match std::env::var("RUST_HDF5_TEST_PYTHON") {
+            Ok(p) => vec![p],
+            Err(_) => TEST_PYTHONS.iter().map(|p| p.to_string()).collect(),
+        };
+        let found = candidates
+            .iter()
+            .find(|c| std::path::Path::new(c).exists())
+            .cloned();
+        if found.is_none() {
+            eprintln!("skipping h5py cross-check: none of {candidates:?} present");
         }
+        found
     })
     .as_deref()
 }
@@ -62,17 +73,42 @@ fn read_back_with_h5py(py: &str, path: &std::path::Path, body: &str) {
 /// write mode. The body should populate `f` and is followed by `f.close()`. A
 /// non-zero exit fails the test.
 fn write_with_h5py(py: &str, path: &std::path::Path, body: &str) {
+    write_with_h5py_libver(py, path, None, body);
+}
+
+/// `write_with_h5py`, pinning the library version bounds (e.g. `"v108"`).
+///
+/// Needed for anything that depends on a version-2 object header: dense
+/// attribute storage only exists there, and h5py's default lower bound is
+/// `earliest`, which pins the header to version 1.
+fn write_with_h5py_libver(
+    py: &str,
+    path: &std::path::Path,
+    libver: Option<&str>,
+    body: &str,
+) -> String {
+    let libver_arg = match libver {
+        Some(v) => format!(", libver=('{v}', '{v}')"),
+        None => String::new(),
+    };
     let script = format!(
-        "import h5py, numpy as np, sys\nf = h5py.File(r'{}', 'w')\n{}\nf.close()\n",
+        "import h5py, numpy as np, sys\nf = h5py.File(r'{}', 'w'{})\n{}\nf.close()\n",
         path.display(),
+        libver_arg,
         body
     );
-    let status = std::process::Command::new(py)
+    let out = std::process::Command::new(py)
         .arg("-c")
         .arg(&script)
-        .status()
+        .output()
         .expect("failed to spawn python");
-    assert!(status.success(), "h5py write failed for {}", path.display());
+    assert!(
+        out.status.success(),
+        "h5py write failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// F1: a vlen-string dataset created via the group helper returns a handle, so
@@ -1185,6 +1221,134 @@ fn packed_shared_collection_readable_by_h5py() {
          assert f['entry'].attrs['title'] == 'packed heap'\n\
          assert list(f['notes'][...]) == [b'alpha', b'beta']\n\
          assert list(f['tags'][...]) == [b'red', b'green']\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// An object with more attributes than the object header's compact threshold
+/// keeps every one of them in a fractal heap named by the `Attribute Info`
+/// message, with nothing left in the header itself. Reading only the header's
+/// attribute messages therefore reports zero attributes, which is what the
+/// dense-storage read path exists to prevent.
+///
+/// h5py's default lower libver bound pins the object header to version 1,
+/// where dense attribute storage does not exist — hence the explicit v108
+/// bounds.
+#[test]
+fn dense_attributes_written_by_h5py_read_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("attrs_dense");
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v108"),
+        "d = f.create_dataset('data', data=np.arange(8, dtype='<i4'))\n\
+         g = f.create_group('grp')\n\
+         for i in range(12):\n\
+         \x20   d.attrs.create('a%02d' % i, np.int32(i))\n\
+         for i in range(12):\n\
+         \x20   g.attrs.create('b%02d' % i, np.int64(100 + i))\n\
+         for i in range(12):\n\
+         \x20   f.attrs.create('r%02d' % i, np.int32(1000 + i))\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+
+    let ds = file.dataset("data").unwrap();
+    let mut names = ds.attr_names().unwrap();
+    names.sort();
+    let expected: Vec<String> = (0..12).map(|i| format!("a{i:02}")).collect();
+    assert_eq!(names, expected, "dense dataset attributes");
+    for i in 0..12i32 {
+        let a = ds.attr(&format!("a{i:02}")).unwrap();
+        assert_eq!(a.read_numeric::<i32>().unwrap(), i);
+    }
+
+    // The same storage on a subgroup and on the root group.
+    let root = file.root_group();
+    let grp = root.group("grp").unwrap();
+    let mut gnames = grp.attr_names().unwrap();
+    gnames.sort();
+    let gexpected: Vec<String> = (0..12).map(|i| format!("b{i:02}")).collect();
+    assert_eq!(gnames, gexpected, "dense group attributes");
+
+    let mut rnames = root.attr_names().unwrap();
+    rnames.sort();
+    let rexpected: Vec<String> = (0..12).map(|i| format!("r{i:02}")).collect();
+    assert_eq!(rnames, rexpected, "dense root-group attributes");
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// An attribute at or above the heap's `max_man_size` (4 KiB) does not fit a
+/// managed block, so libhdf5 stores it as a "huge" object addressed through
+/// the heap's own v2 B-tree. Reading it exercises a different heap-ID branch
+/// than the small dense attributes above.
+#[test]
+fn huge_dense_attribute_written_by_h5py_read_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_huge");
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v108"),
+        "d = f.create_dataset('data', data=np.arange(8, dtype='<i4'))\n\
+         d.attrs.create('big', np.arange(25600, dtype='<i4'))\n\
+         d.attrs.create('small', np.int32(5))\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let mut names = ds.attr_names().unwrap();
+    names.sort();
+    assert_eq!(names, vec!["big".to_string(), "small".to_string()]);
+    let big = ds.attr("big").unwrap().read_numeric_as::<i32>().unwrap();
+    assert_eq!(big.len(), 25600);
+    assert_eq!(big[0], 0);
+    assert_eq!(big[25599], 25599);
+    assert_eq!(ds.attr("small").unwrap().read_numeric::<i32>().unwrap(), 5);
+    std::fs::remove_file(&path).ok();
+}
+
+/// Opening an h5py-written file for append and touching a group rewrites that
+/// group's object header from the attributes the writer collected. Collecting
+/// only the header's attribute messages would rebuild a dense-storage group
+/// without any of its attributes — a silent deletion of data the caller never
+/// asked to change.
+#[test]
+fn rust_append_preserves_h5py_dense_attributes() {
+    let Some(py) = python() else { return };
+    let path = tmp("dense_append");
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v108"),
+        "g = f.create_group('grp')\n\
+         for i in range(12):\n\
+         \x20   g.attrs.create('b%02d' % i, np.int32(i))\n\
+         for i in range(12):\n\
+         \x20   f.attrs.create('r%02d' % i, np.int32(100 + i))\n\
+         f.create_dataset('d', data=np.arange(4, dtype='<i4'))\n",
+    );
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.root_group()
+            .group("grp")
+            .unwrap()
+            .set_attr_string("added", "x")
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "names = sorted(f['grp'].attrs.keys())\n\
+         assert names == ['added'] + ['b%02d' % i for i in range(12)], names\n\
+         for i in range(12):\n\
+         \x20   assert f['grp'].attrs['b%02d' % i] == i\n\
+         rnames = sorted(f.attrs.keys())\n\
+         assert rnames == ['r%02d' % i for i in range(12)], rnames\n\
+         assert list(f['d'][...]) == [0, 1, 2, 3]\n",
     );
     std::fs::remove_file(&path).ok();
 }
