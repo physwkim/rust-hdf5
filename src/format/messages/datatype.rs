@@ -343,23 +343,36 @@ impl ReferenceKind {
         })
     }
 
-    /// Whether this kind's elements are 1.12 opaque tokens, which carry the
-    /// encoding version in the bit field's second nibble.
+    /// Whether this kind's elements are 1.12 encoded references, which carry
+    /// the encoding version in the bit field's second nibble.
     pub fn is_revised(self) -> bool {
-        self.old_style().is_none()
+        matches!(self.encoding(), ReferenceEncoding::Revised)
     }
 
-    /// The pre-1.12 kind this is, or `None` for the 1.12 encodings.
+    /// How elements of this kind are laid out.
     ///
-    /// Element decoding takes an [`OldReferenceKind`], so a caller that has
-    /// passed this gate cannot then be handed a token it has no way to read.
-    pub fn old_style(self) -> Option<OldReferenceKind> {
+    /// The split is what element decoding dispatches on: a pre-1.12 element is
+    /// whatever the datatype message says it is, while every 1.12 element
+    /// repeats its own reference type in its first byte — `H5T__ref_disk_read`
+    /// reads that byte rather than consulting the datatype, because
+    /// `H5T_STD_REF` is stored as `H5R_OBJECT2` no matter which of the three
+    /// revised kinds an element turns out to hold.
+    pub fn encoding(self) -> ReferenceEncoding {
         match self {
-            Self::Object1 => Some(OldReferenceKind::Object),
-            Self::DatasetRegion1 => Some(OldReferenceKind::DatasetRegion),
-            Self::Object2 | Self::DatasetRegion2 | Self::Attr => None,
+            Self::Object1 => ReferenceEncoding::Old(OldReferenceKind::Object),
+            Self::DatasetRegion1 => ReferenceEncoding::Old(OldReferenceKind::DatasetRegion),
+            Self::Object2 | Self::DatasetRegion2 | Self::Attr => ReferenceEncoding::Revised,
         }
     }
+}
+
+/// The element layout a [`ReferenceKind`] implies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceEncoding {
+    /// A pre-1.12 element: a bare file address, or a global-heap id.
+    Old(OldReferenceKind),
+    /// A 1.12 encoded reference, which names its own kind.
+    Revised,
 }
 
 /// The two pre-1.12 reference kinds — the ones whose elements name a file

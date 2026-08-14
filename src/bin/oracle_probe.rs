@@ -228,10 +228,17 @@ fn canon_dtype(dt: &DatatypeMessage) -> String {
         }
         // canon.py splits the class by element width, not by the stored
         // reference type: an 8-byte element is an object reference, anything
-        // else a region one.
-        DatatypeMessage::Reference { size, .. } => {
-            if *size == 8 { "objref" } else { "regref" }.to_string()
+        // else a region one. That rule only covers what h5py can express —
+        // the 1.12 kinds, which it refuses outright, get their own name so a
+        // file holding them is never reported as a pre-1.12 region reference.
+        DatatypeMessage::Reference { size, kind } => if kind.is_revised() {
+            "stdref"
+        } else if *size == 8 {
+            "objref"
+        } else {
+            "regref"
         }
+        .to_string(),
         DatatypeMessage::VarLenSequence { base } => format!("vlen({})", canon_dtype(base)),
         DatatypeMessage::Array { dims, base } => {
             let parts: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
@@ -340,6 +347,13 @@ fn render_ref(r: &Reference) -> String {
             ),
             None => format!("regref:{}:unbounded", target(path, *address)),
         },
+        // No h5py-generated case can reach this arm: h5py 3.x refuses the
+        // `H5T_STD_REF` datatype an attribute reference needs.
+        Reference::Attr {
+            address,
+            path,
+            name,
+        } => format!("attrref:{}:{name}", target(path, *address)),
     }
 }
 

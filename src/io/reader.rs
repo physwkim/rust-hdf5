@@ -18,7 +18,7 @@ use crate::format::local_heap::{local_heap_get_string, LocalHeapHeader};
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::data_layout::{self, DataLayoutMessage};
 use crate::format::messages::dataspace::DataspaceMessage;
-use crate::format::messages::datatype::{DatatypeMessage, OldReferenceKind};
+use crate::format::messages::datatype::{DatatypeMessage, OldReferenceKind, ReferenceEncoding};
 use crate::format::messages::fill_value::{try_tiled_fill, FillValueMessage};
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::link::LinkMessage;
@@ -27,7 +27,8 @@ use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
 use crate::format::reference::{
-    decode_object_element, decode_region_element, decode_region_heap_object, Reference,
+    decode_object_element, decode_region_element, decode_region_heap_object, decode_revised_body,
+    decode_revised_element, Reference, ReferenceTarget, RevisedElement,
 };
 use crate::format::superblock::{detect_superblock_version, SuperblockV0V1, SuperblockV2V3};
 use crate::format::symbol_table::SymbolTableNode;
@@ -1532,21 +1533,14 @@ impl Hdf5Reader {
                 "reference datatype has zero width".into(),
             ));
         }
-        // The 1.12 reference kinds store an opaque token this reader cannot
-        // follow. Refuse the whole read by name rather than misread the bytes
-        // as a 1.10-era address.
-        let kind = kind.old_style().ok_or_else(|| {
-            crate::format::FormatError::UnsupportedFeature(format!(
-                "{kind:?} reference elements (the 1.12 revised encoding)"
-            ))
-        })?;
+        let encoding = kind.encoding();
 
         // References written by one call share one heap collection, so read
         // each collection once rather than per element.
         let mut heaps = std::collections::HashMap::new();
         let mut out = Vec::with_capacity(bytes.len() / size);
         for elem in bytes.chunks_exact(size) {
-            out.push(self.decode_reference_element(elem, kind, &mut heaps)?);
+            out.push(self.decode_reference_element(elem, encoding, &mut heaps)?);
         }
         Ok(out)
     }
@@ -1558,44 +1552,81 @@ impl Hdf5Reader {
     fn decode_reference_element(
         &mut self,
         elem: &[u8],
-        kind: OldReferenceKind,
+        encoding: ReferenceEncoding,
         heaps: &mut std::collections::HashMap<u64, GlobalHeapCollection>,
     ) -> IoResult<Reference> {
-        match kind {
-            OldReferenceKind::Object => match decode_object_element(elem, &self.ctx)? {
-                None => Ok(Reference::Null),
-                Some(address) => Ok(Reference::Object {
-                    address,
-                    path: self.path_for_object(address).map(str::to_string),
-                }),
-            },
-            OldReferenceKind::DatasetRegion => {
+        match encoding {
+            ReferenceEncoding::Old(OldReferenceKind::Object) => {
+                match decode_object_element(elem, &self.ctx)? {
+                    None => Ok(Reference::Null),
+                    Some(address) => Ok(self.resolve_reference(address, ReferenceTarget::Object)),
+                }
+            }
+            ReferenceEncoding::Old(OldReferenceKind::DatasetRegion) => {
                 let Some((coll_addr, obj_index)) = decode_region_element(elem, &self.ctx)? else {
                     return Ok(Reference::Null);
                 };
-                if let std::collections::hash_map::Entry::Vacant(slot) = heaps.entry(coll_addr) {
-                    slot.insert(self.read_heap_collection(coll_addr)?);
-                }
-                let idx = u16::try_from(obj_index).map_err(|_| {
-                    crate::io::IoError::InvalidState(format!(
-                        "global heap object index {obj_index} does not fit the 16-bit \
-                         on-disk field"
-                    ))
-                })?;
-                let obj = heaps[&coll_addr].get_object(idx).ok_or_else(|| {
-                    crate::io::IoError::InvalidState(format!(
-                        "global heap object {idx} not found in the collection at address \
-                         {coll_addr:#x}"
-                    ))
-                })?;
+                let obj = self.heap_object(coll_addr, obj_index, heaps)?;
                 let (address, selection) = decode_region_heap_object(obj, &self.ctx)?;
-                Ok(Reference::Region {
-                    address,
-                    path: self.path_for_object(address).map(str::to_string),
-                    selection,
-                })
+                Ok(self.resolve_reference(address, ReferenceTarget::Region(selection)))
+            }
+            ReferenceEncoding::Revised => {
+                let (kind, body) = match decode_revised_element(elem, &self.ctx)? {
+                    RevisedElement::Null => return Ok(Reference::Null),
+                    RevisedElement::Inline { kind, body } => (kind, body.to_vec()),
+                    RevisedElement::Heap {
+                        kind,
+                        collection,
+                        index,
+                    } => (kind, self.heap_object(collection, index, heaps)?.to_vec()),
+                };
+                match decode_revised_body(kind, &body, &self.ctx)? {
+                    None => Ok(Reference::Null),
+                    Some((address, target)) => Ok(self.resolve_reference(address, target)),
+                }
             }
         }
+    }
+
+    /// Attach the target's path to a decoded reference — the one place an
+    /// address becomes a [`Reference`], so every kind resolves the same way.
+    fn resolve_reference(&self, address: u64, target: ReferenceTarget) -> Reference {
+        let path = self.path_for_object(address).map(str::to_string);
+        match target {
+            ReferenceTarget::Object => Reference::Object { address, path },
+            ReferenceTarget::Region(selection) => Reference::Region {
+                address,
+                path,
+                selection,
+            },
+            ReferenceTarget::Attribute(name) => Reference::Attr {
+                address,
+                path,
+                name,
+            },
+        }
+    }
+
+    /// One global-heap object, reading its collection at most once.
+    fn heap_object<'h>(
+        &mut self,
+        collection: u64,
+        index: u32,
+        heaps: &'h mut std::collections::HashMap<u64, GlobalHeapCollection>,
+    ) -> IoResult<&'h [u8]> {
+        if let std::collections::hash_map::Entry::Vacant(slot) = heaps.entry(collection) {
+            slot.insert(self.read_heap_collection(collection)?);
+        }
+        let idx = u16::try_from(index).map_err(|_| {
+            crate::io::IoError::InvalidState(format!(
+                "global heap object index {index} does not fit the 16-bit on-disk field"
+            ))
+        })?;
+        heaps[&collection].get_object(idx).ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!(
+                "global heap object {idx} not found in the collection at address {collection:#x}"
+            ))
+        })
     }
 
     /// Return the dimensions of a dataset.

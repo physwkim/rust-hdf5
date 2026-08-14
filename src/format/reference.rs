@@ -14,8 +14,26 @@
 //! (`H5R__encode_token_region_compat`), whose wire format lives in the `H5S`
 //! serializers (`H5S__hyper_serialize`, `H5S__point_serialize`,
 //! `H5S__all_serialize`, `H5S__none_serialize`).
+//!
+//! The 1.12 kinds — `H5R_OBJECT2`, `H5R_DATASET_REGION2` and `H5R_ATTR`, all
+//! written as `H5T_STD_REF` — share one element layout instead
+//! (`H5T__ref_disk_getsize`):
+//!
+//! ```text
+//! type (1) | flags (1) | encoded reference           an H5R_OBJECT2 with no
+//!                                                    external file, stored
+//!                                                    inline
+//! type (1) | flags (1) | size (4) | heap id          everything else, whose
+//!                                                    encoded reference is a
+//!                                                    global-heap blob
+//! ```
+//!
+//! and the encoded reference itself is `H5R__encode`: a token (its length, then
+//! the target's object header address), then the serialized selection for a
+//! region and the attribute name for an attribute reference.
 
 use crate::format::bytes::{read_le_addr, read_le_uint};
+use crate::format::messages::datatype::ReferenceKind;
 use crate::format::{FormatContext, FormatError, FormatResult, UNDEF_ADDR};
 
 /// `H5S_sel_type` codes as they appear in a serialized selection.
@@ -92,6 +110,177 @@ pub fn decode_region_heap_object(
     Ok((addr, selection))
 }
 
+/// `H5R_IS_EXTERNAL`: the encoded reference carries the name of the file the
+/// target lives in, after the token.
+const REVISED_FLAG_EXTERNAL: u8 = 0x01;
+
+/// The two bytes every 1.12 element leads with, `H5R_ENCODE_HEADER_SIZE`.
+const REVISED_HEADER: usize = 2;
+
+/// Where a 1.12 element keeps its encoded reference.
+///
+/// `H5T__ref_disk_getsize` makes the same split: an `H5R_OBJECT2` naming an
+/// object in this file is short enough to sit in the element, and every other
+/// element holds a global-heap blob id instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisedElement<'a> {
+    /// An element naming nothing: reference type 0 over a nil blob id.
+    Null,
+    /// The encoded reference, less its two-byte header, stored in the element.
+    Inline {
+        /// The kind the element's own type byte names.
+        kind: ReferenceKind,
+        /// The encoded reference from the token onwards.
+        body: &'a [u8],
+    },
+    /// The encoded reference lives in a global-heap collection.
+    Heap {
+        /// The kind the element's own type byte names.
+        kind: ReferenceKind,
+        /// Address of the collection holding the blob.
+        collection: u64,
+        /// Index of the blob's object within that collection.
+        index: u32,
+    },
+}
+
+/// Split a 1.12 reference element into its kind and the encoded reference.
+///
+/// The element's type byte is the authority on the kind, not the datatype
+/// message: libhdf5 stores every `H5T_STD_REF` as `H5R_OBJECT2` and lets each
+/// element say what it actually holds.
+pub fn decode_revised_element<'a>(
+    elem: &'a [u8],
+    ctx: &FormatContext,
+) -> FormatResult<RevisedElement<'a>> {
+    let sa = ctx.sizeof_addr as usize;
+    let heap_id = REVISED_HEADER + 4;
+    if elem.len() < REVISED_HEADER {
+        return Err(FormatError::BufferTooShort {
+            needed: REVISED_HEADER,
+            available: elem.len(),
+        });
+    }
+    let (code, flags) = (elem[0], elem[1]);
+
+    // Reference type 0 is `H5R_BADTYPE`; `H5T__ref_disk_isnull` reads such an
+    // element as null when — and only when — the blob id it carries is the nil
+    // one (a zero collection address), which is what an unwritten element
+    // holds.
+    if code == 0 {
+        if elem.len() < heap_id + sa {
+            return Err(FormatError::BufferTooShort {
+                needed: heap_id + sa,
+                available: elem.len(),
+            });
+        }
+        return match read_le_addr(&elem[heap_id..], sa) {
+            0 => Ok(RevisedElement::Null),
+            addr => Err(FormatError::InvalidData(format!(
+                "reference type 0 over a blob at {addr:#x}, which is not the nil id a null \
+                 reference carries"
+            ))),
+        };
+    }
+
+    let kind = ReferenceKind::from_code(code)
+        .filter(|k| k.is_revised())
+        .ok_or_else(|| {
+            FormatError::InvalidData(format!("reference type {code} in a 1.12 element"))
+        })?;
+
+    if flags & REVISED_FLAG_EXTERNAL != 0 {
+        return Err(FormatError::UnsupportedFeature(
+            "a reference naming an object in another file".into(),
+        ));
+    }
+
+    if kind == ReferenceKind::Object2 {
+        return Ok(RevisedElement::Inline {
+            kind,
+            body: &elem[REVISED_HEADER..],
+        });
+    }
+
+    if elem.len() < heap_id + sa + 4 {
+        return Err(FormatError::BufferTooShort {
+            needed: heap_id + sa + 4,
+            available: elem.len(),
+        });
+    }
+    let collection = read_le_addr(&elem[heap_id..], sa);
+    let index = read_le_uint(&elem[heap_id + sa..heap_id + sa + 4], 4) as u32;
+    Ok(RevisedElement::Heap {
+        kind,
+        collection,
+        index,
+    })
+}
+
+/// What a reference names beyond the object its token points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReferenceTarget {
+    /// The object itself.
+    Object,
+    /// A selection over the target dataset.
+    Region(RegionSelection),
+    /// An attribute of the target, by name.
+    Attribute(String),
+}
+
+/// Decode an encoded 1.12 reference — `H5R__decode` from the token onwards —
+/// into the address it names and what it names there, or `None` when the token
+/// names no object.
+pub fn decode_revised_body(
+    kind: ReferenceKind,
+    body: &[u8],
+    ctx: &FormatContext,
+) -> FormatResult<Option<(u64, ReferenceTarget)>> {
+    let sa = ctx.sizeof_addr as usize;
+    let mut r = Cursor::new(body);
+
+    // `H5R__decode_obj_token` stores the token's length ahead of it. The
+    // native VOL's token is the object header address (`H5VL_native_addr_to_
+    // token`), so a file whose tokens are some other width came from a
+    // connector this crate cannot follow.
+    let token_size = r.u8()? as usize;
+    if token_size != sa {
+        return Err(FormatError::UnsupportedFeature(format!(
+            "object tokens {token_size} bytes wide, not the {sa}-byte file addresses the \
+             native format uses"
+        )));
+    }
+    let token = r.take(token_size)?;
+    let Some(address) = target_address(token, sa) else {
+        return Ok(None);
+    };
+
+    let target = match kind {
+        ReferenceKind::Object2 => ReferenceTarget::Object,
+        ReferenceKind::DatasetRegion2 => {
+            // `H5R__encode_region` prefixes the serialized selection with its
+            // length and the extent's rank; the selection carries the rank
+            // again, so only the length is needed to bound it.
+            let len = r.u32()? as usize;
+            let _rank = r.u32()?;
+            ReferenceTarget::Region(RegionSelection::decode(r.take(len)?)?)
+        }
+        ReferenceKind::Attr => {
+            let len = r.u16()? as usize;
+            let name = r.take(len)?;
+            ReferenceTarget::Attribute(String::from_utf8(name.to_vec()).map_err(|_| {
+                FormatError::InvalidData("attribute name in a reference is not UTF-8".into())
+            })?)
+        }
+        ReferenceKind::Object1 | ReferenceKind::DatasetRegion1 => {
+            return Err(FormatError::InvalidData(format!(
+                "{kind:?} is not a 1.12 encoded reference"
+            )))
+        }
+    };
+    Ok(Some((address, target)))
+}
+
 /// One reference element, decoded and resolved against the file it came from.
 ///
 /// `path` is the target's absolute path when the file's link structure names
@@ -103,14 +292,15 @@ pub enum Reference {
     /// An element naming no object: the undefined address libhdf5 writes for
     /// an unset object reference, or a zeroed region-reference heap id.
     Null,
-    /// `H5R_OBJECT1`: a whole object.
+    /// A whole object — `H5R_OBJECT1` or `H5R_OBJECT2`.
     Object {
         /// Object header address of the target.
         address: u64,
         /// Absolute path of the target.
         path: Option<String>,
     },
-    /// `H5R_DATASET_REGION1`: a dataset plus a selection over it.
+    /// A dataset plus a selection over it — `H5R_DATASET_REGION1` or
+    /// `H5R_DATASET_REGION2`.
     Region {
         /// Object header address of the target dataset.
         address: u64,
@@ -119,6 +309,16 @@ pub enum Reference {
         /// The selection the reference carries.
         selection: RegionSelection,
     },
+    /// `H5R_ATTR`: one attribute of an object, by name. Only the 1.12
+    /// encodings can express it.
+    Attr {
+        /// Object header address of the object the attribute belongs to.
+        address: u64,
+        /// Absolute path of that object.
+        path: Option<String>,
+        /// Name of the attribute.
+        name: String,
+    },
 }
 
 impl Reference {
@@ -126,7 +326,9 @@ impl Reference {
     pub fn path(&self) -> Option<&str> {
         match self {
             Self::Null => None,
-            Self::Object { path, .. } | Self::Region { path, .. } => path.as_deref(),
+            Self::Object { path, .. } | Self::Region { path, .. } | Self::Attr { path, .. } => {
+                path.as_deref()
+            }
         }
     }
 
@@ -134,7 +336,17 @@ impl Reference {
     pub fn address(&self) -> Option<u64> {
         match self {
             Self::Null => None,
-            Self::Object { address, .. } | Self::Region { address, .. } => Some(*address),
+            Self::Object { address, .. }
+            | Self::Region { address, .. }
+            | Self::Attr { address, .. } => Some(*address),
+        }
+    }
+
+    /// The attribute an attribute reference names; `None` for the other kinds.
+    pub fn attribute_name(&self) -> Option<&str> {
+        match self {
+            Self::Attr { name, .. } => Some(name),
+            _ => None,
         }
     }
 
@@ -409,6 +621,11 @@ impl<'a> Cursor<'a> {
         Ok(self.take(1)?[0])
     }
 
+    fn u16(&mut self) -> FormatResult<u16> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
     fn u32(&mut self) -> FormatResult<u32> {
         let b = self.take(4)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -539,6 +756,189 @@ mod tests {
         assert_eq!(
             RegionSelection::decode(&buf).unwrap(),
             RegionSelection::None
+        );
+    }
+
+    // The four element/blob captures below come from a file libhdf5 1.14.6
+    // wrote with `H5F_LIBVER_V112` as its low bound
+    // (`tests/fixtures/gen_revised_refs.c latest`), the combination that puts
+    // the newest selection encodings inside a reference: `matrix` is a 4x6
+    // dataset at object header address 0xC3, the region references select the
+    // hyperslab (1,2)-(2,4) and the points (0,1) and (3,5), and the attribute
+    // reference names `note`.
+
+    /// `H5R_OBJECT2`: type, flags, then the token inline.
+    const OBJ2_ELEMENT: [u8; 18] = [
+        0x02, 0x00, 0x08, 0xC3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00,
+    ];
+
+    /// `H5R_DATASET_REGION2`: type, flags, blob size, then the heap id.
+    const REGION2_ELEMENT: [u8; 18] = [
+        0x03, 0x00, 0x39, 0x00, 0x00, 0x00, 0xA8, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00,
+    ];
+
+    /// `H5R_ATTR`, whose blob ends in the attribute name.
+    const ATTR_ELEMENT: [u8; 18] = [
+        0x04, 0x00, 0x0F, 0x00, 0x00, 0x00, 0xA8, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+        0x00, 0x00, 0x00,
+    ];
+
+    /// The blob behind `REGION2_ELEMENT`: token, then a version-3 regular
+    /// hyperslab. libhdf5 sizes the blob for the largest reference the dataset
+    /// may hold, so the encoding stops short of the object's end.
+    const REGION2_HYPERSLAB_BLOB: [u8; 57] = [
+        0x08, 0xC3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0x02, 0x00,
+        0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x02, 0x02, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x01, 0x00, 0x01, 0x00,
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// The blob of the second region reference: a version-2 point list.
+    const REGION2_POINT_BLOB: [u8; 57] = [
+        0x08, 0xC3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x17, 0x00, 0x00, 0x00, 0x02, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00,
+        0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x05, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// The blob of the attribute reference: token, name length, name.
+    const ATTR_BLOB: [u8; 15] = [
+        0x08, 0xC3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x6E, 0x6F, 0x74, 0x65,
+    ];
+
+    /// An `H5R_OBJECT2` element keeps its encoded reference inline; the other
+    /// two kinds point at a heap blob.
+    #[test]
+    fn revised_elements_from_libhdf5_split_into_kind_and_body() {
+        let RevisedElement::Inline { kind, body } =
+            decode_revised_element(&OBJ2_ELEMENT, &ctx()).unwrap()
+        else {
+            panic!("an object reference is stored in the element");
+        };
+        assert_eq!(kind, ReferenceKind::Object2);
+        assert_eq!(
+            decode_revised_body(kind, body, &ctx()).unwrap(),
+            Some((0xC3, ReferenceTarget::Object))
+        );
+
+        assert_eq!(
+            decode_revised_element(&REGION2_ELEMENT, &ctx()).unwrap(),
+            RevisedElement::Heap {
+                kind: ReferenceKind::DatasetRegion2,
+                collection: 0x8A8,
+                index: 1,
+            }
+        );
+        assert_eq!(
+            decode_revised_element(&ATTR_ELEMENT, &ctx()).unwrap(),
+            RevisedElement::Heap {
+                kind: ReferenceKind::Attr,
+                collection: 0x8A8,
+                index: 3,
+            }
+        );
+    }
+
+    /// The bounds of both region blobs are what `H5Sget_select_bounds` reports
+    /// for the selections the fixture generator made.
+    #[test]
+    fn revised_region_blobs_decode_to_their_selections() {
+        let hyper = decode_revised_body(
+            ReferenceKind::DatasetRegion2,
+            &REGION2_HYPERSLAB_BLOB,
+            &ctx(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(hyper.0, 0xC3);
+        let ReferenceTarget::Region(selection) = &hyper.1 else {
+            panic!("a region reference names a selection");
+        };
+        assert_eq!(
+            selection,
+            &RegionSelection::Hyperslab(vec![(vec![1, 2], vec![2, 4])])
+        );
+
+        let points =
+            decode_revised_body(ReferenceKind::DatasetRegion2, &REGION2_POINT_BLOB, &ctx())
+                .unwrap()
+                .unwrap();
+        let ReferenceTarget::Region(selection) = &points.1 else {
+            panic!("a region reference names a selection");
+        };
+        assert_eq!(
+            selection,
+            &RegionSelection::Points(vec![vec![0, 1], vec![3, 5]])
+        );
+        assert_eq!(selection.bounds(), Some((vec![0, 1], vec![3, 5])));
+    }
+
+    #[test]
+    fn an_attribute_reference_carries_its_name() {
+        assert_eq!(
+            decode_revised_body(ReferenceKind::Attr, &ATTR_BLOB, &ctx()).unwrap(),
+            Some((0xC3, ReferenceTarget::Attribute("note".into())))
+        );
+    }
+
+    /// An unwritten element is reference type 0 over a nil blob id
+    /// (`H5T__ref_disk_isnull`); a type byte outside the 1.12 kinds, an
+    /// external-file reference and a foreign token width are all reported
+    /// rather than read as something else.
+    #[test]
+    fn revised_elements_that_name_nothing_or_cannot_be_followed() {
+        assert_eq!(
+            decode_revised_element(&[0u8; 18], &ctx()).unwrap(),
+            RevisedElement::Null
+        );
+
+        let mut stale = [0u8; 18];
+        stale[6] = 0xA8;
+        stale[7] = 0x08;
+        assert!(
+            matches!(
+                decode_revised_element(&stale, &ctx()).unwrap_err(),
+                FormatError::InvalidData(_)
+            ),
+            "reference type 0 over a live blob is not a null reference"
+        );
+
+        let mut old_code = OBJ2_ELEMENT;
+        old_code[0] = ReferenceKind::DatasetRegion1.code();
+        assert!(matches!(
+            decode_revised_element(&old_code, &ctx()).unwrap_err(),
+            FormatError::InvalidData(_)
+        ));
+
+        let mut external = OBJ2_ELEMENT;
+        external[1] = 0x01;
+        assert!(matches!(
+            decode_revised_element(&external, &ctx()).unwrap_err(),
+            FormatError::UnsupportedFeature(_)
+        ));
+
+        let mut foreign = ATTR_BLOB;
+        foreign[0] = 16;
+        assert!(
+            matches!(
+                decode_revised_body(ReferenceKind::Attr, &foreign, &ctx()).unwrap_err(),
+                FormatError::UnsupportedFeature(_)
+            ),
+            "a token that is not a file address belongs to another VOL connector"
+        );
+
+        let mut unset = OBJ2_ELEMENT;
+        unset[3] = 0;
+        let RevisedElement::Inline { kind, body } = decode_revised_element(&unset, &ctx()).unwrap()
+        else {
+            panic!("an object reference is stored in the element");
+        };
+        assert_eq!(
+            decode_revised_body(kind, body, &ctx()).unwrap(),
+            None,
+            "a zero token names no object"
         );
     }
 

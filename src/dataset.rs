@@ -2156,13 +2156,16 @@ impl H5Dataset {
     /// Read a reference dataset's elements, each resolved to the object it
     /// names.
     ///
-    /// Both pre-1.12 reference kinds are read — h5py's `Reference` (an object
-    /// header address) and its `RegionReference` (a heap id whose heap object
-    /// holds the target plus a serialized selection). An object reference
-    /// comes back as [`Reference::Object`] carrying the target's path;
-    /// a region reference as [`Reference::Region`], whose
-    /// [`bounds`](Reference::bounds) is the selection's bounding box —
-    /// libhdf5's `H5Sget_select_bounds`.
+    /// Every reference kind is read: the pre-1.12 pair h5py writes —
+    /// `Reference` (an object header address) and `RegionReference` (a heap id
+    /// whose heap object holds the target plus a serialized selection) — and
+    /// the 1.12 `H5T_STD_REF` trio, `H5R_OBJECT2`, `H5R_DATASET_REGION2` and
+    /// `H5R_ATTR`. An object reference comes back as [`Reference::Object`]
+    /// carrying the target's path, a region reference as
+    /// [`Reference::Region`], whose [`bounds`](Reference::bounds) is the
+    /// selection's bounding box — libhdf5's `H5Sget_select_bounds` — and an
+    /// attribute reference as [`Reference::Attr`], which adds the attribute's
+    /// name.
     ///
     /// ```no_run
     /// # use rust_hdf5::H5File;
