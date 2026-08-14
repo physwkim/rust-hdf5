@@ -1569,6 +1569,58 @@ fn reopen_carries_a_libhdf5_dense_root_attribute_back_out_dense() {
     std::fs::remove_file(&path).ok();
 }
 
+/// An attribute set on a *reopened dataset* is a header change the chunk-write
+/// counters cannot see, so finalize used to keep the dataset's original header
+/// and discard the attribute — no error, no trace. Both the replacement of an
+/// existing value and the addition of a new one have to reach the file, and
+/// the spill to dense storage has to fire for the reopened set as well.
+#[test]
+fn attributes_set_on_a_reopened_dataset_reach_the_file() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_reopen_dataset");
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v108"),
+        "d = f.create_dataset('data', data=np.arange(8, dtype='<i4'))\n\
+         d.attrs['gain'] = np.int32(7)\n",
+    );
+
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        let ds = file.dataset_writer("data").unwrap();
+        ds.new_attr::<i32>()
+            .shape(())
+            .create("gain")
+            .unwrap()
+            .write_numeric(&42i32)
+            .unwrap();
+        // Past max_compact, so the reopened set spills to dense storage too.
+        for i in 0..10i32 {
+            ds.new_attr::<i32>()
+                .shape(())
+                .create(&format!("added{i}"))
+                .unwrap()
+                .write_numeric(&i)
+                .unwrap();
+        }
+        file.close().unwrap();
+    }
+
+    read_back_with_h5py(
+        py,
+        &path,
+        "d = f['data']\n\
+         assert list(d[...]) == list(range(8)), list(d[...])\n\
+         assert d.attrs['gain'] == 42, d.attrs['gain']\n\
+         assert all(d.attrs['added%d' % i] == i for i in range(10))\n\
+         i = h5py.h5o.get_info(d.id)\n\
+         assert i.num_attrs == 11, i.num_attrs\n\
+         assert i.meta_size.attr.index_size > 0, 'expected dense storage'\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// An attribute this crate cannot decode must be listed, not dropped.
 ///
 /// An object-reference datatype (class 7) is one `DatatypeMessage::decode`

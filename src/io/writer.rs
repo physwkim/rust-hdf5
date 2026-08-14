@@ -459,6 +459,10 @@ pub struct DatasetInfo {
     /// session that only changed the extent would keep the old on-disk
     /// header — silently dropping the new shape.
     pub extent_dirty: bool,
+    /// Something the object header encodes changed this session without
+    /// touching the dataset's storage — an attribute set or removed, a fill
+    /// value defined. See [`header_stale`](DatasetInfo::header_stale).
+    pub header_dirty: bool,
     /// User-defined fill value bytes (exactly one element wide). `None`
     /// means default zero-fill; `Some` is emitted as a `fill_defined = 2`
     /// fill-value message in the dataset object header.
@@ -469,6 +473,33 @@ pub struct DatasetInfo {
     /// preserved from the file on reopen, and emitted verbatim at finalize.
     /// Contiguous datasets ignore it.
     pub layout_version: u8,
+}
+
+impl DatasetInfo {
+    /// Whether this session wrote chunk data or changed the extent, so the
+    /// dataset's index structures have to be re-flushed.
+    fn storage_dirty(&self) -> bool {
+        self.chunked.as_ref().is_some_and(|c| c.chunks_written > 0)
+            || self
+                .fixed_array
+                .as_ref()
+                .is_some_and(|f| f.chunks_written > 0)
+            || self.btree_v2.as_ref().is_some_and(|b| b.chunks_written > 0)
+            || self.extent_dirty
+    }
+
+    /// Whether a reopened dataset's on-disk object header no longer describes
+    /// it.
+    ///
+    /// INVARIANT: every mutation of something `build_dataset_header` encodes
+    /// must show up here. Finalize keeps the original header when this is
+    /// false, so a change this misses is not deferred — it is discarded, with
+    /// no error to say so. Attributes were the case that proved it: they are
+    /// invisible to the chunk-write counters, so an attribute set on a
+    /// reopened dataset vanished at close.
+    fn header_stale(&self) -> bool {
+        self.storage_dirty() || self.header_dirty
+    }
 }
 
 /// Runtime metadata for a chunked dataset.
@@ -1358,6 +1389,7 @@ impl Hdf5Writer {
                 filter_pipeline: fp,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
                 fill_value,
                 // Preserve the on-disk layout version so finalize re-encodes
                 // what it read: a v5 file reopened and appended to must not be
@@ -3069,6 +3101,7 @@ impl Hdf5Writer {
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
                 fill_value: None,
                 layout_version: 4,
             },
@@ -3158,6 +3191,7 @@ impl Hdf5Writer {
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -3971,7 +4005,12 @@ impl Hdf5Writer {
                         "dataset index {index} out of range (have {count})"
                     )));
                 }
-                Ok(f(&mut self.ds(index).lock().attributes))
+                let ds = self.ds(index);
+                let mut m = ds.lock();
+                // Every caller of this mutates the list, and a reopened
+                // dataset's header is rewritten only when it is marked stale.
+                m.header_dirty = true;
+                Ok(f(&mut m.attributes))
             }
         }
     }
@@ -4225,6 +4264,7 @@ impl Hdf5Writer {
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
                 fill_value: None,
                 layout_version: 4,
                 chunked: None,
@@ -4295,6 +4335,7 @@ impl Hdf5Writer {
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
                 fill_value: None,
                 layout_version: 4,
                 chunked: None,
@@ -4420,6 +4461,7 @@ impl Hdf5Writer {
                 filter_pipeline: Some(pipeline),
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -5057,6 +5099,7 @@ impl Hdf5Writer {
             )));
         }
         ds.fill_value = Some(bytes);
+        ds.header_dirty = true;
 
         // For a contiguous dataset the fill-value message declares
         // fill-on-allocation, but contiguous storage has no per-chunk
@@ -5625,6 +5668,7 @@ impl Hdf5Writer {
                 filter_pipeline: pipeline,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
                 fill_value: None,
                 layout_version,
                 chunked: None,
@@ -5760,6 +5804,7 @@ impl Hdf5Writer {
                 filter_pipeline: pipeline,
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
                 fill_value: None,
                 layout_version,
                 chunked: None,
@@ -5866,6 +5911,7 @@ impl Hdf5Writer {
                 filter_pipeline: Some(FilterPipeline::deflate(compression_level)),
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -5969,6 +6015,7 @@ impl Hdf5Writer {
                 filter_pipeline: Some(pipeline),
                 deleted: false,
                 extent_dirty: false,
+                header_dirty: false,
                 fill_value: None,
                 layout_version,
                 fixed_array: None,
@@ -7438,14 +7485,8 @@ impl Hdf5Writer {
                 if m.deleted {
                     continue;
                 }
-                if m.obj_header_written_addr.is_some() {
-                    let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0)
-                        || m.fixed_array.as_ref().is_some_and(|f| f.chunks_written > 0)
-                        || m.btree_v2.as_ref().is_some_and(|b| b.chunks_written > 0)
-                        || m.extent_dirty;
-                    if !modified {
-                        continue;
-                    }
+                if m.obj_header_written_addr.is_some() && !m.storage_dirty() {
+                    continue;
                 }
                 let is_indexed =
                     m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
@@ -7478,15 +7519,10 @@ impl Hdf5Writer {
                 continue;
             }
             if m.obj_header_written_addr.is_some() {
-                // Existing dataset from append mode.
-                // If any chunk index took writes this session — or its
-                // extent changed without a chunk write — it was modified
-                // and needs a new object header.
-                let modified = m.chunked.as_ref().is_some_and(|c| c.chunks_written > 0)
-                    || m.fixed_array.as_ref().is_some_and(|f| f.chunks_written > 0)
-                    || m.btree_v2.as_ref().is_some_and(|b| b.chunks_written > 0)
-                    || m.extent_dirty;
-                if !modified {
+                // An existing dataset from append mode keeps its header — and
+                // everything that header names — unless this session changed
+                // what the header says.
+                if !m.header_stale() {
                     // Keep the original object header address for the root group link.
                     m.obj_header_addr = m.obj_header_written_addr.unwrap();
                     continue;
