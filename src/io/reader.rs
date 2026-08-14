@@ -18,7 +18,7 @@ use crate::format::local_heap::{local_heap_get_string, LocalHeapHeader};
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::data_layout::{self, DataLayoutMessage};
 use crate::format::messages::dataspace::DataspaceMessage;
-use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::messages::datatype::{DatatypeMessage, ReferenceKind};
 use crate::format::messages::fill_value::{try_tiled_fill, FillValueMessage};
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::link::LinkMessage;
@@ -26,6 +26,7 @@ use crate::format::messages::link::LinkTarget;
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
+use crate::format::reference::{decode_object_element, Reference};
 use crate::format::superblock::{detect_superblock_version, SuperblockV0V1, SuperblockV2V3};
 use crate::format::symbol_table::SymbolTableNode;
 use crate::format::{FormatContext, UNDEF_ADDR};
@@ -101,6 +102,9 @@ impl<'a> ChunkTarget<'a> {
 pub struct DatasetReadInfo {
     /// Dataset name (the link name in the root group).
     pub name: String,
+    /// Address of the dataset's object header — what an object reference to
+    /// this dataset stores.
+    pub object_header_address: u64,
     /// Element datatype.
     pub datatype: DatatypeMessage,
     /// Dataspace (dimensionality).
@@ -115,6 +119,40 @@ pub struct DatasetReadInfo {
     /// fill-value message when `fill_defined == 2`. `None` => default
     /// zero-fill. Applied to unallocated chunks and unwritten regions.
     pub fill_value: Option<Vec<u8>>,
+}
+
+/// What one discovery walk found: the datasets it reached plus the group
+/// bookkeeping that goes with them.
+#[derive(Default)]
+struct Discovery {
+    datasets: Vec<DatasetReadInfo>,
+    group_attributes: std::collections::HashMap<String, Vec<AttributeMessage>>,
+    group_paths: std::collections::BTreeSet<String>,
+    group_aliases: std::collections::HashMap<String, String>,
+    /// Group object header address → the first path that reached it (no
+    /// leading `/`) — the map the walk's cycle guard builds, kept so a
+    /// reference to a group can be resolved back to a path.
+    group_object_paths: std::collections::HashMap<u64, String>,
+}
+
+impl Discovery {
+    /// The address→absolute-path catalog this walk implies, with `root_addr`
+    /// named `/` whether or not the walk itself reached it.
+    ///
+    /// The single owner of the catalog: both file open and the SWMR
+    /// [`Hdf5Reader::refresh`] rescan build it here, so a dataset that appears
+    /// after open is resolvable exactly as one present at open is.
+    fn object_paths(&self, root_addr: u64) -> std::collections::HashMap<u64, String> {
+        let mut paths = std::collections::HashMap::new();
+        paths.insert(root_addr, "/".to_string());
+        for (addr, path) in &self.group_object_paths {
+            paths.insert(*addr, absolute_path(path));
+        }
+        for ds in &self.datasets {
+            paths.insert(ds.object_header_address, absolute_path(&ds.name));
+        }
+        paths
+    }
 }
 
 /// Internal enum to represent what we know about the root group from the
@@ -157,6 +195,17 @@ pub struct Hdf5Reader {
     /// under the first path; lookups resolve alias prefixes through this
     /// map, as HDF5 path traversal does.
     group_aliases: std::collections::HashMap<String, String>,
+    /// Object header address → absolute path, for every group and dataset the
+    /// discovery walk reached plus the root group. This is what turns the
+    /// address an object reference stores back into a name.
+    object_paths: std::collections::HashMap<u64, String>,
+}
+
+/// The absolute form of a discovery-walk path (which carries no leading `/`):
+/// the root group's empty path becomes `/`, `entry/data` becomes
+/// `/entry/data`.
+fn absolute_path(path: &str) -> String {
+    format!("/{}", path.trim_start_matches('/'))
 }
 
 /// Total byte length of `dims.product() * element_size`, computed with
@@ -434,13 +483,12 @@ impl Hdf5Reader {
 
         // Walk link messages to discover datasets, group attributes, and
         // every group path that exists.
-        let (datasets, group_attributes, group_paths, group_aliases) =
-            Self::discover_datasets_from_links(
-                &mut handle,
-                &root_header,
-                sb.root_group_object_header_address,
-                &ctx,
-            )?;
+        let found = Self::discover_datasets_from_links(
+            &mut handle,
+            &root_header,
+            sb.root_group_object_header_address,
+            &ctx,
+        )?;
 
         // Collect root group attributes
         let mut root_attributes = Vec::new();
@@ -452,19 +500,53 @@ impl Hdf5Reader {
             }
         }
 
-        Ok(Self {
+        Ok(Self::assemble(
             handle,
             ctx,
-            _eof: sb.end_of_file_address,
-            root_group_info: RootGroupInfo::V2V3 {
+            sb.end_of_file_address,
+            RootGroupInfo::V2V3 {
                 root_group_object_header_address: sb.root_group_object_header_address,
             },
-            datasets,
             root_attributes,
-            group_attributes,
-            group_paths,
-            group_aliases,
-        })
+            found,
+        ))
+    }
+
+    /// Build the reader from one discovery walk's result.
+    ///
+    /// The single place the address→path catalog reference resolution reads is
+    /// derived, so a group reached by either walk and a dataset reached by
+    /// either walk are named the same way.
+    fn assemble(
+        handle: FileHandle,
+        ctx: FormatContext,
+        eof: u64,
+        root_group_info: RootGroupInfo,
+        root_attributes: Vec<AttributeMessage>,
+        found: Discovery,
+    ) -> Self {
+        let root_addr = match root_group_info {
+            RootGroupInfo::V2V3 {
+                root_group_object_header_address,
+            } => root_group_object_header_address,
+            RootGroupInfo::V0V1 {
+                root_obj_header_addr,
+                ..
+            } => root_obj_header_addr,
+        };
+        let object_paths = found.object_paths(root_addr);
+        Self {
+            handle,
+            ctx,
+            _eof: eof,
+            root_group_info,
+            datasets: found.datasets,
+            root_attributes,
+            group_attributes: found.group_attributes,
+            group_paths: found.group_paths,
+            group_aliases: found.group_aliases,
+            object_paths,
+        }
     }
 
     /// Open a file with v0/v1 superblock (legacy format).
@@ -508,7 +590,7 @@ impl Hdf5Reader {
                 .any(|m| m.msg_type == MSG_LINK || m.msg_type == MSG_LINK_INFO)
         });
 
-        let (datasets, group_attributes, group_paths, group_aliases) = if has_links {
+        let found = if has_links {
             Self::discover_datasets_from_links(
                 &mut handle,
                 root_hdr.as_ref().unwrap(),
@@ -537,30 +619,22 @@ impl Hdf5Reader {
                     root_obj_addr,
                 )?
             } else {
-                (
-                    Vec::new(),
-                    std::collections::HashMap::new(),
-                    std::collections::BTreeSet::new(),
-                    std::collections::HashMap::new(),
-                )
+                Discovery::default()
             }
         };
 
-        Ok(Self {
+        Ok(Self::assemble(
             handle,
             ctx,
-            _eof: sb.end_of_file_address,
-            root_group_info: RootGroupInfo::V0V1 {
+            sb.end_of_file_address,
+            RootGroupInfo::V0V1 {
                 root_obj_header_addr: root_obj_addr,
                 btree_addr: ste_btree_addr,
                 heap_addr: ste_heap_addr,
             },
-            datasets,
             root_attributes,
-            group_attributes,
-            group_paths,
-            group_aliases,
-        })
+            found,
+        ))
     }
 
     /// Extract the symbol-table message (btree_addr, heap_addr) from an
@@ -579,18 +653,12 @@ impl Hdf5Reader {
 
     /// Discover datasets by walking link messages in a v2 object header.
     /// Recursively descends into groups, prefixing dataset names with the group path.
-    #[allow(clippy::type_complexity)]
     fn discover_datasets_from_links(
         handle: &mut FileHandle,
         root_header: &ObjectHeader,
         root_addr: u64,
         ctx: &FormatContext,
-    ) -> IoResult<(
-        Vec<DatasetReadInfo>,
-        std::collections::HashMap<String, Vec<AttributeMessage>>,
-        std::collections::BTreeSet<String>,
-        std::collections::HashMap<String, String>,
-    )> {
+    ) -> IoResult<Discovery> {
         let mut group_attrs = std::collections::HashMap::new();
         let mut group_paths = std::collections::BTreeSet::new();
         // Object headers already descended into, keyed to the first path
@@ -612,7 +680,13 @@ impl Hdf5Reader {
             &mut visited,
             &mut aliases,
         )?;
-        Ok((datasets, group_attrs, group_paths, aliases))
+        Ok(Discovery {
+            datasets,
+            group_attributes: group_attrs,
+            group_paths,
+            group_aliases: aliases,
+            group_object_paths: visited,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -808,12 +882,7 @@ impl Hdf5Reader {
         btree_addr: u64,
         heap_addr: u64,
         root_obj_addr: u64,
-    ) -> IoResult<(
-        Vec<DatasetReadInfo>,
-        std::collections::HashMap<String, Vec<AttributeMessage>>,
-        std::collections::BTreeSet<String>,
-        std::collections::HashMap<String, String>,
-    )> {
+    ) -> IoResult<Discovery> {
         let mut datasets = Vec::new();
         // First path per descended object header + the group-hard-link
         // aliases met later, as in `discover_datasets_from_links`.
@@ -837,7 +906,13 @@ impl Hdf5Reader {
             &mut group_attrs,
             &mut group_paths,
         )?;
-        Ok((datasets, group_attrs, group_paths, aliases))
+        Ok(Discovery {
+            datasets,
+            group_attributes: group_attrs,
+            group_paths,
+            group_aliases: aliases,
+            group_object_paths: visited,
+        })
     }
 
     /// Recursive worker for `discover_datasets_from_btree`. `prefix` is the
@@ -1235,6 +1310,7 @@ impl Hdf5Reader {
         if let (Some(dt), Some(ds), Some(dl)) = (datatype, dataspace, layout) {
             Ok(Some(DatasetReadInfo {
                 name: name.to_string(),
+                object_header_address: addr,
                 datatype: dt,
                 dataspace: ds,
                 layout: dl,
@@ -1409,6 +1485,73 @@ impl Hdf5Reader {
             ))
         })?;
         Ok(String::from_utf8_lossy(obj).to_string())
+    }
+
+    /// The absolute path of the object whose header sits at `addr` — what an
+    /// object reference to it names — or `None` when no group or dataset the
+    /// discovery walk reached lives there (a reference into a file region the
+    /// walk never traversed, or a stale one).
+    pub fn path_for_object(&self, addr: u64) -> Option<&str> {
+        self.object_paths.get(&addr).map(String::as_str)
+    }
+
+    /// Read a reference dataset's elements, resolved to the objects they name.
+    pub fn read_references(&mut self, name: &str) -> IoResult<Vec<Reference>> {
+        let datatype = self
+            .dataset_info(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?
+            .datatype
+            .clone();
+        let raw = self.read_dataset_raw(name)?;
+        self.decode_references(&datatype, &raw)
+    }
+
+    /// Read an attribute's value as reference elements.
+    pub fn attr_references(&mut self, attr: &AttributeMessage) -> IoResult<Vec<Reference>> {
+        self.decode_references(&attr.datatype, &attr.data)
+    }
+
+    /// The single owner of reference decoding for both carriers of reference
+    /// elements — dataset payloads and attribute values.
+    fn decode_references(
+        &mut self,
+        datatype: &DatatypeMessage,
+        bytes: &[u8],
+    ) -> IoResult<Vec<Reference>> {
+        let DatatypeMessage::Reference { size, kind } = datatype else {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "datatype {datatype} is not a reference"
+            )));
+        };
+        let (size, kind) = (*size as usize, *kind);
+        if size == 0 {
+            // A corrupt file can declare it; `chunks_exact(0)` panics.
+            return Err(crate::io::IoError::InvalidState(
+                "reference datatype has zero width".into(),
+            ));
+        }
+        // Only the address-carrying object reference is decoded here. Every
+        // other kind is named rather than misread: a region element is a heap
+        // id whose selection this reader does not yet resolve, and the 1.12
+        // kinds are opaque tokens.
+        if kind != ReferenceKind::Object1 {
+            return Err(crate::format::FormatError::UnsupportedFeature(format!(
+                "{kind:?} reference elements"
+            ))
+            .into());
+        }
+
+        let mut out = Vec::with_capacity(bytes.len() / size);
+        for elem in bytes.chunks_exact(size) {
+            out.push(match decode_object_element(elem, &self.ctx)? {
+                None => Reference::Null,
+                Some(address) => Reference::Object {
+                    address,
+                    path: self.path_for_object(address).map(str::to_string),
+                },
+            });
+        }
+        Ok(out)
     }
 
     /// Return the dimensions of a dataset.
@@ -1588,20 +1731,20 @@ impl Hdf5Reader {
 
         // Re-scan datasets, group attributes, and group paths from link
         // messages.
-        let (datasets, group_attributes, group_paths, group_aliases) =
-            Self::discover_datasets_from_links(
-                &mut self.handle,
-                &root_header,
-                sb.root_group_object_header_address,
-                &ctx,
-            )?;
+        let found = Self::discover_datasets_from_links(
+            &mut self.handle,
+            &root_header,
+            sb.root_group_object_header_address,
+            &ctx,
+        )?;
 
         self._eof = sb.end_of_file_address;
         self.ctx = ctx;
-        self.datasets = datasets;
-        self.group_attributes = group_attributes;
-        self.group_paths = group_paths;
-        self.group_aliases = group_aliases;
+        self.object_paths = found.object_paths(sb.root_group_object_header_address);
+        self.datasets = found.datasets;
+        self.group_attributes = found.group_attributes;
+        self.group_paths = found.group_paths;
+        self.group_aliases = found.group_aliases;
 
         Ok(())
     }

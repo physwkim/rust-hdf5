@@ -27,7 +27,7 @@ use rust_hdf5::format::messages::datatype::{
 };
 use rust_hdf5::format::messages::filter::{Filter, FilterPipeline, FILTER_FLETCHER32};
 use rust_hdf5::types::VarLenUnicode;
-use rust_hdf5::{H5Dataset, H5File, H5Group};
+use rust_hdf5::{H5Dataset, H5File, H5Group, Reference};
 
 const CANON_VERSION: &str = "2";
 const RAW_LIMIT: usize = 1024;
@@ -226,6 +226,12 @@ fn canon_dtype(dt: &DatatypeMessage) -> String {
                 .collect();
             format!("enum({}){{{}}}", canon_dtype(base), parts.join(";"))
         }
+        // canon.py splits the class by element width, not by the stored
+        // reference type: an 8-byte element is an object reference, anything
+        // else a region one.
+        DatatypeMessage::Reference { size, .. } => {
+            if *size == 8 { "objref" } else { "regref" }.to_string()
+        }
         DatatypeMessage::VarLenSequence { base } => format!("vlen({})", canon_dtype(base)),
         DatatypeMessage::Array { dims, base } => {
             let parts: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
@@ -289,16 +295,34 @@ fn render_elem(base: &DatatypeMessage, bytes: &[u8]) -> String {
     }
 }
 
-/// True when the datatype stores its payload outside the element image, so
-/// there is no flat byte picture to compare.
-fn has_heap_type(dt: &DatatypeMessage) -> bool {
+/// True when the element image is not comparable between two writers, so the
+/// canonical form is the rendered values rather than the raw bytes: a
+/// variable-length payload lives in a heap the element only points at, and a
+/// reference names a file address whose value is an allocation detail.
+fn renders_as_values(dt: &DatatypeMessage) -> bool {
     match dt {
-        DatatypeMessage::VarLenString { .. } | DatatypeMessage::VarLenSequence { .. } => true,
-        DatatypeMessage::Array { base, .. } => has_heap_type(base),
+        DatatypeMessage::VarLenString { .. }
+        | DatatypeMessage::VarLenSequence { .. }
+        | DatatypeMessage::Reference { .. } => true,
+        DatatypeMessage::Array { base, .. } => renders_as_values(base),
         DatatypeMessage::Compound { members, .. } => {
-            members.iter().any(|m| has_heap_type(&m.datatype))
+            members.iter().any(|m| renders_as_values(&m.datatype))
         }
         _ => false,
+    }
+}
+
+/// One reference element in the form `oracle/canon.py`'s `render_ref` prints:
+/// the target's path. An address the reader could not name is printed as the
+/// address, which compares unequal to h5py's path — a difference, not a silent
+/// match.
+fn render_ref(r: &Reference) -> String {
+    match r {
+        Reference::Null => "objref:null".to_string(),
+        Reference::Object { address, path } => format!(
+            "objref:{}",
+            path.clone().unwrap_or_else(|| format!("<{address:#x}>"))
+        ),
     }
 }
 
@@ -668,7 +692,7 @@ fn dataset_payload(
     dtype: Option<&DatatypeMessage>,
 ) -> std::result::Result<String, String> {
     let dt = dtype.ok_or("datatype unavailable, so the payload cannot be classified")?;
-    if !has_heap_type(dt) {
+    if !renders_as_values(dt) {
         let bytes = guarded(|| ds.read_raw_bytes())
             .map_err(|p| format!("panic: {p}"))?
             .map_err(oneline)?;
@@ -700,8 +724,15 @@ fn dataset_payload(
                 .collect();
             Ok(encode_vals(&vals))
         }
+        DatatypeMessage::Reference { .. } => {
+            let refs = guarded(|| ds.read_references())
+                .map_err(|p| format!("panic: {p}"))?
+                .map_err(oneline)?;
+            let vals: Vec<String> = refs.iter().map(render_ref).collect();
+            Ok(encode_vals(&vals))
+        }
         other => Err(format!(
-            "no public reader for a heap-backed {} payload",
+            "no public reader for a {} payload",
             canon_dtype(other)
         )),
     }
@@ -766,7 +797,7 @@ fn dump_dataset_attrs(d: &mut Dump, path: &str, ds: &H5Dataset) {
             let dt = dtype
                 .as_ref()
                 .ok_or("datatype unavailable, so the value cannot be classified")?;
-            if !has_heap_type(dt) {
+            if !renders_as_values(dt) {
                 let bytes = guarded(|| a.read_raw())
                     .map_err(|p| format!("panic: {p}"))?
                     .map_err(oneline)?;
@@ -779,8 +810,15 @@ fn dump_dataset_attrs(d: &mut Dump, path: &str, ds: &H5Dataset) {
                         .map_err(oneline)?;
                     Ok(encode_vals(&[esc(&s)]))
                 }
+                DatatypeMessage::Reference { .. } => {
+                    let refs = guarded(|| a.read_references())
+                        .map_err(|p| format!("panic: {p}"))?
+                        .map_err(oneline)?;
+                    let vals: Vec<String> = refs.iter().map(render_ref).collect();
+                    Ok(encode_vals(&vals))
+                }
                 other => Err(format!(
-                    "no public reader for a heap-backed {} attribute",
+                    "no public reader for a {} attribute",
                     canon_dtype(other)
                 )),
             }

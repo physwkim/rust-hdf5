@@ -142,9 +142,14 @@ const CLASS_STRING: u8 = 3;
 const CLASS_BITFIELD: u8 = 4;
 const CLASS_OPAQUE: u8 = 5;
 const CLASS_COMPOUND: u8 = 6;
+const CLASS_REFERENCE: u8 = 7;
 const CLASS_ENUM: u8 = 8;
 const CLASS_VLEN: u8 = 9;
 const CLASS_ARRAY: u8 = 10;
+
+/// libhdf5 `H5R_ENCODE_VERSION` (`H5Rprivate.h`): the only encoding version
+/// the 1.12 reference kinds accept, stored in the bit field's second nibble.
+const REFERENCE_ENCODE_VERSION: u8 = 1;
 
 /// libhdf5 `H5T_OPAQUE_TAG_MAX`: the opaque tag field is stored in
 /// `(strlen + 7) & (H5T_OPAQUE_TAG_MAX - 8)` bytes, i.e. rounded up to a
@@ -275,6 +280,74 @@ pub enum DatatypeMessage {
         /// Base element type.
         base: Box<DatatypeMessage>,
     },
+    /// Reference datatype (class 7): an element that names another object, or
+    /// a region of one, in this file.
+    ///
+    /// The message carries no properties — `H5O__dtype_decode_helper` reads
+    /// only the class bit field, whose low nibble is the `H5R_type_t` — so
+    /// `size` is where the element width lives: 8 (one address) for
+    /// [`ReferenceKind::Object1`] and 12 (a global-heap id) for
+    /// [`ReferenceKind::DatasetRegion1`] in a file with 8-byte addresses.
+    Reference {
+        /// Element size in bytes.
+        size: u32,
+        /// Which flavor of reference the elements are.
+        kind: ReferenceKind,
+    },
+}
+
+/// The flavors of reference an element can be (`H5R_type_t`, `H5Rpublic.h`).
+///
+/// The first two are the pre-1.12 encodings — what h5py 3.x writes today —
+/// and store a file address directly. The last three are the 1.12 revised
+/// encodings, whose elements are opaque tokens carrying an encoding version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceKind {
+    /// `H5R_OBJECT1`: the object header address of the target.
+    Object1,
+    /// `H5R_DATASET_REGION1`: a global-heap id whose heap object holds the
+    /// target's object header address followed by a serialized dataspace
+    /// selection.
+    DatasetRegion1,
+    /// `H5R_OBJECT2`: the 1.12 object reference.
+    Object2,
+    /// `H5R_DATASET_REGION2`: the 1.12 region reference.
+    DatasetRegion2,
+    /// `H5R_ATTR`: a reference to an attribute (1.12).
+    Attr,
+}
+
+impl ReferenceKind {
+    /// The `H5R_type_t` value this kind is stored as.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Object1 => 0,
+            Self::DatasetRegion1 => 1,
+            Self::Object2 => 2,
+            Self::DatasetRegion2 => 3,
+            Self::Attr => 4,
+        }
+    }
+
+    /// The kind a stored `H5R_type_t` names, or `None` for a value the format
+    /// does not define (`>= H5R_MAXTYPE`, which libhdf5 rejects as an invalid
+    /// reference type).
+    pub fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Self::Object1,
+            1 => Self::DatasetRegion1,
+            2 => Self::Object2,
+            3 => Self::DatasetRegion2,
+            4 => Self::Attr,
+            _ => return None,
+        })
+    }
+
+    /// Whether this kind's elements are 1.12 opaque tokens, which carry the
+    /// encoding version in the bit field's second nibble.
+    pub fn is_revised(self) -> bool {
+        matches!(self, Self::Object2 | Self::DatasetRegion2 | Self::Attr)
+    }
 }
 
 // ========================================================================= factory methods
@@ -456,6 +529,24 @@ impl DatatypeMessage {
         }
     }
 
+    /// Object reference type (`H5T_STD_REF_OBJ`): one object header address
+    /// per element, so the width follows the file's address size.
+    pub fn object_reference(ctx: &FormatContext) -> Self {
+        Self::Reference {
+            size: ctx.sizeof_addr as u32,
+            kind: ReferenceKind::Object1,
+        }
+    }
+
+    /// Dataset region reference type (`H5T_STD_REF_DSETREG`): one global-heap
+    /// id per element, which is an address plus a 4-byte object index.
+    pub fn region_reference(ctx: &FormatContext) -> Self {
+        Self::Reference {
+            size: ctx.sizeof_addr as u32 + 4,
+            kind: ReferenceKind::DatasetRegion1,
+        }
+    }
+
     /// Compound datatype.
     pub fn compound(size: u32, members: Vec<CompoundMember>) -> Self {
         Self::Compound { size, members }
@@ -592,7 +683,10 @@ impl DatatypeMessage {
             Self::Compound { members, .. } => members
                 .iter()
                 .any(|m| m.datatype.contains_byte_order(order)),
-            Self::Opaque { .. } | Self::FixedString { .. } | Self::VarLenString { .. } => false,
+            Self::Opaque { .. }
+            | Self::FixedString { .. }
+            | Self::VarLenString { .. }
+            | Self::Reference { .. } => false,
         }
     }
 
@@ -609,6 +703,7 @@ impl DatatypeMessage {
             Self::Opaque { size, .. } => *size,
             Self::FixedString { size, .. } => *size,
             Self::Compound { size, .. } => *size,
+            Self::Reference { size, .. } => *size,
             Self::Enum { base, .. } => base.element_size(),
             Self::VarLenString { .. } | Self::VarLenSequence { .. } => {
                 // Default assumption: sizeof_addr = 8
@@ -966,6 +1061,19 @@ impl DatatypeMessage {
 
                 buf
             }
+            Self::Reference { size, kind } => {
+                // Class 7, version 1, no properties: the whole message is the
+                // 8-byte header, with the reference type in the bit field's
+                // low nibble and — for the 1.12 kinds — the encoding version
+                // in the next one (`H5O__dtype_encode_helper`).
+                let mut flags0 = kind.code();
+                if kind.is_revised() {
+                    flags0 |= REFERENCE_ENCODE_VERSION << 4;
+                }
+                let mut buf = vec![CLASS_REFERENCE | (1 << 4), flags0, 0, 0];
+                buf.extend_from_slice(&size.to_le_bytes());
+                buf
+            }
         }
     }
 
@@ -1314,6 +1422,27 @@ impl DatatypeMessage {
                     pos,
                 ))
             }
+            CLASS_REFERENCE => {
+                // No properties: `H5O__dtype_decode_helper` reads the class
+                // bit field and nothing else. The low nibble is the
+                // `H5R_type_t`; anything at or above `H5R_MAXTYPE` is an
+                // invalid reference type.
+                let kind = ReferenceKind::from_code(flags0 & 0x0F).ok_or_else(|| {
+                    FormatError::InvalidData(format!("invalid reference type {}", flags0 & 0x0F))
+                })?;
+                // The 1.12 kinds carry their encoding version in the next
+                // nibble, and libhdf5 fails a message whose version it does
+                // not know rather than guess the token layout.
+                if kind.is_revised() {
+                    let encode_version = (flags0 >> 4) & 0x0F;
+                    if encode_version != REFERENCE_ENCODE_VERSION {
+                        return Err(FormatError::InvalidData(format!(
+                            "reference version {encode_version} does not match"
+                        )));
+                    }
+                }
+                Ok((Self::Reference { size, kind }, 8))
+            }
             _ => Err(FormatError::UnsupportedFeature(format!(
                 "datatype class {}",
                 class
@@ -1366,6 +1495,7 @@ impl std::fmt::Display for DatatypeMessage {
                 let dim_str: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
                 write!(f, "array[{}; {}]", dim_str.join("x"), base)
             }
+            Self::Reference { size, kind } => write!(f, "reference[{size}; {kind:?}]"),
         }
     }
 }
@@ -1548,9 +1678,10 @@ mod tests {
 
     #[test]
     fn decode_unsupported_class() {
-        // class 7 (reference), version 1
+        // class 2 (H5T_TIME), version 1 — a class libhdf5 defines and this
+        // crate does not decode.
         let mut buf = [0u8; 12];
-        buf[0] = 7 | (1 << 4);
+        buf[0] = 2 | (1 << 4);
         buf[4] = 1; // size = 1
         let err = DatatypeMessage::decode(&buf, &ctx()).unwrap_err();
         match err {

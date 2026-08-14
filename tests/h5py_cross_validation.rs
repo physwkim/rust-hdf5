@@ -6,7 +6,7 @@
 //! skip (pass) when neither is present, so CI without h5py is green.
 
 use rust_hdf5::types::VarLenUnicode;
-use rust_hdf5::{ByteOrder, DatatypeMessage, H5File};
+use rust_hdf5::{ByteOrder, DatatypeMessage, H5File, Reference};
 
 const TEST_PYTHON: &str = "/Users/stevek/mamba/envs/bs2026.1/bin/python";
 
@@ -1666,6 +1666,50 @@ fn big_endian_compound_is_refused_by_typed_writes() {
         bytes.extend_from_slice(&y.to_be_bytes());
     }
     ds.write_raw_bytes(&bytes).unwrap();
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}
+
+/// h5py's `Reference` — the pre-1.12 `H5R_OBJECT1` element — resolves to the
+/// path of the object it names, for a dataset, a group, a nested dataset, and
+/// the same reference stored in an attribute. A zeroed element (an unset
+/// reference, which h5py's `zeros` produces) reads back as null.
+#[test]
+fn object_references_written_by_h5py_resolve_to_paths() {
+    let Some(py) = python() else { return };
+    let path = tmp("ref_object_read");
+    write_with_h5py(
+        py,
+        &path,
+        "t = f.create_dataset('target', data=np.arange(8, dtype='<i4'))\n\
+         g = f.create_group('grp')\n\
+         inner = g.create_dataset('inner', data=np.arange(3, dtype='<i4'))\n\
+         r = f.create_dataset('refs', (4,), dtype=h5py.ref_dtype)\n\
+         r[0] = t.ref\n\
+         r[1] = g.ref\n\
+         r[2] = inner.ref\n\
+         t.attrs.create('source', g.ref, dtype=h5py.ref_dtype)\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let refs = file.dataset("refs").unwrap().read_references().unwrap();
+    let paths: Vec<Option<&str>> = refs.iter().map(|r| r.path()).collect();
+    assert_eq!(
+        paths,
+        vec![Some("/target"), Some("/grp"), Some("/grp/inner"), None]
+    );
+    assert!(refs[3].is_null(), "unset element: {:?}", refs[3]);
+    assert!(matches!(refs[0], Reference::Object { .. }), "{:?}", refs[0]);
+
+    let attr = file
+        .dataset("target")
+        .unwrap()
+        .attr("source")
+        .unwrap()
+        .read_references()
+        .unwrap();
+    assert_eq!(attr.len(), 1);
+    assert_eq!(attr[0].path(), Some("/grp"));
     file.close().unwrap();
     std::fs::remove_file(&path).ok();
 }
