@@ -1263,3 +1263,43 @@ fn chunk_index_implicit_written_by_h5py_read_by_rust() {
     drop(file);
     std::fs::remove_file(&path).ok();
 }
+
+/// External file list (h5py → rust): a dataset whose raw data lives in a
+/// separate file (H5O_EFL_ID) has no local storage address of its own — the
+/// data layout message it still carries (`Contiguous`) leaves `address`
+/// undefined, so a reader that ignores the external file list reads the
+/// dataset back as the fill value (all zero) with no error at all.
+/// rust-hdf5 must resolve the real bytes instead, for both a full read and
+/// a slice. The external file is named by an absolute path here so the
+/// test does not depend on `HDF5_EXTFILE_PREFIX` or the process's current
+/// directory — that resolution is covered separately by the oracle's
+/// `external_storage` case, which names its raw file relatively under
+/// `HDF5_EXTFILE_PREFIX=${ORIGIN}` (see `oracle/hdf5env.py`), not by this
+/// test.
+#[test]
+fn external_file_list_written_by_h5py_read_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("efl_wr");
+    let raw_path = path.with_extension("raw");
+    let raw_bytes: Vec<u8> = (0..16i32).flat_map(|v| v.to_le_bytes()).collect();
+    std::fs::write(&raw_path, &raw_bytes).unwrap();
+    write_with_h5py(
+        py,
+        &path,
+        &format!(
+            "f.create_dataset('data', shape=(16,), dtype='<i4', \
+             external=[(r'{}', 0, 64)])\n",
+            raw_path.display()
+        ),
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.shape(), vec![16]);
+    assert_eq!(ds.read_raw::<i32>().unwrap(), (0..16).collect::<Vec<i32>>());
+    // Selection [6, 10) exercises the slice-read path through the same
+    // external-file dispatch.
+    assert_eq!(ds.read_slice::<i32>(&[6], &[4]).unwrap(), vec![6, 7, 8, 9]);
+    drop(file);
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&raw_path).ok();
+}

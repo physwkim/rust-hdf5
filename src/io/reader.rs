@@ -6,7 +6,7 @@
 //! Supports both legacy (v0/v1 superblock, v1 object headers, symbol tables)
 //! and modern (v2/v3 superblock, v2 object headers, link messages) formats.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::format::btree_v1::{BTreeV1Node, ChunkBTreeV1Node};
 use crate::format::bytes::read_le_uint as read_uint;
@@ -19,6 +19,7 @@ use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::data_layout::{self, DataLayoutMessage};
 use crate::format::messages::dataspace::DataspaceMessage;
 use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::messages::external_file_list::ExternalFileListMessage;
 use crate::format::messages::fill_value::{try_tiled_fill, FillValueMessage};
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::link::LinkMessage;
@@ -34,6 +35,7 @@ use crate::io::file_handle::FileHandle;
 #[cfg(feature = "mmap")]
 use crate::io::file_handle::MmapFileHandle;
 use crate::io::hyperslab::{compute_strides, for_each_contiguous_run};
+use crate::io::locking::FileLocking;
 use crate::io::IoResult;
 
 /// The version-4 chunk-index descriptor pulled from a data-layout message:
@@ -97,6 +99,23 @@ impl<'a> ChunkTarget<'a> {
     }
 }
 
+/// One resolved external-file slot (H5O_EFL_ID): the on-disk message
+/// stores each slot's name as an offset into a local heap, so this is that
+/// slot after the heap lookup, in the order the dataset's logical byte
+/// range concatenates them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalFileSegment {
+    /// The external file's name, exactly as stored — relative names are
+    /// resolved against `HDF5_EXTFILE_PREFIX` at read time, not here.
+    pub name: String,
+    /// Byte offset within the named file where this slot's reserved
+    /// region begins.
+    pub offset: u64,
+    /// Bytes reserved for this slot. `u64::MAX` (`H5O_EFL_UNLIMITED`)
+    /// marks the last slot as unlimited/growable.
+    pub size: u64,
+}
+
 /// Read-side metadata for a single dataset.
 pub struct DatasetReadInfo {
     /// Dataset name (the link name in the root group).
@@ -115,6 +134,12 @@ pub struct DatasetReadInfo {
     /// fill-value message when `fill_defined == 2`. `None` => default
     /// zero-fill. Applied to unallocated chunks and unwritten regions.
     pub fill_value: Option<Vec<u8>>,
+    /// External raw-data segments (H5O_EFL_ID). Non-empty only when this
+    /// dataset's storage is an External Data Files list instead of a
+    /// normal contiguous block — `layout` still reports `Contiguous` with
+    /// an undefined address in that case (H5Dlayout.c overrides the
+    /// layout's storage ops whenever this message is present).
+    pub external_files: Vec<ExternalFileSegment>,
 }
 
 /// Internal enum to represent what we know about the root group from the
@@ -157,6 +182,13 @@ pub struct Hdf5Reader {
     /// under the first path; lookups resolve alias prefixes through this
     /// map, as HDF5 path traversal does.
     group_aliases: std::collections::HashMap<String, String>,
+    /// The directory holding this HDF5 file, resolved once at open time.
+    /// External raw-data files (H5O_EFL_ID) are named relative to it when
+    /// `HDF5_EXTFILE_PREFIX` contains `${ORIGIN}` (`H5D__build_file_prefix`,
+    /// H5Dint.c) — captured at open time rather than re-derived from the
+    /// process's current directory at read time, matching libhdf5's own
+    /// one-time capture in `H5F_t::extpath`.
+    source_dir: PathBuf,
 }
 
 /// Total byte length of `dims.product() * element_size`, computed with
@@ -199,6 +231,110 @@ fn fill_tiled_into(out: &mut [u8], fill_value: Option<&[u8]>) {
             }
         }
     }
+}
+
+/// The declared-size sentinel that marks an External Data Files slot as
+/// unlimited/growable (`H5O_EFL_UNLIMITED` in H5Oprivate.h, `HSIZE_UNDEF` —
+/// the same all-ones bit pattern as [`UNDEF_ADDR`]).
+const EFL_UNLIMITED_SIZE: u64 = u64::MAX;
+
+/// Resolve the directory external raw-data file names are joined against,
+/// matching libhdf5's `H5D__build_file_prefix` (H5Dint.c) for the
+/// `HDF5_EXTFILE_PREFIX` environment variable. There is no dataset access
+/// property list here to fall back to, so unset behaves exactly as an
+/// unset/empty DAPL property would.
+///
+/// `${ORIGIN}` expands to `source_dir` (the directory holding the open
+/// HDF5 file); any other value is used as a literal prefix; unset, empty,
+/// or `"."` means "no prefix" (`H5_combine_path`'s own default), so a
+/// relative external file name resolves against the process's current
+/// directory instead.
+fn resolve_extfile_prefix(source_dir: &Path) -> Option<PathBuf> {
+    let prefix = std::env::var("HDF5_EXTFILE_PREFIX").ok()?;
+    if prefix.is_empty() || prefix == "." {
+        return None;
+    }
+    Some(match prefix.strip_prefix("${ORIGIN}") {
+        Some(rest) => {
+            let rest = rest.trim_start_matches(['/', '\\']);
+            if rest.is_empty() {
+                source_dir.to_path_buf()
+            } else {
+                source_dir.join(rest)
+            }
+        }
+        None => PathBuf::from(prefix),
+    })
+}
+
+/// Join an external-file `name` against a resolved prefix, matching
+/// libhdf5's `H5_combine_path` (H5system.c): an absolute `name` is used
+/// as-is regardless of the prefix, and no prefix means "relative to the
+/// process's current directory" — both of which `Path::join` already
+/// implements for an absolute joinee.
+fn combine_extfile_path(prefix: Option<&Path>, name: &str) -> PathBuf {
+    match prefix {
+        Some(p) => p.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// Read `len` bytes starting at *dataset-relative* offset `skip` from an
+/// external file list into `out`, walking slots by cumulative declared
+/// size exactly like libhdf5's `H5D__efl_read` (H5Defl.c). A read past an
+/// individual slot's actual on-disk length reads back as zero — the file
+/// backing a slot may be shorter than the space the layout reserved in
+/// it — but a read past the *total* declared size of the file list is
+/// still an error, matching `H5D__efl_read`'s own "read past logical end
+/// of file" check.
+fn read_external_file_bytes(
+    external_files: &[ExternalFileSegment],
+    extfile_prefix: Option<&Path>,
+    mut skip: u64,
+    out: &mut [u8],
+) -> IoResult<()> {
+    let mut slot_idx = 0usize;
+    while slot_idx < external_files.len() && skip >= external_files[slot_idx].size {
+        skip -= external_files[slot_idx].size;
+        slot_idx += 1;
+    }
+
+    let mut written = 0usize;
+    while written < out.len() {
+        let Some(slot) = external_files.get(slot_idx) else {
+            return Err(crate::io::IoError::InvalidState(
+                "read past the logical end of the external file list".into(),
+            ));
+        };
+        if slot.size == EFL_UNLIMITED_SIZE {
+            return Err(crate::io::IoError::InvalidState(
+                "unlimited (growable) external file slots are not supported".into(),
+            ));
+        }
+        let full_path = combine_extfile_path(extfile_prefix, &slot.name);
+        let ext_handle = FileHandle::open_read_with_locking(&full_path, FileLocking::Disabled)
+            .map_err(|e| {
+                crate::io::IoError::InvalidState(format!(
+                    "unable to open external raw data file {}: {e}",
+                    full_path.display()
+                ))
+            })?;
+        let avail_in_slot = slot.size.saturating_sub(skip);
+        let want = (out.len() - written) as u64;
+        let this_read = avail_in_slot.min(want) as usize;
+        let dst = &mut out[written..written + this_read];
+        // A short physical file — the reserved slot size exceeds what was
+        // ever actually written to it — reads back as zero for the
+        // remainder, exactly like `H5D__efl_read`.
+        let got = ext_handle.read_at_most(slot.offset + skip, this_read)?;
+        dst[..got.len()].copy_from_slice(&got);
+        dst[got.len()..].fill(0);
+
+        written += this_read;
+        skip = 0;
+        slot_idx += 1;
+    }
+    Ok(())
 }
 
 /// One chunk's on-disk read request, built by a read path before any I/O.
@@ -383,13 +519,23 @@ impl Hdf5Reader {
         let sb_buf = handle.read_at_most(0, 1024)?;
         let version = detect_superblock_version(&sb_buf)?;
 
-        match version {
-            0 | 1 => Self::open_v0v1(handle, &sb_buf),
-            2 | 3 => Self::open_v2v3(handle, &sb_buf),
-            v => Err(crate::io::IoError::Format(
-                crate::format::FormatError::InvalidVersion(v),
-            )),
-        }
+        let mut reader = match version {
+            0 | 1 => Self::open_v0v1(handle, &sb_buf)?,
+            2 | 3 => Self::open_v2v3(handle, &sb_buf)?,
+            v => {
+                return Err(crate::io::IoError::Format(
+                    crate::format::FormatError::InvalidVersion(v),
+                ))
+            }
+        };
+        // Resolved from the path this file was opened with (not the
+        // process's current directory at read time) — see `source_dir`.
+        let canonical = std::fs::canonicalize(path)?;
+        reader.source_dir = canonical
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        Ok(reader)
     }
 
     /// Open a file with v2/v3 superblock (existing code path).
@@ -437,6 +583,8 @@ impl Hdf5Reader {
             group_attributes,
             group_paths,
             group_aliases,
+            // Overwritten by `open_with_locking` once this returns.
+            source_dir: PathBuf::new(),
         })
     }
 
@@ -533,6 +681,8 @@ impl Hdf5Reader {
             group_attributes,
             group_paths,
             group_aliases,
+            // Overwritten by `open_with_locking` once this returns.
+            source_dir: PathBuf::new(),
         })
     }
 
@@ -1164,6 +1314,7 @@ impl Hdf5Reader {
         let mut filter_pipeline = None;
         let mut fill_value = None;
         let mut attributes = Vec::new();
+        let mut external_file_list = None;
 
         for msg in &header.messages {
             match msg.msg_type {
@@ -1201,9 +1352,31 @@ impl Hdf5Reader {
                         attributes.push(attr);
                     }
                 }
+                MSG_EXTERNAL_FILE_LIST => {
+                    // Unlike the messages above, a decode failure here must
+                    // not fall back to silently treating the dataset as
+                    // ordinary contiguous storage: its layout message
+                    // carries no address of its own (H5Dlayout.c routes
+                    // storage through this message instead), so silently
+                    // dropping it would read back as zero bytes with no
+                    // error — exactly the defect this message exists to
+                    // avoid.
+                    let (efl, _) =
+                        ExternalFileListMessage::decode(&msg.data, ctx).map_err(|e| {
+                            crate::io::IoError::InvalidState(format!(
+                                "dataset {name:?} has a malformed external file list: {e}"
+                            ))
+                        })?;
+                    external_file_list = Some(efl);
+                }
                 _ => {}
             }
         }
+
+        let external_files = match external_file_list {
+            Some(efl) => Self::resolve_external_file_slots(handle, ctx, &efl)?,
+            None => Vec::new(),
+        };
 
         if let (Some(dt), Some(ds), Some(dl)) = (datatype, dataspace, layout) {
             Ok(Some(DatasetReadInfo {
@@ -1214,10 +1387,39 @@ impl Hdf5Reader {
                 filter_pipeline,
                 attributes,
                 fill_value,
+                external_files,
             }))
         } else {
             Ok(None)
         }
+    }
+
+    /// Resolve every external-file slot's name through the local heap the
+    /// EFL message points at (H5Oefl.c decodes only the byte offset; the
+    /// string itself lives in a separate on-disk local heap, exactly like a
+    /// v0/v1 group's link names — see [`local_heap_get_string`]).
+    fn resolve_external_file_slots(
+        handle: &mut FileHandle,
+        ctx: &FormatContext,
+        efl: &ExternalFileListMessage,
+    ) -> IoResult<Vec<ExternalFileSegment>> {
+        let sa = ctx.sizeof_addr as usize;
+        let ss = ctx.sizeof_size as usize;
+        let heap_hdr_buf = handle.read_at_most(efl.heap_addr, 64)?;
+        let heap_hdr = LocalHeapHeader::decode(&heap_hdr_buf, sa, ss)?;
+        let heap_data = handle.read_at(heap_hdr.data_addr, heap_hdr.data_size as usize)?;
+
+        efl.slots
+            .iter()
+            .map(|slot| {
+                let name = local_heap_get_string(&heap_data, slot.name_offset)?;
+                Ok(ExternalFileSegment {
+                    name,
+                    offset: slot.offset,
+                    size: slot.size,
+                })
+            })
+            .collect()
     }
 
     /// Return the names of all datasets in the root group.
@@ -1465,8 +1667,13 @@ impl Hdf5Reader {
         let layout = info.layout.clone();
         let pipeline = info.filter_pipeline.clone();
         let fill_value = info.fill_value.clone();
+        let external_files = info.external_files.clone();
 
         match &layout {
+            DataLayoutMessage::Contiguous { .. } if !external_files.is_empty() => {
+                let prefix = resolve_extfile_prefix(&self.source_dir);
+                read_external_file_bytes(&external_files, prefix.as_deref(), 0, out)?;
+            }
             DataLayoutMessage::Contiguous { address, .. } => {
                 if *address == UNDEF_ADDR {
                     // Never-written contiguous data reads back as the fill value.
@@ -2746,9 +2953,16 @@ impl Hdf5Reader {
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         let dims = info.dataspace.dims.clone();
         let layout = info.layout.clone();
+        let external_files = info.external_files.clone();
         let total_elements: u64 = dims.iter().fold(1u64, |acc, &d| acc.saturating_mul(d));
 
         let raw = match &layout {
+            DataLayoutMessage::Contiguous { size, .. } if !external_files.is_empty() => {
+                let prefix = resolve_extfile_prefix(&self.source_dir);
+                let mut buf = vec![0u8; *size as usize];
+                read_external_file_bytes(&external_files, prefix.as_deref(), 0, &mut buf)?;
+                buf
+            }
             DataLayoutMessage::Contiguous { address, size } => {
                 if *address == UNDEF_ADDR {
                     return Ok(vec![]);
@@ -3110,6 +3324,7 @@ impl Hdf5Reader {
         let layout = info.layout.clone();
         let pipeline = info.filter_pipeline.clone();
         let fill_value = info.fill_value.clone();
+        let external_files = info.external_files.clone();
         let ndims = dims.len();
 
         if starts.len() != ndims || counts.len() != ndims {
@@ -3132,6 +3347,28 @@ impl Hdf5Reader {
         }
 
         match &layout {
+            DataLayoutMessage::Contiguous { .. } if !external_files.is_empty() => {
+                // Same coalesced run geometry as the normal contiguous case
+                // below, but each run is read through the external file
+                // list instead of straight from this file (H5D__efl_read,
+                // H5Defl.c) — `src_off` is already dataset-relative, which
+                // is exactly what `read_external_file_bytes` walks slots by.
+                let prefix = resolve_extfile_prefix(&self.source_dir);
+                for_each_contiguous_run(
+                    &dims,
+                    starts,
+                    counts,
+                    element_size,
+                    |src_off, out_off, len| {
+                        read_external_file_bytes(
+                            &external_files,
+                            prefix.as_deref(),
+                            src_off,
+                            &mut out[out_off..out_off + len],
+                        )
+                    },
+                )?;
+            }
             DataLayoutMessage::Contiguous { address, .. } => {
                 if *address == UNDEF_ADDR {
                     // Never-written: the selection reads back as the fill value.

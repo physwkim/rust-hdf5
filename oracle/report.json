@@ -6147,16 +6147,8 @@
    "note": "contiguous data held in an external raw file",
    "rust_case": null,
    "a": {
-    "verdict": "DIFF",
-    "divergences": [
-     {
-      "key": "/data#data",
-      "kind": "value",
-      "field": "data",
-      "ref": "raw:000000000100000002000000030000000400000005000000060000000700000008000000090000000a0000000b0000000c0000000d0000000e0000000f000000",
-      "probe": "raw:00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-     }
-    ],
+    "verdict": "PASS",
+    "divergences": [],
     "gaps": [
      {
       "key": "#superblock",
@@ -6256,7 +6248,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 9,
+    "matched": 10,
     "detail": ""
    },
    "b": {
@@ -11643,14 +11635,6 @@
     "attr_large"
    ],
    "example": "/data#nattrs\n  libhdf5: 12\n  rust:    0"
-  },
-  {
-   "kind": "divergence",
-   "signature": "data: value",
-   "cases": [
-    "external_storage"
-   ],
-   "example": "/data#data\n  libhdf5: raw:000000000100000002000000030000000400000005000000060000000700000008000000090000000a0000000b0000000c0000000d0000000e0\u2026\n  rust:    raw:0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\u2026"
   },
   {
    "kind": "missing-object",

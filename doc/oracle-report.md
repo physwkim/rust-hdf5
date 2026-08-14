@@ -23,7 +23,7 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 
 | direction | PASS | GAP | MISS | DIFF | READ-ERROR | GEN-ERROR |
 |---|---|---|---|---|---|---|
-| A (read) | 63 | 4 | 11 | 3 | 1 | 0 |
+| A (read) | 64 | 4 | 11 | 2 | 1 | 0 |
 
 | direction | PASS | INVALID | UNSUPPORTED-API | SKIPPED |
 |---|---|---|---|---|
@@ -34,15 +34,15 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | # | severity | finding | cases |
 |---|---|---|---|
 | 1 | value divergence | nattrs: value | 2 (attrs_dense, attr_large) |
-| 2 | value divergence | data: value | 1 (external_storage) |
-| 3 | object silently dropped | object present in the file is not listed by the reader | 11 (opaque, bitfield, ref_object, ref_region…) |
-| 4 | written file rejected | nattrs_hdr | 5 (attr_scalar_num, attr_array_num, attr_string, attrs_dense…) |
-| 5 | written file rejected | dtype | 1 (str_vlen_ascii) |
-| 6 | written file rejected | object | 1 (attr_large) |
-| 7 | read capability missing | strpad — DatatypeMessage::VarLenString models only the character set, so the string pad of a variable-length… | 3 (str_vlen_ascii, str_vlen_utf8, attr_string) |
-| 8 | read capability missing | data — hdf5-io error: format error: invalid data: datatype conversion: non-standard floating-point bit lay… | 1 (float_f16le) |
-| 9 | field not reported | dtype not emitted | 2 (attrs_dense, attr_large) |
-| 10 | field not reported | shape not emitted | 2 (attrs_dense, attr_large) |
+| 2 | object silently dropped | object present in the file is not listed by the reader | 11 (opaque, bitfield, ref_object, ref_region…) |
+| 3 | written file rejected | nattrs_hdr | 5 (attr_scalar_num, attr_array_num, attr_string, attrs_dense…) |
+| 4 | written file rejected | dtype | 1 (str_vlen_ascii) |
+| 5 | written file rejected | object | 1 (attr_large) |
+| 6 | read capability missing | strpad — DatatypeMessage::VarLenString models only the character set, so the string pad of a variable-length… | 3 (str_vlen_ascii, str_vlen_utf8, attr_string) |
+| 7 | read capability missing | data — hdf5-io error: format error: invalid data: datatype conversion: non-standard floating-point bit lay… | 1 (float_f16le) |
+| 8 | field not reported | dtype not emitted | 2 (attrs_dense, attr_large) |
+| 9 | field not reported | shape not emitted | 2 (attrs_dense, attr_large) |
+| 10 | field not reported | strpad not emitted | 2 (attrs_dense, attr_large) |
 
 ## Case matrix
 
@@ -98,7 +98,7 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `layout_contiguous_v108` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
 | `layout_chunked_v108` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
 | `chunkidx_earray_dim1` | layout | PASS | 0 | 0 | 0 | PASS |  |
-| `external_storage` | layout | DIFF | 1 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `external_storage` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
 | `vds` | layout | MISS | 0 | 1 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
 | `filter_deflate` | filter | PASS | 0 | 0 | 0 | PASS |  |
 | `filter_shuffle` | filter | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
@@ -132,12 +132,6 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `large_multi_mb` | bulk | PASS | 0 | 0 | 0 | PASS |  |
 
 ## Direction A divergences, in full
-
-### `external_storage`
-
-- `/data#data` (value)
-  - libhdf5: `raw:000000000100000002000000030000000400000005000000060000000700000008000000090000000a0000000b0000000c0000000d0000000e0000000f000000`
-  - rust-hdf5: `raw:00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000`
 
 ### `attrs_dense`
 
@@ -252,7 +246,6 @@ None: every metadata deviation in this run is a declared one.
 | severity | finding | cases | example |
 |---|---|---|---|
 | value divergence | nattrs: value | 2 | /data#nattrs libhdf5: 12 rust: 0 |
-| value divergence | data: value | 1 | /data#data libhdf5: raw:0000000001000000020000000300000004000000050000000600000… |
 | object silently dropped | object present in the file is not listed by the reader | 11 | /data (dataset) |
 | written file rejected | nattrs_hdr | 5 |  |
 | written file rejected | dtype | 1 |  |
