@@ -9063,127 +9063,6 @@ impl Hdf5Writer {
         Ok(idx)
     }
 
-    /// Create a chunked dataset with compression using the given filter pipeline.
-    ///
-    /// This is similar to `create_chunked_dataset` but attaches a filter pipeline
-    /// (e.g., deflate compression). The pipeline is applied when writing chunks.
-    pub fn create_chunked_dataset_compressed(
-        &self,
-        name: &str,
-        datatype: DatatypeMessage,
-        dims: &[u64],
-        max_dims: &[u64],
-        chunk_dims: &[u64],
-        compression_level: u32,
-    ) -> IoResult<usize> {
-        let create = self.begin_create(name, NewStorage::Chunked)?;
-        let name = create.name.as_str();
-        validate_chunk_geometry(dims, max_dims, chunk_dims)?;
-        ensure_at_most_one_unlimited(max_dims)?;
-        let element_size = datatype.element_size() as u64;
-        let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * element_size;
-        let layout_version = self.chunk_layout_version(true, chunk_bytes);
-        let chunk_size_len = self.chunk_size_len_for(layout_version, chunk_bytes);
-
-        let earray_params = EarrayParams::default_params();
-        let ndblk_addrs = compute_ndblk_addrs(earray_params.sup_blk_min_data_ptrs)?;
-        let nsblk_addrs = compute_nsblk_addrs(
-            earray_params.idx_blk_elmts,
-            earray_params.data_blk_min_elmts,
-            earray_params.sup_blk_min_data_ptrs,
-            earray_params.max_nelmts_bits,
-        )?;
-
-        // Create filtered EA header
-        let mut ea_header =
-            ExtensibleArrayHeader::new_for_filtered_chunks(&self.ctx, chunk_size_len);
-        ea_header.max_nelmts_bits = earray_params.max_nelmts_bits;
-        ea_header.idx_blk_elmts = earray_params.idx_blk_elmts;
-        ea_header.data_blk_min_elmts = earray_params.data_blk_min_elmts;
-        ea_header.sup_blk_min_data_ptrs = earray_params.sup_blk_min_data_ptrs;
-        ea_header.max_dblk_page_nelmts_bits = earray_params.max_dblk_page_nelmts_bits;
-
-        let hdr_encoded = ea_header.encode(&self.ctx);
-        let ea_header_addr = self.allocator.allocate(hdr_encoded.len() as u64);
-
-        // Create filtered index block
-        let filt_iblk = FilteredIndexBlock::new(
-            ea_header_addr,
-            earray_params.idx_blk_elmts,
-            ndblk_addrs,
-            nsblk_addrs,
-        );
-        let iblk_encoded = filt_iblk.encode(&self.ctx, chunk_size_len);
-        let ea_iblk_addr = self.allocator.allocate(iblk_encoded.len() as u64);
-
-        ea_header.idx_blk_addr = ea_iblk_addr;
-
-        let hdr_encoded = ea_header.encode(&self.ctx);
-        self.handle.write_at(ea_header_addr, &hdr_encoded)?;
-        self.handle.write_at(ea_iblk_addr, &iblk_encoded)?;
-
-        let dataspace = DataspaceMessage {
-            // Chunked storage always requires at least one dimension, so
-            // this is never Scalar or Null.
-            class: DataspaceClass::Simple,
-            dims: dims.to_vec(),
-            max_dims: Some(max_dims.to_vec()),
-        };
-
-        // Also create a dummy unfiltered iblk (not used for compressed, but needed for struct)
-        let ea_iblk = ExtensibleArrayIndexBlock::new(
-            ea_header_addr,
-            earray_params.idx_blk_elmts,
-            ndblk_addrs,
-            nsblk_addrs,
-        );
-
-        let idx = self.push_dataset(
-            &create,
-            DatasetInfo {
-                name: name.to_string(),
-                datatype,
-                committed_type: None,
-                dataspace,
-                obj_header_addr: 0,
-                data_addr: UNDEF_ADDR,
-                data_size: 0,
-                compact: None,
-                attributes: Vec::new(),
-                obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
-                filter_pipeline: Some(FilterPipeline::deflate(compression_level)),
-                deleted: false,
-                extent_dirty: false,
-                header_dirty: false,
-                nlink_written: 1,
-                creation_seq: self.take_creation_seq(),
-                track_attr_order: self.track_order.attrs,
-                fill_value: None,
-                layout_version,
-                times: None,
-                fixed_array: None,
-                btree_v2: None,
-                chunked: Some(ChunkedDatasetInfo {
-                    chunk_dims: chunk_dims.to_vec(),
-                    max_dims: max_dims.to_vec(),
-                    earray_params,
-                    ea_header_addr,
-                    ea_iblk_addr,
-                    ndblk_addrs,
-                    ea_header,
-                    ea_iblk,
-                    chunks_written: 0,
-                    filt_iblk: Some(filt_iblk),
-                    chunk_size_len,
-                }),
-                append: None,
-            },
-        );
-
-        Ok(idx)
-    }
-
     /// Create a chunked dataset with a custom filter pipeline.
     pub fn create_chunked_dataset_with_pipeline(
         &self,
@@ -11586,14 +11465,14 @@ mod tests {
                 ),
             ),
             (
-                "chunked_compressed",
-                writer.create_chunked_dataset_compressed(
+                "chunked_with_pipeline",
+                writer.create_chunked_dataset_with_pipeline(
                     "d",
                     DatatypeMessage::i32_type(),
                     &[0],
                     &[u64::MAX],
                     &[4],
-                    6,
+                    FilterPipeline::deflate(6),
                 ),
             ),
         ];
@@ -13501,24 +13380,24 @@ mod tests {
 
         let mut writer = Hdf5Writer::create(&path).unwrap();
         let before = writer
-            .create_chunked_dataset_compressed(
+            .create_chunked_dataset_with_pipeline(
                 "d4",
                 DatatypeMessage::i32_type(),
                 &[0],
                 &[u64::MAX],
                 &[16],
-                4,
+                FilterPipeline::deflate(4),
             )
             .unwrap();
         writer.set_libver_latest(true).unwrap();
         let ea5 = writer
-            .create_chunked_dataset_compressed(
+            .create_chunked_dataset_with_pipeline(
                 "ea5",
                 DatatypeMessage::i32_type(),
                 &[0],
                 &[u64::MAX],
                 &[16],
-                4,
+                FilterPipeline::deflate(4),
             )
             .unwrap();
         let plain = writer
@@ -13611,13 +13490,13 @@ mod tests {
         let mut writer = Hdf5Writer::create(&path).unwrap();
         writer.set_libver_latest(true).unwrap();
         let idx = writer
-            .create_chunked_dataset_compressed(
+            .create_chunked_dataset_with_pipeline(
                 "d",
                 DatatypeMessage::i32_type(),
                 &[0],
                 &[u64::MAX],
                 &[chunk as u64],
-                4,
+                FilterPipeline::deflate(4),
             )
             .unwrap();
         for c in 0..2u64 {
@@ -13668,23 +13547,23 @@ mod tests {
 
         let writer = Hdf5Writer::create(&path).unwrap();
         let at_limit = writer
-            .create_chunked_dataset_compressed(
+            .create_chunked_dataset_with_pipeline(
                 "at_limit",
                 DatatypeMessage::u8_type(),
                 &[0],
                 &[u64::MAX],
                 &[u32::MAX as u64],
-                4,
+                FilterPipeline::deflate(4),
             )
             .unwrap();
         let over = writer
-            .create_chunked_dataset_compressed(
+            .create_chunked_dataset_with_pipeline(
                 "over",
                 DatatypeMessage::u8_type(),
                 &[0],
                 &[u64::MAX],
                 &[u32::MAX as u64 + 1],
-                4,
+                FilterPipeline::deflate(4),
             )
             .unwrap();
         let over_unfiltered = writer

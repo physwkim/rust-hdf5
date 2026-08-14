@@ -714,8 +714,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                         } else if wants_filter {
                             // The extensible-array index takes the pipeline
                             // the same way, so it goes through the one owner
-                            // too — `create_chunked_dataset_compressed` is
-                            // this call with a deflate-only pipeline.
+                            // too.
                             writer.create_chunked_dataset_with_pipeline(
                                 &full_name,
                                 datatype,

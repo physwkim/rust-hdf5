@@ -2,6 +2,16 @@
 
 ## 0.4.3
 
+### Changed
+
+- **Breaking.** `Hdf5Writer::create_chunked_dataset_compressed` is gone.
+  Its body was `create_chunked_dataset_with_pipeline` line for line, down
+  to the filtered extensible-array header it lays out, differing only in
+  building the pipeline itself; call that with
+  `FilterPipeline::deflate(level)` instead. Two copies of a chunk-index
+  layout is one copy too many — the v5 layout-version rule had to be
+  written into both.
+
 ### Added
 
 - `H5Dataset::read_numeric_as::<T>()` and `read_numeric_slice_as::<T>()`:
