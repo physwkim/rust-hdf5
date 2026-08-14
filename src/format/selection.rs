@@ -13,14 +13,29 @@
 //! ```text
 //! sel_type: u32 LE (0 = none, 1 = points, 2 = hyperslabs, 3 = all)
 //! ```
-//! followed by a type-specific body. `H5S_SEL_POINTS` bodies are not
-//! decoded — see [`Selection::decode`].
+//! followed by a type-specific body.
 //!
 //! All / None body (version is always 1):
 //! ```text
 //! version:  u32 LE (= 1)
 //! reserved: 8 bytes
 //! ```
+//!
+//! Point body (`H5S__point_deserialize`, H5Spoint.c):
+//! ```text
+//! version: u32 LE (1 or 2)
+//! if version >= 2: enc_size: 1 byte (2, 4, or 8 bytes)
+//! else (version == 1): padding: 4 bytes, length: 4 bytes, enc_size = 4
+//! rank: u32 LE
+//! num_points: enc_size bytes LE
+//! num_points * rank * { coordinate }, each enc_size bytes LE (point-major,
+//! coordinate-minor — point 0's rank coordinates, then point 1's, ...)
+//! ```
+//! The version-1 `length` field records the byte count from `rank` to the
+//! end of the point list (`8 + num_points * rank * 4`); this module does
+//! not validate it on decode (H5S__point_deserialize doesn't either), but
+//! [`Selection::encode`] reproduces the exact value libhdf5 writes there,
+//! since a byte-for-byte comparison against a captured image needs it.
 //!
 //! Hyperslab body:
 //! ```text
@@ -65,6 +80,9 @@ const HYPER_VERSION_3: u32 = 3;
 
 const HYPER_REGULAR_FLAG: u8 = 0x01;
 
+const POINT_VERSION_1: u32 = 1;
+const POINT_VERSION_2: u32 = 2;
+
 /// The dataspace rank ceiling libhdf5 enforces (`H5S_MAX_RANK`,
 /// H5Spublic.h). Bounds `rank`-sized allocations before any element count
 /// derived from the file is trusted.
@@ -101,6 +119,17 @@ pub enum Hyperslab {
     Blocks(Vec<HyperslabBlock>),
 }
 
+/// An explicit list of selected element coordinates (`H5S_SEL_POINTS`):
+/// one `rank`-length coordinate vector per point, in selection order.
+/// Selection order is significant for a pointwise iterator (it is the
+/// linear order in which elements are visited), so callers must not
+/// reorder `points`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PointSelection {
+    pub rank: usize,
+    pub points: Vec<Vec<u64>>,
+}
+
 /// A decoded H5S dataspace selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
@@ -111,6 +140,8 @@ pub enum Selection {
     All,
     /// `H5S_SEL_HYPERSLABS`.
     Hyperslab { rank: usize, form: Hyperslab },
+    /// `H5S_SEL_POINTS`.
+    Points(PointSelection),
 }
 
 impl Selection {
@@ -142,9 +173,10 @@ impl Selection {
                 let (rank, form, consumed) = decode_hyperslab_body(body)?;
                 Ok((Self::Hyperslab { rank, form }, 4 + consumed))
             }
-            SEL_POINTS => Err(FormatError::UnsupportedFeature(
-                "point selection decode (H5S_SEL_POINTS)".into(),
-            )),
+            SEL_POINTS => {
+                let (points, consumed) = decode_points_body(body)?;
+                Ok((Self::Points(points), 4 + consumed))
+            }
             other => Err(FormatError::InvalidData(format!(
                 "unknown dataspace selection type {other}"
             ))),
@@ -166,6 +198,23 @@ impl Selection {
         match self {
             Self::None => Ok(Vec::new()),
             Self::All => Ok(vec![(vec![0u64; dims.len()], dims.to_vec())]),
+            Self::Points(ps) => {
+                if ps.rank != dims.len() {
+                    return Err(FormatError::InvalidData(format!(
+                        "point selection rank {} does not match the {}-dimensional extent",
+                        ps.rank,
+                        dims.len()
+                    )));
+                }
+                // Each point is its own 1-element box in every dimension —
+                // the only axis-aligned decomposition that holds in
+                // general for an arbitrary scatter of coordinates.
+                Ok(ps
+                    .points
+                    .iter()
+                    .map(|p| (p.clone(), vec![1u64; ps.rank]))
+                    .collect())
+            }
             Self::Hyperslab { rank, form } => {
                 if *rank != dims.len() {
                     return Err(FormatError::InvalidData(format!(
@@ -427,6 +476,114 @@ fn decode_hyperslab_body(buf: &[u8]) -> FormatResult<(usize, Hyperslab, usize)> 
     }
 }
 
+fn decode_points_body(buf: &[u8]) -> FormatResult<(PointSelection, usize)> {
+    let mut pos = 0usize;
+    if buf.len() < 4 {
+        return Err(FormatError::BufferTooShort {
+            needed: 4,
+            available: buf.len(),
+        });
+    }
+    let version = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    pos += 4;
+    if version != POINT_VERSION_1 && version != POINT_VERSION_2 {
+        return Err(FormatError::InvalidData(format!(
+            "bad version {version} for point dataspace selection"
+        )));
+    }
+
+    let enc_size: usize;
+    if version >= POINT_VERSION_2 {
+        if buf.len() < pos + 1 {
+            return Err(FormatError::BufferTooShort {
+                needed: pos + 1,
+                available: buf.len(),
+            });
+        }
+        enc_size = match buf[pos] {
+            0x02 => 2,
+            0x04 => 4,
+            0x08 => 8,
+            other => {
+                return Err(FormatError::InvalidData(format!(
+                    "unknown point selection encoding size tag {other:#x}"
+                )))
+            }
+        };
+        pos += 1;
+    } else {
+        // Version 1: 4 padding bytes + a 4-byte length field, neither of
+        // which this decoder validates (H5S__point_deserialize doesn't
+        // either — the length is a serialize-side convenience, not a
+        // decode-side check). Encoding size is fixed at 4.
+        if buf.len() < pos + 8 {
+            return Err(FormatError::BufferTooShort {
+                needed: pos + 8,
+                available: buf.len(),
+            });
+        }
+        pos += 8;
+        enc_size = 4;
+    }
+
+    if buf.len() < pos + 4 {
+        return Err(FormatError::BufferTooShort {
+            needed: pos + 4,
+            available: buf.len(),
+        });
+    }
+    let rank = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+    pos += 4;
+    if rank == 0 || rank > MAX_RANK {
+        return Err(FormatError::InvalidData(format!(
+            "invalid point selection rank {rank}"
+        )));
+    }
+
+    if buf.len() < pos + enc_size {
+        return Err(FormatError::BufferTooShort {
+            needed: pos + enc_size,
+            available: buf.len(),
+        });
+    }
+    let num_points = read_plain(&buf[pos..], enc_size);
+    pos += enc_size;
+
+    // Mirrors H5S__point_deserialize's own overflow guard: `rank *
+    // enc_size * num_points` is computed in checked 64-bit arithmetic
+    // before it is trusted as a buffer offset, so a crafted huge
+    // `num_points` fails cleanly here instead of via an under-allocated
+    // `Vec::with_capacity`.
+    let point_bytes = (rank as u64)
+        .checked_mul(enc_size as u64)
+        .and_then(|per_point| per_point.checked_mul(num_points))
+        .ok_or_else(|| {
+            FormatError::InvalidData("point selection coordinate buffer size overflows".into())
+        })?;
+    if (buf.len() as u64) < pos as u64 + point_bytes {
+        let needed = usize::try_from(point_bytes)
+            .ok()
+            .and_then(|b| pos.checked_add(b))
+            .unwrap_or(usize::MAX);
+        return Err(FormatError::BufferTooShort {
+            needed,
+            available: buf.len(),
+        });
+    }
+
+    let mut points = Vec::with_capacity(num_points as usize);
+    for _ in 0..num_points {
+        let mut coord = Vec::with_capacity(rank);
+        for _ in 0..rank {
+            coord.push(read_plain(&buf[pos..], enc_size));
+            pos += enc_size;
+        }
+        points.push(coord);
+    }
+
+    Ok((PointSelection { rank, points }, pos))
+}
+
 /// Decode an `n`-byte little-endian field with no sentinel substitution
 /// (`start`, `stride`, and block-list coordinates).
 fn read_plain(buf: &[u8], n: usize) -> u64 {
@@ -457,6 +614,16 @@ fn read_dim(buf: &[u8], n: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Strip an `H5Sencode2` envelope (`tests/fixtures/gen_selection_images.c`
+    /// captures the whole blob) down to the selection-only bytes this
+    /// module decodes: `type(1) + version(1) + sizeof_size(1) +
+    /// extent_size(4 LE)` followed by `extent_size` bytes of serialized
+    /// extent (H5S.c `H5S_encode`), then the selection.
+    fn strip_h5sencode_envelope(blob: &[u8]) -> &[u8] {
+        let extent_size = u32::from_le_bytes([blob[3], blob[4], blob[5], blob[6]]) as usize;
+        &blob[7 + extent_size..]
+    }
 
     /// Byte-for-byte the source selection h5debug reported inside a real
     /// h5py-written VDS mapping entry (`layout[...] = VirtualSource(...)`,
@@ -629,10 +796,153 @@ mod tests {
     }
 
     #[test]
-    fn decode_points_is_unsupported() {
-        let buf = [0x01, 0, 0, 0]; // type = SEL_POINTS
+    fn decode_points_truncated_header_is_buffer_too_short() {
+        let buf = [0x01, 0, 0, 0]; // type = SEL_POINTS, no body at all
         let err = Selection::decode(&buf).unwrap_err();
-        assert!(matches!(err, FormatError::UnsupportedFeature(_)));
+        assert!(matches!(err, FormatError::BufferTooShort { .. }));
+    }
+
+    /// Byte-for-byte a libhdf5-captured `H5Sencode2` image
+    /// (`tests/fixtures/gen_selection_images.c`, `points4_v1.bin`): a
+    /// version-1 point selection, rank 1, points at 1/3/7/15.
+    #[test]
+    fn decode_points_matches_libhdf5_image() {
+        let blob = include_bytes!("../../tests/fixtures/points4_v1.bin");
+        let sel_bytes = strip_h5sencode_envelope(blob);
+        let (sel, consumed) = Selection::decode(sel_bytes).unwrap();
+        assert_eq!(consumed, sel_bytes.len());
+        assert_eq!(
+            sel,
+            Selection::Points(PointSelection {
+                rank: 1,
+                points: vec![vec![1], vec![3], vec![7], vec![15]],
+            })
+        );
+    }
+
+    #[test]
+    fn decode_points_version_2_small_enc_size() {
+        let mut buf = vec![0x01, 0, 0, 0]; // SEL_POINTS
+        buf.extend_from_slice(&2u32.to_le_bytes()); // version 2
+        buf.push(0x02); // enc_size tag = 2 bytes
+        buf.extend_from_slice(&2u32.to_le_bytes()); // rank = 2
+        buf.extend_from_slice(&2u16.to_le_bytes()); // num_points = 2
+        buf.extend_from_slice(&1u16.to_le_bytes()); // point 0 = (1, 5)
+        buf.extend_from_slice(&5u16.to_le_bytes());
+        buf.extend_from_slice(&9u16.to_le_bytes()); // point 1 = (9, 0)
+        buf.extend_from_slice(&0u16.to_le_bytes());
+
+        let (sel, consumed) = Selection::decode(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(
+            sel,
+            Selection::Points(PointSelection {
+                rank: 2,
+                points: vec![vec![1, 5], vec![9, 0]],
+            })
+        );
+    }
+
+    #[test]
+    fn decode_points_rejects_bad_version() {
+        let mut buf = vec![0x01, 0, 0, 0];
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version 3 does not exist
+        let err = Selection::decode(&buf).unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)));
+    }
+
+    #[test]
+    fn decode_points_rejects_unknown_enc_size_tag() {
+        let mut buf = vec![0x01, 0, 0, 0];
+        buf.extend_from_slice(&2u32.to_le_bytes()); // version 2
+        buf.push(0x03); // not one of 2/4/8
+        let err = Selection::decode(&buf).unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)));
+    }
+
+    #[test]
+    fn decode_points_rejects_zero_rank() {
+        let mut buf = vec![0x01, 0, 0, 0];
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 8]);
+        buf.extend_from_slice(&0u32.to_le_bytes()); // rank = 0
+        let err = Selection::decode(&buf).unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)));
+    }
+
+    #[test]
+    fn decode_points_rejects_rank_over_max() {
+        let mut buf = vec![0x01, 0, 0, 0];
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 8]);
+        buf.extend_from_slice(&33u32.to_le_bytes()); // rank = 33 > 32
+        let err = Selection::decode(&buf).unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)));
+    }
+
+    #[test]
+    fn decode_points_truncated_coordinates() {
+        // Claims 5 points of rank 1 but the buffer only has room for one.
+        let mut buf = vec![0x01, 0, 0, 0];
+        buf.extend_from_slice(&1u32.to_le_bytes()); // version 1
+        buf.extend_from_slice(&[0u8; 8]); // padding + length placeholder
+        buf.extend_from_slice(&1u32.to_le_bytes()); // rank = 1
+        buf.extend_from_slice(&5u32.to_le_bytes()); // num_points = 5 (lie)
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let err = Selection::decode(&buf).unwrap_err();
+        assert!(matches!(err, FormatError::BufferTooShort { .. }));
+    }
+
+    /// A `num_points` claim that comfortably fits the `rank * enc_size *
+    /// num_points` multiplication (so it doesn't hit the overflow guard)
+    /// but wildly exceeds the actual buffer must still fail on the
+    /// bounds check rather than attempting to allocate.
+    #[test]
+    fn decode_points_huge_num_points_claim_does_not_allocate() {
+        let mut buf = vec![0x01, 0, 0, 0];
+        buf.extend_from_slice(&2u32.to_le_bytes()); // version 2
+        buf.push(0x08); // enc_size tag = 8 bytes
+        buf.extend_from_slice(&1u32.to_le_bytes()); // rank = 1
+        buf.extend_from_slice(&(1u64 << 40).to_le_bytes()); // num_points (lie)
+        let err = Selection::decode(&buf).unwrap_err();
+        assert!(matches!(err, FormatError::BufferTooShort { .. }));
+    }
+
+    /// A `num_points` claim that overflows the `rank * enc_size *
+    /// num_points` multiplication itself must fail cleanly rather than
+    /// wrapping into a small, incorrect buffer requirement.
+    #[test]
+    fn decode_points_num_points_overflow_does_not_allocate() {
+        let mut buf = vec![0x01, 0, 0, 0];
+        buf.extend_from_slice(&2u32.to_le_bytes()); // version 2
+        buf.push(0x08); // enc_size tag = 8 bytes
+        buf.extend_from_slice(&1u32.to_le_bytes()); // rank = 1
+        buf.extend_from_slice(&(u64::MAX - 1).to_le_bytes()); // num_points (lie)
+        let err = Selection::decode(&buf).unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)));
+    }
+
+    #[test]
+    fn to_boxes_points_each_point_is_its_own_unit_box() {
+        let sel = Selection::Points(PointSelection {
+            rank: 2,
+            points: vec![vec![1, 2], vec![5, 5]],
+        });
+        let boxes = sel.to_boxes(&[8, 8]).unwrap();
+        assert_eq!(
+            boxes,
+            vec![(vec![1, 2], vec![1, 1]), (vec![5, 5], vec![1, 1])]
+        );
+    }
+
+    #[test]
+    fn to_boxes_points_rejects_rank_mismatch() {
+        let sel = Selection::Points(PointSelection {
+            rank: 2,
+            points: vec![],
+        });
+        let err = sel.to_boxes(&[8]).unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)));
     }
 
     #[test]
