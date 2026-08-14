@@ -1141,6 +1141,15 @@ impl Hdf5Writer {
         use crate::format::messages::datatype::DatatypeMessage;
 
         let mut handle = FileHandle::open_readwrite_with_locking(path, locking)?;
+        // The same `H5FD_locate_signature` search the read path makes, through
+        // the same handle mechanism: the offset it finds is the file's base
+        // address, so the allocator's end-of-file, every write and the
+        // superblock rewrite all work in the HDF5 address space, and the
+        // userblock in `[0, base)` is not addressable from this writer at all.
+        let super_addr = handle
+            .locate_signature()?
+            .ok_or(crate::format::FormatError::InvalidSignature)?;
+        handle.set_base(super_addr);
         let file_size = handle.file_size()?;
 
         let sb_buf = handle.read_at_most(0, 256)?;
@@ -7119,9 +7128,19 @@ impl Hdf5Writer {
             sizeof_offsets: self.ctx.sizeof_addr,
             sizeof_lengths: self.ctx.sizeof_size,
             file_consistency_flags: flags,
-            base_address: 0,
+            // The userblock this file was opened with. `H5F__super_read`
+            // prefers the located address over this field, but
+            // `H5Pget_userblock` reports it, so a rewrite that zeroed it would
+            // hide the block from every reader that asks for its size.
+            base_address: self.handle.base(),
             superblock_extension_address: UNDEF_ADDR,
-            end_of_file_address: self.allocator.eof(),
+            // The one address in the superblock measured from the start of the
+            // *file* rather than from the base: `H5F__super_read` sets the EOA
+            // to `stored_eof - base_addr` (H5Fsuper.c:635) and calls the file
+            // truncated when `eof + base_addr < stored_eof` (:573). The
+            // allocator counts in the based space, so the userblock is added
+            // back here.
+            end_of_file_address: self.allocator.eof() + self.handle.base(),
             root_group_object_header_address: root_addr,
         };
         let sb_encoded = sb.encode();

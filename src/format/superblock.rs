@@ -53,13 +53,20 @@ pub struct SuperblockV2V3 {
     pub sizeof_lengths: u8,
     /// File consistency flags (see `FLAG_*` constants).
     pub file_consistency_flags: u8,
-    /// Base address of the file (usually 0).
+    /// Base address of the file: the size of the userblock the superblock
+    /// follows, and the offset every other address in the file is measured
+    /// from. Usually 0.
     pub base_address: u64,
     /// Address of the superblock extension object header, or UNDEF.
     pub superblock_extension_address: u64,
-    /// End-of-file address.
+    /// End-of-file address, measured from the start of the *file* — the one
+    /// field here that includes [`base_address`](Self::base_address).
+    /// `H5F__super_read` takes the allocated end as `end_of_file_address -
+    /// base_address` and calls the file truncated when the real end is below
+    /// it.
     pub end_of_file_address: u64,
-    /// Address of the root group object header.
+    /// Address of the root group object header, relative to
+    /// [`base_address`](Self::base_address).
     pub root_group_object_header_address: u64,
 }
 
@@ -412,8 +419,12 @@ pub struct SuperblockV0V1 {
     pub sym_leaf_k: u16,
     pub btree_internal_k: u16,
     pub indexed_storage_k: Option<u16>,
+    /// The userblock size; every other address in the file is measured from
+    /// it, and it is usually 0.
     pub base_address: u64,
     pub superblock_extension_address: u64,
+    /// Measured from the start of the *file*, unlike every other address —
+    /// see [`SuperblockV2V3::end_of_file_address`].
     pub end_of_file_address: u64,
     pub driver_info_address: u64,
     pub root_symbol_table_entry: SymbolTableEntry,
