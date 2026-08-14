@@ -1815,6 +1815,16 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "link_soft" => {
+            let file = H5File::create(path)?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("orig")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.create_soft_link("alias", "/orig")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "links_dense" => {
             // The reference makes `g` with `track_order=True`, so the dense
             // storage it spills into carries a creation-order index beside

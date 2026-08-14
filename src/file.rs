@@ -265,6 +265,20 @@ impl H5File {
         self.root_group().create_group(name)
     }
 
+    /// Create a soft link in the root of the file.
+    ///
+    /// See [`H5Group::create_soft_link`](crate::group::H5Group::create_soft_link).
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    /// let file = H5File::create("soft.h5").unwrap();
+    /// file.new_dataset::<i32>().shape([8]).create("orig").unwrap();
+    /// file.create_soft_link("alias", "/orig").unwrap();
+    /// ```
+    pub fn create_soft_link(&self, link_name: &str, target_path: &str) -> Result<()> {
+        self.root_group().create_soft_link(link_name, target_path)
+    }
+
     /// Start building a new dataset with the given element type.
     ///
     /// This returns a fluent builder. Call `.shape(...)` to set dimensions and

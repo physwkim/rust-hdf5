@@ -29,7 +29,7 @@ use crate::format::messages::datatype::{DatatypeMessage, ReferenceKind};
 use crate::format::messages::fill_value::FillValueMessage;
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::group_info::GroupInfoMessage;
-use crate::format::messages::link::LinkMessage;
+use crate::format::messages::link::{LinkMessage, LinkTarget};
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::*;
 use crate::format::object_header::{ObjectHeader, MAX_MESSAGE_SIZE};
@@ -1042,6 +1042,26 @@ pub struct HardLink {
     pub creation_seq: u64,
 }
 
+/// A user-created symbolic link: a name in a group whose value is a path
+/// rather than an object header address.
+///
+/// A soft link holds a path within this file; an external link holds a file
+/// name and a path within that file. Neither names an object this writer
+/// owns, so — unlike [`HardLink`] — nothing about it is resolved: the link is
+/// stored as written and answered at traversal time, exactly as `H5Lcreate_soft`
+/// and `H5Lcreate_external` store theirs.
+#[derive(Clone)]
+pub struct SymbolicLink {
+    /// Parent group index (`None` = the root group).
+    pub parent: Option<usize>,
+    /// Leaf name of the link within the parent group.
+    pub name: String,
+    /// The path (and, for an external link, the file) this link names.
+    pub target: LinkTarget,
+    /// When this link was created; see [`GroupInfo::creation_seq`].
+    pub creation_seq: u64,
+}
+
 /// A link a reopened file already held that this writer cannot express.
 ///
 /// Soft, external and user-defined links have no creation, retarget or delete
@@ -1877,6 +1897,10 @@ pub struct Hdf5Writer {
     /// User-created hard links (additional names for existing objects),
     /// resolved and emitted during finalize.
     pub(crate) hard_links: Slot<Vec<HardLink>>,
+    /// User-created soft and external links. Held apart from
+    /// [`Self::hard_links`] because they name a path rather than an object:
+    /// nothing resolves them, and no object's reference count counts them.
+    pub(crate) symbolic_links: Slot<Vec<SymbolicLink>>,
     /// Links a reopened file held that this writer cannot express, carried
     /// through every header rewrite by their encoded bytes. Always empty for
     /// a freshly created file; see [`PreservedLink`].
@@ -2087,6 +2111,7 @@ impl Hdf5Writer {
             datasets: Slot::new(Vec::new()),
             groups: Slot::new(Vec::new()),
             hard_links: Slot::new(Vec::new()),
+            symbolic_links: Slot::new(Vec::new()),
             preserved_links: Slot::new(Vec::new()),
             root_attributes: Slot::new(Vec::new()),
             create_lock: Slot::new(()),
@@ -2230,7 +2255,7 @@ impl Hdf5Writer {
         // instead of naming what stops the path. Uniqueness comes first among
         // them: a name already in the file is taken whatever holds it.
         self.reject_external_traversal(&name)?;
-        self.ensure_unique_dataset_name(&name)?;
+        self.ensure_name_free(&name)?;
         self.reject_preserved_object(&name)?;
         let (parent, _leaf) = self.split_parent(&name)?;
         Ok(CreateGuard {
@@ -2337,6 +2362,11 @@ impl Hdf5Writer {
 
     pub(crate) fn hard_links_vec(&self) -> Vec<HardLink> {
         self.hard_links.lock().clone()
+    }
+
+    /// Snapshot the symbolic-link list; see [`Self::hard_links_vec`].
+    pub(crate) fn symbolic_links_vec(&self) -> Vec<SymbolicLink> {
+        self.symbolic_links.lock().clone()
     }
 
     /// Open an existing HDF5 file for appending new datasets, using the
@@ -2793,6 +2823,10 @@ impl Hdf5Writer {
             datasets: Slot::new(datasets),
             groups: Slot::new(groups),
             hard_links: Slot::new(hard_links),
+            // A reopen carries the soft and external links it found as
+            // `preserved_links`, byte for byte; this list holds only the ones
+            // created in this session.
+            symbolic_links: Slot::new(Vec::new()),
             preserved_links: Slot::new(preserved_links),
             root_attributes: Slot::new(root_attributes),
             create_lock: Slot::new(()),
@@ -2875,38 +2909,52 @@ impl Hdf5Writer {
         (shape, element_size, chunked, btree2, fixed_array)
     }
 
-    /// Reject a dataset name already used by a live dataset. Dataset names
-    /// here are full paths, so they must be unique across the file (HDF5
-    /// requires link names to be unique within their group).
-    fn ensure_unique_dataset_name(&self, name: &str) -> IoResult<()> {
-        // A path *through* a carried external link belongs to the other file:
-        // creating it here would put a second link of that name in the group.
-        self.reject_external_traversal(name)?;
-        let exists = self.dataset_refs().iter().any(|d| {
+    /// Reject a name some other link in the file already occupies.
+    ///
+    /// `name` is the registry's full-path form, with no leading `/`. HDF5
+    /// requires link names to be unique within their group, and every kind of
+    /// link this writer can emit competes for the same name: a dataset's own
+    /// link, a group's, a user hard link, a soft or external link, and a link
+    /// a reopen is carrying through verbatim. This is the one place that list
+    /// is written down, so a creator cannot be blind to a kind it does not
+    /// itself make — nor a kind added after it.
+    fn ensure_name_free(&self, name: &str) -> IoResult<()> {
+        let taken = |kind: &str| {
+            Err(crate::io::IoError::InvalidState(format!(
+                "a {kind} named '{name}' already exists"
+            )))
+        };
+        if self.dataset_refs().iter().any(|d| {
             let g = d.lock();
             !g.deleted && g.name == name
-        });
-        if exists {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "a dataset named '{name}' already exists"
-            )));
+        }) {
+            return taken("dataset");
+        }
+        if self.group_refs().iter().any(|g| {
+            let gg = g.lock();
+            !gg.deleted && gg.name.trim_start_matches('/') == name
+        }) {
+            return taken("group");
         }
         if self
             .hard_links_vec()
             .iter()
             .any(|l| self.hard_link_emitted(l) && self.hard_link_full_path(l) == name)
         {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "a hard link named '{name}' already exists"
-            )));
+            return taken("hard link");
+        }
+        if self
+            .symbolic_links_vec()
+            .iter()
+            .any(|l| self.symbolic_link_emitted(l) && self.symbolic_link_full_path(l) == name)
+        {
+            return taken("link");
         }
         // A preserved link occupies its name in the group just as a modelled
         // one does; both are emitted, and two link messages of one name in a
         // group is an invalid file.
         if self.preserved_link_paths().iter().any(|(p, _)| *p == name) {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "a link named '{name}' already exists"
-            )));
+            return taken("link");
         }
         Ok(())
     }
@@ -2983,7 +3031,7 @@ impl Hdf5Writer {
         for grp in self.group_refs() {
             grp.lock().child_datasets.retain(|&di| di != idx);
         }
-        self.purge_dead_hard_links();
+        self.purge_dead_links();
         let ds = self.ds(idx);
         let _op = ds.op.lock();
         self.release_dataset_storage(idx)
@@ -3103,7 +3151,7 @@ impl Hdf5Writer {
         if let Some(pidx) = parent {
             groups[pidx].lock().child_groups.retain(|&gi| gi != gidx);
         }
-        self.purge_dead_hard_links();
+        self.purge_dead_links();
         // Free storage only after the whole subtree is marked: the lists
         // hold each object exactly once (the marking pass skips anything
         // already deleted), so nothing is freed twice.
@@ -3220,10 +3268,12 @@ impl Hdf5Writer {
         }
     }
 
-    /// Drop hard-link entries that can no longer be emitted — their parent
-    /// group or target object was just deleted — so the list mirrors what
-    /// the file will hold instead of carrying suppressed zombies.
-    fn purge_dead_hard_links(&self) {
+    /// Drop link entries that can no longer be emitted — their parent group
+    /// or, for a hard link, their target object was just deleted — so the
+    /// lists mirror what the file will hold instead of carrying suppressed
+    /// zombies. Both kinds are purged here so a delete cannot clear one list
+    /// and leave the other holding a name in a group that is gone.
+    fn purge_dead_links(&self) {
         let dead: Vec<usize> = self
             .hard_links_vec()
             .iter()
@@ -3232,6 +3282,19 @@ impl Hdf5Writer {
             .map(|(p, _)| p)
             .collect();
         let mut links = self.hard_links.lock();
+        for p in dead.into_iter().rev() {
+            links.remove(p);
+        }
+        drop(links);
+
+        let dead: Vec<usize> = self
+            .symbolic_links_vec()
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| !self.symbolic_link_emitted(l))
+            .map(|(p, _)| p)
+            .collect();
+        let mut links = self.symbolic_links.lock();
         for p in dead.into_iter().rev() {
             links.remove(p);
         }
@@ -3651,29 +3714,7 @@ impl Hdf5Writer {
         // is what keeps a '/' out of the link this group will be reached by.
         let (parent_idx, _leaf) = self.split_parent(full_name.trim_start_matches('/'))?;
 
-        let groups = self.group_refs();
-        // Check for duplicates (ignore deleted groups)
-        let dup = groups.iter().any(|g| {
-            let gg = g.lock();
-            gg.name == full_name && !gg.deleted
-        });
-        if dup {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "group '{}' already exists",
-                full_name
-            )));
-        }
-        // A hard link must not already occupy this name in its parent.
-        let full_rel = full_name.trim_start_matches('/');
-        if self
-            .hard_links_vec()
-            .iter()
-            .any(|l| self.hard_link_emitted(l) && self.hard_link_full_path(l) == full_rel)
-        {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "a hard link named '{full_name}' already exists"
-            )));
-        }
+        self.ensure_name_free(full_name.trim_start_matches('/'))?;
 
         let group_idx = self.push_group(GroupInfo {
             name: full_name,
@@ -3763,15 +3804,12 @@ impl Hdf5Writer {
         let parent_group_path = self.canonical_group_path(parent_group_path);
         let parent_group_path = parent_group_path.as_str();
 
-        let datasets = self.dataset_refs();
-        let groups = self.group_refs();
-
         // Resolve the parent group (None == root).
         let parent = if parent_group_path == "/" {
             None
         } else {
             Some(
-                groups
+                self.group_refs()
                     .iter()
                     .position(|g| {
                         let gg = g.lock();
@@ -3800,26 +3838,7 @@ impl Hdf5Writer {
         })?;
 
         // Reject a name already taken in the parent group.
-        let parent_prefix = match parent {
-            None => String::new(),
-            Some(pi) => format!("{}/", groups[pi].lock().name.trim_start_matches('/')),
-        };
-        let full = format!("{parent_prefix}{link_name}");
-        let collides = datasets.iter().any(|d| {
-            let g = d.lock();
-            !g.deleted && g.name.trim_start_matches('/') == full
-        }) || groups.iter().any(|g| {
-            let gg = g.lock();
-            !gg.deleted && gg.name.trim_start_matches('/') == full
-        }) || self
-            .hard_links_vec()
-            .iter()
-            .any(|l| l.parent == parent && l.name == link_name);
-        if collides {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "'{full}' already exists in the file"
-            )));
-        }
+        self.ensure_name_free(&self.link_full_path(parent, link_name))?;
 
         self.hard_links.lock().push(HardLink {
             parent,
@@ -3844,17 +3863,103 @@ impl Hdf5Writer {
         parent_ok && target_ok
     }
 
-    /// The full path a hard link occupies, with no leading `/` — the same
-    /// form dataset names are stored in. Used for name-collision checks.
-    fn hard_link_full_path(&self, link: &HardLink) -> String {
-        match link.parent {
-            None => link.name.clone(),
+    /// The full path a link occupies, with no leading `/` — the same form
+    /// dataset names are stored in. The one place a parent index and a leaf
+    /// name become a path, so every link kind answers the collision check in
+    /// the same spelling.
+    fn link_full_path(&self, parent: Option<usize>, name: &str) -> String {
+        match parent {
+            None => name.to_string(),
             Some(pi) => format!(
-                "{}/{}",
-                self.grp(pi).lock().name.trim_start_matches('/'),
-                link.name
+                "{}/{name}",
+                self.grp(pi).lock().name.trim_start_matches('/')
             ),
         }
+    }
+
+    /// The full path a hard link occupies; see [`Self::link_full_path`].
+    fn hard_link_full_path(&self, link: &HardLink) -> String {
+        self.link_full_path(link.parent, &link.name)
+    }
+
+    /// Whether a symbolic link will actually be emitted: its parent group
+    /// must still be present. There is no target to check — a soft or
+    /// external link is allowed to dangle, and `H5Lcreate_soft` does not look
+    /// at the path it stores.
+    fn symbolic_link_emitted(&self, link: &SymbolicLink) -> bool {
+        match link.parent {
+            None => true,
+            Some(pi) => !self.grp(pi).lock().deleted,
+        }
+    }
+
+    /// The full path a symbolic link occupies; see [`Self::link_full_path`].
+    fn symbolic_link_full_path(&self, link: &SymbolicLink) -> String {
+        self.link_full_path(link.parent, &link.name)
+    }
+
+    /// Create a soft or external link: a name in a group whose value is a
+    /// path rather than an object.
+    ///
+    /// The single owner of symbolic-link creation — `H5Lcreate_soft` and
+    /// `H5Lcreate_external` differ only in the value they store, and the
+    /// name, parent and collision rules they share are all here.
+    ///
+    /// * `parent_group_path` — full path of the group that will hold the
+    ///   link (`"/"` for the root group).
+    /// * `link_name` — leaf name of the new link within that group.
+    /// * `target` — the path this link names, and for an external link the
+    ///   file holding it. Neither is resolved or required to exist: HDF5
+    ///   answers a symbolic link at traversal time, so a dangling one is a
+    ///   legal file.
+    pub fn create_symbolic_link(
+        &self,
+        parent_group_path: &str,
+        link_name: &str,
+        target: LinkTarget,
+    ) -> IoResult<()> {
+        if link_name.is_empty() || link_name.contains('/') {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "link name '{link_name}' must be a non-empty leaf name"
+            )));
+        }
+        // The link itself would be a name in a group that lives in another
+        // file; its *value* may name anything, including a path this writer
+        // cannot follow, because nothing follows it here.
+        self.reject_external_traversal(&format!(
+            "{}/{link_name}",
+            parent_group_path.trim_end_matches('/')
+        ))?;
+
+        let _create = self.create_lock.lock();
+        let parent_group_path = self.canonical_group_path(parent_group_path);
+        let parent_group_path = parent_group_path.as_str();
+        let parent = if parent_group_path == "/" {
+            None
+        } else {
+            Some(
+                self.group_refs()
+                    .iter()
+                    .position(|g| {
+                        let gg = g.lock();
+                        gg.name == parent_group_path && !gg.deleted
+                    })
+                    .ok_or_else(|| {
+                        crate::io::IoError::NotFound(format!(
+                            "parent group '{parent_group_path}' not found"
+                        ))
+                    })?,
+            )
+        };
+
+        self.ensure_name_free(&self.link_full_path(parent, link_name))?;
+        self.symbolic_links.lock().push(SymbolicLink {
+            parent,
+            name: link_name.to_string(),
+            target,
+            creation_seq: self.take_creation_seq(),
+        });
+        Ok(())
     }
 
     /// Rewrite a group path that passes through hard links into the tree
@@ -4075,6 +4180,28 @@ impl Hdf5Writer {
         }
     }
 
+    /// Append every user-created symbolic link whose parent group is `parent`
+    /// (`None` == the root group).
+    ///
+    /// Nothing here waits on the layout pass — the link's value is a path, not
+    /// an address — but it is collected with the rest so it takes its place in
+    /// creation order and counts toward the phase change.
+    fn push_symbolic_links(&self, links: &mut Vec<(u64, LinkMessage)>, parent: Option<usize>) {
+        for link in self.symbolic_links_vec() {
+            if link.parent != parent || !self.symbolic_link_emitted(&link) {
+                continue;
+            }
+            links.push((
+                link.creation_seq,
+                LinkMessage {
+                    name: link.name.clone(),
+                    target: link.target.clone(),
+                    creation_order: None,
+                },
+            ));
+        }
+    }
+
     /// Refuse a caller path that would have to leave this file through one of
     /// the external links a reopened file brought in.
     ///
@@ -4147,6 +4274,30 @@ impl Hdf5Writer {
                  kept exactly as it found it because {why}"
             ))),
         }
+    }
+
+    /// Every link this writer will emit that names a *path* rather than an
+    /// object, with the class a listing reports for it: the soft and external
+    /// links created this session, and the ones a reopen is carrying through.
+    ///
+    /// The object listings answer for hard links, so a write-mode link
+    /// listing is this plus those; keeping both sources in one place is what
+    /// stops a listing from seeing a kind the class lookup does not, or the
+    /// reverse.
+    pub(crate) fn path_link_classes(&self) -> Vec<(String, crate::io::reader::LinkClass)> {
+        let mut out: Vec<(String, crate::io::reader::LinkClass)> = self
+            .symbolic_links_vec()
+            .iter()
+            .filter(|l| self.symbolic_link_emitted(l))
+            .map(|l| {
+                (
+                    self.symbolic_link_full_path(l),
+                    crate::io::reader::LinkClass::from_target(&l.target),
+                )
+            })
+            .collect();
+        out.extend(self.preserved_link_paths());
+        out
     }
 
     /// Every link this writer is carrying but cannot express, by full path.
@@ -4222,6 +4373,7 @@ impl Hdf5Writer {
                     ));
                 }
                 self.push_hard_links(&mut links, None);
+                self.push_symbolic_links(&mut links, None);
             }
             LinkScope::Group(group_idx) => {
                 // Snapshot the child lists, then drop the slot guard: the
@@ -4257,6 +4409,7 @@ impl Hdf5Writer {
                     ));
                 }
                 self.push_hard_links(&mut links, Some(group_idx));
+                self.push_symbolic_links(&mut links, Some(group_idx));
             }
         }
         // Creation order, not order by kind: a run of create_group and

@@ -1829,6 +1829,121 @@ fn past_max_compact_the_link_set_goes_dense() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A soft link stores a path and libhdf5 resolves it on traversal, so the
+/// bytes have to say "soft" rather than name an address: h5py reports
+/// `SoftLink` and follows it to the target, and a link whose target does not
+/// exist is a legal file that reports the same value and fails only when
+/// something tries to open it.
+#[test]
+fn soft_links_read_back_through_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("link_soft");
+    {
+        let file = H5File::create(&path).unwrap();
+        file.new_dataset::<i32>()
+            .shape([8])
+            .create("orig")
+            .unwrap()
+            .write_raw(&(0..8i32).collect::<Vec<_>>())
+            .unwrap();
+        file.create_soft_link("alias", "/orig").unwrap();
+        let grp = file.create_group("g").unwrap();
+        grp.create_soft_link("up", "/orig").unwrap();
+        grp.create_soft_link("nowhere", "/absent").unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "l = f.get('alias', getlink=True)\n\
+         assert isinstance(l, h5py.SoftLink), l\n\
+         assert l.path == '/orig', l.path\n\
+         assert list(f['alias'][:]) == list(range(8))\n\
+         assert f['alias'] == f['orig']\n\
+         g = f['g']\n\
+         assert sorted(g.keys()) == ['nowhere', 'up']\n\
+         assert g.get('up', getlink=True).path == '/orig'\n\
+         assert g.get('nowhere', getlink=True).path == '/absent'\n\
+         try:\n\
+         \x20   g['nowhere']\n\
+         \x20   raise AssertionError('a dangling soft link must not resolve')\n\
+         except KeyError:\n\
+         \x20   pass\n",
+    );
+
+    // And this crate reads its own soft links back.
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(
+        file.root_group().link_class("alias").unwrap(),
+        rust_hdf5::LinkClass::Soft {
+            path: "/orig".into()
+        }
+    );
+    let g = file.root_group().group("g").unwrap();
+    let mut names = g.link_names().unwrap();
+    names.sort();
+    assert_eq!(names, vec!["nowhere".to_string(), "up".to_string()]);
+    assert_eq!(
+        g.link_class("nowhere").unwrap(),
+        rust_hdf5::LinkClass::Soft {
+            path: "/absent".into()
+        }
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// The phase change counts links, not objects: a group whose set crosses
+/// `max_compact` on the strength of its soft links spills the whole set into
+/// a fractal heap, and every soft link has to come back out of it with its
+/// value intact.
+#[test]
+fn soft_links_take_part_in_the_dense_phase_change() {
+    let Some(py) = python() else { return };
+    let path = tmp("link_soft_dense");
+    {
+        let file = H5File::create(&path).unwrap();
+        let g = file.create_group("g").unwrap();
+        g.new_dataset::<i32>()
+            .shape([1])
+            .create("d")
+            .unwrap()
+            .write_raw(&[7i32])
+            .unwrap();
+        // One real object plus ten soft links: eleven links, past the eight
+        // a group header keeps.
+        for i in 0..10i32 {
+            g.create_soft_link(&format!("s{i:02}"), "/g/d").unwrap();
+        }
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "g = f['g']\n\
+         assert sorted(g.keys()) == ['d'] + ['s%02d' % i for i in range(10)]\n\
+         for i in range(10):\n\
+         \x20   l = g.get('s%02d' % i, getlink=True)\n\
+         \x20   assert isinstance(l, h5py.SoftLink), l\n\
+         \x20   assert l.path == '/g/d', l.path\n\
+         \x20   assert g['s%02d' % i][0] == 7\n\
+         i = h5py.h5o.get_info(g.id)\n\
+         assert i.meta_size.obj.index_size > 0, 'expected dense links'\n\
+         assert i.meta_size.obj.heap_size > 0, i.meta_size.obj.heap_size\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let g = file.root_group().group("g").unwrap();
+    for i in 0..10 {
+        assert_eq!(
+            g.link_class(&format!("s{i:02}")).unwrap(),
+            rust_hdf5::LinkClass::Soft {
+                path: "/g/d".into()
+            }
+        );
+    }
+    std::fs::remove_file(&path).ok();
+}
+
 /// A path-like dataset name resolves through real groups instead of becoming
 /// a link whose name contains a `/`. HDF5 link names are single path
 /// components, so libhdf5's own traversal cannot reconstruct such a name:
