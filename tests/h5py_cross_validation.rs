@@ -2032,6 +2032,89 @@ fn soft_links_take_part_in_the_dense_phase_change() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A committed datatype is an object of its own, and a dataset built on it
+/// stores a pointer to that object instead of a datatype message. libhdf5 has
+/// to agree on both halves: `committed()` on the dataset's type, and a
+/// reference count that counts each sharer as well as the link — a type with
+/// one name and two datasets on it is `rc == 3`.
+#[test]
+fn committed_datatypes_read_back_through_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("named_datatype");
+    {
+        let file = H5File::create(&path).unwrap();
+        file.commit_datatype("t", DatatypeMessage::i32_type())
+            .unwrap();
+        // A type nothing shares is still a complete object, and a group can
+        // hold one.
+        let types = file.create_group("types").unwrap();
+        types
+            .commit_datatype("lonely", DatatypeMessage::f64_type())
+            .unwrap();
+
+        file.new_dataset::<i32>()
+            .shape([8])
+            .create("data")
+            .unwrap()
+            .write_raw(&(0..8i32).collect::<Vec<_>>())
+            .unwrap();
+        for name in ["shared", "shared2"] {
+            file.new_dataset::<i32>()
+                .committed_type("t")
+                .shape([8])
+                .create(name)
+                .unwrap()
+                .write_raw(&(0..8i32).collect::<Vec<_>>())
+                .unwrap();
+        }
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "import numpy as np\n\
+         assert isinstance(f['t'], h5py.Datatype), type(f['t'])\n\
+         assert f['t'].dtype == np.dtype('<i4'), f['t'].dtype\n\
+         assert f['types/lonely'].dtype == np.dtype('<f8')\n\
+         assert h5py.h5o.get_info(f['t'].id).rc == 3\n\
+         assert h5py.h5o.get_info(f['types/lonely'].id).rc == 1\n\
+         for name in ('shared', 'shared2'):\n\
+         \x20   t = f[name].id.get_type()\n\
+         \x20   assert t.committed(), name\n\
+         \x20   assert t == f['t'].id, name\n\
+         \x20   assert list(f[name][:]) == list(range(8))\n\
+         assert not f['data'].id.get_type().committed()\n\
+         assert list(f['data'][:]) == list(range(8))\n\
+         assert sorted(f.keys()) == ['data', 'shared', 'shared2', 't', 'types']\n",
+    );
+
+    // And this crate reads its own committed datatypes back, including the
+    // shared pointer on the datasets built from one.
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.named_datatype_names();
+    names.sort();
+    assert_eq!(names, vec!["t".to_string(), "types/lonely".to_string()]);
+    assert_eq!(
+        file.named_datatype("t").unwrap().datatype().unwrap(),
+        DatatypeMessage::i32_type()
+    );
+    assert_eq!(
+        file.named_datatype("types/lonely")
+            .unwrap()
+            .datatype()
+            .unwrap(),
+        DatatypeMessage::f64_type()
+    );
+    for name in ["data", "shared", "shared2"] {
+        assert_eq!(
+            file.dataset(name).unwrap().read_raw::<i32>().unwrap(),
+            (0..8i32).collect::<Vec<_>>(),
+            "{name}"
+        );
+    }
+    std::fs::remove_file(&path).ok();
+}
+
 /// A path-like dataset name resolves through real groups instead of becoming
 /// a link whose name contains a `/`. HDF5 link names are single path
 /// components, so libhdf5's own traversal cannot reconstruct such a name:

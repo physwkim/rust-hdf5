@@ -175,6 +175,46 @@ impl H5Group {
         )
     }
 
+    /// Commit a datatype in this group under `name` — `H5Tcommit2`, h5py's
+    /// `group["name"] = dtype`.
+    ///
+    /// The type becomes an object of its own, so datasets can be built on it
+    /// with [`DatasetBuilder::committed_type`](crate::dataset::DatasetBuilder::committed_type)
+    /// and share one definition instead of each carrying a copy. A committed
+    /// datatype no dataset ever uses is still a complete object, and h5py
+    /// reads it back as a `Datatype`.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    /// use rust_hdf5::format::messages::datatype::DatatypeMessage;
+    ///
+    /// let file = H5File::create("committed.h5").unwrap();
+    /// let grp = file.create_group("types").unwrap();
+    /// grp.commit_datatype("temperature", DatatypeMessage::f64_type()).unwrap();
+    /// ```
+    pub fn commit_datatype(
+        &self,
+        name: &str,
+        datatype: crate::format::messages::datatype::DatatypeMessage,
+    ) -> Result<()> {
+        let full_name = if self.name == "/" {
+            name.to_string()
+        } else {
+            format!("{}/{}", self.name.trim_start_matches('/'), name)
+        };
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => {
+                writer.commit_datatype(&full_name, datatype)?;
+                Ok(())
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot commit datatypes in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
     /// Both symbolic-link constructors, behind one writer-mode check.
     fn create_symbolic_link(&self, link_name: &str, target: LinkTarget) -> Result<()> {
         let inner = borrow_inner(&self.file_inner);
@@ -645,6 +685,7 @@ impl H5Group {
                 drop(inner);
                 names.extend(self.dataset_names()?);
                 names.extend(self.group_names()?);
+                names.extend(self.named_datatype_names()?);
                 Ok(names.into_iter().collect())
             }
             H5FileInner::Closed => Ok(vec![]),
@@ -661,7 +702,8 @@ impl H5Group {
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>(),
-            H5FileInner::Writer(_) | H5FileInner::Closed => return Ok(vec![]),
+            H5FileInner::Writer(writer) => writer.committed_datatype_names(),
+            H5FileInner::Closed => return Ok(vec![]),
         };
         Ok(all
             .iter()

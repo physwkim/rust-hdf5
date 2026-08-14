@@ -126,6 +126,38 @@ impl SharedMessagePointer {
             oh_addr,
         })
     }
+
+    /// The pointer a dataset (or attribute) built on a committed datatype
+    /// stores in place of the message body.
+    ///
+    /// `H5O__shared_encode` picks version 2 for `H5O_SHARE_TYPE_COMMITTED` —
+    /// version 3 exists for the heap form, which needs a flag byte version 2
+    /// has no room for — so a committed pointer libhdf5 wrote and one written
+    /// here agree byte for byte.
+    pub fn committed(oh_addr: u64) -> Self {
+        Self {
+            version: 2,
+            location: SharedLocation::Committed,
+            heap_id: [0u8; SOHM_HEAP_ID_LEN],
+            oh_addr,
+        }
+    }
+
+    /// Encode the committed form — the inverse of [`decode`](Self::decode)
+    /// for the one shape this crate writes.
+    ///
+    /// Only the committed form is produced, so this takes the address rather
+    /// than a pointer and cannot fail: nothing here shares through the SOHM
+    /// heap, and the version-1 form libhdf5 no longer writes has a symbol
+    /// table entry in it that nothing here can fill.
+    pub fn encode_committed(oh_addr: u64, ctx: &FormatContext) -> Vec<u8> {
+        let sa = ctx.sizeof_addr as usize;
+        let mut buf = Vec::with_capacity(2 + sa);
+        buf.push(2); // H5O_SHARED_VERSION_2
+        buf.push(2); // H5O_SHARE_TYPE_COMMITTED
+        buf.extend_from_slice(&oh_addr.to_le_bytes()[..sa]);
+        buf
+    }
 }
 
 /// One SOHM index header, as stored in the master table.
@@ -353,6 +385,36 @@ mod tests {
         assert_eq!(type_flag(MSG_FILL_VALUE_OLD), type_flag(MSG_FILL_VALUE));
         assert_eq!(type_flag(MSG_FILL_VALUE), Some(1 << MSG_FILL_VALUE));
         assert_eq!(type_flag(crate::format::messages::MSG_LINK), None);
+    }
+
+    /// The bytes h5py's `h5d.create` from a committed TypeID left in the
+    /// dataset's datatype message: version 2, `H5O_SHARE_TYPE_COMMITTED`,
+    /// then the datatype object header's address.
+    #[test]
+    fn committed_pointer_encodes_the_bytes_h5o_shared_encode_writes() {
+        let buf = SharedMessagePointer::encode_committed(0x320, &ctx());
+        let mut want = vec![2u8, 2u8];
+        want.extend_from_slice(&0x320u64.to_le_bytes());
+        assert_eq!(buf, want);
+        assert_eq!(
+            SharedMessagePointer::decode(&buf, &ctx()).unwrap(),
+            SharedMessagePointer::committed(0x320)
+        );
+    }
+
+    /// A four-byte address file narrows the pointer to match.
+    #[test]
+    fn committed_pointer_follows_the_address_width() {
+        let ctx4 = FormatContext {
+            sizeof_addr: 4,
+            sizeof_size: 4,
+        };
+        let buf = SharedMessagePointer::encode_committed(0x1234, &ctx4);
+        assert_eq!(buf, vec![2u8, 2, 0x34, 0x12, 0, 0]);
+        assert_eq!(
+            SharedMessagePointer::decode(&buf, &ctx4).unwrap().oh_addr,
+            0x1234
+        );
     }
 
     #[test]

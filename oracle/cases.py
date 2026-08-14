@@ -400,7 +400,7 @@ COMPOSITE_CASES = [
          "variable-length i32 sequences"),
     Case("vlen_bytes", "dtype-composite", gen_vlen_bytes, "vlen_bytes",
          "variable-length u8 sequences"),
-    Case("named_datatype", "dtype-composite", gen_named_datatype, None,
+    Case("named_datatype", "dtype-composite", gen_named_datatype, "named_datatype",
          "committed datatype object, and a dataset that shares it"),
 ]
 

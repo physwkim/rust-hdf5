@@ -1590,6 +1590,22 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "named_datatype" => {
+            let file = H5File::create(path)?;
+            file.commit_datatype("t", DatatypeMessage::i32_type())?;
+            // `data` describes its own type; `shared` points at /t.
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("data")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.new_dataset::<i32>()
+                .committed_type("t")
+                .shape([8usize])
+                .create("shared")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "opaque" => {
             let file = H5File::create(path)?;
             let bytes: Vec<u8> = (0u8..12).collect();
