@@ -1659,6 +1659,21 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
 
         // ---- layouts and chunk indexes ----------------------------------
         "layout_contiguous" => simple_ramp::<i32>(path, ramp_n::<i32>(16)),
+        "layout_compact" => {
+            let file = H5File::create(path)?;
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([16usize])
+                .compact()
+                .create("data")?;
+            ds.write_raw(&ramp_n::<i32>(16))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "layout_contiguous_v108" => layout_at_libver(path, LibverBound::V18, None),
+        "layout_contiguous_v110" => layout_at_libver(path, LibverBound::V110, None),
+        "layout_chunked_v108" => layout_at_libver(path, LibverBound::V18, Some(&[16])),
+        "layout_chunked_v110" => layout_at_libver(path, LibverBound::V110, Some(&[16])),
         "chunkidx_btree1" => {
             let file = H5File::create(path)?;
             file.set_libver_latest(false)?;
@@ -1714,6 +1729,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
 
         // ---- filters ------------------------------------------------------
         "filter_deflate" => filtered(path, |b| b.deflate(6)),
+        "filter_shuffle" => filtered(path, |b| b.shuffle()),
         "filter_deflate_shuffle" => filtered(path, |b| b.shuffle_deflate(6)),
         "filter_fletcher32" => filtered(path, |b| {
             b.filter_pipeline(FilterPipeline {
@@ -2018,8 +2034,29 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         }
 
         // ---- library version bounds -----------------------------------------
-        "libver_earliest" => libver_case(path, false),
-        "libver_latest" => libver_case(path, true),
+        "libver_earliest" => libver_case(path, LibverBound::Earliest),
+        "libver_v108" => libver_case(path, LibverBound::V18),
+        "libver_v110" => libver_case(path, LibverBound::V110),
+        "libver_latest" => libver_case(path, LibverBound::V200),
+        "userblock" => {
+            let file = H5File::options().userblock(512).create(path)?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("data")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.root_group().create_group("g")?;
+            file.close()?;
+            // The h5py arm fills the block with a shebang line afterwards, as
+            // an application that keeps a script there would; the block is the
+            // application's, so this is a plain write to the front of the file.
+            let prefix = b"#!/bin/sh\n# userblock\n";
+            let mut block = prefix.to_vec();
+            block.resize(511, b'#');
+            block.push(b'\n');
+            let mut fh = std::fs::OpenOptions::new().write(true).open(path)?;
+            std::io::Write::write_all(&mut fh, &block)?;
+            Ok(Ok(()))
+        }
 
         // ---- SWMR and bulk ---------------------------------------------------
         "swmr_created" => {
@@ -2120,14 +2157,30 @@ fn filtered(
     Ok(Ok(()))
 }
 
-fn libver_case(path: &str, latest: bool) -> rust_hdf5::Result<WriteResult> {
-    let file = H5File::create(path)?;
-    file.set_libver_latest(latest)?;
+fn libver_case(path: &str, libver: LibverBound) -> rust_hdf5::Result<WriteResult> {
+    let file = H5File::options().libver(libver).create(path)?;
     file.new_dataset::<i32>()
         .shape([8usize])
         .create("data")?
         .write_raw(&ramp_n::<i32>(8))?;
     file.root_group().create_group("g")?;
+    file.close()?;
+    Ok(Ok(()))
+}
+
+/// A single 16-element i32 ramp under an explicit libver bound: contiguous
+/// when `chunk` is `None`, one whole-dataset chunk when it is `Some`.
+fn layout_at_libver(
+    path: &str,
+    libver: LibverBound,
+    chunk: Option<&[usize]>,
+) -> rust_hdf5::Result<WriteResult> {
+    let file = H5File::options().libver(libver).create(path)?;
+    let mut builder = file.new_dataset::<i32>().shape([16usize]);
+    if let Some(chunk) = chunk {
+        builder = builder.chunk(chunk);
+    }
+    builder.create("data")?.write_raw(&ramp_n::<i32>(16))?;
     file.close()?;
     Ok(Ok(()))
 }

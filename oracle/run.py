@@ -94,21 +94,36 @@ B_TOLERATED_FIELDS = {
 # a rerun after a writer fix shows the change rather than hiding it.
 EXPECTED_DEVIATIONS = [
     {
-        "id": "superblock-always-v3",
+        "id": "superblock-floor-v2",
+        "field": "superblock",
+        "ref": "0",
+        "rust": "2",
+        "why": "libhdf5 writes a v0 superblock at the earliest libver bound, "
+               "over symbol-table groups and version-1 object headers; this "
+               "writer emits neither, and no libhdf5 writes a v0 superblock "
+               "over the link-message groups it does emit, so its floor is "
+               "the v1.8 bound's version 2 (HDF5_superblock_ver_bounds)",
+    },
+    {
+        "id": "superblock-v3-for-chunk-index",
         "field": "superblock",
         "ref": None,
         "rust": "3",
-        "why": "the writer emits a v3 superblock for every file it creates; "
-               "H5File::set_libver_latest(false) does not select an older one",
+        "why": "every chunked dataset this writer emits is indexed by a v1.10 "
+               "structure through a version-4 data layout message, which "
+               "H5O_layout_ver_bounds puts at the v1.10 bound and so at "
+               "superblock version 3, whatever bound the file asked for",
     },
     {
         "id": "btree1-index-substituted",
         "field": "chunkindex",
         "ref": "btree1",
-        "rust": "earray",
+        "rust": None,
         "why": "a v1 B-tree chunk index is only legal below superblock v3, so "
-               "this follows from superblock-always-v3: one unlimited "
-               "dimension in a v3 file selects the extensible array",
+               "this follows from superblock-v3-for-chunk-index: the file gets "
+               "whichever v1.10 index its shape selects — the extensible array "
+               "for one unlimited dimension, the single-chunk index for a "
+               "fixed shape covered by one chunk",
     },
     {
         "id": "new-style-groups-always",
@@ -117,7 +132,7 @@ EXPECTED_DEVIATIONS = [
         "rust": "compact",
         "why": "the writer emits a version-2 object header for every group, so "
                "links libhdf5 would keep in a symbol table are stored as link "
-               "messages; follows from superblock-always-v3, and the phase "
+               "messages; the same cause as superblock-floor-v2, and the phase "
                "change past max_compact still moves them to dense storage",
     },
     {

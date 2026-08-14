@@ -79,6 +79,21 @@ impl LibverBound {
             Self::V200 => 5,
         }
     }
+
+    /// The superblock version this bound calls for — libhdf5's
+    /// `HDF5_superblock_ver_bounds` (H5Fsuper.c:68), the floor
+    /// `H5F__super_init` raises the content-derived version to.
+    ///
+    /// Version 0 is the `H5F_LIBVER_EARLIEST` entry
+    /// (`HDF5_SUPERBLOCK_VERSION_DEF`); a writer whose own structures need
+    /// more takes the higher of the two.
+    pub fn superblock_version(self) -> u8 {
+        match self {
+            Self::Earliest => 0,
+            Self::V18 => 2,
+            Self::V110 | Self::V112 | Self::V114 | Self::V200 => 3,
+        }
+    }
 }
 
 /// Which generation of the on-disk object format one file's objects are
