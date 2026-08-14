@@ -30,6 +30,7 @@
 /// msg_data:       [u8; msg_data_size]
 /// ```
 use crate::format::checksum::checksum_metadata;
+use crate::format::creation_order::CreationOrder;
 use crate::format::{FormatError, FormatResult};
 
 /// The 4-byte object header v2 signature.
@@ -116,15 +117,33 @@ impl ObjectHeader {
         });
     }
 
-    /// Track (and index) attribute creation order on this header.
+    /// Declare `order` as this object's attribute creation-order policy.
     ///
     /// `H5Pget_attr_creation_order` reads these two bits back out of the
     /// header, not out of the Attribute Info message (`H5Pocpl.c`), so they
     /// are what makes an object report its attributes as creation-ordered.
-    /// Setting them also widens every message envelope by the two-byte
+    /// Setting `TRACKED` also widens every message envelope by the two-byte
     /// creation index.
-    pub fn track_attribute_creation_order(&mut self) {
-        self.flags |= FLAG_ATTR_CREATION_ORDER_TRACKED | FLAG_ATTR_CREATION_ORDER_INDEXED;
+    pub fn set_attribute_creation_order(&mut self, order: CreationOrder) {
+        self.flags &= !(FLAG_ATTR_CREATION_ORDER_TRACKED | FLAG_ATTR_CREATION_ORDER_INDEXED);
+        if order.is_tracked() {
+            self.flags |= FLAG_ATTR_CREATION_ORDER_TRACKED;
+        }
+        if order.is_indexed() {
+            self.flags |= FLAG_ATTR_CREATION_ORDER_INDEXED;
+        }
+    }
+
+    /// This object's attribute creation-order policy, as its flag bits
+    /// declare it — the reverse of
+    /// [`set_attribute_creation_order`](Self::set_attribute_creation_order),
+    /// and what a reopen must consult so a rewrite re-declares what the file
+    /// already says.
+    pub fn attribute_creation_order(&self) -> CreationOrder {
+        CreationOrder::from_flags(
+            self.flags & FLAG_ATTR_CREATION_ORDER_TRACKED != 0,
+            self.flags & FLAG_ATTR_CREATION_ORDER_INDEXED != 0,
+        )
     }
 
     /// Returns the number of bytes used to encode chunk0's data size, based on
@@ -698,7 +717,7 @@ mod tests {
     #[test]
     fn a_tracked_header_round_trips_each_message_creation_index() {
         let mut hdr = ObjectHeader::new();
-        hdr.track_attribute_creation_order();
+        hdr.set_attribute_creation_order(CreationOrder::Indexed);
         hdr.add_message_indexed(0x0C, 0x00, vec![0xAA; 6], 0);
         hdr.add_message_indexed(0x0C, 0x00, vec![0xBB; 6], 1);
         hdr.add_message_indexed(0x0C, 0x00, vec![0xCC; 6], 2);
@@ -716,6 +735,39 @@ mod tests {
         assert!(plain.encode().unwrap().len() < encoded.len());
         let (plain_back, _) = ObjectHeader::decode(&plain.encode().unwrap()).unwrap();
         assert_eq!(plain_back.messages[0].creation_index, 0);
+    }
+
+    /// The two flag bits are set and read back independently, so a header that
+    /// tracks without indexing survives a decode as exactly that — the state
+    /// `H5Pset_attr_creation_order(H5P_CRT_ORDER_TRACKED)` produces.
+    #[test]
+    fn each_attribute_creation_order_state_round_trips_through_the_flags() {
+        for order in [
+            CreationOrder::Untracked,
+            CreationOrder::Tracked,
+            CreationOrder::Indexed,
+        ] {
+            let mut hdr = ObjectHeader::new();
+            hdr.set_attribute_creation_order(order);
+            hdr.add_message_indexed(0x0C, 0x00, vec![0xAA; 6], 3);
+            let (decoded, _) = ObjectHeader::decode(&hdr.encode().unwrap()).unwrap();
+            assert_eq!(decoded.attribute_creation_order(), order);
+            let want_index = if order.is_tracked() { 3 } else { 0 };
+            assert_eq!(decoded.messages[0].creation_index, want_index);
+        }
+    }
+
+    /// Setting a policy clears whatever the previous one left behind, so a
+    /// header recovered as indexed and re-declared untracked does not keep a
+    /// stale bit.
+    #[test]
+    fn setting_a_weaker_policy_clears_the_stronger_one() {
+        let mut hdr = ObjectHeader::new();
+        hdr.set_attribute_creation_order(CreationOrder::Indexed);
+        hdr.set_attribute_creation_order(CreationOrder::Untracked);
+        assert_eq!(hdr.attribute_creation_order(), CreationOrder::Untracked);
+        // Bits 0-1 (the chunk0 size encoding) are untouched.
+        assert_eq!(hdr.flags, 0x02);
     }
 
     #[test]

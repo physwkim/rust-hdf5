@@ -8,6 +8,7 @@ pub mod btree_v1;
 pub(crate) mod bytes;
 pub mod checksum;
 pub mod chunk_index;
+pub mod creation_order;
 pub mod dense_attr;
 pub mod dense_link;
 pub mod fractal_heap;

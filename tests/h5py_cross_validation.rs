@@ -2222,3 +2222,199 @@ fn an_unreadable_dense_attribute_set_is_reported_on_the_object() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// Run `script` as-is. Needed where the file has to be created through the
+/// low-level property lists, which `h5py.File` cannot express.
+fn run_python(py: &str, script: &str) {
+    let out = std::process::Command::new(py)
+        .arg("-c")
+        .arg(script)
+        .output()
+        .expect("failed to spawn python");
+    assert!(
+        out.status.success(),
+        "python failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The creation-order policy `path`'s group at `group_path` declares on disk,
+/// as `(links, attrs)` — read straight out of the bytes rather than through
+/// any library, so the assertion is on what was written.
+fn on_disk_creation_order(
+    path: &std::path::Path,
+    group_path: &str,
+) -> (
+    rust_hdf5::format::creation_order::CreationOrder,
+    rust_hdf5::format::creation_order::CreationOrder,
+) {
+    use rust_hdf5::format::creation_order::CreationOrder;
+    use rust_hdf5::format::messages::link::{LinkMessage, LinkTarget};
+    use rust_hdf5::format::messages::link_info::LinkInfoMessage;
+    use rust_hdf5::format::messages::{MSG_LINK, MSG_LINK_INFO};
+    use rust_hdf5::format::object_header::ObjectHeader;
+    use rust_hdf5::format::superblock::SuperblockV2V3;
+    use rust_hdf5::format::FormatContext;
+
+    let bytes = std::fs::read(path).unwrap();
+    let sb = SuperblockV2V3::decode(&bytes).unwrap();
+    let ctx = FormatContext {
+        sizeof_addr: sb.sizeof_offsets,
+        sizeof_size: sb.sizeof_lengths,
+    };
+    let mut addr = sb.root_group_object_header_address;
+    let mut header = ObjectHeader::decode(&bytes[addr as usize..]).unwrap().0;
+    for component in group_path.split('/').filter(|c| !c.is_empty()) {
+        addr = header
+            .messages
+            .iter()
+            .filter(|m| m.msg_type == MSG_LINK)
+            .filter_map(|m| LinkMessage::decode(&m.data, &ctx).ok())
+            .find_map(|(l, _)| match l.target {
+                LinkTarget::Hard { address } if l.name == component => Some(address),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no link '{component}' in {group_path}"));
+        header = ObjectHeader::decode(&bytes[addr as usize..]).unwrap().0;
+    }
+    let links = header
+        .messages
+        .iter()
+        .find(|m| m.msg_type == MSG_LINK_INFO)
+        .and_then(|m| LinkInfoMessage::decode(&m.data, &ctx).ok())
+        .map(|(i, _)| i.creation_order())
+        .unwrap_or(CreationOrder::Untracked);
+    (links, header.attribute_creation_order())
+}
+
+/// A file may track link creation order without tracking attribute creation
+/// order, or the reverse: `H5Pset_link_creation_order` writes the Link Info
+/// message's flags and `H5Pset_attr_creation_order` writes the object
+/// header's own flags, and libhdf5 reads each back from its own place. A
+/// reopen that rewrites those headers has to recover the two independently —
+/// inferring both from the header bits gave a one-of-two file both or neither.
+///
+/// The fixture is deliberately small. A libhdf5 object header that outgrows
+/// its first chunk continues into an OCHK block, and this crate's reopen walk
+/// still stops at chunk 0, so a larger fixture would lose links and
+/// attributes to that separate defect instead of testing this one.
+#[test]
+fn each_creation_order_subsystem_survives_a_reopen_rewrite_on_its_own() {
+    use rust_hdf5::format::creation_order::CreationOrder;
+    let Some(py) = python() else { return };
+
+    for &(name, links, attrs) in &[
+        ("none", false, false),
+        ("links", true, false),
+        ("attrs", false, true),
+        ("both", true, true),
+    ] {
+        let path = tmp(&format!("creation_order_{name}"));
+        // h5py's `File(track_order=...)` sets both subsystems at once, which
+        // is exactly the case that cannot tell them apart, so the split
+        // combinations go through the low-level property lists.
+        run_python(
+            py,
+            &format!(
+                "import h5py, numpy as np\n\
+                 T = h5py.h5p.CRT_ORDER_TRACKED | h5py.h5p.CRT_ORDER_INDEXED\n\
+                 fapl = h5py.h5p.create(h5py.h5p.FILE_ACCESS)\n\
+                 fapl.set_libver_bounds(h5py.h5f.LIBVER_V18, h5py.h5f.LIBVER_V18)\n\
+                 fcpl = h5py.h5p.create(h5py.h5p.FILE_CREATE)\n\
+                 gcpl = h5py.h5p.create(h5py.h5p.GROUP_CREATE)\n\
+                 for p in (fcpl, gcpl):\n\
+                 \x20   p.set_link_creation_order(T if {links} else 0)\n\
+                 \x20   p.set_attr_creation_order(T if {attrs} else 0)\n\
+                 fid = h5py.h5f.create(rb'{path}', h5py.h5f.ACC_TRUNC, fcpl=fcpl, fapl=fapl)\n\
+                 f = h5py.File(fid)\n\
+                 f.attrs['x'] = np.int32(5)\n\
+                 g = h5py.Group(h5py.h5g.create(f.id, b'g', gcpl=gcpl))\n\
+                 g.attrs['y'] = np.int32(6)\n\
+                 g.create_dataset('c', data=np.arange(4, dtype='<i4'))\n\
+                 f.close()\n",
+                links = if links { "True" } else { "False" },
+                attrs = if attrs { "True" } else { "False" },
+                path = path.display(),
+            ),
+        );
+
+        let order = |on: bool| {
+            if on {
+                CreationOrder::Indexed
+            } else {
+                CreationOrder::Untracked
+            }
+        };
+        let want = (order(links), order(attrs));
+        assert_eq!(
+            on_disk_creation_order(&path, "/"),
+            want,
+            "{name}: as written"
+        );
+        assert_eq!(
+            on_disk_creation_order(&path, "g"),
+            want,
+            "{name}: /g as written"
+        );
+
+        // Reopening and adding an object to each group rewrites both headers
+        // from whatever state the reopen recovered.
+        {
+            let file = H5File::open_rw(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([1])
+                .create("added")
+                .unwrap()
+                .write_raw(&[99])
+                .unwrap();
+            file.root_group()
+                .group("g")
+                .unwrap()
+                .new_dataset::<i32>()
+                .shape([1])
+                .create("added2")
+                .unwrap()
+                .write_raw(&[98])
+                .unwrap();
+            file.close().unwrap();
+        }
+
+        assert_eq!(
+            on_disk_creation_order(&path, "/"),
+            want,
+            "{name}: root after the rust rewrite"
+        );
+        assert_eq!(
+            on_disk_creation_order(&path, "g"),
+            want,
+            "{name}: /g after the rust rewrite"
+        );
+
+        // And libhdf5 agrees, reading the same bits through its own API. The
+        // link *order* a reopen re-stamps is discovery order rather than what
+        // the file recorded — a separate gap from the policy flags this test
+        // pins — so the names are compared as a set.
+        read_back_with_h5py(
+            py,
+            &path,
+            &format!(
+                "from h5py import h5p\n\
+                 T = h5p.CRT_ORDER_TRACKED | h5p.CRT_ORDER_INDEXED\n\
+                 want = (T if {links} else 0, T if {attrs} else 0)\n\
+                 for g in (f['/'], f['g']):\n\
+                 \x20   c = g.id.get_create_plist()\n\
+                 \x20   got = (c.get_link_creation_order(), c.get_attr_creation_order())\n\
+                 \x20   assert got == want, (g.name, got, want)\n\
+                 assert sorted(f.keys()) == ['added', 'g'], list(f.keys())\n\
+                 assert sorted(f['g'].keys()) == ['added2', 'c'], list(f['g'].keys())\n\
+                 assert dict(f.attrs) == {{'x': 5}}, dict(f.attrs)\n\
+                 assert dict(f['g'].attrs) == {{'y': 6}}, dict(f['g'].attrs)\n\
+                 assert list(f['g']['c'][...]) == [0, 1, 2, 3], list(f['g']['c'][...])\n\
+                 assert f['added'][0] == 99 and f['g']['added2'][0] == 98\n",
+                links = if links { "True" } else { "False" },
+                attrs = if attrs { "True" } else { "False" },
+            ),
+        );
+        std::fs::remove_file(&path).ok();
+    }
+}

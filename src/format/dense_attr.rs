@@ -21,6 +21,7 @@ use crate::format::checksum::checksum_metadata;
 use crate::format::chunk_index::btree_v2::{
     collect_btree_v2_records, Bt2Header, Bt2Tree, BT2_TYPE_ATTR_CORDER, BT2_TYPE_ATTR_NAME,
 };
+use crate::format::creation_order::CreationOrder;
 use crate::format::fractal_heap::{
     collect_managed_blocks, read_heap_object, FractalHeapHeader, HeapId, HeapParams,
 };
@@ -130,13 +131,18 @@ pub struct DenseAttributeStorage {
 /// hands out is reported back through [`DenseAttributeStorage::blocks`], so a
 /// caller that abandons the result can free exactly what it took.
 ///
+/// `order` is the object's attribute creation-order policy: `Tracked` stamps
+/// each record with its real creation index and puts the running maximum in
+/// the `Attribute Info` message, and `Indexed` additionally bulk-loads the
+/// creation-order B-tree.
+///
 /// Mirrors `H5A__dense_create` followed by one `H5A__dense_insert` per
 /// attribute, except that the whole set is known up front, so the index is
 /// bulk-loaded rather than grown by insertion.
 pub fn build_dense_attributes(
     attrs: &[AttributeEntry],
     ctx: &FormatContext,
-    track_order: bool,
+    order: CreationOrder,
     alloc: &mut dyn FnMut(u64) -> u64,
 ) -> FormatResult<DenseAttributeStorage> {
     let objects: Vec<Vec<u8>> = attrs.iter().map(|a| a.encode(ctx)).collect();
@@ -145,8 +151,8 @@ pub fn build_dense_attributes(
     // `H5A__dense_btree2_name_compare` orders on the hash and breaks ties by
     // strcmp of the name pulled back out of the heap, so a bulk load has to
     // sort the same way or a lookup walking the tree misses records.
-    let mut order: Vec<usize> = (0..attrs.len()).collect();
-    order.sort_by(|&a, &b| {
+    let mut by_name: Vec<usize> = (0..attrs.len()).collect();
+    by_name.sort_by(|&a, &b| {
         name_hash(attrs[a].name())
             .cmp(&name_hash(attrs[b].name()))
             .then_with(|| attrs[a].name().cmp(attrs[b].name()))
@@ -157,15 +163,15 @@ pub fn build_dense_attributes(
     // tracking every record carries the "no creation index" sentinel
     // `H5O_MAX_CRT_ORDER_IDX` the library writes in that case.
     let corder = |i: usize| -> u32 {
-        if track_order {
+        if order.is_tracked() {
             i as u32
         } else {
             u32::from(MAX_CREATION_ORDER_INDEX)
         }
     };
 
-    let mut records = Vec::with_capacity(order.len() * NAME_RECORD_LEN);
-    for &i in &order {
+    let mut records = Vec::with_capacity(by_name.len() * NAME_RECORD_LEN);
+    for &i in &by_name {
         records.extend_from_slice(&heap.ids[i]);
         // Nothing here is a shared (SOHM) message.
         records.push(0);
@@ -185,7 +191,7 @@ pub fn build_dense_attributes(
 
     // The creation-order index, when it is asked for. Its records are already
     // in key order: the creation index of `attrs[i]` is `i`.
-    let corder_bt2_addr = track_order.then(|| {
+    let corder_bt2_addr = order.is_indexed().then(|| {
         let mut records = Vec::with_capacity(attrs.len() * CORDER_RECORD_LEN);
         for i in 0..attrs.len() {
             records.extend_from_slice(&heap.ids[i]);
@@ -206,7 +212,7 @@ pub fn build_dense_attributes(
         ainfo: AttributeInfoMessage {
             // `H5O__attr_create` post-increments, so after n attributes the
             // running maximum is n.
-            max_creation_index: track_order.then_some(attrs.len() as u16),
+            max_creation_index: order.is_tracked().then_some(attrs.len() as u16),
             fractal_heap_address: heap.header_addr,
             name_btree_address: bt2_addr,
             creation_order_btree_address: corder_bt2_addr,
@@ -329,8 +335,10 @@ mod tests {
     /// back through the dense reader.
     fn round_trip(attrs: &[AttributeEntry]) -> (MemFile, Vec<AttributeEntry>) {
         let mut file = MemFile::new();
-        let dense =
-            build_dense_attributes(attrs, &ctx(), false, &mut |len| file.alloc(len)).unwrap();
+        let dense = build_dense_attributes(attrs, &ctx(), CreationOrder::Untracked, &mut |len| {
+            file.alloc(len)
+        })
+        .unwrap();
         for block in &dense.blocks {
             assert_eq!(block.len as usize, block.image.len(), "block len vs image");
             let at = block.addr as usize;
@@ -407,8 +415,10 @@ mod tests {
             .map(|i| numeric(&format!("a{:02}", 11 - i), i as i32))
             .collect();
         let mut file = MemFile::new();
-        let dense =
-            build_dense_attributes(&attrs, &ctx(), true, &mut |len| file.alloc(len)).unwrap();
+        let dense = build_dense_attributes(&attrs, &ctx(), CreationOrder::Indexed, &mut |len| {
+            file.alloc(len)
+        })
+        .unwrap();
         for block in &dense.blocks {
             let at = block.addr as usize;
             file.bytes[at..at + block.image.len()].copy_from_slice(&block.image);
@@ -457,8 +467,10 @@ mod tests {
         // misordered bulk load would put a record under the wrong subtree.
         let attrs: Vec<AttributeEntry> = (0..64).map(|i| numeric(&format!("a{i}"), i)).collect();
         let mut file = MemFile::new();
-        let dense =
-            build_dense_attributes(&attrs, &ctx(), false, &mut |len| file.alloc(len)).unwrap();
+        let dense = build_dense_attributes(&attrs, &ctx(), CreationOrder::Untracked, &mut |len| {
+            file.alloc(len)
+        })
+        .unwrap();
         for block in &dense.blocks {
             let at = block.addr as usize;
             file.bytes[at..at + block.image.len()].copy_from_slice(&block.image);

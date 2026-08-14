@@ -20,6 +20,7 @@
 //! attribute info message no matter how many attribute messages it carries.
 
 use crate::format::bytes::read_le_addr as read_addr;
+use crate::format::creation_order::CreationOrder;
 use crate::format::{FormatContext, FormatError, FormatResult, UNDEF_ADDR};
 
 const VERSION: u8 = 0;
@@ -59,6 +60,18 @@ impl AttributeInfoMessage {
     /// Whether the attributes live in dense (fractal-heap) storage.
     pub fn is_dense(&self) -> bool {
         self.fractal_heap_address != UNDEF_ADDR
+    }
+
+    /// The attribute creation-order policy this message declares.
+    ///
+    /// `H5Pget_attr_creation_order` reads the object header's flags instead,
+    /// and `H5O__attr_create` asserts the two agree; this accessor exists so
+    /// the writer can keep that agreement rather than assume it.
+    pub fn creation_order(&self) -> CreationOrder {
+        CreationOrder::from_flags(
+            self.max_creation_index.is_some(),
+            self.creation_order_btree_address.is_some(),
+        )
     }
 
     // ------------------------------------------------------------------ encode

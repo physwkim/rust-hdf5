@@ -20,6 +20,7 @@ use crate::format::checksum::checksum_metadata;
 use crate::format::chunk_index::btree_v2::{
     collect_btree_v2_records, Bt2Header, Bt2Tree, BT2_TYPE_GRP_CORDER, BT2_TYPE_GRP_NAME,
 };
+use crate::format::creation_order::CreationOrder;
 use crate::format::fractal_heap::{
     collect_managed_blocks, read_heap_object, FractalHeapHeader, HeapId, HeapParams,
 };
@@ -124,12 +125,17 @@ pub struct DenseLinkStorage {
 /// hands out is reported back through [`DenseLinkStorage::blocks`], so a caller
 /// that abandons the result can free exactly what it took.
 ///
+/// `order` is the group's link creation-order policy: `Tracked` puts the
+/// running maximum in the `Link Info` message, and `Indexed` additionally
+/// bulk-loads the creation-order B-tree.
+///
 /// Mirrors `H5G__dense_create` followed by one `H5G__dense_insert` per link,
 /// except that the whole set is known up front, so the index is bulk-loaded
 /// rather than grown by insertion.
 pub fn build_dense_links(
     links: &[LinkMessage],
     ctx: &FormatContext,
+    order: CreationOrder,
     alloc: &mut dyn FnMut(u64) -> u64,
 ) -> FormatResult<DenseLinkStorage> {
     let objects: Vec<Vec<u8>> = links.iter().map(|l| l.encode(ctx)).collect();
@@ -138,15 +144,15 @@ pub fn build_dense_links(
     // `H5G__dense_btree2_name_compare` orders on the hash and breaks ties by
     // strcmp of the name pulled back out of the heap, so a bulk load has to
     // sort the same way or a lookup walking the tree misses records.
-    let mut order: Vec<usize> = (0..links.len()).collect();
-    order.sort_by(|&a, &b| {
+    let mut by_name: Vec<usize> = (0..links.len()).collect();
+    by_name.sort_by(|&a, &b| {
         name_hash(&links[a].name)
             .cmp(&name_hash(&links[b].name))
             .then_with(|| links[a].name.cmp(&links[b].name))
     });
 
-    let mut records = Vec::with_capacity(order.len() * NAME_RECORD_LEN);
-    for &i in &order {
+    let mut records = Vec::with_capacity(by_name.len() * NAME_RECORD_LEN);
+    for &i in &by_name {
         records.extend_from_slice(&name_hash(&links[i].name).to_le_bytes());
         records.extend_from_slice(&heap.ids[i]);
     }
@@ -161,15 +167,25 @@ pub fn build_dense_links(
         &mut blocks,
     );
 
-    // The creation-order index exists exactly when the links carry a creation
-    // order — the messages themselves are the authority, so no separate flag
-    // can disagree with what was written into the heap.
-    let corders: Option<Vec<i64>> = links.iter().map(|l| l.creation_order).collect();
-    let corder_bt2_addr = corders.as_ref().map(|corders| {
-        let mut order: Vec<usize> = (0..links.len()).collect();
-        order.sort_by_key(|&i| corders[i]);
-        let mut records = Vec::with_capacity(order.len() * CORDER_RECORD_LEN);
-        for &i in &order {
+    // Tracking is what stamps a creation order onto each link message, so a
+    // tracked group whose links carry none is a caller bug, not a file the
+    // index could be built without.
+    let corders: Option<Vec<i64>> = order
+        .is_tracked()
+        .then(|| links.iter().map(|l| l.creation_order).collect())
+        .flatten();
+    if order.is_tracked() && corders.is_none() {
+        return Err(FormatError::InvalidData(
+            "a group tracking link creation order has a link with no creation order".into(),
+        ));
+    }
+
+    let corder_bt2_addr = order.is_indexed().then(|| {
+        let corders = corders.as_ref().expect("indexed implies tracked");
+        let mut by_corder: Vec<usize> = (0..links.len()).collect();
+        by_corder.sort_by_key(|&i| corders[i]);
+        let mut records = Vec::with_capacity(by_corder.len() * CORDER_RECORD_LEN);
+        for &i in &by_corder {
             records.extend_from_slice(&corders[i].to_le_bytes());
             records.extend_from_slice(&heap.ids[i]);
         }
@@ -279,11 +295,19 @@ mod tests {
         }
     }
 
-    /// Lay `links` out, write the result into a fresh image, and read them
-    /// back through the dense reader.
+    /// Lay `links` out untracked, write the result into a fresh image, and
+    /// read them back through the dense reader.
     fn round_trip(links: &[LinkMessage]) -> (MemFile, DenseLinkStorage, Vec<LinkMessage>) {
+        round_trip_ordered(links, CreationOrder::Untracked)
+    }
+
+    /// [`round_trip`] under an explicit creation-order policy.
+    fn round_trip_ordered(
+        links: &[LinkMessage],
+        order: CreationOrder,
+    ) -> (MemFile, DenseLinkStorage, Vec<LinkMessage>) {
         let mut file = MemFile::new();
-        let dense = build_dense_links(links, &ctx(), &mut |len| file.alloc(len)).unwrap();
+        let dense = build_dense_links(links, &ctx(), order, &mut |len| file.alloc(len)).unwrap();
         for block in &dense.blocks {
             assert_eq!(block.len as usize, block.image.len(), "block len vs image");
             let at = block.addr as usize;
@@ -404,7 +428,7 @@ mod tests {
                     .with_creation_order(i as i64)
             })
             .collect();
-        let (mut file, dense, read) = round_trip(&links);
+        let (mut file, dense, read) = round_trip_ordered(&links, CreationOrder::Indexed);
         assert_eq!(read.len(), links.len());
         assert_eq!(dense.linfo.max_creation_order, Some(12));
 
@@ -424,8 +448,7 @@ mod tests {
         assert_eq!(corders, (0..12i64).collect::<Vec<_>>());
     }
 
-    /// Tracking off: no second index, no maximum. The link messages are the
-    /// only authority, so nothing else can turn it on.
+    /// Tracking off: no second index, no maximum.
     #[test]
     fn an_untracked_group_gets_no_creation_order_index() {
         let links: Vec<LinkMessage> = (0..12)
@@ -434,6 +457,39 @@ mod tests {
         let (_file, dense, _read) = round_trip(&links);
         assert_eq!(dense.linfo.creation_order_btree_address, None);
         assert_eq!(dense.linfo.max_creation_order, None);
+    }
+
+    /// `H5Pset_link_creation_order(H5P_CRT_ORDER_TRACKED)` without `INDEXED`
+    /// is a state libhdf5 accepts: the running maximum is recorded and every
+    /// link keeps its creation order, but no second B-tree is built.
+    #[test]
+    fn a_tracked_but_unindexed_group_records_the_maximum_and_no_index() {
+        let links: Vec<LinkMessage> = (0..12u32)
+            .map(|i| {
+                LinkMessage::hard(&format!("d{i:02}"), 0x400 + i as u64 * 8)
+                    .with_creation_order(i as i64)
+            })
+            .collect();
+        let (_file, dense, read) = round_trip_ordered(&links, CreationOrder::Tracked);
+        assert_eq!(read.len(), links.len());
+        assert_eq!(dense.linfo.max_creation_order, Some(12));
+        assert_eq!(dense.linfo.creation_order_btree_address, None);
+    }
+
+    /// A group that declares tracking but hands over links with no creation
+    /// order is a caller bug; building the storage anyway would write an
+    /// index whose records claim an order the heap objects do not carry.
+    #[test]
+    fn tracking_links_that_carry_no_creation_order_is_refused() {
+        let links: Vec<LinkMessage> = (0..12)
+            .map(|i| LinkMessage::hard(&format!("d{i:02}"), 0x400 + i as u64 * 8))
+            .collect();
+        let mut file = MemFile::new();
+        let err = build_dense_links(&links, &ctx(), CreationOrder::Tracked, &mut |len| {
+            file.alloc(len)
+        })
+        .unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)), "{err:?}");
     }
 
     #[test]

@@ -11,6 +11,7 @@
 //!   [if bit 1]: creation_order_btree_address: sizeof_addr bytes
 
 use crate::format::bytes::read_le_addr as read_addr;
+use crate::format::creation_order::CreationOrder;
 use crate::format::{FormatContext, FormatError, FormatResult, UNDEF_ADDR};
 
 const VERSION: u8 = 0;
@@ -49,6 +50,19 @@ impl LinkInfoMessage {
             name_btree_address: UNDEF_ADDR,
             creation_order_btree_address: None,
         }
+    }
+
+    /// The group's link creation-order policy, as this message declares it.
+    ///
+    /// This message — not the object header's flag bits, which speak only for
+    /// attributes — is what `H5Pget_link_creation_order` reads
+    /// (`H5G__get_create_plist`), so it is the only place a reopen can recover
+    /// link tracking from.
+    pub fn creation_order(&self) -> CreationOrder {
+        CreationOrder::from_flags(
+            self.max_creation_order.is_some(),
+            self.creation_order_btree_address.is_some(),
+        )
     }
 
     // ------------------------------------------------------------------ encode
