@@ -616,9 +616,13 @@ impl H5File {
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Reader(reader) => {
-                let info = reader
-                    .dataset_info(name)
-                    .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?;
+                // The reader's open gate reports *why* a name cannot be
+                // opened — a dangling soft link and an unsupported object are
+                // both present in the listing, and neither is an absence.
+                let info = reader.open_dataset(name).map_err(|e| match e {
+                    crate::io::IoError::NotFound(s) => Hdf5Error::NotFound(s),
+                    other => Hdf5Error::from(other),
+                })?;
                 let shape: Vec<usize> = info.dataspace.dims.iter().map(|&d| d as usize).collect();
                 let element_size = info.datatype.element_size() as usize;
                 Ok(H5Dataset::new_reader(

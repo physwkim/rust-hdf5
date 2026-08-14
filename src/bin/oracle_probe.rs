@@ -27,7 +27,7 @@ use rust_hdf5::format::messages::datatype::{
 };
 use rust_hdf5::format::messages::filter::{Filter, FilterPipeline, FILTER_FLETCHER32};
 use rust_hdf5::types::VarLenUnicode;
-use rust_hdf5::{H5Dataset, H5File, H5Group};
+use rust_hdf5::{H5Dataset, H5File, H5Group, LinkClass};
 
 const CANON_VERSION: &str = "2";
 const RAW_LIMIT: usize = 1024;
@@ -457,6 +457,17 @@ impl Dump {
     }
 }
 
+/// What the walk will say about one child name of a group.
+enum Child {
+    Group,
+    Dataset,
+    Soft(String),
+    External(String, String),
+    /// The name is linked but the public API answers neither "which kind of
+    /// object" nor "which kind of link"; the reason rides along.
+    Unclassified(String),
+}
+
 fn child_path(parent: &str, name: &str) -> String {
     if parent == "/" {
         format!("/{name}")
@@ -505,13 +516,13 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
         return;
     }
 
-    // canon.py walks one sorted list of link names; merge the two typed
-    // listings back into that single order so the text diffs line up.
-    let mut children: BTreeMap<String, &'static str> = BTreeMap::new();
+    // canon.py walks one sorted list of link names; merge the typed listings
+    // back into that single order so the text diffs line up.
+    let mut children: BTreeMap<String, Child> = BTreeMap::new();
     match guarded(|| group.group_names()) {
         Ok(Ok(names)) => {
             for n in names {
-                children.insert(n, "group");
+                children.insert(n, Child::Group);
             }
         }
         Ok(Err(e)) => d.emit(
@@ -526,7 +537,7 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
     match guarded(|| group.dataset_names()) {
         Ok(Ok(names)) => {
             for n in names {
-                children.insert(n, "dataset");
+                children.insert(n, Child::Dataset);
             }
         }
         Ok(Err(e)) => d.emit(
@@ -538,28 +549,100 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
             unsupported("dataset_names", &format!("panic: {p}")),
         ),
     }
+    // canon.py classifies by link kind first (`grp.get(name, getlink=True)`)
+    // and only falls through to the object type for a hard link, so the link
+    // listing both adds names the typed listings cannot answer for and
+    // overrides the ones that are not hard links.
+    match guarded(|| group.link_names()) {
+        Ok(Ok(names)) => {
+            for n in names {
+                let class = match guarded(|| group.link_class(&n)) {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) => {
+                        children.insert(n, Child::Unclassified(oneline(e)));
+                        continue;
+                    }
+                    Err(p) => {
+                        children.insert(n, Child::Unclassified(format!("panic: {p}")));
+                        continue;
+                    }
+                };
+                match class {
+                    // A hard link is described by the object it reaches, which
+                    // the typed listings have already classified; only when
+                    // they have not does the name need a marker of its own.
+                    LinkClass::Hard => {
+                        children.entry(n).or_insert_with(|| {
+                            Child::Unclassified(
+                                "the link is hard but the object it reaches is in neither \
+                                 group_names() nor dataset_names()"
+                                    .into(),
+                            )
+                        });
+                    }
+                    LinkClass::Soft { path } => {
+                        children.insert(n, Child::Soft(path));
+                    }
+                    LinkClass::External { file, path } => {
+                        children.insert(n, Child::External(file, path));
+                    }
+                    LinkClass::UserDefined { link_type } => {
+                        children.insert(
+                            n,
+                            Child::Unclassified(format!(
+                                "user-defined link of type {link_type}, which this crate \
+                                 does not interpret"
+                            )),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(Err(e)) => d.emit(
+            &format!("{path}#link_names"),
+            unsupported("link_names", &oneline(e)),
+        ),
+        Err(p) => d.emit(
+            &format!("{path}#link_names"),
+            unsupported("link_names", &format!("panic: {p}")),
+        ),
+    }
 
-    for (name, kind) in children {
+    for (name, child) in children {
         let cpath = child_path(path, &name);
-        if kind == "group" {
-            match guarded(|| group.group(&name)) {
+        match child {
+            Child::Group => match guarded(|| group.group(&name)) {
                 Ok(Ok(sub)) => dump_group(d, file, &cpath, &sub, depth + 1),
                 Ok(Err(e)) => d.emit(&format!("{cpath}#kind"), unsupported("kind", &oneline(e))),
                 Err(p) => d.emit(
                     &format!("{cpath}#kind"),
                     unsupported("kind", &format!("panic: {p}")),
                 ),
+            },
+            Child::Dataset => {
+                let lookup = cpath.trim_start_matches('/').to_string();
+                match guarded(|| file.dataset(&lookup)) {
+                    Ok(Ok(ds)) => dump_dataset(d, &cpath, &ds),
+                    Ok(Err(e)) => {
+                        d.emit(&format!("{cpath}#kind"), unsupported("kind", &oneline(e)))
+                    }
+                    Err(p) => d.emit(
+                        &format!("{cpath}#kind"),
+                        unsupported("kind", &format!("panic: {p}")),
+                    ),
+                }
             }
-        } else {
-            let lookup = cpath.trim_start_matches('/').to_string();
-            match guarded(|| file.dataset(&lookup)) {
-                Ok(Ok(ds)) => dump_dataset(d, &cpath, &ds),
-                Ok(Err(e)) => d.emit(&format!("{cpath}#kind"), unsupported("kind", &oneline(e))),
-                Err(p) => d.emit(
-                    &format!("{cpath}#kind"),
-                    unsupported("kind", &format!("panic: {p}")),
-                ),
+            // A soft or external link is reported by its value and never
+            // followed, exactly as canon.py reports it.
+            Child::Soft(target) => {
+                d.emit(&format!("{cpath}#kind"), "softlink");
+                d.emit(&format!("{cpath}#target"), target);
             }
+            Child::External(efile, epath) => {
+                d.emit(&format!("{cpath}#kind"), "extlink");
+                d.emit(&format!("{cpath}#target"), format!("{efile}::{epath}"));
+            }
+            Child::Unclassified(why) => d.emit(&format!("{cpath}#kind"), unsupported("kind", &why)),
         }
     }
 }

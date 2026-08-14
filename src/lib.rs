@@ -109,4 +109,5 @@ pub use format::messages::datatype::{ByteOrder, DatatypeMessage};
 pub use format::messages::filter::FilterPipeline;
 pub use group::H5Group;
 pub use io::locking::{FileLocking, LockMode};
+pub use io::reader::LinkClass;
 pub use types::{Complex32, Complex64, CompoundType, H5Type, HBool, VarLenUnicode};

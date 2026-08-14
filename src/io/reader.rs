@@ -26,7 +26,9 @@ use crate::format::messages::link::LinkTarget;
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
-use crate::format::superblock::{detect_superblock_version, SuperblockV0V1, SuperblockV2V3};
+use crate::format::superblock::{
+    detect_superblock_version, SuperblockV0V1, SuperblockV2V3, SymbolTableCache,
+};
 use crate::format::symbol_table::SymbolTableNode;
 use crate::format::{FormatContext, UNDEF_ADDR};
 
@@ -117,6 +119,118 @@ pub struct DatasetReadInfo {
     pub fill_value: Option<Vec<u8>>,
 }
 
+/// The class of one link record in a group: what `H5Lget_info` reports,
+/// carrying the value `H5Lget_val` returns for the classes that have one.
+///
+/// Every link a group holds gets one of these, whether or not the object it
+/// names can be opened — a listing is a listing of links, not of objects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkClass {
+    /// Another name for an object in this file.
+    Hard,
+    /// A path inside this file, resolved when the link is traversed.
+    Soft { path: String },
+    /// A path inside another file. Listed and reported, but not followed.
+    External { file: String, path: String },
+    /// A user-defined link class this reader has no interpreter for; libhdf5
+    /// needs a registered link class for these too.
+    UserDefined { link_type: u8 },
+}
+
+impl LinkClass {
+    fn from_target(target: &LinkTarget) -> Self {
+        match target {
+            LinkTarget::Hard { .. } => Self::Hard,
+            LinkTarget::Soft { target } => Self::Soft {
+                path: target.clone(),
+            },
+            LinkTarget::External { file, path } => Self::External {
+                file: file.clone(),
+                path: path.clone(),
+            },
+            LinkTarget::UserDefined { link_type, .. } => Self::UserDefined {
+                link_type: *link_type,
+            },
+        }
+    }
+}
+
+/// The soft link a traversal crossed, kept so a lookup that finds nothing can
+/// say the link dangles instead of reporting a bare absence.
+struct SoftLinkRef {
+    link: String,
+    target: String,
+}
+
+/// What path traversal produced.
+enum Traversal {
+    /// A path in this file, after every group hard-link alias and soft link
+    /// on it was followed. `via` names the last soft link crossed, if any.
+    Path {
+        path: String,
+        via: Option<SoftLinkRef>,
+    },
+    /// A component of the path is an external link, so the path leaves this
+    /// file. `path` is the remainder inside `file`.
+    External {
+        link: String,
+        file: String,
+        path: String,
+    },
+}
+
+/// One rewrite a traversal step can apply to the path prefix it matched.
+#[derive(Clone, Copy)]
+enum Rewrite<'a> {
+    /// A group hard link: continue from the group's first-walked path.
+    Alias(&'a str),
+    /// A soft link: continue from its value.
+    Soft(&'a str),
+    /// An external link: stop, the rest of the path is in another file.
+    External { file: &'a str, path: &'a str },
+}
+
+/// Resolve a soft link's value against the group the link lives in, the way
+/// `H5G_traverse` does: a value starting with `/` is absolute, anything else
+/// is relative to that group. `.` and `..` components fold. The result has no
+/// leading `/`.
+fn resolve_link_value(link_path: &str, value: &str) -> String {
+    let mut components: Vec<&str> = Vec::new();
+    if !value.starts_with('/') {
+        // The link's own parent group is everything before its last component.
+        if let Some(parent) = link_path.rsplit_once('/').map(|(p, _)| p) {
+            components.extend(parent.split('/').filter(|c| !c.is_empty()));
+        }
+    }
+    for component in value.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            c => components.push(c),
+        }
+    }
+    components.join("/")
+}
+
+/// Everything one discovery walk found: the objects, the link records that
+/// name them, and the group metadata the lookup paths need. Carried as one
+/// value so the walk has a single owner rather than a widening tuple, and so
+/// every walk (link-message and symbol-table alike) fills the same fields.
+#[derive(Default)]
+struct Catalog {
+    datasets: Vec<DatasetReadInfo>,
+    /// Attributes on non-root groups, keyed by group path.
+    group_attributes: std::collections::HashMap<String, Vec<AttributeMessage>>,
+    /// Every non-root group path the walk traversed into.
+    group_paths: std::collections::BTreeSet<String>,
+    /// Group hard-link aliases: alias path → first-walked path.
+    group_aliases: std::collections::HashMap<String, String>,
+    /// Every link record seen, keyed by its full path (no leading `/`).
+    links: std::collections::BTreeMap<String, LinkClass>,
+}
+
 /// Internal enum to represent what we know about the root group from the
 /// superblock. For v2/v3 we have the root group object header address; for
 /// v0/v1 we have a B-tree and local heap that index the root group's children.
@@ -157,6 +271,10 @@ pub struct Hdf5Reader {
     /// under the first path; lookups resolve alias prefixes through this
     /// map, as HDF5 path traversal does.
     group_aliases: std::collections::HashMap<String, String>,
+    /// Every link record in the file, keyed by full path (no leading `/`).
+    /// A listing is a listing of links, so this holds soft and external
+    /// links as well as the hard links that name the objects above.
+    links: std::collections::BTreeMap<String, LinkClass>,
 }
 
 /// Total byte length of `dims.product() * element_size`, computed with
@@ -407,13 +525,12 @@ impl Hdf5Reader {
 
         // Walk link messages to discover datasets, group attributes, and
         // every group path that exists.
-        let (datasets, group_attributes, group_paths, group_aliases) =
-            Self::discover_datasets_from_links(
-                &mut handle,
-                &root_header,
-                sb.root_group_object_header_address,
-                &ctx,
-            )?;
+        let catalog = Self::build_catalog_from_links(
+            &mut handle,
+            &root_header,
+            sb.root_group_object_header_address,
+            &ctx,
+        )?;
 
         // Collect root group attributes
         let mut root_attributes = Vec::new();
@@ -432,11 +549,12 @@ impl Hdf5Reader {
             root_group_info: RootGroupInfo::V2V3 {
                 root_group_object_header_address: sb.root_group_object_header_address,
             },
-            datasets,
+            datasets: catalog.datasets,
             root_attributes,
-            group_attributes,
-            group_paths,
-            group_aliases,
+            group_attributes: catalog.group_attributes,
+            group_paths: catalog.group_paths,
+            group_aliases: catalog.group_aliases,
+            links: catalog.links,
         })
     }
 
@@ -451,9 +569,8 @@ impl Hdf5Reader {
 
         let ste = &sb.root_symbol_table_entry;
         let root_obj_addr = ste.obj_header_addr;
-        let ste_cache_type = ste.cache_type;
-        let ste_btree_addr = ste.btree_addr;
-        let ste_heap_addr = ste.heap_addr;
+        let ste_stab = ste.cached_symbol_table();
+        let (ste_btree_addr, ste_heap_addr) = ste_stab.unwrap_or((UNDEF_ADDR, UNDEF_ADDR));
 
         // Read the root group's object header (following continuations).
         let root_hdr = Self::read_object_header_full(&mut handle, &ctx, root_obj_addr).ok();
@@ -481,8 +598,8 @@ impl Hdf5Reader {
                 .any(|m| m.msg_type == MSG_LINK || m.msg_type == MSG_LINK_INFO)
         });
 
-        let (datasets, group_attributes, group_paths, group_aliases) = if has_links {
-            Self::discover_datasets_from_links(
+        let catalog = if has_links {
+            Self::build_catalog_from_links(
                 &mut handle,
                 root_hdr.as_ref().unwrap(),
                 root_obj_addr,
@@ -491,18 +608,19 @@ impl Hdf5Reader {
         } else {
             // Symbol-table storage: the STE scratch-pad caches the B-tree
             // and local heap; otherwise read them from the object header.
-            let (btree_addr, heap_addr) = if ste_cache_type == 1 {
-                (ste_btree_addr, ste_heap_addr)
-            } else {
-                // Read the symbol-table message from the already-loaded
-                // full root header (which followed continuation blocks).
-                root_hdr
-                    .as_ref()
-                    .map(|h| Self::stab_from_header(h, &ctx))
-                    .unwrap_or((UNDEF_ADDR, UNDEF_ADDR))
+            let (btree_addr, heap_addr) = match ste_stab {
+                Some(pair) => pair,
+                None => {
+                    // Read the symbol-table message from the already-loaded
+                    // full root header (which followed continuation blocks).
+                    root_hdr
+                        .as_ref()
+                        .map(|h| Self::stab_from_header(h, &ctx))
+                        .unwrap_or((UNDEF_ADDR, UNDEF_ADDR))
+                }
             };
             if btree_addr != UNDEF_ADDR && heap_addr != UNDEF_ADDR {
-                Self::discover_datasets_from_btree(
+                Self::build_catalog_from_btree(
                     &mut handle,
                     &ctx,
                     btree_addr,
@@ -510,12 +628,7 @@ impl Hdf5Reader {
                     root_obj_addr,
                 )?
             } else {
-                (
-                    Vec::new(),
-                    std::collections::HashMap::new(),
-                    std::collections::BTreeSet::new(),
-                    std::collections::HashMap::new(),
-                )
+                Catalog::default()
             }
         };
 
@@ -528,11 +641,12 @@ impl Hdf5Reader {
                 btree_addr: ste_btree_addr,
                 heap_addr: ste_heap_addr,
             },
-            datasets,
+            datasets: catalog.datasets,
             root_attributes,
-            group_attributes,
-            group_paths,
-            group_aliases,
+            group_attributes: catalog.group_attributes,
+            group_paths: catalog.group_paths,
+            group_aliases: catalog.group_aliases,
+            links: catalog.links,
         })
     }
 
@@ -550,55 +664,35 @@ impl Hdf5Reader {
         (UNDEF_ADDR, UNDEF_ADDR)
     }
 
-    /// Discover datasets by walking link messages in a v2 object header.
-    /// Recursively descends into groups, prefixing dataset names with the group path.
-    #[allow(clippy::type_complexity)]
-    fn discover_datasets_from_links(
+    /// Build the file catalog by walking link messages in a v2 object header.
+    /// Recursively descends into groups, prefixing names with the group path.
+    fn build_catalog_from_links(
         handle: &mut FileHandle,
         root_header: &ObjectHeader,
         root_addr: u64,
         ctx: &FormatContext,
-    ) -> IoResult<(
-        Vec<DatasetReadInfo>,
-        std::collections::HashMap<String, Vec<AttributeMessage>>,
-        std::collections::BTreeSet<String>,
-        std::collections::HashMap<String, String>,
-    )> {
-        let mut group_attrs = std::collections::HashMap::new();
-        let mut group_paths = std::collections::BTreeSet::new();
+    ) -> IoResult<Catalog> {
+        let mut catalog = Catalog::default();
         // Object headers already descended into, keyed to the first path
         // that reached them: a later path to the same header is a group
         // hard link, recorded in `aliases` so lookups can resolve through
         // it instead of walking (and cycling) a second time.
         let mut visited = std::collections::HashMap::new();
-        let mut aliases = std::collections::HashMap::new();
         // Seed the root object header so a hard link cycling back to the
         // root is not descended into a second time.
         visited.insert(root_addr, String::new());
-        let datasets = Self::discover_datasets_recursive(
-            handle,
-            root_header,
-            ctx,
-            "",
-            &mut group_attrs,
-            &mut group_paths,
-            &mut visited,
-            &mut aliases,
-        )?;
-        Ok((datasets, group_attrs, group_paths, aliases))
+        Self::walk_links_recursive(handle, root_header, ctx, "", &mut catalog, &mut visited)?;
+        Ok(catalog)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn discover_datasets_recursive(
+    fn walk_links_recursive(
         handle: &mut FileHandle,
         header: &ObjectHeader,
         ctx: &FormatContext,
         prefix: &str,
-        group_attrs: &mut std::collections::HashMap<String, Vec<AttributeMessage>>,
-        group_paths: &mut std::collections::BTreeSet<String>,
+        catalog: &mut Catalog,
         visited: &mut std::collections::HashMap<u64, String>,
-        aliases: &mut std::collections::HashMap<String, String>,
-    ) -> IoResult<Vec<DatasetReadInfo>> {
+    ) -> IoResult<()> {
         // Bound recursion depth on a hostile/corrupt file.
         const MAX_GROUP_DEPTH: usize = 256;
         let depth = if prefix.is_empty() {
@@ -607,10 +701,8 @@ impl Hdf5Reader {
             prefix.matches('/').count() + 1
         };
         if depth > MAX_GROUP_DEPTH {
-            return Ok(Vec::new());
+            return Ok(());
         }
-
-        let mut datasets = Vec::new();
 
         // Collect every link in this group: inline `Link` messages plus, for
         // groups using dense storage, links held in a fractal heap referenced
@@ -632,90 +724,83 @@ impl Hdf5Reader {
         }
 
         for link in &links {
-            if let LinkTarget::Hard { address } = &link.target {
-                let full_name = if prefix.is_empty() {
-                    link.name.clone()
-                } else {
-                    format!("{}/{}", prefix, link.name)
-                };
+            let full_name = if prefix.is_empty() {
+                link.name.clone()
+            } else {
+                format!("{}/{}", prefix, link.name)
+            };
 
-                // Try to read as a dataset. A target whose object header
-                // fails to decode (e.g. a stale link left by a deletion) is
-                // skipped rather than aborting the whole file open.
-                match Self::read_dataset_from_object_header(handle, ctx, *address, &full_name) {
-                    Ok(Some(info)) => {
-                        datasets.push(info);
-                        continue;
-                    }
-                    Err(_) => continue,
-                    Ok(None) => {}
-                }
-                // Not a dataset. Read the object header to classify it.
-                let child_header = match Self::read_object_header_full(handle, ctx, *address) {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
-                // A committed (named) datatype object has a datatype message
-                // and no group-storage message — it is neither a group nor a
-                // dataset, so it must not be recorded as a group.
-                let is_group = child_header.messages.iter().any(|m| {
-                    m.msg_type == MSG_LINK
-                        || m.msg_type == MSG_LINK_INFO
-                        || m.msg_type == MSG_SYMBOL_TABLE
-                        || m.msg_type == MSG_GROUP_INFO
-                });
-                if !is_group
-                    && child_header
-                        .messages
-                        .iter()
-                        .any(|m| m.msg_type == MSG_DATATYPE)
-                {
+            // Every link is a listing entry whatever it points at; only a
+            // hard link names an object in this file to descend into.
+            catalog
+                .links
+                .insert(full_name.clone(), LinkClass::from_target(&link.target));
+            let LinkTarget::Hard { address } = &link.target else {
+                continue;
+            };
+
+            // Try to read as a dataset. A target whose object header
+            // fails to decode (e.g. a stale link left by a deletion) is
+            // skipped rather than aborting the whole file open.
+            match Self::read_dataset_from_object_header(handle, ctx, *address, &full_name) {
+                Ok(Some(info)) => {
+                    catalog.datasets.push(info);
                     continue;
                 }
-                {
-                    // It is a group. Record its path from the actual link
-                    // record — before the cycle check, so a hard-link alias
-                    // of an already-visited group still appears — whether or
-                    // not it contains datasets or attributes.
-                    group_paths.insert(full_name.clone());
-                    {
-                        // Capture group attributes (e.g. the NeXus `NX_class`
-                        // marker), keyed by path.
-                        let mut attrs = Vec::new();
-                        for m in &child_header.messages {
-                            if m.msg_type == MSG_ATTRIBUTE {
-                                if let Ok((a, _)) = AttributeMessage::decode(&m.data, ctx) {
-                                    attrs.push(a);
-                                }
-                            }
-                        }
-                        if !attrs.is_empty() {
-                            group_attrs.insert(full_name.clone(), attrs);
-                        }
-                        // Descend at most once per object header (cycle
-                        // guard); a second path to it is a group hard
-                        // link — record the alias for lookups instead.
-                        if let Some(first) = visited.get(address) {
-                            aliases.insert(full_name.clone(), first.clone());
-                            continue;
-                        }
-                        visited.insert(*address, full_name.clone());
-                        let child_ds = Self::discover_datasets_recursive(
-                            handle,
-                            &child_header,
-                            ctx,
-                            &full_name,
-                            group_attrs,
-                            group_paths,
-                            visited,
-                            aliases,
-                        )?;
-                        datasets.extend(child_ds);
+                Err(_) => continue,
+                Ok(None) => {}
+            }
+            // Not a dataset. Read the object header to classify it.
+            let child_header = match Self::read_object_header_full(handle, ctx, *address) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            // A committed (named) datatype object has a datatype message
+            // and no group-storage message — it is neither a group nor a
+            // dataset, so it must not be recorded as a group.
+            let is_group = child_header.messages.iter().any(|m| {
+                m.msg_type == MSG_LINK
+                    || m.msg_type == MSG_LINK_INFO
+                    || m.msg_type == MSG_SYMBOL_TABLE
+                    || m.msg_type == MSG_GROUP_INFO
+            });
+            if !is_group
+                && child_header
+                    .messages
+                    .iter()
+                    .any(|m| m.msg_type == MSG_DATATYPE)
+            {
+                continue;
+            }
+            // It is a group. Record its path from the actual link record —
+            // before the cycle check, so a hard-link alias of an
+            // already-visited group still appears — whether or not it
+            // contains datasets or attributes.
+            catalog.group_paths.insert(full_name.clone());
+            // Capture group attributes (e.g. the NeXus `NX_class` marker),
+            // keyed by path.
+            let mut attrs = Vec::new();
+            for m in &child_header.messages {
+                if m.msg_type == MSG_ATTRIBUTE {
+                    if let Ok((a, _)) = AttributeMessage::decode(&m.data, ctx) {
+                        attrs.push(a);
                     }
                 }
             }
+            if !attrs.is_empty() {
+                catalog.group_attributes.insert(full_name.clone(), attrs);
+            }
+            // Descend at most once per object header (cycle guard); a second
+            // path to it is a group hard link — record the alias for lookups
+            // instead.
+            if let Some(first) = visited.get(address) {
+                catalog.group_aliases.insert(full_name, first.clone());
+                continue;
+            }
+            visited.insert(*address, full_name.clone());
+            Self::walk_links_recursive(handle, &child_header, ctx, &full_name, catalog, visited)?;
         }
-        Ok(datasets)
+        Ok(())
     }
 
     /// Read every link stored in a group's dense (fractal-heap) link storage.
@@ -768,66 +853,52 @@ impl Hdf5Reader {
         Ok(links)
     }
 
-    /// Discover datasets by walking the B-tree v1 + local heap (legacy format).
+    /// Build the file catalog by walking the B-tree v1 + local heap (legacy
+    /// format).
     ///
-    /// Recurses into subgroups: a symbol-table entry whose `cache_type == 1`
-    /// carries scratch-pad `btree_addr`/`heap_addr` for the subgroup; for
-    /// other entries the child object header is read for a symbol-table
-    /// message. Discovered dataset names are prefixed with the group path.
-    #[allow(clippy::type_complexity)]
-    fn discover_datasets_from_btree(
+    /// Recurses into subgroups: a symbol-table entry that caches its child
+    /// group's B-tree and local heap uses those; for other entries the child
+    /// object header is read for a symbol-table message. Discovered names are
+    /// prefixed with the group path.
+    fn build_catalog_from_btree(
         handle: &mut FileHandle,
         ctx: &FormatContext,
         btree_addr: u64,
         heap_addr: u64,
         root_obj_addr: u64,
-    ) -> IoResult<(
-        Vec<DatasetReadInfo>,
-        std::collections::HashMap<String, Vec<AttributeMessage>>,
-        std::collections::BTreeSet<String>,
-        std::collections::HashMap<String, String>,
-    )> {
-        let mut datasets = Vec::new();
+    ) -> IoResult<Catalog> {
+        let mut catalog = Catalog::default();
         // First path per descended object header + the group-hard-link
-        // aliases met later, as in `discover_datasets_from_links`.
+        // aliases met later, as in `build_catalog_from_links`.
         let mut visited = std::collections::HashMap::new();
-        let mut aliases = std::collections::HashMap::new();
         // Seed the root object header so a hard link cycling back to the
         // root group is not descended into a second time.
         visited.insert(root_obj_addr, String::new());
-        let mut group_attrs = std::collections::HashMap::new();
-        let mut group_paths = std::collections::BTreeSet::new();
-        Self::discover_datasets_from_btree_recursive(
+        Self::walk_btree_recursive(
             handle,
             ctx,
             btree_addr,
             heap_addr,
             "",
             0,
-            &mut datasets,
+            &mut catalog,
             &mut visited,
-            &mut aliases,
-            &mut group_attrs,
-            &mut group_paths,
         )?;
-        Ok((datasets, group_attrs, group_paths, aliases))
+        Ok(catalog)
     }
 
-    /// Recursive worker for `discover_datasets_from_btree`. `prefix` is the
+    /// Recursive worker for `build_catalog_from_btree`. `prefix` is the
     /// path of the group being scanned; `depth` bounds recursion.
     #[allow(clippy::too_many_arguments)]
-    fn discover_datasets_from_btree_recursive(
+    fn walk_btree_recursive(
         handle: &mut FileHandle,
         ctx: &FormatContext,
         btree_addr: u64,
         heap_addr: u64,
         prefix: &str,
         depth: usize,
-        datasets: &mut Vec<DatasetReadInfo>,
+        catalog: &mut Catalog,
         visited: &mut std::collections::HashMap<u64, String>,
-        aliases: &mut std::collections::HashMap<String, String>,
-        group_attrs: &mut std::collections::HashMap<String, Vec<AttributeMessage>>,
-        group_paths: &mut std::collections::BTreeSet<String>,
     ) -> IoResult<()> {
         // Bound legacy-group nesting depth on a hostile/corrupt file.
         const MAX_GROUP_DEPTH: usize = 256;
@@ -867,6 +938,19 @@ impl Hdf5Reader {
                     format!("{}/{}", prefix, name)
                 };
 
+                // A `H5G_CACHED_SLINK` entry is a soft link: it names no
+                // object at all, and its value string lives in this group's
+                // local heap. Record the link and move on — reading its
+                // undefined object-header address is what used to drop it.
+                if let SymbolTableCache::SoftLink { value_offset } = entry.cache {
+                    let target = local_heap_get_string(&heap_data, value_offset as u64)?;
+                    catalog
+                        .links
+                        .insert(full_name, LinkClass::Soft { path: target });
+                    continue;
+                }
+                catalog.links.insert(full_name.clone(), LinkClass::Hard);
+
                 // Try to read this entry as a dataset. A target whose
                 // object header fails to decode is skipped, not fatal.
                 match Self::read_dataset_from_object_header(
@@ -876,7 +960,7 @@ impl Hdf5Reader {
                     &full_name,
                 ) {
                     Ok(Some(info)) => {
-                        datasets.push(info);
+                        catalog.datasets.push(info);
                         continue;
                     }
                     Err(_) => continue,
@@ -904,13 +988,13 @@ impl Hdf5Reader {
                 // It is a subgroup. Record its path from the actual
                 // symbol-table entry, whether or not it has datasets or
                 // attributes.
-                group_paths.insert(full_name.clone());
+                catalog.group_paths.insert(full_name.clone());
 
                 // Break cycles: descend into each group object header at
                 // most once. A second path to it is a group hard link —
                 // record the alias for lookups instead.
                 if let Some(first) = visited.get(&entry.obj_header_addr) {
-                    aliases.insert(full_name.clone(), first.clone());
+                    catalog.group_aliases.insert(full_name, first.clone());
                     continue;
                 }
                 visited.insert(entry.obj_header_addr, full_name.clone());
@@ -926,34 +1010,30 @@ impl Hdf5Reader {
                         }
                     }
                     if !attrs.is_empty() {
-                        group_attrs.insert(full_name.clone(), attrs);
+                        catalog.group_attributes.insert(full_name.clone(), attrs);
                     }
                 }
 
                 // Find its B-tree + local heap and recurse, prefixing names
                 // with the group path.
-                let (sub_btree, sub_heap) = if entry.cache_type == 1 {
+                let (sub_btree, sub_heap) = match entry.cached_symbol_table() {
                     // Scratch-pad caches the subgroup's symbol-table info.
-                    (entry.btree_addr, entry.heap_addr)
-                } else {
+                    Some(pair) => pair,
                     // No scratch pad — take the symbol-table message from
                     // the child object header already read above.
-                    Self::stab_from_header(&hdr, ctx)
+                    None => Self::stab_from_header(&hdr, ctx),
                 };
 
                 if sub_btree != UNDEF_ADDR && sub_heap != UNDEF_ADDR {
-                    Self::discover_datasets_from_btree_recursive(
+                    Self::walk_btree_recursive(
                         handle,
                         ctx,
                         sub_btree,
                         sub_heap,
                         &full_name,
                         depth + 1,
-                        datasets,
+                        catalog,
                         visited,
-                        aliases,
-                        group_attrs,
-                        group_paths,
                     )?;
                 }
             }
@@ -1225,37 +1305,128 @@ impl Hdf5Reader {
         self.datasets.iter().map(|d| d.name.as_str()).collect()
     }
 
-    /// Rewrite a path (no leading `/`) whose group components pass
-    /// through hard links into the first-walked path of the object it
-    /// reaches — HDF5 traversal over the aliases the discovery walk
-    /// recorded. Bounded like libhdf5's link-traversal limit, so a link
-    /// cycle cannot loop forever; a path with no alias components comes
-    /// back unchanged.
-    fn canonical_path(&self, name: &str) -> String {
-        let mut name = name.to_string();
-        for _ in 0..64 {
-            let mut best: Option<(&str, &str)> = None;
+    /// Every link record in the file, keyed by full path (no leading `/`).
+    pub fn links(&self) -> &std::collections::BTreeMap<String, LinkClass> {
+        &self.links
+    }
+
+    /// The class of the link at `path` (no leading `/`), or `None` when no
+    /// link of that name exists. The path is traversed first, so a link
+    /// reached through a group hard link or a soft link resolves.
+    pub fn link_class(&self, path: &str) -> Option<&LinkClass> {
+        if let Some(class) = self.links.get(path) {
+            return Some(class);
+        }
+        match self.traverse(path) {
+            Traversal::Path { path, .. } => self.links.get(&path),
+            Traversal::External { .. } => None,
+        }
+    }
+
+    /// Follow a path (no leading `/`) the way `H5Dopen` / `H5Gopen` do:
+    /// rewrite each component that is a group hard-link alias or a soft link
+    /// until nothing changes, bounded so a link cycle cannot loop forever.
+    ///
+    /// This is the single owner of link traversal — every lookup that takes a
+    /// caller-supplied path goes through it rather than comparing the path to
+    /// a catalog key directly.
+    fn traverse(&self, name: &str) -> Traversal {
+        // libhdf5 bounds soft-link traversal at `H5L_NLINKS_DEF`; this covers
+        // that and the hard-link alias rewrites interleaved with it.
+        const MAX_TRAVERSALS: usize = 64;
+        let mut name = name.trim_start_matches('/').to_string();
+        let mut via = None;
+        for _ in 0..MAX_TRAVERSALS {
+            // Take the longest matching prefix so a nested alias wins over a
+            // shorter one that also covers the path.
+            let covers = |prefix: &str| name == prefix || name.starts_with(&format!("{prefix}/"));
+            let mut best: Option<(&str, Rewrite<'_>)> = None;
             for (alias, first) in &self.group_aliases {
-                let covers = name == *alias || name.starts_with(&format!("{alias}/"));
-                if covers && best.is_none_or(|(a, _)| alias.len() > a.len()) {
-                    best = Some((alias, first));
+                if covers(alias) && best.is_none_or(|(p, _)| alias.len() > p.len()) {
+                    best = Some((alias, Rewrite::Alias(first)));
                 }
             }
-            let Some((alias, first)) = best else { break };
-            // `first` is empty for an alias of the root group; trimming
-            // keeps the no-leading-'/' form either way.
-            name = format!("{first}{}", &name[alias.len()..])
-                .trim_start_matches('/')
-                .to_string();
+            for (link, class) in &self.links {
+                let rewrite = match class {
+                    LinkClass::Soft { path } => Rewrite::Soft(path),
+                    LinkClass::External { file, path } => Rewrite::External { file, path },
+                    _ => continue,
+                };
+                if covers(link) && best.is_none_or(|(p, _)| link.len() > p.len()) {
+                    best = Some((link, rewrite));
+                }
+            }
+            let Some((prefix, rewrite)) = best else { break };
+            let rest = name[prefix.len()..].to_string();
+            match rewrite {
+                Rewrite::Alias(first) => {
+                    // `first` is empty for an alias of the root group;
+                    // trimming keeps the no-leading-'/' form either way.
+                    name = format!("{first}{rest}").trim_start_matches('/').to_string();
+                }
+                Rewrite::Soft(target) => {
+                    let resolved = resolve_link_value(prefix, target);
+                    via = Some(SoftLinkRef {
+                        link: prefix.to_string(),
+                        target: target.to_string(),
+                    });
+                    name = format!("{resolved}{rest}")
+                        .trim_start_matches('/')
+                        .to_string();
+                }
+                Rewrite::External { file, path } => {
+                    return Traversal::External {
+                        link: prefix.to_string(),
+                        file: file.to_string(),
+                        path: format!("{path}{rest}"),
+                    };
+                }
+            }
         }
-        name
+        Traversal::Path { path: name, via }
+    }
+
+    /// Rewrite a path (no leading `/`) into the path of the object it reaches
+    /// after link traversal. A path that leaves the file through an external
+    /// link comes back unchanged — the callers that must report that case use
+    /// [`Self::traverse`] directly.
+    pub fn canonical_path(&self, name: &str) -> String {
+        match self.traverse(name) {
+            Traversal::Path { path, .. } => path,
+            Traversal::External { .. } => name.trim_start_matches('/').to_string(),
+        }
     }
 
     /// Return metadata for a dataset by name. Like `H5Dopen`, the name
-    /// may pass through group hard links.
+    /// may pass through group hard links and soft links.
     pub fn dataset_info(&self, name: &str) -> Option<&DatasetReadInfo> {
         let name = self.canonical_path(name);
         self.datasets.iter().find(|d| d.name == name)
+    }
+
+    /// Open `name` as a dataset the way `H5Dopen` does, reporting *why* it
+    /// cannot be opened instead of collapsing every cause into absence: a
+    /// soft link whose target does not exist is a dangling link, and a path
+    /// through an external link leaves this file.
+    ///
+    /// This is the gate every typed dataset access goes through.
+    pub fn open_dataset(&self, name: &str) -> IoResult<&DatasetReadInfo> {
+        let (path, via) = match self.traverse(name) {
+            Traversal::Path { path, via } => (path, via),
+            Traversal::External { link, file, path } => {
+                return Err(crate::io::IoError::Unsupported(format!(
+                    "'{name}' resolves through the external link '{link}' to '{path}' in \
+                     '{file}'; this reader lists external links but does not follow them"
+                )));
+            }
+        };
+        if let Some(info) = self.datasets.iter().find(|d| d.name == path) {
+            return Ok(info);
+        }
+        if let Some(SoftLinkRef { link, target }) = via {
+            return Err(crate::io::IoError::DanglingLink { link, target });
+        }
+        Err(crate::io::IoError::NotFound(name.to_string()))
     }
 
     /// Return the attribute names of a dataset.
@@ -1565,22 +1736,22 @@ impl Hdf5Reader {
             sb.root_group_object_header_address,
         )?;
 
-        // Re-scan datasets, group attributes, and group paths from link
-        // messages.
-        let (datasets, group_attributes, group_paths, group_aliases) =
-            Self::discover_datasets_from_links(
-                &mut self.handle,
-                &root_header,
-                sb.root_group_object_header_address,
-                &ctx,
-            )?;
+        // Re-scan datasets, group attributes, group paths, and link records
+        // from link messages.
+        let catalog = Self::build_catalog_from_links(
+            &mut self.handle,
+            &root_header,
+            sb.root_group_object_header_address,
+            &ctx,
+        )?;
 
         self._eof = sb.end_of_file_address;
         self.ctx = ctx;
-        self.datasets = datasets;
-        self.group_attributes = group_attributes;
-        self.group_paths = group_paths;
-        self.group_aliases = group_aliases;
+        self.datasets = catalog.datasets;
+        self.group_attributes = catalog.group_attributes;
+        self.group_paths = catalog.group_paths;
+        self.group_aliases = catalog.group_aliases;
+        self.links = catalog.links;
 
         Ok(())
     }
@@ -3692,12 +3863,16 @@ mod h5py_debug_tests {
             "sizeof_addr={}, sizeof_size={}",
             sb.sizeof_offsets, sb.sizeof_lengths
         );
+        let (ste_btree, ste_heap) = sb
+            .root_symbol_table_entry
+            .cached_symbol_table()
+            .unwrap_or((UNDEF_ADDR, UNDEF_ADDR));
         eprintln!(
-            "STE: obj_header={}, cache_type={}, btree={}, heap={}",
+            "STE: obj_header={}, cache={:?}, btree={}, heap={}",
             sb.root_symbol_table_entry.obj_header_addr,
-            sb.root_symbol_table_entry.cache_type,
-            sb.root_symbol_table_entry.btree_addr,
-            sb.root_symbol_table_entry.heap_addr
+            sb.root_symbol_table_entry.cache,
+            ste_btree,
+            ste_heap
         );
 
         let ctx = FormatContext {
@@ -3706,9 +3881,7 @@ mod h5py_debug_tests {
         };
 
         // Read local heap
-        let heap_buf = handle
-            .read_at_most(sb.root_symbol_table_entry.heap_addr, 128)
-            .unwrap();
+        let heap_buf = handle.read_at_most(ste_heap, 128).unwrap();
         let heap_hdr = LocalHeapHeader::decode(
             &heap_buf,
             ctx.sizeof_addr as usize,
@@ -3729,9 +3902,7 @@ mod h5py_debug_tests {
         );
 
         // Read btree
-        let btree_buf = handle
-            .read_at_most(sb.root_symbol_table_entry.btree_addr, 8192)
-            .unwrap();
+        let btree_buf = handle.read_at_most(ste_btree, 8192).unwrap();
         let btree = BTreeV1Node::decode(
             &btree_buf,
             ctx.sizeof_addr as usize,
@@ -3756,8 +3927,8 @@ mod h5py_debug_tests {
             for entry in &snod.entries {
                 let name = local_heap_get_string(&heap_data, entry.name_offset).unwrap();
                 eprintln!(
-                    "  entry: name='{}' (offset={}), obj_header={}, cache_type={}",
-                    name, entry.name_offset, entry.obj_header_addr, entry.cache_type
+                    "  entry: name='{}' (offset={}), obj_header={}, cache={:?}",
+                    name, entry.name_offset, entry.obj_header_addr, entry.cache
                 );
             }
         }

@@ -7,7 +7,7 @@
 //! the oracle's pinned env. The tests skip (pass) when none is present, so a
 //! machine without h5py stays green.
 
-use rust_hdf5::H5File;
+use rust_hdf5::{H5File, Hdf5Error, LinkClass};
 
 const PINNED_PYTHON: &str = "/home/stevek/micromamba/envs/tomo/bin/python";
 
@@ -57,6 +57,167 @@ fn h5py_write(py: &str, path: &std::path::Path, body: &str) {
         "h5py fixture generation failed for {}",
         path.display()
     );
+}
+
+/// A soft link, in both group storage layouts h5py can write it into: the
+/// `earliest` bound puts it in a symbol-table entry with cache type 2 and a
+/// local-heap value, `latest` puts it in a link message. Either way libhdf5
+/// lists the name and `H5Dopen` follows it, so both must here too.
+#[test]
+fn soft_link_is_listed_and_followed_in_both_group_layouts() {
+    let Some(py) = python() else { return };
+    for bound in ["earliest", "latest"] {
+        let path = tmp(&format!("softlink_{bound}"));
+        h5py_write(
+            py,
+            &path,
+            &format!(
+                "with h5py.File(PATH, 'w', libver='{bound}') as f:\n\
+                 \x20   f.create_dataset('data', data=np.arange(8, dtype='<i4'))\n\
+                 \x20   f['soft'] = h5py.SoftLink('/data')\n"
+            ),
+        );
+
+        let file = H5File::open(&path).unwrap();
+        let root = file.root_group();
+        assert_eq!(
+            root.link_names().unwrap(),
+            vec!["data".to_string(), "soft".to_string()],
+            "libver {bound}"
+        );
+        assert!(
+            matches!(root.link_class("soft").unwrap(), LinkClass::Soft { path } if path == "/data"),
+            "libver {bound}: {:?}",
+            root.link_class("soft").unwrap()
+        );
+        assert!(matches!(root.link_class("data").unwrap(), LinkClass::Hard));
+
+        let expected: Vec<i32> = (0..8).collect();
+        assert_eq!(
+            file.dataset("soft").unwrap().read_raw::<i32>().unwrap(),
+            expected,
+            "libver {bound}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+}
+
+/// A soft link whose value is relative to the group holding it, and a soft
+/// link that names a group so the traversal has to rewrite a path *prefix*.
+#[test]
+fn soft_link_resolves_relative_values_and_group_prefixes() {
+    let Some(py) = python() else { return };
+    let path = tmp("softlink_shapes");
+    h5py_write(
+        py,
+        &path,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   g = f.create_group('g')\n\
+         \x20   g.create_dataset('d', data=np.arange(4, dtype='<i4'))\n\
+         \x20   g['rel'] = h5py.SoftLink('d')\n\
+         \x20   f['galias'] = h5py.SoftLink('/g')\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let expected: Vec<i32> = (0..4).collect();
+    // relative value: '/g/rel' -> '/g/d'
+    assert_eq!(
+        file.dataset("g/rel").unwrap().read_raw::<i32>().unwrap(),
+        expected
+    );
+    // prefix rewrite: '/galias/d' -> '/g/d'
+    assert_eq!(
+        file.dataset("galias/d").unwrap().read_raw::<i32>().unwrap(),
+        expected
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A dangling soft link is *present* — libhdf5 lists it and fails the open.
+/// Reporting it as absent is the loss this pins: the name must be listed and
+/// the open must name the link and its unreachable target.
+#[test]
+fn dangling_soft_link_is_listed_and_reported_as_dangling() {
+    let Some(py) = python() else { return };
+    let path = tmp("softlink_dangling");
+    h5py_write(
+        py,
+        &path,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f.create_dataset('data', data=np.arange(4, dtype='<i4'))\n\
+         \x20   f['gone'] = h5py.SoftLink('/nowhere')\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let root = file.root_group();
+    assert_eq!(
+        root.link_names().unwrap(),
+        vec!["data".to_string(), "gone".to_string()]
+    );
+    assert!(
+        matches!(root.link_class("gone").unwrap(), LinkClass::Soft { path } if path == "/nowhere")
+    );
+    match file.dataset("gone").err() {
+        Some(Hdf5Error::DanglingLink { link, target }) => {
+            assert_eq!(link, "gone");
+            assert_eq!(target, "/nowhere");
+        }
+        other => panic!("expected a dangling-link error, got {other:?}"),
+    }
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// An external link is listed and its target file and path are readable
+/// through `link_class`; opening through it reports that this reader does not
+/// leave the file, which is a refusal, not an absence.
+#[test]
+fn external_link_is_listed_with_its_target() {
+    let Some(py) = python() else { return };
+    let target = tmp("extlink_target");
+    let path = tmp("extlink");
+    h5py_write(
+        py,
+        &target,
+        "with h5py.File(PATH, 'w') as f:\n\
+         \x20   f.create_dataset('data', data=np.arange(4, dtype='<i4'))\n",
+    );
+    h5py_write(
+        py,
+        &path,
+        &format!(
+            "with h5py.File(PATH, 'w') as f:\n\
+             \x20   f.create_dataset('local', data=np.arange(4, dtype='<i4'))\n\
+             \x20   f['ext'] = h5py.ExternalLink(r'{}', '/data')\n",
+            target.display()
+        ),
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let root = file.root_group();
+    assert_eq!(
+        root.link_names().unwrap(),
+        vec!["ext".to_string(), "local".to_string()]
+    );
+    match root.link_class("ext").unwrap() {
+        LinkClass::External { file, path } => {
+            assert_eq!(file, target.to_string_lossy());
+            assert_eq!(path, "/data");
+        }
+        other => panic!("expected an external link, got {other:?}"),
+    }
+    match file.dataset("ext").err() {
+        Some(Hdf5Error::Unsupported(why)) => {
+            assert!(why.contains("external link"), "{why}");
+            assert!(why.contains("/data"), "{why}");
+        }
+        other => panic!("expected an unsupported-feature error, got {other:?}"),
+    }
+
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&target).ok();
 }
 
 /// A contiguous dataset written under `libver=("v110","v110")` carries a

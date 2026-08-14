@@ -17,6 +17,14 @@ pub enum Hdf5Error {
     InvalidState(String),
     /// A type mismatch between the Rust type and the HDF5 datatype.
     TypeMismatch(String),
+    /// The object exists in the file but uses a feature this crate cannot
+    /// decode. The string names the feature. Distinct from
+    /// [`NotFound`](Self::NotFound): the name is in the listing, the content
+    /// is out of reach.
+    Unsupported(String),
+    /// A soft link whose target does not exist. `H5Dopen` on a path through
+    /// such a link fails; the name itself is present in the listing.
+    DanglingLink { link: String, target: String },
 }
 
 impl From<std::io::Error> for Hdf5Error {
@@ -33,7 +41,15 @@ impl From<crate::format::FormatError> for Hdf5Error {
 
 impl From<crate::io::IoError> for Hdf5Error {
     fn from(e: crate::io::IoError) -> Self {
-        Self::IoLayer(e)
+        // The two link/feature outcomes carry through as themselves so a
+        // caller can match on them; everything else keeps its existing shape.
+        match e {
+            crate::io::IoError::Unsupported(s) => Self::Unsupported(s),
+            crate::io::IoError::DanglingLink { link, target } => {
+                Self::DanglingLink { link, target }
+            }
+            other => Self::IoLayer(other),
+        }
     }
 }
 
@@ -46,6 +62,12 @@ impl std::fmt::Display for Hdf5Error {
             Self::NotFound(s) => write!(f, "dataset '{}' not found", s),
             Self::InvalidState(s) => write!(f, "invalid state: {}", s),
             Self::TypeMismatch(s) => write!(f, "type mismatch: {}", s),
+            Self::Unsupported(s) => write!(f, "unsupported: {}", s),
+            Self::DanglingLink { link, target } => write!(
+                f,
+                "soft link '{}' points to '{}', which does not exist",
+                link, target
+            ),
         }
     }
 }

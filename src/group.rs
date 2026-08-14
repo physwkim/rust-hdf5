@@ -22,6 +22,7 @@ use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::filter::FilterPipeline;
+use crate::io::reader::LinkClass;
 use crate::types::H5Type;
 
 /// A handle to an HDF5 group.
@@ -137,7 +138,11 @@ impl H5Group {
                 if !reader.has_group(group_path) {
                     return Err(Hdf5Error::NotFound(full_name));
                 }
-                full_name
+                // Store the traversed path, as write mode does below: the
+                // handle's listings key off it, so a group reached through a
+                // soft link or a group hard link lists the same children as
+                // the group it names.
+                format!("/{}", reader.canonical_path(group_path))
             }
             // In write mode the handle stores the tree path, so a path
             // through hard links resolves once here and every operation
@@ -480,6 +485,85 @@ impl H5Group {
             H5FileInner::Closed => return Ok(vec![]),
         }
         Ok(groups.into_iter().collect())
+    }
+
+    /// List every link that is a direct child of this group — hard, soft and
+    /// external alike, in name order.
+    ///
+    /// This is the listing of *links* (`H5Lget_name_by_idx`, h5py's
+    /// `grp.keys()`), not of the objects they reach:
+    /// [`dataset_names`](Self::dataset_names) and
+    /// [`group_names`](Self::group_names) answer the object question, and a
+    /// soft or external link appears here whether or not its target resolves.
+    /// Pair it with [`link_class`](Self::link_class) to tell the kinds apart.
+    pub fn link_names(&self) -> Result<Vec<String>> {
+        let prefix = if self.name == "/" {
+            String::new()
+        } else {
+            format!("{}/", self.name.trim_start_matches('/'))
+        };
+
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => {
+                let mut names = std::collections::BTreeSet::new();
+                for path in reader.links().keys() {
+                    let stripped = if prefix.is_empty() {
+                        path.as_str()
+                    } else if let Some(rest) = path.strip_prefix(&prefix) {
+                        rest
+                    } else {
+                        continue;
+                    };
+                    if !stripped.is_empty() && !stripped.contains('/') {
+                        names.insert(stripped.to_string());
+                    }
+                }
+                Ok(names.into_iter().collect())
+            }
+            // The writer creates hard links only, so its link listing is the
+            // union of the object listings.
+            H5FileInner::Writer(_) => {
+                drop(inner);
+                let mut names: std::collections::BTreeSet<String> =
+                    self.dataset_names()?.into_iter().collect();
+                names.extend(self.group_names()?);
+                Ok(names.into_iter().collect())
+            }
+            H5FileInner::Closed => Ok(vec![]),
+        }
+    }
+
+    /// The class of the link `name` in this group, carrying the value
+    /// `H5Lget_val` returns for the classes that have one — the target path
+    /// of a soft link, the file and path of an external link.
+    ///
+    /// # Errors
+    ///
+    /// [`Hdf5Error::NotFound`] when this group holds no link of that name.
+    pub fn link_class(&self, name: &str) -> Result<LinkClass> {
+        let full_name = if self.name == "/" {
+            name.to_string()
+        } else {
+            format!("{}/{}", self.name.trim_start_matches('/'), name)
+        };
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => reader
+                .link_class(&full_name)
+                .cloned()
+                .ok_or(Hdf5Error::NotFound(full_name)),
+            // The writer creates hard links only.
+            H5FileInner::Writer(_) => {
+                drop(inner);
+                if self.link_names()?.iter().any(|n| n == name) {
+                    Ok(LinkClass::Hard)
+                } else {
+                    Err(Hdf5Error::NotFound(full_name))
+                }
+            }
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
     }
 
     /// Add (or replace) a string attribute on this group.

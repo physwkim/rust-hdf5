@@ -23,6 +23,15 @@ pub enum IoError {
     Format(crate::format::FormatError),
     NotFound(String),
     InvalidState(String),
+    /// The object exists in the file but uses a feature this reader cannot
+    /// decode. The string names the feature.
+    Unsupported(String),
+    /// A soft link whose target does not exist — `H5Dopen`/`H5Gopen` on a
+    /// path through it fails, which is not the same as the name being absent.
+    DanglingLink {
+        link: String,
+        target: String,
+    },
 }
 
 impl From<std::io::Error> for IoError {
@@ -44,6 +53,12 @@ impl std::fmt::Display for IoError {
             Self::Format(e) => write!(f, "format error: {}", e),
             Self::NotFound(s) => write!(f, "not found: {}", s),
             Self::InvalidState(s) => write!(f, "invalid state: {}", s),
+            Self::Unsupported(s) => write!(f, "unsupported: {}", s),
+            Self::DanglingLink { link, target } => write!(
+                f,
+                "soft link '{}' points to '{}', which does not exist",
+                link, target
+            ),
         }
     }
 }
