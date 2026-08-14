@@ -28,3 +28,11 @@ pub const MSG_MOD_TIME: u8 = 0x12;
 pub const MSG_BTREE_K: u8 = 0x13;
 pub const MSG_ATTR_INFO: u8 = 0x15;
 pub const MSG_OBJ_REF_COUNT: u8 = 0x16;
+
+// Object header message flags (the `flags` byte of the message envelope)
+/// `H5O_MSG_FLAG_SHARED`: the payload is a reference into the shared message
+/// heap rather than the message itself.
+pub const MSG_FLAG_SHARED: u8 = 0x02;
+/// `H5O_MSG_FLAG_DONTSHARE`: the message must never be moved to the shared
+/// message heap.
+pub const MSG_FLAG_DONTSHARE: u8 = 0x04;

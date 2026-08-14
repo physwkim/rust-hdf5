@@ -25,6 +25,7 @@ use crate::format::fractal_heap::{
 };
 use crate::format::messages::attr_info::AttributeInfoMessage;
 use crate::format::messages::attribute::AttributeMessage;
+use crate::format::messages::MSG_FLAG_SHARED;
 use crate::format::{BlockReader, FormatContext, FormatError, FormatResult, UNDEF_ADDR};
 
 /// Length of the fractal-heap ID embedded in a dense-attribute name record
@@ -34,9 +35,6 @@ const FHEAP_ID_LEN: usize = 8;
 /// A name-index record: heap ID, message flags, creation order, name hash.
 /// 17 bytes on disk (`H5A__dense_btree2_name_encode`).
 const NAME_RECORD_LEN: usize = FHEAP_ID_LEN + 1 + 4 + 4;
-
-/// Object-header message flag marking a shared (SOHM) attribute message.
-const MSG_FLAG_SHARED: u8 = 0x02;
 
 /// Read every attribute an object keeps in dense storage.
 ///

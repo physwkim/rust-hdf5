@@ -17,6 +17,7 @@ use crate::format::chunk_index::fixed_array::{
     FixedArrayDataBlock, FixedArrayFilteredChunkElement, FixedArrayHeader, FixedArrayPagedPrefix,
     FA_CLIENT_FILT_CHUNK,
 };
+use crate::format::messages::attr_info::AttributeInfoMessage;
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::data_layout::{DataLayoutMessage, EarrayParams, FixedArrayParams};
 use crate::format::messages::dataspace::DataspaceMessage;
@@ -2846,6 +2847,29 @@ impl Hdf5Writer {
             };
             let msg = LinkMessage::hard(&link.name, addr);
             header.add_message(MSG_LINK, 0x00, msg.encode(&self.ctx));
+        }
+    }
+
+    /// The single owner of attribute emission into an object header: appends
+    /// the Attribute Info message and then one `MSG_ATTRIBUTE` per attribute.
+    ///
+    /// On a version-2 object header the two are inseparable.
+    /// `H5O__attr_count_real` derives `H5Oget_info().num_attrs` from the
+    /// Attribute Info message alone — with no such message the count reads as
+    /// zero however many attribute messages follow, which is what made every
+    /// rust-written file report `num_attrs == 0` to libhdf5 while
+    /// `H5Aiterate2` still yielded the attributes. The message carries no
+    /// count of its own: `H5A__get_ainfo` fills `nattrs` from the attribute
+    /// messages the header loader actually saw, so compact storage needs
+    /// nothing but the message's presence.
+    fn emit_attributes(&self, header: &mut ObjectHeader, attributes: &[AttributeMessage]) {
+        if attributes.is_empty() {
+            return;
+        }
+        let ainfo = AttributeInfoMessage::compact();
+        header.add_message(MSG_ATTR_INFO, MSG_FLAG_DONTSHARE, ainfo.encode(&self.ctx));
+        for attr in attributes {
+            header.add_message(MSG_ATTRIBUTE, 0x00, attr.encode(&self.ctx));
         }
     }
 
@@ -7475,11 +7499,8 @@ impl Hdf5Writer {
             }
         }
 
-        // Attribute messages (type 0x0C)
-        for attr in &m.attributes {
-            let attr_msg = attr.encode(&self.ctx);
-            header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
-        }
+        // Attribute Info (type 0x15) + attribute messages (type 0x0C)
+        self.emit_attributes(&mut header, &m.attributes);
 
         // Object Reference Count message (type 0x16): emitted only when
         // more than one hard link resolves to this dataset (computed above).
@@ -7546,11 +7567,9 @@ impl Hdf5Writer {
         // User-created hard links whose parent is this group.
         self.emit_hard_links(&mut header, Some(group_idx));
 
-        // Attribute messages (type 0x0C) -- e.g. NeXus `NX_class`.
-        for attr in &attributes {
-            let attr_msg = attr.encode(&self.ctx);
-            header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
-        }
+        // Attribute Info (type 0x15) + attributes (type 0x0C) -- e.g. NeXus
+        // `NX_class`.
+        self.emit_attributes(&mut header, &attributes);
 
         // Object Reference Count message: emitted only when this group is
         // itself a hard-link target reached by more than one link.
@@ -7619,10 +7638,8 @@ impl Hdf5Writer {
         self.emit_hard_links(&mut header, None);
 
         // Root-level attributes
-        for attr in self.root_attributes.lock().iter() {
-            let attr_msg = attr.encode(&self.ctx);
-            header.add_message(MSG_ATTRIBUTE, 0x00, attr_msg);
-        }
+        let root_attributes = self.root_attributes.lock();
+        self.emit_attributes(&mut header, &root_attributes);
 
         header
     }

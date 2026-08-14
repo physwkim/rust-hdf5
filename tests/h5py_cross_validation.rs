@@ -1352,3 +1352,48 @@ fn rust_append_preserves_h5py_dense_attributes() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// `H5Oget_info().num_attrs` on a version-2 object header is derived from the
+/// Attribute Info message alone (`H5O__attr_count_real`), so a header that
+/// carries attribute messages without it reports zero attributes to libhdf5
+/// even though `H5Aiterate2` still yields every one. Every object the writer
+/// emits — dataset, subgroup, root group — must agree with its own attribute
+/// list; an object with no attributes must carry no Attribute Info message,
+/// which libhdf5 asserts (`ainfo.nattrs > 0`) whenever the message is present.
+#[test]
+fn object_header_attribute_count_matches_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("nattrs_hdr");
+    {
+        let file = H5File::create(&path).unwrap();
+        file.set_attr_numeric("version", &3i64).unwrap();
+        let grp = file.root_group().create_group("grp").unwrap();
+        grp.set_attr_string("NX_class", "NXentry").unwrap();
+        grp.set_attr_numeric("depth", &2i32).unwrap();
+        let ds = file.new_dataset::<i32>().shape([4]).create("data").unwrap();
+        ds.write_raw(&[1, 2, 3, 4]).unwrap();
+        ds.new_attr::<i32>()
+            .shape(())
+            .create("gain")
+            .unwrap()
+            .write_numeric(&7i32)
+            .unwrap();
+        let bare = file.new_dataset::<i32>().shape([2]).create("bare").unwrap();
+        bare.write_raw(&[5, 6]).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "def n(o):\n\
+         \x20   return h5py.h5o.get_info(o.id).num_attrs\n\
+         assert n(f['/']) == 1, n(f['/'])\n\
+         assert n(f['grp']) == 2, n(f['grp'])\n\
+         assert n(f['data']) == 1, n(f['data'])\n\
+         assert n(f['bare']) == 0, n(f['bare'])\n\
+         assert sorted(f.attrs.keys()) == ['version'], sorted(f.attrs.keys())\n\
+         assert sorted(f['grp'].attrs.keys()) == ['NX_class', 'depth']\n\
+         assert f['data'].attrs['gain'] == 7\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
