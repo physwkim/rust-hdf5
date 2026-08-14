@@ -1230,3 +1230,36 @@ fn null_dataspace_written_by_h5py_read_by_rust() {
     drop(file);
     std::fs::remove_file(&path).ok();
 }
+
+/// Implicit chunk index (h5py → rust): a fixed-shape, early-allocated,
+/// unfiltered chunked dataset has no on-disk index structure at all —
+/// libhdf5 (`H5Dnone.c`) computes each chunk's address arithmetically from
+/// the dataset's base address. rust-hdf5 must read every chunk correctly
+/// instead of hard-erroring on the index type, for both a full read and a
+/// selection spanning multiple chunks.
+#[test]
+fn chunk_index_implicit_written_by_h5py_read_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("chunkidx_implicit");
+    write_with_h5py(
+        py,
+        &path,
+        "from h5py import h5d, h5p, h5s, h5t\n\
+         dcpl = h5p.create(h5p.DATASET_CREATE)\n\
+         dcpl.set_layout(h5d.CHUNKED)\n\
+         dcpl.set_chunk((4,))\n\
+         dcpl.set_alloc_time(h5d.ALLOC_TIME_EARLY)\n\
+         sid = h5s.create_simple((16,))\n\
+         dsid = h5d.create(f.id, b'data', h5t.STD_I32LE, sid, dcpl=dcpl)\n\
+         dsid.write(h5s.ALL, h5s.ALL, np.arange(16, dtype='<i4'))\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.shape(), vec![16]);
+    assert_eq!(ds.read_raw::<i32>().unwrap(), (0..16).collect::<Vec<i32>>());
+    // Selection [6, 10) spans two chunks ([4,8) and [8,12)), exercising the
+    // slice-read path through the same implicit-index dispatch.
+    assert_eq!(ds.read_slice::<i32>(&[6], &[4]).unwrap(), vec![6, 7, 8, 9]);
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}

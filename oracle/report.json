@@ -3407,7 +3407,7 @@
    "note": "implicit index \u2014 fixed shape, early allocation, no filter",
    "rust_case": null,
    "a": {
-    "verdict": "GAP",
+    "verdict": "PASS",
     "divergences": [],
     "gaps": [
      {
@@ -3433,14 +3433,6 @@
       "structural": true,
       "ref": "implicit",
       "probe": "UNSUPPORTED(chunkindex): H5Dataset exposes no chunk index type"
-     },
-     {
-      "key": "/data#data",
-      "kind": "unsupported",
-      "field": "data",
-      "structural": false,
-      "ref": "raw:000000000100000002000000030000000400000005000000060000000700000008000000090000000a0000000b0000000c0000000d0000000e0000000f000000",
-      "probe": "UNSUPPORTED(data): hdf5-io error: invalid state: unsupported chunk index type: Implicit"
      },
      {
       "key": "/data#fillvalue",
@@ -3476,7 +3468,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 8,
+    "matched": 9,
     "detail": ""
    },
    "b": {
@@ -6960,14 +6952,6 @@
    "signature": "data \u2014 hdf5-io error: format error: invalid data: datatype conversion: non-standard floating-point bit lay\u2026",
    "cases": [
     "float_f16le"
-   ],
-   "example": "/data#data"
-  },
-  {
-   "kind": "capability",
-   "signature": "data \u2014 hdf5-io error: invalid state: unsupported chunk index type: Implicit",
-   "cases": [
-    "chunkidx_implicit"
    ],
    "example": "/data#data"
   },

@@ -23,7 +23,7 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 
 | direction | PASS | GAP | MISS | DIFF | READ-ERROR | GEN-ERROR |
 |---|---|---|---|---|---|---|
-| A (read) | 60 | 2 | 9 | 1 | 0 | 0 |
+| A (read) | 61 | 1 | 9 | 1 | 0 | 0 |
 
 | direction | PASS | INVALID | UNSUPPORTED-API | SKIPPED |
 |---|---|---|---|---|
@@ -38,11 +38,11 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | 3 | written file rejected | nattrs_hdr | 5 (attr_scalar_num, attr_array_num, attr_string, attrs_dense…) |
 | 4 | written file rejected | dtype | 1 (str_vlen_ascii) |
 | 5 | read capability missing | data — hdf5-io error: format error: invalid data: datatype conversion: non-standard floating-point bit lay… | 1 (float_f16le) |
-| 6 | read capability missing | data — hdf5-io error: invalid state: unsupported chunk index type: Implicit | 1 (chunkidx_implicit) |
-| 7 | field not reported | dtype not emitted | 1 (attrs_dense) |
-| 8 | field not reported | shape not emitted | 1 (attrs_dense) |
-| 9 | field not reported | value not emitted | 1 (attrs_dense) |
-| 10 | API cannot express | no rust writer arm: the public API cannot express this case | 16 (str_fixed_nullpad, str_fixed_spacepad, opaque, bitfield…) |
+| 6 | field not reported | dtype not emitted | 1 (attrs_dense) |
+| 7 | field not reported | shape not emitted | 1 (attrs_dense) |
+| 8 | field not reported | value not emitted | 1 (attrs_dense) |
+| 9 | API cannot express | no rust writer arm: the public API cannot express this case | 16 (str_fixed_nullpad, str_fixed_spacepad, opaque, bitfield…) |
+| 10 | no public accessor (API-wide) | nattrs_hdr — H5Group exposes no object-header attribute count | 72 (int_i8, int_u8, int_i16le, int_u16le…) |
 
 ## Case matrix
 
@@ -89,7 +89,7 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `layout_chunked_v110` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
 | `chunkidx_btree1` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `chunkidx_single` | layout | PASS | 0 | 0 | 0 | PASS |  |
-| `chunkidx_implicit` | layout | GAP | 0 | 0 | 1 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `chunkidx_implicit` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
 | `chunkidx_farray` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `chunkidx_earray` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `chunkidx_btree2` | layout | PASS | 0 | 0 | 0 | PASS |  |
@@ -214,7 +214,6 @@ The rust-written file carries the same data, type and shape as the h5py referenc
 | written file rejected | nattrs_hdr | 5 |  |
 | written file rejected | dtype | 1 |  |
 | read capability missing | data — hdf5-io error: format error: invalid data: datatype conversion: non-standard floating-point bit lay… | 1 | /data#data |
-| read capability missing | data — hdf5-io error: invalid state: unsupported chunk index type: Implicit | 1 | /data#data |
 | field not reported | dtype not emitted | 1 | /data@a00#dtype |
 | field not reported | shape not emitted | 1 | /data@a00#shape |
 | field not reported | value not emitted | 1 | /data@a00#value |

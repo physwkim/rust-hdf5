@@ -1683,6 +1683,9 @@ impl Hdf5Reader {
                 }
                 Ok(())
             }
+            data_layout::ChunkIndexType::Implicit => {
+                self.read_chunked_implicit(name, chunk_dims, index_address, target, output)
+            }
             data_layout::ChunkIndexType::FixedArray => self.read_chunked_fixed_array(
                 name,
                 chunk_dims,
@@ -1815,10 +1818,6 @@ impl Hdf5Reader {
 
                 Ok(())
             }
-            _ => Err(crate::io::IoError::InvalidState(format!(
-                "unsupported chunk index type: {:?}",
-                index_type
-            ))),
         }
     }
 
@@ -2053,6 +2052,101 @@ impl Hdf5Reader {
                 coords,
                 element_size,
             );
+        }
+
+        Ok(())
+    }
+
+    /// Read a dataset indexed by the implicit ("none") chunk index.
+    ///
+    /// There is no on-disk index structure at all (`H5Dnone.c`): every chunk
+    /// slot in the maximum-extent grid is allocated in one block at dataset
+    /// creation, so a chunk's address is purely arithmetic — `index_address +
+    /// slot * chunk_bytes`, where `slot` is its row-major position in the
+    /// same maximum-extent grid the fixed/extensible-array/v2-B-tree indexes
+    /// use (`H5D__chunk_set_info_real`'s `max_down_chunks`). This index type
+    /// is only ever selected for a fixed (non-unlimited) chunked dataset with
+    /// early allocation and no filters, so there is no per-chunk allocation
+    /// flag, compressed size, or filter mask to track.
+    ///
+    /// Scatters only; `output` must already be sized to the target extent and
+    /// pre-filled with the tiled fill value by the caller.
+    fn read_chunked_implicit(
+        &mut self,
+        name: &str,
+        chunk_dims: &[u64],
+        index_address: u64,
+        target: ChunkTarget,
+        output: &mut [u8],
+    ) -> IoResult<()> {
+        let info = self
+            .dataset_info(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let dims = info.dataspace.dims.clone();
+        let element_size = info.datatype.element_size() as u64;
+        let ndims = dims.len();
+
+        if index_address == UNDEF_ADDR {
+            // Unallocated: `output` is already the pre-filled buffer.
+            return Ok(());
+        }
+
+        if chunk_dims.len() != ndims {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "implicit-index dataset rank {} does not match chunk rank {}",
+                ndims,
+                chunk_dims.len()
+            )));
+        }
+
+        let max_dims = info.dataspace.max_dims.clone();
+        let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
+        let grid = crate::io::chunk_grid::index_grid(&dims, max_dims.as_deref(), chunk_dims)?;
+        let chunks_total: u64 = grid.iter().fold(1u64, |acc, &n| acc.saturating_mul(n));
+
+        // Every slot's coordinates and address are computed directly, not
+        // read from disk, so there is no "unallocated chunk" case here the
+        // way a sparse index has one: `at_most: false` because
+        // `H5D__none_idx_create` guarantees the whole block is present.
+        let mut slot_coords = Vec::with_capacity(chunks_total as usize);
+        for i in 0..chunks_total {
+            slot_coords.push(crate::io::chunk_grid::coords_of(
+                &dims,
+                max_dims.as_deref(),
+                chunk_dims,
+                i,
+            )?);
+        }
+
+        let jobs: Vec<Option<ChunkReadJob>> = (0..chunks_total)
+            .map(|i| {
+                let coords = &slot_coords[i as usize];
+                if !target.overlaps(coords, chunk_dims) {
+                    None
+                } else {
+                    Some(ChunkReadJob {
+                        addr: index_address + i * chunk_bytes,
+                        len: chunk_bytes as usize,
+                        at_most: false,
+                        mask: 0,
+                    })
+                }
+            })
+            .collect();
+
+        let decompressed = read_and_decompress_chunks(&self.handle, None, jobs)?;
+        for (i, chunk_data) in decompressed.iter().enumerate() {
+            if let Some(data) = chunk_data {
+                self.scatter_chunk(
+                    target,
+                    data,
+                    output,
+                    &dims,
+                    chunk_dims,
+                    &slot_coords[i],
+                    element_size,
+                );
+            }
         }
 
         Ok(())
