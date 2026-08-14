@@ -247,6 +247,18 @@ pub enum DataLayoutMessage {
 }
 
 impl DataLayoutMessage {
+    /// The storage class and message version, for a message that has to name
+    /// which layout it is talking about.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::Contiguous { .. } => "contiguous",
+            Self::Compact { .. } => "compact (version 3)",
+            Self::ChunkedV3 { .. } => "chunked, version-1 B-tree index (layout version 3)",
+            Self::ChunkedV4 { .. } => "chunked (layout version 4 or 5)",
+            Self::Virtual { .. } => "virtual",
+        }
+    }
+
     /// Contiguous layout with no data allocated yet.
     pub fn contiguous_unallocated(size: u64) -> Self {
         Self::Contiguous {

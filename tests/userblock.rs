@@ -10,7 +10,7 @@
 //! `userblock.h5` and `userblock_v0.h5` (from
 //! `tests/fixtures/gen_userblock.py`) both have a 512-byte userblock holding a
 //! shell shebang, one dataset and one root attribute; they differ only in
-//! superblock version, and only the version-2 one can be appended to.
+//! superblock version, and each is appended to in the version it already has.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -182,20 +182,47 @@ fn appending_behind_a_userblock_keeps_the_block_and_both_datasets() {
     cleanup(&path);
 }
 
-/// The classic-format refusal is about the superblock version, and it must
-/// still be that refusal — not a signature error — behind a userblock.
+/// Appending to a classic file behind a userblock. The two features are
+/// independent and each has its own base-relative arithmetic — the userblock
+/// is the base every address is measured from, and the classic superblock is
+/// the one place the base is recorded — so the combination is what proves
+/// neither re-emission dropped the other.
 #[test]
-fn appending_to_a_classic_file_behind_a_userblock_is_refused_as_classic() {
+fn appending_to_a_classic_file_behind_a_userblock_keeps_both() {
     let original = std::fs::read(fixture("userblock_v0.h5")).unwrap();
     let path = unique_tmp("append_v0");
     std::fs::write(&path, &original).unwrap();
 
-    let text = match H5File::open_rw(&path) {
-        Ok(_) => panic!("the append path does not support the classic format"),
-        Err(e) => e.to_string(),
-    };
-    assert!(text.contains("version-0/1 superblock"), "{text}");
-    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let file = H5File::open_rw(&path).unwrap();
+    file.new_dataset::<i32>()
+        .shape([2])
+        .create("again")
+        .unwrap()
+        .write_raw(&[200i32, 201])
+        .unwrap();
+    file.close().unwrap();
+
+    // The userblock is bytes before the superblock, and nothing may move them.
+    let after = std::fs::read(&path).unwrap();
+    assert_eq!(&after[..USERBLOCK], &original[..USERBLOCK]);
+    // The superblock is still the classic one it was, at the same offset.
+    assert_eq!(after[USERBLOCK + 8], 0);
+
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(file.userblock_size(), 512);
+    assert_eq!(
+        file.dataset("data").unwrap().read_raw::<i32>().unwrap(),
+        vec![0, 1, 2, 3, 4, 5, 6, 7]
+    );
+    assert_eq!(
+        file.dataset("again").unwrap().read_raw::<i32>().unwrap(),
+        vec![200, 201]
+    );
+    assert_eq!(
+        file.attr_string("note").unwrap(),
+        "the superblock starts at 512"
+    );
+    drop(file);
     cleanup(&path);
 }
 

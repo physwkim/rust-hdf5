@@ -3822,3 +3822,55 @@ fn vds_same_file_mapping_readable_by_rust() {
     drop(file);
     std::fs::remove_file(&path).ok();
 }
+
+/// The hard link count of a *reopened* object is part of what its header
+/// records, so a session that changes the count has to rewrite the header.
+///
+/// `H5Oget_info().rc` reads that count; libhdf5 keeps it in an Object
+/// Reference Count message on a version-2 header and in the `nlink` prefix
+/// field on a version-1 one. Neither is reachable from the flags that decide
+/// whether a reopened dataset keeps its header — a link is created in the
+/// parent group, not on the target — so linking to an otherwise untouched
+/// dataset used to leave `rc == 1` while both names resolved, which is a file
+/// `H5Ldelete` then frees the storage of while a name still points at it.
+#[test]
+fn a_link_change_on_a_reopened_dataset_rewrites_its_reference_count() {
+    let Some(py) = python() else { return };
+    let path = tmp("reopen_refcount");
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v110"),
+        "f['alpha'] = np.arange(3, dtype='<i4')\n",
+    );
+
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.root_group().link("twin", "/alpha").unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "info = h5py.h5o.get_info(f['alpha'].id)\n\
+         assert info.rc == 2, info.rc\n\
+         assert sorted(f.keys()) == ['alpha', 'twin'], sorted(f.keys())\n",
+    );
+
+    // And back down: unlinking one of the two names is the same change with
+    // the opposite sign, and the header has to follow it there too.
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.delete_dataset("twin").unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "info = h5py.h5o.get_info(f['alpha'].id)\n\
+         assert info.rc == 1, info.rc\n\
+         assert sorted(f.keys()) == ['alpha'], sorted(f.keys())\n\
+         assert list(f['alpha'][...]) == [0, 1, 2]\n",
+    );
+    std::fs::remove_file(&path).ok();
+}

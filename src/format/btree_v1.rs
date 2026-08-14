@@ -65,11 +65,7 @@ impl Default for BTreeV1Config {
     }
 }
 
-/// A symbol-table entry's on-disk size: name offset, object header address,
-/// cache type, reserved word and the 16-byte scratch pad.
-fn symbol_table_entry_size(sizeof_addr: usize, sizeof_size: usize) -> usize {
-    sizeof_size + sizeof_addr + 4 + 4 + 16
-}
+use crate::format::superblock::symbol_table_entry_size;
 
 impl BTreeV1Config {
     /// Maximum entries a symbol table node (SNOD) may declare.
@@ -135,6 +131,68 @@ pub struct BTreeV1Node {
 }
 
 impl BTreeV1Node {
+    /// Encode this type-0 (symbol-table) node into exactly `node_size` bytes.
+    ///
+    /// Like a SNOD, a v1 B-tree node is a fixed-size record derived from the
+    /// file's "K" values ([`BTreeV1Config::snode_btree_node_size`]) however
+    /// few entries it uses, and the slots past `entries_used` are zeroed.
+    /// `keys` must hold exactly one more entry than `children`: a v1 B-tree
+    /// stores both the left and the right bound of every child, so a node with
+    /// n children has n+1 keys.
+    pub fn encode(
+        &self,
+        node_size: usize,
+        sizeof_addr: usize,
+        sizeof_size: usize,
+    ) -> FormatResult<Vec<u8>> {
+        if self.node_type != 0 {
+            return Err(FormatError::UnsupportedFeature(format!(
+                "B-tree v1 type {} is not encoded by BTreeV1Node (only type 0, \
+                 symbol-table nodes)",
+                self.node_type
+            )));
+        }
+        if self.keys.len() != self.children.len() + 1 {
+            return Err(FormatError::InvalidData(format!(
+                "B-tree v1 node has {} keys for {} children; a v1 node stores both \
+                 bounds of every child, so it needs exactly one more key than children",
+                self.keys.len(),
+                self.children.len()
+            )));
+        }
+        if self.entries_used as usize != self.children.len() {
+            return Err(FormatError::InvalidData(format!(
+                "B-tree v1 node declares {} entries but carries {} children",
+                self.entries_used,
+                self.children.len()
+            )));
+        }
+        let needed =
+            8 + 2 * sizeof_addr + self.children.len() * (sizeof_size + sizeof_addr) + sizeof_size;
+        if needed > node_size {
+            return Err(FormatError::InvalidData(format!(
+                "B-tree v1 node needs {needed} bytes for {} children, more than the \
+                 {node_size}-byte record the file's 'K' value allows",
+                self.children.len()
+            )));
+        }
+
+        let mut buf = Vec::with_capacity(node_size);
+        buf.extend_from_slice(&BTREE_V1_SIGNATURE);
+        buf.push(self.node_type);
+        buf.push(self.level);
+        buf.extend_from_slice(&self.entries_used.to_le_bytes());
+        buf.extend_from_slice(&self.left_sibling.to_le_bytes()[..sizeof_addr]);
+        buf.extend_from_slice(&self.right_sibling.to_le_bytes()[..sizeof_addr]);
+        for (i, &child) in self.children.iter().enumerate() {
+            buf.extend_from_slice(&self.keys[i].to_le_bytes()[..sizeof_size]);
+            buf.extend_from_slice(&child.to_le_bytes()[..sizeof_addr]);
+        }
+        buf.extend_from_slice(&self.keys[self.children.len()].to_le_bytes()[..sizeof_size]);
+        buf.resize(node_size, 0);
+        Ok(buf)
+    }
+
     /// Decode a B-tree v1 node from `buf`.
     ///
     /// `sizeof_addr` and `sizeof_size` come from the superblock; `max_entries`
@@ -637,5 +695,121 @@ mod tests {
         let buf = build_chunk_btree(0, &keys, &[0x80], 4);
         let node = ChunkBTreeV1Node::decode(&buf, 4, 1, 64).unwrap();
         assert_eq!(node.children, vec![0x80]);
+    }
+
+    /// The root group's B-tree in a file h5py wrote with no `libver` argument:
+    /// one leaf, keys `[0, 24]` bounding the names `alpha`..`gamma`, and 496
+    /// zero bytes of unused capacity.
+    #[test]
+    fn an_encoded_group_btree_node_matches_the_bytes_libhdf5_wrote() {
+        let node = BTreeV1Node {
+            node_type: 0,
+            level: 0,
+            entries_used: 1,
+            left_sibling: UNDEF_ADDR,
+            right_sibling: UNDEF_ADDR,
+            keys: vec![0, 24],
+            children: vec![0x430],
+        };
+        let node_size = BTreeV1Config::default().snode_btree_node_size(8, 8);
+        assert_eq!(node_size, 544);
+        let encoded = node.encode(node_size, 8, 8).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"TREE");
+        expected.extend_from_slice(&[0, 0, 1, 0]); // type 0, level 0, 1 entry
+        expected.extend_from_slice(&[0xff; 16]); // both siblings undefined
+        expected.extend_from_slice(&0u64.to_le_bytes()); // key[0]: the empty name
+        expected.extend_from_slice(&0x430u64.to_le_bytes()); // child[0]
+        expected.extend_from_slice(&24u64.to_le_bytes()); // key[1]: "gamma"
+        assert_eq!(&encoded[..expected.len()], &expected[..]);
+        assert!(encoded[expected.len()..].iter().all(|&b| b == 0));
+        assert_eq!(encoded.len(), node_size);
+    }
+
+    /// The two-level shape of a 200-link root group: the interior node's keys
+    /// are the right bounds of its children, and its children point at each
+    /// other.
+    #[test]
+    fn an_encoded_group_btree_node_round_trips_an_interior_level() {
+        let cfg = BTreeV1Config::default();
+        let node_size = cfg.snode_btree_node_size(8, 8);
+        let node = BTreeV1Node {
+            node_type: 0,
+            level: 1,
+            entries_used: 2,
+            left_sibling: UNDEF_ADDR,
+            right_sibling: UNDEF_ADDR,
+            keys: vec![0, 896, 1600],
+            children: vec![0x1a2a8, 0x1a088],
+        };
+        let encoded = node.encode(node_size, 8, 8).unwrap();
+        let decoded = BTreeV1Node::decode(&encoded, 8, 8, cfg.snode_max_entries()).unwrap();
+        assert_eq!(decoded.level, 1);
+        assert_eq!(decoded.entries_used, 2);
+        assert_eq!(decoded.keys, node.keys);
+        assert_eq!(decoded.children, node.children);
+        assert_eq!(decoded.left_sibling, UNDEF_ADDR);
+    }
+
+    /// The B-tree a freshly created group gets (`H5B_create`): a root node with
+    /// no children at all, and the single key that bounds nothing.
+    #[test]
+    fn an_encoded_group_btree_node_round_trips_an_empty_root() {
+        let cfg = BTreeV1Config::default();
+        let node = BTreeV1Node {
+            node_type: 0,
+            level: 0,
+            entries_used: 0,
+            left_sibling: UNDEF_ADDR,
+            right_sibling: UNDEF_ADDR,
+            keys: vec![0],
+            children: vec![],
+        };
+        let encoded = node.encode(cfg.snode_btree_node_size(8, 8), 8, 8).unwrap();
+        let decoded = BTreeV1Node::decode(&encoded, 8, 8, cfg.snode_max_entries()).unwrap();
+        assert_eq!(decoded.entries_used, 0);
+        assert!(decoded.children.is_empty());
+        assert_eq!(decoded.keys, vec![0]);
+    }
+
+    /// A node carrying one key per child, rather than one more, would put every
+    /// later key and child at the wrong offset — the encoder refuses it instead
+    /// of writing a node that decodes as something else.
+    #[test]
+    fn a_group_btree_node_refuses_a_key_count_that_does_not_bound_its_children() {
+        let cfg = BTreeV1Config::default();
+        let node = BTreeV1Node {
+            node_type: 0,
+            level: 0,
+            entries_used: 2,
+            left_sibling: UNDEF_ADDR,
+            right_sibling: UNDEF_ADDR,
+            keys: vec![0, 8],
+            children: vec![0x400, 0x800],
+        };
+        assert!(matches!(
+            node.encode(cfg.snode_btree_node_size(8, 8), 8, 8)
+                .unwrap_err(),
+            FormatError::InvalidData(_)
+        ));
+    }
+
+    /// Chunk-index (type 1) trees have a different key structure entirely, so
+    /// this encoder must not be reached for them.
+    #[test]
+    fn a_chunk_btree_node_is_not_encoded_by_the_group_encoder() {
+        let node = BTreeV1Node {
+            node_type: 1,
+            level: 0,
+            entries_used: 0,
+            left_sibling: UNDEF_ADDR,
+            right_sibling: UNDEF_ADDR,
+            keys: vec![0],
+            children: vec![],
+        };
+        assert!(matches!(
+            node.encode(4096, 8, 8).unwrap_err(),
+            FormatError::UnsupportedFeature(_)
+        ));
     }
 }

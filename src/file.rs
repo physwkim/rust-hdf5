@@ -215,7 +215,7 @@ impl H5File {
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
-                writer.set_libver_bound(libver);
+                writer.set_libver_bound(libver)?;
                 Ok(())
             }
             _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
