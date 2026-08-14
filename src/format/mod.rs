@@ -14,6 +14,7 @@ pub mod local_heap;
 pub mod messages;
 pub mod nbit_scaleoffset;
 pub mod object_header;
+pub mod sohm;
 pub mod superblock;
 pub mod symbol_table;
 pub mod szip;

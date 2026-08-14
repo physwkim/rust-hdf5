@@ -12,6 +12,9 @@ without the two sides sharing a data file.
 Only the standard library, numpy and h5py are used.
 """
 
+import pathlib
+import shutil
+
 import numpy as np
 
 import h5py
@@ -742,6 +745,46 @@ MISC_CASES = [
 
 
 # --------------------------------------------------------------------------
+# checked-in fixtures
+#
+# Some file-level features have no h5py binding at all, so the reference file
+# cannot be written from Python. Those come from a C generator run against the
+# pinned libhdf5 (`tests/fixtures/gen_*.sh`), are checked in, and are copied
+# into the run directory here. h5py still reads them, so direction A compares
+# exactly as it does for a generated case.
+# --------------------------------------------------------------------------
+
+FIXTURE_DIR = pathlib.Path(__file__).resolve().parent.parent / "tests" / "fixtures"
+
+
+def _fixture_case(name, fixture, group, note):
+    def gen(path):
+        src = FIXTURE_DIR / fixture
+        if not src.exists():
+            raise FileNotFoundError(
+                "%s is missing; regenerate it with tests/fixtures/%s"
+                % (src, "gen_sohm.sh")
+            )
+        shutil.copyfile(src, path)
+
+    # No rust writer arm: the public API cannot ask for shared messages.
+    return Case(name, group, gen, None, note)
+
+
+FIXTURE_CASES = [
+    _fixture_case(
+        "sohm_list", "sohm_list.h5", "sohm",
+        "shared datatype/dataspace/attribute messages, list index "
+        "(H5Pset_shared_mesg_index) + a committed datatype",
+    ),
+    _fixture_case(
+        "sohm_btree", "sohm_btree.h5", "sohm",
+        "the same file with the shared-message index forced to a v2 B-tree",
+    ),
+]
+
+
+# --------------------------------------------------------------------------
 
 ALL_CASES = (
     INT_CASES
@@ -756,6 +799,7 @@ ALL_CASES = (
     + ATTR_CASES
     + LIBVER_CASES
     + MISC_CASES
+    + FIXTURE_CASES
 )
 
 

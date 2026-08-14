@@ -29,9 +29,10 @@ use crate::format::messages::superblock_ext::{
 };
 use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
+use crate::format::sohm::{SharedLocation, SharedMessagePointer, SohmMasterTable};
 use crate::format::superblock::{detect_superblock_version, SuperblockV0V1, SuperblockV2V3};
 use crate::format::symbol_table::SymbolTableNode;
-use crate::format::{FormatContext, UNDEF_ADDR};
+use crate::format::{FormatContext, FormatError, UNDEF_ADDR};
 
 use crate::io::file_handle::FileHandle;
 #[cfg(feature = "mmap")]
@@ -165,6 +166,10 @@ pub struct SuperblockExtension {
 struct FileMeta {
     ctx: FormatContext,
     btree: BTreeV1Config,
+    /// The SOHM master table, when the superblock extension names one. A
+    /// message whose `H5O_MSG_FLAG_SHARED` bit is set stores a heap ID, and
+    /// only this table says which fractal heap that ID belongs to.
+    sohm: Option<SohmMasterTable>,
 }
 
 /// HDF5 file reader.
@@ -639,6 +644,7 @@ impl Hdf5Reader {
         let mut meta = FileMeta {
             ctx,
             btree: sb_btree,
+            sohm: None,
         };
         let ext = if ext_addr == UNDEF_ADDR || ext_addr == 0 {
             SuperblockExtension::default()
@@ -667,6 +673,12 @@ impl Hdf5Reader {
                     b.sym_leaf_k, b.snode_internal_k, b.chunk_internal_k
                 )),
             ));
+        }
+        // `H5F__super_read` calls `H5SM_get_info` here, so the shared-message
+        // table is in place before the root group — the first object header
+        // that can hold a shared message — is opened.
+        if let Some(smt) = &ext.shared_message_table {
+            meta.sohm = Some(Self::read_sohm_table(handle, &meta.ctx, smt)?);
         }
         Ok((meta, ext))
     }
@@ -700,6 +712,25 @@ impl Hdf5Reader {
             }
         }
         Ok(ext)
+    }
+
+    /// Read the SOHM master table named by the extension's shared-message
+    /// table message.
+    ///
+    /// The table's length is not stored with it: the index count comes from
+    /// the message, exactly as `H5SM__cache_table_get_final_load_size` takes it
+    /// from `H5F_SOHM_NINDEXES`.
+    fn read_sohm_table(
+        handle: &mut FileHandle,
+        ctx: &FormatContext,
+        smt: &SharedMessageTableMessage,
+    ) -> IoResult<SohmMasterTable> {
+        if smt.table_address == UNDEF_ADDR || smt.nindexes == 0 {
+            return Ok(SohmMasterTable::default());
+        }
+        let size = SohmMasterTable::encoded_size(ctx, smt.nindexes);
+        let buf = handle.read_at(smt.table_address, size)?;
+        Ok(SohmMasterTable::decode(&buf, ctx, smt.nindexes)?)
     }
 
     /// Extract the symbol-table message (btree_addr, heap_addr) from an
@@ -1189,10 +1220,26 @@ impl Hdf5Reader {
     ///   order).
     ///
     /// Nested continuations are followed; the total block count is bounded.
+    ///
+    /// Every message of the returned header holds its literal body: a message
+    /// stored shared (`H5O_MSG_FLAG_SHARED`) has been resolved through the
+    /// SOHM heap or its committed object header and its flag cleared, so no
+    /// caller can hand a shared pointer to a message decoder.
     fn read_object_header_full(
         handle: &mut FileHandle,
         meta: &FileMeta,
         addr: u64,
+    ) -> IoResult<ObjectHeader> {
+        Self::read_object_header_at(handle, meta, addr, 0)
+    }
+
+    /// [`Self::read_object_header_full`], with the committed-message
+    /// indirection depth already reached.
+    fn read_object_header_at(
+        handle: &mut FileHandle,
+        meta: &FileMeta,
+        addr: u64,
+        depth: usize,
     ) -> IoResult<ObjectHeader> {
         let ctx = &meta.ctx;
         /// Bound on the number of continuation blocks followed per header.
@@ -1260,7 +1307,242 @@ impl Hdf5Reader {
             header.messages.extend(new_msgs);
         }
 
+        Self::resolve_shared_messages(handle, meta, &mut header, addr, depth)?;
         Ok(header)
+    }
+
+    /// Replace every stored-shared message body in `header` with the literal
+    /// message it points at, and clear the shared flag.
+    ///
+    /// This is `H5O__shared_decode`'s job in libhdf5, where it runs inside
+    /// each message class's decode. The port decodes message bodies lazily
+    /// from raw bytes at many call sites, so the substitution happens once
+    /// here instead: after this returns, `msg.data` is the message.
+    fn resolve_shared_messages(
+        handle: &mut FileHandle,
+        meta: &FileMeta,
+        header: &mut ObjectHeader,
+        self_addr: u64,
+        depth: usize,
+    ) -> IoResult<()> {
+        // Whole-message sharing: the body is a shared pointer.
+        let mut resolved: Vec<(usize, Vec<u8>)> = Vec::new();
+        for (i, msg) in header.messages.iter().enumerate() {
+            if msg.flags & MSG_FLAG_SHARED == 0 {
+                continue;
+            }
+            let body = Self::resolve_shared_body(
+                handle,
+                meta,
+                msg.msg_type,
+                &msg.data,
+                &header.messages,
+                self_addr,
+                depth,
+            )?;
+            resolved.push((i, body));
+        }
+        for (i, body) in resolved {
+            header.messages[i].data = body;
+            header.messages[i].flags &= !MSG_FLAG_SHARED;
+        }
+
+        // Field-level sharing: an attribute whose embedded datatype or
+        // dataspace is shared carries the pointer inside its own body, flagged
+        // in the attribute's flags byte rather than the message's
+        // (`H5O__attr_decode`).
+        let mut rewritten: Vec<(usize, Vec<u8>)> = Vec::new();
+        for (i, msg) in header.messages.iter().enumerate() {
+            if msg.msg_type != MSG_ATTRIBUTE {
+                continue;
+            }
+            if let Some(body) = Self::resolve_shared_attribute_fields(
+                handle,
+                meta,
+                &msg.data,
+                &header.messages,
+                self_addr,
+                depth,
+            )? {
+                rewritten.push((i, body));
+            }
+        }
+        for (i, body) in rewritten {
+            header.messages[i].data = body;
+        }
+
+        Ok(())
+    }
+
+    /// Resolve one shared pointer of message type `msg_type` into the literal
+    /// message body it names (`H5O__shared_read`).
+    ///
+    /// `siblings` are the messages of the header being read, needed for a
+    /// committed pointer that names that same header — an attribute whose
+    /// datatype is the committed datatype it hangs off.
+    fn resolve_shared_body(
+        handle: &mut FileHandle,
+        meta: &FileMeta,
+        msg_type: u8,
+        ptr_bytes: &[u8],
+        siblings: &[crate::format::object_header::ObjectHeaderMessage],
+        self_addr: u64,
+        depth: usize,
+    ) -> IoResult<Vec<u8>> {
+        /// Bound on committed-message indirection: a shared message read from
+        /// another object header can itself be shared. libhdf5 relies on the
+        /// writer never building a cycle; a crafted file must terminate.
+        const MAX_SHARED_DEPTH: usize = 8;
+
+        let invalid = |msg: String| crate::io::IoError::Format(FormatError::InvalidData(msg));
+
+        if depth >= MAX_SHARED_DEPTH {
+            return Err(invalid(format!(
+                "shared message indirection deeper than {MAX_SHARED_DEPTH} levels"
+            )));
+        }
+        let ptr = SharedMessagePointer::decode(ptr_bytes, &meta.ctx)?;
+        match ptr.location {
+            SharedLocation::Sohm => {
+                let table = meta.sohm.as_ref().ok_or_else(|| {
+                    invalid(format!(
+                        "message type {msg_type:#04x} is shared in the heap but the file has no \
+                         shared message table"
+                    ))
+                })?;
+                let heap_addr = table.heap_addr(msg_type).ok_or_else(|| {
+                    invalid(format!(
+                        "no shared-message index covers message type {msg_type:#04x}"
+                    ))
+                })?;
+                // The heap header's length depends only on the address/length
+                // widths and the filter pipeline it may carry; a bounded
+                // prefix covers it, as it does for dense link storage.
+                let hdr_buf = handle.read_at_most(heap_addr, 512)?;
+                let fh_header = FractalHeapHeader::decode(&hdr_buf, &meta.ctx)?;
+                let mut br = HandleBlockReader { handle };
+                Ok(fractal_heap::read_managed_object(
+                    &fh_header,
+                    &meta.ctx,
+                    &mut br,
+                    &ptr.heap_id,
+                )?)
+            }
+            SharedLocation::Committed => {
+                let pick = |msgs: &[crate::format::object_header::ObjectHeaderMessage]| {
+                    msgs.iter()
+                        .find(|m| m.msg_type == msg_type && m.flags & MSG_FLAG_SHARED == 0)
+                        .map(|m| m.data.clone())
+                };
+                let found = if ptr.oh_addr == self_addr {
+                    pick(siblings)
+                } else {
+                    let target = Self::read_object_header_at(handle, meta, ptr.oh_addr, depth + 1)?;
+                    pick(&target.messages)
+                };
+                found.ok_or_else(|| {
+                    invalid(format!(
+                        "object header at {:#x} holds no message of type {msg_type:#04x} for a \
+                         committed shared message",
+                        ptr.oh_addr
+                    ))
+                })
+            }
+            // `H5O__shared_read` asserts the message is stored shared; a file
+            // that flags a message shared and then says it is not is corrupt.
+            SharedLocation::Unshared | SharedLocation::Here => Err(invalid(format!(
+                "message type {msg_type:#04x} is flagged shared but its pointer says it is not \
+                 stored shared"
+            ))),
+        }
+    }
+
+    /// Splice the literal datatype/dataspace into an attribute message whose
+    /// flags byte says either is shared, returning the rewritten body.
+    ///
+    /// Returns `None` when nothing is shared, so the common attribute costs
+    /// only the flags check. The attribute flags byte is defined from version
+    /// 2 on (`H5O__attr_decode` skips it as unused before that), and the
+    /// 8-byte field alignment applies only to version 1, so a rewritten
+    /// attribute never needs padding recomputed.
+    fn resolve_shared_attribute_fields(
+        handle: &mut FileHandle,
+        meta: &FileMeta,
+        body: &[u8],
+        siblings: &[crate::format::object_header::ObjectHeaderMessage],
+        self_addr: u64,
+        depth: usize,
+    ) -> IoResult<Option<Vec<u8>>> {
+        /// `H5O_ATTR_FLAG_TYPE_SHARED`.
+        const ATTR_FLAG_TYPE_SHARED: u8 = 0x01;
+        /// `H5O_ATTR_FLAG_SPACE_SHARED`.
+        const ATTR_FLAG_SPACE_SHARED: u8 = 0x02;
+
+        if body.len() < 8 || body[0] < 2 {
+            return Ok(None);
+        }
+        let flags = body[1];
+        if flags & (ATTR_FLAG_TYPE_SHARED | ATTR_FLAG_SPACE_SHARED) == 0 {
+            return Ok(None);
+        }
+        let name_size = u16::from_le_bytes([body[2], body[3]]) as usize;
+        let dt_size = u16::from_le_bytes([body[4], body[5]]) as usize;
+        let ds_size = u16::from_le_bytes([body[6], body[7]]) as usize;
+        // Version 3 adds the name character-set byte.
+        let hdr_len = if body[0] >= 3 { 9 } else { 8 };
+        let name_end = hdr_len + name_size;
+        let dt_end = name_end + dt_size;
+        let ds_end = dt_end + ds_size;
+        if body.len() < ds_end {
+            return Err(crate::io::IoError::Format(FormatError::BufferTooShort {
+                needed: ds_end,
+                available: body.len(),
+            }));
+        }
+
+        let resolve = |handle: &mut FileHandle, msg_type: u8, range: std::ops::Range<usize>| {
+            Self::resolve_shared_body(
+                handle,
+                meta,
+                msg_type,
+                &body[range],
+                siblings,
+                self_addr,
+                depth,
+            )
+        };
+        let datatype = if flags & ATTR_FLAG_TYPE_SHARED != 0 {
+            resolve(handle, MSG_DATATYPE, name_end..dt_end)?
+        } else {
+            body[name_end..dt_end].to_vec()
+        };
+        let dataspace = if flags & ATTR_FLAG_SPACE_SHARED != 0 {
+            resolve(handle, MSG_DATASPACE, dt_end..ds_end)?
+        } else {
+            body[dt_end..ds_end].to_vec()
+        };
+
+        let (Ok(dt_len), Ok(ds_len)) = (
+            u16::try_from(datatype.len()),
+            u16::try_from(dataspace.len()),
+        ) else {
+            return Err(crate::io::IoError::Format(FormatError::InvalidData(
+                "shared attribute datatype/dataspace does not fit an attribute message".into(),
+            )));
+        };
+
+        let mut out = Vec::with_capacity(hdr_len + name_size + datatype.len() + dataspace.len());
+        out.extend_from_slice(&body[..hdr_len]);
+        // The spliced-in bodies are literal, so the attribute is no longer
+        // sharing either field.
+        out[1] = 0;
+        out[4..6].copy_from_slice(&dt_len.to_le_bytes());
+        out[6..8].copy_from_slice(&ds_len.to_le_bytes());
+        out.extend_from_slice(&body[hdr_len..name_end]);
+        out.extend_from_slice(&datatype);
+        out.extend_from_slice(&dataspace);
+        out.extend_from_slice(&body[ds_end..]);
+        Ok(Some(out))
     }
 
     /// Parse the messages out of a single object-header continuation block.

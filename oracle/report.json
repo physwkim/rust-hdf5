@@ -4,8 +4,8 @@
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
   "python": "/home/stevek/micromamba/envs/tomo/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-oracle-harness-d1c0a356-1/target/release/oracle_probe",
-  "cases": 72
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-sbext-040abf4b-1/target/release/oracle_probe",
+  "cases": 74
  },
  "results": [
   {
@@ -6916,6 +6916,562 @@
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
+  },
+  {
+   "case": "sohm_list",
+   "group": "sohm",
+   "note": "shared datatype/dataspace/attribute messages, list index (H5Pset_shared_mesg_index) + a committed datatype",
+   "rust_case": null,
+   "a": {
+    "verdict": "MISS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "#superblock",
+      "kind": "unsupported",
+      "field": "superblock",
+      "structural": true,
+      "ref": "2",
+      "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
+     },
+     {
+      "key": "/#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
+     },
+     {
+      "key": "/named_i32",
+      "kind": "missing-object",
+      "field": "kind",
+      "structural": false,
+      "ref": "committed-datatype"
+     },
+     {
+      "key": "/shared0#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/shared0#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/shared0#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "contiguous",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/shared0#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[8]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/shared0#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "1",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/shared0@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared1#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/shared1#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/shared1#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "contiguous",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/shared1#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[8]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/shared1#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "1",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/shared1@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared2#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/shared2#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/shared2#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "contiguous",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/shared2#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[8]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/shared2#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "1",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/shared2@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared3#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/shared3#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/shared3#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "contiguous",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/shared3#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[8]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/shared3#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "1",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/shared3@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/uses_named#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/uses_named#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/uses_named#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "contiguous",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/uses_named#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[8]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/uses_named#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 45,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "UNSUPPORTED-API",
+    "detail": "no rust writer arm: the public API cannot express this case",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": null,
+    "h5dump_rc": null
+   }
+  },
+  {
+   "case": "sohm_btree",
+   "group": "sohm",
+   "note": "the same file with the shared-message index forced to a v2 B-tree",
+   "rust_case": null,
+   "a": {
+    "verdict": "MISS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "#superblock",
+      "kind": "unsupported",
+      "field": "superblock",
+      "structural": true,
+      "ref": "2",
+      "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
+     },
+     {
+      "key": "/#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
+     },
+     {
+      "key": "/named_i32",
+      "kind": "missing-object",
+      "field": "kind",
+      "structural": false,
+      "ref": "committed-datatype"
+     },
+     {
+      "key": "/shared0#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/shared0#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/shared0#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "contiguous",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/shared0#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[8]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/shared0#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "1",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/shared0@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared1#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/shared1#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/shared1#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "contiguous",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/shared1#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[8]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/shared1#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "1",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/shared1@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared2#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/shared2#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/shared2#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "contiguous",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/shared2#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[8]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/shared2#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "1",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/shared2@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared3#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/shared3#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/shared3#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "contiguous",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/shared3#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[8]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/shared3#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "1",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/shared3@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/uses_named#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/uses_named#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/uses_named#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "contiguous",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/uses_named#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[8]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/uses_named#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 45,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "UNSUPPORTED-API",
+    "detail": "no rust writer arm: the public API cannot express this case",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": null,
+    "h5dump_rc": null
+   }
   }
  ],
  "findings": [
@@ -6955,7 +7511,9 @@
     "link_soft",
     "link_external",
     "libver_v110",
-    "libver_latest"
+    "libver_latest",
+    "sohm_list",
+    "sohm_btree"
    ],
    "example": "/data (dataset)"
   },
@@ -7039,7 +7597,9 @@
     "link_soft",
     "link_external",
     "libver_v108",
-    "libver_v110"
+    "libver_v110",
+    "sohm_list",
+    "sohm_btree"
    ],
    "example": ""
   },
@@ -7118,7 +7678,9 @@
     "libver_v110",
     "libver_latest",
     "swmr_created",
-    "large_multi_mb"
+    "large_multi_mb",
+    "sohm_list",
+    "sohm_btree"
    ],
    "example": "/#nattrs_hdr"
   },
@@ -7197,7 +7759,9 @@
     "libver_v110",
     "libver_latest",
     "swmr_created",
-    "large_multi_mb"
+    "large_multi_mb",
+    "sohm_list",
+    "sohm_btree"
    ],
    "example": "#superblock"
   },
@@ -7271,7 +7835,9 @@
     "libver_earliest",
     "libver_v108",
     "swmr_created",
-    "large_multi_mb"
+    "large_multi_mb",
+    "sohm_list",
+    "sohm_btree"
    ],
    "example": "/data#fillvalue"
   },
@@ -7345,7 +7911,9 @@
     "libver_earliest",
     "libver_v108",
     "swmr_created",
-    "large_multi_mb"
+    "large_multi_mb",
+    "sohm_list",
+    "sohm_btree"
    ],
    "example": "/data#filters"
   },
@@ -7419,7 +7987,9 @@
     "libver_earliest",
     "libver_v108",
     "swmr_created",
-    "large_multi_mb"
+    "large_multi_mb",
+    "sohm_list",
+    "sohm_btree"
    ],
    "example": "/data#maxshape"
   },
@@ -7493,7 +8063,9 @@
     "libver_earliest",
     "libver_v108",
     "swmr_created",
-    "large_multi_mb"
+    "large_multi_mb",
+    "sohm_list",
+    "sohm_btree"
    ],
    "example": "/data#nattrs_hdr"
   },
@@ -7550,7 +8122,9 @@
     "attrs_dense",
     "attr_on_root",
     "libver_earliest",
-    "libver_v108"
+    "libver_v108",
+    "sohm_list",
+    "sohm_btree"
    ],
    "example": "/data#layout"
   },
@@ -7584,7 +8158,9 @@
    "cases": [
     "attr_scalar_num",
     "attr_array_num",
-    "attr_string"
+    "attr_string",
+    "sohm_list",
+    "sohm_btree"
    ],
    "example": "/data@count#shape"
   },
