@@ -1168,6 +1168,31 @@ impl Hdf5Writer {
             sizeof_size: sb.sizeof_lengths,
         };
 
+        // A file with shared object header messages keeps datatypes,
+        // dataspaces and attributes in a SOHM fractal heap, and each object
+        // header holds only a heap ID pointing at them. This crate reads that
+        // indirection but never writes it, so finalize would rewrite every
+        // header it touches with the shared messages dropped and the master
+        // table left claiming they are still referenced — a file libhdf5 then
+        // reads as missing its objects. Refuse before anything is written.
+        let ext = crate::io::reader::Hdf5Reader::superblock_extension_at(
+            &mut handle,
+            ctx,
+            crate::format::btree_v1::BTreeV1Config::default(),
+            sb.superblock_extension_address,
+        )?;
+        let nindexes = ext
+            .shared_message_table
+            .as_ref()
+            .map_or(0, |smt| smt.nindexes);
+        if nindexes > 0 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "cannot open this file for appending: its superblock extension \
+                 declares {nindexes} shared object header message (SOHM) \
+                 index(es), which this crate can read but not write"
+            )));
+        }
+
         // Discover links from root group (and subgroups recursively).
         // Read to end-of-file so a large object header (many attributes) is
         // not truncated, which would silently drop datasets on reopen.

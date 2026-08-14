@@ -660,14 +660,7 @@ impl Hdf5Reader {
             btree: sb_btree,
             sohm: None,
         };
-        let ext = if ext_addr == UNDEF_ADDR || ext_addr == 0 {
-            SuperblockExtension::default()
-        } else {
-            // The extension header is read with the pre-extension parameters:
-            // its own messages are never shared and never in a v1 B-tree, so
-            // nothing it contains is needed to decode it.
-            Self::read_superblock_extension(handle, &meta, ext_addr)?
-        };
+        let ext = Self::superblock_extension_at(handle, ctx, sb_btree, ext_addr)?;
         if let Some(k) = ext.btree_k {
             meta.btree = BTreeV1Config {
                 sym_leaf_k: k.sym_leaf_k,
@@ -695,6 +688,31 @@ impl Hdf5Reader {
             meta.sohm = Some(Self::read_sohm_table(handle, &meta.ctx, smt)?);
         }
         Ok((meta, ext))
+    }
+
+    /// The superblock extension's messages, for the address the superblock
+    /// names. Yields the default (every field `None`) when there is no
+    /// extension.
+    ///
+    /// The extension header is read with the pre-extension parameters: its own
+    /// messages are never shared and never in a v1 B-tree, so nothing it
+    /// contains is needed to decode it. This is also how the writer's append
+    /// path learns what the file declares before it rewrites anything.
+    pub(crate) fn superblock_extension_at(
+        handle: &mut FileHandle,
+        ctx: FormatContext,
+        btree: BTreeV1Config,
+        ext_addr: u64,
+    ) -> IoResult<SuperblockExtension> {
+        if ext_addr == UNDEF_ADDR || ext_addr == 0 {
+            return Ok(SuperblockExtension::default());
+        }
+        let meta = FileMeta {
+            ctx,
+            btree,
+            sohm: None,
+        };
+        Self::read_superblock_extension(handle, &meta, ext_addr)
     }
 
     /// Decode the messages of the superblock extension object header.
