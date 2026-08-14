@@ -386,6 +386,16 @@ mod tests {
         assert_eq!(p.oh_addr, 0x9999);
     }
 
+    /// The bytes libhdf5 1.14.6 writes for a dataset sharing `/t` at address
+    /// 800, taken verbatim from an h5py-written file.
+    #[test]
+    fn a_libhdf5_committed_datatype_reference_names_its_object_header() {
+        let buf = [0x02, 0x02, 0x20, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let p = SharedMessagePointer::decode(&buf, &ctx()).unwrap();
+        assert_eq!(p.location, SharedLocation::Committed);
+        assert_eq!(p.oh_addr, 800);
+    }
+
     /// Version 2 predates the committed flag: a non-heap pointer is a
     /// committed datatype whatever the type byte says.
     #[test]
