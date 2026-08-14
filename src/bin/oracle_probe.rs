@@ -1255,6 +1255,39 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "opaque" => {
+            let file = H5File::create(path)?;
+            let bytes: Vec<u8> = (0u8..12).collect();
+            raw_typed(
+                &file,
+                "data",
+                DatatypeMessage::Opaque {
+                    size: 4,
+                    tag: "raw4".into(),
+                },
+                &[3],
+                &bytes,
+            )?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "bitfield" => {
+            let file = H5File::create(path)?;
+            raw_typed(
+                &file,
+                "data",
+                DatatypeMessage::BitField {
+                    size: 1,
+                    byte_order: ByteOrder::LittleEndian,
+                    bit_offset: 0,
+                    bit_precision: 8,
+                },
+                &[4],
+                &[0x01, 0x80, 0xFF, 0x00],
+            )?;
+            file.close()?;
+            Ok(Ok(()))
+        }
 
         // ---- layouts and chunk indexes ----------------------------------
         "layout_contiguous" => simple_ramp::<i32>(path, ramp_n::<i32>(16)),
