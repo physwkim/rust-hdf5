@@ -651,6 +651,26 @@ impl H5Group {
         }
     }
 
+    /// Why this group's attribute `name` cannot be read, or `None` when it
+    /// can be. The attribute counterpart of
+    /// [`unreadable_reason`](Self::unreadable_reason)'s shape for datasets:
+    /// an attribute this crate cannot decode stays in
+    /// [`attr_names`](Self::attr_names) and answers here.
+    pub fn attr_unreadable_reason(&self, name: &str) -> Result<Option<String>> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_attr_unreadable_reason(name)
+            } else {
+                reader.group_attr_unreadable_reason(self.name.trim_start_matches('/'), name)
+            }
+            .map(str::to_string)),
+            _ => Err(Hdf5Error::InvalidState(
+                "attr_unreadable_reason is only available in read mode".into(),
+            )),
+        }
+    }
+
     /// Read one of this group's attributes as a string (read mode).
     pub fn attr_string(&self, name: &str) -> Result<String> {
         let mut inner = borrow_inner_mut(&self.file_inner);
@@ -660,8 +680,7 @@ impl H5Group {
                     reader.root_attr(name)
                 } else {
                     reader.group_attr(self.name.trim_start_matches('/'), name)
-                }
-                .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?
+                }?
                 .clone();
                 Ok(reader.attr_string_value(&attr)?)
             }

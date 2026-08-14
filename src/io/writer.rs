@@ -18,7 +18,7 @@ use crate::format::chunk_index::fixed_array::{
     FA_CLIENT_FILT_CHUNK,
 };
 use crate::format::messages::attr_info::AttributeInfoMessage;
-use crate::format::messages::attribute::AttributeMessage;
+use crate::format::messages::attribute::{AttributeEntry, AttributeMessage};
 use crate::format::messages::data_layout::{DataLayoutMessage, EarrayParams, FixedArrayParams};
 use crate::format::messages::dataspace::DataspaceMessage;
 use crate::format::messages::datatype::DatatypeMessage;
@@ -437,7 +437,7 @@ pub struct DatasetInfo {
     /// Appended frames not yet written to chunks, `None` when empty.
     pub append: Option<AppendBuffer>,
     /// Attributes attached to this dataset.
-    pub attributes: Vec<AttributeMessage>,
+    pub attributes: Vec<AttributeEntry>,
     /// File offset where the dataset object header was written (for SWMR in-place rewrites).
     pub obj_header_written_addr: Option<u64>,
     /// Encoded size of the dataset object header (for verifying in-place rewrites fit).
@@ -594,11 +594,11 @@ fn oversized_attr_error(name: &str, encoded_size: usize) -> crate::io::IoError {
 /// this session's chunk data and indices had already been written past the
 /// allocation point the superblock still records, leaving a file libhdf5 reads
 /// as truncated. Refusing the open leaves it untouched.
-fn check_reopened_attributes(attrs: &[AttributeMessage], ctx: &FormatContext) -> IoResult<()> {
+fn check_reopened_attributes(attrs: &[AttributeEntry], ctx: &FormatContext) -> IoResult<()> {
     for attr in attrs {
         let encoded_size = attr.encode(ctx).len();
         if encoded_size > MAX_MESSAGE_SIZE {
-            return Err(oversized_attr_error(&attr.name, encoded_size));
+            return Err(oversized_attr_error(attr.name(), encoded_size));
         }
     }
     Ok(())
@@ -859,7 +859,7 @@ pub struct GroupInfo {
     /// Soft-deleted: excluded from finalize output.
     pub deleted: bool,
     /// Attributes attached to this group (e.g. NeXus `NX_class`).
-    pub attributes: Vec<AttributeMessage>,
+    pub attributes: Vec<AttributeEntry>,
 }
 
 /// The object a [`HardLink`] resolves to.
@@ -920,7 +920,7 @@ pub struct Hdf5Writer {
     /// resolved and emitted during finalize.
     pub(crate) hard_links: Slot<Vec<HardLink>>,
     /// Attributes attached to the root group (file-level attributes).
-    pub(crate) root_attributes: Slot<Vec<crate::format::messages::attribute::AttributeMessage>>,
+    pub(crate) root_attributes: Slot<Vec<crate::format::messages::attribute::AttributeEntry>>,
     /// Serializes object creation so name-uniqueness check and registry insert
     /// happen atomically.
     ///
@@ -1172,7 +1172,6 @@ impl Hdf5Writer {
         path: &Path,
         locking: crate::io::locking::FileLocking,
     ) -> IoResult<Self> {
-        use crate::format::messages::attribute::AttributeMessage;
         use crate::format::messages::data_layout::DataLayoutMessage;
         use crate::format::messages::dataspace::DataspaceMessage;
         use crate::format::messages::datatype::DatatypeMessage;
@@ -1255,7 +1254,7 @@ impl Hdf5Writer {
         // link path — so finalize can free the block its rewrite supersedes —
         // plus the attributes the header carries, which the group registry
         // below must keep or finalize rewrites the group without them.
-        type GroupHeaderInfo = (u64, usize, Vec<AttributeMessage>);
+        type GroupHeaderInfo = (u64, usize, Vec<AttributeEntry>);
         let mut group_headers: std::collections::HashMap<String, GroupHeaderInfo> =
             Default::default();
         for (name, obj_addr) in &link_entries {
@@ -2900,7 +2899,7 @@ impl Hdf5Writer {
     /// count of its own: `H5A__get_ainfo` fills `nattrs` from the attribute
     /// messages the header loader actually saw, so compact storage needs
     /// nothing but the message's presence.
-    fn emit_attributes(&self, header: &mut ObjectHeader, attributes: &[AttributeMessage]) {
+    fn emit_attributes(&self, header: &mut ObjectHeader, attributes: &[AttributeEntry]) {
         if attributes.is_empty() {
             return;
         }
@@ -3744,11 +3743,12 @@ impl Hdf5Writer {
         if encoded_size > MAX_MESSAGE_SIZE {
             return Err(oversized_attr_error(&attr.name, encoded_size));
         }
+        let entry = AttributeEntry::Readable(attr);
         let old = self.with_attr_list(target, |attrs| {
-            if let Some(pos) = attrs.iter().position(|a| a.name == attr.name) {
-                Some(std::mem::replace(&mut attrs[pos], attr))
+            if let Some(pos) = attrs.iter().position(|a| a.name() == entry.name()) {
+                Some(std::mem::replace(&mut attrs[pos], entry))
             } else {
-                attrs.push(attr);
+                attrs.push(entry);
                 None
             }
         })?;
@@ -3803,7 +3803,7 @@ impl Hdf5Writer {
         let old = self.with_attr_list(target, |attrs| {
             attrs
                 .iter()
-                .position(|a| a.name == name)
+                .position(|a| a.name() == name)
                 .map(|pos| attrs.remove(pos))
         })?;
         match old {
@@ -3820,8 +3820,14 @@ impl Hdf5Writer {
     /// class stores its value inline in the message. Per-object removal
     /// keeps collections shared with other refs (libhdf5-written files)
     /// intact.
-    fn release_attr_vlen(&self, old: &AttributeMessage) -> IoResult<()> {
+    fn release_attr_vlen(&self, old: &AttributeEntry) -> IoResult<()> {
         use crate::format::messages::datatype::DatatypeMessage;
+        // An attribute whose message this crate could not decode keeps
+        // whatever heap space it references: releasing objects named by bytes
+        // we cannot interpret would free storage that is still live.
+        let Some(old) = old.readable() else {
+            return Ok(());
+        };
         if matches!(
             old.datatype,
             DatatypeMessage::VarLenString { .. } | DatatypeMessage::VarLenSequence { .. }
@@ -3836,7 +3842,7 @@ impl Hdf5Writer {
     fn with_attr_list<R>(
         &self,
         target: AttrTarget<'_>,
-        f: impl FnOnce(&mut Vec<AttributeMessage>) -> R,
+        f: impl FnOnce(&mut Vec<AttributeEntry>) -> R,
     ) -> IoResult<R> {
         match target {
             AttrTarget::Root => Ok(f(&mut self.root_attributes.lock())),

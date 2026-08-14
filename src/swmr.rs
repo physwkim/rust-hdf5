@@ -712,8 +712,7 @@ impl SwmrFileReader {
         } else {
             self.reader
                 .group_attr(group_path.trim_start_matches('/'), attr)
-        }
-        .ok_or_else(|| crate::error::Hdf5Error::NotFound(attr.to_string()))?
+        }?
         .clone();
         Ok(self.reader.attr_string_value(&a)?)
     }

@@ -730,6 +730,30 @@ impl H5Dataset {
         }
     }
 
+    /// Why the attribute `attr_name` on this dataset cannot be read, or `None`
+    /// when it can be.
+    ///
+    /// An attribute whose message this crate cannot decode is still listed by
+    /// [`attr_names`](Self::attr_names) — the object header carries it — and
+    /// this says what stands in the way. Opening it through
+    /// [`attr`](Self::attr) fails with the same text.
+    pub fn attr_unreadable_reason(&self, attr_name: &str) -> Result<Option<String>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Reader(reader) => Ok(reader
+                        .dataset_attr_unreadable_reason(name, attr_name)
+                        .map(str::to_string)),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "attr_unreadable_reason not available in write mode".into(),
+            )),
+        }
+    }
+
     /// Open an attribute by name (read mode only).
     pub fn attr(&self, attr_name: &str) -> Result<crate::attribute::H5Attribute> {
         match &self.info {

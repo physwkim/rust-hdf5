@@ -24,7 +24,7 @@ use crate::format::fractal_heap::{
     collect_managed_blocks, read_heap_object, FractalHeapHeader, HeapId,
 };
 use crate::format::messages::attr_info::AttributeInfoMessage;
-use crate::format::messages::attribute::AttributeMessage;
+use crate::format::messages::attribute::AttributeEntry;
 use crate::format::messages::MSG_FLAG_SHARED;
 use crate::format::{BlockReader, FormatContext, FormatError, FormatResult, UNDEF_ADDR};
 
@@ -40,14 +40,15 @@ const NAME_RECORD_LEN: usize = FHEAP_ID_LEN + 1 + 4 + 4;
 ///
 /// Returns them in name-index (hash) order, the order `H5Aiterate2` walks with
 /// `H5_INDEX_NAME`. An `ainfo` describing compact storage yields an empty
-/// vector; a record the reader cannot resolve is an error, not a silent
-/// omission, so a partially-read dense object never masquerades as a complete
-/// one.
+/// vector; a record the reader cannot resolve to a heap object is an error,
+/// not a silent omission, so a partially-read dense object never masquerades
+/// as a complete one. A heap object that resolves but whose payload this crate
+/// cannot model is named rather than dropped — see [`AttributeEntry::parse`].
 pub fn read_dense_attributes<R: BlockReader>(
     ainfo: &AttributeInfoMessage,
     ctx: &FormatContext,
     reader: &mut R,
-) -> FormatResult<Vec<AttributeMessage>> {
+) -> FormatResult<Vec<AttributeEntry>> {
     if !ainfo.is_dense() {
         return Ok(Vec::new());
     }
@@ -92,8 +93,7 @@ pub fn read_dense_attributes<R: BlockReader>(
         }
         let id = HeapId::parse(&rec[..FHEAP_ID_LEN], &heap, ctx)?;
         let bytes = read_heap_object(&id, &heap, ctx, &blocks, reader)?;
-        let (attr, _) = AttributeMessage::decode(&bytes, ctx)?;
-        attrs.push(attr);
+        attrs.push(AttributeEntry::parse(&bytes, ctx)?);
     }
     Ok(attrs)
 }

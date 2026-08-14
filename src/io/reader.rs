@@ -16,7 +16,7 @@ use crate::format::global_heap::{
 };
 use crate::format::local_heap::{local_heap_get_string, LocalHeapHeader};
 use crate::format::messages::attr_info::AttributeInfoMessage;
-use crate::format::messages::attribute::AttributeMessage;
+use crate::format::messages::attribute::{AttributeEntry, AttributeMessage};
 use crate::format::messages::data_layout::{self, DataLayoutMessage};
 use crate::format::messages::dataspace::DataspaceMessage;
 use crate::format::messages::datatype::DatatypeMessage;
@@ -111,7 +111,7 @@ pub struct DatasetReadInfo {
     /// Filter pipeline for compressed chunks (None = uncompressed).
     pub filter_pipeline: Option<FilterPipeline>,
     /// Attributes attached to this dataset.
-    pub attributes: Vec<AttributeMessage>,
+    pub attributes: Vec<AttributeEntry>,
     /// User-defined fill value bytes (one element wide), decoded from the
     /// fill-value message when `fill_defined == 2`. `None` => default
     /// zero-fill. Applied to unallocated chunks and unwritten regions.
@@ -144,9 +144,9 @@ pub struct Hdf5Reader {
     root_group_info: RootGroupInfo,
     datasets: Vec<DatasetReadInfo>,
     /// Attributes on the root group (file-level attributes).
-    root_attributes: Vec<AttributeMessage>,
+    root_attributes: Vec<AttributeEntry>,
     /// Attributes on non-root groups, keyed by group path (no leading `/`).
-    group_attributes: std::collections::HashMap<String, Vec<AttributeMessage>>,
+    group_attributes: std::collections::HashMap<String, Vec<AttributeEntry>>,
     /// Every non-root group path the discovery walk traversed into (no
     /// leading `/`), regardless of whether the group has datasets or
     /// attributes. Built from actual link records, so empty groups,
@@ -548,7 +548,7 @@ impl Hdf5Reader {
         ctx: &FormatContext,
     ) -> IoResult<(
         Vec<DatasetReadInfo>,
-        std::collections::HashMap<String, Vec<AttributeMessage>>,
+        std::collections::HashMap<String, Vec<AttributeEntry>>,
         std::collections::BTreeSet<String>,
         std::collections::HashMap<String, String>,
     )> {
@@ -582,7 +582,7 @@ impl Hdf5Reader {
         header: &ObjectHeader,
         ctx: &FormatContext,
         prefix: &str,
-        group_attrs: &mut std::collections::HashMap<String, Vec<AttributeMessage>>,
+        group_attrs: &mut std::collections::HashMap<String, Vec<AttributeEntry>>,
         group_paths: &mut std::collections::BTreeSet<String>,
         visited: &mut std::collections::HashMap<u64, String>,
         aliases: &mut std::collections::HashMap<String, String>,
@@ -764,7 +764,7 @@ impl Hdf5Reader {
         root_obj_addr: u64,
     ) -> IoResult<(
         Vec<DatasetReadInfo>,
-        std::collections::HashMap<String, Vec<AttributeMessage>>,
+        std::collections::HashMap<String, Vec<AttributeEntry>>,
         std::collections::BTreeSet<String>,
         std::collections::HashMap<String, String>,
     )> {
@@ -807,7 +807,7 @@ impl Hdf5Reader {
         datasets: &mut Vec<DatasetReadInfo>,
         visited: &mut std::collections::HashMap<u64, String>,
         aliases: &mut std::collections::HashMap<String, String>,
-        group_attrs: &mut std::collections::HashMap<String, Vec<AttributeMessage>>,
+        group_attrs: &mut std::collections::HashMap<String, Vec<AttributeEntry>>,
         group_paths: &mut std::collections::BTreeSet<String>,
     ) -> IoResult<()> {
         // Bound legacy-group nesting depth on a hostile/corrupt file.
@@ -1227,12 +1227,69 @@ impl Hdf5Reader {
         self.datasets.iter().find(|d| d.name == name)
     }
 
+    /// Resolve one entry of an attribute list.
+    ///
+    /// The three cases an attribute list can answer are kept apart here rather
+    /// than at each call site: decoded, present but undecodable, absent. A
+    /// caller that collapsed the middle case into the last would report an
+    /// attribute the file contains as one it does not.
+    fn resolve_attr<'a>(
+        attrs: &'a [AttributeEntry],
+        owner: &str,
+        name: &str,
+    ) -> IoResult<&'a AttributeMessage> {
+        match attrs.iter().find(|a| a.name() == name) {
+            Some(AttributeEntry::Readable(attr)) => Ok(attr),
+            Some(AttributeEntry::Unreadable { reason, .. }) => Err(crate::io::IoError::Format(
+                crate::format::FormatError::UnsupportedFeature(format!(
+                    "attribute '{name}' on '{owner}' cannot be decoded: {reason}"
+                )),
+            )),
+            None => Err(crate::io::IoError::NotFound(format!("{owner}:{name}"))),
+        }
+    }
+
+    /// Why the attribute `name` in `attrs` cannot be read, or `None` when it
+    /// can be — or is not there at all, which the accessors above report as
+    /// `NotFound`.
+    fn attr_reason<'a>(attrs: &'a [AttributeEntry], name: &str) -> Option<&'a str> {
+        attrs.iter().find(|a| a.name() == name)?.unreadable_reason()
+    }
+
+    /// Why a dataset's attribute cannot be read, or `None` when it can be.
+    pub fn dataset_attr_unreadable_reason(&self, ds_name: &str, attr_name: &str) -> Option<&str> {
+        Self::attr_reason(&self.dataset_info(ds_name)?.attributes, attr_name)
+    }
+
+    /// Why a root-level attribute cannot be read, or `None` when it can be.
+    pub fn root_attr_unreadable_reason(&self, name: &str) -> Option<&str> {
+        Self::attr_reason(&self.root_attributes, name)
+    }
+
+    /// Why a non-root group's attribute cannot be read, or `None` when it can
+    /// be.
+    pub fn group_attr_unreadable_reason(&self, group_path: &str, name: &str) -> Option<&str> {
+        Self::attr_reason(
+            self.group_attributes
+                .get(&self.canonical_path(group_path))?,
+            name,
+        )
+    }
+
     /// Return the attribute names of a dataset.
+    ///
+    /// Includes attributes this crate cannot decode: the object header carries
+    /// them, so the listing does too. [`Self::dataset_attr`] says why one of
+    /// those cannot be read.
     pub fn dataset_attr_names(&self, name: &str) -> IoResult<Vec<String>> {
         let info = self
             .dataset_info(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
-        Ok(info.attributes.iter().map(|a| a.name.clone()).collect())
+        Ok(info
+            .attributes
+            .iter()
+            .map(|a| a.name().to_string())
+            .collect())
     }
 
     /// Return a specific attribute by dataset name and attribute name.
@@ -1240,41 +1297,42 @@ impl Hdf5Reader {
         let info = self
             .dataset_info(ds_name)
             .ok_or_else(|| crate::io::IoError::NotFound(ds_name.to_string()))?;
-        info.attributes
-            .iter()
-            .find(|a| a.name == attr_name)
-            .ok_or_else(|| crate::io::IoError::NotFound(format!("{}:{}", ds_name, attr_name)))
+        Self::resolve_attr(&info.attributes, ds_name, attr_name)
     }
 
-    /// Return the names of root-level (file) attributes.
+    /// Return the names of root-level (file) attributes, undecodable ones
+    /// included — see [`Self::dataset_attr_names`].
     pub fn root_attr_names(&self) -> Vec<String> {
         self.root_attributes
             .iter()
-            .map(|a| a.name.clone())
+            .map(|a| a.name().to_string())
             .collect()
     }
 
     /// Return a root-level attribute by name.
-    pub fn root_attr(&self, name: &str) -> Option<&AttributeMessage> {
-        self.root_attributes.iter().find(|a| a.name == name)
+    pub fn root_attr(&self, name: &str) -> IoResult<&AttributeMessage> {
+        Self::resolve_attr(&self.root_attributes, "/", name)
     }
 
     /// Return the attribute names of a non-root group (path without a
     /// leading `/`, e.g. `"detector"` or `"entry/instrument"`; may pass
-    /// through group hard links).
+    /// through group hard links). Undecodable attributes included — see
+    /// [`Self::dataset_attr_names`].
     pub fn group_attr_names(&self, group_path: &str) -> Vec<String> {
         self.group_attributes
             .get(&self.canonical_path(group_path))
-            .map(|v| v.iter().map(|a| a.name.clone()).collect())
+            .map(|v| v.iter().map(|a| a.name().to_string()).collect())
             .unwrap_or_default()
     }
 
     /// Return a non-root group's attribute by name.
-    pub fn group_attr(&self, group_path: &str, name: &str) -> Option<&AttributeMessage> {
-        self.group_attributes
-            .get(&self.canonical_path(group_path))?
-            .iter()
-            .find(|a| a.name == name)
+    pub fn group_attr(&self, group_path: &str, name: &str) -> IoResult<&AttributeMessage> {
+        let attrs = self
+            .group_attributes
+            .get(&self.canonical_path(group_path))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        Self::resolve_attr(attrs, group_path, name)
     }
 
     /// Return every non-root group path the discovery walk traversed into
@@ -3052,17 +3110,21 @@ pub(crate) struct HandleBlockReader<'a> {
 /// reports zero attributes for a dense object: a silent loss on read, and a
 /// silent deletion when the writer rebuilds that object's header from what it
 /// collected.
+/// An attribute this crate cannot decode is kept, named, with the reason
+/// attached: a listing that omitted it would report a file that does not
+/// contain it. Only a message too damaged to yield a name is dropped, and only
+/// because there is then nothing to list it under.
 pub(crate) fn collect_object_attributes(
     handle: &mut FileHandle,
     ctx: &FormatContext,
     header: &ObjectHeader,
-) -> Vec<AttributeMessage> {
+) -> Vec<AttributeEntry> {
     let mut attrs = Vec::new();
     for msg in &header.messages {
         match msg.msg_type {
             MSG_ATTRIBUTE => {
-                if let Ok((attr, _)) = AttributeMessage::decode(&msg.data, ctx) {
-                    attrs.push(attr);
+                if let Ok(entry) = AttributeEntry::parse(&msg.data, ctx) {
+                    attrs.push(entry);
                 }
             }
             MSG_ATTR_INFO => {

@@ -1493,3 +1493,88 @@ fn reopen_refuses_oversized_dense_attribute_without_touching_the_file() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// An attribute this crate cannot decode must be listed, not dropped.
+///
+/// An object-reference datatype (class 7) is one `DatatypeMessage::decode`
+/// refuses, and the attribute message that carries it was silently discarded:
+/// `attr_names()` then described a file that did not contain the attribute,
+/// and a header rewrite deleted it for real. The name sits ahead of the
+/// datatype in the message, so it is knowable either way — the listing keeps
+/// it, `attr_unreadable_reason` says what stands in the way, and typed access
+/// fails with the same text.
+#[test]
+fn undecodable_attribute_is_listed_with_a_reason() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_undecodable");
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v108"),
+        "d = f.create_dataset('data', data=np.arange(8, dtype='<i4'))\n\
+         g = f.create_group('g')\n\
+         d.attrs['gain'] = np.int32(7)\n\
+         d.attrs.create('ref', d.ref, dtype=h5py.ref_dtype)\n\
+         g.attrs['label'] = 'ok'\n\
+         g.attrs.create('gref', d.ref, dtype=h5py.ref_dtype)\n",
+    );
+    {
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("data").unwrap();
+        let mut names = ds.attr_names().unwrap();
+        names.sort();
+        assert_eq!(names, vec!["gain".to_string(), "ref".to_string()]);
+
+        let why = ds
+            .attr_unreadable_reason("ref")
+            .unwrap()
+            .expect("a reference attribute must report why it cannot be read");
+        assert!(why.contains("datatype class 7"), "{why}");
+        assert_eq!(ds.attr_unreadable_reason("gain").unwrap(), None);
+
+        // Typed access refuses with the same reason, and the readable
+        // attribute beside it is unaffected.
+        let err = ds.attr("ref").err().expect("attr('ref') must fail");
+        assert!(err.to_string().contains("datatype class 7"), "{err}");
+        assert_eq!(ds.attr("gain").unwrap().read_numeric::<i32>().unwrap(), 7);
+
+        let grp = file.root_group().group("g").unwrap();
+        let mut gnames = grp.attr_names().unwrap();
+        gnames.sort();
+        assert_eq!(gnames, vec!["gref".to_string(), "label".to_string()]);
+        assert!(grp
+            .attr_unreadable_reason("gref")
+            .unwrap()
+            .is_some_and(|w| w.contains("datatype class 7")));
+        assert_eq!(grp.attr_unreadable_reason("label").unwrap(), None);
+        assert_eq!(grp.attr_string("label").unwrap(), "ok");
+
+        // An attribute that is genuinely absent stays absent, not unreadable.
+        assert_eq!(ds.attr_unreadable_reason("nope").unwrap(), None);
+        assert!(ds.attr("nope").is_err());
+    }
+
+    // A header rewrite must put back what it could not decode: the writer
+    // re-emits the message bytes verbatim rather than dropping the attribute.
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.root_group()
+            .group("g")
+            .unwrap()
+            .set_attr_string("added", "x")
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "g = f['g']\n\
+         assert sorted(g.attrs.keys()) == ['added', 'gref', 'label'], sorted(g.attrs.keys())\n\
+         assert f[g.attrs['gref']].name == '/data', f[g.attrs['gref']].name\n\
+         assert g.attrs['label'] == 'ok'\n\
+         d = f['data']\n\
+         assert sorted(d.attrs.keys()) == ['gain', 'ref'], sorted(d.attrs.keys())\n\
+         assert f[d.attrs['ref']].name == '/data'\n",
+    );
+    std::fs::remove_file(&path).ok();
+}

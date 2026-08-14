@@ -367,15 +367,24 @@ impl H5File {
         }
     }
 
+    /// Why the file-level attribute `name` cannot be read, or `None` when it
+    /// can be. See [`H5Dataset::attr_unreadable_reason`](crate::H5Dataset::attr_unreadable_reason).
+    pub fn attr_unreadable_reason(&self, name: &str) -> Result<Option<String>> {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => {
+                Ok(reader.root_attr_unreadable_reason(name).map(str::to_string))
+            }
+            _ => Err(Hdf5Error::InvalidState("not in read mode".into())),
+        }
+    }
+
     /// Read a file-level string attribute.
     pub fn attr_string(&self, name: &str) -> Result<String> {
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {
             H5FileInner::Reader(reader) => {
-                let attr = reader
-                    .root_attr(name)
-                    .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?
-                    .clone();
+                let attr = reader.root_attr(name)?.clone();
                 Ok(reader.attr_string_value(&attr)?)
             }
             _ => Err(Hdf5Error::InvalidState("not in read mode".into())),
