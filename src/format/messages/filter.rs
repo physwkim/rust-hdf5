@@ -89,6 +89,28 @@ impl FilterPipeline {
         }
     }
 
+    /// Create a pipeline with a single shuffle filter.
+    ///
+    /// Shuffle reorders a chunk's bytes by their position within an element,
+    /// gathering each element's first bytes together, then each element's
+    /// second bytes, and so on. It compresses nothing by itself — its output
+    /// is a permutation of its input, exactly as long — so it is normally the
+    /// first stage before a compressor. `H5Pset_shuffle` sets it alone all the
+    /// same, and libhdf5 stores the permuted bytes with no filter behind it.
+    ///
+    /// `element_size` is the size of each data element in bytes; the filter
+    /// carries it as its one client-data value, since the raw chunk bytes do
+    /// not say where the element boundaries are.
+    pub fn shuffle(element_size: u32) -> Self {
+        Self {
+            filters: vec![Filter {
+                id: FILTER_SHUFFLE,
+                flags: 0,
+                cd_values: vec![element_size],
+            }],
+        }
+    }
+
     /// Create a pipeline with shuffle + deflate for better compression.
     ///
     /// Shuffle reorders bytes by position within elements, then deflate

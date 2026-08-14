@@ -587,7 +587,7 @@ def _filter_case(name, rust, note, **kw):
 FILTER_CASES = [
     _filter_case("filter_deflate", "filter_deflate", "deflate level 6",
                  compression="gzip", compression_opts=6),
-    _filter_case("filter_shuffle", None, "shuffle only",
+    _filter_case("filter_shuffle", "filter_shuffle", "shuffle only",
                  shuffle=True),
     _filter_case("filter_fletcher32", "filter_fletcher32", "fletcher32 checksum",
                  fletcher32=True),

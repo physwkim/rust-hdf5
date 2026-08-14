@@ -35,7 +35,7 @@ pub struct DatasetBuilder<T: H5Type> {
     max_shape: Option<Vec<Option<usize>>>,
     is_compact: bool,
     deflate_level: Option<u32>,
-    shuffle_deflate_level: Option<u32>,
+    shuffle: bool,
     custom_pipeline: Option<crate::format::messages::filter::FilterPipeline>,
     group_path: Option<String>,
     fill_value: Option<Vec<u8>>,
@@ -54,7 +54,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             max_shape: None,
             is_compact: false,
             deflate_level: None,
-            shuffle_deflate_level: None,
+            shuffle: false,
             custom_pipeline: None,
             group_path: None,
             fill_value: None,
@@ -73,7 +73,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             max_shape: None,
             is_compact: false,
             deflate_level: None,
-            shuffle_deflate_level: None,
+            shuffle: false,
             custom_pipeline: None,
             group_path: Some(group_path),
             fill_value: None,
@@ -178,14 +178,36 @@ impl<T: H5Type> DatasetBuilder<T> {
         self
     }
 
-    /// Enable shuffle + deflate compression.
+    /// Enable the shuffle filter — `H5Pset_shuffle(dcpl)`, h5py's
+    /// `shuffle=True`.
+    ///
+    /// Shuffle reorders a chunk's bytes by their position within an element,
+    /// which typically improves how well a compressor behind it does on
+    /// numeric data. It is a permutation, not a compressor: on its own it
+    /// leaves the chunk exactly as large as it was, which is what
+    /// `H5Pset_shuffle` without a compressor writes. Combine it with
+    /// [`deflate`](Self::deflate) to compress the shuffled stream. Requires
+    /// chunked storage.
+    ///
+    /// The element width the filter records is the dataset's, so a
+    /// [`datatype`](Self::datatype) override is what it follows when the
+    /// stored element is not `T` itself.
+    #[must_use]
+    pub fn shuffle(mut self) -> Self {
+        self.shuffle = true;
+        self
+    }
+
+    /// Enable shuffle + deflate compression — the same pipeline as
+    /// `.shuffle().deflate(level)`.
     ///
     /// Shuffle reorders bytes by position within elements before compression,
     /// which typically improves compression ratios for numeric data.
     /// Requires chunked storage.
     #[must_use]
     pub fn shuffle_deflate(mut self, level: u32) -> Self {
-        self.shuffle_deflate_level = Some(level);
+        self.shuffle = true;
+        self.deflate_level = Some(level);
         self
     }
 
@@ -337,9 +359,8 @@ impl<T: H5Type> DatasetBuilder<T> {
             None => None,
         };
 
-        let wants_filter = self.custom_pipeline.is_some()
-            || self.shuffle_deflate_level.is_some()
-            || self.deflate_level.is_some();
+        let wants_filter =
+            self.custom_pipeline.is_some() || self.shuffle || self.deflate_level.is_some();
 
         if self.is_null {
             // A NULL dataspace holds no elements at all: no chunk grid to
@@ -495,22 +516,25 @@ impl<T: H5Type> DatasetBuilder<T> {
                 let inner = borrow_inner(&self.file_inner);
                 match &*inner {
                     H5FileInner::Writer(writer) => {
-                        // The requested filter pipeline, if any. Both index
-                        // types that take one explicitly (fixed array and v2
-                        // B-tree) build it the same way, so resolve it once.
+                        // The requested filter pipeline, if any. Every index
+                        // builds it from the same options, so one owner
+                        // resolves it: a second construction site is what let
+                        // a request naming no compressor — shuffle on its own
+                        // — fall through to unfiltered storage.
                         let explicit_pipeline = || {
+                            use crate::format::messages::filter::FilterPipeline;
                             if let Some(p) = self.custom_pipeline.clone() {
-                                p
-                            } else if let Some(level) = self.shuffle_deflate_level {
-                                crate::format::messages::filter::FilterPipeline::shuffle_deflate(
-                                    T::element_size() as u32,
-                                    level,
-                                )
-                            } else {
+                                return p;
+                            }
+                            // Shuffle records the width of the element it
+                            // permutes, which is the stored one — a `datatype`
+                            // override moves that away from `T`.
+                            let es = element_size as u32;
+                            match (self.shuffle, self.deflate_level) {
+                                (true, Some(level)) => FilterPipeline::shuffle_deflate(es, level),
+                                (true, None) => FilterPipeline::shuffle(es),
                                 // deflate_level (checked by wants_filter).
-                                crate::format::messages::filter::FilterPipeline::deflate(
-                                    self.deflate_level.unwrap(),
-                                )
+                                (false, level) => FilterPipeline::deflate(level.unwrap()),
                             }
                         };
                         let idx = if is_btree2 {
@@ -544,22 +568,18 @@ impl<T: H5Type> DatasetBuilder<T> {
                             writer.create_fixed_array_dataset_with_max(
                                 &full_name, datatype, &dims_u64, &max_u64, &chunk_u64, pipeline,
                             )?
-                        } else if let Some(pipeline) = self.custom_pipeline {
+                        } else if wants_filter {
+                            // The extensible-array index takes the pipeline
+                            // the same way, so it goes through the one owner
+                            // too — `create_chunked_dataset_compressed` is
+                            // this call with a deflate-only pipeline.
                             writer.create_chunked_dataset_with_pipeline(
-                                &full_name, datatype, &dims_u64, &max_u64, &chunk_u64, pipeline,
-                            )?
-                        } else if let Some(level) = self.shuffle_deflate_level {
-                            let pipeline =
-                                crate::format::messages::filter::FilterPipeline::shuffle_deflate(
-                                    T::element_size() as u32,
-                                    level,
-                                );
-                            writer.create_chunked_dataset_with_pipeline(
-                                &full_name, datatype, &dims_u64, &max_u64, &chunk_u64, pipeline,
-                            )?
-                        } else if let Some(level) = self.deflate_level {
-                            writer.create_chunked_dataset_compressed(
-                                &full_name, datatype, &dims_u64, &max_u64, &chunk_u64, level,
+                                &full_name,
+                                datatype,
+                                &dims_u64,
+                                &max_u64,
+                                &chunk_u64,
+                                explicit_pipeline(),
                             )?
                         } else {
                             writer.create_chunked_dataset(
@@ -7300,6 +7320,131 @@ mod tests {
             .create("e")
             .is_err());
         file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The filter pipeline the reader decodes from `name`'s header.
+    fn stored_pipeline(
+        path: &std::path::Path,
+        name: &str,
+    ) -> crate::format::messages::filter::FilterPipeline {
+        let mut reader = crate::io::reader::Hdf5Reader::open(path).unwrap();
+        reader
+            .dataset_info(name)
+            .unwrap()
+            .filter_pipeline
+            .clone()
+            .unwrap_or_else(|| panic!("{name}: no filter pipeline"))
+    }
+
+    /// Shuffle is a permutation, not a compressor, so it is a pipeline on its
+    /// own — `H5Pset_shuffle` with nothing behind it. Its stage must reach the
+    /// header, and the reader must unpermute what it wrote.
+    #[test]
+    fn shuffle_alone_is_a_filter_pipeline() {
+        use crate::format::messages::filter::{FilterPipeline, FILTER_SHUFFLE};
+        let path = temp_path("shuffle_alone");
+        let values: Vec<i32> = (0..64).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([64usize])
+                .chunk(&[16])
+                .shuffle()
+                .create("d")
+                .unwrap()
+                .write_raw(&values)
+                .unwrap();
+            file.close().unwrap();
+        }
+        let pipeline = stored_pipeline(&path, "d");
+        assert_eq!(pipeline, FilterPipeline::shuffle(4));
+        assert_eq!(pipeline.filters[0].id, FILTER_SHUFFLE);
+
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+            values
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `.shuffle()` and `.deflate()` are separate stages that compose, and
+    /// `.shuffle_deflate()` is the shorthand for both — one pipeline, built
+    /// once, whichever way it was asked for.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn shuffle_composes_with_deflate() {
+        let path = temp_path("shuffle_then_deflate");
+        let values: Vec<i32> = (0..64).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            for (name, ds) in [
+                ("split", file.new_dataset::<i32>().shuffle().deflate(6)),
+                ("combined", file.new_dataset::<i32>().shuffle_deflate(6)),
+            ] {
+                ds.shape([64usize])
+                    .chunk(&[16])
+                    .create(name)
+                    .unwrap()
+                    .write_raw(&values)
+                    .unwrap();
+            }
+            file.close().unwrap();
+        }
+        assert_eq!(
+            stored_pipeline(&path, "split"),
+            crate::format::messages::filter::FilterPipeline::shuffle_deflate(4, 6)
+        );
+        assert_eq!(
+            stored_pipeline(&path, "split"),
+            stored_pipeline(&path, "combined")
+        );
+
+        let file = H5File::open(&path).unwrap();
+        for name in ["split", "combined"] {
+            assert_eq!(
+                file.dataset(name).unwrap().read_raw::<i32>().unwrap(),
+                values,
+                "{name}"
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The width shuffle permutes by is the stored element's, which a
+    /// `datatype` override moves away from the carrier type `T`: recording
+    /// `T`'s width would permute a 4-byte element as four 1-byte ones and
+    /// hand libhdf5 a chunk it unshuffles into different bytes.
+    #[test]
+    fn shuffle_records_the_stored_element_width() {
+        use crate::format::messages::datatype::DatatypeMessage;
+        use crate::format::messages::filter::FilterPipeline;
+        let path = temp_path("shuffle_override_width");
+        let bytes: Vec<u8> = (0..16u8).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<u8>()
+                .datatype(DatatypeMessage::i32_type())
+                .shape([4usize])
+                .chunk(&[4])
+                .shuffle()
+                .create("d")
+                .unwrap()
+                .write_raw_bytes(&bytes)
+                .unwrap();
+            file.close().unwrap();
+        }
+        assert_eq!(stored_pipeline(&path, "d"), FilterPipeline::shuffle(4));
+
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+            bytes
+                .chunks(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        );
         std::fs::remove_file(&path).ok();
     }
 }

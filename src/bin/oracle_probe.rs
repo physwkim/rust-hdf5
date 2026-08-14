@@ -1713,6 +1713,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
 
         // ---- filters ------------------------------------------------------
         "filter_deflate" => filtered(path, |b| b.deflate(6)),
+        "filter_shuffle" => filtered(path, |b| b.shuffle()),
         "filter_deflate_shuffle" => filtered(path, |b| b.shuffle_deflate(6)),
         "filter_fletcher32" => filtered(path, |b| {
             b.filter_pipeline(FilterPipeline {
