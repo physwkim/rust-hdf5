@@ -2023,6 +2023,12 @@ pub struct FileCreateOptions {
     /// The file's low library-version bound; see
     /// [`Hdf5Writer::set_libver_bound`].
     pub libver: LibverBound,
+    /// Bytes reserved in front of the superblock for the application's own
+    /// use (`H5Pset_userblock`). Zero, the default, places the superblock at
+    /// offset 0; otherwise a power of two of at least
+    /// [`MIN_USERBLOCK`] bytes, since a reader finds the
+    /// superblock by doubling its search offset from there.
+    pub userblock: u64,
 }
 
 /// One object-reference element written before its value could be known.
@@ -2087,6 +2093,12 @@ const MAX_COMPACT_LINKS: usize = 8;
 /// one byte below libhdf5's.
 pub const MAX_COMPACT_DATA: usize = MAX_MESSAGE_SIZE - 4;
 
+/// Smallest userblock a file can be created with, and the granularity of
+/// every larger one: `H5Pset_userblock` takes 0 or a power of two from here
+/// up, because `H5FD_locate_signature` looks for the superblock at 0 and then
+/// at this offset doubled repeatedly.
+pub const MIN_USERBLOCK: u64 = 512;
+
 impl Hdf5Writer {
     /// Create a new HDF5 file at `path` using the env-var-derived locking
     /// policy (controlled by `HDF5_USE_FILE_LOCKING`).
@@ -2120,8 +2132,25 @@ impl Hdf5Writer {
             locking,
             track_order,
             libver,
+            userblock,
         } = options;
-        let handle = FileHandle::create_with_locking(path, locking)?;
+        if userblock != 0 && (userblock < MIN_USERBLOCK || !userblock.is_power_of_two()) {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "a userblock is {MIN_USERBLOCK} bytes or a power of two above it, \
+                 not {userblock}: a reader locates the superblock by doubling its \
+                 search offset from {MIN_USERBLOCK}, so no other size can hold one"
+            )));
+        }
+        let mut handle = FileHandle::create_with_locking(path, locking)?;
+        if userblock != 0 {
+            // Written while the handle is still unbased, so offset 0 is the
+            // start of the file: the block belongs to the application, not to
+            // the HDF5 address space that begins where it ends. libhdf5 zeroes
+            // it the same way (`H5F__super_init`), leaving a file whose first
+            // `userblock` bytes are the application's to overwrite.
+            handle.write_at(0, &vec![0u8; userblock as usize])?;
+            handle.set_base(userblock);
+        }
         let ctx = FormatContext::default_v3();
 
         // Reserve the superblock at offset 0. Which version it gets is only
@@ -2173,6 +2202,17 @@ impl Hdf5Writer {
         } else {
             LibverBound::Earliest
         });
+    }
+
+    /// Bytes this file reserves in front of its superblock
+    /// (`H5Pget_userblock`).
+    ///
+    /// The same value for a file created with one and for a file reopened
+    /// through [`open_append_with_locking`](Self::open_append_with_locking),
+    /// which takes it from where the signature turned up: it is the base of
+    /// the handle's address space either way.
+    pub fn userblock_size(&self) -> u64 {
+        self.handle.base()
     }
 
     /// Set the file's low libver bound, the equivalent of

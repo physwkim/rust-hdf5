@@ -927,8 +927,7 @@ LIBVER_CASES = [
     # non-default B-tree K value (H5Pset_sym_k / H5Pset_istore_k), and neither
     # is wrapped on PropFCID. v0, v2 and v3 are covered by the four cases
     # above; the user block below is the remaining v0 variant.
-    # No rust writer arm: the public API cannot ask for a userblock.
-    Case("userblock", "superblock", gen_userblock, None,
+    Case("userblock", "superblock", gen_userblock, "userblock",
          "512-byte userblock — the superblock, and every address, is based at 512"),
 ]
 

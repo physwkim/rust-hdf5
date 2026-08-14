@@ -475,13 +475,13 @@ impl H5File {
 
     /// Size in bytes of the userblock this file was written with — the
     /// application-owned prefix the superblock follows (`H5Pget_userblock`).
-    /// Zero for a file without one, and for a file this handle has open for
-    /// writing (the writer never places a userblock).
+    /// Zero for a file without one, whichever mode the handle is in.
     pub fn userblock_size(&self) -> u64 {
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Reader(reader) => reader.userblock_size(),
-            _ => 0,
+            H5FileInner::Writer(writer) => writer.userblock_size(),
+            H5FileInner::Closed => 0,
         }
     }
 
@@ -933,6 +933,7 @@ pub struct H5FileOptions {
     locking: Option<FileLocking>,
     track_order: bool,
     libver: LibverBound,
+    userblock: u64,
 }
 
 impl H5FileOptions {
@@ -998,6 +999,33 @@ impl H5FileOptions {
         self
     }
 
+    /// Reserve `size` bytes in front of the superblock for the application's
+    /// own use — h5py's `File(path, "w", userblock_size=512)`, libhdf5's
+    /// `H5Pset_userblock`.
+    ///
+    /// The block is the file's first `size` bytes and belongs to whoever
+    /// writes it: an executable header, a checksum, a provenance record. HDF5
+    /// itself only skips it — the superblock and every address in the file are
+    /// based at `size`, and a reader finds the superblock by looking at offset
+    /// 0 and then at [`MIN_USERBLOCK`](crate::MIN_USERBLOCK) doubled
+    /// repeatedly, which is why the size must be zero (no block) or a power of
+    /// two of at least that many bytes. [`create`](Self::create) reports any
+    /// other size as an error; it is not rounded up.
+    ///
+    /// This crate writes the block zero-filled and never reads it back, so
+    /// filling it is a plain write to the front of the file after
+    /// [`H5File::close`].
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    /// let file = H5File::options().userblock(512).create("prefixed.h5").unwrap();
+    /// assert_eq!(file.userblock_size(), 512);
+    /// ```
+    pub fn userblock(mut self, size: u64) -> Self {
+        self.userblock = size;
+        self
+    }
+
     fn resolved_locking(&self) -> FileLocking {
         match self.locking {
             Some(p) => p,
@@ -1013,6 +1041,7 @@ impl H5FileOptions {
                 locking: self.resolved_locking(),
                 track_order: self.track_order,
                 libver: self.libver,
+                userblock: self.userblock,
             },
         )?;
         Ok(H5File {

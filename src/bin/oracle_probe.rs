@@ -1981,6 +1981,25 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         "libver_v108" => libver_case(path, LibverBound::V18),
         "libver_v110" => libver_case(path, LibverBound::V110),
         "libver_latest" => libver_case(path, LibverBound::V200),
+        "userblock" => {
+            let file = H5File::options().userblock(512).create(path)?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("data")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.root_group().create_group("g")?;
+            file.close()?;
+            // The h5py arm fills the block with a shebang line afterwards, as
+            // an application that keeps a script there would; the block is the
+            // application's, so this is a plain write to the front of the file.
+            let prefix = b"#!/bin/sh\n# userblock\n";
+            let mut block = prefix.to_vec();
+            block.resize(511, b'#');
+            block.push(b'\n');
+            let mut fh = std::fs::OpenOptions::new().write(true).open(path)?;
+            std::io::Write::write_all(&mut fh, &block)?;
+            Ok(Ok(()))
+        }
 
         // ---- SWMR and bulk ---------------------------------------------------
         "swmr_created" => {
