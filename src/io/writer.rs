@@ -558,6 +558,24 @@ impl DatasetInfo {
     fn header_stale_with(&self, nlink: u32) -> bool {
         self.header_stale() || nlink != self.nlink_written
     }
+
+    /// Record that this dataset's on-disk object header was just written with
+    /// `nlink` in it.
+    ///
+    /// INVARIANT: every write of a dataset object header passes through here.
+    /// [`header_stale_with`](Self::header_stale_with) is the one authority for
+    /// "does what is on disk still describe this dataset?", and it answers by
+    /// comparing against [`nlink_written`](Self::nlink_written) — so a site
+    /// that writes a header without saying so leaves that answer describing an
+    /// older write. There are three writers: `finalize`, `finalize_for_swmr`
+    /// and `write_dataset_header_inplace`. The last recorded nothing; it could
+    /// not drift today only because a count it could write is a count that
+    /// makes the header outgrow its block, which it refuses. That is a
+    /// property of the reference-count message's size, not a rule anything
+    /// states, and it is not what the field's definition rests on.
+    fn header_written(&mut self, nlink: u32) {
+        self.nlink_written = nlink;
+    }
 }
 
 /// Runtime metadata for a chunked dataset.
@@ -10670,11 +10688,8 @@ impl Hdf5Writer {
         };
 
         let header = self.build_dataset_header(index);
-        let encoded = self.encode_header(
-            &header,
-            self.object_link_count(HardLinkTarget::Dataset(index)),
-            self.dataset_header_format(index),
-        )?;
+        let nlink = self.object_link_count(HardLinkTarget::Dataset(index));
+        let encoded = self.encode_header(&header, nlink, self.dataset_header_format(index))?;
 
         if encoded.len() > original_size {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -10690,6 +10705,9 @@ impl Hdf5Writer {
         padded.resize(original_size, 0);
 
         self.handle.write_at(addr, &padded)?;
+        // Only after the bytes are down: a failed write leaves the registry
+        // describing the header the file still holds.
+        self.ds(index).lock().header_written(nlink);
         Ok(())
     }
 
@@ -10744,7 +10762,7 @@ impl Hdf5Writer {
             m.obj_header_addr = addr;
             m.obj_header_written_addr = Some(addr);
             m.obj_header_encoded_size = encoded_size;
-            m.nlink_written = nlink;
+            m.header_written(nlink);
         }
 
         // 1b. Group object headers. A hard link can point to a group whose
@@ -10928,7 +10946,7 @@ impl Hdf5Writer {
             let ds = self.ds(i);
             let mut m = ds.lock();
             m.obj_header_addr = addr;
-            m.nlink_written = nlink;
+            m.header_written(nlink);
         }
 
         // 1b. Group object headers. A hard link can point to a group whose
@@ -13714,6 +13732,66 @@ mod tests {
         // its readers attached to.
         writer.close().unwrap();
         assert_eq!(std::fs::read(&path).unwrap()[8], SUPERBLOCK_V3);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// After every writer of a dataset object header, `nlink_written` is the
+    /// count that writer encoded.
+    ///
+    /// `header_stale_with` is the one authority for "does the on-disk header
+    /// still describe this dataset?", and it reads `nlink_written`; the three
+    /// writers — `finalize`, `finalize_for_swmr` and
+    /// `write_dataset_header_inplace` — therefore all record through
+    /// `DatasetInfo::header_written`. This walks the SWMR sequence, where the
+    /// in-place writer is the one that could drift, and pins why it does not:
+    /// a name added after the publish grows the header past the block it was
+    /// published into, so the rewrite is refused rather than half-applied and
+    /// the count on disk stays the one the registry names.
+    #[test]
+    fn every_dataset_header_write_records_its_link_count() {
+        let path = temp_path("header_write_records_nlink");
+        let writer = Hdf5Writer::create(&path).unwrap();
+        let idx = writer
+            .create_chunked_dataset("d", DatatypeMessage::i32_type(), &[0], &[u64::MAX], &[4])
+            .unwrap();
+        let mut writer = writer;
+        writer.finalize_for_swmr().unwrap();
+        assert_eq!(
+            writer.ds(idx).lock().nlink_written,
+            1,
+            "the SWMR publish put one name in the header"
+        );
+        writer.write_dataset_header_inplace(idx).unwrap();
+        assert_eq!(writer.ds(idx).lock().nlink_written, 1);
+
+        // A second name after the publish: the reference-count message it
+        // adds does not fit the published block.
+        writer.create_hard_link("/", "alias", "d").unwrap();
+        assert_eq!(writer.object_link_count(HardLinkTarget::Dataset(idx)), 2);
+        let grew = writer
+            .write_dataset_header_inplace(idx)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            grew.contains("cannot rewrite in place"),
+            "a header that outgrew its block must be refused: {grew}"
+        );
+        assert_eq!(
+            writer.ds(idx).lock().nlink_written,
+            1,
+            "a refused rewrite leaves the registry describing the header the file holds"
+        );
+
+        // The close-time finalize is the writer that commits the second name,
+        // and a reopen reads the same count back off the link graph.
+        writer.close().unwrap();
+        let writer = Hdf5Writer::open_append(&path).unwrap();
+        assert_eq!(
+            writer.ds(0).lock().nlink_written,
+            2,
+            "finalize wrote two names and the reopen reads two"
+        );
+        writer.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
 }
