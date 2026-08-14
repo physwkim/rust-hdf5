@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rust_hdf5::{H5File, Reference, RegionSelection};
+use rust_hdf5::{H5File, PointSelection, Reference, Selection};
 
 const REVISED_REFS: &[u8] = include_bytes!("fixtures/revised_refs.h5");
 
@@ -64,13 +64,16 @@ fn region2_references_report_their_selections() {
     assert_eq!(refs[0].bounds(), Some((vec![1, 2], vec![2, 4])));
     assert!(matches!(
         refs[0].selection(),
-        Some(RegionSelection::Hyperslab(_))
+        Some(Selection::Hyperslab { .. })
     ));
     assert_eq!(refs[1].path(), Some("/matrix"));
     assert_eq!(refs[1].bounds(), Some((vec![0, 1], vec![3, 5])));
     assert_eq!(
         refs[1].selection(),
-        Some(&RegionSelection::Points(vec![vec![0, 1], vec![3, 5]]))
+        Some(&Selection::Points(PointSelection {
+            rank: 2,
+            points: vec![vec![0, 1], vec![3, 5]],
+        }))
     );
     drop(file);
     cleanup(&path);

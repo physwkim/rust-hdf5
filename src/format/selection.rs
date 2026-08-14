@@ -279,6 +279,47 @@ impl Selection {
             Self::Hyperslab { rank, form } => encode_hyperslab(*rank, form),
         }
     }
+
+    /// The inclusive bounding box of the selection — `H5Sget_select_bounds`
+    /// — or `None` when the selection has no bounds of its own:
+    /// [`Selection::All`] takes the extent it is bound against,
+    /// [`Selection::None`] selects nothing, and a regular hyperslab with an
+    /// [`UNLIMITED`] count or block has no upper bound until a growable
+    /// extent supplies one.
+    pub fn bounds(&self) -> Option<(Vec<u64>, Vec<u64>)> {
+        match self {
+            Self::All | Self::None => None,
+            Self::Hyperslab { rank, form } => {
+                let blocks = hyperslab_to_block_list(*rank, form).ok()?;
+                let first = blocks.first()?;
+                let mut lo = first.start.clone();
+                let mut hi = first.end.clone();
+                for b in &blocks[1..] {
+                    for (l, s) in lo.iter_mut().zip(&b.start) {
+                        *l = (*l).min(*s);
+                    }
+                    for (h, e) in hi.iter_mut().zip(&b.end) {
+                        *h = (*h).max(*e);
+                    }
+                }
+                Some((lo, hi))
+            }
+            Self::Points(ps) => {
+                let first = ps.points.first()?;
+                let mut lo = first.clone();
+                let mut hi = first.clone();
+                for p in &ps.points[1..] {
+                    for (l, c) in lo.iter_mut().zip(p) {
+                        *l = (*l).min(*c);
+                    }
+                    for (h, c) in hi.iter_mut().zip(p) {
+                        *h = (*h).max(*c);
+                    }
+                }
+                Some((lo, hi))
+            }
+        }
+    }
 }
 
 /// Cast a decoded/caller-supplied coordinate down to the 4-byte width
@@ -1232,6 +1273,71 @@ mod tests {
     }
 
     // --------------------------------------------------------------- to_boxes
+
+    /// A multi-block selection bounds to the box that covers every block, the
+    /// same answer `H5Sget_select_bounds` gives. Moved here with the decoder
+    /// it belongs to, from `format::reference`'s own copy.
+    #[test]
+    fn bounds_cover_every_block_and_point() {
+        let hyper = Selection::Hyperslab {
+            rank: 2,
+            form: Hyperslab::Blocks(vec![
+                HyperslabBlock {
+                    start: vec![4, 1],
+                    end: vec![5, 3],
+                },
+                HyperslabBlock {
+                    start: vec![0, 6],
+                    end: vec![1, 7],
+                },
+            ]),
+        };
+        assert_eq!(hyper.bounds(), Some((vec![0, 1], vec![5, 7])));
+        let points = Selection::Points(PointSelection {
+            rank: 2,
+            points: vec![vec![3, 9], vec![7, 2]],
+        });
+        assert_eq!(points.bounds(), Some((vec![3, 2], vec![7, 9])));
+        assert_eq!(Selection::All.bounds(), None);
+        assert_eq!(Selection::None.bounds(), None);
+    }
+
+    /// A regular hyperslab lists no blocks; it stores the
+    /// start/stride/count/block pattern, and its bounds cover the blocks that
+    /// pattern expands to.
+    #[test]
+    fn bounds_of_a_regular_hyperslab_cover_its_expansion() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&SEL_HYPERSLABS.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.push(HYPER_REGULAR_FLAG);
+        buf.push(4); // coordinate width
+        buf.extend_from_slice(&1u32.to_le_bytes()); // rank
+        for v in [2u32, 5, 3, 2] {
+            // start 2, stride 5, count 3, block 2
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let (selection, consumed) = Selection::decode(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        // Blocks [2,3], [7,8], [12,13].
+        assert_eq!(selection.bounds(), Some((vec![2], vec![13])));
+    }
+
+    /// A regular hyperslab with no upper bound has no bounding box either,
+    /// rather than one built from the `UNLIMITED` sentinel.
+    #[test]
+    fn bounds_of_an_unlimited_regular_hyperslab_are_absent() {
+        let selection = Selection::Hyperslab {
+            rank: 1,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: vec![0],
+                stride: vec![1],
+                count: vec![UNLIMITED],
+                block: vec![1],
+            }),
+        };
+        assert_eq!(selection.bounds(), None);
+    }
 
     #[test]
     fn to_boxes_all_covers_the_full_extent() {

@@ -6,7 +6,9 @@
 //! skip (pass) when neither is present, so CI without h5py is green.
 
 use rust_hdf5::types::VarLenUnicode;
-use rust_hdf5::{ByteOrder, DatatypeMessage, H5File, H5FileOptions, Reference, RegionSelection};
+use rust_hdf5::{
+    ByteOrder, DatatypeMessage, H5File, H5FileOptions, PointSelection, Reference, Selection,
+};
 
 /// Interpreters tried in order when `RUST_HDF5_TEST_PYTHON` is unset. The
 /// second is the same environment the parity oracle pins
@@ -3225,7 +3227,10 @@ fn region_references_written_by_h5py_report_their_bounds() {
     assert_eq!(refs[3].bounds(), Some((vec![0, 1], vec![3, 5])));
     assert_eq!(
         refs[3].selection(),
-        Some(&RegionSelection::Points(vec![vec![0, 1], vec![3, 5]]))
+        Some(&Selection::Points(PointSelection {
+            rank: 2,
+            points: vec![vec![0, 1], vec![3, 5]],
+        }))
     );
     file.close().unwrap();
     std::fs::remove_file(&path).ok();
