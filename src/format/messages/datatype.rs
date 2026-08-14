@@ -10,6 +10,15 @@ use crate::format::{FormatContext, FormatError, FormatResult};
 
 const DT_VERSION: u8 = 1;
 
+/// libhdf5 `H5O_DTYPE_VERSION_LATEST`: the highest datatype message version
+/// the format defines (5, the HDF5 2.0 encoding).
+const DT_VERSION_LATEST: u8 = 5;
+
+/// The highest datatype message version this crate decodes. Versions 1-4 share
+/// the property layouts below; version 5 came with the 2.0 complex-number
+/// encoding and is reported as unsupported rather than misread.
+const DT_VERSION_MAX_SUPPORTED: u8 = 4;
+
 /// libhdf5 `H5VM_limit_enc_size`: the number of bytes needed to encode any
 /// value in `0..=limit`. Used for version-3 compound member offsets, which
 /// are stored in `limit_enc_size(compound_size)` little-endian bytes.
@@ -811,14 +820,25 @@ impl DatatypeMessage {
 
         let size = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
 
+        // libhdf5 validates the message version once, before dispatching on
+        // the class (`H5O__dtype_decode_helper`): anything outside
+        // 1..=H5O_DTYPE_VERSION_LATEST is a bad message. Versions 1-4 share
+        // every property layout decoded below — the version only selects the
+        // name padding, the compound offset width and the array reserved
+        // fields — so no class repeats the range check. Version 5 is the
+        // HDF5 2.0 encoding introduced for complex numbers; a v5 message is
+        // well-formed but not one this crate reads yet.
+        if !(1..=DT_VERSION_LATEST).contains(&version) {
+            return Err(FormatError::InvalidVersion(version));
+        }
+        if version > DT_VERSION_MAX_SUPPORTED {
+            return Err(FormatError::UnsupportedFeature(format!(
+                "datatype message version {version}"
+            )));
+        }
+
         match class {
             CLASS_FIXED_POINT => {
-                // Versions 1-3 share the same fixed-point property layout;
-                // an atomic type's version is bumped when it is a member of
-                // a v3 compound/array.
-                if !(1..=3).contains(&version) {
-                    return Err(FormatError::InvalidVersion(version));
-                }
                 if buf.len() < 12 {
                     return Err(FormatError::BufferTooShort {
                         needed: 12,
@@ -847,10 +867,6 @@ impl DatatypeMessage {
                 ))
             }
             CLASS_FLOATING_POINT => {
-                // Versions 1-3 share the same floating-point property layout.
-                if !(1..=3).contains(&version) {
-                    return Err(FormatError::InvalidVersion(version));
-                }
                 if buf.len() < 20 {
                     return Err(FormatError::BufferTooShort {
                         needed: 20,
@@ -891,9 +907,6 @@ impl DatatypeMessage {
             CLASS_BITFIELD => {
                 // Bit fields carry the same 4 property bytes as a fixed-point
                 // type: bit offset and bit precision (`H5Odtype.c`).
-                if !(1..=3).contains(&version) {
-                    return Err(FormatError::InvalidVersion(version));
-                }
                 if buf.len() < 12 {
                     return Err(FormatError::BufferTooShort {
                         needed: 12,
@@ -916,9 +929,6 @@ impl DatatypeMessage {
                 ))
             }
             CLASS_OPAQUE => {
-                if !(1..=3).contains(&version) {
-                    return Err(FormatError::InvalidVersion(version));
-                }
                 // The low byte of the class bit field holds the length of the
                 // tag field, which must be a multiple of 8.
                 let tag_len = (flags0 as usize) & (OPAQUE_TAG_MAX - 1);
@@ -940,11 +950,7 @@ impl DatatypeMessage {
                 Ok((Self::Opaque { size, tag }, 8 + tag_len))
             }
             CLASS_STRING => {
-                // String class: 8-byte header, no additional properties
-                // Accept version 1 or 3 (HDF5 uses both)
-                if version != DT_VERSION && version != 3 {
-                    return Err(FormatError::InvalidVersion(version));
-                }
+                // String class: 8-byte header, no additional properties.
                 let padding = flags0 & 0x0F;
                 let charset = (flags0 >> 4) & 0x0F;
 
@@ -958,14 +964,6 @@ impl DatatypeMessage {
                 ))
             }
             CLASS_COMPOUND => {
-                // Compound: versions 1, 2 and 3.
-                if !(1..=3).contains(&version) {
-                    return Err(FormatError::UnsupportedFeature(format!(
-                        "compound datatype version {}",
-                        version
-                    )));
-                }
-
                 // num_members from flags bytes 1-2 (16-bit LE)
                 let num_members = u16::from_le_bytes([flags0, flags1]) as usize;
 
@@ -1020,10 +1018,6 @@ impl DatatypeMessage {
                 Ok((Self::Compound { size, members }, pos))
             }
             CLASS_ENUM => {
-                // Enum versions 1-3. Version 3 drops the 8-byte name padding.
-                if !(1..=3).contains(&version) {
-                    return Err(FormatError::InvalidVersion(version));
-                }
                 let num_members = u16::from_le_bytes([flags0, flags1]) as usize;
                 let base_size = size;
 
@@ -1064,10 +1058,9 @@ impl DatatypeMessage {
                 ))
             }
             CLASS_VLEN => {
-                // Variable-length: version 1
-                if version != DT_VERSION {
-                    return Err(FormatError::InvalidVersion(version));
-                }
+                // Variable-length types carry no version-dependent property
+                // layout at all: libhdf5 only checks that the parent's version
+                // does not exceed this one.
                 let vlen_type = flags0 & 0x0F;
                 let charset = flags1 & 0x0F;
 
@@ -1091,12 +1084,11 @@ impl DatatypeMessage {
                 }
             }
             CLASS_ARRAY => {
-                // Array: version 3
-                if version != 3 && version != 2 {
-                    return Err(FormatError::UnsupportedFeature(format!(
-                        "array datatype version {}",
-                        version
-                    )));
+                // "There should be no array datatypes with version < 2"
+                // (`H5Odtype.c`); the separate array class replaced the
+                // intrinsic arrayness of v1 compound members.
+                if version < 2 {
+                    return Err(FormatError::InvalidVersion(version));
                 }
                 let mut pos = 8;
 
@@ -1110,8 +1102,8 @@ impl DatatypeMessage {
                 let ndims = buf[pos] as usize;
                 pos += 1;
 
-                // Version 2 has 3 bytes of padding after ndims
-                if version == 2 {
+                // Versions below 3 have 3 reserved bytes after ndims.
+                if version < 3 {
                     pos += 3;
                 }
 
@@ -1130,8 +1122,8 @@ impl DatatypeMessage {
                     dims.push(d);
                 }
 
-                // Version 2 has permutation indices after dims (ndims * u32), skip them
-                if version == 2 {
+                // Versions below 3 also carry dimension permutation indices.
+                if version < 3 {
                     pos += ndims * 4;
                 }
 
@@ -1549,6 +1541,105 @@ mod tests {
         assert_eq!(decoded, msg);
         let sz = u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]);
         assert_eq!(sz, 12);
+    }
+
+    // ---- message versions ----
+
+    /// Retag an encoded message with a different version nibble.
+    fn with_version(mut msg: Vec<u8>, version: u8) -> Vec<u8> {
+        msg[0] = (msg[0] & 0x0F) | (version << 4);
+        msg
+    }
+
+    /// Versions 1-4 share the property layout of every class this crate
+    /// decodes, so a v4-tagged message — what libhdf5 emits under a
+    /// `H5F_LIBVER_V112` or later low bound — must decode, not be rejected.
+    #[test]
+    fn decode_accepts_version_4() {
+        for msg in [
+            DatatypeMessage::u32_type(),
+            DatatypeMessage::f64_type(),
+            DatatypeMessage::fixed_string(8),
+            DatatypeMessage::BitField {
+                size: 1,
+                byte_order: ByteOrder::LittleEndian,
+                bit_offset: 0,
+                bit_precision: 8,
+            },
+            DatatypeMessage::Opaque {
+                size: 4,
+                tag: "raw4".to_string(),
+            },
+            DatatypeMessage::vlen_string_utf8(),
+            DatatypeMessage::vlen_bytes(),
+        ] {
+            let v4 = with_version(msg.encode(&ctx()), 4);
+            let (decoded, _) = DatatypeMessage::decode(&v4, &ctx())
+                .unwrap_or_else(|e| panic!("v4 {msg} rejected: {e:?}"));
+            assert_eq!(decoded, msg, "v4 {msg} decoded differently");
+        }
+    }
+
+    /// A v4 compound follows the v3 rules: no name padding, minimum-width
+    /// member offsets.
+    #[test]
+    fn decode_accepts_version_4_compound() {
+        let msg = DatatypeMessage::compound(
+            12,
+            vec![
+                CompoundMember {
+                    name: "x".to_string(),
+                    offset: 0,
+                    datatype: DatatypeMessage::i32_type(),
+                },
+                CompoundMember {
+                    name: "y".to_string(),
+                    offset: 4,
+                    datatype: DatatypeMessage::f64_type(),
+                },
+            ],
+        );
+        let v4 = with_version(msg.encode(&ctx()), 4);
+        let (decoded, consumed) = DatatypeMessage::decode(&v4, &ctx()).unwrap();
+        assert_eq!(consumed, v4.len());
+        assert_eq!(decoded, msg);
+    }
+
+    /// Version 5 is the HDF5 2.0 encoding; it is legal on the wire, so the
+    /// error must name it as unsupported rather than claim a bad version.
+    #[test]
+    fn decode_reports_version_5_as_unsupported() {
+        let v5 = with_version(DatatypeMessage::u32_type().encode(&ctx()), 5);
+        let err = DatatypeMessage::decode(&v5, &ctx()).unwrap_err();
+        assert!(
+            matches!(&err, FormatError::UnsupportedFeature(m)
+                     if m == "datatype message version 5"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_versions_outside_the_format() {
+        for version in [0u8, 6, 15] {
+            let msg = with_version(DatatypeMessage::u32_type().encode(&ctx()), version);
+            let err = DatatypeMessage::decode(&msg, &ctx()).unwrap_err();
+            assert!(
+                matches!(err, FormatError::InvalidVersion(v) if v == version),
+                "version {version}: unexpected error: {err:?}"
+            );
+        }
+    }
+
+    /// An array datatype below version 2 does not exist in the format.
+    #[test]
+    fn decode_rejects_array_version_1() {
+        let msg = DatatypeMessage::array(vec![2], DatatypeMessage::f32_type());
+        let v1 = with_version(msg.encode(&ctx()), 1);
+        let err = DatatypeMessage::decode(&v1, &ctx()).unwrap_err();
+        assert!(
+            matches!(err, FormatError::InvalidVersion(1)),
+            "unexpected error: {err:?}"
+        );
     }
 
     // ---- opaque / bit field ----

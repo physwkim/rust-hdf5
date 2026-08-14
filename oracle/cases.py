@@ -292,6 +292,22 @@ def gen_enum_i32(path):
         f.create_dataset("data", data=np.array([-1, 0, 1000, 0], dtype="<i4"), dtype=dt)
 
 
+def gen_compound_dtype_v4(path):
+    # A v1.12 low bound makes libhdf5 tag the compound datatype message
+    # version 4 (H5O_dtype_ver_bounds); its members stay version 1. Nothing
+    # else in the matrix produces a datatype message above version 3.
+    #
+    # Chunked on purpose: a *contiguous* dataset at a v1.10+ bound is dropped
+    # from the listing by an unrelated gap (`layout_contiguous_v110`), which
+    # would mask what this case is about.
+    arr = np.zeros(4, dtype=COMPOUND_SIMPLE)
+    arr["x"] = np.arange(4, dtype="<f4")
+    arr["y"] = np.arange(100, 104, dtype="<f4")
+    with h5py.File(path, "w", libver=("v112", "v112")) as f:
+        ds = f.create_dataset("data", (4,), chunks=(4,), dtype=COMPOUND_SIMPLE)
+        ds[...] = arr
+
+
 def gen_opaque(path):
     with h5py.File(path, "w") as f:
         tid = h5t.create(h5t.OPAQUE, 4)
@@ -353,6 +369,8 @@ COMPOSITE_CASES = [
          "compound_with_string", "fixed string member"),
     Case("compound_padded", "dtype-composite", gen_compound_padded, "compound_padded",
          "member offsets with gaps and trailing padding"),
+    Case("compound_dtype_v4", "dtype-composite", gen_compound_dtype_v4, None,
+         "version-4 datatype message (libver v1.12 bounds)"),
     Case("array_dtype", "dtype-composite", gen_array_dtype, "array_dtype",
          "H5T_ARRAY element type (2x3 f64)"),
     Case("enum_i8", "dtype-composite", gen_enum_i8, "enum_i8", "3-member i8 enum"),

@@ -1073,6 +1073,55 @@ fn numeric_conversion_reads_from_h5py_written_file() {
     std::fs::remove_file(&path).ok();
 }
 
+/// libhdf5 tags datatype messages with version 4 once the file's low libver
+/// bound is v1.12 or later (`H5O_dtype_ver_bounds`). A v4 message is decoded
+/// exactly like a v3 one; rejecting the version dropped the dataset.
+#[test]
+fn v4_datatype_message_from_h5py_is_readable() {
+    use rust_hdf5::format::messages::datatype::DatatypeMessage;
+
+    let Some(py) = python() else { return };
+    let path = tmp("dtype_v4");
+    write_with_h5py(
+        py,
+        &path,
+        // The libver bound has to be set at open time, so the file the helper
+        // opened is reopened under it. Chunked on purpose: a contiguous
+        // dataset at this bound is dropped from the listing by an unrelated
+        // gap, which would mask the datatype version.
+        "p = f.filename\n\
+         f.close()\n\
+         f = h5py.File(p, 'w', libver=('v112', 'v112'))\n\
+         dt = np.dtype([('x', '<f4'), ('y', '<f4')])\n\
+         arr = np.zeros(4, dtype=dt)\n\
+         arr['x'] = np.arange(4, dtype='<f4')\n\
+         arr['y'] = np.arange(100, 104, dtype='<f4')\n\
+         ds = f.create_dataset('data', (4,), chunks=(4,), dtype=dt)\n\
+         ds[...] = arr\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let DatatypeMessage::Compound { size, members } = ds.datatype().unwrap() else {
+        panic!("expected a compound datatype");
+    };
+    assert_eq!(size, 8);
+    assert_eq!(
+        members
+            .iter()
+            .map(|m| (m.name.as_str(), m.offset))
+            .collect::<Vec<_>>(),
+        vec![("x", 0), ("y", 4)]
+    );
+    let raw = ds.read_raw_bytes().unwrap();
+    let xs: Vec<f32> = raw
+        .chunks_exact(8)
+        .map(|e| f32::from_le_bytes(e[0..4].try_into().unwrap()))
+        .collect();
+    assert_eq!(xs, vec![0.0, 1.0, 2.0, 3.0]);
+    std::fs::remove_file(&path).ok();
+}
+
 /// An `H5T_OPAQUE` dataset (tagged 4-byte blobs) and an `H5T_STD_B8LE` bit
 /// field written by h5py: both classes used to fail to decode, which dropped
 /// the dataset from the catalog entirely.
