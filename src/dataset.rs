@@ -33,6 +33,7 @@ pub struct DatasetBuilder<T: H5Type> {
     is_null: bool,
     chunk_dims: Option<Vec<usize>>,
     max_shape: Option<Vec<Option<usize>>>,
+    is_compact: bool,
     deflate_level: Option<u32>,
     shuffle_deflate_level: Option<u32>,
     custom_pipeline: Option<crate::format::messages::filter::FilterPipeline>,
@@ -51,6 +52,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             is_null: false,
             chunk_dims: None,
             max_shape: None,
+            is_compact: false,
             deflate_level: None,
             shuffle_deflate_level: None,
             custom_pipeline: None,
@@ -69,6 +71,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             is_null: false,
             chunk_dims: None,
             max_shape: None,
+            is_compact: false,
             deflate_level: None,
             shuffle_deflate_level: None,
             custom_pipeline: None,
@@ -135,6 +138,33 @@ impl<T: H5Type> DatasetBuilder<T> {
     #[must_use]
     pub fn max_shape(mut self, max: &[Option<usize>]) -> Self {
         self.max_shape = Some(max.to_vec());
+        self
+    }
+
+    /// Store the raw data inside the dataset's object header —
+    /// `H5Pset_layout(dcpl, H5D_COMPACT)`.
+    ///
+    /// A compact dataset costs no data block and no second seek to read, which
+    /// suits the small per-run constants an analysis file is full of. It is
+    /// bounded by what one object header message can hold
+    /// ([`MAX_COMPACT_DATA`](crate::MAX_COMPACT_DATA) bytes) and it
+    /// is fixed in size: [`chunk`](Self::chunk), a filter, and an unlimited
+    /// [`max_shape`](Self::max_shape) are all rejected at
+    /// [`create`](Self::create), as libhdf5 rejects them.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("compact.h5").unwrap();
+    /// let ds = file.new_dataset::<i32>()
+    ///     .shape([16])
+    ///     .compact()
+    ///     .create("data")
+    ///     .unwrap();
+    /// ds.write_raw(&(0..16i32).collect::<Vec<_>>()).unwrap();
+    /// ```
+    #[must_use]
+    pub fn compact(mut self) -> Self {
+        self.is_compact = true;
         self
     }
 
@@ -307,18 +337,19 @@ impl<T: H5Type> DatasetBuilder<T> {
             None => None,
         };
 
+        let wants_filter = self.custom_pipeline.is_some()
+            || self.shuffle_deflate_level.is_some()
+            || self.deflate_level.is_some();
+
         if self.is_null {
             // A NULL dataspace holds no elements at all: no chunk grid to
-            // scatter into, no fill value to apply to unwritten elements
-            // (there are none), matching upstream's rejection of these
-            // combinations (`H5Dchunk.c`'s chunked-layout dataspace check).
-            if self.chunk_dims.is_some()
-                || self.custom_pipeline.is_some()
-                || self.shuffle_deflate_level.is_some()
-                || self.deflate_level.is_some()
-            {
+            // scatter into, no raw image to put in an object header, no fill
+            // value to apply to unwritten elements (there are none), matching
+            // upstream's rejection of these combinations (`H5Dchunk.c`'s
+            // chunked-layout dataspace check).
+            if self.chunk_dims.is_some() || wants_filter || self.is_compact {
                 return Err(Hdf5Error::InvalidState(
-                    "a NULL dataspace dataset cannot be chunked or filtered".into(),
+                    "a NULL dataspace dataset cannot be chunked, filtered or compact".into(),
                 ));
             }
             if fill_value.is_some() {
@@ -369,15 +400,71 @@ impl<T: H5Type> DatasetBuilder<T> {
         })?;
         let dims_u64: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
 
+        if self.is_compact {
+            // The raw data is the layout message, so there is no chunk grid to
+            // filter and no room to grow into: `H5D__compact_construct` refuses
+            // a max dimension above the current one, and `H5Pset_layout` and
+            // `H5Pset_chunk` overwrite each other rather than combining.
+            if self.chunk_dims.is_some() || wants_filter {
+                return Err(Hdf5Error::InvalidState(
+                    "a compact dataset stores its data in the object header, so it \
+                     cannot be chunked or filtered"
+                        .into(),
+                ));
+            }
+            if self
+                .max_shape
+                .as_ref()
+                .is_some_and(|max| max.iter().zip(&shape).any(|(m, &d)| *m != Some(d)))
+            {
+                return Err(Hdf5Error::InvalidState(
+                    "a compact dataset cannot be extendible: its maximum shape must \
+                     equal its shape"
+                        .into(),
+                ));
+            }
+
+            let index = {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Writer(writer) => {
+                        let idx = writer.create_compact_dataset(&full_name, datatype, &dims_u64)?;
+                        if let Some(ref fv) = fill_value {
+                            writer.set_dataset_fill_value(idx, fv.clone())?;
+                        }
+                        idx
+                    }
+                    H5FileInner::Reader(_) => {
+                        return Err(Hdf5Error::InvalidState(
+                            "cannot create a dataset in read mode".into(),
+                        ));
+                    }
+                    H5FileInner::Closed => {
+                        return Err(Hdf5Error::InvalidState("file is closed".into()));
+                    }
+                }
+            };
+
+            return Ok(H5Dataset {
+                file_inner: clone_inner(&self.file_inner),
+                info: DatasetInfo::Writer {
+                    index,
+                    shape,
+                    element_size,
+                    chunked: false,
+                    btree2: false,
+                    fixed_array: false,
+                    is_null: false,
+                },
+            });
+        }
+
         // A filter pipeline requires chunked storage. When a filter is
         // requested without explicit chunk dimensions, store the whole
         // dataset as a single chunk instead of silently dropping the filter
         // on the contiguous path. (This is one whole-dataset chunk, not
         // h5py's ~1 MiB chunk-size heuristic; pass explicit chunk dimensions
         // for large datasets.)
-        let wants_filter = self.custom_pipeline.is_some()
-            || self.shuffle_deflate_level.is_some()
-            || self.deflate_level.is_some();
         let auto_chunk: Option<Vec<usize>> =
             if self.chunk_dims.is_none() && wants_filter && !shape.is_empty() {
                 Some(shape.iter().map(|&d| d.max(1)).collect())
@@ -6985,6 +7072,232 @@ mod tests {
             .null()
             .fill_value(7i32)
             .create("b")
+            .is_err());
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The layout class the reader sees for `name`, plus the image a compact
+    /// layout carries — what distinguishes compact storage from contiguous
+    /// storage that happens to hold the same bytes.
+    fn compact_image(path: &std::path::Path, name: &str) -> Option<Vec<u8>> {
+        use crate::format::messages::data_layout::DataLayoutMessage;
+        let mut reader = crate::io::reader::Hdf5Reader::open(path).unwrap();
+        match &reader.dataset_info(name).unwrap().layout {
+            DataLayoutMessage::Compact { data } => Some(data.clone()),
+            other => panic!("{name}: expected a compact layout, got {other:?}"),
+        }
+    }
+
+    /// `.compact()` puts the raw data inside the data layout message: the
+    /// dataset has no data block of its own, and the image the layout carries
+    /// is what a read returns.
+    #[test]
+    fn a_compact_dataset_stores_its_data_in_the_layout_message() {
+        let path = temp_path("compact_roundtrip");
+        let values: Vec<i32> = (0..16).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([16usize])
+                .compact()
+                .create("d")
+                .unwrap()
+                .write_raw(&values)
+                .unwrap();
+            file.close().unwrap();
+        }
+
+        let image = compact_image(&path, "d").unwrap();
+        assert_eq!(
+            image,
+            values
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("d").unwrap();
+        assert_eq!(ds.shape(), vec![16]);
+        assert_eq!(ds.read_raw::<i32>().unwrap(), values);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A compact dataset created inside a group is linked from that group,
+    /// not from the root: its create path goes through the same parent
+    /// resolution every other layout uses.
+    #[test]
+    fn a_compact_dataset_lands_in_its_group() {
+        let path = temp_path("compact_in_group");
+        {
+            let file = H5File::create(&path).unwrap();
+            let g = file.root_group().create_group("g").unwrap();
+            g.new_dataset::<u8>()
+                .shape([4usize])
+                .compact()
+                .create("d")
+                .unwrap()
+                .write_raw(&[1u8, 2, 3, 4])
+                .unwrap();
+            file.close().unwrap();
+        }
+        assert_eq!(compact_image(&path, "/g/d").unwrap(), vec![1u8, 2, 3, 4]);
+
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("/g/d").unwrap().read_raw::<u8>().unwrap(),
+            vec![1u8, 2, 3, 4]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A compact dataset's storage is the image itself, so the fill value has
+    /// to be tiled into it at create — `H5D__compact_fill`'s job. An unwritten
+    /// element must read back as the fill value, not as zero.
+    #[test]
+    fn an_unwritten_compact_dataset_reads_back_as_its_fill_value() {
+        let path = temp_path("compact_fill");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .compact()
+                .fill_value(-7i32)
+                .create("d")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+            vec![-7i32; 4]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The image is the layout message, so anything that rewrites the header
+    /// rewrites the data with it. Reopening and attaching an attribute makes
+    /// the header stale; the rebuilt one must still carry the image rather
+    /// than fall back to an unallocated contiguous layout.
+    #[test]
+    fn a_reopened_compact_dataset_keeps_its_image() {
+        let path = temp_path("compact_reopen");
+        let values: Vec<i32> = (100..108).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .compact()
+                .create("d")
+                .unwrap()
+                .write_raw(&values)
+                .unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open_rw(&path).unwrap();
+            file.dataset_writer("d")
+                .unwrap()
+                .new_attr::<i32>()
+                .shape(())
+                .create("note")
+                .unwrap()
+                .write_numeric(&1i32)
+                .unwrap();
+            file.close().unwrap();
+        }
+        assert_eq!(
+            compact_image(&path, "d").unwrap(),
+            values
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+            values
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The ceiling is what a data layout message can hold, so it is checked
+    /// in bytes and names them: the largest image that fits is accepted and
+    /// one element more is refused.
+    #[test]
+    fn the_compact_ceiling_is_checked_in_bytes() {
+        let path = temp_path("compact_ceiling");
+        let file = H5File::create(&path).unwrap();
+
+        let fits = crate::MAX_COMPACT_DATA / 4;
+        file.new_dataset::<i32>()
+            .shape([fits])
+            .compact()
+            .create("fits")
+            .unwrap();
+
+        let over = fits + 1;
+        let err = match file
+            .new_dataset::<i32>()
+            .shape([over])
+            .compact()
+            .create("over")
+        {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an image {} bytes wide must be refused", over * 4),
+        };
+        assert!(
+            err.contains(&(over * 4).to_string())
+                && err.contains(&crate::MAX_COMPACT_DATA.to_string()),
+            "the error must name both sizes: {err}"
+        );
+
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Compact storage has no chunk grid to filter and no room to grow, so
+    /// each conflicting option is refused at `create()` rather than silently
+    /// overriding the layout the way `H5Pset_chunk` does.
+    #[test]
+    fn compact_rejects_chunking_filters_growth_and_a_null_dataspace() {
+        let path = temp_path("compact_rejects");
+        let file = H5File::create(&path).unwrap();
+        assert!(file
+            .new_dataset::<i32>()
+            .shape([4usize])
+            .compact()
+            .chunk(&[4])
+            .create("a")
+            .is_err());
+        assert!(file
+            .new_dataset::<i32>()
+            .shape([4usize])
+            .compact()
+            .deflate(4)
+            .create("b")
+            .is_err());
+        assert!(file
+            .new_dataset::<i32>()
+            .shape([4usize])
+            .compact()
+            .max_shape(&[None])
+            .create("c")
+            .is_err());
+        assert!(file
+            .new_dataset::<i32>()
+            .shape([4usize])
+            .compact()
+            .max_shape(&[Some(8)])
+            .create("d")
+            .is_err());
+        assert!(file
+            .new_dataset::<i32>()
+            .null()
+            .compact()
+            .create("e")
             .is_err());
         file.close().unwrap();
         std::fs::remove_file(&path).ok();

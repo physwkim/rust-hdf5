@@ -443,6 +443,14 @@ pub struct DatasetInfo {
     pub data_addr: u64,
     /// Size of the raw data in bytes (contiguous only).
     pub data_size: u64,
+    /// The raw data itself, for a compact dataset — the whole image, which
+    /// [`build_dataset_header`](Hdf5Writer::build_dataset_header) puts inside
+    /// the data layout message rather than in a block of its own. `Some` is
+    /// what makes a dataset compact, and the buffer is created at its final
+    /// length (filled, as `H5D__compact_fill` does, before any write), so it
+    /// is also the dataset's byte count; `data_addr`/`data_size` stay at the
+    /// "no block in the file" values a compact dataset shares with a NULL one.
+    pub compact: Option<Vec<u8>>,
     /// Chunked storage info (None for contiguous).
     pub chunked: Option<ChunkedDatasetInfo>,
     /// Fixed array chunked storage info.
@@ -1538,6 +1546,7 @@ fn rebuild_dataset(
         obj_header_addr: obj_addr,
         data_addr: UNDEF_ADDR,
         data_size: 0,
+        compact: None,
         chunked: None,
         fixed_array: None,
         btree_v2: None,
@@ -1569,6 +1578,14 @@ fn rebuild_dataset(
         DataLayoutMessage::Contiguous { address, size } => {
             info.data_addr = *address;
             info.data_size = *size;
+        }
+        // The image is the layout message, so the rebuild carries it out of
+        // the header it came from: anything that makes this dataset's header
+        // stale rewrites the layout message from `compact`, and a rebuild
+        // that left it empty would rewrite the dataset as an unallocated
+        // contiguous one — dropping every byte.
+        DataLayoutMessage::Compact { data } => {
+            info.compact = Some(data.clone());
         }
         DataLayoutMessage::ChunkedV4 {
             chunk_dims,
@@ -2059,6 +2076,16 @@ const MAX_COMPACT_ATTRS: usize = 8;
 /// storage (`H5G_CRT_GINFO_MAX_COMPACT`). This writer emits no phase-change
 /// values in the Group Info message, so the default is what applies.
 const MAX_COMPACT_LINKS: usize = 8;
+
+/// Bytes a compact dataset's raw image may occupy.
+///
+/// `H5D__compact_construct` bounds it by `H5O_MESG_MAX_SIZE` less the layout
+/// message's own four bytes (version, class, and the 2-byte data length).
+/// The constant it subtracts from is 65536, one past what the object header's
+/// 2-byte message size field can express, so the ceiling here is taken from
+/// [`MAX_MESSAGE_SIZE`] — the largest message that actually encodes — and is
+/// one byte below libhdf5's.
+pub const MAX_COMPACT_DATA: usize = MAX_MESSAGE_SIZE - 4;
 
 impl Hdf5Writer {
     /// Create a new HDF5 file at `path` using the env-var-derived locking
@@ -4641,6 +4668,76 @@ impl Hdf5Writer {
                 obj_header_addr: 0, // set during finalize
                 data_addr,
                 data_size,
+                compact: None,
+                chunked: None,
+                fixed_array: None,
+                btree_v2: None,
+                append: None,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: None,
+                deleted: false,
+                extent_dirty: false,
+                header_dirty: false,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
+                fill_value: None,
+                layout_version: 4,
+            },
+        );
+
+        Ok(idx)
+    }
+
+    /// Define a new compact dataset — `H5Pset_layout(dcpl, H5D_COMPACT)`.
+    ///
+    /// The raw data lives inside the data layout message in the dataset's own
+    /// object header, so it costs no block of its own and no extra seek to
+    /// read; the price is the ceiling, and that the whole image is rewritten
+    /// whenever the header is. The buffer is created at its final length and
+    /// zero-filled, which is what `H5D__compact_fill` does at create time, so
+    /// a dataset never written still reads back as its fill value.
+    ///
+    /// Errors when the image exceeds [`MAX_COMPACT_DATA`].
+    pub fn create_compact_dataset(
+        &self,
+        name: &str,
+        datatype: DatatypeMessage,
+        dims: &[u64],
+    ) -> IoResult<usize> {
+        let total_elements: u64 = if dims.is_empty() {
+            1
+        } else {
+            dims.iter().product()
+        };
+        let data_size = total_elements * datatype.element_size() as u64;
+        if data_size > MAX_COMPACT_DATA as u64 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "compact dataset '{name}' needs {data_size} bytes, above the \
+                 {MAX_COMPACT_DATA}-byte ceiling a data layout message can hold; \
+                 use contiguous or chunked storage"
+            )));
+        }
+
+        let create = self.begin_create(name)?;
+        let name = create.name.as_str();
+        let dataspace = if dims.is_empty() {
+            DataspaceMessage::scalar()
+        } else {
+            DataspaceMessage::simple(dims)
+        };
+
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                dataspace,
+                obj_header_addr: 0, // set during finalize
+                data_addr: UNDEF_ADDR,
+                data_size: 0,
+                compact: Some(vec![0u8; data_size as usize]),
                 chunked: None,
                 fixed_array: None,
                 btree_v2: None,
@@ -4682,6 +4779,7 @@ impl Hdf5Writer {
                 obj_header_addr: 0, // set during finalize
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
+                compact: None,
                 chunked: None,
                 fixed_array: None,
                 btree_v2: None,
@@ -4781,6 +4879,7 @@ impl Hdf5Writer {
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
+                compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
                 obj_header_encoded_size: 0,
@@ -4823,11 +4922,26 @@ impl Hdf5Writer {
         let ds = self.ds(index);
         let _op = ds.op.lock();
         let data_addr = {
-            let g = ds.lock();
+            let mut g = ds.lock();
             if g.chunked.is_some() {
                 return Err(crate::io::IoError::InvalidState(
                     "use write_chunk for chunked datasets".into(),
                 ));
+            }
+            // A compact dataset's raw image is its layout message, so the
+            // write lands in the buffer the header is built from rather than
+            // at a file offset, and the header it is built into is now stale.
+            if let Some(image) = g.compact.as_mut() {
+                if data.len() != image.len() {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "data size mismatch: expected {} bytes, got {}",
+                        image.len(),
+                        data.len()
+                    )));
+                }
+                image.copy_from_slice(data);
+                g.header_dirty = true;
+                return Ok(());
             }
             if g.data_addr == UNDEF_ADDR {
                 return Err(crate::io::IoError::InvalidState(
@@ -5870,6 +5984,7 @@ impl Hdf5Writer {
                 obj_header_addr: 0,
                 data_addr,
                 data_size: data_size as u64,
+                compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
                 obj_header_encoded_size: 0,
@@ -5976,6 +6091,7 @@ impl Hdf5Writer {
                 obj_header_addr: 0,
                 data_addr,
                 data_size: data_size as u64,
+                compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
                 obj_header_encoded_size: 0,
@@ -6107,6 +6223,7 @@ impl Hdf5Writer {
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
+                compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
                 obj_header_encoded_size: 0,
@@ -6752,23 +6869,32 @@ impl Hdf5Writer {
                 es
             )));
         }
+        // For a dataset with no per-chunk fill path the fill-value message
+        // only declares fill-on-allocation — tile the fill value across the
+        // storage itself now, so unwritten elements read back as the fill
+        // value. Which storage that is depends on the layout: a compact
+        // dataset's is the image inside its layout message, a contiguous
+        // one's is its data block. (The high-level builder calls this
+        // immediately after create, before any data is written; a subsequent
+        // write_raw/write_slice overwrites its region.)
+        let is_chunked = ds.chunked.is_some() || ds.fixed_array.is_some() || ds.btree_v2.is_some();
+        if !is_chunked {
+            if let Some(len) = ds.compact.as_ref().map(Vec::len) {
+                ds.compact = Some(crate::format::messages::fill_value::tiled_fill(
+                    len,
+                    Some(&bytes),
+                ));
+            } else if ds.data_addr != UNDEF_ADDR && ds.data_size > 0 {
+                let data_addr = ds.data_addr;
+                let data_size = ds.data_size as usize;
+                let filled =
+                    crate::format::messages::fill_value::tiled_fill(data_size, Some(&bytes));
+                self.handle.write_at(data_addr, &filled)?;
+            }
+        }
+
         ds.fill_value = Some(bytes);
         ds.header_dirty = true;
-
-        // For a contiguous dataset the fill-value message declares
-        // fill-on-allocation, but contiguous storage has no per-chunk
-        // fill path — write the tiled fill value across the data block now
-        // so unwritten elements read back as the fill value. (The high-level
-        // builder calls this immediately after create, before any data is
-        // written; a subsequent write_raw/write_slice overwrites its region.)
-        let is_chunked = ds.chunked.is_some() || ds.fixed_array.is_some() || ds.btree_v2.is_some();
-        if !is_chunked && ds.data_addr != UNDEF_ADDR && ds.data_size > 0 {
-            let data_addr = ds.data_addr;
-            let data_size = ds.data_size as usize;
-            let fv = ds.fill_value.as_deref();
-            let filled = crate::format::messages::fill_value::tiled_fill(data_size, fv);
-            self.handle.write_at(data_addr, &filled)?;
-        }
         Ok(())
     }
 
@@ -7319,6 +7445,7 @@ impl Hdf5Writer {
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
+                compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
                 obj_header_encoded_size: 0,
@@ -7460,6 +7587,7 @@ impl Hdf5Writer {
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
+                compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
                 obj_header_encoded_size: 0,
@@ -7572,6 +7700,7 @@ impl Hdf5Writer {
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
+                compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
                 obj_header_encoded_size: 0,
@@ -7681,6 +7810,7 @@ impl Hdf5Writer {
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
+                compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
                 obj_header_encoded_size: 0,
@@ -9376,7 +9506,15 @@ impl Hdf5Writer {
 
         // Fill Value message (type 0x05)
         let is_chunked = m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
-        let alloc_time = if is_chunked { 3 } else { 2 }; // 3 = incremental, 2 = late
+        // `H5P__init_def_layout` gives each storage class its own default
+        // allocation time: incremental for chunked, early for compact (the
+        // space is the header, so it exists as soon as the dataset does),
+        // late for contiguous.
+        let alloc_time = match (is_chunked, m.compact.is_some()) {
+            (true, _) => 3,  // incremental
+            (_, true) => 1,  // early
+            (false, _) => 2, // late
+        };
         let fv = if let Some(ref bytes) = m.fill_value {
             // User-defined fill value (fill_defined = 2).
             FillValueMessage {
@@ -9430,6 +9568,8 @@ impl Hdf5Writer {
                 },
                 bt2.bt2_header_addr,
             )
+        } else if let Some(ref image) = m.compact {
+            DataLayoutMessage::compact(image.clone())
         } else {
             DataLayoutMessage::contiguous(m.data_addr, m.data_size)
         };

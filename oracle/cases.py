@@ -528,7 +528,7 @@ def gen_chunkidx_btree2(path):
 
 
 LAYOUT_CASES = [
-    Case("layout_compact", "layout", gen_layout_compact, None,
+    Case("layout_compact", "layout", gen_layout_compact, "layout_compact",
          "compact layout — data inside the object header"),
     Case("layout_contiguous", "layout", gen_layout_contiguous, "layout_contiguous",
          "contiguous layout"),
