@@ -37,7 +37,7 @@ use crate::format::reference::{
     decode_object_element, decode_region_element, decode_region_heap_object, decode_revised_body,
     decode_revised_element, Reference, ReferenceTarget, RevisedElement,
 };
-use crate::format::selection::{Hyperslab, RegularHyperslab, Selection};
+use crate::format::selection::{Hyperslab, PointSelection, RegularHyperslab, Selection};
 use crate::format::sohm::SohmMasterTable;
 use crate::format::superblock::{
     detect_superblock_version, SuperblockV0V1, SuperblockV2V3, SymbolTableCache,
@@ -4898,6 +4898,65 @@ impl Hdf5Reader {
             element_size,
             &mut out,
         )?;
+        Self::apply_post_filter_conversion(&mut out, &datatype)?;
+        Ok(out)
+    }
+
+    /// Read a list of coordinates in one call — h5py fancy indexing with a
+    /// coordinate list (`H5S_SEL_POINTS`) — into a returned buffer.
+    ///
+    /// `points[i]` is a `rank`-length coordinate; the returned buffer holds
+    /// one element per point, `element_size` bytes each, in the same order
+    /// as `points` (point selection order is significant, see
+    /// [`PointSelection`]). Backed by [`Selection::Points`] and
+    /// [`Selection::to_boxes`] — the same decomposition
+    /// [`read_hyperslab`](Self::read_hyperslab) and the virtual dataset
+    /// reader use — each point's 1-element box is read with the ordinary
+    /// per-layout selective read
+    /// ([`read_slice_into_unconverted`](Self::read_slice_into_unconverted)).
+    /// A 1-element box is already a flat `element_size`-byte run, so
+    /// placing it needs no further run-decomposition
+    /// ([`for_each_dual_run`] would degenerate to exactly this copy).
+    pub fn read_points(&mut self, name: &str, points: &[Vec<u64>]) -> IoResult<Vec<u8>> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.read_points(&path, points);
+        }
+        let info = self
+            .dataset_info_local(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let dims = info.dataspace.dims.clone();
+        let datatype = info.datatype.clone();
+        let element_size = datatype.element_size() as u64;
+        let rank = dims.len();
+
+        for p in points {
+            if p.len() != rank {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "point coordinate has {} entries but the dataset has {} dimensions",
+                    p.len(),
+                    rank
+                )));
+            }
+        }
+
+        let sel = Selection::Points(PointSelection {
+            rank,
+            points: points.to_vec(),
+        });
+        let boxes = sel.to_boxes(&dims)?;
+
+        let es = element_size as usize;
+        let mut out = alloc_tiled_fill(points.len() * es, None)?;
+        for (i, (bstart, bcount)) in boxes.iter().enumerate() {
+            self.read_slice_into_unconverted(
+                name,
+                bstart,
+                bcount,
+                &mut out[i * es..(i + 1) * es],
+                0,
+            )?;
+        }
         Self::apply_post_filter_conversion(&mut out, &datatype)?;
         Ok(out)
     }

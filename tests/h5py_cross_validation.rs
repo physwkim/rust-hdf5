@@ -3827,3 +3827,41 @@ fn h5py_written_dataset_readable_by_hyperslab_read_with_block_greater_than_one()
     assert_eq!(got, want);
     std::fs::remove_file(&path).ok();
 }
+
+/// SELREAD-2: `read_points` against an h5py-written dataset must match
+/// h5py's own coordinate-list point selection (`H5Sselect_elements`, exposed
+/// as `Dataspace.select_elements`), element for element and in the same
+/// order. h5py's high-level `ds[...]` fancy indexing is *orthogonal*
+/// indexing (a cross product of per-axis picks), not this — so the
+/// comparison goes through the low-level selection API that actually models
+/// a coordinate list, matching `Selection::Points`.
+#[test]
+fn h5py_written_dataset_readable_by_point_selection_read() {
+    let Some(py) = python() else { return };
+    let path = tmp("points_read");
+    write_with_h5py(
+        py,
+        &path,
+        "f.create_dataset('grid', data=np.arange(100, dtype='<f8').reshape(10, 10))\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("grid").unwrap();
+    let points = vec![vec![0, 0], vec![3, 4], vec![9, 9], vec![5, 2], vec![0, 9]];
+    let got: Vec<f64> = ds.read_points(&points).unwrap();
+    drop(file);
+    let want_csv = capture_from_h5py(
+        py,
+        &path,
+        "ds = f['grid']\n\
+         coords = [(0, 0), (3, 4), (9, 9), (5, 2), (0, 9)]\n\
+         space = ds.id.get_space()\n\
+         space.select_elements(coords)\n\
+         mspace = h5py.h5s.create_simple((len(coords),))\n\
+         want = np.zeros((len(coords),), dtype='<f8')\n\
+         ds.id.read(mspace, space, want)\n\
+         print(','.join(repr(float(x)) for x in want))\n",
+    );
+    let want: Vec<f64> = want_csv.split(',').map(|s| s.parse().unwrap()).collect();
+    assert_eq!(got, want);
+    std::fs::remove_file(&path).ok();
+}

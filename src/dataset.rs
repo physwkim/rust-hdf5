@@ -2250,6 +2250,75 @@ impl H5Dataset {
         }
     }
 
+    /// Read a list of coordinates in one call, as a typed vector — h5py
+    /// fancy indexing with a coordinate list.
+    ///
+    /// `points[i]` is a coordinate with one entry per dimension. The
+    /// returned vector holds one element per point, in the same order as
+    /// `points`, regardless of the dataset's rank.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open("data.h5").unwrap();
+    /// let ds = file.dataset("grid").unwrap(); // shape [10, 10]
+    /// // Python: ds[np.array([[0, 0], [3, 4], [9, 9]])]
+    /// let picked: Vec<f64> = ds.read_points(&[vec![0, 0], vec![3, 4], vec![9, 9]]).unwrap();
+    /// ```
+    pub fn read_points<T: H5Type>(&self, points: &[Vec<usize>]) -> Result<Vec<T>> {
+        match &self.info {
+            DatasetInfo::Reader {
+                name, element_size, ..
+            } => {
+                if T::element_size() != *element_size {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "read type has element size {} but dataset has element size {}",
+                        T::element_size(),
+                        element_size,
+                    )));
+                }
+                let datatype = self.datatype()?;
+                let points_u64: Vec<Vec<u64>> = points
+                    .iter()
+                    .map(|p| p.iter().map(|&c| c as u64).collect())
+                    .collect();
+
+                let mut raw = {
+                    let mut inner = borrow_inner_mut(&self.file_inner);
+                    match &mut *inner {
+                        H5FileInner::Reader(reader) => reader.read_points(name, &points_u64)?,
+                        _ => {
+                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()))
+                        }
+                    }
+                };
+                to_host_byte_order(&mut raw, &datatype, T::element_size())?;
+
+                if raw.len() % T::element_size() != 0 {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "raw data size {} is not a multiple of element size {}",
+                        raw.len(),
+                        T::element_size(),
+                    )));
+                }
+
+                let count = raw.len() / T::element_size();
+                let mut result = Vec::<T>::with_capacity(count);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        raw.as_ptr(),
+                        result.as_mut_ptr() as *mut u8,
+                        raw.len(),
+                    );
+                    result.set_len(count);
+                }
+                Ok(result)
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read_points from a dataset in write mode".into(),
+            )),
+        }
+    }
+
     /// Write a typed slice to a sub-region of the dataset.
     ///
     /// `starts` and `counts` define the N-dimensional selection, which must lie
