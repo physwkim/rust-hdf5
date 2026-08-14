@@ -34,6 +34,87 @@ use crate::format::{FormatError, FormatResult};
 /// The 4-byte B-tree v1 signature.
 pub const BTREE_V1_SIGNATURE: [u8; 4] = *b"TREE";
 
+/// The v1 B-tree split ranks ("K" values) in force for one file.
+///
+/// A v1 B-tree node is a *fixed-size* on-disk record whose length is derived
+/// entirely from these ranks (`H5B.c:1676` `sizeof_rnode`), so a reader cannot
+/// know how many bytes a node occupies — nor reject a node claiming more
+/// entries than can fit — without them. They come from the v0/v1 superblock,
+/// from the superblock extension's v1-B-tree-"K" message (0x0013) when one is
+/// present, and otherwise from the library defaults below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BTreeV1Config {
+    /// Symbol-table leaf (SNOD) 1/2 rank: a node holds up to `2 * k` entries.
+    /// `H5F_CRT_SYM_LEAF_DEF`.
+    pub sym_leaf_k: u16,
+    /// Internal-node 1/2 rank for symbol-table (type 0) B-trees.
+    /// `HDF5_BTREE_SNODE_IK_DEF`.
+    pub snode_internal_k: u16,
+    /// Internal-node 1/2 rank for chunked-storage (type 1) B-trees.
+    /// `HDF5_BTREE_CHUNK_IK_DEF`.
+    pub chunk_internal_k: u16,
+}
+
+impl Default for BTreeV1Config {
+    fn default() -> Self {
+        Self {
+            sym_leaf_k: 4,
+            snode_internal_k: 16,
+            chunk_internal_k: 32,
+        }
+    }
+}
+
+/// A symbol-table entry's on-disk size: name offset, object header address,
+/// cache type, reserved word and the 16-byte scratch pad.
+fn symbol_table_entry_size(sizeof_addr: usize, sizeof_size: usize) -> usize {
+    sizeof_size + sizeof_addr + 4 + 4 + 16
+}
+
+impl BTreeV1Config {
+    /// Maximum entries a symbol table node (SNOD) may declare.
+    pub fn sym_leaf_max_entries(&self) -> u16 {
+        self.sym_leaf_k.saturating_mul(2)
+    }
+
+    /// Maximum entries a symbol-table (type 0) B-tree node may declare.
+    pub fn snode_max_entries(&self) -> u16 {
+        self.snode_internal_k.saturating_mul(2)
+    }
+
+    /// Maximum entries a chunked-storage (type 1) B-tree node may declare.
+    pub fn chunk_max_entries(&self) -> u16 {
+        self.chunk_internal_k.saturating_mul(2)
+    }
+
+    /// On-disk size of a symbol-table (type 0) B-tree node.
+    pub fn snode_btree_node_size(&self, sizeof_addr: usize, sizeof_size: usize) -> usize {
+        btree_node_size(self.snode_max_entries(), sizeof_addr, sizeof_size)
+    }
+
+    /// On-disk size of a chunked-storage (type 1) B-tree node for a dataset of
+    /// the given `rank` (excluding the trailing element-size dimension).
+    pub fn chunk_btree_node_size(&self, sizeof_addr: usize, rank: usize) -> usize {
+        btree_node_size(
+            self.chunk_max_entries(),
+            sizeof_addr,
+            4 + 4 + (rank + 1) * 8,
+        )
+    }
+
+    /// On-disk size of a symbol table node (SNOD): its 8-byte prefix plus
+    /// `2 * sym_leaf_k` entries (`H5Gpkg.h` `H5G_NODE_SIZE`).
+    pub fn symbol_table_node_size(&self, sizeof_addr: usize, sizeof_size: usize) -> usize {
+        8 + (self.sym_leaf_k as usize) * 2 * symbol_table_entry_size(sizeof_addr, sizeof_size)
+    }
+}
+
+/// `H5B.c:1676`: header + `2K` child pointers + `2K + 1` keys.
+fn btree_node_size(two_k: u16, sizeof_addr: usize, key_size: usize) -> usize {
+    let two_k = two_k as usize;
+    8 + 2 * sizeof_addr + two_k * sizeof_addr + (two_k + 1) * key_size
+}
+
 /// A decoded B-tree v1 node.
 #[derive(Debug, Clone)]
 pub struct BTreeV1Node {
@@ -56,8 +137,15 @@ pub struct BTreeV1Node {
 impl BTreeV1Node {
     /// Decode a B-tree v1 node from `buf`.
     ///
-    /// `sizeof_addr` and `sizeof_size` come from the superblock.
-    pub fn decode(buf: &[u8], sizeof_addr: usize, sizeof_size: usize) -> FormatResult<Self> {
+    /// `sizeof_addr` and `sizeof_size` come from the superblock; `max_entries`
+    /// is `2 * K` for symbol-table B-trees ([`BTreeV1Config::snode_max_entries`]),
+    /// which upstream guarantees no node exceeds.
+    pub fn decode(
+        buf: &[u8],
+        sizeof_addr: usize,
+        sizeof_size: usize,
+        max_entries: u16,
+    ) -> FormatResult<Self> {
         let header_size = 4 + 1 + 1 + 2 + sizeof_addr * 2;
         if buf.len() < header_size {
             return Err(FormatError::BufferTooShort {
@@ -73,6 +161,12 @@ impl BTreeV1Node {
         let node_type = buf[4];
         let level = buf[5];
         let entries_used = u16::from_le_bytes([buf[6], buf[7]]);
+        if entries_used > max_entries {
+            return Err(FormatError::InvalidData(format!(
+                "B-tree v1 node declares {entries_used} entries, more than the \
+                 {max_entries} its 'K' value allows"
+            )));
+        }
 
         let mut pos = 8;
         let left_sibling = read_addr(&buf[pos..], sizeof_addr);
@@ -168,8 +262,14 @@ impl ChunkBTreeV1Node {
     /// `rank` is the chunk rank *excluding* the trailing element-size
     /// dimension, so each key carries `rank + 1` 8-byte offsets — matching
     /// libhdf5's `H5O_layout_chunk_t::ndims` (which includes the element
-    /// dimension).
-    pub fn decode(buf: &[u8], sizeof_addr: usize, rank: usize) -> FormatResult<Self> {
+    /// dimension). `max_entries` is `2 * K` for chunk B-trees
+    /// ([`BTreeV1Config::chunk_max_entries`]).
+    pub fn decode(
+        buf: &[u8],
+        sizeof_addr: usize,
+        rank: usize,
+        max_entries: u16,
+    ) -> FormatResult<Self> {
         let header_size = 4 + 1 + 1 + 2 + sizeof_addr * 2;
         if buf.len() < header_size {
             return Err(FormatError::BufferTooShort {
@@ -190,6 +290,12 @@ impl ChunkBTreeV1Node {
         }
         let level = buf[5];
         let entries_used = u16::from_le_bytes([buf[6], buf[7]]);
+        if entries_used > max_entries {
+            return Err(FormatError::InvalidData(format!(
+                "chunk B-tree v1 node declares {entries_used} entries, more than \
+                 the {max_entries} its 'K' value allows"
+            )));
+        }
 
         // Skip the signature/type/level/entries header plus the two
         // sibling pointers.
@@ -292,7 +398,7 @@ mod tests {
             8,
             8,
         );
-        let node = BTreeV1Node::decode(&buf, 8, 8).unwrap();
+        let node = BTreeV1Node::decode(&buf, 8, 8, 32).unwrap();
         assert_eq!(node.node_type, 0);
         assert_eq!(node.level, 0);
         assert_eq!(node.entries_used, 2);
@@ -311,7 +417,7 @@ mod tests {
             8,
             8,
         );
-        let node = BTreeV1Node::decode(&buf, 8, 8).unwrap();
+        let node = BTreeV1Node::decode(&buf, 8, 8, 32).unwrap();
         assert_eq!(node.level, 1);
         assert_eq!(node.entries_used, 1);
         assert_eq!(node.children, vec![0x500]);
@@ -320,7 +426,7 @@ mod tests {
     #[test]
     fn decode_single_entry() {
         let buf = build_group_btree(0, &[0, 8], &[0x100], 8, 8);
-        let node = BTreeV1Node::decode(&buf, 8, 8).unwrap();
+        let node = BTreeV1Node::decode(&buf, 8, 8, 32).unwrap();
         assert_eq!(node.entries_used, 1);
         assert_eq!(node.children.len(), 1);
     }
@@ -328,7 +434,7 @@ mod tests {
     #[test]
     fn decode_4byte() {
         let buf = build_group_btree(0, &[0, 4], &[0x80], 4, 4);
-        let node = BTreeV1Node::decode(&buf, 4, 4).unwrap();
+        let node = BTreeV1Node::decode(&buf, 4, 4, 32).unwrap();
         assert_eq!(node.entries_used, 1);
         assert_eq!(node.children, vec![0x80]);
     }
@@ -338,7 +444,7 @@ mod tests {
         let mut buf = build_group_btree(0, &[0, 8], &[0x100], 8, 8);
         buf[0] = b'X';
         assert!(matches!(
-            BTreeV1Node::decode(&buf, 8, 8).unwrap_err(),
+            BTreeV1Node::decode(&buf, 8, 8, 32).unwrap_err(),
             FormatError::InvalidSignature
         ));
     }
@@ -346,7 +452,7 @@ mod tests {
     #[test]
     fn decode_too_short() {
         assert!(matches!(
-            BTreeV1Node::decode(&[0u8; 4], 8, 8).unwrap_err(),
+            BTreeV1Node::decode(&[0u8; 4], 8, 8, 32).unwrap_err(),
             FormatError::BufferTooShort { .. }
         ));
     }
@@ -356,7 +462,7 @@ mod tests {
         let mut buf = build_group_btree(0, &[0, 8], &[0x100], 8, 8);
         buf[4] = 1; // type = raw data chunks
         assert!(matches!(
-            BTreeV1Node::decode(&buf, 8, 8).unwrap_err(),
+            BTreeV1Node::decode(&buf, 8, 8, 32).unwrap_err(),
             FormatError::UnsupportedFeature(_)
         ));
     }
@@ -413,7 +519,7 @@ mod tests {
             chunk_key(0, 0, &[16, 0]),
         ];
         let buf = build_chunk_btree(0, &keys, &[0x400, 0x800], 8);
-        let node = ChunkBTreeV1Node::decode(&buf, 8, 1).unwrap();
+        let node = ChunkBTreeV1Node::decode(&buf, 8, 1, 64).unwrap();
         assert_eq!(node.level, 0);
         assert_eq!(node.entries_used, 2);
         assert_eq!(node.children, vec![0x400, 0x800]);
@@ -427,7 +533,7 @@ mod tests {
         // 2-D dataset (rank 2): each key has rank+1 = 3 offsets.
         let keys = [chunk_key(64, 0, &[0, 0, 0]), chunk_key(64, 0, &[4, 4, 0])];
         let buf = build_chunk_btree(1, &keys, &[0x1000], 8);
-        let node = ChunkBTreeV1Node::decode(&buf, 8, 2).unwrap();
+        let node = ChunkBTreeV1Node::decode(&buf, 8, 2, 64).unwrap();
         assert_eq!(node.level, 1);
         assert_eq!(node.entries_used, 1);
         assert_eq!(node.children, vec![0x1000]);
@@ -438,7 +544,7 @@ mod tests {
     fn decode_chunk_filtered_key() {
         let keys = [chunk_key(17, 0x1, &[0, 0]), chunk_key(0, 0, &[8, 0])];
         let buf = build_chunk_btree(0, &keys, &[0x200], 8);
-        let node = ChunkBTreeV1Node::decode(&buf, 8, 1).unwrap();
+        let node = ChunkBTreeV1Node::decode(&buf, 8, 1, 64).unwrap();
         assert_eq!(node.keys[0].chunk_size, 17);
         assert_eq!(node.keys[0].filter_mask, 0x1);
     }
@@ -447,7 +553,7 @@ mod tests {
     fn decode_chunk_rejects_group_node() {
         let buf = build_group_btree(0, &[0, 8], &[0x100], 8, 8);
         assert!(matches!(
-            ChunkBTreeV1Node::decode(&buf, 8, 1).unwrap_err(),
+            ChunkBTreeV1Node::decode(&buf, 8, 1, 64).unwrap_err(),
             FormatError::UnsupportedFeature(_)
         ));
     }
@@ -455,7 +561,7 @@ mod tests {
     #[test]
     fn decode_chunk_too_short() {
         assert!(matches!(
-            ChunkBTreeV1Node::decode(&[0u8; 4], 8, 1).unwrap_err(),
+            ChunkBTreeV1Node::decode(&[0u8; 4], 8, 1, 64).unwrap_err(),
             FormatError::BufferTooShort { .. }
         ));
     }
@@ -466,16 +572,70 @@ mod tests {
         let mut buf = build_chunk_btree(0, &keys, &[0x100], 8);
         buf[0] = b'X';
         assert!(matches!(
-            ChunkBTreeV1Node::decode(&buf, 8, 1).unwrap_err(),
+            ChunkBTreeV1Node::decode(&buf, 8, 1, 64).unwrap_err(),
             FormatError::InvalidSignature
         ));
+    }
+
+    #[test]
+    fn node_sizes_match_upstream_formula() {
+        let cfg = BTreeV1Config::default();
+        // H5B.c: 8 + 2*addr + 2K*addr + (2K+1)*key.
+        assert_eq!(cfg.snode_btree_node_size(8, 8), 8 + 16 + 32 * 8 + 33 * 8);
+        // rank 1 => key is 4 + 4 + 2*8 = 24 bytes, 2K = 64.
+        assert_eq!(cfg.chunk_btree_node_size(8, 1), 8 + 16 + 64 * 8 + 65 * 24);
+        // SNOD: 8-byte prefix + 2*sym_leaf_k entries of 40 bytes.
+        assert_eq!(cfg.symbol_table_node_size(8, 8), 8 + 8 * 40);
+    }
+
+    #[test]
+    fn non_default_k_scales_every_node_size() {
+        let cfg = BTreeV1Config {
+            sym_leaf_k: 128,
+            snode_internal_k: 512,
+            chunk_internal_k: 256,
+        };
+        assert_eq!(cfg.snode_max_entries(), 1024);
+        assert_eq!(cfg.chunk_max_entries(), 512);
+        // Every one of these exceeds the fixed 8 KiB window the reader used
+        // before the 'K' values were wired in.
+        assert!(cfg.snode_btree_node_size(8, 8) > 8192);
+        assert!(cfg.chunk_btree_node_size(8, 1) > 8192);
+        assert!(cfg.symbol_table_node_size(8, 8) > 8192);
+    }
+
+    #[test]
+    fn decode_rejects_entries_beyond_two_k() {
+        let buf = build_group_btree(0, &[0, 8, 16], &[0x100, 0x200], 8, 8);
+        // The node really holds 2 entries; a K of 0 makes even that illegal.
+        assert!(matches!(
+            BTreeV1Node::decode(&buf, 8, 8, 0).unwrap_err(),
+            FormatError::InvalidData(_)
+        ));
+        // Exactly 2K entries is legal.
+        assert!(BTreeV1Node::decode(&buf, 8, 8, 2).is_ok());
+    }
+
+    #[test]
+    fn decode_chunk_rejects_entries_beyond_two_k() {
+        let keys = [
+            chunk_key(32, 0, &[0, 0]),
+            chunk_key(32, 0, &[8, 0]),
+            chunk_key(0, 0, &[16, 0]),
+        ];
+        let buf = build_chunk_btree(0, &keys, &[0x400, 0x800], 8);
+        assert!(matches!(
+            ChunkBTreeV1Node::decode(&buf, 8, 1, 1).unwrap_err(),
+            FormatError::InvalidData(_)
+        ));
+        assert!(ChunkBTreeV1Node::decode(&buf, 8, 1, 2).is_ok());
     }
 
     #[test]
     fn decode_chunk_4byte_addr() {
         let keys = [chunk_key(16, 0, &[0, 0]), chunk_key(0, 0, &[4, 0])];
         let buf = build_chunk_btree(0, &keys, &[0x80], 4);
-        let node = ChunkBTreeV1Node::decode(&buf, 4, 1).unwrap();
+        let node = ChunkBTreeV1Node::decode(&buf, 4, 1, 64).unwrap();
         assert_eq!(node.children, vec![0x80]);
     }
 }
