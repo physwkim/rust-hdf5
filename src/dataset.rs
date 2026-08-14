@@ -2319,6 +2319,43 @@ impl H5Dataset {
         }
     }
 
+    /// Read one chunk's raw (still-filtered) bytes and its filter mask,
+    /// addressed by chunk-grid coordinates — the read half of
+    /// [`write_chunk_raw_at`](Self::write_chunk_raw_at) and the HDF5 "direct
+    /// chunk read" (`H5Dread_chunk`, formerly `H5DOread_chunk`; h5py's
+    /// `Dataset.id.read_direct_chunk`).
+    ///
+    /// The bytes are exactly what is stored on disk: filtered/compressed if
+    /// the dataset has a filter pipeline, with no decompression applied. The
+    /// returned `u32` is the chunk's filter mask: bit *i* set means filter
+    /// *i* of the pipeline was **not** applied to this particular chunk and
+    /// must be skipped when reversing it.
+    ///
+    /// `Err` if the dataset is not chunked, `chunk_coords` has the wrong
+    /// rank, or the chunk at those coordinates has never been written.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open("data.h5").unwrap();
+    /// let ds = file.dataset("frames").unwrap();
+    /// let (raw, filter_mask) = ds.read_chunk_raw_at(&[0, 0]).unwrap();
+    /// ```
+    pub fn read_chunk_raw_at(&self, chunk_coords: &[usize]) -> Result<(Vec<u8>, u32)> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let coords_u64: Vec<u64> = chunk_coords.iter().map(|&c| c as u64).collect();
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => Ok(reader.read_chunk_raw_at(name, &coords_u64)?),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read_chunk_raw_at from a dataset in write mode".into(),
+            )),
+        }
+    }
+
     /// Write a typed slice to a sub-region of the dataset.
     ///
     /// `starts` and `counts` define the N-dimensional selection, which must lie

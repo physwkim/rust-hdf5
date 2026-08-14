@@ -3865,3 +3865,47 @@ fn h5py_written_dataset_readable_by_point_selection_read() {
     assert_eq!(got, want);
     std::fs::remove_file(&path).ok();
 }
+
+/// SELREAD-3: `read_chunk_raw_at` on a chunked + deflated dataset must
+/// return exactly the bytes and filter mask h5py's own
+/// `Dataset.id.read_direct_chunk` reports for the same chunk — still
+/// compressed, with no decoding on either side.
+#[cfg(feature = "deflate")]
+#[test]
+fn h5py_written_deflated_chunk_matches_h5py_read_direct_chunk() {
+    let Some(py) = python() else { return };
+    let path = tmp("chunk_read_deflate");
+    write_with_h5py(
+        py,
+        &path,
+        "f.create_dataset(\n\
+         \x20   'grid', data=np.arange(64, dtype='<i4').reshape(8, 8),\n\
+         \x20   chunks=(4, 4), compression='gzip', compression_opts=6,\n\
+         )\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("grid").unwrap();
+    // Chunk-grid coordinates [1, 0]: the second row of chunks, first column.
+    let (got_bytes, got_mask) = ds.read_chunk_raw_at(&[1, 0]).unwrap();
+    drop(file);
+    let want = capture_from_h5py(
+        py,
+        &path,
+        // read_direct_chunk takes an element offset, not a chunk-grid index:
+        // chunk [1, 0] with chunk shape (4, 4) starts at element (4, 0).
+        "mask, data = f['grid'].id.read_direct_chunk((4, 0))\n\
+         print(data.hex())\n\
+         print(mask)\n",
+    );
+    let mut lines = want.lines();
+    let want_hex = lines.next().unwrap();
+    let want_mask: u32 = lines.next().unwrap().parse().unwrap();
+    assert!(lines.next().is_none());
+    let want_bytes: Vec<u8> = (0..want_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&want_hex[i..i + 2], 16).unwrap())
+        .collect();
+    assert_eq!(got_bytes, want_bytes);
+    assert_eq!(got_mask, want_mask);
+    std::fs::remove_file(&path).ok();
+}
