@@ -12,6 +12,7 @@ pub mod locking;
 pub(crate) mod object_header_io;
 pub mod reader;
 pub mod swmr;
+pub(crate) mod symbol_table_io;
 pub mod writer;
 
 pub use reader::Hdf5Reader;
