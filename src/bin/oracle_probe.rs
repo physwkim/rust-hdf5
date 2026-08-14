@@ -567,16 +567,17 @@ fn dump_file(path: &str) -> std::result::Result<String, String> {
         "#superblock",
         unsupported("superblock", "H5File exposes no superblock/libver accessor"),
     );
-    d.emit(
-        "#userblock",
-        unsupported("userblock", "H5File exposes no user block accessor"),
-    );
 
     let file = match guarded(|| H5File::open(path)) {
         Ok(Ok(f)) => f,
         Ok(Err(e)) => return Err(format!("H5File::open failed: {}", oneline(e))),
         Err(p) => return Err(format!("H5File::open panicked: {p}")),
     };
+
+    // `H5File::userblock_size` answers in either mode, so this is a value the
+    // canon can be compared against rather than an API gap. It has to come
+    // after the open — it is a property of the file, not of the path.
+    d.field("", "userblock", || Ok(file.userblock_size().to_string()));
 
     let root = file.root_group();
     dump_group(&mut d, &file, "/", &root, 0);

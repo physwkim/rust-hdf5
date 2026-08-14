@@ -178,7 +178,6 @@ def expected_deviation(entry):
 # file at hand and does.
 STRUCTURAL_FIELDS = {
     "superblock",
-    "userblock",
     "maxshape",
     "layout",
     "chunkindex",
