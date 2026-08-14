@@ -26,7 +26,9 @@ use crate::format::fractal_heap::{
     collect_managed_blocks, read_heap_object, FractalHeapHeader, HeapId, HeapParams,
 };
 use crate::format::fractal_heap_write::{build_heap, HeapBlock};
-use crate::format::messages::attr_info::{AttributeInfoMessage, MAX_CREATION_ORDER_INDEX};
+use crate::format::messages::attr_info::{
+    next_creation_index, AttributeInfoMessage, MAX_CREATION_ORDER_INDEX,
+};
 use crate::format::messages::attribute::AttributeEntry;
 use crate::format::messages::MSG_FLAG_SHARED;
 use crate::format::{BlockReader, FormatContext, FormatError, FormatResult, UNDEF_ADDR};
@@ -55,11 +57,15 @@ pub fn name_hash(name: &str) -> u32 {
 /// Read every attribute an object keeps in dense storage.
 ///
 /// Returns them in name-index (hash) order, the order `H5Aiterate2` walks with
-/// `H5_INDEX_NAME`. An `ainfo` describing compact storage yields an empty
-/// vector; a record the reader cannot resolve to a heap object is an error,
-/// not a silent omission, so a partially-read dense object never masquerades
-/// as a complete one. A heap object that resolves but whose payload this crate
-/// cannot model is named rather than dropped — see [`AttributeEntry::parse`].
+/// `H5_INDEX_NAME`, each carrying the creation index its name record records
+/// (`H5A__dense_btree2_name_decode`). Hash order is *not* creation order, so a
+/// caller that needs the latter has the value to sort on rather than the
+/// position it arrived in. An `ainfo` describing compact storage yields an
+/// empty vector; a record the reader cannot resolve to a heap object is an
+/// error, not a silent omission, so a partially-read dense object never
+/// masquerades as a complete one. A heap object that resolves but whose payload
+/// this crate cannot model is named rather than dropped — see
+/// [`AttributeEntry::parse`].
 pub fn read_dense_attributes<R: BlockReader>(
     ainfo: &AttributeInfoMessage,
     ctx: &FormatContext,
@@ -109,9 +115,24 @@ pub fn read_dense_attributes<R: BlockReader>(
         }
         let id = HeapId::parse(&rec[..FHEAP_ID_LEN], &heap, ctx)?;
         let bytes = read_heap_object(&id, &heap, ctx, &blocks, reader)?;
-        attrs.push(AttributeEntry::parse(&bytes, ctx)?);
+        let corder = u32::from_le_bytes([
+            rec[FHEAP_ID_LEN + 1],
+            rec[FHEAP_ID_LEN + 2],
+            rec[FHEAP_ID_LEN + 3],
+            rec[FHEAP_ID_LEN + 4],
+        ]);
+        attrs.push(AttributeEntry::parse(&bytes, ctx)?.with_creation_index(decoded_corder(corder)));
     }
     Ok(attrs)
+}
+
+/// The creation index a record's corder field names, or `None` when it holds
+/// the "no creation index" sentinel `H5O_MAX_CRT_ORDER_IDX` that libhdf5
+/// stores for an object which does not track creation order.
+fn decoded_corder(corder: u32) -> Option<u16> {
+    u16::try_from(corder)
+        .ok()
+        .filter(|&c| c != MAX_CREATION_ORDER_INDEX)
 }
 
 /// Dense storage laid out for an object: what its header must say, and what
@@ -158,15 +179,15 @@ pub fn build_dense_attributes(
             .then_with(|| attrs[a].name().cmp(attrs[b].name()))
     });
 
-    // `attrs` is in creation order, so an attribute's index in it is the
-    // creation index `H5O__attr_create` would have stamped on it. Without
-    // tracking every record carries the "no creation index" sentinel
-    // `H5O_MAX_CRT_ORDER_IDX` the library writes in that case.
+    // Each attribute states its own creation index; nothing here derives one
+    // from a position. Without tracking — or for an attribute that carries no
+    // index because the object it came from tracked nothing — every record
+    // gets the "no creation index" sentinel `H5O_MAX_CRT_ORDER_IDX` the
+    // library writes in that case.
     let corder = |i: usize| -> u32 {
-        if order.is_tracked() {
-            i as u32
-        } else {
-            u32::from(MAX_CREATION_ORDER_INDEX)
+        match (order.is_tracked(), attrs[i].creation_index()) {
+            (true, Some(idx)) => u32::from(idx),
+            _ => u32::from(MAX_CREATION_ORDER_INDEX),
         }
     };
 
@@ -189,11 +210,15 @@ pub fn build_dense_attributes(
         &mut blocks,
     );
 
-    // The creation-order index, when it is asked for. Its records are already
-    // in key order: the creation index of `attrs[i]` is `i`.
+    // The creation-order index, when it is asked for. Sorted on the key it is
+    // indexed by (`H5A__dense_btree2_corder_compare`), which is the creation
+    // index itself — a bulk load in any other order is a tree a lookup walks
+    // straight past.
     let corder_bt2_addr = order.is_indexed().then(|| {
+        let mut by_corder: Vec<usize> = (0..attrs.len()).collect();
+        by_corder.sort_by_key(|&i| corder(i));
         let mut records = Vec::with_capacity(attrs.len() * CORDER_RECORD_LEN);
-        for i in 0..attrs.len() {
+        for &i in &by_corder {
             records.extend_from_slice(&heap.ids[i]);
             records.push(0);
             records.extend_from_slice(&corder(i).to_le_bytes());
@@ -210,9 +235,11 @@ pub fn build_dense_attributes(
 
     Ok(DenseAttributeStorage {
         ainfo: AttributeInfoMessage {
-            // `H5O__attr_create` post-increments, so after n attributes the
-            // running maximum is n.
-            max_creation_index: order.is_tracked().then_some(attrs.len() as u16),
+            // `H5O__attr_create` post-increments `ainfo->max_crt_idx`, so it
+            // is one past the largest index in use — not the attribute count,
+            // which is the same number only while no index has ever been
+            // skipped.
+            max_creation_index: order.is_tracked().then(|| next_creation_index(attrs)),
             fractal_heap_address: heap.header_addr,
             name_btree_address: bt2_addr,
             creation_order_btree_address: corder_bt2_addr,
@@ -411,8 +438,8 @@ mod tests {
     fn a_tracked_object_gets_a_creation_order_index() {
         // Names deliberately reverse the creation order, so an index built
         // from the name ordering would show up here.
-        let attrs: Vec<AttributeEntry> = (0..12u32)
-            .map(|i| numeric(&format!("a{:02}", 11 - i), i as i32))
+        let attrs: Vec<AttributeEntry> = (0..12u16)
+            .map(|i| numeric(&format!("a{:02}", 11 - i), i32::from(i)).with_creation_index(Some(i)))
             .collect();
         let mut file = MemFile::new();
         let dense = build_dense_attributes(&attrs, &ctx(), CreationOrder::Indexed, &mut |len| {
@@ -459,6 +486,57 @@ mod tests {
             .collect();
         seen.sort_unstable();
         assert_eq!(seen, (0..12u32).collect::<Vec<_>>());
+    }
+
+    /// The index written is the one the attribute carries, never the position
+    /// it happens to hold in the list — the whole point of reading it back off
+    /// the record. A set read out of a file arrives in name-hash order and can
+    /// have gaps where attributes were deleted, so a build that numbered by
+    /// position would renumber every attribute of every reopened object.
+    #[test]
+    fn each_attribute_keeps_the_creation_index_it_carries() {
+        let want = [5u16, 0, 9, 2];
+        let attrs: Vec<AttributeEntry> = want
+            .iter()
+            .enumerate()
+            .map(|(pos, &idx)| {
+                numeric(&format!("n{pos}"), pos as i32).with_creation_index(Some(idx))
+            })
+            .collect();
+        let mut file = MemFile::new();
+        let dense = build_dense_attributes(&attrs, &ctx(), CreationOrder::Indexed, &mut |len| {
+            file.alloc(len)
+        })
+        .unwrap();
+        for block in &dense.blocks {
+            let at = block.addr as usize;
+            file.bytes[at..at + block.image.len()].copy_from_slice(&block.image);
+        }
+
+        // One past the largest, with the gaps left where they are.
+        assert_eq!(dense.ainfo.max_creation_index, Some(10));
+
+        let read = read_dense_attributes(&dense.ainfo, &ctx(), &mut file).unwrap();
+        for attr in &attrs {
+            let got = read.iter().find(|a| a.name() == attr.name()).unwrap();
+            assert_eq!(
+                got.creation_index(),
+                attr.creation_index(),
+                "{}",
+                attr.name()
+            );
+        }
+
+        // The type-9 index is ordered by the index itself, which is what
+        // `H5A__dense_btree2_corder_compare` walks it on.
+        let addr = dense.ainfo.creation_order_btree_address.unwrap();
+        let bt2 = Bt2Header::decode(&file.read_block(addr, 256).unwrap(), &ctx()).unwrap();
+        let records = collect_btree_v2_records(&bt2, &ctx(), &mut file).unwrap();
+        let corders: Vec<u32> = records
+            .chunks_exact(CORDER_RECORD_LEN)
+            .map(|r| u32::from_le_bytes(r[FHEAP_ID_LEN + 1..CORDER_RECORD_LEN].try_into().unwrap()))
+            .collect();
+        assert_eq!(corders, vec![0u32, 2, 5, 9]);
     }
 
     #[test]

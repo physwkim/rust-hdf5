@@ -2426,12 +2426,11 @@ impl Hdf5Reader {
         name: &str,
     ) -> IoResult<&'a AttributeMessage> {
         match attrs.entries.iter().find(|a| a.name() == name) {
-            Some(AttributeEntry::Readable(attr)) => Ok(attr),
-            Some(AttributeEntry::Unreadable { reason, .. }) => {
-                Err(crate::io::IoError::Unsupported(format!(
+            Some(entry) => entry.decoded().map_err(|reason| {
+                crate::io::IoError::Unsupported(format!(
                     "attribute '{name}' on '{owner}' cannot be decoded: {reason}"
-                )))
-            }
+                ))
+            }),
             // Not among what was read — but the part that was not read could
             // hold it, so an incomplete set cannot answer "absent".
             None => match attrs.unreadable_reason() {
@@ -4928,10 +4927,17 @@ pub(crate) fn collect_object_attributes(
     header: &ObjectHeader,
 ) -> ObjectAttributes {
     let mut attrs = ObjectAttributes::default();
+    // The message envelope carries a creation index only when the header says
+    // the object tracks one; the field is not even encoded otherwise
+    // (`H5O_SIZEOF_MSGHDR_OH`), so reading it as an index would report zero
+    // for every attribute of an untracked object.
+    let tracked = header.has_creation_order();
     for msg in &header.messages {
         match msg.msg_type {
             MSG_ATTRIBUTE => match AttributeEntry::parse(&msg.data, ctx) {
-                Ok(entry) => attrs.push(entry),
+                Ok(entry) => {
+                    attrs.push(entry.with_creation_index(tracked.then_some(msg.creation_index)))
+                }
                 Err(e) => attrs.mark_incomplete(format!("an attribute message is unreadable: {e}")),
             },
             MSG_ATTR_INFO => match AttributeInfoMessage::decode(&msg.data, ctx) {
@@ -5508,6 +5514,7 @@ mod tests {
         };
         let header = ObjectHeader {
             flags: 0x02,
+            times: None,
             messages,
         };
         let attrs = collect_object_attributes(&mut handle, &ctx, &header);

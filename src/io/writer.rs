@@ -21,7 +21,7 @@ use crate::format::chunk_index::fixed_array::{
 use crate::format::creation_order::CreationOrder;
 use crate::format::dense_attr::build_dense_attributes;
 use crate::format::dense_link::build_dense_links;
-use crate::format::messages::attr_info::AttributeInfoMessage;
+use crate::format::messages::attr_info::{next_creation_index, AttributeInfoMessage};
 use crate::format::messages::attribute::{AttributeEntry, AttributeMessage};
 use crate::format::messages::data_layout::{DataLayoutMessage, EarrayParams, FixedArrayParams};
 use crate::format::messages::dataspace::{DataspaceClass, DataspaceMessage};
@@ -32,7 +32,7 @@ use crate::format::messages::group_info::GroupInfoMessage;
 use crate::format::messages::link::LinkMessage;
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::*;
-use crate::format::object_header::{ObjectHeader, MAX_MESSAGE_SIZE};
+use crate::format::object_header::{ObjectHeader, ObjectTimes, MAX_MESSAGE_SIZE};
 use crate::format::superblock::*;
 use crate::format::{FormatContext, LibverBound, UNDEF_ADDR};
 
@@ -489,6 +489,12 @@ pub struct DatasetInfo {
     /// preserved from the file on reopen, and emitted verbatim at finalize.
     /// Contiguous datasets ignore it.
     pub layout_version: u8,
+    /// The four times this object's header stores, when it was created with
+    /// `H5Pset_obj_track_times(true)`. `None` for a dataset this writer
+    /// created — it offers no way to ask for times — and whatever the file
+    /// held for a reopened one, so a rewrite hands them back rather than
+    /// dropping the flag that announces them.
+    pub times: Option<ObjectTimes>,
 }
 
 impl DatasetInfo {
@@ -622,6 +628,27 @@ fn swmr_attr_error(name: &str) -> crate::io::IoError {
     ))
 }
 
+/// Where an attribute arriving at [`Hdf5Writer::insert_attribute`] came from.
+///
+/// The variable-length setters have to evict before they allocate — the
+/// free-before-alloc order — so by the time the replacement is inserted the
+/// list no longer holds the entry it replaces, and the ordinary "already
+/// present, so keep its index" test cannot see it. `H5A__attr_write` does not
+/// create the attribute again, so the index travels with the eviction rather
+/// than being stamped afresh; without it a rewritten attribute takes the set's
+/// running maximum and moves to the end of the creation order.
+#[derive(Debug, Clone, Copy)]
+enum AttrOrigin {
+    /// A new attribute, which takes the set's next creation index.
+    Created,
+    /// A value written over an attribute this writer has just evicted, which
+    /// keeps that attribute's creation index — `None` when the object tracks
+    /// no order, and so records none. An eviction that found nothing to remove
+    /// answers `Created`: what follows it is a create like any other.
+    Rewritten(Option<u16>),
+}
+use AttrOrigin::{Created, Rewritten};
+
 /// Take an object's attributes into the append session, or refuse the reopen.
 ///
 /// Append mode rebuilds every object header it touches out of the attributes
@@ -637,11 +664,21 @@ fn swmr_attr_error(name: &str) -> crate::io::IoError {
 ///
 /// Size is no longer a reason to refuse: an attribute too large for a header
 /// message goes back out through dense storage, the form libhdf5 read it from.
+///
+/// The set comes back in creation-index order, which is the order the registry
+/// holds attributes in for an object made in this session too. A dense set is
+/// read through the name index, so the order it arrives in is the order a hash
+/// walk took; sorting here is what makes "the list is in creation order" true
+/// of a reopened object as well, without any later stage having to know which
+/// storage form the attributes came out of. Attributes of an untracked object
+/// carry no index and keep the order they were read in.
 fn take_reopened_attributes(
     attrs: crate::io::reader::ObjectAttributes,
     owner: &str,
 ) -> IoResult<Vec<AttributeEntry>> {
-    attrs.into_complete(owner)
+    let mut attrs = attrs.into_complete(owner)?;
+    attrs.sort_by_key(|a| a.creation_index());
+    Ok(attrs)
 }
 
 /// The creation-order policy an on-disk object header declares — the single
@@ -675,6 +712,29 @@ fn recover_track_order(
         links,
         attrs: header.attribute_creation_order(),
     }
+}
+
+/// The times a header being (re)written carries, given what the object had.
+///
+/// Every object header this writer emits is one it is writing *now*, which is
+/// what `H5O_touch_oh` is called for: an object that stores times gets its
+/// access and change time moved to now, and one that does not store them stays
+/// that way — the flag belongs to the object's creation property list, and a
+/// rewrite is not a creation.
+fn touched_times(times: Option<ObjectTimes>) -> Option<ObjectTimes> {
+    times.map(|t| t.touched(now_seconds()))
+}
+
+/// Seconds since the epoch, as an object header stores them (`H5_now`).
+///
+/// Saturates rather than wrapping: the field is a 32-bit count, and a clock
+/// past 2106 is better reported as the largest time the format can express
+/// than as a time in 1970. A clock before the epoch yields 0, which is what
+/// libhdf5 writes for "no time recorded".
+fn now_seconds() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX))
 }
 
 /// The dense storage an on-disk object header names: the fractal heap and the
@@ -979,6 +1039,9 @@ pub struct GroupInfo {
     /// finalize: a later change of policy must not rewrite an object already
     /// made.
     pub track_order: TrackOrder,
+    /// This group's stored times, on the same terms as
+    /// [`DatasetInfo::times`].
+    pub times: Option<ObjectTimes>,
 }
 
 /// One object's creation-order policy, with the two subsystems libhdf5 keeps
@@ -1140,6 +1203,10 @@ struct DatasetParts {
     /// read it from the writer instead would stamp this session's policy onto
     /// an object libhdf5 created under another.
     track_order: TrackOrder,
+    /// The times the on-disk header stores, for the same reason: whether an
+    /// object tracks them is settled when it is created, not when it is
+    /// rewritten.
+    times: Option<ObjectTimes>,
     /// The dense storage the rewrite supersedes and must free.
     dense: DenseCarry,
 }
@@ -1151,6 +1218,7 @@ struct GroupParts {
     attributes: Vec<AttributeEntry>,
     links: Vec<(crate::format::messages::link::LinkMessage, Vec<u8>)>,
     track_order: TrackOrder,
+    times: Option<ObjectTimes>,
     dense: DenseCarry,
 }
 
@@ -1174,6 +1242,7 @@ enum CollectedObject {
         header_size: usize,
         attributes: Vec<AttributeEntry>,
         track_order: TrackOrder,
+        times: Option<ObjectTimes>,
         dense: DenseCarry,
     },
 }
@@ -1252,10 +1321,11 @@ impl<'a> ReopenWalk<'a> {
             }
         };
 
-        // The policy and the storage the header declares, read once from the
-        // whole chain: both are properties of the object, not of any one
-        // message the loop below happens to reach.
+        // The policy, the times and the storage the header declares, read once
+        // from the whole chain: all three are properties of the object, not of
+        // any one message the loop below happens to reach.
         let track_order = recover_track_order(&header, ctx);
+        let times = header.times;
         let (dense_attrs, dense_links) = superseded_dense(&header, ctx);
 
         // Attributes come from the reader's collector rather than from the
@@ -1401,6 +1471,7 @@ impl<'a> ReopenWalk<'a> {
                     fill_value,
                     attributes,
                     track_order,
+                    times,
                     dense: DenseCarry {
                         attrs: dense_attrs,
                         links: dense_links,
@@ -1421,6 +1492,7 @@ impl<'a> ReopenWalk<'a> {
                 attributes,
                 links,
                 track_order,
+                times,
                 dense: DenseCarry {
                     attrs: dense_attrs,
                     links: dense_links,
@@ -1489,6 +1561,7 @@ impl<'a> ReopenWalk<'a> {
                             header_size: parts.header_size,
                             attributes: parts.attributes,
                             track_order: parts.track_order,
+                            times: parts.times,
                             dense: parts.dense,
                         },
                     ));
@@ -1528,6 +1601,7 @@ fn rebuild_dataset(
         fill_value,
         attributes: attrs,
         track_order,
+        times,
         dense: _,
     } = parts;
 
@@ -1562,6 +1636,7 @@ fn rebuild_dataset(
             DataLayoutMessage::ChunkedV4 { version, .. } => *version,
             _ => 4,
         },
+        times,
     };
 
     // Reconstruct storage-specific metadata
@@ -1980,6 +2055,10 @@ pub struct Hdf5Writer {
     /// [`create_with_options`](Self::create_with_options) — or, on reopen,
     /// from the header already on disk.
     root_track_order: TrackOrder,
+    /// The root group's stored times, on the same terms as
+    /// [`GroupInfo::times`]: whatever a reopened file's root header had, and
+    /// `None` for a file this writer created.
+    root_times: Option<ObjectTimes>,
     /// Hands out the creation sequence numbers that order a group's links.
     next_creation_seq: Slot<u64>,
     /// Object-reference elements waiting for their target's object header
@@ -2106,6 +2185,7 @@ impl Hdf5Writer {
             superseded_dense: Slot::new(None),
             track_order: TrackOrder::uniform(track_order),
             root_track_order: TrackOrder::uniform(track_order),
+            root_times: None,
             next_creation_seq: Slot::new(0),
             pending_object_references: Slot::new(Vec::new()),
         })
@@ -2451,6 +2531,7 @@ impl Hdf5Writer {
         let root_header_size = root.header_size;
         let root_attributes = root.attributes;
         let root_track_order = root.track_order;
+        let root_times = root.times;
         let root_dense = root.dense;
 
         walk.group(&root.links, "", 0)?;
@@ -2489,7 +2570,13 @@ impl Hdf5Writer {
         // link path — so finalize can free the block its rewrite supersedes —
         // plus the attributes the header carries, which the group registry
         // below must keep or finalize rewrites the group without them.
-        type GroupHeaderInfo = (u64, usize, Vec<AttributeEntry>, TrackOrder);
+        type GroupHeaderInfo = (
+            u64,
+            usize,
+            Vec<AttributeEntry>,
+            TrackOrder,
+            Option<ObjectTimes>,
+        );
         let mut group_headers: std::collections::HashMap<String, GroupHeaderInfo> =
             Default::default();
         // The dense storage each rebuilt dataset's header named, by registry
@@ -2509,10 +2596,14 @@ impl Hdf5Writer {
                     header_size,
                     attributes,
                     track_order,
+                    times,
                     dense,
                 } => {
                     group_dense.push((name.clone(), dense));
-                    group_headers.insert(name, (obj_addr, header_size, attributes, track_order));
+                    group_headers.insert(
+                        name,
+                        (obj_addr, header_size, attributes, track_order, times),
+                    );
                     continue;
                 }
                 CollectedObject::Dataset(parts) => *parts,
@@ -2580,16 +2671,22 @@ impl Hdf5Writer {
                     group_index_map.get(&parent_path).copied()
                 };
                 let gidx = groups.len();
-                let (obj_header_written_addr, obj_header_encoded_size, attributes, track_order) =
-                    group_headers.remove(path.trim_start_matches('/')).map_or(
-                        (None, 0, Vec::new(), TrackOrder::default()),
-                        |(addr, len, attrs, track)| (Some(addr), len, attrs, track),
-                    );
+                let (
+                    obj_header_written_addr,
+                    obj_header_encoded_size,
+                    attributes,
+                    track_order,
+                    times,
+                ) = group_headers.remove(path.trim_start_matches('/')).map_or(
+                    (None, 0, Vec::new(), TrackOrder::default(), None),
+                    |(addr, len, attrs, track, times)| (Some(addr), len, attrs, track, times),
+                );
                 groups.push(GroupInfo {
                     name: path.clone(),
                     parent,
                     creation_seq: 0,
                     track_order,
+                    times,
                     child_datasets: Vec::new(),
                     child_groups: Vec::new(),
                     obj_header_addr: 0,
@@ -2810,6 +2907,7 @@ impl Hdf5Writer {
             // The reopened file's own policy, so objects added in this
             // session are made the way the file already declares.
             root_track_order,
+            root_times,
             dense_attributes: Slot::new(HashMap::new()),
             dense_links: Slot::new(HashMap::new()),
             superseded_dense: Slot::new(superseded),
@@ -3680,6 +3778,7 @@ impl Hdf5Writer {
             parent: parent_idx,
             creation_seq: self.take_creation_seq(),
             track_order: self.track_order,
+            times: None,
             child_datasets: Vec::new(),
             child_groups: Vec::new(),
             obj_header_addr: 0,
@@ -4462,9 +4561,7 @@ impl Hdf5Writer {
         }
         let mut ainfo = AttributeInfoMessage::compact();
         if order.is_tracked() {
-            // Post-increment, as `H5O__attr_create` does: after n attributes
-            // the running maximum is n.
-            ainfo.max_creation_index = Some(attributes.len() as u16);
+            ainfo.max_creation_index = Some(next_creation_index(attributes));
         }
         if order.is_indexed() {
             // Compact storage has no index B-tree, but the message still
@@ -4473,14 +4570,16 @@ impl Hdf5Writer {
             ainfo.creation_order_btree_address = Some(UNDEF_ADDR);
         }
         header.add_message(MSG_ATTR_INFO, MSG_FLAG_DONTSHARE, ainfo.encode(&self.ctx));
-        // The list is in creation order, so an attribute's position in it is
-        // the creation index libhdf5 would have stamped on its message.
-        for (i, attr) in attributes.iter().enumerate() {
+        // Each attribute states its own creation index — the one it was
+        // created with here, or the one the file it was read from records. An
+        // attribute with none belongs to an object that tracks no order, where
+        // the field is not encoded at all.
+        for attr in attributes {
             header.add_message_indexed(
                 MSG_ATTRIBUTE,
                 0x00,
                 attr.encode_at(&self.ctx, self.libver),
-                i as u16,
+                attr.creation_index().unwrap_or(0),
             );
         }
     }
@@ -4633,6 +4732,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version: 4,
+                times: None,
             },
         );
 
@@ -4674,6 +4774,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version: 4,
+                times: None,
             },
         );
 
@@ -4769,6 +4870,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
+                times: None,
                 fixed_array: None,
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
@@ -5451,6 +5553,17 @@ impl Hdf5Writer {
     /// and a replacement's superseded vlen value could never be reclaimed,
     /// since a streaming reader may hold its heap references.
     pub fn set_attribute(&self, target: AttrTarget<'_>, attr: AttributeMessage) -> IoResult<()> {
+        self.insert_attribute(target, attr, Created)
+    }
+
+    /// The body of [`set_attribute`](Self::set_attribute), told whether the
+    /// attribute it is inserting is genuinely new — see [`AttrOrigin`].
+    fn insert_attribute(
+        &self,
+        target: AttrTarget<'_>,
+        attr: AttributeMessage,
+        origin: AttrOrigin,
+    ) -> IoResult<()> {
         if self.swmr_active {
             return Err(swmr_attr_error(&attr.name));
         }
@@ -5458,11 +5571,22 @@ impl Hdf5Writer {
         // 16-bit size field an object header message has spills the object's
         // whole attribute set to dense storage at finalize, exactly as
         // `H5O__attr_create` does. See `attributes_need_dense`.
-        let entry = AttributeEntry::Readable(attr);
+        let mut entry = AttributeEntry::from(attr);
         let old = self.with_attr_list(target, |attrs| {
             if let Some(pos) = attrs.iter().position(|a| a.name() == entry.name()) {
+                // `H5O__attr_write` replaces an existing attribute's value and
+                // leaves its `crt_idx` alone: the attribute was not created
+                // again, so its creation index does not move.
+                entry.set_creation_index(attrs[pos].creation_index());
                 Some(std::mem::replace(&mut attrs[pos], entry))
             } else {
+                // `H5O__attr_create` stamps the set's running maximum onto the
+                // new attribute and post-increments it — but only a create
+                // reaches for it.
+                entry.set_creation_index(match origin {
+                    Created => Some(next_creation_index(attrs)),
+                    Rewritten(kept) => kept,
+                });
                 attrs.push(entry);
                 None
             }
@@ -5489,9 +5613,9 @@ impl Hdf5Writer {
         name: &str,
         value: &str,
     ) -> IoResult<()> {
-        self.evict_attr(target, name)?;
+        let origin = self.evict_attr(target, name)?;
         let attr = self.vlen_string_attribute(name, value)?;
-        self.set_attribute(target, attr)
+        self.insert_attribute(target, attr, origin)
     }
 
     /// The array counterpart of
@@ -5503,15 +5627,19 @@ impl Hdf5Writer {
         values: &[&str],
         dims: &[u64],
     ) -> IoResult<()> {
-        self.evict_attr(target, name)?;
+        let origin = self.evict_attr(target, name)?;
         let attr = self.vlen_string_array_attribute(name, values, dims)?;
-        self.set_attribute(target, attr)
+        self.insert_attribute(target, attr, origin)
     }
 
     /// Take the attribute `name` off `target`'s list, releasing its heap
     /// objects. No-op when absent. Refused under SWMR — see
     /// [`set_attribute`](Self::set_attribute).
-    fn evict_attr(&self, target: AttrTarget<'_>, name: &str) -> IoResult<()> {
+    ///
+    /// What it answers is what the insert that follows it must be told: an
+    /// attribute that was there is being rewritten and keeps its creation
+    /// index, and one that was not is created.
+    fn evict_attr(&self, target: AttrTarget<'_>, name: &str) -> IoResult<AttrOrigin> {
         if self.swmr_active {
             return Err(swmr_attr_error(name));
         }
@@ -5522,8 +5650,12 @@ impl Hdf5Writer {
                 .map(|pos| attrs.remove(pos))
         })?;
         match old {
-            Some(old) => self.release_attr_vlen(&old),
-            None => Ok(()),
+            Some(old) => {
+                let origin = Rewritten(old.creation_index());
+                self.release_attr_vlen(&old)?;
+                Ok(origin)
+            }
+            None => Ok(Created),
         }
     }
 
@@ -5858,6 +5990,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version: 4,
+                times: None,
                 chunked: None,
                 fixed_array: None,
                 btree_v2: None,
@@ -5964,6 +6097,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version: 4,
+                times: None,
                 chunked: None,
                 fixed_array: None,
                 btree_v2: None,
@@ -6095,6 +6229,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
+                times: None,
                 fixed_array: None,
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
@@ -7307,6 +7442,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
+                times: None,
                 chunked: None,
                 btree_v2: None,
                 fixed_array: Some(FixedArrayDatasetInfo {
@@ -7448,6 +7584,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
+                times: None,
                 chunked: None,
                 fixed_array: None,
                 btree_v2: Some(Bt2DatasetInfo {
@@ -7560,6 +7697,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
+                times: None,
                 fixed_array: None,
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
@@ -7669,6 +7807,7 @@ impl Hdf5Writer {
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
                 layout_version,
+                times: None,
                 fixed_array: None,
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
@@ -9340,6 +9479,7 @@ impl Hdf5Writer {
         let ds = self.ds(index);
         let m = ds.lock();
         let mut header = ObjectHeader::new();
+        header.times = touched_times(m.times);
 
         // Dataspace message (type 0x01)
         let ds_msg = m.dataspace.encode(&self.ctx);
@@ -9444,11 +9584,12 @@ impl Hdf5Writer {
         // themselves, compact or dense.
         // Snapshot what the header needs, then drop the slot guard: the calls
         // below re-lock group slots (including this one).
-        let (attributes, track_order) = {
+        let (attributes, track_order, times) = {
             let grp = self.grp(group_idx);
             let g = grp.lock();
-            (g.attributes.clone(), g.track_order)
+            (g.attributes.clone(), g.track_order, g.times)
         };
+        header.times = touched_times(times);
 
         let links = self.group_links(LinkScope::Group(group_idx), track_order.links);
         self.emit_links(
@@ -9479,6 +9620,7 @@ impl Hdf5Writer {
 
     fn build_root_group_header(&self) -> ObjectHeader {
         let mut header = ObjectHeader::new();
+        header.times = touched_times(self.root_times);
 
         // Link Info (type 0x02) + Group Info (type 0x0A) + the links
         // themselves, compact or dense.

@@ -1609,6 +1609,11 @@ fn object_header_attribute_count_matches_h5py() {
 /// a dirty rewrite is what catalog measured, and the writer's own AINFO
 /// emission is what closes it. The attributes here are libhdf5's, not this
 /// writer's, so the message has to survive the reopen collector as well.
+///
+/// The same rewrite carries `H5O_HDR_STORE_TIMES` and the four times the flag
+/// announces: `d` is created with `track_times`, and an object created that
+/// way must not lose its timestamps to a session that only added an attribute
+/// to it.
 #[test]
 fn ainfo_survives_a_dirty_rewrite() {
     let Some(py) = python() else { return };
@@ -1625,6 +1630,7 @@ fn ainfo_survives_a_dirty_rewrite() {
          d.attrs['gain'] = np.int32(7)\n",
     );
     let timestamped_before = headers_with_timestamps(&path);
+    let rewritten_at = now_seconds();
 
     // Every one of the three objects is dirtied: the root gains a link, the
     // group and the dataset each gain an attribute, so no header reaches the
@@ -1669,28 +1675,64 @@ fn ainfo_survives_a_dirty_rewrite() {
          assert f['d'].attrs['added_gain'] == 11\n\
          assert list(f['added'][...]) == [8, 9]\n",
     );
-    // The other half of the same measurement, still open: the writer builds
-    // every rewritten header from `ObjectHeader::new`, whose flags carry no
-    // `H5O_HDR_STORE_TIMES` bit and whose encoder would write zero timestamps
-    // if they did, so a header libhdf5 wrote with times comes back without
-    // them. Pinned rather than asserted-away: closing it must flip this line.
-    assert_eq!(timestamped_before, 1);
+    // The other half of the same measurement: only `d` was created with
+    // `track_times`, and the rewrite has to hand it back with the flag and the
+    // four stored times still on it. `H5O_touch_oh` moves access and change
+    // time to now on a real modification and leaves modification and birth
+    // time alone, so those two are compared by value.
+    assert_eq!(timestamped_before.len(), 1);
+    let after = headers_with_timestamps(&path);
     assert_eq!(
-        headers_with_timestamps(&path),
-        0,
-        "the rewrite is expected to drop the timestamps flag until the writer carries it"
+        after.len(),
+        1,
+        "the rewrite must carry H5O_HDR_STORE_TIMES and the times with it"
+    );
+    let (before, after) = (timestamped_before[0], after[0]);
+    assert_eq!(
+        (after.modification, after.birth),
+        (before.modification, before.birth),
+        "modification and birth time are not a rewrite's to change"
+    );
+    assert!(
+        after.access >= rewritten_at && after.change >= rewritten_at,
+        "access/change time must be touched by the rewrite: {before:?} -> {after:?}"
     );
 
     std::fs::remove_file(&path).ok();
 }
 
-/// Count the version-2 object headers in `path` whose flags carry the
-/// timestamps bit (`H5O_HDR_STORE_TIMES`, `0x20`).
-fn headers_with_timestamps(path: &std::path::Path) -> usize {
+/// The four times (`access`, `modification`, `change`, `birth`) of every
+/// version-2 object header in `path` whose flags carry the timestamps bit
+/// (`H5O_HDR_STORE_TIMES`, `0x20`), in the order `H5O__cache_serialize`
+/// writes them.
+#[derive(Clone, Copy, Debug)]
+struct HeaderTimes {
+    access: u32,
+    modification: u32,
+    change: u32,
+    birth: u32,
+}
+
+fn headers_with_timestamps(path: &std::path::Path) -> Vec<HeaderTimes> {
     let raw = std::fs::read(path).unwrap();
-    (0..raw.len() - 6)
+    let at = |i: usize| u32::from_le_bytes(raw[i..i + 4].try_into().unwrap());
+    (0..raw.len() - 22)
         .filter(|&i| &raw[i..i + 4] == b"OHDR" && raw[i + 4] == 2 && raw[i + 5] & 0x20 != 0)
-        .count()
+        .map(|i| HeaderTimes {
+            access: at(i + 6),
+            modification: at(i + 10),
+            change: at(i + 14),
+            birth: at(i + 18),
+        })
+        .collect()
+}
+
+/// Seconds since the epoch, as an object header stores them (`H5_now`).
+fn now_seconds() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32
 }
 
 /// An attribute past the object header message limit spills the object's
@@ -2022,6 +2064,48 @@ fn creation_order_tracking_is_captured_per_object() {
          assert list(f.attrs) == ['last', 'first']\n\
          assert list(f.keys()) == ['plain', 'tracked']\n\
          assert list(f['plain'].keys()) == ['alpha', 'beta']\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// Overwriting an attribute is a write, not a create: `H5A__attr_write` puts
+/// the new value under the existing `crt_idx` and leaves the running maximum
+/// alone. The variable-length setters take the old attribute off the list
+/// before allocating the new value's heap objects — the free-before-alloc
+/// order — so the index has to travel with the eviction, or the replacement
+/// is stamped as the newest attribute and moves to the end of the order.
+#[test]
+fn overwriting_an_attribute_keeps_its_creation_index() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_overwrite_corder");
+    {
+        let file = H5FileOptions::new()
+            .track_order(true)
+            .create(&path)
+            .unwrap();
+        let g = file.create_group("g").unwrap();
+        for (i, name) in ["zeta", "alpha", "mu"].iter().enumerate() {
+            g.set_attr_string(name, &format!("v{i}")).unwrap();
+        }
+        // The oldest two are rewritten, so an index taken from the position an
+        // eviction left the attribute in puts them last instead of first.
+        g.set_attr_string("zeta", "rewritten").unwrap();
+        g.set_attr_string_array("alpha", &["a", "b"]).unwrap();
+        // A numeric value over a variable-length one takes the other branch of
+        // the same replacement, and must keep the index just the same.
+        g.set_attr_numeric("mu", &7i32).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "g = f['g']\n\
+         assert list(g.attrs) == ['zeta', 'alpha', 'mu'], list(g.attrs)\n\
+         corder = [h5py.h5a.get_info(g.id, name=n.encode()).corder for n in g.attrs]\n\
+         assert corder == [0, 1, 2], corder\n\
+         assert g.attrs['zeta'] == 'rewritten', g.attrs['zeta']\n\
+         assert list(g.attrs['alpha']) == ['a', 'b'], list(g.attrs['alpha'])\n\
+         assert g.attrs['mu'] == 7, g.attrs['mu']\n",
     );
     std::fs::remove_file(&path).ok();
 }

@@ -21,6 +21,7 @@
 
 use crate::format::bytes::read_le_addr as read_addr;
 use crate::format::creation_order::CreationOrder;
+use crate::format::messages::attribute::AttributeEntry;
 use crate::format::{FormatContext, FormatError, FormatResult, UNDEF_ADDR};
 
 const VERSION: u8 = 0;
@@ -165,6 +166,24 @@ impl AttributeInfoMessage {
     }
 }
 
+/// `H5O_ainfo_t::max_crt_idx` for `attrs`: one past the largest creation index
+/// among them, and so also the index the next attribute added to the set
+/// takes.
+///
+/// The single owner of that number, for the compact and the dense form alike.
+/// It is *not* the attribute count: `H5O__attr_create` post-increments a
+/// counter that nothing decrements, so a set that has ever had an attribute
+/// removed has a maximum above its own length. The saturating step stops at
+/// `MAX_CREATION_ORDER_INDEX`, the ceiling `H5O__attr_create` refuses to go
+/// past.
+pub fn next_creation_index(attrs: &[AttributeEntry]) -> u16 {
+    attrs
+        .iter()
+        .filter_map(|a| a.creation_index())
+        .max()
+        .map_or(0, |m| m.saturating_add(1))
+}
+
 // ========================================================================= helpers
 
 fn check_len(buf: &[u8], pos: usize, need: usize) -> FormatResult<()> {
@@ -250,6 +269,29 @@ mod tests {
         let (decoded, consumed) = AttributeInfoMessage::decode(&encoded, &ctx8()).unwrap();
         assert_eq!(consumed, 28);
         assert_eq!(decoded, msg);
+    }
+
+    fn attr(name: &str, creation_index: Option<u16>) -> AttributeEntry {
+        use crate::format::messages::attribute::AttributeMessage;
+        AttributeEntry::from(AttributeMessage::scalar_string(name, "v"))
+            .with_creation_index(creation_index)
+    }
+
+    #[test]
+    fn the_max_creation_index_is_one_past_the_largest_not_the_count() {
+        // A set two of whose attributes have been removed: three are left, but
+        // the largest index among them is 9, so the next one takes 10.
+        let thinned = [attr("a", Some(0)), attr("b", Some(4)), attr("c", Some(9))];
+        assert_eq!(next_creation_index(&thinned), 10);
+
+        // Untracked attributes carry no index, and contribute none.
+        let untracked = [attr("a", None), attr("b", None)];
+        assert_eq!(next_creation_index(&untracked), 0);
+        assert_eq!(next_creation_index(&[]), 0);
+
+        // The ceiling `H5O__attr_create` refuses to go past.
+        let full = [attr("a", Some(MAX_CREATION_ORDER_INDEX - 1))];
+        assert_eq!(next_creation_index(&full), MAX_CREATION_ORDER_INDEX);
     }
 
     #[test]
