@@ -1,0 +1,140 @@
+# Datatype system — C-parity inventory
+
+Upstream: `/home/stevek/work/hdf5`, branch `develop` (2.0-dev), commit `eeba6ab8a5a62d170fb8921183760887401f615f` (2026-08-11).
+Rust port: `/home/stevek/work/rust-hdf5`, commit `f08df756d4073c3e2ced3c01f6dfab94d3f0ced8` (main, v0.4.3).
+
+Parity target is the **1.14.x on-disk format** (what libhdf5/h5py actually produce today). HDF5-2.0-dev-only
+additions (`H5T_COMPLEX`, datatype message version 5, the `H5F_LIBVER_V200` bound) are inventoried for
+completeness but are explicitly **out of the 1.14.x parity target** and never count against the port.
+
+Wire format lives in `src/format/messages/datatype.rs` (1628 lines; `DatatypeMessage` enum at
+`datatype.rs:70-136`, class codes at `datatype.rs:33-39`). Typed read conversion lives in `src/dataset.rs`
+and `src/attribute.rs`; `src/io/reader.rs` is a raw-byte/global-heap layer that decodes the message but does
+not itself do typed conversion. Typed write construction lives in `src/io/writer.rs`, `src/types.rs`.
+
+Upstream: class enum `H5T_class_t` at `H5Tpublic.h:30-46`; message codec `H5O__dtype_encode_helper` /
+`H5O__dtype_decode_helper` in `H5Odtype.c`; version constants `H5O_DTYPE_VERSION_1..5` in `H5Tpkg.h:78-106`;
+conversion registration in `H5T.c` (`H5T__init_package`), implementations split across `H5Tconv_*.c`.
+
+---
+
+## 1. H5T class coverage
+
+| Feature | Upstream anchor | READ status | WRITE status | Evidence (rust file:line) | Impact |
+|---|---|---|---|---|---|
+| Integer (`H5T_INTEGER`), standard widths 1/2/4/8B, LE | `H5Tpublic.h:32`; `H5Odtype.c:974-1044` (encode), `:167-187` (decode) | Implemented (checked path) | Implemented (LE only, see next row) | checked: `dataset.rs:2367-2409,2411-2436,2475-2504`; format decode `datatype.rs:703-736` | H |
+| Integer, big-endian (`H5T_ORDER_BE`) | `H5Tpublic.h:56` | **Partial** — checked path (`classify`/`decode_element`) honors BE correctly; unchecked `read_raw::<T>()` does a byte-order-blind memcpy and silently misreads BE data | **Missing** — writer never constructs `ByteOrder::BigEndian`; only reachable via manual `.datatype()` override with no payload byte-swap done by the library | checked-BE: `dataset.rs:2411-2436`; unchecked no-check: `dataset.rs:2035-2090` (`read_raw`); write hardcode: `datatype.rs:144-214` (u8/i8/…/i64 factories all `ByteOrder::LittleEndian`); BE encode exists but unused: `datatype.rs:401` | H |
+| Integer, non-power-of-2 precision/bit-offset (nbit-style) | `H5Odtype.c:1042-1043` (offset/prec UINT16ENCODE) | Implemented — applied unconditionally on every full/slice read | UNVERIFIED/Missing — no writer construction found for non-full-width `bit_offset`/`bit_precision` | `format/nbit_scaleoffset.rs:1214-1225,1246-1339`, invoked from `io/reader.rs:1416,1438,2941,2968` | L |
+| Integer, VAX byte order (`H5T_ORDER_VAX`) | `H5Tpublic.h:57`; float VAX bits `H5Odtype.c:194-201,1059` | **Missing, silent** — no VAX variant in `ByteOrder`; decode only tests bit 0 of flags, so a VAX-flagged file is silently treated as LE, not rejected | Missing | `datatype.rs:43-47` (`ByteOrder{LittleEndian,BigEndian}` only); decode bit-0-only check `datatype.rs:716-720,748-752` | L |
+| Float, IEEE binary32/binary64 | `H5Tpublic.h:33`; `H5Odtype.c:1046-1149` | Implemented | Implemented | `dataset.rs:2391-2404` (`classify`); factories `datatype.rs:221-249` | H |
+| Float, non-standard bit layout (custom sign/exp/mantissa position) | `H5Odtype.c:1046-1149` (arbitrary epos/esize/mpos/msize/ebias) | **Explicit reject, not silent** — full/slice reads route through `is_standard_ieee_float`, error out on mismatch | Missing (writer only ever emits the standard layout) | `format/nbit_scaleoffset.rs:1160-1199,1324-1336` (`InvalidData` error); write hardcode `datatype.rs:443-444` (norm forced IMPLIED) | M |
+| Float, `_Float16` / half / bfloat16 / F8E4M3 / F8E5M2 / 80/96/128-bit | `H5Tpublic.h:298-390` (2.0-dev minifloats), `_Float16` hard-registered `H5T.c:1517-1531` | Missing — no `f16`/half impl anywhere | Missing | `grep -rni "f16\|half\|bfloat\|e4m3\|e5m2"` over `src/` — no match (per agent sweep) | M |
+| String, fixed-length, NULLTERM | `H5Tpublic.h:121`; `H5Odtype.c:1171-1183` | Implemented | Implemented (default and only reachable padding style) | `datatype.rs:271-286` (`fixed_string`/`fixed_string_utf8`, `padding: 0` hardcoded) | H |
+| String, fixed-length, NULLPAD / SPACEPAD | `H5Tpublic.h:122-123` | **Partial** — dataset-level `trim_fixed_string` handles all 3 styles correctly; attribute-level `attr_string_value` truncates only at first NUL, so SPACEPAD strings keep trailing spaces (wrong) | **Missing from any public write API** — representable in the struct and encodes correctly, but no writer.rs/attribute.rs caller ever constructs `padding:1`/`padding:2`; only reachable via test-only manual `.datatype()` override | read-correct: `dataset.rs:493-507`; read-bug: `io/reader.rs:1359-1391` (attr path, no strpad branch); write-gap: zero `padding: 1`/`2` construction in `writer.rs`, test-only sites `dataset.rs:4991-4995,5051-5054` | H |
+| String, vlen, cset ASCII vs UTF-8 (dataset) | `H5Tpublic.h:96-97`; `H5Odtype.c:1171-1183` | **Partial** — `dataset.rs::decode_string`/`read_strings` is charset-aware (strict ASCII / strict-or-lossy UTF-8); the lower-level `Hdf5Reader::read_vlen_strings` ignores `charset` entirely and always does `from_utf8_lossy` | **Partial** — ASCII selectable only via manual `.datatype(vlen_string_ascii())` + `write_vlen_strings_slice`; every ergonomic `create_vlen_string_dataset*` helper hardcodes UTF-8 | read: `dataset.rs:513-535` (correct) vs `io/reader.rs:2616-2624` (lossy, charset-blind); write: `dataset.rs:5376-5389` (manual ASCII) vs `io/writer.rs:4042,4183,4308` (hardcoded UTF-8) | H |
+| String, vlen, cset ASCII vs UTF-8 (attribute) | same | **Missing charset distinction** — `attr_string_value` always `from_utf8_lossy`, no charset branch | **Missing** — `vlen_string_attribute`/`vlen_string_array_attribute` unconditionally call `vlen_string_utf8()`; no attribute API path can produce cset=ASCII | read: `io/reader.rs:1359-1391,1390`; write: `io/writer.rs:4794-4808,4804` and `:4827-4861,4857` | H |
+| "vlen bytes" as h5py `bytes` convention (`H5T_STRING`, cset=ASCII, not a sequence) | h5py `string_dtype(encoding='ascii')` maps to `H5T_STRING`/`H5T_VARIABLE`/cset=ASCII | N/A (write-side design choice) | **Missing / diverges by design** — `create_vlen_bytes_dataset` uses `VarLenSequence{base:u8}` (class 9, vlen-type 0 = sequence), which h5py reads back as an array of `uint8` arrays, not Python `bytes` | `io/writer.rs:4081-4145`; documented divergence `file.rs:429-434`, `group.rs:235-241` | H |
+| Bitfield (`H5T_BITFIELD`) | `H5Tpublic.h:36`; `H5Odtype.c:1185-1240` (encode), `:299-319` (decode) | **Missing** | **Missing** | no `CLASS_BITFIELD`/variant anywhere; wildcard fallback `datatype.rs:1022-1025` | L |
+| Opaque (`H5T_OPAQUE`) + tag | `H5Tpublic.h:37,217`; `H5Odtype.c:1242-1259` (encode), `:321-343` (decode) | **Missing** | **Missing** | same wildcard `datatype.rs:1022-1025`; directly tested via `decode_unsupported_class` (class byte 5) at `datatype.rs:1241-1252` | M |
+| Compound (`H5T_COMPOUND`), nested, packed, member offsets | `H5Tpublic.h:38`; `H5Odtype.c:1261-1331` (encode), `:345-635` (decode) | **Partial** — message-level decode fully supports nested/packed compounds via literal on-disk offsets (`datatype.rs:797-876`); no automatic member-name→Rust-struct decode exists (no derive, no reflection) — only reachable via `read_raw_bytes()` + manual field math | **Partial** — message-level encode works (`datatype.rs:491-522`, always v3) and offsets/alignment are 100% caller-supplied with zero packing logic computed by the library (`types.rs:232-251`); writer.rs constructs zero `Compound{..}` values — no ergonomic write API | read: `dataset.rs:2613` (test-only manual decode); write: `types.rs:232-251`, zero writer.rs construction (grep) | H |
+| Reference, old (`H5R_OBJECT1`/`H5R_DATASET_REGION1`) | `H5Rpublic.h:53-54`; `H5Odtype.c:1333-1337` (encode), `:637-672` (decode) | **Missing** | **Missing** | class 7 not a defined constant, wildcard `datatype.rs:1022-1025`; whole-repo grep for `H5R_`/"object reference"/"region reference" — no genuine match | H |
+| Reference, revised (`H5R_OBJECT2`/`H5R_DATASET_REGION2`/`H5R_ATTR`, msg v4) | `H5Rpublic.h:55-57`; `H5Tpkg.h:97` (v4 trigger) | **Missing** | **Missing** | same as above — old and new share class code 7, so the port can't even reach the old/new distinction | H |
+| Enum (`H5T_ENUM`), arbitrary user-defined | `H5Tpublic.h:40`; `H5Odtype.c:1339-1373` (encode), `:674-755` (decode) | **Partial** — message decode supports arbitrary name/value members (`datatype.rs:877-936`); no named-value lookup API exists — only readable as raw underlying integer bytes | **Partial** — message encode works; only production caller is the `bool_type()` special case, no general-purpose enum-write helper (`EnumMember` never constructed outside `bool_type()` and unit tests) | read: no `DatatypeMessage::Enum` match in `dataset.rs`/`reader.rs`/`attribute.rs`; write: `datatype.rs:254-268` (`bool_type`) is the only production `Enum` constructor | M |
+| Enum, HDF5-bool convention (`{FALSE:0,TRUE:1}` over u8) | h5py/numpy bool round-trip convention | Implemented | Implemented | `datatype.rs:251-268`; `types.rs:131-138` (`HBool`); exercised `dataset.rs:6068-6069,6097-6099` | — (parity confirmed) |
+| Vlen, string (`H5T_VLEN`, vlen-type=1) | `H5Tpublic.h:41`; `H5Odtype.c:1375-1388` | Implemented (see string rows above) | Implemented (see string rows above) | — | H |
+| Vlen, numeric sequence (`H5T_VLEN`, vlen-type=0, non-`u8` base) | same | **Missing typed decode** — `read_vlen_objects` resolves any vlen element generically to raw `Vec<u8>`, but no per-element width-aware decode into e.g. `Vec<Vec<i32>>` exists | **Missing from public API** — `VarLenSequence{base}` is generic at the message level, but the only constructor (`vlen_bytes()`) hardcodes `base=u8`; the global-heap inserter (`insert_vlen_objects`) is a private fn | read: zero `VarLenSequence` matches in `dataset.rs`/`reader.rs` read APIs; write: `datatype.rs:305-309` (`vlen_bytes`, u8-only), `io/writer.rs:3839` (`insert_vlen_objects`, not `pub`) | M |
+| Array (`H5T_ARRAY`, fixed-size array-of-type element) | `H5Tpublic.h:42`; `H5Odtype.c:1390-1426` (encode), `:788-863` (decode) | **Missing typed decode** — message-level parse works (`datatype.rs:965-1020`); no dataset/attribute-level typed read API, only raw-bytes manual decode | **Missing / unreachable** — message-level encode works and is unit-tested (`datatype.rs:633-663`), but zero `DatatypeMessage::Array` construction anywhere in `writer.rs`/`dataset.rs`, not even via the manual-override escape hatch used by Compound/vlen | read: no match in `dataset.rs`/`reader.rs`/`attribute.rs`; write: no match in `writer.rs`/`dataset.rs` | M |
+| Time (`H5T_TIME`) | `H5Tpublic.h:34`; `H5Odtype.c:1151-1169` (encode), `:275-283` (decode) | **Missing, and swallowed silently one layer up** — class rejected at message decode, but the `Err` is discarded via `if let Ok(...)` at the object-header layer, so a dataset/attribute using `H5T_TIME` simply vanishes from the catalog instead of surfacing an error | Missing | message reject `datatype.rs:1022-1025`; silent swallow `io/reader.rs:1170-1173` (dataset), `:1199-1203` (attribute) | L |
+| Complex (`H5T_COMPLEX`, 2.0-dev only, class 11, msg v5) | `H5Tpublic.h:43` (2.0-dev only, absent from `hdf5-1_14_3` tag) | **Missing — expected, out of 1.14.x parity target** | **Missing — expected** | no class-11 constant anywhere; `datatype.rs` tops out at `CLASS_ARRAY=10` (`:39`) | L (out of scope) |
+| Complex, legacy h5py compound convention (`{"r","i"}` compound of f32/f64) | h5py/numpy pre-2.0 complex-in-HDF5 convention | Implemented | Implemented | `types.rs:143-202` (`Complex32`/`Complex64` as `Compound{r,i}`); attribute round-trip `dataset.rs:6070-6071` | — (parity confirmed for the convention that matters at 1.14.x) |
+| Committed (named) datatype object + shared datatype message | `H5Tpkg.h:316` (`H5T_STATE_NAMED`); shared-msg glue `H5Odtype.c:44-63`; `H5O__dtype_set_share` `:1830-1867` | **Missing** — the reader recognizes a committed-datatype child object only to *skip* it during group traversal; its content is never opened or resolved, and no shared-message (`H5O_SHARED`) unwrapping exists for datatype messages anywhere | **Missing** — no `H5Tcommit` equivalent; nothing in the crate ever sets the object-header "shared" bit | `io/reader.rs:658-673,891` (skip-only); `format/object_header.rs:53` (shared bit documented, never set); `format/messages/attribute.rs:3` ("no shared datatypes") | H |
+
+---
+
+## 2. Datatype message encoding versions (1–5)
+
+Upstream version semantics (`H5Tpkg.h:78-106`):
+
+| Version | Trigger (upstream) | rust-hdf5 emits it? | rust-hdf5 accepts it on decode? |
+|---|---|---|---|
+| 1 | Default/base version, atomic types, non-array compound, non-VAX | Yes — hardcoded for `FixedPoint`/`FloatingPoint`/`FixedString`/`Enum`/`VarLenString`/`VarLenSequence` (`DT_VERSION=1`, `datatype.rs:11`) | Yes, for the classes it supports |
+| 2 | Compound/Array containing array-typed members, non-VAX; `H5Tarray.c:169` forces ≥2 for any array | No — writer never emits v2 (Compound/Array always hardcode v3, `datatype.rs:492,634`) | Yes for FixedPoint/FloatingPoint/Compound/Enum/Array — **but with a real bug**: compound member-name padding is only applied for `version==1`; upstream pads for v1 **and** v2 (`H5Odtype.c:414-428`), only v3 drops it. A genuine v2 compound message (e.g. containing array-typed members, produced under an older libver-bound setting) is **mis-parsed** — member names/offsets misaligned. (`datatype.rs:826-832` vs `H5Odtype.c:414-428`) |
+| 3 | VAX byte order; compact compound/enum member-name encoding (no 8-byte pad); efficient array/offset encoding | Yes — hardcoded for Compound/Array (`datatype.rs:492,634`); accepted for FixedPoint/FloatingPoint/String/Compound/Enum/Array | Yes |
+| 4 | Revised reference types (`H5R_OBJECT2` etc.); library rejects unrecognized classes | **No** — never emitted, never accepted, for any class, even ones rust-hdf5 otherwise understands (int/float/compound/enum/array) | **No** — `InvalidVersion`/`UnsupportedFeature` for every class's version-range check (all cap at `..=3`) |
+| 5 | `H5T_COMPLEX` (2.0-dev only) | No (expected — out of 1.14.x scope) | No (expected) |
+
+Version *selection* is a further, structural divergence: upstream picks the version dynamically per
+`H5F_libver_t` low/high bound (`H5O_dtype_ver_bounds[]`, `H5T.c:738-746`) plus per-feature minimums (VAX
+float forces v3 `H5T.c:303,318`; new-style reference forces v4 `H5T.c:425`; array forces ≥v2
+`H5Tarray.c:169`), propagated recursively via `H5T__upgrade_version_cb` (`H5T.c:7189-7245`) so a nested
+atomic member inside a v3 compound is itself bumped to v3. rust-hdf5 has **no** version-upgrade logic at
+all — each class hardcodes a literal version constant regardless of context, and a `FixedPoint` nested
+inside a v3 `Compound` is always encoded as v1 (`datatype.rs:11,397,522`). This produces legal-but-nonstandard
+files (bytes are correctly laid out for the version tagged), not corruption — but it means the port can
+never produce the "why is this v1 subtype inside a v3 parent" file shape upstream avoids, and it can never
+read any file that legitimately uses v4/v5 for classes it otherwise supports.
+
+---
+
+## 3. Conversion matrix scope: read/write vs C's soft/hard paths
+
+Upstream `H5T.c`/`H5Tconv_*.c` model: a **hard** (`H5T_PERS_HARD`) path per exact type pair (all native
+int/float width×sign combos, `_Float16`, complex), and a **soft** (`H5T_PERS_SOFT`) fallback per class pair
+(`i_i`, `i_f`, `f_f`, `f_i`, `s_s`, `struct`, `enum`, `enum_i`/`enum_f`, `vlen`, `array`, `ref`) found by
+`H5T__path_find_real` (`H5T.c:5753-5903`): hard match first, else last-registered-wins soft scan
+(`H5T.c:6053-6100`), else hard failure. rust-hdf5 has no equivalent path-registration system; each caller
+(`dataset.rs::classify`/`convert`, `attribute.rs::read_numeric_as`) hardcodes a small, explicit allow-list of
+conversions.
+
+**Default-exception-handler behavior compared** (no custom `H5T_conv_except_func_t`, i.e. what h5py/plain
+`H5Tconvert()` callers get by default):
+
+| Case | Upstream C default | rust-hdf5 | Divergence |
+|---|---|---|---|
+| Integer narrowing overflow (e.g. i64→i32 out of range) | **Silent clamp** to dst max/min (`H5Tconv_integer.c:200-227,242-262`) | **Explicit error** (`TypeMismatch`, names element index + value) | rust-hdf5 is *stricter* — rejects what C silently clamps |
+| Float narrowing, exponent overflow (e.g. f64→f32) | **Silent** round to ±infinity (`H5Tconv_float.c:433-460,528-557`) | **Explicit error**, f64→f32 narrowing rejected outright regardless of value | Stricter |
+| Float→int, fractional truncation | **Silent** truncate toward zero (`H5Tconv_float.c:1176-1180,1303-1306`) | N/A — int↔float cross-class conversion is **entirely rejected**, not attempted | rust-hdf5 supports *strictly less* than C here: C always allows int↔float via soft `i_f`/`f_i`; rust-hdf5 has no such path at all (`dataset.rs:2489-2498,2528-2532,2543-2547`) |
+| Enum→enum, unmatched source name | **Hard error** ("not a subset") (`H5Tconv_enum.c:140-142`) | N/A — no enum→enum conversion API exists at all | — |
+| Enum→int/float | Raw underlying value, no name lookup (`H5Tconv_enum.c:507-561`) | Same behavior *by construction* — only raw-byte access exists | Matches |
+| String cset ASCII↔UTF-8 (fixed or vlen) | **Hard error** at path-init — never silently transcoded (`H5Tconv_string.c:70-75`, `H5Tconv_vlen.c:194-199`) | No conversion attempted either — charset is fixed per-datatype-message, not converted on read/write | Matches (both refuse to transcode) |
+| Fixed string ↔ vlen string, direct | No registered path found in C either (UNVERIFIED beyond registration evidence) | No path — these are different Rust API surfaces entirely | Consistent with upstream's apparent gap |
+| Compound member match | Name-based, subsetting + reordering supported (`H5Tconv_compound.c:203-224,301-342`) | No automatic matching at all — caller manually maps offsets via `read_raw_bytes()` | rust-hdf5 supports strictly less (no automatic path) |
+| Byte-order-only conversion (LE↔BE, same width/class) | Always available (`ibo`/`fbo` soft, `H5T.c:1470-1473`) | Checked path (`classify`/`decode_element`) handles it correctly; **unchecked `read_raw::<T>()` does not** — silent misread | rust-hdf5's *unchecked* path is a genuine regression vs. C, which always converts byte order correctly regardless of API used |
+
+**Net read-side conversion set implemented**: same-class widening (i8→i32, f32→f64) and same-class narrowing
+with an error instead of C's silent clamp/round; strict rejection of all int↔float cross-class conversion
+(a real functional gap vs. C, which always supports this). **Net write-side**: no conversion at all — the
+caller's value must already match the declared on-disk type exactly (LE only, standard IEEE layout only);
+this mirrors C's write-side behavior reasonably closely since C's *type-conversion* buffers are primarily a
+read/transfer-time concept, but C can still write through an arbitrary conversion path (e.g. write f64 data
+into an f32 dataset) which rust-hdf5's writer API does not expose at all.
+
+---
+
+## 4. h5py-visible behaviors
+
+| Behavior | h5py/HDF5-C convention | rust-hdf5 | Evidence | Impact |
+|---|---|---|---|---|
+| Vlen string attribute/dataset → Python `str` | `H5T_STRING`/`H5T_VARIABLE`/cset=UTF-8 | Matches — hardcoded UTF-8 vlen string is exactly this shape | `io/writer.rs:4804,4857,4042,4183,4308` | — |
+| Vlen bytes attribute/dataset → Python `bytes` | `string_dtype(encoding='ascii')` = `H5T_STRING`/`H5T_VARIABLE`/cset=ASCII | **No path produces this.** Dataset "vlen bytes" uses `VarLenSequence{u8}` (sequence, not string) — h5py reads it as a uint8-array-of-arrays, not `bytes`. Attributes cannot express ASCII cset at all. | `io/writer.rs:4081-4145` (dataset); `io/writer.rs:4794-4861` (attribute, UTF-8 only); documented in `file.rs:429-434`, `group.rs:235-241` | H |
+| Fixed-length string dtype (numpy `S`-dtype, NULLPAD convention) | h5py/numpy typically NULLPAD | rust-hdf5 only ever *writes* NULLTERM via any public API | `datatype.rs:274,283` | H |
+| Bool ↔ numpy `bool_`/HDF5 enum | `H5T_ENUM{FALSE:0,TRUE:1}` over `u8` | Matches exactly | `datatype.rs:251-268` | — |
+| Object/region references (`h5py.Reference`, `h5py.RegionReference`) | `H5T_REFERENCE`, old or revised | **Entirely unimplemented** | see class table row above | H |
+| Structured/compound numpy dtype round-trip | `H5T_COMPOUND`, name-addressed fields | Wire-compatible bytes, but no ergonomic Rust-struct↔HDF5-compound mapping (manual raw-byte + offset math both directions) | `types.rs:232-251`, `dataset.rs:2613` | H |
+| Named/shared dtype (`h5py.Datatype`, `dataset.id.get_type()` shared across datasets) | Committed datatype object + `H5O_SHARED` wrapper | **Entirely unimplemented** — reader skips committed-datatype objects during traversal without reading them | `io/reader.rs:658-673,891` | H |
+| Complex numbers (`numpy.complex64/128`) | Legacy `{"r","i"}` compound convention (pre-HDF5-2.0, what h5py/numpy still use) | Matches | `types.rs:143-202` | — |
+
+---
+
+## Top-10 ranked gaps (this slice)
+
+1. **Committed (named) datatypes + shared datatype message are entirely unimplemented** — the reader only recognizes a committed-datatype object well enough to *skip* it during group traversal, never opens its content; there is no `H5Tcommit`-equivalent write path and nothing ever sets the object-header "shared" bit. Named datatypes are structural in netCDF4-via-HDF5, MATLAB, and any h5py file using `h5py.Datatype`/shared dtypes across multiple datasets. (`io/reader.rs:658-673,891`)
+2. **Object/region references (`H5T_REFERENCE`), both legacy and revised forms, are entirely unimplemented on read and write** — no class constant, no enum variant; old vs new can't even be distinguished since both share class code 7 and the class itself is rejected before any subtype dispatch. `h5py.Reference`/`RegionReference` values can't round-trip at all. (`datatype.rs:1022-1025`, whole-repo grep confirms no `H5R_*` handling)
+3. **Unsupported-datatype-class decode errors are silently swallowed**, not surfaced — `io/reader.rs:1170-1173` (dataset) and `:1199-1203` (attribute) discard the `Err` from `DatatypeMessage::decode` via `if let Ok(...)`, so any dataset/attribute using Time, Bitfield, Opaque, Reference, Complex, or a v4/v5-tagged message simply vanishes from the catalog — the caller sees `NotFound`, not a diagnosable error. This turns every "missing class" gap above into a silent-omission bug rather than a legible limitation.
+4. **The unchecked raw read path (`dataset.rs::read_raw::<T>()`) performs no byte-order check** — it only verifies element size and then blind-memcpy's, so a big-endian-tagged integer/float dataset is silently byte-swap-misread. The checked path (`classify`/`decode_element`) gets this right; the fast/unchecked path does not, and nothing warns the caller which path they're on. (`dataset.rs:2035-2090` vs `2411-2436`)
+5. **"vlen bytes" does not match h5py's `bytes` convention, and attribute vlen strings can never be ASCII** — dataset vlen-bytes uses `VarLenSequence{u8}` (a sequence type), which h5py reads back as an array of uint8 arrays, not `bytes`; and every attribute string-writer hardcodes cset=UTF-8 with no code path to cset=ASCII at all. Any workflow that writes byte-string attributes (a very common h5py pattern for provenance/binary blobs) cannot interoperate. (`io/writer.rs:4081-4145,4794-4861`)
+6. **Compound datatypes have no ergonomic write API and no automatic member-name-based read decode** — the wire format is correctly supported at the message level, but every real use requires manual `read_raw_bytes()` + hand-computed offsets on read, and manual `CompoundMember` construction with zero packing/alignment help on write. Compound/structured-array datasets are extremely common in real HDF5 files. (`dataset.rs:2613`, `types.rs:232-251`)
+7. **Fixed-length string writer hardcodes NULLTERM only; attribute reader mishandles SPACEPAD** — no public API ever writes NULLPAD or SPACEPAD (diverging from the numpy `S`-dtype/h5py convention), and `attr_string_value` truncates fixed strings only at the first NUL byte, so a foreign SPACEPAD fixed-string attribute keeps its trailing spaces on read. (`datatype.rs:274,283`; `io/reader.rs:1359-1391`)
+8. **Datatype message versions 4 and 5 are entirely unsupported on read**, even for classes the port otherwise understands (int/float/compound/enum/array) — every version-range check caps at `..=3`, so a v4-tagged plain integer datatype (which upstream would emit under a `H5F_LIBVER_V112`+ bound for unrelated reasons, e.g. file-wide feature use) is rejected outright rather than decoded. Write side never adapts version to file settings either — always hardcoded per class. (`datatype.rs` version checks throughout; no `H5T__upgrade_version` equivalent)
+9. **No int↔float cross-class conversion and no typed vlen-numeric-sequence decode** — `read_numeric_as` rejects int→float/float→int entirely (upstream always supports this via soft `i_f`/`f_i`), and a vlen-of-non-`u8` dataset can only be fetched as opaque per-element `Vec<u8>`, with no typed `Vec<Vec<i32>>`-style decode. Both are common in scientific data pipelines (unit-converting reads; ragged numeric arrays). (`dataset.rs:2489-2498,2528-2532,2543-2547`; no `VarLenSequence` match in read APIs)
+10. **VAX byte order silently misparsed as LE, and a genuine v2-compound-message parsing bug** — VAX float/int (legacy but format-legal) decodes as bogus LE/BE data with no detection; separately, the compound decoder only pads member names to 8 bytes for `version==1`, but upstream pads for v1 **and** v2 — a real v2 compound message (produced whenever an older libver-bound file contains an array-typed compound member) is mis-parsed by rust-hdf5, misaligning every member after the first. (`datatype.rs:43-47,716-720,748-752` for VAX; `datatype.rs:826-832` vs `H5Odtype.c:414-428` for the v2 bug)
