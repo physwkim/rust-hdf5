@@ -5,7 +5,7 @@
   "numpy_version": "1.26.4",
   "python": "/home/stevek/micromamba/envs/tomo/bin/python",
   "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-sbext-040abf4b-1/target/release/oracle_probe",
-  "cases": 74
+  "cases": 75
  },
  "results": [
   {
@@ -7472,6 +7472,229 @@
     "h5diff_rc": null,
     "h5dump_rc": null
    }
+  },
+  {
+   "case": "ochk_root",
+   "group": "objectheader",
+   "note": "root group whose object header spills into two continuation chunks",
+   "rust_case": null,
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "#superblock",
+      "kind": "unsupported",
+      "field": "superblock",
+      "structural": true,
+      "ref": "2",
+      "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
+     },
+     {
+      "key": "/#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "6",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
+     },
+     {
+      "key": "/@note0#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "str[256],pad=null,cset=ascii",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note0#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note0#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:30787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787800",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"0xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""
+     },
+     {
+      "key": "/@note1#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "str[256],pad=null,cset=ascii",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note1#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note1#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:31787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787800",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""
+     },
+     {
+      "key": "/@note2#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "str[256],pad=null,cset=ascii",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note2#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note2#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:32787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787800",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"2xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""
+     },
+     {
+      "key": "/@note3#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "str[256],pad=null,cset=ascii",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note3#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note3#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:33787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787800",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"3xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""
+     },
+     {
+      "key": "/@note4#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "str[256],pad=null,cset=ascii",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note4#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note4#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:34787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787800",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"4xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""
+     },
+     {
+      "key": "/@note5#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "str[256],pad=null,cset=ascii",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note5#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note5#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:35787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787800",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"5xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""
+     },
+     {
+      "key": "/data#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/data#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/data#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "contiguous",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/data#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[8]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/data#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 9,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "UNSUPPORTED-API",
+    "detail": "no rust writer arm: the public API cannot express this case",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": null,
+    "h5dump_rc": null
+   }
   }
  ],
  "findings": [
@@ -7599,7 +7822,8 @@
     "libver_v108",
     "libver_v110",
     "sohm_list",
-    "sohm_btree"
+    "sohm_btree",
+    "ochk_root"
    ],
    "example": ""
   },
@@ -7680,7 +7904,8 @@
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
-    "sohm_btree"
+    "sohm_btree",
+    "ochk_root"
    ],
    "example": "/#nattrs_hdr"
   },
@@ -7761,7 +7986,8 @@
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
-    "sohm_btree"
+    "sohm_btree",
+    "ochk_root"
    ],
    "example": "#superblock"
   },
@@ -7837,7 +8063,8 @@
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
-    "sohm_btree"
+    "sohm_btree",
+    "ochk_root"
    ],
    "example": "/data#fillvalue"
   },
@@ -7913,7 +8140,8 @@
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
-    "sohm_btree"
+    "sohm_btree",
+    "ochk_root"
    ],
    "example": "/data#filters"
   },
@@ -7989,7 +8217,8 @@
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
-    "sohm_btree"
+    "sohm_btree",
+    "ochk_root"
    ],
    "example": "/data#maxshape"
   },
@@ -8065,7 +8294,8 @@
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
-    "sohm_btree"
+    "sohm_btree",
+    "ochk_root"
    ],
    "example": "/data#nattrs_hdr"
   },
@@ -8124,7 +8354,8 @@
     "libver_earliest",
     "libver_v108",
     "sohm_list",
-    "sohm_btree"
+    "sohm_btree",
+    "ochk_root"
    ],
    "example": "/data#layout"
   },
@@ -8169,7 +8400,8 @@
    "signature": "dtype \u2014 H5Group has no attr() handle in read mode",
    "cases": [
     "attr_string",
-    "attr_on_root"
+    "attr_on_root",
+    "ochk_root"
    ],
    "example": "/g@NX_class#dtype"
   },
@@ -8178,7 +8410,8 @@
    "signature": "shape \u2014 H5Group has no attr() handle in read mode",
    "cases": [
     "attr_string",
-    "attr_on_root"
+    "attr_on_root",
+    "ochk_root"
    ],
    "example": "/g@NX_class#shape"
   },
@@ -8187,7 +8420,8 @@
    "signature": "value \u2014 H5Group has no attr() handle",
    "cases": [
     "attr_string",
-    "attr_on_root"
+    "attr_on_root",
+    "ochk_root"
    ],
    "example": "/g@NX_class#value"
   }

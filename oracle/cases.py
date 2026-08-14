@@ -757,29 +757,33 @@ MISC_CASES = [
 FIXTURE_DIR = pathlib.Path(__file__).resolve().parent.parent / "tests" / "fixtures"
 
 
-def _fixture_case(name, fixture, group, note):
+def _fixture_case(name, fixture, generator, group, note):
     def gen(path):
         src = FIXTURE_DIR / fixture
         if not src.exists():
             raise FileNotFoundError(
                 "%s is missing; regenerate it with tests/fixtures/%s"
-                % (src, "gen_sohm.sh")
+                % (src, generator)
             )
         shutil.copyfile(src, path)
 
-    # No rust writer arm: the public API cannot ask for shared messages.
+    # No rust writer arm: the public API cannot ask for these files.
     return Case(name, group, gen, None, note)
 
 
 FIXTURE_CASES = [
     _fixture_case(
-        "sohm_list", "sohm_list.h5", "sohm",
+        "sohm_list", "sohm_list.h5", "gen_sohm.sh", "sohm",
         "shared datatype/dataspace/attribute messages, list index "
         "(H5Pset_shared_mesg_index) + a committed datatype",
     ),
     _fixture_case(
-        "sohm_btree", "sohm_btree.h5", "sohm",
+        "sohm_btree", "sohm_btree.h5", "gen_sohm.sh", "sohm",
         "the same file with the shared-message index forced to a v2 B-tree",
+    ),
+    _fixture_case(
+        "ochk_root", "ochk_root.h5", "gen_ochk.sh", "objectheader",
+        "root group whose object header spills into two continuation chunks",
     ),
 ]
 

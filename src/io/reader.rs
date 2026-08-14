@@ -1300,9 +1300,12 @@ impl Hdf5Reader {
                 break;
             }
 
-            let cont_buf = handle.read_at_most(cont_addr, cont_len as usize)?;
+            // The continuation message states the chunk's exact length, and a
+            // v2 chunk's checksum covers exactly that image: a short read would
+            // check a different buffer than the writer hashed.
+            let cont_buf = handle.read_at(cont_addr, cont_len as usize)?;
             let mut new_msgs = Vec::new();
-            Self::parse_continuation_block(&cont_buf, is_v2, track_creation_order, &mut new_msgs);
+            Self::parse_continuation_block(&cont_buf, is_v2, track_creation_order, &mut new_msgs)?;
             collect(&new_msgs, &mut pending);
             header.messages.extend(new_msgs);
         }
@@ -1549,18 +1552,42 @@ impl Hdf5Reader {
     ///
     /// For v2 (`is_v2`) the block is `"OCHK"(4) + messages + checksum(4)`;
     /// for v1 it is bare messages. Null/padding messages (type 0) are skipped.
+    ///
+    /// A v2 block is checked whole before any message is taken from it, the way
+    /// `H5O__cache_chk_verify_chksum` and `H5O__chunk_deserialize` check it:
+    /// signature first, then the Jenkins checksum over the entire chunk image.
+    /// Version 1 has neither.
     fn parse_continuation_block(
         cont_buf: &[u8],
         is_v2: bool,
         track_creation_order: bool,
         out: &mut Vec<crate::format::object_header::ObjectHeaderMessage>,
-    ) {
+    ) -> crate::format::FormatResult<()> {
         if is_v2 {
             // "OCHK"(4) signature + messages + checksum(4).
-            if cont_buf.len() < 8 || cont_buf[0..4] != *b"OCHK" {
-                return;
+            if cont_buf.len() < 8 {
+                return Err(FormatError::BufferTooShort {
+                    needed: 8,
+                    available: cont_buf.len(),
+                });
+            }
+            if cont_buf[0..4] != *b"OCHK" {
+                return Err(FormatError::InvalidSignature);
             }
             let msgs_end = cont_buf.len() - 4; // strip trailing checksum
+            let stored = u32::from_le_bytes([
+                cont_buf[msgs_end],
+                cont_buf[msgs_end + 1],
+                cont_buf[msgs_end + 2],
+                cont_buf[msgs_end + 3],
+            ]);
+            let computed = crate::format::checksum::checksum_metadata(&cont_buf[..msgs_end]);
+            if stored != computed {
+                return Err(FormatError::ChecksumMismatch {
+                    expected: stored,
+                    computed,
+                });
+            }
             let mut pos = 4; // skip "OCHK" signature
                              // v2 message header: type(1) + size(2) + flags(1) [+ crt_order(2)]
             let hdr_size = if track_creation_order { 6 } else { 4 };
@@ -1603,6 +1630,7 @@ impl Hdf5Reader {
                 pos = (pos + 7) & !7; // v1 8-byte alignment
             }
         }
+        Ok(())
     }
 
     /// Read a dataset's object header and extract metadata. Returns None if
