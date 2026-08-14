@@ -471,6 +471,16 @@ pub struct DatasetInfo {
     /// touching the dataset's storage — an attribute set or removed, a fill
     /// value defined. See [`header_stale`](DatasetInfo::header_stale).
     pub header_dirty: bool,
+    /// The hard link count the on-disk header was written with, so finalize
+    /// can tell that this session changed it.
+    ///
+    /// A count, not a flag, because the count is what the header records and
+    /// the ways to change it are many: creating a link, unlinking one,
+    /// deleting a link's parent group, promoting a link to a primary name.
+    /// Comparing the value closes all of them at once, where a dirty flag
+    /// would have to be set at each and would be forgotten at the next one
+    /// added.
+    pub nlink_written: u32,
     /// When the link naming this dataset was created; see
     /// [`GroupInfo::creation_seq`].
     pub creation_seq: u64,
@@ -515,6 +525,15 @@ impl DatasetInfo {
     /// reopened dataset vanished at close.
     fn header_stale(&self) -> bool {
         self.storage_dirty() || self.header_dirty
+    }
+
+    /// The same question for the one thing the dataset itself cannot see: how
+    /// many hard links resolve to it. That count lives in the header — an
+    /// Object Reference Count message in a version-2 header, the `nlink`
+    /// prefix field of a version-1 one — but it is a property of the file's
+    /// link graph, so the caller supplies today's value.
+    fn header_stale_with(&self, nlink: u32) -> bool {
+        self.header_stale() || nlink != self.nlink_written
     }
 }
 
@@ -1568,6 +1587,10 @@ fn rebuild_dataset(
         deleted: false,
         extent_dirty: false,
         header_dirty: false,
+        // Stamped by the caller once the whole link graph is registered: it
+        // is the count of links reaching this object, which one dataset's
+        // parts cannot see.
+        nlink_written: 1,
         // Stamped by the caller, which knows the order the walk met each
         // object; the rebuild sees one dataset at a time.
         creation_seq: 0,
@@ -2805,7 +2828,7 @@ impl Hdf5Writer {
             .map(|g| Shared::new(Slot::new(g)))
             .collect();
 
-        Ok(Self {
+        let writer = Self {
             handle,
             allocator,
             ctx,
@@ -2835,7 +2858,16 @@ impl Hdf5Writer {
             track_order: root_track_order,
             next_creation_seq: Slot::new(creation_seq),
             pending_object_references: Slot::new(Vec::new()),
-        })
+        };
+        // The link graph is complete only now, so this is the first point the
+        // count each on-disk header was written with can be read off it: in a
+        // well-formed file the links the walk found reaching an object *are*
+        // that count, so nothing has to be decoded out of the headers.
+        for i in 0..writer.dataset_count() {
+            let nlink = writer.object_link_count(HardLinkTarget::Dataset(i));
+            writer.ds(i).lock().nlink_written = nlink;
+        }
+        Ok(writer)
     }
 
     /// Return the names of all datasets created so far.
@@ -4648,6 +4680,7 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                nlink_written: 1,
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
@@ -4689,6 +4722,7 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                nlink_written: 1,
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
@@ -4784,6 +4818,7 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                nlink_written: 1,
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
@@ -5873,6 +5908,7 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                nlink_written: 1,
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
@@ -5979,6 +6015,7 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                nlink_written: 1,
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
@@ -6110,6 +6147,7 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                nlink_written: 1,
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
@@ -7322,6 +7360,7 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                nlink_written: 1,
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
@@ -7463,6 +7502,7 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                nlink_written: 1,
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
@@ -7575,6 +7615,7 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                nlink_written: 1,
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
@@ -7684,6 +7725,7 @@ impl Hdf5Writer {
                 deleted: false,
                 extent_dirty: false,
                 header_dirty: false,
+                nlink_written: 1,
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
@@ -9108,6 +9150,7 @@ impl Hdf5Writer {
             .collect();
         self.prepare_dense_attributes(&live)?;
         for i in live {
+            let nlink = self.object_link_count(HardLinkTarget::Dataset(i));
             let ds_header = self.build_dataset_header(i);
             let encoded = ds_header.encode()?;
             let encoded_size = encoded.len();
@@ -9118,6 +9161,7 @@ impl Hdf5Writer {
             m.obj_header_addr = addr;
             m.obj_header_written_addr = Some(addr);
             m.obj_header_encoded_size = encoded_size;
+            m.nlink_written = nlink;
         }
 
         // 1b. Group object headers. A hard link can point to a group whose
@@ -9248,6 +9292,9 @@ impl Hdf5Writer {
         // only for headers this finalize actually rewrites.
         let mut rewritten: Vec<usize> = Vec::new();
         for i in 0..self.dataset_count() {
+            // Before the slot guard: `object_link_count` re-locks every
+            // dataset and group slot, this one included.
+            let nlink = self.object_link_count(HardLinkTarget::Dataset(i));
             let ds = self.ds(i);
             let mut m = ds.lock();
             if m.deleted {
@@ -9257,7 +9304,7 @@ impl Hdf5Writer {
                 // An existing dataset from append mode keeps its header — and
                 // everything that header names — unless this session changed
                 // what the header says.
-                if !m.header_stale() {
+                if !m.header_stale_with(nlink) {
                     // Keep the original object header address for the root group link.
                     m.obj_header_addr = m.obj_header_written_addr.unwrap();
                     continue;
@@ -9274,11 +9321,15 @@ impl Hdf5Writer {
         }
         self.prepare_dense_attributes(&rewritten)?;
         for i in rewritten {
+            let nlink = self.object_link_count(HardLinkTarget::Dataset(i));
             let ds_header = self.build_dataset_header(i);
             let encoded = ds_header.encode()?;
             let addr = self.allocator.allocate(encoded.len() as u64);
             self.handle.write_at(addr, &encoded)?;
-            self.ds(i).lock().obj_header_addr = addr;
+            let ds = self.ds(i);
+            let mut m = ds.lock();
+            m.obj_header_addr = addr;
+            m.nlink_written = nlink;
         }
 
         // 1b. Group object headers. A hard link can point to a group whose
