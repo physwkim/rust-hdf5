@@ -77,6 +77,7 @@ impl SymbolTableNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::superblock::SymbolTableCache;
     use crate::format::UNDEF_ADDR;
 
     fn build_snod(
@@ -100,16 +101,19 @@ mod tests {
             // reserved
             buf.extend_from_slice(&0u32.to_le_bytes());
             // scratch pad (16 bytes)
-            if cache_type == 1 {
-                buf.extend_from_slice(&btree_addr.to_le_bytes()[..sizeof_addr]);
-                buf.extend_from_slice(&heap_addr.to_le_bytes()[..sizeof_addr]);
-                let used = 2 * sizeof_addr;
-                if used < 16 {
-                    buf.extend_from_slice(&vec![0u8; 16 - used]);
+            let mut scratch = Vec::new();
+            match cache_type {
+                1 => {
+                    scratch.extend_from_slice(&btree_addr.to_le_bytes()[..sizeof_addr]);
+                    scratch.extend_from_slice(&heap_addr.to_le_bytes()[..sizeof_addr]);
                 }
-            } else {
-                buf.extend_from_slice(&[0u8; 16]);
+                // A soft-link entry caches the 4-byte heap offset of its
+                // value string; `btree_addr` carries it in this builder.
+                2 => scratch.extend_from_slice(&(btree_addr as u32).to_le_bytes()),
+                _ => {}
             }
+            scratch.resize(16, 0);
+            buf.extend_from_slice(&scratch);
         }
 
         buf
@@ -129,10 +133,33 @@ mod tests {
         assert_eq!(node.entries.len(), 2);
         assert_eq!(node.entries[0].name_offset, 8);
         assert_eq!(node.entries[0].obj_header_addr, 0x100);
-        assert_eq!(node.entries[0].cache_type, 0);
-        assert_eq!(node.entries[1].cache_type, 1);
-        assert_eq!(node.entries[1].btree_addr, 0x300);
-        assert_eq!(node.entries[1].heap_addr, 0x400);
+        assert_eq!(node.entries[0].cache, SymbolTableCache::Nothing);
+        assert_eq!(
+            node.entries[1].cache,
+            SymbolTableCache::SymbolTable {
+                btree_addr: 0x300,
+                heap_addr: 0x400,
+            }
+        );
+    }
+
+    /// A `H5G_CACHED_SLINK` entry names no object; its scratch pad holds the
+    /// 4-byte offset of the link's value in the group's local heap. Reading
+    /// it as a cached B-tree/heap pair (the old shape) lost the offset and
+    /// left an entry whose object header address is undefined — which is how
+    /// a soft link in a v0/v1 group vanished from the listing.
+    #[test]
+    fn decode_soft_link_entry() {
+        let snod = build_snod(&[(16, UNDEF_ADDR, 2, 24, 0)], 8, 8);
+        let node = SymbolTableNode::decode(&snod, 8, 8).unwrap();
+        assert_eq!(node.entries.len(), 1);
+        assert_eq!(node.entries[0].name_offset, 16);
+        assert_eq!(node.entries[0].obj_header_addr, UNDEF_ADDR);
+        assert_eq!(
+            node.entries[0].cache,
+            SymbolTableCache::SoftLink { value_offset: 24 }
+        );
+        assert_eq!(node.entries[0].cached_symbol_table(), None);
     }
 
     #[test]

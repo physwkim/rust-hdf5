@@ -593,7 +593,7 @@ impl SwmrFileReader {
     }
 
     /// Return the current shape of a dataset.
-    pub fn dataset_shape(&self, name: &str) -> Result<Vec<u64>> {
+    pub fn dataset_shape(&mut self, name: &str) -> Result<Vec<u64>> {
         Ok(self.reader.dataset_shape(name)?)
     }
 
@@ -647,7 +647,7 @@ impl SwmrFileReader {
     /// raw bytes splits or merges elements — an f64 dataset read as `i32`
     /// passed the divisibility check and silently returned twice as many
     /// garbage values.
-    fn check_element_width<T: H5Type>(&self, name: &str) -> Result<()> {
+    fn check_element_width<T: H5Type>(&mut self, name: &str) -> Result<()> {
         let stored = self.dataset_element_size(name)?;
         if T::element_size() != stored {
             return Err(crate::error::Hdf5Error::TypeMismatch(format!(
@@ -665,7 +665,7 @@ impl SwmrFileReader {
 
     /// Element size of a dataset's datatype, in bytes — enough to size a
     /// read buffer without knowing the concrete element type at compile time.
-    pub fn dataset_element_size(&self, name: &str) -> Result<usize> {
+    pub fn dataset_element_size(&mut self, name: &str) -> Result<usize> {
         self.reader
             .dataset_info(name)
             .map(|i| i.datatype.element_size() as usize)
@@ -683,7 +683,7 @@ impl SwmrFileReader {
     }
 
     /// Names of the attributes on a dataset.
-    pub fn dataset_attr_names(&self, name: &str) -> Result<Vec<String>> {
+    pub fn dataset_attr_names(&mut self, name: &str) -> Result<Vec<String>> {
         Ok(self.reader.dataset_attr_names(name)?)
     }
 
@@ -695,7 +695,7 @@ impl SwmrFileReader {
 
     /// Names of the attributes on a group, or on the root group when
     /// `group_path` is `"/"`. A leading `/` is tolerated.
-    pub fn group_attr_names(&self, group_path: &str) -> Vec<String> {
+    pub fn group_attr_names(&mut self, group_path: &str) -> Vec<String> {
         if group_path == "/" {
             self.reader.root_attr_names()
         } else {

@@ -1,4 +1,4 @@
-# The canonical dump format (`!canon 2`)
+# The canonical dump format (`!canon 3`)
 
 Both sides of the oracle — `oracle/canon.py` (h5py / libhdf5 1.14.6) and
 `src/bin/oracle_probe.rs` (rust-hdf5 public API) — emit this format, so the
@@ -8,7 +8,7 @@ two dumps of the same file are comparable as text and, more usefully, as a
 ## Grammar
 
     line   := header | record
-    header := "!canon" TAB "2"
+    header := "!canon" TAB "3"
     record := key TAB value
     key    := path [ "@" attrname ] "#" field
     value  := <no TAB, no LF>
@@ -57,7 +57,7 @@ Dataset fields, in order: `kind`, `dtype`, `strpad`, `shape`, `maxshape`,
 
 Committed datatype fields: `kind`, `dtype`, `strpad`, `nattrs`, attributes.
 
-Link fields: `kind`, `target`.
+Link fields: `kind`, `target`, and for an external link `resolved`.
 
 | field        | value                                                                     |
 |--------------|---------------------------------------------------------------------------|
@@ -78,6 +78,13 @@ Link fields: `kind`, `target`.
 | `strpad`     | `-`, or `.=null;.member=spacepad` for each vlen string in the type tree   |
 | `data`       | see below                                                                 |
 | `target`     | soft: the link path; external: `<file>::<path>`                           |
+| `resolved`   | external only: `dataset <shape> <data>` \| `group` \| `committed-datatype` \| `dangling` |
+
+`target` is only the value stored in the link, so it is identical whether or
+not the producing side can open the file it names. `resolved` is what crossing
+the link lands on — the target's shape and payload for a dataset, `dangling`
+when the target file or the target object is not there — which is what
+separates a reader that follows external links from one that only lists them.
 
 `chunkindex` is *derived* on the h5py side from the DCPL and the dataspace
 following libhdf5's selection rules (`H5D__layout_set_version` /

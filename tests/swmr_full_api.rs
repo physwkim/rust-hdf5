@@ -261,7 +261,7 @@ fn dataset_array_attribute_round_trips() {
 
     // SWMR reader sees the attribute name.
     {
-        let r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+        let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
         assert!(
             r.dataset_attr_names("axis")
                 .unwrap()
@@ -330,7 +330,7 @@ fn grid_dataset_positioned_writes_round_trip() {
 
     // SWMR reader sees the full bounded shape.
     {
-        let r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+        let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
         assert_eq!(r.dataset_shape("grid").unwrap(), vec![NA, NB, H, W]);
     }
 

@@ -669,6 +669,26 @@ def gen_link_external(path):
         f["ext"] = h5py.ExternalLink(target.name, "/payload")
 
 
+def gen_link_external_read(path):
+    """A master file whose payload lives entirely in a sibling.
+
+    Every dataset is reached only by crossing a link, so the `resolved` field
+    is the whole content check: a reader that lists the links but never opens
+    the other file matches on `target` and diverges here. The two dangling
+    links pin the other half — a target file that is not there and a target
+    object that is not there both have to say so rather than read something.
+    """
+    target = path.parent / (path.stem + "_data.h5")
+    with h5py.File(target, "w") as g:
+        g.create_dataset("top", data=ramp("<f8"))
+        g.create_group("deep").create_dataset("inner", data=ramp("<i2"))
+    with h5py.File(path, "w") as f:
+        f["direct"] = h5py.ExternalLink(target.name, "/top")
+        f["nested"] = h5py.ExternalLink(target.name, "/deep/inner")
+        f["gone_object"] = h5py.ExternalLink(target.name, "/absent")
+        f["gone_file"] = h5py.ExternalLink("no_such_file.h5", "/top")
+
+
 def gen_links_dense(path):
     # v1.8 bounds, not "latest": dense link storage needs the v1.8 group
     # format, and stopping there keeps the v1.10 layout message out of the
@@ -693,6 +713,30 @@ def gen_track_order(path):
         g.attrs.create("first", np.int32(1))
 
 
+def gen_group_storage_modern_root(path):
+    """A symbol-table group, holding children, under a link-message root.
+
+    `track_order` migrates the group that asks for it and nothing else, so one
+    h5py call writes a root using link messages over a child still using the
+    legacy symbol table. A reader that walks a group the way its parent is
+    stored lists `legacy` and finds none of its children.
+    """
+    with h5py.File(path, "w", track_order=True) as f:
+        legacy = f.create_group("legacy")
+        legacy.create_dataset("a", data=ramp("<i4"))
+        legacy.create_group("inner").create_dataset("c", data=ramp("<i2"))
+
+
+def gen_group_storage_legacy_root(path):
+    """The same mismatch the other way up: a link-message group, holding
+    children, under a symbol-table root."""
+    with h5py.File(path, "w") as f:
+        f.create_group("legacy").create_dataset("a", data=ramp("<i4"))
+        modern = f.create_group("modern", track_order=True)
+        modern.create_dataset("b", data=ramp("<f8"))
+        modern.create_group("inner").create_dataset("c", data=ramp("<i2"))
+
+
 LINK_CASES = [
     Case("groups_nested", "group", gen_groups_nested, "groups_nested",
          "three levels of nested groups plus an empty leaf group"),
@@ -702,10 +746,18 @@ LINK_CASES = [
     Case("link_external", "link", gen_link_external, None,
          "external link into a sibling file",
          ext_files=("_ext.h5",)),
+    Case("link_external_read", "link", gen_link_external_read, None,
+         "datasets read through external links, plus a dangling object and a "
+         "dangling file",
+         ext_files=("_data.h5",)),
     Case("links_dense", "link", gen_links_dense, "links_dense",
          "12 links in one group — dense link storage (fractal heap + v2 B-tree)"),
     Case("track_order", "group", gen_track_order, None,
          "creation-order indices on links and attributes"),
+    Case("group_storage_modern_root", "group", gen_group_storage_modern_root, None,
+         "symbol-table group with children under a link-message root"),
+    Case("group_storage_legacy_root", "group", gen_group_storage_legacy_root, None,
+         "link-message group with children under a symbol-table root"),
 ]
 
 

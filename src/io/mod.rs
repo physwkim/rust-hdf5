@@ -9,6 +9,7 @@ pub(crate) mod chunk_grid;
 pub mod file_handle;
 pub(crate) mod hyperslab;
 pub mod locking;
+pub(crate) mod object_header_io;
 pub mod reader;
 pub mod swmr;
 pub mod writer;
@@ -23,6 +24,26 @@ pub enum IoError {
     Format(crate::format::FormatError),
     NotFound(String),
     InvalidState(String),
+    /// The object exists in the file but uses a feature this reader cannot
+    /// decode. The string names the feature.
+    Unsupported(String),
+    /// A soft or external link whose target does not exist — `H5Dopen`/
+    /// `H5Gopen` on a path through it fails, which is not the same as the name
+    /// being absent. `target` is the link value: a path for a soft link,
+    /// `file::path` for an external one.
+    DanglingLink {
+        link: String,
+        target: String,
+    },
+    /// An external link whose target *file* could not be opened. `searched`
+    /// lists the candidate paths tried, in the order
+    /// `H5F_prefix_open_file` tries them, so a link that resolved on one
+    /// machine and not another says where it looked.
+    ExternalFileNotFound {
+        link: String,
+        file: String,
+        searched: Vec<String>,
+    },
 }
 
 impl From<std::io::Error> for IoError {
@@ -44,6 +65,23 @@ impl std::fmt::Display for IoError {
             Self::Format(e) => write!(f, "format error: {}", e),
             Self::NotFound(s) => write!(f, "not found: {}", s),
             Self::InvalidState(s) => write!(f, "invalid state: {}", s),
+            Self::Unsupported(s) => write!(f, "unsupported: {}", s),
+            Self::DanglingLink { link, target } => write!(
+                f,
+                "link '{}' points to '{}', which does not exist",
+                link, target
+            ),
+            Self::ExternalFileNotFound {
+                link,
+                file,
+                searched,
+            } => write!(
+                f,
+                "external link '{}' names the file '{}', which could not be opened (tried: {})",
+                link,
+                file,
+                searched.join(", ")
+            ),
         }
     }
 }

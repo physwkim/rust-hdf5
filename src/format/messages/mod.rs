@@ -1,3 +1,4 @@
+pub mod attr_info;
 pub mod attribute;
 pub mod continuation;
 pub mod data_layout;
@@ -9,6 +10,7 @@ pub mod group_info;
 pub mod link;
 pub mod link_info;
 pub mod mod_time;
+pub mod shared;
 
 // Message type IDs
 pub const MSG_DATASPACE: u8 = 0x01;

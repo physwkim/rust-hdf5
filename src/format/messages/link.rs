@@ -14,6 +14,12 @@
 //!   name:        name_length bytes (UTF-8)
 //!   [hard link]:  address (sizeof_addr bytes)
 //!   [soft link]:  target_length u16 LE + target string
+//!   [ud link]:    udata_length u16 LE + udata bytes
+//!
+//! The external link is the one user-defined link class libhdf5 ships
+//! (`H5L_TYPE_EXTERNAL` = 64). Its udata is a version/flags byte followed by
+//! the NUL-terminated target file name and the NUL-terminated object path
+//! within that file (`H5Lexternal.c`).
 
 use crate::format::bytes::read_le_uint as read_uint;
 use crate::format::{FormatContext, FormatError, FormatResult};
@@ -27,14 +33,26 @@ const FLAG_CHARSET: u8 = 0x10;
 
 const LINK_TYPE_HARD: u8 = 0;
 const LINK_TYPE_SOFT: u8 = 1;
+/// `H5L_TYPE_EXTERNAL` — also `H5L_TYPE_UD_MIN`, the bottom of the
+/// user-defined link range (64..=255).
+const LINK_TYPE_EXTERNAL: u8 = 64;
+
+/// Version nibble of the external-link udata (`H5L_EXT_VERSION`).
+const EXT_VERSION: u8 = 0;
 
 /// Link target discriminant.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LinkTarget {
     /// Hard link — points to an object header at `address`.
     Hard { address: u64 },
-    /// Soft link — points to a path string.
+    /// Soft link — points to a path string, resolved at traversal time.
     Soft { target: String },
+    /// External link — points to `path` inside the file named `file`.
+    External { file: String, path: String },
+    /// Any other user-defined link class (65..=255). libhdf5 needs a
+    /// registered link class to interpret `udata`, so it is kept verbatim:
+    /// the link still has a name and still belongs in a listing.
+    UserDefined { link_type: u8, udata: Vec<u8> },
 }
 
 /// Link message payload.
@@ -63,6 +81,17 @@ impl LinkMessage {
         }
     }
 
+    /// Create an external link to `path` inside `file`.
+    pub fn external(name: &str, file: &str, path: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            target: LinkTarget::External {
+                file: file.to_string(),
+                path: path.to_string(),
+            },
+        }
+    }
+
     // ------------------------------------------------------------------ encode
 
     pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
@@ -79,6 +108,8 @@ impl LinkMessage {
         let link_type = match &self.target {
             LinkTarget::Hard { .. } => LINK_TYPE_HARD,
             LinkTarget::Soft { .. } => LINK_TYPE_SOFT,
+            LinkTarget::External { .. } => LINK_TYPE_EXTERNAL,
+            LinkTarget::UserDefined { link_type, .. } => *link_type,
         };
 
         // Always store link type so that soft links are correctly identified.
@@ -117,6 +148,15 @@ impl LinkMessage {
                 let tbytes = target.as_bytes();
                 buf.extend_from_slice(&(tbytes.len() as u16).to_le_bytes());
                 buf.extend_from_slice(tbytes);
+            }
+            LinkTarget::External { file, path } => {
+                let udata = encode_external_udata(file, path);
+                buf.extend_from_slice(&(udata.len() as u16).to_le_bytes());
+                buf.extend_from_slice(&udata);
+            }
+            LinkTarget::UserDefined { udata, .. } => {
+                buf.extend_from_slice(&(udata.len() as u16).to_le_bytes());
+                buf.extend_from_slice(udata);
             }
         }
 
@@ -210,9 +250,30 @@ impl LinkMessage {
                 pos += tlen;
                 LinkTarget::Soft { target }
             }
+            // User-defined links (64..=255) all carry a u16-prefixed opaque
+            // value; only the external-link class is interpreted here. A type
+            // below the user-defined range is not a link libhdf5 would have
+            // written (`H5O__link_decode` rejects it too).
+            ud if ud >= LINK_TYPE_EXTERNAL => {
+                check_len(buf, pos, 2)?;
+                let ulen = u16::from_le_bytes([buf[pos], buf[pos + 1]]) as usize;
+                pos += 2;
+                check_len(buf, pos, ulen)?;
+                let udata = &buf[pos..pos + ulen];
+                pos += ulen;
+                if ud == LINK_TYPE_EXTERNAL {
+                    let (file, path) = decode_external_udata(udata)?;
+                    LinkTarget::External { file, path }
+                } else {
+                    LinkTarget::UserDefined {
+                        link_type: ud,
+                        udata: udata.to_vec(),
+                    }
+                }
+            }
             other => {
-                return Err(FormatError::UnsupportedFeature(format!(
-                    "link type {}",
+                return Err(FormatError::InvalidData(format!(
+                    "unknown link type {}",
                     other
                 )));
             }
@@ -223,6 +284,59 @@ impl LinkMessage {
 }
 
 // ========================================================================= helpers
+
+/// Encode the external-link value: `(version << 4) | flags`, then the
+/// NUL-terminated file name and the NUL-terminated object path (`H5L.c`,
+/// `H5L__create_ud` for `H5L_TYPE_EXTERNAL`).
+fn encode_external_udata(file: &str, path: &str) -> Vec<u8> {
+    let mut udata = Vec::with_capacity(1 + file.len() + path.len() + 2);
+    udata.push(EXT_VERSION << 4);
+    udata.extend_from_slice(file.as_bytes());
+    udata.push(0);
+    udata.extend_from_slice(path.as_bytes());
+    udata.push(0);
+    udata
+}
+
+/// Decode the external-link value written by `encode_external_udata`.
+/// libhdf5 rejects a value shorter than 3 bytes, a version above
+/// `H5L_EXT_VERSION`, and any flag bit set (`H5L_EXT_FLAGS_ALL` is 0).
+fn decode_external_udata(udata: &[u8]) -> FormatResult<(String, String)> {
+    if udata.len() < 3 {
+        return Err(FormatError::InvalidData(format!(
+            "external link value is {} bytes, below the 3-byte minimum",
+            udata.len()
+        )));
+    }
+    let version = udata[0] >> 4;
+    let flags = udata[0] & 0x0f;
+    if version != EXT_VERSION {
+        return Err(FormatError::InvalidVersion(version));
+    }
+    if flags != 0 {
+        return Err(FormatError::InvalidData(format!(
+            "external link flags {flags:#x} are not recognized"
+        )));
+    }
+    let body = &udata[1..];
+    let split = body.iter().position(|&b| b == 0).ok_or_else(|| {
+        FormatError::InvalidData("external link file name is not NUL-terminated".into())
+    })?;
+    let file = str_from_utf8(&body[..split], "external link file name")?;
+    let rest = &body[split + 1..];
+    // The object path's own NUL terminator is present in every file libhdf5
+    // writes; tolerate its absence by taking the remainder, as the C traverse
+    // path does once it has the file name.
+    let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+    let path = str_from_utf8(&rest[..end], "external link object path")?;
+    Ok((file, path))
+}
+
+fn str_from_utf8(bytes: &[u8], what: &str) -> FormatResult<String> {
+    std::str::from_utf8(bytes)
+        .map(|s| s.to_string())
+        .map_err(|e| FormatError::InvalidData(format!("invalid UTF-8 {what}: {e}")))
+}
 
 fn check_len(buf: &[u8], pos: usize, need: usize) -> FormatResult<()> {
     // `need` can be a file-derived length up to 8 bytes wide; a checked add
@@ -323,6 +437,94 @@ mod tests {
         let encoded = msg.encode(&ctx8());
         let (decoded, _) = LinkMessage::decode(&encoded, &ctx8()).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn roundtrip_external_link() {
+        let msg = LinkMessage::external("ext", "sibling.h5", "/payload");
+        let encoded = msg.encode(&ctx8());
+        let (decoded, consumed) = LinkMessage::decode(&encoded, &ctx8()).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, msg);
+    }
+
+    /// The exact bytes h5py wrote for `f['ext'] = h5py.ExternalLink(...)`:
+    /// version 1, flags 0x08 (link type present, 1-byte name length), type 64,
+    /// then the udata (version/flags byte, NUL-terminated file, NUL-terminated
+    /// path). Rejecting this message dropped the link from the listing.
+    #[test]
+    fn decode_h5py_external_link_bytes() {
+        let mut buf = vec![1u8, 0x08, 64, 3];
+        buf.extend_from_slice(b"ext");
+        let udata = {
+            let mut u = vec![0u8];
+            u.extend_from_slice(b"link_external_ext.h5\0");
+            u.extend_from_slice(b"/payload\0");
+            u
+        };
+        assert_eq!(udata.len(), 31);
+        buf.extend_from_slice(&(udata.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&udata);
+
+        let (decoded, consumed) = LinkMessage::decode(&buf, &ctx8()).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(decoded.name, "ext");
+        assert_eq!(
+            decoded.target,
+            LinkTarget::External {
+                file: "link_external_ext.h5".into(),
+                path: "/payload".into(),
+            }
+        );
+    }
+
+    /// A user-defined class other than the external link keeps its value
+    /// verbatim so the link still has a name and still appears in a listing.
+    #[test]
+    fn roundtrip_unregistered_user_defined_link() {
+        let msg = LinkMessage {
+            name: "ud".into(),
+            target: LinkTarget::UserDefined {
+                link_type: 200,
+                udata: vec![9, 8, 7],
+            },
+        };
+        let encoded = msg.encode(&ctx8());
+        let (decoded, consumed) = LinkMessage::decode(&encoded, &ctx8()).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn decode_unknown_link_type_below_user_defined_range() {
+        let buf = [1u8, 0x08, 7, 1, b'x'];
+        match LinkMessage::decode(&buf, &ctx8()).unwrap_err() {
+            FormatError::InvalidData(ref s) => assert!(s.contains("link type 7"), "{s}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_external_value_too_short() {
+        let mut buf = vec![1u8, 0x08, 64, 1, b'e'];
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&[0u8, 0]);
+        match LinkMessage::decode(&buf, &ctx8()).unwrap_err() {
+            FormatError::InvalidData(ref s) => assert!(s.contains("3-byte minimum"), "{s}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_external_value_bad_version() {
+        let mut buf = vec![1u8, 0x08, 64, 1, b'e'];
+        let udata = [0x10u8, b'f', 0, b'/', 0];
+        buf.extend_from_slice(&(udata.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&udata);
+        match LinkMessage::decode(&buf, &ctx8()).unwrap_err() {
+            FormatError::InvalidVersion(1) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
