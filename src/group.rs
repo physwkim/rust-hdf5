@@ -210,9 +210,6 @@ impl H5Group {
         match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_string_dataset(&full_name, strings)?;
-                if self.name != "/" {
-                    writer.assign_dataset_to_group(&self.name, idx)?;
-                }
                 let (shape, element_size, chunked, btree2, fixed_array) =
                     writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
@@ -251,9 +248,6 @@ impl H5Group {
         match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_bytes_dataset(&full_name, items)?;
-                if self.name != "/" {
-                    writer.assign_dataset_to_group(&self.name, idx)?;
-                }
                 let (shape, element_size, chunked, btree2, fixed_array) =
                     writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
@@ -297,9 +291,6 @@ impl H5Group {
                 let idx = writer.create_vlen_string_dataset_compressed(
                     &full_name, strings, chunk_size, pipeline,
                 )?;
-                if self.name != "/" {
-                    writer.assign_dataset_to_group(&self.name, idx)?;
-                }
                 let (shape, element_size, chunked, btree2, fixed_array) =
                     writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
@@ -342,9 +333,6 @@ impl H5Group {
             H5FileInner::Writer(writer) => {
                 let idx = writer
                     .create_appendable_vlen_string_dataset(&full_name, chunk_size, pipeline)?;
-                if self.name != "/" {
-                    writer.assign_dataset_to_group(&self.name, idx)?;
-                }
                 let (shape, element_size, chunked, btree2, fixed_array) =
                     writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(

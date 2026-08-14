@@ -444,16 +444,6 @@ impl H5File {
         match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_string_dataset(name, strings)?;
-                // If the name contains '/', assign the dataset to its parent group
-                if let Some(slash_pos) = name.rfind('/') {
-                    let group_path = &name[..slash_pos];
-                    let abs_group_path = if group_path.starts_with('/') {
-                        group_path.to_string()
-                    } else {
-                        format!("/{}", group_path)
-                    };
-                    writer.assign_dataset_to_group(&abs_group_path, idx)?;
-                }
                 let (shape, element_size, chunked, btree2, fixed_array) =
                     writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
@@ -484,16 +474,6 @@ impl H5File {
         match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_bytes_dataset(name, items)?;
-                // If the name contains '/', assign the dataset to its parent group
-                if let Some(slash_pos) = name.rfind('/') {
-                    let group_path = &name[..slash_pos];
-                    let abs_group_path = if group_path.starts_with('/') {
-                        group_path.to_string()
-                    } else {
-                        format!("/{}", group_path)
-                    };
-                    writer.assign_dataset_to_group(&abs_group_path, idx)?;
-                }
                 let (shape, element_size, chunked, btree2, fixed_array) =
                     writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
@@ -531,15 +511,6 @@ impl H5File {
             H5FileInner::Writer(writer) => {
                 let idx = writer
                     .create_vlen_string_dataset_compressed(name, strings, chunk_size, pipeline)?;
-                if let Some(slash_pos) = name.rfind('/') {
-                    let group_path = &name[..slash_pos];
-                    let abs_group_path = if group_path.starts_with('/') {
-                        group_path.to_string()
-                    } else {
-                        format!("/{}", group_path)
-                    };
-                    writer.assign_dataset_to_group(&abs_group_path, idx)?;
-                }
                 let (shape, element_size, chunked, btree2, fixed_array) =
                     writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
@@ -574,15 +545,6 @@ impl H5File {
             H5FileInner::Writer(writer) => {
                 let idx =
                     writer.create_appendable_vlen_string_dataset(name, chunk_size, pipeline)?;
-                if let Some(slash_pos) = name.rfind('/') {
-                    let group_path = &name[..slash_pos];
-                    let abs_group_path = if group_path.starts_with('/') {
-                        group_path.to_string()
-                    } else {
-                        format!("/{}", group_path)
-                    };
-                    writer.assign_dataset_to_group(&abs_group_path, idx)?;
-                }
                 let (shape, element_size, chunked, btree2, fixed_array) =
                     writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(

@@ -1534,6 +1534,101 @@ fn past_max_compact_the_link_set_goes_dense() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A path-like dataset name resolves through real groups instead of becoming
+/// a link whose name contains a `/`. HDF5 link names are single path
+/// components, so libhdf5's own traversal cannot reconstruct such a name:
+/// `h5o.visit` fails outright and `h5dump` errors on the file. A missing
+/// intermediate is refused rather than created, matching the default link
+/// creation property list.
+#[test]
+fn a_path_like_dataset_name_lands_in_the_group_it_names() {
+    let Some(py) = python() else { return };
+    let path = tmp("path_like_names");
+    {
+        let file = H5File::create(&path).unwrap();
+        let outer = file.create_group("outer").unwrap();
+        // A group named by path lands in the group it names, too.
+        outer.create_group("inner").unwrap();
+        file.create_group("outer/inner/nested").unwrap();
+
+        // Created from the file with the whole path in the name...
+        file.new_dataset::<i32>()
+            .shape([3usize])
+            .create("outer/late")
+            .unwrap()
+            .write_raw(&[1, 2, 3])
+            .unwrap();
+        // ...two levels deep...
+        file.new_dataset::<i32>()
+            .shape([3usize])
+            .create("outer/inner/deep")
+            .unwrap()
+            .write_raw(&[4, 5, 6])
+            .unwrap();
+        // ...and from a group handle, with a path in the name again.
+        outer
+            .new_dataset::<i32>()
+            .shape([3usize])
+            .create("inner/relative")
+            .unwrap()
+            .write_raw(&[7, 8, 9])
+            .unwrap();
+        file.write_vlen_strings("outer/notes", &["n0", "n1"])
+            .unwrap();
+
+        // A component that names no group is refused, not invented.
+        let err = match file
+            .new_dataset::<i32>()
+            .shape([1usize])
+            .create("nowhere/x")
+        {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a missing intermediate group must not be invented"),
+        };
+        assert!(err.contains("group '/nowhere' does not exist"), "{err}");
+        let err = match file.create_group("nowhere/y") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a missing intermediate group must not be invented"),
+        };
+        assert!(err.contains("group '/nowhere' does not exist"), "{err}");
+
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "seen = {}\n\
+         f.visititems(lambda n, o: seen.__setitem__(n, type(o).__name__))\n\
+         assert seen == {'outer': 'Group', 'outer/inner': 'Group',\n\
+         \x20   'outer/inner/nested': 'Group',\n\
+         \x20   'outer/late': 'Dataset', 'outer/notes': 'Dataset',\n\
+         \x20   'outer/inner/deep': 'Dataset',\n\
+         \x20   'outer/inner/relative': 'Dataset'}, seen\n\
+         assert list(f.keys()) == ['outer'], list(f.keys())\n\
+         assert sorted(f['outer'].keys()) == ['inner', 'late', 'notes']\n\
+         assert sorted(f['outer/inner'].keys()) == ['deep', 'nested', 'relative']\n\
+         assert (f['outer/late'][...] == [1, 2, 3]).all()\n\
+         assert (f['outer/inner/deep'][...] == [4, 5, 6]).all()\n\
+         assert (f['outer/inner/relative'][...] == [7, 8, 9]).all()\n\
+         assert [s.decode() for s in f['outer/notes'][...]] == ['n0', 'n1']\n",
+    );
+
+    // And this crate reads the same hierarchy back.
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.dataset_names();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "outer/inner/deep",
+            "outer/inner/relative",
+            "outer/late",
+            "outer/notes",
+        ]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// A dense attribute set big enough to overrun the fractal heap's direct
 /// rows: past ~504 KiB of managed objects the doubling table's next row holds
 /// child *indirect* blocks, and libhdf5 must find every attribute through

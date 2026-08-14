@@ -325,6 +325,12 @@ pub(crate) struct CreateGuard<'a> {
     _gate: std::sync::MutexGuard<'a, ()>,
     /// The dataset name with every group hard link in it resolved.
     pub(crate) name: String,
+    /// The group that will hold the new dataset's link, resolved from the
+    /// path components of `name`; `None` is the root group. Carried here so
+    /// [`Hdf5Writer::push_dataset`] registers the child itself and no creator
+    /// can leave a dataset whose name says one thing and whose parent group
+    /// says another.
+    pub(crate) parent: Option<usize>,
 }
 
 /// Reference-counted shared pointer, feature-selected. The single-thread
@@ -1241,8 +1247,51 @@ impl Hdf5Writer {
         // entry every creator passes — keeps alias forms out of the
         // registry.
         let name = self.canonical_dataset_path(name);
+        let (parent, _leaf) = self.split_parent(&name)?;
         self.ensure_unique_dataset_name(&name)?;
-        Ok(CreateGuard { _gate: gate, name })
+        Ok(CreateGuard {
+            _gate: gate,
+            name,
+            parent,
+        })
+    }
+
+    /// Split an object path into the group that will hold its link and the
+    /// leaf link name, resolving every component through the group registry.
+    ///
+    /// `path` is the registry form — no leading `/`, e.g. `"grp/sub/late"`.
+    /// This is what keeps a `/` out of a link name: HDF5 link names are
+    /// single path components (`H5G_traverse` splits on `/` before it ever
+    /// reaches `H5L_link`), so a name that carries a path must name a group
+    /// that exists, or be refused.
+    ///
+    /// A missing component is an error rather than an implicit group: the
+    /// default link creation property list has `H5Pset_create_intermediate_group`
+    /// off, and this writer exposes no property list to turn it on with.
+    fn split_parent(&self, path: &str) -> IoResult<(Option<usize>, String)> {
+        let (parent_path, leaf) = path.rsplit_once('/').unwrap_or(("", path));
+        if leaf.is_empty() {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "'{path}' does not end in a link name"
+            )));
+        }
+        if parent_path.is_empty() {
+            return Ok((None, leaf.to_string()));
+        }
+        let abs = format!("/{parent_path}");
+        let groups = self.group_refs();
+        let idx = groups
+            .iter()
+            .position(|g| {
+                let gg = g.lock();
+                gg.name == abs && !gg.deleted
+            })
+            .ok_or_else(|| {
+                crate::io::IoError::NotFound(format!(
+                    "cannot create '{path}': group '{abs}' does not exist"
+                ))
+            })?;
+        Ok((Some(idx), leaf.to_string()))
     }
 
     /// Push a freshly-built dataset into the registry and return its index.
@@ -1250,10 +1299,18 @@ impl Hdf5Writer {
     /// in-flight write that already cloned its own [`DatasetRef`] out.
     /// The [`CreateGuard`] proves the caller entered through
     /// [`Self::begin_create`] and still holds the gate.
-    pub(crate) fn push_dataset(&self, _create: &CreateGuard<'_>, info: DatasetInfo) -> usize {
-        let mut reg = self.datasets.lock();
-        let idx = reg.len();
-        reg.push(Shared::new(DatasetCell::new(info)));
+    pub(crate) fn push_dataset(&self, create: &CreateGuard<'_>, info: DatasetInfo) -> usize {
+        let idx = {
+            let mut reg = self.datasets.lock();
+            let idx = reg.len();
+            reg.push(Shared::new(DatasetCell::new(info)));
+            idx
+        };
+        // The spine guard is dropped before the group slot is taken: the lock
+        // order is spine -> slot and never the reverse.
+        if let Some(pidx) = create.parent {
+            self.grp(pidx).lock().child_datasets.push(idx);
+        }
         idx
     }
 
@@ -2771,6 +2828,9 @@ impl Hdf5Writer {
         } else {
             format!("{}/{}", parent_path, name)
         };
+        // `name` may itself carry path components; resolving the whole thing
+        // is what keeps a '/' out of the link this group will be reached by.
+        let (parent_idx, _leaf) = self.split_parent(full_name.trim_start_matches('/'))?;
 
         let groups = self.group_refs();
         // Check for duplicates (ignore deleted groups)
@@ -2795,27 +2855,6 @@ impl Hdf5Writer {
                 "a hard link named '{full_name}' already exists"
             )));
         }
-
-        // Find parent group index (None means it's a root-level group). Indices
-        // are append-only, so a parent found in the snapshot stays valid even
-        // if another thread pushes a new group concurrently.
-        let parent_idx = if parent_path == "/" {
-            None
-        } else {
-            let idx = groups
-                .iter()
-                .position(|g| {
-                    let gg = g.lock();
-                    gg.name == parent_path && !gg.deleted
-                })
-                .ok_or_else(|| {
-                    crate::io::IoError::NotFound(format!(
-                        "parent group '{}' not found",
-                        parent_path
-                    ))
-                })?;
-            Some(idx)
-        };
 
         let group_idx = self.push_group(GroupInfo {
             name: full_name,
@@ -2856,6 +2895,12 @@ impl Hdf5Writer {
             .ok_or_else(|| {
                 crate::io::IoError::NotFound(format!("group '{}' not found", group_path))
             })?;
+        // A move, not an addition: the create gate has already placed every
+        // dataset from the path components of its name, so appending here
+        // would leave one dataset linked from two groups at once.
+        for g in &groups {
+            g.lock().child_datasets.retain(|&d| d != ds_index);
+        }
         groups[group_idx].lock().child_datasets.push(ds_index);
         Ok(())
     }
@@ -3112,9 +3157,13 @@ impl Hdf5Writer {
                     if m.deleted || datasets_in_subgroups.contains(&i) {
                         continue;
                     }
+                    // The leaf, never the registry path: a link name is one
+                    // path component, and `H5G_traverse` would split a '/'
+                    // in it before `H5L_link` ever saw the name.
+                    let leaf_name = m.name.rsplit('/').next().unwrap_or(&m.name);
                     links.push((
                         m.creation_seq,
-                        LinkMessage::hard(&m.name, m.obj_header_addr),
+                        LinkMessage::hard(leaf_name, m.obj_header_addr),
                     ));
                 }
                 for grp in self.group_refs() {
@@ -9874,7 +9923,6 @@ mod tests {
         let ds_g0 = writer
             .create_dataset("group1/data", DatatypeMessage::i32_type(), &[3])
             .unwrap();
-        writer.assign_dataset_to_group("/group1", ds_g0).unwrap();
         let raw_g0: Vec<u8> = [10i32, 20, 30]
             .iter()
             .flat_map(|v| v.to_le_bytes())
@@ -9883,9 +9931,6 @@ mod tests {
 
         let ds_g1 = writer
             .create_dataset("group1/sub/values", DatatypeMessage::u8_type(), &[4])
-            .unwrap();
-        writer
-            .assign_dataset_to_group("/group1/sub", ds_g1)
             .unwrap();
         writer.write_dataset_raw(ds_g1, &[1u8, 2, 3, 4]).unwrap();
 

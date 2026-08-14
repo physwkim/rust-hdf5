@@ -225,7 +225,6 @@ impl<T: H5Type> DatasetBuilder<T> {
         } else {
             name.to_string()
         };
-        let group_path = self.group_path.clone();
         let fill_value = self.fill_value.clone();
 
         let dims_u64: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
@@ -348,11 +347,6 @@ impl<T: H5Type> DatasetBuilder<T> {
                                 &full_name, datatype, &dims_u64, &max_u64, &chunk_u64,
                             )?
                         };
-                        if let Some(ref gp) = group_path {
-                            if gp != "/" {
-                                writer.assign_dataset_to_group(gp, idx)?;
-                            }
-                        }
                         if let Some(ref fv) = fill_value {
                             writer.set_dataset_fill_value(idx, fv.clone())?;
                         }
@@ -387,11 +381,6 @@ impl<T: H5Type> DatasetBuilder<T> {
                 match &*inner {
                     H5FileInner::Writer(writer) => {
                         let idx = writer.create_dataset(&full_name, datatype, &dims_u64)?;
-                        if let Some(ref gp) = group_path {
-                            if gp != "/" {
-                                writer.assign_dataset_to_group(gp, idx)?;
-                            }
-                        }
                         if let Some(ref fv) = fill_value {
                             writer.set_dataset_fill_value(idx, fv.clone())?;
                         }
