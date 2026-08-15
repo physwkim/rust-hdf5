@@ -2365,6 +2365,10 @@ pub struct Hdf5Writer {
     pending_object_references: Slot<Vec<PendingObjectReference>>,
     /// Region-reference heap objects waiting for the same address.
     pending_region_references: Slot<Vec<PendingRegionReference>>,
+    /// What each object-reference attribute's value *means*, so
+    /// [`object_attributes`](Hdf5Writer::object_attributes) can say it in
+    /// addresses every time an object header is built.
+    attribute_references: Slot<Vec<AttributeReferenceValue>>,
     /// Set when this writer reopened a version-0/1 file, and never otherwise.
     /// See [`LegacyFile`]; [`object_format`](Self::object_format) is the only
     /// reader of whether it is there.
@@ -2402,8 +2406,8 @@ pub struct FileCreateOptions {
 ///
 /// An `H5R_OBJECT1` element is the target's object header address, and
 /// addresses are assigned during finalize, so a write records the target by
-/// path here and [`Hdf5Writer::apply_object_reference_fixups`] stamps the
-/// address in once every header has one.
+/// path here and [`Hdf5Writer::write_object_reference_values`] puts the address
+/// down once every header has one.
 pub(crate) struct PendingObjectReference {
     /// Dataset holding the element.
     dataset: usize,
@@ -2420,7 +2424,7 @@ pub(crate) struct PendingObjectReference {
 /// global-heap id of the object the write inserted. What waits is the leading
 /// `sizeof_addr` bytes of that heap object, the target's object header address
 /// (`H5R__encode_token_region_compat` puts the token there, the serialized
-/// selection after it), which [`Hdf5Writer::apply_region_reference_fixups`]
+/// selection after it), which [`Hdf5Writer::write_region_reference_values`]
 /// stamps in.
 pub(crate) struct PendingRegionReference {
     /// Address of the global-heap collection holding the object.
@@ -2429,6 +2433,69 @@ pub(crate) struct PendingRegionReference {
     index: u16,
     /// Path of the dataset the selection is over.
     target: String,
+}
+
+/// The value of an attribute whose elements are object references, kept as
+/// what it means rather than as what it encodes to.
+///
+/// An attribute's value is part of its object header message, so it cannot be
+/// stamped after the fact the way a dataset element can — the header is one
+/// block, written once. What is stored instead is the paths, and
+/// [`Hdf5Writer::object_attributes`] turns them into addresses every time the
+/// attribute set is built: the measuring pass reads the zeros of objects that
+/// have no address yet, the content pass reads the addresses the file will
+/// have, and the two agree in length because an address is a fixed-width
+/// field. The entry in the object's attribute list carries a zero image of
+/// exactly that length and is never itself written.
+pub(crate) struct AttributeReferenceValue {
+    /// The object the attribute hangs on.
+    scope: AttrScope,
+    /// The attribute's name within that object.
+    name: String,
+    /// Paths of the objects the elements name, in element order; `/` is the
+    /// root group.
+    targets: Vec<String>,
+}
+
+/// Refuse an object header body that is not the length its block was reserved
+/// at.
+///
+/// The one check standing behind
+/// [`HeaderLayout`]'s premise that measuring a header before its content is
+/// final gives the same length as encoding it after. `what` names the object
+/// only when the check fails, so the caller pays for the lookup only then.
+fn check_header_size(
+    encoded: &[u8],
+    reserved: usize,
+    what: impl FnOnce() -> String,
+) -> IoResult<()> {
+    if encoded.len() == reserved {
+        return Ok(());
+    }
+    Err(crate::io::IoError::InvalidState(format!(
+        "the object header of {} encodes to {} bytes but was measured at {}; \
+         a message in it changed length once the addresses it names were known",
+        what(),
+        encoded.len(),
+        reserved
+    )))
+}
+
+/// Where every object header a finalize writes will sit, and how long the pass
+/// that measured it said it is.
+///
+/// Produced by [`Hdf5Writer::allocate_object_headers`] and consumed by
+/// [`Hdf5Writer::write_object_headers`]; between the two, everything a header
+/// names is built against the addresses it records. The size travels with the
+/// address because it is what the block was reserved at: the writing pass
+/// checks its body against it rather than trusting that the two passes agreed.
+struct HeaderLayout {
+    /// `(dataset index, address, measured size)`, in write order.
+    datasets: Vec<(usize, u64, usize)>,
+    /// `(group index, address, measured size)`, in write order.
+    groups: Vec<(usize, u64, usize)>,
+    /// The root group's `(address, measured size)`.
+    root: (u64, usize),
 }
 
 /// Refuse a region-reference selection the target dataset's extent does not
@@ -2602,6 +2669,7 @@ impl Hdf5Writer {
             next_creation_seq: Slot::new(0),
             pending_object_references: Slot::new(Vec::new()),
             pending_region_references: Slot::new(Vec::new()),
+            attribute_references: Slot::new(Vec::new()),
             // A file this crate creates is always the modern generation.
             legacy: None,
         })
@@ -3531,6 +3599,7 @@ impl Hdf5Writer {
             next_creation_seq: Slot::new(creation_seq),
             pending_object_references: Slot::new(Vec::new()),
             pending_region_references: Slot::new(Vec::new()),
+            attribute_references: Slot::new(Vec::new()),
             legacy,
         };
         // The link graph is complete only now, so this is the first point the
@@ -4907,7 +4976,7 @@ impl Hdf5Writer {
     ///
     /// The value of an `H5R_OBJECT1` element is its target's object header
     /// address, which finalize assigns, so what lands here is the target path;
-    /// [`Self::apply_object_reference_fixups`] writes the addresses. Elements
+    /// [`Self::write_object_reference_values`] writes the addresses. Elements
     /// never written keep the zero image libhdf5 reads back as a null
     /// reference.
     pub fn write_object_references(
@@ -5012,15 +5081,78 @@ impl Hdf5Writer {
             .ok_or_else(|| crate::io::IoError::NotFound(format!("reference target '{path}'")))
     }
 
-    /// Stamp every pending object reference with its target's object header
-    /// address.
+    /// The object header address an object reference's `path` names, or zero
+    /// when that object has not been given one yet.
+    ///
+    /// Zero is where the superblock sits, so it is never an object header's
+    /// address. It is what every object reads as before
+    /// [`allocate_object_headers`](Self::allocate_object_headers) runs, which
+    /// is what lets the pass that measures a header stand in for the pass that
+    /// writes it: an address is a fixed-width field, so the placeholder is the
+    /// same size as the answer.
+    fn object_reference_address(&self, path: &str) -> IoResult<u64> {
+        Ok(match self.object_reference_target(path)? {
+            Some(HardLinkTarget::Dataset(i)) => self.ds(i).lock().obj_header_addr,
+            Some(HardLinkTarget::Group(i)) => self.grp(i).lock().obj_header_addr,
+            None => self.root_group_addr.unwrap_or(0),
+        })
+    }
+
+    /// `scope`'s attributes as this finalize will write them: the stored set,
+    /// with every object-reference attribute's value said in the object header
+    /// addresses assigned so far.
+    ///
+    /// The single owner of a reference attribute's value, and the only source
+    /// an object header build may take an attribute set from. Nothing stored
+    /// is mutated, so the pass that measures a header and the pass that writes
+    /// it cannot disagree about anything but the addresses — which they cannot
+    /// disagree about in length.
+    fn object_attributes(&self, scope: AttrScope) -> IoResult<Vec<AttributeEntry>> {
+        let mut attrs = match scope {
+            AttrScope::Root => self.root_attributes.lock().clone(),
+            AttrScope::Group(gi) => self.grp(gi).lock().attributes.clone(),
+            AttrScope::Dataset(i) => self.ds(i).lock().attributes.clone(),
+        };
+        // Snapshot first: resolving a path locks group and dataset slots.
+        let values: Vec<(String, Vec<String>)> = self
+            .attribute_references
+            .lock()
+            .iter()
+            .filter(|r| r.scope == scope)
+            .map(|r| (r.name.clone(), r.targets.clone()))
+            .collect();
+        let width = self.ctx.sizeof_addr as usize;
+        for (name, targets) in values {
+            // A deleted object's list was emptied without its recorded values
+            // being visited; there is then no attribute to give a value to.
+            let Some(pos) = attrs.iter().position(|a| a.name() == name) else {
+                continue;
+            };
+            let Some(msg) = attrs[pos].readable() else {
+                continue;
+            };
+            let mut msg = msg.clone();
+            let mut data = Vec::with_capacity(targets.len() * width);
+            for target in &targets {
+                data.extend_from_slice(
+                    &self.object_reference_address(target)?.to_le_bytes()[..width],
+                );
+            }
+            msg.data = data;
+            attrs[pos] = AttributeEntry::from(msg).with_creation_index(attrs[pos].creation_index());
+        }
+        Ok(attrs)
+    }
+
+    /// Write every pending object reference element as its target's object
+    /// header address.
     ///
     /// INVARIANT: a reference element on disk holds its target's header
-    /// address. Both finalize paths call this once every dataset, group and
-    /// root header has an address and before the superblock is written, so no
-    /// file is closed with a placeholder element in it; a target that no
-    /// longer resolves fails the finalize rather than leaving one behind.
-    fn apply_object_reference_fixups(&mut self) -> IoResult<()> {
+    /// address. Reached through [`write_reference_values`](Self::write_reference_values),
+    /// which places it after every header has an address; a target that no
+    /// longer resolves fails the finalize rather than leaving a placeholder
+    /// behind.
+    fn write_object_reference_values(&mut self) -> IoResult<()> {
         // Snapshot rather than drain: a SWMR session finalizes twice, and the
         // close-time finalize rebuilds every header at a fresh address, so the
         // elements must be stamped again with the addresses that survive.
@@ -5057,7 +5189,7 @@ impl Hdf5Writer {
     /// object header address followed by the serialized selection
     /// (`H5R__encode_token_region_compat`). Both the object and the element are
     /// written here; only the address inside the object waits for
-    /// [`Self::apply_region_reference_fixups`]. Elements never written keep the
+    /// [`Self::write_region_reference_values`]. Elements never written keep the
     /// zero image libhdf5 reads back as a null reference.
     pub fn write_region_references(
         &self,
@@ -5154,10 +5286,13 @@ impl Hdf5Writer {
     /// Stamp every pending region reference's heap object with its target's
     /// object header address.
     ///
-    /// The object was inserted with that field zeroed, so its size does not
-    /// change here: each collection is read once, patched, and rewritten at its
-    /// own declared size, which leaves every element's heap id valid.
-    fn apply_region_reference_fixups(&mut self) -> IoResult<()> {
+    /// The one reference kind that is still stamped rather than written once:
+    /// the *element* is a global-heap id, so the heap object has to exist at
+    /// the call that stores the reference, long before any address does. The
+    /// object was inserted with that field zeroed, so its size does not change
+    /// here: each collection is read once, patched, and rewritten at its own
+    /// declared size, which leaves every element's heap id valid.
+    fn write_region_reference_values(&mut self) -> IoResult<()> {
         use crate::format::global_heap::GlobalHeapCollection;
 
         // Snapshot rather than drain, for the same reason the object-reference
@@ -5214,19 +5349,25 @@ impl Hdf5Writer {
         Ok(())
     }
 
-    /// Stamp every reference written this session with its target's object
-    /// header address.
+    /// Give every reference written this session its target's object header
+    /// address.
     ///
     /// INVARIANT: no file is closed holding a reference whose target address is
-    /// still the placeholder its write left. Both finalize paths call this once
-    /// every dataset, group and root header has an address and before the
-    /// superblock is written, and this is the only caller of the per-kind
-    /// passes — so a reference kind added later is stamped at both finalize
-    /// sites or at neither. A target that no longer resolves fails the finalize
-    /// rather than leaving a placeholder behind.
-    fn apply_reference_fixups(&mut self) -> IoResult<()> {
-        self.apply_object_reference_fixups()?;
-        self.apply_region_reference_fixups()
+    /// still the placeholder its write left. Both finalize paths call this in
+    /// the content phase — after
+    /// [`allocate_object_headers`](Self::allocate_object_headers), so every
+    /// address exists, and before any object header is written — and this is
+    /// the only caller of the per-kind passes, so a reference kind added later
+    /// is written at both finalize sites or at neither. A target that no longer
+    /// resolves fails the finalize rather than leaving a placeholder behind.
+    ///
+    /// This covers the two reference kinds whose value lives outside an object
+    /// header. An attribute's value lives *inside* one, so it has no pass here:
+    /// [`object_attributes`](Self::object_attributes) says it in addresses as
+    /// the header is built.
+    fn write_reference_values(&mut self) -> IoResult<()> {
+        self.write_object_reference_values()?;
+        self.write_region_reference_values()
     }
 
     /// Append every user-created hard link whose parent group is `parent`
@@ -5874,21 +6015,35 @@ impl Hdf5Writer {
             }
             return;
         }
-        if let Some(ainfo) = self.dense_attributes.lock().get(&scope) {
-            header.add_message(MSG_ATTR_INFO, MSG_FLAG_DONTSHARE, ainfo.encode(&self.ctx));
+        // Whether the set spills is a property of the set alone, so it is the
+        // same answer in the pass that measures this header and in the pass
+        // that writes it — even though the storage itself is laid out between
+        // the two, because it can only be laid out once every object header
+        // has an address. Sizing therefore falls back to a placeholder message
+        // of the same width: only the creation-order flags change the
+        // Attribute Info message's length, so the header measured here holds
+        // the header written against the storage that replaces it. Same
+        // two-pass rule `emit_links` follows for dense links and symbol
+        // tables.
+        let dense = self.attributes_need_dense(attributes, format);
+        let stored = self.dense_attributes.lock().get(&scope).cloned();
+        let ainfo = stored.unwrap_or_else(|| {
+            let mut ainfo = AttributeInfoMessage::compact();
+            if order.is_tracked() {
+                ainfo.max_creation_index = Some(next_creation_index(attributes));
+            }
+            if order.is_indexed() {
+                // Compact storage has no index B-tree, but the message still
+                // announces one so that its flags match the header's
+                // (`H5O__attr_create` asserts they agree).
+                ainfo.creation_order_btree_address = Some(UNDEF_ADDR);
+            }
+            ainfo
+        });
+        header.add_message(MSG_ATTR_INFO, MSG_FLAG_DONTSHARE, ainfo.encode(&self.ctx));
+        if dense {
             return;
         }
-        let mut ainfo = AttributeInfoMessage::compact();
-        if order.is_tracked() {
-            ainfo.max_creation_index = Some(next_creation_index(attributes));
-        }
-        if order.is_indexed() {
-            // Compact storage has no index B-tree, but the message still
-            // announces one so that its flags match the header's
-            // (`H5O__attr_create` asserts they agree).
-            ainfo.creation_order_btree_address = Some(UNDEF_ADDR);
-        }
-        header.add_message(MSG_ATTR_INFO, MSG_FLAG_DONTSHARE, ainfo.encode(&self.ctx));
         // Each attribute states its own creation index — the one it was
         // created with here, or the one the file it was read from records. An
         // attribute with none belongs to an object that tracks no order, where
@@ -5937,71 +6092,65 @@ impl Hdf5Writer {
                 .any(|a| self.encode_attribute(a).len() > MAX_MESSAGE_SIZE)
     }
 
-    /// Lay out and write dense attribute storage for every object that needs
-    /// it, recording the resulting `Attribute Info` message per object.
-    ///
-    /// The sole owner of that transition: it runs before any object header is
-    /// built, so `emit_attributes` never allocates. Every block is on disk
-    /// before the map naming it is populated, so a header written from that
-    /// map can only point at bytes that exist.
+    /// Every object whose attributes this finalize re-lays-out, with the
+    /// creation-order policy each one's storage must follow.
     ///
     /// `datasets` lists the datasets whose headers this finalize will
     /// actually write. A reopened dataset that took no writes keeps its
     /// original header — and with it whatever storage that header already
-    /// names — so building a heap for it would strand every block of it.
-    ///
-    /// That list is also what makes freeing safe: every object named here has
-    /// its header rewritten, so the dense storage a reopen found on it is
-    /// superseded whether or not the new attribute set is dense again, and
-    /// freeing it before the replacement is laid out is what lets the
-    /// replacement reuse the same blocks.
-    fn prepare_dense_attributes(&self, datasets: &[usize]) -> IoResult<()> {
-        let mut scopes: Vec<(AttrScope, Vec<AttributeEntry>, CreationOrder)> = Vec::new();
-        {
-            self.release_superseded_dense_attrs(AttrScope::Root)?;
-            let root = self.root_attributes.lock();
-            if self.attributes_need_dense(&root, self.header_format(self.root_track_order)) {
-                scopes.push((AttrScope::Root, root.clone(), self.root_track_order.attrs));
-            }
-        }
+    /// names — so touching its attribute storage would strand every block of
+    /// it.
+    fn attribute_scopes(&self, datasets: &[usize]) -> Vec<(AttrScope, CreationOrder)> {
+        let mut scopes = vec![(AttrScope::Root, self.root_track_order.attrs)];
         for gi in 0..self.group_count() {
             if self.grp(gi).lock().deleted {
                 continue;
             }
-            self.release_superseded_dense_attrs(AttrScope::Group(gi))?;
-            let grp = self.grp(gi);
-            let g = grp.lock();
-            if self.attributes_need_dense(&g.attributes, self.header_format(g.track_order)) {
-                scopes.push((
-                    AttrScope::Group(gi),
-                    g.attributes.clone(),
-                    g.track_order.attrs,
-                ));
-            }
+            let order = self.grp(gi).lock().track_order.attrs;
+            scopes.push((AttrScope::Group(gi), order));
         }
         for &i in datasets {
-            self.release_superseded_dense_attrs(AttrScope::Dataset(i))?;
-            let ds = self.ds(i);
-            let m = ds.lock();
-            let format = self.header_format(TrackOrder {
-                links: CreationOrder::default(),
-                attrs: m.track_attr_order,
-            });
-            if self.attributes_need_dense(&m.attributes, format) {
-                scopes.push((
-                    AttrScope::Dataset(i),
-                    m.attributes.clone(),
-                    m.track_attr_order,
-                ));
-            }
+            let order = self.ds(i).lock().track_attr_order;
+            scopes.push((AttrScope::Dataset(i), order));
         }
+        scopes
+    }
 
-        for (scope, attributes, order) in scopes {
+    /// Lay out and write dense attribute storage for every object that needs
+    /// it, recording the resulting `Attribute Info` message per object.
+    ///
+    /// The sole owner of that transition. It runs after every object header
+    /// has an address — an attribute may hold an object reference, and the
+    /// heap holds the encoded attribute messages — and before any object
+    /// header is written, because the header carries the Attribute Info
+    /// message naming what this laid out. Every block is on disk before the
+    /// map naming it is populated, so a header written from that map can only
+    /// point at bytes that exist. The same placement rule, for the same two
+    /// reasons, as [`prepare_dense_links`](Self::prepare_dense_links).
+    ///
+    /// Which objects spill is not decided here: `emit_attributes` asks
+    /// [`attributes_need_dense`](Self::attributes_need_dense) itself, so the
+    /// header measured before this ran and the header written after it agree
+    /// without either consulting the other.
+    fn prepare_dense_attributes(&self, datasets: &[usize]) -> IoResult<()> {
+        for (scope, order) in self.attribute_scopes(datasets) {
+            // Every scope here has its header rewritten, so the storage a
+            // reopen found on it is superseded whether or not the new set is
+            // dense again — a free driven by "the new set needs a heap" would
+            // never reach an object that dropped back to compact. Freed
+            // immediately before its replacement is laid out, so the rewrite
+            // lands in the blocks it just gave back instead of growing the
+            // file on every open/close cycle.
+            self.release_superseded_dense_attrs(scope)?;
             // `close` after `start_swmr` finalizes a second time over the same
             // attribute sets — SWMR refuses every attribute mutation — so
             // rebuilding here would allocate a whole second heap and strand
             // the one the published headers already name.
             if self.dense_attributes.lock().contains_key(&scope) {
+                continue;
+            }
+            let attributes = self.object_attributes(scope)?;
+            if !self.attributes_need_dense(&attributes, self.attr_scope_format(scope)) {
                 continue;
             }
             let dense = build_dense_attributes(&attributes, &self.ctx, order, &mut |len| {
@@ -6013,6 +6162,16 @@ impl Hdf5Writer {
             self.dense_attributes.lock().insert(scope, dense.ainfo);
         }
         Ok(())
+    }
+
+    /// The object header format `scope`'s owner is written at, which is what
+    /// decides whether its attributes may spill at all.
+    fn attr_scope_format(&self, scope: AttrScope) -> ObjectFormat {
+        match scope {
+            AttrScope::Root => self.header_format(self.root_track_order),
+            AttrScope::Group(gi) => self.group_header_format(gi),
+            AttrScope::Dataset(i) => self.dataset_header_format(i),
+        }
     }
 
     /// Define a new contiguous dataset. Returns the dataset index (used with
@@ -10566,7 +10725,7 @@ impl Hdf5Writer {
             (addr, m.obj_header_encoded_size)
         };
 
-        let header = self.build_dataset_header(index);
+        let header = self.build_dataset_header(index)?;
         let nlink = self.object_link_count(HardLinkTarget::Dataset(index));
         let encoded = self.encode_header(&header, nlink, self.dataset_header_format(index))?;
 
@@ -10620,80 +10779,37 @@ impl Hdf5Writer {
             }
         }
 
-        // 1. Write each dataset's object header (none for a dataset deleted
-        // before start_swmr — its storage was freed at delete time).
+        // 1. Allocate every object header (none for a dataset deleted before
+        // start_swmr — its storage was freed at delete time). Same three
+        // phases as the full finalize, and for the same reason: nothing a
+        // header names can be laid out until every object has an address.
         let live: Vec<usize> = (0..self.dataset_count())
             .filter(|&i| !self.ds(i).lock().deleted)
             .collect();
-        self.prepare_dense_attributes(&live)?;
-        // Same order as the full finalize: a sharing dataset's header names
-        // the committed type's address.
+        // Before any dataset header: a sharing dataset's header names the
+        // committed type's address.
         self.write_committed_datatype_headers()?;
-        for i in live {
-            let nlink = self.object_link_count(HardLinkTarget::Dataset(i));
-            let ds_header = self.build_dataset_header(i);
-            let encoded = self.encode_header(&ds_header, nlink, self.dataset_header_format(i))?;
-            let encoded_size = encoded.len();
-            let addr = self.allocator.allocate(encoded_size as u64);
-            self.handle.write_at(addr, &encoded)?;
+        let layout = self.allocate_object_headers(&live)?;
+
+        // 2. Build content against those addresses.
+        self.prepare_dense_attributes(&live)?;
+        self.prepare_link_storage()?;
+        self.write_reference_values()?;
+
+        // 3. Write every object header.
+        self.write_object_headers(&layout)?;
+        // What SWMR alone needs to know afterwards: where each dataset's
+        // header is published and how much room it has, which is what
+        // `write_dataset_header_inplace` rewrites within.
+        for &(i, addr, size) in &layout.datasets {
             let ds = self.ds(i);
             let mut m = ds.lock();
-            m.obj_header_addr = addr;
             m.obj_header_written_addr = Some(addr);
-            m.obj_header_encoded_size = encoded_size;
-            m.header_written(nlink);
+            m.obj_header_encoded_size = size;
         }
+        self.root_group_encoded_size = layout.root.1;
 
-        // 1b. Group object headers. A hard link can point to a group whose
-        // header is written later, so addresses are assigned in a first
-        // pass (a header's encoded size is independent of the address
-        // values it carries) and the content is written in a second.
-        for gi in 0..self.group_count() {
-            if self.grp(gi).lock().deleted {
-                continue;
-            }
-            let rc = self.object_link_count(HardLinkTarget::Group(gi));
-            let size = self
-                .encode_header(
-                    &self.build_group_header(gi),
-                    rc,
-                    self.group_header_format(gi),
-                )?
-                .len() as u64;
-            self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
-        }
-        // Every object header now has an address, so a link message names its
-        // real target; and no group header has been written yet, so the Link
-        // Info messages this lays out are the ones that reach the file.
-        self.prepare_link_storage()?;
-        for gi in 0..self.group_count() {
-            if self.grp(gi).lock().deleted {
-                continue;
-            }
-            let rc = self.object_link_count(HardLinkTarget::Group(gi));
-            let encoded = self.encode_header(
-                &self.build_group_header(gi),
-                rc,
-                self.group_header_format(gi),
-            )?;
-            let addr = self.grp(gi).lock().obj_header_addr;
-            self.handle.write_at(addr, &encoded)?;
-        }
-
-        // 2. Write root group object header.
-        let root_header = self.build_root_group_header();
-        let root_encoded =
-            self.encode_header(&root_header, 1, self.header_format(self.root_track_order))?;
-        let root_encoded_size = root_encoded.len();
-        let root_addr = self.allocator.allocate(root_encoded_size as u64);
-        self.handle.write_at(root_addr, &root_encoded)?;
-        self.root_group_addr = Some(root_addr);
-        self.root_group_encoded_size = root_encoded_size;
-
-        // 2b. Stamp references now that every header has an address.
-        self.apply_reference_fixups()?;
-
-        // 3. Write superblock with SWMR flags.
+        // 4. Write superblock with SWMR flags.
         self.write_superblock(FLAG_WRITE_ACCESS | FLAG_SWMR_WRITE)?;
 
         self.handle.sync_all()?;
@@ -10779,10 +10895,12 @@ impl Hdf5Writer {
         // an aliased block from entering the free list twice.
         let mut freed_headers = std::collections::HashSet::new();
 
-        // 1. Write each dataset's object header (deleted datasets get none —
-        // their storage was already freed at delete time). Which datasets get
-        // one is settled first, because dense attribute storage is laid out
-        // only for headers this finalize actually rewrites.
+        // 1. Plan. Which datasets get a header (deleted datasets get none —
+        // their storage was already freed at delete time) is settled first,
+        // because everything the next phases lay out is laid out only for the
+        // headers this finalize actually rewrites; and every header block
+        // those phases supersede is returned here, before the first
+        // allocation, so a rewrite can land in it.
         let mut rewritten: Vec<usize> = Vec::new();
         for i in 0..self.dataset_count() {
             // Before the slot guard: `object_link_count` re-locks every
@@ -10812,26 +10930,6 @@ impl Hdf5Writer {
             }
             rewritten.push(i);
         }
-        self.prepare_dense_attributes(&rewritten)?;
-        // Before any dataset header: one that shares a committed type stores
-        // that object's address.
-        self.write_committed_datatype_headers()?;
-        for i in rewritten {
-            let nlink = self.object_link_count(HardLinkTarget::Dataset(i));
-            let ds_header = self.build_dataset_header(i);
-            let encoded = self.encode_header(&ds_header, nlink, self.dataset_header_format(i))?;
-            let addr = self.allocator.allocate(encoded.len() as u64);
-            self.handle.write_at(addr, &encoded)?;
-            let ds = self.ds(i);
-            let mut m = ds.lock();
-            m.obj_header_addr = addr;
-            m.header_written(nlink);
-        }
-
-        // 1b. Group object headers. A hard link can point to a group whose
-        // header is written later, so addresses are assigned in a first
-        // pass (a header's encoded size is independent of the address
-        // values it carries) and the content is written in a second.
         if !self.swmr_active {
             for gi in 0..self.group_count() {
                 let grp = self.grp(gi);
@@ -10845,59 +10943,34 @@ impl Hdf5Writer {
                     }
                 }
             }
-        }
-        for gi in 0..self.group_count() {
-            if self.grp(gi).lock().deleted {
-                continue;
-            }
-            let rc = self.object_link_count(HardLinkTarget::Group(gi));
-            let size = self
-                .encode_header(
-                    &self.build_group_header(gi),
-                    rc,
-                    self.group_header_format(gi),
-                )?
-                .len() as u64;
-            self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
-        }
-        // Every object header now has an address, so a link message names its
-        // real target; and no group header has been written yet, so the Link
-        // Info messages this lays out are the ones that reach the file.
-        self.prepare_link_storage()?;
-        for gi in 0..self.group_count() {
-            if self.grp(gi).lock().deleted {
-                continue;
-            }
-            let rc = self.object_link_count(HardLinkTarget::Group(gi));
-            let encoded = self.encode_header(
-                &self.build_group_header(gi),
-                rc,
-                self.group_header_format(gi),
-            )?;
-            let addr = self.grp(gi).lock().obj_header_addr;
-            self.handle.write_at(addr, &encoded)?;
-        }
-
-        // 2. Write root group object header.
-        if !self.swmr_active {
             if let Some((addr, len)) = self.superseded_root_header.take() {
                 if freed_headers.insert(addr) {
                     self.allocator.free(addr, len);
                 }
             }
         }
-        let root_header = self.build_root_group_header();
-        let root_encoded =
-            self.encode_header(&root_header, 1, self.header_format(self.root_track_order))?;
-        let root_addr = self.allocator.allocate(root_encoded.len() as u64);
-        self.handle.write_at(root_addr, &root_encoded)?;
-        self.root_group_addr = Some(root_addr);
 
-        // 2b. Every object header now has an address, so the references
-        // waiting on one can be stamped.
-        self.apply_reference_fixups()?;
+        // 2. Allocate. Committed datatype headers go down whole: a header of
+        // theirs holds a datatype and a reference count, so it waits on
+        // nothing, while a dataset sharing the type and the group naming it
+        // both store its address.
+        self.write_committed_datatype_headers()?;
+        let layout = self.allocate_object_headers(&rewritten)?;
 
-        // 3. Write superblock at offset 0.
+        // 3. Build content, with every object header's address known. Dense
+        // attribute storage holds the attribute messages themselves — an
+        // object reference among them is a header address; dense links and
+        // symbol tables name header addresses; a reference dataset's elements
+        // are header addresses. Nothing here is a fixup: each is written once,
+        // with the value the file keeps.
+        self.prepare_dense_attributes(&rewritten)?;
+        self.prepare_link_storage()?;
+        self.write_reference_values()?;
+
+        // 4. Write every object header over the block phase 2 reserved for it.
+        self.write_object_headers(&layout)?;
+
+        // 5. Write superblock at offset 0.
         self.write_superblock(0)?;
 
         // Durability is opt-in per call: `close` passes `true`, `close_no_sync`
@@ -10909,7 +10982,104 @@ impl Hdf5Writer {
         Ok(())
     }
 
-    fn build_dataset_header(&self, index: usize) -> ObjectHeader {
+    /// Give every object header this finalize writes an address, before
+    /// anything that names one is built.
+    ///
+    /// INVARIANT: from the moment this returns until the file is closed, every
+    /// object in it has the object header address it will be found at. That is
+    /// what lets the phase after this one say an address wherever the format
+    /// wants one — in a link message, in a symbol table entry, in a reference
+    /// dataset's elements, and in an attribute's value, which is the one of the
+    /// four that cannot be revisited after its header is written.
+    ///
+    /// Measuring a header before its content is final is sound because no
+    /// address changes its length: every address is a fixed-width field, and an
+    /// object that has none yet reads as zero, which is the same width. The
+    /// storage a header names is laid out between the two passes for the same
+    /// reason and answers the same way — `emit_attributes` and `emit_links`
+    /// each fall back to a size-equal placeholder message. It is
+    /// [`write_object_headers`](Self::write_object_headers) that checks this
+    /// held, rather than either pass assuming it.
+    fn allocate_object_headers(&mut self, datasets: &[usize]) -> IoResult<HeaderLayout> {
+        let mut layout = HeaderLayout {
+            datasets: Vec::with_capacity(datasets.len()),
+            groups: Vec::new(),
+            root: (0, 0),
+        };
+        for &i in datasets {
+            let rc = self.object_link_count(HardLinkTarget::Dataset(i));
+            let header = self.build_dataset_header(i)?;
+            let size = self
+                .encode_header(&header, rc, self.dataset_header_format(i))?
+                .len();
+            let addr = self.allocator.allocate(size as u64);
+            self.ds(i).lock().obj_header_addr = addr;
+            layout.datasets.push((i, addr, size));
+        }
+        for gi in 0..self.group_count() {
+            if self.grp(gi).lock().deleted {
+                continue;
+            }
+            let rc = self.object_link_count(HardLinkTarget::Group(gi));
+            let header = self.build_group_header(gi)?;
+            let size = self
+                .encode_header(&header, rc, self.group_header_format(gi))?
+                .len();
+            let addr = self.allocator.allocate(size as u64);
+            self.grp(gi).lock().obj_header_addr = addr;
+            layout.groups.push((gi, addr, size));
+        }
+        let header = self.build_root_group_header()?;
+        let size = self
+            .encode_header(&header, 1, self.header_format(self.root_track_order))?
+            .len();
+        let addr = self.allocator.allocate(size as u64);
+        self.root_group_addr = Some(addr);
+        layout.root = (addr, size);
+        Ok(layout)
+    }
+
+    /// Write every object header over the block
+    /// [`allocate_object_headers`](Self::allocate_object_headers) reserved for
+    /// it.
+    ///
+    /// The single owner of object header writing in both finalize paths, and
+    /// the only place a header's body meets its block: a body that does not
+    /// fill its measurement exactly fails the finalize here rather than
+    /// overrunning the next object or leaving a tail of the previous one, which
+    /// is how a message whose length turns out to depend on an address would
+    /// show up.
+    fn write_object_headers(&mut self, layout: &HeaderLayout) -> IoResult<()> {
+        for &(i, addr, size) in &layout.datasets {
+            let rc = self.object_link_count(HardLinkTarget::Dataset(i));
+            let header = self.build_dataset_header(i)?;
+            let encoded = self.encode_header(&header, rc, self.dataset_header_format(i))?;
+            check_header_size(&encoded, size, || {
+                format!("dataset '{}'", self.ds(i).lock().name)
+            })?;
+            self.handle.write_at(addr, &encoded)?;
+            // Only after the bytes are down: a failed write leaves the registry
+            // describing the header the file still holds.
+            self.ds(i).lock().header_written(rc);
+        }
+        for &(gi, addr, size) in &layout.groups {
+            let rc = self.object_link_count(HardLinkTarget::Group(gi));
+            let header = self.build_group_header(gi)?;
+            let encoded = self.encode_header(&header, rc, self.group_header_format(gi))?;
+            check_header_size(&encoded, size, || {
+                format!("group '{}'", self.grp(gi).lock().name)
+            })?;
+            self.handle.write_at(addr, &encoded)?;
+        }
+        let (addr, size) = layout.root;
+        let header = self.build_root_group_header()?;
+        let encoded = self.encode_header(&header, 1, self.header_format(self.root_track_order))?;
+        check_header_size(&encoded, size, || "the root group".to_string())?;
+        self.handle.write_at(addr, &encoded)?;
+        Ok(())
+    }
+
+    fn build_dataset_header(&self, index: usize) -> IoResult<ObjectHeader> {
         // Compute the link count first: object_link_count re-locks dataset and
         // group slots (including this one), so it must run before we take this
         // dataset's slot guard — otherwise it would deadlock on the same slot.
@@ -10920,6 +11090,9 @@ impl Hdf5Writer {
         let committed = self.ds(index).lock().committed_type;
         let committed_addr =
             committed.map(|ci| self.committed_datatypes.lock()[ci].obj_header_addr);
+        // And again: an attribute holding an object reference is said in the
+        // target's header address, which is read off that object's slot.
+        let attributes = self.object_attributes(AttrScope::Dataset(index))?;
 
         // Hold one slot guard for the whole header build.
         let ds = self.ds(index);
@@ -11038,14 +11211,14 @@ impl Hdf5Writer {
         self.emit_attributes(
             &mut header,
             AttrScope::Dataset(index),
-            &m.attributes,
+            &attributes,
             m.track_attr_order,
             format,
         );
 
         self.emit_refcount(&mut header, rc, format);
 
-        header
+        Ok(header)
     }
 
     /// Write the object header of every committed datatype something still
@@ -11096,18 +11269,19 @@ impl Hdf5Writer {
     }
 
     /// Build the object header for a subgroup.
-    fn build_group_header(&self, group_idx: usize) -> ObjectHeader {
+    fn build_group_header(&self, group_idx: usize) -> IoResult<ObjectHeader> {
         let mut header = ObjectHeader::new();
 
         // Link Info (type 0x02) + Group Info (type 0x0A) + the links
         // themselves, compact or dense.
         // Snapshot what the header needs, then drop the slot guard: the calls
         // below re-lock group slots (including this one).
-        let (attributes, track_order, times) = {
+        let (track_order, times) = {
             let grp = self.grp(group_idx);
             let g = grp.lock();
-            (g.attributes.clone(), g.track_order, g.times)
+            (g.track_order, g.times)
         };
+        let attributes = self.object_attributes(AttrScope::Group(group_idx))?;
         header.times = touched_times(times);
 
         let links = self.group_links(LinkScope::Group(group_idx), track_order.links);
@@ -11135,10 +11309,10 @@ impl Hdf5Writer {
             format,
         );
 
-        header
+        Ok(header)
     }
 
-    fn build_root_group_header(&self) -> ObjectHeader {
+    fn build_root_group_header(&self) -> IoResult<ObjectHeader> {
         let mut header = ObjectHeader::new();
         header.times = touched_times(self.root_times);
 
@@ -11153,7 +11327,7 @@ impl Hdf5Writer {
         );
 
         // Root-level attributes
-        let root_attributes = self.root_attributes.lock();
+        let root_attributes = self.object_attributes(AttrScope::Root)?;
         self.emit_attributes(
             &mut header,
             AttrScope::Root,
@@ -11162,7 +11336,7 @@ impl Hdf5Writer {
             self.header_format(self.root_track_order),
         );
 
-        header
+        Ok(header)
     }
 }
 
