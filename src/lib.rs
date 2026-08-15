@@ -112,6 +112,7 @@ pub use format::messages::superblock_ext::{
     BtreeKMessage, DriverInfoMessage, FileSpaceInfoMessage, FileSpaceStrategy,
     SharedMessageTableMessage,
 };
+pub use format::messages::virtual_mapping::VirtualMapping;
 pub use format::reference::Reference;
 pub use format::selection::{
     Hyperslab, HyperslabBlock, PointSelection, RegularHyperslab, Selection,

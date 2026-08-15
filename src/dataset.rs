@@ -1852,6 +1852,37 @@ impl H5Dataset {
         }
     }
 
+    /// Return this dataset's virtual-dataset source/virtual mappings (read
+    /// mode only), in on-disk order. Empty for any dataset whose layout is
+    /// not virtual, and for a virtual dataset that has no mappings yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is in write mode, or if the dataset can
+    /// no longer be found in the reader's metadata.
+    pub fn virtual_mappings(&self) -> Result<Vec<VirtualMapping>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => reader
+                        .dataset_info(name)
+                        .map(|info| {
+                            info.virtual_mappings
+                                .as_ref()
+                                .map(|vml| vml.mappings.clone())
+                                .unwrap_or_default()
+                        })
+                        .ok_or_else(|| Hdf5Error::NotFound(name.clone())),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "virtual_mappings() is only available in read mode".into(),
+            )),
+        }
+    }
+
     /// Return the names of all attributes on this dataset (read mode only).
     pub fn attr_names(&self) -> Result<Vec<String>> {
         match &self.info {
@@ -9298,5 +9329,38 @@ mod tests {
             file.dataset("unlimited").unwrap().max_shape().unwrap(),
             vec![None, Some(8)]
         );
+    }
+
+    /// [`H5Dataset::virtual_mappings`] reports the stored source/virtual
+    /// mapping list in order, and the negative case: a dataset with no
+    /// virtual layout reports an empty list, not an error.
+    #[test]
+    fn virtual_mappings_reports_the_stored_mappings() {
+        use crate::Selection;
+        let path = temp_path("virtual_mappings");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .create("plain")
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([16usize])
+                .virtual_mapping(Selection::All, "src.h5", "src", Selection::All)
+                .create("vds")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("plain").unwrap().virtual_mappings().unwrap(),
+            Vec::new()
+        );
+        let mappings = file.dataset("vds").unwrap().virtual_mappings().unwrap();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].source_file_name, "src.h5");
+        assert_eq!(mappings[0].source_dset_name, "src");
+        assert_eq!(mappings[0].source_selection, Selection::All);
+        assert_eq!(mappings[0].virtual_selection, Selection::All);
     }
 }

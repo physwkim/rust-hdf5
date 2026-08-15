@@ -34,7 +34,7 @@ use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
     ChunkIndex, ExternalFileSegment, FillValue, H5Attribute, H5Dataset, H5File, H5FileOptions,
     H5Group, H5NamedDatatype, Hdf5Error, Hyperslab, HyperslabBlock, LibverBound, LinkClass,
-    Reference, Selection, StorageLayout,
+    Reference, Selection, StorageLayout, VirtualMapping,
 };
 
 const CANON_VERSION: &str = "3";
@@ -139,6 +139,53 @@ fn external_str(segments: &[ExternalFileSegment]) -> String {
     let parts: Vec<String> = segments
         .iter()
         .map(|s| format!("{}@{}+{}", esc(&s.name), s.offset, s.size))
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
+fn dims_u64_str(dims: &[u64]) -> String {
+    let parts: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// The twin of `canon.py`'s `_bounds_str`: `"?"` when the bounds cannot be
+/// resolved. Unlike `Selection::bounds()`, which has no dataspace to
+/// consult and so returns `None` for `Selection::All`, h5py's own
+/// `get_select_bounds()` resolves an ALL selection against whatever
+/// dataspace it is bound to — real and known for the virtual side (the
+/// VDS's own extent, passed as `all_extent`), but never resolvable for the
+/// source side (the mapping stores no source dataspace extent, only the
+/// selection), so `all_extent` must be `None` there.
+fn selection_bounds_str(sel: &Selection, all_extent: Option<&[usize]>) -> String {
+    let bounds = match (sel, all_extent) {
+        (Selection::All, Some(shape)) => Some((
+            vec![0u64; shape.len()],
+            shape.iter().map(|&d| d.saturating_sub(1) as u64).collect(),
+        )),
+        _ => sel.bounds(),
+    };
+    match bounds {
+        Some((lo, hi)) => format!("{}-{}", dims_u64_str(&lo), dims_u64_str(&hi)),
+        None => "?".to_string(),
+    }
+}
+
+/// `virtual_str`'s per-mapping rendering: `name::dsetname srcbounds->vbounds`.
+fn virtual_str(mappings: &[VirtualMapping], vds_shape: &[usize]) -> String {
+    if mappings.is_empty() {
+        return "-".into();
+    }
+    let parts: Vec<String> = mappings
+        .iter()
+        .map(|m| {
+            format!(
+                "{}::{} {}->{}",
+                esc(&m.source_file_name),
+                esc(&m.source_dset_name),
+                selection_bounds_str(&m.source_selection, None),
+                selection_bounds_str(&m.virtual_selection, Some(vds_shape)),
+            )
+        })
         .collect();
     format!("[{}]", parts.join(","))
 }
@@ -946,7 +993,11 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
     });
 
     d.field(path, "virtual", || {
-        Err("H5Dataset exposes no virtual mapping accessor".into())
+        let vds_shape = guarded(|| ds.shape()).map_err(|p| format!("panic: {p}"))?;
+        guarded(|| ds.virtual_mappings())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|mappings| virtual_str(&mappings, &vds_shape))
+            .map_err(oneline)
     });
 
     d.field(path, "filters", || {
