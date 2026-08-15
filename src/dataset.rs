@@ -1529,6 +1529,26 @@ impl FillTime {
     }
 }
 
+/// When a dataset's raw-data storage is allocated —
+/// `H5Pset_alloc_time`/`H5Pget_alloc_time`'s `H5D_alloc_time_t`, read back
+/// from the same fill-value message [`FillTime`] is.
+///
+/// Not user-settable: `H5P__set_layout` (H5Pdcpl.c) picks this from the
+/// dataset's storage class alone (`H5D_ALLOC_TIME_DEFAULT` per layout —
+/// compact is `Early`, chunked and virtual are `Incr`, contiguous is
+/// `Late`), and this crate has no `DatasetBuilder` setter that overrides it.
+/// [`H5Dataset::alloc_time`] exists to read back what the writer declared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocTime {
+    /// Space is allocated as soon as the dataset is created.
+    Early,
+    /// Space is allocated when data is first written.
+    Late,
+    /// Space is allocated incrementally, as chunks (or virtual source
+    /// datasets) are written.
+    Incr,
+}
+
 impl H5Dataset {
     /// Create a reader-mode dataset handle (called internally by `H5File::dataset`).
     pub(crate) fn new_reader(
@@ -1901,6 +1921,35 @@ impl H5Dataset {
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "fill_time() is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Return when this dataset's raw-data storage is allocated (read mode
+    /// only) — `H5Pget_alloc_time`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is in write mode, or if the dataset can
+    /// no longer be found in the reader's metadata.
+    pub fn alloc_time(&self) -> Result<AllocTime> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => reader
+                        .dataset_info(name)
+                        .map(|info| match info.alloc_time {
+                            1 => AllocTime::Early,
+                            3 => AllocTime::Incr,
+                            _ => AllocTime::Late,
+                        })
+                        .ok_or_else(|| Hdf5Error::NotFound(name.clone())),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "alloc_time() is only available in read mode".into(),
             )),
         }
     }
