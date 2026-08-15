@@ -12,6 +12,7 @@ use crate::format::messages::filter::Filter;
 use crate::format::messages::virtual_mapping::VirtualMapping;
 use crate::format::reference::Reference;
 use crate::format::selection::Selection;
+use crate::io::reader::ExternalFileSegment;
 use crate::io::writer::ChunkIndexKind;
 use crate::types::H5Type;
 
@@ -1783,6 +1784,32 @@ impl H5Dataset {
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "fill_value() is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Return this dataset's external raw-data file segments (read mode
+    /// only), in the order the dataset's logical byte range concatenates
+    /// them. Empty for a dataset whose data lives in this file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is in write mode, or if the dataset can
+    /// no longer be found in the reader's metadata.
+    pub fn external_files(&self) -> Result<Vec<ExternalFileSegment>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => reader
+                        .dataset_info(name)
+                        .map(|info| info.external_files.clone())
+                        .ok_or_else(|| Hdf5Error::NotFound(name.clone())),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "external_files() is only available in read mode".into(),
             )),
         }
     }
@@ -9167,5 +9194,39 @@ mod tests {
             file.dataset("set").unwrap().fill_value().unwrap(),
             FillValue::UserDefined((-7i32).to_le_bytes().to_vec())
         );
+    }
+
+    /// [`H5Dataset::external_files`] reports the stored segment list in
+    /// order, and the negative case: a dataset whose data lives in this
+    /// file reports an empty list, not an error.
+    #[test]
+    fn external_files_reports_the_stored_segments() {
+        let path = temp_path("external_files");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .create("contig")
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([16usize])
+                .external(&[("a.raw", 0, 32), ("b.raw", 8, 32)])
+                .create("external")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("contig").unwrap().external_files().unwrap(),
+            Vec::new()
+        );
+        let segments = file.dataset("external").unwrap().external_files().unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].name, "a.raw");
+        assert_eq!(segments[0].offset, 0);
+        assert_eq!(segments[0].size, 32);
+        assert_eq!(segments[1].name, "b.raw");
+        assert_eq!(segments[1].offset, 8);
+        assert_eq!(segments[1].size, 32);
     }
 }

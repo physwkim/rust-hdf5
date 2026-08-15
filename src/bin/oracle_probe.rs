@@ -32,9 +32,9 @@ use rust_hdf5::format::messages::filter::{
 };
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
-    ChunkIndex, FillValue, H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype,
-    Hdf5Error, Hyperslab, HyperslabBlock, LibverBound, LinkClass, Reference, Selection,
-    StorageLayout,
+    ChunkIndex, ExternalFileSegment, FillValue, H5Attribute, H5Dataset, H5File, H5FileOptions,
+    H5Group, H5NamedDatatype, Hdf5Error, Hyperslab, HyperslabBlock, LibverBound, LinkClass,
+    Reference, Selection, StorageLayout,
 };
 
 const CANON_VERSION: &str = "3";
@@ -114,6 +114,19 @@ fn filters_str(filters: &[Filter]) -> String {
             let cd: Vec<String> = f.cd_values.iter().map(|c| c.to_string()).collect();
             format!("{}({})@{}", filter_name(f.id), cd.join("|"), f.flags)
         })
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// `external_str`'s per-segment rendering: `name@offset+size`, `-` when
+/// there are no segments (the data lives in this file).
+fn external_str(segments: &[ExternalFileSegment]) -> String {
+    if segments.is_empty() {
+        return "-".into();
+    }
+    let parts: Vec<String> = segments
+        .iter()
+        .map(|s| format!("{}@{}+{}", esc(&s.name), s.offset, s.size))
         .collect();
     format!("[{}]", parts.join(","))
 }
@@ -908,7 +921,10 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
     });
 
     d.field(path, "external", || {
-        Err("H5Dataset exposes no external file list accessor".into())
+        guarded(|| ds.external_files())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|segments| external_str(&segments))
+            .map_err(oneline)
     });
 
     d.field(path, "virtual", || {

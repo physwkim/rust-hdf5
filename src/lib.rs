@@ -119,6 +119,7 @@ pub use format::selection::{
 pub use format::LibverBound;
 pub use group::H5Group;
 pub use io::locking::{FileLocking, LockMode};
+pub use io::reader::ExternalFileSegment;
 pub use io::reader::LinkClass;
 pub use io::reader::SuperblockExtension;
 pub use io::writer::{MAX_COMPACT_DATA, MIN_USERBLOCK};
