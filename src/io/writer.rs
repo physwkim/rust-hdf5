@@ -17271,4 +17271,109 @@ mod tests {
         writer.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
+
+    /// `H5D__chunk_set_info`'s `version_req` (H5Dchunk.c:909, :936): version 5
+    /// is required for a chunk over 4 GiB — the version-4 layout message's
+    /// stored-size field is 32 bits and cannot record one — and
+    /// `LAYOUT_VERSION_DEFAULT` (3, `H5O_LAYOUT_VERSION_DEFAULT`) is the floor
+    /// for everything at or under that limit. Pure arithmetic on the byte
+    /// count: no chunk is ever allocated.
+    #[test]
+    fn required_chunk_layout_version_pins_5_past_4_gib() {
+        assert_eq!(
+            Hdf5Writer::required_chunk_layout_version(u32::MAX as u64),
+            LAYOUT_VERSION_DEFAULT
+        );
+        assert_eq!(
+            Hdf5Writer::required_chunk_layout_version(u32::MAX as u64 + 1),
+            5
+        );
+    }
+
+    /// `H5D__chunk_set_info`'s index-selection gate (H5Dchunk.c:936): a chunk
+    /// over 4 GiB reaches the v1.10 chunk indexes even under a bound whose
+    /// `H5O_layout_ver_bounds` row (`LibverBound::layout_version`) is below
+    /// 4 — `V18` (row 3) and `Earliest` (row 1) both normally keep an
+    /// ordinary chunk on the version-1 B-tree, but
+    /// `required_chunk_layout_version`'s own escape to 5 overrides that row
+    /// for this one chunk. The default bound (`V110`, row 4) already crosses
+    /// the threshold on its own, so it is asserted only as the baseline, not
+    /// as a distinguishing case for the escape.
+    #[test]
+    fn uses_v110_chunk_indexing_escapes_past_4_gib_at_every_bound() {
+        let over_4gib = u32::MAX as u64 + 1;
+        let small = 1024u64;
+
+        let path = temp_path("uses_v110_default");
+        let writer = Hdf5Writer::create(&path).unwrap();
+        assert!(writer.uses_v110_chunk_indexing(small));
+        assert!(writer.uses_v110_chunk_indexing(over_4gib));
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let path = temp_path("uses_v110_v18");
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        writer.set_libver_bound(LibverBound::V18).unwrap();
+        assert!(
+            !writer.uses_v110_chunk_indexing(small),
+            "V18's layout row (3) stays below the v1.10 gate for an ordinary chunk"
+        );
+        assert!(
+            writer.uses_v110_chunk_indexing(over_4gib),
+            "the >4 GiB escape reaches v1.10 indexing despite V18's row"
+        );
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let path = temp_path("uses_v110_earliest");
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        writer.set_libver_bound(LibverBound::Earliest).unwrap();
+        assert!(
+            !writer.uses_v110_chunk_indexing(small),
+            "Earliest's layout row (1) stays below the v1.10 gate for an ordinary chunk"
+        );
+        assert!(
+            writer.uses_v110_chunk_indexing(over_4gib),
+            "the >4 GiB escape reaches v1.10 indexing despite Earliest's row"
+        );
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `H5D__chunk_set_info`'s closing `MAX3` (H5Dchunk.c:1046): the same
+    /// escape pins the layout message itself at version 5 for a chunk over
+    /// 4 GiB regardless of bound — `required_chunk_layout_version` dominates
+    /// the max chain ahead of both the bound-derived preference and
+    /// `LAYOUT_VERSION_DEFAULT`.
+    #[test]
+    fn chunk_layout_version_pins_5_past_4_gib_at_every_bound() {
+        let over_4gib = u32::MAX as u64 + 1;
+        let small = 1024u64;
+
+        let path = temp_path("chunk_ver_default");
+        let writer = Hdf5Writer::create(&path).unwrap();
+        assert_eq!(writer.chunk_layout_version(false, small), 4);
+        assert_eq!(writer.chunk_layout_version(false, over_4gib), 5);
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let path = temp_path("chunk_ver_v18");
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        writer.set_libver_bound(LibverBound::V18).unwrap();
+        assert_eq!(writer.chunk_layout_version(false, small), 3);
+        assert_eq!(writer.chunk_layout_version(false, over_4gib), 5);
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let path = temp_path("chunk_ver_earliest");
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        writer.set_libver_bound(LibverBound::Earliest).unwrap();
+        assert_eq!(
+            writer.chunk_layout_version(false, small),
+            LAYOUT_VERSION_DEFAULT
+        );
+        assert_eq!(writer.chunk_layout_version(false, over_4gib), 5);
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
 }
