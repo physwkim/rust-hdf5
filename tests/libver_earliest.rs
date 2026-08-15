@@ -394,13 +394,14 @@ fn a_filtered_dataset_created_at_earliest_gets_a_version_1_pipeline() {
     assert_eq!(superblock_version(&path), 0);
     no_newer_structures(&path);
     // The message as it lies in the file: version 1, one filter, six reserved
-    // bytes, then deflate with a name length of 8, flags, one client-data
-    // value, the padded name, the level and the pad that makes the value
-    // count even. A version-2 message would name no filter below
-    // `H5Z_FILTER_RESERVED` at all, so the name alone separates them — but
-    // the whole message is checked, because the padding rules are the half
-    // that is easy to get wrong.
-    let mut deflate_v1 = vec![1u8, 1, 0, 0, 0, 0, 0, 0, 1, 0, 8, 0, 0, 0, 1, 0];
+    // bytes, then deflate with a name length of 8, the `H5Z_FLAG_OPTIONAL`
+    // flags `H5Pset_deflate` asks for, one client-data value, the padded
+    // name, the level and the pad that makes the value count even. A
+    // version-2 message would name no filter below `H5Z_FILTER_RESERVED` at
+    // all, so the name alone separates them — but the whole message is
+    // checked, because the padding rules are the half that is easy to get
+    // wrong.
+    let mut deflate_v1 = vec![1u8, 1, 0, 0, 0, 0, 0, 0, 1, 0, 8, 0, 1, 0, 1, 0];
     deflate_v1.extend_from_slice(b"deflate\0");
     deflate_v1.extend_from_slice(&[6, 0, 0, 0, 0, 0, 0, 0]);
     assert!(

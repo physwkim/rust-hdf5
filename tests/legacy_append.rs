@@ -711,9 +711,11 @@ fn a_classic_file_takes_every_layout_but_virtual() {
 /// h5py reads a version-2 message out of a version-0 file just as happily —
 /// it asks libhdf5, and libhdf5 decodes both — so the read-back above cannot
 /// tell the two apart. This can: the message is checked where it lies, and
-/// it is the one h5py itself writes for the same pipeline down to the flags
-/// byte, which libhdf5 sets to `H5Z_FLAG_OPTIONAL` and this writer leaves at
-/// 0.
+/// it is byte-for-byte the one h5py itself writes for the same pipeline, the
+/// `H5Z_FLAG_OPTIONAL` flags byte included. Both datasets therefore carry the
+/// identical message, so the file must hold two of it and none of the
+/// mandatory-flag form — a count, not a presence, or h5py's own copy would
+/// answer for the writer's.
 #[test]
 fn a_filtered_dataset_in_a_classic_file_gets_a_version_1_pipeline() {
     let Some(py) = python() else { return };
@@ -733,9 +735,14 @@ fn a_filtered_dataset_in_a_classic_file_gets_a_version_1_pipeline() {
         m.extend_from_slice(&[6, 0, 0, 0, 0, 0, 0, 0]);
         m
     };
-    let holds =
-        |p: &std::path::Path, m: &[u8]| std::fs::read(p).unwrap().windows(m.len()).any(|w| w == m);
-    assert!(holds(&path, &pline(1)), "h5py's own version-1 pipeline");
+    let count = |p: &std::path::Path, m: &[u8]| {
+        std::fs::read(p)
+            .unwrap()
+            .windows(m.len())
+            .filter(|w| *w == m)
+            .count()
+    };
+    assert_eq!(count(&path, &pline(1)), 1, "h5py's own version-1 pipeline");
 
     let file = H5File::open_rw(&path).unwrap();
     file.new_dataset::<i32>()
@@ -749,7 +756,16 @@ fn a_filtered_dataset_in_a_classic_file_gets_a_version_1_pipeline() {
     file.close().unwrap();
 
     assert_eq!(superblock_version(&path), 0);
-    assert!(holds(&path, &pline(0)), "the pipeline this writer emitted");
+    assert_eq!(
+        count(&path, &pline(1)),
+        2,
+        "the pipeline this writer emitted, identical to h5py's"
+    );
+    assert_eq!(
+        count(&path, &pline(0)),
+        0,
+        "no filter here is mandatory; `H5Pset_deflate` asks for optional"
+    );
     read_with_h5py(
         py,
         &path,

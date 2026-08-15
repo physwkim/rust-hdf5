@@ -2316,28 +2316,18 @@ mod tests {
     /// padding rules — `H5O__pline_encode` states them, but the file is what
     /// a reader parses.
     ///
-    /// The flags field is 1 in each, `H5Z_FLAG_OPTIONAL`, because that is
-    /// what libhdf5 stored; this crate's own builders leave it 0 and the two
-    /// pipelines decode to the same bytes either way (the `filter-flags-zero`
-    /// row of the parity oracle). The filters here carry the libhdf5 value so
-    /// the comparison is about the layout and nothing else.
+    /// The pipelines are the ones this crate's own builders produce, so the
+    /// flags byte in each expected slice is the flag the builder stored and
+    /// not a value written into the test: `H5Z_FLAG_OPTIONAL` for deflate and
+    /// shuffle, `H5Z_FLAG_MANDATORY` for fletcher32 ([`FLAG_OPTIONAL`]).
+    /// libhdf5 makes the same split, so a hardcoded flags byte on either
+    /// side of it would fail here.
     #[test]
     fn version_1_encodes_the_bytes_libhdf5_writes() {
-        fn filter(id: u16, cd_values: Vec<u32>) -> Filter {
-            Filter {
-                id,
-                flags: 1,
-                cd_values,
-            }
-        }
-
         // gzip level 4: name "deflate\0" is 8 bytes and needs no padding,
         // and the single client-data value is padded out to an even count.
-        let deflate = FilterPipeline {
-            filters: vec![filter(FILTER_DEFLATE, vec![4])],
-        };
         assert_eq!(
-            deflate.encode_v1(),
+            FilterPipeline::deflate(4).encode_v1(),
             b"\x01\x01\x00\x00\x00\x00\x00\x00\
               \x01\x00\x08\x00\x01\x00\x01\x00\
               deflate\x00\
@@ -2346,11 +2336,8 @@ mod tests {
 
         // shuffle over 4-byte elements: same shape, and libhdf5 records the
         // element width `H5Z__set_local_shuffle` filled in.
-        let shuffle = FilterPipeline {
-            filters: vec![filter(FILTER_SHUFFLE, vec![4])],
-        };
         assert_eq!(
-            shuffle.encode_v1(),
+            FilterPipeline::shuffle(4).encode_v1(),
             b"\x01\x01\x00\x00\x00\x00\x00\x00\
               \x02\x00\x08\x00\x01\x00\x01\x00\
               shuffle\x00\
@@ -2359,28 +2346,27 @@ mod tests {
 
         // fletcher32: "fletcher32\0" is 11 bytes, so the name is padded to
         // 16 and the declared length is the padded one. No client data, so
-        // no client-data padding either.
+        // no client-data padding either. Its flags byte is 0 — `H5Pset_fletcher32`
+        // is the one libhdf5 setter that asks for a mandatory filter.
         let fletcher = FilterPipeline {
-            filters: vec![filter(FILTER_FLETCHER32, vec![])],
+            filters: vec![Filter {
+                id: FILTER_FLETCHER32,
+                flags: FLAG_MANDATORY,
+                cd_values: vec![],
+            }],
         };
         assert_eq!(
             fletcher.encode_v1(),
             b"\x01\x01\x00\x00\x00\x00\x00\x00\
-              \x03\x00\x10\x00\x01\x00\x00\x00\
+              \x03\x00\x10\x00\x00\x00\x00\x00\
               fletcher32\x00\x00\x00\x00\x00\x00"
         );
 
         // Two filters in one message: the six reserved bytes are the
         // message's, not each filter's, and shuffle precedes deflate the way
         // libhdf5 applies them.
-        let both = FilterPipeline {
-            filters: vec![
-                filter(FILTER_SHUFFLE, vec![4]),
-                filter(FILTER_DEFLATE, vec![4]),
-            ],
-        };
         assert_eq!(
-            both.encode_v1(),
+            FilterPipeline::shuffle_deflate(4, 4).encode_v1(),
             b"\x01\x02\x00\x00\x00\x00\x00\x00\
               \x02\x00\x08\x00\x01\x00\x01\x00\
               shuffle\x00\
@@ -2388,6 +2374,26 @@ mod tests {
               \x01\x00\x08\x00\x01\x00\x01\x00\
               deflate\x00\
               \x04\x00\x00\x00\x00\x00\x00\x00"
+        );
+
+        // A mandatory filter beside an optional one, `fletcher32=True` with
+        // `compression='gzip'`. Each filter carries its own flags byte, so
+        // one message holds both values — an encoder emitting a constant
+        // cannot produce this.
+        let mixed = FilterPipeline {
+            filters: vec![
+                FilterPipeline::deflate(4).filters[0].clone(),
+                fletcher.filters[0].clone(),
+            ],
+        };
+        assert_eq!(
+            mixed.encode_v1(),
+            b"\x01\x02\x00\x00\x00\x00\x00\x00\
+              \x01\x00\x08\x00\x01\x00\x01\x00\
+              deflate\x00\
+              \x04\x00\x00\x00\x00\x00\x00\x00\
+              \x03\x00\x10\x00\x00\x00\x00\x00\
+              fletcher32\x00\x00\x00\x00\x00\x00"
         );
     }
 
