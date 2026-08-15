@@ -7,8 +7,11 @@
 //! contributes the bound's own entry, and what the file holds contributes the
 //! rest — link-message groups and version-2 object headers put the floor at
 //! v1.8 (version 2), a chunked dataset's version-4/5 layout puts it at v1.10
-//! (version 3), and SWMR is version 3 outright. A reopened file keeps the
-//! version it already has unless what is appended needs a newer one.
+//! (version 3), and SWMR is version 3 outright. Reading the content back is
+//! only how a file whose caller named *no* bound is placed on that table; one
+//! that named a bound takes its row, the layout version being no input to
+//! `H5F__super_init` at all. A reopened file keeps the version it already has
+//! unless what is appended needs a newer one.
 //!
 //! One bound settles the question on its own: `LibverBound::Earliest` asks
 //! for the classic generation, whose superblock is version 0 and whose
@@ -124,11 +127,14 @@ fn each_libver_bound_selects_its_superblock_version() {
     }
 }
 
-/// The bound is a floor, not an override: a v1.8 file holding a chunked
-/// dataset still needs the version-3 superblock its version-4 layout message
-/// implies.
+/// A chunked dataset does not raise a v1.8 file: at that bound
+/// `H5O_layout_ver_bounds` still puts the data layout message at version 3,
+/// which has no index-type field, so the chunks go on the version-1 B-tree
+/// and nothing in the file asks for more than the bound's own version 2.
+/// The unnamed-bound file above reaches version 3 by the same rule read the
+/// other way — a v1.10 index in it is what says V110.
 #[test]
-fn a_chunked_dataset_raises_a_v18_file_to_version_3() {
+fn a_chunked_dataset_leaves_a_v18_file_at_version_2() {
     let path = unique_tmp("v18_chunked");
     let file = H5File::options()
         .libver(LibverBound::V18)
@@ -137,7 +143,7 @@ fn a_chunked_dataset_raises_a_v18_file_to_version_3() {
     write_chunked(&file, "data");
     file.close().unwrap();
 
-    assert_eq!(superblock_version(&path), 3);
+    assert_eq!(superblock_version(&path), 2);
     cleanup(&path);
 }
 

@@ -62,6 +62,14 @@ const VERSION_4: u8 = 4;
 /// structures (a fixed `sizeof_size` field). The reader derives that width
 /// from the chunk-index header, so v5 is decoded exactly like v4.
 const VERSION_5: u8 = 5;
+
+/// `H5O_LAYOUT_VERSION_DEFAULT` (H5Oprivate.h:451), the version a dataset
+/// creation property list starts its layout message at (`H5D_DEF_LAYOUT_*`,
+/// H5Pdcpl.c:124). Every version-selection rule takes the maximum of this and
+/// what the bound or the chunk asks for, so no layout message this writer
+/// emits falls below it — not even in a file whose bound's row is version 1.
+pub const LAYOUT_VERSION_DEFAULT: u8 = VERSION_3;
+
 const CLASS_COMPACT: u8 = 0;
 const CLASS_CONTIGUOUS: u8 = 1;
 const CLASS_CHUNKED: u8 = 2;

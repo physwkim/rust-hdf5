@@ -91,65 +91,7 @@ B_TOLERATED_FIELDS = {
 # A deviation that matches none of these is reported as unexpected, and an
 # entry that matches nothing in a run is reported as no longer observed — so
 # a rerun after a writer fix shows the change rather than hiding it.
-EXPECTED_DEVIATIONS = [
-    {
-        "id": "superblock-floor-v2",
-        "field": "superblock",
-        "ref": "0",
-        "rust": "2",
-        "why": "three cases whose rust arm still creates at this crate's "
-               "default bounds, because H5F_LIBVER_EARLIEST cannot express "
-               "what they write. `vds` needs a virtual dataset, refused in a "
-               "classic file; `link_external` and `link_external_read` need "
-               "an external link, which a symbol table cannot hold — libhdf5 "
-               "answers that by converting the group to link messages under "
-               "the same v0 superblock (H5G__obj_insert), and this writer "
-               "has no such conversion. Every other earliest-bound case now "
-               "writes the v0 superblock itself",
-    },
-    {
-        "id": "superblock-v3-for-chunk-index",
-        "field": "superblock",
-        "ref": None,
-        "rust": "3",
-        "why": "layout_chunked_v108 asks for the v1.8 bound, where "
-               "H5O_layout_ver_bounds still puts the data layout message at "
-               "version 3 and so the chunk index at the version-1 B-tree. "
-               "This writer picks that index for a classic file only, so a "
-               "v1.8 file gets a v1.10 index behind a version-4 layout "
-               "message and the superblock version 3 that implies, above the "
-               "version 2 the bound asked for",
-    },
-    {
-        "id": "btree1-index-substituted",
-        "field": "chunkindex",
-        "ref": "btree1",
-        "rust": None,
-        "why": "a v1 B-tree chunk index is only legal below superblock v3, so "
-               "this follows from superblock-v3-for-chunk-index: the file gets "
-               "whichever v1.10 index its shape selects — here the "
-               "single-chunk index, the shape being one chunk wide. A file "
-               "created at "
-               "H5F_LIBVER_EARLIEST does get the version-1 B-tree "
-               "(tests/libver_earliest.rs), as does a chunked dataset "
-               "appended to a classic file (tests/legacy_append.rs); the v1.8 "
-               "bound is what is left",
-    },
-    {
-        "id": "new-style-groups-always",
-        "field": "linkstore",
-        "ref": "symtab",
-        "rust": "compact",
-        "why": "a version-2 object header keeps its links in messages rather "
-               "than in a symbol table. `sohm_list` and `sohm_btree` carry "
-               "shared messages, whose master table lives in a superblock "
-               "extension and so forces the version-2 superblock and with it "
-               "version-2 headers (H5Fsuper.c:1135), whatever bound is asked "
-               "for; `vds` is the superblock-floor-v2 case above. The phase "
-               "change past max_compact still moves the links to dense "
-               "storage",
-    },
-]
+EXPECTED_DEVIATIONS = []
 
 
 def expected_deviation(entry):
@@ -780,42 +722,52 @@ def write_report(results, gaps, meta, md_path, json_path):
 
     L.append("## Direction B expected deviations")
     L.append("")
-    L.append(
-        "The rust-written file carries the same data, type and shape as the "
-        "h5py reference but describes itself differently. Each row below is a "
-        "known, understood writer deviation declared in `EXPECTED_DEVIATIONS` "
-        "(oracle/run.py); it does not fail a case. `observed: no` means a "
-        "declared deviation no longer happens — either the writer was fixed "
-        "and the entry should go, or the cases that exercised it changed."
-    )
-    L.append("")
-    L.append("| id | field | libhdf5 | rust-hdf5 | observed | cases |")
-    L.append("|---|---|---|---|---|---|")
-    for e in expected:
+    if not expected:
         L.append(
-            "| `%s` | `%s` | `%s` | `%s` | %s | %d%s |"
-            % (
-                e["id"],
-                e["field"],
-                clip(e["ref"], 34),
-                clip(e["rust"], 34),
-                "yes" if e["cases"] else "no",
-                len(e["cases"]),
-                (" (%s)" % clip(", ".join(e["cases"][:3])
-                                + ("…" if len(e["cases"]) > 3 else ""), 44))
-                if e["cases"] else "",
-            )
+            "None: `EXPECTED_DEVIATIONS` (oracle/run.py) is empty, so every "
+            "case in this run describes itself the way libhdf5 describes the "
+            "same file. Any metadata deviation from here on matches no entry "
+            "and is reported as unexpected below."
         )
-    L.append("")
-    for e in expected:
+    else:
         L.append(
-            "- `%s`: %s%s"
-            % (
-                e["id"],
-                e["why"],
-                ("; observed as `%s`" % clip(e["example"], 70)) if e["example"] else "",
-            )
+            "The rust-written file carries the same data, type and shape as "
+            "the h5py reference but describes itself differently. Each row "
+            "below is a known, understood writer deviation declared in "
+            "`EXPECTED_DEVIATIONS` (oracle/run.py); it does not fail a case. "
+            "`observed: no` means a declared deviation no longer happens — "
+            "either the writer was fixed and the entry should go, or the "
+            "cases that exercised it changed."
         )
+        L.append("")
+        L.append("| id | field | libhdf5 | rust-hdf5 | observed | cases |")
+        L.append("|---|---|---|---|---|---|")
+        for e in expected:
+            L.append(
+                "| `%s` | `%s` | `%s` | `%s` | %s | %d%s |"
+                % (
+                    e["id"],
+                    e["field"],
+                    clip(e["ref"], 34),
+                    clip(e["rust"], 34),
+                    "yes" if e["cases"] else "no",
+                    len(e["cases"]),
+                    (" (%s)" % clip(", ".join(e["cases"][:3])
+                                    + ("…" if len(e["cases"]) > 3 else ""), 44))
+                    if e["cases"] else "",
+                )
+            )
+        L.append("")
+        for e in expected:
+            L.append(
+                "- `%s`: %s%s"
+                % (
+                    e["id"],
+                    e["why"],
+                    ("; observed as `%s`" % clip(e["example"], 70))
+                    if e["example"] else "",
+                )
+            )
     L.append("")
 
     L.append("## Direction B unexpected deviations")

@@ -55,6 +55,21 @@ pub enum LinkTarget {
     UserDefined { link_type: u8, udata: Vec<u8> },
 }
 
+impl LinkTarget {
+    /// Whether a version-1 symbol table entry can express this link.
+    ///
+    /// The entry has three cache types — nothing cached, an object header
+    /// address with the target group's own symbol table beside it, and a soft
+    /// link's offset into the local heap — and no room for a fourth. So the
+    /// user-defined classes, `H5L_TYPE_EXTERNAL` among them, exist only as
+    /// link messages: `H5G_obj_insert` converts the whole group out of its
+    /// symbol table rather than insert one (`obj_lnk->type >
+    /// H5L_TYPE_BUILTIN_MAX`, H5Gobj.c:512).
+    pub fn fits_symbol_table(&self) -> bool {
+        matches!(self, Self::Hard { .. } | Self::Soft { .. })
+    }
+}
+
 /// Link message payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkMessage {
