@@ -14832,17 +14832,19 @@ impl Hdf5Writer {
                 fill_defined: 2,
                 fill_value: Some(bytes.clone()),
             }
-        } else if is_chunked {
+        } else {
+            // No fill value of the dataset's own (fill_defined = 1, the
+            // implicit default zero fill) — `alloc_time` above already
+            // carries the per-layout-class default (`H5P__set_layout`,
+            // H5Pdcpl.c:1864-1877), so this branch must use it too instead
+            // of `FillValueMessage::default()`'s hardcoded LATE: that was
+            // wrong for a compact (EARLY) or virtual (INCR) dataset with no
+            // fill value, only coincidentally right for contiguous.
             FillValueMessage {
                 alloc_time,
                 fill_write_time,
                 fill_defined: 1, // default value (zeros)
                 fill_value: None,
-            }
-        } else {
-            FillValueMessage {
-                fill_write_time,
-                ..FillValueMessage::default()
             }
         };
         let fv_msg = fv.encode_for(self.message_format());

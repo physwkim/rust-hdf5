@@ -25,7 +25,7 @@ import hdf5env  # noqa: F401  (must precede h5py; see the module docstring)
 import h5py
 from h5py import h5d, h5o, h5p, h5s, h5t
 
-CANON_VERSION = "4"
+CANON_VERSION = "5"
 RAW_LIMIT = 1024
 MAX_DEPTH = 32
 
@@ -750,6 +750,7 @@ class Dumper:
         self.field(path, "filters", lambda: filters_str(dset))
         self.field(path, "fillvalue", lambda: self.fill_value(dset, dcpl))
         self.field(path, "filltime", lambda: self.fill_time(dcpl))
+        self.field(path, "alloctime", lambda: self.alloc_time(dcpl))
         self.dump_attrs(path, dset)
         self.field(path, "data", lambda: dataset_payload(dset))
 
@@ -772,6 +773,15 @@ class Dumper:
             h5d.FILL_TIME_NEVER: "never",
             h5d.FILL_TIME_IFSET: "ifset",
         }[dcpl.get_fill_time()]
+
+    def alloc_time(self, dcpl):
+        # `H5Pget_alloc_time` reads back from the same fill-value message
+        # `fill_time` above reads — not a client-side property-list echo.
+        return {
+            h5d.ALLOC_TIME_EARLY: "early",
+            h5d.ALLOC_TIME_LATE: "late",
+            h5d.ALLOC_TIME_INCR: "incr",
+        }[dcpl.get_alloc_time()]
 
     def dump_attrs(self, path, obj):
         try:

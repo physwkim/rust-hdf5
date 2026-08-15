@@ -1,4 +1,4 @@
-# The canonical dump format (`!canon 4`)
+# The canonical dump format (`!canon 5`)
 
 Both sides of the oracle — `oracle/canon.py` (h5py / libhdf5 1.14.6) and
 `src/bin/oracle_probe.rs` (rust-hdf5 public API) — emit this format, so the
@@ -8,7 +8,7 @@ two dumps of the same file are comparable as text and, more usefully, as a
 ## Grammar
 
     line   := header | record
-    header := "!canon" TAB "4"
+    header := "!canon" TAB "5"
     record := key TAB value
     key    := path [ "@" attrname ] "#" field
     value  := <no TAB, no LF>
@@ -53,7 +53,7 @@ Group fields: `kind`, `linkorder`, `attrorder`, `nattrs`, then attributes.
 
 Dataset fields, in order: `kind`, `dtype`, `strpad`, `shape`, `maxshape`,
 `layout`, `chunk`, `chunkindex`, `external`, `virtual`, `filters`,
-`fillvalue`, `filltime`, `nattrs`, attributes, `data`.
+`fillvalue`, `filltime`, `alloctime`, `nattrs`, attributes, `data`.
 
 Committed datatype fields: `kind`, `dtype`, `strpad`, `nattrs`, attributes.
 
@@ -72,6 +72,7 @@ Link fields: `kind`, `target`, and for an external link `resolved`.
 | `filters`    | `[]` or `[deflate(6)@0,shuffle(4)@0]` — `name(cd0\|cd1)@flags`             |
 | `fillvalue`  | `default` \| `undefined` \| `0x<hex of the raw fill bytes>`                |
 | `filltime`   | `alloc` \| `never` \| `ifset` — `H5D_fill_time_t`                          |
+| `alloctime`  | `early` \| `late` \| `incr` — `H5D_alloc_time_t`                           |
 | `nattrs`     | attribute count as iteration reports it                                   |
 | `nattrs_hdr` | attribute count as the object header records it (what `H5Oget_info` uses) |
 | `linkorder`  | `-` \| `tracked` \| `tracked+indexed` — link creation-order tracking       |

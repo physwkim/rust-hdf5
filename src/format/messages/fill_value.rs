@@ -33,6 +33,21 @@ const FLAG_HAVE_VALUE: u8 = 0x20;
 const FLAGS_ALL: u8 =
     FLAG_MASK_ALLOC | (FLAG_MASK_FILL << FLAG_SHIFT_FILL) | FLAG_UNDEFINED | FLAG_HAVE_VALUE;
 
+/// `H5D_ALLOC_TIME_EARLY` (`H5Dpublic.h`): space is allocated as soon as the
+/// dataset is created. `H5P__set_layout`'s default switch (H5Pdcpl.c:1864-
+/// 1877) gives this to a compact dataset — its storage *is* the object
+/// header, so it exists as soon as the dataset does.
+pub const ALLOC_TIME_EARLY: u8 = 1;
+
+/// `H5D_ALLOC_TIME_LATE`: space is allocated when data is first written.
+/// The default for a contiguous dataset (`H5P__set_layout`, H5Pdcpl.c:1870).
+pub const ALLOC_TIME_LATE: u8 = 2;
+
+/// `H5D_ALLOC_TIME_INCR`: space is allocated incrementally, as chunks (or
+/// virtual source datasets) are written. The default for a chunked or
+/// virtual dataset (`H5P__set_layout`, H5Pdcpl.c:1874-1877).
+pub const ALLOC_TIME_INCR: u8 = 3;
+
 /// `H5D_FILL_TIME_ALLOC` (`H5Dpublic.h`): fill at allocation regardless of
 /// whether a fill value was ever set — an unset value fills with the
 /// default (zeros), same as leaving newly allocated space untouched.
@@ -77,7 +92,7 @@ pub struct FillValueMessage {
 impl Default for FillValueMessage {
     fn default() -> Self {
         Self {
-            alloc_time: 2, // late
+            alloc_time: ALLOC_TIME_LATE,
             fill_write_time: FILL_TIME_IFSET,
             fill_defined: 1, // default value (zeros)
             fill_value: None,
@@ -89,7 +104,7 @@ impl FillValueMessage {
     /// A user-defined fill value.
     pub fn with_value(data: Vec<u8>) -> Self {
         Self {
-            alloc_time: 2,
+            alloc_time: ALLOC_TIME_LATE,
             fill_write_time: FILL_TIME_IFSET,
             fill_defined: 2,
             fill_value: Some(data),
@@ -99,7 +114,7 @@ impl FillValueMessage {
     /// An undefined fill value (no fill is performed).
     pub fn undefined() -> Self {
         Self {
-            alloc_time: 2,
+            alloc_time: ALLOC_TIME_LATE,
             fill_write_time: FILL_TIME_NEVER,
             fill_defined: 0,
             fill_value: None,
