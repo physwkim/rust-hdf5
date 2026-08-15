@@ -7157,18 +7157,28 @@ impl Hdf5Writer {
     /// original header — and with it whatever storage that header already
     /// names — so touching its attribute storage would strand every block of
     /// it.
+    ///
+    /// The policy is the one the *header* records, not the one the object's
+    /// creation property list asked for: those differ on a file whose
+    /// shared-message configuration covers attributes, where
+    /// [`header_attr_order`](Self::header_attr_order) raises every object to
+    /// tracked. Storage laid out against the property list would then omit the
+    /// creation indices the header says are there — and, since the Attribute
+    /// Info message carries a maximum creation index only when tracked, would
+    /// be two bytes shorter than the message the sizing pass measured.
     fn attribute_scopes(&self, datasets: &[usize]) -> Vec<(AttrScope, CreationOrder)> {
-        let mut scopes = vec![(AttrScope::Root, self.root_track_order.attrs)];
+        let order_of = |requested| self.header_attr_order(requested);
+        let mut scopes = vec![(AttrScope::Root, order_of(self.root_track_order.attrs))];
         for gi in 0..self.group_count() {
             if self.grp(gi).lock().deleted {
                 continue;
             }
             let order = self.grp(gi).lock().track_order.attrs;
-            scopes.push((AttrScope::Group(gi), order));
+            scopes.push((AttrScope::Group(gi), order_of(order)));
         }
         for &i in datasets {
             let order = self.ds(i).lock().track_attr_order;
-            scopes.push((AttrScope::Dataset(i), order));
+            scopes.push((AttrScope::Dataset(i), order_of(order)));
         }
         scopes
     }
@@ -10108,7 +10118,7 @@ impl Hdf5Writer {
                 // chunked dataset.
                 let run = match ds.implicit {
                     Some(ref imp) => (imp.data_addr != UNDEF_ADDR)
-                        .then(|| (ContiguousTarget::Local(imp.data_addr), imp.data_size)),
+                        .then_some((ContiguousTarget::Local(imp.data_addr), imp.data_size)),
                     None => ds.contiguous_target().map(|t| (t, ds.data_size)),
                 };
                 if let Some((target, data_size)) = run.filter(|&(_, size)| size > 0) {
@@ -13244,7 +13254,8 @@ impl Hdf5Writer {
             layout.groups.push((gi, addr, size));
         }
         let header = self.build_root_group_header()?;
-        let size = self.header_encoded_size(&header, 1, self.header_format(self.root_track_order))?;
+        let size =
+            self.header_encoded_size(&header, 1, self.header_format(self.root_track_order))?;
         let addr = self.allocator.allocate(size as u64);
         self.root_group_addr = Some(addr);
         layout.root = (addr, size);
