@@ -1,5 +1,6 @@
 #!/bin/sh
-# Rebuild the checked-in SOHM fixtures (sohm_list.h5, sohm_btree.h5).
+# Rebuild the checked-in SOHM fixtures (sohm_list.h5, sohm_btree.h5,
+# sohm_paged.h5, sohm_named_attr.h5).
 #
 # Needs the pinned libhdf5's h5cc; override with H5CC=/path/to/h5cc.
 # The generated files are byte-stable for a given libhdf5 version, so they are

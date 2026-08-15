@@ -8,8 +8,8 @@
 //! the option is unchanged.
 //!
 //! `tests/sohm.rs` is the read side, against libhdf5-written fixtures;
-//! `tests/sohm_write_guard.rs` covers the append path, which still refuses a
-//! file that has a shared-message table.
+//! `tests/sohm_append.rs` covers reopening a file that already has a
+//! shared-message table.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -394,10 +394,11 @@ fn every_header(bytes: &[u8]) -> Vec<(String, ObjectHeader)> {
 /// and then refusing the file outright when the high bound cannot reach that
 /// version (H5Fsuper.c:1135). Here the combination is unrepresentable instead:
 /// `shared_messages` is read only by `create`, which never writes a superblock
-/// below version 2, and the one path that produces a classic writer —
-/// `open_rw` — both leaves the option unread and refuses outright a file that
-/// already carries a shared-message table (`tests/sohm_write_guard.rs`). So a
-/// classic file keeps its version-1 headers with the floor nowhere in sight.
+/// below version 2, and `open_rw` — the one path that produces a classic
+/// writer — refuses the option outright rather than reading it, so the indexes
+/// a reopened file has are the ones it was created with and never a set this
+/// session asked for. So a classic file keeps its version-1 headers with the
+/// floor nowhere in sight.
 #[test]
 fn the_creation_index_floor_reaches_every_header_and_never_a_classic_file() {
     let path = unique_tmp("crtidx_every");

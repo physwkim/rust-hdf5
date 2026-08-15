@@ -24,7 +24,7 @@
 use rust_hdf5::format::btree_v1::{BTreeV1Config, BTreeV1Node};
 use rust_hdf5::format::local_heap::{local_heap_get_string, LocalHeapHeader};
 use rust_hdf5::format::messages::data_layout::{ChunkIndexType, DataLayoutMessage};
-use rust_hdf5::format::messages::link::{LinkMessage, LinkTarget};
+use rust_hdf5::format::messages::link::{CharacterSet, LinkMessage, LinkTarget};
 use rust_hdf5::format::messages::{
     MSG_DATA_LAYOUT, MSG_FILL_VALUE, MSG_FILL_VALUE_OLD, MSG_FLAG_CONSTANT, MSG_LINK,
     MSG_SYMBOL_TABLE,
@@ -410,6 +410,110 @@ fn a_group_holding_an_external_link_converts_to_link_messages() {
     let _ = std::fs::remove_file(&target);
 }
 
+/// The other half of `H5G_obj_insert`'s conversion test: a link whose name is
+/// not ASCII takes its group out of the symbol table exactly as an external
+/// link does.
+///
+/// `obj_lnk->cset != H5T_CSET_ASCII || obj_lnk->type > H5L_TYPE_BUILTIN_MAX`
+/// is one condition with two halves (H5Gobj.c:514), and the character set is
+/// what a symbol table entry has no field for. h5py reaches the same branch
+/// because it encodes a `str` name to ASCII when it can and to UTF-8 when it
+/// cannot, and puts the answer in the lcpl (`CommonStateObject._e`) — so a
+/// Rust `&str` and an h5py `str` produce the same file.
+///
+/// The conversion is per group: the root converts over its two non-ASCII
+/// names, its ASCII siblings come along as link messages, and a subgroup whose
+/// own children are ASCII-named keeps its table. Character sets are checked in
+/// the written bytes as well, because libhdf5 reads a name the same either way
+/// and would not complain about a wrong one.
+#[test]
+fn a_group_holding_a_non_ascii_name_converts_to_link_messages() {
+    let Some(py) = python() else { return };
+    let path = tmp("nonascii_names");
+    let file = earliest(&path);
+    file.new_dataset::<i32>()
+        .shape([4])
+        .create("데이터")
+        .unwrap()
+        .write_raw(&[0i32, 1, 2, 3])
+        .unwrap();
+    file.create_group("plain").unwrap();
+    for parent in ["그룹", "ascii_only"] {
+        file.create_group(parent)
+            .unwrap()
+            .new_dataset::<i32>()
+            .shape([2])
+            .create("inner")
+            .unwrap()
+            .write_raw(&[7i32, 8])
+            .unwrap();
+    }
+    file.close().unwrap();
+
+    assert_eq!(superblock_version(&path), 0);
+    no_newer_structures(&path);
+    assert!(contains(&path, b"SNOD"), "the unconverted groups' tables");
+
+    // Each root link message, decoded from the header this writer emitted:
+    // the two non-ASCII names carry UTF-8 and the two ASCII ones carry no
+    // character set field at all.
+    let ctx = FormatContext {
+        sizeof_addr: 8,
+        sizeof_size: 8,
+    };
+    let mut seen: Vec<(String, CharacterSet)> = root_link_messages(&path, &ctx)
+        .into_iter()
+        .map(|(link, encoded)| {
+            let has_cset_field = encoded[1] & 0x10 != 0;
+            assert_eq!(
+                has_cset_field,
+                link.cset != CharacterSet::Ascii,
+                "{}: the character set field is written exactly when the set is \
+                 not the default one `H5O__link_decode` assumes",
+                link.name
+            );
+            (link.name, link.cset)
+        })
+        .collect();
+    seen.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        seen,
+        [
+            ("ascii_only".to_string(), CharacterSet::Ascii),
+            ("plain".to_string(), CharacterSet::Ascii),
+            ("그룹".to_string(), CharacterSet::Utf8),
+            ("데이터".to_string(), CharacterSet::Utf8),
+        ]
+    );
+
+    read_with_h5py(
+        py,
+        &path,
+        "STAB = 1 << 0x11\n\
+         def stab(p):\n\
+         \x20   return bool(h5py.h5o.get_info(f[p].id).hdr.mesg.present & STAB)\n\
+         assert not stab('/'), 'the root holds two non-ASCII names'\n\
+         assert stab('/plain'), 'plain is empty and ASCII-named throughout'\n\
+         assert stab('/그룹'), 'its own child is ASCII-named'\n\
+         assert stab('/ascii_only'), 'ASCII throughout'\n\
+         for path in ('/', '/plain', '/그룹', '/ascii_only'):\n\
+         \x20   v = h5py.h5o.get_info(f[path].id).hdr.version\n\
+         \x20   assert v == 1, (path, v)\n\
+         assert sorted(f.keys()) == ['ascii_only', 'plain', '그룹', '데이터']\n\
+         assert list(f['데이터'][...]) == [0, 1, 2, 3]\n\
+         assert list(f['그룹/inner'][...]) == [7, 8]\n\
+         assert list(f['ascii_only/inner'][...]) == [7, 8]\n",
+    );
+    libhdf5_tools_accept(py, &path);
+
+    let reopened = H5File::open(&path).unwrap();
+    let mut names = reopened.root_group().link_names().unwrap();
+    names.sort();
+    assert_eq!(names, ["ascii_only", "plain", "그룹", "데이터"]);
+    drop(reopened);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// A chunked dataset at this bound is indexed by the version-1 B-tree, the
 /// only index a version-3 data layout message can name. The v1.10 indexes
 /// this crate reaches for by default each write a signature of their own, and
@@ -670,6 +774,24 @@ fn classic_messages_of(
         .map(|m| (m.msg_type, m.flags, m.data.clone()))
         .collect();
     (messages, ctx)
+}
+
+/// Every link message of a version-0 superblock's root group, paired with the
+/// raw bytes it was decoded from.
+///
+/// The root symbol table entry names the object header whether or not the
+/// group still has a symbol table, so it is the way in to a classic file whose
+/// root `H5G_obj_insert` converted to link messages.
+fn root_link_messages(path: &std::path::Path, ctx: &FormatContext) -> Vec<(LinkMessage, Vec<u8>)> {
+    let bytes = std::fs::read(path).unwrap();
+    let sb = SuperblockV0V1::decode(&bytes).unwrap();
+    let at = (sb.base_address + sb.root_symbol_table_entry.obj_header_addr) as usize;
+    let (root, _) = ObjectHeader::decode_v1(&bytes[at..]).unwrap();
+    root.messages
+        .iter()
+        .filter(|m| m.msg_type == MSG_LINK)
+        .map(|m| (LinkMessage::decode(&m.data, ctx).unwrap().0, m.data.clone()))
+        .collect()
 }
 
 /// The same, for a file whose root group holds link messages.

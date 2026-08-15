@@ -728,6 +728,28 @@ def gen_link_external_read(path):
         f["gone_file"] = h5py.ExternalLink("no_such_file.h5", "/top")
 
 
+def gen_link_nonascii(path):
+    """Non-ASCII link names in a file written at the earliest bound.
+
+    h5py encodes a name it is handed as `str` to ASCII when it can and to
+    UTF-8 when it cannot, and puts the result in the lcpl's character encoding
+    (`CommonStateObject._e`). `H5G_obj_insert` reads that back off the link and
+    converts a symbol-table group to link messages the moment it is not ASCII
+    (`obj_lnk->cset != H5T_CSET_ASCII`, H5Gobj.c:514) — the same branch an
+    external link takes.
+
+    So the root here loses its symbol table over two non-ASCII names while its
+    ASCII siblings come along as link messages, and every group whose own
+    children are ASCII-named keeps its symbol table. The superblock stays at
+    version 0 throughout: the conversion is per group, not per file.
+    """
+    with h5py.File(path, "w", libver="earliest") as f:
+        f.create_dataset("데이터", data=ramp("<i4"))
+        f.create_group("plain")
+        f.create_group("그룹").create_dataset("inner", data=ramp("<i4", 4))
+        f.create_group("ascii_only").create_dataset("inner", data=ramp("<i4", 4))
+
+
 def gen_links_dense(path):
     # v1.8 bounds, not "latest": dense link storage needs the v1.8 group
     # format, and stopping there keeps the v1.10 layout message out of the
@@ -790,6 +812,9 @@ LINK_CASES = [
          "datasets read through external links, plus a dangling object and a "
          "dangling file",
          ext_files=("_data.h5",)),
+    Case("link_nonascii", "link", gen_link_nonascii, "link_nonascii",
+         "non-ASCII link names at the earliest bound — the root converts to "
+         "link messages, the ASCII-named subgroups keep their symbol tables"),
     Case("links_dense", "link", gen_links_dense, "links_dense",
          "12 links in one group — dense link storage (fractal heap + v2 B-tree)"),
     Case("track_order", "group", gen_track_order, "track_order",
@@ -1046,6 +1071,30 @@ def _fixture_case(name, fixture, generator, group, note, rust=None):
     return Case(name, group, gen, rust, note)
 
 
+def _fixture_append_case(name, fixture, generator, group, note, rust):
+    """A checked-in fixture libhdf5 then reopens and appends to.
+
+    The create is the half h5py cannot express — there is no binding for
+    `H5Pset_shared_mesg_index` — but the *append* is an ordinary `'a'` open,
+    so the reference is a genuine libhdf5 reopen of a file with a
+    shared-message table. The rust arm creates its own equivalent and reopens
+    that, which is the only shape the comparison can take: nothing on the
+    Python side can hand the rust writer a file it did not create.
+    """
+    def gen(path):
+        src = FIXTURE_DIR / fixture
+        if not src.exists():
+            raise FileNotFoundError(
+                "%s is missing; regenerate it with tests/fixtures/%s"
+                % (src, generator)
+            )
+        shutil.copyfile(src, path)
+        with h5py.File(path, "a") as f:
+            f.create_dataset("appended", data=ramp("<i4", 8))
+
+    return Case(name, group, gen, rust, note)
+
+
 FIXTURE_CASES = [
     _fixture_case(
         "sohm_list", "sohm_list.h5", "gen_sohm.sh", "sohm",
@@ -1057,6 +1106,17 @@ FIXTURE_CASES = [
         "sohm_btree", "sohm_btree.h5", "gen_sohm.sh", "sohm",
         "the same file with the shared-message index forced to a v2 B-tree",
         rust="sohm_btree",
+    ),
+    _fixture_append_case(
+        "sohm_list_append", "sohm_list.h5", "gen_sohm.sh", "sohm",
+        "a file with a shared-message list index reopened and appended to — "
+        "the table is laid out whole, so the append replaces it",
+        rust="sohm_list_append",
+    ),
+    _fixture_append_case(
+        "sohm_btree_append", "sohm_btree.h5", "gen_sohm.sh", "sohm",
+        "the same reopen over a v2 B-tree index",
+        rust="sohm_btree_append",
     ),
     _fixture_case(
         "ochk_root", "ochk_root.h5", "gen_ochk.sh", "objectheader",
