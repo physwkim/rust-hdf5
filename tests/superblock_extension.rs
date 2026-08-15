@@ -6,8 +6,14 @@
 //!   `btreek_legacy.h5`  K values in a version-1 superblock, no extension.
 //!   `sbext_btreek.h5`   the same K values in the extension's B-tree-K message.
 //!   `sbext_paged.h5`    paged aggregation with persisted free-space managers.
+//!
+//! The extension is also the one piece of a reopened file that is rewritten
+//! wholesale, so the second half of this file is about what has to survive
+//! that: `H5F__super_ext_write_msg` replaces one message and leaves the rest,
+//! and a writer that lays out a fresh extension instead must reproduce what it
+//! read or the file loses declarations no other structure repeats.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rust_hdf5::{FileSpaceStrategy, H5File};
@@ -136,5 +142,246 @@ fn a_file_without_an_extension_reports_no_messages() {
     }
     let file = H5File::open(&path).unwrap();
     assert_eq!(file.superblock_extension(), Default::default());
+    cleanup(&path);
+}
+
+// -------------------------------------------------- what a reopen must carry
+
+/// Copy a fixture into a temp path of its own.
+fn copy_fixture(name: &str, label: &str) -> PathBuf {
+    let path = unique_tmp(label);
+    std::fs::write(&path, std::fs::read(fixture(name)).unwrap()).unwrap();
+    path
+}
+
+/// Reopen `path` and add one contiguous dataset, which is enough to make the
+/// writer rewrite the superblock and its extension.
+fn append_dataset(path: &PathBuf, name: &str) {
+    let file = H5File::open_rw(path).unwrap();
+    file.new_dataset::<i32>()
+        .shape([4usize])
+        .create(name)
+        .unwrap()
+        .write_raw(&[1i32, 2, 3, 4])
+        .unwrap();
+    file.close().unwrap();
+}
+
+/// The same Python-install probe `tests/sohm_append.rs` uses: the tools beside
+/// it are the ones of the libhdf5 h5py is linked against.
+const TEST_PYTHONS: [&str; 2] = [
+    "/Users/stevek/mamba/envs/bs2026.1/bin/python",
+    "/home/stevek/micromamba/envs/tomo/bin/python",
+];
+
+fn python() -> Option<&'static str> {
+    static PY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PY.get_or_init(|| {
+        let candidates: Vec<String> = match std::env::var("RUST_HDF5_TEST_PYTHON") {
+            Ok(p) => vec![p],
+            Err(_) => TEST_PYTHONS.iter().map(|p| p.to_string()).collect(),
+        };
+        let found = candidates.iter().find(|c| Path::new(c).exists()).cloned();
+        if found.is_none() {
+            eprintln!("skipping superblock extension cross-check: none of {candidates:?} present");
+        }
+        found
+    })
+    .as_deref()
+}
+
+/// Run a libhdf5 tool from beside the probe python and return its stdout.
+/// `None` when neither is installed.
+fn tool_output(name: &str, args: &[&str]) -> Option<String> {
+    let py = python()?;
+    let exe = Path::new(py).parent().unwrap().join(name);
+    if !exe.exists() {
+        return None;
+    }
+    let out = std::process::Command::new(&exe)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {name}: {e}"));
+    assert!(
+        out.status.success(),
+        "{name} failed ({}):\n{}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// What h5py says about the file, which is the only reader that resolves the
+/// declarations under test the way the library itself does.
+fn h5py_reads(path: &Path, body: &str) {
+    let Some(py) = python() else { return };
+    let script = format!(
+        "import h5py\nf = h5py.File(r'{}', 'r')\n{}\n",
+        path.display(),
+        body
+    );
+    let out = std::process::Command::new(py)
+        .args(["-c", &script])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn h5py: {e}"));
+    assert!(
+        out.status.success(),
+        "h5py read-back failed ({}):\n{}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Let libhdf5 append to the file this crate wrote.
+fn h5py_appends(path: &Path, name: &str) {
+    let Some(py) = python() else { return };
+    let script = format!(
+        "import h5py\nf = h5py.File(r'{}', 'a')\nf['{name}'] = [5, 6, 7, 8]\nf.close()\n",
+        path.display()
+    );
+    let out = std::process::Command::new(py)
+        .args(["-c", &script])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn h5py: {e}"));
+    assert!(
+        out.status.success(),
+        "h5py could not append to the file this crate wrote ({}):\n{}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The reopen replaces the superblock extension, so every message the old one
+/// held has to come back out of the replacement. The B-tree-K message is the
+/// one that makes this data loss rather than a lost annotation: without it
+/// libhdf5 sizes the preserved chunk B-tree at the default rank and reports
+/// "number of children is greater than maximum" for a dataset the append never
+/// touched.
+#[test]
+fn a_reopened_extension_comes_back_whole() {
+    let path = copy_fixture("sbext_btreek.h5", "carry");
+    let before = H5File::open(&path).unwrap().superblock_extension();
+    assert!(before.btree_k.is_some() && before.file_space_info.is_some());
+
+    // Twice: the first round replaces the header the fixture's extension was
+    // written into, the second replaces the one this crate wrote, and only the
+    // second reads back what the re-emission itself encoded.
+    for round in 0..2 {
+        append_dataset(&path, &format!("appended{round}"));
+        assert_eq!(
+            H5File::open(&path).unwrap().superblock_extension(),
+            before,
+            "round {round} rewrote the extension without reproducing it"
+        );
+    }
+
+    // Read at the rank the message declares, by this crate and by libhdf5.
+    let file = H5File::open(&path).unwrap();
+    let chunked: Vec<i32> = file.dataset("chunked").unwrap().read_raw().unwrap();
+    assert_eq!(chunked.len(), 1000);
+    assert_eq!(chunked[999], 999);
+    drop(file);
+
+    // h5dump reads the K values and the file space strategy out of the
+    // extension and prints them under SUPER_BLOCK; each line is one message
+    // field that a dropped extension takes with it.
+    if let Some(text) = tool_output("h5dump", &["-pBH", path.to_str().unwrap()]) {
+        for line in [
+            "BTREE_RANK 100",
+            "BTREE_LEAF 110",
+            "ISTORE_K 64",
+            "FILE_SPACE_STRATEGY H5F_FSPACE_STRATEGY_FSM_AGGR",
+            "FREE_SPACE_PERSIST TRUE",
+        ] {
+            assert!(
+                text.contains(line),
+                "h5dump no longer prints {line}:\n{text}"
+            );
+        }
+    }
+    tool_output("h5clear", &["-s", path.to_str().unwrap()]);
+    h5py_reads(
+        &path,
+        "assert len(f) == 211, len(f)\n\
+         assert f['chunked'][()].sum() == 499500\n\
+         assert f['d7'][()].tolist() == [700, 701, 702, 703]\n\
+         assert f['appended1'][()].tolist() == [1, 2, 3, 4]\n",
+    );
+    // And libhdf5 takes the file on from here: it sizes the nodes it adds by
+    // the ranks it reads out of the extension this crate re-emitted, so an
+    // extension that came back subtly wrong fails here rather than silently.
+    h5py_appends(&path, "by_libhdf5");
+    h5py_reads(
+        &path,
+        "assert len(f) == 212, len(f)\n\
+         assert f['chunked'][()].sum() == 499500\n\
+         assert f['by_libhdf5'][()].tolist() == [5, 6, 7, 8]\n",
+    );
+    tool_output("h5clear", &["-s", path.to_str().unwrap()]);
+    cleanup(&path);
+}
+
+/// The ranks the file declares also size the nodes the reopen *writes*, not
+/// only the ones it reads. The append rewrites the root group, and at
+/// `sym_leaf_k = 110` its 210 entries are one symbol table node; sized by the
+/// library default they would be 27, and libhdf5 — reading the rank the
+/// extension still declares — would take the first of them for a 220-entry node
+/// and run off its end.
+#[test]
+fn the_rewritten_symbol_table_is_sized_by_the_files_k_ranks() {
+    fn snod_count(bytes: &[u8]) -> usize {
+        bytes.windows(4).filter(|w| *w == b"SNOD").count()
+    }
+
+    let path = copy_fixture("sbext_btreek.h5", "geometry");
+    assert_eq!(snod_count(&std::fs::read(&path).unwrap()), 1);
+    append_dataset(&path, "appended");
+    assert_eq!(
+        snod_count(&std::fs::read(&path).unwrap()),
+        1,
+        "the rewritten root group was not sized by sym_leaf_k = 110"
+    );
+
+    // Every entry of that one node is still reachable, by name.
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.dataset_names();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["appended", "chunked", "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7"]
+    );
+    drop(file);
+    h5py_reads(&path, "assert len(f) == 210, len(f)\n");
+    cleanup(&path);
+}
+
+/// A file whose extension carries persisted free-space managers: the message
+/// names twelve manager addresses, and the append neither drops it nor
+/// allocates over what it points at.
+#[test]
+fn a_paged_file_keeps_its_persisted_free_space_managers() {
+    let path = copy_fixture("sbext_paged.h5", "paged");
+    let before = H5File::open(&path).unwrap().superblock_extension();
+    let fs = before.file_space_info.clone().expect("file space info");
+    assert_eq!(fs.strategy, FileSpaceStrategy::Page);
+    assert!(fs.persist);
+
+    append_dataset(&path, "appended");
+
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(file.superblock_extension(), before);
+    drop(file);
+    if let Some(text) = tool_output("h5dump", &["-pBH", path.to_str().unwrap()]) {
+        assert!(
+            text.contains("FILE_SPACE_STRATEGY H5F_FSPACE_STRATEGY_PAGE"),
+            "{text}"
+        );
+        assert!(text.contains("FILE_SPACE_PAGE_SIZE 8192"), "{text}");
+    }
+    tool_output("h5clear", &["-s", path.to_str().unwrap()]);
+    h5py_reads(&path, "assert f['appended'][()].tolist() == [1, 2, 3, 4]\n");
     cleanup(&path);
 }

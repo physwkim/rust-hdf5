@@ -33,6 +33,22 @@ const FLAG_HAVE_VALUE: u8 = 0x20;
 const FLAGS_ALL: u8 =
     FLAG_MASK_ALLOC | (FLAG_MASK_FILL << FLAG_SHIFT_FILL) | FLAG_UNDEFINED | FLAG_HAVE_VALUE;
 
+/// `H5D_FILL_TIME_ALLOC` (`H5Dpublic.h`): fill at allocation regardless of
+/// whether a fill value was ever set — an unset value fills with the
+/// default (zeros), same as leaving newly allocated space untouched.
+pub const FILL_TIME_ALLOC: u8 = 0;
+
+/// `H5D_FILL_TIME_NEVER`: the fill value is never written into allocated
+/// storage. `H5D__chunk_lock`'s cache-miss path (H5Dchunk.c:4894) gates on
+/// it, and this crate's writer mirrors that gate at its own two eager-fill
+/// sites — the immediate tiling `set_dataset_fill_value` does for a
+/// compact/contiguous/implicit dataset, and the buffer a chunked partial
+/// write builds for a chunk touched for the first time — unlike a shrink's
+/// straddler refill (`H5D__chunk_prune_fill`), which fills unconditionally
+/// because it is repairing data about to become reachable again, not
+/// filling at allocation.
+pub const FILL_TIME_NEVER: u8 = 1;
+
 /// `H5D_FILL_TIME_IFSET`, the write time the default dataset creation
 /// property list carries (`H5D_CRT_FILL_TIME_DEF`, H5Dpkg.h) and therefore the
 /// one every dataset gets unless `H5Pset_fill_time` says otherwise.
@@ -84,7 +100,7 @@ impl FillValueMessage {
     pub fn undefined() -> Self {
         Self {
             alloc_time: 2,
-            fill_write_time: 1, // never
+            fill_write_time: FILL_TIME_NEVER,
             fill_defined: 0,
             fill_value: None,
         }

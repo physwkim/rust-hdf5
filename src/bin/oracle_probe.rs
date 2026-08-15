@@ -32,13 +32,13 @@ use rust_hdf5::format::messages::filter::{
 };
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
-    AttributeStorage, ChunkIndex, CreationOrder, ExternalFileSegment, FillValue, H5Attribute,
-    H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error, Hyperslab,
+    AttributeStorage, ChunkIndex, CreationOrder, ExternalFileSegment, FillTime, FillValue,
+    H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error, Hyperslab,
     HyperslabBlock, LibverBound, LinkClass, LinkStorage, Reference, Selection, StorageLayout,
     VirtualMapping,
 };
 
-const CANON_VERSION: &str = "3";
+const CANON_VERSION: &str = "4";
 const RAW_LIMIT: usize = 1024;
 const MAX_DEPTH: usize = 32;
 
@@ -1057,6 +1057,20 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
                 FillValue::Default => "default".to_string(),
                 FillValue::Undefined => "undefined".to_string(),
                 FillValue::UserDefined(bytes) => format!("0x{}", hex(&bytes)),
+            })
+            .map_err(oneline)
+    });
+
+    d.field(path, "filltime", || {
+        guarded(|| ds.fill_time())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|ft| {
+                match ft {
+                    FillTime::Alloc => "alloc",
+                    FillTime::Never => "never",
+                    FillTime::IfSet => "ifset",
+                }
+                .to_string()
             })
             .map_err(oneline)
     });
@@ -2201,6 +2215,28 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "link_nonascii" => {
+            // A Rust `&str` is h5py's `str`, so the character set follows the
+            // same rule on both sides: ASCII where the name encodes to ASCII,
+            // UTF-8 where it does not. The root then converts out of its
+            // symbol table and the ASCII-named subgroups keep theirs.
+            let file = earliest_file(path)?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("데이터")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            let root = file.root_group();
+            root.create_group("plain")?;
+            for parent in ["그룹", "ascii_only"] {
+                root.create_group(parent)?
+                    .new_dataset::<i32>()
+                    .shape([4usize])
+                    .create("inner")?
+                    .write_raw(&ramp_n::<i32>(4))?;
+            }
+            file.close()?;
+            Ok(Ok(()))
+        }
         "links_dense" => {
             // The reference makes `g` with `track_order=True`, so the dense
             // storage it spills into carries a creation-order index beside
@@ -2476,6 +2512,8 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         // generator: h5py has no binding for the properties they need.
         "sohm_list" => sohm_file(path, 50, 40),
         "sohm_btree" => sohm_file(path, 0, 0),
+        "sohm_list_append" => sohm_append_case(path, 50, 40),
+        "sohm_btree_append" => sohm_append_case(path, 0, 0),
         "ochk_root" => ochk_root_file(path),
 
         _ => Ok(unsup(&format!("no rust writer arm for case '{case}'"))),
@@ -2520,6 +2558,23 @@ fn sohm_file(path: &str, max_list: u16, min_btree: u16) -> rust_hdf5::Result<Wri
         .create("uses_named")?
         .write_raw(&(100..108i32).collect::<Vec<_>>())?;
 
+    file.close()?;
+    Ok(Ok(()))
+}
+
+/// [`sohm_file`] reopened and appended to, which is what the h5py arm does to
+/// the checked-in fixture. The shared-message table is laid out whole from the
+/// whole message set, so the close after the append replaces the table the
+/// create wrote and reassigns every heap ID in the file.
+fn sohm_append_case(path: &str, max_list: u16, min_btree: u16) -> rust_hdf5::Result<WriteResult> {
+    if let Err(unsupported) = sohm_file(path, max_list, min_btree)? {
+        return Ok(Err(unsupported));
+    }
+    let file = H5File::open_rw(path)?;
+    file.new_dataset::<i32>()
+        .shape([8usize])
+        .create("appended")?
+        .write_raw(&ramp_n::<i32>(8))?;
     file.close()?;
     Ok(Ok(()))
 }
