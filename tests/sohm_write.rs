@@ -21,8 +21,8 @@ use rust_hdf5::format::sohm::{
     type_flag, SohmMasterTable, BT2_TYPE_SOHM_INDEX, SMLI_SIGNATURE, SOHM_B2_NODE_SIZE,
     SOHM_INDEX_BTREE, SOHM_INDEX_LIST,
 };
-use rust_hdf5::format::superblock::SuperblockV2V3;
-use rust_hdf5::format::FormatContext;
+use rust_hdf5::format::superblock::{SuperblockV0V1, SuperblockV2V3};
+use rust_hdf5::format::{FormatContext, UNDEF_ADDR};
 use rust_hdf5::{DatatypeMessage, H5File};
 
 /// Per-test unique temp path; cargo runs tests in parallel.
@@ -350,5 +350,136 @@ fn file_creation_refuses_a_configuration_libhdf5_refuses() {
         };
         assert!(err.contains(expect), "{err}");
     }
+    cleanup(&path);
+}
+
+/// Every object header reachable from the root, by path, decoded from the
+/// bytes. Reaching one at all is the version assertion: `ObjectHeader::decode`
+/// requires the `OHDR` signature, which a version-1 header does not have.
+fn every_header(bytes: &[u8]) -> Vec<(String, ObjectHeader)> {
+    use rust_hdf5::format::messages::link::{LinkMessage, LinkTarget};
+    use rust_hdf5::format::messages::MSG_LINK;
+
+    let sb = SuperblockV2V3::decode(bytes).unwrap();
+    let ctx = FormatContext {
+        sizeof_addr: sb.sizeof_offsets,
+        sizeof_size: sb.sizeof_lengths,
+    };
+    let mut out = Vec::new();
+    let mut queue = vec![(String::from("/"), sb.root_group_object_header_address)];
+    while let Some((path, addr)) = queue.pop() {
+        let at = (sb.base_address + addr) as usize;
+        let (header, _) = ObjectHeader::decode(&bytes[at..])
+            .unwrap_or_else(|e| panic!("the header of {path} is not a version-2 one: {e}"));
+        for m in header.messages.iter().filter(|m| m.msg_type == MSG_LINK) {
+            if let Ok((link, _)) = LinkMessage::decode(&m.data, &ctx) {
+                if let LinkTarget::Hard { address } = link.target {
+                    queue.push((format!("{}{}/", path, link.name), address));
+                }
+            }
+        }
+        out.push((path, header));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// `store_msg_crt_idx` is a property of the *file*, so the floor it puts under
+/// attribute creation order reaches every object header the file holds, not
+/// just the root's: `H5O__create_ohdr` raises each one it makes to version 2
+/// and ORs `H5O_HDR_ATTR_CRT_ORDER_TRACKED` in (H5Oint.c:364, H5Oint.c:442).
+///
+/// The other half is that such a file can never be a classic one. libhdf5
+/// reaches that by raising the superblock to version 2 for `sohm_nindexes > 0`
+/// and then refusing the file outright when the high bound cannot reach that
+/// version (H5Fsuper.c:1135). Here the combination is unrepresentable instead:
+/// `shared_messages` is read only by `create`, which never writes a superblock
+/// below version 2, and the one path that produces a classic writer —
+/// `open_rw` — both leaves the option unread and refuses outright a file that
+/// already carries a shared-message table (`tests/sohm_write_guard.rs`). So a
+/// classic file keeps its version-1 headers with the floor nowhere in sight.
+#[test]
+fn the_creation_index_floor_reaches_every_header_and_never_a_classic_file() {
+    let path = unique_tmp("crtidx_every");
+    {
+        let file = H5File::options()
+            .shared_messages(&[(all_three(), 0)], 50, 40)
+            .create(&path)
+            .unwrap();
+        let group = file.root_group().create_group("g").unwrap();
+        group.set_attr_numeric("scale", &2.0f64).unwrap();
+        for (parent, name) in [(&file.root_group(), "outer"), (&group, "inner")] {
+            let ds = parent.new_dataset::<i32>().shape([4]).create(name).unwrap();
+            ds.write_raw(&[7i32; 4]).unwrap();
+            // The same body in both headers, so the index actually shares it.
+            ds.new_attr::<f64>()
+                .shape(())
+                .create("units")
+                .unwrap()
+                .write_numeric(&1.5f64)
+                .unwrap();
+        }
+        file.close().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(SuperblockV2V3::decode(&bytes).unwrap().version >= 2);
+    let headers = every_header(&bytes);
+    assert_eq!(
+        headers.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+        ["/", "/g/", "/g/inner/", "/outer/"]
+    );
+    for (path, header) in &headers {
+        assert_eq!(
+            header.attribute_creation_order(),
+            CreationOrder::Tracked,
+            "{path}"
+        );
+    }
+    cleanup(&path);
+
+    // The classic side: the option is create-only, so the one call shape that
+    // asks for a shared-message table in a classic file gets a classic file.
+    let path = unique_tmp("classic");
+    std::fs::write(
+        &path,
+        std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/btreek_legacy.h5"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    {
+        let file = H5File::options()
+            .shared_messages(&[(all_three(), 0)], 50, 40)
+            .open_rw(&path)
+            .unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([4])
+            .create("added")
+            .unwrap();
+        ds.write_raw(&[7i32; 4]).unwrap();
+        ds.new_attr::<f64>()
+            .shape(())
+            .create("units")
+            .unwrap()
+            .write_numeric(&1.5f64)
+            .unwrap();
+        file.close().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let sb = SuperblockV0V1::decode(&bytes).unwrap();
+    assert_eq!(sb.version, 1);
+    assert_eq!(sb.superblock_extension_address, UNDEF_ADDR);
+    let root = (sb.base_address + sb.root_symbol_table_entry.obj_header_addr) as usize;
+    assert!(
+        ObjectHeader::decode(&bytes[root..]).is_err(),
+        "a classic file's root header must not carry the OHDR signature"
+    );
+    let (root_header, _) = ObjectHeader::decode_v1(&bytes[root..]).unwrap();
+    assert_eq!(
+        root_header.attribute_creation_order(),
+        CreationOrder::Untracked
+    );
     cleanup(&path);
 }
