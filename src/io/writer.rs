@@ -151,8 +151,8 @@ fn collect_bt2_nodes(
     Ok(())
 }
 
-/// Walk a version-1 raw-data-chunk B-tree from `addr`, collecting every leaf
-/// entry as a [`BtreeV1ChunkRecord`] and every node block's address.
+/// A walk of a version-1 raw-data-chunk B-tree: the file and geometry the
+/// descent reads through, and the two collections it fills.
 ///
 /// The v1 counterpart of [`collect_bt2_nodes`], and for the same reason: the
 /// records are what [`BtreeV1DatasetInfo::build_tree`] bulk-loads on the next
@@ -160,72 +160,88 @@ fn collect_bt2_nodes(
 /// so a reopened tree owns the nodes it found instead of leaking them and
 /// allocating a second set beside them.
 ///
-/// Records come out in key order because a v1 B-tree's leaves are in key order
-/// and this descends left to right, which is what
-/// [`BtreeV1DatasetInfo::position`]'s binary search needs. `rank` is
-/// `chunk_dims.len()`, excluding the trailing element-size dimension; the keys
-/// store element offsets (`scaled * chunk_dim`, `H5D__btree_encode_key`), so
-/// the grid position this records is the quotient.
-#[allow(clippy::too_many_arguments)]
-fn collect_btree_v1_nodes(
-    handle: &FileHandle,
-    ctx: &FormatContext,
-    config: &BTreeV1Config,
-    addr: u64,
-    chunk_dims: &[u64],
+/// One value rather than nine parameters threaded through the recursion: only
+/// `addr` and `depth` change between one level and the next, so they are what
+/// [`descend`](Self::descend) takes and everything else lives here.
+struct BtreeV1Walk<'a> {
+    handle: &'a FileHandle,
+    ctx: &'a FormatContext,
+    config: &'a BTreeV1Config,
+    /// The chunk edge lengths, *without* the trailing element-size dimension,
+    /// so `chunk_dims.len()` is the rank the node keys are decoded at.
+    chunk_dims: &'a [u64],
     file_size: u64,
-    depth: u32,
-    records: &mut Vec<BtreeV1ChunkRecord>,
-    node_addrs: &mut Vec<u64>,
-) -> IoResult<()> {
-    // The same bound the reader's walk uses: a node's level is one byte, so no
-    // honest tree is deeper than that, and a cyclic index stops here.
-    if depth > 256 {
-        return Err(crate::io::IoError::InvalidState(
-            "chunk B-tree v1 exceeds maximum depth".into(),
-        ));
-    }
-    if addr == UNDEF_ADDR || addr >= file_size {
-        return Ok(());
-    }
-    let rank = chunk_dims.len();
-    let sa = ctx.sizeof_addr as usize;
-    let node_size = config.chunk_btree_node_size(sa, rank);
-    let buf = handle.read_at_most(addr, node_size)?;
-    let node = ChunkBTreeV1Node::decode(&buf, sa, rank, config.chunk_max_entries())?;
-    node_addrs.push(addr);
+    records: Vec<BtreeV1ChunkRecord>,
+    node_addrs: Vec<u64>,
+}
 
-    if node.level == 0 {
-        for (i, &child_addr) in node.children.iter().enumerate() {
-            let key = &node.keys[i];
-            let scaled: Vec<u64> = key.offsets[..rank]
-                .iter()
-                .zip(chunk_dims)
-                .map(|(&offset, &dim)| offset.checked_div(dim).unwrap_or(0))
-                .collect();
-            records.push(BtreeV1ChunkRecord {
-                scaled,
-                address: child_addr,
-                nbytes: key.chunk_size,
-                filter_mask: key.filter_mask,
-            });
-        }
-    } else {
-        for &child_addr in &node.children {
-            collect_btree_v1_nodes(
-                handle,
-                ctx,
-                config,
-                child_addr,
-                chunk_dims,
-                file_size,
-                depth + 1,
-                records,
-                node_addrs,
-            )?;
+impl<'a> BtreeV1Walk<'a> {
+    fn new(
+        handle: &'a FileHandle,
+        ctx: &'a FormatContext,
+        config: &'a BTreeV1Config,
+        chunk_dims: &'a [u64],
+        file_size: u64,
+    ) -> Self {
+        Self {
+            handle,
+            ctx,
+            config,
+            chunk_dims,
+            file_size,
+            records: Vec::new(),
+            node_addrs: Vec::new(),
         }
     }
-    Ok(())
+
+    /// Walk the subtree rooted at `addr`, collecting every leaf entry as a
+    /// [`BtreeV1ChunkRecord`] and every node block's address.
+    ///
+    /// Records come out in key order because a v1 B-tree's leaves are in key
+    /// order and this descends left to right, which is what
+    /// [`BtreeV1DatasetInfo::position`]'s binary search needs. The keys store
+    /// element offsets (`scaled * chunk_dim`, `H5D__btree_encode_key`), so the
+    /// grid position this records is the quotient.
+    fn descend(&mut self, addr: u64, depth: u32) -> IoResult<()> {
+        // The same bound the reader's walk uses: a node's level is one byte, so
+        // no honest tree is deeper than that, and a cyclic index stops here.
+        if depth > 256 {
+            return Err(crate::io::IoError::InvalidState(
+                "chunk B-tree v1 exceeds maximum depth".into(),
+            ));
+        }
+        if addr == UNDEF_ADDR || addr >= self.file_size {
+            return Ok(());
+        }
+        let rank = self.chunk_dims.len();
+        let sa = self.ctx.sizeof_addr as usize;
+        let node_size = self.config.chunk_btree_node_size(sa, rank);
+        let buf = self.handle.read_at_most(addr, node_size)?;
+        let node = ChunkBTreeV1Node::decode(&buf, sa, rank, self.config.chunk_max_entries())?;
+        self.node_addrs.push(addr);
+
+        if node.level == 0 {
+            for (i, &child_addr) in node.children.iter().enumerate() {
+                let key = &node.keys[i];
+                let scaled: Vec<u64> = key.offsets[..rank]
+                    .iter()
+                    .zip(self.chunk_dims)
+                    .map(|(&offset, &dim)| offset.checked_div(dim).unwrap_or(0))
+                    .collect();
+                self.records.push(BtreeV1ChunkRecord {
+                    scaled,
+                    address: child_addr,
+                    nbytes: key.chunk_size,
+                    filter_mask: key.filter_mask,
+                });
+            }
+        } else {
+            for &child_addr in &node.children {
+                self.descend(child_addr, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Encode a fixed-array data block for the layout implied by `hdr`, using the
@@ -2488,19 +2504,13 @@ fn rebuild_dataset(
             b_tree_address,
         } => {
             let real_chunk_dims: Vec<u64> = chunk_dims[..chunk_dims.len() - 1].to_vec();
-            let mut records = Vec::new();
-            let mut node_addrs = Vec::new();
-            collect_btree_v1_nodes(
-                handle,
-                ctx,
-                &meta.btree,
-                *b_tree_address,
-                &real_chunk_dims,
-                file_size,
-                0,
-                &mut records,
-                &mut node_addrs,
-            )?;
+            let mut walk = BtreeV1Walk::new(handle, ctx, &meta.btree, &real_chunk_dims, file_size);
+            walk.descend(*b_tree_address, 0)?;
+            let BtreeV1Walk {
+                records,
+                node_addrs,
+                ..
+            } = walk;
             let max_dims = info
                 .dataspace
                 .max_dims
