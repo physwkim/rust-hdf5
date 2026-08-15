@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::format::btree_v1::{BTreeV1Config, ChunkBTreeV1Tree, ChunkKey};
+use crate::format::btree_v1::{BTreeV1Config, ChunkBTreeV1Node, ChunkBTreeV1Tree, ChunkKey};
 use crate::format::chunk_index::btree_v2::Bt2ChunkIndex;
 use crate::format::chunk_index::extensible_array::{
     compute_chunk_size_len, compute_ndblk_addrs, compute_nsblk_addrs, EaDblkPath, EaGeometry,
@@ -33,7 +33,7 @@ use crate::format::messages::data_layout::{
 use crate::format::messages::dataspace::{DataspaceClass, DataspaceMessage};
 use crate::format::messages::datatype::{DatatypeMessage, ReferenceKind};
 use crate::format::messages::external_file_list::{ExternalFileListMessage, UNLIMITED};
-use crate::format::messages::fill_value::FillValueMessage;
+use crate::format::messages::fill_value::{FillValueMessage, FILL_TIME_IFSET};
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::group_info::GroupInfoMessage;
 use crate::format::messages::link::{LinkMessage, LinkTarget};
@@ -146,6 +146,83 @@ fn collect_bt2_nodes(
             if let Some(record) = node.record_data.get(i * rec..(i + 1) * rec) {
                 records.extend_from_slice(record);
             }
+        }
+    }
+    Ok(())
+}
+
+/// Walk a version-1 raw-data-chunk B-tree from `addr`, collecting every leaf
+/// entry as a [`BtreeV1ChunkRecord`] and every node block's address.
+///
+/// The v1 counterpart of [`collect_bt2_nodes`], and for the same reason: the
+/// records are what [`BtreeV1DatasetInfo::build_tree`] bulk-loads on the next
+/// flush, and the addresses are the block pool that flush re-serializes over,
+/// so a reopened tree owns the nodes it found instead of leaking them and
+/// allocating a second set beside them.
+///
+/// Records come out in key order because a v1 B-tree's leaves are in key order
+/// and this descends left to right, which is what
+/// [`BtreeV1DatasetInfo::position`]'s binary search needs. `rank` is
+/// `chunk_dims.len()`, excluding the trailing element-size dimension; the keys
+/// store element offsets (`scaled * chunk_dim`, `H5D__btree_encode_key`), so
+/// the grid position this records is the quotient.
+#[allow(clippy::too_many_arguments)]
+fn collect_btree_v1_nodes(
+    handle: &FileHandle,
+    ctx: &FormatContext,
+    config: &BTreeV1Config,
+    addr: u64,
+    chunk_dims: &[u64],
+    file_size: u64,
+    depth: u32,
+    records: &mut Vec<BtreeV1ChunkRecord>,
+    node_addrs: &mut Vec<u64>,
+) -> IoResult<()> {
+    // The same bound the reader's walk uses: a node's level is one byte, so no
+    // honest tree is deeper than that, and a cyclic index stops here.
+    if depth > 256 {
+        return Err(crate::io::IoError::InvalidState(
+            "chunk B-tree v1 exceeds maximum depth".into(),
+        ));
+    }
+    if addr == UNDEF_ADDR || addr >= file_size {
+        return Ok(());
+    }
+    let rank = chunk_dims.len();
+    let sa = ctx.sizeof_addr as usize;
+    let node_size = config.chunk_btree_node_size(sa, rank);
+    let buf = handle.read_at_most(addr, node_size)?;
+    let node = ChunkBTreeV1Node::decode(&buf, sa, rank, config.chunk_max_entries())?;
+    node_addrs.push(addr);
+
+    if node.level == 0 {
+        for (i, &child_addr) in node.children.iter().enumerate() {
+            let key = &node.keys[i];
+            let scaled: Vec<u64> = key.offsets[..rank]
+                .iter()
+                .zip(chunk_dims)
+                .map(|(&offset, &dim)| offset.checked_div(dim).unwrap_or(0))
+                .collect();
+            records.push(BtreeV1ChunkRecord {
+                scaled,
+                address: child_addr,
+                nbytes: key.chunk_size,
+                filter_mask: key.filter_mask,
+            });
+        }
+    } else {
+        for &child_addr in &node.children {
+            collect_btree_v1_nodes(
+                handle,
+                ctx,
+                config,
+                child_addr,
+                chunk_dims,
+                file_size,
+                depth + 1,
+                records,
+                node_addrs,
+            )?;
         }
     }
     Ok(())
@@ -2163,9 +2240,7 @@ impl<'a> ReopenWalk<'a> {
             // the header as a contiguous, unallocated dataset — every element
             // gone, silently. Only the layouts that rebuild are modelled; the
             // rest keep their bytes, as an undecodable message already does.
-            // Version-3 chunked (a version-1 B-tree index, which h5py writes
-            // at `libver='v108'` and in every classic file) and virtual
-            // layouts are both this.
+            // The virtual layout is this.
             (Some(_), Some(_), Some(layout)) if !layout_rebuilds(&layout) => {
                 Ok(ObjectPlan::preserve(format!(
                     "its data layout is {}, which this writer reads but does not build",
@@ -2312,11 +2387,13 @@ impl<'a> ReopenWalk<'a> {
 /// it that decoded would strand every chunk it could not read.
 fn rebuild_dataset(
     handle: &mut FileHandle,
-    ctx: &FormatContext,
+    meta: &FileMeta,
+    file_size: u64,
     name: String,
     obj_addr: u64,
     parts: DatasetParts,
 ) -> IoResult<DatasetInfo> {
+    let ctx = &meta.ctx;
     let DatasetParts {
         header_size: ds_header_size,
         datatype: dt,
@@ -2371,6 +2448,11 @@ fn rebuild_dataset(
         // 8-byte size fields, which v4 readers would mis-derive).
         layout_version: match &dl {
             DataLayoutMessage::ChunkedV4 { version, .. } => *version,
+            // The classic index has no version above its own: a version-3
+            // message is the whole of `H5D__chunk_set_info`'s MAX below the
+            // version-4 gate, and re-encoding it any higher would name an
+            // index the message cannot carry.
+            DataLayoutMessage::ChunkedV3 { .. } => LAYOUT_VERSION_DEFAULT,
             _ => 4,
         },
         times,
@@ -2393,6 +2475,49 @@ fn rebuild_dataset(
         // contiguous one — dropping every byte.
         DataLayoutMessage::Compact { data } => {
             info.compact = Some(data.clone());
+        }
+        // The classic chunk index, reconstructed into the same
+        // `BtreeV1DatasetInfo` a chunked dataset *created* in this format
+        // gets, so the one set of machinery — `build_tree`, the flush's block
+        // pool, `write_chunk`, `extend_dataset`, the prune a delete runs —
+        // drives a reopened dataset and a fresh one alike. `root_addr` is what
+        // the layout message carries and stays undefined for a dataset whose
+        // chunks were never written, exactly as libhdf5 leaves it.
+        DataLayoutMessage::ChunkedV3 {
+            chunk_dims,
+            b_tree_address,
+        } => {
+            let real_chunk_dims: Vec<u64> = chunk_dims[..chunk_dims.len() - 1].to_vec();
+            let mut records = Vec::new();
+            let mut node_addrs = Vec::new();
+            collect_btree_v1_nodes(
+                handle,
+                ctx,
+                &meta.btree,
+                *b_tree_address,
+                &real_chunk_dims,
+                file_size,
+                0,
+                &mut records,
+                &mut node_addrs,
+            )?;
+            let max_dims = info
+                .dataspace
+                .max_dims
+                .clone()
+                .unwrap_or_else(|| info.dataspace.dims.clone());
+            info.btree_v1 = Some(BtreeV1DatasetInfo {
+                chunk_dims: real_chunk_dims,
+                max_dims,
+                // The file's own "K" ranks, not this session's defaults: they
+                // set every node's width, so a tree bulk-loaded under the
+                // wrong ones would re-serialize over blocks of the wrong size.
+                config: meta.btree,
+                records,
+                node_addrs,
+                root_addr: *b_tree_address,
+                chunks_written: 0,
+            });
         }
         DataLayoutMessage::ChunkedV4 {
             chunk_dims,
@@ -2813,6 +2938,7 @@ fn layout_rebuilds(layout: &DataLayoutMessage) -> bool {
         layout,
         DataLayoutMessage::Contiguous { .. }
             | DataLayoutMessage::Compact { .. }
+            | DataLayoutMessage::ChunkedV3 { .. }
             | DataLayoutMessage::ChunkedV4 { .. }
     )
 }
@@ -2918,6 +3044,60 @@ impl LegacyFile {
     }
 }
 
+/// Where a file's superblock version comes from — the two cases libhdf5 keeps
+/// strictly apart, and this writer's single source for both the version it
+/// writes back and the generation it writes new structures in.
+///
+/// INVARIANT: reopening a file never changes its superblock version, and every
+/// structure appended to it is written at a library-version bound of at least
+/// the row that version belongs to.
+///
+/// libhdf5 splits the same way. `H5F__super_init` is the only place a version
+/// is *decided* — content first, then `MAX(super_vers,
+/// HDF5_superblock_ver_bounds[low_bound])` (H5Fsuper.c:1128-1154).
+/// `H5F__super_read` never recomputes one; it validates what it read and
+/// raises the file's low bound to match, version 2 to at least
+/// `H5F_LIBVER_V18` and version 3 to at least `H5F_LIBVER_V110`
+/// (hdf5_1.14.6 H5Fsuper.c:460-466). One direction only: the version bounds
+/// the structures, the structures never bound the version back.
+///
+/// Two variants rather than one number with a rule attached, because the
+/// number means different things on the two paths — a floor to raise on the
+/// create path, a fixed value on the reopen path — and a single field would
+/// have every reader re-derive which.
+#[derive(Debug, Clone, Copy)]
+enum SuperblockVersion {
+    /// A file this writer created. The version its creation options start
+    /// from, which [`superblock_version_for`](Hdf5Writer::superblock_version_for)
+    /// raises to what the content and the named bound need. Nothing is on
+    /// disk yet, so nothing floors the bound.
+    Chosen(u8),
+    /// A file this writer reopened: the version already in the file. Written
+    /// back unchanged, and the floor under every bound this session writes at.
+    Existing(u8),
+}
+
+impl SuperblockVersion {
+    /// The oldest library-version bound this file may be written at.
+    ///
+    /// `H5F__super_read`'s upgrade, as a table rather than two `if`s: the
+    /// oldest row of `HDF5_superblock_ver_bounds` (H5Fsuper.c:68) whose entry
+    /// is the version on disk. A created file has no superblock on disk, so
+    /// its floor is the oldest bound there is.
+    ///
+    /// `Existing(0..=1)` and `Hdf5Writer::legacy` say the same thing from two
+    /// directions and cannot disagree: `open_append_with_locking` builds the
+    /// `LegacyFile` from exactly the versions this arm covers.
+    fn libver_floor(self) -> LibverBound {
+        match self {
+            Self::Chosen(_) => LibverBound::Earliest,
+            Self::Existing(0..=1) => LibverBound::Earliest,
+            Self::Existing(2) => LibverBound::V18,
+            Self::Existing(_) => LibverBound::V110,
+        }
+    }
+}
+
 /// HDF5 file writer.
 ///
 /// Usage:
@@ -2979,9 +3159,14 @@ pub struct Hdf5Writer {
     /// to 3 only by what the content needs) over the v1.10 chunk indexes,
     /// which is the `H5F_LIBVER_V110` row of the layout table. Naming a bound
     /// asks for one whole libhdf5 generation instead, so the two cannot share
-    /// a field — every reader below goes through the format-decision block
-    /// (`encoding_libver`, `layout_version_bound`) rather than reading this
-    /// directly.
+    /// a field.
+    ///
+    /// Nothing reads this directly:
+    /// [`session_libver`](Hdf5Writer::session_libver) is the only reader, and
+    /// it is where the default meets the floor the file's own superblock puts
+    /// under it (see [`SuperblockVersion`]). A default is a bound the *writer*
+    /// picks, and on a reopened file the writer has no say — which is exactly
+    /// the difference this field cannot express on its own.
     libver: Option<LibverBound>,
     closed: bool,
     /// Set once `finalize_for_swmr` has published a readable file.
@@ -3011,10 +3196,11 @@ pub struct Hdf5Writer {
     /// The on-disk root header block a reopen found, `(addr, len)`, so
     /// finalize can free the block its rewrite supersedes.
     superseded_root_header: Option<(u64, u64)>,
-    /// Superblock version this file starts from — the lowest one it may be
-    /// written with. [`superblock_version_for`](Self::superblock_version_for)
-    /// raises it to what the content needs.
-    superblock_version_base: u8,
+    /// Where this file's superblock version comes from. The single owner of
+    /// both halves of the reopen invariant — see [`SuperblockVersion`],
+    /// [`superblock_version_for`](Self::superblock_version_for) and
+    /// [`libver_floor`](Self::libver_floor).
+    superblock_version: SuperblockVersion,
     /// Objects whose attributes this finalize spilled to dense storage, and
     /// the `Attribute Info` message naming what was written for each.
     ///
@@ -3597,18 +3783,21 @@ impl Hdf5Writer {
         // are.
         let classic = libver == Some(LibverBound::Earliest);
         let legacy = classic.then(|| Box::new(LegacyFile::created(ctx, userblock)));
-        let superblock_version_base = if classic && shared_messages.specs().is_empty() {
-            SUPERBLOCK_V0
-        } else {
-            SUPERBLOCK_V2
-        };
+        let superblock_version =
+            SuperblockVersion::Chosen(if classic && shared_messages.specs().is_empty() {
+                SUPERBLOCK_V0
+            } else {
+                SUPERBLOCK_V2
+            });
 
         // Reserve the superblock at offset 0. Which version it gets is only
         // known once the file's content is (see `superblock_version_for`),
         // but the two a version-2 file can reach — 2 and 3 — encode to the
         // same size, so the reservation follows the base version alone.
         let superblock_size = match legacy.as_deref() {
-            Some(l) if superblock_version_base < SUPERBLOCK_V2 => l.superblock.encoded_size(),
+            Some(l) if matches!(superblock_version, SuperblockVersion::Chosen(v) if v < SUPERBLOCK_V2) => {
+                l.superblock.encoded_size()
+            }
             _ => SuperblockV2V3::size_for(ctx.sizeof_addr),
         };
         let allocator = FileAllocator::new(superblock_size as u64);
@@ -3635,7 +3824,7 @@ impl Hdf5Writer {
             // A new file starts at the oldest superblock the generation it was
             // created in allows, and finalize raises it if the content needs a
             // newer one.
-            superblock_version_base,
+            superblock_version,
             dense_attributes: Slot::new(HashMap::new()),
             dense_links: Slot::new(HashMap::new()),
             superseded_dense: Slot::new(None),
@@ -3690,6 +3879,12 @@ impl Hdf5Writer {
     /// Set the file's low libver bound, the equivalent of
     /// `H5Pset_libver_bounds`'s `low` argument. Objects created after this
     /// call encode their messages at the versions that bound calls for.
+    ///
+    /// On a reopened file the bound is raised to the row the file's superblock
+    /// version belongs to if it names an older one, exactly as
+    /// `H5F__super_read` raises the fapl's value — see
+    /// [`libver_floor`](Self::libver_floor). Only a bound the file's format
+    /// cannot express at all is refused.
     pub fn set_libver_bound(&mut self, libver: LibverBound) -> IoResult<()> {
         // A classic file cannot honour a newer bound: every encoder in it
         // reads `H5F_LOW_BOUND`, and raising that is what makes libhdf5 write
@@ -3834,19 +4029,70 @@ impl Hdf5Writer {
         self.header_format(track)
     }
 
-    /// The bound the message encoders see.
+    /// The oldest bound this file may be written at, and the single owner of
+    /// the reopen half of the [`SuperblockVersion`] invariant.
     ///
-    /// Pinned to `Earliest` in a classic file: `H5F_LIBVER_EARLIEST` is the
-    /// only low bound under which libhdf5 writes a version-0/1 superblock at
-    /// all, so a newer message version inside one is a combination no libhdf5
-    /// produces. Raising the bound on such a file is refused where the caller
-    /// asks for it (`H5File::set_libver_bound`) rather than silently dropped
-    /// here; this keeps the encoders honest if a path ever misses that gate.
-    fn encoding_libver(&self) -> LibverBound {
+    /// A reopened file's superblock version is the only thing on disk that
+    /// says which generation the file is, and `H5F__super_read` reads it as
+    /// exactly that: it raises `H5F_LOW_BOUND` to the row that version belongs
+    /// to (hdf5_1.14.6 H5Fsuper.c:460-466). Every version-selecting site below
+    /// goes through [`session_libver`](Self::session_libver) rather than
+    /// reading the `libver` field, so none of them can hand a reopened file a
+    /// structure older than the file already claims to hold.
+    ///
+    /// A floor, not a ceiling. `H5Fopen` takes a fapl like `H5Fcreate` does,
+    /// and a bound named above this one applies: libhdf5 1.14.6 writes a
+    /// version-4 layout message into a version-2 superblock when asked at
+    /// `H5F_LIBVER_V110`, leaving the superblock version alone. The ceiling is
+    /// the separate question [`set_libver_bound`](Self::set_libver_bound)
+    /// answers — no bound but `Earliest` may be named on a classic file.
+    fn libver_floor(&self) -> LibverBound {
+        self.superblock_version.libver_floor()
+    }
+
+    /// The bound one family of encoders is written at, and the single reader
+    /// of the `libver` field.
+    ///
+    /// Three inputs, in the order libhdf5 applies them. A bound the caller
+    /// named is the fapl's `low`, raised to the floor exactly as
+    /// `H5F__super_read` raises it. With no bound named the answer depends on
+    /// which superblock this file has:
+    ///
+    /// * A file this writer created has none yet, so the writer picks —
+    ///   `create_default`, which differs per family because this crate's
+    ///   default file is two rows rather than one bound (see the `libver`
+    ///   field, [`encoding_libver`] and [`layout_version_bound`]). The
+    ///   superblock is then written to match what was picked.
+    /// * A reopened file has already said which generation it is, and its
+    ///   superblock cannot be rewritten to match a newer pick. So the floor is
+    ///   the whole answer — the same value `H5F_LOW_BOUND` has after
+    ///   `H5F__super_read` under a default fapl.
+    ///
+    /// [`encoding_libver`]: Self::encoding_libver
+    /// [`layout_version_bound`]: Self::layout_version_bound
+    fn session_libver(&self, create_default: LibverBound) -> LibverBound {
+        let floor = self.libver_floor();
+        let bound = match (self.libver, self.superblock_version) {
+            (Some(named), _) => named.max(floor),
+            (None, SuperblockVersion::Existing(_)) => floor,
+            (None, SuperblockVersion::Chosen(_)) => create_default,
+        };
         match self.message_format() {
-            ObjectFormat::Legacy => LibverBound::Earliest,
-            ObjectFormat::Modern => self.libver.unwrap_or_default(),
+            // `H5F_LIBVER_EARLIEST` is the only low bound under which libhdf5
+            // writes a version-0/1 superblock at all, so a newer structure
+            // inside one is a combination no libhdf5 produces. Refused where
+            // the caller asks for it (`set_libver_bound`) rather than silently
+            // dropped; capping here is what keeps the encoders honest if a
+            // path ever misses that gate.
+            ObjectFormat::Legacy => bound.min(LibverBound::Earliest),
+            ObjectFormat::Modern => bound,
         }
+    }
+
+    /// The bound the message encoders see — dataspace, datatype, fill value,
+    /// attribute.
+    fn encoding_libver(&self) -> LibverBound {
+        self.session_libver(LibverBound::Earliest)
     }
 
     /// The data layout message version this file's bound calls for —
@@ -3854,18 +4100,16 @@ impl Hdf5Writer {
     /// `H5D__chunk_set_info` weighs against the version a chunk *requires*
     /// (H5Dchunk.c:936, :1046).
     ///
-    /// A classic file takes the `H5F_LIBVER_EARLIEST` row whether or not the
-    /// bound was named — a reopened one never was. With no bound named on a
-    /// modern file the row is `H5F_LIBVER_V110`'s: this crate's default file
-    /// uses the v1.10 chunk indexes, which is exactly what that row says and
-    /// what no other row does (see the `libver` field for why the default is
-    /// not `Earliest` here even though the datatype and superblock tables
-    /// read it that way).
+    /// With no bound named the row is `H5F_LIBVER_V110`'s: this crate's
+    /// default file uses the v1.10 chunk indexes, which is exactly what that
+    /// row says and what no other row does (see the `libver` field for why the
+    /// default is not `Earliest` here even though the datatype and superblock
+    /// tables read it that way). A file whose superblock already places it on
+    /// an older row takes that row instead — a reopened version-2 superblock
+    /// is the `V18` row, whose layout version of 3 has no index-type field at
+    /// all, so its appended chunked datasets go on the version-1 B-tree.
     fn layout_version_bound(&self) -> u8 {
-        match self.message_format() {
-            ObjectFormat::Legacy => LibverBound::Earliest.layout_version(),
-            ObjectFormat::Modern => self.libver.unwrap_or(LibverBound::V110).layout_version(),
-        }
+        self.session_libver(LibverBound::V110).layout_version()
     }
 
     /// The data layout version a chunk of `chunk_bytes` *requires* whatever
@@ -3903,30 +4147,42 @@ impl Hdf5Writer {
     /// Refuse an SWMR session this file's format cannot record.
     ///
     /// The two checks `H5F__start_swmr_write` opens with: the superblock must
-    /// be at least version 3 (H5Fint.c:3814) — the only version with the
-    /// status-flags field that says a writer is attached — and the low bound
-    /// must be at least `H5F_LIBVER_V110` (H5Fint.c:3818), the oldest bound
-    /// whose `HDF5_superblock_ver_bounds` row reaches version 3. So a file
-    /// asked for at `V18`, whose row is version 2, is refused by libhdf5 for
-    /// the same reason a classic file is here. A file whose caller named no
-    /// bound is not: nothing in it says the superblock may not be version 3,
-    /// and SWMR is what makes it one.
+    /// be at least version 3 (H5Fint.c:3814, hdf5_1.14.6 H5Fint.c:3751) — the
+    /// only version with the status-flags field that says a writer is attached
+    /// — and the low bound must be at least `H5F_LIBVER_V110` (H5Fint.c:3818),
+    /// the oldest bound whose `HDF5_superblock_ver_bounds` row reaches version
+    /// 3.
+    ///
+    /// Which of the two applies is the [`SuperblockVersion`] question. A
+    /// reopened file already has its version and reopening never rewrites one,
+    /// so the first check decides and the second cannot fail after it: the
+    /// version-3 floor is `V110`. A file this writer created has no version on
+    /// disk yet, so only the second is askable — and a caller who named no
+    /// bound at all passes it, because nothing in such a file says the
+    /// superblock may not be version 3 and SWMR is what makes it one.
     ///
     /// Named, not silently upgraded. libhdf5 upgrades in the one case where
     /// SWMR is asked for at *create* time (`H5F_ACC_SWMR_WRITE` raises the
-    /// bound to V110 in `H5F__super_init`, H5Fsuper.c:1131); this crate's
-    /// bound arrives before the SWMR request and stands for the whole file,
-    /// so honouring it by writing the newer file would answer a different
-    /// request than the one that was made.
+    /// bound to V110 in `H5F__super_init`, H5Fsuper.c:1131); on the reopen
+    /// path it refuses instead, and so does this.
     fn reject_swmr(&self) -> IoResult<()> {
-        let why = if self.is_legacy() {
-            "it is in the classic (version-0/1 superblock) format that \
-             H5F_LIBVER_EARLIEST selects"
-        } else if self.libver.is_some_and(|b| b < LibverBound::V110) {
-            "it was asked for at a library-version bound below H5F_LIBVER_V110, \
-             whose superblock row is version 2"
-        } else {
-            return Ok(());
+        let why = match self.superblock_version {
+            SuperblockVersion::Existing(version) if version >= SUPERBLOCK_V3 => return Ok(()),
+            SuperblockVersion::Existing(version) => format!(
+                "its superblock is version {version}, and reopening a file never \
+                 rewrites that"
+            ),
+            SuperblockVersion::Chosen(_) if self.is_legacy() => {
+                "it is in the classic (version-0/1 superblock) format that \
+                 H5F_LIBVER_EARLIEST selects"
+                    .to_string()
+            }
+            SuperblockVersion::Chosen(_) if self.libver.is_some_and(|b| b < LibverBound::V110) => {
+                "it was asked for at a library-version bound below H5F_LIBVER_V110, \
+                 whose superblock row is version 2"
+                    .to_string()
+            }
+            SuperblockVersion::Chosen(_) => return Ok(()),
         };
         Err(crate::io::IoError::Unsupported(format!(
             "cannot start an SWMR session on this file: {why}, and SWMR needs a \
@@ -4381,7 +4637,7 @@ impl Hdf5Writer {
                 CollectedObject::Dataset(parts) => *parts,
             };
             let dense_attrs = parts.dense.attrs.clone();
-            match rebuild_dataset(&mut handle, &ctx, name.clone(), obj_addr, parts) {
+            match rebuild_dataset(&mut handle, &meta, file_size, name.clone(), obj_addr, parts) {
                 Ok(info) => {
                     if let Some(ainfo) = dense_attrs {
                         dataset_dense.push((existing_datasets.len(), ainfo));
@@ -4698,8 +4954,9 @@ impl Hdf5Writer {
             root_attributes: Slot::new(root_attributes),
             create_lock: Slot::new(()),
             // A reopen names no bound: the file already is whichever
-            // generation it is, and this session adds to it at this crate's
-            // default. `set_libver_bound` is where a caller asks for another.
+            // generation it is, and the version in its superblock is what
+            // says so — see `libver_floor`. `set_libver_bound` is where a
+            // caller asks for a newer one, exactly as `H5Fopen` takes a fapl.
             libver: None,
             closed: false,
             swmr_active: false,
@@ -4707,10 +4964,10 @@ impl Hdf5Writer {
             root_group_addr: None,
             root_group_encoded_size: 0,
             superseded_root_header: Some((root_addr, root_header_size as u64)),
-            // Start from the version the file already has, so an append that
-            // adds nothing needing a newer one hands the file back as it
-            // found it.
-            superblock_version_base: version,
+            // The version the file already has. It is written back unchanged
+            // and it floors every bound this session writes at, so the append
+            // hands the file back in the generation it found it in.
+            superblock_version: SuperblockVersion::Existing(version),
             // The reopened file's own policy, so objects added in this
             // session are made the way the file already declares.
             root_track_order,
@@ -13448,9 +13705,9 @@ impl Hdf5Writer {
     /// with the bounds table reading 0, 2, 3, 3, 3, 3, 3 for EARLIEST, V18,
     /// V110, V112, V114, V200, LATEST (H5Fsuper.c:68, :1128-1154). A file
     /// created at `H5F_LIBVER_EARLIEST` takes that bound's entry directly
-    /// (`superblock_version_base`, and the classic branch below) — version 0,
-    /// or version 2 when the file carries shared messages, whose master table
-    /// needs the superblock extension only a version-2 superblock has
+    /// ([`SuperblockVersion::Chosen`], and the classic branch below) — version
+    /// 0, or version 2 when the file carries shared messages, whose master
+    /// table needs the superblock extension only a version-2 superblock has
     /// (H5Fsuper.c:1135). For every other file the bound is read back from
     /// what this crate writes:
     ///
@@ -13472,22 +13729,28 @@ impl Hdf5Writer {
     /// datasets are indexed — which is what libhdf5 does, the layout version
     /// being no input to `H5F__super_init` at all.
     ///
-    /// A reopened file starts from the version it already carries, so an
-    /// append that adds nothing newer leaves that version alone.
+    /// None of that applies to a reopened file. `H5F__super_read` validates
+    /// the version it finds and never recomputes one, so the version written
+    /// back is the version read — see [`SuperblockVersion`], which is also
+    /// where the other half of that rule lives: the version floors the bound
+    /// the appended structures are written at, which is why nothing this
+    /// session adds can need a newer one.
     fn superblock_version_for(&self, flags: u8) -> u8 {
+        let chosen = match self.superblock_version {
+            SuperblockVersion::Existing(version) => return version,
+            SuperblockVersion::Chosen(version) => version,
+        };
         if self.is_legacy() {
-            // A classic file keeps the version it started at — 0 for one this
-            // writer created at the earliest bound, 2 for one whose shared
-            // messages needed the extension, whatever it held for one it
-            // reopened. Nothing a session can add reaches past that: its
-            // objects get symbol-table links, its chunked datasets the
-            // version-1 B-tree behind a version-3 layout message, and the two
-            // features that would raise the bound — SWMR and the 2.0 format —
-            // are refused where the caller asks for them.
-            return self.superblock_version_base;
+            // A classic file keeps the version it was created at — 0, or 2
+            // when its shared messages needed the extension. Nothing a session
+            // can add reaches past that: its objects get symbol-table links,
+            // its chunked datasets the version-1 B-tree behind a version-3
+            // layout message, and the two features that would raise the bound
+            // — SWMR and the 2.0 format — are refused where the caller asks
+            // for them.
+            return chosen;
         }
-        let mut version = self
-            .superblock_version_base
+        let mut version = chosen
             .max(SUPERBLOCK_V2)
             .max(self.effective_libver().superblock_version());
         if self.swmr_active || flags & FLAG_SWMR_WRITE != 0 {
@@ -13496,8 +13759,10 @@ impl Hdf5Writer {
         version
     }
 
-    /// The low bound this modern file is effectively written at: the one the
-    /// caller named, or — with none named — the one its content reads back as.
+    /// The low bound a modern file this writer *created* is effectively
+    /// written at: the one the caller named, or — with none named — the one
+    /// its content reads back as. A reopened file never reaches here; its
+    /// superblock version is not derived from its content at all.
     ///
     /// The read-back is what `superblock_version_for` needs and the field
     /// alone cannot give: this crate's default file names no bound, and the
@@ -14046,15 +14311,15 @@ impl Hdf5Writer {
             // User-defined fill value (fill_defined = 2).
             FillValueMessage {
                 alloc_time,
-                fill_write_time: 0, // on alloc
+                fill_write_time: FILL_TIME_IFSET,
                 fill_defined: 2,
                 fill_value: Some(bytes.clone()),
             }
         } else if is_chunked {
             FillValueMessage {
                 alloc_time,
-                fill_write_time: 0, // on alloc
-                fill_defined: 1,    // default value (zeros)
+                fill_write_time: FILL_TIME_IFSET,
+                fill_defined: 1, // default value (zeros)
                 fill_value: None,
             }
         } else {
@@ -14063,6 +14328,24 @@ impl Hdf5Writer {
         let fv_msg = fv.encode_for(self.message_format());
         let (flags, fv_msg) = self.share_message(MSG_FILL_VALUE, 0x00, fv_msg);
         header.add_message(MSG_FILL_VALUE, flags, fv_msg);
+
+        // The "fill value (old)" message (type 0x04) beside the new one, for a
+        // user-defined fill value below the v1.8 bound. `H5D__update_oh_info`
+        // (H5Dint.c:1024-1035) appends `H5O_FILL_ID` whenever `fill_prop->buf`
+        // is set and `use_at_least_v18` — `H5F_LOW_BOUND(file) >= V18`, which
+        // here is exactly a non-`Legacy` message format — is false, so that a
+        // reader that predates the new message still finds the value. The body
+        // is the size and the bytes and nothing else: no allocation time, no
+        // write time, no defined flag (`H5O__fill_old_encode`, H5Ofill.c:512).
+        if matches!(self.message_format(), ObjectFormat::Legacy) {
+            if let Some(ref bytes) = m.fill_value {
+                let mut old = Vec::with_capacity(4 + bytes.len());
+                old.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                old.extend_from_slice(bytes);
+                let (flags, old) = self.share_message(MSG_FILL_VALUE_OLD, MSG_FLAG_CONSTANT, old);
+                header.add_message(MSG_FILL_VALUE_OLD, flags, old);
+            }
+        }
 
         // External Data Files message (type 0x07), before the layout message
         // and marked constant, exactly where `H5D__layout_oh_create` puts it.

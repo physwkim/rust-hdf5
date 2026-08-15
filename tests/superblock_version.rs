@@ -10,8 +10,10 @@
 //! (version 3), and SWMR is version 3 outright. Reading the content back is
 //! only how a file whose caller named *no* bound is placed on that table; one
 //! that named a bound takes its row, the layout version being no input to
-//! `H5F__super_init` at all. A reopened file keeps the version it already has
-//! unless what is appended needs a newer one.
+//! `H5F__super_init` at all. All of it is a *creation* question: a reopened
+//! file keeps the version it already has, whatever the session adds, because
+//! that version is what places the session's own writes on the table — see
+//! `tests/reopen_superblock_bounds.rs`.
 //!
 //! One bound settles the question on its own: `LibverBound::Earliest` asks
 //! for the classic generation, whose superblock is version 0 and whose
@@ -180,9 +182,73 @@ fn an_swmr_file_is_written_at_version_3() {
     cleanup(&path);
 }
 
-/// The version follows the file's content, not the writing session: an
-/// append that adds nothing newer hands the file back at the version it was
-/// opened with.
+/// ... which is why a reopen cannot start one on a file that is not already
+/// version 3. `H5F__start_swmr_write` refuses below that outright
+/// (H5Fint.c:3814): the status-flags field that records an attached writer
+/// exists only in the version-3 image, and reopening never rewrites a
+/// superblock version to make room for it. libhdf5 1.14.6 answers the same
+/// call with "file superblock version - should be at least 3".
+#[test]
+fn an_swmr_session_on_a_reopened_pre_v3_file_is_refused() {
+    use rust_hdf5::swmr::SwmrFileWriter;
+
+    for (label, libver, expect_sb) in [
+        ("classic", Some(LibverBound::Earliest), 0u8),
+        ("v18", Some(LibverBound::V18), 2),
+        ("default", None, 2),
+    ] {
+        let path = unique_tmp(&format!("swmr_reopen_{label}"));
+        let mut options = H5File::options();
+        if let Some(libver) = libver {
+            options = options.libver(libver);
+        }
+        let file = options.create(&path).unwrap();
+        write_contiguous(&file, "data");
+        file.close().unwrap();
+        assert_eq!(superblock_version(&path), expect_sb, "{label}");
+
+        let mut writer = SwmrFileWriter::open_append(&path).unwrap();
+        let err = writer.start_swmr().unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("superblock is version {expect_sb}")),
+            "{label}: the refusal must name the version it found: {err}"
+        );
+        assert!(err.contains("version-3"), "{label}: {err}");
+        drop(writer);
+
+        // Refused, not half-done: the file is the one it was.
+        assert_eq!(superblock_version(&path), expect_sb, "{label}");
+        cleanup(&path);
+    }
+}
+
+/// A version-3 superblock is what SWMR needs, and a reopen of one has it —
+/// `H5F__start_swmr_write`'s second check, the `H5F_LIBVER_V110` low bound,
+/// cannot fail after the first passes because version 3 is that bound's floor.
+#[test]
+fn an_swmr_session_on_a_reopened_v3_file_is_allowed() {
+    use rust_hdf5::swmr::SwmrFileWriter;
+
+    let path = unique_tmp("swmr_reopen_v3");
+    let mut writer = SwmrFileWriter::create(&path).unwrap();
+    let idx = writer
+        .create_streaming_dataset::<f32>("stream", &[4u64])
+        .unwrap();
+    writer.start_swmr().unwrap();
+    let frame: Vec<u8> = (0..4u32).flat_map(|j| (j as f32).to_le_bytes()).collect();
+    writer.append_frame(idx, &frame).unwrap();
+    writer.close().unwrap();
+    assert_eq!(superblock_version(&path), 3);
+
+    let mut writer = SwmrFileWriter::open_append(&path).unwrap();
+    writer.start_swmr().unwrap();
+    writer.close().unwrap();
+    assert_eq!(superblock_version(&path), 3);
+    cleanup(&path);
+}
+
+/// A reopen hands the file back at the version it was opened with, whatever
+/// the session added — `H5F__super_read` never re-decides a version.
 #[test]
 fn appending_contiguous_data_leaves_a_version_2_file_at_version_2() {
     let path = unique_tmp("append_contig");
@@ -204,10 +270,14 @@ fn appending_contiguous_data_leaves_a_version_2_file_at_version_2() {
     cleanup(&path);
 }
 
-/// ... and one that does need a newer one raises it, because the file now
-/// holds a 1.10 chunk index.
+/// ... and so does one that would have needed a newer version at create time.
+/// The version-2 superblock puts the reopened file on the `H5F_LIBVER_V18`
+/// row, whose data layout version of 3 has no index-type field, so the
+/// appended chunked dataset goes on the version-1 B-tree and asks nothing of
+/// the superblock. `tests/reopen_superblock_bounds.rs` is where that rule is
+/// checked across all three generations.
 #[test]
-fn appending_a_chunked_dataset_raises_a_version_2_file_to_version_3() {
+fn appending_a_chunked_dataset_leaves_a_version_2_file_at_version_2() {
     let path = unique_tmp("append_chunked");
     let file = H5File::create(&path).unwrap();
     write_contiguous(&file, "data");
@@ -218,7 +288,7 @@ fn appending_a_chunked_dataset_raises_a_version_2_file_to_version_3() {
     write_chunked(&file, "added");
     file.close().unwrap();
 
-    assert_eq!(superblock_version(&path), 3);
+    assert_eq!(superblock_version(&path), 2);
     let file = H5File::open(&path).unwrap();
     assert_eq!(
         file.dataset("added").unwrap().read_raw::<i32>().unwrap(),

@@ -2223,6 +2223,9 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         "libver_v108" => libver_case(path, LibverBound::V18),
         "libver_v110" => libver_case(path, LibverBound::V110),
         "libver_latest" => libver_case(path, LibverBound::V200),
+        "reopen_append_earliest" => reopen_append_case(path, LibverBound::Earliest),
+        "reopen_append_v108" => reopen_append_case(path, LibverBound::V18),
+        "reopen_append_latest" => reopen_append_case(path, LibverBound::V200),
         "userblock" => {
             let file = H5File::options()
                 .libver(LibverBound::Earliest)
@@ -2444,6 +2447,26 @@ fn libver_case(path: &str, libver: LibverBound) -> rust_hdf5::Result<WriteResult
         .create("data")?
         .write_raw(&ramp_n::<i32>(8))?;
     file.root_group().create_group("g")?;
+    file.close()?;
+    Ok(Ok(()))
+}
+
+/// The same file, reopened without a bound and appended to.
+///
+/// No `libver` on the reopen, deliberately: the file's own superblock version
+/// is what settles the generation the appended dataset is written in, the way
+/// `H5F__super_read` raises the low bound to match the version it finds. The
+/// superblock version itself must come out of the reopen unchanged.
+fn reopen_append_case(path: &str, libver: LibverBound) -> rust_hdf5::Result<WriteResult> {
+    if let Err(unsupported) = libver_case(path, libver)? {
+        return Ok(Err(unsupported));
+    }
+    let file = H5File::open_rw(path)?;
+    file.new_dataset::<i32>()
+        .shape([4usize, 4])
+        .chunk(&[2, 4])
+        .create("appended")?
+        .write_raw(&ramp_n::<i32>(16))?;
     file.close()?;
     Ok(Ok(()))
 }

@@ -630,51 +630,57 @@ def write_report(results, gaps, meta, md_path, json_path):
 
     L.append("## Top gaps by severity")
     L.append("")
-    L.append("| # | severity | finding | cases |")
-    L.append("|---|---|---|---|")
-    for i, g in enumerate(gaps[:10], 1):
-        L.append(
-            "| %d | %s | %s | %d (%s) |"
-            % (
-                i,
-                SEVERITY_LABEL[g["kind"]],
-                clip(g["signature"], 110),
-                len(g["cases"]),
-                clip(", ".join(g["cases"][:4]) + ("…" if len(g["cases"]) > 4 else ""), 60),
+    if not gaps:
+        L.append("None: no case in this run produced a gap to rank.")
+    else:
+        L.append("| # | severity | finding | cases |")
+        L.append("|---|---|---|---|")
+        for i, g in enumerate(gaps[:10], 1):
+            L.append(
+                "| %d | %s | %s | %d (%s) |"
+                % (
+                    i,
+                    SEVERITY_LABEL[g["kind"]],
+                    clip(g["signature"], 110),
+                    len(g["cases"]),
+                    clip(", ".join(g["cases"][:4]) + ("…" if len(g["cases"]) > 4 else ""), 60),
+                )
             )
-        )
     L.append("")
 
     L.append("## Case matrix")
     L.append("")
-    L.append("| case | group | A | div | miss | gap | B | note |")
-    L.append("|---|---|---|---|---|---|---|---|")
-    for r in results:
-        a, b = r["a"], r["b"]
-        note = ""
-        if a["verdict"] in ("READ-ERROR", "GEN-ERROR"):
-            note = clip(a["detail"], 70)
-        elif b["verdict"] in ("INVALID", "UNSUPPORTED-API"):
-            note = clip(b["detail"], 70)
-        miss = sum(1 for g in a["gaps"] if g["kind"] == "missing-object")
-        gap = sum(
-            1
-            for g in a["gaps"]
-            if g["kind"] != "missing-object" and not g.get("structural")
-        )
-        L.append(
-            "| `%s` | %s | %s | %d | %d | %d | %s | %s |"
-            % (
-                r["case"],
-                r["group"],
-                a["verdict"],
-                len(a["divergences"]),
-                miss,
-                gap,
-                b["verdict"],
-                note,
+    if not results:
+        L.append("None: this run selected no case.")
+    else:
+        L.append("| case | group | A | div | miss | gap | B | note |")
+        L.append("|---|---|---|---|---|---|---|---|")
+        for r in results:
+            a, b = r["a"], r["b"]
+            note = ""
+            if a["verdict"] in ("READ-ERROR", "GEN-ERROR"):
+                note = clip(a["detail"], 70)
+            elif b["verdict"] in ("INVALID", "UNSUPPORTED-API"):
+                note = clip(b["detail"], 70)
+            miss = sum(1 for g in a["gaps"] if g["kind"] == "missing-object")
+            gap = sum(
+                1
+                for g in a["gaps"]
+                if g["kind"] != "missing-object" and not g.get("structural")
             )
-        )
+            L.append(
+                "| `%s` | %s | %s | %d | %d | %d | %s | %s |"
+                % (
+                    r["case"],
+                    r["group"],
+                    a["verdict"],
+                    len(a["divergences"]),
+                    miss,
+                    gap,
+                    b["verdict"],
+                    note,
+                )
+            )
     L.append("")
 
     diffs = [r for r in results if r["a"]["divergences"]]
@@ -815,18 +821,21 @@ def write_report(results, gaps, meta, md_path, json_path):
 
     L.append("## All findings")
     L.append("")
-    L.append("| severity | finding | cases | example |")
-    L.append("|---|---|---|---|")
-    for g in gaps:
-        L.append(
-            "| %s | %s | %d | %s |"
-            % (
-                SEVERITY_LABEL[g["kind"]],
-                clip(g["signature"], 110),
-                len(g["cases"]),
-                clip(g["example"], 80),
+    if not gaps:
+        L.append("None: no case in this run produced a finding.")
+    else:
+        L.append("| severity | finding | cases | example |")
+        L.append("|---|---|---|---|")
+        for g in gaps:
+            L.append(
+                "| %s | %s | %d | %s |"
+                % (
+                    SEVERITY_LABEL[g["kind"]],
+                    clip(g["signature"], 110),
+                    len(g["cases"]),
+                    clip(g["example"], 80),
+                )
             )
-        )
     L.append("")
     L.append("## Known modelling gaps in the canonical format")
     L.append("")

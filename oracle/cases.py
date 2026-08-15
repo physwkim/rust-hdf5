@@ -933,6 +933,31 @@ def gen_userblock(path):
         fh.write(prefix + b"#" * (512 - len(prefix) - 1) + b"\n")
 
 
+def _reopen_append_case(name, libver, rust, note):
+    """Create under one bound, reopen under the default fapl, append.
+
+    `H5F__super_init` is the only place a superblock version is decided, and
+    open never re-decides it; `H5F__super_read` instead raises the file's low
+    library bound to match the version it finds — v2 to `H5F_LIBVER_V18`, v3
+    to `H5F_LIBVER_V110`. So the appended dataset is written in whatever
+    generation the file already has, not the one the default fapl would have
+    picked, and the superblock version comes out of the reopen unchanged.
+
+    The appended dataset is chunked because that is where the two generations
+    differ most visibly: a version-3 layout message has the version-1 B-tree
+    and nothing else, while a version-4 one picks among the v1.10 indexes.
+    """
+    def gen(path):
+        with h5py.File(path, "w", libver=libver) as f:
+            f.create_dataset("data", data=ramp("<i4"))
+            f.create_group("g")
+        with h5py.File(path, "a") as f:
+            f.create_dataset("appended", data=ramp("<i4", 16).reshape(4, 4),
+                             chunks=(2, 4))
+
+    return Case(name, "superblock", gen, rust, note)
+
+
 LIBVER_CASES = [
     _libver_case("libver_earliest", "earliest", "libver_earliest",
                  "libver earliest — superblock v0, symbol-table groups"),
@@ -948,6 +973,18 @@ LIBVER_CASES = [
     # above; the user block below is the remaining v0 variant.
     Case("userblock", "superblock", gen_userblock, "userblock",
          "512-byte userblock — the superblock, and every address, is based at 512"),
+    _reopen_append_case(
+        "reopen_append_earliest", "earliest", "reopen_append_earliest",
+        "classic file reopened under the default fapl — stays superblock v0, "
+        "the appended chunked dataset takes the version-1 B-tree"),
+    _reopen_append_case(
+        "reopen_append_v108", ("v108", "v108"), "reopen_append_v108",
+        "v1.8 file reopened under the default fapl — stays superblock v2, "
+        "the appended chunked dataset takes the version-1 B-tree"),
+    _reopen_append_case(
+        "reopen_append_latest", "latest", "reopen_append_latest",
+        "v1.10+ file reopened under the default fapl — stays superblock v3, "
+        "the appended chunked dataset takes a v1.10 index"),
 ]
 
 
