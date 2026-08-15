@@ -36,7 +36,7 @@ use crate::format::messages::external_file_list::{ExternalFileListMessage, UNLIM
 use crate::format::messages::fill_value::{FillValueMessage, FILL_TIME_IFSET};
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::group_info::GroupInfoMessage;
-use crate::format::messages::link::{LinkMessage, LinkTarget};
+use crate::format::messages::link::{CharacterSet, LinkMessage, LinkTarget};
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::superblock_ext::SharedMessageTableMessage;
 use crate::format::messages::virtual_mapping::{VirtualMapping, VirtualMappingList};
@@ -2008,7 +2008,7 @@ impl<'a> ReopenWalk<'a> {
         let ctx = &meta.ctx;
         use crate::format::messages::data_layout::DataLayoutMessage;
         use crate::format::messages::dataspace::DataspaceMessage;
-        use crate::format::messages::link::LinkMessage;
+        use crate::format::messages::link::{CharacterSet, LinkMessage};
         use crate::format::messages::link_info::LinkInfoMessage;
         use crate::format::messages::shared::MSG_FLAG_SHARED;
         use crate::format::messages::{
@@ -2242,6 +2242,13 @@ impl<'a> ReopenWalk<'a> {
                             StabTarget::Hard { addr, .. } => LinkMessage::hard(&l.name, addr),
                             StabTarget::Soft { value } => LinkMessage::soft(&l.name, &value),
                         };
+                        // An entry carries no character set field, so the link
+                        // it stands for has the file default whatever its name
+                        // looks like (`H5G__ent_to_link`, H5Gent.c:372).
+                        // Deriving one from the name would take a group
+                        // libhdf5 wrote with a high-byte ASCII name out of its
+                        // symbol table on the rewrite.
+                        let msg = msg.with_cset(CharacterSet::Ascii);
                         let bytes = msg.encode(ctx);
                         (msg, bytes)
                     }));
@@ -4002,8 +4009,9 @@ impl Hdf5Writer {
     }
 
     /// Whether every link `scope` holds is one a symbol table entry can
-    /// express — `H5G_obj_insert`'s `obj_lnk->type > H5L_TYPE_BUILTIN_MAX`
-    /// test (H5Gobj.c:512), asked of the whole set.
+    /// express — `H5G_obj_insert`'s `obj_lnk->cset != H5T_CSET_ASCII ||
+    /// obj_lnk->type > H5L_TYPE_BUILTIN_MAX` test (H5Gobj.c:514), asked of the
+    /// whole set.
     ///
     /// A link a reopen carried through verbatim counts too, and one this
     /// writer cannot even decode counts as not fitting: the entry would have
@@ -4012,10 +4020,10 @@ impl Hdf5Writer {
     fn links_fit_symbol_table(&self, scope: LinkScope, order: CreationOrder) -> bool {
         self.group_links(scope, order)
             .iter()
-            .all(|l| l.target.fits_symbol_table())
+            .all(LinkMessage::fits_symbol_table)
             && self.preserved_links_for(scope).iter().all(|encoded| {
                 LinkMessage::decode(encoded, &self.ctx)
-                    .is_ok_and(|(link, _)| link.target.fits_symbol_table())
+                    .is_ok_and(|(link, _)| link.fits_symbol_table())
             })
     }
 
@@ -7018,6 +7026,7 @@ impl Hdf5Writer {
                     name: link.name.clone(),
                     target: link.target.clone(),
                     creation_order: None,
+                    cset: CharacterSet::for_name(&link.name),
                 },
             ));
         }
@@ -7568,7 +7577,7 @@ impl Hdf5Writer {
             },
             // Unreachable by construction: a group holding one of these is
             // not a symbol-table group at all
-            // ([`LinkTarget::fits_symbol_table`] is what
+            // ([`LinkMessage::fits_symbol_table`] is what
             // [`Hdf5Writer::uses_symbol_table`] asks), so this pass never
             // visits it. Reported rather than panicked so a future caller
             // that skips that gate learns which link it lost.

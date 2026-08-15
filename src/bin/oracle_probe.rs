@@ -2201,6 +2201,28 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "link_nonascii" => {
+            // A Rust `&str` is h5py's `str`, so the character set follows the
+            // same rule on both sides: ASCII where the name encodes to ASCII,
+            // UTF-8 where it does not. The root then converts out of its
+            // symbol table and the ASCII-named subgroups keep theirs.
+            let file = earliest_file(path)?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("데이터")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            let root = file.root_group();
+            root.create_group("plain")?;
+            for parent in ["그룹", "ascii_only"] {
+                root.create_group(parent)?
+                    .new_dataset::<i32>()
+                    .shape([4usize])
+                    .create("inner")?
+                    .write_raw(&ramp_n::<i32>(4))?;
+            }
+            file.close()?;
+            Ok(Ok(()))
+        }
         "links_dense" => {
             // The reference makes `g` with `track_order=True`, so the dense
             // storage it spills into carries a creation-order index beside

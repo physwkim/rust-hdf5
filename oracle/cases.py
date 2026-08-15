@@ -728,6 +728,28 @@ def gen_link_external_read(path):
         f["gone_file"] = h5py.ExternalLink("no_such_file.h5", "/top")
 
 
+def gen_link_nonascii(path):
+    """Non-ASCII link names in a file written at the earliest bound.
+
+    h5py encodes a name it is handed as `str` to ASCII when it can and to
+    UTF-8 when it cannot, and puts the result in the lcpl's character encoding
+    (`CommonStateObject._e`). `H5G_obj_insert` reads that back off the link and
+    converts a symbol-table group to link messages the moment it is not ASCII
+    (`obj_lnk->cset != H5T_CSET_ASCII`, H5Gobj.c:514) — the same branch an
+    external link takes.
+
+    So the root here loses its symbol table over two non-ASCII names while its
+    ASCII siblings come along as link messages, and every group whose own
+    children are ASCII-named keeps its symbol table. The superblock stays at
+    version 0 throughout: the conversion is per group, not per file.
+    """
+    with h5py.File(path, "w", libver="earliest") as f:
+        f.create_dataset("데이터", data=ramp("<i4"))
+        f.create_group("plain")
+        f.create_group("그룹").create_dataset("inner", data=ramp("<i4", 4))
+        f.create_group("ascii_only").create_dataset("inner", data=ramp("<i4", 4))
+
+
 def gen_links_dense(path):
     # v1.8 bounds, not "latest": dense link storage needs the v1.8 group
     # format, and stopping there keeps the v1.10 layout message out of the
@@ -790,6 +812,9 @@ LINK_CASES = [
          "datasets read through external links, plus a dangling object and a "
          "dangling file",
          ext_files=("_data.h5",)),
+    Case("link_nonascii", "link", gen_link_nonascii, "link_nonascii",
+         "non-ASCII link names at the earliest bound — the root converts to "
+         "link messages, the ASCII-named subgroups keep their symbol tables"),
     Case("links_dense", "link", gen_links_dense, "links_dense",
          "12 links in one group — dense link storage (fractal heap + v2 B-tree)"),
     Case("track_order", "group", gen_track_order, "track_order",

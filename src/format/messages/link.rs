@@ -40,6 +40,57 @@ const LINK_TYPE_EXTERNAL: u8 = 64;
 /// Version nibble of the external-link udata (`H5L_EXT_VERSION`).
 const EXT_VERSION: u8 = 0;
 
+/// The character set a link name is stored in — `H5T_cset_t` narrowed to the
+/// two values `H5O__link_decode` accepts (`lnk->cset < H5T_CSET_ASCII ||
+/// lnk->cset > H5T_CSET_UTF8` is a hard error there, so a third value is not
+/// a link message at all).
+///
+/// It is a property of the *link*, not of the name bytes: it comes from the
+/// link creation property list (`H5Pset_char_encoding`), and libhdf5 happily
+/// stores a name with high bytes under `Ascii` when that is what the property
+/// list said. It is also the axis that decides a group's storage — see
+/// [`LinkMessage::fits_symbol_table`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CharacterSet {
+    /// `H5T_CSET_ASCII`, and `H5F_DEFAULT_CSET`: the value a link carries
+    /// when the message has no character set field.
+    #[default]
+    Ascii,
+    /// `H5T_CSET_UTF8`.
+    Utf8,
+}
+
+impl CharacterSet {
+    /// The character set h5py picks for a name it is given as `str`: ASCII
+    /// when `name.encode('ascii')` succeeds, UTF-8 when it raises
+    /// (`CommonStateObject._e`). A Rust `&str` is the same input, so this is
+    /// the rule for every link this crate creates.
+    pub fn for_name(name: &str) -> Self {
+        if name.is_ascii() {
+            Self::Ascii
+        } else {
+            Self::Utf8
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Ascii => 0,
+            Self::Utf8 => 1,
+        }
+    }
+
+    fn from_code(code: u8) -> FormatResult<Self> {
+        match code {
+            0 => Ok(Self::Ascii),
+            1 => Ok(Self::Utf8),
+            other => Err(FormatError::InvalidData(format!(
+                "link name character set {other} is neither ASCII nor UTF-8"
+            ))),
+        }
+    }
+}
+
 /// Link target discriminant.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LinkTarget {
@@ -55,21 +106,6 @@ pub enum LinkTarget {
     UserDefined { link_type: u8, udata: Vec<u8> },
 }
 
-impl LinkTarget {
-    /// Whether a version-1 symbol table entry can express this link.
-    ///
-    /// The entry has three cache types — nothing cached, an object header
-    /// address with the target group's own symbol table beside it, and a soft
-    /// link's offset into the local heap — and no room for a fourth. So the
-    /// user-defined classes, `H5L_TYPE_EXTERNAL` among them, exist only as
-    /// link messages: `H5G_obj_insert` converts the whole group out of its
-    /// symbol table rather than insert one (`obj_lnk->type >
-    /// H5L_TYPE_BUILTIN_MAX`, H5Gobj.c:512).
-    pub fn fits_symbol_table(&self) -> bool {
-        matches!(self, Self::Hard { .. } | Self::Soft { .. })
-    }
-}
-
 /// Link message payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkMessage {
@@ -79,6 +115,8 @@ pub struct LinkMessage {
     /// tracks it (`H5O_LINK_STORE_CORDER`). `H5G_obj_insert` stamps it from
     /// the Link Info message's running maximum.
     pub creation_order: Option<i64>,
+    /// Character set of `name` (`H5O_LINK_STORE_NAME_CSET`).
+    pub cset: CharacterSet,
 }
 
 impl LinkMessage {
@@ -88,6 +126,7 @@ impl LinkMessage {
             name: name.to_string(),
             target: LinkTarget::Hard { address },
             creation_order: None,
+            cset: CharacterSet::for_name(name),
         }
     }
 
@@ -99,6 +138,7 @@ impl LinkMessage {
                 target: target.to_string(),
             },
             creation_order: None,
+            cset: CharacterSet::for_name(name),
         }
     }
 
@@ -111,6 +151,7 @@ impl LinkMessage {
                 path: path.to_string(),
             },
             creation_order: None,
+            cset: CharacterSet::for_name(name),
         }
     }
 
@@ -118,6 +159,40 @@ impl LinkMessage {
     pub fn with_creation_order(mut self, corder: i64) -> Self {
         self.creation_order = Some(corder);
         self
+    }
+
+    /// The same link, stamped with a character set the name does not imply.
+    ///
+    /// The one producer that needs it is the symbol table: an entry carries no
+    /// character set field, so `H5G__ent_to_link` gives every link it builds
+    /// `H5F_DEFAULT_CSET` (H5Gent.c:372) whatever the name's bytes are. A
+    /// group libhdf5 wrote can therefore hold a high-byte name under `Ascii`,
+    /// and re-deriving the set from the name would convert that group out of
+    /// its symbol table on a rewrite.
+    pub fn with_cset(mut self, cset: CharacterSet) -> Self {
+        self.cset = cset;
+        self
+    }
+
+    /// Whether a version-1 symbol table entry can express this link.
+    ///
+    /// `H5G_obj_insert` asks it as one condition with two halves
+    /// (`obj_lnk->cset != H5T_CSET_ASCII || obj_lnk->type >
+    /// H5L_TYPE_BUILTIN_MAX`, H5Gobj.c:514), and converts the whole group to
+    /// link messages the moment either holds.
+    ///
+    /// The entry has three cache types — nothing cached, an object header
+    /// address with the target group's own symbol table beside it, and a soft
+    /// link's offset into the local heap — and no room for a fourth, so the
+    /// user-defined classes, `H5L_TYPE_EXTERNAL` among them, exist only as
+    /// link messages. It has no character set field either, so a link whose
+    /// set is not the file default cannot be stored in one without losing it.
+    pub fn fits_symbol_table(&self) -> bool {
+        self.cset == CharacterSet::Ascii
+            && matches!(
+                self.target,
+                LinkTarget::Hard { .. } | LinkTarget::Soft { .. }
+            )
     }
 
     // ------------------------------------------------------------------ encode
@@ -140,10 +215,17 @@ impl LinkMessage {
             LinkTarget::UserDefined { link_type, .. } => *link_type,
         };
 
-        // Always store link type so that soft links are correctly identified.
+        // Every optional field is present exactly when its value is not the
+        // default one the decoder assumes in its absence — `H5O__link_encode`
+        // sets each flag from that test, so a hard link with an ASCII name
+        // carries neither the type byte nor the character set byte.
         let mut flags: u8 = name_len_code & FLAG_NAME_LEN_MASK;
-        flags |= FLAG_LINK_TYPE; // always include link type for clarity
-        flags |= FLAG_CHARSET; // always include charset (UTF-8)
+        if link_type != LINK_TYPE_HARD {
+            flags |= FLAG_LINK_TYPE;
+        }
+        if self.cset != CharacterSet::Ascii {
+            flags |= FLAG_CHARSET;
+        }
         if self.creation_order.is_some() {
             flags |= FLAG_CREATION_ORDER;
         }
@@ -153,15 +235,18 @@ impl LinkMessage {
         buf.push(flags);
 
         // link type
-        buf.push(link_type);
+        if flags & FLAG_LINK_TYPE != 0 {
+            buf.push(link_type);
+        }
 
         // creation order, before the charset byte (`H5O__link_encode`)
         if let Some(corder) = self.creation_order {
             buf.extend_from_slice(&corder.to_le_bytes());
         }
 
-        // charset: 1 = UTF-8
-        buf.push(1u8);
+        if flags & FLAG_CHARSET != 0 {
+            buf.push(self.cset.code());
+        }
 
         // name length
         match name_len_size {
@@ -243,12 +328,15 @@ impl LinkMessage {
             None
         };
 
-        // charset
-        if has_charset {
+        // charset — absent means the file default, `H5T_CSET_ASCII`
+        let cset = if has_charset {
             check_len(buf, pos, 1)?;
-            // skip charset byte
+            let c = CharacterSet::from_code(buf[pos])?;
             pos += 1;
-        }
+            c
+        } else {
+            CharacterSet::Ascii
+        };
 
         // name length
         let name_len_size: usize = match name_len_code {
@@ -324,6 +412,7 @@ impl LinkMessage {
                 name,
                 target,
                 creation_order,
+                cset,
             },
             pos,
         ))
@@ -548,26 +637,26 @@ mod tests {
         );
     }
 
-    /// The other half of [`decode_h5py_external_link_bytes`]: the value this
-    /// encoder produces for the same arguments is the byte string
-    /// `H5Lcreate_external` builds. Only the value is compared — the message
-    /// envelope around it differs from libhdf5's by the charset byte this
-    /// encoder always writes, which libhdf5 reads either way.
+    /// The other half of [`decode_h5py_external_link_bytes`]: for the same
+    /// arguments this encoder now produces the whole message h5py wrote, not
+    /// just the same value inside a wider envelope.
     ///
     /// [`decode_h5py_external_link_bytes`]: self::tests::decode_h5py_external_link_bytes
     #[test]
-    fn encoded_external_value_is_the_byte_string_h5lcreate_external_builds() {
+    fn encoded_external_link_is_the_message_h5lcreate_external_builds() {
         let encoded =
             LinkMessage::external("ext", "link_external_ext.h5", "/payload").encode(&ctx8());
-        let mut want = vec![0u8];
-        want.extend_from_slice(b"link_external_ext.h5\0");
-        want.extend_from_slice(b"/payload\0");
-        let len_at = encoded.len() - want.len() - 2;
-        assert_eq!(
-            u16::from_le_bytes([encoded[len_at], encoded[len_at + 1]]) as usize,
-            want.len()
-        );
-        assert_eq!(&encoded[len_at + 2..], &want[..]);
+        let mut want = vec![1u8, 0x08, 64, 3];
+        want.extend_from_slice(b"ext");
+        let udata = {
+            let mut u = vec![0u8];
+            u.extend_from_slice(b"link_external_ext.h5\0");
+            u.extend_from_slice(b"/payload\0");
+            u
+        };
+        want.extend_from_slice(&(udata.len() as u16).to_le_bytes());
+        want.extend_from_slice(&udata);
+        assert_eq!(encoded, want);
     }
 
     /// A user-defined class other than the external link keeps its value
@@ -581,6 +670,7 @@ mod tests {
                 udata: vec![9, 8, 7],
             },
             creation_order: None,
+            cset: CharacterSet::Ascii,
         };
         let encoded = msg.encode(&ctx8());
         let (decoded, consumed) = LinkMessage::decode(&encoded, &ctx8()).unwrap();
@@ -663,14 +753,80 @@ mod tests {
     }
 
     /// The creation order sits between the link type and the charset byte, so
-    /// a decoder that skipped the wrong span would misread the name.
+    /// a decoder that skipped the wrong span would misread the name. A
+    /// non-ASCII name is what puts the charset byte there at all.
     #[test]
     fn creation_order_precedes_the_charset_byte() {
-        let msg = LinkMessage::soft("alias", "/orig").with_creation_order(-3);
+        let msg = LinkMessage::soft("별칭", "/orig").with_creation_order(-3);
         let encoded = msg.encode(&ctx8());
+        assert_eq!(
+            encoded[1],
+            FLAG_CREATION_ORDER | FLAG_LINK_TYPE | FLAG_CHARSET
+        );
         assert_eq!(&encoded[3..11], &(-3i64).to_le_bytes());
         assert_eq!(encoded[11], 1, "charset follows the creation order");
         assert_eq!(LinkMessage::decode(&encoded, &ctx8()).unwrap().0, msg);
+    }
+
+    /// The exact bytes libhdf5 1.14.6 wrote for the ASCII-named hard link
+    /// `plain` in a group it had just converted out of a symbol table: no
+    /// link-type byte and no charset byte, because a hard link with an ASCII
+    /// name is default on both axes (`H5O__link_encode`). Writing them anyway
+    /// is what this encoder used to do.
+    #[test]
+    fn ascii_hard_link_is_encoded_the_way_libhdf5_wrote_it() {
+        let encoded = LinkMessage::hard("plain", 800).encode(&ctx8());
+        let mut want = vec![1u8, 0x00, 5];
+        want.extend_from_slice(b"plain");
+        want.extend_from_slice(&800u64.to_le_bytes());
+        assert_eq!(encoded, want);
+    }
+
+    /// The same group's non-ASCII link, from the same file: flags 0x10 and a
+    /// charset byte of 1, still with no link-type byte.
+    #[test]
+    fn non_ascii_hard_link_carries_the_utf8_charset_byte() {
+        let encoded = LinkMessage::hard("비ascii", 1832).encode(&ctx8());
+        let name = "비ascii".as_bytes();
+        assert_eq!(name.len(), 8);
+        let mut want = vec![1u8, 0x10, 1, 8];
+        want.extend_from_slice(name);
+        want.extend_from_slice(&1832u64.to_le_bytes());
+        assert_eq!(encoded, want);
+    }
+
+    /// `H5G_obj_insert`'s two-half condition (H5Gobj.c:514): a UTF-8 name
+    /// takes a group out of its symbol table exactly as an external link does.
+    #[test]
+    fn a_utf8_name_does_not_fit_a_symbol_table() {
+        assert!(LinkMessage::hard("plain", 1).fits_symbol_table());
+        assert!(LinkMessage::soft("plain", "/x").fits_symbol_table());
+        assert!(!LinkMessage::hard("비ascii", 1).fits_symbol_table());
+        assert!(!LinkMessage::soft("비ascii", "/x").fits_symbol_table());
+        assert!(!LinkMessage::external("ext", "f.h5", "/p").fits_symbol_table());
+    }
+
+    /// A symbol table entry has no charset field, so `H5G__ent_to_link` gives
+    /// every link it builds `H5F_DEFAULT_CSET` whatever the name's bytes are —
+    /// and such a link still belongs in a symbol table on a rewrite.
+    #[test]
+    fn a_symbol_table_name_keeps_the_default_charset() {
+        let msg = LinkMessage::hard("한글", 0x40).with_cset(CharacterSet::Ascii);
+        assert!(msg.fits_symbol_table());
+        let encoded = msg.encode(&ctx8());
+        assert_eq!(encoded[1] & FLAG_CHARSET, 0);
+        assert_eq!(LinkMessage::decode(&encoded, &ctx8()).unwrap().0, msg);
+    }
+
+    /// `H5O__link_decode` rejects a character set outside `H5T_CSET_ASCII ..=
+    /// H5T_CSET_UTF8` rather than carrying the value through.
+    #[test]
+    fn decode_rejects_an_unknown_charset() {
+        let buf = [1u8, 0x10, 7, 1, b'x', 0, 0, 0, 0, 0, 0, 0, 0];
+        match LinkMessage::decode(&buf, &ctx8()).unwrap_err() {
+            FormatError::InvalidData(ref s) => assert!(s.contains("character set 7"), "{s}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     /// `H5G_normalize`: duplicate slashes collapse, one trailing slash goes,
