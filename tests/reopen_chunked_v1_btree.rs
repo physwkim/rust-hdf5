@@ -15,7 +15,7 @@
 //! one. What these cases check is that the dataset is writable through the
 //! reopen and that libhdf5 still reads every element afterwards.
 
-use rust_hdf5::{H5File, LibverBound};
+use rust_hdf5::{ChunkIndex, H5File, LibverBound};
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -229,6 +229,16 @@ fn a_chunked_dataset_appended_on_a_reopen_survives_a_second_reopen() {
         file.close().unwrap();
     }
     assert_eq!(superblock_version(&path), 2);
+    {
+        // The index the append picked, through the public accessor: a v1.8
+        // file's chunked dataset is a version-1 B-tree, and it is the rebuild
+        // of exactly this that the second reopen below exercises.
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("appended").unwrap().chunk_index().unwrap(),
+            Some(ChunkIndex::BtreeV1)
+        );
+    }
 
     // Second reopen: that dataset is now one the walk has to rebuild.
     {
@@ -252,9 +262,19 @@ fn a_chunked_dataset_appended_on_a_reopen_survives_a_second_reopen() {
     );
     {
         let file = H5File::open(&path).unwrap();
+        let appended = file.dataset("appended").unwrap();
         assert_eq!(
-            file.dataset("appended").unwrap().read_raw::<i32>().unwrap(),
+            appended.read_raw::<i32>().unwrap(),
             (0..16).collect::<Vec<i32>>()
+        );
+        // The rebuild put the tree back as a version-1 B-tree rather than
+        // re-indexing it under this session's own defaults: the accessor reads
+        // the index out of the re-serialized layout message, so a rebuild that
+        // silently promoted the index would show here.
+        assert_eq!(
+            appended.chunk_index().unwrap(),
+            Some(ChunkIndex::BtreeV1),
+            "a second-generation reopen must keep the version-1 B-tree index"
         );
         assert_eq!(
             file.dataset("data").unwrap().read_raw::<i32>().unwrap(),
