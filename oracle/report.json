@@ -3,8 +3,8 @@
   "hdf5_version": "1.14.6",
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
-  "python": "/home/stevek/micromamba/envs/tomo/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-v18-21def2d8-1/target/release/oracle_probe",
+  "python": "/home/stevek/micromamba/envs/tomo/bin/python3",
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-legacy-links-b72b6c22-1/target/release/oracle_probe",
   "cases": 92
  },
  "results": [
@@ -7001,7 +7001,22 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [],
+    "metadata_diffs": [
+     {
+      "key": "#superblock",
+      "field": "superblock",
+      "ref": "2",
+      "rust": "3",
+      "expected": "superblock-v3-for-chunk-index"
+     },
+     {
+      "key": "/data#chunkindex",
+      "field": "chunkindex",
+      "ref": "btree1",
+      "rust": "single",
+      "expected": "btree1-index-substituted"
+     }
+    ],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -7406,22 +7421,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -9829,15 +9829,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -9908,15 +9900,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -15776,15 +15760,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -16223,15 +16199,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -18030,29 +17998,25 @@
  ],
  "expected_deviations": [
   {
-   "id": "superblock-floor-v2",
+   "id": "superblock-v3-for-chunk-index",
    "field": "superblock",
-   "ref": "0",
-   "rust": "2",
-   "example": "0 -> 2",
-   "why": "three cases whose rust arm still creates at this crate's default bounds, because H5F_LIBVER_EARLIEST cannot express what they write. `vds` needs a virtual dataset, refused in a classic file; `link_external` and `link_external_read` need an external link, which a symbol table cannot hold \u2014 libhdf5 answers that by converting the group to link messages under the same v0 superblock (H5G__obj_insert), and this writer has no such conversion. Every other earliest-bound case now writes the v0 superblock itself",
+   "ref": "*",
+   "rust": "3",
+   "example": "2 -> 3",
+   "why": "layout_chunked_v108 asks for the v1.8 bound, where H5O_layout_ver_bounds still puts the data layout message at version 3 and so the chunk index at the version-1 B-tree. This writer picks that index for a classic file only, so a v1.8 file gets a v1.10 index behind a version-4 layout message and the superblock version 3 that implies, above the version 2 the bound asked for",
    "cases": [
-    "vds",
-    "link_external",
-    "link_external_read"
+    "layout_chunked_v108"
    ]
   },
   {
-   "id": "new-style-groups-always",
-   "field": "linkstore",
-   "ref": "symtab",
-   "rust": "compact",
-   "example": "symtab -> compact",
-   "why": "a version-2 object header keeps its links in messages rather than in a symbol table. `sohm_list` and `sohm_btree` carry shared messages, whose master table lives in a superblock extension and so forces the version-2 superblock and with it version-2 headers (H5Fsuper.c:1135), whatever bound is asked for; `vds` is the superblock-floor-v2 case above. The phase change past max_compact still moves the links to dense storage",
+   "id": "btree1-index-substituted",
+   "field": "chunkindex",
+   "ref": "btree1",
+   "rust": "*",
+   "example": "btree1 -> single",
+   "why": "a v1 B-tree chunk index is only legal below superblock v3, so this follows from superblock-v3-for-chunk-index: the file gets whichever v1.10 index its shape selects \u2014 here the single-chunk index, the shape being one chunk wide. A file created at H5F_LIBVER_EARLIEST does get the version-1 B-tree (tests/libver_earliest.rs), as does a chunked dataset appended to a classic file (tests/legacy_append.rs); the v1.8 bound is what is left",
    "cases": [
-    "vds",
-    "sohm_list",
-    "sohm_btree"
+    "layout_chunked_v108"
    ]
   }
  ],

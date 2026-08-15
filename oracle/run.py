@@ -91,37 +91,7 @@ B_TOLERATED_FIELDS = {
 # A deviation that matches none of these is reported as unexpected, and an
 # entry that matches nothing in a run is reported as no longer observed — so
 # a rerun after a writer fix shows the change rather than hiding it.
-EXPECTED_DEVIATIONS = [
-    {
-        "id": "superblock-floor-v2",
-        "field": "superblock",
-        "ref": "0",
-        "rust": "2",
-        "why": "three cases whose rust arm still creates at this crate's "
-               "default bounds, because H5F_LIBVER_EARLIEST cannot express "
-               "what they write. `vds` needs a virtual dataset, refused in a "
-               "classic file; `link_external` and `link_external_read` need "
-               "an external link, which a symbol table cannot hold — libhdf5 "
-               "answers that by converting the group to link messages under "
-               "the same v0 superblock (H5G__obj_insert), and this writer "
-               "has no such conversion. Every other earliest-bound case now "
-               "writes the v0 superblock itself",
-    },
-    {
-        "id": "new-style-groups-always",
-        "field": "linkstore",
-        "ref": "symtab",
-        "rust": "compact",
-        "why": "a version-2 object header keeps its links in messages rather "
-               "than in a symbol table. `sohm_list` and `sohm_btree` carry "
-               "shared messages, whose master table lives in a superblock "
-               "extension and so forces the version-2 superblock and with it "
-               "version-2 headers (H5Fsuper.c:1135), whatever bound is asked "
-               "for; `vds` is the superblock-floor-v2 case above. The phase "
-               "change past max_compact still moves the links to dense "
-               "storage",
-    },
-]
+EXPECTED_DEVIATIONS = []
 
 
 def expected_deviation(entry):

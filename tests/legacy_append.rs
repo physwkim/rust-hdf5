@@ -601,17 +601,17 @@ fn a_classic_chunk_tree_grows_past_one_node_and_past_its_extent() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// What a classic file accepts is decided per storage form, not per file.
+/// A classic file takes every storage form libhdf5 writes into one.
 ///
 /// Compact, contiguous and chunked layouts all encode as a version-3 data
 /// layout message, which is exactly what libhdf5 writes at
 /// `H5F_LIBVER_EARLIEST`, so all of them belong in a version-0 file and are
 /// written into one here — filtered chunks included, over a version-1
-/// pipeline message. Virtual storage does not: no layout message below
-/// version 4 can say "virtual", so it is still refused where the caller asks
-/// for it.
+/// pipeline message. Virtual storage carries a version-4 message instead:
+/// `H5D__virtual_construct` raises that one message and checks only the high
+/// bound (H5Dvirtual.c:2679), so it belongs in a version-0 file too.
 #[test]
-fn a_classic_file_takes_every_layout_but_virtual() {
+fn a_classic_file_takes_every_layout() {
     let Some(py) = python() else { return };
     let path = tmp("storage_matrix");
     write_default_h5py(py, &path, "f['alpha'] = np.arange(6, dtype='<i4')\n");
@@ -669,16 +669,15 @@ fn a_classic_file_takes_every_layout_but_virtual() {
         builder.create(name).unwrap().write_raw(&ramp).unwrap();
     }
 
-    // Refused: no data layout message below version 4 can say "virtual".
-    match file
-        .new_dataset::<i32>()
-        .shape([4])
-        .virtual_mapping(Selection::All, "src.h5", "src", Selection::All)
+    // Writable: the mappings go in a global heap object and the version-4
+    // layout message names it. The source name "." is the virtual dataset's
+    // own file (`H5D__virtual_open_source_dset`, H5Dvirtual.c:1403), so the
+    // read-back below resolves without a second file to keep beside it.
+    file.new_dataset::<i32>()
+        .shape([3])
+        .virtual_mapping(Selection::All, ".", "/flat", Selection::All)
         .create("mapped")
-    {
-        Ok(_) => panic!("a virtual dataset needs a layout message this file cannot hold"),
-        Err(e) => assert!(e.to_string().contains("virtual"), "{e}"),
-    }
+        .unwrap();
 
     file.close().unwrap();
 
@@ -690,12 +689,15 @@ fn a_classic_file_takes_every_layout_but_virtual() {
         py,
         &path,
         "assert sorted(f.keys()) == \
-             ['alpha', 'chunky', 'flat', 'gz', 'packed', 'sh', 'shgz'], sorted(f.keys())\n\
+             ['alpha', 'chunky', 'flat', 'gz', 'mapped', 'packed', 'sh', 'shgz'], \
+             sorted(f.keys())\n\
          assert list(f['packed'][...]) == [10, 20, 30, 40], list(f['packed'][...])\n\
          assert list(f['flat'][...]) == [1, 2, 3], list(f['flat'][...])\n\
          assert list(f['chunky'][...]) == list(range(16)), list(f['chunky'][...])\n\
          assert f['packed'].id.get_create_plist().get_layout() == h5py.h5d.COMPACT\n\
          assert f['chunky'].id.get_create_plist().get_layout() == h5py.h5d.CHUNKED\n\
+         assert f['mapped'].is_virtual\n\
+         assert list(f['mapped'][...]) == [1, 2, 3], list(f['mapped'][...])\n\
          for name in ('gz', 'sh', 'shgz'):\n\
          \x20   assert list(f[name][...]) == list(range(64)), (name, list(f[name][...]))\n\
          assert f['gz'].compression == 'gzip', f['gz'].compression\n\

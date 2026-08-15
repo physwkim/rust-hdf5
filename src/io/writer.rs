@@ -1858,35 +1858,6 @@ struct DenseCarry {
     links: Option<LinkInfoMessage>,
 }
 
-/// The raw-data storage a creator is about to give the object it creates.
-///
-/// Passed into [`Hdf5Writer::begin_create`] rather than checked inside each
-/// creator, so that a creator added later has to say which it is and cannot
-/// silently skip the format check that goes with it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NewStorage {
-    /// One contiguous run of bytes, or none at all (a null dataspace).
-    Contiguous,
-    /// Chunks reached through an index.
-    Chunked,
-    /// Chunks whose bytes pass through a filter pipeline, which needs a
-    /// Filter Pipeline message in the header beside the layout. That message
-    /// is the whole difference from [`Chunked`](Self::Chunked), and both
-    /// formats can hold it, so no check separates the two today; the creators
-    /// still declare which they are, because the declaration is what a check
-    /// added later has to work from.
-    ChunkedFiltered,
-    /// The image inside the data layout message itself, with no block of its
-    /// own — `H5D_COMPACT`.
-    Compact,
-    /// No storage of its own at all: the elements are read out of the source
-    /// datasets a mapping list names — `H5D_VIRTUAL`.
-    Virtual,
-    /// No raw data at all — a committed datatype, whose object holds one
-    /// datatype message and nothing else.
-    None,
-}
-
 /// A modelled object, as the walk hands it to the registry rebuild. A group's
 /// links are not here: the walk followed them, and each child is an entry of
 /// its own.
@@ -3610,25 +3581,35 @@ impl Hdf5Writer {
         let ctx = FormatContext::default_v3();
 
         // `H5F_LIBVER_EARLIEST` is the one bound under which libhdf5 writes
-        // the classic generation — the version-0 superblock row of
-        // `HDF5_superblock_ver_bounds`, and with it the version-1 rows of
-        // every message-version table and the symbol-table group form
-        // (`H5G__obj_create_real`). Shared object header messages are the one
-        // thing that overrides it: their master table lives in a superblock
-        // extension, which only a version-2 superblock has, so
-        // `H5F__super_init` raises such a file to version 2 whatever the low
-        // bound says (H5Fsuper.c:1135) — and this crate's version-2 files are
-        // the ones that can hold the table.
-        let classic = libver == Some(LibverBound::Earliest) && shared_messages.specs().is_empty();
+        // the classic generation — the version-1 rows of every
+        // message-version table, the symbol-table group form
+        // (`H5G__obj_create_real`, H5Gobj.c:179) and the version-0 superblock
+        // row of `HDF5_superblock_ver_bounds`.
+        //
+        // Shared object header messages move the last of those three and
+        // nothing else. Their master table lives in a superblock extension,
+        // which only a version-2 superblock has, so `H5F__super_init` raises
+        // the superblock to version 2 whatever the low bound says
+        // (H5Fsuper.c:1135) — but it does not touch `H5F_LOW_BOUND`, which is
+        // what every other rule reads. So such a file is a version-2
+        // superblock over symbol-table groups and version-1 messages, which
+        // is what the `tests/fixtures/sohm_*.h5` files libhdf5 itself wrote
+        // are.
+        let classic = libver == Some(LibverBound::Earliest);
         let legacy = classic.then(|| Box::new(LegacyFile::created(ctx, userblock)));
+        let superblock_version_base = if classic && shared_messages.specs().is_empty() {
+            SUPERBLOCK_V0
+        } else {
+            SUPERBLOCK_V2
+        };
 
         // Reserve the superblock at offset 0. Which version it gets is only
         // known once the file's content is (see `superblock_version_for`),
-        // but the two a non-classic file can reach — 2 and 3 — encode to the
-        // same size, so the reservation does not have to wait for that choice.
+        // but the two a version-2 file can reach — 2 and 3 — encode to the
+        // same size, so the reservation follows the base version alone.
         let superblock_size = match legacy.as_deref() {
-            Some(l) => l.superblock.encoded_size(),
-            None => SuperblockV2V3::size_for(ctx.sizeof_addr),
+            Some(l) if superblock_version_base < SUPERBLOCK_V2 => l.superblock.encoded_size(),
+            _ => SuperblockV2V3::size_for(ctx.sizeof_addr),
         };
         let allocator = FileAllocator::new(superblock_size as u64);
 
@@ -3654,11 +3635,7 @@ impl Hdf5Writer {
             // A new file starts at the oldest superblock the generation it was
             // created in allows, and finalize raises it if the content needs a
             // newer one.
-            superblock_version_base: if classic {
-                SUPERBLOCK_V0
-            } else {
-                SUPERBLOCK_V2
-            },
+            superblock_version_base,
             dense_attributes: Slot::new(HashMap::new()),
             dense_links: Slot::new(HashMap::new()),
             superseded_dense: Slot::new(None),
@@ -3796,8 +3773,9 @@ impl Hdf5Writer {
             .is_some_and(SohmState::shares_attributes)
     }
 
-    /// Whether a group whose links have this creation-order policy stores them
-    /// in a symbol table — `H5G__obj_create_real` (H5Gobj.c:129).
+    /// Whether the group at `scope` stores its links in a symbol table —
+    /// `H5G__obj_create_real` (H5Gobj.c:129) and the conversion
+    /// `H5G_obj_insert` performs (H5Gobj.c:512).
     ///
     /// The new group format is used unconditionally from `H5F_LIBVER_V18` up,
     /// and below it only when the group tracks link creation order: a symbol
@@ -3805,8 +3783,35 @@ impl Hdf5Writer {
     /// independent — a group that tracks only *attribute* creation order gets
     /// a version-2 header over a symbol table, which is what libhdf5 writes
     /// for it.
-    fn uses_symbol_table(&self, links: CreationOrder) -> bool {
-        self.legacy.is_some() && !links.is_tracked()
+    ///
+    /// The content of the group is the third axis. A symbol table entry has
+    /// three cache types and no room for a fourth, so an external or
+    /// user-defined link cannot go in one; libhdf5 answers by converting that
+    /// one group to link messages the moment such a link is inserted, leaving
+    /// the superblock version, the object header version and every other group
+    /// in the file alone. This writer builds each group's storage once at
+    /// finalize rather than link by link, so the same rule reads as a question
+    /// about the finished set.
+    fn uses_symbol_table(&self, scope: LinkScope, links: CreationOrder) -> bool {
+        self.legacy.is_some() && !links.is_tracked() && self.links_fit_symbol_table(scope, links)
+    }
+
+    /// Whether every link `scope` holds is one a symbol table entry can
+    /// express — `H5G_obj_insert`'s `obj_lnk->type > H5L_TYPE_BUILTIN_MAX`
+    /// test (H5Gobj.c:512), asked of the whole set.
+    ///
+    /// A link a reopen carried through verbatim counts too, and one this
+    /// writer cannot even decode counts as not fitting: the entry would have
+    /// to be built from the decoded form, while a link message is re-emitted
+    /// byte for byte.
+    fn links_fit_symbol_table(&self, scope: LinkScope, order: CreationOrder) -> bool {
+        self.group_links(scope, order)
+            .iter()
+            .all(|l| l.target.fits_symbol_table())
+            && self.preserved_links_for(scope).iter().all(|encoded| {
+                LinkMessage::decode(encoded, &self.ctx)
+                    .is_ok_and(|(link, _)| link.target.fits_symbol_table())
+            })
     }
 
     /// The header format of the registered dataset at `index`.
@@ -4030,58 +4035,11 @@ impl Hdf5Writer {
         Shared::clone(&self.groups.lock()[index])
     }
 
-    /// Refuse a storage form this file's format cannot hold.
-    ///
-    /// Per form, not per file. Contiguous and compact storage both encode as
-    /// a version-3 data layout message, which is what
-    /// `H5O_layout_ver_bounds` gives `H5F_LIBVER_EARLIEST` (H5Dlayout.c:44),
-    /// so a classic file takes both; a committed datatype has no layout at
-    /// all; and chunked storage does too, filtered or not, over the version-1
-    /// B-tree index [`create_btree_v1_dataset`](Self::create_btree_v1_dataset)
-    /// builds.
-    ///
-    /// Virtual storage is the one form still out of reach, and it is refused
-    /// by name rather than as a bare "not supported" so the caller is told
-    /// which of the two files in front of them cannot hold it.
-    fn reject_unwritable_storage(&self, storage: NewStorage, name: &str) -> IoResult<()> {
-        if !self.is_legacy() {
-            return Ok(());
-        }
-        let (kind, why) = match storage {
-            // Nothing older than a version-4 layout message can say "virtual"
-            // at all, and writing one here would convert the file the same way.
-            NewStorage::Virtual => (
-                "virtual",
-                "which predates the version-4 data layout message a virtual dataset is \
-                 written as",
-            ),
-            // A filtered chunked dataset belongs here: its pipeline message
-            // encodes at version 1 (`ObjectFormat::filter_pipeline_version`)
-            // and its chunks are indexed by the version-1 B-tree
-            // `create_btree_v1_dataset` builds, both of which are what
-            // libhdf5 writes at `H5F_LIBVER_EARLIEST`.
-            NewStorage::ChunkedFiltered
-            | NewStorage::Chunked
-            | NewStorage::Contiguous
-            | NewStorage::Compact
-            | NewStorage::None => return Ok(()),
-        };
-        Err(crate::io::IoError::Unsupported(format!(
-            "cannot create the {kind} dataset '{name}' in this file: it is in the classic \
-             (version-0/1 superblock) format, {why}, or re-create the file at a newer \
-             library-version bound"
-        )))
-    }
-
     /// Enter the create gate: take `create_lock` and check that `name` is not
     /// already taken. The returned witness is what [`Self::push_dataset`]
     /// requires, so the uniqueness check and the registry push are atomic
     /// (see `create_lock`) at every creator by construction.
-    pub(crate) fn begin_create(
-        &self,
-        name: &str,
-        storage: NewStorage,
-    ) -> IoResult<CreateGuard<'_>> {
+    pub(crate) fn begin_create(&self, name: &str) -> IoResult<CreateGuard<'_>> {
         let gate = self.create_lock.lock();
         // A creation path through hard links lands in the link's target
         // group, as HDF5 traversal does. Canonicalizing here — the one
@@ -4098,7 +4056,6 @@ impl Hdf5Writer {
         self.reject_external_traversal(&name)?;
         self.ensure_name_free(&name)?;
         self.reject_preserved_object(&name)?;
-        self.reject_unwritable_storage(storage, &name)?;
         let (parent, _leaf) = self.split_parent(&name)?;
         Ok(CreateGuard {
             _gate: gate,
@@ -6028,7 +5985,7 @@ impl Hdf5Writer {
     /// name is resolved to a real parent group, refused if taken, and refused
     /// if it would cross a carried external link.
     pub fn commit_datatype(&self, name: &str, datatype: DatatypeMessage) -> IoResult<usize> {
-        let create = self.begin_create(name.trim_start_matches('/'), NewStorage::None)?;
+        let create = self.begin_create(name.trim_start_matches('/'))?;
         let entry = CommittedDatatype {
             name: create.name.clone(),
             parent: create.parent,
@@ -7076,7 +7033,7 @@ impl Hdf5Writer {
         // Group Info are version-1.8 messages and have no business in a
         // version-1 header — `H5G__stab_valid` reads the Symbol Table message
         // and nothing else.
-        if self.uses_symbol_table(order) {
+        if self.uses_symbol_table(scope, order) {
             let legacy = self
                 .legacy
                 .as_deref()
@@ -7166,7 +7123,7 @@ impl Hdf5Writer {
             // A symbol-table group is `prepare_symbol_tables`' business; it
             // has no Link Info message to hold a fractal heap address, and it
             // never had dense storage to release.
-            if deleted || self.uses_symbol_table(order) {
+            if deleted || self.uses_symbol_table(LinkScope::Group(gi), order) {
                 continue;
             }
             self.release_superseded_dense_links(LinkScope::Group(gi))?;
@@ -7176,7 +7133,7 @@ impl Hdf5Writer {
             }
         }
         let root_order = self.root_track_order.links;
-        if !self.uses_symbol_table(root_order) {
+        if !self.uses_symbol_table(LinkScope::Root, root_order) {
             self.release_superseded_dense_links(LinkScope::Root)?;
             let root_links = self.group_links(LinkScope::Root, root_order);
             if self.links_need_dense(&root_links) {
@@ -7249,7 +7206,7 @@ impl Hdf5Writer {
                 let g = grp.lock();
                 (g.deleted, g.track_order.links, g.parent)
             };
-            if deleted || !self.uses_symbol_table(order) {
+            if deleted || !self.uses_symbol_table(LinkScope::Group(gi), order) {
                 continue;
             }
             let mut depth = 1usize;
@@ -7261,7 +7218,7 @@ impl Hdf5Writer {
         }
         scopes.sort_by_key(|&(depth, ..)| std::cmp::Reverse(depth));
         let root_order = self.root_track_order.links;
-        if self.uses_symbol_table(root_order) {
+        if self.uses_symbol_table(LinkScope::Root, root_order) {
             scopes.push((0, LinkScope::Root, root_order));
         }
 
@@ -7342,15 +7299,17 @@ impl Hdf5Writer {
             LinkTarget::Soft { target } => StabTarget::Soft {
                 value: target.clone(),
             },
-            // A symbol table entry has three cache types and no room for a
-            // fourth: `H5L_TYPE_EXTERNAL` and the user-defined classes exist
-            // only as link messages, which is why libhdf5 converts a group to
-            // the new format before inserting one (`H5G_obj_insert`). This
-            // writer does not convert, so it refuses.
+            // Unreachable by construction: a group holding one of these is
+            // not a symbol-table group at all
+            // ([`LinkTarget::fits_symbol_table`] is what
+            // [`Hdf5Writer::uses_symbol_table`] asks), so this pass never
+            // visits it. Reported rather than panicked so a future caller
+            // that skips that gate learns which link it lost.
             LinkTarget::External { .. } | LinkTarget::UserDefined { .. } => {
                 return Err(crate::io::IoError::InvalidState(format!(
-                    "cannot store the link {:?} in this file: its groups use \
-                     symbol tables, which hold only hard and soft links",
+                    "cannot store the link {:?} in a symbol table: it holds only \
+                     hard and soft links, and this group was not converted to link \
+                     messages the way `H5G_obj_insert` converts it",
                     link.name
                 )))
             }
@@ -7757,7 +7716,7 @@ impl Hdf5Writer {
         datatype: DatatypeMessage,
         dims: &[u64],
     ) -> IoResult<usize> {
-        let create = self.begin_create(name, NewStorage::Contiguous)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         let total_elements: u64 = if dims.is_empty() {
             1
@@ -7850,7 +7809,7 @@ impl Hdf5Writer {
                  the files it lives in, so at least one is required"
             )));
         }
-        let create = self.begin_create(name, NewStorage::Contiguous)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         let total_elements: u64 = if dims.is_empty() {
             1
@@ -8013,7 +7972,7 @@ impl Hdf5Writer {
             reject_unlimited_selection(name, "virtual", &m.virtual_selection)?;
         }
 
-        let create = self.begin_create(name, NewStorage::Virtual)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
 
         // The mapping list is ordinary file metadata, written now: the header
@@ -8107,7 +8066,7 @@ impl Hdf5Writer {
             )));
         }
 
-        let create = self.begin_create(name, NewStorage::Compact)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         let dataspace = if dims.is_empty() {
             DataspaceMessage::scalar()
@@ -8162,7 +8121,7 @@ impl Hdf5Writer {
     /// `data_size` stays 0 permanently, the same terminal state
     /// `create_dataset` already reaches for a zero-length dimension.
     pub fn create_null_dataset(&self, name: &str, datatype: DatatypeMessage) -> IoResult<usize> {
-        let create = self.begin_create(name, NewStorage::Contiguous)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
 
         let idx = self.push_dataset(
@@ -8217,7 +8176,7 @@ impl Hdf5Writer {
         max_dims: &[u64],
         chunk_dims: &[u64],
     ) -> IoResult<usize> {
-        let create = self.begin_create(name, NewStorage::Chunked)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         ensure_at_most_one_unlimited(max_dims)?;
@@ -9462,7 +9421,7 @@ impl Hdf5Writer {
 
         ensure_vlen_charset(charset, strings)?;
 
-        let create = self.begin_create(name, NewStorage::Contiguous)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         let num_strings = strings.len() as u64;
 
@@ -9581,7 +9540,7 @@ impl Hdf5Writer {
             }
         }
 
-        let create = self.begin_create(name, NewStorage::Contiguous)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         let num_items = items.len() as u64;
 
@@ -9666,7 +9625,7 @@ impl Hdf5Writer {
         use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
 
-        let create = self.begin_create(name, NewStorage::ChunkedFiltered)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         let num_strings = strings.len() as u64;
         validate_chunk_geometry(&[num_strings], &[num_strings], &[chunk_size as u64])?;
@@ -11210,14 +11169,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: Option<FilterPipeline>,
     ) -> IoResult<usize> {
-        let create = self.begin_create(
-            name,
-            if pipeline.is_some() {
-                NewStorage::ChunkedFiltered
-            } else {
-                NewStorage::Chunked
-            },
-        )?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         if max_dims.contains(&u64::MAX) {
@@ -11350,7 +11302,7 @@ impl Hdf5Writer {
         dims: &[u64],
         chunk_dims: &[u64],
     ) -> IoResult<usize> {
-        let create = self.begin_create(name, NewStorage::Chunked)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, dims, chunk_dims)?;
         let mut num_chunks: u64 = 1;
@@ -11449,7 +11401,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         early_alloc: bool,
     ) -> IoResult<usize> {
-        let create = self.begin_create(name, NewStorage::Chunked)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, dims, chunk_dims)?;
         let data_size = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
@@ -11544,7 +11496,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: FilterPipeline,
     ) -> IoResult<usize> {
-        let create = self.begin_create(name, NewStorage::ChunkedFiltered)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, dims, chunk_dims)?;
         let data_size = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
@@ -11625,14 +11577,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: Option<FilterPipeline>,
     ) -> IoResult<usize> {
-        let create = self.begin_create(
-            name,
-            if pipeline.is_some() {
-                NewStorage::ChunkedFiltered
-            } else {
-                NewStorage::Chunked
-            },
-        )?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
@@ -11755,14 +11700,7 @@ impl Hdf5Writer {
     ) -> IoResult<usize> {
         use crate::format::chunk_index::btree_v2::Bt2Header;
 
-        let create = self.begin_create(
-            name,
-            if pipeline.is_some() {
-                NewStorage::ChunkedFiltered
-            } else {
-                NewStorage::Chunked
-            },
-        )?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         let ndims = dims.len();
@@ -11870,7 +11808,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: FilterPipeline,
     ) -> IoResult<usize> {
-        let create = self.begin_create(name, NewStorage::ChunkedFiltered)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         ensure_at_most_one_unlimited(max_dims)?;
@@ -13509,9 +13447,12 @@ impl Hdf5Writer {
     /// `super_vers = MAX(super_vers, HDF5_superblock_ver_bounds[low_bound])`,
     /// with the bounds table reading 0, 2, 3, 3, 3, 3, 3 for EARLIEST, V18,
     /// V110, V112, V114, V200, LATEST (H5Fsuper.c:68, :1128-1154). A file
-    /// created at `H5F_LIBVER_EARLIEST` takes the version-0 entry directly
-    /// (`superblock_version_base`, and the classic branch below); for every
-    /// other file the bound is read back from what this crate writes:
+    /// created at `H5F_LIBVER_EARLIEST` takes that bound's entry directly
+    /// (`superblock_version_base`, and the classic branch below) — version 0,
+    /// or version 2 when the file carries shared messages, whose master table
+    /// needs the superblock extension only a version-2 superblock has
+    /// (H5Fsuper.c:1135). For every other file the bound is read back from
+    /// what this crate writes:
     ///
     /// * The floor is `H5F_LIBVER_V18`, hence version 2. Every group such a
     ///   file holds is a link-message group, which libhdf5 only writes at a
@@ -13536,12 +13477,13 @@ impl Hdf5Writer {
     fn superblock_version_for(&self, flags: u8) -> u8 {
         if self.is_legacy() {
             // A classic file keeps the version it started at — 0 for one this
-            // writer created at the earliest bound, whatever it held for one
-            // it reopened. Nothing a session can add reaches past that: its
-            // objects get version-1 headers and symbol-table links, its
-            // chunked datasets the version-1 B-tree behind a version-3 layout
-            // message, and the two features that would raise the bound — SWMR
-            // and the 2.0 format — are refused where the caller asks for them.
+            // writer created at the earliest bound, 2 for one whose shared
+            // messages needed the extension, whatever it held for one it
+            // reopened. Nothing a session can add reaches past that: its
+            // objects get symbol-table links, its chunked datasets the
+            // version-1 B-tree behind a version-3 layout message, and the two
+            // features that would raise the bound — SWMR and the 2.0 format —
+            // are refused where the caller asks for them.
             return self.superblock_version_base;
         }
         let mut version = self
@@ -13613,14 +13555,21 @@ impl Hdf5Writer {
         // the file truncated when `eof + base_addr < stored_eof` (:573). The
         // allocator counts in the based space, so the userblock is added back.
         let eof = self.allocator.eof() + base;
-        if let Some(legacy) = self.legacy.as_deref() {
+        let version = self.superblock_version_for(flags);
+        // Which of the two images is written follows the version, not the
+        // generation: a classic file carrying shared messages is a version-2
+        // superblock over version-1 messages and symbol-table groups
+        // (H5Fsuper.c:1135), and only the version-2/3 image has the extension
+        // address that table is reached through. Below version 2 the file is
+        // always a classic one — the other branch floors at 2.
+        if let Some(legacy) = self.legacy.as_deref().filter(|_| version < SUPERBLOCK_V2) {
             // Re-emitted, not rebuilt: the "K" ranks, the userblock size and
             // the driver info address are recorded nowhere else in the file,
             // and every node width in it is derived from the ranks. Only the
             // three things this session can have changed are recomputed.
             let root_stab = legacy.written.lock().get(&LinkScope::Root).copied();
             let mut sb = legacy.superblock.clone();
-            sb.version = self.superblock_version_for(flags);
+            sb.version = version;
             sb.file_consistency_flags = flags as u32;
             sb.end_of_file_address = eof;
             sb.root_symbol_table_entry.obj_header_addr = root_addr;
@@ -13642,7 +13591,7 @@ impl Hdf5Writer {
             return Ok(());
         }
         let sb = SuperblockV2V3 {
-            version: self.superblock_version_for(flags),
+            version,
             sizeof_offsets: self.ctx.sizeof_addr,
             sizeof_lengths: self.ctx.sizeof_size,
             file_consistency_flags: flags,
