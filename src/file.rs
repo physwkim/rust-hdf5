@@ -189,6 +189,12 @@ impl H5File {
     /// forces version 5 because version 4 cannot represent its size field,
     /// matching libhdf5.
     ///
+    /// `false` is not "back to the default": it is
+    /// [`LibverBound::Earliest`], the opposite end of the same table, where
+    /// the data layout message is version 3 and chunked datasets created
+    /// after the call go on the version-1 B-tree. A file that has never been
+    /// told a bound is the one at the crate default.
+    ///
     /// Errors in read mode.
     pub fn set_libver_latest(&self, latest: bool) -> Result<()> {
         self.set_libver_bound(if latest {
@@ -209,8 +215,16 @@ impl H5File {
     /// [`LibverBound::V200`] additionally selects the version-5 data layout
     /// for filtered chunked datasets, as [`Self::set_libver_latest`] does.
     ///
-    /// [`LibverBound::Earliest`] by default, matching libhdf5's own default
-    /// file access property list.
+    /// The bound also picks the chunk index, through the data layout message
+    /// version `H5O_layout_ver_bounds` gives it: below [`LibverBound::V110`]
+    /// that version is 3, which has no index-type field, so a chunked dataset
+    /// created after this call is indexed by the version-1 B-tree rather than
+    /// by the v1.10 index its shape would otherwise select. Datasets already
+    /// created keep the index they were made with, exactly as libhdf5 keeps
+    /// what a dataset's creation property list settled.
+    ///
+    /// Naming a bound is not the same as leaving it unset: a file created
+    /// through [`H5File::create`] names none and uses the v1.10 indexes.
     ///
     /// Errors in read mode.
     pub fn set_libver_bound(&self, libver: LibverBound) -> Result<()> {
@@ -1117,9 +1131,18 @@ impl H5FileOptions {
     /// newer — SWMR ([`crate::swmr`]) and virtual datasets are refused in
     /// it, and a chunk larger than 4 GiB does not fit its index key.
     ///
-    /// Not calling this at all is *not* the same as asking for `Earliest`:
-    /// the default is the v1.8-shaped file this crate has always written,
-    /// with a version-2 superblock and link-message groups.
+    /// [`LibverBound::V18`] asks for the file libhdf5 writes at
+    /// `H5F_LIBVER_V18`: a version-2 superblock over link-message groups and
+    /// version-2 object headers, but still the version-3 data layout message
+    /// and so still the version-1 B-tree chunk index — `H5O_layout_ver_bounds`
+    /// does not reach version 4 until `V110`, and the v1.10 indexes live in
+    /// nothing older. SWMR is refused in such a file: its status flags need a
+    /// version-3 superblock, which this bound's row does not reach.
+    ///
+    /// Not calling this at all is *not* the same as asking for `Earliest`,
+    /// nor for `V18`: the default file has the version-2 superblock and
+    /// link-message groups of the v1.8 bound over the v1.10 chunk indexes,
+    /// which no single bound describes.
     ///
     /// Only [`create`](Self::create) reads this; an existing file keeps the
     /// superblock it already has.

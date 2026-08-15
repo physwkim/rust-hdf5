@@ -896,34 +896,35 @@ impl<T: H5Type> DatasetBuilder<T> {
                 dims_u64.clone()
             };
 
-            // A classic (version-0/1 superblock) file settles the question
-            // before the shape gets a say: every other index encodes as a
-            // version-4 data layout message, which such a file cannot carry,
-            // and the version-3 message it can carries a version-1 B-tree and
-            // nothing else. libhdf5 reaches the same place from the library
-            // bounds (`H5O_layout_ver_bounds`, H5Dlayout.c), which is what
-            // decides the layout version before `H5D__layout_set_latest_indexing`
-            // is consulted at all.
-            let classic_format = match &*borrow_inner(&self.file_inner) {
-                H5FileInner::Writer(writer) => writer.is_legacy(),
+            // The file's format settles the question before the shape gets a
+            // say. `H5D__chunk_set_info` reaches the index-selection block
+            // only once the data layout message is at version 4 (H5Dchunk.c:936)
+            // — which the file's library-version bound decides, not the
+            // dataspace — and below it the version-3 message carries a
+            // version-1 B-tree and nothing else. The writer owns that reading
+            // of `H5O_layout_ver_bounds`; the chunk's byte count is the one
+            // input from here, a chunk over 4 GiB being the one thing that
+            // forces the newer message whatever the bound says.
+            let chunk_bytes = chunk_u64.iter().product::<u64>() * element_size as u64;
+            let v110_indexing = match &*borrow_inner(&self.file_inner) {
+                H5FileInner::Writer(writer) => writer.uses_v110_chunk_indexing(chunk_bytes),
                 // Neither can create a dataset at all; the creator below
                 // reports which of the two it is.
-                _ => false,
+                _ => true,
             };
 
-            // Otherwise libhdf5 selects the chunk index from the dataspace
-            // and the creation properties, in this order
-            // (`H5D__layout_set_latest_indexing`, H5Dlayout.c): a v2 B-tree
-            // for two or more unlimited dimensions, an extensible array for
-            // exactly one; for a fixed shape, the single-chunk index takes
-            // priority — unconditional of filter or allocation time —
-            // whenever the shape is exactly one whole chunk, ahead of the
-            // implicit index (no filter, and early allocation, which is what
-            // puts every chunk at a computable address) and the fixed array
-            // (everything else).
+            // Inside the block libhdf5 selects the chunk index from the
+            // dataspace and the creation properties, in this order
+            // (`H5D__chunk_set_info`, H5Dchunk.c:955): a v2 B-tree for two or
+            // more unlimited dimensions, an extensible array for exactly one;
+            // for a fixed shape, the single-chunk index takes priority —
+            // unconditional of filter or allocation time — whenever the shape
+            // is exactly one whole chunk, ahead of the implicit index (no
+            // filter, and early allocation, which is what puts every chunk at
+            // a computable address) and the fixed array (everything else).
             let n_unlimited = max_u64.iter().filter(|&&m| m == u64::MAX).count();
             let one_chunk = chunk_u64 == dims_u64 && max_u64 == dims_u64;
-            let kind = if classic_format {
+            let kind = if !v110_indexing {
                 ChunkIndexKind::BtreeV1
             } else if n_unlimited >= 2 {
                 ChunkIndexKind::BtreeV2

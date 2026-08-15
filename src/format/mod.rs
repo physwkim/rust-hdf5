@@ -81,6 +81,25 @@ impl LibverBound {
         }
     }
 
+    /// The data layout message version this bound calls for — libhdf5's
+    /// `H5O_layout_ver_bounds` (H5Dlayout.c:44).
+    ///
+    /// It is what decides the chunk index, before the dataspace gets a say:
+    /// `H5D__chunk_set_info` reaches the v1.10 indexes — extensible array,
+    /// fixed array, v2 B-tree, single chunk, implicit — only once this
+    /// version is 4 or more (H5Dchunk.c:936). Below that the layout message
+    /// has no index-type field at all and the chunks are indexed by the
+    /// version-1 B-tree, which is why `V18` and `Earliest` share one index
+    /// despite differing in every other message version.
+    pub fn layout_version(self) -> u8 {
+        match self {
+            Self::Earliest => 1,
+            Self::V18 => 3,
+            Self::V110 | Self::V112 | Self::V114 => 4,
+            Self::V200 => 5,
+        }
+    }
+
     /// The superblock version this bound calls for — libhdf5's
     /// `HDF5_superblock_ver_bounds` (H5Fsuper.c:68), the floor
     /// `H5F__super_init` raises the content-derived version to.

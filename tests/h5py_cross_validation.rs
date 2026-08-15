@@ -1011,12 +1011,18 @@ fn fa_paged_written_by_h5py_completed_by_rust() {
 }
 
 /// Issue #8: `set_libver_latest(true)` writes a version-5 data layout message
-/// for filtered chunked datasets. Two identical files differing only in the
-/// knob prove both directions: the default file stays h5py-readable (v4), and
-/// hdf5 < 2.0 rejects the opt-in file — the rejection is the on-disk proof
-/// that a genuine v5 message was written, not a v4 one with wider index
-/// fields. Under hdf5 >= 2.0 the v5 file must instead read back exactly.
-/// Either way, rust-hdf5's own reader must read the v5 file.
+/// for filtered chunked datasets. Two otherwise identical files prove both
+/// directions: the default file stays h5py-readable (v4), and hdf5 < 2.0
+/// rejects the opt-in file — the rejection is the on-disk proof that a genuine
+/// v5 message was written, not a v4 one with wider index fields. Under
+/// hdf5 >= 2.0 the v5 file must instead read back exactly. Either way,
+/// rust-hdf5's own reader must read the v5 file.
+///
+/// The control arm names no bound at all rather than calling the knob with
+/// `false`: that call is `H5Pset_libver_bounds(low = H5F_LIBVER_EARLIEST)`,
+/// whose `H5O_layout_ver_bounds` row is below the version-4 message entirely,
+/// so it would answer a different question than "what does the default file
+/// write".
 #[cfg(feature = "deflate")]
 #[test]
 fn libver_latest_v5_layout_write_and_hdf5_1x_rejection() {
@@ -1026,7 +1032,9 @@ fn libver_latest_v5_layout_write_and_hdf5_1x_rejection() {
     let path_v5 = tmp("layout_optin_v5");
     for (path, latest) in [(&path_v4, false), (&path_v5, true)] {
         let file = H5File::create(path).unwrap();
-        file.set_libver_latest(latest).unwrap();
+        if latest {
+            file.set_libver_latest(true).unwrap();
+        }
         let ds = file
             .new_dataset::<i32>()
             .shape([7, 5])
