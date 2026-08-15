@@ -1571,4 +1571,75 @@ mod tests {
             .expect_err("19 bytes cannot hold a 20-byte continuation message");
         assert!(err.to_string().contains("continuation chunk"), "{err}");
     }
+
+    /// The times a version-2 header stores sit in its prefix, ahead of the
+    /// message area a plan divides — so a header carrying them reserves
+    /// sixteen more bytes for chunk 0 and spills at exactly the same message.
+    ///
+    /// `chunk0_capacity` in the writer budgets the *message* area, and the
+    /// prefix is added on top of it here; a plan that folded the times into
+    /// that budget would size chunk 0 sixteen bytes short of the image
+    /// `encode_chunked` then produces, which `check_header_size` refuses.
+    #[test]
+    fn the_times_prefix_widens_chunk_zero_without_moving_the_split() {
+        let ctx = FormatContext::default_v3();
+        let plain = chunked_header();
+        let mut timed = chunked_header();
+        timed.times = Some(ObjectTimes::created_at(0x5EED_1234));
+
+        for capacity in [72usize, 120, 1024] {
+            let a = plain.plan_chunks(capacity, &ctx).unwrap();
+            let b = timed.plan_chunks(capacity, &ctx).unwrap();
+            assert_eq!(a.split, b.split, "capacity {capacity}: same split");
+            assert_eq!(
+                a.continuation_size, b.continuation_size,
+                "capacity {capacity}: same continuation"
+            );
+            assert_eq!(
+                b.chunk0_size,
+                a.chunk0_size + 16,
+                "capacity {capacity}: four times of four bytes"
+            );
+        }
+
+        // And the plan describes the image: chunk 0 is the length the plan
+        // said, times included.
+        let plan = timed.plan_chunks(72, &ctx).unwrap();
+        let (chunk0, continuation) = timed.encode_chunked(&plan, &ctx, 0x2000).unwrap();
+        assert_eq!(chunk0.len(), plan.chunk0_size);
+        assert_eq!(continuation.unwrap().len(), plan.continuation_size);
+        let (decoded, _) = ObjectHeader::decode(&chunk0).unwrap();
+        assert_eq!(decoded.times, timed.times);
+    }
+
+    /// A version-1 header has its own continuation rules (`H5O__chunk_deserialize`
+    /// reads a v1 chunk with no `OCHK` signature and no checksum), so the
+    /// version-2 planner must never be applied to one. `encode_for` is where
+    /// that holds — and it is the whole of `Hdf5Writer::encode_header_at`'s
+    /// legacy arm: the plan is never built, every message goes in chunk 0, and
+    /// the two version-2 prefix fields are refused outright rather than
+    /// planned around (`tests_v1::a_v1_header_refuses_to_drop_its_stored_times`,
+    /// `tests_v1::a_v1_header_refuses_to_drop_attribute_creation_order`).
+    #[test]
+    fn a_version_one_header_is_never_planned_into_chunks() {
+        let hdr = chunked_header();
+        // Far past any plausible chunk-0 estimate, and still one chunk.
+        let v1 = hdr
+            .encode_for(crate::format::ObjectFormat::Legacy, 1)
+            .unwrap();
+        assert_eq!(v1[0], 1, "version-1 prefix");
+        assert!(
+            !v1.windows(4).any(|w| w == OCHK_SIGNATURE),
+            "a version-1 header holds no OCHK chunk"
+        );
+        let (decoded, _) = ObjectHeader::decode_v1(&v1).unwrap();
+        assert_eq!(decoded.messages.len(), hdr.messages.len());
+        assert!(
+            !decoded
+                .messages
+                .iter()
+                .any(|m| m.msg_type == MSG_CONTINUATION),
+            "no continuation message"
+        );
+    }
 }
