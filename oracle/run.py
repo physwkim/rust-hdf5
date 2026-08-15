@@ -722,42 +722,52 @@ def write_report(results, gaps, meta, md_path, json_path):
 
     L.append("## Direction B expected deviations")
     L.append("")
-    L.append(
-        "The rust-written file carries the same data, type and shape as the "
-        "h5py reference but describes itself differently. Each row below is a "
-        "known, understood writer deviation declared in `EXPECTED_DEVIATIONS` "
-        "(oracle/run.py); it does not fail a case. `observed: no` means a "
-        "declared deviation no longer happens — either the writer was fixed "
-        "and the entry should go, or the cases that exercised it changed."
-    )
-    L.append("")
-    L.append("| id | field | libhdf5 | rust-hdf5 | observed | cases |")
-    L.append("|---|---|---|---|---|---|")
-    for e in expected:
+    if not expected:
         L.append(
-            "| `%s` | `%s` | `%s` | `%s` | %s | %d%s |"
-            % (
-                e["id"],
-                e["field"],
-                clip(e["ref"], 34),
-                clip(e["rust"], 34),
-                "yes" if e["cases"] else "no",
-                len(e["cases"]),
-                (" (%s)" % clip(", ".join(e["cases"][:3])
-                                + ("…" if len(e["cases"]) > 3 else ""), 44))
-                if e["cases"] else "",
-            )
+            "None: `EXPECTED_DEVIATIONS` (oracle/run.py) is empty, so every "
+            "case in this run describes itself the way libhdf5 describes the "
+            "same file. Any metadata deviation from here on matches no entry "
+            "and is reported as unexpected below."
         )
-    L.append("")
-    for e in expected:
+    else:
         L.append(
-            "- `%s`: %s%s"
-            % (
-                e["id"],
-                e["why"],
-                ("; observed as `%s`" % clip(e["example"], 70)) if e["example"] else "",
-            )
+            "The rust-written file carries the same data, type and shape as "
+            "the h5py reference but describes itself differently. Each row "
+            "below is a known, understood writer deviation declared in "
+            "`EXPECTED_DEVIATIONS` (oracle/run.py); it does not fail a case. "
+            "`observed: no` means a declared deviation no longer happens — "
+            "either the writer was fixed and the entry should go, or the "
+            "cases that exercised it changed."
         )
+        L.append("")
+        L.append("| id | field | libhdf5 | rust-hdf5 | observed | cases |")
+        L.append("|---|---|---|---|---|---|")
+        for e in expected:
+            L.append(
+                "| `%s` | `%s` | `%s` | `%s` | %s | %d%s |"
+                % (
+                    e["id"],
+                    e["field"],
+                    clip(e["ref"], 34),
+                    clip(e["rust"], 34),
+                    "yes" if e["cases"] else "no",
+                    len(e["cases"]),
+                    (" (%s)" % clip(", ".join(e["cases"][:3])
+                                    + ("…" if len(e["cases"]) > 3 else ""), 44))
+                    if e["cases"] else "",
+                )
+            )
+        L.append("")
+        for e in expected:
+            L.append(
+                "- `%s`: %s%s"
+                % (
+                    e["id"],
+                    e["why"],
+                    ("; observed as `%s`" % clip(e["example"], 70))
+                    if e["example"] else "",
+                )
+            )
     L.append("")
 
     L.append("## Direction B unexpected deviations")
