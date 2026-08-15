@@ -98,23 +98,28 @@ EXPECTED_DEVIATIONS = [
         "field": "superblock",
         "ref": "0",
         "rust": "2",
-        "why": "libhdf5 writes a v0 superblock at the earliest libver bound, "
-               "over symbol-table groups and version-1 object headers; this "
-               "writer emits neither, and no libhdf5 writes a v0 superblock "
-               "over the link-message groups it does emit, so its floor is "
-               "the v1.8 bound's version 2 (HDF5_superblock_ver_bounds)",
+        "why": "three cases whose rust arm still creates at this crate's "
+               "default bounds, because H5F_LIBVER_EARLIEST cannot express "
+               "what they write. `vds` needs a virtual dataset, refused in a "
+               "classic file; `link_external` and `link_external_read` need "
+               "an external link, which a symbol table cannot hold — libhdf5 "
+               "answers that by converting the group to link messages under "
+               "the same v0 superblock (H5G__obj_insert), and this writer "
+               "has no such conversion. Every other earliest-bound case now "
+               "writes the v0 superblock itself",
     },
     {
         "id": "superblock-v3-for-chunk-index",
         "field": "superblock",
         "ref": None,
         "rust": "3",
-        "why": "a chunked dataset in a file this writer created is indexed by "
-               "a v1.10 structure through a version-4 data layout message, "
-               "which H5O_layout_ver_bounds puts at the v1.10 bound and so at "
-               "superblock version 3, whatever bound the file asked for; the "
-               "version-1 B-tree is selected only when reopening a file that "
-               "already is in the classic format, where the bound cannot move",
+        "why": "layout_chunked_v108 asks for the v1.8 bound, where "
+               "H5O_layout_ver_bounds still puts the data layout message at "
+               "version 3 and so the chunk index at the version-1 B-tree. "
+               "This writer picks that index for a classic file only, so a "
+               "v1.8 file gets a v1.10 index behind a version-4 layout "
+               "message and the superblock version 3 that implies, above the "
+               "version 2 the bound asked for",
     },
     {
         "id": "btree1-index-substituted",
@@ -123,21 +128,27 @@ EXPECTED_DEVIATIONS = [
         "rust": None,
         "why": "a v1 B-tree chunk index is only legal below superblock v3, so "
                "this follows from superblock-v3-for-chunk-index: the file gets "
-               "whichever v1.10 index its shape selects — the extensible array "
-               "for one unlimited dimension, the single-chunk index for a "
-               "fixed shape covered by one chunk. Every case here writes a new "
-               "file; a chunked dataset appended to a classic one does get the "
-               "version-1 B-tree (tests/legacy_append.rs)",
+               "whichever v1.10 index its shape selects — here the "
+               "single-chunk index, the shape being one chunk wide. A file "
+               "created at "
+               "H5F_LIBVER_EARLIEST does get the version-1 B-tree "
+               "(tests/libver_earliest.rs), as does a chunked dataset "
+               "appended to a classic file (tests/legacy_append.rs); the v1.8 "
+               "bound is what is left",
     },
     {
         "id": "new-style-groups-always",
         "field": "linkstore",
         "ref": "symtab",
         "rust": "compact",
-        "why": "the writer emits a version-2 object header for every group, so "
-               "links libhdf5 would keep in a symbol table are stored as link "
-               "messages; the same cause as superblock-floor-v2, and the phase "
-               "change past max_compact still moves them to dense storage",
+        "why": "a version-2 object header keeps its links in messages rather "
+               "than in a symbol table. `sohm_list` and `sohm_btree` carry "
+               "shared messages, whose master table lives in a superblock "
+               "extension and so forces the version-2 superblock and with it "
+               "version-2 headers (H5Fsuper.c:1135), whatever bound is asked "
+               "for; `vds` is the superblock-floor-v2 case above. The phase "
+               "change past max_compact still moves the links to dense "
+               "storage",
     },
     {
         "id": "filter-flags-zero",
