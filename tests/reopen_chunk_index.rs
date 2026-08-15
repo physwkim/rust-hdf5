@@ -54,6 +54,16 @@ fn make_bt2(file: &H5File, vals: &[i32]) {
     ds.write_slice(&[0, 0], &[4, 4], vals).unwrap();
 }
 
+fn make_single_chunk(file: &H5File, vals: &[i32]) {
+    let ds = file
+        .new_dataset::<i32>()
+        .shape([16usize])
+        .chunk(&[16])
+        .create("one")
+        .unwrap();
+    ds.write_raw(vals).unwrap();
+}
+
 /// Deleting a reopened FA dataset must free the chunks it read back off
 /// the disk, plus the FA header and data block — the settled-size oracle
 /// of `delete_reclamation.rs`, across sessions.
@@ -117,6 +127,71 @@ fn reopen_session_delete_frees_btree_v2_storage() {
     };
 
     assert_eq!(size_after(10), size_after(2), "10 reopen cycles against 2");
+}
+
+/// Deleting a reopened single-chunk dataset must free its one chunk — read
+/// back off disk through `rebuild_dataset`'s single-chunk arm, which has no
+/// index structure of its own for a re-link placeholder to hide behind, so
+/// a rebuild that dropped the chunk's address would show up here as a
+/// growing file instead of a settled one.
+#[test]
+fn reopen_session_delete_frees_single_chunk_storage() {
+    let size_after = |cycles: usize| {
+        let path = unique_tmp(&format!("single_chunk_del_{cycles}"));
+        let vals: Vec<i32> = (0..16).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            make_single_chunk(&file, &vals);
+            file.close().unwrap();
+        }
+        for _ in 0..cycles {
+            let file = H5File::options().no_locking().open_rw(&path).unwrap();
+            file.delete_dataset("one").unwrap();
+            make_single_chunk(&file, &vals);
+            file.close().unwrap();
+        }
+        let read = H5File::open(&path).unwrap();
+        assert_eq!(
+            read.dataset("one").unwrap().read_raw::<i32>().unwrap(),
+            vals
+        );
+        drop(read);
+        let n = std::fs::metadata(&path).unwrap().len();
+        cleanup(&path);
+        n
+    };
+
+    assert_eq!(size_after(10), size_after(2), "10 reopen cycles against 2");
+}
+
+/// A reopened single-chunk dataset takes a rewrite of its one chunk, and the
+/// new bytes land at the address `rebuild_dataset` read back — exercising
+/// `record_single_chunk`'s in-place reuse of a chunk this session did not
+/// allocate.
+#[test]
+fn reopened_single_chunk_dataset_takes_a_rewrite() {
+    let path = unique_tmp("single_chunk_write");
+    let first: Vec<i32> = (0..16).collect();
+    {
+        let file = H5File::create(&path).unwrap();
+        make_single_chunk(&file, &first);
+        file.close().unwrap();
+    }
+    let second: Vec<i32> = (100..116).collect();
+    {
+        let file = H5File::options().no_locking().open_rw(&path).unwrap();
+        let ds = file.dataset_writer("one").unwrap();
+        ds.write_raw(&second).unwrap();
+        file.close().unwrap();
+    }
+
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("one").unwrap().read_raw::<i32>().unwrap(),
+        second
+    );
+    drop(file);
+    cleanup(&path);
 }
 
 /// A reopened FA dataset takes writes into chunk slots the first session

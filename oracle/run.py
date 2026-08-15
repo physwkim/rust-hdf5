@@ -26,7 +26,6 @@ import argparse
 import json
 import os
 import pathlib
-import re
 import shutil
 import subprocess
 import sys
@@ -150,20 +149,7 @@ EXPECTED_DEVIATIONS = [
                "change past max_compact still moves the links to dense "
                "storage",
     },
-    {
-        "id": "filter-flags-zero",
-        "field": "filters",
-        "ref": None,
-        "rust": None,
-        "check": lambda ref, rust: FILTER_FLAGS_RE.sub("@", ref)
-        == FILTER_FLAGS_RE.sub("@", rust),
-        "why": "the writer stores the per-filter flags byte as 0 where "
-               "libhdf5 stores 1 (H5Z_FLAG_OPTIONAL); both pipelines "
-               "decode to the same bytes",
-    },
 ]
-
-FILTER_FLAGS_RE = re.compile(r"@\d+")
 
 
 def expected_deviation(entry):

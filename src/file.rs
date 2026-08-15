@@ -1211,6 +1211,47 @@ impl H5FileOptions {
         }
     }
 
+    /// Refuse an `open`/`open_rw` call that set an option only [`create`]
+    /// reads — the fcpl/fapl split each of those setters' docs already
+    /// describe: `track_order`, `libver`, `userblock` and `shared_messages`
+    /// all bake into a file at creation, so an existing file's root group,
+    /// superblock and shared-message table are already fixed by whatever
+    /// created it. Silently ignoring the option, the previous behavior,
+    /// hides a builder call that has no effect at all; one gate here checks
+    /// every such field instead of a scattered check per opener.
+    ///
+    /// The `libver` arm tests `is_some`, not inequality against a default
+    /// value: [`LibverBound::default`] is `Earliest`, so a gate written as
+    /// `libver != default()` would let the one bound that asks for a whole
+    /// classic file through unrefused. Whether the builder was *called* is
+    /// the question, and `Option` is what records it.
+    ///
+    /// [`create`]: Self::create
+    fn refuse_create_only_options(&self) -> Result<()> {
+        let mut offending = Vec::new();
+        if self.track_order {
+            offending.push("track_order");
+        }
+        if self.libver.is_some() {
+            offending.push("libver");
+        }
+        if self.userblock != 0 {
+            offending.push("userblock");
+        }
+        if self.shared_messages != SharedMessageConfig::default() {
+            offending.push("shared_messages");
+        }
+        if offending.is_empty() {
+            Ok(())
+        } else {
+            Err(Hdf5Error::InvalidState(format!(
+                "these options only take effect when creating a file, not when \
+                 opening an existing one: {}",
+                offending.join(", ")
+            )))
+        }
+    }
+
     /// Create a new HDF5 file at `path` with the configured options.
     pub fn create<P: AsRef<Path>>(self, path: P) -> Result<H5File> {
         let writer = Hdf5Writer::create_with_options(
@@ -1230,6 +1271,7 @@ impl H5FileOptions {
 
     /// Open an existing HDF5 file for reading with the configured options.
     pub fn open<P: AsRef<Path>>(self, path: P) -> Result<H5File> {
+        self.refuse_create_only_options()?;
         let reader = Hdf5Reader::open_with_locking(path.as_ref(), self.resolved_locking())?;
         Ok(H5File {
             inner: new_shared(H5FileInner::Reader(reader)),
@@ -1238,6 +1280,7 @@ impl H5FileOptions {
 
     /// Open an existing HDF5 file for read/write with the configured options.
     pub fn open_rw<P: AsRef<Path>>(self, path: P) -> Result<H5File> {
+        self.refuse_create_only_options()?;
         let writer = Hdf5Writer::open_append_with_locking(path.as_ref(), self.resolved_locking())?;
         Ok(H5File {
             inner: new_shared(H5FileInner::Writer(writer)),
@@ -2901,5 +2944,87 @@ mod h5py_compat_tests {
         assert_eq!(ds2.shape(), vec![3, 64, 64]);
         let images = ds2.read_raw::<u16>().unwrap();
         assert_eq!(images.len(), 3 * 64 * 64);
+    }
+
+    /// `track_order`, `libver`, `userblock` and `shared_messages` only take
+    /// effect on [`H5FileOptions::create`]; setting any of them for
+    /// [`H5FileOptions::open_rw`] on an already-created file must be
+    /// refused, naming the option, rather than silently doing nothing.
+    #[test]
+    fn open_rw_refuses_every_create_only_option() {
+        let path = temp_path("open_rw_refuses");
+        H5File::create(&path).unwrap().close().unwrap();
+
+        let err = H5File::options()
+            .track_order(true)
+            .open_rw(&path)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("track_order"), "{err}");
+
+        let err = H5File::options()
+            .libver(LibverBound::V110)
+            .open_rw(&path)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("libver"), "{err}");
+
+        // Every bound, not just the ones that differ from `LibverBound`'s
+        // own default. `Earliest` *is* that default and is the bound that
+        // asks for a classic file, so a gate comparing against the default
+        // value would pass this call through as if nothing had been set.
+        for bound in [
+            LibverBound::Earliest,
+            LibverBound::V18,
+            LibverBound::V112,
+            LibverBound::V114,
+            LibverBound::V200,
+        ] {
+            let err = H5File::options()
+                .libver(bound)
+                .open_rw(&path)
+                .err()
+                .unwrap();
+            assert!(err.to_string().contains("libver"), "{bound:?}: {err}");
+        }
+
+        let err = H5File::options()
+            .userblock(512)
+            .open_rw(&path)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("userblock"), "{err}");
+
+        let types = crate::format::sohm::type_flag(crate::format::messages::MSG_DATATYPE).unwrap();
+        let err = H5File::options()
+            .shared_messages(&[(types, 0)], 50, 40)
+            .open_rw(&path)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("shared_messages"), "{err}");
+
+        // A default builder — no create-only option touched — still opens.
+        H5File::options().open_rw(&path).unwrap().close().unwrap();
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// [`H5FileOptions::open`] shares the same gate as `open_rw` — it goes
+    /// through the same `refuse_create_only_options` check.
+    #[test]
+    fn open_refuses_a_create_only_option() {
+        let path = temp_path("open_refuses");
+        H5File::create(&path).unwrap().close().unwrap();
+
+        let err = H5File::options()
+            .track_order(true)
+            .open(&path)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("track_order"), "{err}");
+
+        H5File::options().open(&path).unwrap().close().unwrap();
+
+        std::fs::remove_file(&path).ok();
     }
 }

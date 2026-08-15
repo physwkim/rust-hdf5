@@ -915,16 +915,12 @@ impl<T: H5Type> DatasetBuilder<T> {
             // and the creation properties, in this order
             // (`H5D__layout_set_latest_indexing`, H5Dlayout.c): a v2 B-tree
             // for two or more unlimited dimensions, an extensible array for
-            // exactly one, and for a fixed shape the implicit index when
-            // nothing has to be recorded per chunk — no filter, and early
-            // allocation, which is what puts every chunk at a computable
-            // address — a fixed array otherwise.
-            //
-            // The one condition of that rule this does not implement is the
-            // single-chunk index libhdf5 prefers when one chunk covers the
-            // whole (fixed) dataspace; this crate reads that index but does
-            // not write it, so such a dataset falls through to the fixed
-            // array, as it did before the implicit index existed.
+            // exactly one; for a fixed shape, the single-chunk index takes
+            // priority — unconditional of filter or allocation time —
+            // whenever the shape is exactly one whole chunk, ahead of the
+            // implicit index (no filter, and early allocation, which is what
+            // puts every chunk at a computable address) and the fixed array
+            // (everything else).
             let n_unlimited = max_u64.iter().filter(|&&m| m == u64::MAX).count();
             let one_chunk = chunk_u64 == dims_u64 && max_u64 == dims_u64;
             let kind = if classic_format {
@@ -933,7 +929,9 @@ impl<T: H5Type> DatasetBuilder<T> {
                 ChunkIndexKind::BtreeV2
             } else if n_unlimited == 1 {
                 ChunkIndexKind::ExtensibleArray
-            } else if self.early_allocation && !wants_filter && !one_chunk {
+            } else if one_chunk {
+                ChunkIndexKind::SingleChunk
+            } else if self.early_allocation && !wants_filter {
                 ChunkIndexKind::Implicit
             } else {
                 ChunkIndexKind::FixedArray
@@ -1001,6 +999,32 @@ impl<T: H5Type> DatasetBuilder<T> {
                             writer.create_implicit_dataset(
                                 &full_name, datatype, &dims_u64, &chunk_u64,
                             )?
+                        } else if kind == ChunkIndexKind::SingleChunk {
+                            // A fixed shape covered by exactly one chunk:
+                            // libhdf5 picks this index ahead of Implicit and
+                            // Fixed Array regardless of filter or allocation
+                            // time. Filtered or not, it takes the same
+                            // explicit pipeline the other indexes do; a
+                            // filtered chunk's stored size isn't known ahead
+                            // of its first write, so early allocation only
+                            // ever applies to the unfiltered form.
+                            if wants_filter {
+                                writer.create_single_chunk_dataset_with_pipeline(
+                                    &full_name,
+                                    datatype,
+                                    &dims_u64,
+                                    &chunk_u64,
+                                    explicit_pipeline(),
+                                )?
+                            } else {
+                                writer.create_single_chunk_dataset(
+                                    &full_name,
+                                    datatype,
+                                    &dims_u64,
+                                    &chunk_u64,
+                                    self.early_allocation,
+                                )?
+                            }
                         } else if kind == ChunkIndexKind::FixedArray {
                             // A chunked dataset with no unlimited dimension
                             // must use the fixed-array index — libhdf5
@@ -2073,11 +2097,12 @@ impl H5Dataset {
                         let cell = writer.ds(*index);
                         let _op = cell.op.lock();
                         match kind {
-                            // All three address a chunk by its grid
+                            // All four address a chunk by its grid
                             // coordinates, so the linear slot is decoded back
                             // into them.
                             ChunkIndexKind::FixedArray
                             | ChunkIndexKind::Implicit
+                            | ChunkIndexKind::SingleChunk
                             | ChunkIndexKind::BtreeV1 => {
                                 let coords =
                                     writer.chunk_coords_from_slot(*index, chunk_idx as u64)?;
@@ -2172,6 +2197,17 @@ impl H5Dataset {
                             // stored size and a filter mask of its own.
                             let coords = writer.chunk_coords_from_slot(*index, chunk_idx as u64)?;
                             writer.write_compressed_chunk_btree_v1_inner(
+                                *index,
+                                &coords,
+                                data,
+                                filter_mask,
+                            )?;
+                        } else if kind == ChunkIndexKind::SingleChunk {
+                            // Same again for the single-chunk index, whose
+                            // layout message carries the stored size and mask
+                            // inline.
+                            let coords = writer.chunk_coords_from_slot(*index, chunk_idx as u64)?;
+                            writer.write_compressed_chunk_single_chunk_inner(
                                 *index,
                                 &coords,
                                 data,
@@ -2307,33 +2343,6 @@ impl H5Dataset {
                     )));
                 }
 
-                // Validate coordinates and compute the grown dimensions
-                // up-front, before any chunk is written, so an overflowing
-                // coordinate cannot leave an orphaned chunk in the file.
-                //
-                // The last chunk of a dimension usually hangs past the extent
-                // — a length of 10 in chunks of 4 ends at 12 — so the growth
-                // is capped at the declared maximum, which is what the chunk
-                // still covers. Without the cap a legal edge chunk would be
-                // written and then rejected by the extend below.
-                let max_dims = writer.dataset_max_dims(*index);
-                let mut new_dims = dims.clone();
-                for d in 0..dims.len() {
-                    let needed = coords[d]
-                        .checked_add(1)
-                        .and_then(|c| c.checked_mul(chunk_dims[d]))
-                        .ok_or_else(|| {
-                            Hdf5Error::InvalidState(format!(
-                                "chunk coordinate {} in dimension {} is too large",
-                                coords[d], d
-                            ))
-                        })?;
-                    let needed = needed.min(max_dims[d]);
-                    if needed > new_dims[d] {
-                        new_dims[d] = needed;
-                    }
-                }
-
                 if kind == ChunkIndexKind::FixedArray {
                     // Fixed-array (fixed-shape) dataset: no dimension growth.
                     match bytes {
@@ -2368,6 +2377,53 @@ impl H5Dataset {
                         }
                     }
                     return Ok(());
+                }
+
+                if kind == ChunkIndexKind::SingleChunk {
+                    // Single-chunk index: fixed shape covered by exactly one
+                    // chunk, so no dimension growth either.
+                    match bytes {
+                        ChunkBytes::Unfiltered(data) => {
+                            writer.write_chunk_single_chunk_inner(*index, &coords, data)?
+                        }
+                        ChunkBytes::Prefiltered { data, filter_mask } => writer
+                            .write_compressed_chunk_single_chunk_inner(
+                                *index,
+                                &coords,
+                                data,
+                                filter_mask,
+                            )?,
+                    }
+                    return Ok(());
+                }
+
+                // The remaining indexes (v2 B-tree, v1 B-tree, extensible
+                // array) can all grow: validate the coordinates and compute
+                // the grown dimensions up-front, before any chunk is
+                // written, so an overflowing coordinate cannot leave an
+                // orphaned chunk in the file.
+                //
+                // The last chunk of a dimension usually hangs past the extent
+                // — a length of 10 in chunks of 4 ends at 12 — so the growth
+                // is capped at the declared maximum, which is what the chunk
+                // still covers. Without the cap a legal edge chunk would be
+                // written and then rejected by the extend below.
+                let max_dims = writer.dataset_max_dims(*index);
+                let mut new_dims = dims.clone();
+                for d in 0..dims.len() {
+                    let needed = coords[d]
+                        .checked_add(1)
+                        .and_then(|c| c.checked_mul(chunk_dims[d]))
+                        .ok_or_else(|| {
+                            Hdf5Error::InvalidState(format!(
+                                "chunk coordinate {} in dimension {} is too large",
+                                coords[d], d
+                            ))
+                        })?;
+                    let needed = needed.min(max_dims[d]);
+                    if needed > new_dims[d] {
+                        new_dims[d] = needed;
+                    }
                 }
 
                 if kind == ChunkIndexKind::BtreeV2 {
@@ -5897,26 +5953,23 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// The three conditions are conditions: an unlimited dimension, a
-    /// filter, or a single whole-dataset chunk each send the dataset to the
-    /// index libhdf5 would pick instead, early allocation or not.
+    /// Two of the conditions are conditions: an unlimited dimension or a
+    /// filter each send the dataset to the index libhdf5 would pick
+    /// instead, early allocation or not. (The third — one whole-dataset
+    /// chunk — sends it to the single-chunk index instead of Fixed Array;
+    /// see `one_whole_dataset_chunk_writes_the_single_chunk_index`.)
     #[test]
     fn early_allocation_only_picks_implicit_where_libhdf5_does() {
         // Every case writes and reads back its data, so a mis-selected index
         // shows up as wrong bytes and not just as a different structure.
-        for (which, magic) in [
-            ("unlimited", b"EAHD"),
-            ("filtered", b"FAHD"),
-            ("one whole-dataset chunk", b"FAHD"),
-        ] {
+        for (which, magic) in [("unlimited", b"EAHD"), ("filtered", b"FAHD")] {
             let path = temp_path("implicit_not");
             {
                 let file = H5File::create(&path).unwrap();
                 let builder = file.new_dataset::<i32>().shape([16]);
                 let builder = match which {
                     "unlimited" => builder.chunk(&[4]).max_shape(&[None]),
-                    "filtered" => builder.chunk(&[4]).deflate(6),
-                    _ => builder.chunk(&[16]),
+                    _ => builder.chunk(&[4]).deflate(6),
                 };
                 let ds = builder.early_allocation().create("data").unwrap();
                 ds.write_raw(&(0..16i32).collect::<Vec<_>>()).unwrap();
@@ -5933,6 +5986,48 @@ mod tests {
                 file.dataset("data").unwrap().read_raw::<i32>().unwrap(),
                 (0..16i32).collect::<Vec<_>>(),
                 "{which}"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// One whole-dataset chunk always selects the single-chunk index —
+    /// ahead of Fixed Array, and ahead of Implicit too, whether or not early
+    /// allocation was requested (`H5D__layout_set_latest_indexing` checks it
+    /// unconditionally). Like Implicit, "single chunk" is literal: no index
+    /// structure at all, just the one chunk's address — and, unfiltered and
+    /// early-allocated, that address exists before anything is written — in
+    /// the layout message directly.
+    #[test]
+    fn one_whole_dataset_chunk_writes_the_single_chunk_index() {
+        for early in [false, true] {
+            let path = temp_path("single_chunk_index");
+            {
+                let file = H5File::create(&path).unwrap();
+                let builder = file.new_dataset::<i32>().shape([16]).chunk(&[16]);
+                let builder = if early {
+                    builder.early_allocation()
+                } else {
+                    builder
+                };
+                let ds = builder.create("data").unwrap();
+                ds.write_raw(&(0..16i32).collect::<Vec<_>>()).unwrap();
+                file.close().unwrap();
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            for magic in [b"EAHD", b"EAIB", b"FAHD", b"FADB", b"BTHD", b"TREE"] {
+                assert!(
+                    !bytes.windows(4).any(|w| w == magic),
+                    "early={early}: {} appears in a file whose chunk index is \
+                     supposed to be no structure at all",
+                    String::from_utf8_lossy(magic)
+                );
+            }
+            let file = H5File::open(&path).unwrap();
+            assert_eq!(
+                file.dataset("data").unwrap().read_raw::<i32>().unwrap(),
+                (0..16i32).collect::<Vec<_>>(),
+                "early={early}"
             );
             std::fs::remove_file(&path).ok();
         }

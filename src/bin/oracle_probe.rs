@@ -25,7 +25,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use rust_hdf5::format::messages::datatype::{
     ByteOrder, CompoundMember, DatatypeMessage, EnumMember,
 };
-use rust_hdf5::format::messages::filter::{Filter, FilterPipeline, FILTER_FLETCHER32};
+use rust_hdf5::format::messages::filter::{
+    Filter, FilterPipeline, FILTER_FLETCHER32, FLAG_MANDATORY,
+};
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
     H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error, Hyperslab,
@@ -1819,7 +1821,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             b.filter_pipeline(FilterPipeline {
                 filters: vec![Filter {
                     id: FILTER_FLETCHER32,
-                    flags: 0,
+                    flags: FLAG_MANDATORY,
                     cd_values: vec![],
                 }],
             })

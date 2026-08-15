@@ -56,6 +56,23 @@ pub const FILTER_BITGROOM: u16 = 32022;
 pub const FILTER_BITROUND: u16 = 32023;
 pub const FILTER_BLOSC2: u16 = 32026;
 
+/// Filter flags (`H5Zpublic.h`). A mandatory filter must run; if it can't
+/// (e.g. a compressor whose output would be larger than its input), the
+/// write fails. An optional filter is silently skipped for that chunk
+/// instead, with the skip recorded in the chunk's filter mask.
+///
+/// Every builtin and registered filter libhdf5 sets through its own
+/// `H5Pset_*` convenience call (`H5Pset_deflate`, `H5Pset_shuffle`,
+/// `H5Pset_szip`, `H5Pset_nbit`, `H5Pset_scaleoffset`) or through
+/// `H5Pset_filter` for a dynamically loaded one (h5py's `filters.py`
+/// `fill_dcpl`) uses `H5Z_FLAG_OPTIONAL`. `H5Pset_fletcher32` is the sole
+/// exception: a checksum is meaningless if it can be skipped, so it is
+/// `H5Z_FLAG_MANDATORY` (H5Pocpl.c).
+pub const FLAG_OPTIONAL: u16 = 1;
+/// See [`FLAG_OPTIONAL`]. Matches `H5Z_FLAG_MANDATORY`; used only by
+/// `H5Pset_fletcher32`.
+pub const FLAG_MANDATORY: u16 = 0;
+
 /// The name libhdf5 registers a filter under, for the filters libhdf5
 /// registers itself — the `H5Z_class2_t` name field of `H5Z_DEFLATE`,
 /// `H5Z_SHUFFLE`, `H5Z_FLETCHER32`, `H5Z_SZIP`, `H5Z_NBIT` and
@@ -107,7 +124,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_DEFLATE,
-                flags: 0, // mandatory
+                flags: FLAG_OPTIONAL, // H5Pset_deflate (H5Pocpl.c)
                 cd_values: vec![level],
             }],
         }
@@ -129,7 +146,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_SHUFFLE,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // H5Pset_shuffle (H5Pdcpl.c)
                 cd_values: vec![element_size],
             }],
         }
@@ -145,12 +162,12 @@ impl FilterPipeline {
             filters: vec![
                 Filter {
                     id: FILTER_SHUFFLE,
-                    flags: 0,
+                    flags: FLAG_OPTIONAL,
                     cd_values: vec![element_size],
                 },
                 Filter {
                     id: FILTER_DEFLATE,
-                    flags: 0,
+                    flags: FLAG_OPTIONAL,
                     cd_values: vec![level],
                 },
             ],
@@ -162,7 +179,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_LZ4,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // dynamically registered filter (H5Pset_filter)
                 cd_values: vec![],
             }],
         }
@@ -175,7 +192,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_ZSTD,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // dynamically registered filter (H5Pset_filter)
                 cd_values: vec![level],
             }],
         }
@@ -192,7 +209,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_BSHUF,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // dynamically registered filter (H5Pset_filter)
                 // [major, minor, elem_size, block_size, compression]
                 cd_values: vec![0, 0, element_size, 0, 0],
             }],
@@ -209,7 +226,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_BSHUF,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // dynamically registered filter (H5Pset_filter)
                 cd_values: vec![0, 0, element_size, 0, BSHUF_COMPRESS_LZ4],
             }],
         }
@@ -269,7 +286,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_NBIT,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // H5Pset_nbit (H5Pdcpl.c)
                 // [nparms, need_not_compress, d_nelmts, class, size, order,
                 //  precision, offset] — total 8 (3 base + 5 atomic).
                 cd_values: vec![
@@ -347,7 +364,7 @@ impl FilterPipeline {
         Some(Self {
             filters: vec![Filter {
                 id: FILTER_SCALEOFFSET,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // H5Pset_scaleoffset (H5Pdcpl.c)
                 cd_values,
             }],
         })
