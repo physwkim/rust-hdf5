@@ -564,12 +564,6 @@ fn child_path(parent: &str, name: &str) -> String {
 fn dump_file(path: &str) -> std::result::Result<String, String> {
     let mut d = Dump::new();
     d.emit("!canon", CANON_VERSION);
-    // The superblock version is what pins the libver bound a file was written
-    // under, and there is no public accessor for it on H5File.
-    d.emit(
-        "#superblock",
-        unsupported("superblock", "H5File exposes no superblock/libver accessor"),
-    );
 
     let file = match guarded(|| H5File::open(path)) {
         Ok(Ok(f)) => f,
@@ -577,9 +571,17 @@ fn dump_file(path: &str) -> std::result::Result<String, String> {
         Err(p) => return Err(format!("H5File::open panicked: {p}")),
     };
 
+    // The twin of `canon.py`'s `read_superblock`: the raw version byte
+    // straight after the signature. Has to come after the open — it is a
+    // property of the file, not of the path.
+    d.field("", "superblock", || {
+        file.superblock_version()
+            .map(|v| v.to_string())
+            .map_err(oneline)
+    });
+
     // `H5File::userblock_size` answers in either mode, so this is a value the
-    // canon can be compared against rather than an API gap. It has to come
-    // after the open — it is a property of the file, not of the path.
+    // canon can be compared against rather than an API gap.
     d.field("", "userblock", || Ok(file.userblock_size().to_string()));
 
     let root = file.root_group();

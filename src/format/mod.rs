@@ -115,6 +115,25 @@ impl LibverBound {
             Self::V110 | Self::V112 | Self::V114 | Self::V200 => 3,
         }
     }
+
+    /// The lowest bound whose [`superblock_version`](Self::superblock_version)
+    /// matches an on-disk version byte.
+    ///
+    /// Lossy in one direction: superblock version 3 is shared by four bounds
+    /// (`V110` through `V200`), because raising the low bound past `V18` never
+    /// raises the superblock further — the version alone cannot tell them
+    /// apart, so this reports the lowest, `V110`. A version this crate's own
+    /// writer never emits (1) reads back as `Earliest`, the same legacy
+    /// generation as 0; anything past 3 has no bound to report and falls back
+    /// to the library's newest.
+    pub fn from_superblock_version(version: u8) -> Self {
+        match version {
+            0 | 1 => Self::Earliest,
+            2 => Self::V18,
+            3 => Self::V110,
+            _ => Self::V200,
+        }
+    }
 }
 
 /// Which generation of the on-disk object format one file's objects are

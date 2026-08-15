@@ -120,7 +120,6 @@ def expected_deviation(entry):
 # direction A. Everything else that comes back UNSUPPORTED is specific to the
 # file at hand and does.
 STRUCTURAL_FIELDS = {
-    "superblock",
     "maxshape",
     "layout",
     "chunkindex",

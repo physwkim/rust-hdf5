@@ -822,6 +822,10 @@ pub struct Hdf5Reader {
     ext: SuperblockExtension,
     /// End-of-file address from the superblock.
     _eof: u64,
+    /// Superblock format version (0-3), decoded once at open time by
+    /// `detect_superblock_version` and never re-derived: 0/1 is the legacy
+    /// symbol-table root, 2/3 the link-message root.
+    superblock_version: u8,
     #[allow(dead_code)]
     root_group_info: RootGroupInfo,
     datasets: Vec<DatasetReadInfo>,
@@ -1475,6 +1479,7 @@ impl Hdf5Reader {
             meta,
             ext,
             _eof: sb.end_of_file_address,
+            superblock_version: sb.version,
             root_group_info: RootGroupInfo::V2V3 {
                 root_group_object_header_address: sb.root_group_object_header_address,
             },
@@ -1563,6 +1568,7 @@ impl Hdf5Reader {
             meta,
             ext,
             _eof: sb.end_of_file_address,
+            superblock_version: sb.version,
             root_group_info: RootGroupInfo::V0V1 {
                 root_obj_header_addr: root_obj_addr,
                 btree_addr: ste_btree_addr,
@@ -2356,6 +2362,13 @@ impl Hdf5Reader {
     /// a file without a userblock.
     pub fn userblock_size(&self) -> u64 {
         self.handle.base()
+    }
+
+    /// The superblock format version (0-3), decoded once at open time and
+    /// immutable for the life of an open file — a live SWMR refresh rescans
+    /// the file's contents but never its own format version.
+    pub fn superblock_version(&self) -> u8 {
+        self.superblock_version
     }
 
     /// The v1 B-tree split ranks in force for this file, after the superblock
