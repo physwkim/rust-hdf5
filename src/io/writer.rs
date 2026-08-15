@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::format::btree_v1::{BTreeV1Config, ChunkBTreeV1Tree, ChunkKey};
 use crate::format::chunk_index::btree_v2::Bt2ChunkIndex;
 use crate::format::chunk_index::extensible_array::{
     compute_chunk_size_len, compute_ndblk_addrs, compute_nsblk_addrs, EaDblkPath, EaGeometry,
@@ -471,6 +472,10 @@ pub struct DatasetInfo {
     pub fixed_array: Option<FixedArrayDatasetInfo>,
     /// B-tree v2 chunked storage info.
     pub btree_v2: Option<Bt2DatasetInfo>,
+    /// Implicit (no structure) chunked storage info.
+    pub implicit: Option<ImplicitDatasetInfo>,
+    /// Version-1 B-tree chunked storage info — the classic-format index.
+    pub btree_v1: Option<BtreeV1DatasetInfo>,
     /// Appended frames not yet written to chunks, `None` when empty.
     pub append: Option<AppendBuffer>,
     /// Attributes attached to this dataset.
@@ -530,6 +535,38 @@ pub struct DatasetInfo {
 }
 
 impl DatasetInfo {
+    /// Which chunk index this dataset uses, `None` for storage that is not
+    /// chunked — the one place the index-carrying fields are turned into an
+    /// answer.
+    ///
+    /// INVARIANT: a chunk index added to this struct is added here. A site
+    /// that spells the disjunction out itself is what classifies a new index
+    /// as contiguous storage, and contiguous storage is read and written at
+    /// [`data_addr`](Self::data_addr) — which a chunked dataset leaves
+    /// undefined, so the misclassification is a read or a write at
+    /// `UNDEF_ADDR` rather than an error.
+    pub(crate) fn chunk_index_kind(&self) -> Option<ChunkIndexKind> {
+        if self.chunked.is_some() {
+            Some(ChunkIndexKind::ExtensibleArray)
+        } else if self.fixed_array.is_some() {
+            Some(ChunkIndexKind::FixedArray)
+        } else if self.btree_v2.is_some() {
+            Some(ChunkIndexKind::BtreeV2)
+        } else if self.implicit.is_some() {
+            Some(ChunkIndexKind::Implicit)
+        } else if self.btree_v1.is_some() {
+            Some(ChunkIndexKind::BtreeV1)
+        } else {
+            None
+        }
+    }
+
+    /// Whether this dataset's raw data is stored in chunks — the question
+    /// every storage-form test asks, asked in one place.
+    pub(crate) fn is_chunked(&self) -> bool {
+        self.chunk_index_kind().is_some()
+    }
+
     /// Whether this session wrote chunk data or changed the extent, so the
     /// dataset's index structures have to be re-flushed.
     fn storage_dirty(&self) -> bool {
@@ -539,6 +576,7 @@ impl DatasetInfo {
                 .as_ref()
                 .is_some_and(|f| f.chunks_written > 0)
             || self.btree_v2.as_ref().is_some_and(|b| b.chunks_written > 0)
+            || self.btree_v1.as_ref().is_some_and(|b| b.chunks_written > 0)
             || self.extent_dirty
     }
 
@@ -633,14 +671,23 @@ pub enum AttrTarget<'a> {
     Dataset(usize),
 }
 
-/// Which chunk index a dataset uses. libhdf5 picks it from the dataspace: a
-/// v2 B-tree for two or more unlimited dimensions, an extensible array for
-/// exactly one, a fixed array for none.
+/// Which chunk index a dataset uses.
+///
+/// The five above the line are what `H5D__layout_set_latest_indexing`
+/// (H5Dlayout.c) picks between once the file format allows a version-4 data
+/// layout message: a v2 B-tree for two or more unlimited dimensions, an
+/// extensible array for exactly one, and for a fixed shape the implicit index
+/// when nothing has to be recorded per chunk (no filter, early allocation), a
+/// fixed array otherwise. [`BtreeV1`](Self::BtreeV1) is not one of them: it
+/// belongs to the version-3 layout message, and a file whose superblock is
+/// older than version 2 can carry no other.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ChunkIndexKind {
+pub(crate) enum ChunkIndexKind {
     ExtensibleArray,
     FixedArray,
     BtreeV2,
+    Implicit,
+    BtreeV1,
 }
 
 /// A chunked dataset's grid geometry, snapshotted out of its slot.
@@ -1037,6 +1084,114 @@ pub struct FixedArrayDatasetInfo {
     pub chunks_written: u64,
 }
 
+/// Runtime metadata for an implicitly indexed chunked dataset — the index
+/// that is no structure at all (`H5Dnone.c`).
+///
+/// Every chunk of the maximum-extent grid is allocated at create in one
+/// contiguous run, in the row-major order [`crate::io::chunk_grid`] defines,
+/// so a chunk's address is `data_addr + linear_index * chunk_bytes` and
+/// nothing has to be recorded when one is written. libhdf5 picks this index
+/// only when that arithmetic is total: no filter (every chunk is exactly
+/// `chunk_bytes` long), no unlimited dimension (the run has a finite length),
+/// and early allocation (the run exists before any write).
+pub struct ImplicitDatasetInfo {
+    /// Chunk dimension sizes.
+    pub chunk_dims: Vec<u64>,
+    /// File offset of the first chunk — the layout message's index address.
+    pub data_addr: u64,
+    /// Byte length of the whole chunk run: `nchunks * chunk_bytes`.
+    pub data_size: u64,
+}
+
+/// One chunk as the version-1 B-tree records it — the key libhdf5 stores
+/// (`H5D_btree_key_t`) plus the address it keys.
+pub struct BtreeV1ChunkRecord {
+    /// Grid position of the chunk. The key's element offsets are derived from
+    /// it at encode time (`scaled * chunk_dim`), so this is the one place the
+    /// position is stored and the sort order is over these coordinates.
+    pub scaled: Vec<u64>,
+    /// File offset of the chunk's bytes.
+    pub address: u64,
+    /// Stored byte length — the filtered length when the dataset is filtered,
+    /// the full chunk otherwise. `u32` because the key's field is.
+    pub nbytes: u32,
+    /// Filter mask: bit `i` set means filter `i` was skipped for this chunk.
+    pub filter_mask: u32,
+}
+
+/// Runtime metadata for a chunked dataset indexed by a version-1 B-tree —
+/// the classic-format chunk index (`H5Dbtree.c`), and the only one a
+/// version-0/1 superblock file can carry.
+pub struct BtreeV1DatasetInfo {
+    /// Chunk dimension sizes.
+    pub chunk_dims: Vec<u64>,
+    /// Maximum dimensions (u64::MAX = unlimited).
+    pub max_dims: Vec<u64>,
+    /// The file's v1-B-tree "K" ranks. Every node's width is derived from
+    /// them, and they are recorded only in the superblock this file was
+    /// opened with — so they are carried rather than re-derived.
+    pub config: BTreeV1Config,
+    /// The chunks, in key order (`scaled` ascending, lexicographically).
+    pub records: Vec<BtreeV1ChunkRecord>,
+    /// Pool of node-size blocks holding the tree's nodes, on the same terms
+    /// as [`Bt2DatasetInfo::node_addrs`]: a flush re-serializes the whole
+    /// bulk-loaded tree over them and allocates only the shortfall, so no
+    /// flush can orphan a block it replaced.
+    pub node_addrs: Vec<u64>,
+    /// Address of the tree's root node — what the version-3 data layout
+    /// message carries. `UNDEF_ADDR` until a flush puts a node in the file,
+    /// which is the state libhdf5 leaves a chunked dataset in until its first
+    /// chunk is written.
+    pub root_addr: u64,
+    /// Number of chunks written so far.
+    pub chunks_written: u64,
+}
+
+impl BtreeV1DatasetInfo {
+    /// The chunk shape a key's offsets are scaled by: the chunk dimensions
+    /// with the element size appended, which is also what the layout message
+    /// stores.
+    fn key_dims(&self, element_size: u64) -> Vec<u64> {
+        let mut dims = self.chunk_dims.clone();
+        dims.push(element_size);
+        dims
+    }
+
+    /// Bulk-load the tree this index's records describe.
+    fn build_tree(&self, element_size: u64, sizeof_addr: usize) -> ChunkBTreeV1Tree {
+        let dims = self.key_dims(element_size);
+        let entries: Vec<(ChunkKey, u64)> = self
+            .records
+            .iter()
+            .map(|r| {
+                (
+                    ChunkKey::for_chunk(&r.scaled, &dims, r.nbytes, r.filter_mask),
+                    r.address,
+                )
+            })
+            .collect();
+        // The right boundary closes the tree past its greatest key, which is
+        // the last record's — the records are kept in key order.
+        let last = self
+            .records
+            .last()
+            .map_or_else(|| vec![0; self.chunk_dims.len()], |r| r.scaled.clone());
+        ChunkBTreeV1Tree::build(
+            &entries,
+            ChunkKey::right_bound(&last, &dims),
+            &self.config,
+            sizeof_addr,
+        )
+    }
+
+    /// Where `scaled` sits in [`records`](Self::records): `Ok` at its record,
+    /// `Err` at the position one would be inserted at.
+    fn position(&self, scaled: &[u64]) -> Result<usize, usize> {
+        self.records
+            .binary_search_by(|r| r.scaled.as_slice().cmp(scaled))
+    }
+}
+
 /// Runtime metadata for a B-tree v2 indexed chunked dataset.
 pub struct Bt2DatasetInfo {
     /// Chunk dimension sizes.
@@ -1391,6 +1546,11 @@ pub(crate) enum NewStorage {
     Contiguous,
     /// Chunks reached through an index.
     Chunked,
+    /// Chunks whose bytes pass through a filter pipeline, which needs a
+    /// Filter Pipeline message in the header beside the layout. Apart from
+    /// that message it is [`Chunked`](Self::Chunked), so the two are told
+    /// apart here rather than by a second question at each creator.
+    ChunkedFiltered,
     /// The image inside the data layout message itself, with no block of its
     /// own — `H5D_COMPACT`.
     Compact,
@@ -1843,6 +2003,8 @@ fn rebuild_dataset(
         compact: None,
         chunked: None,
         fixed_array: None,
+        implicit: None,
+        btree_v1: None,
         btree_v2: None,
         append: None,
         attributes: attrs,
@@ -2157,6 +2319,36 @@ fn rebuild_dataset(
                         chunks_written: 0,
                     });
                 }
+            } else if *index_type == crate::format::messages::data_layout::ChunkIndexType::Implicit
+            {
+                // Nothing to read back: the index *is* the run of chunk space
+                // at `index_address`, and its length is the chunk grid times
+                // the chunk size. Reconstructing that length is what lets a
+                // delete free the storage and a write address it — a rebuild
+                // that left this empty would rewrite the dataset as an
+                // unallocated contiguous one, dropping every byte.
+                let mut nchunks: u64 = 1;
+                for g in crate::io::chunk_grid::index_grid(
+                    &info.dataspace.dims,
+                    info.dataspace.max_dims.as_deref(),
+                    &real_chunk_dims,
+                )? {
+                    nchunks = nchunks.checked_mul(g).ok_or_else(|| {
+                        crate::io::IoError::InvalidState("chunk count overflows u64".into())
+                    })?;
+                }
+                let data_size = nchunks
+                    .checked_mul(chunk_dims.iter().product::<u64>())
+                    .ok_or_else(|| {
+                        crate::io::IoError::InvalidState(
+                            "implicit chunk storage overflows u64".into(),
+                        )
+                    })?;
+                info.implicit = Some(ImplicitDatasetInfo {
+                    chunk_dims: real_chunk_dims,
+                    data_addr: *index_address,
+                    data_size,
+                });
             }
         }
         // Unreachable by `layout_rebuilds`, which is the gate
@@ -3077,6 +3269,18 @@ impl Hdf5Writer {
         self.legacy.is_some()
     }
 
+    /// The v1-B-tree "K" ranks in force for this file, from which every v1
+    /// node's width is derived.
+    ///
+    /// Only a version-0/1 superblock records them (a v2/v3 one has no such
+    /// field), and only such a file holds v1 B-trees this writer builds, so
+    /// the defaults are what a file without them would have used anyway.
+    fn btree_v1_config(&self) -> BTreeV1Config {
+        self.legacy
+            .as_ref()
+            .map_or_else(BTreeV1Config::default, |l| l.meta.btree)
+    }
+
     /// Track and index creation order for the links and the attributes of
     /// every object created after this call — the equivalent of setting
     /// `H5Pset_link_creation_order` and `H5Pset_attr_creation_order` to
@@ -3157,20 +3361,22 @@ impl Hdf5Writer {
     /// a version-3 data layout message, which is what
     /// `H5O_layout_ver_bounds` gives `H5F_LIBVER_EARLIEST` (H5Dlayout.c:44),
     /// so a classic file takes both; a committed datatype has no layout at
-    /// all. Only chunked storage is out of reach: its index would be a
-    /// version-1 B-tree this crate reads but does not build, and the
-    /// version-4 layout it *does* build would drag the superblock to version
-    /// 3, silently converting the file the append was supposed to leave
-    /// classic. A filter needs a chunk to live in, so this refusal covers
-    /// deflate and shuffle without naming them.
+    /// all; and chunked storage does too, over the version-1 B-tree index
+    /// [`create_btree_v1_dataset`](Self::create_btree_v1_dataset) builds.
+    ///
+    /// What is still out of reach is a *filter* on those chunks. libhdf5 at
+    /// `H5F_LIBVER_EARLIEST` writes a version-1 Filter Pipeline message
+    /// (`H5O_pline_ver_bounds`), which this crate decodes but only encodes at
+    /// version 2 — and a version-2 pipeline message inside a version-0
+    /// superblock is a file no libhdf5 writes.
     fn reject_unwritable_storage(&self, storage: NewStorage, name: &str) -> IoResult<()> {
-        if storage == NewStorage::Chunked && self.is_legacy() {
+        if storage == NewStorage::ChunkedFiltered && self.is_legacy() {
             return Err(crate::io::IoError::Unsupported(format!(
-                "cannot create the chunked dataset '{name}' in this file: it is in \
-                 the classic (version-0/1 superblock) format, whose chunk index is \
-                 a version-1 B-tree that this crate reads but does not write. \
-                 Create it contiguously or compactly, or re-create the file at a \
-                 newer library-version bound"
+                "cannot create the filtered dataset '{name}' in this file: it is in \
+                 the classic (version-0/1 superblock) format, whose filter pipeline \
+                 message is version 1, which this crate reads but does not write. \
+                 Create it without filters, or re-create the file at a newer \
+                 library-version bound"
             )));
         }
         Ok(())
@@ -3919,24 +4125,19 @@ impl Hdf5Writer {
     }
 
     /// Reconstruct the fields a writer-mode `H5Dataset` handle needs for the
-    /// dataset at `index`: `(shape, element_size, chunked, btree2,
-    /// fixed_array)`. Single owner of this mapping so `H5File::dataset_writer`,
-    /// `H5Group::dataset_writer`, and the vlen-string helpers all agree.
+    /// dataset at `index`: `(shape, element_size, chunk_index)`, where the
+    /// last is `None` for storage that is not chunked. Single owner of this
+    /// mapping so `H5File::dataset_writer`, `H5Group::dataset_writer`, and
+    /// the vlen-string helpers all agree.
     pub(crate) fn dataset_handle_parts(
         &self,
         index: usize,
-    ) -> (Vec<usize>, usize, bool, bool, bool) {
+    ) -> (Vec<usize>, usize, Option<ChunkIndexKind>) {
         let ds = self.ds(index);
         let g = ds.lock();
         let shape: Vec<usize> = g.dataspace.dims.iter().map(|&d| d as usize).collect();
         let element_size = g.datatype.element_size() as usize;
-        let (fixed_array, btree2, has_chunked) = (
-            g.fixed_array.is_some(),
-            g.btree_v2.is_some(),
-            g.chunked.is_some(),
-        );
-        let chunked = has_chunked || fixed_array || btree2;
-        (shape, element_size, chunked, btree2, fixed_array)
+        (shape, element_size, g.chunk_index_kind())
     }
 
     /// Reject a name some other link in the file already occupies.
@@ -4388,7 +4589,7 @@ impl Hdf5Writer {
             // Buffered rows were never written to a chunk; they die with
             // the dataset instead of being flushed at close.
             m.append = None;
-            let indexed = m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
+            let indexed = m.is_chunked();
             let contiguous = (!indexed && m.data_addr != UNDEF_ADDR && m.data_size > 0)
                 .then_some((m.data_addr, m.data_size));
             m.data_addr = UNDEF_ADDR;
@@ -4671,6 +4872,26 @@ impl Hdf5Writer {
             );
             return Ok(());
         }
+        // The implicit index has no structure to free, only the one run of
+        // chunk space it was given at create — which is the whole of its
+        // storage, so nothing else can be leaked or double-freed here.
+        if let Some(imp) = m.implicit.take() {
+            self.allocator.free(imp.data_addr, imp.data_size);
+            return Ok(());
+        }
+        // The version-1 B-tree owns nothing but its node blocks: the header
+        // every other index has is, here, the root pointer inside the layout
+        // message.
+        if let Some(bt1) = m.btree_v1.take() {
+            let element_size = m.datatype.element_size() as u64;
+            let node_size = bt1
+                .build_tree(element_size, self.ctx.sizeof_addr as usize)
+                .node_size();
+            for &a in &bt1.node_addrs {
+                self.allocator.free(a, node_size as u64);
+            }
+            return Ok(());
+        }
         if let Some(bt2) = m.btree_v2.take() {
             let tree = bt2.index.build_tree(&self.ctx);
             for &a in &bt2.node_addrs {
@@ -4691,13 +4912,13 @@ impl Hdf5Writer {
     pub fn dataset_chunk_dims(&self, index: usize) -> Option<Vec<u64>> {
         let ds = self.ds(index);
         let m = ds.lock();
-        if let Some(ref c) = m.chunked {
-            Some(c.chunk_dims.clone())
-        } else if let Some(ref f) = m.fixed_array {
-            Some(f.chunk_dims.clone())
-        } else {
-            m.btree_v2.as_ref().map(|b| b.chunk_dims.clone())
-        }
+        m.chunk_index_kind().map(|kind| match kind {
+            ChunkIndexKind::ExtensibleArray => m.chunked.as_ref().unwrap().chunk_dims.clone(),
+            ChunkIndexKind::FixedArray => m.fixed_array.as_ref().unwrap().chunk_dims.clone(),
+            ChunkIndexKind::BtreeV2 => m.btree_v2.as_ref().unwrap().chunk_dims.clone(),
+            ChunkIndexKind::Implicit => m.implicit.as_ref().unwrap().chunk_dims.clone(),
+            ChunkIndexKind::BtreeV1 => m.btree_v1.as_ref().unwrap().chunk_dims.clone(),
+        })
     }
 
     /// Return the current dimensions of a dataset.
@@ -4706,6 +4927,20 @@ impl Hdf5Writer {
     /// per-dataset [`Slot`]; it cannot be borrowed past the guard.
     pub fn dataset_dims(&self, index: usize) -> Vec<u64> {
         self.ds(index).lock().dataspace.dims.clone()
+    }
+
+    /// Return the maximum extent a dataset declares, per dimension.
+    ///
+    /// An absent maximum shape means the shape is fixed at its current extent
+    /// (libhdf5 defaults maxdims to dims at creation), so the current
+    /// dimensions are returned; `H5S_UNLIMITED` is `u64::MAX`.
+    pub fn dataset_max_dims(&self, index: usize) -> Vec<u64> {
+        let ds = self.ds(index);
+        let m = ds.lock();
+        m.dataspace
+            .max_dims
+            .clone()
+            .unwrap_or_else(|| m.dataspace.dims.clone())
     }
 
     /// Return the datatype a dataset declares on disk.
@@ -5278,7 +5513,7 @@ impl Hdf5Writer {
                 .dims
                 .iter()
                 .fold(1u64, |a, &d| a.saturating_mul(d));
-            let indexed = m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
+            let indexed = m.is_chunked();
             (elements, m.data_addr, indexed)
         };
         if indexed || data_addr == UNDEF_ADDR {
@@ -5630,7 +5865,7 @@ impl Hdf5Writer {
                 .dims
                 .iter()
                 .fold(1u64, |a, &d| a.saturating_mul(d));
-            let indexed = m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
+            let indexed = m.is_chunked();
             (elements, m.data_addr, indexed)
         };
         if indexed || data_addr == UNDEF_ADDR {
@@ -6805,6 +7040,8 @@ impl Hdf5Writer {
                 compact: None,
                 chunked: None,
                 fixed_array: None,
+                implicit: None,
+                btree_v1: None,
                 btree_v2: None,
                 append: None,
                 attributes: Vec::new(),
@@ -6877,6 +7114,8 @@ impl Hdf5Writer {
                 compact: Some(vec![0u8; data_size as usize]),
                 chunked: None,
                 fixed_array: None,
+                implicit: None,
+                btree_v1: None,
                 btree_v2: None,
                 append: None,
                 attributes: Vec::new(),
@@ -6922,6 +7161,8 @@ impl Hdf5Writer {
                 compact: None,
                 chunked: None,
                 fixed_array: None,
+                implicit: None,
+                btree_v1: None,
                 btree_v2: None,
                 append: None,
                 attributes: Vec::new(),
@@ -7037,6 +7278,8 @@ impl Hdf5Writer {
                 layout_version,
                 times: None,
                 fixed_array: None,
+                implicit: None,
+                btree_v1: None,
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
                     chunk_dims: chunk_dims.to_vec(),
@@ -7068,7 +7311,7 @@ impl Hdf5Writer {
         let _op = ds.op.lock();
         let data_addr = {
             let mut g = ds.lock();
-            if g.chunked.is_some() {
+            if g.is_chunked() {
                 return Err(crate::io::IoError::InvalidState(
                     "use write_chunk for chunked datasets".into(),
                 ));
@@ -7514,7 +7757,7 @@ impl Hdf5Writer {
     ) -> IoResult<()> {
         let ds_ref = self.ds(index);
         let ds = ds_ref.lock();
-        let is_chunked = ds.chunked.is_some() || ds.fixed_array.is_some() || ds.btree_v2.is_some();
+        let is_chunked = ds.is_chunked();
 
         let dims = &ds.dataspace.dims;
         let element_size = ds.datatype.element_size() as u64;
@@ -8232,6 +8475,8 @@ impl Hdf5Writer {
                 times: None,
                 chunked: None,
                 fixed_array: None,
+                implicit: None,
+                btree_v1: None,
                 btree_v2: None,
                 append: None,
             },
@@ -8342,6 +8587,8 @@ impl Hdf5Writer {
                 times: None,
                 chunked: None,
                 fixed_array: None,
+                implicit: None,
+                btree_v1: None,
                 btree_v2: None,
                 append: None,
             },
@@ -8365,7 +8612,7 @@ impl Hdf5Writer {
         use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
 
-        let create = self.begin_create(name, NewStorage::Chunked)?;
+        let create = self.begin_create(name, NewStorage::ChunkedFiltered)?;
         let name = create.name.as_str();
         let num_strings = strings.len() as u64;
         validate_chunk_geometry(&[num_strings], &[num_strings], &[chunk_size as u64])?;
@@ -8476,6 +8723,8 @@ impl Hdf5Writer {
                 layout_version,
                 times: None,
                 fixed_array: None,
+                implicit: None,
+                btree_v1: None,
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
                     chunk_dims: chunk_dims.clone(),
@@ -8715,10 +8964,7 @@ impl Hdf5Writer {
                     ))
                 }
             };
-            let writable = m.chunked.is_some()
-                || m.fixed_array.is_some()
-                || m.btree_v2.is_some()
-                || m.data_addr != UNDEF_ADDR;
+            let writable = m.is_chunked() || m.data_addr != UNDEF_ADDR;
             (charset, m.dataspace.dims.clone(), writable)
         };
 
@@ -8811,10 +9057,7 @@ impl Hdf5Writer {
         let (is_chunked, data_addr) = {
             let ds = self.ds(ds_index);
             let m = ds.lock();
-            (
-                m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some(),
-                m.data_addr,
-            )
+            (m.is_chunked(), m.data_addr)
         };
 
         if !is_chunked {
@@ -9117,19 +9360,32 @@ impl Hdf5Writer {
         // one's is its data block. (The high-level builder calls this
         // immediately after create, before any data is written; a subsequent
         // write_raw/write_slice overwrites its region.)
-        let is_chunked = ds.chunked.is_some() || ds.fixed_array.is_some() || ds.btree_v2.is_some();
-        if !is_chunked {
+        // An implicitly indexed dataset is filled here too, and for the same
+        // reason: that index has no per-chunk fill path because it has no
+        // per-chunk anything — its whole chunk grid is one run of space,
+        // allocated and filled at create like a contiguous block. So the test
+        // is not "is it chunked" but "does something else fill its chunks".
+        let fills_per_chunk = ds
+            .chunk_index_kind()
+            .is_some_and(|k| k != ChunkIndexKind::Implicit);
+        if !fills_per_chunk {
             if let Some(len) = ds.compact.as_ref().map(Vec::len) {
                 ds.compact = Some(crate::format::messages::fill_value::tiled_fill(
                     len,
                     Some(&bytes),
                 ));
-            } else if ds.data_addr != UNDEF_ADDR && ds.data_size > 0 {
-                let data_addr = ds.data_addr;
-                let data_size = ds.data_size as usize;
-                let filled =
-                    crate::format::messages::fill_value::tiled_fill(data_size, Some(&bytes));
-                self.handle.write_at(data_addr, &filled)?;
+            } else {
+                let (data_addr, data_size) = match ds.implicit {
+                    Some(ref imp) => (imp.data_addr, imp.data_size),
+                    None => (ds.data_addr, ds.data_size),
+                };
+                if data_addr != UNDEF_ADDR && data_size > 0 {
+                    let filled = crate::format::messages::fill_value::tiled_fill(
+                        data_size as usize,
+                        Some(&bytes),
+                    );
+                    self.handle.write_at(data_addr, &filled)?;
+                }
             }
         }
 
@@ -9470,7 +9726,61 @@ impl Hdf5Writer {
                     None => Ok(None),
                 }
             }
+            // Every chunk of an implicitly indexed dataset exists from the
+            // moment the dataset does, so there is no "never written" answer
+            // to give: an untouched chunk reads back as the fill value the
+            // create wrote there.
+            ChunkIndexKind::Implicit => {
+                let addr = self.implicit_chunk_addr(ds_index, &geo, chunk_coords)?;
+                self.read_chunk_block(None, addr, geo.chunk_bytes(), 0)
+            }
+            ChunkIndexKind::BtreeV1 => {
+                let ds = self.ds(ds_index);
+                let m = ds.lock();
+                let pipeline = m.filter_pipeline.clone();
+                let bt1 = m.btree_v1.as_ref().unwrap();
+                let found = bt1
+                    .position(chunk_coords)
+                    .ok()
+                    .map(|i| &bt1.records[i])
+                    .map(|r| (r.address, r.nbytes as u64, r.filter_mask));
+                drop(m);
+                match found {
+                    Some((addr, nbytes, mask)) => {
+                        self.read_chunk_block(pipeline.as_ref(), addr, nbytes, mask)
+                    }
+                    None => Ok(None),
+                }
+            }
         }
+    }
+
+    /// File offset of one chunk of an implicitly indexed dataset:
+    /// `data_addr + linear_index * chunk_bytes`, the whole of that index
+    /// (`H5D__none_idx_get_addr`, H5Dnone.c).
+    fn implicit_chunk_addr(
+        &self,
+        ds_index: usize,
+        geo: &ChunkGeometry,
+        chunk_coords: &[u64],
+    ) -> IoResult<u64> {
+        let linear = geo.linear_index(chunk_coords)?;
+        let ds = self.ds(ds_index);
+        let m = ds.lock();
+        let imp = m.implicit.as_ref().ok_or_else(|| {
+            crate::io::IoError::InvalidState("not an implicitly indexed dataset".into())
+        })?;
+        let offset = linear.checked_mul(geo.chunk_bytes()).ok_or_else(|| {
+            crate::io::IoError::InvalidState("implicit chunk offset overflows u64".into())
+        })?;
+        if offset + geo.chunk_bytes() > imp.data_size {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "chunk {chunk_coords:?} lies outside the {} bytes of chunk space \
+                 this implicitly indexed dataset was created with",
+                imp.data_size
+            )));
+        }
+        Ok(imp.data_addr + offset)
     }
 
     /// Write one whole chunk addressed by its grid coordinates, whichever
@@ -9501,7 +9811,183 @@ impl Hdf5Writer {
             ChunkIndexKind::BtreeV2 => {
                 self.write_chunk_btree_v2_inner(ds_index, chunk_coords, data)
             }
+            ChunkIndexKind::Implicit => {
+                self.write_chunk_implicit_inner(ds_index, chunk_coords, data)
+            }
+            ChunkIndexKind::BtreeV1 => {
+                self.write_chunk_btree_v1_inner(ds_index, chunk_coords, data)
+            }
         }
+    }
+
+    /// Write one whole chunk to a dataset indexed by a version-1 B-tree.
+    ///
+    /// `chunk_coords` is the chunk's grid position. `data` is the chunk's
+    /// unfiltered bytes; the dataset's filter pipeline runs here if it has
+    /// one, and the key records the stored size and mask the way libhdf5's
+    /// does (`H5D__btree_new_node`).
+    ///
+    /// The caller holds the dataset's op lock or the writer exclusively.
+    pub(crate) fn write_chunk_btree_v1_inner(
+        &self,
+        ds_index: usize,
+        chunk_coords: &[u64],
+        data: &[u8],
+    ) -> IoResult<()> {
+        // Read what the write needs under a brief guard, then filter OUTSIDE
+        // the lock, as every other index's write path does.
+        let ds = self.ds(ds_index);
+        let (chunk_bytes, pipeline) = {
+            let m = ds.lock();
+            let element_size = m.datatype.element_size() as u64;
+            let bt1 = m.btree_v1.as_ref().ok_or_else(|| {
+                crate::io::IoError::InvalidState("not a version-1 B-tree dataset".into())
+            })?;
+            (
+                bt1.chunk_dims.iter().product::<u64>() * element_size,
+                m.filter_pipeline.clone(),
+            )
+        };
+        if data.len() as u64 != chunk_bytes {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "chunk data size mismatch: expected {} bytes, got {}",
+                chunk_bytes,
+                data.len()
+            )));
+        }
+
+        let filtered;
+        let stored = match pipeline {
+            Some(ref pl) => {
+                filtered = filter::apply_filters(pl, data)?;
+                &filtered[..]
+            }
+            None => data,
+        };
+        self.record_btree_v1_chunk(ds_index, chunk_coords, stored, 0)
+    }
+
+    /// Write a pre-filtered chunk verbatim to a version-1 B-tree dataset,
+    /// recording the caller-supplied `filter_mask` — the classic-index half
+    /// of the HDF5 "direct chunk write" (`H5Dwrite_chunk`).
+    ///
+    /// The caller holds the dataset's op lock or the writer exclusively.
+    pub(crate) fn write_compressed_chunk_btree_v1_inner(
+        &self,
+        ds_index: usize,
+        chunk_coords: &[u64],
+        data: &[u8],
+        filter_mask: u32,
+    ) -> IoResult<()> {
+        if self.ds(ds_index).lock().filter_pipeline.is_none() {
+            return Err(crate::io::IoError::InvalidState(
+                "write_chunk_raw requires a filtered dataset (an unfiltered chunk \
+                 is stored at its full size, so there is nothing for a stored size \
+                 or a filter mask to say)"
+                    .into(),
+            ));
+        }
+        self.record_btree_v1_chunk(ds_index, chunk_coords, data, filter_mask)
+    }
+
+    /// Place a chunk's already-final bytes in the file and record them in the
+    /// version-1 B-tree under the caller-supplied `filter_mask`.
+    ///
+    /// Shared by the two writes above, so both reach the index through one
+    /// placement rule. The records are kept in key order here — the bulk load
+    /// at flush walks them in that order and a lookup bisects them.
+    fn record_btree_v1_chunk(
+        &self,
+        ds_index: usize,
+        chunk_coords: &[u64],
+        final_bytes: &[u8],
+        filter_mask: u32,
+    ) -> IoResult<()> {
+        let stored_len = final_bytes.len() as u64;
+        // The key's size field is 32 bits wide (`H5D_btree_key_t::nbytes`),
+        // which is also libhdf5's limit on a chunk in this index.
+        let Ok(nbytes) = u32::try_from(stored_len) else {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "stored chunk size {stored_len} does not fit in the 32-bit size \
+                 field of a version-1 B-tree chunk key"
+            )));
+        };
+        let ds = self.ds(ds_index);
+        let mut m = ds.lock();
+        let bt1 = m.btree_v1.as_ref().ok_or_else(|| {
+            crate::io::IoError::InvalidState("not a version-1 B-tree dataset".into())
+        })?;
+        if chunk_coords.len() != bt1.chunk_dims.len() {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "chunk_coords has {} entries but the dataset has {} dimensions",
+                chunk_coords.len(),
+                bt1.chunk_dims.len()
+            )));
+        }
+        // A coordinate past the maximum extent has no chunk to be: unlike the
+        // array indexes there is no slot to run out of, so the bound is
+        // checked here or not at all. An unlimited dimension has none.
+        for (d, ((&c, &cd), &max)) in chunk_coords
+            .iter()
+            .zip(&bt1.chunk_dims)
+            .zip(&bt1.max_dims)
+            .enumerate()
+        {
+            if max != u64::MAX && c.saturating_mul(cd) >= max {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "chunk coordinate {c} in dimension {d} is outside the maximum \
+                     extent {max}"
+                )));
+            }
+        }
+        let slot = bt1.position(chunk_coords);
+        let old = slot.ok().map(|i| {
+            let r = &bt1.records[i];
+            (r.address, r.nbytes as u64)
+        });
+        // A rewrite whose stored size is unchanged stays where it is (always
+        // so when unfiltered), one that no longer fits moves. See `place_chunk`.
+        let address = self.place_chunk(old, stored_len);
+        self.handle.write_at(address, final_bytes)?;
+
+        let bt1 = m.btree_v1.as_mut().unwrap();
+        let record = BtreeV1ChunkRecord {
+            scaled: chunk_coords.to_vec(),
+            address,
+            nbytes,
+            filter_mask,
+        };
+        match slot {
+            Ok(i) => bt1.records[i] = record,
+            Err(i) => bt1.records.insert(i, record),
+        }
+        bt1.chunks_written += 1;
+        Ok(())
+    }
+
+    /// Write one whole chunk of an implicitly indexed dataset into the slot
+    /// its coordinates name. There is no index to record anything in — the
+    /// slot is where it always was — so this is the write in full.
+    ///
+    /// The caller holds the dataset's op lock or the writer exclusively.
+    pub(crate) fn write_chunk_implicit_inner(
+        &self,
+        ds_index: usize,
+        chunk_coords: &[u64],
+        data: &[u8],
+    ) -> IoResult<()> {
+        let geo = self.chunk_geometry(ds_index)?;
+        let chunk_bytes = geo.chunk_bytes();
+        if data.len() as u64 != chunk_bytes {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "chunk data size mismatch: expected {} bytes, got {}",
+                chunk_bytes,
+                data.len()
+            )));
+        }
+        let addr = self.implicit_chunk_addr(ds_index, &geo, chunk_coords)?;
+        self.handle.write_at(addr, data)?;
+        Ok(())
     }
 
     /// Snapshot the geometry needed to address a chunked dataset's grid.
@@ -9512,16 +9998,17 @@ impl Hdf5Writer {
     fn chunk_geometry(&self, ds_index: usize) -> IoResult<ChunkGeometry> {
         let ds = self.ds(ds_index);
         let m = ds.lock();
-        let (kind, chunk_dims) = if let Some(ref c) = m.chunked {
-            (ChunkIndexKind::ExtensibleArray, c.chunk_dims.clone())
-        } else if let Some(ref f) = m.fixed_array {
-            (ChunkIndexKind::FixedArray, f.chunk_dims.clone())
-        } else if let Some(ref b) = m.btree_v2 {
-            (ChunkIndexKind::BtreeV2, b.chunk_dims.clone())
-        } else {
+        let Some(kind) = m.chunk_index_kind() else {
             return Err(crate::io::IoError::InvalidState(
                 "not a chunked dataset".into(),
             ));
+        };
+        let chunk_dims = match kind {
+            ChunkIndexKind::ExtensibleArray => m.chunked.as_ref().unwrap().chunk_dims.clone(),
+            ChunkIndexKind::FixedArray => m.fixed_array.as_ref().unwrap().chunk_dims.clone(),
+            ChunkIndexKind::BtreeV2 => m.btree_v2.as_ref().unwrap().chunk_dims.clone(),
+            ChunkIndexKind::Implicit => m.implicit.as_ref().unwrap().chunk_dims.clone(),
+            ChunkIndexKind::BtreeV1 => m.btree_v1.as_ref().unwrap().chunk_dims.clone(),
         };
         Ok(ChunkGeometry {
             kind,
@@ -9609,7 +10096,14 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: Option<FilterPipeline>,
     ) -> IoResult<usize> {
-        let create = self.begin_create(name, NewStorage::Chunked)?;
+        let create = self.begin_create(
+            name,
+            if pipeline.is_some() {
+                NewStorage::ChunkedFiltered
+            } else {
+                NewStorage::Chunked
+            },
+        )?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         if max_dims.contains(&u64::MAX) {
@@ -9702,12 +10196,201 @@ impl Hdf5Writer {
                 times: None,
                 chunked: None,
                 btree_v2: None,
+                implicit: None,
+                btree_v1: None,
                 fixed_array: Some(FixedArrayDatasetInfo {
                     chunk_dims: chunk_dims.to_vec(),
                     fa_header_addr,
                     fa_dblk_addr,
                     fa_header,
                     fa_dblk,
+                    chunks_written: 0,
+                }),
+                append: None,
+            },
+        );
+
+        Ok(idx)
+    }
+
+    /// Define a chunked dataset with the *implicit* index: no index structure
+    /// at all, every chunk of the grid allocated at create in one contiguous
+    /// run, addressed by arithmetic (`H5Dnone.c`).
+    ///
+    /// libhdf5 picks this index only where that arithmetic is total, and this
+    /// enforces the same three conditions
+    /// (`H5D__layout_set_latest_indexing`, H5Dlayout.c): no filter — a
+    /// filtered chunk is not `chunk_bytes` long, so the run would not be a
+    /// grid; no unlimited dimension — the run has to have a length; and early
+    /// allocation, which is what this creator *does* rather than something it
+    /// checks. The dataset's fill-value message says so
+    /// (`build_dataset_header`), because a file claiming incremental
+    /// allocation is one libhdf5 would never have chosen this index for.
+    pub fn create_implicit_dataset(
+        &self,
+        name: &str,
+        datatype: DatatypeMessage,
+        dims: &[u64],
+        chunk_dims: &[u64],
+    ) -> IoResult<usize> {
+        let create = self.begin_create(name, NewStorage::Chunked)?;
+        let name = create.name.as_str();
+        validate_chunk_geometry(dims, dims, chunk_dims)?;
+        let mut num_chunks: u64 = 1;
+        for g in crate::io::chunk_grid::index_grid(dims, None, chunk_dims)? {
+            num_chunks = num_chunks.checked_mul(g).ok_or_else(|| {
+                crate::io::IoError::InvalidState("chunk count overflows u64".into())
+            })?;
+        }
+        let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
+        let data_size = num_chunks.checked_mul(chunk_bytes).ok_or_else(|| {
+            crate::io::IoError::InvalidState("implicit chunk storage overflows u64".into())
+        })?;
+        let layout_version = self.chunk_layout_version(false, chunk_bytes);
+
+        // Early allocation is the whole of this index: the run exists, and
+        // holds the fill value, before any chunk is written. It is written
+        // out rather than merely reserved because the file's end-of-file
+        // address is what libhdf5 checks a file's completeness against — a
+        // reserved-but-absent tail is a truncated file to it.
+        let data_addr = self.allocator.allocate(data_size);
+        self.handle.write_at(
+            data_addr,
+            &crate::format::messages::fill_value::tiled_fill(data_size as usize, None),
+        )?;
+
+        let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
+            dims: dims.to_vec(),
+            max_dims: Some(dims.to_vec()),
+        };
+
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                committed_type: None,
+                dataspace,
+                obj_header_addr: 0,
+                data_addr: UNDEF_ADDR,
+                data_size: 0,
+                compact: None,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: None,
+                deleted: false,
+                extent_dirty: false,
+                header_dirty: false,
+                nlink_written: 1,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
+                fill_value: None,
+                layout_version,
+                times: None,
+                chunked: None,
+                btree_v2: None,
+                fixed_array: None,
+                implicit: Some(ImplicitDatasetInfo {
+                    chunk_dims: chunk_dims.to_vec(),
+                    data_addr,
+                    data_size,
+                }),
+                btree_v1: None,
+                append: None,
+            },
+        );
+
+        Ok(idx)
+    }
+
+    /// Define a chunked dataset indexed by a version-1 B-tree — the classic
+    /// chunk index, and the only one a version-0/1 superblock file can carry.
+    ///
+    /// The tree itself is not created here: libhdf5 leaves the layout
+    /// message's address undefined until the first chunk is inserted
+    /// (`H5D__btree_idx_create` runs on that insert), and so does this — the
+    /// flush that bulk-loads the records is what puts a node in the file.
+    ///
+    /// Unlike the array indexes this one has no grid to size, so it takes any
+    /// number of unlimited dimensions: a key *is* the chunk's position, and
+    /// the tree is ordered by it.
+    pub fn create_btree_v1_dataset(
+        &self,
+        name: &str,
+        datatype: DatatypeMessage,
+        dims: &[u64],
+        max_dims: &[u64],
+        chunk_dims: &[u64],
+        pipeline: Option<FilterPipeline>,
+    ) -> IoResult<usize> {
+        let create = self.begin_create(
+            name,
+            if pipeline.is_some() {
+                NewStorage::ChunkedFiltered
+            } else {
+                NewStorage::Chunked
+            },
+        )?;
+        let name = create.name.as_str();
+        validate_chunk_geometry(dims, max_dims, chunk_dims)?;
+        let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
+        if chunk_bytes > u32::MAX as u64 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "a {chunk_bytes}-byte chunk does not fit the 32-bit size field of a \
+                 version-1 B-tree chunk key"
+            )));
+        }
+
+        let dataspace = DataspaceMessage {
+            // Chunked storage always requires at least one dimension, so
+            // this is never Scalar or Null.
+            class: DataspaceClass::Simple,
+            dims: dims.to_vec(),
+            max_dims: Some(max_dims.to_vec()),
+        };
+
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                committed_type: None,
+                dataspace,
+                obj_header_addr: 0,
+                data_addr: UNDEF_ADDR,
+                data_size: 0,
+                compact: None,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: pipeline,
+                deleted: false,
+                extent_dirty: false,
+                header_dirty: false,
+                nlink_written: 1,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
+                fill_value: None,
+                // The version-3 data layout message this index encodes as —
+                // not one of the versions `chunk_layout_version` chooses
+                // between, which are the two the v1.10 indexes use.
+                layout_version: 3,
+                times: None,
+                chunked: None,
+                fixed_array: None,
+                btree_v2: None,
+                implicit: None,
+                btree_v1: Some(BtreeV1DatasetInfo {
+                    chunk_dims: chunk_dims.to_vec(),
+                    max_dims: max_dims.to_vec(),
+                    config: self.btree_v1_config(),
+                    records: Vec::new(),
+                    node_addrs: Vec::new(),
+                    root_addr: UNDEF_ADDR,
                     chunks_written: 0,
                 }),
                 append: None,
@@ -9769,7 +10452,14 @@ impl Hdf5Writer {
     ) -> IoResult<usize> {
         use crate::format::chunk_index::btree_v2::Bt2Header;
 
-        let create = self.begin_create(name, NewStorage::Chunked)?;
+        let create = self.begin_create(
+            name,
+            if pipeline.is_some() {
+                NewStorage::ChunkedFiltered
+            } else {
+                NewStorage::Chunked
+            },
+        )?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         let ndims = dims.len();
@@ -9847,6 +10537,8 @@ impl Hdf5Writer {
                 times: None,
                 chunked: None,
                 fixed_array: None,
+                implicit: None,
+                btree_v1: None,
                 btree_v2: Some(Bt2DatasetInfo {
                     chunk_dims: chunk_dims.to_vec(),
                     max_dims: max_dims.to_vec(),
@@ -9872,7 +10564,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: FilterPipeline,
     ) -> IoResult<usize> {
-        let create = self.begin_create(name, NewStorage::Chunked)?;
+        let create = self.begin_create(name, NewStorage::ChunkedFiltered)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         ensure_at_most_one_unlimited(max_dims)?;
@@ -9954,6 +10646,8 @@ impl Hdf5Writer {
                 layout_version,
                 times: None,
                 fixed_array: None,
+                implicit: None,
+                btree_v1: None,
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
                     chunk_dims: chunk_dims.to_vec(),
@@ -10494,8 +11188,7 @@ impl Hdf5Writer {
     pub(crate) fn extend_dataset_inner(&self, index: usize, new_dims: &[u64]) -> IoResult<()> {
         let ds = self.ds(index);
         let mut m = ds.lock();
-        let is_unindexed = m.chunked.is_none() && m.fixed_array.is_none() && m.btree_v2.is_none();
-        if is_unindexed {
+        if !m.is_chunked() {
             return Err(crate::io::IoError::InvalidState(
                 "can only extend chunked datasets".into(),
             ));
@@ -10557,9 +11250,7 @@ impl Hdf5Writer {
         let _op = ds.op.lock();
         let old_dims = {
             let m = ds.lock();
-            let is_unindexed =
-                m.chunked.is_none() && m.fixed_array.is_none() && m.btree_v2.is_none();
-            if is_unindexed {
+            if !m.is_chunked() {
                 return Err(crate::io::IoError::InvalidState(
                     "can only set the extent of chunked datasets".into(),
                 ));
@@ -10656,6 +11347,14 @@ impl Hdf5Writer {
             }
             ChunkIndexKind::BtreeV2 => {
                 self.prune_bt2_chunks(index, &geo, new_dims, collect_refs)?
+            }
+            // Removing a chunk from the implicit index is
+            // `H5D__none_idx_remove`: a no-op, because the chunk's space is
+            // the dataset's space and stays allocated either way. Only the
+            // straddlers matter, and they are refilled by the caller.
+            ChunkIndexKind::Implicit => (self.implicit_straddlers(&geo, new_dims)?, Vec::new()),
+            ChunkIndexKind::BtreeV1 => {
+                self.prune_btree_v1_chunks(index, &geo, new_dims, collect_refs)?
             }
         };
         if !dead_refs.is_empty() {
@@ -11005,6 +11704,41 @@ impl Hdf5Writer {
         Ok((straddlers, dead_refs))
     }
 
+    /// Implicit half of [`prune_chunks_beyond`](Self::prune_chunks_beyond):
+    /// the grid coordinates of the chunks a shrink to `new_dims` cuts
+    /// through. Nothing is freed or cleared — this index has no per-chunk
+    /// state to clear and no per-chunk block to free — so the chunks wholly
+    /// beyond the extent keep their bytes, exactly as `H5D__none_idx_remove`
+    /// leaves them. That also means their elements stay reachable, so a
+    /// variable-length dataset's heap objects must *not* be released here.
+    fn implicit_straddlers(
+        &self,
+        geo: &ChunkGeometry,
+        new_dims: &[u64],
+    ) -> IoResult<Vec<Vec<u64>>> {
+        let mut nchunks: u64 = 1;
+        for g in
+            crate::io::chunk_grid::index_grid(&geo.dims, geo.max_dims.as_deref(), &geo.chunk_dims)?
+        {
+            nchunks = nchunks.checked_mul(g).ok_or_else(|| {
+                crate::io::IoError::InvalidState("chunk count overflows u64".into())
+            })?;
+        }
+        let mut straddlers = Vec::new();
+        for lidx in 0..nchunks {
+            let coords = crate::io::chunk_grid::coords_of(
+                &geo.dims,
+                geo.max_dims.as_deref(),
+                &geo.chunk_dims,
+                lidx,
+            )?;
+            if chunk_straddles_extent(&coords, &geo.chunk_dims, new_dims) {
+                straddlers.push(coords);
+            }
+        }
+        Ok(straddlers)
+    }
+
     /// V2-B-tree half of [`prune_chunks_beyond`](Self::prune_chunks_beyond):
     /// drop the records of chunks beyond the extent — the next flush
     /// re-serializes the smaller tree over the node pool and releases the
@@ -11077,6 +11811,52 @@ impl Hdf5Writer {
             }
             bt2.index.records = kept;
         }
+        Ok((straddlers, dead_refs))
+    }
+
+    /// Version-1-B-tree half of [`prune_chunks_beyond`](Self::prune_chunks_beyond):
+    /// drop the records of chunks beyond the extent — the next flush
+    /// re-serializes the smaller tree over the node pool and releases the
+    /// surplus node blocks.
+    fn prune_btree_v1_chunks(
+        &self,
+        index: usize,
+        geo: &ChunkGeometry,
+        new_dims: &[u64],
+        collect_refs: bool,
+    ) -> IoResult<(Vec<Vec<u64>>, Vec<u8>)> {
+        let ds = self.ds(index);
+        let mut m = ds.lock();
+        let pipeline = m.filter_pipeline.clone();
+        let swmr = self.swmr_active;
+        let mut straddlers = Vec::new();
+        let mut dead_refs = Vec::new();
+        let bt1 = m.btree_v1.as_mut().unwrap();
+        let records = std::mem::take(&mut bt1.records);
+        let mut kept = Vec::with_capacity(records.len());
+        for r in records {
+            if chunk_outside_extent(&r.scaled, &geo.chunk_dims, new_dims) {
+                if collect_refs {
+                    if let Some(bytes) = self.read_chunk_block(
+                        pipeline.as_ref(),
+                        r.address,
+                        r.nbytes as u64,
+                        r.filter_mask,
+                    )? {
+                        dead_refs.extend_from_slice(&bytes);
+                    }
+                }
+                if !swmr {
+                    self.allocator.free(r.address, r.nbytes as u64);
+                }
+            } else {
+                if chunk_straddles_extent(&r.scaled, &geo.chunk_dims, new_dims) {
+                    straddlers.push(r.scaled.clone());
+                }
+                kept.push(r);
+            }
+        }
+        m.btree_v1.as_mut().unwrap().records = kept;
         Ok((straddlers, dead_refs))
     }
 
@@ -11178,6 +11958,44 @@ impl Hdf5Writer {
             return Ok(());
         }
 
+        // Version-1-B-tree-indexed dataset
+        if let Some(ref bt1) = m.btree_v1 {
+            // Bulk-loaded over the same block pool the v2 B-tree above uses,
+            // and for the same reason: every node of a v1 tree is the width
+            // its "K" value gives, so a block stays usable however the tree
+            // reshapes, and only the shortfall is ever allocated.
+            let element_size = m.datatype.element_size() as u64;
+            let tree = bt1.build_tree(element_size, self.ctx.sizeof_addr as usize);
+            let node_size = tree.node_size() as u64;
+            let mut node_addrs = bt1.node_addrs.clone();
+            while node_addrs.len() < tree.node_count() {
+                node_addrs.push(self.allocator.allocate(node_size));
+            }
+            // A tree with fewer nodes than last flush releases the surplus
+            // straight away, where the v2 B-tree has to keep it out of the
+            // free list for a live SWMR reader: this index lives only in a
+            // classic file, which `start_swmr` refuses outright (and upstream
+            // says the same in `H5D_COPS_BTREE`).
+            for addr in node_addrs.split_off(tree.node_count()) {
+                self.allocator.free(addr, node_size);
+            }
+            for (image, &addr) in tree.encode(&node_addrs)?.iter().zip(&node_addrs) {
+                self.handle.write_at(addr, image)?;
+            }
+            // The root is the last node the bulk load emits, and is undefined
+            // while the dataset has no chunks — what the version-3 data
+            // layout message then carries, exactly as libhdf5 leaves it.
+            let root_addr = tree.root_address(&node_addrs);
+            let bt1 = m.btree_v1.as_mut().unwrap();
+            bt1.node_addrs = node_addrs;
+            bt1.root_addr = root_addr;
+
+            if sync {
+                self.handle.sync_data()?;
+            }
+            return Ok(());
+        }
+
         Ok(())
     }
 
@@ -11272,19 +12090,27 @@ impl Hdf5Writer {
             .superblock_version_base
             .max(SUPERBLOCK_V2)
             .max(self.libver.superblock_version());
-        if self.swmr_active || flags & FLAG_SWMR_WRITE != 0 || self.has_chunked_dataset() {
+        if self.swmr_active || flags & FLAG_SWMR_WRITE != 0 || self.has_v110_chunk_index() {
             version = version.max(SUPERBLOCK_V3);
         }
         version
     }
 
-    /// Whether any dataset still in the file is chunked — the three index
-    /// markers `build_dataset_header` turns into a version-4/5 data layout
-    /// message, and nothing else it can emit reaches that version.
-    fn has_chunked_dataset(&self) -> bool {
+    /// Whether any dataset still in the file is indexed by a v1.10 chunk
+    /// index — the markers `build_dataset_header` turns into a version-4/5
+    /// data layout message, and nothing else it can emit reaches that
+    /// version.
+    ///
+    /// Not "is any dataset chunked": the version-1 B-tree is a chunk index
+    /// that encodes as a *version-3* layout message, the version
+    /// `H5O_layout_ver_bounds` gives the earliest bound, so a dataset using
+    /// it asks nothing of the superblock.
+    fn has_v110_chunk_index(&self) -> bool {
         self.dataset_refs().iter().any(|d| {
             let m = d.lock();
-            !m.deleted && (m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some())
+            !m.deleted
+                && m.chunk_index_kind()
+                    .is_some_and(|k| k != ChunkIndexKind::BtreeV1)
         })
     }
 
@@ -11418,8 +12244,7 @@ impl Hdf5Writer {
             let is_indexed = {
                 let ds = self.ds(i);
                 let m = ds.lock();
-                !m.deleted
-                    && (m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some())
+                !m.deleted && m.is_chunked()
             };
             if is_indexed {
                 self.flush_dataset(i)?;
@@ -11523,8 +12348,7 @@ impl Hdf5Writer {
                 if m.obj_header_written_addr.is_some() && !m.storage_dirty() {
                     continue;
                 }
-                let is_indexed =
-                    m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
+                let is_indexed = m.is_chunked();
                 if !is_indexed {
                     continue;
                 }
@@ -11774,15 +12598,22 @@ impl Hdf5Writer {
         }
 
         // Fill Value message (type 0x05)
-        let is_chunked = m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
+        let is_chunked = m.is_chunked();
         // `H5P__init_def_layout` gives each storage class its own default
         // allocation time: incremental for chunked, early for compact (the
         // space is the header, so it exists as soon as the dataset does),
-        // late for contiguous.
-        let alloc_time = match (is_chunked, m.compact.is_some()) {
-            (true, _) => 3,  // incremental
-            (_, true) => 1,  // early
-            (false, _) => 2, // late
+        // late for contiguous. An implicitly indexed dataset is the one
+        // chunked exception, and not by default but by definition: early
+        // allocation is a *condition* of that index
+        // (`H5D__layout_set_latest_indexing`), so a header claiming
+        // incremental would describe a file libhdf5 would never have chosen
+        // this index for.
+        let alloc_time = if m.compact.is_some() || m.implicit.is_some() {
+            1 // early
+        } else if is_chunked {
+            3 // incremental
+        } else {
+            2 // late
         };
         let fv = if let Some(ref bytes) = m.fill_value {
             // User-defined fill value (fill_defined = 2).
@@ -11794,7 +12625,7 @@ impl Hdf5Writer {
             }
         } else if is_chunked {
             FillValueMessage {
-                alloc_time: 3,      // incremental
+                alloc_time,
                 fill_write_time: 0, // on alloc
                 fill_defined: 1,    // default value (zeros)
                 fill_value: None,
@@ -11838,6 +12669,17 @@ impl Hdf5Writer {
                 },
                 bt2.bt2_header_addr,
             )
+        } else if let Some(ref imp) = m.implicit {
+            let mut layout_dims = imp.chunk_dims.clone();
+            layout_dims.push(m.datatype.element_size() as u64);
+            DataLayoutMessage::chunked_v4_implicit(m.layout_version, layout_dims, imp.data_addr)
+        } else if let Some(ref bt1) = m.btree_v1 {
+            // The classic index: a version-3 layout message carrying the
+            // address of the tree's root node, which is undefined until a
+            // chunk is written.
+            let mut layout_dims = bt1.chunk_dims.clone();
+            layout_dims.push(m.datatype.element_size() as u64);
+            DataLayoutMessage::chunked_v3_btree_v1(layout_dims, bt1.root_addr)
         } else if let Some(ref image) = m.compact {
             DataLayoutMessage::compact(image.clone())
         } else {

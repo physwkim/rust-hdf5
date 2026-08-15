@@ -456,29 +456,36 @@ fn a_creation_order_group_in_a_classic_file_keeps_its_link_messages() {
 }
 
 /// A chunked dataset in a classic file is a version-3 data layout message over
-/// a version-1 B-tree chunk index, which this crate reads but does not write.
-/// It is refused where the caller asks for it, so nothing is written and the
-/// file the caller reopened is still the file they had.
+/// a version-1 B-tree chunk index, and this file gets one of each: a 1-D grid
+/// whose chunks divide the extent evenly and a 2-D grid whose last row and
+/// column hang past it, which is where a key's offsets and the tree's right
+/// bound are easiest to get wrong.
 #[test]
-fn creating_a_chunked_dataset_in_a_classic_file_is_refused() {
+fn a_classic_file_takes_a_chunked_dataset() {
     let Some(py) = python() else { return };
     let path = tmp("chunked");
     write_default_h5py(py, &path, "f['alpha'] = np.arange(6, dtype='<i4')\n");
     let before = std::fs::read(&path).unwrap();
 
     let file = H5File::open_rw(&path).unwrap();
-    let err = match file
-        .new_dataset::<i32>()
+    let line: Vec<i32> = (0..64).collect();
+    file.new_dataset::<i32>()
         .shape([64])
         .chunk(&[8])
         .create("chunky")
-    {
-        Ok(_) => panic!("a classic file has no chunk index this writer can build"),
-        Err(e) => e.to_string(),
-    };
-    assert!(err.contains("version-1 B-tree"), "{err}");
-    // A contiguous dataset in the same session still works, so the refusal is
-    // about the storage and not about the file.
+        .unwrap()
+        .write_raw(&line)
+        .unwrap();
+    // 3 x 2 chunks over a 10 x 7 extent: both edges are partial.
+    let plane: Vec<i32> = (0..70).collect();
+    file.new_dataset::<i32>()
+        .shape([10, 7])
+        .chunk(&[4, 4])
+        .create("plane")
+        .unwrap()
+        .write_raw(&plane)
+        .unwrap();
+    // A contiguous dataset in the same session still works.
     file.new_dataset::<i32>()
         .shape([2])
         .create("flat")
@@ -492,7 +499,103 @@ fn creating_a_chunked_dataset_in_a_classic_file_is_refused() {
     read_with_h5py(
         py,
         &path,
-        "assert sorted(f.keys()) == ['alpha', 'flat'], sorted(f.keys())\n",
+        "assert sorted(f.keys()) == ['alpha', 'chunky', 'flat', 'plane'], sorted(f.keys())\n\
+         assert f['chunky'].chunks == (8,), f['chunky'].chunks\n\
+         assert list(f['chunky'][...]) == list(range(64)), list(f['chunky'][...])\n\
+         assert f['plane'].chunks == (4, 4), f['plane'].chunks\n\
+         assert (f['plane'][...] == np.arange(70).reshape(10, 7)).all(), f['plane'][...]\n\
+         assert f['chunky'].id.get_create_plist().get_layout() == h5py.h5d.CHUNKED\n",
+    );
+    libhdf5_tools_accept(py, &path);
+
+    // This crate's own reader walks the same tree it just wrote.
+    let back = H5File::open(&path).unwrap();
+    assert_eq!(
+        back.dataset("chunky").unwrap().read_raw::<i32>().unwrap(),
+        line
+    );
+    assert_eq!(
+        back.dataset("plane").unwrap().read_raw::<i32>().unwrap(),
+        plane
+    );
+    drop(back);
+
+    // A second append reopens the tree the first wrote: the chunk data has to
+    // survive a header rebuild that does not touch it.
+    let file = H5File::open_rw(&path).unwrap();
+    file.new_dataset::<i32>()
+        .shape([1])
+        .create("later")
+        .unwrap()
+        .write_raw(&[7i32])
+        .unwrap();
+    file.close().unwrap();
+
+    assert_eq!(superblock_version(&path), 0);
+    read_with_h5py(
+        py,
+        &path,
+        "assert list(f['chunky'][...]) == list(range(64)), list(f['chunky'][...])\n\
+         assert (f['plane'][...] == np.arange(70).reshape(10, 7)).all(), f['plane'][...]\n\
+         assert list(f['later'][...]) == [7]\n",
+    );
+    libhdf5_tools_accept(py, &path);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A chunk tree past one node, and an unlimited extent grown after the fact.
+///
+/// The classic index holds `2 * indexed_storage_k` = 64 entries per node at
+/// the default K the superblock carries, so 200 chunks force a second level
+/// and the separator keys that come with it. libhdf5 reading every value back
+/// is what says the keys are ordered and bounded the way `H5D__btree_cmp3`
+/// expects.
+#[test]
+fn a_classic_chunk_tree_grows_past_one_node_and_past_its_extent() {
+    let Some(py) = python() else { return };
+    let path = tmp("chunk_tree");
+    write_default_h5py(py, &path, "f['alpha'] = np.arange(3, dtype='<i4')\n");
+
+    let file = H5File::open_rw(&path).unwrap();
+    let wide: Vec<i32> = (0..200 * 4).collect();
+    file.new_dataset::<i32>()
+        .shape([800])
+        .chunk(&[4])
+        .create("wide")
+        .unwrap()
+        .write_raw(&wide)
+        .unwrap();
+
+    // An unlimited dimension in a classic file is the same index: the tree
+    // takes whatever key it is given, so growth needs no reshape of it.
+    let growing = file
+        .new_dataset::<i32>()
+        .shape([8])
+        .max_shape(&[None])
+        .chunk(&[4])
+        .create("growing")
+        .unwrap();
+    growing
+        .write_raw(&[0i32, 1, 2, 3, 100, 101, 102, 103])
+        .unwrap();
+    growing.append(&[8i32, 9, 10, 11, 12, 13, 14, 15]).unwrap();
+    // Overwrite one already-stored chunk by its linear index: the record has
+    // to be replaced in the tree rather than added beside itself.
+    let second: Vec<u8> = [4i32, 5, 6, 7]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    growing.write_chunk(1, &second).unwrap();
+    file.close().unwrap();
+
+    assert_eq!(superblock_version(&path), 0);
+    read_with_h5py(
+        py,
+        &path,
+        "assert list(f['wide'][...]) == list(range(800)), f['wide'][...]\n\
+         assert f['growing'].shape == (16,), f['growing'].shape\n\
+         assert f['growing'].maxshape == (None,), f['growing'].maxshape\n\
+         assert list(f['growing'][...]) == list(range(16)), list(f['growing'][...])\n",
     );
     libhdf5_tools_accept(py, &path);
     let _ = std::fs::remove_file(&path);
@@ -500,14 +603,14 @@ fn creating_a_chunked_dataset_in_a_classic_file_is_refused() {
 
 /// What a classic file accepts is decided per storage form, not per file.
 ///
-/// Compact and contiguous layouts both encode as a version-3 data layout
-/// message, which is exactly what libhdf5 writes at `H5F_LIBVER_EARLIEST`, so
-/// both belong in a version-0 file and are written into one here. Chunked
-/// storage does not — its index would be a version-1 B-tree this crate reads
-/// but cannot write — so it stays refused, and so does every filter, because
-/// a filter pipeline in HDF5 has nowhere to live but a chunk.
+/// Compact, contiguous and chunked layouts all encode as a version-3 data
+/// layout message, which is exactly what libhdf5 writes at
+/// `H5F_LIBVER_EARLIEST`, so all three belong in a version-0 file and are
+/// written into one here. A filter does not: its pipeline message would have
+/// to be version 1, and this crate encodes version 2 only, so every filtered
+/// dataset is still refused where the caller asks for it.
 #[test]
-fn a_classic_file_takes_compact_and_contiguous_but_no_chunk() {
+fn a_classic_file_takes_compact_and_contiguous_but_no_filter() {
     let Some(py) = python() else { return };
     let path = tmp("storage_matrix");
     write_default_h5py(py, &path, "f['alpha'] = np.arange(6, dtype='<i4')\n");
@@ -533,17 +636,17 @@ fn a_classic_file_takes_compact_and_contiguous_but_no_chunk() {
         .write_raw(&[1i32, 2, 3])
         .unwrap();
 
-    // Refused, each for the chunk index it would need. A filter is refused by
-    // the same rule and not a second one: it is the chunking it requires that
-    // the file cannot hold.
+    // Writable: chunk offsets, sizes and filter masks in a version-1 B-tree.
+    file.new_dataset::<i32>()
+        .shape([16])
+        .chunk(&[8])
+        .create("chunky")
+        .unwrap()
+        .write_raw(&(0i32..16).collect::<Vec<_>>())
+        .unwrap();
+
+    // Refused, each for the version-1 filter pipeline message it would need.
     for (which, res) in [
-        (
-            "chunked",
-            file.new_dataset::<i32>()
-                .shape([64])
-                .chunk(&[8])
-                .create("a"),
-        ),
         (
             "deflate",
             file.new_dataset::<i32>()
@@ -570,23 +673,25 @@ fn a_classic_file_takes_compact_and_contiguous_but_no_chunk() {
         ),
     ] {
         match res {
-            Ok(_) => panic!("{which} needs a chunk index this writer cannot build here"),
-            Err(e) => assert!(e.to_string().contains("version-1 B-tree"), "{which}: {e}"),
+            Ok(_) => panic!("{which} needs a filter pipeline message this file cannot hold"),
+            Err(e) => assert!(e.to_string().contains("filter pipeline"), "{which}: {e}"),
         }
     }
 
     file.close().unwrap();
 
-    // Still the file it was, and libhdf5 reads both new datasets — including
-    // the compact one, whose bytes are only in its header.
+    // Still the file it was, and libhdf5 reads all three new datasets —
+    // including the compact one, whose bytes are only in its header.
     assert_eq!(superblock_version(&path), 0);
     read_with_h5py(
         py,
         &path,
-        "assert sorted(f.keys()) == ['alpha', 'flat', 'packed'], sorted(f.keys())\n\
+        "assert sorted(f.keys()) == ['alpha', 'chunky', 'flat', 'packed'], sorted(f.keys())\n\
          assert list(f['packed'][...]) == [10, 20, 30, 40], list(f['packed'][...])\n\
          assert list(f['flat'][...]) == [1, 2, 3], list(f['flat'][...])\n\
-         assert f['packed'].id.get_create_plist().get_layout() == h5py.h5d.COMPACT\n",
+         assert list(f['chunky'][...]) == list(range(16)), list(f['chunky'][...])\n\
+         assert f['packed'].id.get_create_plist().get_layout() == h5py.h5d.COMPACT\n\
+         assert f['chunky'].id.get_create_plist().get_layout() == h5py.h5d.CHUNKED\n",
     );
     libhdf5_tools_accept(py, &path);
     let _ = std::fs::remove_file(&path);

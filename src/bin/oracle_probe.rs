@@ -1707,6 +1707,21 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "chunkidx_single" => chunked_ramp(path, 8, &[8], &[Some(8)]),
+        "chunkidx_implicit" => {
+            // Fixed shape, no filter, early allocation: the three conditions
+            // libhdf5 picks the implicit index under, which is the index of
+            // no structure at all.
+            let file = H5File::create(path)?;
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([16usize])
+                .chunk(&[4])
+                .early_allocation()
+                .create("data")?;
+            ds.write_raw(&ramp_n::<i32>(16))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "chunkidx_farray" => chunked_ramp(path, 16, &[4], &[Some(16)]),
         "chunkidx_earray" => chunked_ramp(path, 16, &[4], &[None]),
         "chunkidx_earray_unlim_inner" => {
