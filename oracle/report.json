@@ -4,7 +4,7 @@
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
   "python": "/home/stevek/micromamba/envs/tomo/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-integrator2-70ef8082-1/target/release/oracle_probe",
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-groupstorage-fc0f528d-1/target/release/oracle_probe",
   "cases": 91
  },
  "results": [
@@ -12044,7 +12044,7 @@
    "case": "group_storage_modern_root",
    "group": "group",
    "note": "symbol-table group with children under a link-message root",
-   "rust_case": null,
+   "rust_case": "group_storage_modern_root",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -12311,19 +12311,41 @@
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "metadata_diffs": [
+     {
+      "key": "#superblock",
+      "field": "superblock",
+      "ref": "0",
+      "rust": "2",
+      "expected": "superblock-floor-v2"
+     },
+     {
+      "key": "/legacy#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     },
+     {
+      "key": "/legacy/inner#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
    "case": "group_storage_legacy_root",
    "group": "group",
    "note": "link-message group with children under a symbol-table root",
-   "rust_case": null,
+   "rust_case": "group_storage_legacy_root",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -12694,12 +12716,41 @@
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "metadata_diffs": [
+     {
+      "key": "#superblock",
+      "field": "superblock",
+      "ref": "0",
+      "rust": "2",
+      "expected": "superblock-floor-v2"
+     },
+     {
+      "key": "/#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     },
+     {
+      "key": "/legacy#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     },
+     {
+      "key": "/modern/inner#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
@@ -17205,8 +17256,6 @@
     "chunkidx_implicit",
     "external_storage",
     "vds",
-    "group_storage_modern_root",
-    "group_storage_legacy_root",
     "sohm_list",
     "sohm_btree",
     "ochk_root"
@@ -18713,6 +18762,8 @@
     "link_external",
     "link_external_read",
     "track_order",
+    "group_storage_modern_root",
+    "group_storage_legacy_root",
     "attr_scalar_num",
     "attr_array_num",
     "attr_string",
@@ -18801,6 +18852,8 @@
     "link_external",
     "link_external_read",
     "track_order",
+    "group_storage_modern_root",
+    "group_storage_legacy_root",
     "attr_scalar_num",
     "attr_array_num",
     "attr_string",

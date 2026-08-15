@@ -794,9 +794,11 @@ LINK_CASES = [
          "12 links in one group — dense link storage (fractal heap + v2 B-tree)"),
     Case("track_order", "group", gen_track_order, "track_order",
          "creation-order indices on links and attributes"),
-    Case("group_storage_modern_root", "group", gen_group_storage_modern_root, None,
+    Case("group_storage_modern_root", "group", gen_group_storage_modern_root,
+         "group_storage_modern_root",
          "symbol-table group with children under a link-message root"),
-    Case("group_storage_legacy_root", "group", gen_group_storage_legacy_root, None,
+    Case("group_storage_legacy_root", "group", gen_group_storage_legacy_root,
+         "group_storage_legacy_root",
          "link-message group with children under a symbol-table root"),
 ]
 

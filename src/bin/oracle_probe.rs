@@ -1981,6 +1981,52 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "group_storage_modern_root" => {
+            // `File(track_order=True)` reaches the root group only; reset
+            // before the plain `create_group` calls that follow, same as the
+            // "track_order" case above.
+            let file = H5FileOptions::new().track_order(true).create(path)?;
+            file.set_track_order(false)?;
+            let legacy = file.root_group().create_group("legacy")?;
+            legacy
+                .new_dataset::<i32>()
+                .shape([8usize])
+                .create("a")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            let inner = legacy.create_group("inner")?;
+            inner
+                .new_dataset::<i16>()
+                .shape([8usize])
+                .create("c")?
+                .write_raw(&ramp_n::<i16>(8))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "group_storage_legacy_root" => {
+            let file = H5File::create(path)?;
+            let legacy = file.root_group().create_group("legacy")?;
+            legacy
+                .new_dataset::<i32>()
+                .shape([8usize])
+                .create("a")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.set_track_order(true)?;
+            let modern = file.root_group().create_group("modern")?;
+            file.set_track_order(false)?;
+            modern
+                .new_dataset::<f64>()
+                .shape([8usize])
+                .create("b")?
+                .write_raw(&(0..8).map(|i| i as f64).collect::<Vec<_>>())?;
+            let inner = modern.create_group("inner")?;
+            inner
+                .new_dataset::<i16>()
+                .shape([8usize])
+                .create("c")?
+                .write_raw(&ramp_n::<i16>(8))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
 
         // ---- attributes ----------------------------------------------------
         "attr_scalar_num" => {
