@@ -32,8 +32,9 @@ use rust_hdf5::format::messages::filter::{
 };
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
-    ChunkIndex, H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error,
-    Hyperslab, HyperslabBlock, LibverBound, LinkClass, Reference, Selection, StorageLayout,
+    ChunkIndex, FillValue, H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype,
+    Hdf5Error, Hyperslab, HyperslabBlock, LibverBound, LinkClass, Reference, Selection,
+    StorageLayout,
 };
 
 const CANON_VERSION: &str = "3";
@@ -922,7 +923,14 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
     });
 
     d.field(path, "fillvalue", || {
-        Err("H5Dataset exposes no fill value accessor".into())
+        guarded(|| ds.fill_value())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|fv| match fv {
+                FillValue::Default => "default".to_string(),
+                FillValue::Undefined => "undefined".to_string(),
+                FillValue::UserDefined(bytes) => format!("0x{}", hex(&bytes)),
+            })
+            .map_err(oneline)
     });
 
     dump_object_attrs(d, path, ds);

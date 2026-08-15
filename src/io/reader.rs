@@ -156,6 +156,13 @@ pub struct DatasetReadInfo {
     /// fill-value message when `fill_defined == 2`. `None` => default
     /// zero-fill. Applied to unallocated chunks and unwritten regions.
     pub fill_value: Option<Vec<u8>>,
+    /// The fill-value message's own definedness byte
+    /// (`H5D_fill_value_t`/`H5Pfill_value_defined`): 0 = explicitly
+    /// undefined (no fill is ever performed), 1 = default (zero-fill, no
+    /// value stored), 2 = user-defined (`fill_value` carries the bytes). A
+    /// dataset with no fill-value message at all reads as 1, matching a
+    /// fresh dataset creation property list (`FillValueMessage::default`).
+    pub fill_defined: u8,
     /// External raw-data segments (H5O_EFL_ID). Non-empty only when this
     /// dataset's storage is an External Data Files list instead of a
     /// normal contiguous block — `layout` still reports `Contiguous` with
@@ -1849,6 +1856,11 @@ impl Hdf5Reader {
         let mut layout = None;
         let mut filter_pipeline = None;
         let mut fill_value = None;
+        // No message at all is the library default: a fresh dataset
+        // creation property list starts fill_defined = 1
+        // (`FillValueMessage::default`), so a dataset that never got one
+        // written reads back exactly as if it had.
+        let mut fill_defined: u8 = 1;
         // The first message that did not decode, kept verbatim: it is the
         // answer a caller gets when it asks for this dataset.
         let mut blocked: Option<String> = None;
@@ -1909,6 +1921,7 @@ impl Hdf5Reader {
                 },
                 MSG_FILL_VALUE => match FillValueMessage::decode(&msg.data) {
                     Ok((fv, _)) => {
+                        fill_defined = fv.fill_defined;
                         if fv.fill_defined == 2 {
                             fill_value = fv.fill_value;
                         }
@@ -1983,6 +1996,7 @@ impl Hdf5Reader {
                 filter_pipeline,
                 attributes,
                 fill_value,
+                fill_defined,
                 external_files,
                 virtual_mappings,
             })),

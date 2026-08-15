@@ -1426,6 +1426,20 @@ pub enum ChunkIndex {
     ExtensibleArray,
 }
 
+/// A dataset's fill-value state (read mode only) — `H5Pfill_value_defined`'s
+/// tri-state (`H5D_fill_value_t`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FillValue {
+    /// No fill value has ever been set: unwritten elements read back
+    /// zero-filled, and no fill-value message named an explicit value.
+    Default,
+    /// The fill value was explicitly disabled: unallocated storage is never
+    /// fill-initialized.
+    Undefined,
+    /// An explicit fill value, one element wide.
+    UserDefined(Vec<u8>),
+}
+
 impl H5Dataset {
     /// Create a reader-mode dataset handle (called internally by `H5File::dataset`).
     pub(crate) fn new_reader(
@@ -1739,6 +1753,36 @@ impl H5Dataset {
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "filters() is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Return this dataset's fill-value state (read mode only).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is in write mode, or if the dataset can
+    /// no longer be found in the reader's metadata.
+    pub fn fill_value(&self) -> Result<FillValue> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => reader
+                        .dataset_info(name)
+                        .map(|info| match info.fill_defined {
+                            0 => FillValue::Undefined,
+                            2 => {
+                                FillValue::UserDefined(info.fill_value.clone().unwrap_or_default())
+                            }
+                            _ => FillValue::Default,
+                        })
+                        .ok_or_else(|| Hdf5Error::NotFound(name.clone())),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "fill_value() is only available in read mode".into(),
             )),
         }
     }
@@ -9090,5 +9134,38 @@ mod tests {
         assert_eq!(filters[0].flags, FLAG_OPTIONAL);
         assert_eq!(filters[1].id, FILTER_DEFLATE);
         assert_eq!(filters[1].cd_values, vec![6]);
+    }
+
+    /// [`H5Dataset::fill_value`] reports the explicit bytes for a dataset
+    /// created with `.fill_value(...)`, and the negative case: a dataset
+    /// with no fill value set reports [`FillValue::Default`], not an error.
+    /// `FillValue::Undefined` has no constructor on either this crate's
+    /// writer or h5py's public API, so it is not exercised here.
+    #[test]
+    fn fill_value_reports_the_stored_value() {
+        use crate::FillValue;
+        let path = temp_path("fill_value");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .create("unset")
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .fill_value(-7i32)
+                .create("set")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("unset").unwrap().fill_value().unwrap(),
+            FillValue::Default
+        );
+        assert_eq!(
+            file.dataset("set").unwrap().fill_value().unwrap(),
+            FillValue::UserDefined((-7i32).to_le_bytes().to_vec())
+        );
     }
 }
