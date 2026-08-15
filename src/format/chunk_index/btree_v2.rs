@@ -1072,6 +1072,48 @@ impl Bt2Tree {
     }
 }
 
+/// Bulk-load one v2 B-tree over `records` — the encoded records in key order —
+/// and lay its header and nodes out in file space.
+///
+/// `alloc` allocates `len` bytes and returns the address. Returns the header
+/// address and every `(address, image)` pair to write; the images are exactly
+/// what was allocated for them, node images included, so a caller can write
+/// them without re-deriving a length.
+pub fn build_index(
+    record_type: u8,
+    record_size: u16,
+    node_size: u32,
+    records: &[u8],
+    ctx: &FormatContext,
+    alloc: &mut dyn FnMut(u64) -> u64,
+) -> (u64, Vec<(u64, Vec<u8>)>) {
+    let tree = Bt2Tree::build(
+        record_type,
+        record_size,
+        node_size,
+        ctx.sizeof_addr,
+        records,
+    );
+    // The header address is taken first so it keeps the low address libhdf5
+    // gives it, but its image needs the root's address, which only exists once
+    // every node has one.
+    let header_addr = alloc(tree.header(UNDEF_ADDR).encoded_size(ctx) as u64);
+    let node_addrs: Vec<u64> = tree
+        .nodes
+        .iter()
+        .map(|_| alloc(tree.node_size as u64))
+        .collect();
+    let mut blocks: Vec<(u64, Vec<u8>)> = tree
+        .encode(ctx, &node_addrs)
+        .into_iter()
+        .zip(&node_addrs)
+        .map(|(image, &addr)| (addr, image))
+        .collect();
+    let root_addr = node_addrs.last().copied().unwrap_or(UNDEF_ADDR);
+    blocks.push((header_addr, tree.header(root_addr).encode(ctx)));
+    (header_addr, blocks)
+}
+
 // ==========================================================================
 // In-memory BT2 chunk index (flat approach)
 // ==========================================================================

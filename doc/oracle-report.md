@@ -27,13 +27,13 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 
 | direction | PASS | INVALID | UNSUPPORTED-API | SKIPPED |
 |---|---|---|---|---|
-| B (write) | 83 | 0 | 8 | 0 |
+| B (write) | 85 | 0 | 6 | 0 |
 
 ## Top gaps by severity
 
 | # | severity | finding | cases |
 |---|---|---|---|
-| 1 | API cannot express | no rust writer arm: the public API cannot express this case | 8 (chunkidx_implicit, external_storage, vds, group_storage_mod…) |
+| 1 | API cannot express | no rust writer arm: the public API cannot express this case | 6 (chunkidx_implicit, external_storage, vds, group_storage_mod…) |
 | 2 | no public accessor (API-wide) | attrorder — H5Group exposes no attribute creation-order tracking flags | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
 | 3 | no public accessor (API-wide) | attrstore — H5Group exposes no compact/dense attribute storage accessor | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
 | 4 | no public accessor (API-wide) | linkorder — H5Group exposes no link creation-order tracking flags | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
@@ -136,8 +136,8 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `userblock` | superblock | PASS | 0 | 0 | 0 | PASS |  |
 | `swmr_created` | swmr | PASS | 0 | 0 | 0 | PASS |  |
 | `large_multi_mb` | bulk | PASS | 0 | 0 | 0 | PASS |  |
-| `sohm_list` | sohm | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
-| `sohm_btree` | sohm | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `sohm_list` | sohm | PASS | 0 | 0 | 0 | PASS |  |
+| `sohm_btree` | sohm | PASS | 0 | 0 | 0 | PASS |  |
 | `ochk_root` | objectheader | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
 
 ## Direction A divergences, in full
@@ -176,7 +176,7 @@ None.
 
 | severity | finding | cases | example |
 |---|---|---|---|
-| API cannot express | no rust writer arm: the public API cannot express this case | 8 |  |
+| API cannot express | no rust writer arm: the public API cannot express this case | 6 |  |
 | no public accessor (API-wide) | attrorder — H5Group exposes no attribute creation-order tracking flags | 91 | /#attrorder |
 | no public accessor (API-wide) | attrstore — H5Group exposes no compact/dense attribute storage accessor | 91 | /#attrstore |
 | no public accessor (API-wide) | linkorder — H5Group exposes no link creation-order tracking flags | 91 | /#linkorder |

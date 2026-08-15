@@ -20,6 +20,7 @@ use std::path::Path;
 
 use crate::io::locking::FileLocking;
 use crate::io::reader::SuperblockExtension;
+use crate::io::writer::SharedMessageConfig;
 use crate::io::{Hdf5Reader, Hdf5Writer};
 
 use crate::dataset::{DatasetBuilder, H5Dataset};
@@ -987,6 +988,7 @@ pub struct H5FileOptions {
     track_order: bool,
     libver: LibverBound,
     userblock: u64,
+    shared_messages: SharedMessageConfig,
 }
 
 impl H5FileOptions {
@@ -1079,6 +1081,46 @@ impl H5FileOptions {
         self
     }
 
+    /// Create the file with shared object header messages — libhdf5's
+    /// `H5Pset_shared_mesg_nindexes` + `H5Pset_shared_mesg_index` +
+    /// `H5Pset_shared_mesg_phase_change`, which h5py exposes no binding for.
+    ///
+    /// A message class covered by an index is written once into a
+    /// shared-message fractal heap, and every object header that would have
+    /// held that exact body holds a pointer to it instead. `indexes` gives
+    /// one `(message types, minimum message size)` pair per index, where the
+    /// type mask is built from
+    /// [`type_flag`](crate::format::sohm::type_flag); `list_max` and
+    /// `btree_min` are the file-wide counts at which an index changes between
+    /// list and v2 B-tree form.
+    ///
+    /// Only [`create`](Self::create) reads this, and it refuses a
+    /// configuration libhdf5 would refuse: more than eight indexes, an index
+    /// covering no type, or thresholds that overlap.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::{H5File, format::sohm::type_flag};
+    /// use rust_hdf5::format::messages::{MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE};
+    ///
+    /// let types = type_flag(MSG_DATATYPE).unwrap()
+    ///     | type_flag(MSG_DATASPACE).unwrap()
+    ///     | type_flag(MSG_ATTRIBUTE).unwrap();
+    /// let file = H5File::options()
+    ///     .shared_messages(&[(types, 0)], 50, 40)
+    ///     .create("sohm.h5")
+    ///     .unwrap();
+    /// # let _ = file;
+    /// ```
+    pub fn shared_messages(
+        mut self,
+        indexes: &[(u16, u32)],
+        list_max: u16,
+        btree_min: u16,
+    ) -> Self {
+        self.shared_messages = SharedMessageConfig::new(indexes, list_max, btree_min);
+        self
+    }
+
     fn resolved_locking(&self) -> FileLocking {
         match self.locking {
             Some(p) => p,
@@ -1095,6 +1137,7 @@ impl H5FileOptions {
                 track_order: self.track_order,
                 libver: self.libver,
                 userblock: self.userblock,
+                shared_messages: self.shared_messages,
             },
         )?;
         Ok(H5File {

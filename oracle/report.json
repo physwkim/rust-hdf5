@@ -4,7 +4,7 @@
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
   "python": "/home/stevek/micromamba/envs/tomo/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-integrator2-70ef8082-1/target/release/oracle_probe",
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-sohm-076f1778-1/target/release/oracle_probe",
   "cases": 91
  },
  "results": [
@@ -10487,7 +10487,7 @@
       "kind": "unsupported",
       "field": "linkstore",
       "structural": true,
-      "ref": "symtab",
+      "ref": "compact",
       "probe": "UNSUPPORTED(linkstore): H5Group exposes no compact/dense link storage accessor"
      },
      {
@@ -10578,13 +10578,6 @@
       "ref": "0",
       "rust": "2",
       "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
      }
     ],
     "h5diff_rc": 0,
@@ -10637,7 +10630,7 @@
       "kind": "unsupported",
       "field": "linkstore",
       "structural": true,
-      "ref": "symtab",
+      "ref": "compact",
       "probe": "UNSUPPORTED(linkstore): H5Group exposes no compact/dense link storage accessor"
      },
      {
@@ -10664,13 +10657,6 @@
       "ref": "0",
       "rust": "2",
       "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
      }
     ],
     "h5diff_rc": 0,
@@ -15995,7 +15981,7 @@
    "case": "sohm_list",
    "group": "sohm",
    "note": "shared datatype/dataspace/attribute messages, list index (H5Pset_shared_mesg_index) + a committed datatype",
-   "rust_case": null,
+   "rust_case": "sohm_list",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -16037,7 +16023,7 @@
       "kind": "unsupported",
       "field": "linkstore",
       "structural": true,
-      "ref": "dense",
+      "ref": "symtab",
       "probe": "UNSUPPORTED(linkstore): H5Group exposes no compact/dense link storage accessor"
      },
      {
@@ -16422,19 +16408,27 @@
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "metadata_diffs": [
+     {
+      "key": "/#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
    "case": "sohm_btree",
    "group": "sohm",
    "note": "the same file with the shared-message index forced to a v2 B-tree",
-   "rust_case": null,
+   "rust_case": "sohm_btree",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -16476,7 +16470,7 @@
       "kind": "unsupported",
       "field": "linkstore",
       "structural": true,
-      "ref": "dense",
+      "ref": "symtab",
       "probe": "UNSUPPORTED(linkstore): H5Group exposes no compact/dense link storage accessor"
      },
      {
@@ -16861,12 +16855,20 @@
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "metadata_diffs": [
+     {
+      "key": "/#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
@@ -17207,8 +17209,6 @@
     "vds",
     "group_storage_modern_root",
     "group_storage_legacy_root",
-    "sohm_list",
-    "sohm_btree",
     "ochk_root"
    ],
    "example": ""
@@ -18798,15 +18798,15 @@
     "groups_nested",
     "link_hard",
     "link_soft",
-    "link_external",
-    "link_external_read",
     "track_order",
     "attr_scalar_num",
     "attr_array_num",
     "attr_string",
     "attr_on_root",
     "libver_earliest",
-    "userblock"
+    "userblock",
+    "sohm_list",
+    "sohm_btree"
    ]
   },
   {
