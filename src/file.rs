@@ -1057,7 +1057,7 @@ impl H5File {
 pub struct H5FileOptions {
     locking: Option<FileLocking>,
     track_order: bool,
-    libver: LibverBound,
+    libver: Option<LibverBound>,
     userblock: u64,
     shared_messages: SharedMessageConfig,
 }
@@ -1109,6 +1109,18 @@ impl H5FileOptions {
     /// [`H5File::set_libver_bound`] — which only reaches objects created
     /// after the call — it applies to the file itself.
     ///
+    /// [`LibverBound::Earliest`] asks for the whole classic generation, the
+    /// file libhdf5 writes at `H5F_LIBVER_EARLIEST`: a version-0 superblock,
+    /// a symbol-table root group, version-1 object headers, symbol-table
+    /// subgroups and the version-1 B-tree chunk index. Such a file is
+    /// readable by libhdf5 1.6, and correspondingly gives up everything
+    /// newer — SWMR ([`crate::swmr`]) and virtual datasets are refused in
+    /// it, and a chunk larger than 4 GiB does not fit its index key.
+    ///
+    /// Not calling this at all is *not* the same as asking for `Earliest`:
+    /// the default is the v1.8-shaped file this crate has always written,
+    /// with a version-2 superblock and link-message groups.
+    ///
     /// Only [`create`](Self::create) reads this; an existing file keeps the
     /// superblock it already has.
     ///
@@ -1121,7 +1133,7 @@ impl H5FileOptions {
     /// # let _ = file;
     /// ```
     pub fn libver(mut self, libver: LibverBound) -> Self {
-        self.libver = libver;
+        self.libver = Some(libver);
         self
     }
 
