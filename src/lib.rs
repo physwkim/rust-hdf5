@@ -103,7 +103,7 @@ pub mod swmr;
 pub mod types;
 
 pub use attribute::{AttrShape, H5Attribute};
-pub use dataset::{H5Dataset, ReadNumeric};
+pub use dataset::{H5Dataset, ReadNumeric, StorageLayout};
 pub use error::{Hdf5Error, Result};
 pub use file::{H5File, H5FileOptions};
 pub use format::messages::datatype::{ByteOrder, DatatypeMessage};

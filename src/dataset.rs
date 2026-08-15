@@ -1374,6 +1374,30 @@ fn decode_string(bytes: &[u8], charset: u8, lossy: bool, index: usize) -> Result
     }
 }
 
+/// A dataset's storage layout class (read mode only) — `H5Pget_layout`'s
+/// four values.
+///
+/// Distinct from [`ChunkIndex`], which names the structure a `Chunked`
+/// layout's index uses; this only says which of the four storage classes
+/// the dataset was created with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageLayout {
+    /// Raw data stored inline in the object header.
+    Compact,
+    /// Raw data in a single contiguous block — or, when the dataset also
+    /// carries an external file list, in one or more blocks of an outside
+    /// file instead ([`H5Dataset::external_files`]); the layout itself
+    /// still reports `Contiguous` either way.
+    Contiguous,
+    /// Raw data split into fixed-size chunks, each independently
+    /// allocated. [`H5Dataset::chunk_dims`] gives the chunk shape,
+    /// [`H5Dataset::chunk_index`] the index structure.
+    Chunked,
+    /// No raw data of its own: every element comes from another dataset,
+    /// possibly in another file ([`H5Dataset::virtual_mappings`]).
+    Virtual,
+}
+
 impl H5Dataset {
     /// Create a reader-mode dataset handle (called internally by `H5File::dataset`).
     pub(crate) fn new_reader(
@@ -1580,6 +1604,39 @@ impl H5Dataset {
                     _ => false,
                 }
             }
+        }
+    }
+
+    /// Return the dataset's storage layout class (read mode only).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is in write mode, or if the dataset can
+    /// no longer be found in the reader's metadata.
+    pub fn storage_layout(&self) -> Result<StorageLayout> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => {
+                        use crate::format::messages::data_layout::DataLayoutMessage;
+                        reader
+                            .dataset_info(name)
+                            .map(|info| match &info.layout {
+                                DataLayoutMessage::Compact { .. } => StorageLayout::Compact,
+                                DataLayoutMessage::Contiguous { .. } => StorageLayout::Contiguous,
+                                DataLayoutMessage::ChunkedV3 { .. }
+                                | DataLayoutMessage::ChunkedV4 { .. } => StorageLayout::Chunked,
+                                DataLayoutMessage::Virtual { .. } => StorageLayout::Virtual,
+                            })
+                            .ok_or_else(|| Hdf5Error::NotFound(name.clone()))
+                    }
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "storage_layout() is only available in read mode".into(),
+            )),
         }
     }
 
@@ -8801,5 +8858,58 @@ mod tests {
         file.close().unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), baseline);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// [`H5Dataset::storage_layout`] tells the four classes apart — the
+    /// negative case for any one class is simply that it is not another.
+    #[test]
+    fn storage_layout_reports_each_class() {
+        use crate::StorageLayout;
+        let path = temp_path("storage_layout");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .create("contig")
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .compact()
+                .create("compact")
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .chunk(&[4])
+                .create("chunked")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("contig").unwrap().storage_layout().unwrap(),
+            StorageLayout::Contiguous
+        );
+        assert_eq!(
+            file.dataset("compact").unwrap().storage_layout().unwrap(),
+            StorageLayout::Compact
+        );
+        assert_eq!(
+            file.dataset("chunked").unwrap().storage_layout().unwrap(),
+            StorageLayout::Chunked
+        );
+    }
+
+    /// Read-mode-only accessor, matching `datatype()`'s own contract.
+    #[test]
+    fn storage_layout_errors_in_write_mode() {
+        let path = temp_path("storage_layout_write_mode");
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([4usize])
+            .create("data")
+            .unwrap();
+        assert!(ds.storage_layout().is_err());
+        file.close().unwrap();
     }
 }

@@ -31,7 +31,7 @@ use rust_hdf5::format::messages::filter::{
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
     H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error, Hyperslab,
-    HyperslabBlock, LibverBound, LinkClass, Reference, Selection,
+    HyperslabBlock, LibverBound, LinkClass, Reference, Selection, StorageLayout,
 };
 
 const CANON_VERSION: &str = "3";
@@ -826,15 +826,18 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
     let chunked = guarded(|| ds.is_chunked()).unwrap_or(false);
 
     d.field(path, "layout", || {
-        if chunked {
-            Ok("chunked".into())
-        } else {
-            Err(
-                "H5Dataset::is_chunked() is false; contiguous and compact are \
-                 not distinguishable through the public API"
-                    .into(),
-            )
-        }
+        guarded(|| ds.storage_layout())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|layout| {
+                match layout {
+                    StorageLayout::Compact => "compact",
+                    StorageLayout::Contiguous => "contiguous",
+                    StorageLayout::Chunked => "chunked",
+                    StorageLayout::Virtual => "virtual",
+                }
+                .to_string()
+            })
+            .map_err(oneline)
     });
 
     d.field(path, "chunk", || {

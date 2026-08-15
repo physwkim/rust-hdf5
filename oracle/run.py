@@ -122,7 +122,6 @@ def expected_deviation(entry):
 STRUCTURAL_FIELDS = {
     "superblock",
     "maxshape",
-    "layout",
     "chunkindex",
     "external",
     "virtual",
