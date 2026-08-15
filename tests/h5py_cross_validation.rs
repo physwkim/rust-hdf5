@@ -3684,6 +3684,88 @@ fn object_references_written_by_rust_dereference_in_h5py() {
     std::fs::remove_file(&path).ok();
 }
 
+/// An attribute can hold object references — h5py's
+/// `g.attrs['ref'] = f['/data'].ref`. The value is part of the object header
+/// message, so it is written once with the address the target ends up at, on
+/// a dataset, on a group and on the root alike; a reference to an object
+/// created after the attribute was set resolves for the same reason.
+#[test]
+fn object_reference_attributes_written_by_rust_dereference_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_ref_object_write");
+    let file = H5File::create(&path).unwrap();
+    let data = file.new_dataset::<i32>().shape([4]).create("data").unwrap();
+    data.write_raw(&[1i32, 2, 3, 4]).unwrap();
+    let grp = file.create_group("grp").unwrap();
+
+    let attr = data
+        .new_attr::<u64>()
+        .shape([2usize])
+        .create("neighbours")
+        .unwrap();
+    attr.write_object_references(&["/data", "/grp"]).unwrap();
+    grp.set_attr_object_reference("owner", "/data").unwrap();
+    file.set_attr_object_references("entry", &["/grp", "/late"])
+        .unwrap_err();
+    // A path that names nothing is refused, so create the object first.
+    let late = grp.new_dataset::<i32>().shape([2]).create("late").unwrap();
+    late.write_raw(&[7i32, 8]).unwrap();
+    file.set_attr_object_references("entry", &["/grp", "/grp/late"])
+        .unwrap();
+    file.close().unwrap();
+
+    read_back_with_h5py(
+        py,
+        &path,
+        "a = f['data'].attrs['neighbours']\n\
+         assert f['data'].attrs.get_id('neighbours').dtype == h5py.ref_dtype\n\
+         assert f[a[0]].name == '/data', f[a[0]].name\n\
+         assert f[a[1]].name == '/grp', f[a[1]].name\n\
+         o = f['grp'].attrs['owner']\n\
+         assert isinstance(o, h5py.Reference), type(o)\n\
+         assert f[o].name == '/data', f[o].name\n\
+         e = f.attrs['entry']\n\
+         assert f[e[0]].name == '/grp', f[e[0]].name\n\
+         assert f[e[1]].name == '/grp/late', f[e[1]].name\n\
+         assert (f[e[1]][:] == [7, 8]).all(), f[e[1]][:]\n",
+    );
+
+    // The same file reads back through this crate.
+    let file = H5File::open(&path).unwrap();
+    let got = file
+        .dataset("data")
+        .unwrap()
+        .attr("neighbours")
+        .unwrap()
+        .read_references()
+        .unwrap();
+    assert_eq!(
+        got.iter().map(|r| r.path()).collect::<Vec<_>>(),
+        vec![Some("/data"), Some("/grp")]
+    );
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}
+
+/// A reference attribute replaced by one of another type keeps no trace of the
+/// value it had: the replacement's bytes are its own, not the addresses the
+/// reference would have been said in.
+#[test]
+fn replacing_a_reference_attribute_drops_the_value_it_held() {
+    let path = tmp("attr_ref_replaced");
+    let file = H5File::create(&path).unwrap();
+    let data = file.new_dataset::<i32>().shape([4]).create("data").unwrap();
+    data.write_raw(&[1i32, 2, 3, 4]).unwrap();
+    file.set_attr_object_reference("tag", "/data").unwrap();
+    file.set_attr_string("tag", "plain").unwrap();
+    file.close().unwrap();
+
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(file.attr_string("tag").unwrap(), "plain");
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}
+
 /// Region references rust writes are real `H5R_DATASET_REGION1` elements:
 /// h5py dereferences them to the target dataset and slices it with the
 /// selection the heap object carries, for a hyperslab and for a point list.

@@ -2014,6 +2014,20 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "attr_ref_object" => {
+            let file = H5File::create(path)?;
+            let ds = file.new_dataset::<i32>().shape([8usize]).create("data")?;
+            ds.write_raw(&ramp_n::<i32>(8))?;
+            let grp = file.create_group("grp")?;
+            ds.new_attr::<u64>()
+                .shape([2usize])
+                .create("neighbours")?
+                .write_object_references(&["/data", "/grp"])?;
+            grp.set_attr_object_reference("owner", "/data")?;
+            file.set_attr_object_references("entry", &["/grp", "/data"])?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "attr_large" => {
             let file = H5File::create(path)?;
             let ds = file.new_dataset::<i32>().shape([8usize]).create("data")?;

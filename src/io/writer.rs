@@ -5107,6 +5107,14 @@ impl Hdf5Writer {
     /// is mutated, so the pass that measures a header and the pass that writes
     /// it cannot disagree about anything but the addresses — which they cannot
     /// disagree about in length.
+    ///
+    /// INVARIANT: the stored attribute list is what says which attributes
+    /// exist; a recorded reference value can only give a value to one already
+    /// in it. So a value left behind by an object whose list was emptied — a
+    /// deleted group or dataset — cannot put the attribute back, and a value
+    /// whose attribute was replaced by one of another type is dropped at the
+    /// replacement instead of reaching it (see
+    /// [`forget_attribute_reference`](Self::forget_attribute_reference)).
     fn object_attributes(&self, scope: AttrScope) -> IoResult<Vec<AttributeEntry>> {
         let mut attrs = match scope {
             AttrScope::Root => self.root_attributes.lock().clone(),
@@ -5123,8 +5131,6 @@ impl Hdf5Writer {
             .collect();
         let width = self.ctx.sizeof_addr as usize;
         for (name, targets) in values {
-            // A deleted object's list was emptied without its recorded values
-            // being visited; there is then no attribute to give a value to.
             let Some(pos) = attrs.iter().position(|a| a.name() == name) else {
                 continue;
             };
@@ -5142,6 +5148,53 @@ impl Hdf5Writer {
             attrs[pos] = AttributeEntry::from(msg).with_creation_index(attrs[pos].creation_index());
         }
         Ok(attrs)
+    }
+
+    /// The registry scope `target` names — the same object
+    /// [`with_attr_list`](Self::with_attr_list) reaches, as the key the
+    /// reference-value registry is indexed by. Refuses what that accessor
+    /// refuses, and for the same reasons.
+    fn attr_scope(&self, target: AttrTarget<'_>) -> IoResult<AttrScope> {
+        match target {
+            AttrTarget::Root => Ok(AttrScope::Root),
+            AttrTarget::Group(path) => {
+                let path = self.canonical_group_path(path);
+                self.group_refs()
+                    .iter()
+                    .position(|g| {
+                        let gg = g.lock();
+                        gg.name == path && !gg.deleted
+                    })
+                    .map(AttrScope::Group)
+                    .ok_or_else(|| {
+                        crate::io::IoError::NotFound(format!("group '{path}' not found"))
+                    })
+            }
+            AttrTarget::Dataset(index) => {
+                let count = self.dataset_count();
+                if index >= count {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "dataset index {index} out of range (have {count})"
+                    )));
+                }
+                Ok(AttrScope::Dataset(index))
+            }
+        }
+    }
+
+    /// Drop the reference value recorded for `scope`'s attribute `name`.
+    ///
+    /// Called by both owners of attribute-list mutation —
+    /// [`insert_attribute`](Self::insert_attribute) and
+    /// [`evict_attr`](Self::evict_attr) — so an attribute that is replaced or
+    /// removed cannot leave its value behind for whatever takes its name next.
+    /// A string attribute written over a reference attribute is the case that
+    /// needs it: without this the string's bytes would be overwritten with
+    /// addresses at finalize.
+    fn forget_attribute_reference(&self, scope: AttrScope, name: &str) {
+        self.attribute_references
+            .lock()
+            .retain(|r| !(r.scope == scope && r.name == name));
     }
 
     /// Write every pending object reference element as its target's object
@@ -7163,6 +7216,8 @@ impl Hdf5Writer {
         if self.swmr_active {
             return Err(swmr_attr_error(&attr.name));
         }
+        // Whatever this name meant before, it means the incoming message now.
+        self.forget_attribute_reference(self.attr_scope(target)?, &attr.name);
         // No size gate: an attribute whose message is too large for the
         // 16-bit size field an object header message has spills the object's
         // whole attribute set to dense storage at finalize, exactly as
@@ -7228,6 +7283,59 @@ impl Hdf5Writer {
         self.insert_attribute(target, attr, origin)
     }
 
+    /// Set an attribute on `target` whose value is the object references
+    /// naming `paths` — h5py's `obj.attrs['ref'] = f['/target'].ref`.
+    ///
+    /// `dims` is the attribute's dataspace: empty for the scalar shape a
+    /// single reference takes, `&[n]` for an array of them. Each path names a
+    /// dataset or a group (`/` is the root group) and must already exist. What
+    /// reaches the file is each target's object header address, which finalize
+    /// assigns — so the paths are what is stored, and the attribute's message
+    /// is built from them every time an object header is
+    /// ([`object_attributes`](Self::object_attributes)). The message carries a
+    /// zero image of the final width until then.
+    pub fn set_object_reference_attribute(
+        &self,
+        target: AttrTarget<'_>,
+        name: &str,
+        paths: &[&str],
+        dims: &[u64],
+    ) -> IoResult<()> {
+        let scope = self.attr_scope(target)?;
+        // An empty `dims` is the scalar shape, whose one element the empty
+        // product already reports.
+        let elements: u64 = dims.iter().product();
+        if elements != paths.len() as u64 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "attribute '{name}' shape {dims:?} needs {elements} references, got {}",
+                paths.len()
+            )));
+        }
+        // Resolve now as well as at finalize, so a path that names nothing is
+        // reported at the call that got it wrong.
+        for path in paths {
+            self.object_reference_target(path)?;
+        }
+        let datatype = DatatypeMessage::object_reference(&self.ctx);
+        let image = vec![0u8; paths.len() * datatype.element_size() as usize];
+        let attr = if dims.is_empty() {
+            AttributeMessage::scalar_numeric(name, datatype, image)
+        } else {
+            AttributeMessage::array_numeric(name, datatype, dims, image)
+        };
+        // Through the same owner as every other attribute, which is also what
+        // drops any value this name carried before.
+        self.set_attribute(target, attr)?;
+        self.attribute_references
+            .lock()
+            .push(AttributeReferenceValue {
+                scope,
+                name: name.to_string(),
+                targets: paths.iter().map(|p| (*p).to_string()).collect(),
+            });
+        Ok(())
+    }
+
     /// Take the attribute `name` off `target`'s list, releasing its heap
     /// objects. No-op when absent. Refused under SWMR — see
     /// [`set_attribute`](Self::set_attribute).
@@ -7239,6 +7347,7 @@ impl Hdf5Writer {
         if self.swmr_active {
             return Err(swmr_attr_error(name));
         }
+        self.forget_attribute_reference(self.attr_scope(target)?, name);
         let old = self.with_attr_list(target, |attrs| {
             attrs
                 .iter()

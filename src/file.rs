@@ -464,6 +464,41 @@ impl H5File {
         }
     }
 
+    /// Add (or replace) an object-reference attribute on the file (root group)
+    /// — h5py's `f.attrs['entry'] = f['/data'].ref`.
+    ///
+    /// `path` names a dataset or a group (`/` is the root group) and must
+    /// already exist. The attribute takes the scalar shape h5py gives a single
+    /// reference; [`set_attr_object_references`](Self::set_attr_object_references)
+    /// is the array form. What reaches the file is the target's object header
+    /// address, which is assigned when the file is finalized.
+    pub fn set_attr_object_reference(&self, name: &str, path: &str) -> Result<()> {
+        self.set_root_reference_attr(name, &[path], &[])
+    }
+
+    /// Add (or replace) a 1-D array of object references as a file-level
+    /// attribute — the array counterpart of
+    /// [`set_attr_object_reference`](Self::set_attr_object_reference).
+    pub fn set_attr_object_references(&self, name: &str, paths: &[&str]) -> Result<()> {
+        self.set_root_reference_attr(name, paths, &[paths.len() as u64])
+    }
+
+    fn set_root_reference_attr(&self, name: &str, paths: &[&str], dims: &[u64]) -> Result<()> {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => {
+                writer.set_object_reference_attribute(
+                    crate::io::writer::AttrTarget::Root,
+                    name,
+                    paths,
+                    dims,
+                )?;
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
+        }
+    }
+
     /// Return the names of file-level (root group) attributes.
     pub fn attr_names(&self) -> Result<Vec<String>> {
         let inner = borrow_inner(&self.inner);
