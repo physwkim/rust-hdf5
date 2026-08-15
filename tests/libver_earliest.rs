@@ -33,7 +33,7 @@ use rust_hdf5::format::object_header::ObjectHeader;
 use rust_hdf5::format::superblock::{SuperblockV0V1, SuperblockV2V3};
 use rust_hdf5::format::symbol_table::SymbolTableNode;
 use rust_hdf5::format::FormatContext;
-use rust_hdf5::{H5File, LibverBound};
+use rust_hdf5::{FillValue, H5File, LibverBound};
 
 /// Interpreters tried in order when `RUST_HDF5_TEST_PYTHON` is unset,
 /// matching `legacy_append`. `h5dump` and `h5clear` are taken from the same
@@ -800,6 +800,80 @@ fn a_classic_user_defined_fill_value_carries_the_old_message_too() {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&modern);
+}
+
+/// The read side of the dual fill-value message: two messages on disk, one
+/// answer out of [`H5Dataset::fill_value`].
+///
+/// `H5O_FILL_ID` (0x05) and `H5O_FILL_ID_OLD` (0x04) carry the same four bytes
+/// in a classic file, and the reader takes the new one — the only one that
+/// also carries the allocation time, the write time and the defined flag the
+/// accessor's three-way answer needs. So the old message must not add a second
+/// user fill value, and must not shadow the new one into `Default`.
+///
+/// The oracle's `fillvalue` field is the same question asked of the same file
+/// from h5py: `dcpl.get_fill_value()` renders as `0x` plus the raw bytes, so
+/// the string this test builds from the accessor is the string `canon.py`
+/// builds from libhdf5 — asserted here directly against h5py rather than
+/// waiting for a full oracle run.
+#[test]
+fn a_classic_dual_fill_message_dataset_reads_back_one_user_fill_value() {
+    let path = tmp("classic_fill_read");
+    let file = earliest(&path);
+    file.new_dataset::<i32>()
+        .shape([4])
+        .create("plain")
+        .unwrap();
+    file.new_dataset::<i32>()
+        .shape([4])
+        .fill_value(7i32)
+        .create("withfill")
+        .unwrap();
+    file.close().unwrap();
+
+    // The premise: this dataset really does carry both messages.
+    assert_eq!(
+        fill_messages(classic_messages_of(&path, "withfill").0)
+            .iter()
+            .map(|m| m.0)
+            .collect::<Vec<_>>(),
+        vec![MSG_FILL_VALUE, MSG_FILL_VALUE_OLD],
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let fill = file.dataset("withfill").unwrap().fill_value().unwrap();
+    assert_eq!(
+        fill,
+        FillValue::UserDefined(7i32.to_le_bytes().to_vec()),
+        "the new message's value, once, not the old message's copy beside it"
+    );
+    // The canonical rendering `oracle/canon.py` compares against.
+    let FillValue::UserDefined(bytes) = &fill else {
+        unreachable!()
+    };
+    let canon: String = bytes.iter().fold("0x".to_string(), |mut s, b| {
+        s.push_str(&format!("{b:02x}"));
+        s
+    });
+    assert_eq!(canon, "0x07000000");
+    assert_eq!(
+        file.dataset("plain").unwrap().fill_value().unwrap(),
+        FillValue::Default,
+        "a dataset with no fill value of its own has no old message to mistake"
+    );
+    file.close().unwrap();
+
+    if let Some(py) = python() {
+        read_with_h5py(
+            py,
+            &path,
+            "fv = f['withfill'].fillvalue\n\
+             assert fv.tobytes().hex() == '07000000', fv.tobytes().hex()\n\
+             assert f['plain'].fillvalue.tobytes().hex() == '00000000'\n\
+             f.close()",
+        );
+    }
+    let _ = std::fs::remove_file(&path);
 }
 
 /// A fixed shape covered by exactly one chunk is the shape
