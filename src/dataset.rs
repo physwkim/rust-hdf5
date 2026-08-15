@@ -43,6 +43,7 @@ pub struct DatasetBuilder<T: H5Type> {
     datatype_override: Option<crate::format::messages::datatype::DatatypeMessage>,
     committed_type: Option<String>,
     references: Option<ReferenceElement>,
+    external: Option<Vec<(String, u64, u64)>>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -93,6 +94,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             datatype_override: None,
             committed_type: None,
             references: None,
+            external: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -113,6 +115,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             datatype_override: None,
             committed_type: None,
             references: None,
+            external: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -372,6 +375,42 @@ impl<T: H5Type> DatasetBuilder<T> {
         self
     }
 
+    /// Keep the raw data in files outside this one — `H5Pset_external`,
+    /// h5py's `external=[(name, offset, size)]`.
+    ///
+    /// Each entry is a file name, the byte offset in it where that entry's
+    /// region starts, and how many bytes of the dataset it holds; the entries
+    /// concatenate, in order, into the dataset's bytes and together must cover
+    /// them. A relative name is resolved against `HDF5_EXTFILE_PREFIX` the way
+    /// libhdf5 resolves it, so the same name reads back through this crate and
+    /// through h5py. The storage is contiguous by definition, which rules out
+    /// [`chunk`](Self::chunk), a filter, [`compact`](Self::compact),
+    /// [`null`](Self::null) and either reference kind.
+    ///
+    /// The named files are created on first write and never truncated, so
+    /// several datasets may own disjoint ranges of one file.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("ext.h5").unwrap();
+    /// let ds = file.new_dataset::<i32>()
+    ///     .shape([16])
+    ///     .external(&[("ext.raw", 0, 64)])
+    ///     .create("data")
+    ///     .unwrap();
+    /// ds.write_raw(&(0..16i32).collect::<Vec<_>>()).unwrap();
+    /// ```
+    #[must_use]
+    pub fn external(mut self, files: &[(&str, u64, u64)]) -> Self {
+        self.external = Some(
+            files
+                .iter()
+                .map(|&(name, offset, size)| (name.to_string(), offset, size))
+                .collect(),
+        );
+        self
+    }
+
     /// Set a user-defined fill value for unwritten elements.
     ///
     /// Without this, datasets use the HDF5 default zero-fill. When set,
@@ -504,6 +543,27 @@ impl<T: H5Type> DatasetBuilder<T> {
 
         let wants_filter =
             self.custom_pipeline.is_some() || self.shuffle || self.deflate_level.is_some();
+
+        // External storage *is* contiguous storage: the layout message says
+        // contiguous with an undefined address, and the External File List
+        // beside it says where the bytes really are. Every other storage class
+        // names bytes of its own, so none of them can also name these.
+        if self.external.is_some() {
+            if self.chunk_dims.is_some() || wants_filter || self.is_compact || self.is_null {
+                return Err(Hdf5Error::InvalidState(
+                    "a dataset whose raw data lives in external files is contiguous, so it \
+                     cannot also be chunked, filtered, compact or NULL"
+                        .into(),
+                ));
+            }
+            if self.references.is_some() {
+                return Err(Hdf5Error::InvalidState(
+                    "object and region references are stamped into the dataset's own \
+                     contiguous block, which a dataset stored in external files has none of"
+                        .into(),
+                ));
+            }
+        }
 
         if self.is_null {
             // A NULL dataspace holds no elements at all: no chunk grid to
@@ -762,7 +822,18 @@ impl<T: H5Type> DatasetBuilder<T> {
                 let inner = borrow_inner(&self.file_inner);
                 match &*inner {
                     H5FileInner::Writer(writer) => {
-                        let idx = writer.create_dataset(&full_name, datatype, &dims_u64)?;
+                        let idx = match self.external.as_deref() {
+                            Some(files) => {
+                                let slots: Vec<(&str, u64, u64)> = files
+                                    .iter()
+                                    .map(|(name, offset, size)| (name.as_str(), *offset, *size))
+                                    .collect();
+                                writer.create_external_dataset(
+                                    &full_name, datatype, &dims_u64, &slots,
+                                )?
+                            }
+                            None => writer.create_dataset(&full_name, datatype, &dims_u64)?,
+                        };
                         if let Some(ref fv) = fill_value {
                             writer.set_dataset_fill_value(idx, fv.clone())?;
                         }

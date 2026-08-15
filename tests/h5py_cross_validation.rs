@@ -4133,6 +4133,118 @@ fn external_file_list_written_by_h5py_read_by_rust() {
     std::fs::remove_file(&raw_path).ok();
 }
 
+/// External file list (rust → h5py): the mirror of the test above. The
+/// dataset declares contiguous storage at an undefined address plus an
+/// External File List, and its bytes are written through the named file, so
+/// libhdf5 stitching the same list back must see exactly what was written —
+/// including a hyperslab write, which walks the list at a non-zero
+/// dataset-relative offset (`H5D__efl_write`). Two slots, so the walk crosses
+/// a slot boundary rather than always landing in the first.
+#[test]
+fn external_file_list_written_by_rust_read_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("efl_w");
+    let raw_a = path.with_extension("a.raw");
+    let raw_b = path.with_extension("b.raw");
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([16usize])
+            .external(&[
+                (raw_a.to_str().unwrap(), 0, 40),
+                (raw_b.to_str().unwrap(), 0, 24),
+            ])
+            .create("data")
+            .unwrap();
+        ds.write_raw(&(0..16i32).collect::<Vec<_>>()).unwrap();
+        // Elements [8, 12) start inside the first slot and end inside the
+        // second, so the write crosses the boundary at byte 40.
+        ds.write_slice(&[8], &[4], &[100i32, 101, 102, 103])
+            .unwrap();
+        file.close().unwrap();
+    }
+    // Neither slot's file existed before the write: `H5D__efl_write` creates
+    // them, and the second one only holds the tail.
+    assert_eq!(std::fs::metadata(&raw_a).unwrap().len(), 40);
+    assert_eq!(std::fs::metadata(&raw_b).unwrap().len(), 24);
+
+    let mut expected: Vec<i32> = (0..16).collect();
+    expected[8..12].copy_from_slice(&[100, 101, 102, 103]);
+    read_back_with_h5py(
+        py,
+        &path,
+        &format!(
+            "assert f['data'].shape == (16,)\n\
+             assert list(f['data'][...]) == {expected:?}, list(f['data'][...])\n\
+             assert f['data'].external == [({:?}, 0, 40), ({:?}, 0, 24)], f['data'].external\n",
+            raw_a.to_str().unwrap(),
+            raw_b.to_str().unwrap()
+        ),
+    );
+
+    // And this crate reads its own external dataset back through the same
+    // list, full and sliced.
+    {
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("data").unwrap();
+        assert_eq!(ds.read_raw::<i32>().unwrap(), expected);
+        assert_eq!(ds.read_slice::<i32>(&[8], &[4]).unwrap(), expected[8..12]);
+    }
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&raw_a).ok();
+    std::fs::remove_file(&raw_b).ok();
+}
+
+/// An external dataset survives a header rewrite. Reopening the file and
+/// setting an attribute makes the dataset's object header stale, so the close
+/// rebuilds it from the registry — and the registry has to still carry the
+/// External File List, heap address and all. A rebuild that dropped it would
+/// leave a contiguous dataset with an undefined address, which reads back as
+/// the fill value with no error at all.
+#[test]
+fn external_file_list_survives_a_header_rewrite() {
+    let Some(py) = python() else { return };
+    let path = tmp("efl_reopen");
+    let raw = path.with_extension("raw");
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([16usize])
+            .external(&[(raw.to_str().unwrap(), 0, 64)])
+            .create("data")
+            .unwrap();
+        ds.write_raw(&(0..16i32).collect::<Vec<_>>()).unwrap();
+        file.close().unwrap();
+    }
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.dataset_writer("data")
+            .unwrap()
+            .new_attr::<i32>()
+            .shape([1usize])
+            .create("units")
+            .unwrap()
+            .write_array(&[7i32])
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        &format!(
+            "assert list(f['data'][...]) == {:?}, list(f['data'][...])\n\
+             assert list(f['data'].attrs['units']) == [7]\n\
+             assert f['data'].external == [({:?}, 0, 64)], f['data'].external\n",
+            (0..16).collect::<Vec<i32>>(),
+            raw.to_str().unwrap()
+        ),
+    );
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&raw).ok();
+}
+
 /// Virtual dataset, full-extent cross-file mapping (h5py → rust): the
 /// layout message carries no data address at all — every byte comes from
 /// stitching the one mapping's source dataset in a sibling file

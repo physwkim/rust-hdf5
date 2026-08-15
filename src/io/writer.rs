@@ -4,7 +4,7 @@
 //! and datasets with contiguous or chunked storage. The output is readable by `h5dump`.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::format::chunk_index::btree_v2::Bt2ChunkIndex;
 use crate::format::chunk_index::extensible_array::{
@@ -21,11 +21,15 @@ use crate::format::chunk_index::fixed_array::{
 use crate::format::creation_order::CreationOrder;
 use crate::format::dense_attr::build_dense_attributes;
 use crate::format::dense_link::build_dense_links;
+use crate::format::local_heap::{
+    local_heap_header_size, LocalHeapHeader, LocalHeapImage, LOCAL_HEAP_FREE_NULL,
+};
 use crate::format::messages::attr_info::{next_creation_index, AttributeInfoMessage};
 use crate::format::messages::attribute::{AttributeEntry, AttributeMessage};
 use crate::format::messages::data_layout::{DataLayoutMessage, EarrayParams, FixedArrayParams};
 use crate::format::messages::dataspace::{DataspaceClass, DataspaceMessage};
 use crate::format::messages::datatype::{DatatypeMessage, ReferenceKind};
+use crate::format::messages::external_file_list::{ExternalFileListMessage, UNLIMITED};
 use crate::format::messages::fill_value::FillValueMessage;
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::group_info::GroupInfoMessage;
@@ -426,6 +430,84 @@ pub struct AppendBuffer {
     pub bytes: Vec<u8>,
 }
 
+/// One file a dataset's raw data lives in, as the writer holds it: the name
+/// the I/O path opens, together with the local-heap offset the External File
+/// List message stores that name as.
+///
+/// The two halves are one entry rather than two parallel lists because they
+/// describe one slot — the message encodes `name_offset`, and every read or
+/// write of the slot's bytes opens `name`; splitting them is what lets a
+/// rewrite pair a name with another slot's offset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalFile {
+    /// The file name exactly as the heap stores it. Resolved against
+    /// `HDF5_EXTFILE_PREFIX` at I/O time, never here — the same rule the read
+    /// side follows.
+    pub name: String,
+    /// Where `name` sits in the local heap at [`ExternalStorage::heap_addr`].
+    pub name_offset: u64,
+    /// Byte offset within `name` where this slot's region begins.
+    pub offset: u64,
+    /// Bytes of the dataset's raw data this slot holds.
+    pub size: u64,
+}
+
+/// A dataset whose contiguous raw data lives outside this file — the External
+/// File List message (`H5O_EFL_ID`) and the local heap its names are in.
+///
+/// The data layout message of such a dataset still says `Contiguous`, with
+/// its address left undefined: it is this message's presence that makes
+/// libhdf5 route the dataset's I/O through `H5D_LOPS_EFL` (H5Dlayout.c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalStorage {
+    /// Address of the local heap header holding every slot's name.
+    pub heap_addr: u64,
+    /// The files, in the order their regions concatenate into the dataset's
+    /// logical byte range.
+    pub files: Vec<ExternalFile>,
+}
+
+impl ExternalStorage {
+    /// The message this storage encodes to (`H5O_efl_t`).
+    fn message(&self) -> ExternalFileListMessage {
+        ExternalFileListMessage {
+            heap_addr: self.heap_addr,
+            slots: self
+                .files
+                .iter()
+                .map(
+                    |f| crate::format::messages::external_file_list::ExternalFileSlot {
+                        name_offset: f.name_offset,
+                        offset: f.offset,
+                        size: f.size,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    /// Bytes the slots reserve in total (`H5O_efl_total_size`), saturating
+    /// rather than wrapping so an overflowing list reads as "as large as it
+    /// gets" and passes any size check instead of failing one.
+    fn total_size(&self) -> u64 {
+        self.files
+            .iter()
+            .fold(0u64, |acc, f| acc.saturating_add(f.size))
+    }
+}
+
+/// Where a contiguous dataset's raw bytes live, read off its registry entry
+/// so the write itself can run with the slot unlocked.
+///
+/// The one place the external-versus-local choice is made; see
+/// [`DatasetInfo::contiguous_target`].
+enum ContiguousTarget {
+    /// A block in this file, starting at this address.
+    Local(u64),
+    /// The files an External File List names, in dataset order.
+    External(Vec<ExternalFile>),
+}
+
 /// Metadata for a dataset being written.
 ///
 /// The whole struct lives behind a per-dataset [`Slot`] (via [`DatasetRef`]).
@@ -460,6 +542,11 @@ pub struct DatasetInfo {
     /// is also the dataset's byte count; `data_addr`/`data_size` stay at the
     /// "no block in the file" values a compact dataset shares with a NULL one.
     pub compact: Option<Vec<u8>>,
+    /// The files this dataset's contiguous raw data lives in, when it lives
+    /// outside this HDF5 file. `Some` is what makes a contiguous dataset
+    /// externally stored: its `data_addr` stays [`UNDEF_ADDR`] and every byte
+    /// goes to the files named here instead of to a block of this file's own.
+    pub external: Option<ExternalStorage>,
     /// Chunked storage info (None for contiguous).
     pub chunked: Option<ChunkedDatasetInfo>,
     /// Fixed array chunked storage info.
@@ -525,6 +612,33 @@ pub struct DatasetInfo {
 }
 
 impl DatasetInfo {
+    /// Where this dataset's contiguous raw bytes live, or `None` when it has
+    /// no contiguous storage to write into at all — a chunked dataset, a
+    /// compact one (whose bytes *are* the layout message), or one whose block
+    /// was never allocated.
+    ///
+    /// INVARIANT: every write of a contiguous dataset's raw bytes picks its
+    /// destination here and reaches it through
+    /// [`Hdf5Writer::write_contiguous_bytes`]. A site that read `data_addr`
+    /// itself would write an externally-stored dataset's data into this file
+    /// — at [`UNDEF_ADDR`], the far end of the address space — instead of into
+    /// the files its header names.
+    fn contiguous_target(&self) -> Option<ContiguousTarget> {
+        if self.chunked.is_some()
+            || self.fixed_array.is_some()
+            || self.btree_v2.is_some()
+            || self.compact.is_some()
+        {
+            return None;
+        }
+        match &self.external {
+            Some(ext) => Some(ContiguousTarget::External(ext.files.clone())),
+            None => {
+                (self.data_addr != UNDEF_ADDR).then_some(ContiguousTarget::Local(self.data_addr))
+            }
+        }
+    }
+
     /// Whether this session wrote chunk data or changed the extent, so the
     /// dataset's index structures have to be re-flushed.
     fn storage_dirty(&self) -> bool {
@@ -1345,6 +1459,15 @@ struct DatasetParts {
     times: Option<ObjectTimes>,
     /// The dense storage the rewrite supersedes and must free.
     dense: DenseCarry,
+    /// The External File List the header carries, with each slot's name
+    /// already read back out of the local heap the message points at. `None`
+    /// for a dataset whose raw data is in this file.
+    ///
+    /// Carried rather than re-derived because the rewrite has to re-emit the
+    /// message: a contiguous layout with an undefined address and no EFL
+    /// beside it is a dataset with no data at all, so dropping this on a
+    /// header rewrite would silently unlink every external byte.
+    external: Option<ExternalStorage>,
 }
 
 /// The same for a group, plus the links it holds — decoded once, with the
@@ -1455,8 +1578,8 @@ impl<'a> ReopenWalk<'a> {
         use crate::format::messages::link_info::LinkInfoMessage;
         use crate::format::messages::shared::MSG_FLAG_SHARED;
         use crate::format::messages::{
-            MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE, MSG_DATA_LAYOUT, MSG_FILL_VALUE,
-            MSG_FILTER_PIPELINE, MSG_LINK, MSG_LINK_INFO, MSG_SYMBOL_TABLE,
+            MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE, MSG_DATA_LAYOUT, MSG_EXTERNAL_FILE_LIST,
+            MSG_FILL_VALUE, MSG_FILTER_PIPELINE, MSG_LINK, MSG_LINK_INFO, MSG_SYMBOL_TABLE,
         };
 
         // Chunk 0 only, for its encoded size: that is the block the rewrite
@@ -1512,6 +1635,7 @@ impl<'a> ReopenWalk<'a> {
         let mut layout = None;
         let mut filter_pipeline = None;
         let mut fill_value = None;
+        let mut external = None;
         let mut links = Vec::new();
         let mut stab = None;
         // A datatype, dataspace or layout message says the object is not a
@@ -1526,6 +1650,7 @@ impl<'a> ReopenWalk<'a> {
                     | MSG_DATA_LAYOUT
                     | MSG_FILTER_PIPELINE
                     | MSG_FILL_VALUE
+                    | MSG_EXTERNAL_FILE_LIST
                     | MSG_ATTRIBUTE
                     | MSG_LINK
                     | MSG_LINK_INFO
@@ -1584,6 +1709,42 @@ impl<'a> ReopenWalk<'a> {
                     if fv.fill_defined == 2 {
                         fill_value = fv.fill_value;
                     }
+                }
+                MSG_EXTERNAL_FILE_LIST => {
+                    dataset_shaped = true;
+                    let (efl, _) = consume!(
+                        ExternalFileListMessage::decode(&msg.data, ctx),
+                        "external file list"
+                    );
+                    // The names live in a local heap of their own, so the
+                    // rewrite cannot re-emit the message from its bytes alone
+                    // — it has to be able to point at the same strings. A heap
+                    // that does not read back leaves the object preserved,
+                    // which is what keeps its data reachable.
+                    let resolved = match crate::io::reader::Hdf5Reader::resolve_external_file_slots(
+                        handle, ctx, &efl,
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Ok(ObjectPlan::preserve(format!(
+                                "its external file list names do not read back: {e}"
+                            )))
+                        }
+                    };
+                    external = Some(ExternalStorage {
+                        heap_addr: efl.heap_addr,
+                        files: efl
+                            .slots
+                            .iter()
+                            .zip(resolved)
+                            .map(|(slot, seg)| ExternalFile {
+                                name: seg.name,
+                                name_offset: slot.name_offset,
+                                offset: slot.offset,
+                                size: slot.size,
+                            })
+                            .collect(),
+                    });
                 }
                 MSG_LINK => {
                     let (l, _) = consume!(LinkMessage::decode(&msg.data, ctx), "link");
@@ -1685,6 +1846,7 @@ impl<'a> ReopenWalk<'a> {
                         attrs: dense_attrs,
                         links: dense_links,
                     },
+                    external,
                 })))
             }
             // A committed (named) datatype has a datatype message and neither
@@ -1825,12 +1987,14 @@ fn rebuild_dataset(
         track_order,
         times,
         dense: _,
+        external,
     } = parts;
 
     let mut info = DatasetInfo {
         name,
         datatype: dt,
         committed_type: None,
+        external,
         dataspace: ds,
         obj_header_addr: obj_addr,
         data_addr: UNDEF_ADDR,
@@ -2162,6 +2326,73 @@ fn rebuild_dataset(
     Ok(info)
 }
 
+/// Write `data` at *dataset-relative* byte offset `skip` into an external file
+/// list, walking slots by cumulative declared size exactly like
+/// `H5D__efl_write` (H5Defl.c).
+///
+/// Each slot's file is opened create-if-missing and never truncated, so a
+/// write touches only the byte range that slot owns. A write past the *total*
+/// declared size of the list is an error, matching upstream's "write past
+/// logical end of file" check.
+fn write_external_file_bytes(
+    files: &[ExternalFile],
+    extfile_prefix: Option<&Path>,
+    mut skip: u64,
+    data: &[u8],
+) -> IoResult<()> {
+    let mut slot_idx = 0usize;
+    while slot_idx < files.len() && skip >= files[slot_idx].size {
+        skip -= files[slot_idx].size;
+        slot_idx += 1;
+    }
+
+    let mut written = 0usize;
+    while written < data.len() {
+        let Some(slot) = files.get(slot_idx) else {
+            return Err(crate::io::IoError::InvalidState(
+                "write past the logical end of the external file list".into(),
+            ));
+        };
+        if slot.size == UNLIMITED {
+            return Err(crate::io::IoError::InvalidState(
+                "unlimited (growable) external file slots are not supported".into(),
+            ));
+        }
+        let full_path = crate::io::reader::combine_prefixed_path(extfile_prefix, &slot.name);
+        let ext_handle = FileHandle::open_or_create_readwrite_with_locking(
+            &full_path,
+            crate::io::locking::FileLocking::Disabled,
+        )
+        .map_err(|e| {
+            crate::io::IoError::InvalidState(format!(
+                "unable to open external raw data file {} for writing: {e}",
+                full_path.display()
+            ))
+        })?;
+        let this_write = (slot.size - skip).min((data.len() - written) as u64) as usize;
+        ext_handle.write_at(slot.offset + skip, &data[written..written + this_write])?;
+
+        written += this_write;
+        skip = 0;
+        slot_idx += 1;
+    }
+    Ok(())
+}
+
+/// The directory the HDF5 file at `path` sits in — libhdf5's `H5F_t::extpath`,
+/// which `H5D__build_file_prefix` expands `${ORIGIN}` to.
+///
+/// Canonicalized, so the value survives the process changing directory and so
+/// a writer and a reader of the same file agree on it. Called once per open,
+/// never per I/O, for exactly that reason.
+fn source_dir_of(path: &Path) -> IoResult<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    Ok(canonical
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default())
+}
+
 /// Whether [`rebuild_dataset`] has an arm that reconstructs this layout.
 ///
 /// The single list: `ReopenWalk::plan` preserves an object whose layout this
@@ -2369,6 +2600,14 @@ pub struct Hdf5Writer {
     /// See [`LegacyFile`]; [`object_format`](Self::object_format) is the only
     /// reader of whether it is there.
     legacy: Option<Box<LegacyFile>>,
+    /// The directory holding this HDF5 file, resolved once when it was opened
+    /// — libhdf5's `H5F_t::extpath`, and the same value the read side keeps.
+    /// External raw-data file names are joined against it when
+    /// `HDF5_EXTFILE_PREFIX` names `${ORIGIN}`, so a write and a later read of
+    /// the same dataset must resolve a relative name identically; capturing it
+    /// at open time rather than reading the process's current directory per
+    /// write is what makes that hold.
+    source_dir: PathBuf,
 }
 
 /// The file-creation properties a brand-new file is made with.
@@ -2604,6 +2843,7 @@ impl Hdf5Writer {
             pending_region_references: Slot::new(Vec::new()),
             // A file this crate creates is always the modern generation.
             legacy: None,
+            source_dir: source_dir_of(path)?,
         })
     }
 
@@ -3532,6 +3772,7 @@ impl Hdf5Writer {
             pending_object_references: Slot::new(Vec::new()),
             pending_region_references: Slot::new(Vec::new()),
             legacy,
+            source_dir: source_dir_of(path)?,
         };
         // The link graph is complete only now, so this is the first point the
         // count each on-disk header was written with can be read off it: in a
@@ -4054,6 +4295,12 @@ impl Hdf5Writer {
                 .then_some((m.data_addr, m.data_size));
             m.data_addr = UNDEF_ADDR;
             m.data_size = 0;
+            // The external files themselves are the application's, not this
+            // file's, and neither is the name heap freed: `H5O_MSG_EFL`
+            // installs no file-delete method, so libhdf5 leaves the heap block
+            // behind too. Dropping the list is what stops a deleted dataset
+            // still claiming storage.
+            m.external = None;
             let is_vlen = matches!(
                 m.datatype,
                 DatatypeMessage::VarLenString { .. } | DatatypeMessage::VarLenSequence { .. }
@@ -4902,6 +5149,31 @@ impl Hdf5Writer {
         })
     }
 
+    /// The address of dataset `index`'s own contiguous block, for the two
+    /// writers that stamp single elements into it by file offset — object and
+    /// region references, whose values are only known once finalize has placed
+    /// every object header.
+    ///
+    /// Refuses, rather than handing back an address that is not one, every
+    /// dataset that has no such block: chunked, compact, unallocated, or with
+    /// its raw data in files outside this one.
+    fn local_element_block(&self, index: usize, what: &str) -> IoResult<u64> {
+        let ds = self.ds(index);
+        let m = ds.lock();
+        match m.contiguous_target() {
+            Some(ContiguousTarget::Local(addr)) => Ok(addr),
+            Some(ContiguousTarget::External(_)) => Err(crate::io::IoError::InvalidState(format!(
+                "{what} are stamped into the dataset's own contiguous block, and \
+                 dataset '{}' has none: its raw data lives in external files",
+                m.name
+            ))),
+            None => Err(crate::io::IoError::InvalidState(format!(
+                "{what} are stamped into contiguous storage; create the dataset \
+                 without chunking"
+            ))),
+        }
+    }
+
     /// Store object references naming `paths` into the elements of dataset
     /// `index` starting at `start`.
     ///
@@ -4916,7 +5188,7 @@ impl Hdf5Writer {
         start: u64,
         paths: &[&str],
     ) -> IoResult<()> {
-        let (elements, data_addr, indexed) = {
+        let elements = {
             let ds = self.ds(index);
             let m = ds.lock();
             match &m.datatype {
@@ -4931,21 +5203,14 @@ impl Hdf5Writer {
                     )))
                 }
             }
-            let elements = m
-                .dataspace
+            m.dataspace
                 .dims
                 .iter()
-                .fold(1u64, |a, &d| a.saturating_mul(d));
-            let indexed = m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
-            (elements, m.data_addr, indexed)
+                .fold(1u64, |a, &d| a.saturating_mul(d))
         };
-        if indexed || data_addr == UNDEF_ADDR {
-            return Err(crate::io::IoError::InvalidState(
-                "object references are stamped into contiguous storage; \
-                 create the dataset without chunking"
-                    .into(),
-            ));
-        }
+        // Refused here as well as at fixup time, so a dataset whose storage
+        // cannot hold stamped elements is reported at the call that chose it.
+        self.local_element_block(index, "object references")?;
         let end = start.saturating_add(paths.len() as u64);
         if end > elements {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -5041,7 +5306,7 @@ impl Hdf5Writer {
                     )
                 })?,
             };
-            let data_addr = self.ds(*dataset).lock().data_addr;
+            let data_addr = self.local_element_block(*dataset, "object references")?;
             let at = data_addr + element * width as u64;
             self.handle.write_at(at, &addr.to_le_bytes()[..width])?;
         }
@@ -5065,7 +5330,7 @@ impl Hdf5Writer {
         start: u64,
         targets: &[(&str, Selection)],
     ) -> IoResult<()> {
-        let (elements, data_addr, indexed) = {
+        let elements = {
             let ds = self.ds(index);
             let m = ds.lock();
             match &m.datatype {
@@ -5080,21 +5345,12 @@ impl Hdf5Writer {
                     )))
                 }
             }
-            let elements = m
-                .dataspace
+            m.dataspace
                 .dims
                 .iter()
-                .fold(1u64, |a, &d| a.saturating_mul(d));
-            let indexed = m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
-            (elements, m.data_addr, indexed)
+                .fold(1u64, |a, &d| a.saturating_mul(d))
         };
-        if indexed || data_addr == UNDEF_ADDR {
-            return Err(crate::io::IoError::InvalidState(
-                "region references are stamped into contiguous storage; \
-                 create the dataset without chunking"
-                    .into(),
-            ));
-        }
+        let data_addr = self.local_element_block(index, "region references")?;
         let end = start.saturating_add(targets.len() as u64);
         if end > elements {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -6055,9 +6311,161 @@ impl Hdf5Writer {
                 name: name.to_string(),
                 datatype,
                 committed_type: None,
+                external: None,
                 dataspace,
                 obj_header_addr: 0, // set during finalize
                 data_addr,
+                data_size,
+                compact: None,
+                chunked: None,
+                fixed_array: None,
+                btree_v2: None,
+                append: None,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: None,
+                deleted: false,
+                extent_dirty: false,
+                header_dirty: false,
+                nlink_written: 1,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
+                fill_value: None,
+                layout_version: 4,
+                times: None,
+            },
+        );
+
+        Ok(idx)
+    }
+
+    /// Define a new dataset whose raw data lives in files outside this one —
+    /// `H5Pset_external`, h5py's `external=[(name, offset, size)]`.
+    ///
+    /// Each entry names a file, the byte offset in it where that entry's
+    /// region starts, and how many bytes of the dataset the region holds; the
+    /// entries concatenate, in order, into the dataset's logical byte range,
+    /// and together must cover it. Nothing is allocated in this file: the data
+    /// layout message says contiguous storage at an undefined address, and it
+    /// is the External File List beside it that says where the bytes are
+    /// (`H5D__layout_oh_create`).
+    ///
+    /// A named file is created on first write and never truncated, so several
+    /// slots — or several datasets — may own disjoint ranges of one file, the
+    /// way `H5D__efl_write` opens them.
+    ///
+    /// The unlimited/growable slot size (`H5O_EFL_UNLIMITED`) is refused: it
+    /// only means anything for a dataset with an unlimited dataspace, which
+    /// contiguous storage cannot have here.
+    pub fn create_external_dataset(
+        &self,
+        name: &str,
+        datatype: DatatypeMessage,
+        dims: &[u64],
+        files: &[(&str, u64, u64)],
+    ) -> IoResult<usize> {
+        if files.is_empty() {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "external dataset '{name}' names no files; external storage is defined by \
+                 the files it lives in, so at least one is required"
+            )));
+        }
+        let create = self.begin_create(name, NewStorage::Contiguous)?;
+        let name = create.name.as_str();
+        let total_elements: u64 = if dims.is_empty() {
+            1
+        } else {
+            dims.iter().product()
+        };
+        let data_size = total_elements * datatype.element_size() as u64;
+
+        let mut heap = LocalHeapImage::with_empty_string();
+        let mut entries = Vec::with_capacity(files.len());
+        for &(file_name, offset, size) in files {
+            if file_name.is_empty() {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "external dataset '{name}' has a slot with an empty file name"
+                )));
+            }
+            if size == UNLIMITED {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "external dataset '{name}' slot '{file_name}' asks for the unlimited \
+                     (growable) size H5O_EFL_UNLIMITED, which this writer does not emit: \
+                     it is only valid on the last slot of a dataset with an unlimited \
+                     dataspace, and contiguous storage has none"
+                )));
+            }
+            if offset.checked_add(size).is_none() {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "external dataset '{name}' slot '{file_name}' spans offset {offset} \
+                     plus {size} bytes, past the end of the 64-bit address space"
+                )));
+            }
+            entries.push(ExternalFile {
+                name: file_name.to_string(),
+                name_offset: heap.insert_str(file_name),
+                offset,
+                size,
+            });
+        }
+        let external = ExternalStorage {
+            // Filled in below, once the heap the names went into has an
+            // address; the names' offsets within it are already final.
+            heap_addr: UNDEF_ADDR,
+            files: entries,
+        };
+        // `H5D__efl_construct`: the slots must reserve at least the dataset's
+        // own bytes, or part of it would have nowhere to live.
+        let reserved = external.total_size();
+        if reserved < data_size {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "external dataset '{name}' needs {data_size} bytes but its files reserve \
+                 only {reserved}"
+            )));
+        }
+
+        // The names' heap, written now: it is ordinary metadata of this file,
+        // and the message the header carries is only an address into it.
+        let sa = self.ctx.sizeof_addr as usize;
+        let ss = self.ctx.sizeof_size as usize;
+        let heap_bytes = heap.as_bytes().to_vec();
+        let heap_addr = self
+            .allocator
+            .allocate(local_heap_header_size(sa, ss) as u64);
+        let heap_data_addr = self.allocator.allocate(heap_bytes.len() as u64);
+        let heap_hdr = LocalHeapHeader {
+            data_size: heap_bytes.len() as u64,
+            // Sized to hold exactly these names, so no block of it is free.
+            free_list_offset: LOCAL_HEAP_FREE_NULL,
+            data_addr: heap_data_addr,
+        };
+        self.handle.write_at(heap_addr, &heap_hdr.encode(sa, ss))?;
+        self.handle.write_at(heap_data_addr, &heap_bytes)?;
+        let external = ExternalStorage {
+            heap_addr,
+            ..external
+        };
+
+        let dataspace = if dims.is_empty() {
+            DataspaceMessage::scalar()
+        } else {
+            DataspaceMessage::simple(dims)
+        };
+
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                committed_type: None,
+                external: Some(external),
+                dataspace,
+                obj_header_addr: 0, // set during finalize
+                // No block of this file's own: the layout message declares
+                // contiguous storage at an undefined address, which is what
+                // sends a reader to the external file list instead.
+                data_addr: UNDEF_ADDR,
                 data_size,
                 compact: None,
                 chunked: None,
@@ -6127,6 +6535,7 @@ impl Hdf5Writer {
                 name: name.to_string(),
                 datatype,
                 committed_type: None,
+                external: None,
                 dataspace,
                 obj_header_addr: 0, // set during finalize
                 data_addr: UNDEF_ADDR,
@@ -6172,6 +6581,7 @@ impl Hdf5Writer {
                 name: name.to_string(),
                 datatype,
                 committed_type: None,
+                external: None,
                 dataspace: DataspaceMessage::null(),
                 obj_header_addr: 0, // set during finalize
                 data_addr: UNDEF_ADDR,
@@ -6275,6 +6685,7 @@ impl Hdf5Writer {
                 name: name.to_string(),
                 datatype,
                 committed_type: None,
+                external: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
@@ -6315,6 +6726,30 @@ impl Hdf5Writer {
         Ok(idx)
     }
 
+    /// Write `data` into a contiguous dataset's raw storage at *dataset-
+    /// relative* byte offset `off`.
+    ///
+    /// The single owner of a contiguous raw-data write. Which storage that is
+    /// — a block of this file, or the files an External File List names — is
+    /// decided once, by [`DatasetInfo::contiguous_target`], and never at a
+    /// call site.
+    fn write_contiguous_bytes(
+        &self,
+        target: &ContiguousTarget,
+        off: u64,
+        data: &[u8],
+    ) -> IoResult<()> {
+        match target {
+            ContiguousTarget::Local(addr) => Ok(self.handle.write_at(addr + off, data)?),
+            ContiguousTarget::External(files) => {
+                // Resolved through the read side's own prefix logic, so a
+                // relative name lands in the same place a later read looks.
+                let prefix = crate::io::reader::resolve_extfile_prefix(&self.source_dir);
+                write_external_file_bytes(files, prefix.as_deref(), off, data)
+            }
+        }
+    }
+
     /// Write raw bytes to a contiguous dataset identified by `index`.
     ///
     /// The caller is responsible for providing data in the correct byte order
@@ -6323,7 +6758,7 @@ impl Hdf5Writer {
     pub fn write_dataset_raw(&self, index: usize, data: &[u8]) -> IoResult<()> {
         let ds = self.ds(index);
         let _op = ds.op.lock();
-        let data_addr = {
+        let target = {
             let mut g = ds.lock();
             if g.chunked.is_some() {
                 return Err(crate::io::IoError::InvalidState(
@@ -6345,11 +6780,11 @@ impl Hdf5Writer {
                 g.header_dirty = true;
                 return Ok(());
             }
-            if g.data_addr == UNDEF_ADDR {
+            let Some(target) = g.contiguous_target() else {
                 return Err(crate::io::IoError::InvalidState(
                     "dataset has no data allocated".into(),
                 ));
-            }
+            };
             if data.len() as u64 != g.data_size {
                 return Err(crate::io::IoError::InvalidState(format!(
                     "data size mismatch: expected {} bytes, got {}",
@@ -6357,10 +6792,9 @@ impl Hdf5Writer {
                     data.len()
                 )));
             }
-            g.data_addr
+            target
         };
-        self.handle.write_at(data_addr, data)?;
-        Ok(())
+        self.write_contiguous_bytes(&target, 0, data)
     }
 
     /// Write a chunk of data to a chunked dataset.
@@ -6814,7 +7248,7 @@ impl Hdf5Writer {
         // `dims` borrows the dataset slot; collect what the writers below need
         // so the guard can be dropped before they re-lock it.
         let dims = dims.clone();
-        let base_addr = ds.data_addr;
+        let target = ds.contiguous_target();
         drop(ds);
 
         if is_chunked {
@@ -6824,13 +7258,13 @@ impl Hdf5Writer {
             self.flush_append_buffer_if_intersecting(index, starts[0], starts[0] + counts[0])?;
             return self.write_slice_chunked(index, starts, counts, data);
         }
-        if base_addr == UNDEF_ADDR {
+        let Some(target) = target else {
             return Err(crate::io::IoError::InvalidState(
                 "dataset has no data allocated".into(),
             ));
-        }
+        };
 
-        // Write each maximal contiguous run in one `write_at`. Trailing
+        // Write each maximal contiguous run in one write. Trailing
         // full-selected dimensions coalesce, mirroring the read path: a slice
         // with a full last axis becomes one write per outer index instead of
         // one write per last-axis row.
@@ -6840,9 +7274,7 @@ impl Hdf5Writer {
             counts,
             element_size,
             |dst_off, src_off, len| {
-                self.handle
-                    .write_at(base_addr + dst_off, &data[src_off..src_off + len])
-                    .map_err(Into::into)
+                self.write_contiguous_bytes(&target, dst_off, &data[src_off..src_off + len])
             },
         )?;
 
@@ -7413,6 +7845,7 @@ impl Hdf5Writer {
                 name: name.to_string(),
                 datatype,
                 committed_type: None,
+                external: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr,
@@ -7523,6 +7956,7 @@ impl Hdf5Writer {
                 name: name.to_string(),
                 datatype,
                 committed_type: None,
+                external: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr,
@@ -7658,6 +8092,7 @@ impl Hdf5Writer {
                 name: name.to_string(),
                 datatype,
                 committed_type: None,
+                external: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
@@ -7919,7 +8354,7 @@ impl Hdf5Writer {
             let writable = m.chunked.is_some()
                 || m.fixed_array.is_some()
                 || m.btree_v2.is_some()
-                || m.data_addr != UNDEF_ADDR;
+                || m.contiguous_target().is_some();
             (charset, m.dataspace.dims.clone(), writable)
         };
 
@@ -8325,12 +8760,13 @@ impl Hdf5Writer {
                     len,
                     Some(&bytes),
                 ));
-            } else if ds.data_addr != UNDEF_ADDR && ds.data_size > 0 {
-                let data_addr = ds.data_addr;
-                let data_size = ds.data_size as usize;
-                let filled =
-                    crate::format::messages::fill_value::tiled_fill(data_size, Some(&bytes));
-                self.handle.write_at(data_addr, &filled)?;
+            } else if ds.data_size > 0 {
+                if let Some(target) = ds.contiguous_target() {
+                    let data_size = ds.data_size as usize;
+                    let filled =
+                        crate::format::messages::fill_value::tiled_fill(data_size, Some(&bytes));
+                    self.write_contiguous_bytes(&target, 0, &filled)?;
+                }
             }
         }
 
@@ -8883,6 +9319,7 @@ impl Hdf5Writer {
                 name: name.to_string(),
                 datatype,
                 committed_type: None,
+                external: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
@@ -9028,6 +9465,7 @@ impl Hdf5Writer {
                 name: name.to_string(),
                 datatype,
                 committed_type: None,
+                external: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
@@ -9136,6 +9574,7 @@ impl Hdf5Writer {
                 name: name.to_string(),
                 datatype,
                 committed_type: None,
+                external: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
@@ -10979,6 +11418,19 @@ impl Hdf5Writer {
         };
         let fv_msg = fv.encode_for(self.message_format());
         header.add_message(MSG_FILL_VALUE, 0x00, fv_msg);
+
+        // External Data Files message (type 0x07), before the layout message
+        // and marked constant, exactly where `H5D__layout_oh_create` puts it.
+        // It is what makes a reader route the dataset's I/O through the files
+        // it names rather than through the undefined address the layout
+        // message below still declares.
+        if let Some(ref ext) = m.external {
+            header.add_message(
+                MSG_EXTERNAL_FILE_LIST,
+                MSG_FLAG_CONSTANT,
+                ext.message().encode(&self.ctx),
+            );
+        }
 
         // Data Layout message (type 0x08)
         let layout = if let Some(ref chunked) = m.chunked {
