@@ -27,13 +27,13 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 
 | direction | PASS | INVALID | UNSUPPORTED-API | SKIPPED |
 |---|---|---|---|---|
-| B (write) | 83 | 0 | 8 | 0 |
+| B (write) | 85 | 0 | 6 | 0 |
 
 ## Top gaps by severity
 
 | # | severity | finding | cases |
 |---|---|---|---|
-| 1 | API cannot express | no rust writer arm: the public API cannot express this case | 8 (chunkidx_implicit, external_storage, vds, group_storage_mod…) |
+| 1 | API cannot express | no rust writer arm: the public API cannot express this case | 6 (chunkidx_implicit, group_storage_modern_root, group_storage…) |
 | 2 | no public accessor (API-wide) | attrorder — H5Group exposes no attribute creation-order tracking flags | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
 | 3 | no public accessor (API-wide) | attrstore — H5Group exposes no compact/dense attribute storage accessor | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
 | 4 | no public accessor (API-wide) | linkorder — H5Group exposes no link creation-order tracking flags | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
@@ -99,8 +99,8 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `layout_contiguous_v108` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `layout_chunked_v108` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `chunkidx_earray_dim1` | layout | PASS | 0 | 0 | 0 | PASS |  |
-| `external_storage` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
-| `vds` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `external_storage` | layout | PASS | 0 | 0 | 0 | PASS |  |
+| `vds` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `filter_deflate` | filter | PASS | 0 | 0 | 0 | PASS |  |
 | `filter_shuffle` | filter | PASS | 0 | 0 | 0 | PASS |  |
 | `filter_fletcher32` | filter | PASS | 0 | 0 | 0 | PASS |  |
@@ -153,10 +153,10 @@ The rust-written file carries the same data, type and shape as the h5py referenc
 
 | id | field | libhdf5 | rust-hdf5 | observed | cases |
 |---|---|---|---|---|---|
-| `superblock-floor-v2` | `superblock` | `0` | `2` | yes | 53 (int_i8, int_u8, int_i16le…) |
+| `superblock-floor-v2` | `superblock` | `0` | `2` | yes | 55 (int_i8, int_u8, int_i16le…) |
 | `superblock-v3-for-chunk-index` | `superblock` | `*` | `3` | yes | 2 (chunkidx_btree1, layout_chunked_v108) |
 | `btree1-index-substituted` | `chunkindex` | `btree1` | `*` | yes | 2 (chunkidx_btree1, layout_chunked_v108) |
-| `new-style-groups-always` | `linkstore` | `symtab` | `compact` | yes | 54 (int_i8, int_u8, int_i16le…) |
+| `new-style-groups-always` | `linkstore` | `symtab` | `compact` | yes | 56 (int_i8, int_u8, int_i16le…) |
 | `filter-flags-zero` | `filters` | `*` | `*` | yes | 4 (filter_deflate, filter_shuffle, filter_defl…) |
 
 - `superblock-floor-v2`: libhdf5 writes a v0 superblock at the earliest libver bound, over symbol-table groups and version-1 object headers; this writer emits neither, and no libhdf5 writes a v0 superblock over the link-message groups it does emit, so its floor is the v1.8 bound's version 2 (HDF5_superblock_ver_bounds); observed as `0 -> 2`
@@ -176,7 +176,7 @@ None.
 
 | severity | finding | cases | example |
 |---|---|---|---|
-| API cannot express | no rust writer arm: the public API cannot express this case | 8 |  |
+| API cannot express | no rust writer arm: the public API cannot express this case | 6 |  |
 | no public accessor (API-wide) | attrorder — H5Group exposes no attribute creation-order tracking flags | 91 | /#attrorder |
 | no public accessor (API-wide) | attrstore — H5Group exposes no compact/dense attribute storage accessor | 91 | /#attrstore |
 | no public accessor (API-wide) | linkorder — H5Group exposes no link creation-order tracking flags | 91 | /#linkorder |
