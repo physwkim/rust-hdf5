@@ -5077,16 +5077,8 @@
    "note": "scale-offset, library-computed minimum bits",
    "rust_case": "filter_scaleoffset",
    "a": {
-    "verdict": "DIFF",
-    "divergences": [
-     {
-      "key": "/data#filters",
-      "kind": "value",
-      "field": "filters",
-      "ref": "[scaleoffset(2|0|16|0|4|1|0|1|0|0|0|0|0|0|0|0|1818321779|1717989221|7628147|0)@1]",
-      "probe": "[scaleoffset(2|0|16|0|4|1|0|1|0|0|0|0|0|0|0|0|0|0|0|0)@1]"
-     }
-    ],
+    "verdict": "PASS",
+    "divergences": [],
     "gaps": [
      {
       "key": "#superblock",
@@ -5154,7 +5146,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 16,
+    "matched": 17,
     "detail": ""
    },
    "b": {
@@ -10862,14 +10854,6 @@
   }
  ],
  "findings": [
-  {
-   "kind": "divergence",
-   "signature": "filters: value",
-   "cases": [
-    "filter_scaleoffset"
-   ],
-   "example": "/data#filters\n  libhdf5: [scaleoffset(2|0|16|0|4|1|0|1|0|0|0|0|0|0|0|0|1818321779|1717989221|7628147|0)@1]\n  rust:    [scaleoffset(2|0|16|0|4|1|0|1|0|0|0|0|0|0|0|0|0|0|0|0)@1]"
-  },
   {
    "kind": "structural",
    "signature": "attrorder \u2014 H5Group exposes no attribute creation-order tracking flags",

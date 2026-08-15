@@ -23,7 +23,7 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 
 | direction | PASS | GAP | MISS | DIFF | READ-ERROR | GEN-ERROR |
 |---|---|---|---|---|---|---|
-| A (read) | 91 | 0 | 0 | 1 | 0 | 0 |
+| A (read) | 92 | 0 | 0 | 0 | 0 | 0 |
 
 | direction | PASS | INVALID | UNSUPPORTED-API | SKIPPED |
 |---|---|---|---|---|
@@ -33,16 +33,16 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 
 | # | severity | finding | cases |
 |---|---|---|---|
-| 1 | value divergence | filters: value | 1 (filter_scaleoffset) |
-| 2 | no public accessor (API-wide) | attrorder — H5Group exposes no attribute creation-order tracking flags | 92 (int_i8, int_u8, int_i16le, int_u16le…) |
-| 3 | no public accessor (API-wide) | attrstore — H5Group exposes no compact/dense attribute storage accessor | 92 (int_i8, int_u8, int_i16le, int_u16le…) |
-| 4 | no public accessor (API-wide) | linkorder — H5Group exposes no link creation-order tracking flags | 92 (int_i8, int_u8, int_i16le, int_u16le…) |
-| 5 | no public accessor (API-wide) | linkstore — H5Group exposes no compact/dense link storage accessor | 92 (int_i8, int_u8, int_i16le, int_u16le…) |
-| 6 | no public accessor (API-wide) | nattrs_hdr — H5Group exposes no object-header attribute count | 92 (int_i8, int_u8, int_i16le, int_u16le…) |
-| 7 | no public accessor (API-wide) | superblock — H5File exposes no superblock/libver accessor | 92 (int_i8, int_u8, int_i16le, int_u16le…) |
-| 8 | no public accessor (API-wide) | attrstore — H5Dataset exposes no compact/dense attribute storage accessor | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
-| 9 | no public accessor (API-wide) | nattrs_hdr — H5Dataset exposes no object-header attribute count | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
-| 10 | no public accessor (API-wide) | shape — H5Attribute exposes no shape() accessor | 8 (attr_scalar_num, attr_array_num, attr_string, attrs_dense…) |
+| 1 | no public accessor (API-wide) | attrorder — H5Group exposes no attribute creation-order tracking flags | 92 (int_i8, int_u8, int_i16le, int_u16le…) |
+| 2 | no public accessor (API-wide) | attrstore — H5Group exposes no compact/dense attribute storage accessor | 92 (int_i8, int_u8, int_i16le, int_u16le…) |
+| 3 | no public accessor (API-wide) | linkorder — H5Group exposes no link creation-order tracking flags | 92 (int_i8, int_u8, int_i16le, int_u16le…) |
+| 4 | no public accessor (API-wide) | linkstore — H5Group exposes no compact/dense link storage accessor | 92 (int_i8, int_u8, int_i16le, int_u16le…) |
+| 5 | no public accessor (API-wide) | nattrs_hdr — H5Group exposes no object-header attribute count | 92 (int_i8, int_u8, int_i16le, int_u16le…) |
+| 6 | no public accessor (API-wide) | superblock — H5File exposes no superblock/libver accessor | 92 (int_i8, int_u8, int_i16le, int_u16le…) |
+| 7 | no public accessor (API-wide) | attrstore — H5Dataset exposes no compact/dense attribute storage accessor | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
+| 8 | no public accessor (API-wide) | nattrs_hdr — H5Dataset exposes no object-header attribute count | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
+| 9 | no public accessor (API-wide) | shape — H5Attribute exposes no shape() accessor | 8 (attr_scalar_num, attr_array_num, attr_string, attrs_dense…) |
+| 10 | no public accessor (API-wide) | dtype — H5Group has no attr() handle in read mode | 6 (track_order, attr_string, attrs_dense_group, attr_on_root…) |
 
 ## Case matrix
 
@@ -105,7 +105,7 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `filter_shuffle` | filter | PASS | 0 | 0 | 0 | PASS |  |
 | `filter_fletcher32` | filter | PASS | 0 | 0 | 0 | PASS |  |
 | `filter_deflate_shuffle` | filter | PASS | 0 | 0 | 0 | PASS |  |
-| `filter_scaleoffset` | filter | DIFF | 1 | 0 | 0 | PASS |  |
+| `filter_scaleoffset` | filter | PASS | 0 | 0 | 0 | PASS |  |
 | `fill_default` | fillvalue | PASS | 0 | 0 | 0 | PASS |  |
 | `fill_set_int` | fillvalue | PASS | 0 | 0 | 0 | PASS |  |
 | `fill_set_float_nan` | fillvalue | PASS | 0 | 0 | 0 | PASS |  |
@@ -143,12 +143,7 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 
 ## Direction A divergences, in full
 
-### `filter_scaleoffset`
-
-- `/data#filters` (value)
-  - libhdf5: `[scaleoffset(2|0|16|0|4|1|0|1|0|0|0|0|0|0|0|0|1818321779|1717989221|7628147|0)@1]`
-  - rust-hdf5: `[scaleoffset(2|0|16|0|4|1|0|1|0|0|0|0|0|0|0|0|0|0|0|0)@1]`
-
+None.
 ## Objects the reader does not list
 
 None.
@@ -168,7 +163,6 @@ None.
 
 | severity | finding | cases | example |
 |---|---|---|---|
-| value divergence | filters: value | 1 | /data#filters libhdf5: [scaleoffset(2|0|16|0|4|1|0|1|0|0|0|0|0|0|0|0|1818321779… |
 | no public accessor (API-wide) | attrorder — H5Group exposes no attribute creation-order tracking flags | 92 | /#attrorder |
 | no public accessor (API-wide) | attrstore — H5Group exposes no compact/dense attribute storage accessor | 92 | /#attrstore |
 | no public accessor (API-wide) | linkorder — H5Group exposes no link creation-order tracking flags | 92 | /#linkorder |
