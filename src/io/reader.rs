@@ -40,6 +40,7 @@ use crate::format::reference::{
 };
 use crate::format::selection::{Hyperslab, PointSelection, RegularHyperslab, Selection};
 use crate::format::sohm::SohmMasterTable;
+use crate::format::storage_kind::AttributeStorage;
 use crate::format::superblock::{
     detect_superblock_version, SuperblockV0V1, SuperblockV2V3, SymbolTableCache,
 };
@@ -2515,6 +2516,15 @@ impl Hdf5Reader {
         self.dataset_info(ds_name)?.attributes.unreadable_reason()
     }
 
+    /// A dataset's own compact-vs-dense attribute storage.
+    pub fn dataset_attr_storage(&mut self, ds_name: &str) -> IoResult<AttributeStorage> {
+        Ok(self
+            .dataset_info(ds_name)
+            .ok_or_else(|| crate::io::IoError::NotFound(ds_name.to_string()))?
+            .attributes
+            .storage())
+    }
+
     /// Why the root group's attributes cannot be listed at all, or `None` when
     /// the set is whole.
     pub fn root_attrs_unreadable_reason(&self) -> Option<&str> {
@@ -2567,6 +2577,11 @@ impl Hdf5Reader {
         self.root_attributes.creation_order()
     }
 
+    /// The root group's own compact-vs-dense attribute storage.
+    pub fn root_attr_storage(&self) -> AttributeStorage {
+        self.root_attributes.storage()
+    }
+
     /// Return the attribute names of a non-root group (path without a
     /// leading `/`, e.g. `"detector"` or `"entry/instrument"`; may pass
     /// through group hard links). Undecodable attributes included — see
@@ -2599,6 +2614,16 @@ impl Hdf5Reader {
         self.group_attributes
             .get(&self.canonical_path(group_path))
             .map(ObjectAttributes::creation_order)
+            .unwrap_or_default()
+    }
+
+    /// A non-root group's own compact-vs-dense attribute storage. `Compact`
+    /// — the same silent default as an empty attribute set — for a path the
+    /// walk never reached.
+    pub fn group_attr_storage(&self, group_path: &str) -> AttributeStorage {
+        self.group_attributes
+            .get(&self.canonical_path(group_path))
+            .map(ObjectAttributes::storage)
             .unwrap_or_default()
     }
 
@@ -5277,6 +5302,10 @@ pub struct ObjectAttributes {
     /// (`attribute_creation_order`) — a structural fact about the header,
     /// known even when the entries above are `incomplete`.
     creation_order: CreationOrder,
+    /// This object's own compact-vs-dense attribute storage, from the
+    /// attribute info message's heap address (or its absence) — likewise a
+    /// structural fact known even when the entries are `incomplete`.
+    storage: AttributeStorage,
 }
 
 impl ObjectAttributes {
@@ -5314,6 +5343,15 @@ impl ObjectAttributes {
     /// nothing that failed to decode.
     pub fn creation_order(&self) -> CreationOrder {
         self.creation_order
+    }
+
+    /// This object's own compact-vs-dense attribute storage — h5py's
+    /// `h5o.get_info(...).meta_size.attr.index_size` check, read off the
+    /// attribute info message's heap address rather than derived from the
+    /// entries. Available even when the set is
+    /// [`incomplete`](Self::unreadable_reason).
+    pub fn storage(&self) -> AttributeStorage {
+        self.storage
     }
 
     /// Nothing worth recording: no attribute read, and no failure to report.
@@ -5414,6 +5452,11 @@ pub(crate) fn collect_object_attributes(
             },
             MSG_ATTR_INFO => match AttributeInfoMessage::decode(&msg.data, ctx) {
                 Ok((info, _)) => {
+                    attrs.storage = if info.is_dense() {
+                        AttributeStorage::Dense
+                    } else {
+                        AttributeStorage::Compact
+                    };
                     let mut br = HandleBlockReader { handle };
                     match crate::format::dense_attr::read_dense_attributes(&info, ctx, &mut br) {
                         Ok(dense) => attrs.entries.extend(dense),

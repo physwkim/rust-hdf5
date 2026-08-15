@@ -30,8 +30,9 @@ use rust_hdf5::format::messages::filter::{
 };
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
-    CreationOrder, H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype,
-    Hdf5Error, Hyperslab, HyperslabBlock, LibverBound, LinkClass, Reference, Selection,
+    AttributeStorage, CreationOrder, H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group,
+    H5NamedDatatype, Hdf5Error, Hyperslab, HyperslabBlock, LibverBound, LinkClass, Reference,
+    Selection,
 };
 
 const CANON_VERSION: &str = "3";
@@ -597,6 +598,17 @@ fn crt_order_str(order: CreationOrder) -> &'static str {
     }
 }
 
+/// The twin of `canon.py`'s `dump_attrs`'s `attrstore` lambda: `"compact"` or
+/// `"dense"`, the same two strings h5py's `meta_size.attr.index_size` check
+/// produces.
+fn attrstore_str(storage: AttributeStorage) -> &'static str {
+    if storage.is_dense() {
+        "dense"
+    } else {
+        "compact"
+    }
+}
+
 fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: usize) {
     d.emit(&format!("{path}#kind"), "group");
     d.field(path, "linkorder", || {
@@ -953,6 +965,9 @@ trait AttrSource {
     fn attr(&self, name: &str) -> rust_hdf5::Result<H5Attribute>;
     /// What stands in the way of the object-header attribute count.
     fn nattrs_hdr_gap() -> &'static str;
+    /// This object's own compact/dense attribute storage, or what stands in
+    /// the way of reading it.
+    fn attr_storage(&self) -> std::result::Result<AttributeStorage, String>;
 }
 
 impl AttrSource for H5Dataset {
@@ -965,6 +980,9 @@ impl AttrSource for H5Dataset {
     fn nattrs_hdr_gap() -> &'static str {
         "H5Dataset exposes no object-header attribute count"
     }
+    fn attr_storage(&self) -> std::result::Result<AttributeStorage, String> {
+        H5Dataset::attr_storage(self).map_err(oneline)
+    }
 }
 
 impl AttrSource for H5NamedDatatype {
@@ -976,6 +994,9 @@ impl AttrSource for H5NamedDatatype {
     }
     fn nattrs_hdr_gap() -> &'static str {
         "H5NamedDatatype exposes no object-header attribute count"
+    }
+    fn attr_storage(&self) -> std::result::Result<AttributeStorage, String> {
+        Err("H5NamedDatatype exposes no compact/dense attribute storage accessor".into())
     }
 }
 
@@ -1019,13 +1040,9 @@ fn dump_object_attrs<T: AttrSource>(d: &mut Dump, path: &str, ds: &T) {
         &format!("{path}#nattrs_hdr"),
         unsupported("nattrs_hdr", T::nattrs_hdr_gap()),
     );
-    d.emit(
-        &format!("{path}#attrstore"),
-        unsupported(
-            "attrstore",
-            "H5Dataset exposes no compact/dense attribute storage accessor",
-        ),
-    );
+    d.field(path, "attrstore", || {
+        ds.attr_storage().map(attrstore_str).map(str::to_string)
+    });
 
     for name in names {
         let key = format!("{path}@{name}");
@@ -1115,13 +1132,13 @@ fn dump_group_attrs(d: &mut Dump, path: &str, group: &H5Group) {
             "H5Group exposes no object-header attribute count",
         ),
     );
-    d.emit(
-        &format!("{path}#attrstore"),
-        unsupported(
-            "attrstore",
-            "H5Group exposes no compact/dense attribute storage accessor",
-        ),
-    );
+    d.field(path, "attrstore", || {
+        group
+            .attr_storage()
+            .map(attrstore_str)
+            .map(str::to_string)
+            .map_err(oneline)
+    });
 
     for name in names {
         let key = format!("{path}@{name}");

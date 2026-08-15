@@ -22,6 +22,7 @@ pub mod reference;
 pub mod selection;
 pub mod sohm;
 pub mod sohm_write;
+pub mod storage_kind;
 pub mod superblock;
 pub mod symbol_table;
 pub mod szip;

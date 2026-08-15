@@ -117,6 +117,7 @@ pub use format::reference::Reference;
 pub use format::selection::{
     Hyperslab, HyperslabBlock, PointSelection, RegularHyperslab, Selection,
 };
+pub use format::storage_kind::AttributeStorage;
 pub use format::LibverBound;
 pub use group::H5Group;
 pub use io::locking::{FileLocking, LockMode};

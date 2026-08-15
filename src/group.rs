@@ -24,6 +24,7 @@ use crate::format::creation_order::CreationOrder;
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::filter::FilterPipeline;
 use crate::format::messages::link::LinkTarget;
+use crate::format::storage_kind::AttributeStorage;
 use crate::io::reader::LinkClass;
 use crate::types::H5Type;
 
@@ -1025,6 +1026,23 @@ impl H5Group {
             }),
             _ => Err(Hdf5Error::InvalidState(
                 "attr_creation_order is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// This group's own compact-vs-dense attribute storage — the equivalent
+    /// of `h5py.h5o.get_info(gid.id).meta_size.attr.index_size` being
+    /// nonzero.
+    pub fn attr_storage(&self) -> Result<AttributeStorage> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_attr_storage()
+            } else {
+                reader.group_attr_storage(self.name.trim_start_matches('/'))
+            }),
+            _ => Err(Hdf5Error::InvalidState(
+                "attr_storage is only available in read mode".into(),
             )),
         }
     }

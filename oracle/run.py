@@ -129,13 +129,20 @@ STRUCTURAL_FIELDS = {
     "filters",
     "fillvalue",
     "nattrs_hdr",
-    "attrstore",
     "linkstore",
     "linkorder",
 }
 # `strpad` is deliberately NOT structural: it is a datatype detail the probe
 # answers from the decoded type, so a disagreement there is a modelling gap in
 # one class, not a missing accessor.
+
+# Fields with a real accessor on some object kinds but not others: still an
+# API-wide gap on the `#kind` values listed here, so a case is not held to a
+# field the API was never asked to expose there. `attr_storage()` exists on
+# H5Group and H5Dataset; H5NamedDatatype has no counterpart.
+STRUCTURAL_FIELDS_BY_KIND = {
+    "attrstore": {"committed-datatype"},
+}
 
 
 def parse_dump(text):
@@ -167,6 +174,8 @@ def marker(value, name):
 def is_structural(key, field, ref):
     """True when this UNSUPPORTED is one of the always-missing accessors."""
     if field in STRUCTURAL_FIELDS:
+        return True
+    if ref.get("%s#kind" % object_of(key)) in STRUCTURAL_FIELDS_BY_KIND.get(field, ()):
         return True
     if "@" not in key:
         return False
