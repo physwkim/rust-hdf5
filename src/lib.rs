@@ -103,15 +103,16 @@ pub mod swmr;
 pub mod types;
 
 pub use attribute::{AttrShape, H5Attribute};
-pub use dataset::{H5Dataset, ReadNumeric};
+pub use dataset::{ChunkIndex, FillValue, H5Dataset, ReadNumeric, StorageLayout};
 pub use error::{Hdf5Error, Result};
 pub use file::{H5File, H5FileOptions};
 pub use format::messages::datatype::{ByteOrder, DatatypeMessage};
-pub use format::messages::filter::FilterPipeline;
+pub use format::messages::filter::{Filter, FilterPipeline};
 pub use format::messages::superblock_ext::{
     BtreeKMessage, DriverInfoMessage, FileSpaceInfoMessage, FileSpaceStrategy,
     SharedMessageTableMessage,
 };
+pub use format::messages::virtual_mapping::VirtualMapping;
 pub use format::reference::Reference;
 pub use format::selection::{
     Hyperslab, HyperslabBlock, PointSelection, RegularHyperslab, Selection,
@@ -119,6 +120,7 @@ pub use format::selection::{
 pub use format::LibverBound;
 pub use group::H5Group;
 pub use io::locking::{FileLocking, LockMode};
+pub use io::reader::ExternalFileSegment;
 pub use io::reader::LinkClass;
 pub use io::reader::SuperblockExtension;
 pub use io::writer::{MAX_COMPACT_DATA, MIN_USERBLOCK};

@@ -11,6 +11,10 @@ Only the standard library, numpy and h5py are used.
 """
 
 import hashlib
+import os
+import pathlib
+import re
+import subprocess
 import sys
 import traceback
 
@@ -19,7 +23,7 @@ import numpy as np
 import hdf5env  # noqa: F401  (must precede h5py; see the module docstring)
 
 import h5py
-from h5py import h5d, h5p, h5s, h5t
+from h5py import h5d, h5o, h5p, h5s, h5t
 
 CANON_VERSION = "3"
 RAW_LIMIT = 1024
@@ -459,18 +463,71 @@ _FILTER_NAMES = {
 }
 
 
-def filters_str(dcpl):
+# `dcpl.get_filter()` (H5Pget_filter2) does not always describe the on-disk
+# filter-pipeline message: opening a scale-offset-filtered dataset
+# re-invokes `H5Z__set_local_scaleoffset`, which reconstructs the pipeline's
+# cd_values in memory — and for the reserved/unused tail slots past the
+# packed fill-value bytes, that reconstruction leaves them holding whatever
+# was there before rather than the zeros actually stored on disk. Verified
+# on a real file two ways independent of any Python binding: a byte-exact
+# manual parse of the filter-pipeline message (its declared size fully and
+# exactly accounts for 20 zero-filled cd_values, no leftover bytes), and
+# `h5debug <file> <header_addr>` — which calls libhdf5's own
+# `H5O_pline_debug` directly — reporting `CD value 16` through `19` as `0`.
+# `dcpl.get_filter()` instead reports `(1818321779, 1717989221, 7628147, 0)`
+# for that same slot range, which decodes as the ASCII bytes
+# `"scaleoffset\0"` — the filter's own name string bleeding through
+# uncleared memory in the reconstruction. Full writeup: oracle/CANON.md,
+# under `filters`.
+#
+# So `filters` is always measured from the on-disk message via `h5debug`,
+# for every case, filtered or not — one route, not a special case carved
+# out for scaleoffset.
+
+_H5DEBUG_FILTER_MSG_RE = re.compile(
+    r"`filter pipeline'.*?(?=\nMessage \d+\.\.\.|\Z)", re.DOTALL
+)
+_H5DEBUG_FILTER_BLOCK_RE = re.compile(
+    r"Filter at position \d+.*?(?=Filter at position \d+|\Z)", re.DOTALL
+)
+_H5DEBUG_ID_RE = re.compile(r"Filter identification:\s*0x([0-9a-fA-F]+)")
+_H5DEBUG_FLAGS_RE = re.compile(r"Flags:\s*0x([0-9a-fA-F]+)")
+_H5DEBUG_CD_RE = re.compile(r"CD value \d+\s+(-?\d+)")
+
+
+def _h5debug_bin():
+    """Locate `h5debug` the way `run.py` locates `h5dump`/`h5diff`: alongside
+    this interpreter unless `RUST_HDF5_ORACLE_BINDIR` overrides it."""
+    bindir = os.environ.get(
+        "RUST_HDF5_ORACLE_BINDIR", str(pathlib.Path(sys.executable).parent)
+    )
+    return str(pathlib.Path(bindir) / "h5debug")
+
+
+def filters_str(dset):
+    """The `filters` field, read from the on-disk filter-pipeline message
+    via `h5debug` rather than `dcpl.get_filter()` — see the note above.
+
+    Uses `dset.file.filename`, not the top-level file path: `dset` may be
+    reached through an external link, in which case its object header lives
+    in a different file than the one this dump started from.
+    """
+    addr = h5o.get_info(dset.id).addr
+    proc = subprocess.run(
+        [_h5debug_bin(), dset.file.filename, str(addr)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    msg = _H5DEBUG_FILTER_MSG_RE.search(proc.stdout)
+    if not msg:
+        return "[]"
     parts = []
-    for i in range(dcpl.get_nfilters()):
-        code, flags, cd, _name_ = dcpl.get_filter(i)
-        parts.append(
-            "%s(%s)@%d"
-            % (
-                _FILTER_NAMES.get(code, str(code)),
-                "|".join(str(c) for c in cd),
-                flags,
-            )
-        )
+    for block in _H5DEBUG_FILTER_BLOCK_RE.findall(msg.group(0)):
+        fid = int(_H5DEBUG_ID_RE.search(block).group(1), 16)
+        flags = int(_H5DEBUG_FLAGS_RE.search(block).group(1), 16)
+        cd = _H5DEBUG_CD_RE.findall(block)
+        parts.append("%s(%s)@%d" % (_FILTER_NAMES.get(fid, str(fid)), "|".join(cd), flags))
     return "[" + ",".join(parts) + "]"
 
 
@@ -690,7 +747,7 @@ class Dumper:
 
         self.field(path, "external", lambda: external_str(dcpl))
         self.field(path, "virtual", lambda: virtual_str(dcpl))
-        self.field(path, "filters", lambda: filters_str(dcpl))
+        self.field(path, "filters", lambda: filters_str(dset))
         self.field(path, "fillvalue", lambda: self.fill_value(dset, dcpl))
         self.dump_attrs(path, dset)
         self.field(path, "data", lambda: dataset_payload(dset))

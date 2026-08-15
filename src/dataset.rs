@@ -8,9 +8,11 @@ use crate::attribute::AttrBuilder;
 use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
 use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+use crate::format::messages::filter::Filter;
 use crate::format::messages::virtual_mapping::VirtualMapping;
 use crate::format::reference::Reference;
 use crate::format::selection::Selection;
+use crate::io::reader::ExternalFileSegment;
 use crate::io::writer::ChunkIndexKind;
 use crate::types::H5Type;
 
@@ -1374,6 +1376,71 @@ fn decode_string(bytes: &[u8], charset: u8, lossy: bool, index: usize) -> Result
     }
 }
 
+/// A dataset's storage layout class (read mode only) — `H5Pget_layout`'s
+/// four values.
+///
+/// Distinct from [`ChunkIndex`], which names the structure a `Chunked`
+/// layout's index uses; this only says which of the four storage classes
+/// the dataset was created with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageLayout {
+    /// Raw data stored inline in the object header.
+    Compact,
+    /// Raw data in a single contiguous block — or, when the dataset also
+    /// carries an external file list, in one or more blocks of an outside
+    /// file instead ([`H5Dataset::external_files`]); the layout itself
+    /// still reports `Contiguous` either way.
+    Contiguous,
+    /// Raw data split into fixed-size chunks, each independently
+    /// allocated. [`H5Dataset::chunk_dims`] gives the chunk shape,
+    /// [`H5Dataset::chunk_index`] the index structure.
+    Chunked,
+    /// No raw data of its own: every element comes from another dataset,
+    /// possibly in another file ([`H5Dataset::virtual_mappings`]).
+    Virtual,
+}
+
+/// The chunk index structure a chunked dataset uses on disk (read mode
+/// only) — which of libhdf5's chunk-lookup structures the layout message
+/// names.
+///
+/// `BtreeV1` belongs to the version-3 chunked layout message (the only
+/// index a file whose superblock predates version 2 can carry); the other
+/// five are what a version-4 message's index-type byte selects, per
+/// `H5D__layout_set_latest_indexing` (H5Dlayout.c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkIndex {
+    /// Version-1 B-tree — the classic chunk index, and the only one a
+    /// version-3 chunked layout message can carry.
+    BtreeV1,
+    /// Version-2 B-tree — two or more unlimited dimensions.
+    BtreeV2,
+    /// A single index entry for a dataset whose one chunk covers the whole
+    /// dataspace (`dims == max_dims == chunk_dims`).
+    SingleChunk,
+    /// No index structure at all: chunk addresses are computed
+    /// arithmetically over a contiguous run (no filter, early allocation).
+    Implicit,
+    /// Fixed-size array — a fixed shape needing per-chunk bookkeeping.
+    FixedArray,
+    /// Extensible array — exactly one unlimited dimension.
+    ExtensibleArray,
+}
+
+/// A dataset's fill-value state (read mode only) — `H5Pfill_value_defined`'s
+/// tri-state (`H5D_fill_value_t`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FillValue {
+    /// No fill value has ever been set: unwritten elements read back
+    /// zero-filled, and no fill-value message named an explicit value.
+    Default,
+    /// The fill value was explicitly disabled: unallocated storage is never
+    /// fill-initialized.
+    Undefined,
+    /// An explicit fill value, one element wide.
+    UserDefined(Vec<u8>),
+}
+
 impl H5Dataset {
     /// Create a reader-mode dataset handle (called internally by `H5File::dataset`).
     pub(crate) fn new_reader(
@@ -1580,6 +1647,239 @@ impl H5Dataset {
                     _ => false,
                 }
             }
+        }
+    }
+
+    /// Return the dataset's storage layout class (read mode only).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is in write mode, or if the dataset can
+    /// no longer be found in the reader's metadata.
+    pub fn storage_layout(&self) -> Result<StorageLayout> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => {
+                        use crate::format::messages::data_layout::DataLayoutMessage;
+                        reader
+                            .dataset_info(name)
+                            .map(|info| match &info.layout {
+                                DataLayoutMessage::Compact { .. } => StorageLayout::Compact,
+                                DataLayoutMessage::Contiguous { .. } => StorageLayout::Contiguous,
+                                DataLayoutMessage::ChunkedV3 { .. }
+                                | DataLayoutMessage::ChunkedV4 { .. } => StorageLayout::Chunked,
+                                DataLayoutMessage::Virtual { .. } => StorageLayout::Virtual,
+                            })
+                            .ok_or_else(|| Hdf5Error::NotFound(name.clone()))
+                    }
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "storage_layout() is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Return the chunk index structure this dataset's layout uses, or
+    /// `None` for a dataset that is not chunked (read mode only).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is in write mode, or if the dataset can
+    /// no longer be found in the reader's metadata.
+    pub fn chunk_index(&self) -> Result<Option<ChunkIndex>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => {
+                        use crate::format::messages::data_layout::{
+                            ChunkIndexType, DataLayoutMessage,
+                        };
+                        reader
+                            .dataset_info(name)
+                            .map(|info| match &info.layout {
+                                DataLayoutMessage::ChunkedV3 { .. } => Some(ChunkIndex::BtreeV1),
+                                DataLayoutMessage::ChunkedV4 { index_type, .. } => {
+                                    Some(match index_type {
+                                        ChunkIndexType::SingleChunk => ChunkIndex::SingleChunk,
+                                        ChunkIndexType::Implicit => ChunkIndex::Implicit,
+                                        ChunkIndexType::FixedArray => ChunkIndex::FixedArray,
+                                        ChunkIndexType::ExtensibleArray => {
+                                            ChunkIndex::ExtensibleArray
+                                        }
+                                        ChunkIndexType::BTreeV2 => ChunkIndex::BtreeV2,
+                                    })
+                                }
+                                _ => None,
+                            })
+                            .ok_or_else(|| Hdf5Error::NotFound(name.clone()))
+                    }
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "chunk_index() is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Return this dataset's filter pipeline (read mode only), in
+    /// application order. Empty when the dataset has no filter pipeline
+    /// message at all — an unfiltered dataset, not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is in write mode, or if the dataset can
+    /// no longer be found in the reader's metadata.
+    pub fn filters(&self) -> Result<Vec<Filter>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => reader
+                        .dataset_info(name)
+                        .map(|info| {
+                            info.filter_pipeline
+                                .as_ref()
+                                .map(|fp| fp.filters.clone())
+                                .unwrap_or_default()
+                        })
+                        .ok_or_else(|| Hdf5Error::NotFound(name.clone())),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "filters() is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Return this dataset's fill-value state (read mode only).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is in write mode, or if the dataset can
+    /// no longer be found in the reader's metadata.
+    pub fn fill_value(&self) -> Result<FillValue> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => reader
+                        .dataset_info(name)
+                        .map(|info| match info.fill_defined {
+                            0 => FillValue::Undefined,
+                            2 => {
+                                FillValue::UserDefined(info.fill_value.clone().unwrap_or_default())
+                            }
+                            _ => FillValue::Default,
+                        })
+                        .ok_or_else(|| Hdf5Error::NotFound(name.clone())),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "fill_value() is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Return this dataset's external raw-data file segments (read mode
+    /// only), in the order the dataset's logical byte range concatenates
+    /// them. Empty for a dataset whose data lives in this file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is in write mode, or if the dataset can
+    /// no longer be found in the reader's metadata.
+    pub fn external_files(&self) -> Result<Vec<ExternalFileSegment>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => reader
+                        .dataset_info(name)
+                        .map(|info| info.external_files.clone())
+                        .ok_or_else(|| Hdf5Error::NotFound(name.clone())),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "external_files() is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Return this dataset's maximum dimension sizes (read mode only):
+    /// `None` in a dimension marks that axis unlimited. A dataset with no
+    /// maximum-dimensions message reports its current shape (max == current
+    /// — the upstream convention for a fixed-extent dataset).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is in write mode, or if the dataset can
+    /// no longer be found in the reader's metadata.
+    pub fn max_shape(&self) -> Result<Vec<Option<usize>>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => reader
+                        .dataset_info(name)
+                        .map(|info| match &info.dataspace.max_dims {
+                            Some(max_dims) => max_dims
+                                .iter()
+                                .map(|&d| (d != u64::MAX).then_some(d as usize))
+                                .collect(),
+                            None => info
+                                .dataspace
+                                .dims
+                                .iter()
+                                .map(|&d| Some(d as usize))
+                                .collect(),
+                        })
+                        .ok_or_else(|| Hdf5Error::NotFound(name.clone())),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "max_shape() is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Return this dataset's virtual-dataset source/virtual mappings (read
+    /// mode only), in on-disk order. Empty for any dataset whose layout is
+    /// not virtual, and for a virtual dataset that has no mappings yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is in write mode, or if the dataset can
+    /// no longer be found in the reader's metadata.
+    pub fn virtual_mappings(&self) -> Result<Vec<VirtualMapping>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => reader
+                        .dataset_info(name)
+                        .map(|info| {
+                            info.virtual_mappings
+                                .as_ref()
+                                .map(|vml| vml.mappings.clone())
+                                .unwrap_or_default()
+                        })
+                        .ok_or_else(|| Hdf5Error::NotFound(name.clone())),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "virtual_mappings() is only available in read mode".into(),
+            )),
         }
     }
 
@@ -8801,5 +9101,266 @@ mod tests {
         file.close().unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), baseline);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// [`H5Dataset::storage_layout`] tells the four classes apart — the
+    /// negative case for any one class is simply that it is not another.
+    #[test]
+    fn storage_layout_reports_each_class() {
+        use crate::StorageLayout;
+        let path = temp_path("storage_layout");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .create("contig")
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .compact()
+                .create("compact")
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .chunk(&[4])
+                .create("chunked")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("contig").unwrap().storage_layout().unwrap(),
+            StorageLayout::Contiguous
+        );
+        assert_eq!(
+            file.dataset("compact").unwrap().storage_layout().unwrap(),
+            StorageLayout::Compact
+        );
+        assert_eq!(
+            file.dataset("chunked").unwrap().storage_layout().unwrap(),
+            StorageLayout::Chunked
+        );
+    }
+
+    /// Read-mode-only accessor, matching `datatype()`'s own contract.
+    #[test]
+    fn storage_layout_errors_in_write_mode() {
+        let path = temp_path("storage_layout_write_mode");
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([4usize])
+            .create("data")
+            .unwrap();
+        assert!(ds.storage_layout().is_err());
+        file.close().unwrap();
+    }
+
+    /// [`H5Dataset::chunk_index`] reports the real on-disk index kind
+    /// (extensible array for one unlimited dimension, version-1 B-tree
+    /// under a legacy libver bound) and `None` for an unchunked dataset —
+    /// the negative case.
+    #[test]
+    fn chunk_index_reports_the_stored_kind() {
+        use crate::ChunkIndex;
+        let path = temp_path("chunk_index");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .create("contig")
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([16usize])
+                .chunk(&[4])
+                .max_shape(&[None])
+                .create("earray")
+                .unwrap();
+            file.set_libver_latest(false).unwrap();
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .chunk(&[4])
+                .max_shape(&[None])
+                .create("btree1")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(file.dataset("contig").unwrap().chunk_index().unwrap(), None);
+        assert_eq!(
+            file.dataset("earray").unwrap().chunk_index().unwrap(),
+            Some(ChunkIndex::ExtensibleArray)
+        );
+        assert_eq!(
+            file.dataset("btree1").unwrap().chunk_index().unwrap(),
+            Some(ChunkIndex::BtreeV1)
+        );
+    }
+
+    /// [`H5Dataset::filters`] reports the stored pipeline in order — and
+    /// the negative case: an unfiltered dataset reports an empty pipeline,
+    /// not an error.
+    #[test]
+    fn filters_reports_the_stored_pipeline() {
+        use crate::format::messages::filter::{FILTER_DEFLATE, FILTER_SHUFFLE, FLAG_OPTIONAL};
+        let path = temp_path("filters");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([16usize])
+                .create("unfiltered")
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([16usize])
+                .chunk(&[4])
+                .shuffle()
+                .deflate(6)
+                .create("filtered")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("unfiltered").unwrap().filters().unwrap(),
+            Vec::new()
+        );
+        let filters = file.dataset("filtered").unwrap().filters().unwrap();
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[0].id, FILTER_SHUFFLE);
+        assert_eq!(filters[0].flags, FLAG_OPTIONAL);
+        assert_eq!(filters[1].id, FILTER_DEFLATE);
+        assert_eq!(filters[1].cd_values, vec![6]);
+    }
+
+    /// [`H5Dataset::fill_value`] reports the explicit bytes for a dataset
+    /// created with `.fill_value(...)`, and the negative case: a dataset
+    /// with no fill value set reports [`FillValue::Default`], not an error.
+    /// `FillValue::Undefined` has no constructor on either this crate's
+    /// writer or h5py's public API, so it is not exercised here.
+    #[test]
+    fn fill_value_reports_the_stored_value() {
+        use crate::FillValue;
+        let path = temp_path("fill_value");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .create("unset")
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .fill_value(-7i32)
+                .create("set")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("unset").unwrap().fill_value().unwrap(),
+            FillValue::Default
+        );
+        assert_eq!(
+            file.dataset("set").unwrap().fill_value().unwrap(),
+            FillValue::UserDefined((-7i32).to_le_bytes().to_vec())
+        );
+    }
+
+    /// [`H5Dataset::external_files`] reports the stored segment list in
+    /// order, and the negative case: a dataset whose data lives in this
+    /// file reports an empty list, not an error.
+    #[test]
+    fn external_files_reports_the_stored_segments() {
+        let path = temp_path("external_files");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .create("contig")
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([16usize])
+                .external(&[("a.raw", 0, 32), ("b.raw", 8, 32)])
+                .create("external")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("contig").unwrap().external_files().unwrap(),
+            Vec::new()
+        );
+        let segments = file.dataset("external").unwrap().external_files().unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].name, "a.raw");
+        assert_eq!(segments[0].offset, 0);
+        assert_eq!(segments[0].size, 32);
+        assert_eq!(segments[1].name, "b.raw");
+        assert_eq!(segments[1].offset, 8);
+        assert_eq!(segments[1].size, 32);
+    }
+
+    /// [`H5Dataset::max_shape`] reports an unlimited axis as `None` and a
+    /// fixed one as its current size — and the negative case: a dataset
+    /// with no maximum-dimensions message reports max == current, not an
+    /// error.
+    #[test]
+    fn max_shape_reports_unlimited_and_fixed_axes() {
+        let path = temp_path("max_shape");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize, 8])
+                .create("fixed")
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize, 8])
+                .chunk(&[2, 8])
+                .max_shape(&[None, Some(8)])
+                .create("unlimited")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("fixed").unwrap().max_shape().unwrap(),
+            vec![Some(4), Some(8)]
+        );
+        assert_eq!(
+            file.dataset("unlimited").unwrap().max_shape().unwrap(),
+            vec![None, Some(8)]
+        );
+    }
+
+    /// [`H5Dataset::virtual_mappings`] reports the stored source/virtual
+    /// mapping list in order, and the negative case: a dataset with no
+    /// virtual layout reports an empty list, not an error.
+    #[test]
+    fn virtual_mappings_reports_the_stored_mappings() {
+        use crate::Selection;
+        let path = temp_path("virtual_mappings");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .create("plain")
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([16usize])
+                .virtual_mapping(Selection::All, "src.h5", "src", Selection::All)
+                .create("vds")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("plain").unwrap().virtual_mappings().unwrap(),
+            Vec::new()
+        );
+        let mappings = file.dataset("vds").unwrap().virtual_mappings().unwrap();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].source_file_name, "src.h5");
+        assert_eq!(mappings[0].source_dset_name, "src");
+        assert_eq!(mappings[0].source_selection, Selection::All);
+        assert_eq!(mappings[0].virtual_selection, Selection::All);
     }
 }

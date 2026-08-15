@@ -26,12 +26,15 @@ use rust_hdf5::format::messages::datatype::{
     ByteOrder, CompoundMember, DatatypeMessage, EnumMember,
 };
 use rust_hdf5::format::messages::filter::{
-    Filter, FilterPipeline, FILTER_FLETCHER32, FLAG_MANDATORY,
+    Filter, FilterPipeline, FILTER_BLOSC, FILTER_BSHUF, FILTER_BZIP2, FILTER_DEFLATE,
+    FILTER_FLETCHER32, FILTER_LZ4, FILTER_LZF, FILTER_NBIT, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
+    FILTER_SZIP, FILTER_ZSTD, FLAG_MANDATORY,
 };
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
-    H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error, Hyperslab,
-    HyperslabBlock, LibverBound, LinkClass, Reference, Selection,
+    ChunkIndex, ExternalFileSegment, FillValue, H5Attribute, H5Dataset, H5File, H5FileOptions,
+    H5Group, H5NamedDatatype, Hdf5Error, Hyperslab, HyperslabBlock, LibverBound, LinkClass,
+    Reference, Selection, StorageLayout, VirtualMapping,
 };
 
 const CANON_VERSION: &str = "3";
@@ -77,6 +80,113 @@ fn hex(bytes: &[u8]) -> String {
 
 fn dims_str(dims: &[usize]) -> String {
     let parts: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// The twin of `canon.py`'s `maxdims_str`: `U` marks an unlimited axis.
+fn maxdims_str(dims: &[Option<usize>]) -> String {
+    let parts: Vec<String> = dims
+        .iter()
+        .map(|d| match d {
+            Some(n) => n.to_string(),
+            None => "U".to_string(),
+        })
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// The filter name canon.py's `_FILTER_NAMES` reports for a well-known
+/// filter id, falling back to the bare id exactly as `dict.get(code,
+/// str(code))` does. This is a client-side lookup on both sides of the
+/// oracle, not something either reads from the file: h5py's own
+/// `filters_str` discards the on-disk name field the same way.
+fn filter_name(id: u16) -> String {
+    match id {
+        FILTER_DEFLATE => "deflate".into(),
+        FILTER_SHUFFLE => "shuffle".into(),
+        FILTER_FLETCHER32 => "fletcher32".into(),
+        FILTER_SZIP => "szip".into(),
+        FILTER_NBIT => "nbit".into(),
+        FILTER_SCALEOFFSET => "scaleoffset".into(),
+        FILTER_BZIP2 => "bzip2".into(),
+        FILTER_LZF => "lzf".into(),
+        FILTER_BLOSC => "blosc".into(),
+        FILTER_LZ4 => "lz4".into(),
+        FILTER_BSHUF => "bshuf".into(),
+        FILTER_ZSTD => "zstd".into(),
+        other => other.to_string(),
+    }
+}
+
+/// `filters_str`'s per-filter rendering: `name(cd0|cd1|...)@flags`.
+fn filters_str(filters: &[Filter]) -> String {
+    let parts: Vec<String> = filters
+        .iter()
+        .map(|f| {
+            let cd: Vec<String> = f.cd_values.iter().map(|c| c.to_string()).collect();
+            format!("{}({})@{}", filter_name(f.id), cd.join("|"), f.flags)
+        })
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// `external_str`'s per-segment rendering: `name@offset+size`, `-` when
+/// there are no segments (the data lives in this file).
+fn external_str(segments: &[ExternalFileSegment]) -> String {
+    if segments.is_empty() {
+        return "-".into();
+    }
+    let parts: Vec<String> = segments
+        .iter()
+        .map(|s| format!("{}@{}+{}", esc(&s.name), s.offset, s.size))
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
+fn dims_u64_str(dims: &[u64]) -> String {
+    let parts: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// The twin of `canon.py`'s `_bounds_str`: `"?"` when the bounds cannot be
+/// resolved. Unlike `Selection::bounds()`, which has no dataspace to
+/// consult and so returns `None` for `Selection::All`, h5py's own
+/// `get_select_bounds()` resolves an ALL selection against whatever
+/// dataspace it is bound to — real and known for the virtual side (the
+/// VDS's own extent, passed as `all_extent`), but never resolvable for the
+/// source side (the mapping stores no source dataspace extent, only the
+/// selection), so `all_extent` must be `None` there.
+fn selection_bounds_str(sel: &Selection, all_extent: Option<&[usize]>) -> String {
+    let bounds = match (sel, all_extent) {
+        (Selection::All, Some(shape)) => Some((
+            vec![0u64; shape.len()],
+            shape.iter().map(|&d| d.saturating_sub(1) as u64).collect(),
+        )),
+        _ => sel.bounds(),
+    };
+    match bounds {
+        Some((lo, hi)) => format!("{}-{}", dims_u64_str(&lo), dims_u64_str(&hi)),
+        None => "?".to_string(),
+    }
+}
+
+/// `virtual_str`'s per-mapping rendering: `name::dsetname srcbounds->vbounds`.
+fn virtual_str(mappings: &[VirtualMapping], vds_shape: &[usize]) -> String {
+    if mappings.is_empty() {
+        return "-".into();
+    }
+    let parts: Vec<String> = mappings
+        .iter()
+        .map(|m| {
+            format!(
+                "{}::{} {}->{}",
+                esc(&m.source_file_name),
+                esc(&m.source_dset_name),
+                selection_bounds_str(&m.source_selection, None),
+                selection_bounds_str(&m.virtual_selection, Some(vds_shape)),
+            )
+        })
+        .collect();
     format!("[{}]", parts.join(","))
 }
 
@@ -820,21 +930,30 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
     });
 
     d.field(path, "maxshape", || {
-        Err("H5Dataset exposes no max_shape() accessor".into())
+        if is_null {
+            return Ok("null".into());
+        }
+        guarded(|| ds.max_shape())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|dims| maxdims_str(&dims))
+            .map_err(oneline)
     });
 
     let chunked = guarded(|| ds.is_chunked()).unwrap_or(false);
 
     d.field(path, "layout", || {
-        if chunked {
-            Ok("chunked".into())
-        } else {
-            Err(
-                "H5Dataset::is_chunked() is false; contiguous and compact are \
-                 not distinguishable through the public API"
-                    .into(),
-            )
-        }
+        guarded(|| ds.storage_layout())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|layout| {
+                match layout {
+                    StorageLayout::Compact => "compact",
+                    StorageLayout::Contiguous => "contiguous",
+                    StorageLayout::Chunked => "chunked",
+                    StorageLayout::Virtual => "virtual",
+                }
+                .to_string()
+            })
+            .map_err(oneline)
     });
 
     d.field(path, "chunk", || {
@@ -848,27 +967,55 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
     });
 
     d.field(path, "chunkindex", || {
-        if chunked {
-            Err("H5Dataset exposes no chunk index type".into())
-        } else {
-            Ok("-".into())
+        if !chunked {
+            return Ok("-".into());
+        }
+        match guarded(|| ds.chunk_index()).map_err(|p| format!("panic: {p}"))? {
+            Ok(Some(kind)) => Ok(match kind {
+                ChunkIndex::BtreeV1 => "btree1",
+                ChunkIndex::BtreeV2 => "btree2",
+                ChunkIndex::SingleChunk => "single",
+                ChunkIndex::Implicit => "implicit",
+                ChunkIndex::FixedArray => "farray",
+                ChunkIndex::ExtensibleArray => "earray",
+            }
+            .to_string()),
+            Ok(None) => Err("is_chunked() is true but chunk_index() returned None".into()),
+            Err(e) => Err(oneline(e)),
         }
     });
 
     d.field(path, "external", || {
-        Err("H5Dataset exposes no external file list accessor".into())
+        guarded(|| ds.external_files())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|segments| external_str(&segments))
+            .map_err(oneline)
     });
 
     d.field(path, "virtual", || {
-        Err("H5Dataset exposes no virtual mapping accessor".into())
+        let vds_shape = guarded(|| ds.shape()).map_err(|p| format!("panic: {p}"))?;
+        guarded(|| ds.virtual_mappings())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|mappings| virtual_str(&mappings, &vds_shape))
+            .map_err(oneline)
     });
 
     d.field(path, "filters", || {
-        Err("H5Dataset exposes no filter pipeline accessor".into())
+        guarded(|| ds.filters())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|filters| filters_str(&filters))
+            .map_err(oneline)
     });
 
     d.field(path, "fillvalue", || {
-        Err("H5Dataset exposes no fill value accessor".into())
+        guarded(|| ds.fill_value())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|fv| match fv {
+                FillValue::Default => "default".to_string(),
+                FillValue::Undefined => "undefined".to_string(),
+                FillValue::UserDefined(bytes) => format!("0x{}", hex(&bytes)),
+            })
+            .map_err(oneline)
     });
 
     dump_object_attrs(d, path, ds);
