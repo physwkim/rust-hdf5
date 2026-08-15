@@ -182,6 +182,71 @@ fn an_swmr_file_is_written_at_version_3() {
     cleanup(&path);
 }
 
+/// ... which is why a reopen cannot start one on a file that is not already
+/// version 3. `H5F__start_swmr_write` refuses below that outright
+/// (H5Fint.c:3814): the status-flags field that records an attached writer
+/// exists only in the version-3 image, and reopening never rewrites a
+/// superblock version to make room for it. libhdf5 1.14.6 answers the same
+/// call with "file superblock version - should be at least 3".
+#[test]
+fn an_swmr_session_on_a_reopened_pre_v3_file_is_refused() {
+    use rust_hdf5::swmr::SwmrFileWriter;
+
+    for (label, libver, expect_sb) in [
+        ("classic", Some(LibverBound::Earliest), 0u8),
+        ("v18", Some(LibverBound::V18), 2),
+        ("default", None, 2),
+    ] {
+        let path = unique_tmp(&format!("swmr_reopen_{label}"));
+        let mut options = H5File::options();
+        if let Some(libver) = libver {
+            options = options.libver(libver);
+        }
+        let file = options.create(&path).unwrap();
+        write_contiguous(&file, "data");
+        file.close().unwrap();
+        assert_eq!(superblock_version(&path), expect_sb, "{label}");
+
+        let mut writer = SwmrFileWriter::open_append(&path).unwrap();
+        let err = writer.start_swmr().unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("superblock is version {expect_sb}")),
+            "{label}: the refusal must name the version it found: {err}"
+        );
+        assert!(err.contains("version-3"), "{label}: {err}");
+        drop(writer);
+
+        // Refused, not half-done: the file is the one it was.
+        assert_eq!(superblock_version(&path), expect_sb, "{label}");
+        cleanup(&path);
+    }
+}
+
+/// A version-3 superblock is what SWMR needs, and a reopen of one has it —
+/// `H5F__start_swmr_write`'s second check, the `H5F_LIBVER_V110` low bound,
+/// cannot fail after the first passes because version 3 is that bound's floor.
+#[test]
+fn an_swmr_session_on_a_reopened_v3_file_is_allowed() {
+    use rust_hdf5::swmr::SwmrFileWriter;
+
+    let path = unique_tmp("swmr_reopen_v3");
+    let mut writer = SwmrFileWriter::create(&path).unwrap();
+    let idx = writer
+        .create_streaming_dataset::<f32>("stream", &[4u64])
+        .unwrap();
+    writer.start_swmr().unwrap();
+    let frame: Vec<u8> = (0..4u32).flat_map(|j| (j as f32).to_le_bytes()).collect();
+    writer.append_frame(idx, &frame).unwrap();
+    writer.close().unwrap();
+    assert_eq!(superblock_version(&path), 3);
+
+    let mut writer = SwmrFileWriter::open_append(&path).unwrap();
+    writer.start_swmr().unwrap();
+    writer.close().unwrap();
+    assert_eq!(superblock_version(&path), 3);
+    cleanup(&path);
+}
+
 /// A reopen hands the file back at the version it was opened with, whatever
 /// the session added — `H5F__super_read` never re-decides a version.
 #[test]

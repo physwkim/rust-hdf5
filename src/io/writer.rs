@@ -4021,30 +4021,42 @@ impl Hdf5Writer {
     /// Refuse an SWMR session this file's format cannot record.
     ///
     /// The two checks `H5F__start_swmr_write` opens with: the superblock must
-    /// be at least version 3 (H5Fint.c:3814) — the only version with the
-    /// status-flags field that says a writer is attached — and the low bound
-    /// must be at least `H5F_LIBVER_V110` (H5Fint.c:3818), the oldest bound
-    /// whose `HDF5_superblock_ver_bounds` row reaches version 3. So a file
-    /// asked for at `V18`, whose row is version 2, is refused by libhdf5 for
-    /// the same reason a classic file is here. A file whose caller named no
-    /// bound is not: nothing in it says the superblock may not be version 3,
-    /// and SWMR is what makes it one.
+    /// be at least version 3 (H5Fint.c:3814, hdf5_1.14.6 H5Fint.c:3751) — the
+    /// only version with the status-flags field that says a writer is attached
+    /// — and the low bound must be at least `H5F_LIBVER_V110` (H5Fint.c:3818),
+    /// the oldest bound whose `HDF5_superblock_ver_bounds` row reaches version
+    /// 3.
+    ///
+    /// Which of the two applies is the [`SuperblockVersion`] question. A
+    /// reopened file already has its version and reopening never rewrites one,
+    /// so the first check decides and the second cannot fail after it: the
+    /// version-3 floor is `V110`. A file this writer created has no version on
+    /// disk yet, so only the second is askable — and a caller who named no
+    /// bound at all passes it, because nothing in such a file says the
+    /// superblock may not be version 3 and SWMR is what makes it one.
     ///
     /// Named, not silently upgraded. libhdf5 upgrades in the one case where
     /// SWMR is asked for at *create* time (`H5F_ACC_SWMR_WRITE` raises the
-    /// bound to V110 in `H5F__super_init`, H5Fsuper.c:1131); this crate's
-    /// bound arrives before the SWMR request and stands for the whole file,
-    /// so honouring it by writing the newer file would answer a different
-    /// request than the one that was made.
+    /// bound to V110 in `H5F__super_init`, H5Fsuper.c:1131); on the reopen
+    /// path it refuses instead, and so does this.
     fn reject_swmr(&self) -> IoResult<()> {
-        let why = if self.is_legacy() {
-            "it is in the classic (version-0/1 superblock) format that \
-             H5F_LIBVER_EARLIEST selects"
-        } else if self.libver.is_some_and(|b| b < LibverBound::V110) {
-            "it was asked for at a library-version bound below H5F_LIBVER_V110, \
-             whose superblock row is version 2"
-        } else {
-            return Ok(());
+        let why = match self.superblock_version {
+            SuperblockVersion::Existing(version) if version >= SUPERBLOCK_V3 => return Ok(()),
+            SuperblockVersion::Existing(version) => format!(
+                "its superblock is version {version}, and reopening a file never \
+                 rewrites that"
+            ),
+            SuperblockVersion::Chosen(_) if self.is_legacy() => {
+                "it is in the classic (version-0/1 superblock) format that \
+                 H5F_LIBVER_EARLIEST selects"
+                    .to_string()
+            }
+            SuperblockVersion::Chosen(_) if self.libver.is_some_and(|b| b < LibverBound::V110) => {
+                "it was asked for at a library-version bound below H5F_LIBVER_V110, \
+                 whose superblock row is version 2"
+                    .to_string()
+            }
+            SuperblockVersion::Chosen(_) => return Ok(()),
         };
         Err(crate::io::IoError::Unsupported(format!(
             "cannot start an SWMR session on this file: {why}, and SWMR needs a \

@@ -1118,10 +1118,11 @@ fn a_virtual_dataset_in_a_file_created_at_earliest_raises_only_its_layout_messag
 }
 
 /// SWMR needs a version-3 superblock to record that a writer is attached, and
-/// this file has a version-0 one. libhdf5 answers the combination by raising
-/// the low bound to V110 and writing the newer file; this refuses it by name,
-/// because the bound arrived as a request for the classic format and a
-/// version-3 file would answer a different request than the one made.
+/// this file has a version-0 one. Reopened here, so it is
+/// `H5F__start_swmr_write`'s own first check that answers — refuse below
+/// version 3 (H5Fint.c:3814) — and the refusal names the version it found.
+/// libhdf5 refuses the same call the same way; the one place it upgrades
+/// instead is SWMR asked for at *create* time, which is not this.
 #[test]
 fn an_swmr_session_on_a_file_created_at_earliest_is_refused() {
     use rust_hdf5::swmr::SwmrFileWriter;
@@ -1138,7 +1139,7 @@ fn an_swmr_session_on_a_file_created_at_earliest_is_refused() {
 
     let mut writer = SwmrFileWriter::open_append(&path).unwrap();
     let err = writer.start_swmr().unwrap_err().to_string();
-    assert!(err.contains("classic"), "{err}");
+    assert!(err.contains("superblock is version 0"), "{err}");
     assert!(err.contains("version-3"), "{err}");
     drop(writer);
 
