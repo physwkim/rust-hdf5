@@ -760,14 +760,11 @@ fn a_classic_user_defined_fill_value_carries_the_old_message_too() {
     );
     assert_eq!(
         withfill[0].2,
-        // Version 2, allocation time late, then the write time, the defined
-        // flag, the size and the value; the last four bytes are the version-1
-        // header's eight-byte message alignment. h5py's third byte is 2
-        // (`H5D_FILL_TIME_IFSET`, the creation-property default) where this
-        // writer's is 0 — a difference it has at every bound, not one this
-        // bound introduces, and the same one the version-3 message below
-        // carries in its packed flag byte.
-        vec![0x02, 0x02, 0x00, 0x01, 0x04, 0, 0, 0, 0x07, 0, 0, 0, 0, 0, 0, 0],
+        // Version 2, allocation time late, write time `H5D_FILL_TIME_IFSET`,
+        // the defined flag, the size and the value; the last four bytes are
+        // the version-1 header's eight-byte message alignment. Byte for byte
+        // h5py's.
+        vec![0x02, 0x02, 0x02, 0x01, 0x04, 0, 0, 0, 0x07, 0, 0, 0, 0, 0, 0, 0],
     );
     assert_eq!(
         withfill[1].1, MSG_FLAG_CONSTANT,
@@ -796,10 +793,10 @@ fn a_classic_user_defined_fill_value_carries_the_old_message_too() {
         "above the v1.8 bound the old message is not written at all"
     );
     assert_eq!(at_v18[0].2[0], 3, "and the new message is version 3");
-    // The same content in version 3's packed flag byte: allocation time late,
-    // fill written on alloc, value defined. h5py's byte is 0x2a, differing in
-    // the write-time field alone, exactly as the version-2 message above.
-    assert_eq!(at_v18[0].2, vec![0x03, 0x22, 0x04, 0, 0, 0, 0x07, 0, 0, 0]);
+    // The same content in version 3's packed flag byte: allocation time late
+    // in bits 0-1, `H5D_FILL_TIME_IFSET` in bits 2-3, value defined in bit 5.
+    // Byte for byte h5py's 0x2a.
+    assert_eq!(at_v18[0].2, vec![0x03, 0x2a, 0x04, 0, 0, 0, 0x07, 0, 0, 0]);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&modern);

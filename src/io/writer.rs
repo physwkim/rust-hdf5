@@ -33,7 +33,7 @@ use crate::format::messages::data_layout::{
 use crate::format::messages::dataspace::{DataspaceClass, DataspaceMessage};
 use crate::format::messages::datatype::{DatatypeMessage, ReferenceKind};
 use crate::format::messages::external_file_list::{ExternalFileListMessage, UNLIMITED};
-use crate::format::messages::fill_value::FillValueMessage;
+use crate::format::messages::fill_value::{FillValueMessage, FILL_TIME_IFSET};
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::group_info::GroupInfoMessage;
 use crate::format::messages::link::{LinkMessage, LinkTarget};
@@ -14311,15 +14311,15 @@ impl Hdf5Writer {
             // User-defined fill value (fill_defined = 2).
             FillValueMessage {
                 alloc_time,
-                fill_write_time: 0, // on alloc
+                fill_write_time: FILL_TIME_IFSET,
                 fill_defined: 2,
                 fill_value: Some(bytes.clone()),
             }
         } else if is_chunked {
             FillValueMessage {
                 alloc_time,
-                fill_write_time: 0, // on alloc
-                fill_defined: 1,    // default value (zeros)
+                fill_write_time: FILL_TIME_IFSET,
+                fill_defined: 1, // default value (zeros)
                 fill_value: None,
             }
         } else {
