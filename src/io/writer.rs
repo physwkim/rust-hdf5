@@ -3,7 +3,7 @@
 //! Produces a valid HDF5 file with superblock v3, a root group object header,
 //! and datasets with contiguous or chunked storage. The output is readable by `h5dump`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::format::btree_v1::{BTreeV1Config, ChunkBTreeV1Node, ChunkBTreeV1Tree, ChunkKey};
@@ -720,7 +720,7 @@ pub struct DatasetInfo {
     /// dataspace, the element width and every payload check need it — and
     /// this says the header must store a pointer to that object instead of a
     /// datatype message of its own.
-    pub committed_type: Option<usize>,
+    pub committed_type: Option<CommittedTypeRef>,
     /// Dataspace (dimensionality).
     pub dataspace: DataspaceMessage,
     /// File offset of the dataset's object header (set during finalize).
@@ -1769,6 +1769,28 @@ pub struct CommittedDatatype {
     pub obj_header_addr: u64,
 }
 
+/// Where the object header a dataset's shared datatype pointer must name
+/// comes from.
+///
+/// A dataset built on a committed type stores no datatype message: it stores
+/// the address of the type's object header. Only the address matters at
+/// encode time, but it is knowable at two different moments — a type this
+/// session commits has no address until finalize lays the file out, while one
+/// a reopen found is already at an address this session will not move. Naming
+/// both here keeps [`build_dataset_header`](Hdf5Writer::build_dataset_header)
+/// the one place that turns a share into a pointer, whichever way the share
+/// arrived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommittedTypeRef {
+    /// A type committed in this session, by its index in
+    /// [`committed_datatypes`](Hdf5Writer::committed_datatypes); its address
+    /// is read from that registry once finalize has stamped one.
+    Session(usize),
+    /// A committed datatype a reopen kept by its bytes, at the object header
+    /// address it already occupies.
+    Preserved(u64),
+}
+
 /// A link a reopened file already held that this writer cannot express.
 ///
 /// Soft, external and user-defined links have no creation, retarget or delete
@@ -1897,6 +1919,14 @@ struct DatasetParts {
     /// Chunk-0 size: the block the rewrite supersedes and frees.
     header_size: usize,
     datatype: DatatypeMessage,
+    /// The committed datatype object header `datatype` was read *through*,
+    /// when the header stores a pointer instead of a message of its own.
+    ///
+    /// The literal type is in `datatype` either way, because the read resolves
+    /// the pointer before anything decodes it; this is what a rewrite needs to
+    /// put the pointer back rather than inline a copy of the named type and
+    /// leave `H5Tcommitted` false.
+    committed_type: Option<u64>,
     dataspace: crate::format::messages::dataspace::DataspaceMessage,
     layout: crate::format::messages::data_layout::DataLayoutMessage,
     filter_pipeline: Option<FilterPipeline>,
@@ -2271,9 +2301,22 @@ impl<'a> ReopenWalk<'a> {
                 )))
             }
             (Some(datatype), Some(dataspace), Some(layout)) => {
+                // Asked of the raw chain, not of `header`: the read above has
+                // already put the named type's message in place of the pointer.
+                let committed_type = match crate::io::object_header_io::committed_datatype_address(
+                    handle, meta, addr,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Ok(ObjectPlan::preserve(format!(
+                            "its shared datatype pointer does not decode: {e}"
+                        )))
+                    }
+                };
                 Ok(ObjectPlan::Dataset(Box::new(DatasetParts {
                     header_size,
                     datatype,
+                    committed_type,
                     dataspace,
                     layout,
                     filter_pipeline,
@@ -2420,6 +2463,7 @@ fn rebuild_dataset(
     let DatasetParts {
         header_size: ds_header_size,
         datatype: dt,
+        committed_type,
         dataspace: ds,
         layout: dl,
         filter_pipeline: fp,
@@ -2434,7 +2478,10 @@ fn rebuild_dataset(
     let mut info = DatasetInfo {
         name,
         datatype: dt,
-        committed_type: None,
+        // The named type's own object is preserved by its bytes, so the
+        // address the walk read the pointer from is the address it will still
+        // be at when this header is written back.
+        committed_type: committed_type.map(CommittedTypeRef::Preserved),
         external,
         virtual_storage: None,
         dataspace: ds,
@@ -2970,14 +3017,60 @@ fn encode_refcount(refcount: u32) -> Vec<u8> {
     v
 }
 
+/// The symbol-table storage of every group that has one, and the single owner
+/// of which groups those are.
+///
+/// A group stores its links in a symbol table because the file was *made* that
+/// way — `H5F_LIBVER_EARLIEST` is the one bound `H5G__obj_create_real`
+/// (H5Gobj.c:179) writes them at — or because it already had one when the file
+/// was reopened. The second is not the first: `H5G_obj_insert` inserts into
+/// whatever storage the group is in and converts only when a link will not fit
+/// an entry (H5Gobj.c:512), so a symbol table survives a reopen at any bound.
+/// A file with shared messages is where the two come apart, because its
+/// superblock extension forces a version-2 superblock over symbol-table groups
+/// (H5Fsuper.c:1135) and `H5F__super_read` then raises the low bound to
+/// `H5F_LIBVER_V18` on reopen — new objects are the modern generation while the
+/// groups already there stay symbol tables.
+struct SymbolTables {
+    /// The scopes the reopen found a Symbol Table message on. Fixed for the
+    /// session: a group already in that storage stays in it, whatever bound
+    /// the objects added beside it are written at.
+    found: HashSet<LinkScope>,
+    /// The symbol-table storage each group's header already names, by the
+    /// scope whose rewrite supersedes it.
+    ///
+    /// INVARIANT: every entry is freed exactly once, by
+    /// [`Hdf5Writer::prepare_symbol_tables`], which removes it as it frees.
+    superseded: Slot<HashMap<LinkScope, StabExtents>>,
+    /// The storage that same pass laid out, read by the header builders.
+    ///
+    /// INVARIANT: an entry exists here only after every block of that group's
+    /// heap and B-tree is on disk. `build_group_header` reads it and never
+    /// builds — a header is sized and then written by two separate calls, so a
+    /// build that allocated would allocate twice.
+    written: Slot<HashMap<LinkScope, Stab>>,
+}
+
+impl SymbolTables {
+    /// What a file being created starts from: no group found in a symbol table
+    /// because none was read, and nothing on disk to free.
+    fn none_found() -> Self {
+        Self {
+            found: HashSet::new(),
+            superseded: Slot::new(HashMap::new()),
+            written: Slot::new(HashMap::new()),
+        }
+    }
+}
+
 /// Everything a version-0/1 (symbol-table) file carries that a version-2/3 one
 /// does not.
 ///
-/// Its presence *is* the format switch — [`Hdf5Writer::object_format`] reads
-/// nothing else — because the three differences travel together: libhdf5 at
-/// `H5F_LIBVER_EARLIEST` writes a version-0/1 superblock over version-1
-/// object headers over symbol-table groups, and writes no other combination of
-/// the three.
+/// Its presence *is* the generation switch — [`Hdf5Writer::message_format`]
+/// reads nothing else: libhdf5 at `H5F_LIBVER_EARLIEST` writes a version-0/1
+/// superblock over version-1 object headers over symbol-table groups. Which
+/// groups are symbol tables is the separate question [`SymbolTables`] answers,
+/// because a reopen at a newer bound keeps the ones it finds.
 ///
 /// Two things put one here, and only two: reopening a file that already is in
 /// that format, and creating one at that bound
@@ -2995,29 +3088,15 @@ struct LegacyFile {
     /// because a rewrite that used the library defaults on a file that
     /// overrode them would write nodes of the wrong width.
     meta: FileMeta,
-    /// The symbol-table storage each group's header already names, by the
-    /// scope whose rewrite supersedes it.
-    ///
-    /// INVARIANT: every entry is freed exactly once, by
-    /// [`Hdf5Writer::prepare_symbol_tables`], which removes it as it frees.
-    superseded: Slot<HashMap<LinkScope, StabExtents>>,
-    /// The storage that same pass laid out, read by the header builders.
-    ///
-    /// INVARIANT: an entry exists here only after every block of that group's
-    /// heap and B-tree is on disk. `build_group_header` reads it and never
-    /// builds — a header is sized and then written by two separate calls, so a
-    /// build that allocated would allocate twice.
-    written: Slot<HashMap<LinkScope, Stab>>,
 }
 
 impl LegacyFile {
     /// The classic-format state a file created at `H5F_LIBVER_EARLIEST`
     /// starts from.
     ///
-    /// Nothing is superseded and nothing is written yet — a new file has no
-    /// symbol table on disk to free and none laid out — so the two registries
-    /// start empty and the rest of the session treats this file exactly like a
-    /// reopened one.
+    /// A new file has no symbol table on disk to free and none laid out, so
+    /// its [`SymbolTables`] starts empty and every group it makes takes that
+    /// storage from the bound rather than from what was found.
     ///
     /// The superblock is the one `H5F__super_init` writes at that bound: the
     /// library-default "K" ranks (`H5F_CRT_SYM_LEAF_DEF`,
@@ -3055,8 +3134,6 @@ impl LegacyFile {
                 btree,
                 sohm: None,
             },
-            superseded: Slot::new(HashMap::new()),
-            written: Slot::new(HashMap::new()),
         }
     }
 }
@@ -3281,6 +3358,10 @@ pub struct Hdf5Writer {
     /// See [`LegacyFile`]; [`is_legacy`](Self::is_legacy) is the only reader
     /// of whether it is there.
     legacy: Option<Box<LegacyFile>>,
+    /// Which groups keep their links in a symbol table, and the storage each
+    /// of them has. Empty for a file whose groups all store links in messages;
+    /// see [`SymbolTables`], which owns the question.
+    symbol_tables: SymbolTables,
     /// The file's shared-message indexes, when it was created with any.
     /// `None` — the default — is a file with no shared-message table, where
     /// [`share_message`](Self::share_message) is the identity.
@@ -3314,6 +3395,15 @@ struct SohmState {
     /// table, once one has been written. Also the once-only latch on the
     /// layout: a second finalize keeps the table the first one published.
     extension_addr: Slot<Option<u64>>,
+    /// The blocks the table a reopen found occupies — the extension header,
+    /// the master table, and each index's heap and index structure — taken by
+    /// the finalize that replaces them. Empty for a file this session created.
+    ///
+    /// The table is laid out whole from the whole message set, so a reopen
+    /// replaces it rather than inserting into it, and every header holding a
+    /// pointer into the old one is rewritten in the same finalize
+    /// ([`Hdf5Writer::rebuilds_shared_messages`]).
+    superseded: Slot<Vec<(u64, u64)>>,
 }
 
 /// The passes `share_message` runs in, and the state between them.
@@ -3339,6 +3429,17 @@ enum SohmPhase {
 }
 
 impl SohmState {
+    /// A file's indexes, plus the blocks of the table they were read out of
+    /// when the file was reopened (empty when it was created this session).
+    fn new(indexes: Vec<SohmIndexSpec>, superseded: Vec<(u64, u64)>) -> Self {
+        Self {
+            indexes,
+            phase: Slot::new(SohmPhase::Idle),
+            extension_addr: Slot::new(None),
+            superseded: Slot::new(superseded),
+        }
+    }
+
     /// The index that would take a `msg_type` message of `body_len` bytes,
     /// as `H5SM_try_share` resolves one: the first index whose type mask
     /// covers the class, and then only if the message reaches that index's
@@ -3853,13 +3954,9 @@ impl Hdf5Writer {
             pending_region_references: Slot::new(Vec::new()),
             attribute_references: Slot::new(Vec::new()),
             legacy,
-            sohm: (!shared_messages.specs().is_empty()).then(|| {
-                Box::new(SohmState {
-                    indexes: shared_messages.specs().to_vec(),
-                    phase: Slot::new(SohmPhase::Idle),
-                    extension_addr: Slot::new(None),
-                })
-            }),
+            symbol_tables: SymbolTables::none_found(),
+            sohm: (!shared_messages.specs().is_empty())
+                .then(|| Box::new(SohmState::new(shared_messages.specs().to_vec(), Vec::new()))),
             source_dir: source_dir_of(path)?,
         })
     }
@@ -3977,6 +4074,22 @@ impl Hdf5Writer {
         CreationOrder::Tracked
     }
 
+    /// Whether this finalize replaces the file's shared-message table.
+    ///
+    /// It does whenever the file has indexes and no table has been published
+    /// this session — every finalize of a file created with them, and the
+    /// first finalize after a reopen. `build_shared_messages` lays a table out
+    /// whole from the whole message set rather than inserting into an existing
+    /// one, so a reopen's table is a *replacement*: every heap ID in the file
+    /// is reassigned, which makes every object header that holds one stale
+    /// however little else about it changed. A second finalize (a SWMR close)
+    /// keeps the table the first published and answers `false`.
+    fn rebuilds_shared_messages(&self) -> bool {
+        self.sohm
+            .as_deref()
+            .is_some_and(|s| s.extension_addr.lock().is_none())
+    }
+
     /// Whether every object header this writer emits records message creation
     /// indices.
     fn tracks_message_creation_index(&self) -> bool {
@@ -3989,12 +4102,17 @@ impl Hdf5Writer {
     /// `H5G__obj_create_real` (H5Gobj.c:129) and the conversion
     /// `H5G_obj_insert` performs (H5Gobj.c:512).
     ///
-    /// The new group format is used unconditionally from `H5F_LIBVER_V18` up,
-    /// and below it only when the group tracks link creation order: a symbol
-    /// table entry has no room for a creation index. The two axes are
-    /// independent — a group that tracks only *attribute* creation order gets
-    /// a version-2 header over a symbol table, which is what libhdf5 writes
-    /// for it.
+    /// The new group format is used unconditionally from `H5F_LIBVER_V18` up
+    /// *for a group being created*, and below it only when the group tracks
+    /// link creation order: a symbol table entry has no room for a creation
+    /// index. The two axes are independent — a group that tracks only
+    /// *attribute* creation order gets a version-2 header over a symbol table,
+    /// which is what libhdf5 writes for it.
+    ///
+    /// A group the reopen found in a symbol table is not being created, and
+    /// `H5G_obj_insert` never moves an existing group to the new format for
+    /// the bound's sake. So [`SymbolTables::found`] answers for it whatever
+    /// generation the rest of this session writes at.
     ///
     /// The content of the group is the third axis. A symbol table entry has
     /// three cache types and no room for a fourth, so an external or
@@ -4005,7 +4123,9 @@ impl Hdf5Writer {
     /// finalize rather than link by link, so the same rule reads as a question
     /// about the finished set.
     fn uses_symbol_table(&self, scope: LinkScope, links: CreationOrder) -> bool {
-        self.legacy.is_some() && !links.is_tracked() && self.links_fit_symbol_table(scope, links)
+        (self.legacy.is_some() || self.symbol_tables.found.contains(&scope))
+            && !links.is_tracked()
+            && self.links_fit_symbol_table(scope, links)
     }
 
     /// Whether every link `scope` holds is one a symbol table entry can
@@ -4455,6 +4575,99 @@ impl Hdf5Writer {
         )
     }
 
+    /// Carry a reopened file's shared-message table into the writer's model:
+    /// the index specifications the file was created with, and every block the
+    /// table occupies so the finalize that replaces it can give them back.
+    ///
+    /// `H5SM_init` fixes the index count, each index's type mask, its minimum
+    /// message size and the file-wide phase-change pair when the file is
+    /// created, and nothing afterwards changes any of them — they are file
+    /// creation properties. So the master table on disk *is* the
+    /// [`SharedMessageConfig`] the file was made with, read back.
+    ///
+    /// Returns `None` for a file with no shared-message table, which is every
+    /// file libhdf5 writes without `H5Pset_shared_mesg_nindexes`.
+    fn reopen_shared_messages(
+        handle: &mut FileHandle,
+        meta: &crate::io::FileMeta,
+        ext_addr: u64,
+        ext: &crate::io::reader::SuperblockExtension,
+    ) -> IoResult<Option<Box<SohmState>>> {
+        use crate::format::chunk_index::btree_v2::collect_btree_v2_extents;
+        use crate::format::fractal_heap::collect_heap_extents;
+        use crate::format::sohm::{list_size, SohmMasterTable, SOHM_INDEX_LIST};
+
+        let (Some(table), Some(smt)) = (
+            meta.sohm.as_ref().filter(|t| !t.indexes.is_empty()),
+            ext.shared_message_table.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        let ctx = &meta.ctx;
+
+        // The extension this finalize writes holds the shared-message table
+        // and nothing else, so a file whose extension declares anything more
+        // would come back with that declaration gone — non-default B-tree
+        // ranks, a driver's settings, or the file space strategy and the
+        // free-space managers it persisted. Refusing is the honest answer
+        // until the rewrite carries them.
+        let extra = [
+            ext.btree_k.is_some().then_some("v1 B-tree split ranks"),
+            ext.driver_info.is_some().then_some("driver information"),
+            ext.file_space_info
+                .is_some()
+                .then_some("a file space strategy"),
+        ];
+        let extra: Vec<&str> = extra.into_iter().flatten().collect();
+        if !extra.is_empty() {
+            return Err(crate::io::IoError::Unsupported(format!(
+                "cannot open this file for appending: its superblock extension declares {} \
+                 beside the shared object header message table, and an append lays that \
+                 extension out afresh",
+                extra.join(" and ")
+            )));
+        }
+
+        // The superblock extension is an object header of its own, holding
+        // only the shared-message-table message; the finalize writes a fresh
+        // one, so this block is superseded with the rest.
+        let mut superseded = Vec::new();
+        let ext_size = crate::io::object_header_io::object_header_block_size(handle, ext_addr)?;
+        superseded.push((ext_addr, ext_size as u64));
+        superseded.push((
+            smt.table_address,
+            SohmMasterTable::encoded_size(ctx, smt.nindexes) as u64,
+        ));
+
+        let mut specs = Vec::with_capacity(table.indexes.len());
+        for index in &table.indexes {
+            specs.push(SohmIndexSpec {
+                mesg_types: index.mesg_types,
+                min_mesg_size: index.min_mesg_size,
+                list_max: index.list_max,
+                btree_min: index.btree_min,
+            });
+            let mut reader = crate::io::reader::HandleBlockReader { handle };
+            if index.heap_addr != UNDEF_ADDR {
+                superseded.extend(collect_heap_extents(index.heap_addr, ctx, &mut reader)?);
+            }
+            if index.index_addr != UNDEF_ADDR {
+                if index.index_type == SOHM_INDEX_LIST {
+                    // `H5SM_LIST_SIZE`: the block is sized for `list_max`
+                    // records however few are in it.
+                    superseded.push((index.index_addr, list_size(ctx, index.list_max) as u64));
+                } else {
+                    superseded.extend(collect_btree_v2_extents(
+                        index.index_addr,
+                        ctx,
+                        &mut reader,
+                    )?);
+                }
+            }
+        }
+        Ok(Some(Box::new(SohmState::new(specs, superseded))))
+    }
+
     /// Open an existing HDF5 file for appending with an explicit locking
     /// policy.
     pub fn open_append_with_locking(
@@ -4524,23 +4737,16 @@ impl Hdf5Writer {
         )?;
 
         // A file with shared object header messages keeps datatypes,
-        // dataspaces and attributes in a SOHM fractal heap, and each object
-        // header holds only a heap ID pointing at them. This crate reads that
-        // indirection but never writes it, so finalize would rewrite every
-        // header it touches with the shared messages dropped and the master
-        // table left claiming they are still referenced — a file libhdf5 then
-        // reads as missing its objects. Refuse before anything is written.
-        let nindexes = ext
-            .shared_message_table
-            .as_ref()
-            .map_or(0, |smt| smt.nindexes);
-        if nindexes > 0 {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "cannot open this file for appending: its superblock extension \
-                 declares {nindexes} shared object header message (SOHM) \
-                 index(es), which this crate can read but not write"
-            )));
-        }
+        // dataspaces and attributes in a fractal heap per index, and each
+        // object header holds a heap ID pointing at one. The table is laid out
+        // whole from the whole message set (`build_shared_messages`), never
+        // grown insert by insert, so a reopen carries the indexes and the
+        // bodies forward and the next finalize lays a new table out over the
+        // old one's blocks — which is sound exactly while no header keeping
+        // its bytes still points into the old heap. The walk below is what
+        // settles that.
+        let sohm = Self::reopen_shared_messages(&mut handle, &meta, ext_addr, &ext)?;
+
         // Discover links from root group (and subgroups recursively). Every
         // object is classified before it is registered, and the root is the
         // one object with no alternative: its header must be rewritten to
@@ -4793,6 +4999,44 @@ impl Hdf5Writer {
             }
         });
 
+        // The one thing a rebuilt shared-message table can break: an object
+        // kept by its bytes keeps the heap IDs its header holds, and the
+        // finalize gives the heap those IDs name back to the allocator. Every
+        // object the registry holds is rewritten instead
+        // ([`rebuilds_shared_messages`](Self::rebuilds_shared_messages)), so
+        // this asks only the preserved ones, and names the object rather than
+        // the feature — the file is appendable the moment nothing preserved
+        // holds a heap ID or hides a subtree that might.
+        if sohm.is_some() {
+            for entry in &preserved {
+                if !matches!(entry.class, crate::io::reader::LinkClass::Hard) {
+                    continue;
+                }
+                let Ok((link, _)) = LinkMessage::decode(&entry.encoded, &meta.ctx) else {
+                    continue;
+                };
+                let LinkTarget::Hard { address } = link.target else {
+                    continue;
+                };
+                if let Some(blocks) = crate::io::object_header_io::blocks_shared_message_rebuild(
+                    &mut handle,
+                    &meta,
+                    address,
+                )? {
+                    let why = entry
+                        .reason
+                        .as_deref()
+                        .unwrap_or("this writer cannot model it");
+                    return Err(crate::io::IoError::Unsupported(format!(
+                        "cannot open this file for appending: '{}' {blocks}, but {why}, so \
+                         its header keeps the bytes it has while the append lays the \
+                         shared-message table out afresh",
+                        entry.path
+                    )));
+                }
+            }
+        }
+
         // Rebuild the hard-link registry from the alias entries set aside
         // above, so the H5Ldelete semantics survive a reopen. An alias whose
         // target the walk could not model is not here at all: it was
@@ -4923,24 +5167,31 @@ impl Hdf5Writer {
         let superseded = (!superseded.attrs.is_empty() || !superseded.links.is_empty())
             .then(|| Box::new(superseded));
 
-        // The same keying for the symbol-table storage, and the superblock the
-        // close re-emits. Built from the superblock alone: a group whose header
-        // carried no Symbol Table message contributes nothing, which is exactly
-        // what happens to a group libhdf5 wrote at a newer bound inside an
-        // otherwise classic file.
-        let legacy = legacy.map(|superblock| {
-            let mut stabs: HashMap<LinkScope, StabExtents> = HashMap::new();
-            stabs.extend(root_stab.map(|s| (LinkScope::Root, s)));
-            for (name, extents) in group_stabs {
-                if let Some(&gidx) = group_index_map.get(&format!("/{name}")) {
-                    stabs.insert(LinkScope::Group(gidx), extents);
-                }
+        // The same keying for the symbol-table storage. Built from the headers
+        // alone, not from the superblock version: a group whose header carried
+        // no Symbol Table message contributes nothing — what happens to a group
+        // libhdf5 wrote at a newer bound inside an otherwise classic file — and
+        // one that carried it keeps its storage even where the superblock is
+        // version 2, which is what a file with shared messages is.
+        let mut stabs: HashMap<LinkScope, StabExtents> = HashMap::new();
+        stabs.extend(root_stab.map(|s| (LinkScope::Root, s)));
+        for (name, extents) in group_stabs {
+            if let Some(&gidx) = group_index_map.get(&format!("/{name}")) {
+                stabs.insert(LinkScope::Group(gidx), extents);
             }
+        }
+        let symbol_tables = SymbolTables {
+            found: stabs.keys().copied().collect(),
+            superseded: Slot::new(stabs),
+            written: Slot::new(HashMap::new()),
+        };
+
+        // The superblock the close re-emits, and the generation every message
+        // this session encodes belongs to.
+        let legacy = legacy.map(|superblock| {
             Box::new(LegacyFile {
                 superblock,
                 meta: meta.clone(),
-                superseded: Slot::new(stabs),
-                written: Slot::new(HashMap::new()),
             })
         });
 
@@ -4999,10 +5250,11 @@ impl Hdf5Writer {
             pending_region_references: Slot::new(Vec::new()),
             attribute_references: Slot::new(Vec::new()),
             legacy,
-            // A reopened file's shared-message table is not rebuilt here:
-            // `open_rw` refuses a file that has one, so a writer that got this
-            // far has none to carry.
-            sohm: None,
+            symbol_tables,
+            // The indexes the file was created with, and the blocks its
+            // current table occupies; the next finalize lays a new table out
+            // over them from the whole message set.
+            sohm,
             source_dir: source_dir_of(path)?,
         };
         // The link graph is complete only now, so this is the first point the
@@ -6303,7 +6555,7 @@ impl Hdf5Writer {
     /// exists.
     pub(crate) fn share_committed_type(&self, dataset: usize, committed: usize) {
         debug_assert!(committed < self.committed_datatypes.lock().len());
-        self.ds(dataset).lock().committed_type = Some(committed);
+        self.ds(dataset).lock().committed_type = Some(CommittedTypeRef::Session(committed));
     }
 
     /// How many names reach the committed datatype `index`: the link that
@@ -6323,7 +6575,7 @@ impl Hdf5Writer {
             .iter()
             .filter(|d| {
                 let m = d.lock();
-                !m.deleted && m.committed_type == Some(index)
+                !m.deleted && m.committed_type == Some(CommittedTypeRef::Session(index))
             })
             .count() as u32;
         linked + shares
@@ -7303,25 +7555,27 @@ impl Hdf5Writer {
         links: &[LinkMessage],
         order: CreationOrder,
     ) {
-        // A classic group holds no link messages at all: its links are the
+        // A symbol-table group holds no link messages at all: its links are the
         // entries of the symbol table `prepare_symbol_tables` laid out, and
         // the header carries only the two addresses naming it. Link Info and
         // Group Info are version-1.8 messages and have no business in a
         // version-1 header — `H5G__stab_valid` reads the Symbol Table message
         // and nothing else.
         if self.uses_symbol_table(scope, order) {
-            let legacy = self
-                .legacy
-                .as_deref()
-                .expect("uses_symbol_table is only true in a classic file");
             // Sizing runs before the tables are laid out; the message is the
             // same two addresses wide either way, so the placeholder reserves
             // exactly what the real one needs. Same two-pass rule the child
             // link addresses already follow.
-            let stab = legacy.written.lock().get(&scope).copied().unwrap_or(Stab {
-                btree_addr: UNDEF_ADDR,
-                heap_addr: UNDEF_ADDR,
-            });
+            let stab = self
+                .symbol_tables
+                .written
+                .lock()
+                .get(&scope)
+                .copied()
+                .unwrap_or(Stab {
+                    btree_addr: UNDEF_ADDR,
+                    heap_addr: UNDEF_ADDR,
+                });
             header.add_message(MSG_SYMBOL_TABLE, 0x00, stab.encode(&self.ctx));
             return;
         }
@@ -7470,9 +7724,6 @@ impl Hdf5Writer {
     /// session, the other double-finalize, cannot reach here: SWMR needs a
     /// version-3 superblock, so `start_swmr` refuses a classic file.)
     fn prepare_symbol_tables(&self) -> IoResult<()> {
-        let Some(legacy) = self.legacy.as_deref() else {
-            return Ok(());
-        };
         // Depth by parent chain, not by counting separators in the registry
         // path: the chain is what actually says which table has to exist first.
         let mut scopes: Vec<(usize, LinkScope, CreationOrder)> = Vec::new();
@@ -7498,21 +7749,36 @@ impl Hdf5Writer {
             scopes.push((0, LinkScope::Root, root_order));
         }
 
+        let meta = self.stab_meta();
         for (_, scope, order) in scopes {
             // Freed before the replacement is laid out, so a rewrite reuses
             // the same blocks instead of growing the file on every open/close
             // cycle — the rule `prepare_dense_links` and the header rewrite
             // already follow. Removed as it is freed, so no second pass can
             // free it twice.
-            let superseded = legacy.superseded.lock().remove(&scope);
+            let superseded = self.symbol_tables.superseded.lock().remove(&scope);
             if let Some(extents) = superseded {
                 free_stab(&self.allocator, &extents);
             }
             let links = self.stab_links_for(scope, order)?;
-            let stab = write_stab(&self.handle, &self.allocator, &legacy.meta, &links)?;
-            legacy.written.lock().insert(scope, stab);
+            let stab = write_stab(&self.handle, &self.allocator, &meta, &links)?;
+            self.symbol_tables.written.lock().insert(scope, stab);
         }
         Ok(())
+    }
+
+    /// The file-level parameters every symbol-table node width is derived from
+    /// — the address/length widths and the B-tree "K" ranks. Only a version-0/1
+    /// superblock records ranks of its own; [`btree_v1_config`] is the one
+    /// place that decides whether this file has any.
+    ///
+    /// [`btree_v1_config`]: Self::btree_v1_config
+    fn stab_meta(&self) -> FileMeta {
+        FileMeta {
+            ctx: self.ctx,
+            btree: self.btree_v1_config(),
+            sohm: None,
+        }
     }
 
     /// `scope`'s links as symbol table entries.
@@ -7566,7 +7832,7 @@ impl Hdf5Writer {
             LinkTarget::Hard { address } => {
                 let cached = groups
                     .get(address)
-                    .and_then(|scope| self.legacy.as_deref()?.written.lock().get(scope).copied());
+                    .and_then(|scope| self.symbol_tables.written.lock().get(scope).copied());
                 StabTarget::Hard {
                     addr: *address,
                     cached,
@@ -7943,6 +8209,15 @@ impl Hdf5Writer {
             .zip(collector.messages)
             .map(|(&spec, messages)| SohmIndexContent { spec, messages })
             .collect();
+        // The table a reopen found is superseded whole by the one below, and
+        // every header that pointed into it is in this finalize's rewrite set
+        // — so its blocks go back immediately before the replacement is laid
+        // out, and the new table lands in them instead of growing the file on
+        // every open/close cycle. Taken, not read: a second finalize must not
+        // free the same blocks twice.
+        for (addr, len) in std::mem::take(&mut *sohm.superseded.lock()) {
+            self.allocator.free(addr, len);
+        }
         let built =
             build_shared_messages(&indexes, &self.ctx, &mut |len| self.allocator.allocate(len))?;
         for block in &built.blocks {
@@ -13851,7 +14126,12 @@ impl Hdf5Writer {
             // the driver info address are recorded nowhere else in the file,
             // and every node width in it is derived from the ranks. Only the
             // three things this session can have changed are recomputed.
-            let root_stab = legacy.written.lock().get(&LinkScope::Root).copied();
+            let root_stab = self
+                .symbol_tables
+                .written
+                .lock()
+                .get(&LinkScope::Root)
+                .copied();
             let mut sb = legacy.superblock.clone();
             sb.version = version;
             sb.file_consistency_flags = flags as u32;
@@ -14076,6 +14356,10 @@ impl Hdf5Writer {
         // those phases supersede is returned here, before the first
         // allocation, so a rewrite can land in it.
         let mut rewritten: Vec<usize> = Vec::new();
+        // A finalize that lays the shared-message table out afresh reassigns
+        // every heap ID in the file, so no existing header can keep its bytes:
+        // the pointers in them name heap objects the new table does not have.
+        let table_replaced = self.rebuilds_shared_messages();
         for i in 0..self.dataset_count() {
             // Before the slot guard: `object_link_count` re-locks every
             // dataset and group slot, this one included.
@@ -14089,7 +14373,7 @@ impl Hdf5Writer {
                 // An existing dataset from append mode keeps its header — and
                 // everything that header names — unless this session changed
                 // what the header says.
-                if !m.header_stale_with(nlink) {
+                if !table_replaced && !m.header_stale_with(nlink) {
                     // Keep the original object header address for the root group link.
                     m.obj_header_addr = m.obj_header_written_addr.unwrap();
                     continue;
@@ -14264,8 +14548,10 @@ impl Hdf5Writer {
         // committed-datatype registry, which the slot guard below must not be
         // held across.
         let committed = self.ds(index).lock().committed_type;
-        let committed_addr =
-            committed.map(|ci| self.committed_datatypes.lock()[ci].obj_header_addr);
+        let committed_addr = committed.map(|r| match r {
+            CommittedTypeRef::Session(ci) => self.committed_datatypes.lock()[ci].obj_header_addr,
+            CommittedTypeRef::Preserved(addr) => addr,
+        });
         // And again: an attribute holding an object reference is said in the
         // target's header address, which is read off that object's slot.
         let attributes = self.object_attributes(AttrScope::Dataset(index))?;

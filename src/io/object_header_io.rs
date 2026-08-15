@@ -25,7 +25,8 @@ use crate::format::fractal_heap::{
 use crate::format::messages::datatype::DatatypeMessage;
 use crate::format::messages::shared::MSG_FLAG_SHARED;
 use crate::format::messages::{
-    MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE, MSG_OBJ_HEADER_CONTINUATION,
+    MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE, MSG_LINK, MSG_LINK_INFO,
+    MSG_OBJ_HEADER_CONTINUATION, MSG_SYMBOL_TABLE,
 };
 use crate::format::object_header::{ObjectHeader, ObjectHeaderMessage};
 use crate::format::sohm::{SharedLocation, SharedMessagePointer};
@@ -74,6 +75,18 @@ pub(crate) fn read_object_header_full(
     read_object_header_at(handle, meta, addr, 0)
 }
 
+/// The size of the chunk-0 block the object header at `addr` occupies — what
+/// a rewrite of that header supersedes and frees.
+pub(crate) fn object_header_block_size(handle: &mut FileHandle, addr: u64) -> IoResult<usize> {
+    let mut buf = handle.read_at_most(addr, HEADER_PROBE)?;
+    if let Err(FormatError::BufferTooShort { needed, .. }) = ObjectHeader::decode_any(&buf) {
+        if needed > buf.len() {
+            buf = handle.read_at_most(addr, needed)?;
+        }
+    }
+    Ok(ObjectHeader::decode_any(&buf)?.1)
+}
+
 /// [`read_object_header_full`], with the committed-message indirection depth
 /// already reached.
 fn read_object_header_at(
@@ -81,6 +94,18 @@ fn read_object_header_at(
     meta: &FileMeta,
     addr: u64,
     depth: usize,
+) -> IoResult<ObjectHeader> {
+    let mut header = read_header_chain(handle, meta, addr)?;
+    resolve_shared_messages(handle, meta, &mut header, addr, depth)?;
+    Ok(header)
+}
+
+/// Chunk 0 and every continuation block it leads to, flattened into one
+/// message list and nothing else done to them.
+fn read_header_chain(
+    handle: &mut FileHandle,
+    meta: &FileMeta,
+    addr: u64,
 ) -> IoResult<ObjectHeader> {
     let ctx = &meta.ctx;
     let mut buf = handle.read_at_most(addr, HEADER_PROBE)?;
@@ -138,8 +163,127 @@ fn read_object_header_at(
         header.messages.extend(new_msgs);
     }
 
-    resolve_shared_messages(handle, meta, &mut header, addr, depth)?;
     Ok(header)
+}
+
+/// Why the object at `addr` cannot keep its bytes across a rewrite of the
+/// file's shared-message table, or `None` when it can.
+///
+/// A rewritten table reassigns every heap ID in the file, so an object left
+/// untouched must be one that names no heap object. Two things disqualify it:
+///
+/// * It resolves something through the heap. Both forms libhdf5 stores count —
+///   a whole message replaced by a pointer (`H5O_MSG_FLAG_SHARED`), and the
+///   datatype or dataspace of an attribute, whose pointer sits inside the
+///   attribute body and is flagged there instead
+///   (`H5O_ATTR_FLAG_TYPE_SHARED` / `H5O_ATTR_FLAG_SPACE_SHARED`). A pointer
+///   to a *committed* object header is not one of these: it names an object,
+///   not a heap object, and survives the heap being rebuilt.
+/// * It names other objects. Everything below a preserved group keeps its
+///   bytes with it, and this reopen never walked that subtree — the object is
+///   preserved precisely because the walk could not model it — so nothing here
+///   can say whether anything down there shares.
+///
+/// The reopen asks this of every object it will keep by its bytes, which is
+/// the one thing a rebuilt shared-message table can break.
+pub(crate) fn blocks_shared_message_rebuild(
+    handle: &mut FileHandle,
+    meta: &FileMeta,
+    addr: u64,
+) -> IoResult<Option<&'static str>> {
+    let header = read_header_chain(handle, meta, addr)?;
+    let in_heap = |bytes: &[u8]| {
+        SharedMessagePointer::decode(bytes, &meta.ctx)
+            .is_ok_and(|p| p.location == SharedLocation::Sohm)
+    };
+    for msg in &header.messages {
+        if msg.flags & MSG_FLAG_SHARED != 0 && in_heap(&msg.data) {
+            return Ok(Some("holds a shared object header message"));
+        }
+        if msg.msg_type == MSG_ATTRIBUTE
+            && shared_attribute_fields(&msg.data)
+                .into_iter()
+                .flatten()
+                .any(in_heap)
+        {
+            return Ok(Some(
+                "holds an attribute whose datatype or dataspace is a shared object header \
+                 message",
+            ));
+        }
+        if matches!(msg.msg_type, MSG_LINK | MSG_LINK_INFO | MSG_SYMBOL_TABLE) {
+            return Ok(Some(
+                "names objects of its own, which would keep their bytes with it",
+            ));
+        }
+    }
+    Ok(None)
+}
+
+/// The object header address of the committed (named) datatype the object at
+/// `addr` declares its datatype from, or `None` when it holds its own.
+///
+/// [`read_object_header_full`] substitutes the named type's literal datatype
+/// message for the pointer, which is what every reader wants and what makes a
+/// rewrite of that header silently detach the dataset from the name. A rewrite
+/// therefore asks this of the *raw* chain and re-emits the pointer, so
+/// `H5Tget_class`-level equality and `H5Tcommitted` both survive it.
+pub(crate) fn committed_datatype_address(
+    handle: &mut FileHandle,
+    meta: &FileMeta,
+    addr: u64,
+) -> IoResult<Option<u64>> {
+    let header = read_header_chain(handle, meta, addr)?;
+    for msg in &header.messages {
+        if msg.msg_type != MSG_DATATYPE || msg.flags & MSG_FLAG_SHARED == 0 {
+            continue;
+        }
+        let ptr = SharedMessagePointer::decode(&msg.data, &meta.ctx)?;
+        if ptr.location == SharedLocation::Committed {
+            return Ok(Some(ptr.oh_addr));
+        }
+    }
+    Ok(None)
+}
+
+/// The pointer bytes of whichever of an attribute's datatype and dataspace
+/// its flags byte says are stored shared — datatype first.
+///
+/// Both slots are empty when the message is not an attribute this crate reads
+/// that way at all, which is the same answer as an attribute that shares
+/// neither field: a caller only ever asks what there is to follow. The version
+/// and length checks are the ones [`resolve_shared_attribute_fields`] makes
+/// before it splices.
+fn shared_attribute_fields(body: &[u8]) -> [Option<&[u8]>; 2] {
+    /// `H5O_ATTR_FLAG_TYPE_SHARED`.
+    const ATTR_FLAG_TYPE_SHARED: u8 = 0x01;
+    /// `H5O_ATTR_FLAG_SPACE_SHARED`.
+    const ATTR_FLAG_SPACE_SHARED: u8 = 0x02;
+
+    let fields = || {
+        if body.len() < 8 || body[0] < 2 {
+            return None;
+        }
+        let flags = body[1];
+        if flags & (ATTR_FLAG_TYPE_SHARED | ATTR_FLAG_SPACE_SHARED) == 0 {
+            return None;
+        }
+        let name_size = u16::from_le_bytes([body[2], body[3]]) as usize;
+        let dt_size = u16::from_le_bytes([body[4], body[5]]) as usize;
+        let ds_size = u16::from_le_bytes([body[6], body[7]]) as usize;
+        let hdr_len: usize = if body[0] >= 3 { 9 } else { 8 };
+        let name_end = hdr_len.checked_add(name_size)?;
+        let dt_end = name_end.checked_add(dt_size)?;
+        let ds_end = dt_end.checked_add(ds_size)?;
+        if body.len() < ds_end {
+            return None;
+        }
+        Some([
+            (flags & ATTR_FLAG_TYPE_SHARED != 0).then(|| &body[name_end..dt_end]),
+            (flags & ATTR_FLAG_SPACE_SHARED != 0).then(|| &body[dt_end..ds_end]),
+        ])
+    };
+    fields().unwrap_or([None, None])
 }
 
 /// Replace every stored-shared message body in `header` with the literal

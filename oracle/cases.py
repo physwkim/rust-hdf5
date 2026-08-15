@@ -1071,6 +1071,30 @@ def _fixture_case(name, fixture, generator, group, note, rust=None):
     return Case(name, group, gen, rust, note)
 
 
+def _fixture_append_case(name, fixture, generator, group, note, rust):
+    """A checked-in fixture libhdf5 then reopens and appends to.
+
+    The create is the half h5py cannot express — there is no binding for
+    `H5Pset_shared_mesg_index` — but the *append* is an ordinary `'a'` open,
+    so the reference is a genuine libhdf5 reopen of a file with a
+    shared-message table. The rust arm creates its own equivalent and reopens
+    that, which is the only shape the comparison can take: nothing on the
+    Python side can hand the rust writer a file it did not create.
+    """
+    def gen(path):
+        src = FIXTURE_DIR / fixture
+        if not src.exists():
+            raise FileNotFoundError(
+                "%s is missing; regenerate it with tests/fixtures/%s"
+                % (src, generator)
+            )
+        shutil.copyfile(src, path)
+        with h5py.File(path, "a") as f:
+            f.create_dataset("appended", data=ramp("<i4", 8))
+
+    return Case(name, group, gen, rust, note)
+
+
 FIXTURE_CASES = [
     _fixture_case(
         "sohm_list", "sohm_list.h5", "gen_sohm.sh", "sohm",
@@ -1082,6 +1106,17 @@ FIXTURE_CASES = [
         "sohm_btree", "sohm_btree.h5", "gen_sohm.sh", "sohm",
         "the same file with the shared-message index forced to a v2 B-tree",
         rust="sohm_btree",
+    ),
+    _fixture_append_case(
+        "sohm_list_append", "sohm_list.h5", "gen_sohm.sh", "sohm",
+        "a file with a shared-message list index reopened and appended to — "
+        "the table is laid out whole, so the append replaces it",
+        rust="sohm_list_append",
+    ),
+    _fixture_append_case(
+        "sohm_btree_append", "sohm_btree.h5", "gen_sohm.sh", "sohm",
+        "the same reopen over a v2 B-tree index",
+        rust="sohm_btree_append",
     ),
     _fixture_case(
         "ochk_root", "ochk_root.h5", "gen_ochk.sh", "objectheader",
