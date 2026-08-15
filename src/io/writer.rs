@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::format::btree_v1::{BTreeV1Config, ChunkBTreeV1Tree, ChunkKey};
+use crate::format::btree_v1::{BTreeV1Config, ChunkBTreeV1Node, ChunkBTreeV1Tree, ChunkKey};
 use crate::format::chunk_index::btree_v2::Bt2ChunkIndex;
 use crate::format::chunk_index::extensible_array::{
     compute_chunk_size_len, compute_ndblk_addrs, compute_nsblk_addrs, EaDblkPath, EaGeometry,
@@ -146,6 +146,83 @@ fn collect_bt2_nodes(
             if let Some(record) = node.record_data.get(i * rec..(i + 1) * rec) {
                 records.extend_from_slice(record);
             }
+        }
+    }
+    Ok(())
+}
+
+/// Walk a version-1 raw-data-chunk B-tree from `addr`, collecting every leaf
+/// entry as a [`BtreeV1ChunkRecord`] and every node block's address.
+///
+/// The v1 counterpart of [`collect_bt2_nodes`], and for the same reason: the
+/// records are what [`BtreeV1DatasetInfo::build_tree`] bulk-loads on the next
+/// flush, and the addresses are the block pool that flush re-serializes over,
+/// so a reopened tree owns the nodes it found instead of leaking them and
+/// allocating a second set beside them.
+///
+/// Records come out in key order because a v1 B-tree's leaves are in key order
+/// and this descends left to right, which is what
+/// [`BtreeV1DatasetInfo::position`]'s binary search needs. `rank` is
+/// `chunk_dims.len()`, excluding the trailing element-size dimension; the keys
+/// store element offsets (`scaled * chunk_dim`, `H5D__btree_encode_key`), so
+/// the grid position this records is the quotient.
+#[allow(clippy::too_many_arguments)]
+fn collect_btree_v1_nodes(
+    handle: &FileHandle,
+    ctx: &FormatContext,
+    config: &BTreeV1Config,
+    addr: u64,
+    chunk_dims: &[u64],
+    file_size: u64,
+    depth: u32,
+    records: &mut Vec<BtreeV1ChunkRecord>,
+    node_addrs: &mut Vec<u64>,
+) -> IoResult<()> {
+    // The same bound the reader's walk uses: a node's level is one byte, so no
+    // honest tree is deeper than that, and a cyclic index stops here.
+    if depth > 256 {
+        return Err(crate::io::IoError::InvalidState(
+            "chunk B-tree v1 exceeds maximum depth".into(),
+        ));
+    }
+    if addr == UNDEF_ADDR || addr >= file_size {
+        return Ok(());
+    }
+    let rank = chunk_dims.len();
+    let sa = ctx.sizeof_addr as usize;
+    let node_size = config.chunk_btree_node_size(sa, rank);
+    let buf = handle.read_at_most(addr, node_size)?;
+    let node = ChunkBTreeV1Node::decode(&buf, sa, rank, config.chunk_max_entries())?;
+    node_addrs.push(addr);
+
+    if node.level == 0 {
+        for (i, &child_addr) in node.children.iter().enumerate() {
+            let key = &node.keys[i];
+            let scaled: Vec<u64> = key.offsets[..rank]
+                .iter()
+                .zip(chunk_dims)
+                .map(|(&offset, &dim)| offset.checked_div(dim).unwrap_or(0))
+                .collect();
+            records.push(BtreeV1ChunkRecord {
+                scaled,
+                address: child_addr,
+                nbytes: key.chunk_size,
+                filter_mask: key.filter_mask,
+            });
+        }
+    } else {
+        for &child_addr in &node.children {
+            collect_btree_v1_nodes(
+                handle,
+                ctx,
+                config,
+                child_addr,
+                chunk_dims,
+                file_size,
+                depth + 1,
+                records,
+                node_addrs,
+            )?;
         }
     }
     Ok(())
@@ -2163,9 +2240,7 @@ impl<'a> ReopenWalk<'a> {
             // the header as a contiguous, unallocated dataset — every element
             // gone, silently. Only the layouts that rebuild are modelled; the
             // rest keep their bytes, as an undecodable message already does.
-            // Version-3 chunked (a version-1 B-tree index, which h5py writes
-            // at `libver='v108'` and in every classic file) and virtual
-            // layouts are both this.
+            // The virtual layout is this.
             (Some(_), Some(_), Some(layout)) if !layout_rebuilds(&layout) => {
                 Ok(ObjectPlan::preserve(format!(
                     "its data layout is {}, which this writer reads but does not build",
@@ -2312,11 +2387,13 @@ impl<'a> ReopenWalk<'a> {
 /// it that decoded would strand every chunk it could not read.
 fn rebuild_dataset(
     handle: &mut FileHandle,
-    ctx: &FormatContext,
+    meta: &FileMeta,
+    file_size: u64,
     name: String,
     obj_addr: u64,
     parts: DatasetParts,
 ) -> IoResult<DatasetInfo> {
+    let ctx = &meta.ctx;
     let DatasetParts {
         header_size: ds_header_size,
         datatype: dt,
@@ -2371,6 +2448,11 @@ fn rebuild_dataset(
         // 8-byte size fields, which v4 readers would mis-derive).
         layout_version: match &dl {
             DataLayoutMessage::ChunkedV4 { version, .. } => *version,
+            // The classic index has no version above its own: a version-3
+            // message is the whole of `H5D__chunk_set_info`'s MAX below the
+            // version-4 gate, and re-encoding it any higher would name an
+            // index the message cannot carry.
+            DataLayoutMessage::ChunkedV3 { .. } => LAYOUT_VERSION_DEFAULT,
             _ => 4,
         },
         times,
@@ -2393,6 +2475,49 @@ fn rebuild_dataset(
         // contiguous one — dropping every byte.
         DataLayoutMessage::Compact { data } => {
             info.compact = Some(data.clone());
+        }
+        // The classic chunk index, reconstructed into the same
+        // `BtreeV1DatasetInfo` a chunked dataset *created* in this format
+        // gets, so the one set of machinery — `build_tree`, the flush's block
+        // pool, `write_chunk`, `extend_dataset`, the prune a delete runs —
+        // drives a reopened dataset and a fresh one alike. `root_addr` is what
+        // the layout message carries and stays undefined for a dataset whose
+        // chunks were never written, exactly as libhdf5 leaves it.
+        DataLayoutMessage::ChunkedV3 {
+            chunk_dims,
+            b_tree_address,
+        } => {
+            let real_chunk_dims: Vec<u64> = chunk_dims[..chunk_dims.len() - 1].to_vec();
+            let mut records = Vec::new();
+            let mut node_addrs = Vec::new();
+            collect_btree_v1_nodes(
+                handle,
+                ctx,
+                &meta.btree,
+                *b_tree_address,
+                &real_chunk_dims,
+                file_size,
+                0,
+                &mut records,
+                &mut node_addrs,
+            )?;
+            let max_dims = info
+                .dataspace
+                .max_dims
+                .clone()
+                .unwrap_or_else(|| info.dataspace.dims.clone());
+            info.btree_v1 = Some(BtreeV1DatasetInfo {
+                chunk_dims: real_chunk_dims,
+                max_dims,
+                // The file's own "K" ranks, not this session's defaults: they
+                // set every node's width, so a tree bulk-loaded under the
+                // wrong ones would re-serialize over blocks of the wrong size.
+                config: meta.btree,
+                records,
+                node_addrs,
+                root_addr: *b_tree_address,
+                chunks_written: 0,
+            });
         }
         DataLayoutMessage::ChunkedV4 {
             chunk_dims,
@@ -2813,6 +2938,7 @@ fn layout_rebuilds(layout: &DataLayoutMessage) -> bool {
         layout,
         DataLayoutMessage::Contiguous { .. }
             | DataLayoutMessage::Compact { .. }
+            | DataLayoutMessage::ChunkedV3 { .. }
             | DataLayoutMessage::ChunkedV4 { .. }
     )
 }
@@ -4511,7 +4637,7 @@ impl Hdf5Writer {
                 CollectedObject::Dataset(parts) => *parts,
             };
             let dense_attrs = parts.dense.attrs.clone();
-            match rebuild_dataset(&mut handle, &ctx, name.clone(), obj_addr, parts) {
+            match rebuild_dataset(&mut handle, &meta, file_size, name.clone(), obj_addr, parts) {
                 Ok(info) => {
                     if let Some(ainfo) = dense_attrs {
                         dataset_dense.push((existing_datasets.len(), ainfo));

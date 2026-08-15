@@ -648,18 +648,21 @@ fn a_preserved_object_is_named_by_the_writer_rather_than_reported_absent() {
 }
 
 /// A version-3 data layout indexes its chunks with a version-1 B-tree, and a
-/// compact layout keeps the data inside the message. This writer builds
-/// neither, but the reopen registered both as datasets anyway and the close
-/// rewrote each header as a *contiguous, unallocated* one — the address the
-/// rebuild never filled in. Setting one attribute on the chunked dataset (all
-/// it takes to make its header stale) zeroed all 64 of its elements, with no
-/// error anywhere.
+/// compact layout keeps the data inside the message. Both rebuild now, so
+/// what this pins is the two halves of that: the untouched one keeps its
+/// header byte for byte, and the touched one comes back through the rebuild
+/// with every element intact.
+///
+/// The failure this stands against is the one that made the version-3 layout
+/// preserve-only in the first place: the reopen registered the dataset but
+/// the rebuild had no arm for its layout, so the close rewrote the header as
+/// *contiguous, unallocated* — the address the rebuild never filled in — and
+/// setting one attribute zeroed all 64 elements with no error anywhere.
 ///
 /// h5py at `libver='v108'` writes exactly that layout over a version-2
-/// superblock, which is a file this writer otherwise appends to happily; a
-/// classic file's chunked datasets are all of this shape.
+/// superblock; a classic file's chunked datasets are all of this shape.
 #[test]
-fn a_layout_this_writer_does_not_build_keeps_its_bytes_through_a_reopen() {
+fn a_version_3_chunked_dataset_rebuilds_and_keeps_its_data_through_a_reopen() {
     let Some(py) = python() else { return };
     let dir = tmp_dir("layout_v3");
     let (orig, work) = (dir.join("orig.h5"), dir.join("work.h5"));
@@ -694,8 +697,9 @@ fn a_layout_this_writer_does_not_build_keeps_its_bytes_through_a_reopen() {
              \x20   assert list(f['packed'][...]) == [0, 1, 2, 3], list(f['packed'][...])\n\
              \x20   assert list(f['plain'][...]) == [0, 1, 2, 3]\n\
              \x20   assert list(f['added'][...]) == [7, 8]\n\
-             for name in ('chunky', 'packed'):\n\
-             \x20   assert_untouched(name)\n"
+             \x20   assert f['chunky'].attrs['tag'] == 5, dict(f['chunky'].attrs)\n\
+             \x20   assert f['chunky'].chunks == (8,), f['chunky'].chunks\n\
+             assert_untouched('packed')\n"
         ),
     );
 
@@ -706,13 +710,21 @@ fn a_layout_this_writer_does_not_build_keeps_its_bytes_through_a_reopen() {
 /// header stale, and therefore rewritten — add one dataset, close.
 fn reopen_touch_and_add(work: &std::path::Path) {
     let file = rust_hdf5::H5File::open_rw(work).expect("open_rw");
-    // A preserved object is not in the registry at all, so there is nothing to
-    // hang an attribute on. Refusing here is the point: the alternative was
-    // accepting the attribute and dropping the data.
     assert!(
-        file.dataset_writer("chunky").is_err(),
-        "a version-3-layout dataset must not be writable through a reopen"
+        file.dataset_names().contains(&"chunky".to_string()),
+        "a rebuilt dataset is in the registry, so it is listed: {:?}",
+        file.dataset_names()
     );
+    let chunky = file
+        .dataset_writer("chunky")
+        .expect("a version-3-layout dataset rebuilds, so it opens for writing");
+    chunky
+        .new_attr::<i32>()
+        .shape(())
+        .create("tag")
+        .expect("create attr")
+        .write_numeric(&5i32)
+        .expect("write attr");
     file.new_dataset::<i32>()
         .shape([2])
         .create("added")

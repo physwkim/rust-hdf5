@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rust_hdf5::H5File;
+use rust_hdf5::{H5File, LibverBound};
 
 fn unique_tmp(label: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -50,6 +50,16 @@ fn make_bt2(file: &H5File, vals: &[i32]) {
         .chunk(&[2, 2])
         .max_shape(&[None, None])
         .create("tiles")
+        .unwrap();
+    ds.write_slice(&[0, 0], &[4, 4], vals).unwrap();
+}
+
+fn make_btree_v1(file: &H5File, vals: &[i32]) {
+    let ds = file
+        .new_dataset::<i32>()
+        .shape([4usize, 4])
+        .chunk(&[2, 2])
+        .create("classic")
         .unwrap();
     ds.write_slice(&[0, 0], &[4, 4], vals).unwrap();
 }
@@ -118,6 +128,50 @@ fn reopen_session_delete_frees_btree_v2_storage() {
         let read = H5File::open(&path).unwrap();
         assert_eq!(
             read.dataset("tiles").unwrap().read_raw::<i32>().unwrap(),
+            vals
+        );
+        drop(read);
+        let n = std::fs::metadata(&path).unwrap().len();
+        cleanup(&path);
+        n
+    };
+
+    assert_eq!(size_after(10), size_after(2), "10 reopen cycles against 2");
+}
+
+/// Deleting a reopened version-1-B-tree dataset must free the chunks its
+/// tree keys and the tree's own node blocks.
+///
+/// The classic index has no header block to stand in for it: the root pointer
+/// lives in the layout message, so the whole of what a delete can free comes
+/// from the records and node addresses the reopen walked back. A rebuild that
+/// returned an empty tree would delete cleanly and leak all of it, which is a
+/// growing file here rather than an error.
+#[test]
+fn reopen_session_delete_frees_btree_v1_storage() {
+    let size_after = |cycles: usize| {
+        let path = unique_tmp(&format!("bt1_del_{cycles}"));
+        let vals: Vec<i32> = (200..216).collect();
+        {
+            // At the v1.8 bound, so the chunk index is the version-1 B-tree:
+            // the default bound gives a version-4 layout and one of the
+            // v1.10 indexes, which the cases above already cover.
+            let file = H5File::options()
+                .libver(LibverBound::V18)
+                .create(&path)
+                .unwrap();
+            make_btree_v1(&file, &vals);
+            file.close().unwrap();
+        }
+        for _ in 0..cycles {
+            let file = H5File::options().no_locking().open_rw(&path).unwrap();
+            file.delete_dataset("classic").unwrap();
+            make_btree_v1(&file, &vals);
+            file.close().unwrap();
+        }
+        let read = H5File::open(&path).unwrap();
+        assert_eq!(
+            read.dataset("classic").unwrap().read_raw::<i32>().unwrap(),
             vals
         );
         drop(read);
