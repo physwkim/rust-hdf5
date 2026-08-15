@@ -120,19 +120,6 @@ EXPECTED_DEVIATIONS = [
                "appended to a classic file (tests/legacy_append.rs); the v1.8 "
                "bound is what is left",
     },
-    {
-        "id": "new-style-groups-always",
-        "field": "linkstore",
-        "ref": "symtab",
-        "rust": "compact",
-        "why": "a version-2 object header keeps its links in messages rather "
-               "than in a symbol table. `sohm_list` and `sohm_btree` carry "
-               "shared messages, whose master table lives in a superblock "
-               "extension and so forces the version-2 superblock and with it "
-               "version-2 headers (H5Fsuper.c:1135), whatever bound is asked "
-               "for. The phase change past max_compact still moves the links "
-               "to dense storage",
-    },
 ]
 
 

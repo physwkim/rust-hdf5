@@ -2296,7 +2296,11 @@ fn sohm_file(path: &str, max_list: u16, min_btree: u16) -> rust_hdf5::Result<Wri
     let types = type_flag(MSG_DATATYPE).unwrap_or(0)
         | type_flag(MSG_DATASPACE).unwrap_or(0)
         | type_flag(MSG_ATTRIBUTE).unwrap_or(0);
+    // `gen_sohm.c` passes `H5P_DEFAULT` for the fapl, so the file is written
+    // at `H5F_LIBVER_EARLIEST` — symbol-table groups and version-1 messages
+    // under the version-2 superblock the shared-message table forces.
     let file = H5File::options()
+        .libver(LibverBound::Earliest)
         .shared_messages(&[(types, 0)], max_list, min_btree)
         .create(path)?;
 

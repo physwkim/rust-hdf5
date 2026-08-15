@@ -25,7 +25,7 @@ use rust_hdf5::format::btree_v1::{BTreeV1Config, BTreeV1Node};
 use rust_hdf5::format::local_heap::{local_heap_get_string, LocalHeapHeader};
 use rust_hdf5::format::messages::data_layout::{ChunkIndexType, DataLayoutMessage};
 use rust_hdf5::format::messages::link::{LinkMessage, LinkTarget};
-use rust_hdf5::format::messages::{MSG_DATA_LAYOUT, MSG_LINK};
+use rust_hdf5::format::messages::{MSG_DATA_LAYOUT, MSG_LINK, MSG_SYMBOL_TABLE};
 use rust_hdf5::format::object_header::ObjectHeader;
 use rust_hdf5::format::superblock::{SuperblockV0V1, SuperblockV2V3};
 use rust_hdf5::format::symbol_table::SymbolTableNode;
@@ -884,34 +884,152 @@ fn a_file_created_at_earliest_reopens_and_takes_appends() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Shared object header messages override the bound. Their master table lives
-/// in a superblock extension, which only a version-2 superblock has, so
-/// `H5F__super_init` raises such a file to version 2 whatever low bound it
-/// asked for (H5Fsuper.c:1135) — and a version-2 superblock is this crate's
-/// modern file, link-message groups and all.
+/// Shared object header messages raise the superblock and nothing else.
+///
+/// Their master table lives in a superblock extension, which only a version-2
+/// superblock has, so `H5F__super_init` raises such a file to version 2
+/// whatever low bound it asked for (H5Fsuper.c:1135). What it does not do is
+/// touch `H5F_LOW_BOUND`, and that is what every other rule reads: the groups
+/// are still the symbol tables `H5G__obj_create_real` gives the earliest bound
+/// (H5Gobj.c:179) and the messages are still version 1. The headers are
+/// version 2, but from a third rule — sharing attribute messages means finding
+/// one again by its creation index, so `H5SM_init` sets `store_msg_crt_idx`
+/// (H5SM.c:220) and `H5O__create_ohdr` turns that into a version-2 header for
+/// every object in the file (H5Oint.c:364).
+///
+/// So superblock, header and group format disagree in the one file, each
+/// answering to its own rule. `tests/fixtures/sohm_list.h5`, written by
+/// libhdf5 itself with a default fapl, is that file; the oracle compares
+/// against it and this pins the three axes from inside.
 #[test]
-fn shared_messages_raise_a_file_asking_for_earliest_to_version_2() {
-    use rust_hdf5::format::messages::{MSG_DATASPACE, MSG_DATATYPE};
+fn shared_messages_raise_only_the_superblock_of_a_file_asking_for_earliest() {
+    use rust_hdf5::format::messages::{MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE};
     use rust_hdf5::format::sohm::type_flag;
 
+    let Some(py) = python() else { return };
     let path = tmp("sohm");
-    let types = type_flag(MSG_DATATYPE).unwrap() | type_flag(MSG_DATASPACE).unwrap();
+    let types = type_flag(MSG_DATATYPE).unwrap()
+        | type_flag(MSG_DATASPACE).unwrap()
+        | type_flag(MSG_ATTRIBUTE).unwrap();
     let file = H5File::options()
         .libver(LibverBound::Earliest)
         .shared_messages(&[(types, 0)], 50, 40)
         .create(&path)
         .unwrap();
-    file.new_dataset::<i32>()
-        .shape([4])
-        .create("alpha")
-        .unwrap()
-        .write_raw(&[1i32, 2, 3, 4])
-        .unwrap();
+    for name in ["alpha", "beta"] {
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([4])
+            .chunk(&[2])
+            .create(name)
+            .unwrap();
+        ds.write_raw(&[1i32, 2, 3, 4]).unwrap();
+        ds.new_attr::<f64>()
+            .shape(())
+            .create("gain")
+            .unwrap()
+            .write_numeric(&2.5f64)
+            .unwrap();
+    }
+    file.create_group("inner").unwrap();
     file.close().unwrap();
 
-    assert_eq!(superblock_version(&path), 2);
-    assert!(contains(&path, b"OHDR"), "version-2 object headers");
+    assert_eq!(
+        superblock_version(&path),
+        2,
+        "the extension needs version 2"
+    );
+    for magic in [b"HEAP", b"SNOD", b"TREE"] {
+        assert!(
+            contains(&path, magic),
+            "{} is missing from a symbol-table file",
+            String::from_utf8_lossy(magic)
+        );
+    }
+    // `no_newer_structures` is not the probe here: the shared-message table
+    // keeps its own fractal heap, so `FRHP` is in this file legitimately and
+    // the version-2 headers put `OHDR` in it too. What each group stores is
+    // read from the group instead, below and through h5py.
+    let bytes = std::fs::read(&path).unwrap();
+    let sb = SuperblockV2V3::decode(&bytes).unwrap();
+    let root = sb.root_group_object_header_address as usize;
+    assert_eq!(&bytes[root..root + 4], b"OHDR", "version-2 object header");
+    let stab = sohm_symbol_table_of(&bytes, root);
+    let (btree_addr, heap_addr) = stab.expect("the root keeps its links in a symbol table");
+
+    // The dataset the root's symbol table names: its header is version 2 for
+    // the same reason the root's is, but its data layout message — a class no
+    // index here shares, so it is still in the header to read — is the version
+    // 3 `H5O_layout_ver_bounds` gives the earliest bound, over the version-1
+    // B-tree that version's only chunk index. A file that had followed its
+    // superblock into the modern generation would have version 4 here and one
+    // of the v1.10 indexes behind it.
+    let obj = sohm_named(&bytes, btree_addr, heap_addr, "alpha");
+    assert_eq!(&bytes[obj..obj + 4], b"OHDR", "version-2 object header");
+    let (header, _) = ObjectHeader::decode_any(&bytes[obj..]).unwrap();
+    let layout = header
+        .messages
+        .iter()
+        .find(|m| m.msg_type == MSG_DATA_LAYOUT)
+        .expect("a dataset carries a data layout message");
+    assert_eq!(layout.data[0], 3, "version-3 data layout message");
+
+    // The subgroup answers to the bound too, not to the superblock its
+    // sibling's shared messages raised.
+    let inner = sohm_named(&bytes, btree_addr, heap_addr, "inner");
+    assert!(
+        sohm_symbol_table_of(&bytes, inner).is_some(),
+        "a group created at the earliest bound keeps a symbol table"
+    );
+
+    read_with_h5py(
+        py,
+        &path,
+        "assert sorted(f.keys()) == ['alpha', 'beta', 'inner'], sorted(f.keys())\n\
+         assert list(f['alpha'][...]) == [1, 2, 3, 4]\n\
+         assert f['beta'].attrs['gain'] == 2.5\n\
+         import h5py\n\
+         for p in ['/', '/inner']:\n\
+         \x20   present = h5py.h5o.get_info(f[p].id).hdr.mesg.present\n\
+         \x20   assert present & (1 << 0x11), p\n",
+    );
+    libhdf5_tools_accept(py, &path);
     let _ = std::fs::remove_file(&path);
+}
+
+/// The Symbol Table message of the object header at `addr`: the B-tree and
+/// local heap it names, or `None` when the header keeps its links elsewhere.
+fn sohm_symbol_table_of(bytes: &[u8], addr: usize) -> Option<(u64, u64)> {
+    let (header, _) = ObjectHeader::decode_any(&bytes[addr..]).unwrap();
+    let msg = header
+        .messages
+        .iter()
+        .find(|m| m.msg_type == MSG_SYMBOL_TABLE)?;
+    let addr_at = |at: usize| u64::from_le_bytes(msg.data[at..at + 8].try_into().unwrap());
+    Some((addr_at(0), addr_at(8)))
+}
+
+/// The object header address the symbol table `(btree_addr, heap_addr)` gives
+/// `name`. A version-2 superblock records no "K" ranks, so the node widths are
+/// the library defaults `H5G_CRT_BTREE_RANK` sets.
+fn sohm_named(bytes: &[u8], btree_addr: u64, heap_addr: u64, name: &str) -> usize {
+    let cfg = BTreeV1Config::default();
+    let heap = LocalHeapHeader::decode(&bytes[heap_addr as usize..], 8, 8).unwrap();
+    let data = heap.data_addr as usize;
+    let heap_data = &bytes[data..data + heap.data_size as usize];
+    let node =
+        BTreeV1Node::decode(&bytes[btree_addr as usize..], 8, 8, cfg.snode_max_entries()).unwrap();
+    assert_eq!(node.level, 0, "this group fits in a leaf");
+    node.children
+        .iter()
+        .flat_map(|&child| {
+            SymbolTableNode::decode(&bytes[child as usize..], 8, 8, cfg.sym_leaf_max_entries())
+                .unwrap()
+                .entries
+        })
+        .find(|e| local_heap_get_string(heap_data, e.name_offset).unwrap() == name)
+        .unwrap_or_else(|| panic!("no '{name}' in the symbol table"))
+        .obj_header_addr as usize
 }
 
 /// A virtual dataset raises its own layout message to version 4 and takes

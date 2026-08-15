@@ -3571,25 +3571,35 @@ impl Hdf5Writer {
         let ctx = FormatContext::default_v3();
 
         // `H5F_LIBVER_EARLIEST` is the one bound under which libhdf5 writes
-        // the classic generation — the version-0 superblock row of
-        // `HDF5_superblock_ver_bounds`, and with it the version-1 rows of
-        // every message-version table and the symbol-table group form
-        // (`H5G__obj_create_real`). Shared object header messages are the one
-        // thing that overrides it: their master table lives in a superblock
-        // extension, which only a version-2 superblock has, so
-        // `H5F__super_init` raises such a file to version 2 whatever the low
-        // bound says (H5Fsuper.c:1135) — and this crate's version-2 files are
-        // the ones that can hold the table.
-        let classic = libver == Some(LibverBound::Earliest) && shared_messages.specs().is_empty();
+        // the classic generation — the version-1 rows of every
+        // message-version table, the symbol-table group form
+        // (`H5G__obj_create_real`, H5Gobj.c:179) and the version-0 superblock
+        // row of `HDF5_superblock_ver_bounds`.
+        //
+        // Shared object header messages move the last of those three and
+        // nothing else. Their master table lives in a superblock extension,
+        // which only a version-2 superblock has, so `H5F__super_init` raises
+        // the superblock to version 2 whatever the low bound says
+        // (H5Fsuper.c:1135) — but it does not touch `H5F_LOW_BOUND`, which is
+        // what every other rule reads. So such a file is a version-2
+        // superblock over symbol-table groups and version-1 messages, which
+        // is what the `tests/fixtures/sohm_*.h5` files libhdf5 itself wrote
+        // are.
+        let classic = libver == Some(LibverBound::Earliest);
         let legacy = classic.then(|| Box::new(LegacyFile::created(ctx, userblock)));
+        let superblock_version_base = if classic && shared_messages.specs().is_empty() {
+            SUPERBLOCK_V0
+        } else {
+            SUPERBLOCK_V2
+        };
 
         // Reserve the superblock at offset 0. Which version it gets is only
         // known once the file's content is (see `superblock_version_for`),
-        // but the two a non-classic file can reach — 2 and 3 — encode to the
-        // same size, so the reservation does not have to wait for that choice.
+        // but the two a version-2 file can reach — 2 and 3 — encode to the
+        // same size, so the reservation follows the base version alone.
         let superblock_size = match legacy.as_deref() {
-            Some(l) => l.superblock.encoded_size(),
-            None => SuperblockV2V3::size_for(ctx.sizeof_addr),
+            Some(l) if superblock_version_base < SUPERBLOCK_V2 => l.superblock.encoded_size(),
+            _ => SuperblockV2V3::size_for(ctx.sizeof_addr),
         };
         let allocator = FileAllocator::new(superblock_size as u64);
 
@@ -3615,11 +3625,7 @@ impl Hdf5Writer {
             // A new file starts at the oldest superblock the generation it was
             // created in allows, and finalize raises it if the content needs a
             // newer one.
-            superblock_version_base: if classic {
-                SUPERBLOCK_V0
-            } else {
-                SUPERBLOCK_V2
-            },
+            superblock_version_base,
             dense_attributes: Slot::new(HashMap::new()),
             dense_links: Slot::new(HashMap::new()),
             superseded_dense: Slot::new(None),
@@ -13329,9 +13335,12 @@ impl Hdf5Writer {
     /// `super_vers = MAX(super_vers, HDF5_superblock_ver_bounds[low_bound])`,
     /// with the bounds table reading 0, 2, 3, 3, 3, 3, 3 for EARLIEST, V18,
     /// V110, V112, V114, V200, LATEST (H5Fsuper.c:68, :1128-1154). A file
-    /// created at `H5F_LIBVER_EARLIEST` takes the version-0 entry directly
-    /// (`superblock_version_base`, and the classic branch below); for every
-    /// other file the bound is read back from what this crate writes:
+    /// created at `H5F_LIBVER_EARLIEST` takes that bound's entry directly
+    /// (`superblock_version_base`, and the classic branch below) — version 0,
+    /// or version 2 when the file carries shared messages, whose master table
+    /// needs the superblock extension only a version-2 superblock has
+    /// (H5Fsuper.c:1135). For every other file the bound is read back from
+    /// what this crate writes:
     ///
     /// * The floor is `H5F_LIBVER_V18`, hence version 2. Every group such a
     ///   file holds is a link-message group, which libhdf5 only writes at a
@@ -13355,12 +13364,13 @@ impl Hdf5Writer {
     fn superblock_version_for(&self, flags: u8) -> u8 {
         if self.is_legacy() {
             // A classic file keeps the version it started at — 0 for one this
-            // writer created at the earliest bound, whatever it held for one
-            // it reopened. Nothing a session can add reaches past that: its
-            // objects get version-1 headers and symbol-table links, its
-            // chunked datasets the version-1 B-tree behind a version-3 layout
-            // message, and the two features that would raise the bound — SWMR
-            // and the 2.0 format — are refused where the caller asks for them.
+            // writer created at the earliest bound, 2 for one whose shared
+            // messages needed the extension, whatever it held for one it
+            // reopened. Nothing a session can add reaches past that: its
+            // objects get symbol-table links, its chunked datasets the
+            // version-1 B-tree behind a version-3 layout message, and the two
+            // features that would raise the bound — SWMR and the 2.0 format —
+            // are refused where the caller asks for them.
             return self.superblock_version_base;
         }
         let mut version = self
@@ -13410,14 +13420,21 @@ impl Hdf5Writer {
         // the file truncated when `eof + base_addr < stored_eof` (:573). The
         // allocator counts in the based space, so the userblock is added back.
         let eof = self.allocator.eof() + base;
-        if let Some(legacy) = self.legacy.as_deref() {
+        let version = self.superblock_version_for(flags);
+        // Which of the two images is written follows the version, not the
+        // generation: a classic file carrying shared messages is a version-2
+        // superblock over version-1 messages and symbol-table groups
+        // (H5Fsuper.c:1135), and only the version-2/3 image has the extension
+        // address that table is reached through. Below version 2 the file is
+        // always a classic one — the other branch floors at 2.
+        if let Some(legacy) = self.legacy.as_deref().filter(|_| version < SUPERBLOCK_V2) {
             // Re-emitted, not rebuilt: the "K" ranks, the userblock size and
             // the driver info address are recorded nowhere else in the file,
             // and every node width in it is derived from the ranks. Only the
             // three things this session can have changed are recomputed.
             let root_stab = legacy.written.lock().get(&LinkScope::Root).copied();
             let mut sb = legacy.superblock.clone();
-            sb.version = self.superblock_version_for(flags);
+            sb.version = version;
             sb.file_consistency_flags = flags as u32;
             sb.end_of_file_address = eof;
             sb.root_symbol_table_entry.obj_header_addr = root_addr;
@@ -13439,7 +13456,7 @@ impl Hdf5Writer {
             return Ok(());
         }
         let sb = SuperblockV2V3 {
-            version: self.superblock_version_for(flags),
+            version,
             sizeof_offsets: self.ctx.sizeof_addr,
             sizeof_lengths: self.ctx.sizeof_size,
             file_consistency_flags: flags,
