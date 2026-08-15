@@ -752,3 +752,45 @@ fn a_classic_file_survives_two_appends_in_a_row() {
     libhdf5_tools_accept(py, &path);
     let _ = std::fs::remove_file(&path);
 }
+
+/// The edge-write cap reaches the classic index too. A chunk write addressed
+/// by coordinates grows the dataspace to cover the chunk, and the last chunk
+/// of a dimension normally hangs past the extent — 10 elements in chunks of 4
+/// end at 12 — so the growth is capped at the declared maximum. The version-1
+/// B-tree takes any shape and so reaches that extend, unlike the fixed-array
+/// and implicit indexes, which return before it.
+#[test]
+fn a_classic_edge_chunk_written_by_coordinates_keeps_the_extent() {
+    let Some(py) = python() else { return };
+    let path = tmp("edge_chunk");
+    write_default_h5py(py, &path, "f['alpha'] = np.arange(3, dtype='<i4')\n");
+
+    let file = H5File::open_rw(&path).unwrap();
+    let ds = file
+        .new_dataset::<i32>()
+        .shape([10, 7])
+        .chunk(&[4, 4])
+        .create("plane")
+        .unwrap();
+    // Chunk row 2 spans elements 8..12 of a dimension that stops at 10, and
+    // chunk column 1 spans 4..8 of one that stops at 7.
+    let chunk: Vec<u8> = (0i32..16).flat_map(|v| v.to_le_bytes()).collect();
+    ds.write_chunk_at(&[2, 1], &chunk).unwrap();
+    assert_eq!(ds.shape(), vec![10, 7]);
+    file.close().unwrap();
+
+    assert_eq!(superblock_version(&path), 0);
+    read_with_h5py(
+        py,
+        &path,
+        "d = f['plane']\n\
+         assert d.shape == (10, 7), d.shape\n\
+         assert d.chunks == (4, 4), d.chunks\n\
+         assert list(d[8, 4:7]) == [0, 1, 2], list(d[8, 4:7])\n\
+         assert list(d[9, 4:7]) == [4, 5, 6], list(d[9, 4:7])\n\
+         info = h5py.h5o.get_info(d.id)\n\
+         assert info.hdr.version == 1, info.hdr.version\n",
+    );
+    libhdf5_tools_accept(py, &path);
+    let _ = std::fs::remove_file(&path);
+}

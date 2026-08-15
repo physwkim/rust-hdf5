@@ -4089,6 +4089,114 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    // The cap is in `write_chunk_at_inner`, so it belongs to every chunk index
+    // whose write reaches the extend below it — the v2 B-tree as much as the
+    // extensible array. A rank-3 dataset with two unlimited dimensions gets
+    // that index, and its third, fixed dimension is where the last chunk
+    // overhangs. (The fixed array and the implicit index return before the
+    // extend: their shape cannot grow at all. The version-1 B-tree does reach
+    // it — `tests/legacy_append.rs` carries that case, which needs a classic
+    // file.)
+    #[test]
+    fn the_edge_write_cap_holds_for_the_v2_btree_index() {
+        let path = temp_path("edge_chunk_bt2");
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([10usize, 4, 4])
+            .max_shape(&[Some(10), None, None])
+            .chunk(&[4, 4, 4])
+            .create("cube")
+            .unwrap();
+        let chunk: Vec<u8> = (0i32..64).flat_map(|v| v.to_le_bytes()).collect();
+        // Chunk plane 2 spans elements 8..12 of a dimension that stops at 10.
+        ds.write_chunk_at(&[2, 0, 0], &chunk).unwrap();
+        assert_eq!(ds.shape(), vec![10, 4, 4]);
+        file.close().unwrap();
+
+        let file = H5File::open(&path).unwrap();
+        let back = file.dataset("cube").unwrap().read_raw::<i32>().unwrap();
+        assert_eq!(back.len(), 160);
+        // Rows 8 and 9 of the written plane, 16 elements each.
+        assert_eq!(&back[128..160], &(0i32..32).collect::<Vec<_>>()[..]);
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // The cap guards a chunk-coordinate write, and neither an externally
+    // stored nor a virtual dataset has chunk coordinates to guard: both are
+    // contiguous storage classes, refused at build together with chunked
+    // storage, and `write_chunk_at` refuses what is not chunked. So the path
+    // the case above exercises cannot be entered for either — asserted here
+    // rather than left to inspection, since both classes route their raw bytes
+    // through the same writer as the chunk grid does.
+    #[test]
+    fn an_external_or_virtual_dataset_never_reaches_the_edge_write_cap() {
+        use crate::Selection;
+        let dir = std::env::temp_dir().join(format!(
+            "rust_hdf5_edge_cap_{}_{}",
+            std::process::id(),
+            temp_path("x").file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("edge_cap.h5");
+        let file = H5File::create(&path).unwrap();
+        let payload = dir.join("payload.raw");
+
+        // Chunked storage and these two are mutually exclusive at build.
+        for (which, res) in [
+            (
+                "external",
+                file.new_dataset::<i32>()
+                    .shape([10usize])
+                    .external(&[(payload.to_str().unwrap(), 0, 40)])
+                    .chunk(&[4])
+                    .create("a"),
+            ),
+            (
+                "virtual",
+                file.new_dataset::<i32>()
+                    .shape([10usize])
+                    .virtual_mapping(Selection::All, "src.h5", "src", Selection::All)
+                    .chunk(&[4])
+                    .create("b"),
+            ),
+        ] {
+            match res {
+                Ok(_) => panic!("a {which} dataset cannot also be chunked"),
+                Err(e) => assert!(e.to_string().contains("chunked"), "{which}: {e}"),
+            }
+        }
+
+        // And the coordinate write itself is refused on both, with the extent
+        // left exactly where it was.
+        let ext = file
+            .new_dataset::<i32>()
+            .shape([10usize])
+            .external(&[(payload.to_str().unwrap(), 0, 40)])
+            .create("outside")
+            .unwrap();
+        let vds = file
+            .new_dataset::<i32>()
+            .shape([10usize])
+            .virtual_mapping(Selection::All, "src.h5", "src", Selection::All)
+            .create("elsewhere")
+            .unwrap();
+        let chunk: Vec<u8> = (0i32..4).flat_map(|v| v.to_le_bytes()).collect();
+        for (which, ds) in [("external", &ext), ("virtual", &vds)] {
+            let err = ds.write_chunk_at(&[2], &chunk).unwrap_err().to_string();
+            assert!(err.contains("only for chunked datasets"), "{which}: {err}");
+            let err = ds
+                .write_chunk_raw_at(&[2], &chunk, 0)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("only for chunked datasets"), "{which}: {err}");
+            assert_eq!(ds.shape(), vec![10], "{which}");
+        }
+        file.close().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn write_raw_size_mismatch() {
         let path = temp_path("size_mismatch");
