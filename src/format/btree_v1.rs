@@ -299,6 +299,69 @@ pub struct ChunkKey {
     pub offsets: Vec<u64>,
 }
 
+impl ChunkKey {
+    /// The key describing the stored chunk whose grid position is `scaled`.
+    ///
+    /// `dims` is the *layout message's* chunk shape — `rank + 1` entries, the
+    /// last being the element size — because the key stores element offsets,
+    /// `scaled[u] * dims[u]` (`H5D__btree_encode_key`, H5Dbtree.c). A stored
+    /// chunk begins at element 0 of its own footprint, so the element
+    /// dimension of `scaled` is 0 and this appends it rather than asking the
+    /// caller for it.
+    pub fn for_chunk(scaled: &[u64], dims: &[u64], chunk_size: u32, filter_mask: u32) -> Self {
+        let mut offsets: Vec<u64> = scaled
+            .iter()
+            .zip(dims)
+            .map(|(&s, &d)| s.saturating_mul(d))
+            .collect();
+        offsets.push(0);
+        Self {
+            chunk_size,
+            filter_mask,
+            offsets,
+        }
+    }
+
+    /// The right-boundary key closing a tree whose greatest chunk sits at
+    /// `scaled`: a zero-width chunk one element-size past it.
+    ///
+    /// A v1 B-tree stores both bounds of every child, and a search descends
+    /// only where `lt_key <= target < rt_key` under the *lexicographic* order
+    /// of `H5VM_vector_cmp_u` (H5VMprivate.h). Moving the element dimension —
+    /// the least significant one, and 0 for every stored chunk — on by one is
+    /// what makes the greatest chunk fall inside its own node instead of past
+    /// its right bound; libhdf5 reaches the same key from the other side, by
+    /// setting `scaled + 1` when it opens a node (`H5D__btree_new_node`) and
+    /// leaving it alone for every insert that lands within the bound.
+    pub fn right_bound(scaled: &[u64], dims: &[u64]) -> Self {
+        let mut offsets: Vec<u64> = scaled
+            .iter()
+            .zip(dims)
+            .map(|(&s, &d)| s.saturating_mul(d))
+            .collect();
+        offsets.push(*dims.last().unwrap_or(&0));
+        Self {
+            chunk_size: 0,
+            filter_mask: 0,
+            offsets,
+        }
+    }
+
+    /// Encoded width of one key for a chunk of the given `rank` (excluding
+    /// the trailing element-size dimension).
+    fn encoded_size(rank: usize) -> usize {
+        4 + 4 + (rank + 1) * 8
+    }
+
+    fn encode_into(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.chunk_size.to_le_bytes());
+        buf.extend_from_slice(&self.filter_mask.to_le_bytes());
+        for &o in &self.offsets {
+            buf.extend_from_slice(&o.to_le_bytes());
+        }
+    }
+}
+
 /// A decoded raw-data-chunk (type-1) B-tree v1 node.
 #[derive(Debug, Clone)]
 pub struct ChunkBTreeV1Node {
@@ -307,6 +370,10 @@ pub struct ChunkBTreeV1Node {
     pub level: u8,
     /// Number of entries (children) used in this node.
     pub entries_used: u16,
+    /// Address of the left sibling at the same level, or `UNDEF_ADDR`.
+    pub left_sibling: u64,
+    /// Address of the right sibling at the same level, or `UNDEF_ADDR`.
+    pub right_sibling: u64,
     /// Keys, `entries_used + 1` of them. `keys[i]` describes `children[i]`;
     /// the final key is the right-boundary key.
     pub keys: Vec<ChunkKey>,
@@ -315,6 +382,72 @@ pub struct ChunkBTreeV1Node {
 }
 
 impl ChunkBTreeV1Node {
+    /// Encode this type-1 (raw data chunk) node into exactly `node_size`
+    /// bytes.
+    ///
+    /// Like every v1 B-tree node this is a fixed-size record whose width comes
+    /// from the file's "K" value ([`BTreeV1Config::chunk_btree_node_size`])
+    /// however few entries it uses; the slots past `entries_used` are zeroed.
+    /// The chunk rank comes from the keys themselves, which all describe the
+    /// same dataset and so are all the same width.
+    pub fn encode(&self, node_size: usize, sizeof_addr: usize) -> FormatResult<Vec<u8>> {
+        if self.keys.len() != self.children.len() + 1 {
+            return Err(FormatError::InvalidData(format!(
+                "chunk B-tree v1 node has {} keys for {} children; a v1 node stores \
+                 both bounds of every child, so it needs exactly one more key than \
+                 children",
+                self.keys.len(),
+                self.children.len()
+            )));
+        }
+        if self.entries_used as usize != self.children.len() {
+            return Err(FormatError::InvalidData(format!(
+                "chunk B-tree v1 node declares {} entries but carries {} children",
+                self.entries_used,
+                self.children.len()
+            )));
+        }
+        // `keys[0]` always exists: a node with no children still carries its
+        // right boundary.
+        let key_size = self.keys[0].offsets.len() * 8 + 8;
+        if let Some(k) = self
+            .keys
+            .iter()
+            .find(|k| k.offsets.len() * 8 + 8 != key_size)
+        {
+            return Err(FormatError::InvalidData(format!(
+                "chunk B-tree v1 node mixes keys of {} and {} offsets; every key in \
+                 one tree describes the same dataset",
+                self.keys[0].offsets.len(),
+                k.offsets.len()
+            )));
+        }
+        let needed =
+            8 + 2 * sizeof_addr + self.children.len() * sizeof_addr + self.keys.len() * key_size;
+        if needed > node_size {
+            return Err(FormatError::InvalidData(format!(
+                "chunk B-tree v1 node needs {needed} bytes for {} children, more than \
+                 the {node_size}-byte record the file's 'K' value allows",
+                self.children.len()
+            )));
+        }
+
+        let mut buf = Vec::with_capacity(node_size);
+        buf.extend_from_slice(&BTREE_V1_SIGNATURE);
+        buf.push(1);
+        buf.push(self.level);
+        buf.extend_from_slice(&self.entries_used.to_le_bytes());
+        buf.extend_from_slice(&self.left_sibling.to_le_bytes()[..sizeof_addr]);
+        buf.extend_from_slice(&self.right_sibling.to_le_bytes()[..sizeof_addr]);
+        for (i, &child) in self.children.iter().enumerate() {
+            self.keys[i].encode_into(&mut buf);
+            buf.extend_from_slice(&child.to_le_bytes()[..sizeof_addr]);
+        }
+        self.keys[self.children.len()].encode_into(&mut buf);
+        buf.resize(node_size, 0);
+        Ok(buf)
+    }
+
     /// Decode a type-1 (raw data chunk) B-tree v1 node from `buf`.
     ///
     /// `rank` is the chunk rank *excluding* the trailing element-size
@@ -355,13 +488,15 @@ impl ChunkBTreeV1Node {
             )));
         }
 
-        // Skip the signature/type/level/entries header plus the two
-        // sibling pointers.
-        let mut pos = 8 + sizeof_addr * 2;
+        let mut pos = 8;
+        let left_sibling = read_addr(&buf[pos..], sizeof_addr);
+        pos += sizeof_addr;
+        let right_sibling = read_addr(&buf[pos..], sizeof_addr);
+        pos += sizeof_addr;
 
         let n = entries_used as usize;
         // Each chunk key: chunk_size(4) + filter_mask(4) + (rank+1)*8.
-        let key_size = 4 + 4 + (rank + 1) * 8;
+        let key_size = ChunkKey::encoded_size(rank);
         // Interleaved: key[0] child[0] ... key[n-1] child[n-1] key[n].
         let data_size = (n + 1) * key_size + n * sizeof_addr;
         let needed = pos + data_size;
@@ -402,10 +537,221 @@ impl ChunkBTreeV1Node {
         Ok(ChunkBTreeV1Node {
             level,
             entries_used,
+            left_sibling,
+            right_sibling,
             keys,
             children,
         })
     }
+}
+
+/// A bulk-loaded version-1 chunk B-tree: every node laid out in the order it
+/// will be written, with the child pointers of the internal levels still node
+/// *indices* — the file addresses are only known once the caller hands over a
+/// pool of blocks.
+///
+/// A bulk load rather than a sequence of inserts, the same choice
+/// `write_stab` makes for symbol tables: the writer holds every chunk record
+/// in memory anyway, and a tree built from all of them at once needs neither
+/// the split machinery of `H5B__insert_helper` nor the node-level bookkeeping
+/// that goes with it. The result is a tree of uniform depth whose keys mean
+/// exactly what libhdf5's mean, which is what its search requires; the *fill*
+/// of the nodes differs from what a series of inserts would leave, and
+/// nothing reads that.
+pub struct ChunkBTreeV1Tree {
+    /// Level 0 left to right, then level 1, and so on; the root is last.
+    nodes: Vec<TreeNode>,
+    /// Byte width of every node, from the file's "K" value and the rank.
+    node_size: usize,
+    sizeof_addr: usize,
+}
+
+/// One node of a [`ChunkBTreeV1Tree`] before its children have addresses.
+struct TreeNode {
+    level: u8,
+    /// `children + 1` keys: the left bound of every child, then the right
+    /// bound of the last.
+    keys: Vec<ChunkKey>,
+    children: TreeChildren,
+    /// Same-level neighbours, as indices into [`ChunkBTreeV1Tree::nodes`].
+    left: Option<usize>,
+    right: Option<usize>,
+}
+
+/// What a node's child pointers name, which depends on its level rather than
+/// on the value in the slot — so the two are separate variants and no address
+/// can be read as an index.
+enum TreeChildren {
+    /// Level 0: the chunk data addresses themselves.
+    Chunks(Vec<u64>),
+    /// Above level 0: indices into [`ChunkBTreeV1Tree::nodes`].
+    Nodes(Vec<usize>),
+}
+
+impl TreeChildren {
+    fn len(&self) -> usize {
+        match self {
+            Self::Chunks(v) => v.len(),
+            Self::Nodes(v) => v.len(),
+        }
+    }
+}
+
+impl ChunkBTreeV1Tree {
+    /// Bulk-load a tree over `entries` — one `(key, chunk address)` pair per
+    /// stored chunk, in ascending key order — closed on the right by
+    /// `end_key` ([`ChunkKey::right_bound`]).
+    ///
+    /// Each level's children are spread evenly over that level's nodes, none
+    /// holding more than the `2 * K` entries the file's "K" value allows. A
+    /// node's keys are the first key of each child's subtree plus the first
+    /// key of whatever follows the node — `end_key` for the rightmost node of
+    /// every level — which is the invariant `H5B__find` bisects on.
+    ///
+    /// An empty index builds no nodes at all: libhdf5 leaves the layout
+    /// message's address undefined until the first chunk is inserted, and
+    /// [`root_address`](Self::root_address) says the same.
+    pub fn build(
+        entries: &[(ChunkKey, u64)],
+        end_key: ChunkKey,
+        config: &BTreeV1Config,
+        sizeof_addr: usize,
+    ) -> Self {
+        let rank = end_key.offsets.len().saturating_sub(1);
+        let node_size = config.chunk_btree_node_size(sizeof_addr, rank);
+        let cap = (config.chunk_max_entries() as usize).max(1);
+        let mut nodes: Vec<TreeNode> = Vec::new();
+
+        if !entries.is_empty() {
+            // Level 0: the chunks themselves.
+            let mut level_range = spread(entries.len(), cap)
+                .into_iter()
+                .scan(0usize, |start, m| {
+                    let range = *start..*start + m;
+                    *start += m;
+                    Some(range)
+                })
+                .map(|r| {
+                    let mut keys: Vec<ChunkKey> =
+                        entries[r.clone()].iter().map(|(k, _)| k.clone()).collect();
+                    keys.push(match entries.get(r.end) {
+                        Some((k, _)) => k.clone(),
+                        None => end_key.clone(),
+                    });
+                    TreeNode {
+                        level: 0,
+                        keys,
+                        children: TreeChildren::Chunks(
+                            entries[r].iter().map(|&(_, a)| a).collect(),
+                        ),
+                        left: None,
+                        right: None,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut level: u8 = 0;
+            loop {
+                let base = nodes.len();
+                let count = level_range.len();
+                for (i, mut node) in level_range.into_iter().enumerate() {
+                    node.left = (i > 0).then(|| base + i - 1);
+                    node.right = (i + 1 < count).then(|| base + i + 1);
+                    nodes.push(node);
+                }
+                if count == 1 {
+                    break;
+                }
+                // The level above indexes the one just pushed: each parent
+                // takes a run of children and repeats their first keys.
+                let children: Vec<usize> = (base..base + count).collect();
+                level += 1;
+                let mut start = 0usize;
+                level_range = spread(count, cap)
+                    .into_iter()
+                    .map(|m| {
+                        let run = &children[start..start + m];
+                        start += m;
+                        let mut keys: Vec<ChunkKey> =
+                            run.iter().map(|&c| nodes[c].keys[0].clone()).collect();
+                        keys.push(match children.get(start) {
+                            Some(&next) => nodes[next].keys[0].clone(),
+                            None => end_key.clone(),
+                        });
+                        TreeNode {
+                            level,
+                            keys,
+                            children: TreeChildren::Nodes(run.to_vec()),
+                            left: None,
+                            right: None,
+                        }
+                    })
+                    .collect();
+            }
+        }
+
+        Self {
+            nodes,
+            node_size,
+            sizeof_addr,
+        }
+    }
+
+    /// How many node-size blocks this tree needs.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Byte width of every one of those blocks.
+    pub fn node_size(&self) -> usize {
+        self.node_size
+    }
+
+    /// The root's address given the block pool — the address the version-3
+    /// data layout message carries — or `UNDEF_ADDR` for an empty index.
+    pub fn root_address(&self, addrs: &[u64]) -> u64 {
+        match self.nodes.len() {
+            0 => crate::format::UNDEF_ADDR,
+            n => addrs[n - 1],
+        }
+    }
+
+    /// Serialize every node to a [`node_size`](Self::node_size)-byte image,
+    /// in [`build`](Self::build) order. `addrs[i]` is the address assigned to
+    /// node `i`; entries past the node count are ignored, so a caller may
+    /// pass a longer pool.
+    pub fn encode(&self, addrs: &[u64]) -> FormatResult<Vec<Vec<u8>>> {
+        let sibling = |i: Option<usize>| i.map_or(crate::format::UNDEF_ADDR, |j| addrs[j]);
+        self.nodes
+            .iter()
+            .map(|n| {
+                let children = match &n.children {
+                    TreeChildren::Chunks(v) => v.clone(),
+                    TreeChildren::Nodes(v) => v.iter().map(|&j| addrs[j]).collect(),
+                };
+                ChunkBTreeV1Node {
+                    level: n.level,
+                    entries_used: n.children.len() as u16,
+                    left_sibling: sibling(n.left),
+                    right_sibling: sibling(n.right),
+                    keys: n.keys.clone(),
+                    children,
+                }
+                .encode(self.node_size, self.sizeof_addr)
+            })
+            .collect()
+    }
+}
+
+/// Split `n` items over the fewest nodes of capacity `cap`, as evenly as the
+/// count allows: the fewest nodes first, then the remainder one item at a
+/// time to the leftmost nodes.
+fn spread(n: usize, cap: usize) -> Vec<usize> {
+    let k = n.div_ceil(cap);
+    if k == 0 {
+        return Vec::new();
+    }
+    let (base, extra) = (n / k, n % k);
+    (0..k).map(|i| base + usize::from(i < extra)).collect()
 }
 
 // ======================================================================= tests
@@ -790,6 +1136,161 @@ mod tests {
         assert!(matches!(
             node.encode(cfg.snode_btree_node_size(8, 8), 8, 8)
                 .unwrap_err(),
+            FormatError::InvalidData(_)
+        ));
+    }
+
+    /// Bulk-load the tree of `nchunks` chunks of a 1-D dataset chunked at
+    /// `chunk` elements of `elem` bytes, the shape `gen_chunkidx_btree1`
+    /// writes: chunk *i* lives at `0x1000 + i * chunk * elem`.
+    fn dense_1d_tree(nchunks: u64, chunk: u64, elem: u64, cfg: &BTreeV1Config) -> ChunkBTreeV1Tree {
+        let dims = [chunk, elem];
+        let nbytes = (chunk * elem) as u32;
+        let entries: Vec<(ChunkKey, u64)> = (0..nchunks)
+            .map(|i| {
+                (
+                    ChunkKey::for_chunk(&[i], &dims, nbytes, 0),
+                    0x1000 + i * chunk * elem,
+                )
+            })
+            .collect();
+        let end = ChunkKey::right_bound(&[nchunks - 1], &dims);
+        ChunkBTreeV1Tree::build(&entries, end, cfg, 8)
+    }
+
+    /// The tree libhdf5 writes for a two-chunk 1-D dataset, key for key: the
+    /// chunk keys carry element offsets (`scaled * chunk_dim`) and a stored
+    /// size, and the right boundary is a zero-width chunk one element-size
+    /// past the last one. Taken from a file h5py wrote at `libver='earliest'`.
+    #[test]
+    fn a_bulk_loaded_chunk_tree_keys_the_way_libhdf5_does() {
+        let cfg = BTreeV1Config::default();
+        let tree = dense_1d_tree(2, 4, 4, &cfg);
+        assert_eq!(tree.node_count(), 1);
+        assert_eq!(tree.node_size(), cfg.chunk_btree_node_size(8, 1));
+
+        let addrs = [0x578u64];
+        let images = tree.encode(&addrs).unwrap();
+        let node = ChunkBTreeV1Node::decode(&images[0], 8, 1, cfg.chunk_max_entries()).unwrap();
+        assert_eq!(images[0].len(), tree.node_size());
+        assert_eq!(node.level, 0);
+        assert_eq!(node.entries_used, 2);
+        assert_eq!(node.children, vec![0x1000, 0x1010]);
+        assert_eq!(node.left_sibling, UNDEF_ADDR);
+        assert_eq!(node.right_sibling, UNDEF_ADDR);
+        let offsets: Vec<&[u64]> = node.keys.iter().map(|k| k.offsets.as_slice()).collect();
+        assert_eq!(offsets, vec![&[0, 0], &[4, 0], &[4, 4]]);
+        assert_eq!(
+            node.keys.iter().map(|k| k.chunk_size).collect::<Vec<_>>(),
+            vec![16, 16, 0]
+        );
+        assert_eq!(tree.root_address(&addrs), 0x578);
+    }
+
+    /// Past `2 * K` chunks the tree grows a level: the leaves hold every
+    /// chunk, the root repeats each leaf's first key, and the key that closes
+    /// one leaf is the key that opens the next — the invariant `H5B__find`
+    /// bisects on.
+    #[test]
+    fn a_bulk_loaded_chunk_tree_grows_a_level_past_2k() {
+        let cfg = BTreeV1Config::default();
+        let two_k = cfg.chunk_max_entries() as u64;
+        let nchunks = two_k * 3 + 1;
+        let tree = dense_1d_tree(nchunks, 4, 4, &cfg);
+        // Four leaves (the fourth holds the one chunk past three full ones)
+        // and one root above them.
+        assert_eq!(tree.node_count(), 5);
+
+        let addrs: Vec<u64> = (0..tree.node_count() as u64)
+            .map(|i| 0x1_0000 + i * 4096)
+            .collect();
+        let images = tree.encode(&addrs).unwrap();
+        let nodes: Vec<ChunkBTreeV1Node> = images
+            .iter()
+            .map(|img| ChunkBTreeV1Node::decode(img, 8, 1, cfg.chunk_max_entries()).unwrap())
+            .collect();
+
+        let (leaves, root) = nodes.split_at(4);
+        let root = &root[0];
+        assert!(leaves.iter().all(|n| n.level == 0));
+        assert_eq!(root.level, 1);
+        assert_eq!(root.entries_used, 4);
+        assert_eq!(root.children, addrs[..4]);
+        assert_eq!(root.left_sibling, UNDEF_ADDR);
+        assert_eq!(root.right_sibling, UNDEF_ADDR);
+
+        // Every chunk is in a leaf, and no leaf exceeds the file's rank.
+        assert_eq!(
+            leaves.iter().map(|n| n.entries_used as u64).sum::<u64>(),
+            nchunks
+        );
+        assert!(leaves.iter().all(|n| n.entries_used as u64 <= two_k));
+
+        // Leaves are doubly linked in key order, each one's closing key opens
+        // the next, and the root's keys are the leaves' opening keys.
+        for (i, leaf) in leaves.iter().enumerate() {
+            assert_eq!(
+                leaf.left_sibling,
+                if i == 0 { UNDEF_ADDR } else { addrs[i - 1] }
+            );
+            assert_eq!(
+                leaf.right_sibling,
+                if i + 1 == leaves.len() {
+                    UNDEF_ADDR
+                } else {
+                    addrs[i + 1]
+                }
+            );
+            assert_eq!(root.keys[i], leaf.keys[0]);
+            if let Some(next) = leaves.get(i + 1) {
+                assert_eq!(leaf.keys[leaf.keys.len() - 1], next.keys[0]);
+            }
+        }
+        // The right boundary of the whole tree closes both the last leaf and
+        // the root: one element-size past the last chunk, zero bytes wide.
+        let end = ChunkKey::right_bound(&[nchunks - 1], &[4, 4]);
+        assert_eq!(*leaves[3].keys.last().unwrap(), end);
+        assert_eq!(*root.keys.last().unwrap(), end);
+        assert_eq!(end.offsets, vec![(nchunks - 1) * 4, 4]);
+    }
+
+    /// An index with no chunks in it has no nodes at all, and says so with an
+    /// undefined root address — the state libhdf5 leaves a chunked dataset in
+    /// until its first chunk is written.
+    #[test]
+    fn an_empty_chunk_tree_has_no_root() {
+        let cfg = BTreeV1Config::default();
+        let tree = ChunkBTreeV1Tree::build(&[], ChunkKey::right_bound(&[0], &[4, 4]), &cfg, 8);
+        assert_eq!(tree.node_count(), 0);
+        assert!(tree.encode(&[]).unwrap().is_empty());
+        assert_eq!(tree.root_address(&[]), UNDEF_ADDR);
+    }
+
+    /// A node carrying more children than the file's "K" value allows would
+    /// overrun its own record, which the decoder on the other side refuses
+    /// outright — so the encoder refuses first.
+    #[test]
+    fn a_chunk_node_wider_than_its_record_is_refused() {
+        let node = ChunkBTreeV1Node {
+            level: 0,
+            entries_used: 2,
+            left_sibling: UNDEF_ADDR,
+            right_sibling: UNDEF_ADDR,
+            keys: (0..3)
+                .map(|i| ChunkKey::for_chunk(&[i], &[4, 4], 16, 0))
+                .collect(),
+            children: vec![0x100, 0x200],
+        };
+        assert!(matches!(
+            node.encode(64, 8).unwrap_err(),
+            FormatError::InvalidData(_)
+        ));
+        // A node whose key count does not match its children is refused for
+        // the same reason: a v1 node stores both bounds of every child.
+        let mut broken = node.clone();
+        broken.keys.pop();
+        assert!(matches!(
+            broken.encode(4096, 8).unwrap_err(),
             FormatError::InvalidData(_)
         ));
     }

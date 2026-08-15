@@ -109,10 +109,12 @@ EXPECTED_DEVIATIONS = [
         "field": "superblock",
         "ref": None,
         "rust": "3",
-        "why": "every chunked dataset this writer emits is indexed by a v1.10 "
-               "structure through a version-4 data layout message, which "
-               "H5O_layout_ver_bounds puts at the v1.10 bound and so at "
-               "superblock version 3, whatever bound the file asked for",
+        "why": "a chunked dataset in a file this writer created is indexed by "
+               "a v1.10 structure through a version-4 data layout message, "
+               "which H5O_layout_ver_bounds puts at the v1.10 bound and so at "
+               "superblock version 3, whatever bound the file asked for; the "
+               "version-1 B-tree is selected only when reopening a file that "
+               "already is in the classic format, where the bound cannot move",
     },
     {
         "id": "btree1-index-substituted",
@@ -123,7 +125,9 @@ EXPECTED_DEVIATIONS = [
                "this follows from superblock-v3-for-chunk-index: the file gets "
                "whichever v1.10 index its shape selects — the extensible array "
                "for one unlimited dimension, the single-chunk index for a "
-               "fixed shape covered by one chunk",
+               "fixed shape covered by one chunk. Every case here writes a new "
+               "file; a chunked dataset appended to a classic one does get the "
+               "version-1 B-tree (tests/legacy_append.rs)",
     },
     {
         "id": "new-style-groups-always",

@@ -681,8 +681,23 @@ impl<T: H5Type> DatasetBuilder<T> {
                 dims_u64.clone()
             };
 
-            // libhdf5 selects the chunk index from the dataspace and the
-            // creation properties, in this order
+            // A classic (version-0/1 superblock) file settles the question
+            // before the shape gets a say: every other index encodes as a
+            // version-4 data layout message, which such a file cannot carry,
+            // and the version-3 message it can carries a version-1 B-tree and
+            // nothing else. libhdf5 reaches the same place from the library
+            // bounds (`H5O_layout_ver_bounds`, H5Dlayout.c), which is what
+            // decides the layout version before `H5D__layout_set_latest_indexing`
+            // is consulted at all.
+            let classic_format = match &*borrow_inner(&self.file_inner) {
+                H5FileInner::Writer(writer) => writer.is_legacy(),
+                // Neither can create a dataset at all; the creator below
+                // reports which of the two it is.
+                _ => false,
+            };
+
+            // Otherwise libhdf5 selects the chunk index from the dataspace
+            // and the creation properties, in this order
             // (`H5D__layout_set_latest_indexing`, H5Dlayout.c): a v2 B-tree
             // for two or more unlimited dimensions, an extensible array for
             // exactly one, and for a fixed shape the implicit index when
@@ -697,7 +712,9 @@ impl<T: H5Type> DatasetBuilder<T> {
             // array, as it did before the implicit index existed.
             let n_unlimited = max_u64.iter().filter(|&&m| m == u64::MAX).count();
             let one_chunk = chunk_u64 == dims_u64 && max_u64 == dims_u64;
-            let kind = if n_unlimited >= 2 {
+            let kind = if classic_format {
+                ChunkIndexKind::BtreeV1
+            } else if n_unlimited >= 2 {
                 ChunkIndexKind::BtreeV2
             } else if n_unlimited == 1 {
                 ChunkIndexKind::ExtensibleArray
@@ -732,7 +749,16 @@ impl<T: H5Type> DatasetBuilder<T> {
                                 (false, level) => FilterPipeline::deflate(level.unwrap()),
                             }
                         };
-                        let idx = if kind == ChunkIndexKind::BtreeV2 {
+                        let idx = if kind == ChunkIndexKind::BtreeV1 {
+                            // The classic index, which takes the pipeline the
+                            // same way the others do — and is refused with it
+                            // in a classic file, whose filter pipeline
+                            // message is a version this crate does not write.
+                            let pipeline = wants_filter.then(explicit_pipeline);
+                            writer.create_btree_v1_dataset(
+                                &full_name, datatype, &dims_u64, &max_u64, &chunk_u64, pipeline,
+                            )?
+                        } else if kind == ChunkIndexKind::BtreeV2 {
                             // Two or more unlimited dimensions: a v2 B-tree,
                             // whose records carry the stored size and filter
                             // mask when the dataset is compressed (libhdf5
@@ -1659,20 +1685,18 @@ impl H5Dataset {
             coords
         };
 
-        if kind == ChunkIndexKind::BtreeV2 || kind == ChunkIndexKind::Implicit {
-            // Neither index has anything to batch: a v2 B-tree stores chunks
-            // verbatim (unfiltered only in this codebase) and the implicit
-            // index is unfiltered by definition, so there is no compression
-            // to parallelize. Write one chunk at a time.
+        if !matches!(
+            kind,
+            ChunkIndexKind::ExtensibleArray | ChunkIndexKind::FixedArray
+        ) {
+            // No batch entry point to use: only the two array indexes have
+            // one. Each chunk goes through the writer's single
+            // coordinate-addressed owner instead, one at a time.
             for linear in 0..total_chunks {
                 let coords = coords_of(linear);
                 let chunk_buf =
                     Self::gather_chunk(bytes, &dims, &chunk_dims, &coords, element_size);
-                if kind == ChunkIndexKind::BtreeV2 {
-                    writer.write_chunk_btree_v2_inner(index, &coords, &chunk_buf)?;
-                } else {
-                    writer.write_chunk_implicit_inner(index, &coords, &chunk_buf)?;
-                }
+                writer.write_chunk_at_coords(index, &coords, &chunk_buf)?;
             }
         } else {
             // Extensible array and fixed array both compress each chunk through
@@ -1823,16 +1847,15 @@ impl H5Dataset {
                         let cell = writer.ds(*index);
                         let _op = cell.op.lock();
                         match kind {
-                            // Both address a chunk by its grid coordinates,
-                            // so the linear slot is decoded back into them.
-                            ChunkIndexKind::FixedArray | ChunkIndexKind::Implicit => {
+                            // All three address a chunk by its grid
+                            // coordinates, so the linear slot is decoded back
+                            // into them.
+                            ChunkIndexKind::FixedArray
+                            | ChunkIndexKind::Implicit
+                            | ChunkIndexKind::BtreeV1 => {
                                 let coords =
                                     writer.chunk_coords_from_slot(*index, chunk_idx as u64)?;
-                                if kind == ChunkIndexKind::FixedArray {
-                                    writer.write_chunk_fixed_array_inner(*index, &coords, data)?;
-                                } else {
-                                    writer.write_chunk_implicit_inner(*index, &coords, data)?;
-                                }
+                                writer.write_chunk_at_coords(*index, &coords, data)?;
                             }
                             _ => writer.write_chunk_inner(*index, chunk_idx as u64, data)?,
                         }
@@ -1913,6 +1936,16 @@ impl H5Dataset {
                             // into row-major grid coordinates.
                             let coords = writer.chunk_coords_from_slot(*index, chunk_idx as u64)?;
                             writer.write_compressed_chunk_fixed_array_inner(
+                                *index,
+                                &coords,
+                                data,
+                                filter_mask,
+                            )?;
+                        } else if kind == ChunkIndexKind::BtreeV1 {
+                            // Same for the classic index, whose key carries a
+                            // stored size and a filter mask of its own.
+                            let coords = writer.chunk_coords_from_slot(*index, chunk_idx as u64)?;
+                            writer.write_compressed_chunk_btree_v1_inner(
                                 *index,
                                 &coords,
                                 data,
@@ -2118,6 +2151,22 @@ impl H5Dataset {
                         }
                         ChunkBytes::Prefiltered { data, filter_mask } => writer
                             .write_compressed_chunk_btree_v2_inner(
+                                *index,
+                                &coords,
+                                data,
+                                filter_mask,
+                            )?,
+                    }
+                } else if kind == ChunkIndexKind::BtreeV1 {
+                    // The classic index takes any shape, fixed or unlimited,
+                    // so it grows the dataspace with the chunk the way the v2
+                    // B-tree does — bounded below by the maximum extent.
+                    match bytes {
+                        ChunkBytes::Unfiltered(data) => {
+                            writer.write_chunk_btree_v1_inner(*index, &coords, data)?
+                        }
+                        ChunkBytes::Prefiltered { data, filter_mask } => writer
+                            .write_compressed_chunk_btree_v1_inner(
                                 *index,
                                 &coords,
                                 data,
