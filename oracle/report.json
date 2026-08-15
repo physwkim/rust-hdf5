@@ -4,7 +4,7 @@
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
   "python": "/home/stevek/micromamba/envs/tomo/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-integrator-385d5684-1/target/release/oracle_probe",
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-integrator2-70ef8082-1/target/release/oracle_probe",
   "cases": 91
  },
  "results": [
@@ -24,14 +24,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -139,7 +131,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -152,7 +144,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -184,14 +176,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -297,7 +281,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -310,7 +294,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -342,14 +326,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -455,7 +431,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -468,7 +444,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -500,14 +476,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -613,7 +581,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -626,7 +594,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -658,14 +626,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -771,7 +731,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -784,7 +744,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -816,14 +776,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -929,7 +881,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -942,7 +894,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -974,14 +926,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -1087,7 +1031,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -1100,7 +1044,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -1132,14 +1076,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -1245,7 +1181,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -1258,7 +1194,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -1290,14 +1226,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -1403,7 +1331,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -1416,7 +1344,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -1448,14 +1376,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -1561,7 +1481,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -1574,7 +1494,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -1606,14 +1526,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -1719,7 +1631,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -1732,7 +1644,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -1764,14 +1676,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -1877,7 +1781,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -1890,7 +1794,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -1922,14 +1826,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -2035,7 +1931,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -2048,7 +1944,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -2080,14 +1976,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -2193,7 +2081,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -2206,7 +2094,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -2238,14 +2126,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -2351,7 +2231,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -2364,7 +2244,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -2396,14 +2276,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -2509,7 +2381,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -2522,7 +2394,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -2554,14 +2426,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -2667,7 +2531,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -2680,7 +2544,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -2712,14 +2576,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -2825,7 +2681,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -2838,7 +2694,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -2870,14 +2726,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -2983,7 +2831,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -2996,7 +2844,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -3028,14 +2876,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -3141,7 +2981,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -3154,7 +2994,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -3186,14 +3026,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -3299,7 +3131,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -3312,7 +3144,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -3344,14 +3176,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -3457,7 +3281,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -3470,7 +3294,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -3502,14 +3326,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -3615,7 +3431,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -3628,7 +3444,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -3660,14 +3476,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -3773,7 +3581,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -3786,7 +3594,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -3816,14 +3624,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -3931,7 +3731,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -3944,7 +3744,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -3974,14 +3774,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -4089,7 +3881,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -4102,7 +3894,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -4132,14 +3924,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -4247,7 +4031,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -4275,14 +4059,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -4390,7 +4166,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -4403,7 +4179,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -4435,14 +4211,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -4548,7 +4316,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -4561,7 +4329,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -4593,14 +4361,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -4706,7 +4466,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -4719,7 +4479,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -4749,14 +4509,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -4864,7 +4616,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -4877,7 +4629,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -4907,14 +4659,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -5022,7 +4766,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -5035,7 +4779,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -5065,14 +4809,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -5284,7 +5020,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 20,
+    "matched": 21,
     "detail": ""
    },
    "b": {
@@ -5297,7 +5033,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -5334,14 +5070,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -5513,16 +5241,31 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 18,
+    "matched": 19,
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "UNSUPPORTED-API: region references need a selection serializer on the write side",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "metadata_diffs": [
+     {
+      "key": "#superblock",
+      "field": "superblock",
+      "ref": "0",
+      "rust": "2",
+      "expected": "superblock-floor-v2"
+     },
+     {
+      "key": "/#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
@@ -5541,14 +5284,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -5656,7 +5391,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -5669,7 +5404,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -5701,14 +5436,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -5814,7 +5541,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -5827,7 +5554,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -5845,7 +5572,7 @@
    "case": "named_datatype",
    "group": "dtype-composite",
    "note": "committed datatype object, and a dataset that shares it",
-   "rust_case": null,
+   "rust_case": "named_datatype",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -5857,14 +5584,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -6052,23 +5771,38 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 22,
+    "matched": 23,
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "metadata_diffs": [
+     {
+      "key": "#superblock",
+      "field": "superblock",
+      "ref": "0",
+      "rust": "2",
+      "expected": "superblock-floor-v2"
+     },
+     {
+      "key": "/#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
    "case": "layout_compact",
    "group": "layout",
    "note": "compact layout \u2014 data inside the object header",
-   "rust_case": null,
+   "rust_case": "layout_compact",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -6080,14 +5814,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -6195,16 +5921,31 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "metadata_diffs": [
+     {
+      "key": "#superblock",
+      "field": "superblock",
+      "ref": "0",
+      "rust": "2",
+      "expected": "superblock-floor-v2"
+     },
+     {
+      "key": "/#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
@@ -6225,14 +5966,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -6338,7 +6071,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -6351,7 +6084,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -6369,7 +6102,7 @@
    "case": "layout_contiguous_v110",
    "group": "layout",
    "note": "contiguous layout under v1.10 bounds \u2014 data layout message v4",
-   "rust_case": null,
+   "rust_case": "layout_contiguous_v110",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -6381,14 +6114,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -6496,23 +6221,23 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
     "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
    "case": "layout_chunked_v110",
    "group": "layout",
    "note": "chunked layout under v1.10 bounds \u2014 the control for the case above",
-   "rust_case": null,
+   "rust_case": "layout_chunked_v110",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -6524,14 +6249,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -6639,16 +6356,16 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
     "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
@@ -6667,14 +6384,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -6782,7 +6491,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -6795,7 +6504,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "3",
-      "expected": "superblock-always-v3"
+      "expected": "superblock-v3-for-chunk-index"
      },
      {
       "key": "/#linkstore",
@@ -6832,14 +6541,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -6947,7 +6648,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -6975,14 +6676,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -7090,7 +6783,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -7118,14 +6811,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -7233,7 +6918,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -7261,14 +6946,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -7376,7 +7053,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -7404,14 +7081,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -7519,7 +7188,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -7547,14 +7216,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -7662,7 +7323,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -7678,7 +7339,7 @@
    "case": "layout_contiguous_v108",
    "group": "layout",
    "note": "contiguous layout under v1.8 bounds \u2014 the v1.10 pair's control",
-   "rust_case": null,
+   "rust_case": "layout_contiguous_v108",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -7690,14 +7351,6 @@
       "structural": true,
       "ref": "2",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -7805,23 +7458,23 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
     "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
    "case": "layout_chunked_v108",
    "group": "layout",
    "note": "chunked layout under v1.8 bounds",
-   "rust_case": null,
+   "rust_case": "layout_chunked_v108",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -7833,14 +7486,6 @@
       "structural": true,
       "ref": "2",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -7948,16 +7593,31 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "metadata_diffs": [
+     {
+      "key": "#superblock",
+      "field": "superblock",
+      "ref": "2",
+      "rust": "3",
+      "expected": "superblock-v3-for-chunk-index"
+     },
+     {
+      "key": "/data#chunkindex",
+      "field": "chunkindex",
+      "ref": "btree1",
+      "rust": "single",
+      "expected": "btree1-index-substituted"
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
@@ -7976,14 +7636,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -8091,7 +7743,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -8119,14 +7771,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -8234,7 +7878,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -8262,14 +7906,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -8377,7 +8013,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -8405,14 +8041,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -8520,7 +8148,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -8544,7 +8172,7 @@
    "case": "filter_shuffle",
    "group": "filter",
    "note": "shuffle only",
-   "rust_case": null,
+   "rust_case": "filter_shuffle",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -8556,14 +8184,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -8671,16 +8291,24 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "metadata_diffs": [
+     {
+      "key": "/data#filters",
+      "field": "filters",
+      "ref": "[shuffle(4)@1]",
+      "rust": "[shuffle(4)@0]",
+      "expected": "filter-flags-zero"
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
@@ -8699,14 +8327,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -8814,7 +8434,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -8842,14 +8462,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -8957,7 +8569,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -8995,14 +8607,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -9108,7 +8712,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -9144,14 +8748,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -9259,7 +8855,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -9287,14 +8883,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -9402,7 +8990,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -9430,14 +9018,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -9545,7 +9125,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -9573,14 +9153,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -9688,7 +9260,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -9701,7 +9273,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -9731,14 +9303,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -9846,7 +9410,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -9859,7 +9423,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -9889,14 +9453,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -10004,7 +9560,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -10017,7 +9573,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -10047,14 +9603,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -10162,7 +9710,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -10190,14 +9738,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -10489,7 +10029,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 24,
+    "matched": 25,
     "detail": ""
    },
    "b": {
@@ -10502,7 +10042,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -10553,14 +10093,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -10732,7 +10264,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 18,
+    "matched": 19,
     "detail": ""
    },
    "b": {
@@ -10745,7 +10277,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -10763,7 +10295,7 @@
    "case": "link_soft",
    "group": "link",
    "note": "soft link to /orig",
-   "rust_case": null,
+   "rust_case": "link_soft",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -10775,157 +10307,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
-      "key": "/#attrorder",
-      "kind": "unsupported",
-      "field": "attrorder",
-      "structural": true,
-      "ref": "-",
-      "probe": "UNSUPPORTED(attrorder): H5Group exposes no attribute creation-order tracking flags"
-     },
-     {
-      "key": "/#attrstore",
-      "kind": "unsupported",
-      "field": "attrstore",
-      "structural": true,
-      "ref": "compact",
-      "probe": "UNSUPPORTED(attrstore): H5Group exposes no compact/dense attribute storage accessor"
-     },
-     {
-      "key": "/#linkorder",
-      "kind": "unsupported",
-      "field": "linkorder",
-      "structural": true,
-      "ref": "-",
-      "probe": "UNSUPPORTED(linkorder): H5Group exposes no link creation-order tracking flags"
-     },
-     {
-      "key": "/#linkstore",
-      "kind": "unsupported",
-      "field": "linkstore",
-      "structural": true,
-      "ref": "symtab",
-      "probe": "UNSUPPORTED(linkstore): H5Group exposes no compact/dense link storage accessor"
-     },
-     {
-      "key": "/#nattrs_hdr",
-      "kind": "unsupported",
-      "field": "nattrs_hdr",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
-     },
-     {
-      "key": "/orig#attrstore",
-      "kind": "unsupported",
-      "field": "attrstore",
-      "structural": true,
-      "ref": "compact",
-      "probe": "UNSUPPORTED(attrstore): H5Dataset exposes no compact/dense attribute storage accessor"
-     },
-     {
-      "key": "/orig#external",
-      "kind": "unsupported",
-      "field": "external",
-      "structural": true,
-      "ref": "-",
-      "probe": "UNSUPPORTED(external): H5Dataset exposes no external file list accessor"
-     },
-     {
-      "key": "/orig#fillvalue",
-      "kind": "unsupported",
-      "field": "fillvalue",
-      "structural": true,
-      "ref": "default",
-      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
-     },
-     {
-      "key": "/orig#filters",
-      "kind": "unsupported",
-      "field": "filters",
-      "structural": true,
-      "ref": "[]",
-      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
-     },
-     {
-      "key": "/orig#layout",
-      "kind": "unsupported",
-      "field": "layout",
-      "structural": true,
-      "ref": "contiguous",
-      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
-     },
-     {
-      "key": "/orig#maxshape",
-      "kind": "unsupported",
-      "field": "maxshape",
-      "structural": true,
-      "ref": "[8]",
-      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
-     },
-     {
-      "key": "/orig#nattrs_hdr",
-      "kind": "unsupported",
-      "field": "nattrs_hdr",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
-     },
-     {
-      "key": "/orig#virtual",
-      "kind": "unsupported",
-      "field": "virtual",
-      "structural": true,
-      "ref": "-",
-      "probe": "UNSUPPORTED(virtual): H5Dataset exposes no virtual mapping accessor"
-     }
-    ],
-    "oracle_errors": [],
-    "matched": 12,
-    "detail": ""
-   },
-   "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
-    "core_diffs": [],
-    "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
-   }
-  },
-  {
-   "case": "link_external",
-   "group": "link",
-   "note": "external link into a sibling file",
-   "rust_case": null,
-   "a": {
-    "verdict": "PASS",
-    "divergences": [],
-    "gaps": [
-     {
-      "key": "#superblock",
-      "kind": "unsupported",
-      "field": "superblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -11037,19 +10418,34 @@
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "metadata_diffs": [
+     {
+      "key": "#superblock",
+      "field": "superblock",
+      "ref": "0",
+      "rust": "2",
+      "expected": "superblock-floor-v2"
+     },
+     {
+      "key": "/#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
-   "case": "link_external_read",
+   "case": "link_external",
    "group": "link",
-   "note": "datasets read through external links, plus a dangling object and a dangling file",
-   "rust_case": null,
+   "note": "external link into a sibling file",
+   "rust_case": "link_external",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -11063,12 +10459,154 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
+      "key": "/#attrorder",
       "kind": "unsupported",
-      "field": "userblock",
+      "field": "attrorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(attrorder): H5Group exposes no attribute creation-order tracking flags"
+     },
+     {
+      "key": "/#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5Group exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/#linkorder",
+      "kind": "unsupported",
+      "field": "linkorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(linkorder): H5Group exposes no link creation-order tracking flags"
+     },
+     {
+      "key": "/#linkstore",
+      "kind": "unsupported",
+      "field": "linkstore",
+      "structural": true,
+      "ref": "symtab",
+      "probe": "UNSUPPORTED(linkstore): H5Group exposes no compact/dense link storage accessor"
+     },
+     {
+      "key": "/#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
       "structural": true,
       "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
+     },
+     {
+      "key": "/orig#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5Dataset exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/orig#external",
+      "kind": "unsupported",
+      "field": "external",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(external): H5Dataset exposes no external file list accessor"
+     },
+     {
+      "key": "/orig#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/orig#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/orig#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "contiguous",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/orig#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[8]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/orig#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/orig#virtual",
+      "kind": "unsupported",
+      "field": "virtual",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(virtual): H5Dataset exposes no virtual mapping accessor"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 14,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [
+     {
+      "key": "#superblock",
+      "field": "superblock",
+      "ref": "0",
+      "rust": "2",
+      "expected": "superblock-floor-v2"
+     },
+     {
+      "key": "/#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "link_external_read",
+   "group": "link",
+   "note": "datasets read through external links, plus a dangling object and a dangling file",
+   "rust_case": "link_external_read",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "#superblock",
+      "kind": "unsupported",
+      "field": "superblock",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
       "key": "/#attrorder",
@@ -11112,16 +10650,31 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 14,
+    "matched": 15,
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "metadata_diffs": [
+     {
+      "key": "#superblock",
+      "field": "superblock",
+      "ref": "0",
+      "rust": "2",
+      "expected": "superblock-floor-v2"
+     },
+     {
+      "key": "/#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
@@ -11140,14 +10693,6 @@
       "structural": true,
       "ref": "2",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -11999,7 +11544,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 100,
+    "matched": 101,
     "detail": ""
    },
    "b": {
@@ -12027,14 +11572,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -12462,7 +11999,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 18,
+    "matched": 19,
     "detail": ""
    },
    "b": {
@@ -12475,7 +12012,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/apple#linkstore",
@@ -12519,14 +12056,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -12778,7 +12307,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 22,
+    "matched": 23,
     "detail": ""
    },
    "b": {
@@ -12806,14 +12335,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -13169,7 +12690,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 32,
+    "matched": 33,
     "detail": ""
    },
    "b": {
@@ -13197,14 +12718,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -13328,7 +12841,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 16,
+    "matched": 17,
     "detail": ""
    },
    "b": {
@@ -13341,7 +12854,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -13371,14 +12884,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -13502,7 +13007,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 16,
+    "matched": 17,
     "detail": ""
    },
    "b": {
@@ -13515,7 +13020,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -13545,14 +13050,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -13740,7 +13237,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 15,
+    "matched": 16,
     "detail": ""
    },
    "b": {
@@ -13753,7 +13250,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -13790,14 +13287,6 @@
       "structural": true,
       "ref": "2",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -14001,7 +13490,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 46,
+    "matched": 47,
     "detail": ""
    },
    "b": {
@@ -14029,14 +13518,6 @@
       "structural": true,
       "ref": "2",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -14952,7 +14433,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 12,
+    "matched": 13,
     "detail": ""
    },
    "b": {
@@ -14980,14 +14461,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -15159,7 +14632,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -15172,7 +14645,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -15202,14 +14675,6 @@
       "structural": true,
       "ref": "2",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -15325,7 +14790,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 13,
+    "matched": 14,
     "detail": ""
    },
    "b": {
@@ -15355,14 +14820,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -15508,7 +14965,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 12,
+    "matched": 13,
     "detail": ""
    },
    "b": {
@@ -15521,7 +14978,7 @@
       "field": "superblock",
       "ref": "0",
       "rust": "2",
-      "expected": null
+      "expected": "superblock-floor-v2"
      },
      {
       "key": "/#linkstore",
@@ -15546,7 +15003,7 @@
    "case": "libver_v108",
    "group": "superblock",
    "note": "libver v1.8 bounds",
-   "rust_case": null,
+   "rust_case": "libver_v108",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -15560,14 +15017,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -15713,23 +15162,23 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 12,
+    "matched": 13,
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
     "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
    "case": "libver_v110",
    "group": "superblock",
    "note": "libver v1.10 bounds",
-   "rust_case": null,
+   "rust_case": "libver_v110",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -15743,14 +15192,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -15896,16 +15337,16 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 12,
+    "matched": 13,
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
     "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
@@ -15926,14 +15367,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -16079,7 +15512,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 12,
+    "matched": 13,
     "detail": ""
    },
    "b": {
@@ -16095,7 +15528,7 @@
    "case": "userblock",
    "group": "superblock",
    "note": "512-byte userblock \u2014 the superblock, and every address, is based at 512",
-   "rust_case": null,
+   "rust_case": "userblock",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -16107,14 +15540,6 @@
       "structural": true,
       "ref": "0",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "512",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -16262,16 +15687,38 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 12,
+    "matched": 13,
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "metadata_diffs": [
+     {
+      "key": "#superblock",
+      "field": "superblock",
+      "ref": "0",
+      "rust": "2",
+      "expected": "superblock-floor-v2"
+     },
+     {
+      "key": "/#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     },
+     {
+      "key": "/g#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
@@ -16290,14 +15737,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -16405,7 +15844,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -16433,14 +15872,6 @@
       "structural": true,
       "ref": "3",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -16548,7 +15979,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -16578,14 +16009,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -16995,7 +16418,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 58,
+    "matched": 59,
     "detail": ""
    },
    "b": {
@@ -17025,14 +16448,6 @@
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
      },
      {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
-     },
-     {
       "key": "/#attrorder",
       "kind": "unsupported",
       "field": "attrorder",
@@ -17442,7 +16857,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 58,
+    "matched": 59,
     "detail": ""
    },
    "b": {
@@ -17470,14 +16885,6 @@
       "structural": true,
       "ref": "2",
       "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
-     },
-     {
-      "key": "#userblock",
-      "kind": "unsupported",
-      "field": "userblock",
-      "structural": true,
-      "ref": "0",
-      "probe": "UNSUPPORTED(userblock): H5File exposes no user block accessor"
      },
      {
       "key": "/#attrorder",
@@ -17777,7 +17184,7 @@
      }
     ],
     "oracle_errors": [],
-    "matched": 10,
+    "matched": 11,
     "detail": ""
    },
    "b": {
@@ -17795,35 +17202,14 @@
    "kind": "write-unsupported",
    "signature": "no rust writer arm: the public API cannot express this case",
    "cases": [
-    "named_datatype",
-    "layout_compact",
-    "layout_contiguous_v110",
-    "layout_chunked_v110",
     "chunkidx_implicit",
-    "layout_contiguous_v108",
-    "layout_chunked_v108",
     "external_storage",
     "vds",
-    "filter_shuffle",
-    "link_soft",
-    "link_external",
-    "link_external_read",
     "group_storage_modern_root",
     "group_storage_legacy_root",
-    "libver_v108",
-    "libver_v110",
-    "userblock",
     "sohm_list",
     "sohm_btree",
     "ochk_root"
-   ],
-   "example": ""
-  },
-  {
-   "kind": "write-unsupported",
-   "signature": "region references need a selection serializer on the write side",
-   "cases": [
-    "ref_region"
    ],
    "example": ""
   },
@@ -18414,104 +17800,6 @@
     "ochk_root"
    ],
    "example": "#superblock"
-  },
-  {
-   "kind": "structural",
-   "signature": "userblock \u2014 H5File exposes no user block accessor",
-   "cases": [
-    "int_i8",
-    "int_u8",
-    "int_i16le",
-    "int_u16le",
-    "int_i32le",
-    "int_u32le",
-    "int_i64le",
-    "int_u64le",
-    "int_i16be",
-    "int_i32be",
-    "int_u64be",
-    "float_f16le",
-    "float_f32le",
-    "float_f64le",
-    "float_f64be",
-    "float_specials",
-    "str_fixed_ascii",
-    "str_fixed_utf8",
-    "str_fixed_nullpad",
-    "str_fixed_spacepad",
-    "str_vlen_ascii",
-    "str_vlen_utf8",
-    "compound_simple",
-    "compound_nested",
-    "compound_with_string",
-    "compound_padded",
-    "compound_dtype_v4",
-    "array_dtype",
-    "enum_i8",
-    "enum_i32",
-    "opaque",
-    "bitfield",
-    "ref_object",
-    "ref_region",
-    "vlen_numeric",
-    "vlen_bytes",
-    "named_datatype",
-    "layout_compact",
-    "layout_contiguous",
-    "layout_contiguous_v110",
-    "layout_chunked_v110",
-    "chunkidx_btree1",
-    "chunkidx_single",
-    "chunkidx_implicit",
-    "chunkidx_farray",
-    "chunkidx_earray",
-    "chunkidx_earray_unlim_inner",
-    "chunkidx_btree2",
-    "layout_contiguous_v108",
-    "layout_chunked_v108",
-    "chunkidx_earray_dim1",
-    "external_storage",
-    "vds",
-    "filter_deflate",
-    "filter_shuffle",
-    "filter_fletcher32",
-    "filter_deflate_shuffle",
-    "filter_scaleoffset",
-    "fill_default",
-    "fill_set_int",
-    "fill_set_float_nan",
-    "space_scalar",
-    "space_null",
-    "space_zerosized",
-    "space_unlimited_resized",
-    "groups_nested",
-    "link_hard",
-    "link_soft",
-    "link_external",
-    "link_external_read",
-    "links_dense",
-    "track_order",
-    "group_storage_modern_root",
-    "group_storage_legacy_root",
-    "attr_scalar_num",
-    "attr_array_num",
-    "attr_string",
-    "attrs_dense",
-    "attrs_dense_group",
-    "attr_on_root",
-    "attr_large",
-    "libver_earliest",
-    "libver_v108",
-    "libver_v110",
-    "libver_latest",
-    "userblock",
-    "swmr_created",
-    "large_multi_mb",
-    "sohm_list",
-    "sohm_btree",
-    "ochk_root"
-   ],
-   "example": "#userblock"
   },
   {
    "kind": "structural",
@@ -19371,34 +18659,12 @@
  ],
  "expected_deviations": [
   {
-   "id": "superblock-always-v3",
+   "id": "superblock-floor-v2",
    "field": "superblock",
-   "ref": "*",
-   "rust": "3",
-   "example": "0 -> 3",
-   "why": "the writer emits a v3 superblock for every file it creates; H5File::set_libver_latest(false) does not select an older one",
-   "cases": [
-    "chunkidx_btree1"
-   ]
-  },
-  {
-   "id": "btree1-index-substituted",
-   "field": "chunkindex",
-   "ref": "btree1",
-   "rust": "earray",
-   "example": "btree1 -> earray",
-   "why": "a v1 B-tree chunk index is only legal below superblock v3, so this follows from superblock-always-v3: one unlimited dimension in a v3 file selects the extensible array",
-   "cases": [
-    "chunkidx_btree1"
-   ]
-  },
-  {
-   "id": "new-style-groups-always",
-   "field": "linkstore",
-   "ref": "symtab",
-   "rust": "compact",
-   "example": "symtab -> compact",
-   "why": "the writer emits a version-2 object header for every group, so links libhdf5 would keep in a symbol table are stored as link messages; follows from superblock-always-v3, and the phase change past max_compact still moves them to dense storage",
+   "ref": "0",
+   "rust": "2",
+   "example": "0 -> 2",
+   "why": "libhdf5 writes a v0 superblock at the earliest libver bound, over symbol-table groups and version-1 object headers; this writer emits neither, and no libhdf5 writes a v0 superblock over the link-message groups it does emit, so its floor is the v1.8 bound's version 2 (HDF5_superblock_ver_bounds)",
    "cases": [
     "int_i8",
     "int_u8",
@@ -19432,8 +18698,98 @@
     "opaque",
     "bitfield",
     "ref_object",
+    "ref_region",
     "vlen_numeric",
     "vlen_bytes",
+    "named_datatype",
+    "layout_compact",
+    "layout_contiguous",
+    "space_scalar",
+    "space_null",
+    "space_zerosized",
+    "groups_nested",
+    "link_hard",
+    "link_soft",
+    "link_external",
+    "link_external_read",
+    "track_order",
+    "attr_scalar_num",
+    "attr_array_num",
+    "attr_string",
+    "attr_on_root",
+    "libver_earliest",
+    "userblock"
+   ]
+  },
+  {
+   "id": "superblock-v3-for-chunk-index",
+   "field": "superblock",
+   "ref": "*",
+   "rust": "3",
+   "example": "2 -> 3",
+   "why": "every chunked dataset this writer emits is indexed by a v1.10 structure through a version-4 data layout message, which H5O_layout_ver_bounds puts at the v1.10 bound and so at superblock version 3, whatever bound the file asked for",
+   "cases": [
+    "chunkidx_btree1",
+    "layout_chunked_v108"
+   ]
+  },
+  {
+   "id": "btree1-index-substituted",
+   "field": "chunkindex",
+   "ref": "btree1",
+   "rust": "*",
+   "example": "btree1 -> single",
+   "why": "a v1 B-tree chunk index is only legal below superblock v3, so this follows from superblock-v3-for-chunk-index: the file gets whichever v1.10 index its shape selects \u2014 the extensible array for one unlimited dimension, the single-chunk index for a fixed shape covered by one chunk",
+   "cases": [
+    "chunkidx_btree1",
+    "layout_chunked_v108"
+   ]
+  },
+  {
+   "id": "new-style-groups-always",
+   "field": "linkstore",
+   "ref": "symtab",
+   "rust": "compact",
+   "example": "symtab -> compact",
+   "why": "the writer emits a version-2 object header for every group, so links libhdf5 would keep in a symbol table are stored as link messages; the same cause as superblock-floor-v2, and the phase change past max_compact still moves them to dense storage",
+   "cases": [
+    "int_i8",
+    "int_u8",
+    "int_i16le",
+    "int_u16le",
+    "int_i32le",
+    "int_u32le",
+    "int_i64le",
+    "int_u64le",
+    "int_i16be",
+    "int_i32be",
+    "int_u64be",
+    "float_f16le",
+    "float_f32le",
+    "float_f64le",
+    "float_f64be",
+    "float_specials",
+    "str_fixed_ascii",
+    "str_fixed_utf8",
+    "str_fixed_nullpad",
+    "str_fixed_spacepad",
+    "str_vlen_ascii",
+    "str_vlen_utf8",
+    "compound_simple",
+    "compound_nested",
+    "compound_with_string",
+    "compound_padded",
+    "array_dtype",
+    "enum_i8",
+    "enum_i32",
+    "opaque",
+    "bitfield",
+    "ref_object",
+    "ref_region",
+    "vlen_numeric",
+    "vlen_bytes",
+    "named_datatype",
+    "layout_compact",
     "layout_contiguous",
     "chunkidx_btree1",
     "space_scalar",
@@ -19441,12 +18797,16 @@
     "space_zerosized",
     "groups_nested",
     "link_hard",
+    "link_soft",
+    "link_external",
+    "link_external_read",
     "track_order",
     "attr_scalar_num",
     "attr_array_num",
     "attr_string",
     "attr_on_root",
-    "libver_earliest"
+    "libver_earliest",
+    "userblock"
    ]
   },
   {
@@ -19458,64 +18818,11 @@
    "why": "the writer stores the per-filter flags byte as 0 where libhdf5 stores 1 (H5Z_FLAG_OPTIONAL); both pipelines decode to the same bytes",
    "cases": [
     "filter_deflate",
+    "filter_shuffle",
     "filter_deflate_shuffle",
     "filter_scaleoffset"
    ]
   }
  ],
- "unexpected_deviations": [
-  {
-   "key": "#superblock",
-   "ref": "0",
-   "rust": "2",
-   "cases": [
-    "int_i8",
-    "int_u8",
-    "int_i16le",
-    "int_u16le",
-    "int_i32le",
-    "int_u32le",
-    "int_i64le",
-    "int_u64le",
-    "int_i16be",
-    "int_i32be",
-    "int_u64be",
-    "float_f16le",
-    "float_f32le",
-    "float_f64le",
-    "float_f64be",
-    "float_specials",
-    "str_fixed_ascii",
-    "str_fixed_utf8",
-    "str_fixed_nullpad",
-    "str_fixed_spacepad",
-    "str_vlen_ascii",
-    "str_vlen_utf8",
-    "compound_simple",
-    "compound_nested",
-    "compound_with_string",
-    "compound_padded",
-    "array_dtype",
-    "enum_i8",
-    "enum_i32",
-    "opaque",
-    "bitfield",
-    "ref_object",
-    "vlen_numeric",
-    "vlen_bytes",
-    "layout_contiguous",
-    "space_scalar",
-    "space_null",
-    "space_zerosized",
-    "groups_nested",
-    "link_hard",
-    "track_order",
-    "attr_scalar_num",
-    "attr_array_num",
-    "attr_string",
-    "attr_on_root",
-    "libver_earliest"
-   ]
-  }
- ]
+ "unexpected_deviations": []
 }

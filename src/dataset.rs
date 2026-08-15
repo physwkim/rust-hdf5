@@ -9,6 +9,7 @@ use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
 use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
 use crate::format::reference::Reference;
+use crate::format::selection::Selection;
 use crate::types::H5Type;
 
 // ---------------------------------------------------------------------------
@@ -33,14 +34,46 @@ pub struct DatasetBuilder<T: H5Type> {
     is_null: bool,
     chunk_dims: Option<Vec<usize>>,
     max_shape: Option<Vec<Option<usize>>>,
+    is_compact: bool,
     deflate_level: Option<u32>,
-    shuffle_deflate_level: Option<u32>,
+    shuffle: bool,
     custom_pipeline: Option<crate::format::messages::filter::FilterPipeline>,
     group_path: Option<String>,
     fill_value: Option<Vec<u8>>,
     datatype_override: Option<crate::format::messages::datatype::DatatypeMessage>,
-    object_references: bool,
+    committed_type: Option<String>,
+    references: Option<ReferenceElement>,
     _marker: std::marker::PhantomData<T>,
+}
+
+/// Which reference a `*_references()` builder call asked the elements to be.
+///
+/// One field rather than a flag per kind: an element is a whole-object
+/// reference or a region reference, never both, and the width of each is only
+/// known once the file's address size is (see
+/// [`DatatypeMessage::object_reference`] and
+/// [`DatatypeMessage::region_reference`]).
+///
+/// [`DatatypeMessage::object_reference`]: crate::format::messages::datatype::DatatypeMessage::object_reference
+/// [`DatatypeMessage::region_reference`]: crate::format::messages::datatype::DatatypeMessage::region_reference
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReferenceElement {
+    Object,
+    Region,
+}
+
+impl ReferenceElement {
+    /// The stored datatype for this kind in a file with `ctx`'s address size.
+    fn datatype(
+        self,
+        ctx: &crate::format::FormatContext,
+    ) -> crate::format::messages::datatype::DatatypeMessage {
+        use crate::format::messages::datatype::DatatypeMessage;
+        match self {
+            Self::Object => DatatypeMessage::object_reference(ctx),
+            Self::Region => DatatypeMessage::region_reference(ctx),
+        }
+    }
 }
 
 impl<T: H5Type> DatasetBuilder<T> {
@@ -51,13 +84,15 @@ impl<T: H5Type> DatasetBuilder<T> {
             is_null: false,
             chunk_dims: None,
             max_shape: None,
+            is_compact: false,
             deflate_level: None,
-            shuffle_deflate_level: None,
+            shuffle: false,
             custom_pipeline: None,
             group_path: None,
             fill_value: None,
             datatype_override: None,
-            object_references: false,
+            committed_type: None,
+            references: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -69,13 +104,15 @@ impl<T: H5Type> DatasetBuilder<T> {
             is_null: false,
             chunk_dims: None,
             max_shape: None,
+            is_compact: false,
             deflate_level: None,
-            shuffle_deflate_level: None,
+            shuffle: false,
             custom_pipeline: None,
             group_path: Some(group_path),
             fill_value: None,
             datatype_override: None,
-            object_references: false,
+            committed_type: None,
+            references: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -138,6 +175,33 @@ impl<T: H5Type> DatasetBuilder<T> {
         self
     }
 
+    /// Store the raw data inside the dataset's object header —
+    /// `H5Pset_layout(dcpl, H5D_COMPACT)`.
+    ///
+    /// A compact dataset costs no data block and no second seek to read, which
+    /// suits the small per-run constants an analysis file is full of. It is
+    /// bounded by what one object header message can hold
+    /// ([`MAX_COMPACT_DATA`](crate::MAX_COMPACT_DATA) bytes) and it
+    /// is fixed in size: [`chunk`](Self::chunk), a filter, and an unlimited
+    /// [`max_shape`](Self::max_shape) are all rejected at
+    /// [`create`](Self::create), as libhdf5 rejects them.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("compact.h5").unwrap();
+    /// let ds = file.new_dataset::<i32>()
+    ///     .shape([16])
+    ///     .compact()
+    ///     .create("data")
+    ///     .unwrap();
+    /// ds.write_raw(&(0..16i32).collect::<Vec<_>>()).unwrap();
+    /// ```
+    #[must_use]
+    pub fn compact(mut self) -> Self {
+        self.is_compact = true;
+        self
+    }
+
     /// Enable deflate (gzip) compression with the given level (0-9).
     ///
     /// Requires chunked storage (call `.chunk()` before `.create()`).
@@ -148,14 +212,36 @@ impl<T: H5Type> DatasetBuilder<T> {
         self
     }
 
-    /// Enable shuffle + deflate compression.
+    /// Enable the shuffle filter — `H5Pset_shuffle(dcpl)`, h5py's
+    /// `shuffle=True`.
+    ///
+    /// Shuffle reorders a chunk's bytes by their position within an element,
+    /// which typically improves how well a compressor behind it does on
+    /// numeric data. It is a permutation, not a compressor: on its own it
+    /// leaves the chunk exactly as large as it was, which is what
+    /// `H5Pset_shuffle` without a compressor writes. Combine it with
+    /// [`deflate`](Self::deflate) to compress the shuffled stream. Requires
+    /// chunked storage.
+    ///
+    /// The element width the filter records is the dataset's, so a
+    /// [`datatype`](Self::datatype) override is what it follows when the
+    /// stored element is not `T` itself.
+    #[must_use]
+    pub fn shuffle(mut self) -> Self {
+        self.shuffle = true;
+        self
+    }
+
+    /// Enable shuffle + deflate compression — the same pipeline as
+    /// `.shuffle().deflate(level)`.
     ///
     /// Shuffle reorders bytes by position within elements before compression,
     /// which typically improves compression ratios for numeric data.
     /// Requires chunked storage.
     #[must_use]
     pub fn shuffle_deflate(mut self, level: u32) -> Self {
-        self.shuffle_deflate_level = Some(level);
+        self.shuffle = true;
+        self.deflate_level = Some(level);
         self
     }
 
@@ -199,6 +285,36 @@ impl<T: H5Type> DatasetBuilder<T> {
         self
     }
 
+    /// Build the dataset on the committed (named) datatype at `path` —
+    /// h5py's `dtype=f["name"]`, `H5Dcreate2` with a committed type id.
+    ///
+    /// The dataset does not describe its type: its header stores a pointer to
+    /// that object, so the type is defined once and every dataset sharing it
+    /// is guaranteed to agree. The type comes from the committed object, so
+    /// this supersedes both `T` and [`datatype`](Self::datatype).
+    ///
+    /// The path is resolved at [`create`](Self::create), which fails when no
+    /// committed datatype is there — commit it with
+    /// [`H5File::commit_datatype`](crate::file::H5File::commit_datatype)
+    /// first.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// # use rust_hdf5::format::messages::datatype::DatatypeMessage;
+    /// let file = H5File::create("committed.h5").unwrap();
+    /// file.commit_datatype("temperature", DatatypeMessage::f64_type()).unwrap();
+    /// file.new_dataset::<f64>()
+    ///     .committed_type("temperature")
+    ///     .shape([4])
+    ///     .create("readings")
+    ///     .unwrap();
+    /// ```
+    #[must_use]
+    pub fn committed_type(mut self, path: &str) -> Self {
+        self.committed_type = Some(path.to_string());
+        self
+    }
+
     /// Store object references — h5py's `h5py.ref_dtype`.
     ///
     /// The elements are written with
@@ -221,7 +337,38 @@ impl<T: H5Type> DatasetBuilder<T> {
     /// ```
     #[must_use]
     pub fn object_references(mut self) -> Self {
-        self.object_references = true;
+        self.references = Some(ReferenceElement::Object);
+        self
+    }
+
+    /// Store dataset region references — h5py's `h5py.regionref_dtype`.
+    ///
+    /// The elements are written with
+    /// [`write_region_references`](H5Dataset::write_region_references) and name
+    /// a dataset plus a selection over it. The element is a global-heap id, so
+    /// its width follows the file's address size and the datatype is resolved
+    /// at [`create`](Self::create) rather than here; it overrides both `T` and
+    /// any [`datatype`](Self::datatype) call.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::{H5File, Hyperslab, HyperslabBlock, Selection};
+    /// let file = H5File::create("regions.h5").unwrap();
+    /// file.new_dataset::<i32>().shape([8]).create("target").unwrap();
+    /// let refs = file.new_dataset::<u64>()
+    ///     .region_references()
+    ///     .shape([1])
+    ///     .create("refs")
+    ///     .unwrap();
+    /// let rows = Selection::Hyperslab {
+    ///     rank: 1,
+    ///     form: Hyperslab::Blocks(vec![HyperslabBlock { start: vec![0], end: vec![2] }]),
+    /// };
+    /// refs.write_region_references(&[("/target", rows)]).unwrap();
+    /// file.close().unwrap();
+    /// ```
+    #[must_use]
+    pub fn region_references(mut self) -> Self {
+        self.references = Some(ReferenceElement::Region);
         self
     }
 
@@ -257,6 +404,53 @@ impl<T: H5Type> DatasetBuilder<T> {
     /// The name is the link name within the root group (e.g. `"data"` or
     /// `"group1/data"` once nested groups are supported).
     pub fn create(self, name: &str) -> Result<H5Dataset> {
+        // A committed type is resolved before the dataset exists and recorded
+        // after, here rather than in each storage path: every path reaches
+        // this one return, so a dataset can never be built on a committed
+        // type and then fail to say so — which would silently write the type
+        // out in full instead of pointing at the object.
+        let committed = self.resolve_committed_type()?;
+        let file_inner = clone_inner(&self.file_inner);
+        let ds = self.create_object(name, committed.as_ref().map(|(_, dt)| dt.clone()))?;
+        if let (Some((share, _)), DatasetInfo::Writer { index, .. }) = (committed, &ds.info) {
+            let inner = borrow_inner(&file_inner);
+            if let H5FileInner::Writer(writer) = &*inner {
+                writer.share_committed_type(*index, share);
+            }
+        }
+        Ok(ds)
+    }
+
+    /// The committed datatype this dataset is built on, with the type it
+    /// holds; `None` when [`committed_type`](Self::committed_type) was not
+    /// called.
+    fn resolve_committed_type(&self) -> Result<Option<(usize, DatatypeMessage)>> {
+        let Some(path) = self.committed_type.as_deref() else {
+            return Ok(None);
+        };
+        if self.references.is_some() {
+            // Both name the stored type and they cannot both be it: the
+            // pointer would say the elements are the committed type while the
+            // reference writers write addresses. True of either reference
+            // kind — an object reference is an address, a region reference is
+            // a global-heap address plus a serialized selection.
+            return Err(Hdf5Error::InvalidState(
+                "a dataset cannot be built on a committed datatype and hold references".into(),
+            ));
+        }
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => Ok(Some(writer.committed_datatype_for_share(path)?)),
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot create a dataset in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
+    /// Everything [`create`](Self::create) does apart from recording the
+    /// committed-type share; `committed` is the type that object holds.
+    fn create_object(self, name: &str, committed: Option<DatatypeMessage>) -> Result<H5Dataset> {
         // Build the full name: if created within a group, prefix with group path
         let full_name = if let Some(ref gp) = self.group_path {
             if gp == "/" {
@@ -269,16 +463,12 @@ impl<T: H5Type> DatasetBuilder<T> {
             name.to_string()
         };
 
-        let datatype = if self.object_references {
-            // The element is one file address wide, and only the writer knows
-            // how wide that is for this file.
+        let datatype = if let Some(kind) = self.references {
+            // The element is measured in file addresses, and only the writer
+            // knows how wide one is for this file.
             let inner = borrow_inner(&self.file_inner);
             match &*inner {
-                H5FileInner::Writer(writer) => {
-                    crate::format::messages::datatype::DatatypeMessage::object_reference(
-                        writer.ctx(),
-                    )
-                }
+                H5FileInner::Writer(writer) => kind.datatype(writer.ctx()),
                 H5FileInner::Reader(_) => {
                     return Err(Hdf5Error::InvalidState(
                         "cannot create a dataset in read mode".into(),
@@ -288,6 +478,11 @@ impl<T: H5Type> DatasetBuilder<T> {
                     return Err(Hdf5Error::InvalidState("file is closed".into()))
                 }
             }
+        } else if let Some(dt) = committed {
+            // The object header holds the type; the dataset stores a pointer
+            // to it, but every size and payload check still needs the type
+            // itself.
+            dt
         } else {
             self.datatype_override.clone().unwrap_or_else(T::hdf5_type)
         };
@@ -307,18 +502,18 @@ impl<T: H5Type> DatasetBuilder<T> {
             None => None,
         };
 
+        let wants_filter =
+            self.custom_pipeline.is_some() || self.shuffle || self.deflate_level.is_some();
+
         if self.is_null {
             // A NULL dataspace holds no elements at all: no chunk grid to
-            // scatter into, no fill value to apply to unwritten elements
-            // (there are none), matching upstream's rejection of these
-            // combinations (`H5Dchunk.c`'s chunked-layout dataspace check).
-            if self.chunk_dims.is_some()
-                || self.custom_pipeline.is_some()
-                || self.shuffle_deflate_level.is_some()
-                || self.deflate_level.is_some()
-            {
+            // scatter into, no raw image to put in an object header, no fill
+            // value to apply to unwritten elements (there are none), matching
+            // upstream's rejection of these combinations (`H5Dchunk.c`'s
+            // chunked-layout dataspace check).
+            if self.chunk_dims.is_some() || wants_filter || self.is_compact {
                 return Err(Hdf5Error::InvalidState(
-                    "a NULL dataspace dataset cannot be chunked or filtered".into(),
+                    "a NULL dataspace dataset cannot be chunked, filtered or compact".into(),
                 ));
             }
             if fill_value.is_some() {
@@ -369,15 +564,71 @@ impl<T: H5Type> DatasetBuilder<T> {
         })?;
         let dims_u64: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
 
+        if self.is_compact {
+            // The raw data is the layout message, so there is no chunk grid to
+            // filter and no room to grow into: `H5D__compact_construct` refuses
+            // a max dimension above the current one, and `H5Pset_layout` and
+            // `H5Pset_chunk` overwrite each other rather than combining.
+            if self.chunk_dims.is_some() || wants_filter {
+                return Err(Hdf5Error::InvalidState(
+                    "a compact dataset stores its data in the object header, so it \
+                     cannot be chunked or filtered"
+                        .into(),
+                ));
+            }
+            if self
+                .max_shape
+                .as_ref()
+                .is_some_and(|max| max.iter().zip(&shape).any(|(m, &d)| *m != Some(d)))
+            {
+                return Err(Hdf5Error::InvalidState(
+                    "a compact dataset cannot be extendible: its maximum shape must \
+                     equal its shape"
+                        .into(),
+                ));
+            }
+
+            let index = {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Writer(writer) => {
+                        let idx = writer.create_compact_dataset(&full_name, datatype, &dims_u64)?;
+                        if let Some(ref fv) = fill_value {
+                            writer.set_dataset_fill_value(idx, fv.clone())?;
+                        }
+                        idx
+                    }
+                    H5FileInner::Reader(_) => {
+                        return Err(Hdf5Error::InvalidState(
+                            "cannot create a dataset in read mode".into(),
+                        ));
+                    }
+                    H5FileInner::Closed => {
+                        return Err(Hdf5Error::InvalidState("file is closed".into()));
+                    }
+                }
+            };
+
+            return Ok(H5Dataset {
+                file_inner: clone_inner(&self.file_inner),
+                info: DatasetInfo::Writer {
+                    index,
+                    shape,
+                    element_size,
+                    chunked: false,
+                    btree2: false,
+                    fixed_array: false,
+                    is_null: false,
+                },
+            });
+        }
+
         // A filter pipeline requires chunked storage. When a filter is
         // requested without explicit chunk dimensions, store the whole
         // dataset as a single chunk instead of silently dropping the filter
         // on the contiguous path. (This is one whole-dataset chunk, not
         // h5py's ~1 MiB chunk-size heuristic; pass explicit chunk dimensions
         // for large datasets.)
-        let wants_filter = self.custom_pipeline.is_some()
-            || self.shuffle_deflate_level.is_some()
-            || self.deflate_level.is_some();
         let auto_chunk: Option<Vec<usize>> =
             if self.chunk_dims.is_none() && wants_filter && !shape.is_empty() {
                 Some(shape.iter().map(|&d| d.max(1)).collect())
@@ -408,22 +659,25 @@ impl<T: H5Type> DatasetBuilder<T> {
                 let inner = borrow_inner(&self.file_inner);
                 match &*inner {
                     H5FileInner::Writer(writer) => {
-                        // The requested filter pipeline, if any. Both index
-                        // types that take one explicitly (fixed array and v2
-                        // B-tree) build it the same way, so resolve it once.
+                        // The requested filter pipeline, if any. Every index
+                        // builds it from the same options, so one owner
+                        // resolves it: a second construction site is what let
+                        // a request naming no compressor — shuffle on its own
+                        // — fall through to unfiltered storage.
                         let explicit_pipeline = || {
+                            use crate::format::messages::filter::FilterPipeline;
                             if let Some(p) = self.custom_pipeline.clone() {
-                                p
-                            } else if let Some(level) = self.shuffle_deflate_level {
-                                crate::format::messages::filter::FilterPipeline::shuffle_deflate(
-                                    T::element_size() as u32,
-                                    level,
-                                )
-                            } else {
+                                return p;
+                            }
+                            // Shuffle records the width of the element it
+                            // permutes, which is the stored one — a `datatype`
+                            // override moves that away from `T`.
+                            let es = element_size as u32;
+                            match (self.shuffle, self.deflate_level) {
+                                (true, Some(level)) => FilterPipeline::shuffle_deflate(es, level),
+                                (true, None) => FilterPipeline::shuffle(es),
                                 // deflate_level (checked by wants_filter).
-                                crate::format::messages::filter::FilterPipeline::deflate(
-                                    self.deflate_level.unwrap(),
-                                )
+                                (false, level) => FilterPipeline::deflate(level.unwrap()),
                             }
                         };
                         let idx = if is_btree2 {
@@ -457,22 +711,17 @@ impl<T: H5Type> DatasetBuilder<T> {
                             writer.create_fixed_array_dataset_with_max(
                                 &full_name, datatype, &dims_u64, &max_u64, &chunk_u64, pipeline,
                             )?
-                        } else if let Some(pipeline) = self.custom_pipeline {
+                        } else if wants_filter {
+                            // The extensible-array index takes the pipeline
+                            // the same way, so it goes through the one owner
+                            // too.
                             writer.create_chunked_dataset_with_pipeline(
-                                &full_name, datatype, &dims_u64, &max_u64, &chunk_u64, pipeline,
-                            )?
-                        } else if let Some(level) = self.shuffle_deflate_level {
-                            let pipeline =
-                                crate::format::messages::filter::FilterPipeline::shuffle_deflate(
-                                    T::element_size() as u32,
-                                    level,
-                                );
-                            writer.create_chunked_dataset_with_pipeline(
-                                &full_name, datatype, &dims_u64, &max_u64, &chunk_u64, pipeline,
-                            )?
-                        } else if let Some(level) = self.deflate_level {
-                            writer.create_chunked_dataset_compressed(
-                                &full_name, datatype, &dims_u64, &max_u64, &chunk_u64, level,
+                                &full_name,
+                                datatype,
+                                &dims_u64,
+                                &max_u64,
+                                &chunk_u64,
+                                explicit_pipeline(),
                             )?
                         } else {
                             writer.create_chunked_dataset(
@@ -2165,6 +2414,197 @@ impl H5Dataset {
         }
     }
 
+    /// Read a strided hyperslab as a typed vector — h5py's stepped slicing
+    /// (`ds[a:b:s]`) or the general `start`/`stride`/`count`/`block` form of
+    /// `H5Sselect_hyperslab`.
+    ///
+    /// One entry per dimension: `start[d]` is the first index, `stride[d]`
+    /// the spacing between selected blocks (all-`1` is the same selection
+    /// [`read_slice`](Self::read_slice) reads), `count[d]` how many blocks,
+    /// and `block[d]` how many contiguous elements each block covers. The
+    /// returned vector is row-major over `count[d] * block[d]` per
+    /// dimension — exactly the shape h5py's stepped slicing produces.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open("data.h5").unwrap();
+    /// let ds = file.dataset("series").unwrap(); // shape [100]
+    /// // Python: ds[0:100:2] — every other element.
+    /// let evens: Vec<f64> = ds.read_hyperslab(&[0], &[2], &[50], &[1]).unwrap();
+    /// ```
+    pub fn read_hyperslab<T: H5Type>(
+        &self,
+        start: &[usize],
+        stride: &[usize],
+        count: &[usize],
+        block: &[usize],
+    ) -> Result<Vec<T>> {
+        match &self.info {
+            DatasetInfo::Reader {
+                name, element_size, ..
+            } => {
+                if T::element_size() != *element_size {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "read type has element size {} but dataset has element size {}",
+                        T::element_size(),
+                        element_size,
+                    )));
+                }
+                let datatype = self.datatype()?;
+                let start_u64: Vec<u64> = start.iter().map(|&s| s as u64).collect();
+                let stride_u64: Vec<u64> = stride.iter().map(|&s| s as u64).collect();
+                let count_u64: Vec<u64> = count.iter().map(|&c| c as u64).collect();
+                let block_u64: Vec<u64> = block.iter().map(|&b| b as u64).collect();
+
+                let mut raw = {
+                    let mut inner = borrow_inner_mut(&self.file_inner);
+                    match &mut *inner {
+                        H5FileInner::Reader(reader) => reader.read_hyperslab(
+                            name,
+                            &start_u64,
+                            &stride_u64,
+                            &count_u64,
+                            &block_u64,
+                        )?,
+                        _ => {
+                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()))
+                        }
+                    }
+                };
+                to_host_byte_order(&mut raw, &datatype, T::element_size())?;
+
+                if raw.len() % T::element_size() != 0 {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "raw data size {} is not a multiple of element size {}",
+                        raw.len(),
+                        T::element_size(),
+                    )));
+                }
+
+                let count = raw.len() / T::element_size();
+                let mut result = Vec::<T>::with_capacity(count);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        raw.as_ptr(),
+                        result.as_mut_ptr() as *mut u8,
+                        raw.len(),
+                    );
+                    result.set_len(count);
+                }
+                Ok(result)
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read_hyperslab from a dataset in write mode".into(),
+            )),
+        }
+    }
+
+    /// Read a list of coordinates in one call, as a typed vector — h5py
+    /// fancy indexing with a coordinate list.
+    ///
+    /// `points[i]` is a coordinate with one entry per dimension. The
+    /// returned vector holds one element per point, in the same order as
+    /// `points`, regardless of the dataset's rank.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open("data.h5").unwrap();
+    /// let ds = file.dataset("grid").unwrap(); // shape [10, 10]
+    /// // Python: ds[np.array([[0, 0], [3, 4], [9, 9]])]
+    /// let picked: Vec<f64> = ds.read_points(&[vec![0, 0], vec![3, 4], vec![9, 9]]).unwrap();
+    /// ```
+    pub fn read_points<T: H5Type>(&self, points: &[Vec<usize>]) -> Result<Vec<T>> {
+        match &self.info {
+            DatasetInfo::Reader {
+                name, element_size, ..
+            } => {
+                if T::element_size() != *element_size {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "read type has element size {} but dataset has element size {}",
+                        T::element_size(),
+                        element_size,
+                    )));
+                }
+                let datatype = self.datatype()?;
+                let points_u64: Vec<Vec<u64>> = points
+                    .iter()
+                    .map(|p| p.iter().map(|&c| c as u64).collect())
+                    .collect();
+
+                let mut raw = {
+                    let mut inner = borrow_inner_mut(&self.file_inner);
+                    match &mut *inner {
+                        H5FileInner::Reader(reader) => reader.read_points(name, &points_u64)?,
+                        _ => {
+                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()))
+                        }
+                    }
+                };
+                to_host_byte_order(&mut raw, &datatype, T::element_size())?;
+
+                if raw.len() % T::element_size() != 0 {
+                    return Err(Hdf5Error::TypeMismatch(format!(
+                        "raw data size {} is not a multiple of element size {}",
+                        raw.len(),
+                        T::element_size(),
+                    )));
+                }
+
+                let count = raw.len() / T::element_size();
+                let mut result = Vec::<T>::with_capacity(count);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        raw.as_ptr(),
+                        result.as_mut_ptr() as *mut u8,
+                        raw.len(),
+                    );
+                    result.set_len(count);
+                }
+                Ok(result)
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read_points from a dataset in write mode".into(),
+            )),
+        }
+    }
+
+    /// Read one chunk's raw (still-filtered) bytes and its filter mask,
+    /// addressed by chunk-grid coordinates — the read half of
+    /// [`write_chunk_raw_at`](Self::write_chunk_raw_at) and the HDF5 "direct
+    /// chunk read" (`H5Dread_chunk`, formerly `H5DOread_chunk`; h5py's
+    /// `Dataset.id.read_direct_chunk`).
+    ///
+    /// The bytes are exactly what is stored on disk: filtered/compressed if
+    /// the dataset has a filter pipeline, with no decompression applied. The
+    /// returned `u32` is the chunk's filter mask: bit *i* set means filter
+    /// *i* of the pipeline was **not** applied to this particular chunk and
+    /// must be skipped when reversing it.
+    ///
+    /// `Err` if the dataset is not chunked, `chunk_coords` has the wrong
+    /// rank, or the chunk at those coordinates has never been written.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open("data.h5").unwrap();
+    /// let ds = file.dataset("frames").unwrap();
+    /// let (raw, filter_mask) = ds.read_chunk_raw_at(&[0, 0]).unwrap();
+    /// ```
+    pub fn read_chunk_raw_at(&self, chunk_coords: &[usize]) -> Result<(Vec<u8>, u32)> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let coords_u64: Vec<u64> = chunk_coords.iter().map(|&c| c as u64).collect();
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => Ok(reader.read_chunk_raw_at(name, &coords_u64)?),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "cannot read_chunk_raw_at from a dataset in write mode".into(),
+            )),
+        }
+    }
+
     /// Write a typed slice to a sub-region of the dataset.
     ///
     /// `starts` and `counts` define the N-dimensional selection, which must lie
@@ -2331,6 +2771,53 @@ impl H5Dataset {
                 match &*inner {
                     H5FileInner::Writer(writer) => {
                         writer.write_object_references(*index, 0, paths)?;
+                        Ok(())
+                    }
+                    _ => Err(Hdf5Error::InvalidState(
+                        "file is no longer in write mode".into(),
+                    )),
+                }
+            }
+            DatasetInfo::Reader { .. } => {
+                Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
+            }
+        }
+    }
+
+    /// Write region references over `targets` into elements
+    /// `0..targets.len()` — h5py's `refs[i] = f['/target'].regionref[0:3]`.
+    ///
+    /// The dataset must have been created with
+    /// [`region_references`](DatasetBuilder::region_references). Each target is
+    /// the path of an existing *dataset* and a [`Selection`] over it, which
+    /// must fit that dataset's extent — the rule `H5Rcreate` applies. What
+    /// reaches the file is a global-heap object holding the target's object
+    /// header address (assigned when the file is finalized) and the serialized
+    /// selection. Elements left unwritten read back as null references.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::{H5File, PointSelection, Selection};
+    /// let file = H5File::create("regions.h5").unwrap();
+    /// file.new_dataset::<i32>().shape([4, 6]).create("m").unwrap();
+    /// let refs = file.new_dataset::<u64>()
+    ///     .region_references()
+    ///     .shape([1])
+    ///     .create("refs")
+    ///     .unwrap();
+    /// let points = Selection::Points(PointSelection {
+    ///     rank: 2,
+    ///     points: vec![vec![0, 1], vec![3, 5]],
+    /// });
+    /// refs.write_region_references(&[("/m", points)]).unwrap();
+    /// file.close().unwrap();
+    /// ```
+    pub fn write_region_references(&self, targets: &[(&str, Selection)]) -> Result<()> {
+        match &self.info {
+            DatasetInfo::Writer { index, .. } => {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Writer(writer) => {
+                        writer.write_region_references(*index, 0, targets)?;
                         Ok(())
                     }
                     _ => Err(Hdf5Error::InvalidState(
@@ -6987,6 +7474,444 @@ mod tests {
             .create("b")
             .is_err());
         file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A committed type is resolved before the dataset is created, so a name
+    /// that is not one — or one paired with object references, which would
+    /// make the stored type disagree with the payload — leaves no dataset
+    /// behind.
+    #[test]
+    fn a_committed_type_that_cannot_be_shared_creates_no_dataset() {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let path = temp_path("committed_refused");
+        let file = H5File::create(&path).unwrap();
+        file.commit_datatype("t", DatatypeMessage::i32_type())
+            .unwrap();
+
+        assert!(file
+            .new_dataset::<i32>()
+            .committed_type("absent")
+            .shape([2usize])
+            .create("a")
+            .is_err());
+        assert!(file
+            .new_dataset::<u64>()
+            .committed_type("t")
+            .object_references()
+            .shape([2usize])
+            .create("b")
+            .is_err());
+        // A dataset already exists under that name, so the type cannot take
+        // it either.
+        file.new_dataset::<i32>()
+            .shape([2usize])
+            .create("taken")
+            .unwrap();
+        assert!(file
+            .commit_datatype("taken", DatatypeMessage::i32_type())
+            .is_err());
+        assert!(file
+            .commit_datatype("t", DatatypeMessage::f64_type())
+            .is_err());
+
+        assert_eq!(file.dataset_names(), vec!["taken".to_string()]);
+        assert_eq!(file.named_datatype_names(), vec!["t".to_string()]);
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Deleting the group that named a committed datatype takes the name with
+    /// it: nothing in the file reaches the type, so it is not written, the
+    /// name is free again, and it can no longer be shared by that name.
+    #[test]
+    fn deleting_a_group_takes_the_committed_datatypes_it_named() {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let path = temp_path("committed_group_deleted");
+        {
+            let file = H5File::create(&path).unwrap();
+            let types = file.create_group("types").unwrap();
+            types
+                .commit_datatype("t", DatatypeMessage::i32_type())
+                .unwrap();
+            assert_eq!(file.named_datatype_names(), vec!["types/t".to_string()]);
+
+            file.delete_group("types").unwrap();
+            assert!(file.named_datatype_names().is_empty());
+            assert!(file
+                .new_dataset::<i32>()
+                .committed_type("types/t")
+                .shape([2usize])
+                .create("d")
+                .is_err());
+
+            // The name is free, so a new group may take it back.
+            let types = file.create_group("types").unwrap();
+            types
+                .commit_datatype("t", DatatypeMessage::f64_type())
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(file.named_datatype_names(), vec!["types/t".to_string()]);
+        assert_eq!(
+            file.named_datatype("types/t").unwrap().datatype().unwrap(),
+            crate::format::messages::datatype::DatatypeMessage::f64_type()
+        );
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The layout class the reader sees for `name`, plus the image a compact
+    /// layout carries — what distinguishes compact storage from contiguous
+    /// storage that happens to hold the same bytes.
+    fn compact_image(path: &std::path::Path, name: &str) -> Option<Vec<u8>> {
+        use crate::format::messages::data_layout::DataLayoutMessage;
+        let mut reader = crate::io::reader::Hdf5Reader::open(path).unwrap();
+        match &reader.dataset_info(name).unwrap().layout {
+            DataLayoutMessage::Compact { data } => Some(data.clone()),
+            other => panic!("{name}: expected a compact layout, got {other:?}"),
+        }
+    }
+
+    /// `.compact()` puts the raw data inside the data layout message: the
+    /// dataset has no data block of its own, and the image the layout carries
+    /// is what a read returns.
+    #[test]
+    fn a_compact_dataset_stores_its_data_in_the_layout_message() {
+        let path = temp_path("compact_roundtrip");
+        let values: Vec<i32> = (0..16).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([16usize])
+                .compact()
+                .create("d")
+                .unwrap()
+                .write_raw(&values)
+                .unwrap();
+            file.close().unwrap();
+        }
+
+        let image = compact_image(&path, "d").unwrap();
+        assert_eq!(
+            image,
+            values
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("d").unwrap();
+        assert_eq!(ds.shape(), vec![16]);
+        assert_eq!(ds.read_raw::<i32>().unwrap(), values);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A compact dataset created inside a group is linked from that group,
+    /// not from the root: its create path goes through the same parent
+    /// resolution every other layout uses.
+    #[test]
+    fn a_compact_dataset_lands_in_its_group() {
+        let path = temp_path("compact_in_group");
+        {
+            let file = H5File::create(&path).unwrap();
+            let g = file.root_group().create_group("g").unwrap();
+            g.new_dataset::<u8>()
+                .shape([4usize])
+                .compact()
+                .create("d")
+                .unwrap()
+                .write_raw(&[1u8, 2, 3, 4])
+                .unwrap();
+            file.close().unwrap();
+        }
+        assert_eq!(compact_image(&path, "/g/d").unwrap(), vec![1u8, 2, 3, 4]);
+
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("/g/d").unwrap().read_raw::<u8>().unwrap(),
+            vec![1u8, 2, 3, 4]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A compact dataset's storage is the image itself, so the fill value has
+    /// to be tiled into it at create — `H5D__compact_fill`'s job. An unwritten
+    /// element must read back as the fill value, not as zero.
+    #[test]
+    fn an_unwritten_compact_dataset_reads_back_as_its_fill_value() {
+        let path = temp_path("compact_fill");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .compact()
+                .fill_value(-7i32)
+                .create("d")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+            vec![-7i32; 4]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The image is the layout message, so anything that rewrites the header
+    /// rewrites the data with it. Reopening and attaching an attribute makes
+    /// the header stale; the rebuilt one must still carry the image rather
+    /// than fall back to an unallocated contiguous layout.
+    #[test]
+    fn a_reopened_compact_dataset_keeps_its_image() {
+        let path = temp_path("compact_reopen");
+        let values: Vec<i32> = (100..108).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .compact()
+                .create("d")
+                .unwrap()
+                .write_raw(&values)
+                .unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open_rw(&path).unwrap();
+            file.dataset_writer("d")
+                .unwrap()
+                .new_attr::<i32>()
+                .shape(())
+                .create("note")
+                .unwrap()
+                .write_numeric(&1i32)
+                .unwrap();
+            file.close().unwrap();
+        }
+        assert_eq!(
+            compact_image(&path, "d").unwrap(),
+            values
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+            values
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The ceiling is what a data layout message can hold, so it is checked
+    /// in bytes and names them: the largest image that fits is accepted and
+    /// one element more is refused.
+    #[test]
+    fn the_compact_ceiling_is_checked_in_bytes() {
+        let path = temp_path("compact_ceiling");
+        let file = H5File::create(&path).unwrap();
+
+        let fits = crate::MAX_COMPACT_DATA / 4;
+        file.new_dataset::<i32>()
+            .shape([fits])
+            .compact()
+            .create("fits")
+            .unwrap();
+
+        let over = fits + 1;
+        let err = match file
+            .new_dataset::<i32>()
+            .shape([over])
+            .compact()
+            .create("over")
+        {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an image {} bytes wide must be refused", over * 4),
+        };
+        assert!(
+            err.contains(&(over * 4).to_string())
+                && err.contains(&crate::MAX_COMPACT_DATA.to_string()),
+            "the error must name both sizes: {err}"
+        );
+
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Compact storage has no chunk grid to filter and no room to grow, so
+    /// each conflicting option is refused at `create()` rather than silently
+    /// overriding the layout the way `H5Pset_chunk` does.
+    #[test]
+    fn compact_rejects_chunking_filters_growth_and_a_null_dataspace() {
+        let path = temp_path("compact_rejects");
+        let file = H5File::create(&path).unwrap();
+        assert!(file
+            .new_dataset::<i32>()
+            .shape([4usize])
+            .compact()
+            .chunk(&[4])
+            .create("a")
+            .is_err());
+        assert!(file
+            .new_dataset::<i32>()
+            .shape([4usize])
+            .compact()
+            .deflate(4)
+            .create("b")
+            .is_err());
+        assert!(file
+            .new_dataset::<i32>()
+            .shape([4usize])
+            .compact()
+            .max_shape(&[None])
+            .create("c")
+            .is_err());
+        assert!(file
+            .new_dataset::<i32>()
+            .shape([4usize])
+            .compact()
+            .max_shape(&[Some(8)])
+            .create("d")
+            .is_err());
+        assert!(file
+            .new_dataset::<i32>()
+            .null()
+            .compact()
+            .create("e")
+            .is_err());
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The filter pipeline the reader decodes from `name`'s header.
+    fn stored_pipeline(
+        path: &std::path::Path,
+        name: &str,
+    ) -> crate::format::messages::filter::FilterPipeline {
+        let mut reader = crate::io::reader::Hdf5Reader::open(path).unwrap();
+        reader
+            .dataset_info(name)
+            .unwrap()
+            .filter_pipeline
+            .clone()
+            .unwrap_or_else(|| panic!("{name}: no filter pipeline"))
+    }
+
+    /// Shuffle is a permutation, not a compressor, so it is a pipeline on its
+    /// own — `H5Pset_shuffle` with nothing behind it. Its stage must reach the
+    /// header, and the reader must unpermute what it wrote.
+    #[test]
+    fn shuffle_alone_is_a_filter_pipeline() {
+        use crate::format::messages::filter::{FilterPipeline, FILTER_SHUFFLE};
+        let path = temp_path("shuffle_alone");
+        let values: Vec<i32> = (0..64).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([64usize])
+                .chunk(&[16])
+                .shuffle()
+                .create("d")
+                .unwrap()
+                .write_raw(&values)
+                .unwrap();
+            file.close().unwrap();
+        }
+        let pipeline = stored_pipeline(&path, "d");
+        assert_eq!(pipeline, FilterPipeline::shuffle(4));
+        assert_eq!(pipeline.filters[0].id, FILTER_SHUFFLE);
+
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+            values
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `.shuffle()` and `.deflate()` are separate stages that compose, and
+    /// `.shuffle_deflate()` is the shorthand for both — one pipeline, built
+    /// once, whichever way it was asked for.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn shuffle_composes_with_deflate() {
+        let path = temp_path("shuffle_then_deflate");
+        let values: Vec<i32> = (0..64).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            for (name, ds) in [
+                ("split", file.new_dataset::<i32>().shuffle().deflate(6)),
+                ("combined", file.new_dataset::<i32>().shuffle_deflate(6)),
+            ] {
+                ds.shape([64usize])
+                    .chunk(&[16])
+                    .create(name)
+                    .unwrap()
+                    .write_raw(&values)
+                    .unwrap();
+            }
+            file.close().unwrap();
+        }
+        assert_eq!(
+            stored_pipeline(&path, "split"),
+            crate::format::messages::filter::FilterPipeline::shuffle_deflate(4, 6)
+        );
+        assert_eq!(
+            stored_pipeline(&path, "split"),
+            stored_pipeline(&path, "combined")
+        );
+
+        let file = H5File::open(&path).unwrap();
+        for name in ["split", "combined"] {
+            assert_eq!(
+                file.dataset(name).unwrap().read_raw::<i32>().unwrap(),
+                values,
+                "{name}"
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The width shuffle permutes by is the stored element's, which a
+    /// `datatype` override moves away from the carrier type `T`: recording
+    /// `T`'s width would permute a 4-byte element as four 1-byte ones and
+    /// hand libhdf5 a chunk it unshuffles into different bytes.
+    #[test]
+    fn shuffle_records_the_stored_element_width() {
+        use crate::format::messages::datatype::DatatypeMessage;
+        use crate::format::messages::filter::FilterPipeline;
+        let path = temp_path("shuffle_override_width");
+        let bytes: Vec<u8> = (0..16u8).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<u8>()
+                .datatype(DatatypeMessage::i32_type())
+                .shape([4usize])
+                .chunk(&[4])
+                .shuffle()
+                .create("d")
+                .unwrap()
+                .write_raw_bytes(&bytes)
+                .unwrap();
+            file.close().unwrap();
+        }
+        assert_eq!(stored_pipeline(&path, "d"), FilterPipeline::shuffle(4));
+
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+            bytes
+                .chunks(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        );
         std::fs::remove_file(&path).ok();
     }
 }

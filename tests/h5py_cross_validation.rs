@@ -7,7 +7,8 @@
 
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
-    ByteOrder, DatatypeMessage, H5File, H5FileOptions, PointSelection, Reference, Selection,
+    ByteOrder, DatatypeMessage, H5File, H5FileOptions, Hyperslab, HyperslabBlock, PointSelection,
+    Reference, Selection,
 };
 
 /// Interpreters tried in order when `RUST_HDF5_TEST_PYTHON` is unset. The
@@ -69,6 +70,30 @@ fn read_back_with_h5py(py: &str, path: &std::path::Path, body: &str) {
         "h5py cross-check failed for {}",
         path.display()
     );
+}
+
+/// `read_back_with_h5py`, but returning `body`'s stdout instead of only
+/// checking the exit status — for a check that needs h5py's own computed
+/// answer (a stepped slice, a fancy-indexed pick, `read_direct_chunk`) rather
+/// than one a Rust-side formula can stand in for.
+fn capture_from_h5py(py: &str, path: &std::path::Path, body: &str) -> String {
+    let script = format!(
+        "import h5py, numpy as np, sys\nf = h5py.File(r'{}', 'r')\n{}",
+        path.display(),
+        body
+    );
+    let out = std::process::Command::new(py)
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("failed to spawn python");
+    assert!(
+        out.status.success(),
+        "h5py cross-check failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// Run `body` (top-level python statements) with a fresh file opened as `f` in
@@ -1609,6 +1634,11 @@ fn object_header_attribute_count_matches_h5py() {
 /// a dirty rewrite is what catalog measured, and the writer's own AINFO
 /// emission is what closes it. The attributes here are libhdf5's, not this
 /// writer's, so the message has to survive the reopen collector as well.
+///
+/// The same rewrite carries `H5O_HDR_STORE_TIMES` and the four times the flag
+/// announces: `d` is created with `track_times`, and an object created that
+/// way must not lose its timestamps to a session that only added an attribute
+/// to it.
 #[test]
 fn ainfo_survives_a_dirty_rewrite() {
     let Some(py) = python() else { return };
@@ -1625,6 +1655,7 @@ fn ainfo_survives_a_dirty_rewrite() {
          d.attrs['gain'] = np.int32(7)\n",
     );
     let timestamped_before = headers_with_timestamps(&path);
+    let rewritten_at = now_seconds();
 
     // Every one of the three objects is dirtied: the root gains a link, the
     // group and the dataset each gain an attribute, so no header reaches the
@@ -1669,28 +1700,64 @@ fn ainfo_survives_a_dirty_rewrite() {
          assert f['d'].attrs['added_gain'] == 11\n\
          assert list(f['added'][...]) == [8, 9]\n",
     );
-    // The other half of the same measurement, still open: the writer builds
-    // every rewritten header from `ObjectHeader::new`, whose flags carry no
-    // `H5O_HDR_STORE_TIMES` bit and whose encoder would write zero timestamps
-    // if they did, so a header libhdf5 wrote with times comes back without
-    // them. Pinned rather than asserted-away: closing it must flip this line.
-    assert_eq!(timestamped_before, 1);
+    // The other half of the same measurement: only `d` was created with
+    // `track_times`, and the rewrite has to hand it back with the flag and the
+    // four stored times still on it. `H5O_touch_oh` moves access and change
+    // time to now on a real modification and leaves modification and birth
+    // time alone, so those two are compared by value.
+    assert_eq!(timestamped_before.len(), 1);
+    let after = headers_with_timestamps(&path);
     assert_eq!(
-        headers_with_timestamps(&path),
-        0,
-        "the rewrite is expected to drop the timestamps flag until the writer carries it"
+        after.len(),
+        1,
+        "the rewrite must carry H5O_HDR_STORE_TIMES and the times with it"
+    );
+    let (before, after) = (timestamped_before[0], after[0]);
+    assert_eq!(
+        (after.modification, after.birth),
+        (before.modification, before.birth),
+        "modification and birth time are not a rewrite's to change"
+    );
+    assert!(
+        after.access >= rewritten_at && after.change >= rewritten_at,
+        "access/change time must be touched by the rewrite: {before:?} -> {after:?}"
     );
 
     std::fs::remove_file(&path).ok();
 }
 
-/// Count the version-2 object headers in `path` whose flags carry the
-/// timestamps bit (`H5O_HDR_STORE_TIMES`, `0x20`).
-fn headers_with_timestamps(path: &std::path::Path) -> usize {
+/// The four times (`access`, `modification`, `change`, `birth`) of every
+/// version-2 object header in `path` whose flags carry the timestamps bit
+/// (`H5O_HDR_STORE_TIMES`, `0x20`), in the order `H5O__cache_serialize`
+/// writes them.
+#[derive(Clone, Copy, Debug)]
+struct HeaderTimes {
+    access: u32,
+    modification: u32,
+    change: u32,
+    birth: u32,
+}
+
+fn headers_with_timestamps(path: &std::path::Path) -> Vec<HeaderTimes> {
     let raw = std::fs::read(path).unwrap();
-    (0..raw.len() - 6)
+    let at = |i: usize| u32::from_le_bytes(raw[i..i + 4].try_into().unwrap());
+    (0..raw.len() - 22)
         .filter(|&i| &raw[i..i + 4] == b"OHDR" && raw[i + 4] == 2 && raw[i + 5] & 0x20 != 0)
-        .count()
+        .map(|i| HeaderTimes {
+            access: at(i + 6),
+            modification: at(i + 10),
+            change: at(i + 14),
+            birth: at(i + 18),
+        })
+        .collect()
+}
+
+/// Seconds since the epoch, as an object header stores them (`H5_now`).
+fn now_seconds() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32
 }
 
 /// An attribute past the object header message limit spills the object's
@@ -1826,6 +1893,292 @@ fn past_max_compact_the_link_set_goes_dense() {
         file.dataset("many/d07").unwrap().read_raw::<i32>().unwrap(),
         vec![7]
     );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A soft link stores a path and libhdf5 resolves it on traversal, so the
+/// bytes have to say "soft" rather than name an address: h5py reports
+/// `SoftLink` and follows it to the target, and a link whose target does not
+/// exist is a legal file that reports the same value and fails only when
+/// something tries to open it.
+#[test]
+fn soft_links_read_back_through_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("link_soft");
+    {
+        let file = H5File::create(&path).unwrap();
+        file.new_dataset::<i32>()
+            .shape([8])
+            .create("orig")
+            .unwrap()
+            .write_raw(&(0..8i32).collect::<Vec<_>>())
+            .unwrap();
+        file.create_soft_link("alias", "/orig").unwrap();
+        let grp = file.create_group("g").unwrap();
+        grp.create_soft_link("up", "/orig").unwrap();
+        grp.create_soft_link("nowhere", "/absent").unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "l = f.get('alias', getlink=True)\n\
+         assert isinstance(l, h5py.SoftLink), l\n\
+         assert l.path == '/orig', l.path\n\
+         assert list(f['alias'][:]) == list(range(8))\n\
+         assert f['alias'] == f['orig']\n\
+         g = f['g']\n\
+         assert sorted(g.keys()) == ['nowhere', 'up']\n\
+         assert g.get('up', getlink=True).path == '/orig'\n\
+         assert g.get('nowhere', getlink=True).path == '/absent'\n\
+         try:\n\
+         \x20   g['nowhere']\n\
+         \x20   raise AssertionError('a dangling soft link must not resolve')\n\
+         except KeyError:\n\
+         \x20   pass\n",
+    );
+
+    // And this crate reads its own soft links back.
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(
+        file.root_group().link_class("alias").unwrap(),
+        rust_hdf5::LinkClass::Soft {
+            path: "/orig".into()
+        }
+    );
+    let g = file.root_group().group("g").unwrap();
+    let mut names = g.link_names().unwrap();
+    names.sort();
+    assert_eq!(names, vec!["nowhere".to_string(), "up".to_string()]);
+    assert_eq!(
+        g.link_class("nowhere").unwrap(),
+        rust_hdf5::LinkClass::Soft {
+            path: "/absent".into()
+        }
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// An external link is a user-defined link of class 64 whose value is a
+/// version/flags byte, the NUL-terminated file name and the NUL-terminated
+/// object path. h5py must report `ExternalLink` with both halves and open the
+/// object through it; libhdf5 resolves the file name against the directory
+/// holding this file, so the bare name is what gets stored. The object path
+/// is normalized on the way in, the way `H5Lcreate_external` normalizes it.
+#[test]
+fn external_links_read_back_through_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("link_external");
+    let target = path.with_file_name(format!(
+        "{}_ext.h5",
+        path.file_stem().unwrap().to_string_lossy()
+    ));
+    let target_name = target.file_name().unwrap().to_string_lossy().to_string();
+    {
+        let ext = H5File::create(&target).unwrap();
+        ext.create_group("deep")
+            .unwrap()
+            .new_dataset::<i32>()
+            .shape([8])
+            .create("payload")
+            .unwrap()
+            .write_raw(&(0..8i32).collect::<Vec<_>>())
+            .unwrap();
+        ext.close().unwrap();
+
+        let file = H5File::create(&path).unwrap();
+        file.create_external_link("ext", &target_name, "/deep/payload")
+            .unwrap();
+        // Duplicate and trailing slashes do not survive `H5G_normalize`.
+        file.create_external_link("messy", &target_name, "//deep///payload/")
+            .unwrap();
+        file.create_external_link("gone_object", &target_name, "/absent")
+            .unwrap();
+        file.create_external_link("gone_file", "no_such_file.h5", "/deep/payload")
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        &format!(
+            "l = f.get('ext', getlink=True)\n\
+             assert isinstance(l, h5py.ExternalLink), l\n\
+             assert l.filename == {name:?}, l.filename\n\
+             assert l.path == '/deep/payload', l.path\n\
+             assert list(f['ext'][:]) == list(range(8))\n\
+             m = f.get('messy', getlink=True)\n\
+             assert m.path == '/deep/payload', m.path\n\
+             assert list(f['messy'][:]) == list(range(8))\n\
+             assert sorted(f.keys()) == ['ext', 'gone_file', 'gone_object', 'messy']\n\
+             for dangling in ('gone_object', 'gone_file'):\n\
+             \x20   try:\n\
+             \x20       f[dangling]\n\
+             \x20       raise AssertionError('%s must not resolve' % dangling)\n\
+             \x20   except KeyError:\n\
+             \x20       pass\n",
+            name = target_name
+        ),
+    );
+
+    // And this crate reads its own external links back, following the one
+    // that resolves into the other file.
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(
+        file.root_group().link_class("ext").unwrap(),
+        rust_hdf5::LinkClass::External {
+            file: target_name.clone(),
+            path: "/deep/payload".into()
+        }
+    );
+    assert_eq!(
+        file.root_group().link_class("messy").unwrap(),
+        rust_hdf5::LinkClass::External {
+            file: target_name,
+            path: "/deep/payload".into()
+        }
+    );
+    assert_eq!(
+        file.dataset("ext").unwrap().read_raw::<i32>().unwrap(),
+        (0..8i32).collect::<Vec<_>>()
+    );
+    drop(file);
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&target).ok();
+}
+
+/// The phase change counts links, not objects: a group whose set crosses
+/// `max_compact` on the strength of its soft links spills the whole set into
+/// a fractal heap, and every soft link has to come back out of it with its
+/// value intact.
+#[test]
+fn soft_links_take_part_in_the_dense_phase_change() {
+    let Some(py) = python() else { return };
+    let path = tmp("link_soft_dense");
+    {
+        let file = H5File::create(&path).unwrap();
+        let g = file.create_group("g").unwrap();
+        g.new_dataset::<i32>()
+            .shape([1])
+            .create("d")
+            .unwrap()
+            .write_raw(&[7i32])
+            .unwrap();
+        // One real object plus ten soft links: eleven links, past the eight
+        // a group header keeps.
+        for i in 0..10i32 {
+            g.create_soft_link(&format!("s{i:02}"), "/g/d").unwrap();
+        }
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "g = f['g']\n\
+         assert sorted(g.keys()) == ['d'] + ['s%02d' % i for i in range(10)]\n\
+         for i in range(10):\n\
+         \x20   l = g.get('s%02d' % i, getlink=True)\n\
+         \x20   assert isinstance(l, h5py.SoftLink), l\n\
+         \x20   assert l.path == '/g/d', l.path\n\
+         \x20   assert g['s%02d' % i][0] == 7\n\
+         i = h5py.h5o.get_info(g.id)\n\
+         assert i.meta_size.obj.index_size > 0, 'expected dense links'\n\
+         assert i.meta_size.obj.heap_size > 0, i.meta_size.obj.heap_size\n",
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let g = file.root_group().group("g").unwrap();
+    for i in 0..10 {
+        assert_eq!(
+            g.link_class(&format!("s{i:02}")).unwrap(),
+            rust_hdf5::LinkClass::Soft {
+                path: "/g/d".into()
+            }
+        );
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+/// A committed datatype is an object of its own, and a dataset built on it
+/// stores a pointer to that object instead of a datatype message. libhdf5 has
+/// to agree on both halves: `committed()` on the dataset's type, and a
+/// reference count that counts each sharer as well as the link — a type with
+/// one name and two datasets on it is `rc == 3`.
+#[test]
+fn committed_datatypes_read_back_through_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("named_datatype");
+    {
+        let file = H5File::create(&path).unwrap();
+        file.commit_datatype("t", DatatypeMessage::i32_type())
+            .unwrap();
+        // A type nothing shares is still a complete object, and a group can
+        // hold one.
+        let types = file.create_group("types").unwrap();
+        types
+            .commit_datatype("lonely", DatatypeMessage::f64_type())
+            .unwrap();
+
+        file.new_dataset::<i32>()
+            .shape([8])
+            .create("data")
+            .unwrap()
+            .write_raw(&(0..8i32).collect::<Vec<_>>())
+            .unwrap();
+        for name in ["shared", "shared2"] {
+            file.new_dataset::<i32>()
+                .committed_type("t")
+                .shape([8])
+                .create(name)
+                .unwrap()
+                .write_raw(&(0..8i32).collect::<Vec<_>>())
+                .unwrap();
+        }
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "import numpy as np\n\
+         assert isinstance(f['t'], h5py.Datatype), type(f['t'])\n\
+         assert f['t'].dtype == np.dtype('<i4'), f['t'].dtype\n\
+         assert f['types/lonely'].dtype == np.dtype('<f8')\n\
+         assert h5py.h5o.get_info(f['t'].id).rc == 3\n\
+         assert h5py.h5o.get_info(f['types/lonely'].id).rc == 1\n\
+         for name in ('shared', 'shared2'):\n\
+         \x20   t = f[name].id.get_type()\n\
+         \x20   assert t.committed(), name\n\
+         \x20   assert t == f['t'].id, name\n\
+         \x20   assert list(f[name][:]) == list(range(8))\n\
+         assert not f['data'].id.get_type().committed()\n\
+         assert list(f['data'][:]) == list(range(8))\n\
+         assert sorted(f.keys()) == ['data', 'shared', 'shared2', 't', 'types']\n",
+    );
+
+    // And this crate reads its own committed datatypes back, including the
+    // shared pointer on the datasets built from one.
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.named_datatype_names();
+    names.sort();
+    assert_eq!(names, vec!["t".to_string(), "types/lonely".to_string()]);
+    assert_eq!(
+        file.named_datatype("t").unwrap().datatype().unwrap(),
+        DatatypeMessage::i32_type()
+    );
+    assert_eq!(
+        file.named_datatype("types/lonely")
+            .unwrap()
+            .datatype()
+            .unwrap(),
+        DatatypeMessage::f64_type()
+    );
+    for name in ["data", "shared", "shared2"] {
+        assert_eq!(
+            file.dataset(name).unwrap().read_raw::<i32>().unwrap(),
+            (0..8i32).collect::<Vec<_>>(),
+            "{name}"
+        );
+    }
     std::fs::remove_file(&path).ok();
 }
 
@@ -2022,6 +2375,48 @@ fn creation_order_tracking_is_captured_per_object() {
          assert list(f.attrs) == ['last', 'first']\n\
          assert list(f.keys()) == ['plain', 'tracked']\n\
          assert list(f['plain'].keys()) == ['alpha', 'beta']\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// Overwriting an attribute is a write, not a create: `H5A__attr_write` puts
+/// the new value under the existing `crt_idx` and leaves the running maximum
+/// alone. The variable-length setters take the old attribute off the list
+/// before allocating the new value's heap objects — the free-before-alloc
+/// order — so the index has to travel with the eviction, or the replacement
+/// is stamped as the newest attribute and moves to the end of the order.
+#[test]
+fn overwriting_an_attribute_keeps_its_creation_index() {
+    let Some(py) = python() else { return };
+    let path = tmp("attr_overwrite_corder");
+    {
+        let file = H5FileOptions::new()
+            .track_order(true)
+            .create(&path)
+            .unwrap();
+        let g = file.create_group("g").unwrap();
+        for (i, name) in ["zeta", "alpha", "mu"].iter().enumerate() {
+            g.set_attr_string(name, &format!("v{i}")).unwrap();
+        }
+        // The oldest two are rewritten, so an index taken from the position an
+        // eviction left the attribute in puts them last instead of first.
+        g.set_attr_string("zeta", "rewritten").unwrap();
+        g.set_attr_string_array("alpha", &["a", "b"]).unwrap();
+        // A numeric value over a variable-length one takes the other branch of
+        // the same replacement, and must keep the index just the same.
+        g.set_attr_numeric("mu", &7i32).unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "g = f['g']\n\
+         assert list(g.attrs) == ['zeta', 'alpha', 'mu'], list(g.attrs)\n\
+         corder = [h5py.h5a.get_info(g.id, name=n.encode()).corder for n in g.attrs]\n\
+         assert corder == [0, 1, 2], corder\n\
+         assert g.attrs['zeta'] == 'rewritten', g.attrs['zeta']\n\
+         assert list(g.attrs['alpha']) == ['a', 'b'], list(g.attrs['alpha'])\n\
+         assert g.attrs['mu'] == 7, g.attrs['mu']\n",
     );
     std::fs::remove_file(&path).ok();
 }
@@ -3289,6 +3684,127 @@ fn object_references_written_by_rust_dereference_in_h5py() {
     std::fs::remove_file(&path).ok();
 }
 
+/// Region references rust writes are real `H5R_DATASET_REGION1` elements:
+/// h5py dereferences them to the target dataset and slices it with the
+/// selection the heap object carries, for a hyperslab and for a point list.
+#[test]
+fn region_references_written_by_rust_dereference_in_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("ref_region_write");
+    let file = H5File::create(&path).unwrap();
+    let target = file
+        .new_dataset::<i32>()
+        .shape([8])
+        .create("target")
+        .unwrap();
+    target.write_raw(&(0..8i32).collect::<Vec<_>>()).unwrap();
+    let matrix = file
+        .new_dataset::<i32>()
+        .shape([4, 6])
+        .create("matrix")
+        .unwrap();
+    matrix.write_raw(&(0..24i32).collect::<Vec<_>>()).unwrap();
+    let refs = file
+        .new_dataset::<u64>()
+        .region_references()
+        .shape([4])
+        .create("refs")
+        .unwrap();
+    let block = |start: Vec<u64>, end: Vec<u64>| Selection::Hyperslab {
+        rank: start.len(),
+        form: Hyperslab::Blocks(vec![HyperslabBlock { start, end }]),
+    };
+    refs.write_region_references(&[
+        ("/target", block(vec![0], vec![2])),
+        ("matrix", block(vec![1, 2], vec![2, 4])),
+        (
+            "/matrix",
+            Selection::Points(PointSelection {
+                rank: 2,
+                points: vec![vec![0, 1], vec![3, 5]],
+            }),
+        ),
+    ])
+    .unwrap();
+    file.close().unwrap();
+
+    read_back_with_h5py(
+        py,
+        &path,
+        "r = f['refs']\n\
+         assert r.dtype == h5py.regionref_dtype, r.dtype\n\
+         t = f[r[0]]\n\
+         assert t.name == '/target', t.name\n\
+         assert (t[r[0]] == [0, 1, 2]).all(), t[r[0]]\n\
+         m = f[r[1]]\n\
+         assert m.name == '/matrix', m.name\n\
+         assert (m[r[1]] == [[8, 9, 10], [14, 15, 16]]).all(), m[r[1]]\n\
+         assert (f[r[2]][r[2]] == [1, 23]).all(), f[r[2]][r[2]]\n\
+         lo, hi = h5py.h5r.get_region(r[2], m.id).get_select_bounds()\n\
+         assert (lo, hi) == ((0, 1), (3, 5)), (lo, hi)\n\
+         assert not bool(r[3]), 'unwritten element must be a null reference'\n",
+    );
+
+    // The same file reads back through this crate.
+    let file = H5File::open(&path).unwrap();
+    let got = file.dataset("refs").unwrap().read_references().unwrap();
+    assert_eq!(
+        got.iter().map(|r| r.path()).collect::<Vec<_>>(),
+        vec![Some("/target"), Some("/matrix"), Some("/matrix"), None]
+    );
+    assert_eq!(got[0].bounds(), Some((vec![0], vec![2])));
+    assert_eq!(got[1].bounds(), Some((vec![1, 2], vec![2, 4])));
+    assert_eq!(
+        got[2].selection(),
+        Some(&Selection::Points(PointSelection {
+            rank: 2,
+            points: vec![vec![0, 1], vec![3, 5]],
+        }))
+    );
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}
+
+/// A region reference names a dataset and a selection that dataset's extent
+/// admits; both rules are enforced at the call, not at finalize.
+#[test]
+fn a_region_reference_outside_the_target_is_refused() {
+    let path = tmp("ref_region_invalid");
+    let file = H5File::create(&path).unwrap();
+    file.new_dataset::<i32>()
+        .shape([8])
+        .create("target")
+        .unwrap();
+    file.create_group("grp").unwrap();
+    let refs = file
+        .new_dataset::<u64>()
+        .region_references()
+        .shape([1])
+        .create("refs")
+        .unwrap();
+    let block = |start: Vec<u64>, end: Vec<u64>| Selection::Hyperslab {
+        rank: start.len(),
+        form: Hyperslab::Blocks(vec![HyperslabBlock { start, end }]),
+    };
+    let err = refs
+        .write_region_references(&[("/grp", block(vec![0], vec![2]))])
+        .expect_err("a group is not a region target")
+        .to_string();
+    assert!(err.contains("/grp"), "got: {err}");
+    let err = refs
+        .write_region_references(&[("/target", block(vec![4], vec![9]))])
+        .expect_err("the selection runs past the extent")
+        .to_string();
+    assert!(err.contains("extent"), "got: {err}");
+    let err = refs
+        .write_region_references(&[("/target", block(vec![0, 0], vec![1, 1]))])
+        .expect_err("the selection has the wrong rank")
+        .to_string();
+    assert!(err.contains("rank"), "got: {err}");
+    file.close().unwrap();
+    std::fs::remove_file(&path).ok();
+}
+
 /// A reference to a path that names nothing is refused at the call that got
 /// it wrong, not silently stored as a null.
 #[test]
@@ -3736,5 +4252,204 @@ fn vds_same_file_mapping_readable_by_rust() {
     assert_eq!(ds.read_raw::<i32>().unwrap(), (0..8).collect::<Vec<i32>>());
     assert_eq!(ds.read_slice::<i32>(&[2], &[4]).unwrap(), vec![2, 3, 4, 5]);
     drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The hard link count of a *reopened* object is part of what its header
+/// records, so a session that changes the count has to rewrite the header.
+///
+/// `H5Oget_info().rc` reads that count; libhdf5 keeps it in an Object
+/// Reference Count message on a version-2 header and in the `nlink` prefix
+/// field on a version-1 one. Neither is reachable from the flags that decide
+/// whether a reopened dataset keeps its header — a link is created in the
+/// parent group, not on the target — so linking to an otherwise untouched
+/// dataset used to leave `rc == 1` while both names resolved, which is a file
+/// `H5Ldelete` then frees the storage of while a name still points at it.
+#[test]
+fn a_link_change_on_a_reopened_dataset_rewrites_its_reference_count() {
+    let Some(py) = python() else { return };
+    let path = tmp("reopen_refcount");
+    write_with_h5py_libver(
+        py,
+        &path,
+        Some("v110"),
+        "f['alpha'] = np.arange(3, dtype='<i4')\n",
+    );
+
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.root_group().link("twin", "/alpha").unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "info = h5py.h5o.get_info(f['alpha'].id)\n\
+         assert info.rc == 2, info.rc\n\
+         assert sorted(f.keys()) == ['alpha', 'twin'], sorted(f.keys())\n",
+    );
+
+    // And back down: unlinking one of the two names is the same change with
+    // the opposite sign, and the header has to follow it there too.
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.delete_dataset("twin").unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "info = h5py.h5o.get_info(f['alpha'].id)\n\
+         assert info.rc == 1, info.rc\n\
+         assert sorted(f.keys()) == ['alpha'], sorted(f.keys())\n\
+         assert list(f['alpha'][...]) == [0, 1, 2]\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// SELREAD-1: `read_hyperslab`'s `start`/`stride`/`count`/`block` against an
+/// h5py-written dataset must match h5py's own stepped slicing, not a
+/// hand-derived formula — the expected values come from h5py evaluating
+/// `ds[1:5:2, 2:8:3]` itself.
+#[test]
+fn h5py_written_dataset_readable_by_strided_hyperslab_read() {
+    let Some(py) = python() else { return };
+    let path = tmp("hyperslab_read");
+    write_with_h5py(
+        py,
+        &path,
+        "f.create_dataset('grid', data=np.arange(48, dtype='<i4').reshape(6, 8))\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("grid").unwrap();
+    // Python: ds[1:5:2, 2:8:3] -- rows {1, 3}, columns {2, 5}.
+    let got: Vec<i32> = ds
+        .read_hyperslab(&[1, 2], &[2, 3], &[2, 2], &[1, 1])
+        .unwrap();
+    drop(file);
+    let want_csv = capture_from_h5py(
+        py,
+        &path,
+        "want = f['grid'][1:5:2, 2:8:3].reshape(-1)\n\
+         print(','.join(str(int(x)) for x in want))\n",
+    );
+    let want: Vec<i32> = want_csv.split(',').map(|s| s.parse().unwrap()).collect();
+    assert_eq!(got, want);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A non-unit `block` covers h5py's *general* hyperslab form (contiguous
+/// blocks of more than one element per step), which stepped slicing alone
+/// cannot express — `ds[1:5:2, 2:8:3]` above only ever has `block == 1`.
+#[test]
+fn h5py_written_dataset_readable_by_hyperslab_read_with_block_greater_than_one() {
+    let Some(py) = python() else { return };
+    let path = tmp("hyperslab_block");
+    write_with_h5py(
+        py,
+        &path,
+        "f.create_dataset('grid', data=np.arange(48, dtype='<i4').reshape(6, 8))\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("grid").unwrap();
+    // start=[0,1], stride=[3,4], count=[2,2], block=[2,3]: two 2x3 blocks
+    // along each axis, spaced 3 and 4 apart.
+    let got: Vec<i32> = ds
+        .read_hyperslab(&[0, 1], &[3, 4], &[2, 2], &[2, 3])
+        .unwrap();
+    drop(file);
+    let want_csv = capture_from_h5py(
+        py,
+        &path,
+        // h5py's own selector only accepts a 1D array per fancy-indexed axis
+        // (no broadcasting), so the row pick goes through h5py and the
+        // column pick is plain numpy indexing on the now in-memory result.
+        "want = f['grid'][[0, 1, 3, 4], :][:, [1, 2, 3, 5, 6, 7]].reshape(-1)\n\
+         print(','.join(str(int(x)) for x in want))\n",
+    );
+    let want: Vec<i32> = want_csv.split(',').map(|s| s.parse().unwrap()).collect();
+    assert_eq!(got, want);
+    std::fs::remove_file(&path).ok();
+}
+
+/// SELREAD-2: `read_points` against an h5py-written dataset must match
+/// h5py's own coordinate-list point selection (`H5Sselect_elements`, exposed
+/// as `Dataspace.select_elements`), element for element and in the same
+/// order. h5py's high-level `ds[...]` fancy indexing is *orthogonal*
+/// indexing (a cross product of per-axis picks), not this — so the
+/// comparison goes through the low-level selection API that actually models
+/// a coordinate list, matching `Selection::Points`.
+#[test]
+fn h5py_written_dataset_readable_by_point_selection_read() {
+    let Some(py) = python() else { return };
+    let path = tmp("points_read");
+    write_with_h5py(
+        py,
+        &path,
+        "f.create_dataset('grid', data=np.arange(100, dtype='<f8').reshape(10, 10))\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("grid").unwrap();
+    let points = vec![vec![0, 0], vec![3, 4], vec![9, 9], vec![5, 2], vec![0, 9]];
+    let got: Vec<f64> = ds.read_points(&points).unwrap();
+    drop(file);
+    let want_csv = capture_from_h5py(
+        py,
+        &path,
+        "ds = f['grid']\n\
+         coords = [(0, 0), (3, 4), (9, 9), (5, 2), (0, 9)]\n\
+         space = ds.id.get_space()\n\
+         space.select_elements(coords)\n\
+         mspace = h5py.h5s.create_simple((len(coords),))\n\
+         want = np.zeros((len(coords),), dtype='<f8')\n\
+         ds.id.read(mspace, space, want)\n\
+         print(','.join(repr(float(x)) for x in want))\n",
+    );
+    let want: Vec<f64> = want_csv.split(',').map(|s| s.parse().unwrap()).collect();
+    assert_eq!(got, want);
+    std::fs::remove_file(&path).ok();
+}
+
+/// SELREAD-3: `read_chunk_raw_at` on a chunked + deflated dataset must
+/// return exactly the bytes and filter mask h5py's own
+/// `Dataset.id.read_direct_chunk` reports for the same chunk — still
+/// compressed, with no decoding on either side.
+#[cfg(feature = "deflate")]
+#[test]
+fn h5py_written_deflated_chunk_matches_h5py_read_direct_chunk() {
+    let Some(py) = python() else { return };
+    let path = tmp("chunk_read_deflate");
+    write_with_h5py(
+        py,
+        &path,
+        "f.create_dataset(\n\
+         \x20   'grid', data=np.arange(64, dtype='<i4').reshape(8, 8),\n\
+         \x20   chunks=(4, 4), compression='gzip', compression_opts=6,\n\
+         )\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("grid").unwrap();
+    // Chunk-grid coordinates [1, 0]: the second row of chunks, first column.
+    let (got_bytes, got_mask) = ds.read_chunk_raw_at(&[1, 0]).unwrap();
+    drop(file);
+    let want = capture_from_h5py(
+        py,
+        &path,
+        // read_direct_chunk takes an element offset, not a chunk-grid index:
+        // chunk [1, 0] with chunk shape (4, 4) starts at element (4, 0).
+        "mask, data = f['grid'].id.read_direct_chunk((4, 0))\n\
+         print(data.hex())\n\
+         print(mask)\n",
+    );
+    let mut lines = want.lines();
+    let want_hex = lines.next().unwrap();
+    let want_mask: u32 = lines.next().unwrap().parse().unwrap();
+    assert!(lines.next().is_none());
+    let want_bytes: Vec<u8> = (0..want_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&want_hex[i..i + 2], 16).unwrap())
+        .collect();
+    assert_eq!(got_bytes, want_bytes);
+    assert_eq!(got_mask, want_mask);
     std::fs::remove_file(&path).ok();
 }

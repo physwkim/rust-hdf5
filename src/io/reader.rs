@@ -37,6 +37,7 @@ use crate::format::reference::{
     decode_object_element, decode_region_element, decode_region_heap_object, decode_revised_body,
     decode_revised_element, Reference, ReferenceTarget, RevisedElement,
 };
+use crate::format::selection::{Hyperslab, PointSelection, RegularHyperslab, Selection};
 use crate::format::sohm::SohmMasterTable;
 use crate::format::superblock::{
     detect_superblock_version, SuperblockV0V1, SuperblockV2V3, SymbolTableCache,
@@ -68,6 +69,11 @@ struct ChunkIndexDesc<'a> {
     /// on-disk size and per-chunk filter mask.
     single_chunk_filter: Option<data_layout::SingleChunkFilter>,
 }
+
+/// One v2-B-tree chunk-index record, resolved to `(chunk address, on-disk
+/// read size, scaled chunk-grid offsets, filter mask)` — see
+/// [`Hdf5Reader::collect_bt2_chunk_entries`].
+type Bt2ChunkEntry = (u64, usize, Vec<u64>, u32);
 
 /// What a chunked read should produce: the whole dataset, or one hyperslab.
 ///
@@ -648,6 +654,24 @@ enum ObjectKind {
     /// A committed (named) datatype object: a datatype message with neither
     /// group storage nor the dataspace/layout pair a dataset needs.
     CommittedDatatype(Box<CommittedDatatypeInfo>),
+}
+
+/// Whether a header's messages say it is a committed (named) datatype: a
+/// datatype message, no group storage, and not the dataspace/layout pair a
+/// dataset needs.
+///
+/// The one authority for that question. [`Hdf5Reader::classify_object`] asks it
+/// of a file being read and `ReopenWalk::plan` of one being appended to, and a
+/// header that is a named datatype to one and an unclassifiable object to the
+/// other is how `named_datatype_names` came to answer differently in the two
+/// modes for the same file.
+pub(crate) fn header_is_committed_datatype(header: &ObjectHeader) -> bool {
+    let present = |t: u8| header.messages.iter().any(|m| m.msg_type == t);
+    let is_group = present(MSG_LINK)
+        || present(MSG_LINK_INFO)
+        || present(MSG_SYMBOL_TABLE)
+        || present(MSG_GROUP_INFO);
+    !is_group && present(MSG_DATATYPE) && !(present(MSG_DATASPACE) && present(MSG_DATA_LAYOUT))
 }
 
 /// A committed (named) datatype as read from its own object header.
@@ -1812,16 +1836,15 @@ impl Hdf5Reader {
         if is_group {
             return ObjectKind::Group;
         }
+        if header_is_committed_datatype(header) {
+            return ObjectKind::CommittedDatatype(Box::new(Self::committed_datatype(
+                handle, header, meta,
+            )));
+        }
         let is_dataset =
             present(MSG_DATATYPE) && present(MSG_DATASPACE) && present(MSG_DATA_LAYOUT);
         if !is_dataset {
-            return if present(MSG_DATATYPE) {
-                ObjectKind::CommittedDatatype(Box::new(Self::committed_datatype(
-                    handle, header, meta,
-                )))
-            } else {
-                ObjectKind::Group
-            };
+            return ObjectKind::Group;
         }
 
         let mut datatype = None;
@@ -2426,12 +2449,11 @@ impl Hdf5Reader {
         name: &str,
     ) -> IoResult<&'a AttributeMessage> {
         match attrs.entries.iter().find(|a| a.name() == name) {
-            Some(AttributeEntry::Readable(attr)) => Ok(attr),
-            Some(AttributeEntry::Unreadable { reason, .. }) => {
-                Err(crate::io::IoError::Unsupported(format!(
+            Some(entry) => entry.decoded().map_err(|reason| {
+                crate::io::IoError::Unsupported(format!(
                     "attribute '{name}' on '{owner}' cannot be decoded: {reason}"
-                )))
-            }
+                ))
+            }),
             // Not among what was read — but the part that was not read could
             // hold it, so an incomplete set cannot answer "absent".
             None => match attrs.unreadable_reason() {
@@ -3387,31 +3409,28 @@ impl Hdf5Reader {
         }
     }
 
-    /// Read a dataset indexed by a fixed array.
+    /// Collect a fixed-array dataset's per-chunk `(address, on-disk byte
+    /// count, filter mask)` entries, indexed by index-grid linear slot
+    /// ([`crate::io::chunk_grid`]). Empty when the index or its data block is
+    /// unallocated.
     ///
-    /// Scatters only; `output` must already be sized to the target extent and
-    /// pre-filled with the tiled fill value by the caller.
-    fn read_chunked_fixed_array(
+    /// Shared by the full/slice chunked reader
+    /// ([`read_chunked_fixed_array`](Self::read_chunked_fixed_array)) and the
+    /// direct single-chunk read
+    /// ([`read_chunk_raw_at`](Self::read_chunk_raw_at)), so the fixed-array
+    /// wire format has one decoder.
+    fn collect_fa_chunk_entries(
         &mut self,
-        name: &str,
         chunk_dims: &[u64],
+        ndims: usize,
+        element_size: u64,
         index_address: u64,
-        pipeline: Option<&FilterPipeline>,
-        target: ChunkTarget,
-        output: &mut [u8],
-    ) -> IoResult<()> {
+    ) -> IoResult<Vec<(u64, u64, u32)>> {
         use crate::format::chunk_index::fixed_array::*;
 
-        let info = self
-            .dataset_info_local(name)
-            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
-        let dims = info.dataspace.dims.clone();
-        let element_size = info.datatype.element_size() as u64;
-        let ndims = dims.len();
-
         if index_address == UNDEF_ADDR {
-            // Unallocated: `output` is already the pre-filled buffer.
-            return Ok(());
+            // Unallocated: no chunks recorded.
+            return Ok(Vec::new());
         }
 
         // Read FA header
@@ -3419,8 +3438,8 @@ impl Hdf5Reader {
         let fa_hdr = FixedArrayHeader::decode(&hdr_buf, &self.meta.ctx)?;
 
         if fa_hdr.data_blk_addr == UNDEF_ADDR {
-            // Unallocated data block: `output` is already pre-filled.
-            return Ok(());
+            // Unallocated data block: no chunks recorded.
+            return Ok(Vec::new());
         }
 
         // The chunk shape (from the layout message) must match the
@@ -3554,12 +3573,43 @@ impl Hdf5Reader {
             }
         }
 
+        Ok(chunk_entries)
+    }
+
+    /// Read a dataset indexed by a fixed array.
+    ///
+    /// Scatters only; `output` must already be sized to the target extent and
+    /// pre-filled with the tiled fill value by the caller.
+    fn read_chunked_fixed_array(
+        &mut self,
+        name: &str,
+        chunk_dims: &[u64],
+        index_address: u64,
+        pipeline: Option<&FilterPipeline>,
+        target: ChunkTarget,
+        output: &mut [u8],
+    ) -> IoResult<()> {
+        let info = self
+            .dataset_info_local(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let dims = info.dataspace.dims.clone();
+        let element_size = info.datatype.element_size() as u64;
+        let max_dims = info.dataspace.max_dims.clone();
+        let ndims = dims.len();
+
+        let chunk_entries =
+            self.collect_fa_chunk_entries(chunk_dims, ndims, element_size, index_address)?;
+        if chunk_entries.is_empty() {
+            // Unallocated index/data block: `output` is already pre-filled.
+            return Ok(());
+        }
+        let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
+
         // Index-grid slot -> chunk-grid coordinates (row-major, against the
         // maximum extent — the array was sized from its chunk grid, so a slot
         // beyond the current extent still decodes to its true position and
         // then simply falls outside the read target). A zero chunk dimension
         // from a malformed layout message is rejected inside.
-        let max_dims = info.dataspace.max_dims.clone();
         let mut slot_coords = Vec::with_capacity(chunk_entries.len());
         for i in 0..chunk_entries.len() as u64 {
             slot_coords.push(crate::io::chunk_grid::coords_of(
@@ -3722,31 +3772,28 @@ impl Hdf5Reader {
         Ok(())
     }
 
-    /// Read a dataset indexed by a B-tree v2.
+    /// Collect a v2-B-tree-indexed dataset's per-chunk `(address, read
+    /// size, scaled chunk-grid offsets, filter mask)` entries, walking the
+    /// tree once. `read_size` is the compressed size for a filtered chunk,
+    /// the full chunk size otherwise. Empty when the index has no records.
     ///
-    /// Scatters only; `output` must already be sized to the target extent and
-    /// pre-filled with the tiled fill value by the caller.
-    fn read_chunked_btree_v2(
+    /// Shared by the full/slice chunked reader
+    /// ([`read_chunked_btree_v2`](Self::read_chunked_btree_v2)) and the
+    /// direct single-chunk read
+    /// ([`read_chunk_raw_at`](Self::read_chunk_raw_at)), so the v2 B-tree
+    /// record format has one decoder.
+    fn collect_bt2_chunk_entries(
         &mut self,
-        name: &str,
         chunk_dims: &[u64],
+        ndims: usize,
+        element_size: u64,
         index_address: u64,
-        pipeline: Option<&FilterPipeline>,
-        target: ChunkTarget,
-        output: &mut [u8],
-    ) -> IoResult<()> {
+    ) -> IoResult<Vec<Bt2ChunkEntry>> {
         use crate::format::chunk_index::btree_v2::*;
 
-        let info = self
-            .dataset_info_local(name)
-            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
-        let dims = info.dataspace.dims.clone();
-        let element_size = info.datatype.element_size() as u64;
-        let ndims = dims.len();
-
         if index_address == UNDEF_ADDR {
-            // Unallocated: `output` is already the pre-filled buffer.
-            return Ok(());
+            // Unallocated: no chunks recorded.
+            return Ok(Vec::new());
         }
 
         // Read BT2 header
@@ -3754,8 +3801,8 @@ impl Hdf5Reader {
         let bt2_hdr = Bt2Header::decode(&hdr_buf, &self.meta.ctx)?;
 
         if bt2_hdr.root_node_addr == UNDEF_ADDR || bt2_hdr.total_num_records == 0 {
-            // No records: `output` is already pre-filled.
-            return Ok(());
+            // No records.
+            return Ok(Vec::new());
         }
 
         // Walk the B-tree to any depth, collecting every record's raw bytes
@@ -3782,36 +3829,65 @@ impl Hdf5Reader {
         // scaled offsets, filter mask). read_size is the compressed size for
         // filtered chunks, the full chunk size otherwise; the mask is 0 for
         // unfiltered records.
-        let entries: Vec<(u64, usize, Vec<u64>, u32)> =
-            if bt2_hdr.record_type == BT2_TYPE_CHUNK_UNFILT {
-                Bt2ChunkIndex::decode_unfiltered_records(
-                    &record_bytes,
-                    total_records,
-                    ndims,
-                    &self.meta.ctx,
-                )?
-                .into_iter()
-                .map(|r| (r.chunk_address, chunk_bytes as usize, r.scaled_offsets, 0))
-                .collect()
-            } else {
-                Bt2ChunkIndex::decode_filtered_records(
-                    &record_bytes,
-                    total_records,
-                    ndims,
-                    bt2_hdr.record_size,
-                    &self.meta.ctx,
-                )?
-                .into_iter()
-                .map(|r| {
-                    (
-                        r.chunk_address,
-                        r.chunk_size as usize,
-                        r.scaled_offsets,
-                        r.filter_mask,
-                    )
-                })
-                .collect()
-            };
+        let entries: Vec<Bt2ChunkEntry> = if bt2_hdr.record_type == BT2_TYPE_CHUNK_UNFILT {
+            Bt2ChunkIndex::decode_unfiltered_records(
+                &record_bytes,
+                total_records,
+                ndims,
+                &self.meta.ctx,
+            )?
+            .into_iter()
+            .map(|r| (r.chunk_address, chunk_bytes as usize, r.scaled_offsets, 0))
+            .collect()
+        } else {
+            Bt2ChunkIndex::decode_filtered_records(
+                &record_bytes,
+                total_records,
+                ndims,
+                bt2_hdr.record_size,
+                &self.meta.ctx,
+            )?
+            .into_iter()
+            .map(|r| {
+                (
+                    r.chunk_address,
+                    r.chunk_size as usize,
+                    r.scaled_offsets,
+                    r.filter_mask,
+                )
+            })
+            .collect()
+        };
+
+        Ok(entries)
+    }
+
+    /// Read a dataset indexed by a B-tree v2.
+    ///
+    /// Scatters only; `output` must already be sized to the target extent and
+    /// pre-filled with the tiled fill value by the caller.
+    fn read_chunked_btree_v2(
+        &mut self,
+        name: &str,
+        chunk_dims: &[u64],
+        index_address: u64,
+        pipeline: Option<&FilterPipeline>,
+        target: ChunkTarget,
+        output: &mut [u8],
+    ) -> IoResult<()> {
+        let info = self
+            .dataset_info_local(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let dims = info.dataspace.dims.clone();
+        let element_size = info.datatype.element_size() as u64;
+        let ndims = dims.len();
+
+        let entries =
+            self.collect_bt2_chunk_entries(chunk_dims, ndims, element_size, index_address)?;
+        if entries.is_empty() {
+            // Unallocated index or no records: `output` is already pre-filled.
+            return Ok(());
+        }
 
         // Build one read job per chunk (no I/O yet), keeping each chunk's
         // scaled (chunk-grid) offsets alongside for the scatter. For a slice,
@@ -4805,6 +4881,356 @@ impl Hdf5Reader {
         }
         Ok(())
     }
+
+    /// Read a strided hyperslab — h5py's stepped slicing (`ds[a:b:s]`) or
+    /// the general `start`/`stride`/`count`/`block` form of
+    /// `H5Sselect_hyperslab` — into a returned buffer.
+    ///
+    /// One tuple per dimension: `start[d]` is the first index, `stride[d]`
+    /// the spacing between selected blocks (`1` = the classic contiguous
+    /// selection [`read_slice`](Self::read_slice) reads), `count[d]` how
+    /// many blocks, and `block[d]` how many contiguous elements each block
+    /// covers. The returned buffer is row-major over `count[d] * block[d]`
+    /// per dimension — exactly the shape h5py's stepped slicing produces.
+    ///
+    /// Built on the same selection-decomposition primitives the virtual
+    /// dataset reader uses for its per-mapping scatter
+    /// ([`Selection::to_boxes`], [`copy_matched_boxes`]) rather than a
+    /// second box walker: the requested selection and a densely-packed
+    /// "output" selection sharing the same `count` decompose into the same
+    /// number of same-shaped boxes in the same row-major order, so each
+    /// source box is read with the ordinary per-layout selective read
+    /// ([`read_slice_into_unconverted`](Self::read_slice_into_unconverted))
+    /// and scattered straight into its matching output box.
+    pub fn read_hyperslab(
+        &mut self,
+        name: &str,
+        start: &[u64],
+        stride: &[u64],
+        count: &[u64],
+        block: &[u64],
+    ) -> IoResult<Vec<u8>> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.read_hyperslab(&path, start, stride, count, block);
+        }
+        let info = self
+            .dataset_info_local(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let dims = info.dataspace.dims.clone();
+        let datatype = info.datatype.clone();
+        let element_size = datatype.element_size() as u64;
+        let rank = dims.len();
+
+        if start.len() != rank || stride.len() != rank || count.len() != rank || block.len() != rank
+        {
+            return Err(crate::io::IoError::InvalidState(
+                "start/stride/count/block length must match dataset rank".into(),
+            ));
+        }
+        if stride.contains(&0) {
+            return Err(crate::io::IoError::InvalidState(
+                "hyperslab stride must be nonzero in every dimension".into(),
+            ));
+        }
+
+        let src_sel = Selection::Hyperslab {
+            rank,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: start.to_vec(),
+                stride: stride.to_vec(),
+                count: count.to_vec(),
+                block: block.to_vec(),
+            }),
+        };
+        let out_dims: Vec<u64> = (0..rank)
+            .map(|d| count[d].saturating_mul(block[d]))
+            .collect();
+        // A densely-packed selection sharing the same `count`: its boxes
+        // decompose in the same row-major order as `src_sel`'s (the nested
+        // loop `Selection::to_boxes` drives is indexed purely by `count`),
+        // so `src_boxes[i]` and `dst_boxes[i]` are always the same logical
+        // block, letting `copy_matched_boxes` pair them positionally.
+        let dst_sel = Selection::Hyperslab {
+            rank,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: vec![0u64; rank],
+                stride: block.to_vec(),
+                count: count.to_vec(),
+                block: block.to_vec(),
+            }),
+        };
+        let src_boxes = src_sel.to_boxes(&dims)?;
+        let dst_boxes = dst_sel.to_boxes(&out_dims)?;
+
+        let total = saturating_byte_len(&out_dims, element_size) as usize;
+        let mut out = alloc_tiled_fill(total, None)?;
+        copy_matched_boxes(
+            |bstart, bcount, buf| self.read_slice_into_unconverted(name, bstart, bcount, buf, 0),
+            &src_boxes,
+            &dst_boxes,
+            &out_dims,
+            element_size,
+            &mut out,
+        )?;
+        Self::apply_post_filter_conversion(&mut out, &datatype)?;
+        Ok(out)
+    }
+
+    /// Read a list of coordinates in one call — h5py fancy indexing with a
+    /// coordinate list (`H5S_SEL_POINTS`) — into a returned buffer.
+    ///
+    /// `points[i]` is a `rank`-length coordinate; the returned buffer holds
+    /// one element per point, `element_size` bytes each, in the same order
+    /// as `points` (point selection order is significant, see
+    /// [`PointSelection`]). Backed by [`Selection::Points`] and
+    /// [`Selection::to_boxes`] — the same decomposition
+    /// [`read_hyperslab`](Self::read_hyperslab) and the virtual dataset
+    /// reader use — each point's 1-element box is read with the ordinary
+    /// per-layout selective read
+    /// ([`read_slice_into_unconverted`](Self::read_slice_into_unconverted)).
+    /// A 1-element box is already a flat `element_size`-byte run, so
+    /// placing it needs no further run-decomposition
+    /// ([`for_each_dual_run`] would degenerate to exactly this copy).
+    pub fn read_points(&mut self, name: &str, points: &[Vec<u64>]) -> IoResult<Vec<u8>> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.read_points(&path, points);
+        }
+        let info = self
+            .dataset_info_local(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let dims = info.dataspace.dims.clone();
+        let datatype = info.datatype.clone();
+        let element_size = datatype.element_size() as u64;
+        let rank = dims.len();
+
+        for p in points {
+            if p.len() != rank {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "point coordinate has {} entries but the dataset has {} dimensions",
+                    p.len(),
+                    rank
+                )));
+            }
+        }
+
+        let sel = Selection::Points(PointSelection {
+            rank,
+            points: points.to_vec(),
+        });
+        let boxes = sel.to_boxes(&dims)?;
+
+        let es = element_size as usize;
+        let mut out = alloc_tiled_fill(points.len() * es, None)?;
+        for (i, (bstart, bcount)) in boxes.iter().enumerate() {
+            self.read_slice_into_unconverted(
+                name,
+                bstart,
+                bcount,
+                &mut out[i * es..(i + 1) * es],
+                0,
+            )?;
+        }
+        Self::apply_post_filter_conversion(&mut out, &datatype)?;
+        Ok(out)
+    }
+
+    /// Read one chunk's raw (still-filtered) bytes and its filter mask —
+    /// the read half of `H5Dread_chunk` (h5py:
+    /// `Dataset.id.read_direct_chunk`).
+    ///
+    /// `chunk_coords` is the chunk's position in the chunk grid, one
+    /// coordinate per dimension counted in chunks (not elements) — the same
+    /// addressing [`write_chunk_raw_at`](crate::Dataset::write_chunk_raw_at)
+    /// uses on the write side. The bytes returned are exactly what is
+    /// stored on disk: filtered/compressed if the dataset has a filter
+    /// pipeline, with no decompression applied — the caller runs the
+    /// pipeline itself (honoring the returned mask, which marks any filter
+    /// this particular chunk skipped) if it wants decoded data.
+    ///
+    /// Resolved through whichever chunk index the dataset uses, reusing the
+    /// same per-index decoders the full/slice chunked reader walks
+    /// ([`collect_fa_chunk_entries`](Self::collect_fa_chunk_entries),
+    /// [`collect_ea_chunk_entries`](Self::collect_ea_chunk_entries),
+    /// [`collect_bt2_chunk_entries`](Self::collect_bt2_chunk_entries),
+    /// [`collect_btree_v1_chunks`](Self::collect_btree_v1_chunks)) rather
+    /// than a new index walker.
+    ///
+    /// `Err` when the dataset is not chunked, `chunk_coords` has the wrong
+    /// rank, or the chunk at those coordinates has never been written.
+    pub fn read_chunk_raw_at(
+        &mut self,
+        name: &str,
+        chunk_coords: &[u64],
+    ) -> IoResult<(Vec<u8>, u32)> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.read_chunk_raw_at(&path, chunk_coords);
+        }
+        let info = self
+            .dataset_info_local(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let dims = info.dataspace.dims.clone();
+        let max_dims = info.dataspace.max_dims.clone();
+        let element_size = info.datatype.element_size() as u64;
+        let layout = info.layout.clone();
+        let ndims = dims.len();
+
+        if chunk_coords.len() != ndims {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "chunk_coords has {} entries but the dataset has {} dimensions",
+                chunk_coords.len(),
+                ndims
+            )));
+        }
+
+        let not_written = || {
+            crate::io::IoError::InvalidState(format!(
+                "chunk at coordinates {chunk_coords:?} has not been written"
+            ))
+        };
+
+        match &layout {
+            DataLayoutMessage::ChunkedV3 {
+                chunk_dims,
+                b_tree_address,
+            } => {
+                let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
+                if *b_tree_address == UNDEF_ADDR {
+                    return Err(not_written());
+                }
+                let file_size = self.handle.file_size()?;
+                let mut entries = Vec::new();
+                self.collect_btree_v1_chunks(*b_tree_address, ndims, file_size, 0, &mut entries)?;
+                for (offsets, addr, chunk_size, mask) in &entries {
+                    if *addr == UNDEF_ADDR {
+                        continue;
+                    }
+                    let mut scaled = Vec::with_capacity(ndims);
+                    for d in 0..ndims {
+                        scaled.push(offsets[d].checked_div(real_chunk_dims[d]).unwrap_or(0));
+                    }
+                    if scaled.as_slice() == chunk_coords {
+                        return Ok((self.handle.read_at(*addr, *chunk_size as usize)?, *mask));
+                    }
+                }
+                Err(not_written())
+            }
+            DataLayoutMessage::ChunkedV4 {
+                chunk_dims,
+                index_type,
+                index_address,
+                earray_params,
+                single_chunk_filter,
+                ..
+            } => {
+                let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
+                match index_type {
+                    data_layout::ChunkIndexType::SingleChunk => {
+                        if chunk_coords.iter().any(|&c| c != 0) {
+                            return Err(crate::io::IoError::InvalidState(format!(
+                                "chunk coordinates {chunk_coords:?} are outside the chunk \
+                                 grid (0..1): this dataset has a single-chunk index"
+                            )));
+                        }
+                        if *index_address == UNDEF_ADDR {
+                            return Err(not_written());
+                        }
+                        match single_chunk_filter {
+                            Some(scf) => Ok((
+                                self.handle.read_at(*index_address, scf.nbytes as usize)?,
+                                scf.filter_mask,
+                            )),
+                            None => {
+                                let total = saturating_byte_len(&dims, element_size);
+                                Ok((self.handle.read_at(*index_address, total as usize)?, 0))
+                            }
+                        }
+                    }
+                    data_layout::ChunkIndexType::Implicit => {
+                        if *index_address == UNDEF_ADDR {
+                            return Err(not_written());
+                        }
+                        let linear = crate::io::chunk_grid::linear_index(
+                            &dims,
+                            max_dims.as_deref(),
+                            real_chunk_dims,
+                            chunk_coords,
+                        )?;
+                        let chunk_bytes = saturating_byte_len(real_chunk_dims, element_size);
+                        let addr = index_address.saturating_add(linear.saturating_mul(chunk_bytes));
+                        Ok((self.handle.read_at(addr, chunk_bytes as usize)?, 0))
+                    }
+                    data_layout::ChunkIndexType::FixedArray => {
+                        let linear = crate::io::chunk_grid::linear_index(
+                            &dims,
+                            max_dims.as_deref(),
+                            real_chunk_dims,
+                            chunk_coords,
+                        )?;
+                        let entries = self.collect_fa_chunk_entries(
+                            real_chunk_dims,
+                            ndims,
+                            element_size,
+                            *index_address,
+                        )?;
+                        match entries.get(linear as usize) {
+                            Some(&(addr, size, mask)) if addr != UNDEF_ADDR => {
+                                Ok((self.handle.read_at(addr, size as usize)?, mask))
+                            }
+                            _ => Err(not_written()),
+                        }
+                    }
+                    data_layout::ChunkIndexType::ExtensibleArray => {
+                        let params = earray_params.as_ref().ok_or_else(|| {
+                            crate::io::IoError::InvalidState("missing earray params".into())
+                        })?;
+                        let linear = crate::io::chunk_grid::linear_index(
+                            &dims,
+                            max_dims.as_deref(),
+                            real_chunk_dims,
+                            chunk_coords,
+                        )?;
+                        let entries = self.collect_ea_chunk_entries(
+                            *index_address,
+                            params,
+                            &dims,
+                            max_dims.as_deref(),
+                            real_chunk_dims,
+                            element_size,
+                        )?;
+                        match entries.get(linear as usize) {
+                            Some(&(addr, size, mask)) if addr != UNDEF_ADDR => {
+                                Ok((self.handle.read_at(addr, size as usize)?, mask))
+                            }
+                            _ => Err(not_written()),
+                        }
+                    }
+                    data_layout::ChunkIndexType::BTreeV2 => {
+                        let entries = self.collect_bt2_chunk_entries(
+                            real_chunk_dims,
+                            ndims,
+                            element_size,
+                            *index_address,
+                        )?;
+                        match entries
+                            .iter()
+                            .find(|(_, _, scaled, _)| scaled.as_slice() == chunk_coords)
+                        {
+                            Some(&(addr, size, _, mask)) if addr != UNDEF_ADDR => {
+                                Ok((self.handle.read_at(addr, size)?, mask))
+                            }
+                            _ => Err(not_written()),
+                        }
+                    }
+                }
+            }
+            _ => Err(crate::io::IoError::InvalidState(
+                "read_chunk_raw_at is only for chunked datasets".into(),
+            )),
+        }
+    }
 }
 
 /// Adapts a `FileHandle` to the `BlockReader` trait used by the fractal-heap
@@ -4928,10 +5354,17 @@ pub(crate) fn collect_object_attributes(
     header: &ObjectHeader,
 ) -> ObjectAttributes {
     let mut attrs = ObjectAttributes::default();
+    // The message envelope carries a creation index only when the header says
+    // the object tracks one; the field is not even encoded otherwise
+    // (`H5O_SIZEOF_MSGHDR_OH`), so reading it as an index would report zero
+    // for every attribute of an untracked object.
+    let tracked = header.has_creation_order();
     for msg in &header.messages {
         match msg.msg_type {
             MSG_ATTRIBUTE => match AttributeEntry::parse(&msg.data, ctx) {
-                Ok(entry) => attrs.push(entry),
+                Ok(entry) => {
+                    attrs.push(entry.with_creation_index(tracked.then_some(msg.creation_index)))
+                }
                 Err(e) => attrs.mark_incomplete(format!("an attribute message is unreadable: {e}")),
             },
             MSG_ATTR_INFO => match AttributeInfoMessage::decode(&msg.data, ctx) {
@@ -5508,6 +5941,7 @@ mod tests {
         };
         let header = ObjectHeader {
             flags: 0x02,
+            times: None,
             messages,
         };
         let attrs = collect_object_attributes(&mut handle, &ctx, &header);

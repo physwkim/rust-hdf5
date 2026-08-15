@@ -28,8 +28,8 @@ use rust_hdf5::format::messages::datatype::{
 use rust_hdf5::format::messages::filter::{Filter, FilterPipeline, FILTER_FLETCHER32};
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
-    H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error,
-    LibverBound, LinkClass, Reference,
+    H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error, Hyperslab,
+    HyperslabBlock, LibverBound, LinkClass, Reference, Selection,
 };
 
 const CANON_VERSION: &str = "3";
@@ -567,16 +567,17 @@ fn dump_file(path: &str) -> std::result::Result<String, String> {
         "#superblock",
         unsupported("superblock", "H5File exposes no superblock/libver accessor"),
     );
-    d.emit(
-        "#userblock",
-        unsupported("userblock", "H5File exposes no user block accessor"),
-    );
 
     let file = match guarded(|| H5File::open(path)) {
         Ok(Ok(f)) => f,
         Ok(Err(e)) => return Err(format!("H5File::open failed: {}", oneline(e))),
         Err(p) => return Err(format!("H5File::open panicked: {p}")),
     };
+
+    // `H5File::userblock_size` answers in either mode, so this is a value the
+    // canon can be compared against rather than an API gap. It has to come
+    // after the open — it is a property of the file, not of the path.
+    d.field("", "userblock", || Ok(file.userblock_size().to_string()));
 
     let root = file.root_group();
     dump_group(&mut d, &file, "/", &root, 0);
@@ -1590,6 +1591,22 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "named_datatype" => {
+            let file = H5File::create(path)?;
+            file.commit_datatype("t", DatatypeMessage::i32_type())?;
+            // `data` describes its own type; `shared` points at /t.
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("data")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.new_dataset::<i32>()
+                .committed_type("t")
+                .shape([8usize])
+                .create("shared")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "opaque" => {
             let file = H5File::create(path)?;
             let bytes: Vec<u8> = (0u8..12).collect();
@@ -1637,12 +1654,45 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
-        "ref_region" => Ok(unsup(
-            "region references need a selection serializer on the write side",
-        )),
+        "ref_region" => {
+            let file = H5File::create(path)?;
+            let target = file.new_dataset::<i32>().shape([8]).create("target")?;
+            target.write_raw(&ramp_n::<i32>(8))?;
+            let refs = file
+                .new_dataset::<u64>()
+                .region_references()
+                .shape([2])
+                .create("refs")?;
+            // The two slices h5py's `t.regionref[0:3]` and `[4:8]` select.
+            let slice = |start: u64, end: u64| Selection::Hyperslab {
+                rank: 1,
+                form: Hyperslab::Blocks(vec![HyperslabBlock {
+                    start: vec![start],
+                    end: vec![end],
+                }]),
+            };
+            refs.write_region_references(&[("/target", slice(0, 2)), ("/target", slice(4, 7))])?;
+            file.close()?;
+            Ok(Ok(()))
+        }
 
         // ---- layouts and chunk indexes ----------------------------------
         "layout_contiguous" => simple_ramp::<i32>(path, ramp_n::<i32>(16)),
+        "layout_compact" => {
+            let file = H5File::create(path)?;
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([16usize])
+                .compact()
+                .create("data")?;
+            ds.write_raw(&ramp_n::<i32>(16))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "layout_contiguous_v108" => layout_at_libver(path, LibverBound::V18, None),
+        "layout_contiguous_v110" => layout_at_libver(path, LibverBound::V110, None),
+        "layout_chunked_v108" => layout_at_libver(path, LibverBound::V18, Some(&[16])),
+        "layout_chunked_v110" => layout_at_libver(path, LibverBound::V110, Some(&[16])),
         "chunkidx_btree1" => {
             let file = H5File::create(path)?;
             file.set_libver_latest(false)?;
@@ -1698,6 +1748,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
 
         // ---- filters ------------------------------------------------------
         "filter_deflate" => filtered(path, |b| b.deflate(6)),
+        "filter_shuffle" => filtered(path, |b| b.shuffle()),
         "filter_deflate_shuffle" => filtered(path, |b| b.shuffle_deflate(6)),
         "filter_fletcher32" => filtered(path, |b| {
             b.filter_pipeline(FilterPipeline {
@@ -1812,6 +1863,80 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 .create("orig")?
                 .write_raw(&ramp_n::<i32>(8))?;
             file.root_group().link("alias", "/orig")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "link_soft" => {
+            let file = H5File::create(path)?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("orig")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.create_soft_link("alias", "/orig")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "link_external" => {
+            // The reference builds the sibling's name from this file's stem,
+            // and stores the bare file name so the link resolves against the
+            // directory holding the master.
+            let target = std::path::Path::new(path).with_file_name(format!(
+                "{}_ext.h5",
+                std::path::Path::new(path)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            ));
+            let ext = H5File::create(&target)?;
+            ext.new_dataset::<i32>()
+                .shape([8usize])
+                .create("payload")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            ext.close()?;
+
+            let file = H5File::create(path)?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("orig")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.create_external_link(
+                "ext",
+                &target.file_name().unwrap_or_default().to_string_lossy(),
+                "/payload",
+            )?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "link_external_read" => {
+            // The whole payload lives in the sibling; the master holds only
+            // links, two of which are deliberately dangling — a target object
+            // that is not there and a target file that is not there.
+            let target = std::path::Path::new(path).with_file_name(format!(
+                "{}_data.h5",
+                std::path::Path::new(path)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            ));
+            let data = H5File::create(&target)?;
+            data.new_dataset::<f64>()
+                .shape([8usize])
+                .create("top")?
+                .write_raw(&(0..8).map(|i| i as f64).collect::<Vec<_>>())?;
+            data.root_group()
+                .create_group("deep")?
+                .new_dataset::<i16>()
+                .shape([8usize])
+                .create("inner")?
+                .write_raw(&ramp_n::<i16>(8))?;
+            data.close()?;
+
+            let name = target.file_name().unwrap_or_default().to_string_lossy();
+            let file = H5File::create(path)?;
+            file.create_external_link("direct", &name, "/top")?;
+            file.create_external_link("nested", &name, "/deep/inner")?;
+            file.create_external_link("gone_object", &name, "/absent")?;
+            file.create_external_link("gone_file", "no_such_file.h5", "/top")?;
             file.close()?;
             Ok(Ok(()))
         }
@@ -1961,8 +2086,29 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         }
 
         // ---- library version bounds -----------------------------------------
-        "libver_earliest" => libver_case(path, false),
-        "libver_latest" => libver_case(path, true),
+        "libver_earliest" => libver_case(path, LibverBound::Earliest),
+        "libver_v108" => libver_case(path, LibverBound::V18),
+        "libver_v110" => libver_case(path, LibverBound::V110),
+        "libver_latest" => libver_case(path, LibverBound::V200),
+        "userblock" => {
+            let file = H5File::options().userblock(512).create(path)?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("data")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.root_group().create_group("g")?;
+            file.close()?;
+            // The h5py arm fills the block with a shebang line afterwards, as
+            // an application that keeps a script there would; the block is the
+            // application's, so this is a plain write to the front of the file.
+            let prefix = b"#!/bin/sh\n# userblock\n";
+            let mut block = prefix.to_vec();
+            block.resize(511, b'#');
+            block.push(b'\n');
+            let mut fh = std::fs::OpenOptions::new().write(true).open(path)?;
+            std::io::Write::write_all(&mut fh, &block)?;
+            Ok(Ok(()))
+        }
 
         // ---- SWMR and bulk ---------------------------------------------------
         "swmr_created" => {
@@ -2063,14 +2209,30 @@ fn filtered(
     Ok(Ok(()))
 }
 
-fn libver_case(path: &str, latest: bool) -> rust_hdf5::Result<WriteResult> {
-    let file = H5File::create(path)?;
-    file.set_libver_latest(latest)?;
+fn libver_case(path: &str, libver: LibverBound) -> rust_hdf5::Result<WriteResult> {
+    let file = H5File::options().libver(libver).create(path)?;
     file.new_dataset::<i32>()
         .shape([8usize])
         .create("data")?
         .write_raw(&ramp_n::<i32>(8))?;
     file.root_group().create_group("g")?;
+    file.close()?;
+    Ok(Ok(()))
+}
+
+/// A single 16-element i32 ramp under an explicit libver bound: contiguous
+/// when `chunk` is `None`, one whole-dataset chunk when it is `Some`.
+fn layout_at_libver(
+    path: &str,
+    libver: LibverBound,
+    chunk: Option<&[usize]>,
+) -> rust_hdf5::Result<WriteResult> {
+    let file = H5File::options().libver(libver).create(path)?;
+    let mut builder = file.new_dataset::<i32>().shape([16usize]);
+    if let Some(chunk) = chunk {
+        builder = builder.chunk(chunk);
+    }
+    builder.create("data")?.write_raw(&ramp_n::<i32>(16))?;
     file.close()?;
     Ok(Ok(()))
 }

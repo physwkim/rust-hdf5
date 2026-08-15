@@ -3,16 +3,17 @@
 //! libhdf5 does not pick it from a knob: `H5F__super_init` takes the oldest
 //! version that can describe the file and raises it to the one the file's
 //! library-version low bound implies (`HDF5_superblock_ver_bounds`,
-//! H5Fsuper.c:68). This crate has no bound property list, so the bound comes
-//! from what it writes — link-message groups and version-2 object headers put
-//! the floor at v1.8 (version 2), a chunked dataset's version-4/5 layout puts
-//! it at v1.10 (version 3), and SWMR is version 3 outright. A reopened file
-//! keeps the version it already has unless what is appended needs a newer one.
+//! H5Fsuper.c:68). Both halves are in play here: `H5FileOptions::libver`
+//! contributes the bound's own entry, and what the file holds contributes the
+//! rest — link-message groups and version-2 object headers put the floor at
+//! v1.8 (version 2), a chunked dataset's version-4/5 layout puts it at v1.10
+//! (version 3), and SWMR is version 3 outright. A reopened file keeps the
+//! version it already has unless what is appended needs a newer one.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rust_hdf5::H5File;
+use rust_hdf5::{H5File, LibverBound};
 
 /// Per-test unique temp path; cargo runs tests in parallel.
 fn unique_tmp(label: &str) -> PathBuf {
@@ -85,6 +86,49 @@ fn a_file_of_contiguous_datasets_is_written_at_version_2() {
 fn a_file_with_a_chunked_dataset_is_written_at_version_3() {
     let path = unique_tmp("chunked");
     let file = H5File::create(&path).unwrap();
+    write_chunked(&file, "data");
+    file.close().unwrap();
+
+    assert_eq!(superblock_version(&path), 3);
+    cleanup(&path);
+}
+
+/// One case per entry of `HDF5_superblock_ver_bounds`, against a file whose
+/// content asks for nothing above the floor. The bound's own entry is 0 for
+/// EARLIEST and 2 for V18, both below this crate's version-2 floor, so the two
+/// oldest bounds land on the same version from opposite directions; V110 and
+/// everything after it are 3.
+#[test]
+fn each_libver_bound_selects_its_superblock_version() {
+    for (bound, expected) in [
+        (LibverBound::Earliest, 2),
+        (LibverBound::V18, 2),
+        (LibverBound::V110, 3),
+        (LibverBound::V112, 3),
+        (LibverBound::V114, 3),
+        (LibverBound::V200, 3),
+    ] {
+        let path = unique_tmp(&format!("bound_{bound:?}"));
+        let file = H5File::options().libver(bound).create(&path).unwrap();
+        write_contiguous(&file, "data");
+        file.root_group().create_group("g").unwrap();
+        file.close().unwrap();
+
+        assert_eq!(superblock_version(&path), expected, "bound {bound:?}");
+        cleanup(&path);
+    }
+}
+
+/// The bound is a floor, not an override: a v1.8 file holding a chunked
+/// dataset still needs the version-3 superblock its version-4 layout message
+/// implies.
+#[test]
+fn a_chunked_dataset_raises_a_v18_file_to_version_3() {
+    let path = unique_tmp("v18_chunked");
+    let file = H5File::options()
+        .libver(LibverBound::V18)
+        .create(&path)
+        .unwrap();
     write_chunked(&file, "data");
     file.close().unwrap();
 

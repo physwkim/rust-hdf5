@@ -107,6 +107,30 @@ impl DataspaceMessage {
     // ------------------------------------------------------------------ encode
 
     pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
+        self.encode_for(ctx, crate::format::ObjectFormat::Modern)
+    }
+
+    /// The message version libhdf5 would stamp on this dataspace in a file of
+    /// this `format` — `H5S__set_version`: the floor from
+    /// `H5O_sdspace_ver_bounds`, raised to 2 when the class needs it. Only the
+    /// NULL class does: version 1 has no type field, so it cannot say "no
+    /// elements" at all, and upstream `H5S_set_version` raises the same way.
+    fn version_for(&self, format: crate::format::ObjectFormat) -> u8 {
+        let needed = if self.class == DataspaceClass::Null {
+            2
+        } else {
+            1
+        };
+        needed.max(format.dataspace_version())
+    }
+
+    /// Encode for a file of the given object format.
+    ///
+    /// A version-1 dataspace differs only in its prefix: no type byte, and
+    /// five reserved bytes where version 2 has one, so the header is 8 bytes
+    /// rather than 4. The dimensions that follow are identical.
+    pub fn encode_for(&self, ctx: &FormatContext, format: crate::format::ObjectFormat) -> Vec<u8> {
+        let version = self.version_for(format);
         let ndims = self.dims.len();
         let ss = ctx.sizeof_size as usize;
         let has_max = self.max_dims.is_some();
@@ -118,13 +142,20 @@ impl DataspaceMessage {
             DataspaceClass::Null => DS_TYPE_NULL,
         };
 
-        let body_len = 4 + ndims * ss + if has_max { ndims * ss } else { 0 };
+        let prefix_len = if version == 1 { 8 } else { 4 };
+        let body_len = prefix_len + ndims * ss + if has_max { ndims * ss } else { 0 };
         let mut buf = Vec::with_capacity(body_len);
 
-        buf.push(VERSION);
+        buf.push(version);
         buf.push(ndims as u8);
         buf.push(flags);
-        buf.push(ds_type); // type byte required for version 2
+        if version == 1 {
+            // reserved byte, then a reserved word: version 1 has no type
+            // field, and a rank-0 version-1 dataspace is scalar by definition.
+            buf.extend_from_slice(&[0u8; 5]);
+        } else {
+            buf.push(ds_type);
+        }
 
         // current dimensions
         for &d in &self.dims {
@@ -499,5 +530,49 @@ mod tests {
         let (msg, _) = DataspaceMessage::decode(&buf, &ctx8()).unwrap();
         assert!(!msg.is_null());
         assert_eq!(msg.class, DataspaceClass::Scalar);
+    }
+
+    /// The 24 bytes libhdf5 1.14.6 wrote for the dataspace of a shape-(6,)
+    /// dataset in a default (superblock-0) file: version 1, an 8-byte prefix,
+    /// then current and maximum dimensions.
+    #[test]
+    fn a_legacy_dataspace_matches_the_bytes_libhdf5_wrote() {
+        let ds = DataspaceMessage {
+            class: DataspaceClass::Simple,
+            dims: vec![6],
+            max_dims: Some(vec![6]),
+        };
+        let buf = ds.encode_for(&ctx8(), crate::format::ObjectFormat::Legacy);
+        assert_eq!(
+            buf,
+            vec![0x01, 0x01, 0x01, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0]
+        );
+        let (back, consumed) = DataspaceMessage::decode(&buf, &ctx8()).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(back, ds);
+    }
+
+    /// Version 1 has no type field, so it cannot say "no elements"; upstream
+    /// `H5S_set_version` raises a null dataspace to version 2 whatever the
+    /// bound says, and so must this.
+    #[test]
+    fn a_null_dataspace_stays_at_version_2_in_a_legacy_file() {
+        let buf = DataspaceMessage::null().encode_for(&ctx8(), crate::format::ObjectFormat::Legacy);
+        assert_eq!(buf[0], 2);
+        assert_eq!(buf[3], DS_TYPE_NULL);
+        let (back, _) = DataspaceMessage::decode(&buf, &ctx8()).unwrap();
+        assert!(back.is_null());
+    }
+
+    /// A scalar has rank 0, so version 1's extra prefix bytes are the whole
+    /// message; nothing about the class reaches the file, and the decoder has
+    /// to infer it from the rank exactly as libhdf5 does.
+    #[test]
+    fn a_legacy_scalar_dataspace_round_trips_as_scalar() {
+        let buf =
+            DataspaceMessage::scalar().encode_for(&ctx8(), crate::format::ObjectFormat::Legacy);
+        assert_eq!(buf, vec![1, 0, 0, 0, 0, 0, 0, 0]);
+        let (back, _) = DataspaceMessage::decode(&buf, &ctx8()).unwrap();
+        assert_eq!(back.class, DataspaceClass::Scalar);
     }
 }

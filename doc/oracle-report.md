@@ -15,7 +15,7 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 
 **Direction A** (h5py writes, rust-hdf5 reads) — `DIFF` at least one field where both sides produced a value and the values disagree; `MISS` no divergence, but an object that is in the file never appears in `group_names`/`dataset_names`, so the reader does not even report an error for it; `GAP` a field this file has that the public API cannot observe here (an unreadable datatype, an unresolvable link); `PASS` everything this file contains was read correctly; `READ-ERROR` the probe could not open or walk the file at all.
 
-`PASS` tolerates the 14 accessors that are missing from the API *everywhere* (`attrorder`, `attrstore`, `chunkindex`, `external`, `fillvalue`, `filters`, `layout`, `linkorder`, `linkstore`, `maxshape`, `nattrs_hdr`, `superblock`, `userblock`, `virtual`) — they are counted once each in the findings table below rather than against every case that happens to contain a dataset.
+`PASS` tolerates the 13 accessors that are missing from the API *everywhere* (`attrorder`, `attrstore`, `chunkindex`, `external`, `fillvalue`, `filters`, `layout`, `linkorder`, `linkstore`, `maxshape`, `nattrs_hdr`, `superblock`, `virtual`) — they are counted once each in the findings table below rather than against every case that happens to contain a dataset.
 
 **Direction B** (rust-hdf5 writes, h5py/libhdf5 reads) — `PASS` h5py read it, every core field (kind, dtype, shape, data, attributes, link targets) matched the reference and `h5diff`/`h5dump` were clean; `INVALID` one of those failed; `UNSUPPORTED-API` the public API cannot express the case. Differences confined to `attrorder`, `chunkindex`, `fillvalue`, `filters`, `layout`, `linkorder`, `linkstore`, `maxshape`, `superblock` are recorded as metadata deviations and do not fail a case, because the values libhdf5 reads are identical.
 
@@ -27,22 +27,22 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 
 | direction | PASS | INVALID | UNSUPPORTED-API | SKIPPED |
 |---|---|---|---|---|
-| B (write) | 69 | 0 | 22 | 0 |
+| B (write) | 83 | 0 | 8 | 0 |
 
 ## Top gaps by severity
 
 | # | severity | finding | cases |
 |---|---|---|---|
-| 1 | API cannot express | no rust writer arm: the public API cannot express this case | 21 (named_datatype, layout_compact, layout_contiguous_v110, lay…) |
-| 2 | API cannot express | region references need a selection serializer on the write side | 1 (ref_region) |
-| 3 | no public accessor (API-wide) | attrorder — H5Group exposes no attribute creation-order tracking flags | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
-| 4 | no public accessor (API-wide) | attrstore — H5Group exposes no compact/dense attribute storage accessor | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
-| 5 | no public accessor (API-wide) | linkorder — H5Group exposes no link creation-order tracking flags | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
-| 6 | no public accessor (API-wide) | linkstore — H5Group exposes no compact/dense link storage accessor | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
-| 7 | no public accessor (API-wide) | nattrs_hdr — H5Group exposes no object-header attribute count | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
-| 8 | no public accessor (API-wide) | superblock — H5File exposes no superblock/libver accessor | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
-| 9 | no public accessor (API-wide) | userblock — H5File exposes no user block accessor | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
-| 10 | no public accessor (API-wide) | attrstore — H5Dataset exposes no compact/dense attribute storage accessor | 90 (int_i8, int_u8, int_i16le, int_u16le…) |
+| 1 | API cannot express | no rust writer arm: the public API cannot express this case | 8 (chunkidx_implicit, external_storage, vds, group_storage_mod…) |
+| 2 | no public accessor (API-wide) | attrorder — H5Group exposes no attribute creation-order tracking flags | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
+| 3 | no public accessor (API-wide) | attrstore — H5Group exposes no compact/dense attribute storage accessor | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
+| 4 | no public accessor (API-wide) | linkorder — H5Group exposes no link creation-order tracking flags | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
+| 5 | no public accessor (API-wide) | linkstore — H5Group exposes no compact/dense link storage accessor | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
+| 6 | no public accessor (API-wide) | nattrs_hdr — H5Group exposes no object-header attribute count | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
+| 7 | no public accessor (API-wide) | superblock — H5File exposes no superblock/libver accessor | 91 (int_i8, int_u8, int_i16le, int_u16le…) |
+| 8 | no public accessor (API-wide) | attrstore — H5Dataset exposes no compact/dense attribute storage accessor | 90 (int_i8, int_u8, int_i16le, int_u16le…) |
+| 9 | no public accessor (API-wide) | external — H5Dataset exposes no external file list accessor | 90 (int_i8, int_u8, int_i16le, int_u16le…) |
+| 10 | no public accessor (API-wide) | fillvalue — H5Dataset exposes no fill value accessor | 90 (int_i8, int_u8, int_i16le, int_u16le…) |
 
 ## Case matrix
 
@@ -81,14 +81,14 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `opaque` | dtype-composite | PASS | 0 | 0 | 0 | PASS |  |
 | `bitfield` | dtype-composite | PASS | 0 | 0 | 0 | PASS |  |
 | `ref_object` | dtype-composite | PASS | 0 | 0 | 0 | PASS |  |
-| `ref_region` | dtype-composite | PASS | 0 | 0 | 0 | UNSUPPORTED-API | UNSUPPORTED-API: region references need a selection serializer on the… |
+| `ref_region` | dtype-composite | PASS | 0 | 0 | 0 | PASS |  |
 | `vlen_numeric` | dtype-composite | PASS | 0 | 0 | 0 | PASS |  |
 | `vlen_bytes` | dtype-composite | PASS | 0 | 0 | 0 | PASS |  |
-| `named_datatype` | dtype-composite | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
-| `layout_compact` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `named_datatype` | dtype-composite | PASS | 0 | 0 | 0 | PASS |  |
+| `layout_compact` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `layout_contiguous` | layout | PASS | 0 | 0 | 0 | PASS |  |
-| `layout_contiguous_v110` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
-| `layout_chunked_v110` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `layout_contiguous_v110` | layout | PASS | 0 | 0 | 0 | PASS |  |
+| `layout_chunked_v110` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `chunkidx_btree1` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `chunkidx_single` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `chunkidx_implicit` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
@@ -96,13 +96,13 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `chunkidx_earray` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `chunkidx_earray_unlim_inner` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `chunkidx_btree2` | layout | PASS | 0 | 0 | 0 | PASS |  |
-| `layout_contiguous_v108` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
-| `layout_chunked_v108` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `layout_contiguous_v108` | layout | PASS | 0 | 0 | 0 | PASS |  |
+| `layout_chunked_v108` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `chunkidx_earray_dim1` | layout | PASS | 0 | 0 | 0 | PASS |  |
 | `external_storage` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
 | `vds` | layout | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
 | `filter_deflate` | filter | PASS | 0 | 0 | 0 | PASS |  |
-| `filter_shuffle` | filter | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `filter_shuffle` | filter | PASS | 0 | 0 | 0 | PASS |  |
 | `filter_fletcher32` | filter | PASS | 0 | 0 | 0 | PASS |  |
 | `filter_deflate_shuffle` | filter | PASS | 0 | 0 | 0 | PASS |  |
 | `filter_scaleoffset` | filter | PASS | 0 | 0 | 0 | PASS |  |
@@ -115,9 +115,9 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `space_unlimited_resized` | dataspace | PASS | 0 | 0 | 0 | PASS |  |
 | `groups_nested` | group | PASS | 0 | 0 | 0 | PASS |  |
 | `link_hard` | link | PASS | 0 | 0 | 0 | PASS |  |
-| `link_soft` | link | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
-| `link_external` | link | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
-| `link_external_read` | link | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `link_soft` | link | PASS | 0 | 0 | 0 | PASS |  |
+| `link_external` | link | PASS | 0 | 0 | 0 | PASS |  |
+| `link_external_read` | link | PASS | 0 | 0 | 0 | PASS |  |
 | `links_dense` | link | PASS | 0 | 0 | 0 | PASS |  |
 | `track_order` | group | PASS | 0 | 0 | 0 | PASS |  |
 | `group_storage_modern_root` | group | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
@@ -130,10 +130,10 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 | `attr_on_root` | attribute | PASS | 0 | 0 | 0 | PASS |  |
 | `attr_large` | attribute | PASS | 0 | 0 | 0 | PASS |  |
 | `libver_earliest` | superblock | PASS | 0 | 0 | 0 | PASS |  |
-| `libver_v108` | superblock | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
-| `libver_v110` | superblock | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `libver_v108` | superblock | PASS | 0 | 0 | 0 | PASS |  |
+| `libver_v110` | superblock | PASS | 0 | 0 | 0 | PASS |  |
 | `libver_latest` | superblock | PASS | 0 | 0 | 0 | PASS |  |
-| `userblock` | superblock | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
+| `userblock` | superblock | PASS | 0 | 0 | 0 | PASS |  |
 | `swmr_created` | swmr | PASS | 0 | 0 | 0 | PASS |  |
 | `large_multi_mb` | bulk | PASS | 0 | 0 | 0 | PASS |  |
 | `sohm_list` | sohm | PASS | 0 | 0 | 0 | UNSUPPORTED-API | no rust writer arm: the public API cannot express this case |
@@ -153,23 +153,21 @@ The rust-written file carries the same data, type and shape as the h5py referenc
 
 | id | field | libhdf5 | rust-hdf5 | observed | cases |
 |---|---|---|---|---|---|
-| `superblock-always-v3` | `superblock` | `*` | `3` | yes | 1 (chunkidx_btree1) |
-| `btree1-index-substituted` | `chunkindex` | `btree1` | `earray` | yes | 1 (chunkidx_btree1) |
-| `new-style-groups-always` | `linkstore` | `symtab` | `compact` | yes | 47 (int_i8, int_u8, int_i16le…) |
-| `filter-flags-zero` | `filters` | `*` | `*` | yes | 3 (filter_deflate, filter_deflate_shuffle, fil…) |
+| `superblock-floor-v2` | `superblock` | `0` | `2` | yes | 53 (int_i8, int_u8, int_i16le…) |
+| `superblock-v3-for-chunk-index` | `superblock` | `*` | `3` | yes | 2 (chunkidx_btree1, layout_chunked_v108) |
+| `btree1-index-substituted` | `chunkindex` | `btree1` | `*` | yes | 2 (chunkidx_btree1, layout_chunked_v108) |
+| `new-style-groups-always` | `linkstore` | `symtab` | `compact` | yes | 54 (int_i8, int_u8, int_i16le…) |
+| `filter-flags-zero` | `filters` | `*` | `*` | yes | 4 (filter_deflate, filter_shuffle, filter_defl…) |
 
-- `superblock-always-v3`: the writer emits a v3 superblock for every file it creates; H5File::set_libver_latest(false) does not select an older one; observed as `0 -> 3`
-- `btree1-index-substituted`: a v1 B-tree chunk index is only legal below superblock v3, so this follows from superblock-always-v3: one unlimited dimension in a v3 file selects the extensible array; observed as `btree1 -> earray`
-- `new-style-groups-always`: the writer emits a version-2 object header for every group, so links libhdf5 would keep in a symbol table are stored as link messages; follows from superblock-always-v3, and the phase change past max_compact still moves them to dense storage; observed as `symtab -> compact`
+- `superblock-floor-v2`: libhdf5 writes a v0 superblock at the earliest libver bound, over symbol-table groups and version-1 object headers; this writer emits neither, and no libhdf5 writes a v0 superblock over the link-message groups it does emit, so its floor is the v1.8 bound's version 2 (HDF5_superblock_ver_bounds); observed as `0 -> 2`
+- `superblock-v3-for-chunk-index`: every chunked dataset this writer emits is indexed by a v1.10 structure through a version-4 data layout message, which H5O_layout_ver_bounds puts at the v1.10 bound and so at superblock version 3, whatever bound the file asked for; observed as `2 -> 3`
+- `btree1-index-substituted`: a v1 B-tree chunk index is only legal below superblock v3, so this follows from superblock-v3-for-chunk-index: the file gets whichever v1.10 index its shape selects — the extensible array for one unlimited dimension, the single-chunk index for a fixed shape covered by one chunk; observed as `btree1 -> single`
+- `new-style-groups-always`: the writer emits a version-2 object header for every group, so links libhdf5 would keep in a symbol table are stored as link messages; the same cause as superblock-floor-v2, and the phase change past max_compact still moves them to dense storage; observed as `symtab -> compact`
 - `filter-flags-zero`: the writer stores the per-filter flags byte as 0 where libhdf5 stores 1 (H5Z_FLAG_OPTIONAL); both pipelines decode to the same bytes; observed as `[scaleoffset(2|0|16|0|4|1|0|1|0|0|0|0|0|0|0|0|1818321779|1717989221|7…`
 
 ## Direction B unexpected deviations
 
-Metadata deviations matching no `EXPECTED_DEVIATIONS` entry. These are new since the table was written and want a verdict.
-
-| key | libhdf5 | rust-hdf5 | cases |
-|---|---|---|---|
-| `#superblock` | `0` | `2` | 46 (int_i8, int_u8, int_i16le…) |
+None: every metadata deviation in this run is a declared one.
 
 ## Direction B failures, in full
 
@@ -178,15 +176,13 @@ None.
 
 | severity | finding | cases | example |
 |---|---|---|---|
-| API cannot express | no rust writer arm: the public API cannot express this case | 21 |  |
-| API cannot express | region references need a selection serializer on the write side | 1 |  |
+| API cannot express | no rust writer arm: the public API cannot express this case | 8 |  |
 | no public accessor (API-wide) | attrorder — H5Group exposes no attribute creation-order tracking flags | 91 | /#attrorder |
 | no public accessor (API-wide) | attrstore — H5Group exposes no compact/dense attribute storage accessor | 91 | /#attrstore |
 | no public accessor (API-wide) | linkorder — H5Group exposes no link creation-order tracking flags | 91 | /#linkorder |
 | no public accessor (API-wide) | linkstore — H5Group exposes no compact/dense link storage accessor | 91 | /#linkstore |
 | no public accessor (API-wide) | nattrs_hdr — H5Group exposes no object-header attribute count | 91 | /#nattrs_hdr |
 | no public accessor (API-wide) | superblock — H5File exposes no superblock/libver accessor | 91 | #superblock |
-| no public accessor (API-wide) | userblock — H5File exposes no user block accessor | 91 | #userblock |
 | no public accessor (API-wide) | attrstore — H5Dataset exposes no compact/dense attribute storage accessor | 90 | /data#attrstore |
 | no public accessor (API-wide) | external — H5Dataset exposes no external file list accessor | 90 | /data#external |
 | no public accessor (API-wide) | fillvalue — H5Dataset exposes no fill value accessor | 90 | /data#fillvalue |

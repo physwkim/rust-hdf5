@@ -400,7 +400,7 @@ COMPOSITE_CASES = [
          "variable-length i32 sequences"),
     Case("vlen_bytes", "dtype-composite", gen_vlen_bytes, "vlen_bytes",
          "variable-length u8 sequences"),
-    Case("named_datatype", "dtype-composite", gen_named_datatype, None,
+    Case("named_datatype", "dtype-composite", gen_named_datatype, "named_datatype",
          "committed datatype object, and a dataset that shares it"),
 ]
 
@@ -528,13 +528,15 @@ def gen_chunkidx_btree2(path):
 
 
 LAYOUT_CASES = [
-    Case("layout_compact", "layout", gen_layout_compact, None,
+    Case("layout_compact", "layout", gen_layout_compact, "layout_compact",
          "compact layout — data inside the object header"),
     Case("layout_contiguous", "layout", gen_layout_contiguous, "layout_contiguous",
          "contiguous layout"),
-    Case("layout_contiguous_v110", "layout", gen_layout_contiguous_v110, None,
+    Case("layout_contiguous_v110", "layout", gen_layout_contiguous_v110,
+         "layout_contiguous_v110",
          "contiguous layout under v1.10 bounds — data layout message v4"),
-    Case("layout_chunked_v110", "layout", gen_layout_chunked_v110, None,
+    Case("layout_chunked_v110", "layout", gen_layout_chunked_v110,
+         "layout_chunked_v110",
          "chunked layout under v1.10 bounds — the control for the case above"),
     Case("chunkidx_btree1", "layout", gen_chunkidx_btree1, "chunkidx_btree1",
          "layout v3 + version-1 B-tree chunk index (libver earliest)"),
@@ -551,10 +553,11 @@ LAYOUT_CASES = [
          "extensible-array index — the unlimited dimension is dim 1, not dim 0"),
     Case("chunkidx_btree2", "layout", gen_chunkidx_btree2, "chunkidx_btree2",
          "version-2 B-tree index — two unlimited dimensions"),
-    Case("layout_contiguous_v108", "layout", gen_layout_contiguous_v108, None,
+    Case("layout_contiguous_v108", "layout", gen_layout_contiguous_v108,
+         "layout_contiguous_v108",
          "contiguous layout under v1.8 bounds — the v1.10 pair's control"),
-    Case("layout_chunked_v108", "layout", gen_layout_chunked_v108, None,
-         "chunked layout under v1.8 bounds"),
+    Case("layout_chunked_v108", "layout", gen_layout_chunked_v108,
+         "layout_chunked_v108", "chunked layout under v1.8 bounds"),
     Case("chunkidx_earray_dim1", "layout", gen_chunkidx_earray_dim1,
          "chunkidx_earray_dim1",
          "extensible-array index whose unlimited dimension is not the first"),
@@ -584,7 +587,7 @@ def _filter_case(name, rust, note, **kw):
 FILTER_CASES = [
     _filter_case("filter_deflate", "filter_deflate", "deflate level 6",
                  compression="gzip", compression_opts=6),
-    _filter_case("filter_shuffle", None, "shuffle only",
+    _filter_case("filter_shuffle", "filter_shuffle", "shuffle only",
                  shuffle=True),
     _filter_case("filter_fletcher32", "filter_fletcher32", "fletcher32 checksum",
                  fletcher32=True),
@@ -778,11 +781,12 @@ LINK_CASES = [
          "three levels of nested groups plus an empty leaf group"),
     Case("link_hard", "link", gen_link_hard, "link_hard",
          "two names for one object"),
-    Case("link_soft", "link", gen_link_soft, None, "soft link to /orig"),
-    Case("link_external", "link", gen_link_external, None,
+    Case("link_soft", "link", gen_link_soft, "link_soft", "soft link to /orig"),
+    Case("link_external", "link", gen_link_external, "link_external",
          "external link into a sibling file",
          ext_files=("_ext.h5",)),
-    Case("link_external_read", "link", gen_link_external_read, None,
+    Case("link_external_read", "link", gen_link_external_read,
+         "link_external_read",
          "datasets read through external links, plus a dangling object and a "
          "dangling file",
          ext_files=("_data.h5",)),
@@ -914,16 +918,17 @@ def gen_userblock(path):
 LIBVER_CASES = [
     _libver_case("libver_earliest", "earliest", "libver_earliest",
                  "libver earliest — superblock v0, symbol-table groups"),
-    _libver_case("libver_v108", ("v108", "v108"), None, "libver v1.8 bounds"),
-    _libver_case("libver_v110", ("v110", "v110"), None, "libver v1.10 bounds"),
+    _libver_case("libver_v108", ("v108", "v108"), "libver_v108",
+                 "libver v1.8 bounds"),
+    _libver_case("libver_v110", ("v110", "v110"), "libver_v110",
+                 "libver v1.10 bounds"),
     _libver_case("libver_latest", "latest", "libver_latest",
                  "libver latest — superblock v3, new-style groups"),
     # Superblock v1 is not reachable from h5py 3.15: it is produced only by a
     # non-default B-tree K value (H5Pset_sym_k / H5Pset_istore_k), and neither
     # is wrapped on PropFCID. v0, v2 and v3 are covered by the four cases
     # above; the user block below is the remaining v0 variant.
-    # No rust writer arm: the public API cannot ask for a userblock.
-    Case("userblock", "superblock", gen_userblock, None,
+    Case("userblock", "superblock", gen_userblock, "userblock",
          "512-byte userblock — the superblock, and every address, is based at 512"),
 ]
 

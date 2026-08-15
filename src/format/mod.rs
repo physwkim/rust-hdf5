@@ -79,6 +79,81 @@ impl LibverBound {
             Self::V200 => 5,
         }
     }
+
+    /// The superblock version this bound calls for — libhdf5's
+    /// `HDF5_superblock_ver_bounds` (H5Fsuper.c:68), the floor
+    /// `H5F__super_init` raises the content-derived version to.
+    ///
+    /// Version 0 is the `H5F_LIBVER_EARLIEST` entry
+    /// (`HDF5_SUPERBLOCK_VERSION_DEF`); a writer whose own structures need
+    /// more takes the higher of the two.
+    pub fn superblock_version(self) -> u8 {
+        match self {
+            Self::Earliest => 0,
+            Self::V18 => 2,
+            Self::V110 | Self::V112 | Self::V114 | Self::V200 => 3,
+        }
+    }
+}
+
+/// Which generation of the on-disk object format one file's objects are
+/// written in.
+///
+/// Not a second [`LibverBound`]: the bound picks the datatype version a
+/// *caller* asked for, while this says which superblock generation the file
+/// already is. The two never combine freely — libhdf5 derives both from the
+/// same low bound, so a version-0/1 superblock always carries version-1 object
+/// headers and the `H5F_LIBVER_EARLIEST` row of every message-version table,
+/// and a version-2/3 superblock always carries version-2 headers and the
+/// `H5F_LIBVER_V18` row. Choosing per message is what would let this writer
+/// emit a combination libhdf5 never writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ObjectFormat {
+    /// A version-0/1 superblock file: version-1 object headers, symbol-table
+    /// groups, and the oldest message versions that can express the content.
+    Legacy,
+    /// A version-2/3 superblock file: version-2 object headers and the
+    /// message versions `H5F_LIBVER_V18` calls for.
+    #[default]
+    Modern,
+}
+
+impl ObjectFormat {
+    /// The object header version (`H5O_obj_ver_bounds`, H5Oint.c:125).
+    pub fn object_header_version(self) -> u8 {
+        match self {
+            Self::Legacy => 1,
+            Self::Modern => 2,
+        }
+    }
+
+    /// The floor for a dataspace message's version
+    /// (`H5O_sdspace_ver_bounds`, H5S.c:61). A null dataspace cannot be
+    /// expressed at version 1 and raises itself.
+    pub fn dataspace_version(self) -> u8 {
+        match self {
+            Self::Legacy => 1,
+            Self::Modern => 2,
+        }
+    }
+
+    /// The fill-value message version (`H5O_fill_ver_bounds`, H5Ofill.c:150).
+    /// The earliest bound writes version 2 — version 1 is the separate
+    /// "fill value (old)" message type, which this writer never emits.
+    pub fn fill_value_version(self) -> u8 {
+        match self {
+            Self::Legacy => 2,
+            Self::Modern => 3,
+        }
+    }
+
+    /// The attribute message version (`H5O_attr_ver_bounds`, H5Aint.c:95).
+    pub fn attribute_version(self) -> u8 {
+        match self {
+            Self::Legacy => 1,
+            Self::Modern => 3,
+        }
+    }
 }
 
 /// UNDEF address constant

@@ -22,6 +22,7 @@ use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::filter::FilterPipeline;
+use crate::format::messages::link::LinkTarget;
 use crate::io::reader::LinkClass;
 use crate::types::H5Type;
 
@@ -114,6 +115,116 @@ impl H5Group {
             }
             H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
                 "cannot create hard links in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
+    /// Create a soft link — `H5Lcreate_soft`, h5py's `h5py.SoftLink`.
+    ///
+    /// The link stores `target_path` as text and HDF5 resolves it on every
+    /// traversal, so it may name an object that does not exist yet, or one
+    /// that never will: unlike [`link`](Self::link), nothing is checked here
+    /// and a dangling soft link is a legal file.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    ///
+    /// let file = H5File::create("soft.h5").unwrap();
+    /// file.new_dataset::<i32>().shape([8]).create("orig").unwrap();
+    /// file.root_group().create_soft_link("alias", "/orig").unwrap();
+    /// ```
+    pub fn create_soft_link(&self, link_name: &str, target_path: &str) -> Result<()> {
+        self.create_symbolic_link(
+            link_name,
+            LinkTarget::Soft {
+                target: target_path.to_string(),
+            },
+        )
+    }
+
+    /// Create an external link — `H5Lcreate_external`, h5py's
+    /// `h5py.ExternalLink`.
+    ///
+    /// The link names `target_path` inside `target_file`; neither is opened
+    /// here, and libhdf5 resolves `target_file` against the directory holding
+    /// *this* file, so a relative name is the portable form. As with
+    /// [`create_soft_link`](Self::create_soft_link) the link may dangle: a
+    /// file that is not there and an object that is not there are both legal.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    ///
+    /// let file = H5File::create("master.h5").unwrap();
+    /// file.root_group()
+    ///     .create_external_link("ext", "payload.h5", "/data")
+    ///     .unwrap();
+    /// ```
+    pub fn create_external_link(
+        &self,
+        link_name: &str,
+        target_file: &str,
+        target_path: &str,
+    ) -> Result<()> {
+        self.create_symbolic_link(
+            link_name,
+            LinkTarget::External {
+                file: target_file.to_string(),
+                path: target_path.to_string(),
+            },
+        )
+    }
+
+    /// Commit a datatype in this group under `name` — `H5Tcommit2`, h5py's
+    /// `group["name"] = dtype`.
+    ///
+    /// The type becomes an object of its own, so datasets can be built on it
+    /// with [`DatasetBuilder::committed_type`](crate::dataset::DatasetBuilder::committed_type)
+    /// and share one definition instead of each carrying a copy. A committed
+    /// datatype no dataset ever uses is still a complete object, and h5py
+    /// reads it back as a `Datatype`.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    /// use rust_hdf5::format::messages::datatype::DatatypeMessage;
+    ///
+    /// let file = H5File::create("committed.h5").unwrap();
+    /// let grp = file.create_group("types").unwrap();
+    /// grp.commit_datatype("temperature", DatatypeMessage::f64_type()).unwrap();
+    /// ```
+    pub fn commit_datatype(
+        &self,
+        name: &str,
+        datatype: crate::format::messages::datatype::DatatypeMessage,
+    ) -> Result<()> {
+        let full_name = if self.name == "/" {
+            name.to_string()
+        } else {
+            format!("{}/{}", self.name.trim_start_matches('/'), name)
+        };
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => {
+                writer.commit_datatype(&full_name, datatype)?;
+                Ok(())
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot commit datatypes in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
+    /// Both symbolic-link constructors, behind one writer-mode check.
+    fn create_symbolic_link(&self, link_name: &str, target: LinkTarget) -> Result<()> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => {
+                writer.create_symbolic_link(&self.name, link_name, target)?;
+                Ok(())
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot create links in read mode".into(),
             )),
             H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
         }
@@ -553,12 +664,13 @@ impl H5Group {
                 }
                 Ok(names.into_iter().collect())
             }
-            // The writer creates hard links only, so its own objects are the
-            // union of the object listings — plus the links a reopened file
-            // brought in that the writer carries but cannot express.
+            // A hard link to one of the writer's own objects is in the object
+            // listings, so those are the union — plus every link that names a
+            // path instead: a soft or external link made this session, or one
+            // a reopened file brought in.
             H5FileInner::Writer(writer) => {
                 let mut names = std::collections::BTreeSet::new();
-                for (path, _) in writer.preserved_link_paths() {
+                for (path, _) in writer.path_link_classes() {
                     let stripped = if prefix.is_empty() {
                         path.as_str()
                     } else if let Some(rest) = path.strip_prefix(&prefix) {
@@ -573,6 +685,7 @@ impl H5Group {
                 drop(inner);
                 names.extend(self.dataset_names()?);
                 names.extend(self.group_names()?);
+                names.extend(self.named_datatype_names()?);
                 Ok(names.into_iter().collect())
             }
             H5FileInner::Closed => Ok(vec![]),
@@ -589,7 +702,8 @@ impl H5Group {
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>(),
-            H5FileInner::Writer(_) | H5FileInner::Closed => return Ok(vec![]),
+            H5FileInner::Writer(writer) => writer.committed_datatype_names(),
+            H5FileInner::Closed => return Ok(vec![]),
         };
         Ok(all
             .iter()
@@ -660,16 +774,17 @@ impl H5Group {
                 .link_class(&full_name)
                 .cloned()
                 .ok_or(Hdf5Error::NotFound(full_name)),
-            // The writer creates hard links only; anything else it holds came
-            // in with a reopened file and kept its class.
+            // Anything the writer holds by a path — created here or carried
+            // in by a reopen — answers with the class it was made with; every
+            // other name it knows reaches an object of its own, so it is hard.
             H5FileInner::Writer(writer) => {
-                let preserved = writer
-                    .preserved_link_paths()
+                let by_path = writer
+                    .path_link_classes()
                     .into_iter()
                     .find(|(p, _)| *p == full_name)
                     .map(|(_, class)| class);
                 drop(inner);
-                match preserved {
+                match by_path {
                     Some(class) => Ok(class),
                     None if self.link_names()?.iter().any(|n| n == name) => Ok(LinkClass::Hard),
                     None => Err(Hdf5Error::NotFound(full_name)),
