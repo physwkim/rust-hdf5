@@ -11,7 +11,7 @@
 //! The invariant they share: the file comes back in the format it went in, so
 //! a reader that could open it before the append can open it after.
 
-use rust_hdf5::{H5File, LibverBound};
+use rust_hdf5::{H5File, LibverBound, Selection};
 
 /// Interpreters tried in order when `RUST_HDF5_TEST_PYTHON` is unset, matching
 /// `h5py_cross_validation`. `h5dump` and `h5clear` are taken from the same
@@ -605,12 +605,13 @@ fn a_classic_chunk_tree_grows_past_one_node_and_past_its_extent() {
 ///
 /// Compact, contiguous and chunked layouts all encode as a version-3 data
 /// layout message, which is exactly what libhdf5 writes at
-/// `H5F_LIBVER_EARLIEST`, so all three belong in a version-0 file and are
-/// written into one here. A filter does not: its pipeline message would have
-/// to be version 1, and this crate encodes version 2 only, so every filtered
-/// dataset is still refused where the caller asks for it.
+/// `H5F_LIBVER_EARLIEST`, so all of them belong in a version-0 file and are
+/// written into one here — filtered chunks included, over a version-1
+/// pipeline message. Virtual storage does not: no layout message below
+/// version 4 can say "virtual", so it is still refused where the caller asks
+/// for it.
 #[test]
-fn a_classic_file_takes_compact_and_contiguous_but_no_filter() {
+fn a_classic_file_takes_every_layout_but_virtual() {
     let Some(py) = python() else { return };
     let path = tmp("storage_matrix");
     write_default_h5py(py, &path, "f['alpha'] = np.arange(6, dtype='<i4')\n");
@@ -645,53 +646,117 @@ fn a_classic_file_takes_compact_and_contiguous_but_no_filter() {
         .write_raw(&(0i32..16).collect::<Vec<_>>())
         .unwrap();
 
-    // Refused, each for the version-1 filter pipeline message it would need.
-    for (which, res) in [
+    // Writable: the same tree, with the stored size and filter mask its keys
+    // already carry, under a version-1 filter pipeline message.
+    let ramp: Vec<i32> = (0i32..64).collect();
+    for (name, builder) in [
         (
-            "deflate",
-            file.new_dataset::<i32>()
-                .shape([64])
-                .chunk(&[8])
-                .deflate(6)
-                .create("b"),
+            "gz",
+            file.new_dataset::<i32>().shape([64]).chunk(&[8]).deflate(6),
         ),
         (
-            "shuffle",
-            file.new_dataset::<i32>()
-                .shape([64])
-                .chunk(&[8])
-                .shuffle()
-                .create("c"),
+            "sh",
+            file.new_dataset::<i32>().shape([64]).chunk(&[8]).shuffle(),
         ),
         (
-            "shuffle+deflate",
+            "shgz",
             file.new_dataset::<i32>()
                 .shape([64])
                 .chunk(&[8])
-                .shuffle_deflate(6)
-                .create("d"),
+                .shuffle_deflate(6),
         ),
     ] {
-        match res {
-            Ok(_) => panic!("{which} needs a filter pipeline message this file cannot hold"),
-            Err(e) => assert!(e.to_string().contains("filter pipeline"), "{which}: {e}"),
-        }
+        builder.create(name).unwrap().write_raw(&ramp).unwrap();
+    }
+
+    // Refused: no data layout message below version 4 can say "virtual".
+    match file
+        .new_dataset::<i32>()
+        .shape([4])
+        .virtual_mapping(Selection::All, "src.h5", "src", Selection::All)
+        .create("mapped")
+    {
+        Ok(_) => panic!("a virtual dataset needs a layout message this file cannot hold"),
+        Err(e) => assert!(e.to_string().contains("virtual"), "{e}"),
     }
 
     file.close().unwrap();
 
-    // Still the file it was, and libhdf5 reads all three new datasets —
-    // including the compact one, whose bytes are only in its header.
+    // Still the file it was, and libhdf5 reads every new dataset — the
+    // compact one, whose bytes are only in its header, and the filtered ones,
+    // whose pipeline it has to decode at version 1 to find the chunks at all.
     assert_eq!(superblock_version(&path), 0);
     read_with_h5py(
         py,
         &path,
-        "assert sorted(f.keys()) == ['alpha', 'chunky', 'flat', 'packed'], sorted(f.keys())\n\
+        "assert sorted(f.keys()) == \
+             ['alpha', 'chunky', 'flat', 'gz', 'packed', 'sh', 'shgz'], sorted(f.keys())\n\
          assert list(f['packed'][...]) == [10, 20, 30, 40], list(f['packed'][...])\n\
          assert list(f['flat'][...]) == [1, 2, 3], list(f['flat'][...])\n\
          assert list(f['chunky'][...]) == list(range(16)), list(f['chunky'][...])\n\
          assert f['packed'].id.get_create_plist().get_layout() == h5py.h5d.COMPACT\n\
-         assert f['chunky'].id.get_create_plist().get_layout() == h5py.h5d.CHUNKED\n",
+         assert f['chunky'].id.get_create_plist().get_layout() == h5py.h5d.CHUNKED\n\
+         for name in ('gz', 'sh', 'shgz'):\n\
+         \x20   assert list(f[name][...]) == list(range(64)), (name, list(f[name][...]))\n\
+         assert f['gz'].compression == 'gzip', f['gz'].compression\n\
+         assert f['sh'].shuffle is True\n\
+         assert f['shgz'].compression == 'gzip' and f['shgz'].shuffle is True\n",
+    );
+    libhdf5_tools_accept(py, &path);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The pipeline message a classic file gets is version 1, on the bytes.
+///
+/// h5py reads a version-2 message out of a version-0 file just as happily —
+/// it asks libhdf5, and libhdf5 decodes both — so the read-back above cannot
+/// tell the two apart. This can: the message is checked where it lies, and
+/// it is the one h5py itself writes for the same pipeline down to the flags
+/// byte, which libhdf5 sets to `H5Z_FLAG_OPTIONAL` and this writer leaves at
+/// 0.
+#[test]
+fn a_filtered_dataset_in_a_classic_file_gets_a_version_1_pipeline() {
+    let Some(py) = python() else { return };
+    let path = tmp("pline_v1");
+    write_default_h5py(
+        py,
+        &path,
+        "f.create_dataset('gz', data=np.arange(64, dtype='<i4'), chunks=(8,), \
+         compression='gzip', compression_opts=6)\n",
+    );
+    // Version 1, one filter, six reserved bytes; then deflate, a name length
+    // of 8, the flags, one client-data value, the padded name, the level and
+    // the pad that makes the value count even.
+    let pline = |flags: u8| {
+        let mut m = vec![1u8, 1, 0, 0, 0, 0, 0, 0, 1, 0, 8, 0, flags, 0, 1, 0];
+        m.extend_from_slice(b"deflate\0");
+        m.extend_from_slice(&[6, 0, 0, 0, 0, 0, 0, 0]);
+        m
+    };
+    let holds =
+        |p: &std::path::Path, m: &[u8]| std::fs::read(p).unwrap().windows(m.len()).any(|w| w == m);
+    assert!(holds(&path, &pline(1)), "h5py's own version-1 pipeline");
+
+    let file = H5File::open_rw(&path).unwrap();
+    file.new_dataset::<i32>()
+        .shape([64])
+        .chunk(&[8])
+        .deflate(6)
+        .create("mine")
+        .unwrap()
+        .write_raw(&(0i32..64).collect::<Vec<_>>())
+        .unwrap();
+    file.close().unwrap();
+
+    assert_eq!(superblock_version(&path), 0);
+    assert!(holds(&path, &pline(0)), "the pipeline this writer emitted");
+    read_with_h5py(
+        py,
+        &path,
+        "assert list(f['gz'][...]) == list(range(64)), list(f['gz'][...])\n\
+         assert list(f['mine'][...]) == list(range(64)), list(f['mine'][...])\n\
+         assert f['mine'].compression == 'gzip', f['mine'].compression\n\
+         assert f['mine'].compression_opts == 6, f['mine'].compression_opts\n",
     );
     libhdf5_tools_accept(py, &path);
     let _ = std::fs::remove_file(&path);

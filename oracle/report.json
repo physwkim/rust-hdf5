@@ -4,7 +4,7 @@
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
   "python": "/home/stevek/micromamba/envs/tomo/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-integrator3-71ef8215-1/target/release/oracle_probe",
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-earliest-3dfba97c-1/target/release/oracle_probe",
   "cases": 92
  },
  "results": [
@@ -138,22 +138,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -288,22 +273,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -438,22 +408,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -588,22 +543,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -738,22 +678,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -888,22 +813,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -1038,22 +948,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -1188,22 +1083,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -1338,22 +1218,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -1488,22 +1353,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -1638,22 +1488,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -1788,22 +1623,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -1938,22 +1758,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -2088,22 +1893,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -2238,22 +2028,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -2388,22 +2163,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -2538,22 +2298,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -2688,22 +2433,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -2838,22 +2568,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -2988,22 +2703,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -3138,22 +2838,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -3288,22 +2973,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -3438,22 +3108,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -3588,22 +3243,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -3738,22 +3378,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -3888,22 +3513,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -4173,22 +3783,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -4323,22 +3918,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -4473,22 +4053,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -4623,22 +4188,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -4773,22 +4323,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -5027,29 +4562,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     },
-     {
-      "key": "/grp#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -5248,22 +4761,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -5398,22 +4896,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -5548,22 +5031,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -5778,22 +5246,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -5928,22 +5381,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -6078,22 +5516,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -6498,29 +5921,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "3",
-      "expected": "superblock-v3-for-chunk-index"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     },
-     {
-      "key": "/data#chunkindex",
-      "field": "chunkindex",
-      "ref": "btree1",
-      "rust": "earray",
-      "expected": "btree1-index-substituted"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -7885,22 +7286,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -9297,22 +8683,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -9447,22 +8818,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -9597,22 +8953,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -10066,43 +9407,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     },
-     {
-      "key": "/a#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     },
-     {
-      "key": "/a/b#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     },
-     {
-      "key": "/a/b/c#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -10301,22 +9606,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -10451,22 +9741,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -12022,36 +11297,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/apple#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     },
-     {
-      "key": "/mango#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     },
-     {
-      "key": "/zebra#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -12330,29 +11576,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/legacy#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     },
-     {
-      "key": "/legacy/inner#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -12735,36 +11959,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     },
-     {
-      "key": "/legacy#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     },
-     {
-      "key": "/modern/inner#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -12915,22 +12110,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -13081,22 +12261,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -13311,29 +12476,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     },
-     {
-      "key": "/g#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -14706,22 +13849,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -15111,29 +14239,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     },
-     {
-      "key": "/grp#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -15308,29 +14414,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     },
-     {
-      "key": "/g#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -16030,29 +15114,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "0",
-      "rust": "2",
-      "expected": "superblock-floor-v2"
-     },
-     {
-      "key": "/#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     },
-     {
-      "key": "/g#linkstore",
-      "field": "linkstore",
-      "ref": "symtab",
-      "rust": "compact",
-      "expected": "new-style-groups-always"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -19020,66 +18082,11 @@
    "ref": "0",
    "rust": "2",
    "example": "0 -> 2",
-   "why": "libhdf5 writes a v0 superblock at the earliest libver bound, over symbol-table groups and version-1 object headers; this writer emits neither, and no libhdf5 writes a v0 superblock over the link-message groups it does emit, so its floor is the v1.8 bound's version 2 (HDF5_superblock_ver_bounds)",
+   "why": "three cases whose rust arm still creates at this crate's default bounds, because H5F_LIBVER_EARLIEST cannot express what they write. `vds` needs a virtual dataset, refused in a classic file; `link_external` and `link_external_read` need an external link, which a symbol table cannot hold \u2014 libhdf5 answers that by converting the group to link messages under the same v0 superblock (H5G__obj_insert), and this writer has no such conversion. Every other earliest-bound case now writes the v0 superblock itself",
    "cases": [
-    "int_i8",
-    "int_u8",
-    "int_i16le",
-    "int_u16le",
-    "int_i32le",
-    "int_u32le",
-    "int_i64le",
-    "int_u64le",
-    "int_i16be",
-    "int_i32be",
-    "int_u64be",
-    "float_f16le",
-    "float_f32le",
-    "float_f64le",
-    "float_f64be",
-    "float_specials",
-    "str_fixed_ascii",
-    "str_fixed_utf8",
-    "str_fixed_nullpad",
-    "str_fixed_spacepad",
-    "str_vlen_ascii",
-    "str_vlen_utf8",
-    "compound_simple",
-    "compound_nested",
-    "compound_with_string",
-    "compound_padded",
-    "array_dtype",
-    "enum_i8",
-    "enum_i32",
-    "opaque",
-    "bitfield",
-    "ref_object",
-    "ref_region",
-    "vlen_numeric",
-    "vlen_bytes",
-    "named_datatype",
-    "layout_compact",
-    "layout_contiguous",
-    "external_storage",
     "vds",
-    "space_scalar",
-    "space_null",
-    "space_zerosized",
-    "groups_nested",
-    "link_hard",
-    "link_soft",
     "link_external",
-    "link_external_read",
-    "track_order",
-    "group_storage_modern_root",
-    "group_storage_legacy_root",
-    "attr_scalar_num",
-    "attr_array_num",
-    "attr_string",
-    "attr_on_root",
-    "attr_ref_object",
-    "libver_earliest",
-    "userblock"
+    "link_external_read"
    ]
   },
   {
@@ -19088,9 +18095,8 @@
    "ref": "*",
    "rust": "3",
    "example": "2 -> 3",
-   "why": "a chunked dataset in a file this writer created is indexed by a v1.10 structure through a version-4 data layout message, which H5O_layout_ver_bounds puts at the v1.10 bound and so at superblock version 3, whatever bound the file asked for; the version-1 B-tree is selected only when reopening a file that already is in the classic format, where the bound cannot move",
+   "why": "layout_chunked_v108 asks for the v1.8 bound, where H5O_layout_ver_bounds still puts the data layout message at version 3 and so the chunk index at the version-1 B-tree. This writer picks that index for a classic file only, so a v1.8 file gets a v1.10 index behind a version-4 layout message and the superblock version 3 that implies, above the version 2 the bound asked for",
    "cases": [
-    "chunkidx_btree1",
     "layout_chunked_v108"
    ]
   },
@@ -19100,9 +18106,8 @@
    "ref": "btree1",
    "rust": "*",
    "example": "btree1 -> single",
-   "why": "a v1 B-tree chunk index is only legal below superblock v3, so this follows from superblock-v3-for-chunk-index: the file gets whichever v1.10 index its shape selects \u2014 the extensible array for one unlimited dimension, the single-chunk index for a fixed shape covered by one chunk. Every case here writes a new file; a chunked dataset appended to a classic one does get the version-1 B-tree (tests/legacy_append.rs)",
+   "why": "a v1 B-tree chunk index is only legal below superblock v3, so this follows from superblock-v3-for-chunk-index: the file gets whichever v1.10 index its shape selects \u2014 here the single-chunk index, the shape being one chunk wide. A file created at H5F_LIBVER_EARLIEST does get the version-1 B-tree (tests/libver_earliest.rs), as does a chunked dataset appended to a classic file (tests/legacy_append.rs); the v1.8 bound is what is left",
    "cases": [
-    "chunkidx_btree1",
     "layout_chunked_v108"
    ]
   },
@@ -19112,65 +18117,9 @@
    "ref": "symtab",
    "rust": "compact",
    "example": "symtab -> compact",
-   "why": "the writer emits a version-2 object header for every group, so links libhdf5 would keep in a symbol table are stored as link messages; the same cause as superblock-floor-v2, and the phase change past max_compact still moves them to dense storage",
+   "why": "a version-2 object header keeps its links in messages rather than in a symbol table. `sohm_list` and `sohm_btree` carry shared messages, whose master table lives in a superblock extension and so forces the version-2 superblock and with it version-2 headers (H5Fsuper.c:1135), whatever bound is asked for; `vds` is the superblock-floor-v2 case above. The phase change past max_compact still moves the links to dense storage",
    "cases": [
-    "int_i8",
-    "int_u8",
-    "int_i16le",
-    "int_u16le",
-    "int_i32le",
-    "int_u32le",
-    "int_i64le",
-    "int_u64le",
-    "int_i16be",
-    "int_i32be",
-    "int_u64be",
-    "float_f16le",
-    "float_f32le",
-    "float_f64le",
-    "float_f64be",
-    "float_specials",
-    "str_fixed_ascii",
-    "str_fixed_utf8",
-    "str_fixed_nullpad",
-    "str_fixed_spacepad",
-    "str_vlen_ascii",
-    "str_vlen_utf8",
-    "compound_simple",
-    "compound_nested",
-    "compound_with_string",
-    "compound_padded",
-    "array_dtype",
-    "enum_i8",
-    "enum_i32",
-    "opaque",
-    "bitfield",
-    "ref_object",
-    "ref_region",
-    "vlen_numeric",
-    "vlen_bytes",
-    "named_datatype",
-    "layout_compact",
-    "layout_contiguous",
-    "chunkidx_btree1",
-    "external_storage",
     "vds",
-    "space_scalar",
-    "space_null",
-    "space_zerosized",
-    "groups_nested",
-    "link_hard",
-    "link_soft",
-    "track_order",
-    "group_storage_modern_root",
-    "group_storage_legacy_root",
-    "attr_scalar_num",
-    "attr_array_num",
-    "attr_string",
-    "attr_on_root",
-    "attr_ref_object",
-    "libver_earliest",
-    "userblock",
     "sohm_list",
     "sohm_btree"
    ]

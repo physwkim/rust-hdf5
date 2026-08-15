@@ -9,6 +9,12 @@
 //! v1.8 (version 2), a chunked dataset's version-4/5 layout puts it at v1.10
 //! (version 3), and SWMR is version 3 outright. A reopened file keeps the
 //! version it already has unless what is appended needs a newer one.
+//!
+//! One bound settles the question on its own: `LibverBound::Earliest` asks
+//! for the classic generation, whose superblock is version 0 and whose
+//! content — symbol-table groups, version-1 object headers, the version-1
+//! B-tree chunk index — never raises it. `tests/libver_earliest.rs` is where
+//! that file is checked; here it is one row of the bounds table.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -63,9 +69,10 @@ fn write_chunked(file: &H5File, name: &str) {
 }
 
 /// Contiguous data, compact links and attributes are all expressible in the
-/// v1.8 format, which is where this crate's floor is: it writes no
-/// symbol-table group and no version-1 object header, so it never has cause
-/// to claim the version-0 superblock libhdf5 writes under earliest bounds.
+/// v1.8 format, which is where a file created without a named bound sits: it
+/// gets no symbol-table group and no version-1 object header, so it never has
+/// cause to claim the version-0 superblock libhdf5 writes under earliest
+/// bounds. Naming that bound is what asks for it.
 #[test]
 fn a_file_of_contiguous_datasets_is_written_at_version_2() {
     let path = unique_tmp("contiguous");
@@ -94,14 +101,12 @@ fn a_file_with_a_chunked_dataset_is_written_at_version_3() {
 }
 
 /// One case per entry of `HDF5_superblock_ver_bounds`, against a file whose
-/// content asks for nothing above the floor. The bound's own entry is 0 for
-/// EARLIEST and 2 for V18, both below this crate's version-2 floor, so the two
-/// oldest bounds land on the same version from opposite directions; V110 and
-/// everything after it are 3.
+/// content asks for nothing above the bound's own entry: 0 for EARLIEST, 2
+/// for V18, 3 for V110 and everything after it.
 #[test]
 fn each_libver_bound_selects_its_superblock_version() {
     for (bound, expected) in [
-        (LibverBound::Earliest, 2),
+        (LibverBound::Earliest, 0),
         (LibverBound::V18, 2),
         (LibverBound::V110, 3),
         (LibverBound::V112, 3),

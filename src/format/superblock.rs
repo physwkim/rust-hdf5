@@ -13,6 +13,10 @@ use crate::format::{FormatError, FormatResult};
 /// The 8-byte HDF5 file signature that begins every superblock.
 pub const HDF5_SIGNATURE: [u8; 8] = [0x89, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a];
 
+/// `HDF5_SUPERBLOCK_VERSION_DEF`, the version `H5F__super_init` starts from
+/// and the one `HDF5_superblock_ver_bounds` gives `H5F_LIBVER_EARLIEST`.
+pub const SUPERBLOCK_V0: u8 = 0;
+
 /// Superblock version 2.
 pub const SUPERBLOCK_V2: u8 = 2;
 

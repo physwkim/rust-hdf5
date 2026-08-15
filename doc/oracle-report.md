@@ -154,16 +154,16 @@ The rust-written file carries the same data, type and shape as the h5py referenc
 
 | id | field | libhdf5 | rust-hdf5 | observed | cases |
 |---|---|---|---|---|---|
-| `superblock-floor-v2` | `superblock` | `0` | `2` | yes | 58 (int_i8, int_u8, int_i16le…) |
-| `superblock-v3-for-chunk-index` | `superblock` | `*` | `3` | yes | 2 (chunkidx_btree1, layout_chunked_v108) |
-| `btree1-index-substituted` | `chunkindex` | `btree1` | `*` | yes | 2 (chunkidx_btree1, layout_chunked_v108) |
-| `new-style-groups-always` | `linkstore` | `symtab` | `compact` | yes | 59 (int_i8, int_u8, int_i16le…) |
+| `superblock-floor-v2` | `superblock` | `0` | `2` | yes | 3 (vds, link_external, link_external_read) |
+| `superblock-v3-for-chunk-index` | `superblock` | `*` | `3` | yes | 1 (layout_chunked_v108) |
+| `btree1-index-substituted` | `chunkindex` | `btree1` | `*` | yes | 1 (layout_chunked_v108) |
+| `new-style-groups-always` | `linkstore` | `symtab` | `compact` | yes | 3 (vds, sohm_list, sohm_btree) |
 | `filter-flags-zero` | `filters` | `*` | `*` | yes | 4 (filter_deflate, filter_shuffle, filter_defl…) |
 
-- `superblock-floor-v2`: libhdf5 writes a v0 superblock at the earliest libver bound, over symbol-table groups and version-1 object headers; this writer emits neither, and no libhdf5 writes a v0 superblock over the link-message groups it does emit, so its floor is the v1.8 bound's version 2 (HDF5_superblock_ver_bounds); observed as `0 -> 2`
-- `superblock-v3-for-chunk-index`: a chunked dataset in a file this writer created is indexed by a v1.10 structure through a version-4 data layout message, which H5O_layout_ver_bounds puts at the v1.10 bound and so at superblock version 3, whatever bound the file asked for; the version-1 B-tree is selected only when reopening a file that already is in the classic format, where the bound cannot move; observed as `2 -> 3`
-- `btree1-index-substituted`: a v1 B-tree chunk index is only legal below superblock v3, so this follows from superblock-v3-for-chunk-index: the file gets whichever v1.10 index its shape selects — the extensible array for one unlimited dimension, the single-chunk index for a fixed shape covered by one chunk. Every case here writes a new file; a chunked dataset appended to a classic one does get the version-1 B-tree (tests/legacy_append.rs); observed as `btree1 -> single`
-- `new-style-groups-always`: the writer emits a version-2 object header for every group, so links libhdf5 would keep in a symbol table are stored as link messages; the same cause as superblock-floor-v2, and the phase change past max_compact still moves them to dense storage; observed as `symtab -> compact`
+- `superblock-floor-v2`: three cases whose rust arm still creates at this crate's default bounds, because H5F_LIBVER_EARLIEST cannot express what they write. `vds` needs a virtual dataset, refused in a classic file; `link_external` and `link_external_read` need an external link, which a symbol table cannot hold — libhdf5 answers that by converting the group to link messages under the same v0 superblock (H5G__obj_insert), and this writer has no such conversion. Every other earliest-bound case now writes the v0 superblock itself; observed as `0 -> 2`
+- `superblock-v3-for-chunk-index`: layout_chunked_v108 asks for the v1.8 bound, where H5O_layout_ver_bounds still puts the data layout message at version 3 and so the chunk index at the version-1 B-tree. This writer picks that index for a classic file only, so a v1.8 file gets a v1.10 index behind a version-4 layout message and the superblock version 3 that implies, above the version 2 the bound asked for; observed as `2 -> 3`
+- `btree1-index-substituted`: a v1 B-tree chunk index is only legal below superblock v3, so this follows from superblock-v3-for-chunk-index: the file gets whichever v1.10 index its shape selects — here the single-chunk index, the shape being one chunk wide. A file created at H5F_LIBVER_EARLIEST does get the version-1 B-tree (tests/libver_earliest.rs), as does a chunked dataset appended to a classic file (tests/legacy_append.rs); the v1.8 bound is what is left; observed as `btree1 -> single`
+- `new-style-groups-always`: a version-2 object header keeps its links in messages rather than in a symbol table. `sohm_list` and `sohm_btree` carry shared messages, whose master table lives in a superblock extension and so forces the version-2 superblock and with it version-2 headers (H5Fsuper.c:1135), whatever bound is asked for; `vds` is the superblock-floor-v2 case above. The phase change past max_compact still moves the links to dense storage; observed as `symtab -> compact`
 - `filter-flags-zero`: the writer stores the per-filter flags byte as 0 where libhdf5 stores 1 (H5Z_FLAG_OPTIONAL); both pipelines decode to the same bytes; observed as `[scaleoffset(2|0|16|0|4|1|0|1|0|0|0|0|0|0|0|0|1818321779|1717989221|7…`
 
 ## Direction B unexpected deviations

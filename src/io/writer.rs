@@ -1814,9 +1814,11 @@ pub(crate) enum NewStorage {
     /// Chunks reached through an index.
     Chunked,
     /// Chunks whose bytes pass through a filter pipeline, which needs a
-    /// Filter Pipeline message in the header beside the layout. Apart from
-    /// that message it is [`Chunked`](Self::Chunked), so the two are told
-    /// apart here rather than by a second question at each creator.
+    /// Filter Pipeline message in the header beside the layout. That message
+    /// is the whole difference from [`Chunked`](Self::Chunked), and both
+    /// formats can hold it, so no check separates the two today; the creators
+    /// still declare which they are, because the declaration is what a check
+    /// added later has to work from.
     ChunkedFiltered,
     /// The image inside the data layout message itself, with no block of its
     /// own — `H5D_COMPACT`.
@@ -2768,14 +2770,19 @@ fn encode_refcount(refcount: u32) -> Vec<u8> {
 ///
 /// Its presence *is* the format switch — [`Hdf5Writer::object_format`] reads
 /// nothing else — because the three differences travel together: libhdf5 at
-/// default library bounds writes a version-0/1 superblock over version-1
+/// `H5F_LIBVER_EARLIEST` writes a version-0/1 superblock over version-1
 /// object headers over symbol-table groups, and writes no other combination of
-/// the three. A file this crate creates never has one.
+/// the three.
+///
+/// Two things put one here, and only two: reopening a file that already is in
+/// that format, and creating one at that bound
+/// ([`LegacyFile::created`]). Neither is distinguished afterwards — a file is
+/// classic or it is not, and every encoder asks only that.
 struct LegacyFile {
-    /// The superblock as it was read. The close re-emits it with only the end
-    /// of file and the root symbol table entry recomputed: the "K" ranks in
-    /// particular are recorded nowhere else, and every node width in the file
-    /// is derived from them.
+    /// The superblock as it was read, or as [`LegacyFile::created`] built it.
+    /// The close re-emits it with only the end of file and the root symbol
+    /// table entry recomputed: the "K" ranks in particular are recorded
+    /// nowhere else, and every node width in the file is derived from them.
     superblock: SuperblockV0V1,
     /// The file-level parameters every node width in a symbol table is derived
     /// from — the address/length widths and the B-tree "K" ranks, after the
@@ -2796,6 +2803,57 @@ struct LegacyFile {
     /// builds — a header is sized and then written by two separate calls, so a
     /// build that allocated would allocate twice.
     written: Slot<HashMap<LinkScope, Stab>>,
+}
+
+impl LegacyFile {
+    /// The classic-format state a file created at `H5F_LIBVER_EARLIEST`
+    /// starts from.
+    ///
+    /// Nothing is superseded and nothing is written yet — a new file has no
+    /// symbol table on disk to free and none laid out — so the two registries
+    /// start empty and the rest of the session treats this file exactly like a
+    /// reopened one.
+    ///
+    /// The superblock is the one `H5F__super_init` writes at that bound: the
+    /// library-default "K" ranks (`H5F_CRT_SYM_LEAF_DEF`,
+    /// `HDF5_BTREE_SNODE_IK_DEF`), no free-space info and no driver info. The
+    /// root entry's object header address and cached symbol table are stamped
+    /// in by [`Hdf5Writer::write_superblock`] once the root group has one;
+    /// its name offset is the empty string at the front of every local heap.
+    ///
+    /// Version 0, not 1: a version-1 superblock exists only to carry a
+    /// non-default chunked-storage "K" value (H5Fsuper.c:1150), and this
+    /// writer has no property to set one.
+    fn created(ctx: FormatContext, base_address: u64) -> Self {
+        let btree = BTreeV1Config::default();
+        Self {
+            superblock: SuperblockV0V1 {
+                version: SUPERBLOCK_V0,
+                sizeof_offsets: ctx.sizeof_addr,
+                sizeof_lengths: ctx.sizeof_size,
+                file_consistency_flags: 0,
+                sym_leaf_k: btree.sym_leaf_k,
+                btree_internal_k: btree.snode_internal_k,
+                indexed_storage_k: None,
+                base_address,
+                superblock_extension_address: UNDEF_ADDR,
+                end_of_file_address: 0,
+                driver_info_address: UNDEF_ADDR,
+                root_symbol_table_entry: SymbolTableEntry {
+                    name_offset: 0,
+                    obj_header_addr: UNDEF_ADDR,
+                    cache: SymbolTableCache::Nothing,
+                },
+            },
+            meta: FileMeta {
+                ctx,
+                btree,
+                sohm: None,
+            },
+            superseded: Slot::new(HashMap::new()),
+            written: Slot::new(HashMap::new()),
+        }
+    }
 }
 
 /// HDF5 file writer.
@@ -2945,9 +3003,10 @@ pub struct Hdf5Writer {
     /// [`object_attributes`](Hdf5Writer::object_attributes) can say it in
     /// addresses every time an object header is built.
     attribute_references: Slot<Vec<AttributeReferenceValue>>,
-    /// Set when this writer reopened a version-0/1 file, and never otherwise.
-    /// See [`LegacyFile`]; [`object_format`](Self::object_format) is the only
-    /// reader of whether it is there.
+    /// Set when this file is in the classic (version-0/1 superblock) format,
+    /// whether it was reopened in it or created at `H5F_LIBVER_EARLIEST`.
+    /// See [`LegacyFile`]; [`is_legacy`](Self::is_legacy) is the only reader
+    /// of whether it is there.
     legacy: Option<Box<LegacyFile>>,
     /// The file's shared-message indexes, when it was created with any.
     /// `None` — the default — is a file with no shared-message table, where
@@ -3083,9 +3142,19 @@ pub struct FileCreateOptions {
     /// Creation-order policy for the root group, and the default for every
     /// object created afterwards; see [`Hdf5Writer::set_track_order`].
     pub track_order: bool,
-    /// The file's low library-version bound; see
-    /// [`Hdf5Writer::set_libver_bound`].
-    pub libver: LibverBound,
+    /// The file's low library-version bound (`H5Pset_libver_bounds`'s `low`),
+    /// or `None` when the caller named none.
+    ///
+    /// The distinction is not decoration. `Some(LibverBound::Earliest)` is a
+    /// request for the format libhdf5 writes at `H5F_LIBVER_EARLIEST` — a
+    /// version-0 superblock over symbol-table groups and version-1 object
+    /// headers, which is what [`ObjectFormat::Legacy`] encodes. `None` keeps
+    /// what this crate has always written for a file whose creator said
+    /// nothing: the version-2 superblock and link-message groups of the v1.8
+    /// format, with the earliest bound's message versions where they can
+    /// express the content. That combination is this crate's own, not one
+    /// libhdf5 writes, so it cannot be spelled as a bound.
+    pub libver: Option<LibverBound>,
     /// Bytes reserved in front of the superblock for the application's own
     /// use (`H5Pset_userblock`). Zero, the default, places the superblock at
     /// offset 0; otherwise a power of two of at least
@@ -3441,11 +3510,28 @@ impl Hdf5Writer {
         }
         let ctx = FormatContext::default_v3();
 
+        // `H5F_LIBVER_EARLIEST` is the one bound under which libhdf5 writes
+        // the classic generation — the version-0 superblock row of
+        // `HDF5_superblock_ver_bounds`, and with it the version-1 rows of
+        // every message-version table and the symbol-table group form
+        // (`H5G__obj_create_real`). Shared object header messages are the one
+        // thing that overrides it: their master table lives in a superblock
+        // extension, which only a version-2 superblock has, so
+        // `H5F__super_init` raises such a file to version 2 whatever the low
+        // bound says (H5Fsuper.c:1135) — and this crate's version-2 files are
+        // the ones that can hold the table.
+        let classic = libver == Some(LibverBound::Earliest) && shared_messages.specs().is_empty();
+        let legacy = classic.then(|| Box::new(LegacyFile::created(ctx, userblock)));
+
         // Reserve the superblock at offset 0. Which version it gets is only
         // known once the file's content is (see `superblock_version_for`),
-        // but versions 2 and 3 encode to the same size, so the reservation
-        // does not have to wait for that choice.
-        let allocator = FileAllocator::new(SuperblockV2V3::size_for(ctx.sizeof_addr) as u64);
+        // but the two a non-classic file can reach — 2 and 3 — encode to the
+        // same size, so the reservation does not have to wait for that choice.
+        let superblock_size = match legacy.as_deref() {
+            Some(l) => l.superblock.encoded_size(),
+            None => SuperblockV2V3::size_for(ctx.sizeof_addr),
+        };
+        let allocator = FileAllocator::new(superblock_size as u64);
 
         Ok(Self {
             handle,
@@ -3459,17 +3545,21 @@ impl Hdf5Writer {
             preserved_links: Slot::new(Vec::new()),
             root_attributes: Slot::new(Vec::new()),
             create_lock: Slot::new(()),
-            libver,
+            libver: libver.unwrap_or_default(),
             closed: false,
             swmr_active: false,
             cwfs: Slot::new(Vec::new()),
             root_group_addr: None,
             root_group_encoded_size: 0,
             superseded_root_header: None,
-            // A new file starts at the oldest superblock this writer's own
-            // structures allow, and finalize raises it if the content needs
-            // a newer one.
-            superblock_version_base: SUPERBLOCK_V2,
+            // A new file starts at the oldest superblock the generation it was
+            // created in allows, and finalize raises it if the content needs a
+            // newer one.
+            superblock_version_base: if classic {
+                SUPERBLOCK_V0
+            } else {
+                SUPERBLOCK_V2
+            },
             dense_attributes: Slot::new(HashMap::new()),
             dense_links: Slot::new(HashMap::new()),
             superseded_dense: Slot::new(None),
@@ -3480,8 +3570,7 @@ impl Hdf5Writer {
             pending_object_references: Slot::new(Vec::new()),
             pending_region_references: Slot::new(Vec::new()),
             attribute_references: Slot::new(Vec::new()),
-            // A file this crate creates is always the modern generation.
-            legacy: None,
+            legacy,
             sohm: (!shared_messages.specs().is_empty()).then(|| {
                 Box::new(SohmState {
                     indexes: shared_messages.specs().to_vec(),
@@ -3651,8 +3740,10 @@ impl Hdf5Writer {
         }
     }
 
-    /// Whether this writer is appending to a file whose groups store their
-    /// links in symbol tables.
+    /// Whether this file is in the classic (version-0/1 superblock) format,
+    /// whose groups store their links in symbol tables — either because it
+    /// was reopened in it or because it was created at
+    /// `H5F_LIBVER_EARLIEST`.
     pub(crate) fn is_legacy(&self) -> bool {
         self.legacy.is_some()
     }
@@ -3749,36 +3840,32 @@ impl Hdf5Writer {
     /// a version-3 data layout message, which is what
     /// `H5O_layout_ver_bounds` gives `H5F_LIBVER_EARLIEST` (H5Dlayout.c:44),
     /// so a classic file takes both; a committed datatype has no layout at
-    /// all; and chunked storage does too, over the version-1 B-tree index
-    /// [`create_btree_v1_dataset`](Self::create_btree_v1_dataset) builds.
+    /// all; and chunked storage does too, filtered or not, over the version-1
+    /// B-tree index [`create_btree_v1_dataset`](Self::create_btree_v1_dataset)
+    /// builds.
     ///
-    /// A filter on those chunks and virtual storage are the two still out of
-    /// reach, each for a reason of its own — named separately below rather
-    /// than as one "not supported", because they are answered differently.
+    /// Virtual storage is the one form still out of reach, and it is refused
+    /// by name rather than as a bare "not supported" so the caller is told
+    /// which of the two files in front of them cannot hold it.
     fn reject_unwritable_storage(&self, storage: NewStorage, name: &str) -> IoResult<()> {
         if !self.is_legacy() {
             return Ok(());
         }
         let (kind, why) = match storage {
-            // libhdf5 at `H5F_LIBVER_EARLIEST` writes a version-1 Filter
-            // Pipeline message (`H5O_pline_ver_bounds`), which this crate
-            // decodes but only encodes at version 2 — and a version-2 pipeline
-            // message inside a version-0 superblock is a file no libhdf5
-            // writes. The chunks themselves are fine: their index is the
-            // version-1 B-tree `create_btree_v1_dataset` builds.
-            NewStorage::ChunkedFiltered => (
-                "filtered",
-                "whose filter pipeline message is version 1, which this crate reads but \
-                 does not write. Create it without filters",
-            ),
             // Nothing older than a version-4 layout message can say "virtual"
             // at all, and writing one here would convert the file the same way.
             NewStorage::Virtual => (
                 "virtual",
                 "which predates the version-4 data layout message a virtual dataset is \
-                 written as. Create it in a file this crate wrote",
+                 written as",
             ),
-            NewStorage::Chunked
+            // A filtered chunked dataset belongs here: its pipeline message
+            // encodes at version 1 (`ObjectFormat::filter_pipeline_version`)
+            // and its chunks are indexed by the version-1 B-tree
+            // `create_btree_v1_dataset` builds, both of which are what
+            // libhdf5 writes at `H5F_LIBVER_EARLIEST`.
+            NewStorage::ChunkedFiltered
+            | NewStorage::Chunked
             | NewStorage::Contiguous
             | NewStorage::Compact
             | NewStorage::None => return Ok(()),
@@ -12845,14 +12932,15 @@ impl Hdf5Writer {
     /// and raises it to the one the file's library-version low bound implies:
     /// `super_vers = MAX(super_vers, HDF5_superblock_ver_bounds[low_bound])`,
     /// with the bounds table reading 0, 2, 3, 3, 3, 3, 3 for EARLIEST, V18,
-    /// V110, V112, V114, V200, LATEST (H5Fsuper.c:68, :1128-1154). This crate
-    /// has no version-bound property list, so the bound is read back from
-    /// what it writes:
+    /// V110, V112, V114, V200, LATEST (H5Fsuper.c:68, :1128-1154). A file
+    /// created at `H5F_LIBVER_EARLIEST` takes the version-0 entry directly
+    /// (`superblock_version_base`, and the classic branch below); for every
+    /// other file the bound is read back from what this crate writes:
     ///
-    /// * The floor is `H5F_LIBVER_V18`, hence version 2. Every group this
-    ///   writer emits is a link-message group, which libhdf5 only writes at a
+    /// * The floor is `H5F_LIBVER_V18`, hence version 2. Every group such a
+    ///   file holds is a link-message group, which libhdf5 only writes at a
     ///   low bound of V18 or newer (`use_at_least_v18`, H5Gobj.c:179), and
-    ///   every object header it emits is version 2, which `H5O_obj_ver_bounds`
+    ///   every object header in it is version 2, which `H5O_obj_ver_bounds`
     ///   likewise puts at V18 (H5Oint.c:125). A version-0 superblock over
     ///   this content would claim a file libhdf5 1.6 can read, and no libhdf5
     ///   writes that combination.
@@ -12870,11 +12958,13 @@ impl Hdf5Writer {
     /// append that adds nothing newer leaves that version alone.
     fn superblock_version_for(&self, flags: u8) -> u8 {
         if self.is_legacy() {
-            // A classic file keeps the version it came with. Nothing this
-            // session can add to it reaches past that version: the objects it
-            // creates get version-1 headers and symbol-table links, and every
-            // feature that would raise the bound — chunked storage, SWMR, the
-            // 2.0 format — is refused where the caller asks for it.
+            // A classic file keeps the version it started at — 0 for one this
+            // writer created at the earliest bound, whatever it held for one
+            // it reopened. Nothing a session can add reaches past that: its
+            // objects get version-1 headers and symbol-table links, its
+            // chunked datasets the version-1 B-tree behind a version-3 layout
+            // message, and the two features that would raise the bound — SWMR
+            // and the 2.0 format — are refused where the caller asks for them.
             return self.superblock_version_base;
         }
         let mut version = self
@@ -13024,9 +13114,18 @@ impl Hdf5Writer {
         // version. A classic file cannot carry either, so the session is
         // refused before its first header is written rather than closed as a
         // file that says nothing about the writer still attached to it.
+        //
+        // libhdf5 does not refuse it — `H5F_ACC_SWMR_WRITE` raises the low
+        // bound to V110 and writes the newer file (H5Fsuper.c:1131). Refused
+        // here because the bound reached this writer as a request for the
+        // classic format, and quietly handing back a version-3 file would
+        // answer a different request than the one that was made.
         if self.is_legacy() {
             return Err(crate::io::IoError::Unsupported(
-                "cannot start an SWMR session on this file: it is in the classic                  (version-0/1 superblock) format, and SWMR needs a version-3                  superblock to record that a writer is attached"
+                "cannot start an SWMR session on this file: it is in the classic \
+                 (version-0/1 superblock) format that H5F_LIBVER_EARLIEST selects, \
+                 and SWMR needs a version-3 superblock to record that a writer is \
+                 attached; create the file at a newer library-version bound"
                     .into(),
             ));
         }
@@ -13504,8 +13603,11 @@ impl Hdf5Writer {
         // Filter Pipeline message (type 0x0B) -- only if filters are configured
         if let Some(ref pipeline) = m.filter_pipeline {
             if !pipeline.filters.is_empty() {
-                let (flags, filter_msg) =
-                    self.share_message(MSG_FILTER_PIPELINE, 0x00, pipeline.encode());
+                let (flags, filter_msg) = self.share_message(
+                    MSG_FILTER_PIPELINE,
+                    0x00,
+                    pipeline.encode_for(self.message_format()),
+                );
                 header.add_message(MSG_FILTER_PIPELINE, flags, filter_msg);
             }
         }
