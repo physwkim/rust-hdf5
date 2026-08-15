@@ -401,6 +401,34 @@ impl DataLayoutMessage {
         }
     }
 
+    /// Version 4 chunked layout with a *filtered* single-chunk index: the
+    /// "single index with filter" flag (`0x02`) is set and the chunk's
+    /// on-disk size and filter mask are carried inline
+    /// (`H5O_LAYOUT_CHUNK_SINGLE_INDEX_WITH_FILTER`, H5Dsingle.c).
+    ///
+    /// `chunk_dims` should include the trailing element-size dimension.
+    pub fn chunked_v4_single_filtered(
+        chunk_dims: Vec<u64>,
+        index_address: u64,
+        nbytes: u64,
+        filter_mask: u32,
+    ) -> Self {
+        Self::ChunkedV4 {
+            version: VERSION_4,
+            flags: 0x02,
+            chunk_dims,
+            index_type: ChunkIndexType::SingleChunk,
+            earray_params: None,
+            farray_params: None,
+            bt2_params: None,
+            single_chunk_filter: Some(SingleChunkFilter {
+                nbytes,
+                filter_mask,
+            }),
+            index_address,
+        }
+    }
+
     // ------------------------------------------------------------------ encode
 
     pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
