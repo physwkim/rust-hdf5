@@ -788,6 +788,43 @@ impl DatasetInfo {
         }
     }
 
+    /// The one run of file bytes an implicitly indexed dataset's chunk grid
+    /// is — its start and its length — or `None` when the dataset is indexed
+    /// some other way or its space is not allocated yet.
+    ///
+    /// That index has no per-chunk structure to hold an address in: every
+    /// chunk sits at `data_addr + linear_index * chunk_bytes` and the grid is
+    /// allocated whole at create (`H5D__none_idx_get_addr`, H5Dnone.c). So the
+    /// run is file space this writer allocated, and it is the *only* storage a
+    /// chunk of such a dataset can occupy — the builder refuses external and
+    /// virtual storage together with chunked storage, which is why
+    /// [`raw_storage_run`](Self::raw_storage_run) can name it
+    /// [`ContiguousTarget::Local`] and no chunk write can reach the other two.
+    fn implicit_grid(&self) -> Option<(u64, u64)> {
+        let imp = self.implicit.as_ref()?;
+        (imp.data_addr != UNDEF_ADDR).then_some((imp.data_addr, imp.data_size))
+    }
+
+    /// The whole of this dataset's raw storage as one run — the target to
+    /// write it through and its size — or `None` when it has no such run.
+    ///
+    /// The two storage forms that are one run of bytes: a contiguous
+    /// dataset's data block, and an implicitly indexed dataset's chunk grid.
+    /// A compact dataset is excluded (its bytes are its layout message) and so
+    /// is every other chunk index, whose chunks are placed one at a time.
+    ///
+    /// INVARIANT: a write that covers a dataset's whole storage picks its
+    /// destination here, so the external and virtual destinations stay
+    /// reachable only from the storage forms that can have them.
+    fn raw_storage_run(&self) -> Option<(ContiguousTarget, u64)> {
+        match self.implicit_grid() {
+            Some((addr, size)) => Some((ContiguousTarget::Local(addr), size)),
+            // Not a fallthrough for an unallocated implicit grid:
+            // `contiguous_target` answers `None` for every chunked dataset.
+            None => self.contiguous_target().map(|t| (t, self.data_size)),
+        }
+    }
+
     /// Whether this session wrote chunk data or changed the extent, so the
     /// dataset's index structures have to be re-flushed.
     fn storage_dirty(&self) -> bool {
@@ -10108,19 +10145,10 @@ impl Hdf5Writer {
                     Some(&bytes),
                 ));
             } else {
-                // An implicit index's chunk grid is one run of this file's own
-                // space, allocated at create — not what `contiguous_target`
-                // answers, which classifies the dataset as chunked, as it is,
-                // but a run of raw bytes all the same. It is named as a local
-                // target so that it reaches the file through the one owner of
-                // a raw-byte write, and so that the external and virtual
-                // destinations that owner knows about stay unreachable from a
-                // chunked dataset.
-                let run = match ds.implicit {
-                    Some(ref imp) => (imp.data_addr != UNDEF_ADDR)
-                        .then_some((ContiguousTarget::Local(imp.data_addr), imp.data_size)),
-                    None => ds.contiguous_target().map(|t| (t, ds.data_size)),
-                };
+                // An implicit index's chunk grid is filled as one run, the
+                // same way a contiguous block is; `raw_storage_run` is where
+                // that equivalence is decided.
+                let run = ds.raw_storage_run();
                 if let Some((target, data_size)) = run.filter(|&(_, size)| size > 0) {
                     let filled = crate::format::messages::fill_value::tiled_fill(
                         data_size as usize,
@@ -10473,8 +10501,8 @@ impl Hdf5Writer {
             // to give: an untouched chunk reads back as the fill value the
             // create wrote there.
             ChunkIndexKind::Implicit => {
-                let addr = self.implicit_chunk_addr(ds_index, &geo, chunk_coords)?;
-                self.read_chunk_block(None, addr, geo.chunk_bytes(), 0)
+                let (grid, offset) = self.implicit_chunk_slot(ds_index, &geo, chunk_coords)?;
+                self.read_chunk_block(None, grid + offset, geo.chunk_bytes(), 0)
             }
             ChunkIndexKind::BtreeV1 => {
                 let ds = self.ds(ds_index);
@@ -10497,32 +10525,40 @@ impl Hdf5Writer {
         }
     }
 
-    /// File offset of one chunk of an implicitly indexed dataset:
-    /// `data_addr + linear_index * chunk_bytes`, the whole of that index
-    /// (`H5D__none_idx_get_addr`, H5Dnone.c).
-    fn implicit_chunk_addr(
+    /// The slot one chunk of an implicitly indexed dataset occupies: the
+    /// address its whole chunk grid starts at, and the chunk's offset within
+    /// that grid. `data_addr + linear_index * chunk_bytes` is the whole of
+    /// that index (`H5D__none_idx_get_addr`, H5Dnone.c).
+    ///
+    /// The one place a chunk of such a dataset is placed — read and write both
+    /// come through here, so the bounds check below covers both. The grid it
+    /// names is [`DatasetInfo::implicit_grid`], which is why the write side
+    /// can hand [`ContiguousTarget::Local`] to
+    /// [`write_contiguous_bytes`](Self::write_contiguous_bytes) without asking
+    /// anything: the external and virtual destinations that owner also knows
+    /// about are unreachable from a chunked dataset.
+    fn implicit_chunk_slot(
         &self,
         ds_index: usize,
         geo: &ChunkGeometry,
         chunk_coords: &[u64],
-    ) -> IoResult<u64> {
+    ) -> IoResult<(u64, u64)> {
         let linear = geo.linear_index(chunk_coords)?;
         let ds = self.ds(ds_index);
         let m = ds.lock();
-        let imp = m.implicit.as_ref().ok_or_else(|| {
-            crate::io::IoError::InvalidState("not an implicitly indexed dataset".into())
+        let (grid, grid_size) = m.implicit_grid().ok_or_else(|| {
+            crate::io::IoError::InvalidState("no implicitly indexed chunk grid".into())
         })?;
         let offset = linear.checked_mul(geo.chunk_bytes()).ok_or_else(|| {
             crate::io::IoError::InvalidState("implicit chunk offset overflows u64".into())
         })?;
-        if offset + geo.chunk_bytes() > imp.data_size {
+        if offset + geo.chunk_bytes() > grid_size {
             return Err(crate::io::IoError::InvalidState(format!(
-                "chunk {chunk_coords:?} lies outside the {} bytes of chunk space \
-                 this implicitly indexed dataset was created with",
-                imp.data_size
+                "chunk {chunk_coords:?} lies outside the {grid_size} bytes of chunk space \
+                 this implicitly indexed dataset was created with"
             )));
         }
-        Ok(imp.data_addr + offset)
+        Ok((grid, offset))
     }
 
     /// Write one whole chunk addressed by its grid coordinates, whichever
@@ -10711,6 +10747,10 @@ impl Hdf5Writer {
     /// its coordinates name. There is no index to record anything in — the
     /// slot is where it always was — so this is the write in full.
     ///
+    /// The bytes go through [`write_contiguous_bytes`](Self::write_contiguous_bytes),
+    /// the one owner of a raw-byte write, against the grid
+    /// [`implicit_chunk_slot`](Self::implicit_chunk_slot) names.
+    ///
     /// The caller holds the dataset's op lock or the writer exclusively.
     pub(crate) fn write_chunk_implicit_inner(
         &self,
@@ -10727,9 +10767,8 @@ impl Hdf5Writer {
                 data.len()
             )));
         }
-        let addr = self.implicit_chunk_addr(ds_index, &geo, chunk_coords)?;
-        self.handle.write_at(addr, data)?;
-        Ok(())
+        let (grid, offset) = self.implicit_chunk_slot(ds_index, &geo, chunk_coords)?;
+        self.write_contiguous_bytes(&ContiguousTarget::Local(grid), offset, data)
     }
 
     /// Snapshot the geometry needed to address a chunked dataset's grid.
