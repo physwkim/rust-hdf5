@@ -3082,12 +3082,6 @@ struct LegacyFile {
     /// table entry recomputed: the "K" ranks in particular are recorded
     /// nowhere else, and every node width in the file is derived from them.
     superblock: SuperblockV0V1,
-    /// The file-level parameters every node width in a symbol table is derived
-    /// from — the address/length widths and the B-tree "K" ranks, after the
-    /// superblock extension has had its say. Carried rather than re-derived
-    /// because a rewrite that used the library defaults on a file that
-    /// overrode them would write nodes of the wrong width.
-    meta: FileMeta,
 }
 
 impl LegacyFile {
@@ -3129,11 +3123,52 @@ impl LegacyFile {
                     cache: SymbolTableCache::Nothing,
                 },
             },
-            meta: FileMeta {
-                ctx,
-                btree,
-                sohm: None,
-            },
+        }
+    }
+}
+
+/// The superblock extension a reopen found, and the single owner of the one
+/// this file's close writes back.
+///
+/// The extension is external truth: it is where a file records the things its
+/// superblock has no field for — non-default v1 B-tree "K" ranks, a driver's
+/// settings, the file space strategy and its persisted free-space managers,
+/// and the shared object header message table. `H5F__super_ext_write_msg`
+/// modifies one message of it and leaves the rest alone, so a close that lays
+/// a fresh extension out from what *this writer* models drops everything it
+/// does not — and the K ranks are not decoration: a chunked dataset's version-1
+/// B-tree nodes are sized from `chunk_internal_k`, so a reader that has lost
+/// the message reads the tree at the default rank and fails outright.
+///
+/// INVARIANT: every message of the extension read is re-emitted by
+/// [`Hdf5Writer::write_superblock_extension`], byte for byte, except the
+/// shared-message table — the one message naming storage this session lays out
+/// afresh, which [`SohmState`] recomputes. Nothing else here is interpreted,
+/// so a message this crate does not model survives exactly as a modelled one
+/// does.
+struct CarriedExtension {
+    /// The block the extension header occupied, freed once the replacement is
+    /// laid out. `None` for a file with no extension, and for one whose
+    /// extension this session is the first to write.
+    superseded: Option<(u64, u64)>,
+    /// Every message that header held — the shared-message table,
+    /// continuations and null padding excepted. The first two are structure
+    /// rather than content; the third is free space.
+    carried: Vec<crate::io::object_header_io::ExtensionMessage>,
+    /// Where [`Hdf5Writer::write_superblock_extension`] put the replacement,
+    /// and the only value the superblock's extension address is read from.
+    /// `None` until that pass runs, and for a file that needs no extension.
+    addr: Slot<Option<u64>>,
+}
+
+impl Default for CarriedExtension {
+    /// What a file with no extension carries: nothing to free, nothing to
+    /// re-emit, and no address until a shared-message table gives it one.
+    fn default() -> Self {
+        Self {
+            superseded: None,
+            carried: Vec::new(),
+            addr: Slot::new(None),
         }
     }
 }
@@ -3362,6 +3397,16 @@ pub struct Hdf5Writer {
     /// of them has. Empty for a file whose groups all store links in messages;
     /// see [`SymbolTables`], which owns the question.
     symbol_tables: SymbolTables,
+    /// The v1 B-tree "K" ranks every node width in this file is derived from,
+    /// after the superblock extension has had its say. A property of the file
+    /// rather than of its generation: a version-2 superblock records no ranks
+    /// of its own but its extension may, and a rewrite that used the library
+    /// defaults there would write nodes of the wrong width.
+    /// [`btree_v1_config`](Hdf5Writer::btree_v1_config) is the only reader.
+    btree: BTreeV1Config,
+    /// The superblock extension this file carries, and where the replacement
+    /// went; see [`CarriedExtension`].
+    extension: Box<CarriedExtension>,
     /// The file's shared-message indexes, when it was created with any.
     /// `None` — the default — is a file with no shared-message table, where
     /// [`share_message`](Self::share_message) is the identity.
@@ -3391,13 +3436,15 @@ struct SohmState {
     indexes: Vec<SohmIndexSpec>,
     /// What `share_message` does to an eligible message right now.
     phase: Slot<SohmPhase>,
-    /// Address of the superblock extension object header naming the master
-    /// table, once one has been written. Also the once-only latch on the
-    /// layout: a second finalize keeps the table the first one published.
-    extension_addr: Slot<Option<u64>>,
-    /// The blocks the table a reopen found occupies — the extension header,
-    /// the master table, and each index's heap and index structure — taken by
-    /// the finalize that replaces them. Empty for a file this session created.
+    /// Address of the master table this session laid out, once it has one.
+    /// Also the once-only latch on the layout: a second finalize keeps the
+    /// table the first one published, and
+    /// [`Hdf5Writer::write_superblock_extension`] reads it to name that table
+    /// in the extension.
+    table_addr: Slot<Option<u64>>,
+    /// The blocks the table a reopen found occupies — the master table and
+    /// each index's heap and index structure — taken by the finalize that
+    /// replaces them. Empty for a file this session created.
     ///
     /// The table is laid out whole from the whole message set, so a reopen
     /// replaces it rather than inserting into it, and every header holding a
@@ -3435,7 +3482,7 @@ impl SohmState {
         Self {
             indexes,
             phase: Slot::new(SohmPhase::Idle),
-            extension_addr: Slot::new(None),
+            table_addr: Slot::new(None),
             superseded: Slot::new(superseded),
         }
     }
@@ -3955,6 +4002,11 @@ impl Hdf5Writer {
             attribute_references: Slot::new(Vec::new()),
             legacy,
             symbol_tables: SymbolTables::none_found(),
+            // A created file has no extension to carry and no ranks but the
+            // library defaults: `H5Pset_sym_k`/`H5Pset_istore_k` have no
+            // equivalent on this writer's creation path.
+            btree: BTreeV1Config::default(),
+            extension: Box::default(),
             sohm: (!shared_messages.specs().is_empty())
                 .then(|| Box::new(SohmState::new(shared_messages.specs().to_vec(), Vec::new()))),
             source_dir: source_dir_of(path)?,
@@ -4087,7 +4139,7 @@ impl Hdf5Writer {
     fn rebuilds_shared_messages(&self) -> bool {
         self.sohm
             .as_deref()
-            .is_some_and(|s| s.extension_addr.lock().is_none())
+            .is_some_and(|s| s.table_addr.lock().is_none())
     }
 
     /// Whether every object header this writer emits records message creation
@@ -4340,13 +4392,13 @@ impl Hdf5Writer {
     /// The v1-B-tree "K" ranks in force for this file, from which every v1
     /// node's width is derived.
     ///
-    /// Only a version-0/1 superblock records them (a v2/v3 one has no such
-    /// field), and only such a file holds v1 B-trees this writer builds, so
-    /// the defaults are what a file without them would have used anyway.
+    /// A version-0/1 superblock records them in a field of its own and a
+    /// version-2/3 one in a B-tree-K message in its superblock extension, so
+    /// the file's generation says nothing about whether they are the defaults
+    /// — `H5F__super_read` reads both into the same `H5F_shared_t`, and so
+    /// does the reopen, into `btree`.
     fn btree_v1_config(&self) -> BTreeV1Config {
-        self.legacy
-            .as_ref()
-            .map_or_else(BTreeV1Config::default, |l| l.meta.btree)
+        self.btree
     }
 
     /// Track and index creation order for the links and the attributes of
@@ -4590,7 +4642,6 @@ impl Hdf5Writer {
     fn reopen_shared_messages(
         handle: &mut FileHandle,
         meta: &crate::io::FileMeta,
-        ext_addr: u64,
         ext: &crate::io::reader::SuperblockExtension,
     ) -> IoResult<Option<Box<SohmState>>> {
         use crate::format::chunk_index::btree_v2::collect_btree_v2_extents;
@@ -4605,35 +4656,10 @@ impl Hdf5Writer {
         };
         let ctx = &meta.ctx;
 
-        // The extension this finalize writes holds the shared-message table
-        // and nothing else, so a file whose extension declares anything more
-        // would come back with that declaration gone — non-default B-tree
-        // ranks, a driver's settings, or the file space strategy and the
-        // free-space managers it persisted. Refusing is the honest answer
-        // until the rewrite carries them.
-        let extra = [
-            ext.btree_k.is_some().then_some("v1 B-tree split ranks"),
-            ext.driver_info.is_some().then_some("driver information"),
-            ext.file_space_info
-                .is_some()
-                .then_some("a file space strategy"),
-        ];
-        let extra: Vec<&str> = extra.into_iter().flatten().collect();
-        if !extra.is_empty() {
-            return Err(crate::io::IoError::Unsupported(format!(
-                "cannot open this file for appending: its superblock extension declares {} \
-                 beside the shared object header message table, and an append lays that \
-                 extension out afresh",
-                extra.join(" and ")
-            )));
-        }
-
-        // The superblock extension is an object header of its own, holding
-        // only the shared-message-table message; the finalize writes a fresh
-        // one, so this block is superseded with the rest.
+        // The extension header itself is superseded by `CarriedExtension`,
+        // which owns it whether or not the file has shared messages; what is
+        // superseded here is only the storage the table message names.
         let mut superseded = Vec::new();
-        let ext_size = crate::io::object_header_io::object_header_block_size(handle, ext_addr)?;
-        superseded.push((ext_addr, ext_size as u64));
         superseded.push((
             smt.table_address,
             SohmMasterTable::encoded_size(ctx, smt.nindexes) as u64,
@@ -4745,7 +4771,27 @@ impl Hdf5Writer {
         // old one's blocks — which is sound exactly while no header keeping
         // its bytes still points into the old heap. The walk below is what
         // settles that.
-        let sohm = Self::reopen_shared_messages(&mut handle, &meta, ext_addr, &ext)?;
+        let sohm = Self::reopen_shared_messages(&mut handle, &meta, &ext)?;
+
+        // The extension is external truth this close rewrites, so what it held
+        // is captured whole here — before anything else reads the file — and
+        // re-emitted by `write_superblock_extension`. Read from the raw chain
+        // rather than from `ext`, which keeps only the messages this crate
+        // models.
+        let extension = if ext_addr == UNDEF_ADDR || ext_addr == 0 {
+            Box::<CarriedExtension>::default()
+        } else {
+            let (carried, size) = crate::io::object_header_io::superblock_extension_messages(
+                &mut handle,
+                &meta,
+                ext_addr,
+            )?;
+            Box::new(CarriedExtension {
+                superseded: Some((ext_addr, size as u64)),
+                carried,
+                addr: Slot::new(None),
+            })
+        };
 
         // Discover links from root group (and subgroups recursively). Every
         // object is classified before it is registered, and the root is the
@@ -5188,12 +5234,7 @@ impl Hdf5Writer {
 
         // The superblock the close re-emits, and the generation every message
         // this session encodes belongs to.
-        let legacy = legacy.map(|superblock| {
-            Box::new(LegacyFile {
-                superblock,
-                meta: meta.clone(),
-            })
-        });
+        let legacy = legacy.map(|superblock| Box::new(LegacyFile { superblock }));
 
         // Wrap the reconstructed plain vecs into the per-slot registry. The
         // reconstruction logic above runs single-threaded on local `Vec`s;
@@ -5251,6 +5292,10 @@ impl Hdf5Writer {
             attribute_references: Slot::new(Vec::new()),
             legacy,
             symbol_tables,
+            // The ranks the superblock or its extension declared, which every
+            // v1-B-tree and symbol-table node this session writes is sized by.
+            btree: meta.btree,
+            extension,
             // The indexes the file was created with, and the blocks its
             // current table occupies; the next finalize lays a new table out
             // over them from the whole message set.
@@ -8148,7 +8193,7 @@ impl Hdf5Writer {
             return;
         };
         let mut phase = sohm.phase.lock();
-        if matches!(*phase, SohmPhase::Idle) && sohm.extension_addr.lock().is_none() {
+        if matches!(*phase, SohmPhase::Idle) && sohm.table_addr.lock().is_none() {
             *phase = SohmPhase::Predict;
         }
     }
@@ -8178,7 +8223,7 @@ impl Hdf5Writer {
         let Some(sohm) = self.sohm.as_deref() else {
             return Ok(());
         };
-        if sohm.extension_addr.lock().is_some() {
+        if sohm.table_addr.lock().is_some() {
             return Ok(());
         }
 
@@ -8224,35 +8269,75 @@ impl Hdf5Writer {
             self.handle.write_at(block.addr, &block.image)?;
         }
 
-        // The superblock extension: a version-1 object header holding nothing
-        // but the shared-message-table message, which is what libhdf5 writes
-        // for it (`H5F__super_ext_create` creates the header before anything
-        // raises the file's object header version).
-        let nindexes = u8::try_from(sohm.indexes.len()).map_err(|_| {
-            crate::io::IoError::InvalidState(format!(
-                "{} shared-message indexes",
-                sohm.indexes.len()
-            ))
-        })?;
+        // Only now, with every block on disk: from here the header builders
+        // substitute pointers, and `write_superblock_extension` names the
+        // table this laid out.
+        *sohm.phase.lock() = SohmPhase::Resolve(built.heap_ids);
+        *sohm.table_addr.lock() = Some(built.table_addr);
+        Ok(())
+    }
+
+    /// Write the file's superblock extension, and the sole owner of that
+    /// object header.
+    ///
+    /// Runs after [`prepare_shared_messages`](Self::prepare_shared_messages),
+    /// whose table it names, and before the superblock that names it. What it
+    /// writes is [`CarriedExtension`] — every message the reopened file's
+    /// extension held — plus the shared-message table message, which is the
+    /// one message whose content this session owns: the table moved, so the
+    /// message read is stale and the message written names the new address.
+    ///
+    /// A file with neither carried messages nor shared messages gets no
+    /// extension, which is what libhdf5 writes for it: `H5F__super_ext_create`
+    /// is called only when there is a message to put in one.
+    ///
+    /// Version 1, holding its messages in one chunk: the extension is created
+    /// before anything raises the file's object header version
+    /// (`H5F__super_ext_create` passes `H5O_HDR_STORE_TIMES` off and takes the
+    /// version-1 path), so an extension of any generation of file looks the
+    /// same.
+    fn write_superblock_extension(&self) -> IoResult<()> {
+        if self.extension.addr.lock().is_some() {
+            return Ok(());
+        }
+        let table = self.sohm.as_deref().and_then(|sohm| {
+            sohm.table_addr
+                .lock()
+                .map(|addr| (sohm.indexes.len(), addr))
+        });
+        if self.extension.carried.is_empty() && table.is_none() {
+            return Ok(());
+        }
+
         let mut extension = ObjectHeader::new();
-        extension.add_message(
-            MSG_SHARED_MESSAGE_TABLE,
-            MSG_FLAG_CONSTANT | MSG_FLAG_DONTSHARE,
-            SharedMessageTableMessage {
-                version: 0,
-                table_address: built.table_addr,
-                nindexes,
-            }
-            .encode(&self.ctx),
-        );
+        for msg in &self.extension.carried {
+            extension.add_message(msg.msg_type, msg.flags, msg.body.clone());
+        }
+        if let Some((nindexes, table_addr)) = table {
+            let nindexes = u8::try_from(nindexes).map_err(|_| {
+                crate::io::IoError::InvalidState(format!("{nindexes} shared-message indexes"))
+            })?;
+            extension.add_message(
+                MSG_SHARED_MESSAGE_TABLE,
+                MSG_FLAG_CONSTANT | MSG_FLAG_DONTSHARE,
+                SharedMessageTableMessage {
+                    version: 0,
+                    table_address: table_addr,
+                    nindexes,
+                }
+                .encode(&self.ctx),
+            );
+        }
         let image = extension.encode_v1(1)?;
+        // Freed before the replacement is placed, so a reopen reuses the block
+        // instead of stranding one per open/close cycle — the rule every other
+        // superseded structure follows.
+        if let Some((addr, len)) = self.extension.superseded {
+            self.allocator.free(addr, len);
+        }
         let addr = self.allocator.allocate(image.len() as u64);
         self.handle.write_at(addr, &image)?;
-
-        // Only now, with every block on disk: from here the header builders
-        // substitute pointers, and the superblock names the extension.
-        *sohm.phase.lock() = SohmPhase::Resolve(built.heap_ids);
-        *sohm.extension_addr.lock() = Some(addr);
+        *self.extension.addr.lock() = Some(addr);
         Ok(())
     }
 
@@ -14160,13 +14245,9 @@ impl Hdf5Writer {
             sizeof_lengths: self.ctx.sizeof_size,
             file_consistency_flags: flags,
             base_address: base,
-            // The extension holds the shared-message table, and nothing else
-            // this writer emits needs one.
-            superblock_extension_address: self
-                .sohm
-                .as_deref()
-                .and_then(|sohm| *sohm.extension_addr.lock())
-                .unwrap_or(UNDEF_ADDR),
+            // Whatever `write_superblock_extension` put there, which is the
+            // only place an extension is written.
+            superblock_extension_address: self.extension.addr.lock().unwrap_or(UNDEF_ADDR),
             end_of_file_address: eof,
             root_group_object_header_address: root_addr,
         };
@@ -14429,6 +14510,7 @@ impl Hdf5Writer {
         self.prepare_link_storage()?;
         self.write_reference_values()?;
         self.prepare_shared_messages(&rewritten)?;
+        self.write_superblock_extension()?;
 
         // 4. Write every object header over the block phase 2 reserved for it.
         self.write_object_headers(&layout)?;

@@ -87,6 +87,57 @@ pub(crate) fn object_header_block_size(handle: &mut FileHandle, addr: u64) -> Io
     Ok(ObjectHeader::decode_any(&buf)?.1)
 }
 
+/// One message of a superblock extension, kept as it was read.
+///
+/// Uninterpreted on purpose: what a rewrite must reproduce is the message, not
+/// this crate's understanding of it, so a type it has no decoder for survives
+/// exactly as one it does.
+pub(crate) struct ExtensionMessage {
+    pub msg_type: u8,
+    pub flags: u8,
+    pub body: Vec<u8>,
+}
+
+/// Every message of the superblock extension at `addr` that a rewrite must
+/// carry, and the size of the block it occupies.
+///
+/// Read from the raw chain rather than from the decoded
+/// [`SuperblockExtension`](crate::io::reader::SuperblockExtension): that view
+/// keeps only the four messages this crate models, so re-emitting from it
+/// would silently drop any other the file holds. Three are left out here
+/// because they are structure, not content — the continuation message that
+/// names the next block, the null message that is free space inside one, and
+/// the shared-message table, whose storage the caller lays out afresh and
+/// whose address it therefore recomputes.
+pub(crate) fn superblock_extension_messages(
+    handle: &mut FileHandle,
+    meta: &FileMeta,
+    addr: u64,
+) -> IoResult<(Vec<ExtensionMessage>, usize)> {
+    use crate::format::messages::MSG_SHARED_MESSAGE_TABLE;
+
+    /// `H5O_MSG_NULL`: free space inside a chunk, not content.
+    const MSG_NIL: u8 = 0x00;
+
+    let header = read_header_chain(handle, meta, addr)?;
+    let carried = header
+        .messages
+        .iter()
+        .filter(|m| {
+            !matches!(
+                m.msg_type,
+                MSG_NIL | MSG_OBJ_HEADER_CONTINUATION | MSG_SHARED_MESSAGE_TABLE
+            )
+        })
+        .map(|m| ExtensionMessage {
+            msg_type: m.msg_type,
+            flags: m.flags,
+            body: m.data.clone(),
+        })
+        .collect();
+    Ok((carried, object_header_block_size(handle, addr)?))
+}
+
 /// [`read_object_header_full`], with the committed-message indirection depth
 /// already reached.
 fn read_object_header_at(

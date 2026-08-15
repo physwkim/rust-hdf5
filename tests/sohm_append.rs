@@ -235,8 +235,10 @@ fn symbol_table_targets(bytes: &[u8], ctx: &FormatContext, body: &[u8]) -> Vec<u
     let sa = ctx.sizeof_addr as usize;
     let ss = ctx.sizeof_size as usize;
     let btree_addr = u64::from_le_bytes(body[..8].try_into().unwrap());
-    // A version-2 superblock records no "K" ranks, so every node in it is the
-    // library-default width.
+    // A version-2 superblock keeps its "K" ranks in a B-tree-K message, which
+    // none of these fixtures carries: every node in them is the library-default
+    // width. (`tests/superblock_extension.rs` covers a file that does carry
+    // one.)
     let cfg = BTreeV1Config::default();
 
     let mut snods = Vec::new();
@@ -696,33 +698,43 @@ fn a_crate_written_earliest_file_with_shared_messages_reopens() {
     cleanup(&path);
 }
 
-/// The extension the append writes holds the shared-message table and nothing
-/// else, so a file whose extension declares more is refused rather than
-/// silently stripped of the declaration.
+/// The shared-message table is the one extension message this path owns — its
+/// storage is laid out afresh, so its address is recomputed. Everything else
+/// the extension held is carried across unread, and a file that has both proves
+/// the two do not displace each other.
 #[test]
-fn an_extension_message_the_append_would_drop_refuses_the_file() {
-    let bytes = std::fs::read(fixture("sohm_paged.h5")).unwrap();
+fn an_extension_message_beside_the_table_survives_the_append() {
     let path = copy_fixture("sohm_paged.h5", "paged");
 
-    // The fixture really does have both: a shared-message table to carry, and
-    // a file space strategy that would go missing.
-    {
+    // The fixture really does have both: a shared-message table to relocate,
+    // and a file space strategy that would go missing with it.
+    let before = {
         let file = H5File::open(&path).unwrap();
         let ext = file.superblock_extension();
         assert!(ext.shared_message_table.is_some());
         assert!(ext.file_space_info.is_some());
-    }
-
-    let text = match H5File::open_rw(&path) {
-        Ok(_) => panic!("a file whose extension declares more must not open for writing"),
-        Err(e) => e.to_string(),
+        ext
     };
-    assert!(text.contains("a file space strategy"), "{text}");
+
+    append_dataset(&path, "appended", 200);
+
+    let after = H5File::open(&path).unwrap().superblock_extension();
+    assert_eq!(after.file_space_info, before.file_space_info);
+    assert_eq!(after.driver_info, before.driver_info);
+    assert_eq!(after.btree_k, before.btree_k);
+    // The table moved with its heap, and is still named.
+    let table = after
+        .shared_message_table
+        .expect("the appended file still declares its shared messages");
     assert_eq!(
-        std::fs::read(&path).unwrap(),
-        bytes,
-        "a refusal wrote bytes"
+        table.nindexes,
+        before.shared_message_table.unwrap().nindexes
     );
+
+    let extra = [("appended", 200)];
+    check_fixture_contents(&path, &extra);
+    reference_counts_match_the_pointers(&path);
+    libhdf5_reads_back(&path, &h5py_fixture_body(&extra));
     cleanup(&path);
 }
 
