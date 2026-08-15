@@ -2182,6 +2182,30 @@ fn committed_datatypes_read_back_through_h5py() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A committed datatype's attributes have no rust-hdf5 write path
+/// (`H5NamedDatatype` is read-only), so the only way to exercise
+/// `named_datatype_attr_names`'s ordering is a datatype h5py commits and
+/// attaches attributes to itself. h5py does not track creation order for a
+/// committed datatype unless asked, so its default iteration — and this
+/// crate's — is name order.
+#[test]
+fn committed_datatype_attrs_list_in_name_order() {
+    let Some(py) = python() else { return };
+    let path = tmp("named_datatype_attr_order");
+    write_with_h5py(
+        py,
+        &path,
+        "f['t'] = np.dtype('<i4')\n\
+         for i, name in enumerate(['zeta', 'alpha', 'delta', 'beta']):\n\
+         \x20   f['t'].attrs[name] = i\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let names = file.named_datatype("t").unwrap().attr_names().unwrap();
+    assert_eq!(names, vec!["alpha", "beta", "delta", "zeta"]);
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
 /// A path-like dataset name resolves through real groups instead of becoming
 /// a link whose name contains a `/`. HDF5 link names are single path
 /// components, so libhdf5's own traversal cannot reconstruct such a name:
