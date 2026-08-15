@@ -4,8 +4,8 @@
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
   "python": "/home/stevek/micromamba/envs/tomo/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-integrator6-6cef7a36-1/target/release/oracle_probe",
-  "cases": 95
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-cset-sohm-673859c0-1/target/release/oracle_probe",
+  "cases": 98
  },
  "results": [
   {
@@ -1546,6 +1546,28 @@
     "gaps": [],
     "oracle_errors": [],
     "matched": 21,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "link_nonascii",
+   "group": "link",
+   "note": "non-ASCII link names at the earliest bound \u2014 the root converts to link messages, the ASCII-named subgroups keep their symbol tables",
+   "rust_case": "link_nonascii",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 78,
     "detail": ""
    },
    "b": {
@@ -3417,6 +3439,132 @@
    }
   },
   {
+   "case": "sohm_list_append",
+   "group": "sohm",
+   "note": "a file with a shared-message list index reopened and appended to \u2014 the table is laid out whole, so the append replaces it",
+   "rust_case": "sohm_list_append",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/named_i32#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5NamedDatatype exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/shared0@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared1@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared2@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared3@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 122,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "sohm_btree_append",
+   "group": "sohm",
+   "note": "the same reopen over a v2 B-tree index",
+   "rust_case": "sohm_btree_append",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/named_i32#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5NamedDatatype exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/shared0@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared1@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared2@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared3@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 122,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
    "case": "ochk_root",
    "group": "objectheader",
    "note": "root group whose object header spills into two continuation chunks",
@@ -3644,7 +3792,9 @@
     "attr_large",
     "attr_ref_object",
     "sohm_list",
-    "sohm_btree"
+    "sohm_btree",
+    "sohm_list_append",
+    "sohm_btree_append"
    ],
    "example": "/data@count#shape"
   },
@@ -3706,7 +3856,9 @@
    "cases": [
     "named_datatype",
     "sohm_list",
-    "sohm_btree"
+    "sohm_btree",
+    "sohm_list_append",
+    "sohm_btree_append"
    ],
    "example": "/t#attrstore"
   }
