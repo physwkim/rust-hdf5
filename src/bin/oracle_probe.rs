@@ -25,7 +25,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use rust_hdf5::format::messages::datatype::{
     ByteOrder, CompoundMember, DatatypeMessage, EnumMember,
 };
-use rust_hdf5::format::messages::filter::{Filter, FilterPipeline, FILTER_FLETCHER32};
+use rust_hdf5::format::messages::filter::{
+    Filter, FilterPipeline, FILTER_FLETCHER32, FLAG_MANDATORY,
+};
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
     H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error, Hyperslab,
@@ -1283,7 +1285,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         // their big-endian image. Its siblings keep writing a pre-swapped
         // byte image, so both write styles stay covered.
         "int_i32be" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             let ds = file
                 .new_dataset::<i32>()
                 .datatype(be_of(DatatypeMessage::i32_type()))
@@ -1298,7 +1300,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         // ---- floats -----------------------------------------------------
         "float_f16le" => {
             let bytes: Vec<u8> = F16_RAMP.iter().flat_map(|b| b.to_le_bytes()).collect();
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             raw_typed(&file, "data", f16_dtype(), &[8], &bytes)?;
             file.close()?;
             Ok(Ok(()))
@@ -1307,7 +1309,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         "float_f64le" => simple_ramp::<f64>(path, (0..8).map(|i| i as f64).collect()),
         "float_f64be" => {
             let bytes: Vec<u8> = (0..8u64).flat_map(|i| (i as f64).to_be_bytes()).collect();
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             raw_typed(
                 &file,
                 "data",
@@ -1325,7 +1327,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
 
         // ---- strings ----------------------------------------------------
         "str_fixed_ascii" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             raw_typed(
                 &file,
                 "data",
@@ -1348,7 +1350,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             } else {
                 (1u8, 0u8)
             };
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             raw_typed(
                 &file,
                 "data",
@@ -1364,7 +1366,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "str_fixed_utf8" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             raw_typed(
                 &file,
                 "data",
@@ -1380,13 +1382,13 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "str_vlen_ascii" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             file.write_vlen_strings_ascii("data", &STRINGS)?;
             file.close()?;
             Ok(Ok(()))
         }
         "str_vlen_utf8" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             file.write_vlen_strings("data", &UNISTR)?;
             file.close()?;
             Ok(Ok(()))
@@ -1406,7 +1408,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 bytes.extend_from_slice(&(i as f32).to_le_bytes());
                 bytes.extend_from_slice(&((100 + i) as f32).to_le_bytes());
             }
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             raw_typed(&file, "data", dt, &[4], &bytes)?;
             file.close()?;
             Ok(Ok(()))
@@ -1432,7 +1434,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 bytes.extend_from_slice(&((10 + i) as i16).to_le_bytes());
                 bytes.extend_from_slice(&((20 + i) as i16).to_le_bytes());
             }
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             raw_typed(&file, "data", dt, &[4], &bytes)?;
             file.close()?;
             Ok(Ok(()))
@@ -1459,7 +1461,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 bytes.extend_from_slice(&(i as i32).to_le_bytes());
                 bytes.extend_from_slice(&fixed_string_bytes(&[n], 8, 0));
             }
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             raw_typed(&file, "data", dt, &[3], &bytes)?;
             file.close()?;
             Ok(Ok(()))
@@ -1479,7 +1481,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 bytes.extend_from_slice(&(1000 + i).to_le_bytes());
                 bytes.extend_from_slice(&[0, 0, 0, 0]);
             }
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             raw_typed(&file, "data", dt, &[4], &bytes)?;
             file.close()?;
             Ok(Ok(()))
@@ -1518,7 +1520,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 base: Box::new(DatatypeMessage::f64_type()),
             };
             let bytes: Vec<u8> = (0..12u64).flat_map(|i| (i as f64).to_le_bytes()).collect();
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             raw_typed(&file, "data", dt, &[2], &bytes)?;
             file.close()?;
             Ok(Ok(()))
@@ -1541,7 +1543,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                     },
                 ],
             };
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             raw_typed(&file, "data", dt, &[4], &[0u8, 1, 2, 1])?;
             file.close()?;
             Ok(Ok(()))
@@ -1568,13 +1570,13 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             for v in [-1i32, 0, 1000, 0] {
                 bytes.extend_from_slice(&v.to_le_bytes());
             }
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             raw_typed(&file, "data", dt, &[4], &bytes)?;
             file.close()?;
             Ok(Ok(()))
         }
         "vlen_bytes" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             let a: &[u8] = &[0, 1, 2];
             let b: &[u8] = &[];
             let c: &[u8] = &[255];
@@ -1583,7 +1585,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "vlen_numeric" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             let a: &[i32] = &[1, 2, 3];
             let b: &[i32] = &[];
             let c: &[i32] = &[-7];
@@ -1592,7 +1594,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "named_datatype" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             file.commit_datatype("t", DatatypeMessage::i32_type())?;
             // `data` describes its own type; `shared` points at /t.
             file.new_dataset::<i32>()
@@ -1608,7 +1610,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "opaque" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             let bytes: Vec<u8> = (0u8..12).collect();
             raw_typed(
                 &file,
@@ -1624,7 +1626,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "bitfield" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             raw_typed(
                 &file,
                 "data",
@@ -1641,7 +1643,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "ref_object" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             let target = file.new_dataset::<i32>().shape([8]).create("target")?;
             target.write_raw(&ramp_n::<i32>(8))?;
             file.create_group("grp")?;
@@ -1655,7 +1657,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "ref_region" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             let target = file.new_dataset::<i32>().shape([8]).create("target")?;
             target.write_raw(&ramp_n::<i32>(8))?;
             let refs = file
@@ -1679,7 +1681,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         // ---- layouts and chunk indexes ----------------------------------
         "layout_contiguous" => simple_ramp::<i32>(path, ramp_n::<i32>(16)),
         "layout_compact" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             let ds = file
                 .new_dataset::<i32>()
                 .shape([16usize])
@@ -1702,7 +1704,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                     .unwrap_or_default()
                     .to_string_lossy()
             );
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             let ds = file
                 .new_dataset::<i32>()
                 .shape([16usize])
@@ -1744,7 +1746,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         "layout_chunked_v108" => layout_at_libver(path, LibverBound::V18, Some(&[16])),
         "layout_chunked_v110" => layout_at_libver(path, LibverBound::V110, Some(&[16])),
         "chunkidx_btree1" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             file.set_libver_latest(false)?;
             let ds = file
                 .new_dataset::<i32>()
@@ -1819,7 +1821,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             b.filter_pipeline(FilterPipeline {
                 filters: vec![Filter {
                     id: FILTER_FLETCHER32,
-                    flags: 0,
+                    flags: FLAG_MANDATORY,
                     cd_values: vec![],
                 }],
             })
@@ -1868,7 +1870,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
 
         // ---- dataspaces ---------------------------------------------------
         "space_scalar" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             let ds = file.new_dataset::<i32>().scalar().create("data")?;
             ds.write_raw(&[42i32])?;
             file.close()?;
@@ -1876,14 +1878,14 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         }
         "space_null" => {
             // Mirrors h5py.Empty("<i4"): the dataset holds no elements at all.
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             file.new_dataset::<i32>().null().create("data")?;
             file.close()?;
             Ok(Ok(()))
         }
         "space_zerosized" => {
             // Nothing to write: the h5py reference only creates the dataset.
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             file.new_dataset::<i32>().shape([0usize]).create("data")?;
             file.close()?;
             Ok(Ok(()))
@@ -1906,7 +1908,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
 
         // ---- groups and links ---------------------------------------------
         "groups_nested" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             let a = file.root_group().create_group("a")?;
             let b = a.create_group("b")?;
             b.create_group("c")?;
@@ -1922,7 +1924,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "link_hard" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             file.new_dataset::<i32>()
                 .shape([8usize])
                 .create("orig")?
@@ -1932,7 +1934,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "link_soft" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             file.new_dataset::<i32>()
                 .shape([8usize])
                 .create("orig")?
@@ -2026,7 +2028,10 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             // it reaches the root group only; the three plain `create_group`
             // calls take h5py's default policy, and `g` turns it back on for
             // itself.
-            let file = H5FileOptions::new().track_order(true).create(path)?;
+            let file = H5FileOptions::new()
+                .libver(LibverBound::Earliest)
+                .track_order(true)
+                .create(path)?;
             file.set_track_order(false)?;
             let root = file.root_group();
             for name in ["zebra", "apple", "mango"] {
@@ -2050,7 +2055,10 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             // `File(track_order=True)` reaches the root group only; reset
             // before the plain `create_group` calls that follow, same as the
             // "track_order" case above.
-            let file = H5FileOptions::new().track_order(true).create(path)?;
+            let file = H5FileOptions::new()
+                .libver(LibverBound::Earliest)
+                .track_order(true)
+                .create(path)?;
             file.set_track_order(false)?;
             let legacy = file.root_group().create_group("legacy")?;
             legacy
@@ -2068,7 +2076,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "group_storage_legacy_root" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             let legacy = file.root_group().create_group("legacy")?;
             legacy
                 .new_dataset::<i32>()
@@ -2095,7 +2103,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
 
         // ---- attributes ----------------------------------------------------
         "attr_scalar_num" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             let ds = file.new_dataset::<i32>().shape([8usize]).create("data")?;
             ds.write_raw(&ramp_n::<i32>(8))?;
             ds.new_attr::<f64>()
@@ -2110,7 +2118,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "attr_array_num" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             let ds = file.new_dataset::<i32>().shape([8usize]).create("data")?;
             ds.write_raw(&ramp_n::<i32>(8))?;
             ds.new_attr::<i32>()
@@ -2126,7 +2134,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "attr_ref_object" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             let ds = file.new_dataset::<i32>().shape([8usize]).create("data")?;
             ds.write_raw(&ramp_n::<i32>(8))?;
             let grp = file.create_group("grp")?;
@@ -2156,7 +2164,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "attr_string" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             let ds = file.new_dataset::<i32>().shape([8usize]).create("data")?;
             ds.write_raw(&ramp_n::<i32>(8))?;
             ds.new_attr::<VarLenUnicode>()
@@ -2199,7 +2207,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "attr_on_root" => {
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             file.set_attr_string("title", "root")?;
             file.set_attr_numeric("version", &3i64)?;
             file.new_dataset::<i32>()
@@ -2216,7 +2224,10 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         "libver_v110" => libver_case(path, LibverBound::V110),
         "libver_latest" => libver_case(path, LibverBound::V200),
         "userblock" => {
-            let file = H5File::options().userblock(512).create(path)?;
+            let file = H5File::options()
+                .libver(LibverBound::Earliest)
+                .userblock(512)
+                .create(path)?;
             file.new_dataset::<i32>()
                 .shape([8usize])
                 .create("data")?
@@ -2364,8 +2375,18 @@ where
         .collect()
 }
 
+/// Create the file at `H5F_LIBVER_EARLIEST`.
+///
+/// h5py called without a `libver` argument writes at that bound, so this is
+/// what the reference generator for every case that uses this did — the arms
+/// that stay on [`H5File::create`] are the ones whose generator named a
+/// newer bound.
+fn earliest_file(path: impl AsRef<std::path::Path>) -> rust_hdf5::Result<H5File> {
+    H5File::options().libver(LibverBound::Earliest).create(path)
+}
+
 fn simple_ramp<T: rust_hdf5::H5Type>(path: &str, data: Vec<T>) -> rust_hdf5::Result<WriteResult> {
-    let file = H5File::create(path)?;
+    let file = earliest_file(path)?;
     let ds = file.new_dataset::<T>().shape([data.len()]).create("data")?;
     ds.write_raw(&data)?;
     file.close()?;
@@ -2373,7 +2394,7 @@ fn simple_ramp<T: rust_hdf5::H5Type>(path: &str, data: Vec<T>) -> rust_hdf5::Res
 }
 
 fn be_ramp(path: &str, le: DatatypeMessage, width: usize) -> rust_hdf5::Result<WriteResult> {
-    let file = H5File::create(path)?;
+    let file = earliest_file(path)?;
     raw_typed(&file, "data", be_of(le), &[8], &be_bytes_ramp(width, 8))?;
     file.close()?;
     Ok(Ok(()))

@@ -2108,14 +2108,24 @@ impl Hdf5Reader {
             .map_err(|why| crate::io::IoError::Unsupported(why.to_string()))
     }
 
-    /// The attribute names of the committed datatype at `path`.
+    /// The attribute names of the committed datatype at `path`, in name
+    /// order — matching h5py's default iteration for the (usual) case where
+    /// the committed datatype does not track attribute creation order.
+    /// Unlike [`Self::dataset_attr_names`] and its group/root counterparts,
+    /// this path does not carry a per-attribute creation index to prefer
+    /// when the object does track it: committed-datatype attributes are
+    /// collected straight from compact header messages
+    /// ([`Self::committed_datatype`]), without the envelope's creation index
+    /// or dense-storage support the shared `AttributeEntry` collector has.
     pub fn named_datatype_attr_names(&mut self, path: &str) -> IoResult<Vec<String>> {
-        Ok(self
+        let mut names: Vec<String> = self
             .named_datatype_info(path)?
             .attributes()
             .iter()
             .map(|a| a.name.clone())
-            .collect())
+            .collect();
+        names.sort();
+        Ok(names)
     }
 
     /// One attribute of the committed datatype at `path`, by name.
@@ -2528,12 +2538,7 @@ impl Hdf5Reader {
         let info = self
             .dataset_info(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
-        Ok(info
-            .attributes
-            .complete(name)?
-            .iter()
-            .map(|a| a.name().to_string())
-            .collect())
+        info.attributes.ordered_names(name)
     }
 
     /// Return a specific attribute by dataset name and attribute name.
@@ -2547,12 +2552,7 @@ impl Hdf5Reader {
     /// Return the names of root-level (file) attributes, undecodable ones
     /// included — see [`Self::dataset_attr_names`].
     pub fn root_attr_names(&self) -> IoResult<Vec<String>> {
-        Ok(self
-            .root_attributes
-            .complete("/")?
-            .iter()
-            .map(|a| a.name().to_string())
-            .collect())
+        self.root_attributes.ordered_names("/")
     }
 
     /// Return a root-level attribute by name.
@@ -2581,11 +2581,7 @@ impl Hdf5Reader {
         let Some(attrs) = self.group_attributes.get(&self.canonical_path(group_path)) else {
             return Ok(Vec::new());
         };
-        Ok(attrs
-            .complete(group_path)?
-            .iter()
-            .map(|a| a.name().to_string())
-            .collect())
+        attrs.ordered_names(group_path)
     }
 
     /// Return a non-root group's attribute by name.
@@ -5312,6 +5308,23 @@ impl ObjectAttributes {
             Some(reason) => Err(incomplete_error(owner, reason)),
             None => Ok(&self.entries),
         }
+    }
+
+    /// This object's attribute names, once the set is known to be whole, in
+    /// the order h5py's default iteration produces them: creation order when
+    /// the object tracks it, name order otherwise
+    /// (`H5A__compact_cmp_corder`/`H5A__compact_cmp_name` for compact
+    /// storage, the matching v2 B-tree index for dense) — never the physical
+    /// order the entries happen to sit in, which `entries` otherwise
+    /// preserves for the writer's rewrite path.
+    pub(crate) fn ordered_names(&self, owner: &str) -> IoResult<Vec<String>> {
+        let mut ordered: Vec<&AttributeEntry> = self.complete(owner)?.iter().collect();
+        if !ordered.is_empty() && ordered.iter().all(|e| e.creation_index().is_some()) {
+            ordered.sort_by_key(|e| e.creation_index());
+        } else {
+            ordered.sort_by(|a, b| a.name().cmp(b.name()));
+        }
+        Ok(ordered.into_iter().map(|e| e.name().to_string()).collect())
     }
 }
 

@@ -142,6 +142,35 @@ fn deleted_fixed_array_dataset_frees_chunks_and_index() {
     assert_eq!(size_after(20), size_after(2), "20 delete cycles against 2");
 }
 
+/// Single-chunk-indexed dataset (a fixed shape covered by exactly one
+/// chunk): the delete frees that one chunk — the whole of its storage,
+/// addressed directly from the layout message rather than through any
+/// index structure of its own.
+#[test]
+fn deleted_single_chunk_dataset_frees_its_one_chunk() {
+    let size_after = |cycles: usize| {
+        let path = unique_tmp(&format!("single_chunk_{cycles}"));
+        let file = H5File::create(&path).unwrap();
+        let row: Vec<u8> = (0..16i32).flat_map(|v| v.to_le_bytes()).collect();
+        for _ in 0..cycles {
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([16usize])
+                .chunk(&[16])
+                .create("data")
+                .unwrap();
+            ds.write_chunk(0, &row).unwrap();
+            file.delete_dataset("data").unwrap();
+        }
+        file.close().unwrap();
+        let n = std::fs::metadata(&path).unwrap().len();
+        cleanup(&path);
+        n
+    };
+
+    assert_eq!(size_after(20), size_after(2), "20 delete cycles against 2");
+}
+
 /// v2-B-tree-indexed dataset (two unlimited dimensions): the delete frees
 /// the chunk blocks plus the BT2 header (and any flushed node blocks).
 #[test]

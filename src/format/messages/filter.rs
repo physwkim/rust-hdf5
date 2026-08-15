@@ -56,6 +56,47 @@ pub const FILTER_BITGROOM: u16 = 32022;
 pub const FILTER_BITROUND: u16 = 32023;
 pub const FILTER_BLOSC2: u16 = 32026;
 
+/// Filter flags (`H5Zpublic.h`). A mandatory filter must run; if it can't
+/// (e.g. a compressor whose output would be larger than its input), the
+/// write fails. An optional filter is silently skipped for that chunk
+/// instead, with the skip recorded in the chunk's filter mask.
+///
+/// Every builtin and registered filter libhdf5 sets through its own
+/// `H5Pset_*` convenience call (`H5Pset_deflate`, `H5Pset_shuffle`,
+/// `H5Pset_szip`, `H5Pset_nbit`, `H5Pset_scaleoffset`) or through
+/// `H5Pset_filter` for a dynamically loaded one (h5py's `filters.py`
+/// `fill_dcpl`) uses `H5Z_FLAG_OPTIONAL`. `H5Pset_fletcher32` is the sole
+/// exception: a checksum is meaningless if it can be skipped, so it is
+/// `H5Z_FLAG_MANDATORY` (H5Pocpl.c).
+pub const FLAG_OPTIONAL: u16 = 1;
+/// See [`FLAG_OPTIONAL`]. Matches `H5Z_FLAG_MANDATORY`; used only by
+/// `H5Pset_fletcher32`.
+pub const FLAG_MANDATORY: u16 = 0;
+
+/// The name libhdf5 registers a filter under, for the filters libhdf5
+/// registers itself — the `H5Z_class2_t` name field of `H5Z_DEFLATE`,
+/// `H5Z_SHUFFLE`, `H5Z_FLETCHER32`, `H5Z_SZIP`, `H5Z_NBIT` and
+/// `H5Z_SCALEOFFSET`.
+///
+/// Only these. Everything at or above `H5Z_FILTER_RESERVED` (256,
+/// H5Zpublic.h:84) is a third-party filter whose registered name belongs to
+/// the plugin that registers it, and this crate does not know what the reader
+/// on the other side will have loaded — a guessed name would be a claim about
+/// someone else's plugin. `None` is what a version-1 pipeline writes as a
+/// zero name length, exactly as `H5O__pline_encode` does when `H5Z_find`
+/// resolves nothing.
+fn registered_name(id: u16) -> Option<&'static str> {
+    match id {
+        FILTER_DEFLATE => Some("deflate"),
+        FILTER_SHUFFLE => Some("shuffle"),
+        FILTER_FLETCHER32 => Some("fletcher32"),
+        FILTER_SZIP => Some("szip"),
+        FILTER_NBIT => Some("nbit"),
+        FILTER_SCALEOFFSET => Some("scaleoffset"),
+        _ => None,
+    }
+}
+
 /// A single filter in the pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Filter {
@@ -83,7 +124,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_DEFLATE,
-                flags: 0, // mandatory
+                flags: FLAG_OPTIONAL, // H5Pset_deflate (H5Pocpl.c)
                 cd_values: vec![level],
             }],
         }
@@ -105,7 +146,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_SHUFFLE,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // H5Pset_shuffle (H5Pdcpl.c)
                 cd_values: vec![element_size],
             }],
         }
@@ -121,12 +162,12 @@ impl FilterPipeline {
             filters: vec![
                 Filter {
                     id: FILTER_SHUFFLE,
-                    flags: 0,
+                    flags: FLAG_OPTIONAL,
                     cd_values: vec![element_size],
                 },
                 Filter {
                     id: FILTER_DEFLATE,
-                    flags: 0,
+                    flags: FLAG_OPTIONAL,
                     cd_values: vec![level],
                 },
             ],
@@ -138,7 +179,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_LZ4,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // dynamically registered filter (H5Pset_filter)
                 cd_values: vec![],
             }],
         }
@@ -151,7 +192,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_ZSTD,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // dynamically registered filter (H5Pset_filter)
                 cd_values: vec![level],
             }],
         }
@@ -168,7 +209,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_BSHUF,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // dynamically registered filter (H5Pset_filter)
                 // [major, minor, elem_size, block_size, compression]
                 cd_values: vec![0, 0, element_size, 0, 0],
             }],
@@ -185,7 +226,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_BSHUF,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // dynamically registered filter (H5Pset_filter)
                 cd_values: vec![0, 0, element_size, 0, BSHUF_COMPRESS_LZ4],
             }],
         }
@@ -245,7 +286,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_NBIT,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // H5Pset_nbit (H5Pdcpl.c)
                 // [nparms, need_not_compress, d_nelmts, class, size, order,
                 //  precision, offset] — total 8 (3 base + 5 atomic).
                 cd_values: vec![
@@ -323,7 +364,7 @@ impl FilterPipeline {
         Some(Self {
             filters: vec![Filter {
                 id: FILTER_SCALEOFFSET,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // H5Pset_scaleoffset (H5Pdcpl.c)
                 cd_values,
             }],
         })
@@ -334,6 +375,67 @@ impl FilterPipeline {
         Self {
             filters: Vec::new(),
         }
+    }
+
+    /// Encode at the version `format` calls for (`H5O_pline_ver_bounds`,
+    /// H5Opline.c:85): version 1 in a classic file, version 2 otherwise.
+    pub fn encode_for(&self, format: crate::format::ObjectFormat) -> Vec<u8> {
+        match format.filter_pipeline_version() {
+            1 => self.encode_v1(),
+            _ => self.encode(),
+        }
+    }
+
+    /// Encode as a version-1 filter pipeline message, the one libhdf5 writes
+    /// at `H5F_LIBVER_EARLIEST`.
+    ///
+    /// Version 1 differs from version 2 in three ways, all of them alignment
+    /// (`H5O__pline_encode`, H5Opline.c:280-350): six reserved bytes follow
+    /// the filter count, every filter carries a name length whether or not it
+    /// is one of libhdf5's own, and both the name and the client-data array
+    /// are padded — the name to a multiple of 8 bytes, the array to an even
+    /// number of values.
+    ///
+    /// The name written is the one the filter is registered under
+    /// ([`registered_name`]), because that is what `H5O__pline_encode` reaches
+    /// for when the message carries none of its own. A filter this crate has
+    /// no registered name for gets a zero name length, which is what libhdf5
+    /// writes when `H5Z_find` does not resolve the id either.
+    pub fn encode_v1(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64);
+
+        buf.push(1);
+        buf.push(self.filters.len() as u8);
+        buf.extend_from_slice(&[0u8; 6]);
+
+        for f in &self.filters {
+            buf.extend_from_slice(&f.id.to_le_bytes());
+
+            // The stored length counts the NUL terminator and is rounded up
+            // to the 8-byte multiple the name is padded to (`H5O_ALIGN_OLD`,
+            // H5Opkg.h:57).
+            let name = registered_name(f.id);
+            let name_len = name.map_or(0, |n| n.len() + 1);
+            let padded_len = name_len.div_ceil(8) * 8;
+            buf.extend_from_slice(&(padded_len as u16).to_le_bytes());
+
+            buf.extend_from_slice(&f.flags.to_le_bytes());
+            buf.extend_from_slice(&(f.cd_values.len() as u16).to_le_bytes());
+
+            if let Some(name) = name {
+                buf.extend_from_slice(name.as_bytes());
+                buf.resize(buf.len() + (padded_len - name.len()), 0);
+            }
+
+            for &cd in &f.cd_values {
+                buf.extend_from_slice(&cd.to_le_bytes());
+            }
+            if !f.cd_values.len().is_multiple_of(2) {
+                buf.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+
+        buf
     }
 
     /// Encode as a version-2 filter pipeline message.
@@ -2207,6 +2309,168 @@ fn blosclz_decompress(input: &[u8], maxout: usize) -> FormatResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Byte-for-byte against what libhdf5 writes. Each expected slice was
+    /// read out of a file h5py created with `libver='earliest'` and a chunked
+    /// dataset carrying that pipeline, which is the only authority on the
+    /// padding rules — `H5O__pline_encode` states them, but the file is what
+    /// a reader parses.
+    ///
+    /// The pipelines are the ones this crate's own builders produce, so the
+    /// flags byte in each expected slice is the flag the builder stored and
+    /// not a value written into the test: `H5Z_FLAG_OPTIONAL` for deflate and
+    /// shuffle, `H5Z_FLAG_MANDATORY` for fletcher32 ([`FLAG_OPTIONAL`]).
+    /// libhdf5 makes the same split, so a hardcoded flags byte on either
+    /// side of it would fail here.
+    #[test]
+    fn version_1_encodes_the_bytes_libhdf5_writes() {
+        // gzip level 4: name "deflate\0" is 8 bytes and needs no padding,
+        // and the single client-data value is padded out to an even count.
+        assert_eq!(
+            FilterPipeline::deflate(4).encode_v1(),
+            b"\x01\x01\x00\x00\x00\x00\x00\x00\
+              \x01\x00\x08\x00\x01\x00\x01\x00\
+              deflate\x00\
+              \x04\x00\x00\x00\x00\x00\x00\x00"
+        );
+
+        // shuffle over 4-byte elements: same shape, and libhdf5 records the
+        // element width `H5Z__set_local_shuffle` filled in.
+        assert_eq!(
+            FilterPipeline::shuffle(4).encode_v1(),
+            b"\x01\x01\x00\x00\x00\x00\x00\x00\
+              \x02\x00\x08\x00\x01\x00\x01\x00\
+              shuffle\x00\
+              \x04\x00\x00\x00\x00\x00\x00\x00"
+        );
+
+        // fletcher32: "fletcher32\0" is 11 bytes, so the name is padded to
+        // 16 and the declared length is the padded one. No client data, so
+        // no client-data padding either. Its flags byte is 0 — `H5Pset_fletcher32`
+        // is the one libhdf5 setter that asks for a mandatory filter.
+        let fletcher = FilterPipeline {
+            filters: vec![Filter {
+                id: FILTER_FLETCHER32,
+                flags: FLAG_MANDATORY,
+                cd_values: vec![],
+            }],
+        };
+        assert_eq!(
+            fletcher.encode_v1(),
+            b"\x01\x01\x00\x00\x00\x00\x00\x00\
+              \x03\x00\x10\x00\x00\x00\x00\x00\
+              fletcher32\x00\x00\x00\x00\x00\x00"
+        );
+
+        // Two filters in one message: the six reserved bytes are the
+        // message's, not each filter's, and shuffle precedes deflate the way
+        // libhdf5 applies them.
+        assert_eq!(
+            FilterPipeline::shuffle_deflate(4, 4).encode_v1(),
+            b"\x01\x02\x00\x00\x00\x00\x00\x00\
+              \x02\x00\x08\x00\x01\x00\x01\x00\
+              shuffle\x00\
+              \x04\x00\x00\x00\x00\x00\x00\x00\
+              \x01\x00\x08\x00\x01\x00\x01\x00\
+              deflate\x00\
+              \x04\x00\x00\x00\x00\x00\x00\x00"
+        );
+
+        // A mandatory filter beside an optional one, `fletcher32=True` with
+        // `compression='gzip'`. Each filter carries its own flags byte, so
+        // one message holds both values — an encoder emitting a constant
+        // cannot produce this.
+        let mixed = FilterPipeline {
+            filters: vec![
+                FilterPipeline::deflate(4).filters[0].clone(),
+                fletcher.filters[0].clone(),
+            ],
+        };
+        assert_eq!(
+            mixed.encode_v1(),
+            b"\x01\x02\x00\x00\x00\x00\x00\x00\
+              \x01\x00\x08\x00\x01\x00\x01\x00\
+              deflate\x00\
+              \x04\x00\x00\x00\x00\x00\x00\x00\
+              \x03\x00\x10\x00\x00\x00\x00\x00\
+              fletcher32\x00\x00\x00\x00\x00\x00"
+        );
+    }
+
+    /// A filter this crate has no registered name for gets a zero name
+    /// length and no name bytes — what `H5O__pline_encode` writes when
+    /// `H5Z_find` resolves nothing — and the client-data padding still
+    /// applies.
+    #[test]
+    fn version_1_names_only_the_filters_libhdf5_registers() {
+        let pipeline = FilterPipeline {
+            filters: vec![Filter {
+                id: FILTER_ZSTD,
+                flags: 0,
+                cd_values: vec![3],
+            }],
+        };
+        assert_eq!(
+            pipeline.encode_v1(),
+            b"\x01\x01\x00\x00\x00\x00\x00\x00\
+              \x0f\x7d\x00\x00\x00\x00\x01\x00\
+              \x03\x00\x00\x00\x00\x00\x00\x00"
+        );
+        let (decoded, consumed) = FilterPipeline::decode(&pipeline.encode_v1()).unwrap();
+        assert_eq!(consumed, pipeline.encode_v1().len());
+        assert_eq!(decoded, pipeline);
+    }
+
+    /// Every pipeline this crate can build survives its own version-1
+    /// encoding, whatever the name length and client-data count do to the
+    /// padding. The decoder is the one libhdf5 files are read with, so a
+    /// round trip through it is what says the two agree on where each field
+    /// ends.
+    #[test]
+    fn version_1_round_trips_through_the_decoder() {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let dt = DatatypeMessage::i32_type();
+        let single = |id, cd_values| FilterPipeline {
+            filters: vec![Filter {
+                id,
+                flags: 0,
+                cd_values,
+            }],
+        };
+        for pipeline in [
+            FilterPipeline::none(),
+            FilterPipeline::deflate(6),
+            FilterPipeline::shuffle(4),
+            FilterPipeline::shuffle_deflate(4, 9),
+            single(FILTER_FLETCHER32, vec![]),
+            single(FILTER_SZIP, vec![4, 32, 32, 256]),
+            FilterPipeline::nbit(&dt, 16),
+            FilterPipeline::scaleoffset(&dt, 16, 0).unwrap(),
+            FilterPipeline::zstd(3),
+            FilterPipeline::bshuf_lz4(4),
+        ] {
+            let encoded = pipeline.encode_v1();
+            assert_eq!(encoded[0], 1, "{pipeline:?}");
+            assert_eq!(encoded[1] as usize, pipeline.filters.len(), "{pipeline:?}");
+            let (decoded, consumed) = FilterPipeline::decode(&encoded).unwrap();
+            assert_eq!(consumed, encoded.len(), "{pipeline:?}");
+            assert_eq!(decoded, pipeline);
+        }
+    }
+
+    /// The version follows the file's format and nothing else.
+    #[test]
+    fn the_object_format_picks_the_pipeline_version() {
+        use crate::format::ObjectFormat;
+
+        let pipeline = FilterPipeline::deflate(6);
+        assert_eq!(
+            pipeline.encode_for(ObjectFormat::Legacy),
+            pipeline.encode_v1()
+        );
+        assert_eq!(pipeline.encode_for(ObjectFormat::Modern), pipeline.encode());
+    }
 
     #[test]
     fn encode_decode_deflate() {
