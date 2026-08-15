@@ -2343,33 +2343,6 @@ impl H5Dataset {
                     )));
                 }
 
-                // Validate coordinates and compute the grown dimensions
-                // up-front, before any chunk is written, so an overflowing
-                // coordinate cannot leave an orphaned chunk in the file.
-                //
-                // The last chunk of a dimension usually hangs past the extent
-                // — a length of 10 in chunks of 4 ends at 12 — so the growth
-                // is capped at the declared maximum, which is what the chunk
-                // still covers. Without the cap a legal edge chunk would be
-                // written and then rejected by the extend below.
-                let max_dims = writer.dataset_max_dims(*index);
-                let mut new_dims = dims.clone();
-                for d in 0..dims.len() {
-                    let needed = coords[d]
-                        .checked_add(1)
-                        .and_then(|c| c.checked_mul(chunk_dims[d]))
-                        .ok_or_else(|| {
-                            Hdf5Error::InvalidState(format!(
-                                "chunk coordinate {} in dimension {} is too large",
-                                coords[d], d
-                            ))
-                        })?;
-                    let needed = needed.min(max_dims[d]);
-                    if needed > new_dims[d] {
-                        new_dims[d] = needed;
-                    }
-                }
-
                 if kind == ChunkIndexKind::FixedArray {
                     // Fixed-array (fixed-shape) dataset: no dimension growth.
                     match bytes {
@@ -2422,6 +2395,35 @@ impl H5Dataset {
                             )?,
                     }
                     return Ok(());
+                }
+
+                // The remaining indexes (v2 B-tree, v1 B-tree, extensible
+                // array) can all grow: validate the coordinates and compute
+                // the grown dimensions up-front, before any chunk is
+                // written, so an overflowing coordinate cannot leave an
+                // orphaned chunk in the file.
+                //
+                // The last chunk of a dimension usually hangs past the extent
+                // — a length of 10 in chunks of 4 ends at 12 — so the growth
+                // is capped at the declared maximum, which is what the chunk
+                // still covers. Without the cap a legal edge chunk would be
+                // written and then rejected by the extend below.
+                let max_dims = writer.dataset_max_dims(*index);
+                let mut new_dims = dims.clone();
+                for d in 0..dims.len() {
+                    let needed = coords[d]
+                        .checked_add(1)
+                        .and_then(|c| c.checked_mul(chunk_dims[d]))
+                        .ok_or_else(|| {
+                            Hdf5Error::InvalidState(format!(
+                                "chunk coordinate {} in dimension {} is too large",
+                                coords[d], d
+                            ))
+                        })?;
+                    let needed = needed.min(max_dims[d]);
+                    if needed > new_dims[d] {
+                        new_dims[d] = needed;
+                    }
                 }
 
                 if kind == ChunkIndexKind::BtreeV2 {
