@@ -2051,6 +2051,13 @@ impl H5Dataset {
                 // Validate coordinates and compute the grown dimensions
                 // up-front, before any chunk is written, so an overflowing
                 // coordinate cannot leave an orphaned chunk in the file.
+                //
+                // The last chunk of a dimension usually hangs past the extent
+                // — a length of 10 in chunks of 4 ends at 12 — so the growth
+                // is capped at the declared maximum, which is what the chunk
+                // still covers. Without the cap a legal edge chunk would be
+                // written and then rejected by the extend below.
+                let max_dims = writer.dataset_max_dims(*index);
                 let mut new_dims = dims.clone();
                 for d in 0..dims.len() {
                     let needed = coords[d]
@@ -2062,6 +2069,7 @@ impl H5Dataset {
                                 coords[d], d
                             ))
                         })?;
+                    let needed = needed.min(max_dims[d]);
                     if needed > new_dims[d] {
                         new_dims[d] = needed;
                     }
@@ -3771,6 +3779,38 @@ mod tests {
         let file = H5File::create(&path).unwrap();
         let result = file.new_dataset::<u8>().create("data");
         assert!(result.is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    // The last chunk along a *fixed* dimension covers more elements than the
+    // extent has, so growing the dataspace to the chunk's far edge asks for
+    // more than the declared maximum. Before the clamp the chunk was written
+    // and then the call failed on that extend, leaving the bytes in the file
+    // and the caller an error.
+    #[test]
+    fn a_partial_edge_chunk_does_not_grow_past_the_declared_maximum() {
+        let path = temp_path("edge_chunk_extent");
+        // Extensible array: dimension 1 is unlimited, dimension 0 is fixed at
+        // 10 and not a multiple of the chunk's 4.
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([10usize, 4])
+            .max_shape(&[Some(10), None])
+            .chunk(&[4, 4])
+            .create("grid")
+            .unwrap();
+        let chunk: Vec<u8> = (0i32..16).flat_map(|v| v.to_le_bytes()).collect();
+        // Chunk row 2 spans elements 8..12 of a dimension that stops at 10.
+        ds.write_chunk_at(&[2, 0], &chunk).unwrap();
+        assert_eq!(ds.shape(), vec![10, 4]);
+        file.close().unwrap();
+
+        let file = H5File::open(&path).unwrap();
+        let back = file.dataset("grid").unwrap().read_raw::<i32>().unwrap();
+        assert_eq!(back.len(), 40);
+        assert_eq!(&back[32..40], &[0, 1, 2, 3, 4, 5, 6, 7]);
+        drop(file);
         std::fs::remove_file(&path).ok();
     }
 

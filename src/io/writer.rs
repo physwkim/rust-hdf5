@@ -4456,6 +4456,20 @@ impl Hdf5Writer {
         self.ds(index).lock().dataspace.dims.clone()
     }
 
+    /// Return the maximum extent a dataset declares, per dimension.
+    ///
+    /// An absent maximum shape means the shape is fixed at its current extent
+    /// (libhdf5 defaults maxdims to dims at creation), so the current
+    /// dimensions are returned; `H5S_UNLIMITED` is `u64::MAX`.
+    pub fn dataset_max_dims(&self, index: usize) -> Vec<u64> {
+        let ds = self.ds(index);
+        let m = ds.lock();
+        m.dataspace
+            .max_dims
+            .clone()
+            .unwrap_or_else(|| m.dataspace.dims.clone())
+    }
+
     /// Return the datatype a dataset declares on disk.
     ///
     /// The typed write paths need it to store bytes in the declared byte
