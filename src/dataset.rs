@@ -46,6 +46,7 @@ pub struct DatasetBuilder<T: H5Type> {
     custom_pipeline: Option<crate::format::messages::filter::FilterPipeline>,
     group_path: Option<String>,
     fill_value: Option<Vec<u8>>,
+    fill_time: Option<FillTime>,
     datatype_override: Option<crate::format::messages::datatype::DatatypeMessage>,
     committed_type: Option<String>,
     references: Option<ReferenceElement>,
@@ -101,6 +102,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             custom_pipeline: None,
             group_path: None,
             fill_value: None,
+            fill_time: None,
             datatype_override: None,
             committed_type: None,
             references: None,
@@ -124,6 +126,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             custom_pipeline: None,
             group_path: Some(group_path),
             fill_value: None,
+            fill_time: None,
             datatype_override: None,
             committed_type: None,
             references: None,
@@ -562,6 +565,33 @@ impl<T: H5Type> DatasetBuilder<T> {
         self
     }
 
+    /// Set when the fill value is written into allocated storage —
+    /// `H5Pset_fill_time`.
+    ///
+    /// Without this, a dataset gets [`FillTime::IfSet`]
+    /// (`H5D_CRT_FILL_TIME_DEF`), the default every dataset creation
+    /// property list carries. [`FillTime::Never`] applies to a dataset with
+    /// no fill value too: it only stops this writer's own eager tiling of
+    /// the value into newly allocated storage, not the default zero-fill
+    /// that storage already has, so its only observable effect is on a
+    /// dataset that also calls [`fill_value`](Self::fill_value).
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::{FillTime, H5File};
+    /// let file = H5File::create("fv.h5").unwrap();
+    /// let ds = file.new_dataset::<f32>()
+    ///     .shape(&[100])
+    ///     .fill_value(f32::NAN)
+    ///     .fill_time(FillTime::Never)
+    ///     .create("data")
+    ///     .unwrap();
+    /// ```
+    #[must_use]
+    pub fn fill_time(mut self, time: FillTime) -> Self {
+        self.fill_time = Some(time);
+        self
+    }
+
     /// Finalize and create the dataset with the given `name`.
     ///
     /// The name is the link name within the root group (e.g. `"data"` or
@@ -732,6 +762,11 @@ impl<T: H5Type> DatasetBuilder<T> {
                     "a NULL dataspace dataset cannot have a fill value".into(),
                 ));
             }
+            if self.fill_time.is_some() {
+                return Err(Hdf5Error::InvalidState(
+                    "a NULL dataspace dataset cannot have a fill time".into(),
+                ));
+            }
 
             let index = {
                 let inner = borrow_inner(&self.file_inner);
@@ -802,6 +837,11 @@ impl<T: H5Type> DatasetBuilder<T> {
                 match &*inner {
                     H5FileInner::Writer(writer) => {
                         let idx = writer.create_compact_dataset(&full_name, datatype, &dims_u64)?;
+                        // Set before the fill value: NEVER must be in place
+                        // before that call decides whether to eager-tile it.
+                        if let Some(time) = self.fill_time {
+                            writer.set_dataset_fill_time(idx, time.wire_byte())?;
+                        }
                         if let Some(ref fv) = fill_value {
                             writer.set_dataset_fill_value(idx, fv.clone())?;
                         }
@@ -846,6 +886,11 @@ impl<T: H5Type> DatasetBuilder<T> {
                         // dataset property a virtual dataset carries about its
                         // own elements. Nothing is tiled into storage: it has
                         // none.
+                        // Set before the fill value: NEVER must be in place
+                        // before that call decides whether to eager-tile it.
+                        if let Some(time) = self.fill_time {
+                            writer.set_dataset_fill_time(idx, time.wire_byte())?;
+                        }
                         if let Some(ref fv) = fill_value {
                             writer.set_dataset_fill_value(idx, fv.clone())?;
                         }
@@ -1058,6 +1103,11 @@ impl<T: H5Type> DatasetBuilder<T> {
                                 &full_name, datatype, &dims_u64, &max_u64, &chunk_u64,
                             )?
                         };
+                        // Set before the fill value: NEVER must be in place
+                        // before that call decides whether to eager-tile it.
+                        if let Some(time) = self.fill_time {
+                            writer.set_dataset_fill_time(idx, time.wire_byte())?;
+                        }
                         if let Some(ref fv) = fill_value {
                             writer.set_dataset_fill_value(idx, fv.clone())?;
                         }
@@ -1102,6 +1152,11 @@ impl<T: H5Type> DatasetBuilder<T> {
                             }
                             None => writer.create_dataset(&full_name, datatype, &dims_u64)?,
                         };
+                        // Set before the fill value: NEVER must be in place
+                        // before that call decides whether to eager-tile it.
+                        if let Some(time) = self.fill_time {
+                            writer.set_dataset_fill_time(idx, time.wire_byte())?;
+                        }
                         if let Some(ref fv) = fill_value {
                             writer.set_dataset_fill_value(idx, fv.clone())?;
                         }
@@ -1440,6 +1495,38 @@ pub enum FillValue {
     Undefined,
     /// An explicit fill value, one element wide.
     UserDefined(Vec<u8>),
+}
+
+/// When a dataset's fill value is written into allocated storage —
+/// `H5Pset_fill_time`/`H5Pget_fill_time`'s `H5D_fill_time_t`.
+///
+/// Distinct from [`FillValue`], which says *what* the fill value is; this
+/// says *when* it is written. The two agree everywhere except a dataset with
+/// no fill value of its own: there, `Alloc` writes the default fill (zeros)
+/// at allocation and `IfSet` writes nothing into space that already reads as
+/// zeros — indistinguishable on disk in the value itself, only in this byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillTime {
+    /// Fill at allocation regardless of whether a fill value was ever set.
+    Alloc,
+    /// Never write the fill value into allocated storage.
+    Never,
+    /// Fill at allocation only when a fill value was set — the default
+    /// every dataset gets unless [`fill_time`](DatasetBuilder::fill_time)
+    /// says otherwise.
+    IfSet,
+}
+
+impl FillTime {
+    /// The on-disk `H5D_fill_time_t` byte this variant is — what the writer
+    /// stores and the fill-value message's write-time field carries.
+    fn wire_byte(self) -> u8 {
+        match self {
+            Self::Alloc => 0,
+            Self::Never => 1,
+            Self::IfSet => 2,
+        }
+    }
 }
 
 impl H5Dataset {
@@ -1785,6 +1872,35 @@ impl H5Dataset {
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "fill_value() is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Return when this dataset's fill value is written into allocated
+    /// storage (read mode only) — `H5Pget_fill_time`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is in write mode, or if the dataset can
+    /// no longer be found in the reader's metadata.
+    pub fn fill_time(&self) -> Result<FillTime> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => reader
+                        .dataset_info(name)
+                        .map(|info| match info.fill_write_time {
+                            0 => FillTime::Alloc,
+                            1 => FillTime::Never,
+                            _ => FillTime::IfSet,
+                        })
+                        .ok_or_else(|| Hdf5Error::NotFound(name.clone())),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "fill_time() is only available in read mode".into(),
             )),
         }
     }

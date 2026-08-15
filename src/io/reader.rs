@@ -22,7 +22,7 @@ use crate::format::messages::data_layout::{self, DataLayoutMessage};
 use crate::format::messages::dataspace::DataspaceMessage;
 use crate::format::messages::datatype::{DatatypeMessage, OldReferenceKind, ReferenceEncoding};
 use crate::format::messages::external_file_list::ExternalFileListMessage;
-use crate::format::messages::fill_value::{try_tiled_fill, FillValueMessage};
+use crate::format::messages::fill_value::{try_tiled_fill, FillValueMessage, FILL_TIME_IFSET};
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::link::LinkMessage;
 use crate::format::messages::link::LinkTarget;
@@ -165,6 +165,12 @@ pub struct DatasetReadInfo {
     /// dataset with no fill-value message at all reads as 1, matching a
     /// fresh dataset creation property list (`FillValueMessage::default`).
     pub fill_defined: u8,
+    /// The fill-value message's write-time byte (`H5D_fill_time_t`): 0 =
+    /// `H5D_FILL_TIME_ALLOC`, 1 = `H5D_FILL_TIME_NEVER`, 2 =
+    /// `H5D_FILL_TIME_IFSET`. A dataset with no fill-value message at all
+    /// reads as 2, `H5D_CRT_FILL_TIME_DEF` — the same "no message" default
+    /// [`fill_defined`](Self::fill_defined) uses.
+    pub fill_write_time: u8,
     /// External raw-data segments (H5O_EFL_ID). Non-empty only when this
     /// dataset's storage is an External Data Files list instead of a
     /// normal contiguous block — `layout` still reports `Contiguous` with
@@ -1957,6 +1963,7 @@ impl Hdf5Reader {
         // (`FillValueMessage::default`), so a dataset that never got one
         // written reads back exactly as if it had.
         let mut fill_defined: u8 = 1;
+        let mut fill_write_time: u8 = FILL_TIME_IFSET;
         // The first message that did not decode, kept verbatim: it is the
         // answer a caller gets when it asks for this dataset.
         let mut blocked: Option<String> = None;
@@ -2018,6 +2025,7 @@ impl Hdf5Reader {
                 MSG_FILL_VALUE => match FillValueMessage::decode(&msg.data) {
                     Ok((fv, _)) => {
                         fill_defined = fv.fill_defined;
+                        fill_write_time = fv.fill_write_time;
                         if fv.fill_defined == 2 {
                             fill_value = fv.fill_value;
                         }
@@ -2093,6 +2101,7 @@ impl Hdf5Reader {
                 attributes,
                 fill_value,
                 fill_defined,
+                fill_write_time,
                 external_files,
                 virtual_mappings,
             })),

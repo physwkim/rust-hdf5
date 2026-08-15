@@ -32,13 +32,13 @@ use rust_hdf5::format::messages::filter::{
 };
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
-    AttributeStorage, ChunkIndex, CreationOrder, ExternalFileSegment, FillValue, H5Attribute,
-    H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error, Hyperslab,
+    AttributeStorage, ChunkIndex, CreationOrder, ExternalFileSegment, FillTime, FillValue,
+    H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error, Hyperslab,
     HyperslabBlock, LibverBound, LinkClass, LinkStorage, Reference, Selection, StorageLayout,
     VirtualMapping,
 };
 
-const CANON_VERSION: &str = "3";
+const CANON_VERSION: &str = "4";
 const RAW_LIMIT: usize = 1024;
 const MAX_DEPTH: usize = 32;
 
@@ -1057,6 +1057,20 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
                 FillValue::Default => "default".to_string(),
                 FillValue::Undefined => "undefined".to_string(),
                 FillValue::UserDefined(bytes) => format!("0x{}", hex(&bytes)),
+            })
+            .map_err(oneline)
+    });
+
+    d.field(path, "filltime", || {
+        guarded(|| ds.fill_time())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|ft| {
+                match ft {
+                    FillTime::Alloc => "alloc",
+                    FillTime::Never => "never",
+                    FillTime::IfSet => "ifset",
+                }
+                .to_string()
             })
             .map_err(oneline)
     });
