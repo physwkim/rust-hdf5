@@ -586,6 +586,17 @@ fn an_unlimited_dataset_created_at_earliest_stays_on_the_version_1_btree() {
 /// heap. Every group here fits in one leaf level, so the walk is the leaf's
 /// children rather than a descent.
 fn classic_layout_of(path: &std::path::Path, name: &str) -> DataLayoutMessage {
+    let (msg, ctx) = classic_layout_message_of(path, name);
+    DataLayoutMessage::decode(&msg, &ctx).unwrap().0
+}
+
+/// The same message undecoded, for the one claim the decoded form cannot
+/// carry: the version byte of a class whose variant does not record it.
+fn classic_layout_version_of(path: &std::path::Path, name: &str) -> u8 {
+    classic_layout_message_of(path, name).0[0]
+}
+
+fn classic_layout_message_of(path: &std::path::Path, name: &str) -> (Vec<u8>, FormatContext) {
     let bytes = std::fs::read(path).unwrap();
     let sb = SuperblockV0V1::decode(&bytes).unwrap();
     let (addr_size, size_size) = (sb.sizeof_offsets as usize, sb.sizeof_lengths as usize);
@@ -642,7 +653,7 @@ fn classic_layout_of(path: &std::path::Path, name: &str) -> DataLayoutMessage {
         .iter()
         .find(|m| m.msg_type == MSG_DATA_LAYOUT)
         .unwrap_or_else(|| panic!("'{name}' has no data layout message"));
-    DataLayoutMessage::decode(&msg.data, &ctx).unwrap().0
+    (msg.data.clone(), ctx)
 }
 
 /// A fixed shape covered by exactly one chunk is the shape
@@ -903,30 +914,89 @@ fn shared_messages_raise_a_file_asking_for_earliest_to_version_2() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// A virtual dataset is refused by name for the same reason SWMR is: nothing
-/// older than the version-4 data layout message can say "virtual" at all, and
-/// the layout message at this bound is version 3.
+/// A virtual dataset raises its own layout message to version 4 and takes
+/// nothing else in the file with it.
+///
+/// The bound sets a floor, not a ceiling. `H5O_layout_ver_bounds` gives the
+/// earliest bound version 1, and every other dataset here settles at the
+/// version 3 that reaches; `H5D__virtual_construct` then raises this one
+/// message on its own, because "virtual datasets require layout version 4",
+/// and checks only the *high* bound while doing it (H5Dvirtual.c:2679). So the
+/// classic file keeps its version-0 superblock, its version-1 object headers
+/// and its symbol-table root over a version-4 layout message — which is what
+/// h5py writes for the same file.
 #[test]
-fn a_virtual_dataset_in_a_file_created_at_earliest_is_refused() {
+fn a_virtual_dataset_in_a_file_created_at_earliest_raises_only_its_layout_message() {
+    use rust_hdf5::format::messages::data_layout::DataLayoutMessage;
     use rust_hdf5::Selection;
 
+    let Some(py) = python() else { return };
     let path = tmp("virtual");
+    let source = path.with_file_name("virtual_source.h5");
+    let src = earliest(&source);
+    src.new_dataset::<i32>()
+        .shape([16])
+        .create("src")
+        .unwrap()
+        .write_raw(&(0..16i32).collect::<Vec<_>>())
+        .unwrap();
+    src.close().unwrap();
+
     let file = earliest(&path);
-    let err = match file
-        .new_dataset::<i32>()
-        .shape([4])
-        .virtual_mapping(Selection::All, "src.h5", "src", Selection::All)
+    file.new_dataset::<i32>()
+        .shape([16])
+        .virtual_mapping(
+            Selection::All,
+            source.file_name().unwrap().to_str().unwrap(),
+            "src",
+            Selection::All,
+        )
         .create("mapped")
-    {
-        Ok(_) => panic!("a virtual dataset needs a layout message this file cannot hold"),
-        Err(e) => e.to_string(),
-    };
-    assert!(err.contains("virtual"), "{err}");
-    assert!(err.contains("version-4 data layout"), "{err}");
+        .unwrap();
+    // The control: a contiguous dataset in the same file stays at version 3.
+    file.new_dataset::<i32>()
+        .shape([4])
+        .create("plain")
+        .unwrap()
+        .write_raw(&[1i32, 2, 3, 4])
+        .unwrap();
     file.close().unwrap();
 
     assert_eq!(superblock_version(&path), 0);
+    no_newer_structures(&path);
+    match classic_layout_of(&path, "mapped") {
+        DataLayoutMessage::Virtual { version, .. } => assert_eq!(version, 4),
+        other => panic!("expected a virtual layout, got {other:?}"),
+    }
+    let plain = classic_layout_of(&path, "plain");
+    assert!(
+        matches!(plain, DataLayoutMessage::Contiguous { .. }),
+        "expected a contiguous layout, got {plain:?}"
+    );
+    assert_eq!(
+        classic_layout_version_of(&path, "plain"),
+        3,
+        "the neighbour is untouched by the virtual dataset's raise"
+    );
+
+    read_with_h5py(
+        py,
+        &path,
+        "assert f['mapped'].is_virtual\n\
+         assert list(f['mapped'][...]) == list(range(16)), list(f['mapped'][...])\n\
+         (vspace, fname, dname, sspace), = f['mapped'].virtual_sources()\n\
+         assert fname == 'virtual_source.h5', fname\n\
+         assert dname == 'src', dname\n\
+         assert list(f['plain'][...]) == [1, 2, 3, 4]\n\
+         STAB = 1 << 0x11\n\
+         assert h5py.h5o.get_info(f['/'].id).hdr.mesg.present & STAB, 'symbol-table root'\n\
+         for path in ('/', '/mapped', '/plain'):\n\
+         \x20   v = h5py.h5o.get_info(f[path].id).hdr.version\n\
+         \x20   assert v == 1, (path, v)\n",
+    );
+    libhdf5_tools_accept(py, &path);
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&source);
 }
 
 /// SWMR needs a version-3 superblock to record that a writer is attached, and

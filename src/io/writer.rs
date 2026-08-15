@@ -1856,35 +1856,6 @@ struct DenseCarry {
     links: Option<LinkInfoMessage>,
 }
 
-/// The raw-data storage a creator is about to give the object it creates.
-///
-/// Passed into [`Hdf5Writer::begin_create`] rather than checked inside each
-/// creator, so that a creator added later has to say which it is and cannot
-/// silently skip the format check that goes with it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NewStorage {
-    /// One contiguous run of bytes, or none at all (a null dataspace).
-    Contiguous,
-    /// Chunks reached through an index.
-    Chunked,
-    /// Chunks whose bytes pass through a filter pipeline, which needs a
-    /// Filter Pipeline message in the header beside the layout. That message
-    /// is the whole difference from [`Chunked`](Self::Chunked), and both
-    /// formats can hold it, so no check separates the two today; the creators
-    /// still declare which they are, because the declaration is what a check
-    /// added later has to work from.
-    ChunkedFiltered,
-    /// The image inside the data layout message itself, with no block of its
-    /// own — `H5D_COMPACT`.
-    Compact,
-    /// No storage of its own at all: the elements are read out of the source
-    /// datasets a mapping list names — `H5D_VIRTUAL`.
-    Virtual,
-    /// No raw data at all — a committed datatype, whose object holds one
-    /// datatype message and nothing else.
-    None,
-}
-
 /// A modelled object, as the walk hands it to the registry rebuild. A group's
 /// links are not here: the walk followed them, and each child is an entry of
 /// its own.
@@ -3951,58 +3922,11 @@ impl Hdf5Writer {
         Shared::clone(&self.groups.lock()[index])
     }
 
-    /// Refuse a storage form this file's format cannot hold.
-    ///
-    /// Per form, not per file. Contiguous and compact storage both encode as
-    /// a version-3 data layout message, which is what
-    /// `H5O_layout_ver_bounds` gives `H5F_LIBVER_EARLIEST` (H5Dlayout.c:44),
-    /// so a classic file takes both; a committed datatype has no layout at
-    /// all; and chunked storage does too, filtered or not, over the version-1
-    /// B-tree index [`create_btree_v1_dataset`](Self::create_btree_v1_dataset)
-    /// builds.
-    ///
-    /// Virtual storage is the one form still out of reach, and it is refused
-    /// by name rather than as a bare "not supported" so the caller is told
-    /// which of the two files in front of them cannot hold it.
-    fn reject_unwritable_storage(&self, storage: NewStorage, name: &str) -> IoResult<()> {
-        if !self.is_legacy() {
-            return Ok(());
-        }
-        let (kind, why) = match storage {
-            // Nothing older than a version-4 layout message can say "virtual"
-            // at all, and writing one here would convert the file the same way.
-            NewStorage::Virtual => (
-                "virtual",
-                "which predates the version-4 data layout message a virtual dataset is \
-                 written as",
-            ),
-            // A filtered chunked dataset belongs here: its pipeline message
-            // encodes at version 1 (`ObjectFormat::filter_pipeline_version`)
-            // and its chunks are indexed by the version-1 B-tree
-            // `create_btree_v1_dataset` builds, both of which are what
-            // libhdf5 writes at `H5F_LIBVER_EARLIEST`.
-            NewStorage::ChunkedFiltered
-            | NewStorage::Chunked
-            | NewStorage::Contiguous
-            | NewStorage::Compact
-            | NewStorage::None => return Ok(()),
-        };
-        Err(crate::io::IoError::Unsupported(format!(
-            "cannot create the {kind} dataset '{name}' in this file: it is in the classic \
-             (version-0/1 superblock) format, {why}, or re-create the file at a newer \
-             library-version bound"
-        )))
-    }
-
     /// Enter the create gate: take `create_lock` and check that `name` is not
     /// already taken. The returned witness is what [`Self::push_dataset`]
     /// requires, so the uniqueness check and the registry push are atomic
     /// (see `create_lock`) at every creator by construction.
-    pub(crate) fn begin_create(
-        &self,
-        name: &str,
-        storage: NewStorage,
-    ) -> IoResult<CreateGuard<'_>> {
+    pub(crate) fn begin_create(&self, name: &str) -> IoResult<CreateGuard<'_>> {
         let gate = self.create_lock.lock();
         // A creation path through hard links lands in the link's target
         // group, as HDF5 traversal does. Canonicalizing here — the one
@@ -4019,7 +3943,6 @@ impl Hdf5Writer {
         self.reject_external_traversal(&name)?;
         self.ensure_name_free(&name)?;
         self.reject_preserved_object(&name)?;
-        self.reject_unwritable_storage(storage, &name)?;
         let (parent, _leaf) = self.split_parent(&name)?;
         Ok(CreateGuard {
             _gate: gate,
@@ -5946,7 +5869,7 @@ impl Hdf5Writer {
     /// name is resolved to a real parent group, refused if taken, and refused
     /// if it would cross a carried external link.
     pub fn commit_datatype(&self, name: &str, datatype: DatatypeMessage) -> IoResult<usize> {
-        let create = self.begin_create(name.trim_start_matches('/'), NewStorage::None)?;
+        let create = self.begin_create(name.trim_start_matches('/'))?;
         let entry = CommittedDatatype {
             name: create.name.clone(),
             parent: create.parent,
@@ -7677,7 +7600,7 @@ impl Hdf5Writer {
         datatype: DatatypeMessage,
         dims: &[u64],
     ) -> IoResult<usize> {
-        let create = self.begin_create(name, NewStorage::Contiguous)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         let total_elements: u64 = if dims.is_empty() {
             1
@@ -7770,7 +7693,7 @@ impl Hdf5Writer {
                  the files it lives in, so at least one is required"
             )));
         }
-        let create = self.begin_create(name, NewStorage::Contiguous)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         let total_elements: u64 = if dims.is_empty() {
             1
@@ -7933,7 +7856,7 @@ impl Hdf5Writer {
             reject_unlimited_selection(name, "virtual", &m.virtual_selection)?;
         }
 
-        let create = self.begin_create(name, NewStorage::Virtual)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
 
         // The mapping list is ordinary file metadata, written now: the header
@@ -8027,7 +7950,7 @@ impl Hdf5Writer {
             )));
         }
 
-        let create = self.begin_create(name, NewStorage::Compact)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         let dataspace = if dims.is_empty() {
             DataspaceMessage::scalar()
@@ -8082,7 +8005,7 @@ impl Hdf5Writer {
     /// `data_size` stays 0 permanently, the same terminal state
     /// `create_dataset` already reaches for a zero-length dimension.
     pub fn create_null_dataset(&self, name: &str, datatype: DatatypeMessage) -> IoResult<usize> {
-        let create = self.begin_create(name, NewStorage::Contiguous)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
 
         let idx = self.push_dataset(
@@ -8137,7 +8060,7 @@ impl Hdf5Writer {
         max_dims: &[u64],
         chunk_dims: &[u64],
     ) -> IoResult<usize> {
-        let create = self.begin_create(name, NewStorage::Chunked)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         ensure_at_most_one_unlimited(max_dims)?;
@@ -9382,7 +9305,7 @@ impl Hdf5Writer {
 
         ensure_vlen_charset(charset, strings)?;
 
-        let create = self.begin_create(name, NewStorage::Contiguous)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         let num_strings = strings.len() as u64;
 
@@ -9501,7 +9424,7 @@ impl Hdf5Writer {
             }
         }
 
-        let create = self.begin_create(name, NewStorage::Contiguous)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         let num_items = items.len() as u64;
 
@@ -9586,7 +9509,7 @@ impl Hdf5Writer {
         use crate::format::global_heap::encode_vlen_reference;
         use crate::format::messages::datatype::DatatypeMessage;
 
-        let create = self.begin_create(name, NewStorage::ChunkedFiltered)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         let num_strings = strings.len() as u64;
         validate_chunk_geometry(&[num_strings], &[num_strings], &[chunk_size as u64])?;
@@ -11130,14 +11053,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: Option<FilterPipeline>,
     ) -> IoResult<usize> {
-        let create = self.begin_create(
-            name,
-            if pipeline.is_some() {
-                NewStorage::ChunkedFiltered
-            } else {
-                NewStorage::Chunked
-            },
-        )?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         if max_dims.contains(&u64::MAX) {
@@ -11270,7 +11186,7 @@ impl Hdf5Writer {
         dims: &[u64],
         chunk_dims: &[u64],
     ) -> IoResult<usize> {
-        let create = self.begin_create(name, NewStorage::Chunked)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, dims, chunk_dims)?;
         let mut num_chunks: u64 = 1;
@@ -11369,7 +11285,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         early_alloc: bool,
     ) -> IoResult<usize> {
-        let create = self.begin_create(name, NewStorage::Chunked)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, dims, chunk_dims)?;
         let data_size = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
@@ -11464,7 +11380,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: FilterPipeline,
     ) -> IoResult<usize> {
-        let create = self.begin_create(name, NewStorage::ChunkedFiltered)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, dims, chunk_dims)?;
         let data_size = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
@@ -11545,14 +11461,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: Option<FilterPipeline>,
     ) -> IoResult<usize> {
-        let create = self.begin_create(
-            name,
-            if pipeline.is_some() {
-                NewStorage::ChunkedFiltered
-            } else {
-                NewStorage::Chunked
-            },
-        )?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         let chunk_bytes: u64 = chunk_dims.iter().product::<u64>() * datatype.element_size() as u64;
@@ -11673,14 +11582,7 @@ impl Hdf5Writer {
     ) -> IoResult<usize> {
         use crate::format::chunk_index::btree_v2::Bt2Header;
 
-        let create = self.begin_create(
-            name,
-            if pipeline.is_some() {
-                NewStorage::ChunkedFiltered
-            } else {
-                NewStorage::Chunked
-            },
-        )?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         let ndims = dims.len();
@@ -11788,7 +11690,7 @@ impl Hdf5Writer {
         chunk_dims: &[u64],
         pipeline: FilterPipeline,
     ) -> IoResult<usize> {
-        let create = self.begin_create(name, NewStorage::ChunkedFiltered)?;
+        let create = self.begin_create(name)?;
         let name = create.name.as_str();
         validate_chunk_geometry(dims, max_dims, chunk_dims)?;
         ensure_at_most_one_unlimited(max_dims)?;

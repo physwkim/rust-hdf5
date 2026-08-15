@@ -93,17 +93,6 @@ B_TOLERATED_FIELDS = {
 # a rerun after a writer fix shows the change rather than hiding it.
 EXPECTED_DEVIATIONS = [
     {
-        "id": "superblock-floor-v2",
-        "field": "superblock",
-        "ref": "0",
-        "rust": "2",
-        "why": "one case whose rust arm still creates at this crate's default "
-               "bounds, because H5F_LIBVER_EARLIEST cannot express what it "
-               "writes: `vds` needs a virtual dataset, refused in a classic "
-               "file. Every other earliest-bound case now writes the v0 "
-               "superblock itself",
-    },
-    {
         "id": "superblock-v3-for-chunk-index",
         "field": "superblock",
         "ref": None,
@@ -141,9 +130,8 @@ EXPECTED_DEVIATIONS = [
                "shared messages, whose master table lives in a superblock "
                "extension and so forces the version-2 superblock and with it "
                "version-2 headers (H5Fsuper.c:1135), whatever bound is asked "
-               "for; `vds` is the superblock-floor-v2 case above. The phase "
-               "change past max_compact still moves the links to dense "
-               "storage",
+               "for. The phase change past max_compact still moves the links "
+               "to dense storage",
     },
 ]
 

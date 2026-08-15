@@ -1726,14 +1726,14 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                     .to_string_lossy()
             );
             let src_path = std::path::Path::new(path).with_file_name(&src_name);
-            let src = H5File::create(src_path.to_string_lossy().as_ref())?;
+            let src = earliest_file(src_path.to_string_lossy().as_ref())?;
             src.new_dataset::<i32>()
                 .shape([16usize])
                 .create("src")?
                 .write_raw(&ramp_n::<i32>(16))?;
             src.close()?;
 
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             file.new_dataset::<i32>()
                 .shape([16usize])
                 .virtual_mapping(Selection::All, &src_name, "src", Selection::All)
