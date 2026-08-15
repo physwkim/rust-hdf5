@@ -92,6 +92,56 @@ fn libver_bound_reports_the_lowest_bound_sharing_a_version() {
     std::fs::remove_file(&path).ok();
 }
 
+/// The accessor answers over `SuperblockVersion::Existing`, not just
+/// `Chosen`: an append names no bound, so the version the reopen *found* is
+/// the version written back, at every generation. This is the read side of
+/// `reopen_superblock_bounds`'s structural assertions — that test reads the
+/// version byte out of the file, this one asks the public accessor.
+#[test]
+fn a_reopened_file_reports_the_superblock_version_it_was_created_with() {
+    for (label, libver, expect_version, expect_bound) in [
+        (
+            "reopen_v0",
+            Some(LibverBound::Earliest),
+            0u8,
+            LibverBound::Earliest,
+        ),
+        ("reopen_v2", None, 2, LibverBound::V18),
+        ("reopen_v3", Some(LibverBound::V110), 3, LibverBound::V110),
+    ] {
+        let path = unique_tmp(label);
+        let mut options = H5File::options();
+        if let Some(bound) = libver {
+            options = options.libver(bound);
+        }
+        let file = options.create(&path).unwrap();
+        file.create_group("g").unwrap();
+        file.close().unwrap();
+
+        // No bound named on the reopen: the file's own superblock is what
+        // settles the generation the appended dataset is written in.
+        let file = H5File::open_rw(&path).unwrap();
+        file.new_dataset::<i32>()
+            .shape([4usize, 4])
+            .chunk(&[2, 4])
+            .create("appended")
+            .unwrap()
+            .write_raw(&(0..16i32).collect::<Vec<_>>())
+            .unwrap();
+        file.close().unwrap();
+
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.superblock_version().unwrap(),
+            expect_version,
+            "{label}: superblock version changed across the reopen"
+        );
+        assert_eq!(file.libver_bound().unwrap(), expect_bound, "{label}");
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+}
+
 #[test]
 fn superblock_version_errors_in_write_mode() {
     let path = unique_tmp("write_mode");
