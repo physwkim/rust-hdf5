@@ -83,6 +83,18 @@ fn dims_str(dims: &[usize]) -> String {
     format!("[{}]", parts.join(","))
 }
 
+/// The twin of `canon.py`'s `maxdims_str`: `U` marks an unlimited axis.
+fn maxdims_str(dims: &[Option<usize>]) -> String {
+    let parts: Vec<String> = dims
+        .iter()
+        .map(|d| match d {
+            Some(n) => n.to_string(),
+            None => "U".to_string(),
+        })
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
 /// The filter name canon.py's `_FILTER_NAMES` reports for a well-known
 /// filter id, falling back to the bare id exactly as `dict.get(code,
 /// str(code))` does. This is a client-side lookup on both sides of the
@@ -871,7 +883,13 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
     });
 
     d.field(path, "maxshape", || {
-        Err("H5Dataset exposes no max_shape() accessor".into())
+        if is_null {
+            return Ok("null".into());
+        }
+        guarded(|| ds.max_shape())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|dims| maxdims_str(&dims))
+            .map_err(oneline)
     });
 
     let chunked = guarded(|| ds.is_chunked()).unwrap_or(false);

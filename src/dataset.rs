@@ -1814,6 +1814,44 @@ impl H5Dataset {
         }
     }
 
+    /// Return this dataset's maximum dimension sizes (read mode only):
+    /// `None` in a dimension marks that axis unlimited. A dataset with no
+    /// maximum-dimensions message reports its current shape (max == current
+    /// — the upstream convention for a fixed-extent dataset).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is in write mode, or if the dataset can
+    /// no longer be found in the reader's metadata.
+    pub fn max_shape(&self) -> Result<Vec<Option<usize>>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => reader
+                        .dataset_info(name)
+                        .map(|info| match &info.dataspace.max_dims {
+                            Some(max_dims) => max_dims
+                                .iter()
+                                .map(|&d| (d != u64::MAX).then_some(d as usize))
+                                .collect(),
+                            None => info
+                                .dataspace
+                                .dims
+                                .iter()
+                                .map(|&d| Some(d as usize))
+                                .collect(),
+                        })
+                        .ok_or_else(|| Hdf5Error::NotFound(name.clone())),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "max_shape() is only available in read mode".into(),
+            )),
+        }
+    }
+
     /// Return the names of all attributes on this dataset (read mode only).
     pub fn attr_names(&self) -> Result<Vec<String>> {
         match &self.info {
@@ -9228,5 +9266,37 @@ mod tests {
         assert_eq!(segments[1].name, "b.raw");
         assert_eq!(segments[1].offset, 8);
         assert_eq!(segments[1].size, 32);
+    }
+
+    /// [`H5Dataset::max_shape`] reports an unlimited axis as `None` and a
+    /// fixed one as its current size — and the negative case: a dataset
+    /// with no maximum-dimensions message reports max == current, not an
+    /// error.
+    #[test]
+    fn max_shape_reports_unlimited_and_fixed_axes() {
+        let path = temp_path("max_shape");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize, 8])
+                .create("fixed")
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize, 8])
+                .chunk(&[2, 8])
+                .max_shape(&[None, Some(8)])
+                .create("unlimited")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("fixed").unwrap().max_shape().unwrap(),
+            vec![Some(4), Some(8)]
+        );
+        assert_eq!(
+            file.dataset("unlimited").unwrap().max_shape().unwrap(),
+            vec![None, Some(8)]
+        );
     }
 }
