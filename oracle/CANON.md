@@ -91,6 +91,25 @@ following libhdf5's selection rules (`H5D__layout_set_version` /
 `H5D__chunk_construct`), because neither h5py nor the h5 CLI tools expose the
 chosen index type. It is marked as derived in the report.
 
+`filters` is read on the h5py side from the on-disk filter-pipeline message
+via `h5debug`, not from `dcpl.get_filter()` (`H5Pget_filter2`). Opening a
+scale-offset-filtered dataset re-invokes `H5Z__set_local_scaleoffset`, which
+rebuilds the pipeline's cd_values in memory; for the reserved/unused tail
+slots past the packed fill-value bytes, that rebuild leaves whatever was
+there before instead of the zeros actually on disk. On a real single-filter
+scale-offset case this was verified two ways, both independent of any Python
+binding: a byte-exact manual parse of the filter-pipeline message (its
+declared 88-byte size fully and exactly accounts for 20 zero-filled
+cd_values, nothing left over), and `h5debug <file> <header_addr>` — which
+calls libhdf5's own `H5O_pline_debug` directly — reporting `CD value 16`
+through `19` as `0`. `dcpl.get_filter()` instead reported
+`(1818321779, 1717989221, 7628147, 0)` for that same slot range, which
+decodes as the ASCII bytes `"scaleoffset\0"`: the filter's own name string
+bleeding through uncleared memory in the in-memory reconstruction. Routing
+`filters` through `h5debug` for every case (filtered or not, not just
+scale-offset) makes both oracle arms measure the same on-disk bytes; see
+`canon.py`'s `filters_str`.
+
 ## `data`
 
 * `empty` — NULL dataspace.
