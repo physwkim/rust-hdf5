@@ -376,3 +376,89 @@ fn h5py_reads_a_v18_file_back_at_the_same_bound() {
     libhdf5_tools_accept(py, &path);
     let _ = std::fs::remove_file(&path);
 }
+
+/// The other half of the VDS crossing. `tests/libver_earliest.rs` pins the
+/// classic end; this is the same rule one bound up, where the file around the
+/// virtual dataset is a modern one.
+///
+/// The bound sets a floor, not a ceiling — the `version_req` term of
+/// `H5D__chunk_set_info`'s final MAX (H5Dchunk.c:936) is what a *chunk* uses
+/// to escape it, and `H5D__virtual_construct` does the same for the virtual
+/// class, raising its own layout message to 4 against the high bound alone
+/// (H5Dvirtual.c:2679). So the file keeps everything the v1.8 row gives it —
+/// a version-2 superblock, and a chunked neighbour still on the version-1
+/// B-tree behind a version-3 layout message — over a version-4 layout message
+/// that no bound in it asked for. The layout version is no input to
+/// `H5F__super_init`, which is why the superblock does not move.
+#[test]
+fn a_virtual_dataset_at_v18_raises_only_its_own_layout_message() {
+    use rust_hdf5::Selection;
+
+    let path = tmp("virtual");
+    let source = path.with_file_name("rust_hdf5_v18_virtual_source.h5");
+    let src = v18(&source);
+    src.new_dataset::<i32>()
+        .shape([16usize])
+        .create("src")
+        .unwrap()
+        .write_raw(&(0..16i32).collect::<Vec<_>>())
+        .unwrap();
+    src.close().unwrap();
+
+    let file = v18(&path);
+    file.new_dataset::<i32>()
+        .shape([16usize])
+        .virtual_mapping(
+            Selection::All,
+            source.file_name().unwrap().to_str().unwrap(),
+            "src",
+            Selection::All,
+        )
+        .create("mapped")
+        .unwrap();
+    // The control: a chunked neighbour in the same file stays on the index
+    // the bound gives it.
+    file.new_dataset::<i32>()
+        .shape([16usize])
+        .chunk(&[16])
+        .create("grid")
+        .unwrap()
+        .write_raw(&(0..16i32).collect::<Vec<_>>())
+        .unwrap();
+    file.close().unwrap();
+
+    assert_eq!(superblock_version(&path), 2);
+    match layout_of(&path, "mapped") {
+        DataLayoutMessage::Virtual { version, .. } => assert_eq!(version, 4),
+        other => panic!("expected a virtual layout, got {other:?}"),
+    }
+    let grid = layout_of(&path, "grid");
+    assert!(
+        matches!(grid, DataLayoutMessage::ChunkedV3 { .. }),
+        "the neighbour is untouched by the virtual dataset's raise: {grid:?}"
+    );
+    for magic in [b"EAHD", b"FAHD", b"BTHD"] {
+        assert!(
+            !contains(&path, magic),
+            "{} appears beside a virtual dataset at H5F_LIBVER_V18",
+            String::from_utf8_lossy(magic)
+        );
+    }
+
+    if let Some(py) = python() {
+        read_at_v108(
+            py,
+            &path,
+            "expected = np.arange(16, dtype='<i4')\n\
+             assert f['mapped'].is_virtual\n\
+             assert np.array_equal(f['mapped'][...], expected), f['mapped'][...]\n\
+             (vspace, fname, dname, sspace), = f['mapped'].virtual_sources()\n\
+             assert fname == 'rust_hdf5_v18_virtual_source.h5', fname\n\
+             assert dname == 'src', dname\n\
+             assert np.array_equal(f['grid'][...], expected), f['grid'][...]\n",
+        );
+        libhdf5_tools_accept(py, &path);
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&source);
+}
