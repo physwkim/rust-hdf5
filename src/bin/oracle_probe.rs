@@ -26,12 +26,16 @@ use rust_hdf5::format::messages::datatype::{
     ByteOrder, CompoundMember, DatatypeMessage, EnumMember,
 };
 use rust_hdf5::format::messages::filter::{
-    Filter, FilterPipeline, FILTER_FLETCHER32, FLAG_MANDATORY,
+    Filter, FilterPipeline, FILTER_BLOSC, FILTER_BSHUF, FILTER_BZIP2, FILTER_DEFLATE,
+    FILTER_FLETCHER32, FILTER_LZ4, FILTER_LZF, FILTER_NBIT, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
+    FILTER_SZIP, FILTER_ZSTD, FLAG_MANDATORY,
 };
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
-    H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error, Hyperslab,
-    HyperslabBlock, LibverBound, LinkClass, Reference, Selection,
+    AttributeStorage, ChunkIndex, CreationOrder, ExternalFileSegment, FillValue, H5Attribute,
+    H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error, Hyperslab,
+    HyperslabBlock, LibverBound, LinkClass, LinkStorage, Reference, Selection, StorageLayout,
+    VirtualMapping,
 };
 
 const CANON_VERSION: &str = "3";
@@ -77,6 +81,113 @@ fn hex(bytes: &[u8]) -> String {
 
 fn dims_str(dims: &[usize]) -> String {
     let parts: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// The twin of `canon.py`'s `maxdims_str`: `U` marks an unlimited axis.
+fn maxdims_str(dims: &[Option<usize>]) -> String {
+    let parts: Vec<String> = dims
+        .iter()
+        .map(|d| match d {
+            Some(n) => n.to_string(),
+            None => "U".to_string(),
+        })
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// The filter name canon.py's `_FILTER_NAMES` reports for a well-known
+/// filter id, falling back to the bare id exactly as `dict.get(code,
+/// str(code))` does. This is a client-side lookup on both sides of the
+/// oracle, not something either reads from the file: h5py's own
+/// `filters_str` discards the on-disk name field the same way.
+fn filter_name(id: u16) -> String {
+    match id {
+        FILTER_DEFLATE => "deflate".into(),
+        FILTER_SHUFFLE => "shuffle".into(),
+        FILTER_FLETCHER32 => "fletcher32".into(),
+        FILTER_SZIP => "szip".into(),
+        FILTER_NBIT => "nbit".into(),
+        FILTER_SCALEOFFSET => "scaleoffset".into(),
+        FILTER_BZIP2 => "bzip2".into(),
+        FILTER_LZF => "lzf".into(),
+        FILTER_BLOSC => "blosc".into(),
+        FILTER_LZ4 => "lz4".into(),
+        FILTER_BSHUF => "bshuf".into(),
+        FILTER_ZSTD => "zstd".into(),
+        other => other.to_string(),
+    }
+}
+
+/// `filters_str`'s per-filter rendering: `name(cd0|cd1|...)@flags`.
+fn filters_str(filters: &[Filter]) -> String {
+    let parts: Vec<String> = filters
+        .iter()
+        .map(|f| {
+            let cd: Vec<String> = f.cd_values.iter().map(|c| c.to_string()).collect();
+            format!("{}({})@{}", filter_name(f.id), cd.join("|"), f.flags)
+        })
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// `external_str`'s per-segment rendering: `name@offset+size`, `-` when
+/// there are no segments (the data lives in this file).
+fn external_str(segments: &[ExternalFileSegment]) -> String {
+    if segments.is_empty() {
+        return "-".into();
+    }
+    let parts: Vec<String> = segments
+        .iter()
+        .map(|s| format!("{}@{}+{}", esc(&s.name), s.offset, s.size))
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
+fn dims_u64_str(dims: &[u64]) -> String {
+    let parts: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// The twin of `canon.py`'s `_bounds_str`: `"?"` when the bounds cannot be
+/// resolved. Unlike `Selection::bounds()`, which has no dataspace to
+/// consult and so returns `None` for `Selection::All`, h5py's own
+/// `get_select_bounds()` resolves an ALL selection against whatever
+/// dataspace it is bound to — real and known for the virtual side (the
+/// VDS's own extent, passed as `all_extent`), but never resolvable for the
+/// source side (the mapping stores no source dataspace extent, only the
+/// selection), so `all_extent` must be `None` there.
+fn selection_bounds_str(sel: &Selection, all_extent: Option<&[usize]>) -> String {
+    let bounds = match (sel, all_extent) {
+        (Selection::All, Some(shape)) => Some((
+            vec![0u64; shape.len()],
+            shape.iter().map(|&d| d.saturating_sub(1) as u64).collect(),
+        )),
+        _ => sel.bounds(),
+    };
+    match bounds {
+        Some((lo, hi)) => format!("{}-{}", dims_u64_str(&lo), dims_u64_str(&hi)),
+        None => "?".to_string(),
+    }
+}
+
+/// `virtual_str`'s per-mapping rendering: `name::dsetname srcbounds->vbounds`.
+fn virtual_str(mappings: &[VirtualMapping], vds_shape: &[usize]) -> String {
+    if mappings.is_empty() {
+        return "-".into();
+    }
+    let parts: Vec<String> = mappings
+        .iter()
+        .map(|m| {
+            format!(
+                "{}::{} {}->{}",
+                esc(&m.source_file_name),
+                esc(&m.source_dset_name),
+                selection_bounds_str(&m.source_selection, None),
+                selection_bounds_str(&m.virtual_selection, Some(vds_shape)),
+            )
+        })
+        .collect();
     format!("[{}]", parts.join(","))
 }
 
@@ -563,12 +674,6 @@ fn child_path(parent: &str, name: &str) -> String {
 fn dump_file(path: &str) -> std::result::Result<String, String> {
     let mut d = Dump::new();
     d.emit("!canon", CANON_VERSION);
-    // The superblock version is what pins the libver bound a file was written
-    // under, and there is no public accessor for it on H5File.
-    d.emit(
-        "#superblock",
-        unsupported("superblock", "H5File exposes no superblock/libver accessor"),
-    );
 
     let file = match guarded(|| H5File::open(path)) {
         Ok(Ok(f)) => f,
@@ -576,9 +681,17 @@ fn dump_file(path: &str) -> std::result::Result<String, String> {
         Err(p) => return Err(format!("H5File::open panicked: {p}")),
     };
 
+    // The twin of `canon.py`'s `read_superblock`: the raw version byte
+    // straight after the signature. Has to come after the open — it is a
+    // property of the file, not of the path.
+    d.field("", "superblock", || {
+        file.superblock_version()
+            .map(|v| v.to_string())
+            .map_err(oneline)
+    });
+
     // `H5File::userblock_size` answers in either mode, so this is a value the
-    // canon can be compared against rather than an API gap. It has to come
-    // after the open — it is a property of the file, not of the path.
+    // canon can be compared against rather than an API gap.
     d.field("", "userblock", || Ok(file.userblock_size().to_string()));
 
     let root = file.root_group();
@@ -586,21 +699,61 @@ fn dump_file(path: &str) -> std::result::Result<String, String> {
     Ok(d.lines.join("\n") + "\n")
 }
 
+/// The twin of `canon.py`'s `crt_order_str`: `-`, `tracked`, or
+/// `tracked+indexed` — `Indexed` always implies `Tracked`, so those three are
+/// the only strings either side ever produces.
+fn crt_order_str(order: CreationOrder) -> &'static str {
+    match order {
+        CreationOrder::Untracked => "-",
+        CreationOrder::Tracked => "tracked",
+        CreationOrder::Indexed => "tracked+indexed",
+    }
+}
+
+/// The twin of `canon.py`'s `dump_attrs`'s `attrstore` lambda: `"compact"` or
+/// `"dense"`, the same two strings h5py's `meta_size.attr.index_size` check
+/// produces.
+fn attrstore_str(storage: AttributeStorage) -> &'static str {
+    if storage.is_dense() {
+        "dense"
+    } else {
+        "compact"
+    }
+}
+
+/// The twin of `canon.py`'s `link_storage_str`: `"symtab"`, `"compact"`, or
+/// `"dense"`.
+fn linkstore_str(storage: LinkStorage) -> &'static str {
+    match storage {
+        LinkStorage::SymbolTable => "symtab",
+        LinkStorage::Compact => "compact",
+        LinkStorage::Dense => "dense",
+    }
+}
+
 fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: usize) {
     d.emit(&format!("{path}#kind"), "group");
     d.field(path, "linkorder", || {
-        Err("H5Group exposes no link creation-order tracking flags".into())
+        group
+            .link_creation_order()
+            .map(crt_order_str)
+            .map(str::to_string)
+            .map_err(oneline)
     });
     d.field(path, "attrorder", || {
-        Err("H5Group exposes no attribute creation-order tracking flags".into())
+        group
+            .attr_creation_order()
+            .map(crt_order_str)
+            .map(str::to_string)
+            .map_err(oneline)
     });
-    d.emit(
-        &format!("{path}#linkstore"),
-        unsupported(
-            "linkstore",
-            "H5Group exposes no compact/dense link storage accessor",
-        ),
-    );
+    d.field(path, "linkstore", || {
+        group
+            .link_storage()
+            .map(linkstore_str)
+            .map(str::to_string)
+            .map_err(oneline)
+    });
     dump_group_attrs(d, path, group);
 
     if depth >= MAX_DEPTH {
@@ -820,21 +973,30 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
     });
 
     d.field(path, "maxshape", || {
-        Err("H5Dataset exposes no max_shape() accessor".into())
+        if is_null {
+            return Ok("null".into());
+        }
+        guarded(|| ds.max_shape())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|dims| maxdims_str(&dims))
+            .map_err(oneline)
     });
 
     let chunked = guarded(|| ds.is_chunked()).unwrap_or(false);
 
     d.field(path, "layout", || {
-        if chunked {
-            Ok("chunked".into())
-        } else {
-            Err(
-                "H5Dataset::is_chunked() is false; contiguous and compact are \
-                 not distinguishable through the public API"
-                    .into(),
-            )
-        }
+        guarded(|| ds.storage_layout())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|layout| {
+                match layout {
+                    StorageLayout::Compact => "compact",
+                    StorageLayout::Contiguous => "contiguous",
+                    StorageLayout::Chunked => "chunked",
+                    StorageLayout::Virtual => "virtual",
+                }
+                .to_string()
+            })
+            .map_err(oneline)
     });
 
     d.field(path, "chunk", || {
@@ -848,27 +1010,55 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
     });
 
     d.field(path, "chunkindex", || {
-        if chunked {
-            Err("H5Dataset exposes no chunk index type".into())
-        } else {
-            Ok("-".into())
+        if !chunked {
+            return Ok("-".into());
+        }
+        match guarded(|| ds.chunk_index()).map_err(|p| format!("panic: {p}"))? {
+            Ok(Some(kind)) => Ok(match kind {
+                ChunkIndex::BtreeV1 => "btree1",
+                ChunkIndex::BtreeV2 => "btree2",
+                ChunkIndex::SingleChunk => "single",
+                ChunkIndex::Implicit => "implicit",
+                ChunkIndex::FixedArray => "farray",
+                ChunkIndex::ExtensibleArray => "earray",
+            }
+            .to_string()),
+            Ok(None) => Err("is_chunked() is true but chunk_index() returned None".into()),
+            Err(e) => Err(oneline(e)),
         }
     });
 
     d.field(path, "external", || {
-        Err("H5Dataset exposes no external file list accessor".into())
+        guarded(|| ds.external_files())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|segments| external_str(&segments))
+            .map_err(oneline)
     });
 
     d.field(path, "virtual", || {
-        Err("H5Dataset exposes no virtual mapping accessor".into())
+        let vds_shape = guarded(|| ds.shape()).map_err(|p| format!("panic: {p}"))?;
+        guarded(|| ds.virtual_mappings())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|mappings| virtual_str(&mappings, &vds_shape))
+            .map_err(oneline)
     });
 
     d.field(path, "filters", || {
-        Err("H5Dataset exposes no filter pipeline accessor".into())
+        guarded(|| ds.filters())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|filters| filters_str(&filters))
+            .map_err(oneline)
     });
 
     d.field(path, "fillvalue", || {
-        Err("H5Dataset exposes no fill value accessor".into())
+        guarded(|| ds.fill_value())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|fv| match fv {
+                FillValue::Default => "default".to_string(),
+                FillValue::Undefined => "undefined".to_string(),
+                FillValue::UserDefined(bytes) => format!("0x{}", hex(&bytes)),
+            })
+            .map_err(oneline)
     });
 
     dump_object_attrs(d, path, ds);
@@ -936,8 +1126,12 @@ fn dataset_payload(
 trait AttrSource {
     fn attr_names(&self) -> rust_hdf5::Result<Vec<String>>;
     fn attr(&self, name: &str) -> rust_hdf5::Result<H5Attribute>;
-    /// What stands in the way of the object-header attribute count.
-    fn nattrs_hdr_gap() -> &'static str;
+    /// This object's own object-header attribute count, or what stands in
+    /// the way of reading it.
+    fn header_attr_count(&self) -> std::result::Result<u64, String>;
+    /// This object's own compact/dense attribute storage, or what stands in
+    /// the way of reading it.
+    fn attr_storage(&self) -> std::result::Result<AttributeStorage, String>;
 }
 
 impl AttrSource for H5Dataset {
@@ -947,8 +1141,11 @@ impl AttrSource for H5Dataset {
     fn attr(&self, name: &str) -> rust_hdf5::Result<H5Attribute> {
         H5Dataset::attr(self, name)
     }
-    fn nattrs_hdr_gap() -> &'static str {
-        "H5Dataset exposes no object-header attribute count"
+    fn header_attr_count(&self) -> std::result::Result<u64, String> {
+        H5Dataset::header_attr_count(self).map_err(oneline)
+    }
+    fn attr_storage(&self) -> std::result::Result<AttributeStorage, String> {
+        H5Dataset::attr_storage(self).map_err(oneline)
     }
 }
 
@@ -959,8 +1156,11 @@ impl AttrSource for H5NamedDatatype {
     fn attr(&self, name: &str) -> rust_hdf5::Result<H5Attribute> {
         H5NamedDatatype::attr(self, name)
     }
-    fn nattrs_hdr_gap() -> &'static str {
-        "H5NamedDatatype exposes no object-header attribute count"
+    fn header_attr_count(&self) -> std::result::Result<u64, String> {
+        H5NamedDatatype::header_attr_count(self).map_err(oneline)
+    }
+    fn attr_storage(&self) -> std::result::Result<AttributeStorage, String> {
+        Err("H5NamedDatatype exposes no compact/dense attribute storage accessor".into())
     }
 }
 
@@ -1000,17 +1200,12 @@ fn dump_object_attrs<T: AttrSource>(d: &mut Dump, path: &str, ds: &T) {
         }
     };
     d.emit(&format!("{path}#nattrs"), names.len().to_string());
-    d.emit(
-        &format!("{path}#nattrs_hdr"),
-        unsupported("nattrs_hdr", T::nattrs_hdr_gap()),
-    );
-    d.emit(
-        &format!("{path}#attrstore"),
-        unsupported(
-            "attrstore",
-            "H5Dataset exposes no compact/dense attribute storage accessor",
-        ),
-    );
+    d.field(path, "nattrs_hdr", || {
+        ds.header_attr_count().map(|n| n.to_string())
+    });
+    d.field(path, "attrstore", || {
+        ds.attr_storage().map(attrstore_str).map(str::to_string)
+    });
 
     for name in names {
         let key = format!("{path}@{name}");
@@ -1093,20 +1288,19 @@ fn dump_group_attrs(d: &mut Dump, path: &str, group: &H5Group) {
         }
     };
     d.emit(&format!("{path}#nattrs"), names.len().to_string());
-    d.emit(
-        &format!("{path}#nattrs_hdr"),
-        unsupported(
-            "nattrs_hdr",
-            "H5Group exposes no object-header attribute count",
-        ),
-    );
-    d.emit(
-        &format!("{path}#attrstore"),
-        unsupported(
-            "attrstore",
-            "H5Group exposes no compact/dense attribute storage accessor",
-        ),
-    );
+    d.field(path, "nattrs_hdr", || {
+        group
+            .header_attr_count()
+            .map(|n| n.to_string())
+            .map_err(oneline)
+    });
+    d.field(path, "attrstore", || {
+        group
+            .attr_storage()
+            .map(attrstore_str)
+            .map(str::to_string)
+            .map_err(oneline)
+    });
 
     for name in names {
         let key = format!("{path}@{name}");
@@ -2223,6 +2417,9 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         "libver_v108" => libver_case(path, LibverBound::V18),
         "libver_v110" => libver_case(path, LibverBound::V110),
         "libver_latest" => libver_case(path, LibverBound::V200),
+        "reopen_append_earliest" => reopen_append_case(path, LibverBound::Earliest),
+        "reopen_append_v108" => reopen_append_case(path, LibverBound::V18),
+        "reopen_append_latest" => reopen_append_case(path, LibverBound::V200),
         "userblock" => {
             let file = H5File::options()
                 .libver(LibverBound::Earliest)
@@ -2444,6 +2641,26 @@ fn libver_case(path: &str, libver: LibverBound) -> rust_hdf5::Result<WriteResult
         .create("data")?
         .write_raw(&ramp_n::<i32>(8))?;
     file.root_group().create_group("g")?;
+    file.close()?;
+    Ok(Ok(()))
+}
+
+/// The same file, reopened without a bound and appended to.
+///
+/// No `libver` on the reopen, deliberately: the file's own superblock version
+/// is what settles the generation the appended dataset is written in, the way
+/// `H5F__super_read` raises the low bound to match the version it finds. The
+/// superblock version itself must come out of the reopen unchanged.
+fn reopen_append_case(path: &str, libver: LibverBound) -> rust_hdf5::Result<WriteResult> {
+    if let Err(unsupported) = libver_case(path, libver)? {
+        return Ok(Err(unsupported));
+    }
+    let file = H5File::open_rw(path)?;
+    file.new_dataset::<i32>()
+        .shape([4usize, 4])
+        .chunk(&[2, 4])
+        .create("appended")?
+        .write_raw(&ramp_n::<i32>(16))?;
     file.close()?;
     Ok(Ok(()))
 }

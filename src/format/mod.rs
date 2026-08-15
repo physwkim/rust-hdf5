@@ -22,6 +22,7 @@ pub mod reference;
 pub mod selection;
 pub mod sohm;
 pub mod sohm_write;
+pub mod storage_kind;
 pub mod superblock;
 pub mod symbol_table;
 pub mod szip;
@@ -114,6 +115,25 @@ impl LibverBound {
             Self::V110 | Self::V112 | Self::V114 | Self::V200 => 3,
         }
     }
+
+    /// The lowest bound whose [`superblock_version`](Self::superblock_version)
+    /// matches an on-disk version byte.
+    ///
+    /// Lossy in one direction: superblock version 3 is shared by four bounds
+    /// (`V110` through `V200`), because raising the low bound past `V18` never
+    /// raises the superblock further — the version alone cannot tell them
+    /// apart, so this reports the lowest, `V110`. A version this crate's own
+    /// writer never emits (1) reads back as `Earliest`, the same legacy
+    /// generation as 0; anything past 3 has no bound to report and falls back
+    /// to the library's newest.
+    pub fn from_superblock_version(version: u8) -> Self {
+        match version {
+            0 | 1 => Self::Earliest,
+            2 => Self::V18,
+            3 => Self::V110,
+            _ => Self::V200,
+        }
+    }
 }
 
 /// Which generation of the on-disk object format one file's objects are
@@ -157,9 +177,19 @@ impl ObjectFormat {
         }
     }
 
-    /// The fill-value message version (`H5O_fill_ver_bounds`, H5Ofill.c:150).
-    /// The earliest bound writes version 2 — version 1 is the separate
-    /// "fill value (old)" message type, which this writer never emits.
+    /// The fill-value message version.
+    ///
+    /// `H5O_fill_ver_bounds` (H5Ofill.c:150) is `H5O_FILL_VERSION_1` at the
+    /// earliest bound, but the bound is only half of it: `H5O__fill_set_version`
+    /// takes `MAX(fill->version, bound)`, and the default creation property list
+    /// starts every fill value at `H5O_FILL_VERSION_2` (H5Pdcpl.c:163). Nothing
+    /// in the public API lowers it, so version 1 is unreachable and a classic
+    /// file's new fill message is version 2.
+    ///
+    /// Version 1 is not the "fill value (old)" message either — that is a
+    /// separate message type (0x04, `MSG_FILL_VALUE_OLD`) with its own
+    /// size-and-bytes encoding, which a classic file carries *alongside* this
+    /// one when the fill value is user-defined.
     pub fn fill_value_version(self) -> u8 {
         match self {
             Self::Legacy => 2,

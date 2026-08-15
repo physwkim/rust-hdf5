@@ -60,6 +60,12 @@ impl H5NamedDatatype {
         Ok(H5Attribute::new_reader(clone_inner(&self.file_inner), msg))
     }
 
+    /// This committed datatype's own object-header attribute count — the
+    /// equivalent of `h5py.h5o.get_info(o.id).num_attrs`.
+    pub fn header_attr_count(&self) -> Result<u64> {
+        self.with_reader(|reader, name| Ok(reader.named_datatype_header_attr_count(name)?))
+    }
+
     /// Run `f` against the reader behind this handle.
     fn with_reader<T>(
         &self,

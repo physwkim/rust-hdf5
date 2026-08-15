@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::format::btree_v1::{BTreeV1Config, BTreeV1Node, ChunkBTreeV1Node};
 use crate::format::bytes::read_le_uint as read_uint;
+use crate::format::creation_order::CreationOrder;
 use crate::format::fractal_heap::{self, FractalHeapHeader};
 use crate::format::global_heap::{
     decode_vlen_reference, vlen_reference_size, GlobalHeapCollection,
@@ -39,6 +40,7 @@ use crate::format::reference::{
 };
 use crate::format::selection::{Hyperslab, PointSelection, RegularHyperslab, Selection};
 use crate::format::sohm::SohmMasterTable;
+use crate::format::storage_kind::{AttributeStorage, LinkStorage};
 use crate::format::superblock::{
     detect_superblock_version, SuperblockV0V1, SuperblockV2V3, SymbolTableCache,
 };
@@ -156,6 +158,13 @@ pub struct DatasetReadInfo {
     /// fill-value message when `fill_defined == 2`. `None` => default
     /// zero-fill. Applied to unallocated chunks and unwritten regions.
     pub fill_value: Option<Vec<u8>>,
+    /// The fill-value message's own definedness byte
+    /// (`H5D_fill_value_t`/`H5Pfill_value_defined`): 0 = explicitly
+    /// undefined (no fill is ever performed), 1 = default (zero-fill, no
+    /// value stored), 2 = user-defined (`fill_value` carries the bytes). A
+    /// dataset with no fill-value message at all reads as 1, matching a
+    /// fresh dataset creation property list (`FillValueMessage::default`).
+    pub fill_defined: u8,
     /// External raw-data segments (H5O_EFL_ID). Non-empty only when this
     /// dataset's storage is an External Data Files list instead of a
     /// normal contiguous block — `layout` still reports `Contiguous` with
@@ -313,6 +322,9 @@ struct Catalog {
     unreadable: std::collections::BTreeMap<String, String>,
     /// Attributes on non-root groups, keyed by group path.
     group_attributes: std::collections::HashMap<String, ObjectAttributes>,
+    /// Link storage kind and link creation-order policy of non-root groups,
+    /// keyed by group path.
+    group_link_storage: std::collections::HashMap<String, (LinkStorage, CreationOrder)>,
     /// Every non-root group path the walk traversed into.
     group_paths: std::collections::BTreeSet<String>,
     /// Group object header address → the first path that reached it (no
@@ -416,11 +428,7 @@ impl<'a> CatalogWalk<'a> {
         if depth > Self::MAX_DEPTH {
             return Ok(());
         }
-        let link_storage = header.filter(|h| {
-            h.messages
-                .iter()
-                .any(|m| m.msg_type == MSG_LINK || m.msg_type == MSG_LINK_INFO)
-        });
+        let link_storage = header.filter(|h| header_declares_link_storage(h));
         if let Some(h) = link_storage {
             return self.links(h, prefix, depth);
         }
@@ -602,13 +610,21 @@ impl<'a> CatalogWalk<'a> {
         // by path. Through the shared collector, which carries a per-attribute
         // failure as an entry naming it: a group whose attribute did not
         // decode must not come back as a group with one fewer attribute.
+        // Recorded unconditionally, even for a group with none: the entry
+        // also carries the header's own creation-order and storage facts,
+        // which exist whether or not the group currently has any attributes.
         let ctx = self.meta.ctx;
         let attrs = collect_object_attributes(self.handle, &ctx, &header);
-        if !attrs.is_empty() {
-            self.catalog
-                .group_attributes
-                .insert(full_name.clone(), attrs);
-        }
+        self.catalog
+            .group_attributes
+            .insert(full_name.clone(), attrs);
+        // Same unconditional recording for link storage and link
+        // creation-order: this group's own header answers both whether or
+        // not it descends any further.
+        self.catalog.group_link_storage.insert(
+            full_name.clone(),
+            describe_link_storage(Some(&header), &ctx, stab),
+        );
 
         // Descend at most once per object header (cycle guard); a second path
         // to it is a group hard link — record the alias for lookups instead.
@@ -630,6 +646,71 @@ fn join_path(prefix: &str, name: &str) -> String {
     } else {
         format!("{}/{}", prefix, name)
     }
+}
+
+/// Whether an object header declares link-message storage (compact or
+/// dense) rather than the legacy symbol-table format — `Walk::group`'s own
+/// dispatch predicate, factored out so [`describe_link_storage`] answers the
+/// same question by construction rather than by keeping two checks in sync.
+fn header_declares_link_storage(header: &ObjectHeader) -> bool {
+    header
+        .messages
+        .iter()
+        .any(|m| m.msg_type == MSG_LINK || m.msg_type == MSG_LINK_INFO)
+}
+
+/// A group's own link storage kind and link creation-order policy — h5py's
+/// `link_storage_str` and `get_link_creation_order()`, computed together
+/// because both read the same `Link Info` message.
+///
+/// `stab` is the symbol-table scratch-pad copy from the entry that named
+/// this group, exactly as [`CatalogWalk::group`] takes it; `header` is
+/// `None` only when the object header itself did not decode.
+fn describe_link_storage(
+    header: Option<&ObjectHeader>,
+    ctx: &FormatContext,
+    stab: Option<(u64, u64)>,
+) -> (LinkStorage, CreationOrder) {
+    if let Some(h) = header.filter(|h| header_declares_link_storage(h)) {
+        // Link-message storage: the `Link Info` message, when present, gives
+        // both facts at once. Its absence means compact and untracked — no
+        // message exists to carry a creation index in.
+        return h
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MSG_LINK_INFO)
+            .and_then(|m| LinkInfoMessage::decode(&m.data, ctx).ok())
+            .map(|(info, _)| {
+                let storage = if info.is_dense() {
+                    LinkStorage::Dense
+                } else {
+                    LinkStorage::Compact
+                };
+                (storage, info.creation_order())
+            })
+            .unwrap_or((LinkStorage::Compact, CreationOrder::Untracked));
+    }
+    // No link-message storage in the header (or no header to check at all):
+    // symbol-table format when the scratch-pad or the header's own `Symbol
+    // Table` message resolves an address pair. Creation order is always
+    // untracked here — the pre-1.8 format predates the feature, and 1.8+
+    // never tracks creation order without also converting to link storage.
+    let (btree_addr, heap_addr) = match stab {
+        Some(pair) if pair.0 != UNDEF_ADDR && pair.1 != UNDEF_ADDR => pair,
+        _ => header.map_or((UNDEF_ADDR, UNDEF_ADDR), |h| {
+            Hdf5Reader::stab_from_header(h, ctx)
+        }),
+    };
+    let storage = if btree_addr != UNDEF_ADDR && heap_addr != UNDEF_ADDR {
+        LinkStorage::SymbolTable
+    } else {
+        // Neither link-message nor symbol-table storage is declared — an
+        // object header this crate could not fully account for. Nothing in
+        // the 92-case oracle suite reaches this path; it exists so an
+        // unreadable root group still answers rather than panicking.
+        LinkStorage::Compact
+    };
+    (storage, CreationOrder::Untracked)
 }
 
 /// What an object header describes.
@@ -748,6 +829,10 @@ pub struct Hdf5Reader {
     ext: SuperblockExtension,
     /// End-of-file address from the superblock.
     _eof: u64,
+    /// Superblock format version (0-3), decoded once at open time by
+    /// `detect_superblock_version` and never re-derived: 0/1 is the legacy
+    /// symbol-table root, 2/3 the link-message root.
+    superblock_version: u8,
     #[allow(dead_code)]
     root_group_info: RootGroupInfo,
     datasets: Vec<DatasetReadInfo>,
@@ -758,8 +843,13 @@ pub struct Hdf5Reader {
     unreadable: std::collections::BTreeMap<String, String>,
     /// Attributes on the root group (file-level attributes).
     root_attributes: ObjectAttributes,
+    /// Link storage kind and link creation-order policy of the root group.
+    root_link_storage: (LinkStorage, CreationOrder),
     /// Attributes on non-root groups, keyed by group path (no leading `/`).
     group_attributes: std::collections::HashMap<String, ObjectAttributes>,
+    /// Link storage kind and link creation-order policy of non-root groups,
+    /// keyed by group path (no leading `/`).
+    group_link_storage: std::collections::HashMap<String, (LinkStorage, CreationOrder)>,
     /// Every non-root group path the discovery walk traversed into (no
     /// leading `/`), regardless of whether the group has datasets or
     /// attributes. Built from actual link records, so empty groups,
@@ -1387,12 +1477,16 @@ impl Hdf5Reader {
 
         // Collect root group attributes
         let root_attributes = collect_object_attributes(&mut handle, &ctx, &root_header);
+        // A v2/v3 root group is always addressed directly by the superblock,
+        // never through a symbol-table scratch-pad.
+        let root_link_storage = describe_link_storage(Some(&root_header), &ctx, None);
 
         Ok(Self {
             handle,
             meta,
             ext,
             _eof: sb.end_of_file_address,
+            superblock_version: sb.version,
             root_group_info: RootGroupInfo::V2V3 {
                 root_group_object_header_address: sb.root_group_object_header_address,
             },
@@ -1400,7 +1494,9 @@ impl Hdf5Reader {
             datasets: catalog.datasets,
             unreadable: catalog.unreadable,
             root_attributes,
+            root_link_storage,
             group_attributes: catalog.group_attributes,
+            group_link_storage: catalog.group_link_storage,
             group_paths: catalog.group_paths,
             group_aliases: catalog.group_aliases,
             links: catalog.links,
@@ -1453,6 +1549,10 @@ impl Hdf5Reader {
             Some(ref h) => collect_object_attributes(&mut handle, &ctx, h),
             None => ObjectAttributes::default(),
         };
+        // The root group's own link storage and link creation-order, from
+        // the same header-first/scratch-pad-fallback rule the walk below
+        // uses to choose how to enumerate it.
+        let root_link_storage = describe_link_storage(root_hdr.as_ref(), &ctx, ste_stab);
 
         // A v0/v1-superblock file whose root group has migrated to link
         // storage (more than ~8 objects, or one link the old format cannot
@@ -1475,6 +1575,7 @@ impl Hdf5Reader {
             meta,
             ext,
             _eof: sb.end_of_file_address,
+            superblock_version: sb.version,
             root_group_info: RootGroupInfo::V0V1 {
                 root_obj_header_addr: root_obj_addr,
                 btree_addr: ste_btree_addr,
@@ -1484,7 +1585,9 @@ impl Hdf5Reader {
             datasets: catalog.datasets,
             unreadable: catalog.unreadable,
             root_attributes,
+            root_link_storage,
             group_attributes: catalog.group_attributes,
+            group_link_storage: catalog.group_link_storage,
             group_paths: catalog.group_paths,
             group_aliases: catalog.group_aliases,
             links: catalog.links,
@@ -1849,6 +1952,11 @@ impl Hdf5Reader {
         let mut layout = None;
         let mut filter_pipeline = None;
         let mut fill_value = None;
+        // No message at all is the library default: a fresh dataset
+        // creation property list starts fill_defined = 1
+        // (`FillValueMessage::default`), so a dataset that never got one
+        // written reads back exactly as if it had.
+        let mut fill_defined: u8 = 1;
         // The first message that did not decode, kept verbatim: it is the
         // answer a caller gets when it asks for this dataset.
         let mut blocked: Option<String> = None;
@@ -1909,6 +2017,7 @@ impl Hdf5Reader {
                 },
                 MSG_FILL_VALUE => match FillValueMessage::decode(&msg.data) {
                     Ok((fv, _)) => {
+                        fill_defined = fv.fill_defined;
                         if fv.fill_defined == 2 {
                             fill_value = fv.fill_value;
                         }
@@ -1983,6 +2092,7 @@ impl Hdf5Reader {
                 filter_pipeline,
                 attributes,
                 fill_value,
+                fill_defined,
                 external_files,
                 virtual_mappings,
             })),
@@ -2128,6 +2238,18 @@ impl Hdf5Reader {
         Ok(names)
     }
 
+    /// The committed datatype at `path`'s own object-header attribute count.
+    ///
+    /// Committed-datatype attributes are collected only from compact header
+    /// messages ([`Self::committed_datatype`]) — this crate does not model
+    /// dense attribute storage on a named datatype — so unlike
+    /// [`ObjectAttributes::header_count`] this is simply the count of what
+    /// [`Self::named_datatype_attr_names`] already lists, with no separate
+    /// dense-index path to fall back to.
+    pub fn named_datatype_header_attr_count(&mut self, path: &str) -> IoResult<u64> {
+        Ok(self.named_datatype_info(path)?.attributes().len() as u64)
+    }
+
     /// One attribute of the committed datatype at `path`, by name.
     pub fn named_datatype_attr(
         &mut self,
@@ -2254,6 +2376,13 @@ impl Hdf5Reader {
     /// a file without a userblock.
     pub fn userblock_size(&self) -> u64 {
         self.handle.base()
+    }
+
+    /// The superblock format version (0-3), decoded once at open time and
+    /// immutable for the life of an open file — a live SWMR refresh rescans
+    /// the file's contents but never its own format version.
+    pub fn superblock_version(&self) -> u8 {
+        self.superblock_version
     }
 
     /// The v1 B-tree split ranks in force for this file, after the superblock
@@ -2513,6 +2642,23 @@ impl Hdf5Reader {
         self.dataset_info(ds_name)?.attributes.unreadable_reason()
     }
 
+    /// A dataset's own compact-vs-dense attribute storage.
+    pub fn dataset_attr_storage(&mut self, ds_name: &str) -> IoResult<AttributeStorage> {
+        Ok(self
+            .dataset_info(ds_name)
+            .ok_or_else(|| crate::io::IoError::NotFound(ds_name.to_string()))?
+            .attributes
+            .storage())
+    }
+
+    /// A dataset's own object-header attribute count.
+    pub fn dataset_header_attr_count(&mut self, ds_name: &str) -> IoResult<u64> {
+        let info = self
+            .dataset_info(ds_name)
+            .ok_or_else(|| crate::io::IoError::NotFound(ds_name.to_string()))?;
+        info.attributes.header_count(ds_name)
+    }
+
     /// Why the root group's attributes cannot be listed at all, or `None` when
     /// the set is whole.
     pub fn root_attrs_unreadable_reason(&self) -> Option<&str> {
@@ -2560,6 +2706,32 @@ impl Hdf5Reader {
         Self::resolve_attr(&self.root_attributes, "/", name)
     }
 
+    /// The root group's own attribute creation-order policy.
+    pub fn root_attr_creation_order(&self) -> CreationOrder {
+        self.root_attributes.creation_order()
+    }
+
+    /// The root group's own compact-vs-dense attribute storage.
+    pub fn root_attr_storage(&self) -> AttributeStorage {
+        self.root_attributes.storage()
+    }
+
+    /// The root group's own object-header attribute count.
+    pub fn root_header_attr_count(&self) -> IoResult<u64> {
+        self.root_attributes.header_count("/")
+    }
+
+    /// The root group's own link creation-order policy.
+    pub fn root_link_creation_order(&self) -> CreationOrder {
+        self.root_link_storage.1
+    }
+
+    /// The root group's own link storage kind: symbol-table (legacy),
+    /// compact link messages, or dense (fractal heap plus name index).
+    pub fn root_link_storage(&self) -> LinkStorage {
+        self.root_link_storage.0
+    }
+
     /// Return the attribute names of a non-root group (path without a
     /// leading `/`, e.g. `"detector"` or `"entry/instrument"`; may pass
     /// through group hard links). Undecodable attributes included — see
@@ -2582,6 +2754,56 @@ impl Hdf5Reader {
             return Ok(Vec::new());
         };
         attrs.ordered_names(group_path)
+    }
+
+    /// A non-root group's own attribute creation-order policy. `Untracked`
+    /// for a path the walk never reached, the same silent default
+    /// [`group_attr_names_local`](Self::group_attr_names_local) gives an
+    /// unknown group's attribute listing.
+    pub fn group_attr_creation_order(&self, group_path: &str) -> CreationOrder {
+        self.group_attributes
+            .get(&self.canonical_path(group_path))
+            .map(ObjectAttributes::creation_order)
+            .unwrap_or_default()
+    }
+
+    /// A non-root group's own compact-vs-dense attribute storage. `Compact`
+    /// — the same silent default as an empty attribute set — for a path the
+    /// walk never reached.
+    pub fn group_attr_storage(&self, group_path: &str) -> AttributeStorage {
+        self.group_attributes
+            .get(&self.canonical_path(group_path))
+            .map(ObjectAttributes::storage)
+            .unwrap_or_default()
+    }
+
+    /// A non-root group's own object-header attribute count. `0` for a path
+    /// the walk never reached, the same silent default
+    /// [`group_attr_names_local`](Self::group_attr_names_local) gives an
+    /// unknown group's attribute listing.
+    pub fn group_header_attr_count(&self, group_path: &str) -> IoResult<u64> {
+        let Some(attrs) = self.group_attributes.get(&self.canonical_path(group_path)) else {
+            return Ok(0);
+        };
+        attrs.header_count(group_path)
+    }
+
+    /// A non-root group's own link creation-order policy. `Untracked` for a
+    /// path the walk never reached, the same silent default
+    /// [`group_attr_creation_order`](Self::group_attr_creation_order) gives.
+    pub fn group_link_creation_order(&self, group_path: &str) -> CreationOrder {
+        self.group_link_storage
+            .get(&self.canonical_path(group_path))
+            .map_or(CreationOrder::Untracked, |(_, order)| *order)
+    }
+
+    /// A non-root group's own link storage kind. `Compact` — the same
+    /// silent default as an empty link set — for a path the walk never
+    /// reached.
+    pub fn group_link_storage(&self, group_path: &str) -> LinkStorage {
+        self.group_link_storage
+            .get(&self.canonical_path(group_path))
+            .map_or(LinkStorage::Compact, |(storage, _)| *storage)
     }
 
     /// Return a non-root group's attribute by name.
@@ -3159,13 +3381,20 @@ impl Hdf5Reader {
             None,
         )?;
 
+        // Root link storage from the freshly re-read header, the same way
+        // `open_v2v3` derives it at open time — SWMR refresh is v2/v3-only,
+        // so there is no symbol-table scratch-pad to fall back to here either.
+        let root_link_storage = describe_link_storage(Some(&root_header), &meta.ctx, None);
+
         self._eof = sb.end_of_file_address;
         self.meta = meta;
         self.ext = ext;
         self.object_paths = catalog.object_paths(sb.root_group_object_header_address);
         self.datasets = catalog.datasets;
         self.unreadable = catalog.unreadable;
+        self.root_link_storage = root_link_storage;
         self.group_attributes = catalog.group_attributes;
+        self.group_link_storage = catalog.group_link_storage;
         self.group_paths = catalog.group_paths;
         self.group_aliases = catalog.group_aliases;
         self.links = catalog.links;
@@ -5254,6 +5483,15 @@ pub(crate) struct HandleBlockReader<'a> {
 pub struct ObjectAttributes {
     entries: Vec<AttributeEntry>,
     incomplete: Option<String>,
+    /// This object's own attribute creation-order policy, from the header
+    /// flag bits `H5Pget_attr_creation_order` reads back
+    /// (`attribute_creation_order`) — a structural fact about the header,
+    /// known even when the entries above are `incomplete`.
+    creation_order: CreationOrder,
+    /// This object's own compact-vs-dense attribute storage, from the
+    /// attribute info message's heap address (or its absence) — likewise a
+    /// structural fact known even when the entries are `incomplete`.
+    storage: AttributeStorage,
 }
 
 impl ObjectAttributes {
@@ -5282,6 +5520,41 @@ impl ObjectAttributes {
     /// [`AttributeEntry::unreadable_reason`] answers for those.
     pub fn unreadable_reason(&self) -> Option<&str> {
         self.incomplete.as_deref()
+    }
+
+    /// This object's own attribute creation-order policy —
+    /// `H5Pget_attr_creation_order`'s answer, read off the object header's
+    /// own flag bits rather than derived from the entries. Available even
+    /// when the set is [`incomplete`](Self::unreadable_reason): it names
+    /// nothing that failed to decode.
+    pub fn creation_order(&self) -> CreationOrder {
+        self.creation_order
+    }
+
+    /// This object's own compact-vs-dense attribute storage — h5py's
+    /// `h5o.get_info(...).meta_size.attr.index_size` check, read off the
+    /// attribute info message's heap address rather than derived from the
+    /// entries. Available even when the set is
+    /// [`incomplete`](Self::unreadable_reason).
+    pub fn storage(&self) -> AttributeStorage {
+        self.storage
+    }
+
+    /// This object's own attribute count as `H5Oget_info().num_attrs`
+    /// reports it — the object header's count, not necessarily the same
+    /// enumeration path as [`ordered_names`](Self::ordered_names).
+    ///
+    /// `H5O__attr_count_real` derives this from the attribute info message
+    /// when the header carries one (the dense name-index record count, or
+    /// the compact message count `H5O__attr_open_by_idx` already counted
+    /// while building it) and from the raw attribute-message envelope count
+    /// otherwise. Both reduce to the number of attributes this collector
+    /// successfully names: a conformant writer creates the info message
+    /// exactly when it has attributes to report through it, so a whole set's
+    /// length already equals what libhdf5's header-count algorithm answers,
+    /// without replaying its v1-header/v2-header branch here.
+    pub fn header_count(&self, owner: &str) -> IoResult<u64> {
+        Ok(self.complete(owner)?.len() as u64)
     }
 
     /// Nothing worth recording: no attribute read, and no failure to report.
@@ -5363,7 +5636,10 @@ pub(crate) fn collect_object_attributes(
     ctx: &FormatContext,
     header: &ObjectHeader,
 ) -> ObjectAttributes {
-    let mut attrs = ObjectAttributes::default();
+    let mut attrs = ObjectAttributes {
+        creation_order: header.attribute_creation_order(),
+        ..ObjectAttributes::default()
+    };
     // The message envelope carries a creation index only when the header says
     // the object tracks one; the field is not even encoded otherwise
     // (`H5O_SIZEOF_MSGHDR_OH`), so reading it as an index would report zero
@@ -5379,6 +5655,11 @@ pub(crate) fn collect_object_attributes(
             },
             MSG_ATTR_INFO => match AttributeInfoMessage::decode(&msg.data, ctx) {
                 Ok((info, _)) => {
+                    attrs.storage = if info.is_dense() {
+                        AttributeStorage::Dense
+                    } else {
+                        AttributeStorage::Compact
+                    };
                     let mut br = HandleBlockReader { handle };
                     match crate::format::dense_attr::read_dense_attributes(&info, ctx, &mut br) {
                         Ok(dense) => attrs.entries.extend(dense),

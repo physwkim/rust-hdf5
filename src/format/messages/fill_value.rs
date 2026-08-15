@@ -33,6 +33,18 @@ const FLAG_HAVE_VALUE: u8 = 0x20;
 const FLAGS_ALL: u8 =
     FLAG_MASK_ALLOC | (FLAG_MASK_FILL << FLAG_SHIFT_FILL) | FLAG_UNDEFINED | FLAG_HAVE_VALUE;
 
+/// `H5D_FILL_TIME_IFSET`, the write time the default dataset creation
+/// property list carries (`H5D_CRT_FILL_TIME_DEF`, H5Dpkg.h) and therefore the
+/// one every dataset gets unless `H5Pset_fill_time` says otherwise.
+///
+/// It means "fill at allocation only when the user set a fill value", where
+/// `H5D_FILL_TIME_ALLOC` fills at allocation either way. The two differ only
+/// for a dataset with no fill value of its own, where `ALLOC` writes the
+/// default fill — zeros — and `IFSET` writes nothing into space that reads as
+/// zeros regardless. So this is what the writer's own allocation-time fills
+/// already do, whichever of the two the message claimed.
+pub const FILL_TIME_IFSET: u8 = 2;
+
 /// Fill value message payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FillValueMessage {
@@ -49,9 +61,9 @@ pub struct FillValueMessage {
 impl Default for FillValueMessage {
     fn default() -> Self {
         Self {
-            alloc_time: 2,      // late
-            fill_write_time: 0, // on alloc
-            fill_defined: 1,    // default value (zeros)
+            alloc_time: 2, // late
+            fill_write_time: FILL_TIME_IFSET,
+            fill_defined: 1, // default value (zeros)
             fill_value: None,
         }
     }
@@ -62,7 +74,7 @@ impl FillValueMessage {
     pub fn with_value(data: Vec<u8>) -> Self {
         Self {
             alloc_time: 2,
-            fill_write_time: 0,
+            fill_write_time: FILL_TIME_IFSET,
             fill_defined: 2,
             fill_value: Some(data),
         }
@@ -537,7 +549,7 @@ mod tests {
     fn a_legacy_user_fill_value_round_trips() {
         let fv = FillValueMessage::with_value(vec![7, 0, 0, 0]);
         let buf = fv.encode_for(crate::format::ObjectFormat::Legacy);
-        assert_eq!(&buf[..4], &[0x02, 0x02, 0x00, 0x01]);
+        assert_eq!(&buf[..4], &[0x02, 0x02, 0x02, 0x01]);
         let (back, _) = FillValueMessage::decode(&buf).unwrap();
         assert_eq!(back, fv);
     }

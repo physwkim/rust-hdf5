@@ -637,6 +637,30 @@ impl H5File {
         }
     }
 
+    /// This file's on-disk superblock format version (0-3) — libhdf5's
+    /// `H5F_get_info2`'s `super_version`, read from the file's own header
+    /// rather than derived from any bound a caller asked for.
+    pub fn superblock_version(&self) -> Result<u8> {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(reader.superblock_version()),
+            _ => Err(Hdf5Error::InvalidState(
+                "superblock_version is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// The lowest [`LibverBound`] consistent with this file's on-disk
+    /// superblock version — a *view* reconstructed from
+    /// [`superblock_version`](Self::superblock_version), not the bound a
+    /// writer may have named: [`LibverBound::superblock_version`] maps four
+    /// bounds onto version 3, so a version-3 file reports [`LibverBound::V110`]
+    /// regardless of which of the four actually wrote it.
+    pub fn libver_bound(&self) -> Result<LibverBound> {
+        self.superblock_version()
+            .map(LibverBound::from_superblock_version)
+    }
+
     /// Check if the file is in write/append mode.
     pub fn is_writable(&self) -> bool {
         let inner = borrow_inner(&self.inner);

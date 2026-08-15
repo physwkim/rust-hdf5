@@ -25,12 +25,15 @@ use rust_hdf5::format::btree_v1::{BTreeV1Config, BTreeV1Node};
 use rust_hdf5::format::local_heap::{local_heap_get_string, LocalHeapHeader};
 use rust_hdf5::format::messages::data_layout::{ChunkIndexType, DataLayoutMessage};
 use rust_hdf5::format::messages::link::{LinkMessage, LinkTarget};
-use rust_hdf5::format::messages::{MSG_DATA_LAYOUT, MSG_LINK, MSG_SYMBOL_TABLE};
+use rust_hdf5::format::messages::{
+    MSG_DATA_LAYOUT, MSG_FILL_VALUE, MSG_FILL_VALUE_OLD, MSG_FLAG_CONSTANT, MSG_LINK,
+    MSG_SYMBOL_TABLE,
+};
 use rust_hdf5::format::object_header::ObjectHeader;
 use rust_hdf5::format::superblock::{SuperblockV0V1, SuperblockV2V3};
 use rust_hdf5::format::symbol_table::SymbolTableNode;
 use rust_hdf5::format::FormatContext;
-use rust_hdf5::{H5File, LibverBound};
+use rust_hdf5::{FillValue, H5File, LibverBound};
 
 /// Interpreters tried in order when `RUST_HDF5_TEST_PYTHON` is unset,
 /// matching `legacy_append`. `h5dump` and `h5clear` are taken from the same
@@ -597,6 +600,19 @@ fn classic_layout_version_of(path: &std::path::Path, name: &str) -> u8 {
 }
 
 fn classic_layout_message_of(path: &std::path::Path, name: &str) -> (Vec<u8>, FormatContext) {
+    let (messages, ctx) = classic_messages_of(path, name);
+    let msg = messages
+        .iter()
+        .find(|(msg_type, _, _)| *msg_type == MSG_DATA_LAYOUT)
+        .unwrap_or_else(|| panic!("'{name}' has no data layout message"));
+    (msg.2.clone(), ctx)
+}
+
+/// Every header message of a classic file's dataset, as `(type, flags, body)`.
+fn classic_messages_of(
+    path: &std::path::Path,
+    name: &str,
+) -> (Vec<(u8, u8, Vec<u8>)>, FormatContext) {
     let bytes = std::fs::read(path).unwrap();
     let sb = SuperblockV0V1::decode(&bytes).unwrap();
     let (addr_size, size_size) = (sb.sizeof_offsets as usize, sb.sizeof_lengths as usize);
@@ -648,12 +664,216 @@ fn classic_layout_message_of(path: &std::path::Path, name: &str) -> (Vec<u8>, Fo
     // A version-1 header carries no "OHDR" signature, so this is the arm
     // `decode_any` picks by its absence.
     let (header, _) = ObjectHeader::decode_v1(&bytes[at..]).unwrap();
-    let msg = header
+    let messages = header
         .messages
         .iter()
-        .find(|m| m.msg_type == MSG_DATA_LAYOUT)
-        .unwrap_or_else(|| panic!("'{name}' has no data layout message"));
-    (msg.data.clone(), ctx)
+        .map(|m| (m.msg_type, m.flags, m.data.clone()))
+        .collect();
+    (messages, ctx)
+}
+
+/// The same, for a file whose root group holds link messages.
+fn modern_messages_of(path: &std::path::Path, name: &str) -> Vec<(u8, u8, Vec<u8>)> {
+    let bytes = std::fs::read(path).unwrap();
+    let sb = SuperblockV2V3::decode(&bytes).unwrap();
+    let ctx = FormatContext {
+        sizeof_addr: sb.sizeof_offsets,
+        sizeof_size: sb.sizeof_lengths,
+    };
+    let at = (sb.base_address + sb.root_group_object_header_address) as usize;
+    let (root, _) = ObjectHeader::decode(&bytes[at..]).unwrap();
+    let addr = root
+        .messages
+        .iter()
+        .filter(|m| m.msg_type == MSG_LINK)
+        .filter_map(|m| LinkMessage::decode(&m.data, &ctx).ok())
+        .find_map(|(l, _)| match l.target {
+            LinkTarget::Hard { address } if l.name == name => Some(address),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no link '{name}' in the root group"));
+    let (header, _) = ObjectHeader::decode(&bytes[(sb.base_address + addr) as usize..]).unwrap();
+    header
+        .messages
+        .iter()
+        .map(|m| (m.msg_type, m.flags, m.data.clone()))
+        .collect()
+}
+
+/// The fill-value messages of `name`, in header order.
+fn fill_messages(messages: Vec<(u8, u8, Vec<u8>)>) -> Vec<(u8, u8, Vec<u8>)> {
+    messages
+        .into_iter()
+        .filter(|(msg_type, _, _)| *msg_type == MSG_FILL_VALUE || *msg_type == MSG_FILL_VALUE_OLD)
+        .collect()
+}
+
+/// A user-defined fill value in a classic file is written twice: once in the
+/// fill-value message (0x05) every generation writes, and once more in the
+/// "fill value (old)" message (0x04) that predates it.
+///
+/// `H5D__update_oh_info` (H5Dint.c:1024-1035) appends the old message whenever
+/// `fill_prop->buf` is set and `use_at_least_v18` — `H5F_LOW_BOUND(file) >=
+/// H5F_LIBVER_V18` — is false, so that a reader too old to know the new
+/// message still finds the value. It carries the size and the bytes and
+/// nothing else (`H5O__fill_old_encode`, H5Ofill.c:512): the allocation time,
+/// the write time and the defined flag have no place in it.
+///
+/// The new message stays at version 2 at this bound, which the version table
+/// alone does not say — `H5O_fill_ver_bounds[H5F_LIBVER_EARLIEST]` is
+/// `H5O_FILL_VERSION_1`, but `H5O__fill_set_version` takes the maximum of that
+/// and `fill->version`, which the default creation property list has already
+/// set to `H5O_FILL_VERSION_2` (H5Pdcpl.c:163). Version 1 is unreachable.
+///
+/// Every byte asserted here was read out of an h5py `libver='earliest'` file
+/// by walking its version-1 object headers.
+#[test]
+fn a_classic_user_defined_fill_value_carries_the_old_message_too() {
+    let path = tmp("classic_fill_old");
+    let file = earliest(&path);
+    file.new_dataset::<i32>()
+        .shape([4])
+        .create("plain")
+        .unwrap();
+    file.new_dataset::<i32>()
+        .shape([4])
+        .fill_value(7i32)
+        .create("withfill")
+        .unwrap();
+    file.close().unwrap();
+
+    // No fill value of the dataset's own, so `fill_prop->buf` is NULL and the
+    // old message is not written — h5py's `/plain` has the one message too.
+    let plain = fill_messages(classic_messages_of(&path, "plain").0);
+    assert_eq!(
+        plain.iter().map(|m| m.0).collect::<Vec<_>>(),
+        vec![MSG_FILL_VALUE],
+        "a dataset with no fill value of its own gets the new message alone"
+    );
+    assert_eq!(plain[0].2[0], 2, "the classic fill message is version 2");
+
+    let withfill = fill_messages(classic_messages_of(&path, "withfill").0);
+    assert_eq!(
+        withfill.iter().map(|m| m.0).collect::<Vec<_>>(),
+        vec![MSG_FILL_VALUE, MSG_FILL_VALUE_OLD],
+        "the old message follows the new one, as `H5D__update_oh_info` appends it"
+    );
+    assert_eq!(
+        withfill[0].2,
+        // Version 2, allocation time late, write time `H5D_FILL_TIME_IFSET`,
+        // the defined flag, the size and the value; the last four bytes are
+        // the version-1 header's eight-byte message alignment. Byte for byte
+        // h5py's.
+        vec![0x02, 0x02, 0x02, 0x01, 0x04, 0, 0, 0, 0x07, 0, 0, 0, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        withfill[1].1, MSG_FLAG_CONSTANT,
+        "H5O_MSG_FLAG_CONSTANT, the flag `H5D__update_oh_info` passes"
+    );
+    assert_eq!(
+        withfill[1].2,
+        // The four-byte size and the four value bytes, byte-for-byte h5py's.
+        vec![0x04, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00],
+    );
+
+    // The same dataset at the default bounds: `use_at_least_v18` is true, so
+    // the new message stands alone and is version 3.
+    let modern = tmp("modern_fill_old");
+    let file = H5File::create(&modern).unwrap();
+    file.new_dataset::<i32>()
+        .shape([4])
+        .fill_value(7i32)
+        .create("withfill")
+        .unwrap();
+    file.close().unwrap();
+    let at_v18 = fill_messages(modern_messages_of(&modern, "withfill"));
+    assert_eq!(
+        at_v18.iter().map(|m| m.0).collect::<Vec<_>>(),
+        vec![MSG_FILL_VALUE],
+        "above the v1.8 bound the old message is not written at all"
+    );
+    assert_eq!(at_v18[0].2[0], 3, "and the new message is version 3");
+    // The same content in version 3's packed flag byte: allocation time late
+    // in bits 0-1, `H5D_FILL_TIME_IFSET` in bits 2-3, value defined in bit 5.
+    // Byte for byte h5py's 0x2a.
+    assert_eq!(at_v18[0].2, vec![0x03, 0x2a, 0x04, 0, 0, 0, 0x07, 0, 0, 0]);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&modern);
+}
+
+/// The read side of the dual fill-value message: two messages on disk, one
+/// answer out of [`H5Dataset::fill_value`].
+///
+/// `H5O_FILL_ID` (0x05) and `H5O_FILL_ID_OLD` (0x04) carry the same four bytes
+/// in a classic file, and the reader takes the new one — the only one that
+/// also carries the allocation time, the write time and the defined flag the
+/// accessor's three-way answer needs. So the old message must not add a second
+/// user fill value, and must not shadow the new one into `Default`.
+///
+/// The oracle's `fillvalue` field is the same question asked of the same file
+/// from h5py: `dcpl.get_fill_value()` renders as `0x` plus the raw bytes, so
+/// the string this test builds from the accessor is the string `canon.py`
+/// builds from libhdf5 — asserted here directly against h5py rather than
+/// waiting for a full oracle run.
+#[test]
+fn a_classic_dual_fill_message_dataset_reads_back_one_user_fill_value() {
+    let path = tmp("classic_fill_read");
+    let file = earliest(&path);
+    file.new_dataset::<i32>()
+        .shape([4])
+        .create("plain")
+        .unwrap();
+    file.new_dataset::<i32>()
+        .shape([4])
+        .fill_value(7i32)
+        .create("withfill")
+        .unwrap();
+    file.close().unwrap();
+
+    // The premise: this dataset really does carry both messages.
+    assert_eq!(
+        fill_messages(classic_messages_of(&path, "withfill").0)
+            .iter()
+            .map(|m| m.0)
+            .collect::<Vec<_>>(),
+        vec![MSG_FILL_VALUE, MSG_FILL_VALUE_OLD],
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let fill = file.dataset("withfill").unwrap().fill_value().unwrap();
+    assert_eq!(
+        fill,
+        FillValue::UserDefined(7i32.to_le_bytes().to_vec()),
+        "the new message's value, once, not the old message's copy beside it"
+    );
+    // The canonical rendering `oracle/canon.py` compares against.
+    let FillValue::UserDefined(bytes) = &fill else {
+        unreachable!()
+    };
+    let canon: String = bytes.iter().fold("0x".to_string(), |mut s, b| {
+        s.push_str(&format!("{b:02x}"));
+        s
+    });
+    assert_eq!(canon, "0x07000000");
+    assert_eq!(
+        file.dataset("plain").unwrap().fill_value().unwrap(),
+        FillValue::Default,
+        "a dataset with no fill value of its own has no old message to mistake"
+    );
+    file.close().unwrap();
+
+    if let Some(py) = python() {
+        read_with_h5py(
+            py,
+            &path,
+            "fv = f['withfill'].fillvalue\n\
+             assert fv.tobytes().hex() == '07000000', fv.tobytes().hex()\n\
+             assert f['plain'].fillvalue.tobytes().hex() == '00000000'\n\
+             f.close()",
+        );
+    }
+    let _ = std::fs::remove_file(&path);
 }
 
 /// A fixed shape covered by exactly one chunk is the shape
@@ -1118,10 +1338,11 @@ fn a_virtual_dataset_in_a_file_created_at_earliest_raises_only_its_layout_messag
 }
 
 /// SWMR needs a version-3 superblock to record that a writer is attached, and
-/// this file has a version-0 one. libhdf5 answers the combination by raising
-/// the low bound to V110 and writing the newer file; this refuses it by name,
-/// because the bound arrived as a request for the classic format and a
-/// version-3 file would answer a different request than the one made.
+/// this file has a version-0 one. Reopened here, so it is
+/// `H5F__start_swmr_write`'s own first check that answers — refuse below
+/// version 3 (H5Fint.c:3814) — and the refusal names the version it found.
+/// libhdf5 refuses the same call the same way; the one place it upgrades
+/// instead is SWMR asked for at *create* time, which is not this.
 #[test]
 fn an_swmr_session_on_a_file_created_at_earliest_is_refused() {
     use rust_hdf5::swmr::SwmrFileWriter;
@@ -1138,7 +1359,7 @@ fn an_swmr_session_on_a_file_created_at_earliest_is_refused() {
 
     let mut writer = SwmrFileWriter::open_append(&path).unwrap();
     let err = writer.start_swmr().unwrap_err().to_string();
-    assert!(err.contains("classic"), "{err}");
+    assert!(err.contains("superblock is version 0"), "{err}");
     assert!(err.contains("version-3"), "{err}");
     drop(writer);
 

@@ -20,9 +20,11 @@
 use crate::dataset::{DatasetBuilder, H5Dataset};
 use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
+use crate::format::creation_order::CreationOrder;
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::filter::FilterPipeline;
 use crate::format::messages::link::LinkTarget;
+use crate::format::storage_kind::{AttributeStorage, LinkStorage};
 use crate::io::reader::LinkClass;
 use crate::types::H5Type;
 
@@ -1005,6 +1007,99 @@ impl H5Group {
             }
             _ => Err(Hdf5Error::InvalidState(
                 "attr_names is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// This group's own attribute creation-order policy — the equivalent of
+    /// `H5Pget_attr_creation_order(gid.get_create_plist())` — `-` when
+    /// neither `TRACKED` nor `INDEXED` is set, and never derived from
+    /// whether the group currently holds any attributes: a group can track
+    /// creation order and still be empty (read mode).
+    pub fn attr_creation_order(&self) -> Result<CreationOrder> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_attr_creation_order()
+            } else {
+                reader.group_attr_creation_order(self.name.trim_start_matches('/'))
+            }),
+            _ => Err(Hdf5Error::InvalidState(
+                "attr_creation_order is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// This group's own compact-vs-dense attribute storage — the equivalent
+    /// of `h5py.h5o.get_info(gid.id).meta_size.attr.index_size` being
+    /// nonzero.
+    pub fn attr_storage(&self) -> Result<AttributeStorage> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_attr_storage()
+            } else {
+                reader.group_attr_storage(self.name.trim_start_matches('/'))
+            }),
+            _ => Err(Hdf5Error::InvalidState(
+                "attr_storage is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// This group's own object-header attribute count — the equivalent of
+    /// `h5py.h5o.get_info(gid.id).num_attrs`, which need not equal
+    /// [`attr_names`](Self::attr_names)'s length when the set could not be
+    /// read whole.
+    pub fn header_attr_count(&self) -> Result<u64> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_header_attr_count()?
+            } else {
+                reader.group_header_attr_count(self.name.trim_start_matches('/'))?
+            }),
+            _ => Err(Hdf5Error::InvalidState(
+                "header_attr_count is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// This group's own link creation-order policy — the equivalent of
+    /// `H5Pget_link_creation_order(gid.get_create_plist())`. A fact about
+    /// the group's own `Link Info` message, independent of
+    /// [`attr_creation_order`](Self::attr_creation_order): a group can track
+    /// one without the other.
+    pub fn link_creation_order(&self) -> Result<CreationOrder> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_link_creation_order()
+            } else {
+                reader.group_link_creation_order(self.name.trim_start_matches('/'))
+            }),
+            _ => Err(Hdf5Error::InvalidState(
+                "link_creation_order is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// This group's own link storage kind — the equivalent of libhdf5's
+    /// `H5Gget_info(gid).storage_type`: `SymbolTable` for a pre-1.8 group
+    /// (a v1 B-tree plus local heap, present regardless of the object
+    /// header's own version), `Compact` while links live as messages in the
+    /// header, or `Dense` once the phase change moves the whole set into a
+    /// fractal heap plus name index.
+    pub fn link_storage(&self) -> Result<LinkStorage> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_link_storage()
+            } else {
+                reader.group_link_storage(self.name.trim_start_matches('/'))
+            }),
+            _ => Err(Hdf5Error::InvalidState(
+                "link_storage is only available in read mode".into(),
             )),
         }
     }
