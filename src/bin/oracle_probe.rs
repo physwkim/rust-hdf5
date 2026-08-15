@@ -30,8 +30,8 @@ use rust_hdf5::format::messages::filter::{
 };
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
-    H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error, Hyperslab,
-    HyperslabBlock, LibverBound, LinkClass, Reference, Selection, StorageLayout,
+    ChunkIndex, H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error,
+    Hyperslab, HyperslabBlock, LibverBound, LinkClass, Reference, Selection, StorageLayout,
 };
 
 const CANON_VERSION: &str = "3";
@@ -851,10 +851,21 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
     });
 
     d.field(path, "chunkindex", || {
-        if chunked {
-            Err("H5Dataset exposes no chunk index type".into())
-        } else {
-            Ok("-".into())
+        if !chunked {
+            return Ok("-".into());
+        }
+        match guarded(|| ds.chunk_index()).map_err(|p| format!("panic: {p}"))? {
+            Ok(Some(kind)) => Ok(match kind {
+                ChunkIndex::BtreeV1 => "btree1",
+                ChunkIndex::BtreeV2 => "btree2",
+                ChunkIndex::SingleChunk => "single",
+                ChunkIndex::Implicit => "implicit",
+                ChunkIndex::FixedArray => "farray",
+                ChunkIndex::ExtensibleArray => "earray",
+            }
+            .to_string()),
+            Ok(None) => Err("is_chunked() is true but chunk_index() returned None".into()),
+            Err(e) => Err(oneline(e)),
         }
     });
 

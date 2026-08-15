@@ -1398,6 +1398,33 @@ pub enum StorageLayout {
     Virtual,
 }
 
+/// The chunk index structure a chunked dataset uses on disk (read mode
+/// only) — which of libhdf5's chunk-lookup structures the layout message
+/// names.
+///
+/// `BtreeV1` belongs to the version-3 chunked layout message (the only
+/// index a file whose superblock predates version 2 can carry); the other
+/// five are what a version-4 message's index-type byte selects, per
+/// `H5D__layout_set_latest_indexing` (H5Dlayout.c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkIndex {
+    /// Version-1 B-tree — the classic chunk index, and the only one a
+    /// version-3 chunked layout message can carry.
+    BtreeV1,
+    /// Version-2 B-tree — two or more unlimited dimensions.
+    BtreeV2,
+    /// A single index entry for a dataset whose one chunk covers the whole
+    /// dataspace (`dims == max_dims == chunk_dims`).
+    SingleChunk,
+    /// No index structure at all: chunk addresses are computed
+    /// arithmetically over a contiguous run (no filter, early allocation).
+    Implicit,
+    /// Fixed-size array — a fixed shape needing per-chunk bookkeeping.
+    FixedArray,
+    /// Extensible array — exactly one unlimited dimension.
+    ExtensibleArray,
+}
+
 impl H5Dataset {
     /// Create a reader-mode dataset handle (called internally by `H5File::dataset`).
     pub(crate) fn new_reader(
@@ -1636,6 +1663,50 @@ impl H5Dataset {
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "storage_layout() is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Return the chunk index structure this dataset's layout uses, or
+    /// `None` for a dataset that is not chunked (read mode only).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is in write mode, or if the dataset can
+    /// no longer be found in the reader's metadata.
+    pub fn chunk_index(&self) -> Result<Option<ChunkIndex>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => {
+                        use crate::format::messages::data_layout::{
+                            ChunkIndexType, DataLayoutMessage,
+                        };
+                        reader
+                            .dataset_info(name)
+                            .map(|info| match &info.layout {
+                                DataLayoutMessage::ChunkedV3 { .. } => Some(ChunkIndex::BtreeV1),
+                                DataLayoutMessage::ChunkedV4 { index_type, .. } => {
+                                    Some(match index_type {
+                                        ChunkIndexType::SingleChunk => ChunkIndex::SingleChunk,
+                                        ChunkIndexType::Implicit => ChunkIndex::Implicit,
+                                        ChunkIndexType::FixedArray => ChunkIndex::FixedArray,
+                                        ChunkIndexType::ExtensibleArray => {
+                                            ChunkIndex::ExtensibleArray
+                                        }
+                                        ChunkIndexType::BTreeV2 => ChunkIndex::BtreeV2,
+                                    })
+                                }
+                                _ => None,
+                            })
+                            .ok_or_else(|| Hdf5Error::NotFound(name.clone()))
+                    }
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "chunk_index() is only available in read mode".into(),
             )),
         }
     }
@@ -8911,5 +8982,46 @@ mod tests {
             .unwrap();
         assert!(ds.storage_layout().is_err());
         file.close().unwrap();
+    }
+
+    /// [`H5Dataset::chunk_index`] reports the real on-disk index kind
+    /// (extensible array for one unlimited dimension, version-1 B-tree
+    /// under a legacy libver bound) and `None` for an unchunked dataset —
+    /// the negative case.
+    #[test]
+    fn chunk_index_reports_the_stored_kind() {
+        use crate::ChunkIndex;
+        let path = temp_path("chunk_index");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .create("contig")
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([16usize])
+                .chunk(&[4])
+                .max_shape(&[None])
+                .create("earray")
+                .unwrap();
+            file.set_libver_latest(false).unwrap();
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .chunk(&[4])
+                .max_shape(&[None])
+                .create("btree1")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(file.dataset("contig").unwrap().chunk_index().unwrap(), None);
+        assert_eq!(
+            file.dataset("earray").unwrap().chunk_index().unwrap(),
+            Some(ChunkIndex::ExtensibleArray)
+        );
+        assert_eq!(
+            file.dataset("btree1").unwrap().chunk_index().unwrap(),
+            Some(ChunkIndex::BtreeV1)
+        );
     }
 }
