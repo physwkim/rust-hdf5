@@ -3194,7 +3194,7 @@ pub struct FileCreateOptions {
 /// sets the list/B-tree thresholds for all of them at once. The default —
 /// no indexes — is a file with no shared-message table, which is what every
 /// file this crate wrote before the option existed.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SharedMessageConfig {
     /// Indexes in table order; only the first `count` are in use.
     indexes: [SohmIndexSpec; MAX_SOHM_INDEXES],

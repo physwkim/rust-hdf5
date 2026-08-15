@@ -437,8 +437,8 @@ fn the_creation_index_floor_reaches_every_header_and_never_a_classic_file() {
     }
     cleanup(&path);
 
-    // The classic side: the option is create-only, so the one call shape that
-    // asks for a shared-message table in a classic file gets a classic file.
+    // The classic side: the option is create-only, so open_rw of an
+    // existing file refuses it outright rather than silently doing nothing.
     let path = unique_tmp("classic");
     std::fs::write(
         &path,
@@ -448,35 +448,27 @@ fn the_creation_index_floor_reaches_every_header_and_never_a_classic_file() {
         .unwrap(),
     )
     .unwrap();
-    {
-        let file = H5File::options()
-            .shared_messages(&[(all_three(), 0)], 50, 40)
-            .open_rw(&path)
-            .unwrap();
-        let ds = file
-            .new_dataset::<i32>()
-            .shape([4])
-            .create("added")
-            .unwrap();
-        ds.write_raw(&[7i32; 4]).unwrap();
-        ds.new_attr::<f64>()
-            .shape(())
-            .create("units")
-            .unwrap()
-            .write_numeric(&1.5f64)
-            .unwrap();
-        file.close().unwrap();
-    }
-    let bytes = std::fs::read(&path).unwrap();
-    let sb = SuperblockV0V1::decode(&bytes).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let err = H5File::options()
+        .shared_messages(&[(all_three(), 0)], 50, 40)
+        .open_rw(&path)
+        .err()
+        .unwrap();
+    assert!(
+        err.to_string().contains("shared_messages"),
+        "error should name the offending option: {err}"
+    );
+    let after = std::fs::read(&path).unwrap();
+    assert_eq!(before, after, "a refused open must not touch the file");
+    let sb = SuperblockV0V1::decode(&after).unwrap();
     assert_eq!(sb.version, 1);
     assert_eq!(sb.superblock_extension_address, UNDEF_ADDR);
     let root = (sb.base_address + sb.root_symbol_table_entry.obj_header_addr) as usize;
     assert!(
-        ObjectHeader::decode(&bytes[root..]).is_err(),
+        ObjectHeader::decode(&after[root..]).is_err(),
         "a classic file's root header must not carry the OHDR signature"
     );
-    let (root_header, _) = ObjectHeader::decode_v1(&bytes[root..]).unwrap();
+    let (root_header, _) = ObjectHeader::decode_v1(&after[root..]).unwrap();
     assert_eq!(
         root_header.attribute_creation_order(),
         CreationOrder::Untracked
