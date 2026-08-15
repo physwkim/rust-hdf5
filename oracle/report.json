@@ -4,8 +4,8 @@
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
   "python": "/home/stevek/micromamba/envs/tomo/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-integrator5-6bef78a3-1/target/release/oracle_probe",
-  "cases": 92
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-reopen-bounds-1edbfe92-1/target/release/oracle_probe",
+  "cases": 95
  },
  "results": [
   {
@@ -15042,6 +15042,723 @@
    }
   },
   {
+   "case": "reopen_append_earliest",
+   "group": "superblock",
+   "note": "classic file reopened under the default fapl \u2014 stays superblock v0, the appended chunked dataset takes the version-1 B-tree",
+   "rust_case": "reopen_append_earliest",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "#superblock",
+      "kind": "unsupported",
+      "field": "superblock",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
+     },
+     {
+      "key": "/#attrorder",
+      "kind": "unsupported",
+      "field": "attrorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(attrorder): H5Group exposes no attribute creation-order tracking flags"
+     },
+     {
+      "key": "/#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5Group exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/#linkorder",
+      "kind": "unsupported",
+      "field": "linkorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(linkorder): H5Group exposes no link creation-order tracking flags"
+     },
+     {
+      "key": "/#linkstore",
+      "kind": "unsupported",
+      "field": "linkstore",
+      "structural": true,
+      "ref": "symtab",
+      "probe": "UNSUPPORTED(linkstore): H5Group exposes no compact/dense link storage accessor"
+     },
+     {
+      "key": "/#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
+     },
+     {
+      "key": "/appended#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5Dataset exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/appended#chunkindex",
+      "kind": "unsupported",
+      "field": "chunkindex",
+      "structural": true,
+      "ref": "btree1",
+      "probe": "UNSUPPORTED(chunkindex): H5Dataset exposes no chunk index type"
+     },
+     {
+      "key": "/appended#external",
+      "kind": "unsupported",
+      "field": "external",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(external): H5Dataset exposes no external file list accessor"
+     },
+     {
+      "key": "/appended#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/appended#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/appended#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[4,4]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/appended#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/appended#virtual",
+      "kind": "unsupported",
+      "field": "virtual",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(virtual): H5Dataset exposes no virtual mapping accessor"
+     },
+     {
+      "key": "/data#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5Dataset exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/data#external",
+      "kind": "unsupported",
+      "field": "external",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(external): H5Dataset exposes no external file list accessor"
+     },
+     {
+      "key": "/data#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/data#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/data#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "contiguous",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/data#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[8]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/data#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/data#virtual",
+      "kind": "unsupported",
+      "field": "virtual",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(virtual): H5Dataset exposes no virtual mapping accessor"
+     },
+     {
+      "key": "/g#attrorder",
+      "kind": "unsupported",
+      "field": "attrorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(attrorder): H5Group exposes no attribute creation-order tracking flags"
+     },
+     {
+      "key": "/g#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5Group exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/g#linkorder",
+      "kind": "unsupported",
+      "field": "linkorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(linkorder): H5Group exposes no link creation-order tracking flags"
+     },
+     {
+      "key": "/g#linkstore",
+      "kind": "unsupported",
+      "field": "linkstore",
+      "structural": true,
+      "ref": "symtab",
+      "probe": "UNSUPPORTED(linkstore): H5Group exposes no compact/dense link storage accessor"
+     },
+     {
+      "key": "/g#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 21,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "reopen_append_v108",
+   "group": "superblock",
+   "note": "v1.8 file reopened under the default fapl \u2014 stays superblock v2, the appended chunked dataset takes the version-1 B-tree",
+   "rust_case": "reopen_append_v108",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "#superblock",
+      "kind": "unsupported",
+      "field": "superblock",
+      "structural": true,
+      "ref": "2",
+      "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
+     },
+     {
+      "key": "/#attrorder",
+      "kind": "unsupported",
+      "field": "attrorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(attrorder): H5Group exposes no attribute creation-order tracking flags"
+     },
+     {
+      "key": "/#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5Group exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/#linkorder",
+      "kind": "unsupported",
+      "field": "linkorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(linkorder): H5Group exposes no link creation-order tracking flags"
+     },
+     {
+      "key": "/#linkstore",
+      "kind": "unsupported",
+      "field": "linkstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(linkstore): H5Group exposes no compact/dense link storage accessor"
+     },
+     {
+      "key": "/#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
+     },
+     {
+      "key": "/appended#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5Dataset exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/appended#chunkindex",
+      "kind": "unsupported",
+      "field": "chunkindex",
+      "structural": true,
+      "ref": "btree1",
+      "probe": "UNSUPPORTED(chunkindex): H5Dataset exposes no chunk index type"
+     },
+     {
+      "key": "/appended#external",
+      "kind": "unsupported",
+      "field": "external",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(external): H5Dataset exposes no external file list accessor"
+     },
+     {
+      "key": "/appended#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/appended#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/appended#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[4,4]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/appended#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/appended#virtual",
+      "kind": "unsupported",
+      "field": "virtual",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(virtual): H5Dataset exposes no virtual mapping accessor"
+     },
+     {
+      "key": "/data#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5Dataset exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/data#external",
+      "kind": "unsupported",
+      "field": "external",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(external): H5Dataset exposes no external file list accessor"
+     },
+     {
+      "key": "/data#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/data#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/data#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "contiguous",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/data#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[8]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/data#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/data#virtual",
+      "kind": "unsupported",
+      "field": "virtual",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(virtual): H5Dataset exposes no virtual mapping accessor"
+     },
+     {
+      "key": "/g#attrorder",
+      "kind": "unsupported",
+      "field": "attrorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(attrorder): H5Group exposes no attribute creation-order tracking flags"
+     },
+     {
+      "key": "/g#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5Group exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/g#linkorder",
+      "kind": "unsupported",
+      "field": "linkorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(linkorder): H5Group exposes no link creation-order tracking flags"
+     },
+     {
+      "key": "/g#linkstore",
+      "kind": "unsupported",
+      "field": "linkstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(linkstore): H5Group exposes no compact/dense link storage accessor"
+     },
+     {
+      "key": "/g#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 21,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "reopen_append_latest",
+   "group": "superblock",
+   "note": "v1.10+ file reopened under the default fapl \u2014 stays superblock v3, the appended chunked dataset takes a v1.10 index",
+   "rust_case": "reopen_append_latest",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "#superblock",
+      "kind": "unsupported",
+      "field": "superblock",
+      "structural": true,
+      "ref": "3",
+      "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
+     },
+     {
+      "key": "/#attrorder",
+      "kind": "unsupported",
+      "field": "attrorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(attrorder): H5Group exposes no attribute creation-order tracking flags"
+     },
+     {
+      "key": "/#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5Group exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/#linkorder",
+      "kind": "unsupported",
+      "field": "linkorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(linkorder): H5Group exposes no link creation-order tracking flags"
+     },
+     {
+      "key": "/#linkstore",
+      "kind": "unsupported",
+      "field": "linkstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(linkstore): H5Group exposes no compact/dense link storage accessor"
+     },
+     {
+      "key": "/#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
+     },
+     {
+      "key": "/appended#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5Dataset exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/appended#chunkindex",
+      "kind": "unsupported",
+      "field": "chunkindex",
+      "structural": true,
+      "ref": "farray",
+      "probe": "UNSUPPORTED(chunkindex): H5Dataset exposes no chunk index type"
+     },
+     {
+      "key": "/appended#external",
+      "kind": "unsupported",
+      "field": "external",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(external): H5Dataset exposes no external file list accessor"
+     },
+     {
+      "key": "/appended#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/appended#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/appended#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[4,4]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/appended#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/appended#virtual",
+      "kind": "unsupported",
+      "field": "virtual",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(virtual): H5Dataset exposes no virtual mapping accessor"
+     },
+     {
+      "key": "/data#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5Dataset exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/data#external",
+      "kind": "unsupported",
+      "field": "external",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(external): H5Dataset exposes no external file list accessor"
+     },
+     {
+      "key": "/data#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/data#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/data#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "contiguous",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/data#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[8]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/data#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/data#virtual",
+      "kind": "unsupported",
+      "field": "virtual",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(virtual): H5Dataset exposes no virtual mapping accessor"
+     },
+     {
+      "key": "/g#attrorder",
+      "kind": "unsupported",
+      "field": "attrorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(attrorder): H5Group exposes no attribute creation-order tracking flags"
+     },
+     {
+      "key": "/g#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5Group exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/g#linkorder",
+      "kind": "unsupported",
+      "field": "linkorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(linkorder): H5Group exposes no link creation-order tracking flags"
+     },
+     {
+      "key": "/g#linkstore",
+      "kind": "unsupported",
+      "field": "linkstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(linkstore): H5Group exposes no compact/dense link storage accessor"
+     },
+     {
+      "key": "/g#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 21,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
    "case": "swmr_created",
    "group": "swmr",
    "note": "file created through the SWMR writer path and appended frame by frame",
@@ -16609,6 +17326,9 @@
     "libver_v110",
     "libver_latest",
     "userblock",
+    "reopen_append_earliest",
+    "reopen_append_v108",
+    "reopen_append_latest",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -16708,6 +17428,9 @@
     "libver_v110",
     "libver_latest",
     "userblock",
+    "reopen_append_earliest",
+    "reopen_append_v108",
+    "reopen_append_latest",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -16807,6 +17530,9 @@
     "libver_v110",
     "libver_latest",
     "userblock",
+    "reopen_append_earliest",
+    "reopen_append_v108",
+    "reopen_append_latest",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -16906,6 +17632,9 @@
     "libver_v110",
     "libver_latest",
     "userblock",
+    "reopen_append_earliest",
+    "reopen_append_v108",
+    "reopen_append_latest",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -17005,6 +17734,9 @@
     "libver_v110",
     "libver_latest",
     "userblock",
+    "reopen_append_earliest",
+    "reopen_append_v108",
+    "reopen_append_latest",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -17104,6 +17836,9 @@
     "libver_v110",
     "libver_latest",
     "userblock",
+    "reopen_append_earliest",
+    "reopen_append_v108",
+    "reopen_append_latest",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -17202,6 +17937,9 @@
     "libver_v110",
     "libver_latest",
     "userblock",
+    "reopen_append_earliest",
+    "reopen_append_v108",
+    "reopen_append_latest",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -17300,6 +18038,9 @@
     "libver_v110",
     "libver_latest",
     "userblock",
+    "reopen_append_earliest",
+    "reopen_append_v108",
+    "reopen_append_latest",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -17398,6 +18139,9 @@
     "libver_v110",
     "libver_latest",
     "userblock",
+    "reopen_append_earliest",
+    "reopen_append_v108",
+    "reopen_append_latest",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -17496,6 +18240,9 @@
     "libver_v110",
     "libver_latest",
     "userblock",
+    "reopen_append_earliest",
+    "reopen_append_v108",
+    "reopen_append_latest",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -17594,6 +18341,9 @@
     "libver_v110",
     "libver_latest",
     "userblock",
+    "reopen_append_earliest",
+    "reopen_append_v108",
+    "reopen_append_latest",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -17692,6 +18442,9 @@
     "libver_v110",
     "libver_latest",
     "userblock",
+    "reopen_append_earliest",
+    "reopen_append_v108",
+    "reopen_append_latest",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -17790,6 +18543,9 @@
     "libver_v110",
     "libver_latest",
     "userblock",
+    "reopen_append_earliest",
+    "reopen_append_v108",
+    "reopen_append_latest",
     "swmr_created",
     "large_multi_mb",
     "sohm_list",
@@ -17868,6 +18624,9 @@
     "libver_v110",
     "libver_latest",
     "userblock",
+    "reopen_append_earliest",
+    "reopen_append_v108",
+    "reopen_append_latest",
     "sohm_list",
     "sohm_btree",
     "ochk_root"
@@ -17898,6 +18657,9 @@
     "fill_set_int",
     "fill_set_float_nan",
     "space_unlimited_resized",
+    "reopen_append_earliest",
+    "reopen_append_v108",
+    "reopen_append_latest",
     "swmr_created",
     "large_multi_mb"
    ],
