@@ -208,6 +208,54 @@ pub fn decode_revised_element<'a>(
     })
 }
 
+/// The element image an object reference naming `address` has, at the `size`
+/// its datatype declares.
+///
+/// The single owner of object-reference element encoding, for both the
+/// pre-1.12 and the 1.12 form, so the two element layouts this module
+/// documents are written where they are read. Anything past what the layout
+/// needs is left zero, which is where libhdf5 leaves it too: it sizes every
+/// element for the largest reference the dataset may hold and writes only as
+/// much of it as the reference uses.
+///
+/// A region or attribute reference is not encodable here — its encoded
+/// reference is a global-heap blob, so the element is a blob id whose object
+/// only the writer holding the heap can place.
+pub fn encode_object_element(
+    kind: ReferenceKind,
+    size: usize,
+    address: u64,
+    ctx: &FormatContext,
+) -> FormatResult<Vec<u8>> {
+    let sa = ctx.sizeof_addr as usize;
+    let mut elem = vec![0u8; size];
+    let token_at = match kind {
+        // The whole element is the address.
+        ReferenceKind::Object1 => 0,
+        // Type, flags, then the encoded reference inline: the token's length
+        // and the token itself (`H5R__encode_obj_token`).
+        ReferenceKind::Object2 => {
+            elem[0] = kind.code();
+            elem[1] = 0;
+            elem[2] = sa as u8;
+            REVISED_HEADER + 1
+        }
+        other => {
+            return Err(FormatError::UnsupportedFeature(format!(
+                "{other:?} elements are global-heap blob ids, not an encodable image"
+            )))
+        }
+    };
+    let end = token_at + sa;
+    if end > size {
+        return Err(FormatError::InvalidData(format!(
+            "a {kind:?} element needs {end} bytes but its datatype declares {size}"
+        )));
+    }
+    elem[token_at..end].copy_from_slice(&address.to_le_bytes()[..sa]);
+    Ok(elem)
+}
+
 /// What a reference names beyond the object its token points at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReferenceTarget {

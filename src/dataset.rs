@@ -59,6 +59,7 @@ pub struct DatasetBuilder<T: H5Type> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReferenceElement {
     Object,
+    StdObject,
     Region,
 }
 
@@ -71,6 +72,7 @@ impl ReferenceElement {
         use crate::format::messages::datatype::DatatypeMessage;
         match self {
             Self::Object => DatatypeMessage::object_reference(ctx),
+            Self::StdObject => DatatypeMessage::std_object_reference(ctx),
             Self::Region => DatatypeMessage::region_reference(ctx),
         }
     }
@@ -338,6 +340,32 @@ impl<T: H5Type> DatasetBuilder<T> {
     #[must_use]
     pub fn object_references(mut self) -> Self {
         self.references = Some(ReferenceElement::Object);
+        self
+    }
+
+    /// Store revised object references — the 1.12 `H5T_STD_REF`.
+    ///
+    /// Same paths and same [`write_object_references`](H5Dataset::write_object_references)
+    /// call as [`object_references`](Self::object_references); only the stored
+    /// element differs, carrying the reference's kind alongside the address so
+    /// one datatype can hold every reference kind. h5py cannot read it, so
+    /// prefer the pre-1.12 form for files h5py will open.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("stdrefs.h5").unwrap();
+    /// file.new_dataset::<i32>().shape([4]).create("target").unwrap();
+    /// let refs = file.new_dataset::<u64>()
+    ///     .std_object_references()
+    ///     .shape([1])
+    ///     .create("refs")
+    ///     .unwrap();
+    /// refs.write_object_references(&["/target"]).unwrap();
+    /// file.close().unwrap();
+    /// ```
+    #[must_use]
+    pub fn std_object_references(mut self) -> Self {
+        self.references = Some(ReferenceElement::StdObject);
         self
     }
 

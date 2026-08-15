@@ -4,8 +4,8 @@
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
   "python": "/home/stevek/micromamba/envs/tomo/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-integrator2-70ef8082-1/target/release/oracle_probe",
-  "cases": 91
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-finalize-00dad617-1/target/release/oracle_probe",
+  "cases": 92
  },
  "results": [
   {
@@ -14803,6 +14803,275 @@
    }
   },
   {
+   "case": "attr_ref_object",
+   "group": "attribute",
+   "note": "object references stored in attributes of a dataset, a group and the root",
+   "rust_case": "attr_ref_object",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "#superblock",
+      "kind": "unsupported",
+      "field": "superblock",
+      "structural": true,
+      "ref": "0",
+      "probe": "UNSUPPORTED(superblock): H5File exposes no superblock/libver accessor"
+     },
+     {
+      "key": "/#attrorder",
+      "kind": "unsupported",
+      "field": "attrorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(attrorder): H5Group exposes no attribute creation-order tracking flags"
+     },
+     {
+      "key": "/#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5Group exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/#linkorder",
+      "kind": "unsupported",
+      "field": "linkorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(linkorder): H5Group exposes no link creation-order tracking flags"
+     },
+     {
+      "key": "/#linkstore",
+      "kind": "unsupported",
+      "field": "linkstore",
+      "structural": true,
+      "ref": "symtab",
+      "probe": "UNSUPPORTED(linkstore): H5Group exposes no compact/dense link storage accessor"
+     },
+     {
+      "key": "/#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "1",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
+     },
+     {
+      "key": "/@entry#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "objref",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@entry#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[2]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@entry#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@entry#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "vals:[objref:/grp,objref:/data]",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"x\\x05\""
+     },
+     {
+      "key": "/data#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5Dataset exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/data#external",
+      "kind": "unsupported",
+      "field": "external",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(external): H5Dataset exposes no external file list accessor"
+     },
+     {
+      "key": "/data#fillvalue",
+      "kind": "unsupported",
+      "field": "fillvalue",
+      "structural": true,
+      "ref": "default",
+      "probe": "UNSUPPORTED(fillvalue): H5Dataset exposes no fill value accessor"
+     },
+     {
+      "key": "/data#filters",
+      "kind": "unsupported",
+      "field": "filters",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(filters): H5Dataset exposes no filter pipeline accessor"
+     },
+     {
+      "key": "/data#layout",
+      "kind": "unsupported",
+      "field": "layout",
+      "structural": true,
+      "ref": "contiguous",
+      "probe": "UNSUPPORTED(layout): H5Dataset::is_chunked() is false; contiguous and compact are not distinguishable through the public API"
+     },
+     {
+      "key": "/data#maxshape",
+      "kind": "unsupported",
+      "field": "maxshape",
+      "structural": true,
+      "ref": "[8]",
+      "probe": "UNSUPPORTED(maxshape): H5Dataset exposes no max_shape() accessor"
+     },
+     {
+      "key": "/data#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "1",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Dataset exposes no object-header attribute count"
+     },
+     {
+      "key": "/data#virtual",
+      "kind": "unsupported",
+      "field": "virtual",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(virtual): H5Dataset exposes no virtual mapping accessor"
+     },
+     {
+      "key": "/data@neighbours#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[2]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/grp#attrorder",
+      "kind": "unsupported",
+      "field": "attrorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(attrorder): H5Group exposes no attribute creation-order tracking flags"
+     },
+     {
+      "key": "/grp#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5Group exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/grp#linkorder",
+      "kind": "unsupported",
+      "field": "linkorder",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(linkorder): H5Group exposes no link creation-order tracking flags"
+     },
+     {
+      "key": "/grp#linkstore",
+      "kind": "unsupported",
+      "field": "linkstore",
+      "structural": true,
+      "ref": "symtab",
+      "probe": "UNSUPPORTED(linkstore): H5Group exposes no compact/dense link storage accessor"
+     },
+     {
+      "key": "/grp#nattrs_hdr",
+      "kind": "unsupported",
+      "field": "nattrs_hdr",
+      "structural": true,
+      "ref": "1",
+      "probe": "UNSUPPORTED(nattrs_hdr): H5Group exposes no object-header attribute count"
+     },
+     {
+      "key": "/grp@owner#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "objref",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/grp@owner#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/grp@owner#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/grp@owner#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "vals:[objref:/data]",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \" \\x03\""
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 16,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [
+     {
+      "key": "#superblock",
+      "field": "superblock",
+      "ref": "0",
+      "rust": "2",
+      "expected": "superblock-floor-v2"
+     },
+     {
+      "key": "/#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     },
+     {
+      "key": "/grp#linkstore",
+      "field": "linkstore",
+      "ref": "symtab",
+      "rust": "compact",
+      "expected": "new-style-groups-always"
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
    "case": "libver_earliest",
    "group": "superblock",
    "note": "libver earliest \u2014 superblock v0, symbol-table groups",
@@ -17298,6 +17567,7 @@
     "attrs_dense_group",
     "attr_on_root",
     "attr_large",
+    "attr_ref_object",
     "libver_earliest",
     "libver_v108",
     "libver_v110",
@@ -17396,6 +17666,7 @@
     "attrs_dense_group",
     "attr_on_root",
     "attr_large",
+    "attr_ref_object",
     "libver_earliest",
     "libver_v108",
     "libver_v110",
@@ -17494,6 +17765,7 @@
     "attrs_dense_group",
     "attr_on_root",
     "attr_large",
+    "attr_ref_object",
     "libver_earliest",
     "libver_v108",
     "libver_v110",
@@ -17592,6 +17864,7 @@
     "attrs_dense_group",
     "attr_on_root",
     "attr_large",
+    "attr_ref_object",
     "libver_earliest",
     "libver_v108",
     "libver_v110",
@@ -17690,6 +17963,7 @@
     "attrs_dense_group",
     "attr_on_root",
     "attr_large",
+    "attr_ref_object",
     "libver_earliest",
     "libver_v108",
     "libver_v110",
@@ -17788,6 +18062,7 @@
     "attrs_dense_group",
     "attr_on_root",
     "attr_large",
+    "attr_ref_object",
     "libver_earliest",
     "libver_v108",
     "libver_v110",
@@ -17885,6 +18160,7 @@
     "attrs_dense_group",
     "attr_on_root",
     "attr_large",
+    "attr_ref_object",
     "libver_earliest",
     "libver_v108",
     "libver_v110",
@@ -17982,6 +18258,7 @@
     "attrs_dense_group",
     "attr_on_root",
     "attr_large",
+    "attr_ref_object",
     "libver_earliest",
     "libver_v108",
     "libver_v110",
@@ -18079,6 +18356,7 @@
     "attrs_dense_group",
     "attr_on_root",
     "attr_large",
+    "attr_ref_object",
     "libver_earliest",
     "libver_v108",
     "libver_v110",
@@ -18176,6 +18454,7 @@
     "attrs_dense_group",
     "attr_on_root",
     "attr_large",
+    "attr_ref_object",
     "libver_earliest",
     "libver_v108",
     "libver_v110",
@@ -18273,6 +18552,7 @@
     "attrs_dense_group",
     "attr_on_root",
     "attr_large",
+    "attr_ref_object",
     "libver_earliest",
     "libver_v108",
     "libver_v110",
@@ -18370,6 +18650,7 @@
     "attrs_dense_group",
     "attr_on_root",
     "attr_large",
+    "attr_ref_object",
     "libver_earliest",
     "libver_v108",
     "libver_v110",
@@ -18467,6 +18748,7 @@
     "attrs_dense_group",
     "attr_on_root",
     "attr_large",
+    "attr_ref_object",
     "libver_earliest",
     "libver_v108",
     "libver_v110",
@@ -18544,6 +18826,7 @@
     "attrs_dense_group",
     "attr_on_root",
     "attr_large",
+    "attr_ref_object",
     "libver_earliest",
     "libver_v108",
     "libver_v110",
@@ -18593,6 +18876,7 @@
     "attr_string",
     "attrs_dense",
     "attr_large",
+    "attr_ref_object",
     "sohm_list",
     "sohm_btree"
    ],
@@ -18606,6 +18890,7 @@
     "attr_string",
     "attrs_dense_group",
     "attr_on_root",
+    "attr_ref_object",
     "ochk_root"
    ],
    "example": "/@alpha#dtype"
@@ -18618,6 +18903,7 @@
     "attr_string",
     "attrs_dense_group",
     "attr_on_root",
+    "attr_ref_object",
     "ochk_root"
    ],
    "example": "/@alpha#shape"
@@ -18630,6 +18916,7 @@
     "attr_string",
     "attrs_dense_group",
     "attr_on_root",
+    "attr_ref_object",
     "ochk_root"
    ],
    "example": "/@alpha#strpad"
@@ -18642,6 +18929,7 @@
     "attr_string",
     "attrs_dense_group",
     "attr_on_root",
+    "attr_ref_object",
     "ochk_root"
    ],
    "example": "/@alpha#value"
@@ -18717,6 +19005,7 @@
     "attr_array_num",
     "attr_string",
     "attr_on_root",
+    "attr_ref_object",
     "libver_earliest",
     "userblock"
    ]
@@ -18805,6 +19094,7 @@
     "attr_array_num",
     "attr_string",
     "attr_on_root",
+    "attr_ref_object",
     "libver_earliest",
     "userblock"
    ]

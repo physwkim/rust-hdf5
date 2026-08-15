@@ -859,6 +859,19 @@ def gen_attr_on_root(path):
         f.create_dataset("data", data=ramp("<i4"))
 
 
+def gen_attr_ref_object(path):
+    # An attribute whose value is object references, on all three kinds of
+    # object header: a dataset's, a group's and the root's. The value is part
+    # of the header message, so unlike a reference dataset's elements it cannot
+    # be stamped in after the header is written.
+    with h5py.File(path, "w") as f:
+        ds = f.create_dataset("data", data=ramp("<i4"))
+        g = f.create_group("grp")
+        ds.attrs.create("neighbours", np.array([ds.ref, g.ref], dtype=h5py.ref_dtype))
+        g.attrs.create("owner", ds.ref, dtype=h5py.ref_dtype)
+        f.attrs.create("entry", np.array([g.ref, ds.ref], dtype=h5py.ref_dtype))
+
+
 def gen_attr_large(path):
     # One attribute past the 64 KiB object-header message limit: the value
     # spills to dense storage no matter how few attributes there are.
@@ -883,6 +896,9 @@ ATTR_CASES = [
          "attributes on the root group"),
     Case("attr_large", "attribute", gen_attr_large, "attr_large",
          "single 100 KiB attribute — dense storage forced by size, not count"),
+    Case("attr_ref_object", "attribute", gen_attr_ref_object, "attr_ref_object",
+         "object references stored in attributes of a dataset, a group and "
+         "the root"),
 ]
 
 
