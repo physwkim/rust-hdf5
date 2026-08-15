@@ -40,7 +40,7 @@ use crate::format::reference::{
 };
 use crate::format::selection::{Hyperslab, PointSelection, RegularHyperslab, Selection};
 use crate::format::sohm::SohmMasterTable;
-use crate::format::storage_kind::AttributeStorage;
+use crate::format::storage_kind::{AttributeStorage, LinkStorage};
 use crate::format::superblock::{
     detect_superblock_version, SuperblockV0V1, SuperblockV2V3, SymbolTableCache,
 };
@@ -315,6 +315,9 @@ struct Catalog {
     unreadable: std::collections::BTreeMap<String, String>,
     /// Attributes on non-root groups, keyed by group path.
     group_attributes: std::collections::HashMap<String, ObjectAttributes>,
+    /// Link storage kind and link creation-order policy of non-root groups,
+    /// keyed by group path.
+    group_link_storage: std::collections::HashMap<String, (LinkStorage, CreationOrder)>,
     /// Every non-root group path the walk traversed into.
     group_paths: std::collections::BTreeSet<String>,
     /// Group object header address → the first path that reached it (no
@@ -418,11 +421,7 @@ impl<'a> CatalogWalk<'a> {
         if depth > Self::MAX_DEPTH {
             return Ok(());
         }
-        let link_storage = header.filter(|h| {
-            h.messages
-                .iter()
-                .any(|m| m.msg_type == MSG_LINK || m.msg_type == MSG_LINK_INFO)
-        });
+        let link_storage = header.filter(|h| header_declares_link_storage(h));
         if let Some(h) = link_storage {
             return self.links(h, prefix, depth);
         }
@@ -612,6 +611,13 @@ impl<'a> CatalogWalk<'a> {
         self.catalog
             .group_attributes
             .insert(full_name.clone(), attrs);
+        // Same unconditional recording for link storage and link
+        // creation-order: this group's own header answers both whether or
+        // not it descends any further.
+        self.catalog.group_link_storage.insert(
+            full_name.clone(),
+            describe_link_storage(Some(&header), &ctx, stab),
+        );
 
         // Descend at most once per object header (cycle guard); a second path
         // to it is a group hard link — record the alias for lookups instead.
@@ -633,6 +639,71 @@ fn join_path(prefix: &str, name: &str) -> String {
     } else {
         format!("{}/{}", prefix, name)
     }
+}
+
+/// Whether an object header declares link-message storage (compact or
+/// dense) rather than the legacy symbol-table format — `Walk::group`'s own
+/// dispatch predicate, factored out so [`describe_link_storage`] answers the
+/// same question by construction rather than by keeping two checks in sync.
+fn header_declares_link_storage(header: &ObjectHeader) -> bool {
+    header
+        .messages
+        .iter()
+        .any(|m| m.msg_type == MSG_LINK || m.msg_type == MSG_LINK_INFO)
+}
+
+/// A group's own link storage kind and link creation-order policy — h5py's
+/// `link_storage_str` and `get_link_creation_order()`, computed together
+/// because both read the same `Link Info` message.
+///
+/// `stab` is the symbol-table scratch-pad copy from the entry that named
+/// this group, exactly as [`CatalogWalk::group`] takes it; `header` is
+/// `None` only when the object header itself did not decode.
+fn describe_link_storage(
+    header: Option<&ObjectHeader>,
+    ctx: &FormatContext,
+    stab: Option<(u64, u64)>,
+) -> (LinkStorage, CreationOrder) {
+    if let Some(h) = header.filter(|h| header_declares_link_storage(h)) {
+        // Link-message storage: the `Link Info` message, when present, gives
+        // both facts at once. Its absence means compact and untracked — no
+        // message exists to carry a creation index in.
+        return h
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MSG_LINK_INFO)
+            .and_then(|m| LinkInfoMessage::decode(&m.data, ctx).ok())
+            .map(|(info, _)| {
+                let storage = if info.is_dense() {
+                    LinkStorage::Dense
+                } else {
+                    LinkStorage::Compact
+                };
+                (storage, info.creation_order())
+            })
+            .unwrap_or((LinkStorage::Compact, CreationOrder::Untracked));
+    }
+    // No link-message storage in the header (or no header to check at all):
+    // symbol-table format when the scratch-pad or the header's own `Symbol
+    // Table` message resolves an address pair. Creation order is always
+    // untracked here — the pre-1.8 format predates the feature, and 1.8+
+    // never tracks creation order without also converting to link storage.
+    let (btree_addr, heap_addr) = match stab {
+        Some(pair) if pair.0 != UNDEF_ADDR && pair.1 != UNDEF_ADDR => pair,
+        _ => header.map_or((UNDEF_ADDR, UNDEF_ADDR), |h| {
+            Hdf5Reader::stab_from_header(h, ctx)
+        }),
+    };
+    let storage = if btree_addr != UNDEF_ADDR && heap_addr != UNDEF_ADDR {
+        LinkStorage::SymbolTable
+    } else {
+        // Neither link-message nor symbol-table storage is declared — an
+        // object header this crate could not fully account for. Nothing in
+        // the 92-case oracle suite reaches this path; it exists so an
+        // unreadable root group still answers rather than panicking.
+        LinkStorage::Compact
+    };
+    (storage, CreationOrder::Untracked)
 }
 
 /// What an object header describes.
@@ -761,8 +832,13 @@ pub struct Hdf5Reader {
     unreadable: std::collections::BTreeMap<String, String>,
     /// Attributes on the root group (file-level attributes).
     root_attributes: ObjectAttributes,
+    /// Link storage kind and link creation-order policy of the root group.
+    root_link_storage: (LinkStorage, CreationOrder),
     /// Attributes on non-root groups, keyed by group path (no leading `/`).
     group_attributes: std::collections::HashMap<String, ObjectAttributes>,
+    /// Link storage kind and link creation-order policy of non-root groups,
+    /// keyed by group path (no leading `/`).
+    group_link_storage: std::collections::HashMap<String, (LinkStorage, CreationOrder)>,
     /// Every non-root group path the discovery walk traversed into (no
     /// leading `/`), regardless of whether the group has datasets or
     /// attributes. Built from actual link records, so empty groups,
@@ -1390,6 +1466,9 @@ impl Hdf5Reader {
 
         // Collect root group attributes
         let root_attributes = collect_object_attributes(&mut handle, &ctx, &root_header);
+        // A v2/v3 root group is always addressed directly by the superblock,
+        // never through a symbol-table scratch-pad.
+        let root_link_storage = describe_link_storage(Some(&root_header), &ctx, None);
 
         Ok(Self {
             handle,
@@ -1403,7 +1482,9 @@ impl Hdf5Reader {
             datasets: catalog.datasets,
             unreadable: catalog.unreadable,
             root_attributes,
+            root_link_storage,
             group_attributes: catalog.group_attributes,
+            group_link_storage: catalog.group_link_storage,
             group_paths: catalog.group_paths,
             group_aliases: catalog.group_aliases,
             links: catalog.links,
@@ -1456,6 +1537,10 @@ impl Hdf5Reader {
             Some(ref h) => collect_object_attributes(&mut handle, &ctx, h),
             None => ObjectAttributes::default(),
         };
+        // The root group's own link storage and link creation-order, from
+        // the same header-first/scratch-pad-fallback rule the walk below
+        // uses to choose how to enumerate it.
+        let root_link_storage = describe_link_storage(root_hdr.as_ref(), &ctx, ste_stab);
 
         // A v0/v1-superblock file whose root group has migrated to link
         // storage (more than ~8 objects, or one link the old format cannot
@@ -1487,7 +1572,9 @@ impl Hdf5Reader {
             datasets: catalog.datasets,
             unreadable: catalog.unreadable,
             root_attributes,
+            root_link_storage,
             group_attributes: catalog.group_attributes,
+            group_link_storage: catalog.group_link_storage,
             group_paths: catalog.group_paths,
             group_aliases: catalog.group_aliases,
             links: catalog.links,
@@ -2607,6 +2694,11 @@ impl Hdf5Reader {
         self.root_attributes.header_count("/")
     }
 
+    /// The root group's own link creation-order policy.
+    pub fn root_link_creation_order(&self) -> CreationOrder {
+        self.root_link_storage.1
+    }
+
     /// Return the attribute names of a non-root group (path without a
     /// leading `/`, e.g. `"detector"` or `"entry/instrument"`; may pass
     /// through group hard links). Undecodable attributes included — see
@@ -2661,6 +2753,15 @@ impl Hdf5Reader {
             return Ok(0);
         };
         attrs.header_count(group_path)
+    }
+
+    /// A non-root group's own link creation-order policy. `Untracked` for a
+    /// path the walk never reached, the same silent default
+    /// [`group_attr_creation_order`](Self::group_attr_creation_order) gives.
+    pub fn group_link_creation_order(&self, group_path: &str) -> CreationOrder {
+        self.group_link_storage
+            .get(&self.canonical_path(group_path))
+            .map_or(CreationOrder::Untracked, |(_, order)| *order)
     }
 
     /// Return a non-root group's attribute by name.
@@ -3238,13 +3339,20 @@ impl Hdf5Reader {
             None,
         )?;
 
+        // Root link storage from the freshly re-read header, the same way
+        // `open_v2v3` derives it at open time — SWMR refresh is v2/v3-only,
+        // so there is no symbol-table scratch-pad to fall back to here either.
+        let root_link_storage = describe_link_storage(Some(&root_header), &meta.ctx, None);
+
         self._eof = sb.end_of_file_address;
         self.meta = meta;
         self.ext = ext;
         self.object_paths = catalog.object_paths(sb.root_group_object_header_address);
         self.datasets = catalog.datasets;
         self.unreadable = catalog.unreadable;
+        self.root_link_storage = root_link_storage;
         self.group_attributes = catalog.group_attributes;
+        self.group_link_storage = catalog.group_link_storage;
         self.group_paths = catalog.group_paths;
         self.group_aliases = catalog.group_aliases;
         self.links = catalog.links;

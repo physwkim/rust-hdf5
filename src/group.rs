@@ -1065,6 +1065,25 @@ impl H5Group {
         }
     }
 
+    /// This group's own link creation-order policy — the equivalent of
+    /// `H5Pget_link_creation_order(gid.get_create_plist())`. A fact about
+    /// the group's own `Link Info` message, independent of
+    /// [`attr_creation_order`](Self::attr_creation_order): a group can track
+    /// one without the other.
+    pub fn link_creation_order(&self) -> Result<CreationOrder> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_link_creation_order()
+            } else {
+                reader.group_link_creation_order(self.name.trim_start_matches('/'))
+            }),
+            _ => Err(Hdf5Error::InvalidState(
+                "link_creation_order is only available in read mode".into(),
+            )),
+        }
+    }
+
     /// Why this group's attribute `name` cannot be read, or `None` when it
     /// can be. The attribute counterpart of
     /// [`unreadable_reason`](Self::unreadable_reason)'s shape for datasets:

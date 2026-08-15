@@ -612,7 +612,11 @@ fn attrstore_str(storage: AttributeStorage) -> &'static str {
 fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: usize) {
     d.emit(&format!("{path}#kind"), "group");
     d.field(path, "linkorder", || {
-        Err("H5Group exposes no link creation-order tracking flags".into())
+        group
+            .link_creation_order()
+            .map(crt_order_str)
+            .map(str::to_string)
+            .map_err(oneline)
     });
     d.field(path, "attrorder", || {
         group
