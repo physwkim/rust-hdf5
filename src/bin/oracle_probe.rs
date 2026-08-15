@@ -2152,8 +2152,86 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
 
+        // ---- checked-in fixtures ---------------------------------------------
+        // These mirror the C generators in tests/fixtures, not an h5py
+        // generator: h5py has no binding for the properties they need.
+        "sohm_list" => sohm_file(path, 50, 40),
+        "sohm_btree" => sohm_file(path, 0, 0),
+        "ochk_root" => ochk_root_file(path),
+
         _ => Ok(unsup(&format!("no rust writer arm for case '{case}'"))),
     }
+}
+
+/// `tests/fixtures/gen_sohm.c`: one shared-message index over datatype,
+/// dataspace and attribute messages, then four datasets that share a
+/// dataspace and an attribute plus a committed datatype and a dataset built
+/// on it. `max_list`/`min_btree` pick the index form.
+fn sohm_file(path: &str, max_list: u16, min_btree: u16) -> rust_hdf5::Result<WriteResult> {
+    use rust_hdf5::format::messages::{MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE};
+    use rust_hdf5::format::sohm::type_flag;
+
+    let types = type_flag(MSG_DATATYPE).unwrap_or(0)
+        | type_flag(MSG_DATASPACE).unwrap_or(0)
+        | type_flag(MSG_ATTRIBUTE).unwrap_or(0);
+    let file = H5File::options()
+        .shared_messages(&[(types, 0)], max_list, min_btree)
+        .create(path)?;
+
+    for i in 0..4i32 {
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([8usize])
+            .create(&format!("shared{i}"))?;
+        ds.write_raw(&(0..8i32).map(|j| i * 10 + j).collect::<Vec<_>>())?;
+        ds.new_attr::<f64>()
+            .shape([3usize])
+            .create("cal")?
+            .write_array(&[0.5f64, 1.5, 2.5])?;
+    }
+
+    file.commit_datatype("named_i32", DatatypeMessage::i32_type())?;
+    file.new_dataset::<i32>()
+        .committed_type("named_i32")
+        .shape([8usize])
+        .create("uses_named")?
+        .write_raw(&(100..108i32).collect::<Vec<_>>())?;
+
+    file.close()?;
+    Ok(Ok(()))
+}
+
+/// `tests/fixtures/gen_ochk.c`: a dataset and six 256-byte fixed-string root
+/// attributes, which are far more than the root group's object header was
+/// sized for — so the header spills into a continuation chunk.
+fn ochk_root_file(path: &str) -> rust_hdf5::Result<WriteResult> {
+    /// `H5Tcopy(H5T_C_S1)` keeps the null-terminated pad rule; `H5Tset_size`
+    /// takes it to 256.
+    const TEXT: usize = 256;
+
+    let file = H5File::options().libver(LibverBound::V18).create(path)?;
+    file.new_dataset::<i32>()
+        .shape([8usize])
+        .create("data")?
+        .write_raw(&ramp_n::<i32>(8))?;
+
+    for i in 0..6u8 {
+        let mut text = vec![b'x'; TEXT];
+        text[0] = b'0' + i;
+        text[TEXT - 1] = 0;
+        file.set_attr_typed(
+            &format!("note{i}"),
+            DatatypeMessage::FixedString {
+                size: TEXT as u32,
+                padding: 0,
+                charset: 0,
+            },
+            text,
+        )?;
+    }
+
+    file.close()?;
+    Ok(Ok(()))
 }
 
 fn member(name: &str, offset: u32, datatype: DatatypeMessage) -> CompoundMember {

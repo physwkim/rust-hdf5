@@ -19,7 +19,8 @@
 
 use crate::format::checksum::checksum_metadata;
 use crate::format::chunk_index::btree_v2::{
-    collect_btree_v2_records, Bt2Header, Bt2Tree, BT2_TYPE_ATTR_CORDER, BT2_TYPE_ATTR_NAME,
+    build_index as build_btree_v2_index, collect_btree_v2_records, Bt2Header, BT2_TYPE_ATTR_CORDER,
+    BT2_TYPE_ATTR_NAME,
 };
 use crate::format::creation_order::CreationOrder;
 use crate::format::fractal_heap::{
@@ -258,33 +259,19 @@ fn build_index(
     alloc: &mut dyn FnMut(u64) -> u64,
     blocks: &mut Vec<HeapBlock>,
 ) -> u64 {
-    let tree = Bt2Tree::build(
+    let (bt2_addr, nodes) = build_btree_v2_index(
         record_type,
         record_size,
         NAME_BT2_NODE_SIZE,
-        ctx.sizeof_addr,
         records,
+        ctx,
+        alloc,
     );
-    let bt2_addr = alloc(tree.header(UNDEF_ADDR).encoded_size(ctx) as u64);
-    let node_addrs: Vec<u64> = tree
-        .nodes
-        .iter()
-        .map(|_| alloc(tree.node_size as u64))
-        .collect();
-    for (image, &addr) in tree.encode(ctx, &node_addrs).into_iter().zip(&node_addrs) {
-        blocks.push(HeapBlock {
-            addr,
-            len: tree.node_size as u64,
-            image,
-        });
-    }
-    let root_addr = node_addrs.last().copied().unwrap_or(UNDEF_ADDR);
-    let image = tree.header(root_addr).encode(ctx);
-    blocks.push(HeapBlock {
-        addr: bt2_addr,
+    blocks.extend(nodes.into_iter().map(|(addr, image)| HeapBlock {
+        addr,
         len: image.len() as u64,
         image,
-    });
+    }));
     bt2_addr
 }
 

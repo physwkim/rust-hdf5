@@ -44,6 +44,16 @@ impl SharedMessageTableMessage {
             nindexes: buf[1 + sa],
         })
     }
+
+    /// Encode the message body (`H5O__shmesg_encode`).
+    pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
+        let sa = ctx.sizeof_addr as usize;
+        let mut buf = Vec::with_capacity(1 + sa + 1);
+        buf.push(self.version);
+        buf.extend_from_slice(&self.table_address.to_le_bytes()[..sa]);
+        buf.push(self.nindexes);
+        buf
+    }
 }
 
 /// v1 B-tree "K" values message (0x0013) — `H5Obtreek.c`.
@@ -314,6 +324,26 @@ mod tests {
         let m = SharedMessageTableMessage::decode(&buf, &ctx()).unwrap();
         assert_eq!(m.table_address, 88);
         assert_eq!(m.nindexes, 3);
+    }
+
+    /// The ten bytes `sohm_list.h5` carries in its superblock extension: the
+    /// table at 88, one index.
+    #[test]
+    fn shmesg_encodes_the_fixture_body() {
+        let m = SharedMessageTableMessage {
+            version: 0,
+            table_address: 88,
+            nindexes: 1,
+        };
+        assert_eq!(
+            m.encode(&ctx()),
+            vec![0, 0x58, 0, 0, 0, 0, 0, 0, 0, 1],
+            "H5O__shmesg_encode order: version, table address, index count"
+        );
+        assert_eq!(
+            SharedMessageTableMessage::decode(&m.encode(&ctx()), &ctx()).unwrap(),
+            m
+        );
     }
 
     #[test]

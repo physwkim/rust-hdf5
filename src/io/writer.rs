@@ -31,11 +31,15 @@ use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::group_info::GroupInfoMessage;
 use crate::format::messages::link::{LinkMessage, LinkTarget};
 use crate::format::messages::link_info::LinkInfoMessage;
+use crate::format::messages::superblock_ext::SharedMessageTableMessage;
 use crate::format::messages::*;
 use crate::format::object_header::{ObjectHeader, ObjectTimes, MAX_MESSAGE_SIZE};
 use crate::format::reference::encode_object_element;
 use crate::format::selection::Selection;
-use crate::format::sohm::SharedMessagePointer;
+use crate::format::sohm::{type_flag, SharedMessagePointer, MAX_SOHM_INDEXES, SOHM_HEAP_ID_LEN};
+use crate::format::sohm_write::{
+    build_shared_messages, SharedMessage, SohmIndexContent, SohmIndexSpec,
+};
 use crate::format::superblock::*;
 use crate::format::{FormatContext, LibverBound, ObjectFormat, UNDEF_ADDR};
 
@@ -2374,6 +2378,114 @@ pub struct Hdf5Writer {
     /// See [`LegacyFile`]; [`object_format`](Self::object_format) is the only
     /// reader of whether it is there.
     legacy: Option<Box<LegacyFile>>,
+    /// The file's shared-message indexes, when it was created with any.
+    /// `None` — the default — is a file with no shared-message table, where
+    /// [`share_message`](Self::share_message) is the identity.
+    sohm: Option<Box<SohmState>>,
+}
+
+/// A file's shared object header messages, from creation to the table on disk.
+///
+/// INVARIANT: a message body reaches the file either literally or as a pointer
+/// to exactly one heap object, never both, and the reference count of that
+/// object is the number of headers that hold the pointer.
+/// [`share_message`](Hdf5Writer::share_message) is the only place a body is
+/// offered to an index, and
+/// [`prepare_shared_messages`](Hdf5Writer::prepare_shared_messages) is the
+/// only place the phase changes — so counting and substituting are two passes
+/// over the same call site rather than two pieces of logic that must agree.
+struct SohmState {
+    /// The indexes the file was created with, in table order.
+    indexes: Vec<SohmIndexSpec>,
+    /// What `share_message` does to an eligible message right now.
+    phase: Slot<SohmPhase>,
+    /// Address of the superblock extension object header naming the master
+    /// table, once one has been written. Also the once-only latch on the
+    /// layout: a second finalize keeps the table the first one published.
+    extension_addr: Slot<Option<u64>>,
+}
+
+/// The passes `share_message` runs in, and the state between them.
+enum SohmPhase {
+    /// Outside a finalize: every message stays literal.
+    Idle,
+    /// Measuring headers, before the bodies they will hold are final. A
+    /// shareable message answers at the width of a heap pointer over a heap
+    /// object that does not exist yet, which is the width the one it ends up
+    /// pointing at has: a `H5O_shared_t` in heap form is the same size
+    /// whatever it names. Nothing this pass produces is written — it exists so
+    /// [`allocate_object_headers`](Hdf5Writer::allocate_object_headers) can
+    /// reserve a block for a header whose messages are shared before the
+    /// content phase has decided which heap object each one shares.
+    Predict,
+    /// Counting the bodies the file will share. Messages still go in
+    /// literally, so nothing this pass builds is written.
+    Collect(SohmCollector),
+    /// Substituting. A body the collect pass never saw stays literal, which
+    /// is a valid file: the record it would have shared simply keeps a
+    /// reference count one higher than the pointers that reach it.
+    Resolve(HashMap<(u8, Vec<u8>), [u8; SOHM_HEAP_ID_LEN]>),
+}
+
+impl SohmState {
+    /// The index that would take a `msg_type` message of `body_len` bytes,
+    /// as `H5SM_try_share` resolves one: the first index whose type mask
+    /// covers the class, and then only if the message reaches that index's
+    /// minimum. A message too small for its index is not offered to another —
+    /// `H5SM__get_index` picks by type alone and the size check comes after.
+    fn index_for(&self, msg_type: u8, body_len: usize) -> Option<usize> {
+        let flag = type_flag(msg_type)?;
+        let (at, spec) = self
+            .indexes
+            .iter()
+            .enumerate()
+            .find(|(_, spec)| spec.mesg_types & flag != 0)?;
+        (body_len as u64 >= u64::from(spec.min_mesg_size)).then_some(at)
+    }
+
+    /// Whether any index takes attribute messages, which is what makes the
+    /// file record message creation indices — `H5SM_init` sets
+    /// `store_msg_crt_idx` on exactly this condition (H5SM.c:220).
+    fn shares_attributes(&self) -> bool {
+        let Some(flag) = type_flag(MSG_ATTRIBUTE) else {
+            return false;
+        };
+        self.indexes.iter().any(|spec| spec.mesg_types & flag != 0)
+    }
+}
+
+/// The shareable message bodies of one collect pass, in first-seen order.
+struct SohmCollector {
+    /// Per index, its bodies with the number of headers holding each.
+    messages: Vec<Vec<SharedMessage>>,
+    /// Where a body sits: `(index, position in that index's messages)`.
+    seen: HashMap<(u8, Vec<u8>), (usize, usize)>,
+}
+
+impl SohmCollector {
+    fn new(nindexes: usize) -> Self {
+        Self {
+            messages: vec![Vec::new(); nindexes],
+            seen: HashMap::new(),
+        }
+    }
+
+    /// Count one header message against `index`, adding the body the first
+    /// time it is seen.
+    fn record(&mut self, index: usize, msg_type: u8, body: &[u8]) {
+        match self.seen.get(&(msg_type, body.to_vec())) {
+            Some(&(at, pos)) => self.messages[at][pos].ref_count += 1,
+            None => {
+                let pos = self.messages[index].len();
+                self.messages[index].push(SharedMessage {
+                    msg_type,
+                    body: body.to_vec(),
+                    ref_count: 1,
+                });
+                self.seen.insert((msg_type, body.to_vec()), (index, pos));
+            }
+        }
+    }
 }
 
 /// The file-creation properties a brand-new file is made with.
@@ -2401,6 +2513,105 @@ pub struct FileCreateOptions {
     /// [`MIN_USERBLOCK`] bytes, since a reader finds the
     /// superblock by doubling its search offset from there.
     pub userblock: u64,
+    /// Shared object header message indexes; see [`SharedMessageConfig`].
+    pub shared_messages: SharedMessageConfig,
+}
+
+/// The shared object header message indexes a new file is created with.
+///
+/// libhdf5 sets these with three calls on the file creation property list:
+/// `H5Pset_shared_mesg_nindexes` fixes how many indexes there are,
+/// `H5Pset_shared_mesg_index` gives each one the message types it covers and
+/// the smallest message it will take, and `H5Pset_shared_mesg_phase_change`
+/// sets the list/B-tree thresholds for all of them at once. The default —
+/// no indexes — is a file with no shared-message table, which is what every
+/// file this crate wrote before the option existed.
+#[derive(Debug, Clone, Copy)]
+pub struct SharedMessageConfig {
+    /// Indexes in table order; only the first `count` are in use.
+    indexes: [SohmIndexSpec; MAX_SOHM_INDEXES],
+    /// How many indexes the caller asked for. Kept even when it is more than
+    /// the array holds, so file creation can refuse the count the way
+    /// `H5Pset_shared_mesg_nindexes` does rather than silently drop indexes.
+    count: usize,
+}
+
+impl Default for SharedMessageConfig {
+    fn default() -> Self {
+        Self {
+            indexes: [SohmIndexSpec {
+                mesg_types: 0,
+                min_mesg_size: 0,
+                list_max: DEFAULT_SOHM_LIST_MAX,
+                btree_min: DEFAULT_SOHM_BTREE_MIN,
+            }; MAX_SOHM_INDEXES],
+            count: 0,
+        }
+    }
+}
+
+impl SharedMessageConfig {
+    /// One index per `(mesg_types, min_mesg_size)` pair — the arguments
+    /// `H5Pset_shared_mesg_index` takes, where `mesg_types` is the bit mask
+    /// [`type_flag`](crate::format::sohm::type_flag) builds — with the
+    /// file-wide phase change `H5Pset_shared_mesg_phase_change` sets: above
+    /// `list_max` an index is a v2 B-tree, below `btree_min` it is a list
+    /// again, and `list_max == 0` makes it a B-tree from its first message.
+    ///
+    /// Nothing is validated here; [`Hdf5Writer::create_with_options`] refuses
+    /// a configuration libhdf5 would refuse, so an invalid one is reported
+    /// where the file is made rather than where the value is typed.
+    pub fn new(indexes: &[(u16, u32)], list_max: u16, btree_min: u16) -> Self {
+        let mut config = Self {
+            count: indexes.len(),
+            ..Self::default()
+        };
+        for (slot, &(mesg_types, min_mesg_size)) in config.indexes.iter_mut().zip(indexes) {
+            *slot = SohmIndexSpec {
+                mesg_types,
+                min_mesg_size,
+                list_max,
+                btree_min,
+            };
+        }
+        config
+    }
+
+    /// The indexes in use, in table order.
+    pub(crate) fn specs(&self) -> &[SohmIndexSpec] {
+        &self.indexes[..self.count.min(MAX_SOHM_INDEXES)]
+    }
+
+    /// Refuse a configuration `H5Pset_shared_mesg_nindexes` or
+    /// `H5Pset_shared_mesg_phase_change` would refuse.
+    fn validate(&self) -> IoResult<()> {
+        if self.count > MAX_SOHM_INDEXES {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "a file may declare at most {MAX_SOHM_INDEXES} shared-message \
+                 indexes, not {}",
+                self.count
+            )));
+        }
+        for spec in self.specs() {
+            // The two thresholds must not overlap, or an index would convert
+            // back and forth on every insert.
+            if u32::from(spec.btree_min) > u32::from(spec.list_max) + 1 {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "shared-message phase change needs btree_min ({}) at most one \
+                     past list_max ({}), or an index converts on every insert",
+                    spec.btree_min, spec.list_max
+                )));
+            }
+            if spec.mesg_types == 0 {
+                return Err(crate::io::IoError::InvalidState(
+                    "a shared-message index covering no message type would never \
+                     be used; give it a type mask or drop it"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One object-reference element written before its value could be known.
@@ -2557,6 +2768,23 @@ pub(crate) enum LinkScope {
 /// dense storage (`H5O_CRT_ATTR_MAX_COMPACT_DEF`).
 const MAX_COMPACT_ATTRS: usize = 8;
 
+/// Links `H5G__obj_create_real` sizes a new group's object header for
+/// (`H5G_CRT_GINFO_EST_NUM_ENTRIES`), and the name length it assumes for each
+/// (`H5G_CRT_GINFO_EST_NAME_LEN`). Together with the link info and group info
+/// messages they are the whole of chunk 0 — see
+/// [`chunk0_capacity`](Hdf5Writer::chunk0_capacity).
+const EST_LINK_COUNT: usize = 4;
+/// See [`EST_LINK_COUNT`].
+const EST_LINK_NAME_LEN: usize = 8;
+
+/// Messages a shared-message index keeps in list form before it becomes a v2
+/// B-tree (`H5F_CRT_SHMSG_LIST_MAX_DEF`).
+const DEFAULT_SOHM_LIST_MAX: u16 = 50;
+
+/// Messages a shared-message B-tree index drops to before it reverts to a
+/// list (`H5F_CRT_SHMSG_BTREE_MIN_DEF`).
+const DEFAULT_SOHM_BTREE_MIN: u16 = 40;
+
 /// Links a group header keeps before libhdf5 spills the whole set to dense
 /// storage (`H5G_CRT_GINFO_MAX_COMPACT`). This writer emits no phase-change
 /// values in the Group Info message, so the default is what applies.
@@ -2612,7 +2840,9 @@ impl Hdf5Writer {
             track_order,
             libver,
             userblock,
+            shared_messages,
         } = options;
+        shared_messages.validate()?;
         if userblock != 0 && (userblock < MIN_USERBLOCK || !userblock.is_power_of_two()) {
             return Err(crate::io::IoError::InvalidState(format!(
                 "a userblock is {MIN_USERBLOCK} bytes or a power of two above it, \
@@ -2673,6 +2903,13 @@ impl Hdf5Writer {
             attribute_references: Slot::new(Vec::new()),
             // A file this crate creates is always the modern generation.
             legacy: None,
+            sohm: (!shared_messages.specs().is_empty()).then(|| {
+                Box::new(SohmState {
+                    indexes: shared_messages.specs().to_vec(),
+                    phase: Slot::new(SohmPhase::Idle),
+                    extension_addr: Slot::new(None),
+                })
+            }),
         })
     }
 
@@ -2751,11 +2988,39 @@ impl Hdf5Writer {
     /// a version-0 superblock whenever the creation property list asks for
     /// creation order.
     fn header_format(&self, track: TrackOrder) -> ObjectFormat {
-        if self.legacy.is_some() && !track.links.is_tracked() && !track.attrs.is_tracked() {
+        let attrs = self.header_attr_order(track.attrs);
+        if self.legacy.is_some() && !track.links.is_tracked() && !attrs.is_tracked() {
             ObjectFormat::Legacy
         } else {
             ObjectFormat::Modern
         }
+    }
+
+    /// The attribute creation-order policy an object header records, given
+    /// what the object's creation property list asked for.
+    ///
+    /// A file whose shared-message configuration covers attributes records a
+    /// creation index on every object header message: a shared attribute is
+    /// found again through it, so `H5SM_init` sets `store_msg_crt_idx`
+    /// (H5SM.c:220) and `H5O__create_ohdr` then raises every header it creates
+    /// to version 2 and ORs `H5O_HDR_ATTR_CRT_ORDER_TRACKED` into its flags
+    /// (H5Oint.c:364, H5Oint.c:442) whatever the property list says. So on
+    /// such a file the floor is `Tracked` — this is the only place that floor
+    /// is applied, and both the header version and the header flags come
+    /// through here.
+    fn header_attr_order(&self, requested: CreationOrder) -> CreationOrder {
+        if requested.is_tracked() || !self.tracks_message_creation_index() {
+            return requested;
+        }
+        CreationOrder::Tracked
+    }
+
+    /// Whether every object header this writer emits records message creation
+    /// indices.
+    fn tracks_message_creation_index(&self) -> bool {
+        self.sohm
+            .as_deref()
+            .is_some_and(SohmState::shares_attributes)
     }
 
     /// Whether a group whose links have this creation-order policy stores them
@@ -3602,6 +3867,10 @@ impl Hdf5Writer {
             pending_region_references: Slot::new(Vec::new()),
             attribute_references: Slot::new(Vec::new()),
             legacy,
+            // A reopened file's shared-message table is not rebuilt here:
+            // `open_rw` refuses a file that has one, so a writer that got this
+            // far has none to carry.
+            sohm: None,
         };
         // The link graph is complete only now, so this is the first point the
         // count each on-disk header was written with can be read off it: in a
@@ -5056,21 +5325,95 @@ impl Hdf5Writer {
         }
     }
 
-    /// Encode an object header at the version this file's format calls for,
-    /// with `rc` as the object's hard link count.
+    /// Encode an object header for the block at `addr`, at the version this
+    /// file's format calls for and with `rc` as the object's hard link count.
     ///
     /// The count is passed rather than read off the header because the two
     /// versions carry it in different places — the version-1 prefix's `nlink`
     /// field, the version-2 Reference Count message
     /// [`emit_refcount`](Self::emit_refcount) already added — and only the
     /// caller knows it.
-    fn encode_header(
+    ///
+    /// INVARIANT: every chunk of an object header lives in the one block its
+    /// address and encoded size describe. A header whose messages overflow
+    /// chunk 0 gets a continuation chunk immediately behind it in that same
+    /// block, so the address is enough to free, relocate or supersede the
+    /// whole header — which is what every caller already assumes. libhdf5
+    /// would have grown chunk 0 into space that free rather than chaining
+    /// onto it, but it reads a continuation chunk by the address and length
+    /// its message states and cares nothing for where that lands.
+    fn encode_header_at(
         &self,
         header: &ObjectHeader,
         rc: u32,
         format: ObjectFormat,
+        addr: u64,
     ) -> IoResult<Vec<u8>> {
-        Ok(header.encode_for(format, rc)?)
+        if format == ObjectFormat::Legacy {
+            return Ok(header.encode_for(format, rc)?);
+        }
+        let plan = header.plan_chunks(self.chunk0_capacity(header), &self.ctx)?;
+        let (mut image, continuation) =
+            header.encode_chunked(&plan, &self.ctx, addr + plan.chunk0_size as u64)?;
+        if let Some(chunk) = continuation {
+            image.extend_from_slice(&chunk);
+        }
+        Ok(image)
+    }
+
+    /// The bytes [`encode_header_at`](Self::encode_header_at) will produce for
+    /// `header`, without an address and without producing them.
+    ///
+    /// A header's encoded size does not depend on the addresses it carries,
+    /// which is what lets the group pass hand every group header an address
+    /// before it writes any of their content.
+    fn header_encoded_size(
+        &self,
+        header: &ObjectHeader,
+        rc: u32,
+        format: ObjectFormat,
+    ) -> IoResult<usize> {
+        if format == ObjectFormat::Legacy {
+            return Ok(header.encode_for(format, rc)?.len());
+        }
+        let plan = header.plan_chunks(self.chunk0_capacity(header), &self.ctx)?;
+        Ok(plan.chunk0_size + plan.continuation_size)
+    }
+
+    /// How many bytes of messages `header`'s chunk 0 holds before the rest
+    /// spill into a continuation chunk.
+    ///
+    /// libhdf5 sizes chunk 0 once, when the object header is created, and can
+    /// only grow it while the space behind it is still free — so an object
+    /// whose creation-time estimate covered every message it would ever hold
+    /// keeps one chunk, and one whose estimate was a guess does not. A dataset
+    /// or a committed datatype is created from messages already in hand
+    /// (`H5D__update_oh_info`, `H5T__commit`), so its estimate is exact and
+    /// this writer's exact fit is the same answer.
+    ///
+    /// A group is the exception: `H5G__obj_create_real` (H5Gobj.c:219) sizes
+    /// its header for the link info and group info messages plus
+    /// `H5G_CRT_GINFO_EST_NUM_ENTRIES` links of `H5G_CRT_GINFO_EST_NAME_LEN`
+    /// characters, and nothing else — attributes above all — is in that
+    /// estimate. The Link Info message is what identifies one: it is the
+    /// message that makes an object a new-format group, and
+    /// `H5G__obj_get_linfo` uses it for exactly this question.
+    fn chunk0_capacity(&self, header: &ObjectHeader) -> usize {
+        let envelope = header.message_envelope_size();
+        let sized = |msg_type: u8| {
+            header
+                .messages
+                .iter()
+                .find(|m| m.msg_type == msg_type)
+                .map(|m| envelope + m.data.len())
+        };
+        let Some(link_info) = sized(MSG_LINK_INFO) else {
+            return usize::MAX;
+        };
+        // One estimated hard link: version, flags, a one-byte name length for
+        // a name this short, the name, and the object header address.
+        let link = envelope + 1 + 1 + 1 + EST_LINK_NAME_LEN + self.ctx.sizeof_addr as usize;
+        link_info + sized(MSG_GROUP_INFO).unwrap_or(0) + EST_LINK_COUNT * link
     }
 
     /// The object an object reference's path names, as a hard-link target;
@@ -6070,6 +6413,7 @@ impl Hdf5Writer {
         // not the Attribute Info message, so this is what makes the object
         // report creation-ordered attributes — and tracking widens every
         // message envelope by the creation index below.
+        let order = self.header_attr_order(order);
         header.set_attribute_creation_order(order);
         if attributes.is_empty() {
             return;
@@ -6119,10 +6463,12 @@ impl Hdf5Writer {
         // attribute with none belongs to an object that tracks no order, where
         // the field is not encoded at all.
         for attr in attributes {
+            let (flags, body) =
+                self.share_message(MSG_ATTRIBUTE, 0x00, self.encode_attribute(attr));
             header.add_message_indexed(
                 MSG_ATTRIBUTE,
-                0x00,
-                self.encode_attribute(attr),
+                flags,
+                body,
                 attr.creation_index().unwrap_or(0),
             );
         }
@@ -6242,6 +6588,174 @@ impl Hdf5Writer {
             AttrScope::Group(gi) => self.group_header_format(gi),
             AttrScope::Dataset(i) => self.dataset_header_format(i),
         }
+    }
+
+    /// What a header stores for a message a shared-message index may cover:
+    /// the body itself, or a pointer into the shared-message heap.
+    ///
+    /// The single point at which a message is offered to an index. Every
+    /// header builder routes its shareable messages through here, so the pass
+    /// that counts references and the pass that substitutes pointers walk
+    /// exactly the same set — the counting and the substituting cannot drift
+    /// apart, because they are one call site in two phases.
+    ///
+    /// Outside a finalize, and in any file created without indexes, this is
+    /// the identity.
+    fn share_message(&self, msg_type: u8, flags: u8, body: Vec<u8>) -> (u8, Vec<u8>) {
+        let Some(sohm) = self.sohm.as_deref() else {
+            return (flags, body);
+        };
+        // A message already carrying a pointer — a committed datatype — is
+        // shared by address and must not be shared again, and the message
+        // classes libhdf5 marks `H5O_MSG_FLAG_DONTSHARE` never reach an index.
+        if flags & (MSG_FLAG_SHARED | MSG_FLAG_DONTSHARE) != 0 {
+            return (flags, body);
+        }
+        let Some(index) = sohm.index_for(msg_type, body.len()) else {
+            return (flags, body);
+        };
+        match &mut *sohm.phase.lock() {
+            SohmPhase::Idle => (flags, body),
+            SohmPhase::Predict => (
+                flags | MSG_FLAG_SHARED,
+                SharedMessagePointer::encode_sohm([0u8; SOHM_HEAP_ID_LEN]),
+            ),
+            SohmPhase::Collect(collector) => {
+                collector.record(index, msg_type, &body);
+                (flags, body)
+            }
+            SohmPhase::Resolve(ids) => {
+                let key = (msg_type, body);
+                match ids.get(&key) {
+                    Some(&id) => (
+                        flags | MSG_FLAG_SHARED,
+                        SharedMessagePointer::encode_sohm(id),
+                    ),
+                    // The collect pass never saw this body — a dataspace a
+                    // SWMR extend changed after the table was laid out, say.
+                    // Left literal, which leaves a heap object counted for one
+                    // reference more than reaches it and nothing else.
+                    None => (flags, key.1),
+                }
+            }
+        }
+    }
+
+    /// Answer every shareable message at a heap pointer's width for the rest
+    /// of this finalize's allocation phase.
+    ///
+    /// Half of the bracket [`prepare_shared_messages`](Self::prepare_shared_messages)
+    /// closes, and the reason the two can sit on opposite sides of the
+    /// allocation: a header cannot be measured until it is known which of its
+    /// messages are pointers, and a body cannot be counted until every address
+    /// it names exists. Only the width is knowable in the first phase, and the
+    /// width is all the measurement needs.
+    ///
+    /// A finalize that will not lay a table out — a `finalize_for_swmr`, a
+    /// second finalize over a table already published — leaves the phase where
+    /// it found it, so what that pass measures is what it writes.
+    fn begin_shared_message_layout(&self) {
+        let Some(sohm) = self.sohm.as_deref() else {
+            return;
+        };
+        let mut phase = sohm.phase.lock();
+        if matches!(*phase, SohmPhase::Idle) && sohm.extension_addr.lock().is_none() {
+            *phase = SohmPhase::Predict;
+        }
+    }
+
+    /// Lay out the file's shared-message table: count the bodies every header
+    /// this finalize writes would share, put them in their index's heap, and
+    /// arm the substitution the header builders then apply.
+    ///
+    /// The sole owner of the transition to `Resolve`. It runs last in the
+    /// content phase, after
+    /// [`prepare_dense_attributes`](Self::prepare_dense_attributes),
+    /// [`prepare_link_storage`](Self::prepare_link_storage) and
+    /// [`write_reference_values`](Self::write_reference_values), because a
+    /// body is only counted once it is the body the file will hold: an
+    /// attribute that spilled into dense storage is not in a header to be
+    /// shared at all, and one holding an object reference says an object
+    /// header address that exists only after the allocation phase. Counting
+    /// either of them earlier would count a body no header ends up carrying,
+    /// and leave the header that carries the real one literal — which
+    /// [`check_header_size`] would then refuse, the block having been
+    /// reserved at a pointer's width.
+    ///
+    /// Once per file: a second finalize (a SWMR session's close) keeps the
+    /// table the first one published rather than allocating a second one and
+    /// stranding the first.
+    fn prepare_shared_messages(&self, datasets: &[usize]) -> IoResult<()> {
+        let Some(sohm) = self.sohm.as_deref() else {
+            return Ok(());
+        };
+        if sohm.extension_addr.lock().is_some() {
+            return Ok(());
+        }
+
+        // Collect: build every header this finalize will write and throw it
+        // away, keeping only what its shareable messages were.
+        *sohm.phase.lock() = SohmPhase::Collect(SohmCollector::new(sohm.indexes.len()));
+        for &i in datasets {
+            self.build_dataset_header(i)?;
+        }
+        for gi in 0..self.group_count() {
+            if self.grp(gi).lock().deleted {
+                continue;
+            }
+            self.build_group_header(gi)?;
+        }
+        self.build_root_group_header()?;
+        let SohmPhase::Collect(collector) =
+            std::mem::replace(&mut *sohm.phase.lock(), SohmPhase::Idle)
+        else {
+            return Err(crate::io::IoError::InvalidState(
+                "the shared-message collect pass did not finish in the collect phase".into(),
+            ));
+        };
+
+        let indexes: Vec<SohmIndexContent> = sohm
+            .indexes
+            .iter()
+            .zip(collector.messages)
+            .map(|(&spec, messages)| SohmIndexContent { spec, messages })
+            .collect();
+        let built =
+            build_shared_messages(&indexes, &self.ctx, &mut |len| self.allocator.allocate(len))?;
+        for block in &built.blocks {
+            self.handle.write_at(block.addr, &block.image)?;
+        }
+
+        // The superblock extension: a version-1 object header holding nothing
+        // but the shared-message-table message, which is what libhdf5 writes
+        // for it (`H5F__super_ext_create` creates the header before anything
+        // raises the file's object header version).
+        let nindexes = u8::try_from(sohm.indexes.len()).map_err(|_| {
+            crate::io::IoError::InvalidState(format!(
+                "{} shared-message indexes",
+                sohm.indexes.len()
+            ))
+        })?;
+        let mut extension = ObjectHeader::new();
+        extension.add_message(
+            MSG_SHARED_MESSAGE_TABLE,
+            MSG_FLAG_CONSTANT | MSG_FLAG_DONTSHARE,
+            SharedMessageTableMessage {
+                version: 0,
+                table_address: built.table_addr,
+                nindexes,
+            }
+            .encode(&self.ctx),
+        );
+        let image = extension.encode_v1(1)?;
+        let addr = self.allocator.allocate(image.len() as u64);
+        self.handle.write_at(addr, &image)?;
+
+        // Only now, with every block on disk: from here the header builders
+        // substitute pointers, and the superblock names the extension.
+        *sohm.phase.lock() = SohmPhase::Resolve(built.heap_ids);
+        *sohm.extension_addr.lock() = Some(addr);
+        Ok(())
     }
 
     /// Define a new contiguous dataset. Returns the dataset index (used with
@@ -10827,7 +11341,13 @@ impl Hdf5Writer {
             sizeof_lengths: self.ctx.sizeof_size,
             file_consistency_flags: flags,
             base_address: base,
-            superblock_extension_address: UNDEF_ADDR,
+            // The extension holds the shared-message table, and nothing else
+            // this writer emits needs one.
+            superblock_extension_address: self
+                .sohm
+                .as_deref()
+                .and_then(|sohm| *sohm.extension_addr.lock())
+                .unwrap_or(UNDEF_ADDR),
             end_of_file_address: eof,
             root_group_object_header_address: root_addr,
         };
@@ -10853,7 +11373,8 @@ impl Hdf5Writer {
 
         let header = self.build_dataset_header(index)?;
         let nlink = self.object_link_count(HardLinkTarget::Dataset(index));
-        let encoded = self.encode_header(&header, nlink, self.dataset_header_format(index))?;
+        let encoded =
+            self.encode_header_at(&header, nlink, self.dataset_header_format(index), addr)?;
 
         if encoded.len() > original_size {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -11079,8 +11600,10 @@ impl Hdf5Writer {
         // 2. Allocate. Committed datatype headers go down whole: a header of
         // theirs holds a datatype and a reference count, so it waits on
         // nothing, while a dataset sharing the type and the group naming it
-        // both store its address.
+        // both store its address. They are written before the shared-message
+        // phase opens, so a committed type reaches the file as itself.
         self.write_committed_datatype_headers()?;
+        self.begin_shared_message_layout();
         let layout = self.allocate_object_headers(&rewritten)?;
 
         // 3. Build content, with every object header's address known. Dense
@@ -11088,10 +11611,13 @@ impl Hdf5Writer {
         // object reference among them is a header address; dense links and
         // symbol tables name header addresses; a reference dataset's elements
         // are header addresses. Nothing here is a fixup: each is written once,
-        // with the value the file keeps.
+        // with the value the file keeps. The shared-message table comes last:
+        // it counts the bodies the headers will hold, and the three above are
+        // what settle them.
         self.prepare_dense_attributes(&rewritten)?;
         self.prepare_link_storage()?;
         self.write_reference_values()?;
+        self.prepare_shared_messages(&rewritten)?;
 
         // 4. Write every object header over the block phase 2 reserved for it.
         self.write_object_headers(&layout)?;
@@ -11135,9 +11661,7 @@ impl Hdf5Writer {
         for &i in datasets {
             let rc = self.object_link_count(HardLinkTarget::Dataset(i));
             let header = self.build_dataset_header(i)?;
-            let size = self
-                .encode_header(&header, rc, self.dataset_header_format(i))?
-                .len();
+            let size = self.header_encoded_size(&header, rc, self.dataset_header_format(i))?;
             let addr = self.allocator.allocate(size as u64);
             self.ds(i).lock().obj_header_addr = addr;
             layout.datasets.push((i, addr, size));
@@ -11148,17 +11672,13 @@ impl Hdf5Writer {
             }
             let rc = self.object_link_count(HardLinkTarget::Group(gi));
             let header = self.build_group_header(gi)?;
-            let size = self
-                .encode_header(&header, rc, self.group_header_format(gi))?
-                .len();
+            let size = self.header_encoded_size(&header, rc, self.group_header_format(gi))?;
             let addr = self.allocator.allocate(size as u64);
             self.grp(gi).lock().obj_header_addr = addr;
             layout.groups.push((gi, addr, size));
         }
         let header = self.build_root_group_header()?;
-        let size = self
-            .encode_header(&header, 1, self.header_format(self.root_track_order))?
-            .len();
+        let size = self.header_encoded_size(&header, 1, self.header_format(self.root_track_order))?;
         let addr = self.allocator.allocate(size as u64);
         self.root_group_addr = Some(addr);
         layout.root = (addr, size);
@@ -11179,7 +11699,8 @@ impl Hdf5Writer {
         for &(i, addr, size) in &layout.datasets {
             let rc = self.object_link_count(HardLinkTarget::Dataset(i));
             let header = self.build_dataset_header(i)?;
-            let encoded = self.encode_header(&header, rc, self.dataset_header_format(i))?;
+            let encoded =
+                self.encode_header_at(&header, rc, self.dataset_header_format(i), addr)?;
             check_header_size(&encoded, size, || {
                 format!("dataset '{}'", self.ds(i).lock().name)
             })?;
@@ -11191,7 +11712,7 @@ impl Hdf5Writer {
         for &(gi, addr, size) in &layout.groups {
             let rc = self.object_link_count(HardLinkTarget::Group(gi));
             let header = self.build_group_header(gi)?;
-            let encoded = self.encode_header(&header, rc, self.group_header_format(gi))?;
+            let encoded = self.encode_header_at(&header, rc, self.group_header_format(gi), addr)?;
             check_header_size(&encoded, size, || {
                 format!("group '{}'", self.grp(gi).lock().name)
             })?;
@@ -11199,7 +11720,8 @@ impl Hdf5Writer {
         }
         let (addr, size) = layout.root;
         let header = self.build_root_group_header()?;
-        let encoded = self.encode_header(&header, 1, self.header_format(self.root_track_order))?;
+        let encoded =
+            self.encode_header_at(&header, 1, self.header_format(self.root_track_order), addr)?;
         check_header_size(&encoded, size, || "the root group".to_string())?;
         self.handle.write_at(addr, &encoded)?;
         Ok(())
@@ -11228,7 +11750,8 @@ impl Hdf5Writer {
 
         // Dataspace message (type 0x01)
         let ds_msg = m.dataspace.encode_for(&self.ctx, self.message_format());
-        header.add_message(MSG_DATASPACE, 0x00, ds_msg);
+        let (flags, ds_msg) = self.share_message(MSG_DATASPACE, 0x00, ds_msg);
+        header.add_message(MSG_DATASPACE, flags, ds_msg);
 
         // Datatype message (type 0x03). A dataset built on a committed type
         // stores a pointer to that object header in place of the message, and
@@ -11240,11 +11763,14 @@ impl Hdf5Writer {
                 MSG_FLAG_CONSTANT | MSG_FLAG_SHARED,
                 SharedMessagePointer::encode_committed(addr, &self.ctx),
             ),
-            None => header.add_message(
-                MSG_DATATYPE,
-                MSG_FLAG_CONSTANT,
-                m.datatype.encode_at(&self.ctx, self.encoding_libver()),
-            ),
+            None => {
+                let (flags, body) = self.share_message(
+                    MSG_DATATYPE,
+                    MSG_FLAG_CONSTANT,
+                    m.datatype.encode_at(&self.ctx, self.encoding_libver()),
+                );
+                header.add_message(MSG_DATATYPE, flags, body)
+            }
         }
 
         // Fill Value message (type 0x05)
@@ -11277,7 +11803,8 @@ impl Hdf5Writer {
             FillValueMessage::default()
         };
         let fv_msg = fv.encode_for(self.message_format());
-        header.add_message(MSG_FILL_VALUE, 0x00, fv_msg);
+        let (flags, fv_msg) = self.share_message(MSG_FILL_VALUE, 0x00, fv_msg);
+        header.add_message(MSG_FILL_VALUE, flags, fv_msg);
 
         // Data Layout message (type 0x08)
         let layout = if let Some(ref chunked) = m.chunked {
@@ -11322,8 +11849,9 @@ impl Hdf5Writer {
         // Filter Pipeline message (type 0x0B) -- only if filters are configured
         if let Some(ref pipeline) = m.filter_pipeline {
             if !pipeline.filters.is_empty() {
-                let filter_msg = pipeline.encode();
-                header.add_message(MSG_FILTER_PIPELINE, 0x00, filter_msg);
+                let (flags, filter_msg) =
+                    self.share_message(MSG_FILTER_PIPELINE, 0x00, pipeline.encode());
+                header.add_message(MSG_FILTER_PIPELINE, flags, filter_msg);
             }
         }
 
@@ -11380,6 +11908,11 @@ impl Hdf5Writer {
     fn build_committed_datatype_header(&self, index: usize, rc: u32) -> ObjectHeader {
         let datatype = self.committed_datatypes.lock()[index].datatype.clone();
         let mut header = ObjectHeader::new();
+        // No attributes to emit, so nothing else would apply the file-wide
+        // floor to this header. `store_msg_crt_idx` is a property of the file,
+        // not of the object: every header created under it records creation
+        // indices, a committed datatype's included.
+        header.set_attribute_creation_order(self.header_attr_order(CreationOrder::default()));
         // `H5T__commit` marks the message constant and unshareable: this
         // header is where shared datatype bodies are read *from*, so its own
         // message must never become a pointer into the shared-message heap.
