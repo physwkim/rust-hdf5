@@ -32,9 +32,10 @@ use rust_hdf5::format::messages::filter::{
 };
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
-    ChunkIndex, ExternalFileSegment, FillValue, H5Attribute, H5Dataset, H5File, H5FileOptions,
-    H5Group, H5NamedDatatype, Hdf5Error, Hyperslab, HyperslabBlock, LibverBound, LinkClass,
-    Reference, Selection, StorageLayout, VirtualMapping,
+    AttributeStorage, ChunkIndex, CreationOrder, ExternalFileSegment, FillValue, H5Attribute,
+    H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error, Hyperslab,
+    HyperslabBlock, LibverBound, LinkClass, LinkStorage, Reference, Selection, StorageLayout,
+    VirtualMapping,
 };
 
 const CANON_VERSION: &str = "3";
@@ -673,12 +674,6 @@ fn child_path(parent: &str, name: &str) -> String {
 fn dump_file(path: &str) -> std::result::Result<String, String> {
     let mut d = Dump::new();
     d.emit("!canon", CANON_VERSION);
-    // The superblock version is what pins the libver bound a file was written
-    // under, and there is no public accessor for it on H5File.
-    d.emit(
-        "#superblock",
-        unsupported("superblock", "H5File exposes no superblock/libver accessor"),
-    );
 
     let file = match guarded(|| H5File::open(path)) {
         Ok(Ok(f)) => f,
@@ -686,9 +681,17 @@ fn dump_file(path: &str) -> std::result::Result<String, String> {
         Err(p) => return Err(format!("H5File::open panicked: {p}")),
     };
 
+    // The twin of `canon.py`'s `read_superblock`: the raw version byte
+    // straight after the signature. Has to come after the open — it is a
+    // property of the file, not of the path.
+    d.field("", "superblock", || {
+        file.superblock_version()
+            .map(|v| v.to_string())
+            .map_err(oneline)
+    });
+
     // `H5File::userblock_size` answers in either mode, so this is a value the
-    // canon can be compared against rather than an API gap. It has to come
-    // after the open — it is a property of the file, not of the path.
+    // canon can be compared against rather than an API gap.
     d.field("", "userblock", || Ok(file.userblock_size().to_string()));
 
     let root = file.root_group();
@@ -696,21 +699,61 @@ fn dump_file(path: &str) -> std::result::Result<String, String> {
     Ok(d.lines.join("\n") + "\n")
 }
 
+/// The twin of `canon.py`'s `crt_order_str`: `-`, `tracked`, or
+/// `tracked+indexed` — `Indexed` always implies `Tracked`, so those three are
+/// the only strings either side ever produces.
+fn crt_order_str(order: CreationOrder) -> &'static str {
+    match order {
+        CreationOrder::Untracked => "-",
+        CreationOrder::Tracked => "tracked",
+        CreationOrder::Indexed => "tracked+indexed",
+    }
+}
+
+/// The twin of `canon.py`'s `dump_attrs`'s `attrstore` lambda: `"compact"` or
+/// `"dense"`, the same two strings h5py's `meta_size.attr.index_size` check
+/// produces.
+fn attrstore_str(storage: AttributeStorage) -> &'static str {
+    if storage.is_dense() {
+        "dense"
+    } else {
+        "compact"
+    }
+}
+
+/// The twin of `canon.py`'s `link_storage_str`: `"symtab"`, `"compact"`, or
+/// `"dense"`.
+fn linkstore_str(storage: LinkStorage) -> &'static str {
+    match storage {
+        LinkStorage::SymbolTable => "symtab",
+        LinkStorage::Compact => "compact",
+        LinkStorage::Dense => "dense",
+    }
+}
+
 fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: usize) {
     d.emit(&format!("{path}#kind"), "group");
     d.field(path, "linkorder", || {
-        Err("H5Group exposes no link creation-order tracking flags".into())
+        group
+            .link_creation_order()
+            .map(crt_order_str)
+            .map(str::to_string)
+            .map_err(oneline)
     });
     d.field(path, "attrorder", || {
-        Err("H5Group exposes no attribute creation-order tracking flags".into())
+        group
+            .attr_creation_order()
+            .map(crt_order_str)
+            .map(str::to_string)
+            .map_err(oneline)
     });
-    d.emit(
-        &format!("{path}#linkstore"),
-        unsupported(
-            "linkstore",
-            "H5Group exposes no compact/dense link storage accessor",
-        ),
-    );
+    d.field(path, "linkstore", || {
+        group
+            .link_storage()
+            .map(linkstore_str)
+            .map(str::to_string)
+            .map_err(oneline)
+    });
     dump_group_attrs(d, path, group);
 
     if depth >= MAX_DEPTH {
@@ -1083,8 +1126,12 @@ fn dataset_payload(
 trait AttrSource {
     fn attr_names(&self) -> rust_hdf5::Result<Vec<String>>;
     fn attr(&self, name: &str) -> rust_hdf5::Result<H5Attribute>;
-    /// What stands in the way of the object-header attribute count.
-    fn nattrs_hdr_gap() -> &'static str;
+    /// This object's own object-header attribute count, or what stands in
+    /// the way of reading it.
+    fn header_attr_count(&self) -> std::result::Result<u64, String>;
+    /// This object's own compact/dense attribute storage, or what stands in
+    /// the way of reading it.
+    fn attr_storage(&self) -> std::result::Result<AttributeStorage, String>;
 }
 
 impl AttrSource for H5Dataset {
@@ -1094,8 +1141,11 @@ impl AttrSource for H5Dataset {
     fn attr(&self, name: &str) -> rust_hdf5::Result<H5Attribute> {
         H5Dataset::attr(self, name)
     }
-    fn nattrs_hdr_gap() -> &'static str {
-        "H5Dataset exposes no object-header attribute count"
+    fn header_attr_count(&self) -> std::result::Result<u64, String> {
+        H5Dataset::header_attr_count(self).map_err(oneline)
+    }
+    fn attr_storage(&self) -> std::result::Result<AttributeStorage, String> {
+        H5Dataset::attr_storage(self).map_err(oneline)
     }
 }
 
@@ -1106,8 +1156,11 @@ impl AttrSource for H5NamedDatatype {
     fn attr(&self, name: &str) -> rust_hdf5::Result<H5Attribute> {
         H5NamedDatatype::attr(self, name)
     }
-    fn nattrs_hdr_gap() -> &'static str {
-        "H5NamedDatatype exposes no object-header attribute count"
+    fn header_attr_count(&self) -> std::result::Result<u64, String> {
+        H5NamedDatatype::header_attr_count(self).map_err(oneline)
+    }
+    fn attr_storage(&self) -> std::result::Result<AttributeStorage, String> {
+        Err("H5NamedDatatype exposes no compact/dense attribute storage accessor".into())
     }
 }
 
@@ -1147,17 +1200,12 @@ fn dump_object_attrs<T: AttrSource>(d: &mut Dump, path: &str, ds: &T) {
         }
     };
     d.emit(&format!("{path}#nattrs"), names.len().to_string());
-    d.emit(
-        &format!("{path}#nattrs_hdr"),
-        unsupported("nattrs_hdr", T::nattrs_hdr_gap()),
-    );
-    d.emit(
-        &format!("{path}#attrstore"),
-        unsupported(
-            "attrstore",
-            "H5Dataset exposes no compact/dense attribute storage accessor",
-        ),
-    );
+    d.field(path, "nattrs_hdr", || {
+        ds.header_attr_count().map(|n| n.to_string())
+    });
+    d.field(path, "attrstore", || {
+        ds.attr_storage().map(attrstore_str).map(str::to_string)
+    });
 
     for name in names {
         let key = format!("{path}@{name}");
@@ -1240,20 +1288,19 @@ fn dump_group_attrs(d: &mut Dump, path: &str, group: &H5Group) {
         }
     };
     d.emit(&format!("{path}#nattrs"), names.len().to_string());
-    d.emit(
-        &format!("{path}#nattrs_hdr"),
-        unsupported(
-            "nattrs_hdr",
-            "H5Group exposes no object-header attribute count",
-        ),
-    );
-    d.emit(
-        &format!("{path}#attrstore"),
-        unsupported(
-            "attrstore",
-            "H5Group exposes no compact/dense attribute storage accessor",
-        ),
-    );
+    d.field(path, "nattrs_hdr", || {
+        group
+            .header_attr_count()
+            .map(|n| n.to_string())
+            .map_err(oneline)
+    });
+    d.field(path, "attrstore", || {
+        group
+            .attr_storage()
+            .map(attrstore_str)
+            .map(str::to_string)
+            .map_err(oneline)
+    });
 
     for name in names {
         let key = format!("{path}@{name}");

@@ -12,6 +12,7 @@ use crate::format::messages::filter::Filter;
 use crate::format::messages::virtual_mapping::VirtualMapping;
 use crate::format::reference::Reference;
 use crate::format::selection::Selection;
+use crate::format::storage_kind::AttributeStorage;
 use crate::io::reader::ExternalFileSegment;
 use crate::io::writer::ChunkIndexKind;
 use crate::types::H5Type;
@@ -1945,6 +1946,41 @@ impl H5Dataset {
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "attrs_unreadable_reason not available in write mode".into(),
+            )),
+        }
+    }
+
+    /// This dataset's own compact-vs-dense attribute storage — the
+    /// equivalent of `h5py.h5o.get_info(did.id).meta_size.attr.index_size`
+    /// being nonzero (read mode only).
+    pub fn attr_storage(&self) -> Result<AttributeStorage> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => Ok(reader.dataset_attr_storage(name)?),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "attr_storage not available in write mode".into(),
+            )),
+        }
+    }
+
+    /// This dataset's own object-header attribute count — the equivalent of
+    /// `h5py.h5o.get_info(did.id).num_attrs` (read mode only).
+    pub fn header_attr_count(&self) -> Result<u64> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => Ok(reader.dataset_header_attr_count(name)?),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "header_attr_count not available in write mode".into(),
             )),
         }
     }

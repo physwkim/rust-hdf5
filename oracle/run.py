@@ -118,18 +118,21 @@ def expected_deviation(entry):
 # Each is one API gap, listed once in the findings; they say nothing about the
 # case that happens to contain them, so they do not stop a case passing
 # direction A. Everything else that comes back UNSUPPORTED is specific to the
-# file at hand and does.
-STRUCTURAL_FIELDS = {
-    "superblock",
-    "nattrs_hdr",
-    "attrstore",
-    "linkstore",
-    "linkorder",
-    "attrorder",
-}
+# file at hand and does. Empty since wave 6: every field the canonical format
+# names now has an accessor on at least one object kind, so the remaining
+# carve-outs are all per-kind (below).
+STRUCTURAL_FIELDS = set()
 # `strpad` is deliberately NOT structural: it is a datatype detail the probe
 # answers from the decoded type, so a disagreement there is a modelling gap in
 # one class, not a missing accessor.
+
+# Fields with a real accessor on some object kinds but not others: still an
+# API-wide gap on the `#kind` values listed here, so a case is not held to a
+# field the API was never asked to expose there. `attr_storage()` exists on
+# H5Group and H5Dataset; H5NamedDatatype has no counterpart.
+STRUCTURAL_FIELDS_BY_KIND = {
+    "attrstore": {"committed-datatype"},
+}
 
 
 def parse_dump(text):
@@ -161,6 +164,8 @@ def marker(value, name):
 def is_structural(key, field, ref):
     """True when this UNSUPPORTED is one of the always-missing accessors."""
     if field in STRUCTURAL_FIELDS:
+        return True
+    if ref.get("%s#kind" % object_of(key)) in STRUCTURAL_FIELDS_BY_KIND.get(field, ()):
         return True
     if "@" not in key:
         return False

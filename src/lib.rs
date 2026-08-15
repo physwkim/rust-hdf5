@@ -106,6 +106,7 @@ pub use attribute::{AttrShape, H5Attribute};
 pub use dataset::{ChunkIndex, FillValue, H5Dataset, ReadNumeric, StorageLayout};
 pub use error::{Hdf5Error, Result};
 pub use file::{H5File, H5FileOptions};
+pub use format::creation_order::CreationOrder;
 pub use format::messages::datatype::{ByteOrder, DatatypeMessage};
 pub use format::messages::filter::{Filter, FilterPipeline};
 pub use format::messages::superblock_ext::{
@@ -117,6 +118,7 @@ pub use format::reference::Reference;
 pub use format::selection::{
     Hyperslab, HyperslabBlock, PointSelection, RegularHyperslab, Selection,
 };
+pub use format::storage_kind::{AttributeStorage, LinkStorage};
 pub use format::LibverBound;
 pub use group::H5Group;
 pub use io::locking::{FileLocking, LockMode};
