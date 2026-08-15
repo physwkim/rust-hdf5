@@ -25,6 +25,7 @@ use crate::io::{Hdf5Reader, Hdf5Writer};
 
 use crate::dataset::{DatasetBuilder, H5Dataset};
 use crate::error::{Hdf5Error, Result};
+use crate::format::messages::datatype::DatatypeMessage;
 use crate::format::messages::filter::FilterPipeline;
 use crate::format::LibverBound;
 use crate::group::H5Group;
@@ -356,6 +357,56 @@ impl H5File {
         let es = T::element_size();
         let raw = unsafe { std::slice::from_raw_parts(value as *const T as *const u8, es) };
         let attr = AttributeMessage::scalar_numeric(name, T::hdf5_type(), raw.to_vec());
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => {
+                writer.add_root_attribute(attr)?;
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
+        }
+    }
+
+    /// Add a scalar attribute to the file (root group) whose datatype and raw
+    /// value the caller supplies.
+    ///
+    /// The escape hatch for a type this crate has no Rust mapping for — a
+    /// fixed-length string of a size the value alone does not imply, say,
+    /// which is what `H5Tcopy(H5T_C_S1)` plus `H5Tset_size` produces.
+    /// [`DatasetBuilder::datatype`](crate::dataset::DatasetBuilder::datatype)
+    /// is the same hatch for a dataset; every typed setter here builds one of
+    /// these underneath.
+    ///
+    /// `value` is the raw element image and must be exactly as long as the
+    /// datatype's element size.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::{DatatypeMessage, H5File};
+    /// let file = H5File::create("notes.h5").unwrap();
+    /// let mut text = vec![b'x'; 256];
+    /// text[255] = 0;
+    /// file.set_attr_typed(
+    ///     "note",
+    ///     DatatypeMessage::FixedString { size: 256, padding: 0, charset: 0 },
+    ///     text,
+    /// )
+    /// .unwrap();
+    /// ```
+    pub fn set_attr_typed(
+        &self,
+        name: &str,
+        datatype: DatatypeMessage,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        use crate::format::messages::attribute::AttributeMessage;
+        if value.len() as u64 != u64::from(datatype.element_size()) {
+            return Err(Hdf5Error::InvalidState(format!(
+                "attribute '{name}' was given {} bytes for a datatype whose element is {}",
+                value.len(),
+                datatype.element_size()
+            )));
+        }
+        let attr = AttributeMessage::scalar_numeric(name, datatype, value);
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {

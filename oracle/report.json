@@ -16875,7 +16875,7 @@
    "case": "ochk_root",
    "group": "objectheader",
    "note": "root group whose object header spills into two continuation chunks",
-   "rust_case": null,
+   "rust_case": "ochk_root",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -17190,12 +17190,12 @@
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
     "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   }
  ],
@@ -17208,8 +17208,7 @@
     "external_storage",
     "vds",
     "group_storage_modern_root",
-    "group_storage_legacy_root",
-    "ochk_root"
+    "group_storage_legacy_root"
    ],
    "example": ""
   },

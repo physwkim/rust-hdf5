@@ -2691,6 +2691,15 @@ pub(crate) enum LinkScope {
 /// dense storage (`H5O_CRT_ATTR_MAX_COMPACT_DEF`).
 const MAX_COMPACT_ATTRS: usize = 8;
 
+/// Links `H5G__obj_create_real` sizes a new group's object header for
+/// (`H5G_CRT_GINFO_EST_NUM_ENTRIES`), and the name length it assumes for each
+/// (`H5G_CRT_GINFO_EST_NAME_LEN`). Together with the link info and group info
+/// messages they are the whole of chunk 0 — see
+/// [`chunk0_capacity`](Hdf5Writer::chunk0_capacity).
+const EST_LINK_COUNT: usize = 4;
+/// See [`EST_LINK_COUNT`].
+const EST_LINK_NAME_LEN: usize = 8;
+
 /// Messages a shared-message index keeps in list form before it becomes a v2
 /// B-tree (`H5F_CRT_SHMSG_LIST_MAX_DEF`).
 const DEFAULT_SOHM_LIST_MAX: u16 = 50;
@@ -5234,21 +5243,95 @@ impl Hdf5Writer {
         }
     }
 
-    /// Encode an object header at the version this file's format calls for,
-    /// with `rc` as the object's hard link count.
+    /// Encode an object header for the block at `addr`, at the version this
+    /// file's format calls for and with `rc` as the object's hard link count.
     ///
     /// The count is passed rather than read off the header because the two
     /// versions carry it in different places — the version-1 prefix's `nlink`
     /// field, the version-2 Reference Count message
     /// [`emit_refcount`](Self::emit_refcount) already added — and only the
     /// caller knows it.
-    fn encode_header(
+    ///
+    /// INVARIANT: every chunk of an object header lives in the one block its
+    /// address and encoded size describe. A header whose messages overflow
+    /// chunk 0 gets a continuation chunk immediately behind it in that same
+    /// block, so the address is enough to free, relocate or supersede the
+    /// whole header — which is what every caller already assumes. libhdf5
+    /// would have grown chunk 0 into space that free rather than chaining
+    /// onto it, but it reads a continuation chunk by the address and length
+    /// its message states and cares nothing for where that lands.
+    fn encode_header_at(
         &self,
         header: &ObjectHeader,
         rc: u32,
         format: ObjectFormat,
+        addr: u64,
     ) -> IoResult<Vec<u8>> {
-        Ok(header.encode_for(format, rc)?)
+        if format == ObjectFormat::Legacy {
+            return Ok(header.encode_for(format, rc)?);
+        }
+        let plan = header.plan_chunks(self.chunk0_capacity(header), &self.ctx)?;
+        let (mut image, continuation) =
+            header.encode_chunked(&plan, &self.ctx, addr + plan.chunk0_size as u64)?;
+        if let Some(chunk) = continuation {
+            image.extend_from_slice(&chunk);
+        }
+        Ok(image)
+    }
+
+    /// The bytes [`encode_header_at`](Self::encode_header_at) will produce for
+    /// `header`, without an address and without producing them.
+    ///
+    /// A header's encoded size does not depend on the addresses it carries,
+    /// which is what lets the group pass hand every group header an address
+    /// before it writes any of their content.
+    fn header_encoded_size(
+        &self,
+        header: &ObjectHeader,
+        rc: u32,
+        format: ObjectFormat,
+    ) -> IoResult<usize> {
+        if format == ObjectFormat::Legacy {
+            return Ok(header.encode_for(format, rc)?.len());
+        }
+        let plan = header.plan_chunks(self.chunk0_capacity(header), &self.ctx)?;
+        Ok(plan.chunk0_size + plan.continuation_size)
+    }
+
+    /// How many bytes of messages `header`'s chunk 0 holds before the rest
+    /// spill into a continuation chunk.
+    ///
+    /// libhdf5 sizes chunk 0 once, when the object header is created, and can
+    /// only grow it while the space behind it is still free — so an object
+    /// whose creation-time estimate covered every message it would ever hold
+    /// keeps one chunk, and one whose estimate was a guess does not. A dataset
+    /// or a committed datatype is created from messages already in hand
+    /// (`H5D__update_oh_info`, `H5T__commit`), so its estimate is exact and
+    /// this writer's exact fit is the same answer.
+    ///
+    /// A group is the exception: `H5G__obj_create_real` (H5Gobj.c:219) sizes
+    /// its header for the link info and group info messages plus
+    /// `H5G_CRT_GINFO_EST_NUM_ENTRIES` links of `H5G_CRT_GINFO_EST_NAME_LEN`
+    /// characters, and nothing else — attributes above all — is in that
+    /// estimate. The Link Info message is what identifies one: it is the
+    /// message that makes an object a new-format group, and
+    /// `H5G__obj_get_linfo` uses it for exactly this question.
+    fn chunk0_capacity(&self, header: &ObjectHeader) -> usize {
+        let envelope = header.message_envelope_size();
+        let sized = |msg_type: u8| {
+            header
+                .messages
+                .iter()
+                .find(|m| m.msg_type == msg_type)
+                .map(|m| envelope + m.data.len())
+        };
+        let Some(link_info) = sized(MSG_LINK_INFO) else {
+            return usize::MAX;
+        };
+        // One estimated hard link: version, flags, a one-byte name length for
+        // a name this short, the name, and the object header address.
+        let link = envelope + 1 + 1 + 1 + EST_LINK_NAME_LEN + self.ctx.sizeof_addr as usize;
+        link_info + sized(MSG_GROUP_INFO).unwrap_or(0) + EST_LINK_COUNT * link
     }
 
     /// The object an object reference's path names, as a hard-link target;
@@ -10962,7 +11045,8 @@ impl Hdf5Writer {
 
         let header = self.build_dataset_header(index);
         let nlink = self.object_link_count(HardLinkTarget::Dataset(index));
-        let encoded = self.encode_header(&header, nlink, self.dataset_header_format(index))?;
+        let encoded =
+            self.encode_header_at(&header, nlink, self.dataset_header_format(index), addr)?;
 
         if encoded.len() > original_size {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -11026,9 +11110,10 @@ impl Hdf5Writer {
         for i in live {
             let nlink = self.object_link_count(HardLinkTarget::Dataset(i));
             let ds_header = self.build_dataset_header(i);
-            let encoded = self.encode_header(&ds_header, nlink, self.dataset_header_format(i))?;
-            let encoded_size = encoded.len();
+            let format = self.dataset_header_format(i);
+            let encoded_size = self.header_encoded_size(&ds_header, nlink, format)?;
             let addr = self.allocator.allocate(encoded_size as u64);
+            let encoded = self.encode_header_at(&ds_header, nlink, format, addr)?;
             self.handle.write_at(addr, &encoded)?;
             let ds = self.ds(i);
             let mut m = ds.lock();
@@ -11047,14 +11132,12 @@ impl Hdf5Writer {
                 continue;
             }
             let rc = self.object_link_count(HardLinkTarget::Group(gi));
-            let size = self
-                .encode_header(
-                    &self.build_group_header(gi),
-                    rc,
-                    self.group_header_format(gi),
-                )?
-                .len() as u64;
-            self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
+            let size = self.header_encoded_size(
+                &self.build_group_header(gi),
+                rc,
+                self.group_header_format(gi),
+            )?;
+            self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size as u64);
         }
         // Every object header now has an address, so a link message names its
         // real target; and no group header has been written yet, so the Link
@@ -11065,21 +11148,22 @@ impl Hdf5Writer {
                 continue;
             }
             let rc = self.object_link_count(HardLinkTarget::Group(gi));
-            let encoded = self.encode_header(
+            let addr = self.grp(gi).lock().obj_header_addr;
+            let encoded = self.encode_header_at(
                 &self.build_group_header(gi),
                 rc,
                 self.group_header_format(gi),
+                addr,
             )?;
-            let addr = self.grp(gi).lock().obj_header_addr;
             self.handle.write_at(addr, &encoded)?;
         }
 
         // 2. Write root group object header.
         let root_header = self.build_root_group_header();
-        let root_encoded =
-            self.encode_header(&root_header, 1, self.header_format(self.root_track_order))?;
-        let root_encoded_size = root_encoded.len();
+        let root_format = self.header_format(self.root_track_order);
+        let root_encoded_size = self.header_encoded_size(&root_header, 1, root_format)?;
         let root_addr = self.allocator.allocate(root_encoded_size as u64);
+        let root_encoded = self.encode_header_at(&root_header, 1, root_format, root_addr)?;
         self.handle.write_at(root_addr, &root_encoded)?;
         self.root_group_addr = Some(root_addr);
         self.root_group_encoded_size = root_encoded_size;
@@ -11216,8 +11300,10 @@ impl Hdf5Writer {
         for i in rewritten {
             let nlink = self.object_link_count(HardLinkTarget::Dataset(i));
             let ds_header = self.build_dataset_header(i);
-            let encoded = self.encode_header(&ds_header, nlink, self.dataset_header_format(i))?;
-            let addr = self.allocator.allocate(encoded.len() as u64);
+            let format = self.dataset_header_format(i);
+            let size = self.header_encoded_size(&ds_header, nlink, format)?;
+            let addr = self.allocator.allocate(size as u64);
+            let encoded = self.encode_header_at(&ds_header, nlink, format, addr)?;
             self.handle.write_at(addr, &encoded)?;
             let ds = self.ds(i);
             let mut m = ds.lock();
@@ -11248,14 +11334,12 @@ impl Hdf5Writer {
                 continue;
             }
             let rc = self.object_link_count(HardLinkTarget::Group(gi));
-            let size = self
-                .encode_header(
-                    &self.build_group_header(gi),
-                    rc,
-                    self.group_header_format(gi),
-                )?
-                .len() as u64;
-            self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size);
+            let size = self.header_encoded_size(
+                &self.build_group_header(gi),
+                rc,
+                self.group_header_format(gi),
+            )?;
+            self.grp(gi).lock().obj_header_addr = self.allocator.allocate(size as u64);
         }
         // Every object header now has an address, so a link message names its
         // real target; and no group header has been written yet, so the Link
@@ -11266,12 +11350,13 @@ impl Hdf5Writer {
                 continue;
             }
             let rc = self.object_link_count(HardLinkTarget::Group(gi));
-            let encoded = self.encode_header(
+            let addr = self.grp(gi).lock().obj_header_addr;
+            let encoded = self.encode_header_at(
                 &self.build_group_header(gi),
                 rc,
                 self.group_header_format(gi),
+                addr,
             )?;
-            let addr = self.grp(gi).lock().obj_header_addr;
             self.handle.write_at(addr, &encoded)?;
         }
 
@@ -11284,9 +11369,10 @@ impl Hdf5Writer {
             }
         }
         let root_header = self.build_root_group_header();
-        let root_encoded =
-            self.encode_header(&root_header, 1, self.header_format(self.root_track_order))?;
-        let root_addr = self.allocator.allocate(root_encoded.len() as u64);
+        let root_format = self.header_format(self.root_track_order);
+        let root_size = self.header_encoded_size(&root_header, 1, root_format)?;
+        let root_addr = self.allocator.allocate(root_size as u64);
+        let root_encoded = self.encode_header_at(&root_header, 1, root_format, root_addr)?;
         self.handle.write_at(root_addr, &root_encoded)?;
         self.root_group_addr = Some(root_addr);
 

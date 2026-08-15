@@ -2143,6 +2143,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         // generator: h5py has no binding for the properties they need.
         "sohm_list" => sohm_file(path, 50, 40),
         "sohm_btree" => sohm_file(path, 0, 0),
+        "ochk_root" => ochk_root_file(path),
 
         _ => Ok(unsup(&format!("no rust writer arm for case '{case}'"))),
     }
@@ -2181,6 +2182,39 @@ fn sohm_file(path: &str, max_list: u16, min_btree: u16) -> rust_hdf5::Result<Wri
         .shape([8usize])
         .create("uses_named")?
         .write_raw(&(100..108i32).collect::<Vec<_>>())?;
+
+    file.close()?;
+    Ok(Ok(()))
+}
+
+/// `tests/fixtures/gen_ochk.c`: a dataset and six 256-byte fixed-string root
+/// attributes, which are far more than the root group's object header was
+/// sized for — so the header spills into a continuation chunk.
+fn ochk_root_file(path: &str) -> rust_hdf5::Result<WriteResult> {
+    /// `H5Tcopy(H5T_C_S1)` keeps the null-terminated pad rule; `H5Tset_size`
+    /// takes it to 256.
+    const TEXT: usize = 256;
+
+    let file = H5File::options().libver(LibverBound::V18).create(path)?;
+    file.new_dataset::<i32>()
+        .shape([8usize])
+        .create("data")?
+        .write_raw(&ramp_n::<i32>(8))?;
+
+    for i in 0..6u8 {
+        let mut text = vec![b'x'; TEXT];
+        text[0] = b'0' + i;
+        text[TEXT - 1] = 0;
+        file.set_attr_typed(
+            &format!("note{i}"),
+            DatatypeMessage::FixedString {
+                size: TEXT as u32,
+                padding: 0,
+                charset: 0,
+            },
+            text,
+        )?;
+    }
 
     file.close()?;
     Ok(Ok(()))

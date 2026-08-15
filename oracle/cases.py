@@ -1006,6 +1006,7 @@ FIXTURE_CASES = [
     _fixture_case(
         "ochk_root", "ochk_root.h5", "gen_ochk.sh", "objectheader",
         "root group whose object header spills into two continuation chunks",
+        rust="ochk_root",
     ),
 ]
 
