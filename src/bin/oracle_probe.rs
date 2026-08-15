@@ -1954,14 +1954,14 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                     .unwrap_or_default()
                     .to_string_lossy()
             ));
-            let ext = H5File::create(&target)?;
+            let ext = earliest_file(&target)?;
             ext.new_dataset::<i32>()
                 .shape([8usize])
                 .create("payload")?
                 .write_raw(&ramp_n::<i32>(8))?;
             ext.close()?;
 
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             file.new_dataset::<i32>()
                 .shape([8usize])
                 .create("orig")?
@@ -1985,7 +1985,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                     .unwrap_or_default()
                     .to_string_lossy()
             ));
-            let data = H5File::create(&target)?;
+            let data = earliest_file(&target)?;
             data.new_dataset::<f64>()
                 .shape([8usize])
                 .create("top")?
@@ -1999,7 +1999,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             data.close()?;
 
             let name = target.file_name().unwrap_or_default().to_string_lossy();
-            let file = H5File::create(path)?;
+            let file = earliest_file(path)?;
             file.create_external_link("direct", &name, "/top")?;
             file.create_external_link("nested", &name, "/deep/inner")?;
             file.create_external_link("gone_object", &name, "/absent")?;

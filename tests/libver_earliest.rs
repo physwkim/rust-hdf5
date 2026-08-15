@@ -304,6 +304,109 @@ fn every_group_created_at_earliest_stores_its_links_in_a_symbol_table() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The one group holding an external link converts out of its symbol table,
+/// and nothing else in the file moves with it.
+///
+/// A symbol table entry has three cache types and no room for a fourth, so
+/// `H5G_obj_insert` answers an `H5L_TYPE_EXTERNAL` insert by giving that group
+/// a Link Info and a Group Info message, re-inserting its entries as link
+/// messages and dropping its Symbol Table message (H5Gobj.c:512). The
+/// superblock stays version 0 and the headers stay version 1 — the conversion
+/// is per group, not per file, which is what the sibling `plain` group and the
+/// symbol-table root here pin.
+#[test]
+fn a_group_holding_an_external_link_converts_to_link_messages() {
+    let Some(py) = python() else { return };
+    let path = tmp("external_link");
+    let target = path.with_file_name("external_link_target.h5");
+    let payload = H5File::create(&target).unwrap();
+    payload
+        .new_dataset::<i32>()
+        .shape([4])
+        .create("payload")
+        .unwrap()
+        .write_raw(&[10i32, 11, 12, 13])
+        .unwrap();
+    payload.close().unwrap();
+
+    let file = earliest(&path);
+    file.new_dataset::<i32>()
+        .shape([4])
+        .create("orig")
+        .unwrap()
+        .write_raw(&[0i32, 1, 2, 3])
+        .unwrap();
+    let plain = file.create_group("plain").unwrap();
+    plain
+        .new_dataset::<i32>()
+        .shape([2])
+        .create("beta")
+        .unwrap()
+        .write_raw(&[7i32, 8])
+        .unwrap();
+    let crossing = file.create_group("crossing").unwrap();
+    crossing
+        .new_dataset::<i32>()
+        .shape([2])
+        .create("gamma")
+        .unwrap()
+        .write_raw(&[4i32, 5])
+        .unwrap();
+    crossing
+        .create_external_link("ext", "external_link_target.h5", "/payload")
+        .unwrap();
+    crossing.create_soft_link("shortcut", "/orig").unwrap();
+    file.close().unwrap();
+
+    assert_eq!(superblock_version(&path), 0);
+    // The conversion does not reach for the version-2 generation: no version-2
+    // object header, and the two groups that kept their symbol table still
+    // write one.
+    no_newer_structures(&path);
+    assert!(contains(&path, b"SNOD"), "the unconverted groups' tables");
+
+    // A Symbol Table message is the observable — `H5Oget_info().hdr.mesg`
+    // reports which message types an object header holds, and it is the same
+    // bit libhdf5's own `H5G_STORAGE_TYPE_SYMBOL_TABLE` is derived from.
+    read_with_h5py(
+        py,
+        &path,
+        "STAB = 1 << 0x11\n\
+         def stab(p):\n\
+         \x20   return bool(h5py.h5o.get_info(f[p].id).hdr.mesg.present & STAB)\n\
+         assert stab('/'), 'the root holds only hard links'\n\
+         assert stab('/plain'), 'plain holds only a hard link'\n\
+         assert not stab('/crossing'), 'crossing holds an external link'\n\
+         for path in ('/', '/plain', '/crossing'):\n\
+         \x20   v = h5py.h5o.get_info(f[path].id).hdr.version\n\
+         \x20   assert v == 1, (path, v)\n\
+         assert sorted(f['crossing'].keys()) == ['ext', 'gamma', 'shortcut']\n\
+         link = f['crossing'].get('ext', getlink=True)\n\
+         assert isinstance(link, h5py.ExternalLink), type(link)\n\
+         assert link.filename == 'external_link_target.h5', link.filename\n\
+         assert link.path == '/payload', link.path\n\
+         assert list(f['crossing/ext'][...]) == [10, 11, 12, 13]\n\
+         assert list(f['crossing/gamma'][...]) == [4, 5]\n\
+         assert list(f['crossing/shortcut'][...]) == [0, 1, 2, 3]\n\
+         assert list(f['plain/beta'][...]) == [7, 8]\n",
+    );
+    libhdf5_tools_accept(py, &path);
+
+    // And this crate reads its own file back the same way.
+    let reopened = H5File::open(&path).unwrap();
+    let mut names = reopened
+        .root_group()
+        .group("crossing")
+        .unwrap()
+        .link_names()
+        .unwrap();
+    names.sort();
+    assert_eq!(names, ["ext", "gamma", "shortcut"]);
+    drop(reopened);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&target);
+}
+
 /// A chunked dataset at this bound is indexed by the version-1 B-tree, the
 /// only index a version-3 data layout message can name. The v1.10 indexes
 /// this crate reaches for by default each write a signature of their own, and

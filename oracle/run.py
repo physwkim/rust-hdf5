@@ -97,15 +97,11 @@ EXPECTED_DEVIATIONS = [
         "field": "superblock",
         "ref": "0",
         "rust": "2",
-        "why": "three cases whose rust arm still creates at this crate's "
-               "default bounds, because H5F_LIBVER_EARLIEST cannot express "
-               "what they write. `vds` needs a virtual dataset, refused in a "
-               "classic file; `link_external` and `link_external_read` need "
-               "an external link, which a symbol table cannot hold — libhdf5 "
-               "answers that by converting the group to link messages under "
-               "the same v0 superblock (H5G__obj_insert), and this writer "
-               "has no such conversion. Every other earliest-bound case now "
-               "writes the v0 superblock itself",
+        "why": "one case whose rust arm still creates at this crate's default "
+               "bounds, because H5F_LIBVER_EARLIEST cannot express what it "
+               "writes: `vds` needs a virtual dataset, refused in a classic "
+               "file. Every other earliest-bound case now writes the v0 "
+               "superblock itself",
     },
     {
         "id": "superblock-v3-for-chunk-index",

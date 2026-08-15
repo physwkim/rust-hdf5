@@ -3781,8 +3781,9 @@ impl Hdf5Writer {
             .is_some_and(SohmState::shares_attributes)
     }
 
-    /// Whether a group whose links have this creation-order policy stores them
-    /// in a symbol table — `H5G__obj_create_real` (H5Gobj.c:129).
+    /// Whether the group at `scope` stores its links in a symbol table —
+    /// `H5G__obj_create_real` (H5Gobj.c:129) and the conversion
+    /// `H5G_obj_insert` performs (H5Gobj.c:512).
     ///
     /// The new group format is used unconditionally from `H5F_LIBVER_V18` up,
     /// and below it only when the group tracks link creation order: a symbol
@@ -3790,8 +3791,35 @@ impl Hdf5Writer {
     /// independent — a group that tracks only *attribute* creation order gets
     /// a version-2 header over a symbol table, which is what libhdf5 writes
     /// for it.
-    fn uses_symbol_table(&self, links: CreationOrder) -> bool {
-        self.legacy.is_some() && !links.is_tracked()
+    ///
+    /// The content of the group is the third axis. A symbol table entry has
+    /// three cache types and no room for a fourth, so an external or
+    /// user-defined link cannot go in one; libhdf5 answers by converting that
+    /// one group to link messages the moment such a link is inserted, leaving
+    /// the superblock version, the object header version and every other group
+    /// in the file alone. This writer builds each group's storage once at
+    /// finalize rather than link by link, so the same rule reads as a question
+    /// about the finished set.
+    fn uses_symbol_table(&self, scope: LinkScope, links: CreationOrder) -> bool {
+        self.legacy.is_some() && !links.is_tracked() && self.links_fit_symbol_table(scope, links)
+    }
+
+    /// Whether every link `scope` holds is one a symbol table entry can
+    /// express — `H5G_obj_insert`'s `obj_lnk->type > H5L_TYPE_BUILTIN_MAX`
+    /// test (H5Gobj.c:512), asked of the whole set.
+    ///
+    /// A link a reopen carried through verbatim counts too, and one this
+    /// writer cannot even decode counts as not fitting: the entry would have
+    /// to be built from the decoded form, while a link message is re-emitted
+    /// byte for byte.
+    fn links_fit_symbol_table(&self, scope: LinkScope, order: CreationOrder) -> bool {
+        self.group_links(scope, order)
+            .iter()
+            .all(|l| l.target.fits_symbol_table())
+            && self.preserved_links_for(scope).iter().all(|encoded| {
+                LinkMessage::decode(encoded, &self.ctx)
+                    .is_ok_and(|(link, _)| link.target.fits_symbol_table())
+            })
     }
 
     /// The header format of the registered dataset at `index`.
@@ -6966,7 +6994,7 @@ impl Hdf5Writer {
         // Group Info are version-1.8 messages and have no business in a
         // version-1 header — `H5G__stab_valid` reads the Symbol Table message
         // and nothing else.
-        if self.uses_symbol_table(order) {
+        if self.uses_symbol_table(scope, order) {
             let legacy = self
                 .legacy
                 .as_deref()
@@ -7056,7 +7084,7 @@ impl Hdf5Writer {
             // A symbol-table group is `prepare_symbol_tables`' business; it
             // has no Link Info message to hold a fractal heap address, and it
             // never had dense storage to release.
-            if deleted || self.uses_symbol_table(order) {
+            if deleted || self.uses_symbol_table(LinkScope::Group(gi), order) {
                 continue;
             }
             self.release_superseded_dense_links(LinkScope::Group(gi))?;
@@ -7066,7 +7094,7 @@ impl Hdf5Writer {
             }
         }
         let root_order = self.root_track_order.links;
-        if !self.uses_symbol_table(root_order) {
+        if !self.uses_symbol_table(LinkScope::Root, root_order) {
             self.release_superseded_dense_links(LinkScope::Root)?;
             let root_links = self.group_links(LinkScope::Root, root_order);
             if self.links_need_dense(&root_links) {
@@ -7139,7 +7167,7 @@ impl Hdf5Writer {
                 let g = grp.lock();
                 (g.deleted, g.track_order.links, g.parent)
             };
-            if deleted || !self.uses_symbol_table(order) {
+            if deleted || !self.uses_symbol_table(LinkScope::Group(gi), order) {
                 continue;
             }
             let mut depth = 1usize;
@@ -7151,7 +7179,7 @@ impl Hdf5Writer {
         }
         scopes.sort_by_key(|&(depth, ..)| std::cmp::Reverse(depth));
         let root_order = self.root_track_order.links;
-        if self.uses_symbol_table(root_order) {
+        if self.uses_symbol_table(LinkScope::Root, root_order) {
             scopes.push((0, LinkScope::Root, root_order));
         }
 
@@ -7232,15 +7260,17 @@ impl Hdf5Writer {
             LinkTarget::Soft { target } => StabTarget::Soft {
                 value: target.clone(),
             },
-            // A symbol table entry has three cache types and no room for a
-            // fourth: `H5L_TYPE_EXTERNAL` and the user-defined classes exist
-            // only as link messages, which is why libhdf5 converts a group to
-            // the new format before inserting one (`H5G_obj_insert`). This
-            // writer does not convert, so it refuses.
+            // Unreachable by construction: a group holding one of these is
+            // not a symbol-table group at all
+            // ([`LinkTarget::fits_symbol_table`] is what
+            // [`Hdf5Writer::uses_symbol_table`] asks), so this pass never
+            // visits it. Reported rather than panicked so a future caller
+            // that skips that gate learns which link it lost.
             LinkTarget::External { .. } | LinkTarget::UserDefined { .. } => {
                 return Err(crate::io::IoError::InvalidState(format!(
-                    "cannot store the link {:?} in this file: its groups use \
-                     symbol tables, which hold only hard and soft links",
+                    "cannot store the link {:?} in a symbol table: it holds only \
+                     hard and soft links, and this group was not converted to link \
+                     messages the way `H5G_obj_insert` converts it",
                     link.name
                 )))
             }
