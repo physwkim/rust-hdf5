@@ -359,6 +359,79 @@ fn a_chunked_dataset_created_at_earliest_uses_the_version_1_btree() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A filtered chunked dataset, whose pipeline message is version 1 at this
+/// bound (`H5O_pline_ver_bounds`) — the version that names every filter,
+/// libhdf5's own included, and pads the name and the client-data array. The
+/// chunks go in the same version-1 B-tree an unfiltered dataset uses; its
+/// keys already carry the stored size and the filter mask.
+#[test]
+fn a_filtered_dataset_created_at_earliest_gets_a_version_1_pipeline() {
+    let Some(py) = python() else { return };
+    let path = tmp("filtered");
+    let file = earliest(&path);
+    let ramp: Vec<i32> = (0..64).collect();
+    for (name, builder) in [
+        (
+            "gz",
+            file.new_dataset::<i32>().shape([64]).chunk(&[8]).deflate(6),
+        ),
+        (
+            "sh",
+            file.new_dataset::<i32>().shape([64]).chunk(&[8]).shuffle(),
+        ),
+        (
+            "shgz",
+            file.new_dataset::<i32>()
+                .shape([64])
+                .chunk(&[8])
+                .shuffle_deflate(6),
+        ),
+    ] {
+        builder.create(name).unwrap().write_raw(&ramp).unwrap();
+    }
+    file.close().unwrap();
+
+    assert_eq!(superblock_version(&path), 0);
+    no_newer_structures(&path);
+    // The message as it lies in the file: version 1, one filter, six reserved
+    // bytes, then deflate with a name length of 8, flags, one client-data
+    // value, the padded name, the level and the pad that makes the value
+    // count even. A version-2 message would name no filter below
+    // `H5Z_FILTER_RESERVED` at all, so the name alone separates them — but
+    // the whole message is checked, because the padding rules are the half
+    // that is easy to get wrong.
+    let mut deflate_v1 = vec![1u8, 1, 0, 0, 0, 0, 0, 0, 1, 0, 8, 0, 0, 0, 1, 0];
+    deflate_v1.extend_from_slice(b"deflate\0");
+    deflate_v1.extend_from_slice(&[6, 0, 0, 0, 0, 0, 0, 0]);
+    assert!(
+        std::fs::read(&path)
+            .unwrap()
+            .windows(deflate_v1.len())
+            .any(|w| w == deflate_v1),
+        "no version-1 deflate pipeline in the file"
+    );
+
+    read_with_h5py(
+        py,
+        &path,
+        "for name in ('gz', 'sh', 'shgz'):\n\
+         \x20   assert list(f[name][...]) == list(range(64)), (name, list(f[name][...]))\n\
+         \x20   assert f[name].chunks == (8,), (name, f[name].chunks)\n\
+         assert f['gz'].compression == 'gzip' and f['gz'].compression_opts == 6\n\
+         assert f['sh'].shuffle is True and f['sh'].compression is None\n\
+         assert f['shgz'].compression == 'gzip' and f['shgz'].shuffle is True\n",
+    );
+    libhdf5_tools_accept(py, &path);
+
+    let back = H5File::open(&path).unwrap();
+    assert_eq!(
+        back.dataset("shgz").unwrap().read_raw::<i32>().unwrap(),
+        ramp
+    );
+    drop(back);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// An unlimited dimension does not move the index: at this bound the
 /// extensible array is not available, and libhdf5 grows the same version-1
 /// B-tree instead. The rows are appended rather than written at once, so the

@@ -1814,9 +1814,11 @@ pub(crate) enum NewStorage {
     /// Chunks reached through an index.
     Chunked,
     /// Chunks whose bytes pass through a filter pipeline, which needs a
-    /// Filter Pipeline message in the header beside the layout. Apart from
-    /// that message it is [`Chunked`](Self::Chunked), so the two are told
-    /// apart here rather than by a second question at each creator.
+    /// Filter Pipeline message in the header beside the layout. That message
+    /// is the whole difference from [`Chunked`](Self::Chunked), and both
+    /// formats can hold it, so no check separates the two today; the creators
+    /// still declare which they are, because the declaration is what a check
+    /// added later has to work from.
     ChunkedFiltered,
     /// The image inside the data layout message itself, with no block of its
     /// own — `H5D_COMPACT`.
@@ -3838,28 +3840,18 @@ impl Hdf5Writer {
     /// a version-3 data layout message, which is what
     /// `H5O_layout_ver_bounds` gives `H5F_LIBVER_EARLIEST` (H5Dlayout.c:44),
     /// so a classic file takes both; a committed datatype has no layout at
-    /// all; and chunked storage does too, over the version-1 B-tree index
-    /// [`create_btree_v1_dataset`](Self::create_btree_v1_dataset) builds.
+    /// all; and chunked storage does too, filtered or not, over the version-1
+    /// B-tree index [`create_btree_v1_dataset`](Self::create_btree_v1_dataset)
+    /// builds.
     ///
-    /// A filter on those chunks and virtual storage are the two still out of
-    /// reach, each for a reason of its own — named separately below rather
-    /// than as one "not supported", because they are answered differently.
+    /// Virtual storage is the one form still out of reach, and it is refused
+    /// by name rather than as a bare "not supported" so the caller is told
+    /// which of the two files in front of them cannot hold it.
     fn reject_unwritable_storage(&self, storage: NewStorage, name: &str) -> IoResult<()> {
         if !self.is_legacy() {
             return Ok(());
         }
         let (kind, why) = match storage {
-            // libhdf5 at `H5F_LIBVER_EARLIEST` writes a version-1 Filter
-            // Pipeline message (`H5O_pline_ver_bounds`), which this crate
-            // decodes but only encodes at version 2 — and a version-2 pipeline
-            // message inside a version-0 superblock is a file no libhdf5
-            // writes. The chunks themselves are fine: their index is the
-            // version-1 B-tree `create_btree_v1_dataset` builds.
-            NewStorage::ChunkedFiltered => (
-                "filtered",
-                "whose filter pipeline message is version 1, which this crate reads but \
-                 does not write. Create it without filters",
-            ),
             // Nothing older than a version-4 layout message can say "virtual"
             // at all, and writing one here would convert the file the same way.
             NewStorage::Virtual => (
@@ -3867,7 +3859,13 @@ impl Hdf5Writer {
                 "which predates the version-4 data layout message a virtual dataset is \
                  written as",
             ),
-            NewStorage::Chunked
+            // A filtered chunked dataset belongs here: its pipeline message
+            // encodes at version 1 (`ObjectFormat::filter_pipeline_version`)
+            // and its chunks are indexed by the version-1 B-tree
+            // `create_btree_v1_dataset` builds, both of which are what
+            // libhdf5 writes at `H5F_LIBVER_EARLIEST`.
+            NewStorage::ChunkedFiltered
+            | NewStorage::Chunked
             | NewStorage::Contiguous
             | NewStorage::Compact
             | NewStorage::None => return Ok(()),
@@ -13605,8 +13603,11 @@ impl Hdf5Writer {
         // Filter Pipeline message (type 0x0B) -- only if filters are configured
         if let Some(ref pipeline) = m.filter_pipeline {
             if !pipeline.filters.is_empty() {
-                let (flags, filter_msg) =
-                    self.share_message(MSG_FILTER_PIPELINE, 0x00, pipeline.encode());
+                let (flags, filter_msg) = self.share_message(
+                    MSG_FILTER_PIPELINE,
+                    0x00,
+                    pipeline.encode_for(self.message_format()),
+                );
                 header.add_message(MSG_FILTER_PIPELINE, flags, filter_msg);
             }
         }

@@ -155,6 +155,15 @@ impl ObjectFormat {
             Self::Modern => 3,
         }
     }
+
+    /// The filter pipeline message version (`H5O_pline_ver_bounds`,
+    /// H5Opline.c:85).
+    pub fn filter_pipeline_version(self) -> u8 {
+        match self {
+            Self::Legacy => 1,
+            Self::Modern => 2,
+        }
+    }
 }
 
 /// UNDEF address constant
