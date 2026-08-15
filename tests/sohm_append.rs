@@ -564,6 +564,88 @@ fn a_reopened_symbol_table_group_keeps_its_symbol_table() {
     cleanup(&path);
 }
 
+/// The fill-value message a reopen writes carries a write-time byte, and this
+/// is the one path where that byte is produced while a shared-message table is
+/// being laid out afresh. The `gen_sohm.c` index covers datatype, dataspace
+/// and attribute messages only, so the fill value stays literal in each new
+/// header — which is exactly what has to be checked, because a fill-value
+/// message that had been swept into the index would put the byte in the heap
+/// instead. Both policies are exercised: an `i32` dataset keeps
+/// `H5D_CRT_FILL_TIME_DEF`, and a variable-length one with no explicit fill
+/// value is forced to `ALLOC` by `H5D__update_oh_info` (H5Dint.c:927) even
+/// though neither dataset declared a policy. h5py answers on the byte the file
+/// holds, so the assertion is libhdf5's reading, not this crate's echo.
+#[test]
+fn an_appended_dataset_carries_its_fill_time_through_the_rebuilt_table() {
+    use rust_hdf5::FillTime;
+
+    let path = copy_fixture("sohm_list.h5", "filltime");
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.new_dataset::<i32>()
+            .shape([8usize])
+            .create("appended")
+            .unwrap()
+            .write_raw(&(0..8i32).map(|j| 200 + j).collect::<Vec<_>>())
+            .unwrap();
+        file.write_vlen_strings_ascii("vlstr", &["a", "bb", "ccc"])
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("appended").unwrap().fill_time().unwrap(),
+        FillTime::IfSet
+    );
+    assert_eq!(
+        file.dataset("vlstr").unwrap().fill_time().unwrap(),
+        FillTime::Alloc
+    );
+    // The four datasets libhdf5 itself wrote are rewritten by the same
+    // reopen; their declared policy has to come back off the disk rather
+    // than be restamped from this session's default, and they still have to
+    // reach their bodies through the table this reopen laid out afresh.
+    for i in 0..4i32 {
+        let ds = file.dataset(&format!("shared{i}")).unwrap();
+        assert_eq!(
+            ds.fill_time().unwrap(),
+            FillTime::IfSet,
+            "shared{i} lost the fill time libhdf5 gave it"
+        );
+        assert_eq!(ds.shape(), vec![8]);
+        assert_eq!(
+            ds.read_raw::<i32>().unwrap(),
+            (0..8i32).map(|j| i * 10 + j).collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(
+        file.dataset("vlstr").unwrap().read_vlen_strings().unwrap(),
+        vec!["a", "bb", "ccc"]
+    );
+    drop(file);
+
+    let extra = [("appended", 200)];
+    reference_counts_match_the_pointers(&path);
+    let mut body = h5py_fixture_body(&extra).replace(
+        "assert sorted(f) == sorted(EXPECTED), sorted(f)",
+        "assert sorted(f) == sorted(EXPECTED + ['vlstr']), sorted(f)",
+    );
+    body.push_str(
+        "\
+def ft(name):
+    return f[name].id.get_create_plist().get_fill_time()
+assert ft('appended') == h5py.h5d.FILL_TIME_IFSET, ft('appended')
+assert ft('vlstr') == h5py.h5d.FILL_TIME_ALLOC, ft('vlstr')
+for i in range(4):
+    assert ft('shared%d' % i) == h5py.h5d.FILL_TIME_IFSET, ft('shared%d' % i)
+assert [s.decode() for s in f['vlstr'][()]] == ['a', 'bb', 'ccc']
+",
+    );
+    libhdf5_reads_back(&path, &body);
+    cleanup(&path);
+}
+
 /// The same for the B-tree form, which the append must keep: `list_max` is 0
 /// in that fixture, so a rebuilt index that fell back to a list would be a
 /// file libhdf5 never writes.
