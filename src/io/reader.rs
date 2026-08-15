@@ -2699,6 +2699,12 @@ impl Hdf5Reader {
         self.root_link_storage.1
     }
 
+    /// The root group's own link storage kind: symbol-table (legacy),
+    /// compact link messages, or dense (fractal heap plus name index).
+    pub fn root_link_storage(&self) -> LinkStorage {
+        self.root_link_storage.0
+    }
+
     /// Return the attribute names of a non-root group (path without a
     /// leading `/`, e.g. `"detector"` or `"entry/instrument"`; may pass
     /// through group hard links). Undecodable attributes included — see
@@ -2762,6 +2768,15 @@ impl Hdf5Reader {
         self.group_link_storage
             .get(&self.canonical_path(group_path))
             .map_or(CreationOrder::Untracked, |(_, order)| *order)
+    }
+
+    /// A non-root group's own link storage kind. `Compact` — the same
+    /// silent default as an empty link set — for a path the walk never
+    /// reached.
+    pub fn group_link_storage(&self, group_path: &str) -> LinkStorage {
+        self.group_link_storage
+            .get(&self.canonical_path(group_path))
+            .map_or(LinkStorage::Compact, |(storage, _)| *storage)
     }
 
     /// Return a non-root group's attribute by name.

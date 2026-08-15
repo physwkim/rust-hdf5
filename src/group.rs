@@ -24,7 +24,7 @@ use crate::format::creation_order::CreationOrder;
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::filter::FilterPipeline;
 use crate::format::messages::link::LinkTarget;
-use crate::format::storage_kind::AttributeStorage;
+use crate::format::storage_kind::{AttributeStorage, LinkStorage};
 use crate::io::reader::LinkClass;
 use crate::types::H5Type;
 
@@ -1080,6 +1080,26 @@ impl H5Group {
             }),
             _ => Err(Hdf5Error::InvalidState(
                 "link_creation_order is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// This group's own link storage kind — the equivalent of libhdf5's
+    /// `H5Gget_info(gid).storage_type`: `SymbolTable` for a pre-1.8 group
+    /// (a v1 B-tree plus local heap, present regardless of the object
+    /// header's own version), `Compact` while links live as messages in the
+    /// header, or `Dense` once the phase change moves the whole set into a
+    /// fractal heap plus name index.
+    pub fn link_storage(&self) -> Result<LinkStorage> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_link_storage()
+            } else {
+                reader.group_link_storage(self.name.trim_start_matches('/'))
+            }),
+            _ => Err(Hdf5Error::InvalidState(
+                "link_storage is only available in read mode".into(),
             )),
         }
     }

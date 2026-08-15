@@ -31,8 +31,8 @@ use rust_hdf5::format::messages::filter::{
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
     AttributeStorage, CreationOrder, H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group,
-    H5NamedDatatype, Hdf5Error, Hyperslab, HyperslabBlock, LibverBound, LinkClass, Reference,
-    Selection,
+    H5NamedDatatype, Hdf5Error, Hyperslab, HyperslabBlock, LibverBound, LinkClass, LinkStorage,
+    Reference, Selection,
 };
 
 const CANON_VERSION: &str = "3";
@@ -609,6 +609,16 @@ fn attrstore_str(storage: AttributeStorage) -> &'static str {
     }
 }
 
+/// The twin of `canon.py`'s `link_storage_str`: `"symtab"`, `"compact"`, or
+/// `"dense"`.
+fn linkstore_str(storage: LinkStorage) -> &'static str {
+    match storage {
+        LinkStorage::SymbolTable => "symtab",
+        LinkStorage::Compact => "compact",
+        LinkStorage::Dense => "dense",
+    }
+}
+
 fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: usize) {
     d.emit(&format!("{path}#kind"), "group");
     d.field(path, "linkorder", || {
@@ -625,13 +635,13 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
             .map(str::to_string)
             .map_err(oneline)
     });
-    d.emit(
-        &format!("{path}#linkstore"),
-        unsupported(
-            "linkstore",
-            "H5Group exposes no compact/dense link storage accessor",
-        ),
-    );
+    d.field(path, "linkstore", || {
+        group
+            .link_storage()
+            .map(linkstore_str)
+            .map(str::to_string)
+            .map_err(oneline)
+    });
     dump_group_attrs(d, path, group);
 
     if depth >= MAX_DEPTH {
