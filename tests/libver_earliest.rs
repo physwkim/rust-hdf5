@@ -21,6 +21,15 @@
 //! `h5clear`, which is the check that the structures are not merely present
 //! but correct.
 
+use rust_hdf5::format::btree_v1::{BTreeV1Config, BTreeV1Node};
+use rust_hdf5::format::local_heap::{local_heap_get_string, LocalHeapHeader};
+use rust_hdf5::format::messages::data_layout::{ChunkIndexType, DataLayoutMessage};
+use rust_hdf5::format::messages::link::{LinkMessage, LinkTarget};
+use rust_hdf5::format::messages::{MSG_DATA_LAYOUT, MSG_LINK};
+use rust_hdf5::format::object_header::ObjectHeader;
+use rust_hdf5::format::superblock::{SuperblockV0V1, SuperblockV2V3};
+use rust_hdf5::format::symbol_table::SymbolTableNode;
+use rust_hdf5::format::FormatContext;
 use rust_hdf5::{H5File, LibverBound};
 
 /// Interpreters tried in order when `RUST_HDF5_TEST_PYTHON` is unset,
@@ -462,6 +471,218 @@ fn an_unlimited_dataset_created_at_earliest_stays_on_the_version_1_btree() {
         "assert f['growing'].shape == (16,), f['growing'].shape\n\
          assert f['growing'].maxshape == (None,), f['growing'].maxshape\n\
          assert list(f['growing'][...]) == list(range(16)), list(f['growing'][...])\n",
+    );
+    libhdf5_tools_accept(py, &path);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The data layout message of the root-level dataset `name` in a *classic*
+/// file, reached the way libhdf5 reaches it: the superblock's own root symbol
+/// table entry caches the root group's B-tree and local heap, the B-tree's
+/// leaves name symbol table nodes, and an entry's name offset points into the
+/// heap. Every group here fits in one leaf level, so the walk is the leaf's
+/// children rather than a descent.
+fn classic_layout_of(path: &std::path::Path, name: &str) -> DataLayoutMessage {
+    let bytes = std::fs::read(path).unwrap();
+    let sb = SuperblockV0V1::decode(&bytes).unwrap();
+    let (addr_size, size_size) = (sb.sizeof_offsets as usize, sb.sizeof_lengths as usize);
+    let ctx = FormatContext {
+        sizeof_addr: sb.sizeof_offsets,
+        sizeof_size: sb.sizeof_lengths,
+    };
+    let cfg = BTreeV1Config {
+        sym_leaf_k: sb.sym_leaf_k,
+        snode_internal_k: sb.btree_internal_k,
+        ..Default::default()
+    };
+    let at = |addr: u64| (sb.base_address + addr) as usize;
+
+    let (btree_addr, heap_addr) = sb
+        .root_symbol_table_entry
+        .cached_symbol_table()
+        .expect("a classic root group caches its symbol table");
+    let heap = LocalHeapHeader::decode(&bytes[at(heap_addr)..], addr_size, size_size).unwrap();
+    let heap_data = &bytes[at(heap.data_addr)..at(heap.data_addr) + heap.data_size as usize];
+
+    let node = BTreeV1Node::decode(
+        &bytes[at(btree_addr)..],
+        addr_size,
+        size_size,
+        cfg.snode_max_entries(),
+    )
+    .unwrap();
+    assert_eq!(node.level, 0, "these groups fit in a leaf");
+
+    let obj_addr = node
+        .children
+        .iter()
+        .flat_map(|&child| {
+            SymbolTableNode::decode(
+                &bytes[at(child)..],
+                addr_size,
+                size_size,
+                cfg.sym_leaf_max_entries(),
+            )
+            .unwrap()
+            .entries
+        })
+        .find(|e| local_heap_get_string(heap_data, e.name_offset).unwrap() == name)
+        .unwrap_or_else(|| panic!("no '{name}' in the root group's symbol table"))
+        .obj_header_addr;
+
+    let at = at(obj_addr);
+    // A version-1 header carries no "OHDR" signature, so this is the arm
+    // `decode_any` picks by its absence.
+    let (header, _) = ObjectHeader::decode_v1(&bytes[at..]).unwrap();
+    let msg = header
+        .messages
+        .iter()
+        .find(|m| m.msg_type == MSG_DATA_LAYOUT)
+        .unwrap_or_else(|| panic!("'{name}' has no data layout message"));
+    DataLayoutMessage::decode(&msg.data, &ctx).unwrap().0
+}
+
+/// A fixed shape covered by exactly one chunk is the shape
+/// `H5D__layout_set_latest_indexing` gives the single-chunk index, ahead of
+/// every other v1.10 index. That rule is reached only after the layout
+/// message version is settled, and at this bound the version is 3
+/// (`H5O_layout_ver_bounds`), whose sole index is the version-1 B-tree —
+/// which is also the only one a version-0 superblock can carry. So the
+/// format decides before the shape does, and this pins the crossing from
+/// both sides: the same one-chunk shape gets the B-tree in a classic file
+/// and the single-chunk index in the default one.
+#[test]
+fn a_one_chunk_shape_created_at_earliest_takes_the_btree_not_the_single_chunk_index() {
+    let vals: Vec<i32> = (0..16).collect();
+
+    let classic = tmp("one_chunk_classic");
+    let file = earliest(&classic);
+    file.new_dataset::<i32>()
+        .shape([16usize])
+        .chunk(&[16])
+        .create("one")
+        .unwrap()
+        .write_raw(&vals)
+        .unwrap();
+    file.close().unwrap();
+
+    assert_eq!(superblock_version(&classic), 0);
+    no_newer_structures(&classic);
+    let layout = classic_layout_of(&classic, "one");
+    assert!(
+        matches!(layout, DataLayoutMessage::ChunkedV3 { .. }),
+        "a classic file's one-chunk dataset must stay on the version-3 \
+         layout message and its version-1 B-tree, got {layout:?}"
+    );
+    assert!(
+        H5File::open(&classic)
+            .unwrap()
+            .dataset("one")
+            .unwrap()
+            .read_raw::<i32>()
+            .unwrap()
+            == vals
+    );
+
+    // The default bounds, same shape: here the shape does decide, and the
+    // index is the single-chunk one.
+    let modern = tmp("one_chunk_modern");
+    let file = H5File::create(&modern).unwrap();
+    file.new_dataset::<i32>()
+        .shape([16usize])
+        .chunk(&[16])
+        .create("one")
+        .unwrap()
+        .write_raw(&vals)
+        .unwrap();
+    file.close().unwrap();
+
+    let bytes = std::fs::read(&modern).unwrap();
+    let sb = SuperblockV2V3::decode(&bytes).unwrap();
+    let ctx = FormatContext {
+        sizeof_addr: sb.sizeof_offsets,
+        sizeof_size: sb.sizeof_lengths,
+    };
+    let at = (sb.base_address + sb.root_group_object_header_address) as usize;
+    let (root, _) = ObjectHeader::decode(&bytes[at..]).unwrap();
+    let addr = root
+        .messages
+        .iter()
+        .filter(|m| m.msg_type == MSG_LINK)
+        .filter_map(|m| LinkMessage::decode(&m.data, &ctx).ok())
+        .find_map(|(l, _)| match l.target {
+            LinkTarget::Hard { address } if l.name == "one" => Some(address),
+            _ => None,
+        })
+        .expect("no link 'one' in the root group");
+    let (header, _) = ObjectHeader::decode(&bytes[(sb.base_address + addr) as usize..]).unwrap();
+    let msg = header
+        .messages
+        .iter()
+        .find(|m| m.msg_type == MSG_DATA_LAYOUT)
+        .expect("'one' has no data layout message");
+    let layout = DataLayoutMessage::decode(&msg.data, &ctx).unwrap().0;
+    let DataLayoutMessage::ChunkedV4 { index_type, .. } = layout else {
+        panic!("the default bounds give a version-4 layout message, got {layout:?}");
+    };
+    assert_eq!(index_type, ChunkIndexType::SingleChunk);
+
+    let _ = std::fs::remove_file(&classic);
+    let _ = std::fs::remove_file(&modern);
+}
+
+/// The same crossing reached from the other side: the classic file is one
+/// libhdf5 wrote, and the one-chunk dataset is appended to it. The bound was
+/// never asked for here — `is_legacy` reads it off the file — so this is the
+/// path `tests/legacy_append.rs` covers, carrying the shape that would
+/// otherwise select the single-chunk index.
+#[test]
+fn a_one_chunk_shape_appended_to_a_classic_file_takes_the_btree() {
+    let Some(py) = python() else { return };
+    let path = tmp("one_chunk_append");
+    run(
+        py,
+        &[
+            "-c",
+            &format!(
+                "import h5py, numpy as np\n\
+                 with h5py.File({:?}, 'w', libver='earliest') as f:\n\
+                 \x20   f['seed'] = np.arange(4, dtype='<i4')\n",
+                path.to_str().unwrap()
+            ),
+        ],
+        "h5py seed file",
+    );
+    assert_eq!(superblock_version(&path), 0);
+
+    let vals: Vec<i32> = (0..16).collect();
+    let file = H5File::options().no_locking().open_rw(&path).unwrap();
+    file.new_dataset::<i32>()
+        .shape([16usize])
+        .chunk(&[16])
+        .create("one")
+        .unwrap()
+        .write_raw(&vals)
+        .unwrap();
+    file.close().unwrap();
+
+    assert_eq!(superblock_version(&path), 0);
+    no_newer_structures(&path);
+    // `no_newer_structures` cannot see this one: the single-chunk index
+    // writes no signature of its own, keeping its one address inline in the
+    // layout message. The message itself is the only witness.
+    let layout = classic_layout_of(&path, "one");
+    assert!(
+        matches!(layout, DataLayoutMessage::ChunkedV3 { .. }),
+        "a dataset appended to a classic file must stay on the version-3 \
+         layout message and its version-1 B-tree, got {layout:?}"
+    );
+    read_with_h5py(
+        py,
+        &path,
+        "assert f['one'].chunks == (16,), f['one'].chunks\n\
+         assert list(f['one'][...]) == list(range(16)), list(f['one'][...])\n\
+         assert list(f['seed'][...]) == [0, 1, 2, 3]\n",
     );
     libhdf5_tools_accept(py, &path);
     let _ = std::fs::remove_file(&path);
