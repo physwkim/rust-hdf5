@@ -108,34 +108,6 @@ EXPECTED_DEVIATIONS = [
                "writes the v0 superblock itself",
     },
     {
-        "id": "superblock-v3-for-chunk-index",
-        "field": "superblock",
-        "ref": None,
-        "rust": "3",
-        "why": "layout_chunked_v108 asks for the v1.8 bound, where "
-               "H5O_layout_ver_bounds still puts the data layout message at "
-               "version 3 and so the chunk index at the version-1 B-tree. "
-               "This writer picks that index for a classic file only, so a "
-               "v1.8 file gets a v1.10 index behind a version-4 layout "
-               "message and the superblock version 3 that implies, above the "
-               "version 2 the bound asked for",
-    },
-    {
-        "id": "btree1-index-substituted",
-        "field": "chunkindex",
-        "ref": "btree1",
-        "rust": None,
-        "why": "a v1 B-tree chunk index is only legal below superblock v3, so "
-               "this follows from superblock-v3-for-chunk-index: the file gets "
-               "whichever v1.10 index its shape selects — here the "
-               "single-chunk index, the shape being one chunk wide. A file "
-               "created at "
-               "H5F_LIBVER_EARLIEST does get the version-1 B-tree "
-               "(tests/libver_earliest.rs), as does a chunked dataset "
-               "appended to a classic file (tests/legacy_append.rs); the v1.8 "
-               "bound is what is left",
-    },
-    {
         "id": "new-style-groups-always",
         "field": "linkstore",
         "ref": "symtab",
