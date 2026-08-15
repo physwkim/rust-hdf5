@@ -3,8 +3,8 @@
   "hdf5_version": "1.14.6",
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
-  "python": "/home/stevek/micromamba/envs/tomo/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-integrator3-71ef8215-1/target/release/oracle_probe",
+  "python": "/home/stevek/micromamba/envs/tomo/bin/python3",
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-polish-0370b494-1/target/release/oracle_probe",
   "cases": 92
  },
  "results": [
@@ -8185,15 +8185,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "/data#filters",
-      "field": "filters",
-      "ref": "[deflate(6)@1]",
-      "rust": "[deflate(6)@0]",
-      "expected": "filter-flags-zero"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -8328,15 +8320,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "/data#filters",
-      "field": "filters",
-      "ref": "[shuffle(4)@1]",
-      "rust": "[shuffle(4)@0]",
-      "expected": "filter-flags-zero"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -8606,15 +8590,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "/data#filters",
-      "field": "filters",
-      "ref": "[shuffle(4)@1,deflate(6)@1]",
-      "rust": "[shuffle(4)@0,deflate(6)@0]",
-      "expected": "filter-flags-zero"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -8749,15 +8725,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "/data#filters",
-      "field": "filters",
-      "ref": "[scaleoffset(2|0|16|0|4|1|0|1|0|0|0|0|0|0|0|0|1818321779|1717989221|7628147|0)@1]",
-      "rust": "[scaleoffset(2|0|16|0|4|1|0|1|0|0|0|0|0|0|0|0|1818321779|1717989221|7628147|0)@0]",
-      "expected": "filter-flags-zero"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -19173,20 +19141,6 @@
     "userblock",
     "sohm_list",
     "sohm_btree"
-   ]
-  },
-  {
-   "id": "filter-flags-zero",
-   "field": "filters",
-   "ref": "*",
-   "rust": "*",
-   "example": "[scaleoffset(2|0|16|0|4|1|0|1|0|0|0|0|0|0|0|0|1818321779|1717989221|7628147|0)@1] -> [scaleoffset(2|0|16|0|4|1|0|1|0|0|0|0|0|0|0|0|1818321779|1717989221|7628147|0)@0]",
-   "why": "the writer stores the per-filter flags byte as 0 where libhdf5 stores 1 (H5Z_FLAG_OPTIONAL); both pipelines decode to the same bytes",
-   "cases": [
-    "filter_deflate",
-    "filter_shuffle",
-    "filter_deflate_shuffle",
-    "filter_scaleoffset"
    ]
   }
  ],
