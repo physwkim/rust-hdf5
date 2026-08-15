@@ -856,10 +856,11 @@ fn an_swmr_session_on_a_file_created_at_earliest_is_refused() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// The bound is opt-in. A file created without one is the v1.8-shaped file
-/// this crate has always written — version-2 superblock, version-2 object
-/// headers, link-message groups — and asking for `V18` explicitly does not
-/// change that either.
+/// The bound is opt-in. A file created without one keeps the shape this
+/// crate has always written — version-2 superblock, version-2 object headers,
+/// link-message groups — which is also what asking for `V18` gives, these
+/// being the rows the two agree on. Where they part is the chunk index, which
+/// `tests/libver_v18.rs` covers; nothing here is chunked.
 #[test]
 fn a_file_created_without_the_bound_is_unchanged() {
     for (label, bound) in [("no bound", None), ("V18", Some(LibverBound::V18))] {
