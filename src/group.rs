@@ -20,6 +20,7 @@
 use crate::dataset::{DatasetBuilder, H5Dataset};
 use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
+use crate::format::creation_order::CreationOrder;
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::filter::FilterPipeline;
 use crate::format::messages::link::LinkTarget;
@@ -1005,6 +1006,25 @@ impl H5Group {
             }
             _ => Err(Hdf5Error::InvalidState(
                 "attr_names is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// This group's own attribute creation-order policy — the equivalent of
+    /// `H5Pget_attr_creation_order(gid.get_create_plist())` — `-` when
+    /// neither `TRACKED` nor `INDEXED` is set, and never derived from
+    /// whether the group currently holds any attributes: a group can track
+    /// creation order and still be empty (read mode).
+    pub fn attr_creation_order(&self) -> Result<CreationOrder> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_attr_creation_order()
+            } else {
+                reader.group_attr_creation_order(self.name.trim_start_matches('/'))
+            }),
+            _ => Err(Hdf5Error::InvalidState(
+                "attr_creation_order is only available in read mode".into(),
             )),
         }
     }

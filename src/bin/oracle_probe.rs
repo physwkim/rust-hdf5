@@ -30,8 +30,8 @@ use rust_hdf5::format::messages::filter::{
 };
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
-    H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error, Hyperslab,
-    HyperslabBlock, LibverBound, LinkClass, Reference, Selection,
+    CreationOrder, H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype,
+    Hdf5Error, Hyperslab, HyperslabBlock, LibverBound, LinkClass, Reference, Selection,
 };
 
 const CANON_VERSION: &str = "3";
@@ -586,13 +586,28 @@ fn dump_file(path: &str) -> std::result::Result<String, String> {
     Ok(d.lines.join("\n") + "\n")
 }
 
+/// The twin of `canon.py`'s `crt_order_str`: `-`, `tracked`, or
+/// `tracked+indexed` — `Indexed` always implies `Tracked`, so those three are
+/// the only strings either side ever produces.
+fn crt_order_str(order: CreationOrder) -> &'static str {
+    match order {
+        CreationOrder::Untracked => "-",
+        CreationOrder::Tracked => "tracked",
+        CreationOrder::Indexed => "tracked+indexed",
+    }
+}
+
 fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: usize) {
     d.emit(&format!("{path}#kind"), "group");
     d.field(path, "linkorder", || {
         Err("H5Group exposes no link creation-order tracking flags".into())
     });
     d.field(path, "attrorder", || {
-        Err("H5Group exposes no attribute creation-order tracking flags".into())
+        group
+            .attr_creation_order()
+            .map(crt_order_str)
+            .map(str::to_string)
+            .map_err(oneline)
     });
     d.emit(
         &format!("{path}#linkstore"),

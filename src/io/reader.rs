@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::format::btree_v1::{BTreeV1Config, BTreeV1Node, ChunkBTreeV1Node};
 use crate::format::bytes::read_le_uint as read_uint;
+use crate::format::creation_order::CreationOrder;
 use crate::format::fractal_heap::{self, FractalHeapHeader};
 use crate::format::global_heap::{
     decode_vlen_reference, vlen_reference_size, GlobalHeapCollection,
@@ -602,13 +603,14 @@ impl<'a> CatalogWalk<'a> {
         // by path. Through the shared collector, which carries a per-attribute
         // failure as an entry naming it: a group whose attribute did not
         // decode must not come back as a group with one fewer attribute.
+        // Recorded unconditionally, even for a group with none: the entry
+        // also carries the header's own creation-order and storage facts,
+        // which exist whether or not the group currently has any attributes.
         let ctx = self.meta.ctx;
         let attrs = collect_object_attributes(self.handle, &ctx, &header);
-        if !attrs.is_empty() {
-            self.catalog
-                .group_attributes
-                .insert(full_name.clone(), attrs);
-        }
+        self.catalog
+            .group_attributes
+            .insert(full_name.clone(), attrs);
 
         // Descend at most once per object header (cycle guard); a second path
         // to it is a group hard link — record the alias for lookups instead.
@@ -2560,6 +2562,11 @@ impl Hdf5Reader {
         Self::resolve_attr(&self.root_attributes, "/", name)
     }
 
+    /// The root group's own attribute creation-order policy.
+    pub fn root_attr_creation_order(&self) -> CreationOrder {
+        self.root_attributes.creation_order()
+    }
+
     /// Return the attribute names of a non-root group (path without a
     /// leading `/`, e.g. `"detector"` or `"entry/instrument"`; may pass
     /// through group hard links). Undecodable attributes included — see
@@ -2582,6 +2589,17 @@ impl Hdf5Reader {
             return Ok(Vec::new());
         };
         attrs.ordered_names(group_path)
+    }
+
+    /// A non-root group's own attribute creation-order policy. `Untracked`
+    /// for a path the walk never reached, the same silent default
+    /// [`group_attr_names_local`](Self::group_attr_names_local) gives an
+    /// unknown group's attribute listing.
+    pub fn group_attr_creation_order(&self, group_path: &str) -> CreationOrder {
+        self.group_attributes
+            .get(&self.canonical_path(group_path))
+            .map(ObjectAttributes::creation_order)
+            .unwrap_or_default()
     }
 
     /// Return a non-root group's attribute by name.
@@ -5254,6 +5272,11 @@ pub(crate) struct HandleBlockReader<'a> {
 pub struct ObjectAttributes {
     entries: Vec<AttributeEntry>,
     incomplete: Option<String>,
+    /// This object's own attribute creation-order policy, from the header
+    /// flag bits `H5Pget_attr_creation_order` reads back
+    /// (`attribute_creation_order`) — a structural fact about the header,
+    /// known even when the entries above are `incomplete`.
+    creation_order: CreationOrder,
 }
 
 impl ObjectAttributes {
@@ -5282,6 +5305,15 @@ impl ObjectAttributes {
     /// [`AttributeEntry::unreadable_reason`] answers for those.
     pub fn unreadable_reason(&self) -> Option<&str> {
         self.incomplete.as_deref()
+    }
+
+    /// This object's own attribute creation-order policy —
+    /// `H5Pget_attr_creation_order`'s answer, read off the object header's
+    /// own flag bits rather than derived from the entries. Available even
+    /// when the set is [`incomplete`](Self::unreadable_reason): it names
+    /// nothing that failed to decode.
+    pub fn creation_order(&self) -> CreationOrder {
+        self.creation_order
     }
 
     /// Nothing worth recording: no attribute read, and no failure to report.
@@ -5363,7 +5395,10 @@ pub(crate) fn collect_object_attributes(
     ctx: &FormatContext,
     header: &ObjectHeader,
 ) -> ObjectAttributes {
-    let mut attrs = ObjectAttributes::default();
+    let mut attrs = ObjectAttributes {
+        creation_order: header.attribute_creation_order(),
+        ..ObjectAttributes::default()
+    };
     // The message envelope carries a creation index only when the header says
     // the object tracks one; the field is not even encoded otherwise
     // (`H5O_SIZEOF_MSGHDR_OH`), so reading it as an index would report zero

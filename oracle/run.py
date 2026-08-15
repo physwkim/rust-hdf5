@@ -132,7 +132,6 @@ STRUCTURAL_FIELDS = {
     "attrstore",
     "linkstore",
     "linkorder",
-    "attrorder",
 }
 # `strpad` is deliberately NOT structural: it is a datatype detail the probe
 # answers from the decoded type, so a disagreement there is a modelling gap in
