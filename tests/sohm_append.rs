@@ -858,6 +858,116 @@ fn a_preserved_object_holding_a_heap_pointer_refuses_the_file() {
     cleanup(&path);
 }
 
+/// The offset in `sohm_group.h5` of the "SNOD" signature belonging to `/g`'s
+/// own Symbol Table Node, and the root group's (lower, since it was written
+/// first). Found with `h5debug`: `/g`'s object header (address from h5py's
+/// `h5o.get_info(g.id).addr`) holds one Symbol Table message naming B-tree
+/// address 4638; `h5debug sohm_group.h5 4638 5182` (that B-tree, then `/g`'s
+/// local heap address, both from the same message) shows the tree has one
+/// level-0 child — the SNOD holding `/g`'s single link — at address 5302. A
+/// byte-for-byte read of the file at 5302 confirms `"SNOD"` starts there.
+const ROOT_SNOD_OFFSET: usize = 2129;
+const GROUP_SNOD_OFFSET: usize = 5302;
+
+/// Flip one byte of `/g`'s Symbol Table Node signature, in a copy of
+/// `sohm_group.h5` at `path`. `SymbolTableNode::decode`
+/// (src/format/symbol_table.rs:100) rejects anything but the literal 4 bytes
+/// `"SNOD"`, so this alone makes `read_stab` fail while leaving the Symbol
+/// Table *message* in `/g`'s own header — the 16 bytes naming the B-tree and
+/// heap addresses — untouched: `read_header_chain` never decodes those
+/// addresses, only the message's type and raw bytes, so it still reports
+/// `/g` as carrying a `MSG_SYMBOL_TABLE` message. That split is exactly what
+/// `blocks_shared_message_rebuild`'s third clause depends on: the object is
+/// still recognizable as a group by message type alone even though nothing
+/// can walk what is underneath it. Both known "SNOD" offsets are checked
+/// before either is touched, rather than trusting the derivation blindly —
+/// if `gen_sohm.c` ever changes and the fixture is regenerated, this fails
+/// loudly instead of silently corrupting the wrong node.
+fn corrupt_group_snod_signature(path: &Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let hits: Vec<usize> = bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| w == b"SNOD")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        hits,
+        vec![ROOT_SNOD_OFFSET, GROUP_SNOD_OFFSET],
+        "sohm_group.h5's SNOD offsets moved; recompute with h5debug and update this test"
+    );
+    bytes[GROUP_SNOD_OFFSET] = b'X'; // 'S' -> 'X': anything but 'S' fails the signature check
+    std::fs::write(path, &bytes).unwrap();
+}
+
+/// A group this writer cannot classify on reopen is preserved by its raw
+/// bytes rather than rewritten, which means nothing here ever inspects what
+/// it names. If anything in that unwalked subtree shared a message through
+/// the SOHM heap the append is about to lay out afresh, keeping the group's
+/// bytes as they are would leave it pointing at heap IDs the rebuild just
+/// freed. The file is refused instead, exactly as for a preserved object
+/// that visibly holds a heap pointer
+/// (`a_preserved_object_holding_a_heap_pointer_refuses_the_file` above) —
+/// this is the third, harder-to-reach clause: it is the group's *own*
+/// failure to decode that makes its subtree unwalked in the first place.
+#[test]
+fn a_preserved_group_with_an_unwalked_subtree_refuses_the_file() {
+    let path = copy_fixture("sohm_group.h5", "group_snod");
+    corrupt_group_snod_signature(&path);
+    let bytes = std::fs::read(&path).unwrap();
+
+    let text = match H5File::open_rw(&path) {
+        Ok(_) => {
+            panic!("a file with a group whose symbol table does not read must not open for writing")
+        }
+        Err(e) => e.to_string(),
+    };
+    assert!(text.contains("'g'"), "{text}");
+    assert!(
+        text.contains("names objects of its own, which would keep their bytes with it"),
+        "{text}"
+    );
+    assert!(text.contains("its symbol table does not read"), "{text}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "a refusal wrote bytes"
+    );
+    cleanup(&path);
+}
+
+/// Positive control for the test above: the same fixture, uncorrupted, opens
+/// for appending and reads back exactly as `gen_sohm.c` wrote it plus the
+/// appended dataset — so the refusal above comes from the corruption, not
+/// from anything else about this fixture's shape (an old-format group
+/// sharing space with a SOHM index).
+#[test]
+fn an_intact_group_fixture_still_opens_for_appending() {
+    let path = copy_fixture("sohm_group.h5", "group_intact");
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.new_dataset::<i32>()
+            .shape([2usize])
+            .create("appended")
+            .unwrap()
+            .write_raw(&[9i32, 10])
+            .unwrap();
+        file.close().unwrap();
+    }
+    let file = H5File::open(&path).unwrap();
+    let appended: Vec<i32> = file.dataset("appended").unwrap().read_raw().unwrap();
+    assert_eq!(appended, vec![9, 10]);
+    let shared0: Vec<i32> = file.dataset("shared0").unwrap().read_raw().unwrap();
+    assert_eq!(shared0, vec![1, 2, 3, 4]);
+    let g = file.root_group().group("g").unwrap();
+    assert_eq!(
+        g.link_names().unwrap(),
+        vec!["corrupt_target_link".to_string()]
+    );
+    drop(file);
+    cleanup(&path);
+}
+
 /// The append path reads the superblock extension, which most files do not
 /// have: they keep working.
 #[test]

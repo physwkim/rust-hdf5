@@ -6,7 +6,7 @@
  *
  *     tests/fixtures/gen_sohm.sh
  *
- * Four files are written next to this source:
+ * Five files are written next to this source:
  *
  *   sohm_list.h5   one SOHM index holding datatype + dataspace + attribute
  *                  messages, left in its initial "list" form.
@@ -20,8 +20,21 @@
  *                  on the committed datatype. A committed datatype is kept by
  *                  its bytes across a reopen, so this is a file where an
  *                  object that keeps its bytes holds a heap pointer.
+ *   sohm_group.h5  the list form again, plus a subgroup ("g") whose only
+ *                  content is one hard link (named GROUP_LINK_NAME below).
+ *                  Neither H5Pset_shared_mesg_* nor H5Pset_libver_bounds is
+ *                  called on this file, so "g" gets libhdf5's EARLIEST-format
+ *                  default group storage: a classic Symbol Table message
+ *                  (B-tree + local heap + one Symbol Table Node holding the
+ *                  one link), not the newer Link-message form. Well-formed as
+ *                  written; tests/sohm_append.rs corrupts a copy of it at
+ *                  test time (flips a byte of that SNOD's 4-byte "SNOD"
+ *                  signature) to reach `blocks_shared_message_rebuild`'s
+ *                  "names objects of its own" clause: a *group* this writer
+ *                  cannot classify on reopen, kept by its bytes, whose
+ *                  unwalked subtree could hide anything.
  *
- * All four put the shared-message table in the superblock extension, which is
+ * All five put the shared-message table in the superblock extension, which is
  * what makes them exercise the extension walk as well as SOHM itself.
  */
 
@@ -128,6 +141,70 @@ write_file(const char *path, unsigned max_list, unsigned min_btree, int paged, i
     return 0;
 }
 
+/* The link this file's one subgroup holds. Named long and distinctive so a
+ * raw byte search for it in tests/sohm_append.rs cannot collide with
+ * anything else the file happens to contain (used only to confirm which
+ * local-heap string belongs to "g" while diagnosing the fixture's layout;
+ * the corruption itself targets the Symbol Table Node's signature, not this
+ * name). */
+#define GROUP_LINK_NAME "corrupt_target_link"
+
+/* One SOHM index (same shape as `write_file`'s list form) plus a subgroup
+ * whose only content is one hard link. This file pins no libver bound, so
+ * that subgroup gets libhdf5's default EARLIEST-format storage: a classic
+ * Symbol Table (B-tree + local heap + one Symbol Table Node), never the
+ * newer Link-message form regardless of how few links it holds. */
+static int
+write_group_file(const char *path)
+{
+    hid_t   fcpl = H5Pcreate(H5P_FILE_CREATE);
+    hid_t   file, space, dset, attr, aspace, atype, group;
+    hsize_t dims[1]  = {4};
+    hsize_t adims[1] = {2};
+    int     data[4]  = {1, 2, 3, 4};
+    double  adata[2] = {0.5, 1.5};
+
+    CHECK(fcpl);
+    CHECK(H5Pset_shared_mesg_nindexes(fcpl, 1));
+    CHECK(H5Pset_shared_mesg_index(
+        fcpl, 0, H5O_SHMESG_DTYPE_FLAG | H5O_SHMESG_SDSPACE_FLAG | H5O_SHMESG_ATTR_FLAG, 0));
+    CHECK(H5Pset_shared_mesg_phase_change(fcpl, 50, 40));
+
+    file = H5Fcreate(path, H5F_ACC_TRUNC, fcpl, H5P_DEFAULT);
+    CHECK(file);
+    CHECK(H5Pclose(fcpl));
+
+    space = H5Screate_simple(1, dims, NULL);
+    CHECK(space);
+    aspace = H5Screate_simple(1, adims, NULL);
+    CHECK(aspace);
+    atype = H5Tcopy(H5T_IEEE_F64LE);
+    CHECK(atype);
+
+    dset = H5Dcreate2(file, "shared0", H5T_STD_I32LE, space, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    CHECK(dset);
+    CHECK(H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, data));
+    attr = H5Acreate2(dset, "cal", atype, aspace, H5P_DEFAULT, H5P_DEFAULT);
+    CHECK(attr);
+    CHECK(H5Awrite(attr, H5T_NATIVE_DOUBLE, adata));
+    CHECK(H5Aclose(attr));
+    CHECK(H5Dclose(dset));
+
+    /* The subgroup this fixture exists for: one hard link, stored the
+     * classic way (Symbol Table message + B-tree + local heap + SNOD) since
+     * this file never raises the format's libver bound. */
+    group = H5Gcreate2(file, "g", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    CHECK(group);
+    CHECK(H5Lcreate_hard(file, "/shared0", group, GROUP_LINK_NAME, H5P_DEFAULT, H5P_DEFAULT));
+    CHECK(H5Gclose(group));
+
+    CHECK(H5Tclose(atype));
+    CHECK(H5Sclose(aspace));
+    CHECK(H5Sclose(space));
+    CHECK(H5Fclose(file));
+    return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -151,6 +228,11 @@ main(int argc, char **argv)
 
     snprintf(path, sizeof(path), "%s/sohm_named_attr.h5", dir);
     if (write_file(path, 50, 40, 0, 1) < 0)
+        return 1;
+    printf("wrote %s\n", path);
+
+    snprintf(path, sizeof(path), "%s/sohm_group.h5", dir);
+    if (write_group_file(path) < 0)
         return 1;
     printf("wrote %s\n", path);
 
