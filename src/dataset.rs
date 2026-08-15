@@ -10,6 +10,7 @@ use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, Shar
 use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
 use crate::format::reference::Reference;
 use crate::format::selection::Selection;
+use crate::io::writer::ChunkIndexKind;
 use crate::types::H5Type;
 
 // ---------------------------------------------------------------------------
@@ -35,6 +36,7 @@ pub struct DatasetBuilder<T: H5Type> {
     chunk_dims: Option<Vec<usize>>,
     max_shape: Option<Vec<Option<usize>>>,
     is_compact: bool,
+    early_allocation: bool,
     deflate_level: Option<u32>,
     shuffle: bool,
     custom_pipeline: Option<crate::format::messages::filter::FilterPipeline>,
@@ -85,6 +87,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             chunk_dims: None,
             max_shape: None,
             is_compact: false,
+            early_allocation: false,
             deflate_level: None,
             shuffle: false,
             custom_pipeline: None,
@@ -105,6 +108,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             chunk_dims: None,
             max_shape: None,
             is_compact: false,
+            early_allocation: false,
             deflate_level: None,
             shuffle: false,
             custom_pipeline: None,
@@ -199,6 +203,39 @@ impl<T: H5Type> DatasetBuilder<T> {
     #[must_use]
     pub fn compact(mut self) -> Self {
         self.is_compact = true;
+        self
+    }
+
+    /// Allocate the whole of a chunked dataset's storage at create —
+    /// `H5Pset_alloc_time(dcpl, H5D_ALLOC_TIME_EARLY)`, h5py's
+    /// `alloc_time=h5d.ALLOC_TIME_EARLY`.
+    ///
+    /// Every chunk exists, holding the fill value, before anything is
+    /// written, so an unwritten chunk costs a read of fill bytes rather than
+    /// a miss. On a fixed-shape unfiltered dataset that is also what lets
+    /// libhdf5 pick its cheapest chunk index — the *implicit* index, which
+    /// is no index at all: the chunks are one contiguous run in grid order
+    /// and a chunk's address is arithmetic. This builder makes the same
+    /// choice under the same conditions, so such a dataset is written with
+    /// no index structure in the file.
+    ///
+    /// Ignored by storage that has no chunk grid to allocate: contiguous,
+    /// compact and NULL-dataspace datasets.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("implicit.h5").unwrap();
+    /// let ds = file.new_dataset::<i32>()
+    ///     .shape([16])
+    ///     .chunk(&[4])
+    ///     .early_allocation()
+    ///     .create("data")
+    ///     .unwrap();
+    /// ds.write_raw(&(0..16i32).collect::<Vec<_>>()).unwrap();
+    /// ```
+    #[must_use]
+    pub fn early_allocation(mut self) -> Self {
+        self.early_allocation = true;
         self
     }
 
@@ -551,9 +588,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                     index,
                     shape: Vec::new(),
                     element_size,
-                    chunked: false,
-                    btree2: false,
-                    fixed_array: false,
+                    chunk_index: None,
                     is_null: true,
                 },
             });
@@ -615,9 +650,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                     index,
                     shape,
                     element_size,
-                    chunked: false,
-                    btree2: false,
-                    fixed_array: false,
+                    chunk_index: None,
                     is_null: false,
                 },
             });
@@ -648,12 +681,31 @@ impl<T: H5Type> DatasetBuilder<T> {
                 dims_u64.clone()
             };
 
-            // libhdf5 selects the chunk index from the dataspace: a v2
-            // B-tree for two or more unlimited dimensions, an extensible
-            // array for exactly one, and a fixed array when there are none.
+            // libhdf5 selects the chunk index from the dataspace and the
+            // creation properties, in this order
+            // (`H5D__layout_set_latest_indexing`, H5Dlayout.c): a v2 B-tree
+            // for two or more unlimited dimensions, an extensible array for
+            // exactly one, and for a fixed shape the implicit index when
+            // nothing has to be recorded per chunk — no filter, and early
+            // allocation, which is what puts every chunk at a computable
+            // address — a fixed array otherwise.
+            //
+            // The one condition of that rule this does not implement is the
+            // single-chunk index libhdf5 prefers when one chunk covers the
+            // whole (fixed) dataspace; this crate reads that index but does
+            // not write it, so such a dataset falls through to the fixed
+            // array, as it did before the implicit index existed.
             let n_unlimited = max_u64.iter().filter(|&&m| m == u64::MAX).count();
-            let is_btree2 = n_unlimited >= 2;
-            let is_fixed_array = n_unlimited == 0;
+            let one_chunk = chunk_u64 == dims_u64 && max_u64 == dims_u64;
+            let kind = if n_unlimited >= 2 {
+                ChunkIndexKind::BtreeV2
+            } else if n_unlimited == 1 {
+                ChunkIndexKind::ExtensibleArray
+            } else if self.early_allocation && !wants_filter && !one_chunk {
+                ChunkIndexKind::Implicit
+            } else {
+                ChunkIndexKind::FixedArray
+            };
 
             let index = {
                 let inner = borrow_inner(&self.file_inner);
@@ -680,7 +732,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                                 (false, level) => FilterPipeline::deflate(level.unwrap()),
                             }
                         };
-                        let idx = if is_btree2 {
+                        let idx = if kind == ChunkIndexKind::BtreeV2 {
                             // Two or more unlimited dimensions: a v2 B-tree,
                             // whose records carry the stored size and filter
                             // mask when the dataset is compressed (libhdf5
@@ -699,7 +751,16 @@ impl<T: H5Type> DatasetBuilder<T> {
                                     &full_name, datatype, &dims_u64, &max_u64, &chunk_u64,
                                 )?
                             }
-                        } else if is_fixed_array {
+                        } else if kind == ChunkIndexKind::Implicit {
+                            // No index structure at all: every chunk of the
+                            // grid is allocated at create in one run, so
+                            // there is no pipeline arm — a filter is what
+                            // makes chunks different sizes, and this index
+                            // has no room to say so.
+                            writer.create_implicit_dataset(
+                                &full_name, datatype, &dims_u64, &chunk_u64,
+                            )?
+                        } else if kind == ChunkIndexKind::FixedArray {
                             // A chunked dataset with no unlimited dimension
                             // must use the fixed-array index — libhdf5
                             // rejects an extensible-array index here. A
@@ -750,9 +811,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                     index,
                     shape,
                     element_size,
-                    chunked: true,
-                    btree2: is_btree2,
-                    fixed_array: is_fixed_array,
+                    chunk_index: Some(kind),
                     is_null: false,
                 },
             })
@@ -785,9 +844,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                     index,
                     shape,
                     element_size,
-                    chunked: false,
-                    btree2: false,
-                    fixed_array: false,
+                    chunk_index: None,
                     is_null: false,
                 },
             })
@@ -809,15 +866,16 @@ enum DatasetInfo {
         shape: Vec<usize>,
         /// Size of one element in bytes.
         element_size: usize,
-        /// Whether this is a chunked dataset.
-        chunked: bool,
-        /// Whether the chunk index is a v2 B-tree (multiple unlimited dims).
-        btree2: bool,
-        /// Whether the chunk index is a Fixed Array (no unlimited dims).
-        fixed_array: bool,
+        /// Which chunk index this dataset uses, `None` when its storage is
+        /// not chunked. One field rather than a flag per index: a dataset
+        /// has exactly one chunk index, and the flags could spell
+        /// combinations ("not chunked, but indexed by a v2 B-tree") that no
+        /// dataset has — which is what a write path reading only some of
+        /// them turns into a write to the wrong index.
+        chunk_index: Option<ChunkIndexKind>,
         /// Whether this is a NULL dataspace (no elements at all — distinct
         /// from a scalar, which holds exactly one). Always `false` when
-        /// `chunked` is `true`: a NULL dataspace can never be chunked.
+        /// `chunk_index` is `Some`: a NULL dataspace can never be chunked.
         is_null: bool,
     },
     /// A dataset opened by name in read mode.
@@ -1072,9 +1130,7 @@ impl H5Dataset {
         index: usize,
         shape: Vec<usize>,
         element_size: usize,
-        chunked: bool,
-        btree2: bool,
-        fixed_array: bool,
+        chunk_index: Option<ChunkIndexKind>,
     ) -> Self {
         Self {
             file_inner,
@@ -1082,9 +1138,7 @@ impl H5Dataset {
                 index,
                 shape,
                 element_size,
-                chunked,
-                btree2,
-                fixed_array,
+                chunk_index,
                 is_null: false,
             },
         }
@@ -1230,7 +1284,7 @@ impl H5Dataset {
     /// Return whether this is a chunked dataset.
     pub fn is_chunked(&self) -> bool {
         match &self.info {
-            DatasetInfo::Writer { chunked, .. } => *chunked,
+            DatasetInfo::Writer { chunk_index, .. } => chunk_index.is_some(),
             DatasetInfo::Reader { name, .. } => {
                 let mut inner = borrow_inner_mut(&self.file_inner);
                 match &mut *inner {
@@ -1387,9 +1441,7 @@ impl H5Dataset {
                 index,
                 shape,
                 element_size,
-                chunked,
-                btree2,
-                fixed_array,
+                chunk_index,
                 is_null,
             } => {
                 if *is_null {
@@ -1434,17 +1486,11 @@ impl H5Dataset {
                 };
                 let stored = to_stored_byte_order(host, &datatype, T::element_size())?;
 
-                if *chunked {
+                if let Some(kind) = *chunk_index {
                     // A chunked dataset has no contiguous data block; scatter
                     // the full row-major image into its chunk grid and write
                     // each chunk through the dataset's filter pipeline.
-                    return self.write_full_image_chunked(
-                        *index,
-                        *btree2,
-                        *fixed_array,
-                        &stored,
-                        *element_size,
-                    );
+                    return self.write_full_image_chunked(*index, kind, &stored, *element_size);
                 }
 
                 let inner = borrow_inner(&self.file_inner);
@@ -1507,9 +1553,7 @@ impl H5Dataset {
                 index,
                 shape,
                 element_size,
-                chunked,
-                btree2,
-                fixed_array,
+                chunk_index,
                 is_null,
             } => {
                 if *is_null {
@@ -1527,16 +1571,10 @@ impl H5Dataset {
                         element_size,
                     )));
                 }
-                if *chunked {
+                if let Some(kind) = *chunk_index {
                     // Scatter the full row-major image into the chunk grid
                     // (same path as write_raw, carrier-agnostic bytes).
-                    return self.write_full_image_chunked(
-                        *index,
-                        *btree2,
-                        *fixed_array,
-                        bytes,
-                        *element_size,
-                    );
+                    return self.write_full_image_chunked(*index, kind, bytes, *element_size);
                 }
                 let inner = borrow_inner(&self.file_inner);
                 match &*inner {
@@ -1567,8 +1605,7 @@ impl H5Dataset {
     fn write_full_image_chunked(
         &self,
         index: usize,
-        btree2: bool,
-        fixed_array: bool,
+        kind: ChunkIndexKind,
         bytes: &[u8],
         element_size: usize,
     ) -> Result<()> {
@@ -1622,15 +1659,20 @@ impl H5Dataset {
             coords
         };
 
-        if btree2 {
-            // B-tree v2 stores chunks verbatim (unfiltered only in this
-            // codebase), so there is no compression to parallelize; write one
-            // chunk at a time.
+        if kind == ChunkIndexKind::BtreeV2 || kind == ChunkIndexKind::Implicit {
+            // Neither index has anything to batch: a v2 B-tree stores chunks
+            // verbatim (unfiltered only in this codebase) and the implicit
+            // index is unfiltered by definition, so there is no compression
+            // to parallelize. Write one chunk at a time.
             for linear in 0..total_chunks {
                 let coords = coords_of(linear);
                 let chunk_buf =
                     Self::gather_chunk(bytes, &dims, &chunk_dims, &coords, element_size);
-                writer.write_chunk_btree_v2_inner(index, &coords, &chunk_buf)?;
+                if kind == ChunkIndexKind::BtreeV2 {
+                    writer.write_chunk_btree_v2_inner(index, &coords, &chunk_buf)?;
+                } else {
+                    writer.write_chunk_implicit_inner(index, &coords, &chunk_buf)?;
+                }
             }
         } else {
             // Extensible array and fixed array both compress each chunk through
@@ -1653,7 +1695,7 @@ impl H5Dataset {
                         (coords, buf)
                     })
                     .collect();
-                if fixed_array {
+                if kind == ChunkIndexKind::FixedArray {
                     let pairs: Vec<(&[u64], &[u8])> = items
                         .iter()
                         .map(|(c, d)| (c.as_slice(), d.as_slice()))
@@ -1758,18 +1800,14 @@ impl H5Dataset {
     pub fn write_chunk(&self, chunk_idx: usize, data: &[u8]) -> Result<()> {
         match &self.info {
             DatasetInfo::Writer {
-                index,
-                chunked,
-                btree2,
-                fixed_array,
-                ..
+                index, chunk_index, ..
             } => {
-                if !*chunked {
+                let Some(kind) = *chunk_index else {
                     return Err(Hdf5Error::InvalidState(
                         "write_chunk is only for chunked datasets".into(),
                     ));
-                }
-                if *btree2 {
+                };
+                if kind == ChunkIndexKind::BtreeV2 {
                     return Err(Hdf5Error::InvalidState(
                         "this dataset uses a v2 B-tree chunk index; use write_chunk_at \
                          with the chunk's grid coordinates"
@@ -1784,13 +1822,19 @@ impl H5Dataset {
                         // extents.
                         let cell = writer.ds(*index);
                         let _op = cell.op.lock();
-                        if *fixed_array {
-                            // Fixed-array dataset: decode the index-grid slot
-                            // into row-major grid coordinates.
-                            let coords = writer.chunk_coords_from_slot(*index, chunk_idx as u64)?;
-                            writer.write_chunk_fixed_array_inner(*index, &coords, data)?;
-                        } else {
-                            writer.write_chunk_inner(*index, chunk_idx as u64, data)?;
+                        match kind {
+                            // Both address a chunk by its grid coordinates,
+                            // so the linear slot is decoded back into them.
+                            ChunkIndexKind::FixedArray | ChunkIndexKind::Implicit => {
+                                let coords =
+                                    writer.chunk_coords_from_slot(*index, chunk_idx as u64)?;
+                                if kind == ChunkIndexKind::FixedArray {
+                                    writer.write_chunk_fixed_array_inner(*index, &coords, data)?;
+                                } else {
+                                    writer.write_chunk_implicit_inner(*index, &coords, data)?;
+                                }
+                            }
+                            _ => writer.write_chunk_inner(*index, chunk_idx as u64, data)?,
                         }
                         Ok(())
                     }
@@ -1834,21 +1878,25 @@ impl H5Dataset {
     pub fn write_chunk_raw(&self, chunk_idx: usize, data: &[u8], filter_mask: u32) -> Result<()> {
         match &self.info {
             DatasetInfo::Writer {
-                index,
-                chunked,
-                btree2,
-                fixed_array,
-                ..
+                index, chunk_index, ..
             } => {
-                if !*chunked {
+                let Some(kind) = *chunk_index else {
                     return Err(Hdf5Error::InvalidState(
                         "write_chunk_raw is only for chunked datasets".into(),
                     ));
-                }
-                if *btree2 {
+                };
+                if kind == ChunkIndexKind::BtreeV2 {
                     return Err(Hdf5Error::InvalidState(
                         "this dataset uses a v2 B-tree chunk index; use \
                          write_chunk_raw_at with the chunk's grid coordinates"
+                            .into(),
+                    ));
+                }
+                if kind == ChunkIndexKind::Implicit {
+                    return Err(Hdf5Error::InvalidState(
+                        "this dataset uses the implicit chunk index, which stores \
+                         every chunk at its full unfiltered size and has nowhere to \
+                         record a stored size or a filter mask"
                             .into(),
                     ));
                 }
@@ -1860,7 +1908,7 @@ impl H5Dataset {
                         // extents.
                         let cell = writer.ds(*index);
                         let _op = cell.op.lock();
-                        if *fixed_array {
+                        if kind == ChunkIndexKind::FixedArray {
                             // Fixed-array dataset: decode the index-grid slot
                             // into row-major grid coordinates.
                             let coords = writer.chunk_coords_from_slot(*index, chunk_idx as u64)?;
@@ -1958,20 +2006,14 @@ impl H5Dataset {
     ) -> Result<()> {
         match &self.info {
             DatasetInfo::Writer {
-                index,
-                chunked,
-                btree2,
-                fixed_array,
-                ..
+                index, chunk_index, ..
             } => {
-                if !*chunked {
+                let Some(kind) = *chunk_index else {
                     return Err(Hdf5Error::InvalidState(format!(
                         "{what} is only for chunked datasets"
                     )));
-                }
+                };
                 let coords: Vec<u64> = chunk_coords.iter().map(|&c| c as u64).collect();
-                let btree2 = *btree2;
-                let fixed_array = *fixed_array;
                 let inner = borrow_inner(&self.file_inner);
                 let writer = match &*inner {
                     H5FileInner::Writer(w) => w,
@@ -2025,7 +2067,7 @@ impl H5Dataset {
                     }
                 }
 
-                if fixed_array {
+                if kind == ChunkIndexKind::FixedArray {
                     // Fixed-array (fixed-shape) dataset: no dimension growth.
                     match bytes {
                         ChunkBytes::Unfiltered(data) => {
@@ -2042,7 +2084,26 @@ impl H5Dataset {
                     return Ok(());
                 }
 
-                if btree2 {
+                if kind == ChunkIndexKind::Implicit {
+                    // Implicit index: fixed shape, so no dimension growth
+                    // either, and no slot to record a stored size in.
+                    match bytes {
+                        ChunkBytes::Unfiltered(data) => {
+                            writer.write_chunk_implicit_inner(*index, &coords, data)?
+                        }
+                        ChunkBytes::Prefiltered { .. } => {
+                            return Err(Hdf5Error::InvalidState(
+                                "this dataset uses the implicit chunk index, which stores \
+                                 every chunk at its full unfiltered size and has nowhere \
+                                 to record a stored size or a filter mask"
+                                    .into(),
+                            ))
+                        }
+                    }
+                    return Ok(());
+                }
+
+                if kind == ChunkIndexKind::BtreeV2 {
                     match bytes {
                         ChunkBytes::Unfiltered(data) => {
                             writer.write_chunk_btree_v2_inner(*index, &coords, data)?
@@ -2086,8 +2147,10 @@ impl H5Dataset {
     /// chunks are compressed concurrently via rayon.
     pub fn write_chunks_batch(&self, chunks: &[(usize, &[u8])]) -> Result<()> {
         match &self.info {
-            DatasetInfo::Writer { index, chunked, .. } => {
-                if !*chunked {
+            DatasetInfo::Writer {
+                index, chunk_index, ..
+            } => {
+                if chunk_index.is_none() {
                     return Err(Hdf5Error::InvalidState(
                         "write_chunks_batch is only for chunked datasets".into(),
                     ));
@@ -2140,10 +2203,10 @@ impl H5Dataset {
             DatasetInfo::Writer {
                 index,
                 element_size,
-                chunked,
+                chunk_index,
                 ..
             } => {
-                if !*chunked {
+                if chunk_index.is_none() {
                     return Err(Hdf5Error::InvalidState(
                         "append is only for chunked datasets".into(),
                     ));
@@ -2279,8 +2342,10 @@ impl H5Dataset {
     /// Extend the dimensions of a chunked dataset.
     pub fn extend(&self, new_dims: &[usize]) -> Result<()> {
         match &self.info {
-            DatasetInfo::Writer { index, chunked, .. } => {
-                if !*chunked {
+            DatasetInfo::Writer {
+                index, chunk_index, ..
+            } => {
+                if chunk_index.is_none() {
                     return Err(Hdf5Error::InvalidState(
                         "extend is only for chunked datasets".into(),
                     ));
@@ -5367,6 +5432,156 @@ mod tests {
             let ds = file.dataset("data").unwrap();
             assert_eq!(ds.read_raw::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
         }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Early allocation on a fixed unfiltered shape selects the implicit
+    /// index, and "implicit" is literal: the file holds no index structure
+    /// at all, only a version-4 layout message of index type 2 pointing at
+    /// the run of chunk space the create allocated.
+    #[test]
+    fn early_allocation_writes_the_implicit_index() {
+        let path = temp_path("implicit_index");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([16])
+                .chunk(&[4])
+                .early_allocation()
+                .create("data")
+                .unwrap();
+            ds.write_raw(&(0..16i32).collect::<Vec<_>>()).unwrap();
+            file.close().unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        for magic in [b"EAHD", b"EAIB", b"FAHD", b"FADB", b"BTHD", b"TREE"] {
+            assert!(
+                !bytes.windows(4).any(|w| w == magic),
+                "{} appears in a file whose chunk index is supposed to be no \
+                 structure at all",
+                String::from_utf8_lossy(magic)
+            );
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("data").unwrap();
+            assert_eq!(
+                ds.read_raw::<i32>().unwrap(),
+                (0..16i32).collect::<Vec<_>>()
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The three conditions are conditions: an unlimited dimension, a
+    /// filter, or a single whole-dataset chunk each send the dataset to the
+    /// index libhdf5 would pick instead, early allocation or not.
+    #[test]
+    fn early_allocation_only_picks_implicit_where_libhdf5_does() {
+        // Every case writes and reads back its data, so a mis-selected index
+        // shows up as wrong bytes and not just as a different structure.
+        for (which, magic) in [
+            ("unlimited", b"EAHD"),
+            ("filtered", b"FAHD"),
+            ("one whole-dataset chunk", b"FAHD"),
+        ] {
+            let path = temp_path("implicit_not");
+            {
+                let file = H5File::create(&path).unwrap();
+                let builder = file.new_dataset::<i32>().shape([16]);
+                let builder = match which {
+                    "unlimited" => builder.chunk(&[4]).max_shape(&[None]),
+                    "filtered" => builder.chunk(&[4]).deflate(6),
+                    _ => builder.chunk(&[16]),
+                };
+                let ds = builder.early_allocation().create("data").unwrap();
+                ds.write_raw(&(0..16i32).collect::<Vec<_>>()).unwrap();
+                file.close().unwrap();
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(
+                bytes.windows(4).any(|w| w == magic),
+                "{which}: expected a {} index",
+                String::from_utf8_lossy(magic)
+            );
+            let file = H5File::open(&path).unwrap();
+            assert_eq!(
+                file.dataset("data").unwrap().read_raw::<i32>().unwrap(),
+                (0..16i32).collect::<Vec<_>>(),
+                "{which}"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// An implicitly indexed dataset's chunks all exist from create, so an
+    /// unwritten one reads back as the fill value — and the fill value is
+    /// tiled over the whole run at create, not per chunk on demand.
+    #[test]
+    fn implicit_index_fills_every_chunk_at_create() {
+        let path = temp_path("implicit_fill");
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([8])
+                .chunk(&[4])
+                .early_allocation()
+                .fill_value(-3i32)
+                .create("data")
+                .unwrap();
+            // Only chunk 0.
+            let chunk: Vec<u8> = [1i32, 2, 3, 4]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            ds.write_chunk(0, &chunk).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("data").unwrap();
+        assert_eq!(
+            ds.read_raw::<i32>().unwrap(),
+            vec![1, 2, 3, 4, -3, -3, -3, -3]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A reopen has to reconstruct the run's address *and* its length from
+    /// the layout message alone — there is no index structure to read it
+    /// back from — or the close would rewrite the dataset as unallocated
+    /// contiguous storage and drop every byte.
+    #[test]
+    fn implicit_index_survives_a_reopen() {
+        let path = temp_path("implicit_reopen");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([8])
+                .chunk(&[4])
+                .early_allocation()
+                .create("data")
+                .unwrap()
+                .write_raw(&[0i32, 1, 2, 3, 4, 5, 6, 7])
+                .unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open_rw(&path).unwrap();
+            let ds = file.dataset_writer("data").unwrap();
+            let chunk: Vec<u8> = [10i32, 11, 12, 13]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            ds.write_chunk(1, &chunk).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("data").unwrap().read_raw::<i32>().unwrap(),
+            vec![0, 1, 2, 3, 10, 11, 12, 13]
+        );
         std::fs::remove_file(&path).ok();
     }
 

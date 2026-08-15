@@ -355,6 +355,26 @@ impl DataLayoutMessage {
         }
     }
 
+    /// Version 4 chunked layout with the implicit index — no index structure
+    /// at all: `index_address` is the start of one contiguous run holding
+    /// every chunk of the maximum-extent grid in row-major order, so a
+    /// chunk's address is arithmetic (`H5D__none_idx_get_addr`, H5Dnone.c).
+    ///
+    /// `chunk_dims` should include the trailing element-size dimension.
+    pub fn chunked_v4_implicit(version: u8, chunk_dims: Vec<u64>, index_address: u64) -> Self {
+        Self::ChunkedV4 {
+            version,
+            flags: 0,
+            chunk_dims,
+            index_type: ChunkIndexType::Implicit,
+            earray_params: None,
+            farray_params: None,
+            bt2_params: None,
+            single_chunk_filter: None,
+            index_address,
+        }
+    }
+
     /// Virtual dataset layout pointing at a global-heap mapping list.
     pub fn virtual_layout(version: u8, heap_address: u64, heap_index: u32) -> Self {
         Self::Virtual {

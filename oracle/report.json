@@ -3,8 +3,8 @@
   "hdf5_version": "1.14.6",
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
-  "python": "/home/stevek/micromamba/envs/tomo/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-integrator2-70ef8082-1/target/release/oracle_probe",
+  "python": "/home/stevek/micromamba/envs/tomo/bin/python3",
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-chunkidx-33d32acd-1/target/release/oracle_probe",
   "cases": 91
  },
  "results": [
@@ -6664,7 +6664,7 @@
    "case": "chunkidx_implicit",
    "group": "layout",
    "note": "implicit index \u2014 fixed shape, early allocation, no filter",
-   "rust_case": null,
+   "rust_case": "chunkidx_implicit",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -6787,12 +6787,12 @@
     "detail": ""
    },
    "b": {
-    "verdict": "UNSUPPORTED-API",
-    "detail": "no rust writer arm: the public API cannot express this case",
+    "verdict": "PASS",
+    "detail": "",
     "core_diffs": [],
     "metadata_diffs": [],
-    "h5diff_rc": null,
-    "h5dump_rc": null
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
    }
   },
   {
@@ -17202,7 +17202,6 @@
    "kind": "write-unsupported",
    "signature": "no rust writer arm: the public API cannot express this case",
    "cases": [
-    "chunkidx_implicit",
     "external_storage",
     "vds",
     "group_storage_modern_root",

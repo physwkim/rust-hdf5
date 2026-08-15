@@ -542,7 +542,7 @@ LAYOUT_CASES = [
          "layout v3 + version-1 B-tree chunk index (libver earliest)"),
     Case("chunkidx_single", "layout", gen_chunkidx_single, "chunkidx_single",
          "single-chunk index"),
-    Case("chunkidx_implicit", "layout", gen_chunkidx_implicit, None,
+    Case("chunkidx_implicit", "layout", gen_chunkidx_implicit, "chunkidx_implicit",
          "implicit index — fixed shape, early allocation, no filter"),
     Case("chunkidx_farray", "layout", gen_chunkidx_farray, "chunkidx_farray",
          "fixed-array index"),
