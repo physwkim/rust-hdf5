@@ -564,7 +564,7 @@ LAYOUT_CASES = [
     Case("external_storage", "layout", gen_external_storage, "external_storage",
          "contiguous data held in an external raw file",
          ext_files=("_ext.raw",)),
-    Case("vds", "layout", gen_vds, None,
+    Case("vds", "layout", gen_vds, "vds",
          "virtual dataset mapped onto a dataset in a sibling file",
          ext_files=("_src.h5",)),
 ]

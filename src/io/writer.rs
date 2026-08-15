@@ -35,6 +35,7 @@ use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::group_info::GroupInfoMessage;
 use crate::format::messages::link::{LinkMessage, LinkTarget};
 use crate::format::messages::link_info::LinkInfoMessage;
+use crate::format::messages::virtual_mapping::{VirtualMapping, VirtualMappingList};
 use crate::format::messages::*;
 use crate::format::object_header::{ObjectHeader, ObjectTimes, MAX_MESSAGE_SIZE};
 use crate::format::selection::Selection;
@@ -496,16 +497,109 @@ impl ExternalStorage {
     }
 }
 
+/// A dataset whose elements are read out of other datasets — the virtual
+/// layout message (`H5D_VIRTUAL`) and the mapping list it points at.
+///
+/// The mappings live in one global heap object rather than in the header
+/// (`H5D__virtual_store_layout`), so the layout message carries only its
+/// address and index; the list itself is kept here so a rewrite of the header
+/// can re-emit the message pointing at the same object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualStorage {
+    /// Address of the global heap collection holding the mapping list.
+    pub heap_addr: u64,
+    /// Index of the mapping-list object within that collection.
+    pub heap_index: u32,
+    /// The mappings themselves, in the order they were declared — which is
+    /// the order libhdf5 resolves overlapping ones in.
+    pub mappings: Vec<VirtualMapping>,
+}
+
 /// Where a contiguous dataset's raw bytes live, read off its registry entry
 /// so the write itself can run with the slot unlocked.
 ///
-/// The one place the external-versus-local choice is made; see
+/// The one place the local-versus-external-versus-nowhere choice is made; see
 /// [`DatasetInfo::contiguous_target`].
 enum ContiguousTarget {
     /// A block in this file, starting at this address.
     Local(u64),
     /// The files an External File List names, in dataset order.
     External(Vec<ExternalFile>),
+    /// Nowhere: the dataset is virtual, and every element of it is stored in
+    /// whichever source dataset its mappings send that element to.
+    Virtual,
+}
+
+impl ContiguousTarget {
+    /// Whether this target is storage bytes can be written into at all —
+    /// false only for [`ContiguousTarget::Virtual`], which names sources
+    /// rather than storage.
+    fn is_storage(&self) -> bool {
+        !matches!(self, Self::Virtual)
+    }
+}
+
+/// The one refusal of a write into a virtual dataset, so the two paths that
+/// can reach one — [`Hdf5Writer::write_contiguous_bytes`] and the pre-insert
+/// gate of [`Hdf5Writer::write_vlen_strings_slice`] — say the same thing.
+///
+/// libhdf5 does take this write, pushing each element through the mapping
+/// that covers it into the source dataset holding it (`H5D__virtual_write`);
+/// this writer never opens a source file, so it refuses rather than dropping
+/// the bytes somewhere they cannot be read back from.
+/// Refuse a virtual-dataset source name libhdf5 would read as a `printf`
+/// pattern rather than as the name itself.
+///
+/// `H5D_virtual_parse_source_name` splits a source file or dataset name on
+/// every `%`: `%b` substitutes the mapping's block index (one mapping then
+/// stands for a whole family of source datasets) and `%%` is an escaped
+/// literal. So a name holding a `%` cannot be written verbatim — libhdf5
+/// would read back something else, or reject the specifier outright — and
+/// this writer builds no pattern of its own.
+fn reject_printf_source_name(dataset: &str, what: &str, name: &str) -> IoResult<()> {
+    if name.contains('%') {
+        return Err(crate::io::IoError::Unsupported(format!(
+            "virtual dataset '{dataset}' names the source {what} '{name}', whose '%' \
+             libhdf5 reads as a printf-style specifier (`%b` substitutes the block \
+             index); this writer emits names literally and does not build pattern \
+             mappings"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse an unlimited (`H5S_UNLIMITED`) mapping selection.
+///
+/// A mapping whose count or block is unlimited grows with its source: libhdf5
+/// clips it against the source dataset's real extent every time the virtual
+/// dataset is opened (`H5D__virtual_set_extent_unlim`), which is a resolution
+/// step this writer does not perform.
+fn reject_unlimited_selection(dataset: &str, which: &str, sel: &Selection) -> IoResult<()> {
+    use crate::format::selection::{Hyperslab, UNLIMITED as SEL_UNLIMITED};
+    let Selection::Hyperslab {
+        form: Hyperslab::Regular(r),
+        ..
+    } = sel
+    else {
+        return Ok(());
+    };
+    if r.count.contains(&SEL_UNLIMITED) || r.block.contains(&SEL_UNLIMITED) {
+        return Err(crate::io::IoError::Unsupported(format!(
+            "virtual dataset '{dataset}' has an unlimited (H5S_UNLIMITED) {which} \
+             selection; such a mapping is clipped against the source's extent every \
+             time the dataset is opened, which this writer does not model"
+        )));
+    }
+    Ok(())
+}
+
+fn virtual_write_refused() -> crate::io::IoError {
+    crate::io::IoError::Unsupported(
+        "cannot write into a virtual dataset: its elements live in the source datasets \
+         its mappings name, and this writer does not write through to them — write the \
+         source datasets themselves"
+            .into(),
+    )
 }
 
 /// Metadata for a dataset being written.
@@ -547,6 +641,11 @@ pub struct DatasetInfo {
     /// externally stored: its `data_addr` stays [`UNDEF_ADDR`] and every byte
     /// goes to the files named here instead of to a block of this file's own.
     pub external: Option<ExternalStorage>,
+    /// The source datasets this dataset's elements are read from, when it is
+    /// virtual. `Some` is what makes it virtual, and it stores nothing of its
+    /// own: `data_addr`/`data_size` keep the "no block in this file" values a
+    /// compact dataset also has.
+    pub virtual_storage: Option<VirtualStorage>,
     /// Chunked storage info (None for contiguous).
     pub chunked: Option<ChunkedDatasetInfo>,
     /// Fixed array chunked storage info.
@@ -622,7 +721,8 @@ impl DatasetInfo {
     /// [`Hdf5Writer::write_contiguous_bytes`]. A site that read `data_addr`
     /// itself would write an externally-stored dataset's data into this file
     /// — at [`UNDEF_ADDR`], the far end of the address space — instead of into
-    /// the files its header names.
+    /// the files its header names, and would do the same to a virtual one,
+    /// whose bytes are not this file's to write at all.
     fn contiguous_target(&self) -> Option<ContiguousTarget> {
         if self.chunked.is_some()
             || self.fixed_array.is_some()
@@ -630,6 +730,9 @@ impl DatasetInfo {
             || self.compact.is_some()
         {
             return None;
+        }
+        if self.virtual_storage.is_some() {
+            return Some(ContiguousTarget::Virtual);
         }
         match &self.external {
             Some(ext) => Some(ContiguousTarget::External(ext.files.clone())),
@@ -1512,6 +1615,9 @@ pub(crate) enum NewStorage {
     /// The image inside the data layout message itself, with no block of its
     /// own — `H5D_COMPACT`.
     Compact,
+    /// No storage of its own at all: the elements are read out of the source
+    /// datasets a mapping list names — `H5D_VIRTUAL`.
+    Virtual,
     /// No raw data at all — a committed datatype, whose object holds one
     /// datatype message and nothing else.
     None,
@@ -1995,6 +2101,7 @@ fn rebuild_dataset(
         datatype: dt,
         committed_type: None,
         external,
+        virtual_storage: None,
         dataspace: ds,
         obj_header_addr: obj_addr,
         data_addr: UNDEF_ADDR,
@@ -3063,23 +3170,38 @@ impl Hdf5Writer {
     /// a version-3 data layout message, which is what
     /// `H5O_layout_ver_bounds` gives `H5F_LIBVER_EARLIEST` (H5Dlayout.c:44),
     /// so a classic file takes both; a committed datatype has no layout at
-    /// all. Only chunked storage is out of reach: its index would be a
-    /// version-1 B-tree this crate reads but does not build, and the
-    /// version-4 layout it *does* build would drag the superblock to version
-    /// 3, silently converting the file the append was supposed to leave
-    /// classic. A filter needs a chunk to live in, so this refusal covers
-    /// deflate and shuffle without naming them.
+    /// all. Chunked and virtual storage are the two out of reach, each for a
+    /// reason of its own — named separately below rather than as one "not
+    /// supported", because they are answered differently.
     fn reject_unwritable_storage(&self, storage: NewStorage, name: &str) -> IoResult<()> {
-        if storage == NewStorage::Chunked && self.is_legacy() {
-            return Err(crate::io::IoError::Unsupported(format!(
-                "cannot create the chunked dataset '{name}' in this file: it is in \
-                 the classic (version-0/1 superblock) format, whose chunk index is \
-                 a version-1 B-tree that this crate reads but does not write. \
-                 Create it contiguously or compactly, or re-create the file at a \
-                 newer library-version bound"
-            )));
+        if !self.is_legacy() {
+            return Ok(());
         }
-        Ok(())
+        let (kind, why) = match storage {
+            // Its index would be a version-1 B-tree this crate reads but does
+            // not build, and the version-4 layout it *does* build would drag
+            // the superblock to version 3, silently converting the file the
+            // append was supposed to leave classic. A filter needs a chunk to
+            // live in, so this covers deflate and shuffle without naming them.
+            NewStorage::Chunked => (
+                "chunked",
+                "whose chunk index is a version-1 B-tree that this crate reads but does \
+                 not write. Create it contiguously or compactly",
+            ),
+            // Nothing older than a version-4 layout message can say "virtual"
+            // at all, and writing one here would convert the file the same way.
+            NewStorage::Virtual => (
+                "virtual",
+                "which predates the version-4 data layout message a virtual dataset is \
+                 written as. Create it in a file this crate wrote",
+            ),
+            NewStorage::Contiguous | NewStorage::Compact | NewStorage::None => return Ok(()),
+        };
+        Err(crate::io::IoError::Unsupported(format!(
+            "cannot create the {kind} dataset '{name}' in this file: it is in the classic \
+             (version-0/1 superblock) format, {why}, or re-create the file at a newer \
+             library-version bound"
+        )))
     }
 
     /// Enter the create gate: take `create_lock` and check that `name` is not
@@ -4284,7 +4406,7 @@ impl Hdf5Writer {
     /// SWMR — the delete entry points refuse first.
     fn release_dataset_storage(&self, index: usize) -> IoResult<()> {
         use crate::format::messages::datatype::DatatypeMessage;
-        let (indexed, ndims, contiguous, is_vlen, attrs, header_block) = {
+        let (indexed, ndims, contiguous, is_vlen, attrs, header_block, mapping_list) = {
             let ds = self.ds(index);
             let mut m = ds.lock();
             // Buffered rows were never written to a chunk; they die with
@@ -4301,6 +4423,14 @@ impl Hdf5Writer {
             // behind too. Dropping the list is what stops a deleted dataset
             // still claiming storage.
             m.external = None;
+            // The mapping list is this file's own metadata, so unlike the
+            // external files above it *is* freed — `H5D__virtual_delete`
+            // removes the heap object. The source datasets it named are
+            // another file's and are left alone.
+            let mapping_list = m
+                .virtual_storage
+                .take()
+                .and_then(|v| u16::try_from(v.heap_index).ok().map(|i| (v.heap_addr, i)));
             let is_vlen = matches!(
                 m.datatype,
                 DatatypeMessage::VarLenString { .. } | DatatypeMessage::VarLenSequence { .. }
@@ -4319,8 +4449,12 @@ impl Hdf5Writer {
                 is_vlen,
                 attrs,
                 header_block,
+                mapping_list,
             )
         };
+        if let Some((addr, idx)) = mapping_list {
+            self.remove_heap_objects([(addr, vec![idx])].into_iter().collect())?;
+        }
         if indexed {
             // Prune to a zero extent: every stored chunk is entirely beyond
             // it, so the walk frees each chunk block and collects the vlen
@@ -5165,6 +5299,12 @@ impl Hdf5Writer {
             Some(ContiguousTarget::External(_)) => Err(crate::io::IoError::InvalidState(format!(
                 "{what} are stamped into the dataset's own contiguous block, and \
                  dataset '{}' has none: its raw data lives in external files",
+                m.name
+            ))),
+            Some(ContiguousTarget::Virtual) => Err(crate::io::IoError::InvalidState(format!(
+                "{what} are stamped into the dataset's own contiguous block, and \
+                 dataset '{}' has none: it is virtual, and its elements come from \
+                 the source datasets its mappings name",
                 m.name
             ))),
             None => Err(crate::io::IoError::InvalidState(format!(
@@ -6312,6 +6452,7 @@ impl Hdf5Writer {
                 datatype,
                 committed_type: None,
                 external: None,
+                virtual_storage: None,
                 dataspace,
                 obj_header_addr: 0, // set during finalize
                 data_addr,
@@ -6460,6 +6601,7 @@ impl Hdf5Writer {
                 datatype,
                 committed_type: None,
                 external: Some(external),
+                virtual_storage: None,
                 dataspace,
                 obj_header_addr: 0, // set during finalize
                 // No block of this file's own: the layout message declares
@@ -6467,6 +6609,106 @@ impl Hdf5Writer {
                 // sends a reader to the external file list instead.
                 data_addr: UNDEF_ADDR,
                 data_size,
+                compact: None,
+                chunked: None,
+                fixed_array: None,
+                btree_v2: None,
+                append: None,
+                attributes: Vec::new(),
+                obj_header_written_addr: None,
+                obj_header_encoded_size: 0,
+                filter_pipeline: None,
+                deleted: false,
+                extent_dirty: false,
+                header_dirty: false,
+                nlink_written: 1,
+                creation_seq: self.take_creation_seq(),
+                track_attr_order: self.track_order.attrs,
+                fill_value: None,
+                layout_version: 4,
+                times: None,
+            },
+        );
+
+        Ok(idx)
+    }
+
+    /// Define a new virtual dataset — `H5Pset_virtual`, h5py's
+    /// `create_virtual_dataset(name, VirtualLayout)`.
+    ///
+    /// Each mapping says which elements of this dataset (`virtual_selection`)
+    /// are read from which elements (`source_selection`) of a dataset in
+    /// another file; the sources are never opened here, and a mapping naming
+    /// one that does not exist yet is perfectly legal — libhdf5 resolves each
+    /// at read time, filling from the fill value where nothing maps.
+    ///
+    /// The mappings do not live in the object header: they are serialized
+    /// into one global heap object and the layout message carries only its
+    /// address and index (`H5D__virtual_store_layout`), which is why this
+    /// allocates a heap object and nothing else.
+    ///
+    /// Two things `H5Pset_virtual` takes and this does not, refused rather
+    /// than silently written as literal text or a bounded selection:
+    /// `printf`-style source names (`%b` block substitution, which turns one
+    /// mapping into a family of them) and unlimited selections (a mapping
+    /// that grows with its source).
+    pub fn create_virtual_dataset(
+        &self,
+        name: &str,
+        datatype: DatatypeMessage,
+        dims: &[u64],
+        mappings: &[VirtualMapping],
+    ) -> IoResult<usize> {
+        if mappings.is_empty() {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "virtual dataset '{name}' names no mappings; a virtual dataset is defined \
+                 by the source datasets it maps, so at least one is required"
+            )));
+        }
+        for m in mappings {
+            reject_printf_source_name(name, "file", &m.source_file_name)?;
+            reject_printf_source_name(name, "dataset", &m.source_dset_name)?;
+            reject_unlimited_selection(name, "source", &m.source_selection)?;
+            reject_unlimited_selection(name, "virtual", &m.virtual_selection)?;
+        }
+
+        let create = self.begin_create(name, NewStorage::Virtual)?;
+        let name = create.name.as_str();
+
+        // The mapping list is ordinary file metadata, written now: the header
+        // built at finalize carries only the heap address and object index it
+        // lands at.
+        let block = VirtualMappingList {
+            mappings: mappings.to_vec(),
+        }
+        .encode(&self.ctx)?;
+        let (heap_addr, heap_index) = self.insert_vlen_objects(&[&block])?[0];
+
+        let dataspace = if dims.is_empty() {
+            DataspaceMessage::scalar()
+        } else {
+            DataspaceMessage::simple(dims)
+        };
+
+        let idx = self.push_dataset(
+            &create,
+            DatasetInfo {
+                name: name.to_string(),
+                datatype,
+                committed_type: None,
+                external: None,
+                virtual_storage: Some(VirtualStorage {
+                    heap_addr,
+                    heap_index: heap_index as u32,
+                    mappings: mappings.to_vec(),
+                }),
+                dataspace,
+                obj_header_addr: 0, // set during finalize
+                // Not a block of this file at all: every element is read out
+                // of a source dataset, so there is nothing here to allocate
+                // and nothing to free when the dataset is deleted.
+                data_addr: UNDEF_ADDR,
+                data_size: 0,
                 compact: None,
                 chunked: None,
                 fixed_array: None,
@@ -6536,6 +6778,7 @@ impl Hdf5Writer {
                 datatype,
                 committed_type: None,
                 external: None,
+                virtual_storage: None,
                 dataspace,
                 obj_header_addr: 0, // set during finalize
                 data_addr: UNDEF_ADDR,
@@ -6582,6 +6825,7 @@ impl Hdf5Writer {
                 datatype,
                 committed_type: None,
                 external: None,
+                virtual_storage: None,
                 dataspace: DataspaceMessage::null(),
                 obj_header_addr: 0, // set during finalize
                 data_addr: UNDEF_ADDR,
@@ -6686,6 +6930,7 @@ impl Hdf5Writer {
                 datatype,
                 committed_type: None,
                 external: None,
+                virtual_storage: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
@@ -6747,6 +6992,7 @@ impl Hdf5Writer {
                 let prefix = crate::io::reader::resolve_extfile_prefix(&self.source_dir);
                 write_external_file_bytes(files, prefix.as_deref(), off, data)
             }
+            ContiguousTarget::Virtual => Err(virtual_write_refused()),
         }
     }
 
@@ -6785,7 +7031,10 @@ impl Hdf5Writer {
                     "dataset has no data allocated".into(),
                 ));
             };
-            if data.len() as u64 != g.data_size {
+            // A dataset that stores nothing of its own has no byte count to
+            // check a write against — `write_contiguous_bytes` refuses it by
+            // name below, which is the answer the caller needs.
+            if target.is_storage() && data.len() as u64 != g.data_size {
                 return Err(crate::io::IoError::InvalidState(format!(
                     "data size mismatch: expected {} bytes, got {}",
                     g.data_size,
@@ -7846,6 +8095,7 @@ impl Hdf5Writer {
                 datatype,
                 committed_type: None,
                 external: None,
+                virtual_storage: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr,
@@ -7957,6 +8207,7 @@ impl Hdf5Writer {
                 datatype,
                 committed_type: None,
                 external: None,
+                virtual_storage: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr,
@@ -8093,6 +8344,7 @@ impl Hdf5Writer {
                 datatype,
                 committed_type: None,
                 external: None,
+                virtual_storage: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
@@ -8351,22 +8603,27 @@ impl Hdf5Writer {
                     ))
                 }
             };
-            let writable = m.chunked.is_some()
-                || m.fixed_array.is_some()
-                || m.btree_v2.is_some()
-                || m.contiguous_target().is_some();
+            let writable = if m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some()
+            {
+                Ok(())
+            } else {
+                match m.contiguous_target() {
+                    Some(ContiguousTarget::Virtual) => Err(virtual_write_refused()),
+                    Some(_) => Ok(()),
+                    None => Err(crate::io::IoError::InvalidState(
+                        "dataset has no data allocated".into(),
+                    )),
+                }
+            };
             (charset, m.dataspace.dims.clone(), writable)
         };
 
         // `write_slice_inner` rejects a dataset with neither chunk machinery
         // nor allocated data (a reopened dataset whose index was not
-        // reconstructed) — that rejection must come before the heap write
-        // below, or every failed call orphans a 4096-byte collection.
-        if !writable {
-            return Err(crate::io::IoError::InvalidState(
-                "dataset has no data allocated".into(),
-            ));
-        }
+        // reconstructed), and refuses a virtual one outright — those
+        // rejections must come before the heap write below, or every failed
+        // call orphans a 4096-byte collection.
+        writable?;
 
         if dims.len() != 1 {
             return Err(crate::io::IoError::InvalidState(format!(
@@ -8537,13 +8794,8 @@ impl Hdf5Writer {
     /// be following those references, the same reason `place_chunk` keeps a
     /// relocated chunk's old block.
     fn release_vlen_references(&self, refs: &[u8]) -> IoResult<()> {
-        use crate::format::global_heap::{
-            decode_vlen_reference, vlen_reference_size, GlobalHeapCollection,
-        };
+        use crate::format::global_heap::{decode_vlen_reference, vlen_reference_size};
 
-        if self.swmr_active {
-            return Ok(());
-        }
         let ref_size = vlen_reference_size(&self.ctx);
         if ref_size == 0 || refs.len() < ref_size {
             return Ok(());
@@ -8563,6 +8815,26 @@ impl Hdf5Writer {
                 )));
             };
             per_collection.entry(addr).or_default().push(idx);
+        }
+        self.remove_heap_objects(per_collection)
+    }
+
+    /// Remove global heap objects — `H5HG_remove` — given the object indices
+    /// grouped by the collection they live in.
+    ///
+    /// The single owner of heap-object removal: the vlen release path above
+    /// reaches it with the objects a replaced element used to name, and
+    /// [`release_dataset_storage`](Self::release_dataset_storage) with the
+    /// one mapping-list object a deleted virtual dataset owned, which is what
+    /// `H5D__virtual_delete` frees the same way.
+    fn remove_heap_objects(
+        &self,
+        per_collection: std::collections::BTreeMap<u64, Vec<u16>>,
+    ) -> IoResult<()> {
+        use crate::format::global_heap::GlobalHeapCollection;
+
+        if self.swmr_active {
+            return Ok(());
         }
 
         // The `cwfs` lock is held across the sweep: it serializes these
@@ -9320,6 +9592,7 @@ impl Hdf5Writer {
                 datatype,
                 committed_type: None,
                 external: None,
+                virtual_storage: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
@@ -9466,6 +9739,7 @@ impl Hdf5Writer {
                 datatype,
                 committed_type: None,
                 external: None,
+                virtual_storage: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
@@ -9575,6 +9849,7 @@ impl Hdf5Writer {
                 datatype,
                 committed_type: None,
                 external: None,
+                virtual_storage: None,
                 dataspace,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
@@ -11390,10 +11665,14 @@ impl Hdf5Writer {
         // Fill Value message (type 0x05)
         let is_chunked = m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some();
         // `H5P__init_def_layout` gives each storage class its own default
-        // allocation time: incremental for chunked, early for compact (the
-        // space is the header, so it exists as soon as the dataset does),
-        // late for contiguous.
-        let alloc_time = match (is_chunked, m.compact.is_some()) {
+        // allocation time: incremental for chunked and for virtual (whose
+        // source datasets are allocated as they are written), early for
+        // compact (the space is the header, so it exists as soon as the
+        // dataset does), late for contiguous.
+        let alloc_time = match (
+            is_chunked || m.virtual_storage.is_some(),
+            m.compact.is_some(),
+        ) {
             (true, _) => 3,  // incremental
             (_, true) => 1,  // early
             (false, _) => 2, // late
@@ -11466,6 +11745,13 @@ impl Hdf5Writer {
             )
         } else if let Some(ref image) = m.compact {
             DataLayoutMessage::compact(image.clone())
+        } else if let Some(ref virt) = m.virtual_storage {
+            // Version 4 always: the virtual layout class did not exist before
+            // it, so the default virtual layout is created at version 4 and
+            // `H5Pset_virtual` raises any lower one to it (H5Pdcpl.c),
+            // whatever the file's library-version bounds say — which is why a
+            // v0-superblock file can still hold one.
+            DataLayoutMessage::virtual_layout(4, virt.heap_addr, virt.heap_index)
         } else {
             DataLayoutMessage::contiguous(m.data_addr, m.data_size)
         };

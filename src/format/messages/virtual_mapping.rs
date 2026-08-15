@@ -75,6 +75,37 @@ pub struct VirtualMappingList {
 }
 
 impl VirtualMappingList {
+    /// Encode this mapping list into the bytes one global heap object holds
+    /// — `H5D__virtual_store_layout` (H5Dvirtual.c).
+    ///
+    /// Always at heap encoding version 0, because that is the only version
+    /// libhdf5 writes short of `H5F_LIBVER_V200`: version 1 exists solely to
+    /// shorten repeated names (`SOURCE_SAME_FILE` / the two `_SHARED` forms),
+    /// and `H5D__virtual_store_layout` picks it only when the file's *low*
+    /// bound is at least V200 *and* it measures the version-1 block as no
+    /// larger. Nothing here is lost by staying at 0: the same mappings decode
+    /// back identically, one inline name per entry.
+    ///
+    /// A name holding an interior NUL is refused rather than written: the
+    /// wire form terminates each name with one, so a name containing another
+    /// would read back truncated — and everything after it in the block would
+    /// decode as some other field.
+    pub fn encode(&self, ctx: &FormatContext) -> FormatResult<Vec<u8>> {
+        let ss = ctx.sizeof_size as usize;
+        let mut buf = Vec::new();
+        buf.push(ENC_VERS_0);
+        buf.extend_from_slice(&(self.mappings.len() as u64).to_le_bytes()[..ss]);
+        for m in &self.mappings {
+            push_cstr(&mut buf, &m.source_file_name, "source file")?;
+            push_cstr(&mut buf, &m.source_dset_name, "source dataset")?;
+            buf.extend_from_slice(&m.source_selection.encode()?);
+            buf.extend_from_slice(&m.virtual_selection.encode()?);
+        }
+        let cksum = checksum_metadata(&buf);
+        buf.extend_from_slice(&cksum.to_le_bytes());
+        Ok(buf)
+    }
+
     /// Decode a mapping list from a global heap object's raw bytes.
     ///
     /// Unlike most message decoders here, this does not return a
@@ -181,6 +212,20 @@ impl VirtualMappingList {
 
         Ok(Self { mappings })
     }
+}
+
+/// Append a name and its NUL terminator, refusing one that already holds a
+/// NUL (see [`VirtualMappingList::encode`]).
+fn push_cstr(buf: &mut Vec<u8>, name: &str, what: &str) -> FormatResult<()> {
+    if name.as_bytes().contains(&0) {
+        return Err(FormatError::InvalidData(format!(
+            "virtual dataset {what} name {name:?} contains a NUL, which terminates a \
+             name on the wire"
+        )));
+    }
+    buf.extend_from_slice(name.as_bytes());
+    buf.push(0);
+    Ok(())
 }
 
 /// Read a `sizeof_size`-byte origin-entry index and validate it points
@@ -442,6 +487,95 @@ mod tests {
     fn decode_empty_buffer() {
         let err = VirtualMappingList::decode(&[], &ctx8()).unwrap_err();
         assert!(matches!(err, FormatError::BufferTooShort { .. }));
+    }
+
+    /// The 60 bytes libhdf5 1.14 actually wrote for the oracle's `vds` case
+    /// (`h5py.VirtualLayout(shape=(16,))[...] = VirtualSource("vds_src.h5",
+    /// "src", shape=(16,))`), lifted out of the global heap object the layout
+    /// message points at — heap version 0, one entry, both selections ALL.
+    /// `encode` must reproduce it byte for byte, checksum included.
+    #[test]
+    fn encode_matches_the_captured_libhdf5_block() {
+        let list = VirtualMappingList {
+            mappings: vec![VirtualMapping {
+                source_file_name: "vds_src.h5".into(),
+                source_dset_name: "src".into(),
+                source_selection: Selection::All,
+                virtual_selection: Selection::All,
+            }],
+        };
+        let captured = [
+            0x00, // heap encoding version 0
+            0x01, 0, 0, 0, 0, 0, 0, 0, // num_entries = 1
+            b'v', b'd', b's', b'_', b's', b'r', b'c', b'.', b'h', b'5', 0x00, b's', b'r', b'c',
+            0x00, //
+            0x03, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // source: ALL
+            0x03, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // virtual: ALL
+            0xcd, 0xe5, 0xe5, 0xed, // checksum
+        ];
+        assert_eq!(list.encode(&ctx8()).unwrap(), captured);
+    }
+
+    #[test]
+    fn encode_roundtrips_a_hyperslab_mapping_at_ctx4() {
+        let ctx4 = FormatContext {
+            sizeof_addr: 4,
+            sizeof_size: 4,
+        };
+        let list = VirtualMappingList {
+            mappings: vec![
+                VirtualMapping {
+                    source_file_name: "a.h5".into(),
+                    source_dset_name: "one".into(),
+                    source_selection: Selection::All,
+                    virtual_selection: Selection::Hyperslab {
+                        rank: 1,
+                        form: Hyperslab::Blocks(vec![HyperslabBlock {
+                            start: vec![0],
+                            end: vec![7],
+                        }]),
+                    },
+                },
+                VirtualMapping {
+                    source_file_name: "b.h5".into(),
+                    source_dset_name: "two".into(),
+                    source_selection: Selection::All,
+                    virtual_selection: Selection::Hyperslab {
+                        rank: 1,
+                        form: Hyperslab::Blocks(vec![HyperslabBlock {
+                            start: vec![8],
+                            end: vec![15],
+                        }]),
+                    },
+                },
+            ],
+        };
+        let encoded = list.encode(&ctx4).unwrap();
+        assert_eq!(VirtualMappingList::decode(&encoded, &ctx4).unwrap(), list);
+    }
+
+    #[test]
+    fn encode_empty_list_roundtrips() {
+        let list = VirtualMappingList {
+            mappings: Vec::new(),
+        };
+        let encoded = list.encode(&ctx8()).unwrap();
+        assert_eq!(encoded.len(), 1 + 8 + 4);
+        assert_eq!(VirtualMappingList::decode(&encoded, &ctx8()).unwrap(), list);
+    }
+
+    #[test]
+    fn encode_rejects_a_name_holding_a_nul() {
+        let list = VirtualMappingList {
+            mappings: vec![VirtualMapping {
+                source_file_name: "sr\0c.h5".into(),
+                source_dset_name: "src".into(),
+                source_selection: Selection::All,
+                virtual_selection: Selection::All,
+            }],
+        };
+        let err = list.encode(&ctx8()).unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)), "{err:?}");
     }
 
     #[test]

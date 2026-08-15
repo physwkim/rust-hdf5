@@ -8,6 +8,7 @@ use crate::attribute::AttrBuilder;
 use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
 use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+use crate::format::messages::virtual_mapping::VirtualMapping;
 use crate::format::reference::Reference;
 use crate::format::selection::Selection;
 use crate::types::H5Type;
@@ -44,6 +45,7 @@ pub struct DatasetBuilder<T: H5Type> {
     committed_type: Option<String>,
     references: Option<ReferenceElement>,
     external: Option<Vec<(String, u64, u64)>>,
+    virtual_mappings: Vec<VirtualMapping>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -95,6 +97,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             committed_type: None,
             references: None,
             external: None,
+            virtual_mappings: Vec::new(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -116,6 +119,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             committed_type: None,
             references: None,
             external: None,
+            virtual_mappings: Vec::new(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -411,6 +415,58 @@ impl<T: H5Type> DatasetBuilder<T> {
         self
     }
 
+    /// Map part of this dataset onto part of a dataset in another file, making
+    /// it virtual — `H5Pset_virtual`, one `VirtualLayout[...] =
+    /// VirtualSource(...)` assignment in h5py.
+    ///
+    /// The arguments are `H5Pset_virtual`'s, in its order: which elements of
+    /// *this* dataset the mapping fills, the file and dataset the data comes
+    /// from, and which elements of that source dataset it comes from. Call it
+    /// once per mapping; they apply in the order given, which is the order
+    /// libhdf5 resolves overlapping ones in.
+    ///
+    /// The source file is named exactly as stored — resolved against
+    /// `HDF5_VDS_PREFIX`, or the virtual dataset's own directory, when the
+    /// file is read — and `"."` means this file. Nothing is opened or checked
+    /// here: a source that does not exist yet is legal, and reads of the
+    /// unmapped or unresolvable parts return the [`fill_value`](Self::fill_value).
+    ///
+    /// A virtual dataset stores nothing of its own, which rules out
+    /// [`chunk`](Self::chunk), a filter, [`compact`](Self::compact),
+    /// [`null`](Self::null), [`external`](Self::external) and either reference
+    /// kind — and makes writing to it an error, since its elements belong to
+    /// the source datasets.
+    ///
+    /// `printf`-style source names (libhdf5's `%b` block substitution) and
+    /// unlimited (`H5S_UNLIMITED`) selections are refused at
+    /// [`create`](Self::create) rather than written as something else.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::{H5File, Selection};
+    /// let file = H5File::create("vds.h5").unwrap();
+    /// let ds = file.new_dataset::<i32>()
+    ///     .shape([16])
+    ///     .virtual_mapping(Selection::All, "src.h5", "src", Selection::All)
+    ///     .create("vds")
+    ///     .unwrap();
+    /// ```
+    #[must_use]
+    pub fn virtual_mapping(
+        mut self,
+        virtual_selection: Selection,
+        source_file: &str,
+        source_dataset: &str,
+        source_selection: Selection,
+    ) -> Self {
+        self.virtual_mappings.push(VirtualMapping {
+            source_file_name: source_file.to_string(),
+            source_dset_name: source_dataset.to_string(),
+            source_selection,
+            virtual_selection,
+        });
+        self
+    }
+
     /// Set a user-defined fill value for unwritten elements.
     ///
     /// Without this, datasets use the HDF5 default zero-fill. When set,
@@ -565,6 +621,33 @@ impl<T: H5Type> DatasetBuilder<T> {
             }
         }
 
+        // A virtual dataset stores nothing of its own — its elements are read
+        // out of the datasets its mappings name — so it can be none of the
+        // storage classes that do, and there is no block for a reference
+        // writer to stamp into either.
+        if !self.virtual_mappings.is_empty() {
+            if self.chunk_dims.is_some()
+                || wants_filter
+                || self.is_compact
+                || self.is_null
+                || self.external.is_some()
+            {
+                return Err(Hdf5Error::InvalidState(
+                    "a virtual dataset's elements live in the datasets its mappings name, \
+                     so it cannot also be chunked, filtered, compact, NULL or stored in \
+                     external files"
+                        .into(),
+                ));
+            }
+            if self.references.is_some() {
+                return Err(Hdf5Error::InvalidState(
+                    "object and region references are stamped into the dataset's own \
+                     contiguous block, which a virtual dataset has none of"
+                        .into(),
+                ));
+            }
+        }
+
         if self.is_null {
             // A NULL dataspace holds no elements at all: no chunk grid to
             // scatter into, no raw image to put in an object header, no fill
@@ -653,6 +736,52 @@ impl<T: H5Type> DatasetBuilder<T> {
                 match &*inner {
                     H5FileInner::Writer(writer) => {
                         let idx = writer.create_compact_dataset(&full_name, datatype, &dims_u64)?;
+                        if let Some(ref fv) = fill_value {
+                            writer.set_dataset_fill_value(idx, fv.clone())?;
+                        }
+                        idx
+                    }
+                    H5FileInner::Reader(_) => {
+                        return Err(Hdf5Error::InvalidState(
+                            "cannot create a dataset in read mode".into(),
+                        ));
+                    }
+                    H5FileInner::Closed => {
+                        return Err(Hdf5Error::InvalidState("file is closed".into()));
+                    }
+                }
+            };
+
+            return Ok(H5Dataset {
+                file_inner: clone_inner(&self.file_inner),
+                info: DatasetInfo::Writer {
+                    index,
+                    shape,
+                    element_size,
+                    chunked: false,
+                    btree2: false,
+                    fixed_array: false,
+                    is_null: false,
+                },
+            });
+        }
+
+        if !self.virtual_mappings.is_empty() {
+            let index = {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Writer(writer) => {
+                        let idx = writer.create_virtual_dataset(
+                            &full_name,
+                            datatype,
+                            &dims_u64,
+                            &self.virtual_mappings,
+                        )?;
+                        // The fill value is what a read of an unmapped — or
+                        // unresolvable — element returns, so it is the one
+                        // dataset property a virtual dataset carries about its
+                        // own elements. Nothing is tiled into storage: it has
+                        // none.
                         if let Some(ref fv) = fill_value {
                             writer.set_dataset_fill_value(idx, fv.clone())?;
                         }
@@ -7983,6 +8112,160 @@ mod tests {
                 .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
                 .collect::<Vec<_>>()
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A write into a virtual dataset is refused by name rather than landing
+    /// somewhere no reader would look: libhdf5 pushes such a write through
+    /// the mapping into the source dataset (`H5D__virtual_write`), which this
+    /// writer does not do.
+    #[test]
+    fn a_virtual_dataset_refuses_every_write() {
+        use crate::Selection;
+        let path = temp_path("vds_write_refused");
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([16usize])
+            .virtual_mapping(Selection::All, "src.h5", "src", Selection::All)
+            .create("vds")
+            .unwrap();
+        for err in [
+            ds.write_raw(&(0..16i32).collect::<Vec<_>>()).unwrap_err(),
+            ds.write_slice(&[0], &[2], &[1i32, 2]).unwrap_err(),
+        ] {
+            let msg = err.to_string();
+            assert!(msg.contains("virtual dataset"), "{msg}");
+        }
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `%` in a source name is libhdf5's printf-style block substitution, not
+    /// part of the name, so a name holding one is refused instead of written
+    /// as something the library would read back differently.
+    #[test]
+    fn a_printf_style_source_name_is_refused() {
+        use crate::Selection;
+        let path = temp_path("vds_printf");
+        let file = H5File::create(&path).unwrap();
+        for (f, d) in [("src_%b.h5", "src"), ("src.h5", "block_%b")] {
+            let err = match file
+                .new_dataset::<i32>()
+                .shape([16usize])
+                .virtual_mapping(Selection::All, f, d, Selection::All)
+                .create("vds")
+            {
+                Ok(_) => panic!("'%' in a source name is a printf specifier to libhdf5"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("printf"), "{err}");
+        }
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An unlimited mapping is clipped against its source's extent at every
+    /// open, which this writer does not model — refused rather than written
+    /// as the all-ones count it would encode to.
+    #[test]
+    fn an_unlimited_mapping_selection_is_refused() {
+        use crate::format::selection::UNLIMITED;
+        use crate::{Hyperslab, RegularHyperslab, Selection};
+        let path = temp_path("vds_unlimited");
+        let file = H5File::create(&path).unwrap();
+        let unlimited = Selection::Hyperslab {
+            rank: 1,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: vec![0],
+                stride: vec![1],
+                count: vec![UNLIMITED],
+                block: vec![1],
+            }),
+        };
+        let err = match file
+            .new_dataset::<i32>()
+            .shape([16usize])
+            .virtual_mapping(unlimited, "src.h5", "src", Selection::All)
+            .create("vds")
+        {
+            Ok(_) => panic!("an unlimited mapping needs clipping this writer does not do"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("H5S_UNLIMITED"), "{err}");
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A virtual dataset stores nothing of its own, so it cannot also be one
+    /// of the storage classes that do.
+    #[test]
+    fn a_virtual_dataset_cannot_also_be_chunked_or_external() {
+        use crate::Selection;
+        let path = temp_path("vds_exclusive");
+        let file = H5File::create(&path).unwrap();
+        let builder = || {
+            file.new_dataset::<i32>().shape([16usize]).virtual_mapping(
+                Selection::All,
+                "src.h5",
+                "src",
+                Selection::All,
+            )
+        };
+        for (which, res) in [
+            ("chunked", builder().chunk(&[4]).create("a")),
+            ("compact", builder().compact().create("b")),
+            (
+                "external",
+                builder().external(&[("x.raw", 0, 64)]).create("c"),
+            ),
+            ("references", builder().object_references().create("d")),
+        ] {
+            match res {
+                Ok(_) => panic!("a virtual dataset cannot also be {which}"),
+                Err(e) => assert!(e.to_string().contains("virtual dataset"), "{which}: {e}"),
+            }
+        }
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Deleting a virtual dataset frees the global heap object its mapping
+    /// list lived in — `H5D__virtual_delete` reaches `H5HG_remove` — so the
+    /// next dataset's own heap object reuses that space instead of the file
+    /// growing by a whole collection per deleted virtual dataset.
+    #[test]
+    fn deleting_a_virtual_dataset_frees_its_mapping_list() {
+        use crate::Selection;
+        let path = temp_path("vds_delete");
+        let baseline = {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([16usize])
+                .virtual_mapping(Selection::All, "src.h5", "src", Selection::All)
+                .create("vds")
+                .unwrap();
+            file.delete_dataset("vds").unwrap();
+            file.close().unwrap();
+            std::fs::metadata(&path).unwrap().len()
+        };
+        std::fs::remove_file(&path).ok();
+
+        // Ten more create-then-delete rounds must land on the same file size:
+        // each round's heap object is removed, its collection becomes empty
+        // and returns to the allocator, and the next round takes it back.
+        let file = H5File::create(&path).unwrap();
+        for i in 0..10 {
+            let name = format!("vds{i}");
+            file.new_dataset::<i32>()
+                .shape([16usize])
+                .virtual_mapping(Selection::All, "src.h5", "src", Selection::All)
+                .create(&name)
+                .unwrap();
+            file.delete_dataset(&name).unwrap();
+        }
+        file.close().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), baseline);
         std::fs::remove_file(&path).ok();
     }
 }
