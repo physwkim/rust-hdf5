@@ -103,7 +103,7 @@ pub mod swmr;
 pub mod types;
 
 pub use attribute::{AttrShape, H5Attribute};
-pub use dataset::{ChunkIndex, FillValue, H5Dataset, ReadNumeric, StorageLayout};
+pub use dataset::{ChunkIndex, FillTime, FillValue, H5Dataset, ReadNumeric, StorageLayout};
 pub use error::{Hdf5Error, Result};
 pub use file::{H5File, H5FileOptions};
 pub use format::creation_order::CreationOrder;

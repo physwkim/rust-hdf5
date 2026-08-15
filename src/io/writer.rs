@@ -33,7 +33,9 @@ use crate::format::messages::data_layout::{
 use crate::format::messages::dataspace::{DataspaceClass, DataspaceMessage};
 use crate::format::messages::datatype::{DatatypeMessage, ReferenceKind};
 use crate::format::messages::external_file_list::{ExternalFileListMessage, UNLIMITED};
-use crate::format::messages::fill_value::{FillValueMessage, FILL_TIME_IFSET};
+use crate::format::messages::fill_value::{
+    FillValueMessage, FILL_TIME_ALLOC, FILL_TIME_IFSET, FILL_TIME_NEVER,
+};
 use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::group_info::GroupInfoMessage;
 use crate::format::messages::link::{CharacterSet, LinkMessage, LinkTarget};
@@ -86,75 +88,90 @@ fn fixed_array_dblk_disk_size(ctx: &FormatContext, hdr: &FixedArrayHeader) -> u6
     }
 }
 
-/// Walk a v2 B-tree from `addr`, collecting every node's raw record bytes
-/// and every node block's address — the reader's record walk plus the
-/// addresses, which `open_append` needs so the reconstructed
-/// [`Bt2DatasetInfo::node_addrs`] pool owns the on-disk nodes (the next
-/// flush re-serializes the tree over them, and a delete frees them).
-#[allow(clippy::too_many_arguments)]
-fn collect_bt2_nodes(
-    handle: &FileHandle,
-    ctx: &FormatContext,
-    addr: u64,
-    depth: u16,
-    nrec: u16,
+/// A walk of a v2 B-tree: the file and node geometry the descent reads
+/// through, and the two collections it fills — every node's raw record
+/// bytes and every node block's address, the latter because `open_append`
+/// needs it so the reconstructed [`Bt2DatasetInfo::node_addrs`] pool owns
+/// the on-disk nodes (the next flush re-serializes the tree over them, and
+/// a delete frees them).
+///
+/// `record_size`, `node_size` and `geo` are constant for the whole walk, so
+/// [`descend`](Self::descend) takes only what changes per level: the node's
+/// address, its depth, and how many records it holds.
+struct Bt2Walk<'a> {
+    handle: &'a FileHandle,
+    ctx: &'a FormatContext,
     record_size: u16,
     node_size: u32,
-    geo: &crate::format::chunk_index::btree_v2::Bt2Geometry,
-    records: &mut Vec<u8>,
-    node_addrs: &mut Vec<u64>,
-) -> IoResult<()> {
-    use crate::format::chunk_index::btree_v2::{Bt2InternalNode, Bt2LeafNode};
+    geo: &'a crate::format::chunk_index::btree_v2::Bt2Geometry,
+    records: Vec<u8>,
+    node_addrs: Vec<u64>,
+}
 
-    node_addrs.push(addr);
-    let buf = handle.read_at_most(addr, node_size as usize)?;
-    if depth == 0 {
-        let leaf = Bt2LeafNode::decode(&buf, nrec, record_size)?;
-        records.extend_from_slice(&leaf.record_data);
-    } else {
-        let node = Bt2InternalNode::decode(
-            &buf,
+impl<'a> Bt2Walk<'a> {
+    fn new(
+        handle: &'a FileHandle,
+        ctx: &'a FormatContext,
+        record_size: u16,
+        node_size: u32,
+        geo: &'a crate::format::chunk_index::btree_v2::Bt2Geometry,
+    ) -> Self {
+        Self {
+            handle,
             ctx,
-            depth,
-            nrec,
             record_size,
-            geo.max_nrec_size,
-            geo.child_total_size(depth),
-        )?;
-        // In-order: an internal node's records separate its children, so each
-        // one belongs between the subtrees on either side of it.
-        let children: Vec<(u64, u16)> = node
-            .child_addrs
-            .iter()
-            .zip(node.child_nrecords.iter())
-            .map(|(&a, &n)| (a, n))
-            .collect();
-        let rec = record_size as usize;
-        for (i, (child_addr, child_nrec)) in children.into_iter().enumerate() {
-            collect_bt2_nodes(
-                handle,
-                ctx,
-                child_addr,
-                depth - 1,
-                child_nrec,
-                record_size,
-                node_size,
-                geo,
-                records,
-                node_addrs,
-            )?;
-            if let Some(record) = node.record_data.get(i * rec..(i + 1) * rec) {
-                records.extend_from_slice(record);
-            }
+            node_size,
+            geo,
+            records: Vec::new(),
+            node_addrs: Vec::new(),
         }
     }
-    Ok(())
+
+    /// Walk the subtree rooted at `addr`, at depth `depth` with `nrec`
+    /// records, collecting every node's raw record bytes and every node
+    /// block's address.
+    fn descend(&mut self, addr: u64, depth: u16, nrec: u16) -> IoResult<()> {
+        use crate::format::chunk_index::btree_v2::{Bt2InternalNode, Bt2LeafNode};
+
+        self.node_addrs.push(addr);
+        let buf = self.handle.read_at_most(addr, self.node_size as usize)?;
+        if depth == 0 {
+            let leaf = Bt2LeafNode::decode(&buf, nrec, self.record_size)?;
+            self.records.extend_from_slice(&leaf.record_data);
+        } else {
+            let node = Bt2InternalNode::decode(
+                &buf,
+                self.ctx,
+                depth,
+                nrec,
+                self.record_size,
+                self.geo.max_nrec_size,
+                self.geo.child_total_size(depth),
+            )?;
+            // In-order: an internal node's records separate its children, so each
+            // one belongs between the subtrees on either side of it.
+            let children: Vec<(u64, u16)> = node
+                .child_addrs
+                .iter()
+                .zip(node.child_nrecords.iter())
+                .map(|(&a, &n)| (a, n))
+                .collect();
+            let rec = self.record_size as usize;
+            for (i, (child_addr, child_nrec)) in children.into_iter().enumerate() {
+                self.descend(child_addr, depth - 1, child_nrec)?;
+                if let Some(record) = node.record_data.get(i * rec..(i + 1) * rec) {
+                    self.records.extend_from_slice(record);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A walk of a version-1 raw-data-chunk B-tree: the file and geometry the
 /// descent reads through, and the two collections it fills.
 ///
-/// The v1 counterpart of [`collect_bt2_nodes`], and for the same reason: the
+/// The v1 counterpart of [`Bt2Walk`], and for the same reason: the
 /// records are what [`BtreeV1DatasetInfo::build_tree`] bulk-loads on the next
 /// flush, and the addresses are the block pool that flush re-serializes over,
 /// so a reopened tree owns the nodes it found instead of leaking them and
@@ -804,6 +821,13 @@ pub struct DatasetInfo {
     /// means default zero-fill; `Some` is emitted as a `fill_defined = 2`
     /// fill-value message in the dataset object header.
     pub fill_value: Option<Vec<u8>>,
+    /// Fill value write time (`H5Pset_fill_time`'s `H5D_fill_time_t`, one of
+    /// [`FILL_TIME_ALLOC`], [`FILL_TIME_NEVER`], [`FILL_TIME_IFSET`]),
+    /// emitted verbatim into the fill-value message's write-time field.
+    /// Defaults to `FILL_TIME_IFSET`, `H5D_CRT_FILL_TIME_DEF` — what a fresh
+    /// dataset creation property list carries until `set_dataset_fill_time`
+    /// says otherwise.
+    pub fill_time: u8,
     /// Layout message version for chunked storage: 4, or 5 when the chunk
     /// index encodes stored chunk sizes in a fixed `sizeof_size` field
     /// (libhdf5 2.0). Chosen at create by `Hdf5Writer::chunk_layout_version`,
@@ -1931,6 +1955,11 @@ struct DatasetParts {
     layout: crate::format::messages::data_layout::DataLayoutMessage,
     filter_pipeline: Option<FilterPipeline>,
     fill_value: Option<Vec<u8>>,
+    /// The fill-value message's write-time byte, preserved across a
+    /// rewrite the same way `fill_value` is — an appended-to dataset must
+    /// keep the policy libhdf5 (or this writer) declared for it, not fall
+    /// back to the `H5D_CRT_FILL_TIME_DEF` a fresh dataset gets.
+    fill_write_time: u8,
     attributes: Vec<AttributeEntry>,
     /// The creation-order policy the on-disk header declares; a rewrite that
     /// read it from the writer instead would stamp this session's policy onto
@@ -2099,6 +2128,10 @@ impl<'a> ReopenWalk<'a> {
         let mut layout = None;
         let mut filter_pipeline = None;
         let mut fill_value = None;
+        // No fill-value message at all is the library default, the same
+        // convention the reader-side decode (`Hdf5Reader::dataset_info`)
+        // uses for `fill_defined`.
+        let mut fill_write_time: u8 = FILL_TIME_IFSET;
         let mut external = None;
         let mut links = Vec::new();
         let mut stab = None;
@@ -2173,6 +2206,7 @@ impl<'a> ReopenWalk<'a> {
                     if fv.fill_defined == 2 {
                         fill_value = fv.fill_value;
                     }
+                    fill_write_time = fv.fill_write_time;
                 }
                 MSG_EXTERNAL_FILE_LIST => {
                     dataset_shaped = true;
@@ -2321,6 +2355,7 @@ impl<'a> ReopenWalk<'a> {
                     layout,
                     filter_pipeline,
                     fill_value,
+                    fill_write_time,
                     attributes,
                     track_order,
                     times,
@@ -2468,6 +2503,7 @@ fn rebuild_dataset(
         layout: dl,
         filter_pipeline: fp,
         fill_value,
+        fill_write_time,
         attributes: attrs,
         track_order,
         times,
@@ -2512,6 +2548,7 @@ fn rebuild_dataset(
         creation_seq: 0,
         track_attr_order: track_order.attrs,
         fill_value,
+        fill_time: fill_write_time,
         // Preserve the on-disk layout version so finalize re-encodes
         // what it read: a v5 file reopened and appended to must not be
         // silently downgraded to v4 (the filtered indexes keep their
@@ -2793,19 +2830,15 @@ fn rebuild_dataset(
                             bt2_hdr.depth,
                             ctx.sizeof_addr,
                         );
-                        let mut record_bytes = Vec::new();
-                        collect_bt2_nodes(
-                            handle,
-                            ctx,
+                        let mut walk =
+                            Bt2Walk::new(handle, ctx, bt2_hdr.record_size, bt2_hdr.node_size, &geo);
+                        walk.descend(
                             bt2_hdr.root_node_addr,
                             bt2_hdr.depth,
                             bt2_hdr.num_records_in_root,
-                            bt2_hdr.record_size,
-                            bt2_hdr.node_size,
-                            &geo,
-                            &mut record_bytes,
-                            &mut node_addrs,
                         )?;
+                        node_addrs = walk.node_addrs;
+                        let record_bytes = walk.records;
                         let total = if bt2_hdr.record_size > 0 {
                             record_bytes.len() / bt2_hdr.record_size as usize
                         } else {
@@ -8406,6 +8439,7 @@ impl Hdf5Writer {
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
+                fill_time: FILL_TIME_IFSET,
                 layout_version: 4,
                 times: None,
             },
@@ -8561,6 +8595,7 @@ impl Hdf5Writer {
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
+                fill_time: FILL_TIME_IFSET,
                 layout_version: 4,
                 times: None,
             },
@@ -8664,6 +8699,7 @@ impl Hdf5Writer {
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
+                fill_time: FILL_TIME_IFSET,
                 layout_version: 4,
                 times: None,
             },
@@ -8741,6 +8777,7 @@ impl Hdf5Writer {
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
+                fill_time: FILL_TIME_IFSET,
                 layout_version: 4,
                 times: None,
             },
@@ -8791,6 +8828,7 @@ impl Hdf5Writer {
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
+                fill_time: FILL_TIME_IFSET,
                 layout_version: 4,
                 times: None,
             },
@@ -8892,6 +8930,7 @@ impl Hdf5Writer {
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
+                fill_time: FILL_TIME_IFSET,
                 layout_version,
                 times: None,
                 fixed_array: None,
@@ -9561,7 +9600,7 @@ impl Hdf5Writer {
                         }
                         existing
                     }
-                    None => self.new_chunk_buffer(index, chunk_bytes),
+                    None => self.new_write_chunk_buffer(index, chunk_bytes),
                 }
             };
 
@@ -10116,6 +10155,7 @@ impl Hdf5Writer {
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
+                fill_time: FILL_TIME_IFSET,
                 layout_version: 4,
                 times: None,
                 chunked: None,
@@ -10231,6 +10271,7 @@ impl Hdf5Writer {
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
+                fill_time: FILL_TIME_IFSET,
                 layout_version: 4,
                 times: None,
                 chunked: None,
@@ -10371,6 +10412,7 @@ impl Hdf5Writer {
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
+                fill_time: FILL_TIME_IFSET,
                 layout_version,
                 times: None,
                 fixed_array: None,
@@ -11042,7 +11084,12 @@ impl Hdf5Writer {
         let fills_per_chunk = ds
             .chunk_index_kind()
             .is_some_and(|k| k != ChunkIndexKind::Implicit);
-        if !fills_per_chunk {
+        // `H5D_FILL_TIME_NEVER` means exactly this: the library never writes
+        // the fill value into allocated storage. Call `set_dataset_fill_time`
+        // before this method to have it observed here — the storage this
+        // would otherwise tile keeps whatever zero bytes its allocation
+        // already gave it.
+        if !fills_per_chunk && ds.fill_time != FILL_TIME_NEVER {
             if let Some(len) = ds.compact.as_ref().map(Vec::len) {
                 ds.compact = Some(crate::format::messages::fill_value::tiled_fill(
                     len,
@@ -11068,6 +11115,36 @@ impl Hdf5Writer {
         Ok(())
     }
 
+    /// Set when the fill value is written into allocated storage —
+    /// `H5Pset_fill_time`. `time` is one of [`FILL_TIME_ALLOC`],
+    /// [`FILL_TIME_NEVER`], [`FILL_TIME_IFSET`]; anything else is rejected
+    /// the way `H5Pset_fill_time` rejects an out-of-range `H5D_fill_time_t`.
+    ///
+    /// Call this before [`set_dataset_fill_value`](Self::set_dataset_fill_value)
+    /// so that a `FILL_TIME_NEVER` policy is in place before that call
+    /// decides whether to eager-tile the value into storage. (The
+    /// high-level builder always calls it first.)
+    pub fn set_dataset_fill_time(&self, ds_index: usize, time: u8) -> IoResult<()> {
+        if !matches!(time, FILL_TIME_ALLOC | FILL_TIME_NEVER | FILL_TIME_IFSET) {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "invalid fill time {time}; must be {FILL_TIME_ALLOC} (alloc), \
+                 {FILL_TIME_NEVER} (never) or {FILL_TIME_IFSET} (if-set)"
+            )));
+        }
+        let count = self.dataset_count();
+        if ds_index >= count {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "dataset index {} out of range",
+                ds_index
+            )));
+        }
+        let ds_ref = self.ds(ds_index);
+        let mut ds = ds_ref.lock();
+        ds.fill_time = time;
+        ds.header_dirty = true;
+        Ok(())
+    }
+
     /// Allocate a `chunk_bytes`-sized buffer pre-filled with dataset
     /// `ds_index`'s fill value (tiled one element wide), or zeros when no
     /// user-defined fill value exists.
@@ -11075,11 +11152,37 @@ impl Hdf5Writer {
     /// Every partial chunk the writer emits must be built on top of a
     /// buffer from this method, so that the unwritten element region of an
     /// allocated chunk reads back as the fill value rather than zero.
+    ///
+    /// Unconditional: a shrink's straddler refill
+    /// (`refill_chunk_beyond_extent`) calls this to repair data about to
+    /// become reachable again, which libhdf5's `H5D__chunk_prune_fill` does
+    /// regardless of the fill-time policy. [`new_write_chunk_buffer`](Self::new_write_chunk_buffer)
+    /// is the gated counterpart for a chunk touched for the first time
+    /// during a write, where the policy does apply.
     pub(crate) fn new_chunk_buffer(&self, ds_index: usize, chunk_bytes: usize) -> Vec<u8> {
         let ds = self.ds(ds_index);
         let m = ds.lock();
         let fv = m.fill_value.as_deref();
         crate::format::messages::fill_value::tiled_fill(chunk_bytes, fv)
+    }
+
+    /// The buffer a chunk gets the first time a write touches it — this
+    /// dataset's allocation-time fill gate. `H5D__chunk_lock`'s cache-miss
+    /// path (H5Dchunk.c:4894) fills such a buffer only for `ALLOC`, or for
+    /// `IFSET` with a fill value defined; `NEVER` leaves it as the zeros a
+    /// fresh buffer already has. Everything else about the buffer is
+    /// [`new_chunk_buffer`](Self::new_chunk_buffer)'s.
+    fn new_write_chunk_buffer(&self, ds_index: usize, chunk_bytes: usize) -> Vec<u8> {
+        let never = {
+            let ds = self.ds(ds_index);
+            let m = ds.lock();
+            m.fill_time == FILL_TIME_NEVER
+        };
+        if never {
+            vec![0u8; chunk_bytes]
+        } else {
+            self.new_chunk_buffer(ds_index, chunk_bytes)
+        }
     }
 
     /// Write `n_frames` whole frames whose first row is `base_frame`, for
@@ -11896,6 +11999,7 @@ impl Hdf5Writer {
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
+                fill_time: FILL_TIME_IFSET,
                 layout_version,
                 times: None,
                 chunked: None,
@@ -11996,6 +12100,7 @@ impl Hdf5Writer {
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
+                fill_time: FILL_TIME_IFSET,
                 layout_version,
                 times: None,
                 chunked: None,
@@ -12090,6 +12195,7 @@ impl Hdf5Writer {
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
+                fill_time: FILL_TIME_IFSET,
                 layout_version,
                 times: None,
                 chunked: None,
@@ -12170,6 +12276,7 @@ impl Hdf5Writer {
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
+                fill_time: FILL_TIME_IFSET,
                 layout_version,
                 times: None,
                 chunked: None,
@@ -12256,6 +12363,7 @@ impl Hdf5Writer {
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
+                fill_time: FILL_TIME_IFSET,
                 // The version-3 data layout message this index encodes as:
                 // `H5O_LAYOUT_VERSION_DEFAULT`, which is the floor of
                 // `H5D__chunk_set_info`'s final MAX and the whole of it below
@@ -12412,6 +12520,7 @@ impl Hdf5Writer {
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
+                fill_time: FILL_TIME_IFSET,
                 layout_version,
                 times: None,
                 chunked: None,
@@ -12525,6 +12634,7 @@ impl Hdf5Writer {
                 creation_seq: self.take_creation_seq(),
                 track_attr_order: self.track_order.attrs,
                 fill_value: None,
+                fill_time: FILL_TIME_IFSET,
                 layout_version,
                 times: None,
                 fixed_array: None,
@@ -14694,23 +14804,46 @@ impl Hdf5Writer {
         } else {
             2 // late
         };
+        // `H5D__update_oh_info` (H5Dint.c:927-943): a variable-length
+        // datatype with no explicit fill value forces ALLOC regardless of
+        // the declared policy — its heap-reference encoding has no safe
+        // all-zero "no fill" representation, so libhdf5 always writes the
+        // (empty) fill value at allocation for such a dataset. `IFSET` is
+        // the only declared policy this touches: an explicit `ALLOC` is
+        // already what it forces, and upstream rejects `NEVER` for a
+        // VL-typed dataset at `H5Dcreate` outright — this crate's
+        // VL-typed datasets have no builder path to declare `NEVER` in the
+        // first place, so that branch cannot be reached here.
+        let is_vlen = matches!(
+            m.datatype,
+            DatatypeMessage::VarLenString { .. } | DatatypeMessage::VarLenSequence { .. }
+        );
+        let fill_write_time = if is_vlen && m.fill_value.is_none() && m.fill_time == FILL_TIME_IFSET
+        {
+            FILL_TIME_ALLOC
+        } else {
+            m.fill_time
+        };
         let fv = if let Some(ref bytes) = m.fill_value {
             // User-defined fill value (fill_defined = 2).
             FillValueMessage {
                 alloc_time,
-                fill_write_time: FILL_TIME_IFSET,
+                fill_write_time,
                 fill_defined: 2,
                 fill_value: Some(bytes.clone()),
             }
         } else if is_chunked {
             FillValueMessage {
                 alloc_time,
-                fill_write_time: FILL_TIME_IFSET,
+                fill_write_time,
                 fill_defined: 1, // default value (zeros)
                 fill_value: None,
             }
         } else {
-            FillValueMessage::default()
+            FillValueMessage {
+                fill_write_time,
+                ..FillValueMessage::default()
+            }
         };
         let fv_msg = fv.encode_for(self.message_format());
         let (flags, fv_msg) = self.share_message(MSG_FILL_VALUE, 0x00, fv_msg);
@@ -17512,6 +17645,111 @@ mod tests {
             2,
             "finalize wrote two names and the reopen reads two"
         );
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `H5D__chunk_set_info`'s `version_req` (H5Dchunk.c:909, :936): version 5
+    /// is required for a chunk over 4 GiB — the version-4 layout message's
+    /// stored-size field is 32 bits and cannot record one — and
+    /// `LAYOUT_VERSION_DEFAULT` (3, `H5O_LAYOUT_VERSION_DEFAULT`) is the floor
+    /// for everything at or under that limit. Pure arithmetic on the byte
+    /// count: no chunk is ever allocated.
+    #[test]
+    fn required_chunk_layout_version_pins_5_past_4_gib() {
+        assert_eq!(
+            Hdf5Writer::required_chunk_layout_version(u32::MAX as u64),
+            LAYOUT_VERSION_DEFAULT
+        );
+        assert_eq!(
+            Hdf5Writer::required_chunk_layout_version(u32::MAX as u64 + 1),
+            5
+        );
+    }
+
+    /// `H5D__chunk_set_info`'s index-selection gate (H5Dchunk.c:936): a chunk
+    /// over 4 GiB reaches the v1.10 chunk indexes even under a bound whose
+    /// `H5O_layout_ver_bounds` row (`LibverBound::layout_version`) is below
+    /// 4 — `V18` (row 3) and `Earliest` (row 1) both normally keep an
+    /// ordinary chunk on the version-1 B-tree, but
+    /// `required_chunk_layout_version`'s own escape to 5 overrides that row
+    /// for this one chunk. The default bound (`V110`, row 4) already crosses
+    /// the threshold on its own, so it is asserted only as the baseline, not
+    /// as a distinguishing case for the escape.
+    #[test]
+    fn uses_v110_chunk_indexing_escapes_past_4_gib_at_every_bound() {
+        let over_4gib = u32::MAX as u64 + 1;
+        let small = 1024u64;
+
+        let path = temp_path("uses_v110_default");
+        let writer = Hdf5Writer::create(&path).unwrap();
+        assert!(writer.uses_v110_chunk_indexing(small));
+        assert!(writer.uses_v110_chunk_indexing(over_4gib));
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let path = temp_path("uses_v110_v18");
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        writer.set_libver_bound(LibverBound::V18).unwrap();
+        assert!(
+            !writer.uses_v110_chunk_indexing(small),
+            "V18's layout row (3) stays below the v1.10 gate for an ordinary chunk"
+        );
+        assert!(
+            writer.uses_v110_chunk_indexing(over_4gib),
+            "the >4 GiB escape reaches v1.10 indexing despite V18's row"
+        );
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let path = temp_path("uses_v110_earliest");
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        writer.set_libver_bound(LibverBound::Earliest).unwrap();
+        assert!(
+            !writer.uses_v110_chunk_indexing(small),
+            "Earliest's layout row (1) stays below the v1.10 gate for an ordinary chunk"
+        );
+        assert!(
+            writer.uses_v110_chunk_indexing(over_4gib),
+            "the >4 GiB escape reaches v1.10 indexing despite Earliest's row"
+        );
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `H5D__chunk_set_info`'s closing `MAX3` (H5Dchunk.c:1046): the same
+    /// escape pins the layout message itself at version 5 for a chunk over
+    /// 4 GiB regardless of bound — `required_chunk_layout_version` dominates
+    /// the max chain ahead of both the bound-derived preference and
+    /// `LAYOUT_VERSION_DEFAULT`.
+    #[test]
+    fn chunk_layout_version_pins_5_past_4_gib_at_every_bound() {
+        let over_4gib = u32::MAX as u64 + 1;
+        let small = 1024u64;
+
+        let path = temp_path("chunk_ver_default");
+        let writer = Hdf5Writer::create(&path).unwrap();
+        assert_eq!(writer.chunk_layout_version(false, small), 4);
+        assert_eq!(writer.chunk_layout_version(false, over_4gib), 5);
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let path = temp_path("chunk_ver_v18");
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        writer.set_libver_bound(LibverBound::V18).unwrap();
+        assert_eq!(writer.chunk_layout_version(false, small), 3);
+        assert_eq!(writer.chunk_layout_version(false, over_4gib), 5);
+        writer.close().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let path = temp_path("chunk_ver_earliest");
+        let mut writer = Hdf5Writer::create(&path).unwrap();
+        writer.set_libver_bound(LibverBound::Earliest).unwrap();
+        assert_eq!(
+            writer.chunk_layout_version(false, small),
+            LAYOUT_VERSION_DEFAULT
+        );
+        assert_eq!(writer.chunk_layout_version(false, over_4gib), 5);
         writer.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
