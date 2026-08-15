@@ -1689,6 +1689,56 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "external_storage" => {
+            // The reference names the raw file by its bare name, built from
+            // this file's stem, so both resolve it against the directory the
+            // HDF5 file is in. The bytes go through the dataset rather than
+            // being written to the raw file directly: that is the external
+            // write path under test.
+            let raw = format!(
+                "{}_ext.raw",
+                std::path::Path::new(path)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            );
+            let file = H5File::create(path)?;
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([16usize])
+                .external(&[(raw.as_str(), 0, 64)])
+                .create("data")?;
+            ds.write_raw(&ramp_n::<i32>(16))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "vds" => {
+            // Both files are written here, source first: the reference names
+            // the source by its bare name, so each of the two directions
+            // resolves it against the directory its own VDS file is in.
+            let src_name = format!(
+                "{}_src.h5",
+                std::path::Path::new(path)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            );
+            let src_path = std::path::Path::new(path).with_file_name(&src_name);
+            let src = H5File::create(src_path.to_string_lossy().as_ref())?;
+            src.new_dataset::<i32>()
+                .shape([16usize])
+                .create("src")?
+                .write_raw(&ramp_n::<i32>(16))?;
+            src.close()?;
+
+            let file = H5File::create(path)?;
+            file.new_dataset::<i32>()
+                .shape([16usize])
+                .virtual_mapping(Selection::All, &src_name, "src", Selection::All)
+                .create("vds")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "layout_contiguous_v108" => layout_at_libver(path, LibverBound::V18, None),
         "layout_contiguous_v110" => layout_at_libver(path, LibverBound::V110, None),
         "layout_chunked_v108" => layout_at_libver(path, LibverBound::V18, Some(&[16])),
@@ -1707,6 +1757,21 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
         "chunkidx_single" => chunked_ramp(path, 8, &[8], &[Some(8)]),
+        "chunkidx_implicit" => {
+            // Fixed shape, no filter, early allocation: the three conditions
+            // libhdf5 picks the implicit index under, which is the index of
+            // no structure at all.
+            let file = H5File::create(path)?;
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([16usize])
+                .chunk(&[4])
+                .early_allocation()
+                .create("data")?;
+            ds.write_raw(&ramp_n::<i32>(16))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "chunkidx_farray" => chunked_ramp(path, 16, &[4], &[Some(16)]),
         "chunkidx_earray" => chunked_ramp(path, 16, &[4], &[None]),
         "chunkidx_earray_unlim_inner" => {
@@ -1981,6 +2046,52 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "group_storage_modern_root" => {
+            // `File(track_order=True)` reaches the root group only; reset
+            // before the plain `create_group` calls that follow, same as the
+            // "track_order" case above.
+            let file = H5FileOptions::new().track_order(true).create(path)?;
+            file.set_track_order(false)?;
+            let legacy = file.root_group().create_group("legacy")?;
+            legacy
+                .new_dataset::<i32>()
+                .shape([8usize])
+                .create("a")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            let inner = legacy.create_group("inner")?;
+            inner
+                .new_dataset::<i16>()
+                .shape([8usize])
+                .create("c")?
+                .write_raw(&ramp_n::<i16>(8))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "group_storage_legacy_root" => {
+            let file = H5File::create(path)?;
+            let legacy = file.root_group().create_group("legacy")?;
+            legacy
+                .new_dataset::<i32>()
+                .shape([8usize])
+                .create("a")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.set_track_order(true)?;
+            let modern = file.root_group().create_group("modern")?;
+            file.set_track_order(false)?;
+            modern
+                .new_dataset::<f64>()
+                .shape([8usize])
+                .create("b")?
+                .write_raw(&(0..8).map(|i| i as f64).collect::<Vec<_>>())?;
+            let inner = modern.create_group("inner")?;
+            inner
+                .new_dataset::<i16>()
+                .shape([8usize])
+                .create("c")?
+                .write_raw(&ramp_n::<i16>(8))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
 
         // ---- attributes ----------------------------------------------------
         "attr_scalar_num" => {
@@ -2011,6 +2122,20 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 .shape([2usize, 3])
                 .create("matrix")?
                 .write_array(&matrix)?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "attr_ref_object" => {
+            let file = H5File::create(path)?;
+            let ds = file.new_dataset::<i32>().shape([8usize]).create("data")?;
+            ds.write_raw(&ramp_n::<i32>(8))?;
+            let grp = file.create_group("grp")?;
+            ds.new_attr::<u64>()
+                .shape([2usize])
+                .create("neighbours")?
+                .write_object_references(&["/data", "/grp"])?;
+            grp.set_attr_object_reference("owner", "/data")?;
+            file.set_attr_object_references("entry", &["/grp", "/data"])?;
             file.close()?;
             Ok(Ok(()))
         }
@@ -2138,8 +2263,86 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             Ok(Ok(()))
         }
 
+        // ---- checked-in fixtures ---------------------------------------------
+        // These mirror the C generators in tests/fixtures, not an h5py
+        // generator: h5py has no binding for the properties they need.
+        "sohm_list" => sohm_file(path, 50, 40),
+        "sohm_btree" => sohm_file(path, 0, 0),
+        "ochk_root" => ochk_root_file(path),
+
         _ => Ok(unsup(&format!("no rust writer arm for case '{case}'"))),
     }
+}
+
+/// `tests/fixtures/gen_sohm.c`: one shared-message index over datatype,
+/// dataspace and attribute messages, then four datasets that share a
+/// dataspace and an attribute plus a committed datatype and a dataset built
+/// on it. `max_list`/`min_btree` pick the index form.
+fn sohm_file(path: &str, max_list: u16, min_btree: u16) -> rust_hdf5::Result<WriteResult> {
+    use rust_hdf5::format::messages::{MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE};
+    use rust_hdf5::format::sohm::type_flag;
+
+    let types = type_flag(MSG_DATATYPE).unwrap_or(0)
+        | type_flag(MSG_DATASPACE).unwrap_or(0)
+        | type_flag(MSG_ATTRIBUTE).unwrap_or(0);
+    let file = H5File::options()
+        .shared_messages(&[(types, 0)], max_list, min_btree)
+        .create(path)?;
+
+    for i in 0..4i32 {
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([8usize])
+            .create(&format!("shared{i}"))?;
+        ds.write_raw(&(0..8i32).map(|j| i * 10 + j).collect::<Vec<_>>())?;
+        ds.new_attr::<f64>()
+            .shape([3usize])
+            .create("cal")?
+            .write_array(&[0.5f64, 1.5, 2.5])?;
+    }
+
+    file.commit_datatype("named_i32", DatatypeMessage::i32_type())?;
+    file.new_dataset::<i32>()
+        .committed_type("named_i32")
+        .shape([8usize])
+        .create("uses_named")?
+        .write_raw(&(100..108i32).collect::<Vec<_>>())?;
+
+    file.close()?;
+    Ok(Ok(()))
+}
+
+/// `tests/fixtures/gen_ochk.c`: a dataset and six 256-byte fixed-string root
+/// attributes, which are far more than the root group's object header was
+/// sized for — so the header spills into a continuation chunk.
+fn ochk_root_file(path: &str) -> rust_hdf5::Result<WriteResult> {
+    /// `H5Tcopy(H5T_C_S1)` keeps the null-terminated pad rule; `H5Tset_size`
+    /// takes it to 256.
+    const TEXT: usize = 256;
+
+    let file = H5File::options().libver(LibverBound::V18).create(path)?;
+    file.new_dataset::<i32>()
+        .shape([8usize])
+        .create("data")?
+        .write_raw(&ramp_n::<i32>(8))?;
+
+    for i in 0..6u8 {
+        let mut text = vec![b'x'; TEXT];
+        text[0] = b'0' + i;
+        text[TEXT - 1] = 0;
+        file.set_attr_typed(
+            &format!("note{i}"),
+            DatatypeMessage::FixedString {
+                size: TEXT as u32,
+                padding: 0,
+                charset: 0,
+            },
+            text,
+        )?;
+    }
+
+    file.close()?;
+    Ok(Ok(()))
 }
 
 fn member(name: &str, offset: u32, datatype: DatatypeMessage) -> CompoundMember {

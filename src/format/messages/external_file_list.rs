@@ -34,6 +34,12 @@ use crate::format::{FormatContext, FormatError, FormatResult, UNDEF_ADDR};
 
 const VERSION: u8 = 1;
 
+/// The declared-size sentinel marking a slot as unlimited/growable
+/// (`H5O_EFL_UNLIMITED` in H5Oprivate.h, numerically `HSIZE_UNDEF` — the same
+/// all-ones pattern as [`UNDEF_ADDR`]). Only the last slot may carry it, and
+/// only for a dataset with an unlimited dataspace (`H5D__efl_construct`).
+pub const UNLIMITED: u64 = u64::MAX;
+
 /// One external-file slot, before its name is resolved through the local
 /// heap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +67,29 @@ pub struct ExternalFileListMessage {
 }
 
 impl ExternalFileListMessage {
+    /// Encode the message (`H5O__efl_encode`).
+    ///
+    /// The allocated-slot count is written as the in-use one — upstream
+    /// encodes `nused` into both fields ("yes, twice"), so a message it wrote
+    /// never declares spare slots however many the property list reserved.
+    pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
+        let sa = ctx.sizeof_addr as usize;
+        let ss = ctx.sizeof_size as usize;
+        let nused = self.slots.len() as u16;
+        let mut buf = Vec::with_capacity(8 + sa + self.slots.len() * 3 * ss);
+        buf.push(VERSION);
+        buf.extend_from_slice(&[0u8; 3]); // reserved
+        buf.extend_from_slice(&nused.to_le_bytes()); // nalloc
+        buf.extend_from_slice(&nused.to_le_bytes()); // nused
+        buf.extend_from_slice(&self.heap_addr.to_le_bytes()[..sa]);
+        for slot in &self.slots {
+            buf.extend_from_slice(&slot.name_offset.to_le_bytes()[..ss]);
+            buf.extend_from_slice(&slot.offset.to_le_bytes()[..ss]);
+            buf.extend_from_slice(&slot.size.to_le_bytes()[..ss]);
+        }
+        buf
+    }
+
     pub fn decode(buf: &[u8], ctx: &FormatContext) -> FormatResult<(Self, usize)> {
         let sa = ctx.sizeof_addr as usize;
         let ss = ctx.sizeof_size as usize;
@@ -261,6 +290,48 @@ mod tests {
         let last = buf.len() - 8;
         buf[last..].copy_from_slice(&[0xFFu8; 8]);
         let (msg, _) = ExternalFileListMessage::decode(&buf, &ctx8()).unwrap();
-        assert_eq!(msg.slots[0].size, u64::MAX);
+        assert_eq!(msg.slots[0].size, UNLIMITED);
+    }
+
+    /// The encoder reproduces the h5py-written message this module's fixture
+    /// was captured from, byte for byte.
+    #[test]
+    fn encode_matches_the_captured_single_slot_message() {
+        let msg = ExternalFileListMessage {
+            heap_addr: 1072,
+            slots: vec![ExternalFileSlot {
+                name_offset: 8,
+                offset: 0,
+                size: 64,
+            }],
+        };
+        assert_eq!(msg.encode(&ctx8()), single_slot_buf());
+    }
+
+    #[test]
+    fn encode_roundtrips_multi_slot_at_ctx4() {
+        let ctx = FormatContext {
+            sizeof_addr: 4,
+            sizeof_size: 4,
+        };
+        let msg = ExternalFileListMessage {
+            heap_addr: 0x800,
+            slots: vec![
+                ExternalFileSlot {
+                    name_offset: 8,
+                    offset: 0,
+                    size: 32,
+                },
+                ExternalFileSlot {
+                    name_offset: 20,
+                    offset: 16,
+                    size: 32,
+                },
+            ],
+        };
+        let buf = msg.encode(&ctx);
+        let (back, consumed) = ExternalFileListMessage::decode(&buf, &ctx).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(back, msg);
     }
 }

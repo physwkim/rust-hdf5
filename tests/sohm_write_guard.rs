@@ -1,9 +1,11 @@
-//! Shared object header messages (SOHM), write side.
+//! Shared object header messages (SOHM), append side.
 //!
-//! Reading a file whose messages live in the SOHM fractal heap works (see
-//! `tests/sohm.rs`), but writing that indirection does not exist here: a
-//! finalize would rewrite the headers it touches with the shared messages
-//! dropped, while the master table still claims they are referenced, and
+//! Creating a file with shared messages works (`tests/sohm_write.rs`) and so
+//! does reading one (`tests/sohm.rs`), but *appending* to one does not: the
+//! table and its indexes are laid out once, from the whole message set, and a
+//! reopen has no record of which heap object each header's pointer resolves
+//! to. A finalize would rewrite the headers it touches with those messages
+//! dropped while the master table still claims they are referenced, and
 //! libhdf5 then reads the result as a file missing its objects. The append
 //! path therefore refuses such a file, before it writes anything.
 

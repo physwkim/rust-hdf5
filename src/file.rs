@@ -20,10 +20,12 @@ use std::path::Path;
 
 use crate::io::locking::FileLocking;
 use crate::io::reader::SuperblockExtension;
+use crate::io::writer::SharedMessageConfig;
 use crate::io::{Hdf5Reader, Hdf5Writer};
 
 use crate::dataset::{DatasetBuilder, H5Dataset};
 use crate::error::{Hdf5Error, Result};
+use crate::format::messages::datatype::DatatypeMessage;
 use crate::format::messages::filter::FilterPipeline;
 use crate::format::LibverBound;
 use crate::group::H5Group;
@@ -365,6 +367,56 @@ impl H5File {
         }
     }
 
+    /// Add a scalar attribute to the file (root group) whose datatype and raw
+    /// value the caller supplies.
+    ///
+    /// The escape hatch for a type this crate has no Rust mapping for — a
+    /// fixed-length string of a size the value alone does not imply, say,
+    /// which is what `H5Tcopy(H5T_C_S1)` plus `H5Tset_size` produces.
+    /// [`DatasetBuilder::datatype`](crate::dataset::DatasetBuilder::datatype)
+    /// is the same hatch for a dataset; every typed setter here builds one of
+    /// these underneath.
+    ///
+    /// `value` is the raw element image and must be exactly as long as the
+    /// datatype's element size.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::{DatatypeMessage, H5File};
+    /// let file = H5File::create("notes.h5").unwrap();
+    /// let mut text = vec![b'x'; 256];
+    /// text[255] = 0;
+    /// file.set_attr_typed(
+    ///     "note",
+    ///     DatatypeMessage::FixedString { size: 256, padding: 0, charset: 0 },
+    ///     text,
+    /// )
+    /// .unwrap();
+    /// ```
+    pub fn set_attr_typed(
+        &self,
+        name: &str,
+        datatype: DatatypeMessage,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        use crate::format::messages::attribute::AttributeMessage;
+        if value.len() as u64 != u64::from(datatype.element_size()) {
+            return Err(Hdf5Error::InvalidState(format!(
+                "attribute '{name}' was given {} bytes for a datatype whose element is {}",
+                value.len(),
+                datatype.element_size()
+            )));
+        }
+        let attr = AttributeMessage::scalar_numeric(name, datatype, value);
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => {
+                writer.add_root_attribute(attr)?;
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
+        }
+    }
+
     /// Add a numeric (or bool) **array** attribute to the file (root group).
     ///
     /// The values are written as a 1-D HDF5 array attribute (simple dataspace
@@ -457,6 +509,41 @@ impl H5File {
                     name,
                     values,
                     &dims,
+                )?;
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
+        }
+    }
+
+    /// Add (or replace) an object-reference attribute on the file (root group)
+    /// — h5py's `f.attrs['entry'] = f['/data'].ref`.
+    ///
+    /// `path` names a dataset or a group (`/` is the root group) and must
+    /// already exist. The attribute takes the scalar shape h5py gives a single
+    /// reference; [`set_attr_object_references`](Self::set_attr_object_references)
+    /// is the array form. What reaches the file is the target's object header
+    /// address, which is assigned when the file is finalized.
+    pub fn set_attr_object_reference(&self, name: &str, path: &str) -> Result<()> {
+        self.set_root_reference_attr(name, &[path], &[])
+    }
+
+    /// Add (or replace) a 1-D array of object references as a file-level
+    /// attribute — the array counterpart of
+    /// [`set_attr_object_reference`](Self::set_attr_object_reference).
+    pub fn set_attr_object_references(&self, name: &str, paths: &[&str]) -> Result<()> {
+        self.set_root_reference_attr(name, paths, &[paths.len() as u64])
+    }
+
+    fn set_root_reference_attr(&self, name: &str, paths: &[&str], dims: &[u64]) -> Result<()> {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => {
+                writer.set_object_reference_attribute(
+                    crate::io::writer::AttrTarget::Root,
+                    name,
+                    paths,
+                    dims,
                 )?;
                 Ok(())
             }
@@ -582,16 +669,13 @@ impl H5File {
         match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_string_dataset(name, strings, charset)?;
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(idx);
+                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.inner),
                     idx,
                     shape,
                     element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
+                    chunk_index,
                 ))
             }
             H5FileInner::Reader(_) => {
@@ -636,16 +720,13 @@ impl H5File {
         match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_sequence_dataset(name, T::hdf5_type(), &images)?;
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(idx);
+                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.inner),
                     idx,
                     shape,
                     element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
+                    chunk_index,
                 ))
             }
             H5FileInner::Reader(_) => {
@@ -673,16 +754,13 @@ impl H5File {
             H5FileInner::Writer(writer) => {
                 let idx = writer
                     .create_vlen_string_dataset_compressed(name, strings, chunk_size, pipeline)?;
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(idx);
+                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.inner),
                     idx,
                     shape,
                     element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
+                    chunk_index,
                 ))
             }
             H5FileInner::Reader(_) => {
@@ -707,16 +785,13 @@ impl H5File {
             H5FileInner::Writer(writer) => {
                 let idx =
                     writer.create_appendable_vlen_string_dataset(name, chunk_size, pipeline)?;
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(idx);
+                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.inner),
                     idx,
                     shape,
                     element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
+                    chunk_index,
                 ))
             }
             H5FileInner::Reader(_) => {
@@ -826,16 +901,13 @@ impl H5File {
         match &*inner {
             H5FileInner::Writer(writer) => {
                 let index = writer.open_dataset_index(name)?;
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(index);
+                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(index);
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.inner),
                     index,
                     shape,
                     element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
+                    chunk_index,
                 ))
             }
             H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
@@ -987,6 +1059,7 @@ pub struct H5FileOptions {
     track_order: bool,
     libver: LibverBound,
     userblock: u64,
+    shared_messages: SharedMessageConfig,
 }
 
 impl H5FileOptions {
@@ -1079,6 +1152,46 @@ impl H5FileOptions {
         self
     }
 
+    /// Create the file with shared object header messages — libhdf5's
+    /// `H5Pset_shared_mesg_nindexes` + `H5Pset_shared_mesg_index` +
+    /// `H5Pset_shared_mesg_phase_change`, which h5py exposes no binding for.
+    ///
+    /// A message class covered by an index is written once into a
+    /// shared-message fractal heap, and every object header that would have
+    /// held that exact body holds a pointer to it instead. `indexes` gives
+    /// one `(message types, minimum message size)` pair per index, where the
+    /// type mask is built from
+    /// [`type_flag`](crate::format::sohm::type_flag); `list_max` and
+    /// `btree_min` are the file-wide counts at which an index changes between
+    /// list and v2 B-tree form.
+    ///
+    /// Only [`create`](Self::create) reads this, and it refuses a
+    /// configuration libhdf5 would refuse: more than eight indexes, an index
+    /// covering no type, or thresholds that overlap.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::{H5File, format::sohm::type_flag};
+    /// use rust_hdf5::format::messages::{MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE};
+    ///
+    /// let types = type_flag(MSG_DATATYPE).unwrap()
+    ///     | type_flag(MSG_DATASPACE).unwrap()
+    ///     | type_flag(MSG_ATTRIBUTE).unwrap();
+    /// let file = H5File::options()
+    ///     .shared_messages(&[(types, 0)], 50, 40)
+    ///     .create("sohm.h5")
+    ///     .unwrap();
+    /// # let _ = file;
+    /// ```
+    pub fn shared_messages(
+        mut self,
+        indexes: &[(u16, u32)],
+        list_max: u16,
+        btree_min: u16,
+    ) -> Self {
+        self.shared_messages = SharedMessageConfig::new(indexes, list_max, btree_min);
+        self
+    }
+
     fn resolved_locking(&self) -> FileLocking {
         match self.locking {
             Some(p) => p,
@@ -1095,6 +1208,7 @@ impl H5FileOptions {
                 track_order: self.track_order,
                 libver: self.libver,
                 userblock: self.userblock,
+                shared_messages: self.shared_messages,
             },
         )?;
         Ok(H5File {

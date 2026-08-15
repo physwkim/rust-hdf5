@@ -542,7 +542,7 @@ LAYOUT_CASES = [
          "layout v3 + version-1 B-tree chunk index (libver earliest)"),
     Case("chunkidx_single", "layout", gen_chunkidx_single, "chunkidx_single",
          "single-chunk index"),
-    Case("chunkidx_implicit", "layout", gen_chunkidx_implicit, None,
+    Case("chunkidx_implicit", "layout", gen_chunkidx_implicit, "chunkidx_implicit",
          "implicit index — fixed shape, early allocation, no filter"),
     Case("chunkidx_farray", "layout", gen_chunkidx_farray, "chunkidx_farray",
          "fixed-array index"),
@@ -561,10 +561,10 @@ LAYOUT_CASES = [
     Case("chunkidx_earray_dim1", "layout", gen_chunkidx_earray_dim1,
          "chunkidx_earray_dim1",
          "extensible-array index whose unlimited dimension is not the first"),
-    Case("external_storage", "layout", gen_external_storage, None,
+    Case("external_storage", "layout", gen_external_storage, "external_storage",
          "contiguous data held in an external raw file",
          ext_files=("_ext.raw",)),
-    Case("vds", "layout", gen_vds, None,
+    Case("vds", "layout", gen_vds, "vds",
          "virtual dataset mapped onto a dataset in a sibling file",
          ext_files=("_src.h5",)),
 ]
@@ -794,9 +794,11 @@ LINK_CASES = [
          "12 links in one group — dense link storage (fractal heap + v2 B-tree)"),
     Case("track_order", "group", gen_track_order, "track_order",
          "creation-order indices on links and attributes"),
-    Case("group_storage_modern_root", "group", gen_group_storage_modern_root, None,
+    Case("group_storage_modern_root", "group", gen_group_storage_modern_root,
+         "group_storage_modern_root",
          "symbol-table group with children under a link-message root"),
-    Case("group_storage_legacy_root", "group", gen_group_storage_legacy_root, None,
+    Case("group_storage_legacy_root", "group", gen_group_storage_legacy_root,
+         "group_storage_legacy_root",
          "link-message group with children under a symbol-table root"),
 ]
 
@@ -859,6 +861,19 @@ def gen_attr_on_root(path):
         f.create_dataset("data", data=ramp("<i4"))
 
 
+def gen_attr_ref_object(path):
+    # An attribute whose value is object references, on all three kinds of
+    # object header: a dataset's, a group's and the root's. The value is part
+    # of the header message, so unlike a reference dataset's elements it cannot
+    # be stamped in after the header is written.
+    with h5py.File(path, "w") as f:
+        ds = f.create_dataset("data", data=ramp("<i4"))
+        g = f.create_group("grp")
+        ds.attrs.create("neighbours", np.array([ds.ref, g.ref], dtype=h5py.ref_dtype))
+        g.attrs.create("owner", ds.ref, dtype=h5py.ref_dtype)
+        f.attrs.create("entry", np.array([g.ref, ds.ref], dtype=h5py.ref_dtype))
+
+
 def gen_attr_large(path):
     # One attribute past the 64 KiB object-header message limit: the value
     # spills to dense storage no matter how few attributes there are.
@@ -883,6 +898,9 @@ ATTR_CASES = [
          "attributes on the root group"),
     Case("attr_large", "attribute", gen_attr_large, "attr_large",
          "single 100 KiB attribute — dense storage forced by size, not count"),
+    Case("attr_ref_object", "attribute", gen_attr_ref_object, "attr_ref_object",
+         "object references stored in attributes of a dataset, a group and "
+         "the root"),
 ]
 
 
@@ -976,7 +994,7 @@ MISC_CASES = [
 FIXTURE_DIR = pathlib.Path(__file__).resolve().parent.parent / "tests" / "fixtures"
 
 
-def _fixture_case(name, fixture, generator, group, note):
+def _fixture_case(name, fixture, generator, group, note, rust=None):
     def gen(path):
         src = FIXTURE_DIR / fixture
         if not src.exists():
@@ -986,8 +1004,9 @@ def _fixture_case(name, fixture, generator, group, note):
             )
         shutil.copyfile(src, path)
 
-    # No rust writer arm: the public API cannot ask for these files.
-    return Case(name, group, gen, None, note)
+    # `rust` is None where the public API cannot ask for the file at all;
+    # where it can, the arm mirrors the C generator rather than an h5py one.
+    return Case(name, group, gen, rust, note)
 
 
 FIXTURE_CASES = [
@@ -995,14 +1014,17 @@ FIXTURE_CASES = [
         "sohm_list", "sohm_list.h5", "gen_sohm.sh", "sohm",
         "shared datatype/dataspace/attribute messages, list index "
         "(H5Pset_shared_mesg_index) + a committed datatype",
+        rust="sohm_list",
     ),
     _fixture_case(
         "sohm_btree", "sohm_btree.h5", "gen_sohm.sh", "sohm",
         "the same file with the shared-message index forced to a v2 B-tree",
+        rust="sohm_btree",
     ),
     _fixture_case(
         "ochk_root", "ochk_root.h5", "gen_ochk.sh", "objectheader",
         "root group whose object header spills into two continuation chunks",
+        rust="ochk_root",
     ),
 ]
 

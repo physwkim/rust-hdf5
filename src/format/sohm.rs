@@ -17,7 +17,7 @@
 //! (`H5SM__cache_table_deserialize`).
 
 use crate::format::bytes::read_le_uint as read_uint;
-use crate::format::checksum::checksum_metadata;
+use crate::format::checksum::{checksum_metadata, jenkins_lookup3};
 use crate::format::messages::{
     MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE, MSG_FILL_VALUE, MSG_FILL_VALUE_OLD,
     MSG_FILTER_PIPELINE,
@@ -32,6 +32,95 @@ pub const SMLI_SIGNATURE: [u8; 4] = *b"SMLI";
 /// Length of a SOHM fractal-heap ID (`H5O_FHEAP_ID_LEN`). Unlike other heaps,
 /// the SOHM heap's ID length is fixed by the format, not read from the heap.
 pub const SOHM_HEAP_ID_LEN: usize = 8;
+
+/// `H5SM_IN_HEAP`: the record's message body is in the index's fractal heap.
+pub const SOHM_IN_HEAP: u8 = 0;
+/// `H5SM_IN_OH`: the record's message body is a message of an object header.
+pub const SOHM_IN_OH: u8 = 1;
+
+/// Index form stored in an index header's `index_type` byte (`H5SM_index_type_t`).
+pub const SOHM_INDEX_LIST: u8 = 0;
+/// The B-tree form of the same field.
+pub const SOHM_INDEX_BTREE: u8 = 1;
+
+/// v2 B-tree record type of a SOHM index (`H5B2_SOHM_INDEX_ID`).
+pub const BT2_TYPE_SOHM_INDEX: u8 = 7;
+
+/// Node size of a SOHM index B-tree (`H5SM_B2_NODE_SIZE`).
+pub const SOHM_B2_NODE_SIZE: u32 = 512;
+
+/// Most indexes a file may declare (`H5O_SHMESG_MAX_NINDEXES`).
+pub const MAX_SOHM_INDEXES: usize = 8;
+
+/// The hash an index records a message under (`H5SM__write_mesg`): Jenkins
+/// lookup3 over the *encoded* message body, seeded with the message type id.
+/// Two message classes that happen to encode identically therefore land on
+/// different records, which is what lets one index cover several classes.
+pub fn message_hash(body: &[u8], msg_type: u8) -> u32 {
+    jenkins_lookup3(body, u32::from(msg_type))
+}
+
+/// On-disk size of one index record (`H5SM_SOHM_ENTRY_SIZE`): a location byte
+/// and a hash, then whichever of the two location-specific bodies is larger.
+pub fn record_size(ctx: &FormatContext) -> usize {
+    let sa = ctx.sizeof_addr as usize;
+    // Heap form: reference count + heap id. Object-header form: reserved byte,
+    // message type, message index, header address.
+    1 + 4 + (4 + SOHM_HEAP_ID_LEN).max(1 + 1 + 2 + sa)
+}
+
+/// One index record naming a message body in the index's fractal heap
+/// (`H5SM_sohm_t` with `location == H5SM_IN_HEAP`).
+///
+/// The object-header form — the shape a message left literal in the header
+/// that first used it is recorded under — is decoded by readers but never
+/// written here: this crate moves a message to the heap the first time it
+/// shares it, so no record ever names an object header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SohmRecord {
+    /// [`message_hash`] of the body this record names.
+    pub hash: u32,
+    /// Object header messages pointing at this body.
+    pub ref_count: u32,
+    /// Fractal-heap ID of the body.
+    pub heap_id: [u8; SOHM_HEAP_ID_LEN],
+}
+
+impl SohmRecord {
+    /// Encode the record (`H5SM__message_encode`).
+    pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
+        let size = record_size(ctx);
+        let mut buf = Vec::with_capacity(size);
+        buf.push(SOHM_IN_HEAP);
+        buf.extend_from_slice(&self.hash.to_le_bytes());
+        buf.extend_from_slice(&self.ref_count.to_le_bytes());
+        buf.extend_from_slice(&self.heap_id);
+        buf.resize(size, 0);
+        buf
+    }
+}
+
+/// Space a list index occupies (`H5SM_LIST_SIZE`), which is sized for
+/// `list_max` records however few are in use.
+pub fn list_size(ctx: &FormatContext, list_max: u16) -> usize {
+    4 + record_size(ctx) * list_max as usize + 4
+}
+
+/// Encode a list index (`SMLI`, `H5SM__cache_list_serialize`).
+///
+/// The image covers only the records in use: the checksum follows the last
+/// one, and the rest of the [`list_size`] block the index occupies is left
+/// untouched. A reader sizes the buffer from `list_max` but checksums exactly
+/// this prefix, so trailing bytes are never part of the sum.
+pub fn encode_list(records: &[SohmRecord], ctx: &FormatContext) -> Vec<u8> {
+    let mut buf = SMLI_SIGNATURE.to_vec();
+    for record in records {
+        buf.extend_from_slice(&record.encode(ctx));
+    }
+    let sum = checksum_metadata(&buf);
+    buf.extend_from_slice(&sum.to_le_bytes());
+    buf
+}
 
 /// Where a shared message's body actually lives (`H5O_SHARE_TYPE_*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +247,21 @@ impl SharedMessagePointer {
         buf.extend_from_slice(&oh_addr.to_le_bytes()[..sa]);
         buf
     }
+
+    /// The pointer a header stores in place of a message whose body was moved
+    /// to the shared-message fractal heap.
+    ///
+    /// Version 3, where the committed form stays at version 2: only version 3
+    /// has the type byte free to mean `H5O_SHARE_TYPE_SOHM`, and its body is
+    /// the fixed-width heap ID rather than an address, so it does not follow
+    /// the file's address size.
+    pub fn encode_sohm(heap_id: [u8; SOHM_HEAP_ID_LEN]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(2 + SOHM_HEAP_ID_LEN);
+        buf.push(3); // H5O_SHARED_VERSION_3
+        buf.push(1); // H5O_SHARE_TYPE_SOHM
+        buf.extend_from_slice(&heap_id);
+        buf
+    }
 }
 
 /// One SOHM index header, as stored in the master table.
@@ -260,6 +364,28 @@ impl SohmMasterTable {
         }
 
         Ok(Self { indexes })
+    }
+
+    /// Encode the master table (`H5SM__cache_table_serialize`). The index
+    /// count is not stored here — the shared-message-table message in the
+    /// superblock extension is the only place it is written.
+    pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
+        let sa = ctx.sizeof_addr as usize;
+        let mut buf = SMTB_SIGNATURE.to_vec();
+        for index in &self.indexes {
+            buf.push(SM_LIST_VERSION);
+            buf.push(index.index_type);
+            buf.extend_from_slice(&index.mesg_types.to_le_bytes());
+            buf.extend_from_slice(&index.min_mesg_size.to_le_bytes());
+            buf.extend_from_slice(&index.list_max.to_le_bytes());
+            buf.extend_from_slice(&index.btree_min.to_le_bytes());
+            buf.extend_from_slice(&index.num_messages.to_le_bytes());
+            buf.extend_from_slice(&index.index_addr.to_le_bytes()[..sa]);
+            buf.extend_from_slice(&index.heap_addr.to_le_bytes()[..sa]);
+        }
+        let sum = checksum_metadata(&buf);
+        buf.extend_from_slice(&sum.to_le_bytes());
+        buf
     }
 
     /// Address of the fractal heap holding shared messages of `msg_type`, as
@@ -489,6 +615,124 @@ mod tests {
             SharedMessagePointer::decode(&[4u8, 1u8], &ctx()).unwrap_err(),
             FormatError::InvalidVersion(4)
         ));
+    }
+
+    /// The dataspace and datatype messages `sohm_list.h5` shares, with the
+    /// hash libhdf5 filed each under. Seeding lookup3 with the message type
+    /// id is what the seed is *for*: the same bytes under another class must
+    /// not collide with these.
+    #[test]
+    fn message_hash_matches_the_fixture_records() {
+        // A simple dataspace of [8] with max dims, as libhdf5 encoded it.
+        let sdspace = [
+            1u8, 1, 1, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(message_hash(&sdspace, MSG_DATASPACE), 701521455);
+        // H5T_IEEE_F64LE.
+        let dtype = [
+            0x11u8, 0x20, 0x3f, 0x00, 8, 0, 0, 0, 0, 0, 0x40, 0x00, 0x34, 0x0b, 0x00, 0x34, 0xff,
+            0x03, 0x00, 0x00,
+        ];
+        assert_eq!(message_hash(&dtype, MSG_DATATYPE), 3573483313);
+        assert_ne!(
+            message_hash(&sdspace, MSG_DATASPACE),
+            message_hash(&sdspace, MSG_DATATYPE)
+        );
+    }
+
+    #[test]
+    fn record_is_seventeen_bytes_for_eight_byte_addresses() {
+        assert_eq!(record_size(&ctx()), 17);
+        assert_eq!(
+            record_size(&FormatContext {
+                sizeof_addr: 4,
+                sizeof_size: 4
+            }),
+            17
+        );
+    }
+
+    /// The four records `sohm_list.h5` holds, byte for byte, including the
+    /// checksum that follows the last one rather than the end of the block.
+    #[test]
+    fn list_index_encodes_the_fixture_image() {
+        let records = [
+            SohmRecord {
+                hash: 701521455,
+                ref_count: 5,
+                heap_id: [0x00, 0x42, 0, 0, 0, 0, 0x18, 0x00],
+            },
+            SohmRecord {
+                hash: 3573483313,
+                ref_count: 1,
+                heap_id: [0x00, 0x16, 0, 0, 0, 0, 0x14, 0x00],
+            },
+            SohmRecord {
+                hash: 826238635,
+                ref_count: 1,
+                heap_id: [0x00, 0x2a, 0, 0, 0, 0, 0x18, 0x00],
+            },
+            SohmRecord {
+                hash: 2575530442,
+                ref_count: 4,
+                heap_id: [0x00, 0x7a, 0, 0, 0, 0, 0x38, 0x00],
+            },
+        ];
+        let image = encode_list(&records, &ctx());
+        let want = concat!(
+            "534d4c49",
+            "002f5ed029050000000042000000001800",
+            "003107ffd4010000000016000000001400",
+            "00ab663f3101000000002a000000001800",
+            "00ca79839904000000007a000000003800",
+            "cbfec07c",
+        );
+        assert_eq!(hex(&image), want);
+        // The block the index occupies is sized for `list_max` records; the
+        // image stops after the ones in use.
+        assert_eq!(list_size(&ctx(), 50), 858);
+        assert!(image.len() < list_size(&ctx(), 50));
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// `sohm_list.h5`'s master table: one list index over dataspace, datatype
+    /// and attribute messages.
+    #[test]
+    fn master_table_encodes_what_decode_reads_back() {
+        let table = SohmMasterTable {
+            indexes: vec![SohmIndexHeader {
+                index_type: SOHM_INDEX_LIST,
+                mesg_types: (1 << MSG_DATASPACE) | (1 << MSG_DATATYPE) | (1 << MSG_ATTRIBUTE),
+                min_mesg_size: 0,
+                list_max: 50,
+                btree_min: 40,
+                num_messages: 4,
+                index_addr: 1125,
+                heap_addr: 1983,
+            }],
+        };
+        let image = table.encode(&ctx());
+        assert_eq!(image.len(), SohmMasterTable::encoded_size(&ctx(), 1));
+        assert_eq!(&image[..4], &SMTB_SIGNATURE);
+        assert_eq!(
+            u16::from_le_bytes([image[6], image[7]]),
+            0x100a,
+            "the type mask libhdf5 wrote for DTYPE|SDSPACE|ATTR"
+        );
+        assert_eq!(SohmMasterTable::decode(&image, &ctx(), 1).unwrap(), table);
+    }
+
+    #[test]
+    fn heap_pointer_is_a_version_three_message() {
+        let id = [0x00, 0x7a, 0, 0, 0, 0, 0x38, 0x00];
+        let buf = SharedMessagePointer::encode_sohm(id);
+        assert_eq!(hex(&buf), "0301007a000000003800");
+        let p = SharedMessagePointer::decode(&buf, &ctx()).unwrap();
+        assert_eq!(p.location, SharedLocation::Sohm);
+        assert_eq!(p.heap_id, id);
     }
 
     #[test]

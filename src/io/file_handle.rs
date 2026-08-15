@@ -95,6 +95,35 @@ impl FileHandle {
         })
     }
 
+    /// Open a file for read/write access, creating it when it does not exist
+    /// and keeping whatever it already holds — `O_CREAT | O_RDWR` with no
+    /// `O_TRUNC`.
+    ///
+    /// What `H5D__efl_write` (H5Defl.c) opens an external raw-data file with.
+    /// A dataset's External File List slot owns one byte range of a file this
+    /// library does not otherwise manage, so a write to it must neither
+    /// require the file to exist already nor destroy the ranges its other
+    /// slots — or another dataset's — hold in the same file.
+    pub fn open_or_create_readwrite_with_locking(
+        path: &Path,
+        policy: FileLocking,
+    ) -> std::io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        let lock_held = locking::try_acquire(&file, LockMode::Exclusive, policy)?;
+        Ok(Self {
+            file,
+            writable: true,
+            lock_policy: policy,
+            lock_held,
+            base: 0,
+        })
+    }
+
     /// Open an existing file for read-only access with the env-var-derived
     /// locking policy.
     pub fn open_read(path: &Path) -> std::io::Result<Self> {

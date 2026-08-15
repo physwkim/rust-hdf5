@@ -129,6 +129,54 @@ impl H5Attribute {
         }
     }
 
+    /// Write an object-reference attribute — h5py's
+    /// `ds.attrs['source'] = f['/data'].ref`.
+    ///
+    /// The attribute is given its shape via [`AttrBuilder::shape`] (empty =
+    /// the scalar shape a single reference takes) and `paths` must hold
+    /// exactly the product of those dimensions, in row-major order. Each path
+    /// names a dataset or a group (`/` is the root group) and must already
+    /// exist; what reaches the file is the target's object header address,
+    /// which is assigned when the file is finalized.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("refs.h5").unwrap();
+    /// let ds = file.new_dataset::<f32>().shape(&[4]).create("data").unwrap();
+    /// let attr = ds.new_attr::<u64>().shape(()).create("self").unwrap();
+    /// attr.write_object_references(&["/data"]).unwrap();
+    /// ```
+    pub fn write_object_references(&self, paths: &[&str]) -> Result<()> {
+        // Product of an empty shape is 1 (a scalar holds one element).
+        let expected: usize = self.write_dims.iter().product();
+        if paths.len() != expected {
+            return Err(Hdf5Error::InvalidState(format!(
+                "attribute '{}' shape {:?} needs {} references, got {}",
+                self.name,
+                self.write_dims,
+                expected,
+                paths.len()
+            )));
+        }
+        let dims_u64: Vec<u64> = self.write_dims.iter().map(|&d| d as u64).collect();
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => {
+                writer.set_object_reference_attribute(
+                    crate::io::writer::AttrTarget::Dataset(self.ds_index),
+                    &self.name,
+                    paths,
+                    &dims_u64,
+                )?;
+                Ok(())
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot write attributes in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
     /// Write a numeric scalar attribute.
     ///
     /// ```no_run

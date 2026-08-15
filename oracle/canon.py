@@ -25,6 +25,10 @@ CANON_VERSION = "3"
 RAW_LIMIT = 1024
 MAX_DEPTH = 32
 
+# Object header message type of the **Symbol Table** message (`H5Opkg.h`),
+# used as a bit position in `H5O_hdr_info_t.mesg.present`.
+H5O_STAB_ID = 0x11
+
 # --------------------------------------------------------------------------
 # canonical scalar / string encoding
 # --------------------------------------------------------------------------
@@ -526,15 +530,20 @@ def link_storage_str(gid):
 
     libhdf5 exposes `H5G_info_t.storage_type` for exactly this, but h5py has
     no binding for `H5Gget_info`, so it is reconstructed from what h5py does
-    expose. A version-1 object header is the pre-1.8 group format — a symbol
-    table with its own v1 B-tree and local heap. On a version-2 header the
-    links are messages until `H5G_obj_insert`'s phase change moves the whole
-    set into a fractal heap plus a name index, which is when libhdf5 starts
-    sizing them. The sizes themselves are not observables: a bulk-loaded index
-    and heap are legitimately smaller than ones grown insert by insert.
+    expose. A **Symbol Table** message is the pre-1.8 group format — a v1
+    B-tree and local heap — and its presence is the observable, not the object
+    header version: anything else in the file can raise the header past
+    version 1 over a symbol table underneath, and a file with shared messages
+    does exactly that (`H5SM_init` sets `store_msg_crt_idx`, which
+    `H5O__create_ohdr` turns into a version-2 header for every object).
+    Otherwise the links are messages until `H5G_obj_insert`'s phase change
+    moves the whole set into a fractal heap plus a name index, which is when
+    libhdf5 starts sizing them. The sizes themselves are not observables: a
+    bulk-loaded index and heap are legitimately smaller than ones grown insert
+    by insert.
     """
     info = h5py.h5o.get_info(gid)
-    if info.hdr.version < 2:
+    if info.hdr.mesg.present & (1 << H5O_STAB_ID):
         return "symtab"
     return "dense" if info.meta_size.obj.index_size else "compact"
 

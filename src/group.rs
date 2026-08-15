@@ -361,16 +361,13 @@ impl H5Group {
         match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_string_dataset(&full_name, strings, charset)?;
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(idx);
+                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.file_inner),
                     idx,
                     shape,
                     element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
+                    chunk_index,
                 ))
             }
             H5FileInner::Reader(_) => {
@@ -412,16 +409,13 @@ impl H5Group {
             H5FileInner::Writer(writer) => {
                 let idx =
                     writer.create_vlen_sequence_dataset(&full_name, T::hdf5_type(), &images)?;
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(idx);
+                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.file_inner),
                     idx,
                     shape,
                     element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
+                    chunk_index,
                 ))
             }
             H5FileInner::Reader(_) => {
@@ -455,16 +449,13 @@ impl H5Group {
                 let idx = writer.create_vlen_string_dataset_compressed(
                     &full_name, strings, chunk_size, pipeline,
                 )?;
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(idx);
+                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.file_inner),
                     idx,
                     shape,
                     element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
+                    chunk_index,
                 ))
             }
             H5FileInner::Reader(_) => {
@@ -497,16 +488,13 @@ impl H5Group {
             H5FileInner::Writer(writer) => {
                 let idx = writer
                     .create_appendable_vlen_string_dataset(&full_name, chunk_size, pipeline)?;
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(idx);
+                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(idx);
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.file_inner),
                     idx,
                     shape,
                     element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
+                    chunk_index,
                 ))
             }
             H5FileInner::Reader(_) => {
@@ -557,16 +545,13 @@ impl H5Group {
         match &*inner {
             H5FileInner::Writer(writer) => {
                 let index = writer.open_dataset_index(&full_name)?;
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(index);
+                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(index);
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.file_inner),
                     index,
                     shape,
                     element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
+                    chunk_index,
                 ))
             }
             H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
@@ -937,6 +922,41 @@ impl H5Group {
         match &mut *inner {
             H5FileInner::Writer(writer) => {
                 writer.set_vlen_string_array_attribute(self.attr_target(), name, values, &dims)?;
+                Ok(())
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot write attributes in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
+    /// Add (or replace) an object-reference attribute on this group — h5py's
+    /// `g.attrs['owner'] = f['/data'].ref`.
+    ///
+    /// `path` names a dataset or a group (`/` is the root group) and must
+    /// already exist. The attribute takes the scalar shape h5py gives a single
+    /// reference; [`set_attr_object_references`](Self::set_attr_object_references)
+    /// is the array form. What reaches the file is the target's object header
+    /// address, which is assigned when the file is finalized.
+    pub fn set_attr_object_reference(&self, name: &str, path: &str) -> Result<()> {
+        self.set_reference_attr(name, &[path], &[])
+    }
+
+    /// Add (or replace) a 1-D array of object references as an attribute on
+    /// this group — the array counterpart of
+    /// [`set_attr_object_reference`](Self::set_attr_object_reference).
+    pub fn set_attr_object_references(&self, name: &str, paths: &[&str]) -> Result<()> {
+        self.set_reference_attr(name, paths, &[paths.len() as u64])
+    }
+
+    /// Route a reference attribute to the writer, the way
+    /// [`add_attr`](Self::add_attr) routes every other kind.
+    fn set_reference_attr(&self, name: &str, paths: &[&str], dims: &[u64]) -> Result<()> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => {
+                writer.set_object_reference_attribute(self.attr_target(), name, paths, dims)?;
                 Ok(())
             }
             H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
