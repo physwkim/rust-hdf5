@@ -14203,6 +14203,24 @@ impl Hdf5Writer {
         let (flags, fv_msg) = self.share_message(MSG_FILL_VALUE, 0x00, fv_msg);
         header.add_message(MSG_FILL_VALUE, flags, fv_msg);
 
+        // The "fill value (old)" message (type 0x04) beside the new one, for a
+        // user-defined fill value below the v1.8 bound. `H5D__update_oh_info`
+        // (H5Dint.c:1024-1035) appends `H5O_FILL_ID` whenever `fill_prop->buf`
+        // is set and `use_at_least_v18` — `H5F_LOW_BOUND(file) >= V18`, which
+        // here is exactly a non-`Legacy` message format — is false, so that a
+        // reader that predates the new message still finds the value. The body
+        // is the size and the bytes and nothing else: no allocation time, no
+        // write time, no defined flag (`H5O__fill_old_encode`, H5Ofill.c:512).
+        if matches!(self.message_format(), ObjectFormat::Legacy) {
+            if let Some(ref bytes) = m.fill_value {
+                let mut old = Vec::with_capacity(4 + bytes.len());
+                old.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                old.extend_from_slice(bytes);
+                let (flags, old) = self.share_message(MSG_FILL_VALUE_OLD, MSG_FLAG_CONSTANT, old);
+                header.add_message(MSG_FILL_VALUE_OLD, flags, old);
+            }
+        }
+
         // External Data Files message (type 0x07), before the layout message
         // and marked constant, exactly where `H5D__layout_oh_create` puts it.
         // It is what makes a reader route the dataset's I/O through the files

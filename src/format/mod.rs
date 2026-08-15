@@ -157,9 +157,19 @@ impl ObjectFormat {
         }
     }
 
-    /// The fill-value message version (`H5O_fill_ver_bounds`, H5Ofill.c:150).
-    /// The earliest bound writes version 2 — version 1 is the separate
-    /// "fill value (old)" message type, which this writer never emits.
+    /// The fill-value message version.
+    ///
+    /// `H5O_fill_ver_bounds` (H5Ofill.c:150) is `H5O_FILL_VERSION_1` at the
+    /// earliest bound, but the bound is only half of it: `H5O__fill_set_version`
+    /// takes `MAX(fill->version, bound)`, and the default creation property list
+    /// starts every fill value at `H5O_FILL_VERSION_2` (H5Pdcpl.c:163). Nothing
+    /// in the public API lowers it, so version 1 is unreachable and a classic
+    /// file's new fill message is version 2.
+    ///
+    /// Version 1 is not the "fill value (old)" message either — that is a
+    /// separate message type (0x04, `MSG_FILL_VALUE_OLD`) with its own
+    /// size-and-bytes encoding, which a classic file carries *alongside* this
+    /// one when the fill value is user-defined.
     pub fn fill_value_version(self) -> u8 {
         match self {
             Self::Legacy => 2,

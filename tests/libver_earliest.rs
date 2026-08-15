@@ -25,7 +25,10 @@ use rust_hdf5::format::btree_v1::{BTreeV1Config, BTreeV1Node};
 use rust_hdf5::format::local_heap::{local_heap_get_string, LocalHeapHeader};
 use rust_hdf5::format::messages::data_layout::{ChunkIndexType, DataLayoutMessage};
 use rust_hdf5::format::messages::link::{LinkMessage, LinkTarget};
-use rust_hdf5::format::messages::{MSG_DATA_LAYOUT, MSG_LINK, MSG_SYMBOL_TABLE};
+use rust_hdf5::format::messages::{
+    MSG_DATA_LAYOUT, MSG_FILL_VALUE, MSG_FILL_VALUE_OLD, MSG_FLAG_CONSTANT, MSG_LINK,
+    MSG_SYMBOL_TABLE,
+};
 use rust_hdf5::format::object_header::ObjectHeader;
 use rust_hdf5::format::superblock::{SuperblockV0V1, SuperblockV2V3};
 use rust_hdf5::format::symbol_table::SymbolTableNode;
@@ -597,6 +600,19 @@ fn classic_layout_version_of(path: &std::path::Path, name: &str) -> u8 {
 }
 
 fn classic_layout_message_of(path: &std::path::Path, name: &str) -> (Vec<u8>, FormatContext) {
+    let (messages, ctx) = classic_messages_of(path, name);
+    let msg = messages
+        .iter()
+        .find(|(msg_type, _, _)| *msg_type == MSG_DATA_LAYOUT)
+        .unwrap_or_else(|| panic!("'{name}' has no data layout message"));
+    (msg.2.clone(), ctx)
+}
+
+/// Every header message of a classic file's dataset, as `(type, flags, body)`.
+fn classic_messages_of(
+    path: &std::path::Path,
+    name: &str,
+) -> (Vec<(u8, u8, Vec<u8>)>, FormatContext) {
     let bytes = std::fs::read(path).unwrap();
     let sb = SuperblockV0V1::decode(&bytes).unwrap();
     let (addr_size, size_size) = (sb.sizeof_offsets as usize, sb.sizeof_lengths as usize);
@@ -648,12 +664,145 @@ fn classic_layout_message_of(path: &std::path::Path, name: &str) -> (Vec<u8>, Fo
     // A version-1 header carries no "OHDR" signature, so this is the arm
     // `decode_any` picks by its absence.
     let (header, _) = ObjectHeader::decode_v1(&bytes[at..]).unwrap();
-    let msg = header
+    let messages = header
         .messages
         .iter()
-        .find(|m| m.msg_type == MSG_DATA_LAYOUT)
-        .unwrap_or_else(|| panic!("'{name}' has no data layout message"));
-    (msg.data.clone(), ctx)
+        .map(|m| (m.msg_type, m.flags, m.data.clone()))
+        .collect();
+    (messages, ctx)
+}
+
+/// The same, for a file whose root group holds link messages.
+fn modern_messages_of(path: &std::path::Path, name: &str) -> Vec<(u8, u8, Vec<u8>)> {
+    let bytes = std::fs::read(path).unwrap();
+    let sb = SuperblockV2V3::decode(&bytes).unwrap();
+    let ctx = FormatContext {
+        sizeof_addr: sb.sizeof_offsets,
+        sizeof_size: sb.sizeof_lengths,
+    };
+    let at = (sb.base_address + sb.root_group_object_header_address) as usize;
+    let (root, _) = ObjectHeader::decode(&bytes[at..]).unwrap();
+    let addr = root
+        .messages
+        .iter()
+        .filter(|m| m.msg_type == MSG_LINK)
+        .filter_map(|m| LinkMessage::decode(&m.data, &ctx).ok())
+        .find_map(|(l, _)| match l.target {
+            LinkTarget::Hard { address } if l.name == name => Some(address),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no link '{name}' in the root group"));
+    let (header, _) = ObjectHeader::decode(&bytes[(sb.base_address + addr) as usize..]).unwrap();
+    header
+        .messages
+        .iter()
+        .map(|m| (m.msg_type, m.flags, m.data.clone()))
+        .collect()
+}
+
+/// The fill-value messages of `name`, in header order.
+fn fill_messages(messages: Vec<(u8, u8, Vec<u8>)>) -> Vec<(u8, u8, Vec<u8>)> {
+    messages
+        .into_iter()
+        .filter(|(msg_type, _, _)| *msg_type == MSG_FILL_VALUE || *msg_type == MSG_FILL_VALUE_OLD)
+        .collect()
+}
+
+/// A user-defined fill value in a classic file is written twice: once in the
+/// fill-value message (0x05) every generation writes, and once more in the
+/// "fill value (old)" message (0x04) that predates it.
+///
+/// `H5D__update_oh_info` (H5Dint.c:1024-1035) appends the old message whenever
+/// `fill_prop->buf` is set and `use_at_least_v18` — `H5F_LOW_BOUND(file) >=
+/// H5F_LIBVER_V18` — is false, so that a reader too old to know the new
+/// message still finds the value. It carries the size and the bytes and
+/// nothing else (`H5O__fill_old_encode`, H5Ofill.c:512): the allocation time,
+/// the write time and the defined flag have no place in it.
+///
+/// The new message stays at version 2 at this bound, which the version table
+/// alone does not say — `H5O_fill_ver_bounds[H5F_LIBVER_EARLIEST]` is
+/// `H5O_FILL_VERSION_1`, but `H5O__fill_set_version` takes the maximum of that
+/// and `fill->version`, which the default creation property list has already
+/// set to `H5O_FILL_VERSION_2` (H5Pdcpl.c:163). Version 1 is unreachable.
+///
+/// Every byte asserted here was read out of an h5py `libver='earliest'` file
+/// by walking its version-1 object headers.
+#[test]
+fn a_classic_user_defined_fill_value_carries_the_old_message_too() {
+    let path = tmp("classic_fill_old");
+    let file = earliest(&path);
+    file.new_dataset::<i32>()
+        .shape([4])
+        .create("plain")
+        .unwrap();
+    file.new_dataset::<i32>()
+        .shape([4])
+        .fill_value(7i32)
+        .create("withfill")
+        .unwrap();
+    file.close().unwrap();
+
+    // No fill value of the dataset's own, so `fill_prop->buf` is NULL and the
+    // old message is not written — h5py's `/plain` has the one message too.
+    let plain = fill_messages(classic_messages_of(&path, "plain").0);
+    assert_eq!(
+        plain.iter().map(|m| m.0).collect::<Vec<_>>(),
+        vec![MSG_FILL_VALUE],
+        "a dataset with no fill value of its own gets the new message alone"
+    );
+    assert_eq!(plain[0].2[0], 2, "the classic fill message is version 2");
+
+    let withfill = fill_messages(classic_messages_of(&path, "withfill").0);
+    assert_eq!(
+        withfill.iter().map(|m| m.0).collect::<Vec<_>>(),
+        vec![MSG_FILL_VALUE, MSG_FILL_VALUE_OLD],
+        "the old message follows the new one, as `H5D__update_oh_info` appends it"
+    );
+    assert_eq!(
+        withfill[0].2,
+        // Version 2, allocation time late, then the write time, the defined
+        // flag, the size and the value; the last four bytes are the version-1
+        // header's eight-byte message alignment. h5py's third byte is 2
+        // (`H5D_FILL_TIME_IFSET`, the creation-property default) where this
+        // writer's is 0 — a difference it has at every bound, not one this
+        // bound introduces, and the same one the version-3 message below
+        // carries in its packed flag byte.
+        vec![0x02, 0x02, 0x00, 0x01, 0x04, 0, 0, 0, 0x07, 0, 0, 0, 0, 0, 0, 0],
+    );
+    assert_eq!(
+        withfill[1].1, MSG_FLAG_CONSTANT,
+        "H5O_MSG_FLAG_CONSTANT, the flag `H5D__update_oh_info` passes"
+    );
+    assert_eq!(
+        withfill[1].2,
+        // The four-byte size and the four value bytes, byte-for-byte h5py's.
+        vec![0x04, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00],
+    );
+
+    // The same dataset at the default bounds: `use_at_least_v18` is true, so
+    // the new message stands alone and is version 3.
+    let modern = tmp("modern_fill_old");
+    let file = H5File::create(&modern).unwrap();
+    file.new_dataset::<i32>()
+        .shape([4])
+        .fill_value(7i32)
+        .create("withfill")
+        .unwrap();
+    file.close().unwrap();
+    let at_v18 = fill_messages(modern_messages_of(&modern, "withfill"));
+    assert_eq!(
+        at_v18.iter().map(|m| m.0).collect::<Vec<_>>(),
+        vec![MSG_FILL_VALUE],
+        "above the v1.8 bound the old message is not written at all"
+    );
+    assert_eq!(at_v18[0].2[0], 3, "and the new message is version 3");
+    // The same content in version 3's packed flag byte: allocation time late,
+    // fill written on alloc, value defined. h5py's byte is 0x2a, differing in
+    // the write-time field alone, exactly as the version-2 message above.
+    assert_eq!(at_v18[0].2, vec![0x03, 0x22, 0x04, 0, 0, 0, 0x07, 0, 0, 0]);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&modern);
 }
 
 /// A fixed shape covered by exactly one chunk is the shape
