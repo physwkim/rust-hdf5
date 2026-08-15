@@ -88,75 +88,90 @@ fn fixed_array_dblk_disk_size(ctx: &FormatContext, hdr: &FixedArrayHeader) -> u6
     }
 }
 
-/// Walk a v2 B-tree from `addr`, collecting every node's raw record bytes
-/// and every node block's address — the reader's record walk plus the
-/// addresses, which `open_append` needs so the reconstructed
-/// [`Bt2DatasetInfo::node_addrs`] pool owns the on-disk nodes (the next
-/// flush re-serializes the tree over them, and a delete frees them).
-#[allow(clippy::too_many_arguments)]
-fn collect_bt2_nodes(
-    handle: &FileHandle,
-    ctx: &FormatContext,
-    addr: u64,
-    depth: u16,
-    nrec: u16,
+/// A walk of a v2 B-tree: the file and node geometry the descent reads
+/// through, and the two collections it fills — every node's raw record
+/// bytes and every node block's address, the latter because `open_append`
+/// needs it so the reconstructed [`Bt2DatasetInfo::node_addrs`] pool owns
+/// the on-disk nodes (the next flush re-serializes the tree over them, and
+/// a delete frees them).
+///
+/// `record_size`, `node_size` and `geo` are constant for the whole walk, so
+/// [`descend`](Self::descend) takes only what changes per level: the node's
+/// address, its depth, and how many records it holds.
+struct Bt2Walk<'a> {
+    handle: &'a FileHandle,
+    ctx: &'a FormatContext,
     record_size: u16,
     node_size: u32,
-    geo: &crate::format::chunk_index::btree_v2::Bt2Geometry,
-    records: &mut Vec<u8>,
-    node_addrs: &mut Vec<u64>,
-) -> IoResult<()> {
-    use crate::format::chunk_index::btree_v2::{Bt2InternalNode, Bt2LeafNode};
+    geo: &'a crate::format::chunk_index::btree_v2::Bt2Geometry,
+    records: Vec<u8>,
+    node_addrs: Vec<u64>,
+}
 
-    node_addrs.push(addr);
-    let buf = handle.read_at_most(addr, node_size as usize)?;
-    if depth == 0 {
-        let leaf = Bt2LeafNode::decode(&buf, nrec, record_size)?;
-        records.extend_from_slice(&leaf.record_data);
-    } else {
-        let node = Bt2InternalNode::decode(
-            &buf,
+impl<'a> Bt2Walk<'a> {
+    fn new(
+        handle: &'a FileHandle,
+        ctx: &'a FormatContext,
+        record_size: u16,
+        node_size: u32,
+        geo: &'a crate::format::chunk_index::btree_v2::Bt2Geometry,
+    ) -> Self {
+        Self {
+            handle,
             ctx,
-            depth,
-            nrec,
             record_size,
-            geo.max_nrec_size,
-            geo.child_total_size(depth),
-        )?;
-        // In-order: an internal node's records separate its children, so each
-        // one belongs between the subtrees on either side of it.
-        let children: Vec<(u64, u16)> = node
-            .child_addrs
-            .iter()
-            .zip(node.child_nrecords.iter())
-            .map(|(&a, &n)| (a, n))
-            .collect();
-        let rec = record_size as usize;
-        for (i, (child_addr, child_nrec)) in children.into_iter().enumerate() {
-            collect_bt2_nodes(
-                handle,
-                ctx,
-                child_addr,
-                depth - 1,
-                child_nrec,
-                record_size,
-                node_size,
-                geo,
-                records,
-                node_addrs,
-            )?;
-            if let Some(record) = node.record_data.get(i * rec..(i + 1) * rec) {
-                records.extend_from_slice(record);
-            }
+            node_size,
+            geo,
+            records: Vec::new(),
+            node_addrs: Vec::new(),
         }
     }
-    Ok(())
+
+    /// Walk the subtree rooted at `addr`, at depth `depth` with `nrec`
+    /// records, collecting every node's raw record bytes and every node
+    /// block's address.
+    fn descend(&mut self, addr: u64, depth: u16, nrec: u16) -> IoResult<()> {
+        use crate::format::chunk_index::btree_v2::{Bt2InternalNode, Bt2LeafNode};
+
+        self.node_addrs.push(addr);
+        let buf = self.handle.read_at_most(addr, self.node_size as usize)?;
+        if depth == 0 {
+            let leaf = Bt2LeafNode::decode(&buf, nrec, self.record_size)?;
+            self.records.extend_from_slice(&leaf.record_data);
+        } else {
+            let node = Bt2InternalNode::decode(
+                &buf,
+                self.ctx,
+                depth,
+                nrec,
+                self.record_size,
+                self.geo.max_nrec_size,
+                self.geo.child_total_size(depth),
+            )?;
+            // In-order: an internal node's records separate its children, so each
+            // one belongs between the subtrees on either side of it.
+            let children: Vec<(u64, u16)> = node
+                .child_addrs
+                .iter()
+                .zip(node.child_nrecords.iter())
+                .map(|(&a, &n)| (a, n))
+                .collect();
+            let rec = self.record_size as usize;
+            for (i, (child_addr, child_nrec)) in children.into_iter().enumerate() {
+                self.descend(child_addr, depth - 1, child_nrec)?;
+                if let Some(record) = node.record_data.get(i * rec..(i + 1) * rec) {
+                    self.records.extend_from_slice(record);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A walk of a version-1 raw-data-chunk B-tree: the file and geometry the
 /// descent reads through, and the two collections it fills.
 ///
-/// The v1 counterpart of [`collect_bt2_nodes`], and for the same reason: the
+/// The v1 counterpart of [`Bt2Walk`], and for the same reason: the
 /// records are what [`BtreeV1DatasetInfo::build_tree`] bulk-loads on the next
 /// flush, and the addresses are the block pool that flush re-serializes over,
 /// so a reopened tree owns the nodes it found instead of leaking them and
@@ -2761,19 +2776,15 @@ fn rebuild_dataset(
                             bt2_hdr.depth,
                             ctx.sizeof_addr,
                         );
-                        let mut record_bytes = Vec::new();
-                        collect_bt2_nodes(
-                            handle,
-                            ctx,
+                        let mut walk =
+                            Bt2Walk::new(handle, ctx, bt2_hdr.record_size, bt2_hdr.node_size, &geo);
+                        walk.descend(
                             bt2_hdr.root_node_addr,
                             bt2_hdr.depth,
                             bt2_hdr.num_records_in_root,
-                            bt2_hdr.record_size,
-                            bt2_hdr.node_size,
-                            &geo,
-                            &mut record_bytes,
-                            &mut node_addrs,
                         )?;
+                        node_addrs = walk.node_addrs;
+                        let record_bytes = walk.records;
                         let total = if bt2_hdr.record_size > 0 {
                             record_bytes.len() / bt2_hdr.record_size as usize
                         } else {
