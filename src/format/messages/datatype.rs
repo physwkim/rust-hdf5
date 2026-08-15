@@ -587,6 +587,23 @@ impl DatatypeMessage {
         }
     }
 
+    /// Revised object reference type (`H5T_STD_REF`, the 1.12 form): the
+    /// two-byte header every 1.12 element leads with, over the wider of the
+    /// two payloads `H5T__ref_disk_getsize` sizes an element for.
+    ///
+    /// Those two are the encoded reference stored inline — a token length byte
+    /// and the token — and the global-heap blob id everything else stores, a
+    /// 4-byte size then the collection address then a 4-byte object index. The
+    /// blob id is the wider, so it is what sets the width: 18 bytes over
+    /// 8-byte addresses, which is what libhdf5 writes for an `H5T_STD_REF`
+    /// dataset whatever its elements turn out to name.
+    pub fn std_object_reference(ctx: &FormatContext) -> Self {
+        Self::Reference {
+            size: 2 + 4 + ctx.sizeof_addr as u32 + 4,
+            kind: ReferenceKind::Object2,
+        }
+    }
+
     /// Dataset region reference type (`H5T_STD_REF_DSETREG`): one global-heap
     /// id per element, which is an address plus a 4-byte object index.
     pub fn region_reference(ctx: &FormatContext) -> Self {

@@ -33,6 +33,7 @@ use crate::format::messages::link::{LinkMessage, LinkTarget};
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::*;
 use crate::format::object_header::{ObjectHeader, ObjectTimes, MAX_MESSAGE_SIZE};
+use crate::format::reference::encode_object_element;
 use crate::format::selection::Selection;
 use crate::format::sohm::SharedMessagePointer;
 use crate::format::superblock::*;
@@ -4989,8 +4990,11 @@ impl Hdf5Writer {
             let ds = self.ds(index);
             let m = ds.lock();
             match &m.datatype {
+                // Both generations of object reference: `H5T_STD_REF_OBJ` and
+                // the 1.12 `H5T_STD_REF`. They differ only in the element
+                // image, which `encode_object_element` owns.
                 DatatypeMessage::Reference {
-                    kind: ReferenceKind::Object1,
+                    kind: ReferenceKind::Object1 | ReferenceKind::Object2,
                     ..
                 } => {}
                 other => {
@@ -5215,7 +5219,6 @@ impl Hdf5Writer {
             .iter()
             .map(|p| (p.dataset, p.element, p.target.clone()))
             .collect();
-        let width = self.ctx.sizeof_addr as usize;
         for (dataset, element, target) in &pending {
             let addr = match self.object_reference_target(target)? {
                 Some(HardLinkTarget::Dataset(i)) => self.ds(i).lock().obj_header_addr,
@@ -5226,9 +5229,23 @@ impl Hdf5Writer {
                     )
                 })?,
             };
-            let data_addr = self.ds(*dataset).lock().data_addr;
+            // The element image is the dataset's own datatype's business: the
+            // pre-1.12 and 1.12 forms differ in width and in layout, and the
+            // dataset says which it holds.
+            let (kind, width, data_addr) = {
+                let ds = self.ds(*dataset);
+                let m = ds.lock();
+                let DatatypeMessage::Reference { kind, size } = &m.datatype else {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "dataset '{}' is no longer a reference dataset",
+                        m.name
+                    )));
+                };
+                (*kind, *size as usize, m.data_addr)
+            };
+            let image = encode_object_element(kind, width, addr, &self.ctx)?;
             let at = data_addr + element * width as u64;
-            self.handle.write_at(at, &addr.to_le_bytes()[..width])?;
+            self.handle.write_at(at, &image)?;
         }
         Ok(())
     }
