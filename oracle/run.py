@@ -124,7 +124,6 @@ STRUCTURAL_FIELDS = {
     "maxshape",
     "external",
     "virtual",
-    "filters",
     "fillvalue",
     "nattrs_hdr",
     "attrstore",

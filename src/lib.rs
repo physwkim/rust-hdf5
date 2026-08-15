@@ -107,7 +107,7 @@ pub use dataset::{ChunkIndex, H5Dataset, ReadNumeric, StorageLayout};
 pub use error::{Hdf5Error, Result};
 pub use file::{H5File, H5FileOptions};
 pub use format::messages::datatype::{ByteOrder, DatatypeMessage};
-pub use format::messages::filter::FilterPipeline;
+pub use format::messages::filter::{Filter, FilterPipeline};
 pub use format::messages::superblock_ext::{
     BtreeKMessage, DriverInfoMessage, FileSpaceInfoMessage, FileSpaceStrategy,
     SharedMessageTableMessage,

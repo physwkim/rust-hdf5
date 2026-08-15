@@ -8,6 +8,7 @@ use crate::attribute::AttrBuilder;
 use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
 use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+use crate::format::messages::filter::Filter;
 use crate::format::messages::virtual_mapping::VirtualMapping;
 use crate::format::reference::Reference;
 use crate::format::selection::Selection;
@@ -1707,6 +1708,37 @@ impl H5Dataset {
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "chunk_index() is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Return this dataset's filter pipeline (read mode only), in
+    /// application order. Empty when the dataset has no filter pipeline
+    /// message at all — an unfiltered dataset, not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is in write mode, or if the dataset can
+    /// no longer be found in the reader's metadata.
+    pub fn filters(&self) -> Result<Vec<Filter>> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => reader
+                        .dataset_info(name)
+                        .map(|info| {
+                            info.filter_pipeline
+                                .as_ref()
+                                .map(|fp| fp.filters.clone())
+                                .unwrap_or_default()
+                        })
+                        .ok_or_else(|| Hdf5Error::NotFound(name.clone())),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "filters() is only available in read mode".into(),
             )),
         }
     }
@@ -9023,5 +9055,40 @@ mod tests {
             file.dataset("btree1").unwrap().chunk_index().unwrap(),
             Some(ChunkIndex::BtreeV1)
         );
+    }
+
+    /// [`H5Dataset::filters`] reports the stored pipeline in order — and
+    /// the negative case: an unfiltered dataset reports an empty pipeline,
+    /// not an error.
+    #[test]
+    fn filters_reports_the_stored_pipeline() {
+        use crate::format::messages::filter::{FILTER_DEFLATE, FILTER_SHUFFLE, FLAG_OPTIONAL};
+        let path = temp_path("filters");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([16usize])
+                .create("unfiltered")
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([16usize])
+                .chunk(&[4])
+                .shuffle()
+                .deflate(6)
+                .create("filtered")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("unfiltered").unwrap().filters().unwrap(),
+            Vec::new()
+        );
+        let filters = file.dataset("filtered").unwrap().filters().unwrap();
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[0].id, FILTER_SHUFFLE);
+        assert_eq!(filters[0].flags, FLAG_OPTIONAL);
+        assert_eq!(filters[1].id, FILTER_DEFLATE);
+        assert_eq!(filters[1].cd_values, vec![6]);
     }
 }

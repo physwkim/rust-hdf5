@@ -26,7 +26,9 @@ use rust_hdf5::format::messages::datatype::{
     ByteOrder, CompoundMember, DatatypeMessage, EnumMember,
 };
 use rust_hdf5::format::messages::filter::{
-    Filter, FilterPipeline, FILTER_FLETCHER32, FLAG_MANDATORY,
+    Filter, FilterPipeline, FILTER_BLOSC, FILTER_BSHUF, FILTER_BZIP2, FILTER_DEFLATE,
+    FILTER_FLETCHER32, FILTER_LZ4, FILTER_LZF, FILTER_NBIT, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
+    FILTER_SZIP, FILTER_ZSTD, FLAG_MANDATORY,
 };
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
@@ -77,6 +79,41 @@ fn hex(bytes: &[u8]) -> String {
 
 fn dims_str(dims: &[usize]) -> String {
     let parts: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// The filter name canon.py's `_FILTER_NAMES` reports for a well-known
+/// filter id, falling back to the bare id exactly as `dict.get(code,
+/// str(code))` does. This is a client-side lookup on both sides of the
+/// oracle, not something either reads from the file: h5py's own
+/// `filters_str` discards the on-disk name field the same way.
+fn filter_name(id: u16) -> String {
+    match id {
+        FILTER_DEFLATE => "deflate".into(),
+        FILTER_SHUFFLE => "shuffle".into(),
+        FILTER_FLETCHER32 => "fletcher32".into(),
+        FILTER_SZIP => "szip".into(),
+        FILTER_NBIT => "nbit".into(),
+        FILTER_SCALEOFFSET => "scaleoffset".into(),
+        FILTER_BZIP2 => "bzip2".into(),
+        FILTER_LZF => "lzf".into(),
+        FILTER_BLOSC => "blosc".into(),
+        FILTER_LZ4 => "lz4".into(),
+        FILTER_BSHUF => "bshuf".into(),
+        FILTER_ZSTD => "zstd".into(),
+        other => other.to_string(),
+    }
+}
+
+/// `filters_str`'s per-filter rendering: `name(cd0|cd1|...)@flags`.
+fn filters_str(filters: &[Filter]) -> String {
+    let parts: Vec<String> = filters
+        .iter()
+        .map(|f| {
+            let cd: Vec<String> = f.cd_values.iter().map(|c| c.to_string()).collect();
+            format!("{}({})@{}", filter_name(f.id), cd.join("|"), f.flags)
+        })
+        .collect();
     format!("[{}]", parts.join(","))
 }
 
@@ -878,7 +915,10 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
     });
 
     d.field(path, "filters", || {
-        Err("H5Dataset exposes no filter pipeline accessor".into())
+        guarded(|| ds.filters())
+            .map_err(|p| format!("panic: {p}"))?
+            .map(|filters| filters_str(&filters))
+            .map_err(oneline)
     });
 
     d.field(path, "fillvalue", || {
