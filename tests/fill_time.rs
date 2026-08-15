@@ -204,6 +204,55 @@ fn vlen_dataset_with_no_fill_value_forces_alloc() {
     std::fs::remove_file(&path).ok();
 }
 
+/// The write time is part of the fill-value message *body*, and `MSG_FILL_VALUE`
+/// is one of the classes a shared-message index may cover
+/// (`format::sohm::type_flag`). So an index over fill values is the one place
+/// where the VL force-upgrade could be undone by sharing: two datasets that
+/// differ only in write time must land as two records, not collapse into one
+/// pointer both headers name. They do, because the index keys on the encoded
+/// body and the write-time byte is inside it — a collapse would make both
+/// datasets read back the same policy here.
+#[test]
+fn a_shared_fill_value_index_keeps_the_vlen_upgrade_apart() {
+    use rust_hdf5::format::messages::{MSG_DATASPACE, MSG_DATATYPE, MSG_FILL_VALUE};
+    use rust_hdf5::format::sohm::type_flag;
+
+    let path = tmp("sohm");
+    let types = type_flag(MSG_FILL_VALUE).unwrap()
+        | type_flag(MSG_DATATYPE).unwrap()
+        | type_flag(MSG_DATASPACE).unwrap();
+    {
+        let file = H5File::options()
+            .shared_messages(&[(types, 0)], 50, 40)
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape([8usize])
+            .create("plain")
+            .unwrap()
+            .write_raw(&(0..8i32).collect::<Vec<_>>())
+            .unwrap();
+        file.write_vlen_strings_ascii("vl", &["a", "bb"]).unwrap();
+        file.close().unwrap();
+    }
+    let file = H5File::open(&path).unwrap();
+    assert!(file.superblock_extension().shared_message_table.is_some());
+    assert_eq!(
+        file.dataset("plain").unwrap().fill_time().unwrap(),
+        FillTime::IfSet
+    );
+    assert_eq!(
+        file.dataset("vl").unwrap().fill_time().unwrap(),
+        FillTime::Alloc
+    );
+    assert_eq!(
+        file.dataset("vl").unwrap().read_vlen_strings().unwrap(),
+        vec!["a", "bb"]
+    );
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
 /// A dataset reopened for append preserves its declared fill-time policy
 /// instead of resetting to `IFSET` — the same round-trip `fill_value` gets
 /// through `DatasetParts`.
