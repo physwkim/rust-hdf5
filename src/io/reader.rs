@@ -894,10 +894,7 @@ fn fill_tiled_into(out: &mut [u8], fill_value: Option<&[u8]>) {
     }
 }
 
-/// The declared-size sentinel that marks an External Data Files slot as
-/// unlimited/growable (`H5O_EFL_UNLIMITED` in H5Oprivate.h, `HSIZE_UNDEF` —
-/// the same all-ones bit pattern as [`UNDEF_ADDR`]).
-const EFL_UNLIMITED_SIZE: u64 = u64::MAX;
+use crate::format::messages::external_file_list::UNLIMITED as EFL_UNLIMITED_SIZE;
 
 /// Resolve the directory a raw-data file name is joined against, matching
 /// libhdf5's `H5D__build_file_prefix` (H5Dint.c) for the given environment
@@ -930,7 +927,7 @@ fn resolve_file_prefix(env_var: &str, source_dir: &Path) -> Option<PathBuf> {
     })
 }
 
-fn resolve_extfile_prefix(source_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_extfile_prefix(source_dir: &Path) -> Option<PathBuf> {
     resolve_file_prefix("HDF5_EXTFILE_PREFIX", source_dir)
 }
 
@@ -946,7 +943,7 @@ fn resolve_vdsfile_prefix(source_dir: &Path) -> Option<PathBuf> {
 /// process's current directory" — both of which `Path::join` already
 /// implements for an absolute joinee. Shared by External Data Files and
 /// Virtual Dataset source resolution — both call the same C function.
-fn combine_prefixed_path(prefix: Option<&Path>, name: &str) -> PathBuf {
+pub(crate) fn combine_prefixed_path(prefix: Option<&Path>, name: &str) -> PathBuf {
     match prefix {
         Some(p) => p.join(name),
         None => PathBuf::from(name),
@@ -2042,7 +2039,7 @@ impl Hdf5Reader {
     /// EFL message points at (H5Oefl.c decodes only the byte offset; the
     /// string itself lives in a separate on-disk local heap, exactly like a
     /// v0/v1 group's link names — see [`local_heap_get_string`]).
-    fn resolve_external_file_slots(
+    pub(crate) fn resolve_external_file_slots(
         handle: &mut FileHandle,
         ctx: &FormatContext,
         efl: &ExternalFileListMessage,

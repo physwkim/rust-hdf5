@@ -1689,6 +1689,56 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "external_storage" => {
+            // The reference names the raw file by its bare name, built from
+            // this file's stem, so both resolve it against the directory the
+            // HDF5 file is in. The bytes go through the dataset rather than
+            // being written to the raw file directly: that is the external
+            // write path under test.
+            let raw = format!(
+                "{}_ext.raw",
+                std::path::Path::new(path)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            );
+            let file = H5File::create(path)?;
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([16usize])
+                .external(&[(raw.as_str(), 0, 64)])
+                .create("data")?;
+            ds.write_raw(&ramp_n::<i32>(16))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "vds" => {
+            // Both files are written here, source first: the reference names
+            // the source by its bare name, so each of the two directions
+            // resolves it against the directory its own VDS file is in.
+            let src_name = format!(
+                "{}_src.h5",
+                std::path::Path::new(path)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            );
+            let src_path = std::path::Path::new(path).with_file_name(&src_name);
+            let src = H5File::create(src_path.to_string_lossy().as_ref())?;
+            src.new_dataset::<i32>()
+                .shape([16usize])
+                .create("src")?
+                .write_raw(&ramp_n::<i32>(16))?;
+            src.close()?;
+
+            let file = H5File::create(path)?;
+            file.new_dataset::<i32>()
+                .shape([16usize])
+                .virtual_mapping(Selection::All, &src_name, "src", Selection::All)
+                .create("vds")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "layout_contiguous_v108" => layout_at_libver(path, LibverBound::V18, None),
         "layout_contiguous_v110" => layout_at_libver(path, LibverBound::V110, None),
         "layout_chunked_v108" => layout_at_libver(path, LibverBound::V18, Some(&[16])),

@@ -561,10 +561,10 @@ LAYOUT_CASES = [
     Case("chunkidx_earray_dim1", "layout", gen_chunkidx_earray_dim1,
          "chunkidx_earray_dim1",
          "extensible-array index whose unlimited dimension is not the first"),
-    Case("external_storage", "layout", gen_external_storage, None,
+    Case("external_storage", "layout", gen_external_storage, "external_storage",
          "contiguous data held in an external raw file",
          ext_files=("_ext.raw",)),
-    Case("vds", "layout", gen_vds, None,
+    Case("vds", "layout", gen_vds, "vds",
          "virtual dataset mapped onto a dataset in a sibling file",
          ext_files=("_src.h5",)),
 ]
