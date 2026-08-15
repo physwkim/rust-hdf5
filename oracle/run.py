@@ -128,7 +128,6 @@ STRUCTURAL_FIELDS = {
     "virtual",
     "filters",
     "fillvalue",
-    "nattrs_hdr",
     "linkstore",
     "linkorder",
 }

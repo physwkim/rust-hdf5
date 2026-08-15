@@ -963,8 +963,9 @@ fn dataset_payload(
 trait AttrSource {
     fn attr_names(&self) -> rust_hdf5::Result<Vec<String>>;
     fn attr(&self, name: &str) -> rust_hdf5::Result<H5Attribute>;
-    /// What stands in the way of the object-header attribute count.
-    fn nattrs_hdr_gap() -> &'static str;
+    /// This object's own object-header attribute count, or what stands in
+    /// the way of reading it.
+    fn header_attr_count(&self) -> std::result::Result<u64, String>;
     /// This object's own compact/dense attribute storage, or what stands in
     /// the way of reading it.
     fn attr_storage(&self) -> std::result::Result<AttributeStorage, String>;
@@ -977,8 +978,8 @@ impl AttrSource for H5Dataset {
     fn attr(&self, name: &str) -> rust_hdf5::Result<H5Attribute> {
         H5Dataset::attr(self, name)
     }
-    fn nattrs_hdr_gap() -> &'static str {
-        "H5Dataset exposes no object-header attribute count"
+    fn header_attr_count(&self) -> std::result::Result<u64, String> {
+        H5Dataset::header_attr_count(self).map_err(oneline)
     }
     fn attr_storage(&self) -> std::result::Result<AttributeStorage, String> {
         H5Dataset::attr_storage(self).map_err(oneline)
@@ -992,8 +993,8 @@ impl AttrSource for H5NamedDatatype {
     fn attr(&self, name: &str) -> rust_hdf5::Result<H5Attribute> {
         H5NamedDatatype::attr(self, name)
     }
-    fn nattrs_hdr_gap() -> &'static str {
-        "H5NamedDatatype exposes no object-header attribute count"
+    fn header_attr_count(&self) -> std::result::Result<u64, String> {
+        H5NamedDatatype::header_attr_count(self).map_err(oneline)
     }
     fn attr_storage(&self) -> std::result::Result<AttributeStorage, String> {
         Err("H5NamedDatatype exposes no compact/dense attribute storage accessor".into())
@@ -1036,10 +1037,9 @@ fn dump_object_attrs<T: AttrSource>(d: &mut Dump, path: &str, ds: &T) {
         }
     };
     d.emit(&format!("{path}#nattrs"), names.len().to_string());
-    d.emit(
-        &format!("{path}#nattrs_hdr"),
-        unsupported("nattrs_hdr", T::nattrs_hdr_gap()),
-    );
+    d.field(path, "nattrs_hdr", || {
+        ds.header_attr_count().map(|n| n.to_string())
+    });
     d.field(path, "attrstore", || {
         ds.attr_storage().map(attrstore_str).map(str::to_string)
     });
@@ -1125,13 +1125,12 @@ fn dump_group_attrs(d: &mut Dump, path: &str, group: &H5Group) {
         }
     };
     d.emit(&format!("{path}#nattrs"), names.len().to_string());
-    d.emit(
-        &format!("{path}#nattrs_hdr"),
-        unsupported(
-            "nattrs_hdr",
-            "H5Group exposes no object-header attribute count",
-        ),
-    );
+    d.field(path, "nattrs_hdr", || {
+        group
+            .header_attr_count()
+            .map(|n| n.to_string())
+            .map_err(oneline)
+    });
     d.field(path, "attrstore", || {
         group
             .attr_storage()

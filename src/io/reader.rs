@@ -2131,6 +2131,18 @@ impl Hdf5Reader {
         Ok(names)
     }
 
+    /// The committed datatype at `path`'s own object-header attribute count.
+    ///
+    /// Committed-datatype attributes are collected only from compact header
+    /// messages ([`Self::committed_datatype`]) — this crate does not model
+    /// dense attribute storage on a named datatype — so unlike
+    /// [`ObjectAttributes::header_count`] this is simply the count of what
+    /// [`Self::named_datatype_attr_names`] already lists, with no separate
+    /// dense-index path to fall back to.
+    pub fn named_datatype_header_attr_count(&mut self, path: &str) -> IoResult<u64> {
+        Ok(self.named_datatype_info(path)?.attributes().len() as u64)
+    }
+
     /// One attribute of the committed datatype at `path`, by name.
     pub fn named_datatype_attr(
         &mut self,
@@ -2525,6 +2537,14 @@ impl Hdf5Reader {
             .storage())
     }
 
+    /// A dataset's own object-header attribute count.
+    pub fn dataset_header_attr_count(&mut self, ds_name: &str) -> IoResult<u64> {
+        let info = self
+            .dataset_info(ds_name)
+            .ok_or_else(|| crate::io::IoError::NotFound(ds_name.to_string()))?;
+        info.attributes.header_count(ds_name)
+    }
+
     /// Why the root group's attributes cannot be listed at all, or `None` when
     /// the set is whole.
     pub fn root_attrs_unreadable_reason(&self) -> Option<&str> {
@@ -2582,6 +2602,11 @@ impl Hdf5Reader {
         self.root_attributes.storage()
     }
 
+    /// The root group's own object-header attribute count.
+    pub fn root_header_attr_count(&self) -> IoResult<u64> {
+        self.root_attributes.header_count("/")
+    }
+
     /// Return the attribute names of a non-root group (path without a
     /// leading `/`, e.g. `"detector"` or `"entry/instrument"`; may pass
     /// through group hard links). Undecodable attributes included — see
@@ -2625,6 +2650,17 @@ impl Hdf5Reader {
             .get(&self.canonical_path(group_path))
             .map(ObjectAttributes::storage)
             .unwrap_or_default()
+    }
+
+    /// A non-root group's own object-header attribute count. `0` for a path
+    /// the walk never reached, the same silent default
+    /// [`group_attr_names_local`](Self::group_attr_names_local) gives an
+    /// unknown group's attribute listing.
+    pub fn group_header_attr_count(&self, group_path: &str) -> IoResult<u64> {
+        let Some(attrs) = self.group_attributes.get(&self.canonical_path(group_path)) else {
+            return Ok(0);
+        };
+        attrs.header_count(group_path)
     }
 
     /// Return a non-root group's attribute by name.
@@ -5352,6 +5388,23 @@ impl ObjectAttributes {
     /// [`incomplete`](Self::unreadable_reason).
     pub fn storage(&self) -> AttributeStorage {
         self.storage
+    }
+
+    /// This object's own attribute count as `H5Oget_info().num_attrs`
+    /// reports it — the object header's count, not necessarily the same
+    /// enumeration path as [`ordered_names`](Self::ordered_names).
+    ///
+    /// `H5O__attr_count_real` derives this from the attribute info message
+    /// when the header carries one (the dense name-index record count, or
+    /// the compact message count `H5O__attr_open_by_idx` already counted
+    /// while building it) and from the raw attribute-message envelope count
+    /// otherwise. Both reduce to the number of attributes this collector
+    /// successfully names: a conformant writer creates the info message
+    /// exactly when it has attributes to report through it, so a whole set's
+    /// length already equals what libhdf5's header-count algorithm answers,
+    /// without replaying its v1-header/v2-header branch here.
+    pub fn header_count(&self, owner: &str) -> IoResult<u64> {
+        Ok(self.complete(owner)?.len() as u64)
     }
 
     /// Nothing worth recording: no attribute read, and no failure to report.

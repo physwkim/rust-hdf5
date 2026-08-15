@@ -1047,6 +1047,24 @@ impl H5Group {
         }
     }
 
+    /// This group's own object-header attribute count — the equivalent of
+    /// `h5py.h5o.get_info(gid.id).num_attrs`, which need not equal
+    /// [`attr_names`](Self::attr_names)'s length when the set could not be
+    /// read whole.
+    pub fn header_attr_count(&self) -> Result<u64> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_header_attr_count()?
+            } else {
+                reader.group_header_attr_count(self.name.trim_start_matches('/'))?
+            }),
+            _ => Err(Hdf5Error::InvalidState(
+                "header_attr_count is only available in read mode".into(),
+            )),
+        }
+    }
+
     /// Why this group's attribute `name` cannot be read, or `None` when it
     /// can be. The attribute counterpart of
     /// [`unreadable_reason`](Self::unreadable_reason)'s shape for datasets:

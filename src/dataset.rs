@@ -1668,6 +1668,23 @@ impl H5Dataset {
         }
     }
 
+    /// This dataset's own object-header attribute count — the equivalent of
+    /// `h5py.h5o.get_info(did.id).num_attrs` (read mode only).
+    pub fn header_attr_count(&self) -> Result<u64> {
+        match &self.info {
+            DatasetInfo::Reader { name, .. } => {
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                match &mut *inner {
+                    H5FileInner::Reader(reader) => Ok(reader.dataset_header_attr_count(name)?),
+                    _ => Err(Hdf5Error::InvalidState("file is not in read mode".into())),
+                }
+            }
+            DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
+                "header_attr_count not available in write mode".into(),
+            )),
+        }
+    }
+
     /// Open an attribute by name (read mode only).
     pub fn attr(&self, attr_name: &str) -> Result<crate::attribute::H5Attribute> {
         match &self.info {
