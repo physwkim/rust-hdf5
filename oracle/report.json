@@ -3,8 +3,8 @@
   "hdf5_version": "1.14.6",
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
-  "python": "/home/stevek/micromamba/envs/tomo/bin/python3",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-legacy-links-b72b6c22-1/target/release/oracle_probe",
+  "python": "/home/stevek/micromamba/envs/tomo/bin/python",
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-integrator5-6bef78a3-1/target/release/oracle_probe",
   "cases": 92
  },
  "results": [
@@ -7001,22 +7001,7 @@
     "verdict": "PASS",
     "detail": "",
     "core_diffs": [],
-    "metadata_diffs": [
-     {
-      "key": "#superblock",
-      "field": "superblock",
-      "ref": "2",
-      "rust": "3",
-      "expected": "superblock-v3-for-chunk-index"
-     },
-     {
-      "key": "/data#chunkindex",
-      "field": "chunkindex",
-      "ref": "btree1",
-      "rust": "single",
-      "expected": "btree1-index-substituted"
-     }
-    ],
+    "metadata_diffs": [],
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
@@ -17996,29 +17981,6 @@
    "example": "/t#nattrs_hdr"
   }
  ],
- "expected_deviations": [
-  {
-   "id": "superblock-v3-for-chunk-index",
-   "field": "superblock",
-   "ref": "*",
-   "rust": "3",
-   "example": "2 -> 3",
-   "why": "layout_chunked_v108 asks for the v1.8 bound, where H5O_layout_ver_bounds still puts the data layout message at version 3 and so the chunk index at the version-1 B-tree. This writer picks that index for a classic file only, so a v1.8 file gets a v1.10 index behind a version-4 layout message and the superblock version 3 that implies, above the version 2 the bound asked for",
-   "cases": [
-    "layout_chunked_v108"
-   ]
-  },
-  {
-   "id": "btree1-index-substituted",
-   "field": "chunkindex",
-   "ref": "btree1",
-   "rust": "*",
-   "example": "btree1 -> single",
-   "why": "a v1 B-tree chunk index is only legal below superblock v3, so this follows from superblock-v3-for-chunk-index: the file gets whichever v1.10 index its shape selects \u2014 here the single-chunk index, the shape being one chunk wide. A file created at H5F_LIBVER_EARLIEST does get the version-1 B-tree (tests/libver_earliest.rs), as does a chunked dataset appended to a classic file (tests/legacy_append.rs); the v1.8 bound is what is left",
-   "cases": [
-    "layout_chunked_v108"
-   ]
-  }
- ],
+ "expected_deviations": [],
  "unexpected_deviations": []
 }

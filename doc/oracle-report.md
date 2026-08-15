@@ -150,15 +150,7 @@ None.
 
 ## Direction B expected deviations
 
-The rust-written file carries the same data, type and shape as the h5py reference but describes itself differently. Each row below is a known, understood writer deviation declared in `EXPECTED_DEVIATIONS` (oracle/run.py); it does not fail a case. `observed: no` means a declared deviation no longer happens — either the writer was fixed and the entry should go, or the cases that exercised it changed.
-
-| id | field | libhdf5 | rust-hdf5 | observed | cases |
-|---|---|---|---|---|---|
-| `superblock-v3-for-chunk-index` | `superblock` | `*` | `3` | yes | 1 (layout_chunked_v108) |
-| `btree1-index-substituted` | `chunkindex` | `btree1` | `*` | yes | 1 (layout_chunked_v108) |
-
-- `superblock-v3-for-chunk-index`: layout_chunked_v108 asks for the v1.8 bound, where H5O_layout_ver_bounds still puts the data layout message at version 3 and so the chunk index at the version-1 B-tree. This writer picks that index for a classic file only, so a v1.8 file gets a v1.10 index behind a version-4 layout message and the superblock version 3 that implies, above the version 2 the bound asked for; observed as `2 -> 3`
-- `btree1-index-substituted`: a v1 B-tree chunk index is only legal below superblock v3, so this follows from superblock-v3-for-chunk-index: the file gets whichever v1.10 index its shape selects — here the single-chunk index, the shape being one chunk wide. A file created at H5F_LIBVER_EARLIEST does get the version-1 B-tree (tests/libver_earliest.rs), as does a chunked dataset appended to a classic file (tests/legacy_append.rs); the v1.8 bound is what is left; observed as `btree1 -> single`
+None: `EXPECTED_DEVIATIONS` (oracle/run.py) is empty, so every case in this run describes itself the way libhdf5 describes the same file. Any metadata deviation from here on matches no entry and is reported as unexpected below.
 
 ## Direction B unexpected deviations
 
