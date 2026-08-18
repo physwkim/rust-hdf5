@@ -313,7 +313,7 @@ fn every_header(bytes: &[u8], ctx: &FormatContext) -> Vec<(String, Vec<ObjectHea
 /// The heap-ID pointer of a shared datatype or dataspace stored *inside* an
 /// attribute body, where the attribute's own flags byte says which is shared
 /// (`H5O_ATTR_FLAG_TYPE_SHARED` / `H5O_ATTR_FLAG_SPACE_SHARED`).
-fn attribute_shared_fields(body: &[u8]) -> Vec<&[u8]> {
+fn attribute_shared_fields(body: &[u8]) -> Vec<(u8, &[u8])> {
     if body.len() < 9 || !(2..=3).contains(&body[0]) || body[1] & 0x03 == 0 {
         return Vec::new();
     }
@@ -332,10 +332,10 @@ fn attribute_shared_fields(body: &[u8]) -> Vec<&[u8]> {
     }
     let mut out = Vec::new();
     if flags & 0x01 != 0 {
-        out.push(&body[name_end..dt_end]);
+        out.push((MSG_DATATYPE, &body[name_end..dt_end]));
     }
     if flags & 0x02 != 0 {
-        out.push(&body[dt_end..ds_end]);
+        out.push((MSG_DATASPACE, &body[dt_end..ds_end]));
     }
     out
 }
@@ -387,7 +387,7 @@ fn reference_counts_match_the_pointers(path: &PathBuf) -> Vec<u32> {
             if msg.flags & MSG_FLAG_SHARED != 0 {
                 count(&msg.data);
             } else if msg.msg_type == MSG_ATTRIBUTE {
-                for raw in attribute_shared_fields(&msg.data) {
+                for (_, raw) in attribute_shared_fields(&msg.data) {
                     count(raw);
                 }
             }
@@ -407,7 +407,7 @@ fn reference_counts_match_the_pointers(path: &PathBuf) -> Vec<u32> {
             continue;
         }
         for body in index.values() {
-            for raw in attribute_shared_fields(body) {
+            for (_, raw) in attribute_shared_fields(body) {
                 count(raw);
             }
         }
@@ -434,6 +434,55 @@ fn reference_counts_match_the_pointers(path: &PathBuf) -> Vec<u32> {
         "headers point at heap objects no record names: {pointers:02x?}"
     );
     counts
+}
+
+/// Every shared attribute body in the file, as `(its reference count, the
+/// reference counts of the records its own datatype and dataspace fields
+/// name)`.
+///
+/// The count on a nested record is the thing this says: it is one per
+/// attribute *body*, not one per object holding that attribute, because the
+/// pointer lives in the heap object rather than in each header.
+fn nested_attribute_census(path: &PathBuf) -> Vec<(u32, Vec<u32>)> {
+    let bytes = std::fs::read(path).unwrap();
+    let ctx = FormatContext::default_v3();
+    let table = master_table(path);
+
+    let mut counts: std::collections::HashMap<(usize, [u8; SOHM_HEAP_ID_LEN]), u32> =
+        Default::default();
+    for (i, header) in table.indexes.iter().enumerate() {
+        for (id, ref_count) in index_records(&bytes, &ctx, header) {
+            counts.insert((i, id), ref_count);
+        }
+    }
+    let index_of = |msg_type: u8| {
+        let heap = table.heap_addr(msg_type)?;
+        table.indexes.iter().position(|h| h.heap_addr == heap)
+    };
+
+    let mut out = Vec::new();
+    for (i, header) in table.indexes.iter().enumerate() {
+        if type_flag(MSG_ATTRIBUTE).is_none_or(|f| header.mesg_types & f == 0) {
+            continue;
+        }
+        for (id, body) in heap_bodies(&bytes, &ctx, header) {
+            let fields = attribute_shared_fields(&body);
+            if fields.is_empty() {
+                continue;
+            }
+            let nested = fields
+                .iter()
+                .map(|(class, raw)| {
+                    let pointer = SharedMessagePointer::decode(raw, &ctx).unwrap();
+                    assert_eq!(pointer.location, SharedLocation::Sohm);
+                    counts[&(index_of(*class).unwrap(), pointer.heap_id)]
+                })
+                .collect();
+            out.push((counts[&(i, id)], nested));
+        }
+    }
+    out.sort();
+    out
 }
 
 // ------------------------------------------------------------ libhdf5 tools
@@ -571,6 +620,111 @@ fn a_list_index_file_takes_a_new_dataset() {
         (a.mesg_types, a.min_mesg_size, a.list_max, a.btree_min),
         (b.mesg_types, b.min_mesg_size, b.list_max, b.btree_min)
     );
+    cleanup(&path);
+}
+
+/// A reopen carries the nested reference counts across unchanged: the shared
+/// `cal` body is still named by four datasets, and the datatype and dataspace
+/// it points at are still named once each — by that one body, not by the four
+/// headers behind it.
+#[test]
+fn a_reopen_keeps_the_nested_reference_counts() {
+    let path = copy_fixture("sohm_nested.h5", "nested_reopen");
+    let before = nested_attribute_census(&path);
+    assert_eq!(
+        before,
+        vec![(4, vec![1, 1])],
+        "the fixture as libhdf5 wrote it"
+    );
+
+    append_dataset(&path, "appended", 200);
+    check_fixture_contents(&path, &[("appended", 200)]);
+    reference_counts_match_the_pointers(&path);
+    assert_eq!(nested_attribute_census(&path), before);
+    cleanup(&path);
+}
+
+/// Deleting a dataset gives back the reference its attribute held, and only
+/// that one: the shared body is still there for the other three, so the
+/// datatype and dataspace it points at keep their single reference.
+#[test]
+fn a_deleted_dataset_gives_back_the_reference_its_shared_attribute_held() {
+    let path = copy_fixture("sohm_nested.h5", "nested_delete");
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.delete_dataset("shared0").unwrap();
+        file.close().unwrap();
+    }
+
+    reference_counts_match_the_pointers(&path);
+    assert_eq!(nested_attribute_census(&path), vec![(3, vec![1, 1])]);
+
+    // Take the other three as well: with no body left to point at them, the
+    // datatype and the dataspace leave the index with it.
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        for i in 1..4 {
+            file.delete_dataset(&format!("shared{i}")).unwrap();
+        }
+        file.close().unwrap();
+    }
+    reference_counts_match_the_pointers(&path);
+    assert_eq!(nested_attribute_census(&path), Vec::new());
+    cleanup(&path);
+}
+
+/// A second, different `cal` is a second heap body, and each body holds its
+/// own pointer to what they have in common — so the datatype goes to two
+/// references, not to five.
+///
+/// Only the datatype: the four attributes this fixture already had carry the
+/// maximum dimensions `H5Screate_simple` set, which the reopen keeps, while a
+/// dataspace created here has none. Those are two different dataspace
+/// messages and so two records of one reference each — a difference in what
+/// the reopen preserves, not in how a nested reference is counted.
+#[test]
+fn a_second_attribute_body_takes_its_own_reference_on_the_shared_internals() {
+    let path = copy_fixture("sohm_nested.h5", "nested_rewrite");
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([8usize])
+            .create("other")
+            .unwrap();
+        ds.write_raw(&(0..8i32).collect::<Vec<_>>()).unwrap();
+        ds.new_attr::<f64>()
+            .shape([3usize])
+            .create("cal")
+            .unwrap()
+            .write_array(&[9.5f64, 8.5, 7.5])
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    reference_counts_match_the_pointers(&path);
+    assert_eq!(
+        nested_attribute_census(&path),
+        vec![(1, vec![2, 1]), (4, vec![2, 1])]
+    );
+
+    let file = H5File::open(&path).unwrap();
+    let other: Vec<f64> = file
+        .dataset("other")
+        .unwrap()
+        .attr("cal")
+        .unwrap()
+        .read_numeric_as()
+        .unwrap();
+    assert_eq!(other, vec![9.5, 8.5, 7.5]);
+    let first: Vec<f64> = file
+        .dataset("shared0")
+        .unwrap()
+        .attr("cal")
+        .unwrap()
+        .read_numeric_as()
+        .unwrap();
+    assert_eq!(first, vec![0.5, 1.5, 2.5]);
     cleanup(&path);
 }
 
