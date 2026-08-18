@@ -1,6 +1,8 @@
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "mmap")]
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::io::locking::{self, FileLocking, LockMode};
@@ -101,8 +103,14 @@ enum ReadSource {
     /// A read-only map of the whole file as of the moment it was taken.
     /// Reads up to [`MAP_MAX_READ`] come out of it; larger ones still go
     /// through `pread` — see there for why.
+    ///
+    /// Held behind an `Arc` because a zero-copy view handed to a caller
+    /// borrows nothing: it clones this handle, so the pages stay mapped for
+    /// as long as the view lives even after
+    /// [`FileHandle::refresh_read_source`] has retaken the map or the handle
+    /// itself is gone.
     #[cfg(feature = "mmap")]
-    Mapped(memmap2::Mmap),
+    Mapped(Arc<memmap2::Mmap>),
 }
 
 /// Largest read a mapped handle serves out of its map.
@@ -161,7 +169,7 @@ impl ReadSource {
                 // concurrent modification can only be seen or not seen, never
                 // half-seen.
                 if let Ok(map) = unsafe { memmap2::Mmap::map(file) } {
-                    return ReadSource::Mapped(map);
+                    return ReadSource::Mapped(Arc::new(map));
                 }
             }
         }
@@ -729,6 +737,29 @@ impl FileHandle {
             // space of a large file is not held twice.
             self.source = ReadSource::Pread;
             self.source = ReadSource::for_read_only(&self.file);
+        }
+    }
+
+    /// A share of the map this handle reads through, or `None` when it reads
+    /// through `pread`.
+    ///
+    /// The one way the map leaves this type. A caller that holds the clone
+    /// holds the pages: [`refresh_read_source`](Self::refresh_read_source)
+    /// dropping this handle's share, or the handle itself going away, unmaps
+    /// nothing while a share is outstanding, so a view built on it stays
+    /// readable and keeps showing the file as it was when the map was taken.
+    ///
+    /// The bytes are the file's own, so a caller must not assume they stop
+    /// changing: another process writing the file in place through a shared
+    /// mapping is seen through this one too, and a truncation past the map's
+    /// end takes `SIGBUS` on the pages that went away — the same risk
+    /// [`ReadSource::for_read_only`] takes when it maps at all, and one no
+    /// guard in this process can remove.
+    #[cfg(feature = "mmap")]
+    pub fn map_snapshot(&self) -> Option<Arc<memmap2::Mmap>> {
+        match &self.source {
+            ReadSource::Mapped(map) => Some(Arc::clone(map)),
+            ReadSource::Pread => None,
         }
     }
 

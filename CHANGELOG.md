@@ -21,6 +21,21 @@
   that owns the dataset, so a name crossing an external link gets the
   target's size.
 
+- `H5Dataset::read_mapped::<T>()` and `read_mapped_slice`, under the
+  `mmap` feature: a `MappedView<T>` dereferencing to `&[T]` that points
+  straight into the file's memory map — no read, no copy, no allocation.
+  It works for a contiguous, allocated dataset whose stored elements are
+  already the host image of a `T`, and the slice form additionally
+  requires the selection to be one contiguous run of the stored image;
+  everything else is refused with a `ViewRefusal` naming the reason,
+  never a silent copy. The view holds a share of the map, so it outlives
+  the dataset, the file, and a SWMR `refresh` that retook the map,
+  showing the file as of the moment its map was taken. On the `perf/`
+  contig-view probe (open a 128 MiB f64 dataset and sum every element),
+  the view takes 19.2 ms where `read_raw` takes 66.3 ms, and 0.94x of
+  libhdf5 1.14.6's own idiom for the same thing — `H5Dget_offset` plus a
+  caller-made map, since `H5Dread` cannot hand back the file's bytes.
+
 ### Changed
 
 - The `mmap` feature now does something: a file opened for reading maps
