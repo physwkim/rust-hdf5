@@ -150,9 +150,10 @@ fn a_created_file_shares_the_bodies_its_index_covers() {
     assert_eq!(index.list_max, 50);
     assert_eq!(index.btree_min, 40);
     // The dataspace every dataset has, the datatype the four that describe
-    // their own share, and the attribute body. `uses_named` reaches its type
-    // through the committed datatype, which is shared by address instead.
-    assert_eq!(index.num_messages, 3);
+    // their own share, the attribute body, and the datatype and dataspace
+    // that body points at. `uses_named` reaches its type through the
+    // committed datatype, which is shared by address instead.
+    assert_eq!(index.num_messages, 5);
 
     let bytes = std::fs::read(&path).unwrap();
     let at = index.index_addr as usize;
@@ -171,7 +172,7 @@ fn a_zero_list_maximum_writes_a_btree_index() {
     let table = read_master_table(&path);
     let index = &table.indexes[0];
     assert_eq!(index.index_type, SOHM_INDEX_BTREE);
-    assert_eq!(index.num_messages, 3);
+    assert_eq!(index.num_messages, 5);
 
     let bytes = std::fs::read(&path).unwrap();
     let at = index.index_addr as usize;
@@ -191,7 +192,9 @@ fn a_zero_list_maximum_writes_a_btree_index() {
 
 /// An index takes only the classes its mask names. Covering just dataspaces
 /// leaves the datatype and attribute messages in the headers, so the index
-/// holds one body.
+/// holds the two dataspaces this file has: the datasets' and the one the
+/// attributes carry, which `H5A__create` offers whether or not the attribute
+/// around it is itself shared (H5Aint.c:375-378).
 #[test]
 fn an_index_takes_only_the_classes_its_mask_names() {
     let path = unique_tmp("mask");
@@ -199,7 +202,7 @@ fn an_index_takes_only_the_classes_its_mask_names() {
     check_contents(&path);
 
     let table = read_master_table(&path);
-    assert_eq!(table.indexes[0].num_messages, 1);
+    assert_eq!(table.indexes[0].num_messages, 2);
     cleanup(&path);
 }
 
@@ -274,10 +277,12 @@ fn two_indexes_split_the_message_classes_between_them() {
 
     let table = read_master_table(&path);
     assert_eq!(table.indexes.len(), 2);
-    // One attribute body in the first index; the shared dataspace and the
-    // shared datatype in the second.
+    // One attribute body in the first index; in the second, the datasets'
+    // dataspace, the datatype the datasets and the attribute share, and the
+    // scalar dataspace the attribute body points at across the index
+    // boundary.
     assert_eq!(table.indexes[0].num_messages, 1);
-    assert_eq!(table.indexes[1].num_messages, 2);
+    assert_eq!(table.indexes[1].num_messages, 3);
     assert_ne!(table.indexes[0].heap_addr, table.indexes[1].heap_addr);
     assert_eq!(
         table.heap_addr(MSG_ATTRIBUTE),

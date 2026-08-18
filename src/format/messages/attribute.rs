@@ -18,6 +18,28 @@ use crate::format::{FormatContext, FormatError, FormatResult, LibverBound};
 
 const ATTR_VERSION: u8 = 3;
 
+/// `H5O_ATTR_FLAG_TYPE_SHARED` (H5Oattr.c:88): the datatype field holds a
+/// shared-message pointer rather than the datatype message.
+pub const ATTR_FLAG_TYPE_SHARED: u8 = 0x01;
+/// `H5O_ATTR_FLAG_SPACE_SHARED` (H5Oattr.c:89), the same for the dataspace.
+pub const ATTR_FLAG_SPACE_SHARED: u8 = 0x02;
+
+/// One attribute message body, and where its datatype and dataspace fields
+/// sit inside it.
+///
+/// The offsets are what a caller that put a shared-message pointer in either
+/// field needs in order to fill the pointer's heap ID in later, once the heap
+/// it points into has been laid out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedAttribute {
+    /// The message payload.
+    pub body: Vec<u8>,
+    /// Offset of the datatype field in `body`.
+    pub datatype_at: usize,
+    /// Offset of the dataspace field in `body`.
+    pub dataspace_at: usize,
+}
+
 /// An HDF5 attribute message.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttributeMessage {
@@ -159,29 +181,47 @@ impl AttributeMessage {
         }
         let encoded_dt = self.datatype.encode_at(ctx, libver);
         let encoded_ds = self.dataspace.encode_for(ctx, format);
+        self.encode_with_fields(0x00, &encoded_dt, &encoded_ds).body
+    }
 
+    /// The version-3 body with its datatype and dataspace fields supplied.
+    ///
+    /// `H5O__attr_encode` writes each of the two through its message class's
+    /// encoder, which is the *shared* encoder when that piece is a shared
+    /// message — the field then holds a `H5O_shared_t` and the attribute's own
+    /// flags byte says so (`H5O_ATTR_FLAG_TYPE_SHARED` /
+    /// `H5O_ATTR_FLAG_SPACE_SHARED`, H5Oattr.c:358-359). Whichever it is, the
+    /// size fields record what is actually stored, so the caller supplies the
+    /// bytes and the matching flag bits and this lays the message out around
+    /// them.
+    pub fn encode_with_fields(
+        &self,
+        flags: u8,
+        datatype: &[u8],
+        dataspace: &[u8],
+    ) -> EncodedAttribute {
         // Name with null terminator
         let name_bytes = self.name.as_bytes();
         let name_size = name_bytes.len() + 1; // +1 for null terminator
 
         // Total: 9 (header) + name_size + datatype_size + dataspace_size + data_size
-        let total = 9 + name_size + encoded_dt.len() + encoded_ds.len() + self.data.len();
+        let total = 9 + name_size + datatype.len() + dataspace.len() + self.data.len();
         let mut buf = Vec::with_capacity(total);
 
         // Byte 0: version
         buf.push(ATTR_VERSION);
 
-        // Byte 1: flags (0 = non-shared)
-        buf.push(0x00);
+        // Byte 1: flags — which of the two fields below is a shared pointer.
+        buf.push(flags);
 
         // Bytes 2-3: name size (u16 LE)
         buf.extend_from_slice(&(name_size as u16).to_le_bytes());
 
         // Bytes 4-5: datatype size (u16 LE)
-        buf.extend_from_slice(&(encoded_dt.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&(datatype.len() as u16).to_le_bytes());
 
         // Bytes 6-7: dataspace size (u16 LE)
-        buf.extend_from_slice(&(encoded_ds.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&(dataspace.len() as u16).to_le_bytes());
 
         // Byte 8: name character set encoding (1 = UTF-8)
         buf.push(0x01);
@@ -190,17 +230,21 @@ impl AttributeMessage {
         buf.extend_from_slice(name_bytes);
         buf.push(0x00);
 
-        // Encoded datatype
-        buf.extend_from_slice(&encoded_dt);
+        let datatype_at = buf.len();
+        buf.extend_from_slice(datatype);
 
-        // Encoded dataspace
-        buf.extend_from_slice(&encoded_ds);
+        let dataspace_at = buf.len();
+        buf.extend_from_slice(dataspace);
 
         // Raw data
         buf.extend_from_slice(&self.data);
 
         debug_assert_eq!(buf.len(), total);
-        buf
+        EncodedAttribute {
+            body: buf,
+            datatype_at,
+            dataspace_at,
+        }
     }
 
     /// Decode an attribute message from a byte buffer.
@@ -321,8 +365,6 @@ impl AttributeHeader {
         // message decoder does not have — an attribute read out of an object
         // header has been resolved before it gets here, one read out of dense
         // storage has not.
-        const ATTR_FLAG_TYPE_SHARED: u8 = 0x01;
-        const ATTR_FLAG_SPACE_SHARED: u8 = 0x02;
         let flags = buf[1];
         if flags & (ATTR_FLAG_TYPE_SHARED | ATTR_FLAG_SPACE_SHARED) != 0 {
             let what = if flags & ATTR_FLAG_TYPE_SHARED != 0 {

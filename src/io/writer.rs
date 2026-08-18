@@ -26,7 +26,9 @@ use crate::format::local_heap::{
     local_heap_header_size, LocalHeapHeader, LocalHeapImage, LOCAL_HEAP_FREE_NULL,
 };
 use crate::format::messages::attr_info::{next_creation_index, AttributeInfoMessage};
-use crate::format::messages::attribute::{AttributeEntry, AttributeMessage};
+use crate::format::messages::attribute::{
+    AttributeEntry, AttributeMessage, ATTR_FLAG_SPACE_SHARED, ATTR_FLAG_TYPE_SHARED,
+};
 use crate::format::messages::data_layout::{
     DataLayoutMessage, EarrayParams, FixedArrayParams, LAYOUT_VERSION_DEFAULT,
 };
@@ -46,9 +48,11 @@ use crate::format::messages::*;
 use crate::format::object_header::{ObjectHeader, ObjectTimes, MAX_MESSAGE_SIZE};
 use crate::format::reference::encode_object_element;
 use crate::format::selection::Selection;
-use crate::format::sohm::{type_flag, SharedMessagePointer, MAX_SOHM_INDEXES, SOHM_HEAP_ID_LEN};
+use crate::format::sohm::{
+    type_flag, SharedMessagePointer, MAX_SOHM_INDEXES, SOHM_HEAP_ID_LEN, SOHM_POINTER_HEAP_ID_AT,
+};
 use crate::format::sohm_write::{
-    build_shared_messages, SharedMessage, SohmIndexContent, SohmIndexSpec,
+    build_shared_messages, NestedShare, SharedMessage, SohmIndexContent, SohmIndexSpec,
 };
 use crate::format::superblock::*;
 use crate::format::{FormatContext, LibverBound, ObjectFormat, UNDEF_ADDR};
@@ -3546,12 +3550,18 @@ impl SohmState {
     }
 }
 
+/// What decides whether two offers are the same shared message: the class,
+/// the bytes, and the messages the bytes will end up pointing at.
+type CollectedKey = (u8, Vec<u8>, Vec<NestedShare>);
+
 /// The shareable message bodies of one collect pass, in first-seen order.
 struct SohmCollector {
     /// Per index, its bodies with the number of headers holding each.
     messages: Vec<Vec<SharedMessage>>,
-    /// Where a body sits: `(index, position in that index's messages)`.
-    seen: HashMap<(u8, Vec<u8>), (usize, usize)>,
+    /// Where a body sits: `(index, position in that index's messages)`, keyed
+    /// by everything that decides what will be stored — the class, the bytes,
+    /// and the messages the bytes will end up pointing at.
+    seen: HashMap<CollectedKey, (usize, usize)>,
 }
 
 impl SohmCollector {
@@ -3562,20 +3572,49 @@ impl SohmCollector {
         }
     }
 
-    /// Count one header message against `index`, adding the body the first
-    /// time it is seen.
-    fn record(&mut self, index: usize, msg_type: u8, body: &[u8]) {
-        match self.seen.get(&(msg_type, body.to_vec())) {
-            Some(&(at, pos)) => self.messages[at][pos].ref_count += 1,
+    /// Count one message against `index`, adding the body the first time it
+    /// is seen, and say whether that body is new.
+    ///
+    /// Two bodies are the same message only if their nesting agrees as well:
+    /// the heap IDs a nesting body will hold are still zero here, so two
+    /// attributes that differ only in their datatype are the same bytes at
+    /// this point and different bytes on disk.
+    fn record(&mut self, index: usize, msg_type: u8, body: &[u8], nested: &[NestedShare]) -> bool {
+        let key = (msg_type, body.to_vec(), nested.to_vec());
+        match self.seen.get(&key) {
+            Some(&(at, pos)) => {
+                self.messages[at][pos].ref_count += 1;
+                false
+            }
             None => {
                 let pos = self.messages[index].len();
                 self.messages[index].push(SharedMessage {
                     msg_type,
                     body: body.to_vec(),
+                    nested: nested.to_vec(),
                     ref_count: 1,
                 });
-                self.seen.insert((msg_type, body.to_vec()), (index, pos));
+                self.seen.insert(key, (index, pos));
+                true
             }
+        }
+    }
+
+    /// Give back the reference [`record`](Self::record) took for a body whose
+    /// container turned out to be a copy of one already here.
+    ///
+    /// A body reached only through a shared container is referenced once per
+    /// container *record*, not once per object that has one: the pointer to
+    /// it lives in the container's heap object, which exists once however
+    /// many headers name it. `H5O__attr_create` reaches the same count from
+    /// the other side, by building each attribute's components shared and
+    /// then calling `H5O__attr_delete` — which decrements exactly the
+    /// datatype and dataspace (H5Oattr.c:568-585) — whenever the attribute it
+    /// built was not the first copy (H5Oattribute.c:331-366).
+    fn release(&mut self, msg_type: u8, body: &[u8]) {
+        if let Some(&(at, pos)) = self.seen.get(&(msg_type, body.to_vec(), Vec::new())) {
+            let count = &mut self.messages[at][pos].ref_count;
+            *count = count.saturating_sub(1);
         }
     }
 }
@@ -8020,8 +8059,7 @@ impl Hdf5Writer {
         // attribute with none belongs to an object that tracks no order, where
         // the field is not encoded at all.
         for attr in attributes {
-            let (flags, body) =
-                self.share_message(MSG_ATTRIBUTE, 0x00, self.encode_attribute(attr));
+            let (flags, body) = self.share_attribute(attr, format);
             header.add_message_indexed(
                 MSG_ATTRIBUTE,
                 flags,
@@ -8036,6 +8074,68 @@ impl Hdf5Writer {
     /// about the object the attribute hangs on).
     fn encode_attribute(&self, attr: &AttributeEntry) -> Vec<u8> {
         attr.encode_for(&self.ctx, self.encoding_libver(), self.message_format())
+    }
+
+    /// What a header stores for one attribute: the message flags and the body,
+    /// with the attribute's own datatype and dataspace shared wherever an
+    /// index covers them.
+    ///
+    /// `H5A__create` offers both to `H5SM_try_share` (H5Aint.c:375-377) before
+    /// `H5O__attr_create` offers the attribute itself (H5Oattribute.c:726), so
+    /// the attribute body that reaches the heap already holds their pointers
+    /// and says which fields they are in its own flags byte
+    /// (`H5O_ATTR_FLAG_TYPE_SHARED` / `H5O_ATTR_FLAG_SPACE_SHARED`,
+    /// H5Oattr.c:358-359). Both offers go through
+    /// [`share_message`](Self::share_message) like any other, so the pass that
+    /// counts references and the pass that substitutes see the same three
+    /// messages.
+    fn share_attribute(&self, attr: &AttributeEntry, format: ObjectFormat) -> (u8, Vec<u8>) {
+        let libver = self.encoding_libver();
+        // Only a readable attribute has pieces to offer: an unreadable one is
+        // the bytes it was read from, put back as they were. Version 1 has no
+        // flags byte to record a shared field in — `H5O__attr_encode` writes a
+        // reserved zero there — so a classic file shares the attribute whole
+        // or not at all.
+        let Some(message) = attr.readable().filter(|_| format.attribute_version() >= 2) else {
+            return self.share_message(
+                MSG_ATTRIBUTE,
+                0x00,
+                attr.encode_for(&self.ctx, libver, format),
+            );
+        };
+
+        let datatype = message.datatype.encode_at(&self.ctx, libver);
+        let dataspace = message.dataspace.encode_for(&self.ctx, format);
+        let (dt_flags, dt_field) = self.share_message(MSG_DATATYPE, 0x00, datatype.clone());
+        let (ds_flags, ds_field) = self.share_message(MSG_DATASPACE, 0x00, dataspace.clone());
+
+        let mut attr_flags = 0u8;
+        if dt_flags & MSG_FLAG_SHARED != 0 {
+            attr_flags |= ATTR_FLAG_TYPE_SHARED;
+        }
+        if ds_flags & MSG_FLAG_SHARED != 0 {
+            attr_flags |= ATTR_FLAG_SPACE_SHARED;
+        }
+        let encoded = message.encode_with_fields(attr_flags, &dt_field, &ds_field);
+
+        // Each shared field's heap ID sits two bytes into the pointer that
+        // replaced it; the body offered below carries whatever
+        // `share_message` just produced, which is a zeroed ID in the pass that
+        // counts and the real one in the pass that substitutes.
+        let mut nested = Vec::new();
+        if attr_flags & ATTR_FLAG_TYPE_SHARED != 0 {
+            nested.push(NestedShare {
+                heap_id_at: encoded.datatype_at + SOHM_POINTER_HEAP_ID_AT,
+                target: (MSG_DATATYPE, datatype),
+            });
+        }
+        if attr_flags & ATTR_FLAG_SPACE_SHARED != 0 {
+            nested.push(NestedShare {
+                heap_id_at: encoded.dataspace_at + SOHM_POINTER_HEAP_ID_AT,
+                target: (MSG_DATASPACE, dataspace),
+            });
+        }
+        self.share_nesting_message(MSG_ATTRIBUTE, 0x00, encoded.body, nested)
     }
 
     /// Whether `attributes` must live in dense storage rather than in the
@@ -8169,6 +8269,23 @@ impl Hdf5Writer {
     /// Outside a finalize, and in any file created without indexes, this is
     /// the identity.
     fn share_message(&self, msg_type: u8, flags: u8, body: Vec<u8>) -> (u8, Vec<u8>) {
+        self.share_nesting_message(msg_type, flags, body, Vec::new())
+    }
+
+    /// [`share_message`](Self::share_message) for a body that itself holds
+    /// shared-message pointers.
+    ///
+    /// `nested` names each heap ID inside `body`, which is zero until the
+    /// table is laid out. Two bodies that differ only in what they point at
+    /// are the same bytes here and different bytes on disk, so the count and
+    /// the substitute are keyed on the pair.
+    fn share_nesting_message(
+        &self,
+        msg_type: u8,
+        flags: u8,
+        body: Vec<u8>,
+        nested: Vec<NestedShare>,
+    ) -> (u8, Vec<u8>) {
         let Some(sohm) = self.sohm.as_deref() else {
             return (flags, body);
         };
@@ -8187,9 +8304,24 @@ impl Hdf5Writer {
                 flags | MSG_FLAG_SHARED,
                 SharedMessagePointer::encode_sohm([0u8; SOHM_HEAP_ID_LEN]),
             ),
+            // The same substitution `Predict` makes, so that what the collect
+            // pass builds around a shared message is the width the resolve
+            // pass will build — which is what lets an attribute body assembled
+            // in this pass be the body assembled in that one, bar the heap IDs
+            // it is here recording a need for.
             SohmPhase::Collect(collector) => {
-                collector.record(index, msg_type, &body);
-                (flags, body)
+                if !collector.record(index, msg_type, &body, &nested) && !nested.is_empty() {
+                    // This body is already here, so the pointers it holds
+                    // already exist in the heap and the offers that built
+                    // this copy of it must not count a second time.
+                    for share in &nested {
+                        collector.release(share.target.0, &share.target.1);
+                    }
+                }
+                (
+                    flags | MSG_FLAG_SHARED,
+                    SharedMessagePointer::encode_sohm([0u8; SOHM_HEAP_ID_LEN]),
+                )
             }
             SohmPhase::Resolve(ids) => {
                 let key = (msg_type, body);

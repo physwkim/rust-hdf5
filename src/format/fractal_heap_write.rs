@@ -114,6 +114,12 @@ impl PlannedHeap {
         &self.ids
     }
 
+    /// Address of the heap header — what an `Attribute Info` message or a
+    /// shared-message index header names.
+    pub fn header_addr(&self) -> u64 {
+        self.header_addr
+    }
+
     /// Write the objects into the layout this planned.
     ///
     /// Every object must still be the length it was planned at — the heap IDs

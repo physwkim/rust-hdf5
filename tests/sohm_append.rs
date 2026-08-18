@@ -314,7 +314,7 @@ fn every_header(bytes: &[u8], ctx: &FormatContext) -> Vec<(String, Vec<ObjectHea
 /// attribute body, where the attribute's own flags byte says which is shared
 /// (`H5O_ATTR_FLAG_TYPE_SHARED` / `H5O_ATTR_FLAG_SPACE_SHARED`).
 fn attribute_shared_fields(body: &[u8]) -> Vec<&[u8]> {
-    if body.len() < 8 || body[0] < 2 || body[1] & 0x03 == 0 {
+    if body.len() < 9 || !(2..=3).contains(&body[0]) || body[1] & 0x03 == 0 {
         return Vec::new();
     }
     let flags = body[1];
@@ -324,6 +324,12 @@ fn attribute_shared_fields(body: &[u8]) -> Vec<&[u8]> {
     let name_end = if body[0] >= 3 { 9 } else { 8 } + name_size;
     let dt_end = name_end + dt_size;
     let ds_end = dt_end + ds_size;
+    // Heap bodies arrive here untyped — a record carries no message class —
+    // so a body whose fields do not add up is some other message, not an
+    // attribute with a short tail.
+    if ds_end > body.len() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     if flags & 0x01 != 0 {
         out.push(&body[name_end..dt_end]);
@@ -334,10 +340,36 @@ fn attribute_shared_fields(body: &[u8]) -> Vec<&[u8]> {
     out
 }
 
+/// The body of every record of one index, by heap ID: what the index's own
+/// fractal heap stores for it.
+fn heap_bodies(
+    bytes: &[u8],
+    ctx: &FormatContext,
+    header: &SohmIndexHeader,
+) -> std::collections::HashMap<[u8; SOHM_HEAP_ID_LEN], Vec<u8>> {
+    use rust_hdf5::format::fractal_heap::{
+        collect_managed_blocks, read_heap_object, FractalHeapHeader, HeapId,
+    };
+
+    let mut reader = Bytes(bytes);
+    let raw = reader.read_block(header.heap_addr, 512).unwrap();
+    let heap = FractalHeapHeader::decode(&raw, ctx).unwrap();
+    let blocks = collect_managed_blocks(&heap, ctx, &mut reader).unwrap();
+    index_records(bytes, ctx, header)
+        .into_iter()
+        .map(|(id, _)| {
+            let parsed = HeapId::parse(&id, &heap, ctx).unwrap();
+            let body = read_heap_object(&parsed, &heap, ctx, &blocks, &mut reader).unwrap();
+            (id, body)
+        })
+        .collect()
+}
+
 /// The invariant on `SohmState`, checked against the file the append wrote:
-/// a record's reference count is the number of object header pointers that
-/// name its heap object, counting both the whole-message form and the
-/// datatype/dataspace an attribute body carries.
+/// a record's reference count is the number of pointers that name its heap
+/// object, counting the whole-message form in an object header, the
+/// datatype/dataspace an attribute body carries there, and the same two
+/// carried by an attribute body that is itself in the heap.
 fn reference_counts_match_the_pointers(path: &PathBuf) -> Vec<u32> {
     let bytes = std::fs::read(path).unwrap();
     let ctx = FormatContext::default_v3();
@@ -363,6 +395,24 @@ fn reference_counts_match_the_pointers(path: &PathBuf) -> Vec<u32> {
     }
 
     let table = master_table(path);
+    // A shared attribute holds its shared datatype and dataspace the same way
+    // a header-resident one does, so its heap body is a reference site too.
+    let bodies: Vec<_> = table
+        .indexes
+        .iter()
+        .map(|h| heap_bodies(&bytes, &ctx, h))
+        .collect();
+    for (header, index) in table.indexes.iter().zip(&bodies) {
+        if type_flag(MSG_ATTRIBUTE).is_none_or(|f| header.mesg_types & f == 0) {
+            continue;
+        }
+        for body in index.values() {
+            for raw in attribute_shared_fields(body) {
+                count(raw);
+            }
+        }
+    }
+
     let mut counts = Vec::new();
     for header in &table.indexes {
         for (heap_id, ref_count) in index_records(&bytes, &ctx, header) {

@@ -22,6 +22,7 @@ use crate::format::bytes::read_le_uint as read_uint;
 use crate::format::fractal_heap::{
     collect_managed_blocks, read_heap_object, FractalHeapHeader, HeapId,
 };
+use crate::format::messages::attribute::{ATTR_FLAG_SPACE_SHARED, ATTR_FLAG_TYPE_SHARED};
 use crate::format::messages::datatype::DatatypeMessage;
 use crate::format::messages::shared::MSG_FLAG_SHARED;
 use crate::format::messages::{
@@ -306,11 +307,6 @@ pub(crate) fn committed_datatype_address(
 /// and length checks are the ones [`resolve_shared_attribute_fields`] makes
 /// before it splices.
 fn shared_attribute_fields(body: &[u8]) -> [Option<&[u8]>; 2] {
-    /// `H5O_ATTR_FLAG_TYPE_SHARED`.
-    const ATTR_FLAG_TYPE_SHARED: u8 = 0x01;
-    /// `H5O_ATTR_FLAG_SPACE_SHARED`.
-    const ATTR_FLAG_SPACE_SHARED: u8 = 0x02;
-
     let fields = || {
         if body.len() < 8 || body[0] < 2 {
             return None;
@@ -495,11 +491,6 @@ fn resolve_shared_attribute_fields(
     self_addr: u64,
     depth: usize,
 ) -> IoResult<Option<Vec<u8>>> {
-    /// `H5O_ATTR_FLAG_TYPE_SHARED`.
-    const ATTR_FLAG_TYPE_SHARED: u8 = 0x01;
-    /// `H5O_ATTR_FLAG_SPACE_SHARED`.
-    const ATTR_FLAG_SPACE_SHARED: u8 = 0x02;
-
     if body.len() < 8 || body[0] < 2 {
         return Ok(None);
     }

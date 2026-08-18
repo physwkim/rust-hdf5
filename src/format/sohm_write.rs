@@ -28,7 +28,7 @@ use std::collections::HashMap;
 
 use crate::format::chunk_index::btree_v2::build_index;
 use crate::format::fractal_heap::HeapParams;
-use crate::format::fractal_heap_write::{build_heap, HeapBlock};
+use crate::format::fractal_heap_write::{plan_heap, HeapBlock};
 use crate::format::sohm::{
     encode_list, list_size, message_hash, record_size, SohmIndexHeader, SohmMasterTable,
     SohmRecord, BT2_TYPE_SOHM_INDEX, SOHM_B2_NODE_SIZE, SOHM_HEAP_ID_LEN, SOHM_INDEX_BTREE,
@@ -52,14 +52,45 @@ pub struct SohmIndexSpec {
     pub btree_min: u16,
 }
 
+/// A message body as an index identifies it: the type it belongs to and the
+/// bytes, which together seed the record's hash.
+pub type SharedKey = (u8, Vec<u8>);
+
+/// One place a message body holds another shared message's heap ID.
+///
+/// The attribute message is the one class that does this: `H5A__create`
+/// shares the attribute's datatype and dataspace before `H5O__attr_create`
+/// shares the attribute (H5Aint.c:375-377), so the body that reaches the heap
+/// carries their heap IDs and says so in its own flags byte. Those IDs are
+/// zero in [`SharedMessage::body`] — the heap has not been laid out when the
+/// body is offered — and [`build_shared_messages`] fills them in.
+///
+/// The target is named by its own key rather than by position: an index picks
+/// messages by class, so an attribute's datatype can belong to a different
+/// index than the attribute, and a reader resolves the pointer through the
+/// master table by class as well (`H5SM_get_fheap_addr`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NestedShare {
+    /// Offset in the body of the eight-byte heap ID, i.e. two bytes past the
+    /// start of the `H5O_shared_t` that holds it.
+    pub heap_id_at: usize,
+    /// The message this pointer names. It holds no nesting of its own —
+    /// datatype and dataspace messages have nothing to nest.
+    pub target: SharedKey,
+}
+
 /// One message body an index holds, and how many object header messages were
 /// replaced by a pointer to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedMessage {
     /// The message type the body belongs to; it seeds the record's hash.
     pub msg_type: u8,
-    /// The encoded message body, exactly as an unshared header would hold it.
+    /// The encoded message body, exactly as an unshared header would hold it,
+    /// except that any heap ID [`nested`](Self::nested) names is still zero.
     pub body: Vec<u8>,
+    /// Where this body points at other shared messages; empty for every class
+    /// but the attribute.
+    pub nested: Vec<NestedShare>,
     /// References to this body (`H5SM_sohm_t::ref_count`).
     pub ref_count: u32,
 }
@@ -98,10 +129,43 @@ pub fn build_shared_messages(
     alloc: &mut dyn FnMut(u64) -> u64,
 ) -> FormatResult<BuiltSharedMessages> {
     let mut blocks = Vec::new();
-    let mut heap_ids = HashMap::new();
+    let mut heap_ids: HashMap<SharedKey, [u8; SOHM_HEAP_ID_LEN]> = HashMap::new();
     let mut headers = Vec::with_capacity(indexes.len());
 
+    // Every heap is placed before any of them is written: an attribute body in
+    // one index names its datatype and dataspace by heap ID, and an index
+    // takes messages by class, so the two may belong to a different index than
+    // the attribute. Only once every index is placed is every heap ID a body
+    // could name known.
+    let mut plans = Vec::with_capacity(indexes.len());
     for index in indexes {
+        let lengths: Vec<usize> = index.messages.iter().map(|m| m.body.len()).collect();
+        plans.push(plan_heap(
+            &HeapParams::object_header(),
+            ctx,
+            &lengths,
+            alloc,
+        )?);
+    }
+
+    // What a nested pointer may name, keyed the way the message was collected.
+    // A body that is itself pointed at nests nothing — datatype and dataspace
+    // messages have nothing to nest — so for those two keys the collected body
+    // and the stored one are the same bytes.
+    let mut collected: HashMap<SharedKey, [u8; SOHM_HEAP_ID_LEN]> = HashMap::new();
+    for (index, plan) in indexes.iter().zip(&plans) {
+        for (message, id) in index.messages.iter().zip(plan.ids()) {
+            let heap_id: [u8; SOHM_HEAP_ID_LEN] = id.as_slice().try_into().map_err(|_| {
+                FormatError::InvalidData(format!(
+                    "shared-message heap returned a {}-byte id, expected {SOHM_HEAP_ID_LEN}",
+                    id.len()
+                ))
+            })?;
+            collected.insert((message.msg_type, message.body.clone()), heap_id);
+        }
+    }
+
+    for (index, plan) in indexes.iter().zip(plans) {
         let num_messages = u16::try_from(index.messages.len()).map_err(|_| {
             FormatError::InvalidData(format!(
                 "shared-message index holds {} messages, more than the count field takes",
@@ -109,28 +173,30 @@ pub fn build_shared_messages(
             ))
         })?;
 
-        // The heap comes first: a record names a heap ID, so nothing can be
-        // recorded before the bodies have one.
-        let objects: Vec<Vec<u8>> = index.messages.iter().map(|m| m.body.clone()).collect();
-        let heap = build_heap(&HeapParams::object_header(), ctx, &objects, alloc)?;
-        blocks.extend(heap.blocks);
+        let mut bodies = Vec::with_capacity(index.messages.len());
+        for message in &index.messages {
+            bodies.push(resolve_nested(message, &collected)?);
+        }
+        let heap_addr = plan.header_addr();
+        let ids = plan.ids().to_vec();
+        blocks.extend(plan.finish(&bodies)?.blocks);
 
         let mut records = Vec::with_capacity(index.messages.len());
-        for (message, id) in index.messages.iter().zip(&heap.ids) {
-            let heap_id: [u8; SOHM_HEAP_ID_LEN] = id.as_slice().try_into().map_err(|_| {
-                FormatError::InvalidData(format!(
-                    "shared-message heap returned a {}-byte id, expected {SOHM_HEAP_ID_LEN}",
-                    id.len()
-                ))
-            })?;
-            heap_ids.insert((message.msg_type, message.body.clone()), heap_id);
+        for ((message, body), id) in index.messages.iter().zip(bodies).zip(ids) {
+            let heap_id: [u8; SOHM_HEAP_ID_LEN] = id
+                .as_slice()
+                .try_into()
+                .expect("the plan's ids were checked above");
+            // Keyed by what a header will hold: for a nesting body that is
+            // this resolved one, not the one the collect pass offered.
+            heap_ids.insert((message.msg_type, body.clone()), heap_id);
             records.push((
-                message,
                 SohmRecord {
-                    hash: message_hash(&message.body, message.msg_type),
+                    hash: message_hash(&body, message.msg_type),
                     ref_count: message.ref_count,
                     heap_id,
                 },
+                body,
             ));
         }
 
@@ -154,7 +220,7 @@ pub fn build_shared_messages(
             btree_min: index.spec.btree_min,
             num_messages,
             index_addr,
-            heap_addr: heap.header_addr,
+            heap_addr,
         });
     }
 
@@ -188,9 +254,39 @@ fn is_btree(spec: &SohmIndexSpec, num_messages: u16) -> bool {
     spec.list_max == 0 || num_messages > spec.list_max
 }
 
+/// The body a header holds for `message`: its collected bytes with every heap
+/// ID it nests filled in from `placed`.
+///
+/// A body that nests nothing is returned unchanged, which is every class but
+/// the attribute.
+fn resolve_nested(
+    message: &SharedMessage,
+    placed: &HashMap<SharedKey, [u8; SOHM_HEAP_ID_LEN]>,
+) -> FormatResult<Vec<u8>> {
+    if message.nested.is_empty() {
+        return Ok(message.body.clone());
+    }
+    let mut body = message.body.clone();
+    for nested in &message.nested {
+        let Some(heap_id) = placed.get(&nested.target) else {
+            return Err(FormatError::InvalidData(
+                "a shared message points at a body no index holds".into(),
+            ));
+        };
+        let at = nested.heap_id_at;
+        if body.len() < at + SOHM_HEAP_ID_LEN {
+            return Err(FormatError::InvalidData(
+                "a shared message's nested pointer runs past the body holding it".into(),
+            ));
+        }
+        body[at..at + SOHM_HEAP_ID_LEN].copy_from_slice(heap_id);
+    }
+    Ok(body)
+}
+
 /// Lay out a list index and return its address.
 fn build_list(
-    records: &[(&SharedMessage, SohmRecord)],
+    records: &[(SohmRecord, Vec<u8>)],
     spec: &SohmIndexSpec,
     ctx: &FormatContext,
     alloc: &mut dyn FnMut(u64) -> u64,
@@ -200,7 +296,7 @@ fn build_list(
     // image covers only the ones written, and the rest stays as allocated.
     let len = list_size(ctx, spec.list_max) as u64;
     let addr = alloc(len);
-    let entries: Vec<SohmRecord> = records.iter().map(|(_, r)| *r).collect();
+    let entries: Vec<SohmRecord> = records.iter().map(|(r, _)| *r).collect();
     blocks.push(HeapBlock {
         addr,
         len,
@@ -211,7 +307,7 @@ fn build_list(
 
 /// Bulk-load a B-tree index and return its header address.
 fn build_btree(
-    records: &mut [(&SharedMessage, SohmRecord)],
+    records: &mut [(SohmRecord, Vec<u8>)],
     ctx: &FormatContext,
     alloc: &mut dyn FnMut(u64) -> u64,
     blocks: &mut Vec<HeapBlock>,
@@ -219,13 +315,9 @@ fn build_btree(
     // `H5SM__message_compare` orders on the hash and breaks ties on the
     // message body itself, so a bulk load has to sort the same way or a
     // lookup walking the tree misses records.
-    records.sort_by(|a, b| {
-        a.1.hash
-            .cmp(&b.1.hash)
-            .then_with(|| a.0.body.cmp(&b.0.body))
-    });
+    records.sort_by(|a, b| a.0.hash.cmp(&b.0.hash).then_with(|| a.1.cmp(&b.1)));
     let mut image = Vec::with_capacity(records.len() * record_size(ctx));
-    for (_, record) in records.iter() {
+    for (record, _) in records.iter() {
         image.extend_from_slice(&record.encode(ctx));
     }
     let (addr, nodes) = build_index(
@@ -306,6 +398,7 @@ mod tests {
         SharedMessage {
             msg_type,
             body: (0..len).map(|i| seed.wrapping_add(i as u8)).collect(),
+            nested: Vec::new(),
             ref_count,
         }
     }
@@ -464,6 +557,7 @@ mod tests {
             .map(|i| SharedMessage {
                 msg_type: MSG_DATASPACE,
                 body: i.to_le_bytes().repeat(6),
+                nested: Vec::new(),
                 ref_count: i + 1,
             })
             .collect();
