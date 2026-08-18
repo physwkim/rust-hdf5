@@ -1367,6 +1367,13 @@ FIXTURE_CASES = [
         "root group whose object header spills into two continuation chunks",
         rust="ochk_root",
     ),
+    _fixture_case(
+        "vds_late_layout", "vds_late_layout.h5", "gen_vds_late_layout.sh",
+        "layout",
+        "virtual datasets built by H5Pset_virtual with and without a prior "
+        "H5Pset_layout — the pairs differ only in allocation time "
+        "(H5Pdcpl.c:2146 pokes the layout past H5P__set_layout's default)",
+    ),
 ]
 
 
