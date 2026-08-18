@@ -3257,6 +3257,21 @@ impl Hdf5Reader {
         crate::io::object_header_io::read_header_message_flags(&mut self.handle, &self.meta, addr)
     }
 
+    /// The class and version of every datatype message the object at `path`
+    /// carries, outermost first; see
+    /// [`DatatypeMessage::decode_versions`](crate::format::messages::datatype::DatatypeMessage::decode_versions).
+    pub fn object_datatype_versions(
+        &mut self,
+        path: &str,
+    ) -> IoResult<Vec<crate::format::messages::datatype::DatatypeNodeVersion>> {
+        let addr = self.object_header_address(path)?;
+        crate::io::object_header_io::read_header_datatype_versions(
+            &mut self.handle,
+            &self.meta,
+            addr,
+        )
+    }
+
     /// Whether the object at `path` records its times —
     /// `H5Pget_obj_track_times` on the property list it was created with, read
     /// back from the header that answers it; see

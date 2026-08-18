@@ -163,6 +163,38 @@ const CLASS_ENUM: u8 = 8;
 const CLASS_VLEN: u8 = 9;
 const CLASS_ARRAY: u8 = 10;
 
+/// The name `H5O__dtype_debug` prints for a class (H5Odtype.c:1959-2010),
+/// spelled the way this crate's canon field spells it: one word, so the class
+/// and its version fit a `class:version` pair.
+fn class_name(class: u8) -> &'static str {
+    match class {
+        CLASS_FIXED_POINT => "integer",
+        CLASS_FLOATING_POINT => "float",
+        2 => "time",
+        CLASS_STRING => "string",
+        CLASS_BITFIELD => "bitfield",
+        CLASS_OPAQUE => "opaque",
+        CLASS_COMPOUND => "compound",
+        CLASS_REFERENCE => "reference",
+        CLASS_ENUM => "enum",
+        CLASS_VLEN => "vlen",
+        CLASS_ARRAY => "array",
+        _ => "unknown",
+    }
+}
+
+/// One datatype message in an encoded tree: how deep it sits under the
+/// outermost message, its class and the version its own header byte claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatatypeNodeVersion {
+    /// 0 for the outermost message, one more for each nesting level.
+    pub depth: usize,
+    /// The class name [`class_name`] gives, e.g. `compound`.
+    pub class: &'static str,
+    /// The version nibble of the message's first byte.
+    pub version: u8,
+}
+
 /// libhdf5 `H5R_ENCODE_VERSION` (`H5Rprivate.h`): the only encoding version
 /// the 1.12 reference kinds accept, stored in the bit field's second nibble.
 const REFERENCE_ENCODE_VERSION: u8 = 1;
@@ -1313,14 +1345,31 @@ impl DatatypeMessage {
     /// types' `decode`, several of which do need it; a datatype message is
     /// fully self-describing on disk, so decoding never reads it.
     pub fn decode(buf: &[u8], _ctx: &FormatContext) -> FormatResult<(Self, usize)> {
-        Self::decode_inner(buf, 0)
+        Self::decode_inner(buf, 0, &mut Vec::new())
+    }
+
+    /// The class and version of every datatype message in the tree at `buf`,
+    /// outermost first and then depth-first in encode order — the same walk
+    /// `H5O__dtype_debug` prints (H5Odtype.c:1984-2027).
+    ///
+    /// The version is the one thing a decode drops: [`Self::decode`] returns
+    /// the type, not the encoding it arrived in, so this is what answers
+    /// "which version does the message in this file claim".
+    pub fn decode_versions(buf: &[u8]) -> FormatResult<Vec<DatatypeNodeVersion>> {
+        let mut versions = Vec::new();
+        Self::decode_inner(buf, 0, &mut versions)?;
+        Ok(versions)
     }
 
     /// Recursive worker for [`decode`]. `depth` bounds datatype nesting:
     /// compound/enum/vlen/array types embed a base datatype recursively, and
     /// a crafted message can nest these deeply enough to exhaust the stack.
     /// libhdf5-written types nest only a handful of levels.
-    fn decode_inner(buf: &[u8], depth: usize) -> FormatResult<(Self, usize)> {
+    fn decode_inner(
+        buf: &[u8],
+        depth: usize,
+        versions: &mut Vec<DatatypeNodeVersion>,
+    ) -> FormatResult<(Self, usize)> {
         const MAX_DATATYPE_DEPTH: usize = 256;
         if depth > MAX_DATATYPE_DEPTH {
             return Err(FormatError::InvalidData(
@@ -1354,6 +1403,12 @@ impl DatatypeMessage {
         if !(1..=DT_VERSION_LATEST).contains(&version) {
             return Err(FormatError::InvalidVersion(version));
         }
+
+        versions.push(DatatypeNodeVersion {
+            depth,
+            class: class_name(class),
+            version,
+        });
 
         match class {
             CLASS_FIXED_POINT => {
@@ -1511,7 +1566,8 @@ impl DatatypeMessage {
                     }
 
                     // Member datatype (recursive)
-                    let (member_dt, dt_consumed) = Self::decode_inner(&buf[pos..], depth + 1)?;
+                    let (member_dt, dt_consumed) =
+                        Self::decode_inner(&buf[pos..], depth + 1, versions)?;
                     pos += dt_consumed;
 
                     members.push(CompoundMember {
@@ -1530,7 +1586,8 @@ impl DatatypeMessage {
                 let mut pos = 8;
 
                 // Base datatype
-                let (base_dt, base_consumed) = Self::decode_inner(&buf[pos..], depth + 1)?;
+                let (base_dt, base_consumed) =
+                    Self::decode_inner(&buf[pos..], depth + 1, versions)?;
                 pos += base_consumed;
 
                 // Member names (null-terminated, padded to 8-byte boundary for v1)
@@ -1577,7 +1634,8 @@ impl DatatypeMessage {
                 let mut pos = 8;
 
                 // Properties: base (parent) datatype
-                let (base_dt, base_consumed) = Self::decode_inner(&buf[pos..], depth + 1)?;
+                let (base_dt, base_consumed) =
+                    Self::decode_inner(&buf[pos..], depth + 1, versions)?;
                 pos += base_consumed;
 
                 if vlen_type == 1 {
@@ -1638,7 +1696,8 @@ impl DatatypeMessage {
                 }
 
                 // Base datatype
-                let (base_dt, base_consumed) = Self::decode_inner(&buf[pos..], depth + 1)?;
+                let (base_dt, base_consumed) =
+                    Self::decode_inner(&buf[pos..], depth + 1, versions)?;
                 pos += base_consumed;
 
                 Ok((

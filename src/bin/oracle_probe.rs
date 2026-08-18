@@ -48,7 +48,7 @@ use rust_hdf5::{
 };
 use rust_hdf5::{FileSpaceInfoMessage, FileSpaceStrategy};
 
-const CANON_VERSION: &str = "9";
+const CANON_VERSION: &str = "10";
 const RAW_LIMIT: usize = 1024;
 const MAX_DEPTH: usize = 32;
 
@@ -870,6 +870,33 @@ fn message_flags_name(flags: u8) -> String {
     }
 }
 
+/// The twin of `canon.py`'s `dtypever_str`: the version each datatype message
+/// body in the object header at `path` claims, as `class:version` in the order
+/// `H5O__dtype_debug` prints them (H5Odtype.c:1984-2027) — outermost first,
+/// then depth-first through compound members, an enum's base and an array's
+/// base.
+///
+/// A vlen's base type is left out because that walk does not descend into it:
+/// the array and enum branches call `H5O__dtype_debug` on their parent type
+/// (H5Odtype.c:2029, :2244) and the vlen branch does not. Its own version is
+/// its base's anyway (`H5T__upgrade_version_cb`, H5T.c:6522-6524).
+fn dtypever_str(file: &H5File, path: &str) -> std::result::Result<String, String> {
+    let nodes = file.object_datatype_versions(path).map_err(oneline)?;
+    let mut parts = Vec::new();
+    let mut under_vlen: Option<usize> = None;
+    for node in nodes {
+        match under_vlen {
+            Some(depth) if node.depth > depth => continue,
+            _ => under_vlen = None,
+        }
+        parts.push(format!("{}:{}", node.class, node.version));
+        if node.class == "vlen" {
+            under_vlen = Some(node.depth);
+        }
+    }
+    Ok(format!("[{}]", parts.join(",")))
+}
+
 /// The twin of `canon.py`'s `hdrtimes_str`: whether the object header at
 /// `path` records the times it can hold.
 fn hdrtimes_str(file: &H5File, path: &str) -> std::result::Result<String, String> {
@@ -1157,6 +1184,7 @@ fn dump_dataset(d: &mut Dump, file: &H5File, path: &str, ds: &H5Dataset) {
     let is_null = guarded(|| ds.is_null()).unwrap_or(false);
 
     d.field(path, "strpad", || strpad_field(dtype.as_ref()));
+    d.field(path, "dtypever", || dtypever_str(file, path));
 
     // H5Dataset::shape() returns Vec<usize>, so a scalar dataspace and a NULL
     // dataspace are both the empty vector and cannot be told apart.
@@ -1402,6 +1430,7 @@ fn dump_named_datatype(d: &mut Dump, file: &H5File, path: &str, t: &H5NamedDatat
         None => Err("H5NamedDatatype::datatype() failed or is unavailable".into()),
     });
     d.field(path, "strpad", || strpad_field(dtype.as_ref()));
+    d.field(path, "dtypever", || dtypever_str(file, path));
     d.field(path, "msgflags", || msgflags_str(file, path));
     d.field(path, "hdrtimes", || hdrtimes_str(file, path));
 
