@@ -162,10 +162,12 @@ impl FileAllocator {
             .map(|(i, _)| i)?;
         let block = list[pos];
         let addr = self.align_up(block.addr);
-        // `size` rounded up, except where that would run past the block: one
-        // with fewer than `alignment` bytes to spare is taken whole rather
-        // than over-drawn.
-        let used = self.align_up(size).min(block.addr + block.len - addr);
+        // Exactly `size`: what a caller is handed is what it will hand back,
+        // so a block released later returns every byte drawn here. Rounding
+        // the draw up to the alignment instead left the difference inside a
+        // live block — bytes no structure holds and no free-space manager
+        // records, which is what `h5stat -S` counts as unaccounted space.
+        let used = size;
         let head = FreeBlock {
             addr: block.addr,
             len: addr - block.addr,
@@ -176,8 +178,11 @@ impl FileAllocator {
             len: block.addr + block.len - addr - used,
             class: block.class,
         };
-        // Both remainders stay free: the head is what alignment cost, and
-        // dropping it would leave bytes no free-space manager records.
+        // Both remainders stay free: the head is what alignment cost and the
+        // tail is what the request did not use. A remainder too short to
+        // start an aligned allocation is kept anyway — `usable` will pass it
+        // over, but it stays recorded, and it merges the moment a neighbour
+        // is released.
         list.remove(pos);
         for b in [tail, head] {
             if b.len > 0 {
@@ -196,10 +201,9 @@ impl FileAllocator {
     /// block ends at the end of the file, so the end-of-file pointer moves
     /// (published by compare-and-swap, so a concurrent `allocate` cannot be
     /// handed the same region); or a released block starts exactly at
-    /// `addr + len` and is large enough, so the front of it is consumed
-    /// (`extra` rounded up to the alignment, which leaves the remainder at
-    /// whatever alignment the block had — an extension is contiguous by
-    /// definition, so there is no address to choose here).
+    /// `addr + len` and is large enough, so the front of it is consumed —
+    /// exactly `extra` bytes of it, an extension being contiguous by
+    /// definition, so there is no address to choose here.
     pub fn try_extend(&self, addr: u64, len: u64, extra: u64) -> bool {
         if extra == 0 {
             return true;
@@ -222,7 +226,8 @@ impl FileAllocator {
             return false;
         }
         let mut list = self.free_list.lock().unwrap();
-        let used = self.align_up(extra);
+        // Exactly `extra`, for the reason `take_free` draws exactly `size`.
+        let used = extra;
         let Some(pos) = list.iter().position(|b| b.addr == end && b.len >= used) else {
             return false;
         };
@@ -499,18 +504,24 @@ mod tests {
         assert!(free_blocks(&alloc).is_empty());
     }
 
+    /// A partial reuse hands out exactly the bytes asked for, so the remainder
+    /// starts wherever that ends — aligned or not. Rounding the draw up would
+    /// bury the difference inside a live allocation, where no free-space
+    /// manager can record it.
     #[test]
-    fn reusing_part_of_a_block_leaves_an_aligned_remainder() {
+    fn reusing_part_of_a_block_leaves_exactly_the_undrawn_remainder() {
         let alloc = FileAllocator::new(0);
         let a = alloc.allocate(64);
         alloc.allocate(8);
         let eof_before = alloc.eof();
 
         alloc.free(a, 64, META);
-        // 10 bytes round up to 16, so 48 bytes remain at a + 16.
         assert_eq!(alloc.allocate(10), a);
-        assert_eq!(free_blocks(&alloc), vec![(a + 16, 48)]);
+        assert_eq!(free_blocks(&alloc), vec![(a + 10, 54)]);
+        // The next draw still starts aligned; the six bytes that costs stay on
+        // the list instead of disappearing into the allocation before them.
         assert_eq!(alloc.allocate(48), a + 16);
+        assert_eq!(free_blocks(&alloc), vec![(a + 10, 6)]);
         assert_eq!(alloc.eof(), eof_before);
     }
 
@@ -652,15 +663,15 @@ mod tests {
         assert_eq!(free_blocks(&alloc), vec![(2038, 2), (2056, 82)]);
     }
 
-    /// A block with fewer than one alignment unit to spare is taken whole
-    /// rather than over-drawn past its end.
+    /// A draw that takes a block's usable part to its end leaves only the head
+    /// alignment cost, and nothing past the block: the draw is `size`, never
+    /// `size` rounded up.
     #[test]
-    fn a_block_with_no_room_to_round_up_is_taken_whole() {
+    fn a_block_whose_usable_part_exactly_fits_leaves_only_the_head() {
         let alloc = FileAllocator::new(4096);
         alloc.reset_free_list(&[block(2038, 12)]);
 
-        // 10 rounds up to 16, which the block cannot give: it holds 10 usable
-        // bytes from 2040, so those 10 are the allocation and the block goes.
+        // Ten usable bytes from 2040, and ten are asked for.
         assert_eq!(alloc.allocate(10), 2040);
         assert_eq!(free_blocks(&alloc), vec![(2038, 2)]);
     }

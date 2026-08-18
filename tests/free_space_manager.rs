@@ -198,6 +198,38 @@ fn a_crate_append_spends_and_rewrites_the_persisted_managers() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Every byte an append touches lands in something the file names or in a
+/// section a manager records. `h5stat -S`'s "Unaccounted space" is libhdf5's
+/// own count of the bytes in neither, and an append must leave it where
+/// libhdf5 left it, at zero.
+///
+/// Two things put bytes outside the account before this. Rewriting an object
+/// header freed its first chunk only, so the continuation chunk of a
+/// multi-chunk header — the file libhdf5 writes here has one, in its
+/// superblock extension — stayed allocated with nothing pointing at it. And
+/// reusing part of a free block rounded the draw up to the allocator's
+/// alignment, burying the difference inside the allocation, where no manager
+/// can name it.
+#[test]
+fn an_append_leaves_no_byte_outside_the_account() {
+    let Some(py) = python() else { return };
+    let path = tmp("accounted");
+    write_persisting_file(py, &path);
+    assert_eq!(h5stat_space(py, &path).unaccounted, 0);
+
+    crate_appends(&path, "added");
+    let once = h5stat_space(py, &path);
+    assert_eq!(once.unaccounted, 0, "{once:?}");
+
+    // Again, so the second append reads back the managers the first wrote.
+    crate_appends(&path, "again");
+    let twice = h5stat_space(py, &path);
+    assert_eq!(twice.unaccounted, 0, "{twice:?}");
+
+    h5clear_accepts(py, &path);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// The second append reads managers this crate wrote rather than libhdf5's,
 /// which is the only way to reach the encoding the write side produces. The
 /// file stays one libhdf5 accepts and h5py can still add to.
