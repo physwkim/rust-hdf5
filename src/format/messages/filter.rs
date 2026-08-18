@@ -667,6 +667,78 @@ pub fn reverse_filters(pipeline: &FilterPipeline, data: &[u8]) -> FormatResult<V
     reverse_filters_masked(pipeline, data, 0)
 }
 
+/// Reverse the filter pipeline straight into `out`, returning the length of
+/// the image it produced.
+///
+/// A chunk's decoded image is frequently one contiguous stretch of the read's
+/// output — for a whole chunk of a full read it always is — and then the image
+/// *is* those output bytes: the last reverse stage writes them where they
+/// belong and no staging buffer is allocated, filled and copied out. Stages
+/// before the last still materialize their own buffer; only the last one has a
+/// destination the caller can name.
+///
+/// The returned length is the whole image the pipeline produced, which may
+/// exceed `out.len()` — the surplus is discarded, exactly as a caller copying
+/// `out.len()` bytes out of a materialized image discards it. A length below
+/// `out.len()` means the stored chunk decoded short of its image; `out` past
+/// that length is then left **unspecified**, because the inflate writes its
+/// output in blocks and the last one can run past the byte the stream ends on.
+/// A caller whose destination may outlast the image owns every byte of it,
+/// not just the tail past the image.
+pub fn reverse_filters_masked_into(
+    pipeline: &FilterPipeline,
+    data: &[u8],
+    filter_mask: u32,
+    out: &mut [u8],
+) -> FormatResult<usize> {
+    let masked = |i: usize| i < 32 && filter_mask & (1u32 << i) != 0;
+    // The last stage to run is the lowest-numbered filter still in play; it is
+    // the one whose output is the image, so it is the one that writes to `out`.
+    let Some(last) = (0..pipeline.filters.len()).find(|i| !masked(*i)) else {
+        // Every filter masked off (or an empty pipeline): the stored bytes are
+        // already the chunk's image.
+        return Ok(copy_image_into(data, out));
+    };
+    let mut buf: Option<Vec<u8>> = None;
+    for (i, filter) in pipeline.filters.iter().enumerate().rev() {
+        if masked(i) || i == last {
+            continue;
+        }
+        buf = Some(apply_single_filter(
+            filter,
+            buf.as_deref().unwrap_or(data),
+            false,
+        )?);
+    }
+    reverse_single_filter_into(&pipeline.filters[last], buf.as_deref().unwrap_or(data), out)
+}
+
+/// Copy an already-decoded image into a caller's destination, returning the
+/// image's own length so a short image is visible to the caller as one.
+fn copy_image_into(image: &[u8], out: &mut [u8]) -> usize {
+    let n = image.len().min(out.len());
+    out[..n].copy_from_slice(&image[..n]);
+    image.len()
+}
+
+/// Reverse one filter into `out`, returning the length of the image it
+/// produced (which may exceed `out.len()`; see
+/// [`reverse_filters_masked_into`]).
+///
+/// Only the inflate has a decoder that can be pointed at a caller's buffer;
+/// every other filter builds its image and copies it, which is what the caller
+/// would have done with it anyway.
+fn reverse_single_filter_into(filter: &Filter, data: &[u8], out: &mut [u8]) -> FormatResult<usize> {
+    #[cfg(feature = "deflate")]
+    if filter.id == FILTER_DEFLATE {
+        return inflate_zlib_into(data, out);
+    }
+    Ok(copy_image_into(
+        &apply_single_filter(filter, data, false)?,
+        out,
+    ))
+}
+
 /// Apply the shuffle filter (byte transposition).
 ///
 /// For elements of size `bytesoftype`, the shuffle gathers all first bytes,
@@ -766,6 +838,64 @@ fn inflate_zlib(data: &[u8], expected: Option<usize>) -> FormatResult<Vec<u8>> {
     }
     out.truncate(inflate.total_out() as usize);
     Ok(out)
+}
+
+/// Bytes of scratch the overflow drain works through when a stream turns out
+/// to be longer than the destination the caller named. Allocated only when
+/// that happens, which for a chunk whose image is the size the layout says it
+/// is never does.
+#[cfg(feature = "deflate")]
+const INFLATE_DRAIN_BYTES: usize = 32 * 1024;
+
+/// Inflate one zlib stream straight into `out`, returning the stream's whole
+/// decompressed length.
+///
+/// The destination is fixed, so nothing is allocated, grown or copied: the
+/// [`inflate_zlib`] growth loop exists only because that spelling has no
+/// destination to write to. A stream longer than `out` keeps inflating through
+/// a small scratch buffer and the surplus is dropped — so a stream that is
+/// malformed past the caller's window still fails here, as it does when
+/// `inflate_zlib` grows a buffer to the stream's end.
+///
+/// `out` past the returned length is left unspecified: the decoder copies
+/// output in blocks and the block that finishes the stream may reach past the
+/// stream's last byte, into slack the caller offered.
+#[cfg(feature = "deflate")]
+fn inflate_zlib_into(data: &[u8], out: &mut [u8]) -> FormatResult<usize> {
+    use zlib_rs::{Inflate, InflateFlush, Status};
+
+    let err = |what: &str| FormatError::InvalidData(format!("deflate decompress error: {what}"));
+    let mut inflate = Inflate::new(true, 15);
+    let mut drain: Vec<u8> = Vec::new();
+    let mut filled = 0usize;
+    let mut produced = 0usize;
+    loop {
+        let consumed = inflate.total_in() as usize;
+        let before = inflate.total_out();
+        let status = if filled < out.len() {
+            inflate.decompress(&data[consumed..], &mut out[filled..], InflateFlush::NoFlush)
+        } else {
+            if drain.is_empty() {
+                drain = vec![0u8; INFLATE_DRAIN_BYTES];
+            }
+            inflate.decompress(&data[consumed..], &mut drain, InflateFlush::NoFlush)
+        }
+        .map_err(|e| err(e.as_str()))?;
+        let made = (inflate.total_out() - before) as usize;
+        if filled < out.len() {
+            filled += made;
+        }
+        produced += made;
+        if status == Status::StreamEnd {
+            break;
+        }
+        // Neither side moved with output still to spare: the stored bytes end
+        // before the stream does.
+        if inflate.total_in() as usize == consumed && made == 0 {
+            return Err(err("truncated stream"));
+        }
+    }
+    Ok(produced)
 }
 
 fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatResult<Vec<u8>> {
@@ -2690,6 +2820,118 @@ mod tests {
             let decompressed = reverse_filters(&pipeline, &compressed).unwrap();
             assert_eq!(decompressed, original, "length {len}");
         }
+    }
+
+    /// Decoding into a caller's destination lands the same bytes the
+    /// materializing spelling produces, for every pipeline shape: a lone
+    /// deflate, a deflate behind another filter, and a pipeline masked down to
+    /// nothing.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn reverse_into_a_destination_matches_reverse_into_a_vec() {
+        let original: Vec<u8> = (0..40_000u32).map(|i| (i % 17) as u8).collect();
+        let cases = [
+            FilterPipeline::deflate(6),
+            FilterPipeline {
+                filters: vec![
+                    Filter {
+                        id: FILTER_SHUFFLE,
+                        flags: 0,
+                        cd_values: vec![8],
+                    },
+                    Filter {
+                        id: FILTER_DEFLATE,
+                        flags: 0,
+                        cd_values: vec![6],
+                    },
+                ],
+            },
+            FilterPipeline {
+                filters: vec![
+                    Filter {
+                        id: FILTER_DEFLATE,
+                        flags: 0,
+                        cd_values: vec![6],
+                    },
+                    Filter {
+                        id: FILTER_FLETCHER32,
+                        flags: 0,
+                        cd_values: vec![],
+                    },
+                ],
+            },
+        ];
+        for (case, pipeline) in cases.iter().enumerate() {
+            let compressed = apply_filters(pipeline, &original).unwrap();
+            let want = reverse_filters(pipeline, &compressed).unwrap();
+            let mut got = vec![0xAAu8; want.len()];
+            assert_eq!(
+                reverse_filters_masked_into(pipeline, &compressed, 0, &mut got).unwrap(),
+                want.len(),
+                "case {case}"
+            );
+            assert_eq!(got, want, "case {case}");
+
+            // Masked down to nothing: the stored bytes are the image.
+            let mask = u32::MAX;
+            let mut raw = vec![0u8; compressed.len()];
+            assert_eq!(
+                reverse_filters_masked_into(pipeline, &compressed, mask, &mut raw).unwrap(),
+                compressed.len(),
+                "case {case}"
+            );
+            assert_eq!(
+                raw,
+                reverse_filters_masked(pipeline, &compressed, mask).unwrap(),
+                "case {case}"
+            );
+        }
+    }
+
+    /// The returned length is the image the pipeline produced, not what fitted:
+    /// a destination shorter than the image keeps its first bytes and reports
+    /// the whole length, a longer one is written only as far as the image goes.
+    /// Both are what a caller copying out of a materialized image would see.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn reverse_into_reports_the_image_length_not_the_destination() {
+        let pipeline = FilterPipeline::deflate(6);
+        let original: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+        let compressed = apply_filters(&pipeline, &original).unwrap();
+
+        let mut short = vec![0u8; 1000];
+        assert_eq!(
+            reverse_filters_masked_into(&pipeline, &compressed, 0, &mut short).unwrap(),
+            original.len()
+        );
+        assert_eq!(short, original[..1000]);
+
+        // A destination outlasting the image keeps the image; what the slack
+        // past it holds is unspecified (the inflate's last output block can
+        // reach past the byte the stream ends on), which is why a caller that
+        // sees a short image owns the whole destination, not just that tail.
+        let mut long = vec![0xCDu8; original.len() + 4096];
+        assert_eq!(
+            reverse_filters_masked_into(&pipeline, &compressed, 0, &mut long).unwrap(),
+            original.len()
+        );
+        assert_eq!(&long[..original.len()], &original[..]);
+    }
+
+    /// A stream that is malformed past the destination still fails: the
+    /// overflow is inflated through a scratch buffer rather than abandoned at
+    /// the destination's end, which is where a growing buffer would have found
+    /// the same error.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn reverse_into_a_short_destination_still_validates_the_rest_of_the_stream() {
+        let pipeline = FilterPipeline::deflate(6);
+        let original: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let compressed = apply_filters(&pipeline, &original).unwrap();
+        let cut = &compressed[..compressed.len() / 2];
+        let mut small = vec![0u8; 4096];
+        assert!(reverse_filters_masked_into(&pipeline, cut, 0, &mut small).is_err());
+        assert!(reverse_filters(&pipeline, cut).is_err());
     }
 
     /// A chunk read `at_most` can carry bytes past the end of the stream (the
