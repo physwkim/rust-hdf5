@@ -727,21 +727,25 @@ fn unshuffle(data: &[u8], bytesoftype: usize) -> Vec<u8> {
 /// per growth step, which on a 2 MiB chunk that compresses well costs about
 /// as much as the inflate itself.
 ///
-/// HDF5 records the uncompressed chunk size nowhere the filter can see, so
-/// the buffer starts at the next power of two above the compressed length and
-/// doubles. Chunk sizes are themselves powers of two often enough that this
-/// usually lands on the exact size in two or three steps; growing by doubling
-/// from the compressed length instead overshoots by up to 2x and costs more
-/// than `read_to_end` did.
+/// `expected` is the uncompressed length when the caller knows it — blosc
+/// records one in its own header. The deflate filter does not: HDF5 keeps the
+/// uncompressed chunk size nowhere the filter can see, so its buffer starts at
+/// the next power of two above the compressed length and doubles. Chunk sizes
+/// are themselves powers of two often enough that this usually lands on the
+/// exact size in two or three steps; doubling from the compressed length
+/// instead overshoots by up to 2x and cost more than `read_to_end` did.
 #[cfg(feature = "deflate")]
-fn inflate_zlib(data: &[u8]) -> FormatResult<Vec<u8>> {
+fn inflate_zlib(data: &[u8], expected: Option<usize>) -> FormatResult<Vec<u8>> {
     use zlib_rs::{Inflate, InflateFlush, Status};
 
     let err = |what: &str| FormatError::InvalidData(format!("deflate decompress error: {what}"));
     // 15 is the largest LZ77 window; a stream that declares a smaller one in
     // its zlib header still inflates against it.
     let mut inflate = Inflate::new(true, 15);
-    let mut out = vec![0u8; data.len().max(4096).next_power_of_two()];
+    let start = expected
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| data.len().max(4096).next_power_of_two());
+    let mut out = vec![0u8; start];
     loop {
         let consumed = inflate.total_in() as usize;
         let filled = inflate.total_out() as usize;
@@ -782,7 +786,7 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
                     .finish()
                     .map_err(|e| FormatError::InvalidData(format!("deflate finish error: {}", e)))
             } else {
-                inflate_zlib(data)
+                inflate_zlib(data, None)
             }
         }
         #[cfg(not(feature = "deflate"))]
@@ -1888,15 +1892,8 @@ fn blosc_sub_decompress(compressor: u32, data: &[u8], nbytes: usize) -> FormatRe
                 .map_err(|e| FormatError::InvalidData(format!("blosc snappy: {}", e)))
         }
         #[cfg(feature = "deflate")]
-        BLOSC_ZLIB => {
-            use flate2::read::ZlibDecoder;
-            use std::io::Read;
-            let mut dec = ZlibDecoder::new(data);
-            let mut out = Vec::with_capacity(nbytes);
-            dec.read_to_end(&mut out)
-                .map_err(|e| FormatError::InvalidData(format!("blosc zlib: {}", e)))?;
-            Ok(out)
-        }
+        BLOSC_ZLIB => inflate_zlib(data, Some(nbytes))
+            .map_err(|e| FormatError::InvalidData(format!("blosc zlib: {e}"))),
         #[cfg(not(feature = "deflate"))]
         BLOSC_ZLIB => Err(FormatError::UnsupportedFeature(
             "blosc zlib sub-codec requires the 'deflate' feature".into(),
