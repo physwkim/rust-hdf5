@@ -92,6 +92,7 @@ pub(crate) fn object_header_block_size(handle: &mut FileHandle, addr: u64) -> Io
 /// Uninterpreted on purpose: what a rewrite must reproduce is the message, not
 /// this crate's understanding of it, so a type it has no decoder for survives
 /// exactly as one it does.
+#[derive(Clone)]
 pub(crate) struct ExtensionMessage {
     pub msg_type: u8,
     pub flags: u8,

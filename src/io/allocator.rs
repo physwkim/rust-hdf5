@@ -24,10 +24,11 @@ struct FreeBlock {
 ///
 /// [`free`](Self::free) returns a block for reuse — the counterpart of
 /// libhdf5's `H5MF_xfree`, called when a rewritten chunk no longer fits its
-/// old location. Like libhdf5's default (non-persistent) free-space strategy,
-/// the list lives only for the session: a block released but not reused
-/// before `close` stays as slack in the file rather than being recorded in an
-/// on-disk free-space manager.
+/// old location. Where the list goes at `close` follows the file: like
+/// libhdf5's default (non-persistent) strategy, a block released but not
+/// reused stays as slack in a file that records no free space, while a file
+/// whose file-space info message says `persist` gets what is left written to
+/// its on-disk free-space manager (`Hdf5Writer::write_free_space_managers`).
 pub struct FileAllocator {
     eof: AtomicU64,
     alignment: u64,
@@ -195,13 +196,13 @@ impl FileAllocator {
         self.eof.load(Ordering::Acquire)
     }
 
-    /// Snapshot of the free list, as `(addr, len)` sorted by address.
+    /// Snapshot of the free list, as `(addr, len)` sorted by address with
+    /// adjacent blocks already merged.
     ///
-    /// A test seam: a reclamation test asserts on the blocks that came back,
-    /// which stays true even where the file size cannot show it — a session
-    /// that reuses the freed space immediately, or one whose file is dominated
-    /// by something else.
-    #[cfg(test)]
+    /// The set a persisting file writes to its free-space manager on close,
+    /// and the seam a reclamation test asserts on where the file size cannot
+    /// show the reuse — a session that reuses the freed space immediately, or
+    /// one whose file is dominated by something else.
     pub(crate) fn free_blocks(&self) -> Vec<(u64, u64)> {
         self.free_list
             .lock()
@@ -209,6 +210,41 @@ impl FileAllocator {
             .iter()
             .map(|b| (b.addr, b.len))
             .collect()
+    }
+
+    /// Empty the free list, returning what was in it.
+    ///
+    /// Leaves [`allocate`](Self::allocate) with nothing to reuse, so every
+    /// call after this one bumps the end of the file. That is what lets the
+    /// close settle a free-space manager over the list: the blocks the manager
+    /// itself needs must come out of a set nothing else can allocate from
+    /// while the layout is being chosen.
+    pub(crate) fn take_all_free(&self) -> Vec<(u64, u64)> {
+        let mut list = self.free_list.lock().unwrap();
+        let taken = list.iter().map(|b| (b.addr, b.len)).collect();
+        list.clear();
+        self.free_count.store(0, Ordering::Release);
+        taken
+    }
+
+    /// Put `blocks` back as the whole free list, replacing what is there.
+    ///
+    /// The counterpart of [`take_all_free`](Self::take_all_free). The list is
+    /// sorted here rather than by the caller: address order is what
+    /// [`free`](Self::free) and [`try_extend`](Self::try_extend) search by, so
+    /// a caller that handed the blocks over in some other order — a free-space
+    /// manager's layout orders its sections by size — would leave the list
+    /// unsearchable. `blocks` must still be non-overlapping.
+    pub(crate) fn reset_free_list(&self, blocks: &[(u64, u64)]) {
+        let mut sorted: Vec<FreeBlock> = blocks
+            .iter()
+            .filter(|b| b.1 > 0)
+            .map(|&(addr, len)| FreeBlock { addr, len })
+            .collect();
+        sorted.sort_unstable_by_key(|b| b.addr);
+        let mut list = self.free_list.lock().unwrap();
+        *list = sorted;
+        self.free_count.store(list.len() as u64, Ordering::Release);
     }
 }
 

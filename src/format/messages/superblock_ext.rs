@@ -293,6 +293,36 @@ impl FileSpaceInfoMessage {
             fs_addr,
         })
     }
+    /// Encode the message body at version 1 (`H5O__fsinfo_encode`).
+    ///
+    /// Version 1 only: the version-0 form is the deprecated 1.10.0 encoding
+    /// that [`decode`](Self::decode) maps onto these fields, and re-emitting a
+    /// file's version-0 message as version 1 would change its length and the
+    /// number of manager addresses it carries.
+    pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
+        let sa = ctx.sizeof_addr as usize;
+        let ss = ctx.sizeof_size as usize;
+        let mut buf = Vec::with_capacity(3 + 2 * ss + 2 + sa + self.fs_addr.len() * sa);
+        buf.push(1);
+        buf.push(match self.strategy {
+            FileSpaceStrategy::FsmAggr => 0,
+            FileSpaceStrategy::Page => 1,
+            FileSpaceStrategy::Aggr => 2,
+            FileSpaceStrategy::None => 3,
+            FileSpaceStrategy::Unknown(b) => b,
+        });
+        buf.push(self.persist as u8);
+        buf.extend_from_slice(&self.threshold.to_le_bytes()[..ss]);
+        buf.extend_from_slice(&self.page_size.to_le_bytes()[..ss]);
+        buf.extend_from_slice(&self.pgend_meta_thres.to_le_bytes());
+        buf.extend_from_slice(&self.eoa_pre_fsm_fsalloc.to_le_bytes()[..sa]);
+        if self.persist {
+            for addr in &self.fs_addr {
+                buf.extend_from_slice(&addr.to_le_bytes()[..sa]);
+            }
+        }
+        buf
+    }
 }
 
 fn need(buf: &[u8], n: usize) -> FormatResult<()> {

@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rust_hdf5::{FileSpaceStrategy, H5File};
+use rust_hdf5::{FileSpaceInfoMessage, FileSpaceStrategy, H5File, SuperblockExtension};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -271,10 +271,37 @@ fn a_reopened_extension_comes_back_whole() {
     // second reads back what the re-emission itself encoded.
     for round in 0..2 {
         append_dataset(&path, &format!("appended{round}"));
+        let after = H5File::open(&path).unwrap().superblock_extension();
+        // Everything but the two fields the close owns: this file persists its
+        // free space, so the managers move and the file grows.
+        let fsinfo = after.file_space_info.clone().unwrap();
         assert_eq!(
-            H5File::open(&path).unwrap().superblock_extension(),
+            SuperblockExtension {
+                file_space_info: before.file_space_info.clone(),
+                ..after
+            },
             before,
             "round {round} rewrote the extension without reproducing it"
+        );
+        let reference = before.file_space_info.clone().unwrap();
+        assert_eq!(
+            FileSpaceInfoMessage {
+                eoa_pre_fsm_fsalloc: reference.eoa_pre_fsm_fsalloc,
+                fs_addr: reference.fs_addr.clone(),
+                ..fsinfo.clone()
+            },
+            reference,
+            "round {round} changed more of the file-space info message than the managers"
+        );
+        assert_eq!(
+            fsinfo.eoa_pre_fsm_fsalloc,
+            std::fs::metadata(&path).unwrap().len(),
+            "round {round} did not record the end of the file it wrote"
+        );
+        assert_ne!(
+            fsinfo.fs_addr[0],
+            u64::MAX,
+            "round {round} left the file with no free-space manager"
         );
     }
 
