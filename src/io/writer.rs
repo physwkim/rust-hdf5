@@ -16221,8 +16221,30 @@ impl Hdf5Writer {
         } else {
             DataLayoutMessage::contiguous(m.data_addr, m.data_size)
         };
+        // `H5D__layout_oh_create` (H5Dlayout.c:530-536) marks the layout
+        // message constant only where the storage it names is certain to be
+        // there already: allocation time is early, the class is not compact,
+        // no filter can change a chunk's size, and the dataspace holds at
+        // least one element. Anything else leaves the address undefined at
+        // creation and rewrites the message when the space is allocated, so
+        // the flag would be a lie. `H5S_GET_EXTENT_NPOINTS` is zero for a
+        // NULL dataspace and for any extent with a zero-length dimension.
+        let npoints: u64 = if m.dataspace.is_null() {
+            0
+        } else {
+            m.dataspace.dims.iter().product()
+        };
+        let filtered = m
+            .filter_pipeline
+            .as_ref()
+            .is_some_and(|p| !p.filters.is_empty());
+        let layout_flags = if alloc_time == 1 && m.compact.is_none() && !filtered && npoints != 0 {
+            MSG_FLAG_CONSTANT
+        } else {
+            0x00
+        };
         let layout_msg = layout.encode(&self.ctx);
-        header.add_message(MSG_DATA_LAYOUT, 0x00, layout_msg);
+        header.add_message(MSG_DATA_LAYOUT, layout_flags, layout_msg);
 
         // Filter Pipeline message (type 0x0B) -- only if filters are
         // configured. `H5D__layout_oh_create` appends it with
