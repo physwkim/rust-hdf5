@@ -626,38 +626,40 @@ fn walk_doubling_table<R: BlockReader>(
     ctx: &FormatContext,
     reader: &mut R,
 ) -> FormatResult<HeapWalk> {
-    let mut walk = HeapWalk::default();
     if header.table_addr == UNDEF_ADDR {
-        return Ok(walk);
+        return Ok(HeapWalk::default());
     }
 
-    let mut block_budget = MAX_BLOCKS;
+    let mut walker = DoublingTableWalker {
+        header,
+        ctx,
+        reader,
+        walk: HeapWalk::default(),
+        budget: MAX_BLOCKS,
+    };
 
     if header.curr_root_rows == 0 {
         // Root block is a single direct block of `start_block_size`.
-        read_direct_block(
-            header,
-            ctx,
-            reader,
-            header.table_addr,
-            header.start_block_size as usize,
-            &mut walk,
-            &mut block_budget,
-        )?;
+        walker.read_direct_block(header.table_addr, header.start_block_size as usize)?;
     } else {
-        walk_indirect_block(
-            header,
-            ctx,
-            reader,
-            header.table_addr,
-            header.curr_root_rows as u32,
-            &mut walk,
-            &mut block_budget,
-            0,
-        )?;
+        walker.walk_indirect_block(header.table_addr, header.curr_root_rows as u32, 0)?;
     }
 
-    Ok(walk)
+    Ok(walker.walk)
+}
+
+/// The header, file context, reader and shared block budget a doubling-table
+/// walk reads through, and the accumulator it fills. Held together so
+/// [`walk_indirect_block`](Self::walk_indirect_block) and
+/// [`read_direct_block`](Self::read_direct_block) take only what changes per
+/// level: the block's address, its row count (indirect) or size (direct),
+/// and — for the recursive indirect walk — how deep it has gone.
+struct DoublingTableWalker<'a, R: BlockReader> {
+    header: &'a FractalHeapHeader,
+    ctx: &'a FormatContext,
+    reader: &'a mut R,
+    walk: HeapWalk,
+    budget: usize,
 }
 
 /// Walk a fractal heap and return the raw payload bytes of every managed
@@ -892,136 +894,125 @@ fn huge_object_records<R: BlockReader>(
         .collect())
 }
 
-/// Recursively walk an indirect block, descending into child direct and
-/// indirect blocks.
-#[allow(clippy::too_many_arguments)]
-fn walk_indirect_block<R: BlockReader>(
-    header: &FractalHeapHeader,
-    ctx: &FormatContext,
-    reader: &mut R,
-    addr: u64,
-    nrows: u32,
-    walk: &mut HeapWalk,
-    budget: &mut usize,
-    depth: usize,
-) -> FormatResult<()> {
-    // The block budget bounds total blocks visited, not recursion depth: a
-    // crafted heap that is a deep linear chain of indirect blocks would
-    // recurse far enough to exhaust the stack before the budget runs out.
-    const MAX_INDIRECT_DEPTH: usize = 256;
-    if depth > MAX_INDIRECT_DEPTH {
-        return Err(FormatError::InvalidData(
-            "fractal heap indirect-block nesting exceeds maximum depth".into(),
-        ));
-    }
-    if addr == u64::MAX || nrows == 0 {
-        return Ok(());
-    }
-    if *budget == 0 {
-        return Err(FormatError::InvalidData(
-            "fractal heap block budget exhausted".into(),
-        ));
-    }
-    *budget -= 1;
-
-    let sa = ctx.sizeof_addr as usize;
-    let width = header.table_width as usize;
-    let n_entries = nrows as usize * width;
-
-    // Indirect-block size: prefix(sig+ver) + heap_addr + block_off
-    //   + per-entry child addresses (+ filter info on direct rows if filtered)
-    //   + checksum.
-    let dir_rows = nrows.min(header.max_direct_rows) as usize;
-    let dir_entries = dir_rows * width;
-    let per_dir_entry = if header.filter_len > 0 {
-        sa + ctx.sizeof_size as usize + 4
-    } else {
-        sa
-    };
-    let indir_entries = n_entries - dir_entries;
-    let block_len = 4
-        + 1
-        + sa
-        + header.heap_off_size as usize
-        + dir_entries * per_dir_entry
-        + indir_entries * sa
-        + 4;
-    walk.extents.push((addr, block_len as u64));
-
-    let buf = reader.read_block(addr, block_len)?;
-    need(&buf, 0, block_len)?;
-
-    if buf[0..4] != FHIB_SIGNATURE {
-        return Err(FormatError::InvalidSignature);
-    }
-    if buf[4] != 0 {
-        return Err(FormatError::InvalidVersion(buf[4]));
-    }
-
-    // Verify checksum.
-    let csum_off = block_len - 4;
-    let stored = u32::from_le_bytes([
-        buf[csum_off],
-        buf[csum_off + 1],
-        buf[csum_off + 2],
-        buf[csum_off + 3],
-    ]);
-    let computed = checksum_metadata(&buf[..csum_off]);
-    if stored != computed {
-        return Err(FormatError::ChecksumMismatch {
-            expected: stored,
-            computed,
-        });
-    }
-
-    // Skip prefix: signature(4) + version(1) + heap header address(sa)
-    //              + block offset(heap_off_size).
-    let mut pos = 4 + 1 + sa + header.heap_off_size as usize;
-
-    for entry in 0..n_entries {
-        let row = entry / width;
-        let child_addr = read_uint(&buf[pos..], sa);
-        pos += sa;
-        if header.filter_len > 0 && row < header.max_direct_rows as usize {
-            // Filtered direct-block entries carry size + filter mask.
-            pos += ctx.sizeof_size as usize + 4;
+impl<R: BlockReader> DoublingTableWalker<'_, R> {
+    /// Recursively walk an indirect block, descending into child direct and
+    /// indirect blocks.
+    ///
+    /// `header`, `ctx`, `reader`, `walk` and `budget` are constant threads for
+    /// the whole walk, so only `addr`, `nrows` and `depth` — what changes per
+    /// level — are parameters; the rest live on `self`.
+    fn walk_indirect_block(&mut self, addr: u64, nrows: u32, depth: usize) -> FormatResult<()> {
+        // The block budget bounds total blocks visited, not recursion depth: a
+        // crafted heap that is a deep linear chain of indirect blocks would
+        // recurse far enough to exhaust the stack before the budget runs out.
+        const MAX_INDIRECT_DEPTH: usize = 256;
+        if depth > MAX_INDIRECT_DEPTH {
+            return Err(FormatError::InvalidData(
+                "fractal heap indirect-block nesting exceeds maximum depth".into(),
+            ));
         }
-
-        if child_addr == u64::MAX || child_addr == 0 {
-            continue;
+        if addr == u64::MAX || nrows == 0 {
+            return Ok(());
         }
+        if self.budget == 0 {
+            return Err(FormatError::InvalidData(
+                "fractal heap block budget exhausted".into(),
+            ));
+        }
+        self.budget -= 1;
 
-        if row < header.max_direct_rows as usize {
-            // Direct-block child.
-            let size = header
-                .row_block_size
-                .get(row)
-                .copied()
-                .unwrap_or(header.start_block_size) as usize;
-            read_direct_block(header, ctx, reader, child_addr, size, walk, budget)?;
+        let header = self.header;
+        let ctx = self.ctx;
+        let sa = ctx.sizeof_addr as usize;
+        let width = header.table_width as usize;
+        let n_entries = nrows as usize * width;
+
+        // Indirect-block size: prefix(sig+ver) + heap_addr + block_off
+        //   + per-entry child addresses (+ filter info on direct rows if filtered)
+        //   + checksum.
+        let dir_rows = nrows.min(header.max_direct_rows) as usize;
+        let dir_entries = dir_rows * width;
+        let per_dir_entry = if header.filter_len > 0 {
+            sa + ctx.sizeof_size as usize + 4
         } else {
-            // Indirect-block child. Its row count is derived from the row's
-            // block size (see H5HFhdr.c / H5HF__dtable_size_to_rows).
-            let block_size = header
-                .row_block_size
-                .get(row)
-                .copied()
-                .unwrap_or(header.start_block_size);
-            let child_nrows = indirect_nrows(header, block_size);
-            walk_indirect_block(
-                header,
-                ctx,
-                reader,
-                child_addr,
-                child_nrows,
-                walk,
-                budget,
-                depth + 1,
-            )?;
-        }
-    }
+            sa
+        };
+        let indir_entries = n_entries - dir_entries;
+        let block_len = 4
+            + 1
+            + sa
+            + header.heap_off_size as usize
+            + dir_entries * per_dir_entry
+            + indir_entries * sa
+            + 4;
+        self.walk.extents.push((addr, block_len as u64));
 
-    Ok(())
+        let buf = self.reader.read_block(addr, block_len)?;
+        need(&buf, 0, block_len)?;
+
+        if buf[0..4] != FHIB_SIGNATURE {
+            return Err(FormatError::InvalidSignature);
+        }
+        if buf[4] != 0 {
+            return Err(FormatError::InvalidVersion(buf[4]));
+        }
+
+        // Verify checksum.
+        let csum_off = block_len - 4;
+        let stored = u32::from_le_bytes([
+            buf[csum_off],
+            buf[csum_off + 1],
+            buf[csum_off + 2],
+            buf[csum_off + 3],
+        ]);
+        let computed = checksum_metadata(&buf[..csum_off]);
+        if stored != computed {
+            return Err(FormatError::ChecksumMismatch {
+                expected: stored,
+                computed,
+            });
+        }
+
+        // Skip prefix: signature(4) + version(1) + heap header address(sa)
+        //              + block offset(heap_off_size).
+        let mut pos = 4 + 1 + sa + header.heap_off_size as usize;
+
+        for entry in 0..n_entries {
+            let row = entry / width;
+            let child_addr = read_uint(&buf[pos..], sa);
+            pos += sa;
+            if header.filter_len > 0 && row < header.max_direct_rows as usize {
+                // Filtered direct-block entries carry size + filter mask.
+                pos += ctx.sizeof_size as usize + 4;
+            }
+
+            if child_addr == u64::MAX || child_addr == 0 {
+                continue;
+            }
+
+            if row < header.max_direct_rows as usize {
+                // Direct-block child.
+                let size = header
+                    .row_block_size
+                    .get(row)
+                    .copied()
+                    .unwrap_or(header.start_block_size) as usize;
+                self.read_direct_block(child_addr, size)?;
+            } else {
+                // Indirect-block child. Its row count is derived from the row's
+                // block size (see H5HFhdr.c / H5HF__dtable_size_to_rows).
+                let block_size = header
+                    .row_block_size
+                    .get(row)
+                    .copied()
+                    .unwrap_or(header.start_block_size);
+                let child_nrows = indirect_nrows(header, block_size);
+                self.walk_indirect_block(child_addr, child_nrows, depth + 1)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Number of rows in a child indirect block whose row-block size is
@@ -1033,92 +1024,88 @@ pub(crate) fn indirect_nrows(header: &FractalHeapHeader, block_size: u64) -> u32
     size_log2.saturating_sub(first_row_bits).saturating_add(1)
 }
 
-/// Read a direct block and append it to `blocks`.
-fn read_direct_block<R: BlockReader>(
-    header: &FractalHeapHeader,
-    ctx: &FormatContext,
-    reader: &mut R,
-    addr: u64,
-    size: usize,
-    walk: &mut HeapWalk,
-    budget: &mut usize,
-) -> FormatResult<()> {
-    if addr == UNDEF_ADDR || size == 0 {
-        return Ok(());
-    }
-    if *budget == 0 {
-        return Err(FormatError::InvalidData(
-            "fractal heap block budget exhausted".into(),
-        ));
-    }
-    *budget -= 1;
-    walk.extents.push((addr, size as u64));
-
-    let sa = ctx.sizeof_addr as usize;
-    let buf = reader.read_block(addr, size)?;
-
-    let prefix_min = 4 + 1 + sa + header.heap_off_size as usize;
-    if buf.len() < prefix_min {
-        return Ok(());
-    }
-    if buf[0..4] != FHDB_SIGNATURE {
-        return Err(FormatError::InvalidSignature);
-    }
-    if buf[4] != 0 {
-        return Err(FormatError::InvalidVersion(buf[4]));
-    }
-
-    // prefix: signature(4) + version(1) + heap header address(sa)
-    //         + block offset(heap_off_size) + optional checksum(4)
-    let mut payload_start = prefix_min;
-    if header.checksum_dblocks {
-        // Verify the direct-block checksum.
-        //
-        // libhdf5 (`H5HF__cache_dblock_verify_chksum` / `_pre_serialize` in
-        // H5HFcache.c) computes the Jenkins `H5_checksum_metadata` over the
-        // *entire* direct-block image (`dblock->size` bytes) with the 4-byte
-        // checksum field cleared to zero. The checksum field sits at
-        // `H5HF_MAN_ABS_DIRECT_OVERHEAD(hdr) - H5HF_SIZEOF_CHKSUM`, i.e.
-        // immediately after signature(4) + version(1) + heap-header
-        // address(sizeof_addr) + block offset(heap_off_size) = `prefix_min`.
-        //
-        // Filtered heaps store the checksum over the *decompressed* image;
-        // since this reader does not run the direct-block filter pipeline,
-        // verification is only performed for unfiltered heaps.
-        let chk_off = prefix_min;
-        if header.filter_len == 0 && buf.len() >= chk_off + 4 {
-            let stored = u32::from_le_bytes([
-                buf[chk_off],
-                buf[chk_off + 1],
-                buf[chk_off + 2],
-                buf[chk_off + 3],
-            ]);
-            let mut image = buf.clone();
-            image[chk_off..chk_off + 4].fill(0);
-            let computed = checksum_metadata(&image);
-            if stored != computed {
-                return Err(FormatError::ChecksumMismatch {
-                    expected: stored,
-                    computed,
-                });
-            }
+impl<R: BlockReader> DoublingTableWalker<'_, R> {
+    /// Read a direct block and append it to `self.walk.blocks`.
+    fn read_direct_block(&mut self, addr: u64, size: usize) -> FormatResult<()> {
+        if addr == UNDEF_ADDR || size == 0 {
+            return Ok(());
         }
-        payload_start += 4;
-    }
-    if payload_start >= buf.len() {
-        return Ok(());
-    }
+        if self.budget == 0 {
+            return Err(FormatError::InvalidData(
+                "fractal heap block budget exhausted".into(),
+            ));
+        }
+        self.budget -= 1;
+        self.walk.extents.push((addr, size as u64));
 
-    // The block's own offset in the heap address space, from its prefix: this
-    // is what a managed heap ID is relative to.
-    let heap_offset = read_uint(&buf[4 + 1 + sa..], header.heap_off_size as usize);
+        let header = self.header;
+        let ctx = self.ctx;
+        let sa = ctx.sizeof_addr as usize;
+        let buf = self.reader.read_block(addr, size)?;
 
-    walk.blocks.push(ManagedBlock {
-        heap_offset,
-        payload_start,
-        image: buf,
-    });
-    Ok(())
+        let prefix_min = 4 + 1 + sa + header.heap_off_size as usize;
+        if buf.len() < prefix_min {
+            return Ok(());
+        }
+        if buf[0..4] != FHDB_SIGNATURE {
+            return Err(FormatError::InvalidSignature);
+        }
+        if buf[4] != 0 {
+            return Err(FormatError::InvalidVersion(buf[4]));
+        }
+
+        // prefix: signature(4) + version(1) + heap header address(sa)
+        //         + block offset(heap_off_size) + optional checksum(4)
+        let mut payload_start = prefix_min;
+        if header.checksum_dblocks {
+            // Verify the direct-block checksum.
+            //
+            // libhdf5 (`H5HF__cache_dblock_verify_chksum` / `_pre_serialize` in
+            // H5HFcache.c) computes the Jenkins `H5_checksum_metadata` over the
+            // *entire* direct-block image (`dblock->size` bytes) with the 4-byte
+            // checksum field cleared to zero. The checksum field sits at
+            // `H5HF_MAN_ABS_DIRECT_OVERHEAD(hdr) - H5HF_SIZEOF_CHKSUM`, i.e.
+            // immediately after signature(4) + version(1) + heap-header
+            // address(sizeof_addr) + block offset(heap_off_size) = `prefix_min`.
+            //
+            // Filtered heaps store the checksum over the *decompressed* image;
+            // since this reader does not run the direct-block filter pipeline,
+            // verification is only performed for unfiltered heaps.
+            let chk_off = prefix_min;
+            if header.filter_len == 0 && buf.len() >= chk_off + 4 {
+                let stored = u32::from_le_bytes([
+                    buf[chk_off],
+                    buf[chk_off + 1],
+                    buf[chk_off + 2],
+                    buf[chk_off + 3],
+                ]);
+                let mut image = buf.clone();
+                image[chk_off..chk_off + 4].fill(0);
+                let computed = checksum_metadata(&image);
+                if stored != computed {
+                    return Err(FormatError::ChecksumMismatch {
+                        expected: stored,
+                        computed,
+                    });
+                }
+            }
+            payload_start += 4;
+        }
+        if payload_start >= buf.len() {
+            return Ok(());
+        }
+
+        // The block's own offset in the heap address space, from its prefix: this
+        // is what a managed heap ID is relative to.
+        let heap_offset = read_uint(&buf[4 + 1 + sa..], header.heap_off_size as usize);
+
+        self.walk.blocks.push(ManagedBlock {
+            heap_offset,
+            payload_start,
+            image: buf,
+        });
+        Ok(())
+    }
 }
 
 #[cfg(test)]
