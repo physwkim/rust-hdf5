@@ -23,7 +23,7 @@ Parity target: the 1.14.x file format as produced by libhdf5/h5py.
 | 5 | Rust-written files carry object-header attribute count 0 (`h5a.get_num_attrs`=0 while `h5a.iterate` yields them) | oracle B INVALID ×5 (`attr_scalar_num` etc.) | wp-attrs |
 | 6 | Unsupported-datatype decode errors silently swallowed → dataset/attribute vanishes from the catalog | datatypes #3; oracle `opaque`/`bitfield`/`ref_*` MISS | wp-catalog (surface) + wp-dtype (decode) |
 | 7 | Compound v2 member-name padding uses the wrong version guard — byte-level mis-parse of real files (found independently by two auditors) | datatypes #10; format-infra #4 | wp-dtype |
-| 8 | Shared-message (SOHM) flag bit never checked — shared payloads misdecoded as literal message bodies | format-infra #8 | wp-sbext |
+| 8 | **Closed.** The flag is honored and the pointer resolved through the master table before any per-type decode; SOHM is written as well as read, list and B-tree index forms both. Wave 9 added attribute nesting — an attribute's datatype and dataspace are shared before the attribute itself | format-infra #8 | wp-sbext |
 | 9 | Unchecked `read_raw::<T>()` ignores byte order — silent misread of big-endian files (invisible to the raw-image oracle; needs typed-read tests) | datatypes #4 | wp-dtype |
 | 10 | NULL dataspace read as a 4-byte scalar | oracle `space_null` DIFF | wp-space |
 | 11 | Object-header continuation-chunk (OCHK) checksum parsed but never verified | format-infra #5 | wp-sbext |
@@ -36,14 +36,20 @@ Parity target: the 1.14.x file format as produced by libhdf5/h5py.
 | 13 | IEEE f16 unreadable ("non-standard floating-point bit layout") | oracle `float_f16le` GAP | wp-dtype |
 | 14 | Datatype message v4 rejected on read even for known classes; vlen-sequence rejects any version but 1 | datatypes #8; format-infra #9 | wp-dtype |
 | 15 | Extensible-array index restricted to unlimited dim == 0, unlike upstream | format-infra #10 | wp-space |
-| 16 | Superblock extension OH never opened — gates SOHM, FSINFO, driver-info, btree-K all at once | format-infra #2 | wp-sbext |
+| 16 | **Closed.** The extension OH is created and opened; SOHM, FSINFO and btree-K went with it. Driver-info is still unimplemented, now for want of its own codec | format-infra #2 | wp-sbext |
 | 17 | String fidelity: fixed-string SPACEPAD mishandled on read; vlen-string cset forced utf8 on write (`str_vlen_ascii` B INVALID); h5py `bytes` convention unmatched | datatypes #5/#7; oracle B | wp-dtype |
 
 ## Tier 3 — feature gaps (Round 3 queue, ranked)
 
-1. Object/region references (`H5T_REFERENCE`, old + revised) — whole class missing
+1. ~~Object/region references (`H5T_REFERENCE`, old + revised)~~ — closed; all five
+   kinds round-trip, the `H5R_DATASET_REGION2` and `H5R_ATTR` write paths
+   landing in wave 9. Residual: an element flagged `H5R_IS_EXTERNAL` is
+   refused rather than followed into the file it names.
 2. Committed (named) datatypes + shared-datatype message
-3. Virtual datasets (VDS); external file storage (EFL)
+3. ~~Virtual datasets (VDS); external file storage (EFL)~~ — closed; wave 9 added
+   VDS unlimited and `printf`-pattern mappings and the EFL `H5O_EFL_UNLIMITED`
+   last slot. Residual: the VDS DAPL properties (`printf_gap`, view) have no
+   surface.
 4. `H5Ocopy` / `H5Oget_info` / comments
 5. Hyperslab stride/block; point selection; direct chunk **read** (write exists)
 6. Link/attr creation-order tracking + by-order iteration; dense-storage write

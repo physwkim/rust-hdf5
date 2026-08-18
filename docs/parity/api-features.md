@@ -44,7 +44,7 @@ Upstream anchor: `H5Fpublic.h` (2009 lines).
 | Meta block size (`H5Pset_meta_block_size`) | H5Ppublic.h:5228-5249 | Missing | No "meta_block" match anywhere in src/ | M |
 | Small data block size (`H5Pset_small_data_block_size`) | H5Ppublic.h:5435-5461 | Missing | No "small_data_block" match anywhere in src/ | M |
 | Paged buffering (`H5Pset_page_buffer_size`) | H5Ppublic.h:5746-5801 | Missing | No "page_buffer" match anywhere in src/ | L |
-| File space strategy (`H5Pset_file_space_strategy`, `H5F_FSPACE_STRATEGY_*`) | H5Fpublic.h:191-204; H5Ppublic.h:3107-3126 | Missing (configurable); implicit behavior resembles non-persistent `FSM_AGGR` | No "file_space_strategy"/"FSPACE_STRATEGY" match; closest analog is the session-only, non-persistent free list in src/io/allocator.rs:34-44,93-141, never written to disk as a persistent free-space manager | M |
+| File space strategy (`H5Pset_file_space_strategy`, `H5F_FSPACE_STRATEGY_*`) | H5Fpublic.h:191-204; H5Ppublic.h:3107-3126 | Partial(`PAGE` refused) | src/file.rs:1313 (`H5FileOptions::file_space(strategy, persist, threshold)`), :644 (`tracked_free_space`); src/format/messages/superblock_ext.rs:133 (`FileSpaceStrategy`), :206 (`FileSpaceInfoMessage`, v0 and v1); `FSM_AGGR`/`AGGR`/`NONE` round-trip, `persist` writes the managers on close (src/io/writer.rs:8984 `write_free_space_managers`) and reuses them on reopen (:5037 `reopen_free_space`); `PAGE` is rejected at :3915 — paged aggregation is unimplemented | M |
 
 **2.0-dev-only H5F additions (informational, not scored):** `H5F_LIBVER_V200`
 (H5Fpublic.h:186) redefines `H5F_LIBVER_LATEST = 5` instead of 1.14.x's
@@ -122,8 +122,8 @@ Upstream anchor: `H5Dpublic.h` (2059 lines).
 | Fill value (`H5Pset_fill_value`) | H5Ppublic.h:6727 | Implemented | src/dataset.rs:198 (`DatasetBuilder::fill_value`); src/io/writer.rs:7422-7429; src/format/messages/fill_value.rs:37-79 | L |
 | Fill time (`H5Pset_fill_time`) | H5Ppublic.h:6677 | Implemented | src/dataset.rs:590 (`DatasetBuilder::fill_time`), :1886 (`H5Dataset::fill_time` accessor); src/io/writer.rs:10747 (`set_dataset_fill_time`); src/format/messages/fill_value.rs:39,47,59 (`FILL_TIME_ALLOC`/`NEVER`/`IFSET`) | L |
 | Allocation time (`H5Pset_alloc_time`) | H5Ppublic.h:6436 | Partial(not user-settable; and contiguous behavior contradicts its own declared value) | src/dataset.rs:1888 (`H5Dataset::alloc_time` read accessor, no `DatasetBuilder` setter); src/io/writer.rs:14797-14806 (`build_dataset_header` resolves `alloc_time` per layout class — 1=early for compact, 3=incr for chunked/virtual, 2=late for contiguous, matching `H5P__set_layout`, H5Pdcpl.c:1864-1877) but :8399-8403 `create_dataset` eagerly allocates every contiguous dataset at creation time regardless of the "late" value it just wrote | M |
-| External file storage (`H5Pset_external` / EFL) | H5Ppublic.h:6635 | Missing | No "external"/"efl" file-layout handling anywhere in src/; src/format/messages/data_layout.rs:44-46 implements only Compact/Contiguous/Chunked classes, no EFL class | L |
-| Virtual datasets (VDS) | H5Ppublic.h:7297 `H5Pset_virtual`; H5Dpublic.h:63 `H5D_VIRTUAL` | Missing | No `H5D_VIRTUAL`/`VirtualLayout`/`set_virtual` anywhere in src/ | M |
+| External file storage (`H5Pset_external` / EFL) | H5Ppublic.h:6635 | Implemented (incl. `H5O_EFL_UNLIMITED`) | src/dataset.rs:554 (`DatasetBuilder::external`), :2069 (`external_files`); src/format/messages/external_file_list.rs:41 (`UNLIMITED`), :75/:93 (encode/decode); src/io/writer.rs:9399 (`create_external_dataset`, `H5D__efl_construct`'s rule that an unlimited extent needs an unlimited last slot and only the first dimension may extend), :2999 (`H5D__efl_write` slot walk) | L |
+| Virtual datasets (VDS) | H5Ppublic.h:7297 `H5Pset_virtual`; H5Dpublic.h:63 `H5D_VIRTUAL` | Partial(no DAPL properties) | src/io/writer.rs:9604 (`create_virtual_dataset`); src/dataset.rs:2133 (`virtual_mappings`); src/format/messages/virtual_mapping.rs:112 (`parse_source_name` = `H5D_virtual_parse_source_name`, printf `%b`), :136 (`VirtualMappingList`); unlimited mappings resolved at catalog build (src/io/reader.rs:3351 `resolve_virtual_extents` = `H5D__virtual_set_extent_unlim`). `H5Pset_virtual_printf_gap`/`H5Pset_virtual_view` have no surface — `printf_gap` is fixed at 0 and the view is always `H5D_VDS_LAST_AVAILABLE` | M |
 | Direct chunk write (`H5Dwrite_chunk`) | H5Dpublic.h:1311 | Implemented | src/dataset.rs:1222 (`write_chunk_raw`), :1323 (`write_chunk_raw_at`) — write pre-filtered bytes verbatim with caller-supplied `filter_mask` | L |
 | Direct chunk read (`H5Dread_chunk2`/`H5Dread_chunk1`) | H5Dpublic.h:1377 (2.0.0), :2051 (deprecated 1.x) | Missing | `pub fn` list in src/dataset.rs has no `read_chunk`/`read_chunk_raw`; the only chunk-byte readers, src/io/writer.rs:5015 (`read_chunk_if_present`) and :5183 (`read_chunk_at_coords`), are `pub(crate)`-only | M |
 | Chunk query APIs (`H5Dget_num_chunks`/`get_chunk_info`/`get_chunk_info_by_coord`) | H5Dpublic.h:689, 808, 723 | Missing | No `num_chunks`/`chunk_info`/`chunk_info_by_coord` method in src/dataset.rs; only `chunk_dims()` (:663) and `is_chunked()` (:693) expose any chunk metadata | M |
@@ -151,11 +151,11 @@ Upstream anchors: `H5Opublic.h` (2480 lines), `H5Rpublic.h` (964 lines).
 | Object refresh (`H5Orefresh`, SWMR per-object metadata re-read) | H5Opublic.h:1436 (`\since 1.10.0`) | Partial(whole-reader refresh only, not per-object) | src/swmr.rs:579-583 (`SwmrFileReader::refresh`, "re-read the superblock and dataset metadata") refreshes the whole reader, not one object identifier; no `Dataset::refresh`/`Group::refresh` method exists | M |
 | User comments on an object (`H5Oset_comment`/`H5Oget_comment`) | H5Opublic.h:985,1034,1074,1126 | Missing | Zero HDF5-comment-message hits anywhere in src/ (`rg -ni "comment"` matches only an unrelated code comment at src/io/file_handle.rs:15) | L |
 | Object exists / visit (`H5Oexists_by_name`, `H5Ovisit3`) | H5Opublic.h:463, 1220 | Missing | No `pub fn ... exist`; no recursive-visit API in src/group.rs (only single-level `dataset_names`/`group_names`); existence can only be inferred indirectly via `Err` from `group()`/`dataset()` (src/group.rs:122, src/file.rs:615) | L |
-| Create object reference (`H5Rcreate_object`, `H5R_OBJECT`) | H5Rpublic.h:150 (`\since 1.12.0`) | Missing | No `H5R_OBJECT`/object-reference construction anywhere; `H5Type` trait (src/types.rs:8-15) has no reference-type impl; `DatatypeMessage` enum (src/format/messages/datatype.rs:70-134) has no `Reference` variant | H |
-| Create region reference (`H5Rcreate_region`, `H5R_DATASET_REGION`) | H5Rpublic.h:189 (`\since 1.12.0`) | Missing | Same evidence as above; dataspace-selection serialization exists (src/format/messages/dataspace.rs) but is never paired with an object address to build a reference blob | H |
-| Create attribute reference (`H5Rcreate_attr`) | H5Rpublic.h:229 (`\since 1.12.0`, new-API-only, no back-compat) | Missing | No `H5R`-anything in src/attribute.rs | M |
-| Dereference (`H5Rdereference`/`H5Ropen_object`/`H5Ropen_region`) | H5Rpublic.h:366,417,464 (new API); H5Rpublic.h:734,876 (legacy) | Missing | No open/dereference-by-reference API in src/dataset.rs, src/group.rs, or src/file.rs — consistent with no reference-creation support above | H |
-| On-disk reference encoding (`H5T_REFERENCE` datatype class: object address, or address + global-heap-stored serialized selection) | H5Rpublic.h:44-56 (`H5R_type_t`); referenced via `H5T_STD_REF_OBJ`/`H5T_STD_REF_DSETREG` | Missing | src/format/messages/datatype.rs:33-39 defines datatype classes 0,1,3,6,8,9,10 — class 7 (Reference) is absent and falls through to the catch-all error at :1022-1025 (`UnsupportedFeature(format!("datatype class {}", class))`); vlen global-heap support (src/format/global_heap.rs:377,394) is exclusively for vlen strings/sequences, not region-reference selections | H |
+| Create object reference (`H5Rcreate_object`, `H5R_OBJECT`) | H5Rpublic.h:150 (`\since 1.12.0`) | Implemented (both encodings) | src/dataset.rs:397 (`DatasetBuilder::object_references`, `H5R_OBJECT1`), :423 (`std_object_references`, `H5R_OBJECT2`), :3777 (`write_object_references`); attributes at src/attribute.rs:149, src/file.rs:549/:556, src/group.rs:944/:951 | H |
+| Create region reference (`H5Rcreate_region`, `H5R_DATASET_REGION`) | H5Rpublic.h:189 (`\since 1.12.0`) | Implemented (both encodings) | src/dataset.rs:515 (`region_references`, `H5R_DATASET_REGION1`), :458 (`std_region_references`, `H5R_DATASET_REGION2`), :3824/:3857 (`write_region_references`/`write_std_region_references`); the selection is serialized into a global-heap blob, region rank taken from the target's own extent | H |
+| Create attribute reference (`H5Rcreate_attr`) | H5Rpublic.h:229 (`\since 1.12.0`, new-API-only, no back-compat) | Implemented | src/dataset.rs:485 (`attribute_references`), :3875 (`write_attribute_references`); `H5R_ATTR` element is a global-heap blob carrying the token plus the attribute name (src/format/reference.rs:117 `RevisedElement`) | M |
+| Dereference (`H5Rdereference`/`H5Ropen_object`/`H5Ropen_region`) | H5Rpublic.h:366,417,464 (new API); H5Rpublic.h:734,876 (legacy) | Partial(resolves to address+path, no handle) | src/dataset.rs:3926 / src/attribute.rs:389 (`read_references` → `Vec<Reference>`, src/format/reference.rs:427) resolve each element to its object-header address and, when the link structure names it, its absolute path plus the region selection or attribute name; there is no `H5Ropen_object`-style call returning an open `H5Dataset`/`H5Group` — the caller re-opens by path | M |
+| On-disk reference encoding (`H5T_REFERENCE` datatype class: object address, or address + global-heap-stored serialized selection) | H5Rpublic.h:44-56 (`H5R_type_t`); referenced via `H5T_STD_REF_OBJ`/`H5T_STD_REF_DSETREG` | Partial(external references refused) | src/format/messages/datatype.rs:154 (`CLASS_REFERENCE`), :305 (`Reference` variant), :319 (`ReferenceKind` — all five of `H5R_OBJECT1`/`DATASET_REGION1`/`OBJECT2`/`DATASET_REGION2`/`ATTR`), :1187/:1537 (encode/decode; the 1.12 kinds force message version 4); src/format/reference.rs:143 (`decode_revised_element` — the element's own type byte is the authority, as `H5T__ref_disk_getsize` splits them). An element with `H5R_IS_EXTERNAL` set is rejected rather than followed into the named file (src/format/reference.rs:104, test at :783) | M |
 
 **2.0-dev-only H5O/H5R notes:** H5O's `H5Oopen_by_token`/`H5Otoken_*`
 (H5Opublic.h:299,1617,1639,1660) are 1.12+ opaque-token replacements for the
@@ -222,7 +222,7 @@ the task scope are covered here (not the full header).
 | `H5Pset_sym_k` (symbol-table v1 B-tree K, old-style groups) | H5Ppublic.h:3360 | Missing | rust never writes old-style (v1-B-tree + local-heap) groups — group creation always emits new-style Link-Info/Group-Info messages (src/io/writer.rs:7503-7515); src/format/btree_v1.rs and src/format/symbol_table.rs are decode-only (legacy-file read support) | L |
 | `H5Pset_attr_phase_change` (compact↔dense attribute threshold) | H5Ppublic.h:2427 | Partial(hardcoded, not configurable) | `FLAG_NON_DEFAULT_ATTR_THRESHOLDS` plumbing exists (src/format/object_header.rs:45,130-134,151-155,221) but is never set — `ObjectHeader::new()` hardcodes `flags: 0x02` (:74-79), used unconditionally by writer.rs:7409-7414,7503-7508; no dense (fractal-heap+v2-B-tree) attribute storage exists anywhere, so attributes are always compact regardless of count | M |
 | `H5Pset_link_phase_change` (compact↔dense link threshold) | H5Ppublic.h:9103 | Partial(hardcoded, not configurable) | `GroupInfoMessage::with_phase_change` (src/format/messages/group_info.rs:31-38) exists but the writer never calls it — every group uses `GroupInfoMessage::default()`/`LinkInfoMessage::compact()` unconditionally (writer.rs:7508-7515,7579-7586); `fractal_heap_address` is only ever `UNDEF_ADDR` on write (src/format/messages/link_info.rs:35-40) — groups are always compact regardless of link count | M |
-| `H5Pset_shared_mesg_nindexes`/`_index` (SOHM) | H5Ppublic.h:3225, 3258 | Missing | Zero matches for "SOHM"/"shared_mesg"/"SharedMessage" anywhere in src/ | M |
+| `H5Pset_shared_mesg_nindexes`/`_index` (SOHM) | H5Ppublic.h:3225, 3258 | Implemented (incl. `_phase_change`) | src/file.rs:1271 (`H5FileOptions::shared_messages(indexes, list_max, btree_min)`), index type flags via src/format/sohm.rs:409 (`type_flag`); the master table, list and v2-B-tree index forms are all written (src/format/sohm_write.rs:126 `build_shared_messages`, :253 `is_btree`) and shared messages are resolved on read (src/io/object_header_io.rs:263) | M |
 | `H5Pset_obj_track_times` | H5Ppublic.h:2825 | Partial(preserved, not configurable) | An object read with `H5O_HDR_STORE_TIMES` keeps the flag and its four times through a rewrite: `ObjectHeader::times` owns the bit (src/format/object_header.rs), `DatasetInfo::times`/`GroupInfo::times`/`Hdf5Writer::root_times` carry it across a reopen, and `touched_times` applies `H5O_touch_oh` (access + change → now) at each of the three header builders. What is still missing is the *choice*: an object this writer creates gets `times: None`, and there is no `track_times` knob to ask for them; the legacy `H5O_MTIME` message remains an explicit stub (src/format/messages/mod_time.rs:1) | M |
 | `H5Pset_layout` (`H5D_COMPACT`/`CONTIGUOUS`/`CHUNKED` selection) | H5Ppublic.h:6800 | Partial(missing explicit selection + Compact write support) | `DatasetBuilder` has no `.layout()` selector; layout is inferred purely from `chunk_dims` presence (src/dataset.rs:257 chunked branch, :384 contiguous fallback); `DataLayoutMessage::Compact` exists for decode/round-trip only — never constructed in src/io/writer.rs or src/dataset.rs | M |
 
@@ -231,7 +231,7 @@ the task scope are covered here (not the full header).
 `H5F_LIBVER_V200` — layered on the 1.14.x baseline, out of scope here.
 `H5Pset_virtual_spatial_tree`/`get_` (H5Ppublic.h:6060,6581) are new 2.0-only
 VDS-acceleration properties, not part of the 1.14.x-parity surface and
-outside this slice (VDS itself is scored under H5D, above, as Missing).
+outside this slice (VDS itself is scored under H5D, above).
 `H5Pget_external`'s `off_t`→`HDoff_t` widening (H5Ppublic.h:6092-6096,6631)
 is a 2.0 ABI change with no on-disk format implication.
 
@@ -271,13 +271,14 @@ they have no on-disk-format implication — they are process/runtime behavior:
    commonly use soft/external links for default-plot pointers or federated
    datasets). No error is raised; the link just disappears from
    `group_names()`/`dataset_names()`.
-2. **`H5T_REFERENCE` (object and region references) is entirely
-   unimplemented** (H5O/R rows 7-11). Any dataset or attribute whose
-   datatype class is Reference (class 7) hits a hard decode error on read
-   and cannot be constructed on write at all — this is a whole datatype
-   class missing, not a single API gap, and it blocks every workflow that
-   uses HDF5 references (common in MATLAB-authored files and h5py low-level
-   reference usage).
+2. **Closed. `H5T_REFERENCE` is implemented in both directions for all five
+   reference kinds** (H5O/R rows 7-11) — the two 1.8 encodings
+   (`H5R_OBJECT1`, `H5R_DATASET_REGION1`) and the three 1.12 ones
+   (`H5R_OBJECT2`, `H5R_DATASET_REGION2`, `H5R_ATTR`), on datasets and on
+   attributes. What remains is narrower than the original gap: an element
+   flagged `H5R_IS_EXTERNAL` is refused rather than followed into the file
+   it names, and reads resolve to an address plus a path rather than
+   returning an open object handle.
 3. **Attribute values ≥64KB silently corrupt the file on write** (H5A "large
    attribute" row): the object-header message-length field is cast straight
    to `u16` with no bounds check, so the length wraps instead of erroring or
@@ -300,13 +301,15 @@ they have no on-disk-format implication — they are process/runtime behavior:
    `H5Ocopy`/`H5Oset_comment` are all entirely missing (H5O rows 1-2, 5).
    `H5Ocopy` in particular is the mechanism h5py's `.copy()` and most
    "consolidate several files into one" scripts rely on.
-7. **External file storage (EFL, `H5Pset_external`) is entirely missing**
-   (H5D row). Files that keep raw data in sibling files — common in legacy
-   NetCDF-classic-in-HDF5 bridges and some instrument pipelines — can be
-   neither created nor read.
-8. **Virtual datasets (VDS) are entirely unimplemented** (H5D row). Common
-   in detector/synchrotron NeXus pipelines that stitch many physical files
-   into one logical dataset (e.g. Eiger/DECTRIS acquisition software).
+7. **Closed. External file storage (EFL, `H5Pset_external`) round-trips**
+   (H5D row), including the `H5O_EFL_UNLIMITED` last slot that lets an
+   extendible dataset grow into its final external file.
+8. **Closed. Virtual datasets are implemented** (H5D row), including
+   unlimited mappings and `printf`-pattern source names — the arrangement
+   detector/synchrotron NeXus pipelines use to stitch a growing family of
+   physical files into one logical dataset. What remains is the VDS DAPL
+   surface: `printf_gap` is fixed at 0 and the view is always
+   `H5D_VDS_LAST_AVAILABLE`.
 9. **Hyperslab I/O has no stride/block support (start+count only), and point
    selection is entirely missing** (H5D rows 2-3). This caps the port's own
    slicing flexibility relative to `H5Sselect_hyperslab`/
