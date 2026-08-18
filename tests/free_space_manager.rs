@@ -905,3 +905,100 @@ fn a_crate_created_paged_file_is_one_libhdf5_accepts() {
     drop(file);
     let _ = std::fs::remove_file(&path);
 }
+
+/// `eoa_pre_fsm_fsalloc` is the end of the finished file, not the end it had
+/// before the managers took their own two blocks.
+///
+/// The name says otherwise, and it is the older meaning: 1.10 kept both EOAs
+/// and put the pre-allocation one in this field. 1.14 keeps one value, taken
+/// after the allocation loop (H5MF.c:3234-3240), and calls it "the final eoa"
+/// where it reads it back (H5Fsuper.c:826). So the check is not against a
+/// number this crate chose — it is the identity libhdf5's own file satisfies,
+/// asserted first on the twin h5py writes and then on the file this crate
+/// writes for the same properties.
+#[test]
+fn the_recorded_eoa_is_the_end_of_the_finished_file() {
+    let Some(py) = python() else { return };
+    for strategy in ["fsm", "page"] {
+        let reference = tmp(&format!("eoa_ref_{strategy}"));
+        write_persisting_file_with(py, &reference, strategy);
+        let twin = H5File::open(&reference)
+            .unwrap()
+            .superblock_extension()
+            .file_space_info
+            .expect("the h5py twin declares its strategy");
+        // Non-vacuous only if the settle had something to allocate: a file
+        // with no manager on disk never moves the EOA during the settle, so
+        // both readings of the field would agree on it.
+        assert_ne!(
+            twin.fs_addr[0],
+            u64::MAX,
+            "the {strategy} twin persisted no manager: {twin:?}"
+        );
+        assert_eq!(
+            twin.eoa_pre_fsm_fsalloc,
+            std::fs::metadata(&reference).unwrap().len(),
+            "libhdf5 did not record the end of the {strategy} file it wrote"
+        );
+        let _ = std::fs::remove_file(&reference);
+
+        let path = tmp(&format!("eoa_{strategy}"));
+        let file = H5File::options()
+            .file_space(
+                match strategy {
+                    "fsm" => FileSpaceStrategy::FsmAggr,
+                    _ => FileSpaceStrategy::Page,
+                },
+                true,
+                1,
+            )
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape([16usize])
+            .create("keep")
+            .unwrap()
+            .write_raw(&(0..16i32).collect::<Vec<_>>())
+            .unwrap();
+        file.create_group("grp").unwrap();
+        file.new_dataset::<f64>()
+            .shape([8usize])
+            .create("grp/inner")
+            .unwrap()
+            .write_raw(&(0..8).map(f64::from).collect::<Vec<_>>())
+            .unwrap();
+        file.close().unwrap();
+
+        // Once for the file this crate creates, once for the one it reopens:
+        // the second close settles managers it read off disk, and records the
+        // end of a file whose blocks moved.
+        for round in ["created", "appended"] {
+            let info = H5File::open(&path)
+                .unwrap()
+                .superblock_extension()
+                .file_space_info
+                .expect("the created file declares its strategy");
+            assert_ne!(
+                info.fs_addr[0],
+                u64::MAX,
+                "the {round} {strategy} file persisted no manager: {info:?}"
+            );
+            assert_eq!(
+                info.eoa_pre_fsm_fsalloc,
+                std::fs::metadata(&path).unwrap().len(),
+                "the {round} {strategy} file recorded an EOA from before its \
+                 managers were placed"
+            );
+            let space = h5stat_space(py, &path);
+            assert_eq!(
+                space.unaccounted, 0,
+                "the {round} {strategy} file leaks space: {space:?}"
+            );
+            if round == "created" {
+                crate_appends(&path, "added");
+            }
+        }
+        h5clear_accepts(py, &path);
+        let _ = std::fs::remove_file(&path);
+    }
+}

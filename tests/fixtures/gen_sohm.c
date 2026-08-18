@@ -25,9 +25,10 @@
  *                  predefined type is immutable, and H5O__dtype_can_share
  *                  refuses to share an immutable or committed type, so the
  *                  other files' datasets keep their datatype literal. The
- *                  copy is shareable, which makes this the file whose record
- *                  census a crate-written twin can be compared against
- *                  one-for-one (tests/sohm_write.rs).
+ *                  copy is shareable, so this file and sohm_list.h5 are the
+ *                  two halves of that rule; the crate mirrors the predefined
+ *                  half, and sohm_list.h5 is the record census a crate-written
+ *                  twin is compared against one-for-one (tests/sohm_write.rs).
  *   sohm_group.h5  the list form again, plus a subgroup ("g") whose only
  *                  content is one hard link (named GROUP_LINK_NAME below).
  *                  Neither H5Pset_shared_mesg_* nor H5Pset_libver_bounds is

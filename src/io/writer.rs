@@ -8801,6 +8801,33 @@ impl Hdf5Writer {
         }
     }
 
+    /// Whether a dataset's datatype message may be offered to a
+    /// shared-message index at all.
+    ///
+    /// The datatype is the one message class carrying a `can_share` callback
+    /// (`H5O__dtype_can_share`, H5Odtype.c:99), and `H5SM__can_share_common`
+    /// asks it before any index is consulted (H5SM.c:895-899). It refuses an
+    /// immutable type and a committed one (H5Odtype.c:1893-1901); the
+    /// committed half is already answered by address at the call site.
+    ///
+    /// A dataset's type reaches that predicate still immutable only when
+    /// `H5D__init_type` kept the caller's own `H5T_t` rather than copying it,
+    /// which it does exactly when the type is immutable, is not relocatable,
+    /// and the file's low bound is below `H5F_LIBVER_V18` (H5Dint.c:569-572).
+    /// Any of the three failing produces an `H5T_COPY_ALL` copy, which is
+    /// `H5T_STATE_RDONLY` rather than immutable (H5T.c:4461-4462) and so is
+    /// shareable — which is why `H5Tcopy(H5T_STD_I32LE)` shares where
+    /// `H5T_STD_I32LE` itself does not (tests/fixtures/gen_sohm.c).
+    ///
+    /// An attribute has no such branch: `H5A__create` copies unconditionally
+    /// (H5Aint.c:341), so its datatype is always eligible and
+    /// [`share_attribute`](Self::share_attribute) offers it without asking.
+    fn dataset_datatype_shareable(&self, datatype: &DatatypeMessage) -> bool {
+        !datatype.is_predefined()
+            || datatype.is_relocatable()
+            || self.encoding_libver() >= LibverBound::V18
+    }
+
     /// What a header stores for a message a shared-message index may cover:
     /// the body itself, or a pointer into the shared-message heap.
     ///
@@ -9059,6 +9086,18 @@ impl Hdf5Writer {
             // without an address, so only the ones written name themselves.
             info.fs_addr[placed.manager.message_slot()] = placed.hdr_addr;
         }
+        // The end of the file *after* the settle above, not before it, which
+        // the field's name denies: it is 1.10 vintage, where two EOAs were
+        // kept — one taken before the self-referential managers were placed
+        // and one after (H5MF.c:3305 and 3382 in 1.10.11) — and the message
+        // carried the first (1.10.11 H5MF.c:1833, 1999). 1.14 keeps one,
+        // `f->shared->eoa_fsm_fsalloc`, read once the allocation loop has run
+        // (H5MF.c:3234-3240) and encoded into this field by both close paths
+        // (H5MF.c:1759, 1923); H5Fsuper.c:826 names it "the final eoa". A
+        // 1.10 reader wants that value and not the older one: equal EOAs are
+        // the case `H5MF_tidy_self_referential_fsm_hack` returns on
+        // (1.10.11 H5MF.c:3620-3622), which is what leaves the managers this
+        // close wrote in place.
         info.eoa_pre_fsm_fsalloc = self.allocator.eof();
         Ok(Some(info.encode(&self.ctx)?))
     }
@@ -9664,7 +9703,14 @@ impl Hdf5Writer {
             DataspaceMessage::scalar()
         } else {
             let mut ds = DataspaceMessage::simple(dims);
-            ds.max_dims = max_dims.map(<[u64]>::to_vec);
+            // A caller that named no maximum gets the current dimensions, the
+            // maximum `simple` already filled in: `H5Screate_simple(rank,
+            // dims, NULL)` reaches the encoder with `extent.max` set
+            // (H5S.c:1293-1299), so leaving it absent here would write a
+            // message no upstream API call can produce.
+            if let Some(max) = max_dims {
+                ds.max_dims = Some(max.to_vec());
+            }
             ds
         };
 
@@ -15789,11 +15835,12 @@ impl Hdf5Writer {
                 SharedMessagePointer::encode_committed(addr, &self.ctx),
             ),
             None => {
-                let (flags, body) = self.share_message(
-                    MSG_DATATYPE,
-                    MSG_FLAG_CONSTANT,
-                    m.datatype.encode_at(&self.ctx, self.encoding_libver()),
-                );
+                let body = m.datatype.encode_at(&self.ctx, self.encoding_libver());
+                let (flags, body) = if self.dataset_datatype_shareable(&m.datatype) {
+                    self.share_message(MSG_DATATYPE, MSG_FLAG_CONSTANT, body)
+                } else {
+                    (MSG_FLAG_CONSTANT, body)
+                };
                 header.add_message(MSG_DATATYPE, flags, body)
             }
         }

@@ -43,7 +43,21 @@ pub struct DataspaceMessage {
     pub class: DataspaceClass,
     /// Current dimension sizes. Empty for `Scalar` and `Null`.
     pub dims: Vec<u64>,
-    /// Optional maximum dimension sizes.  An entry of `u64::MAX` means unlimited.
+    /// Maximum dimension sizes; an entry of `u64::MAX` means unlimited.
+    ///
+    /// `None` is upstream's `H5S_extent_t.max == NULL`: the extent carries no
+    /// maximum array at all, which is a different thing from a maximum that
+    /// happens to equal the current dimensions. Only decoding a message with
+    /// `H5S_VALID_MAX` clear produces it (H5Osdspace.c:188-194) — every extent
+    /// the API builds is given one (H5S.c:1293-1299) — and it survives being
+    /// rewritten, because `H5S_read` and `H5S_write` decode and re-encode the
+    /// one extent (H5S.c:1100, H5S.c:1039) and the encoder raises the flag
+    /// only for a non-null array (H5Osdspace.c:271-272).
+    ///
+    /// Upstream reads the absent array as the current dimensions wherever a
+    /// bound is reported (`H5S_extent_get_dims`, H5S.c:968-973), which is what
+    /// the crate's consumers do too; `H5S_set_extent` is the exception that
+    /// treats it as no bound at all (H5S.c:1777).
     pub max_dims: Option<Vec<u64>>,
 }
 
@@ -72,11 +86,20 @@ impl DataspaceMessage {
     /// A simple dataspace with fixed dimensions (max == current). An empty
     /// `dims` yields a scalar dataspace, matching how upstream never emits a
     /// `Simple`-class dataspace at rank 0.
+    ///
+    /// The maximum is filled in here, not at encode time, because that is
+    /// where upstream fills it in: `H5S_set_extent_simple` allocates
+    /// `extent.max` for every simple extent and copies the current dimensions
+    /// into it when the caller named no maximum (H5S.c:1293-1299).
     pub fn simple(dims: &[u64]) -> Self {
+        let class = Self::class_for_rank(dims.len());
         Self {
-            class: Self::class_for_rank(dims.len()),
+            class,
             dims: dims.to_vec(),
-            max_dims: None,
+            max_dims: match class {
+                DataspaceClass::Simple => Some(dims.to_vec()),
+                DataspaceClass::Scalar | DataspaceClass::Null => None,
+            },
         }
     }
 
@@ -124,29 +147,6 @@ impl DataspaceMessage {
         needed.max(format.dataspace_version())
     }
 
-    /// The maximum dimensions this message is written with.
-    ///
-    /// A simple dataspace always has them. `H5S_set_extent_simple` allocates
-    /// the maximum array for every simple extent and fills it from the
-    /// current dimensions when the caller passed none (H5S.c:1292-1299), so
-    /// `H5Screate_simple(rank, dims, NULL)` reaches the encoder with
-    /// `extent.max` set; `H5O__sdspace_encode` then raises `H5S_VALID_MAX`
-    /// for any non-null maximum array (H5Osdspace.c:269-272) and writes it
-    /// after the current dimensions (H5Osdspace.c:289-293). A scalar or NULL
-    /// extent has no dimensions to bound and no maximum array, so it keeps
-    /// the flag clear.
-    ///
-    /// `None` here means "the caller named no maximum", not "the file has
-    /// none": the two used to encode alike, which made the same logical
-    /// extent two different messages depending on which side it came from.
-    fn encoded_max_dims(&self) -> Option<&[u64]> {
-        match (&self.max_dims, self.class) {
-            (Some(max), _) => Some(max),
-            (None, DataspaceClass::Simple) => Some(&self.dims),
-            (None, _) => None,
-        }
-    }
-
     /// Encode for a file of the given object format.
     ///
     /// A version-1 dataspace differs only in its prefix: no type byte, and
@@ -156,7 +156,10 @@ impl DataspaceMessage {
         let version = self.version_for(format);
         let ndims = self.dims.len();
         let ss = ctx.sizeof_size as usize;
-        let max_dims = self.encoded_max_dims();
+        // `H5O__sdspace_encode` raises `H5S_VALID_MAX` for a non-null maximum
+        // array and for nothing else (H5Osdspace.c:271-272), so an extent that
+        // reached us without one is written without one.
+        let max_dims = self.max_dims.as_deref();
         let has_max = max_dims.is_some();
         let flags: u8 = if has_max { FLAG_MAX_DIMS } else { 0 };
 
@@ -459,6 +462,44 @@ mod tests {
         assert_eq!(consumed, 16); // 8 header + 8 dim
         assert_eq!(msg.dims, vec![100]);
         assert_eq!(msg.max_dims, None);
+    }
+
+    /// A message that stores no maximum is re-encoded without one, at either
+    /// version. Upstream keeps the state because `H5O__sdspace_encode` raises
+    /// `H5S_VALID_MAX` only for a non-null `extent.max` (H5Osdspace.c:271-272)
+    /// and the decoder leaves it null when the flag was clear
+    /// (H5Osdspace.c:188-194); a re-encode that invented a maximum would make
+    /// the message eight bytes per dimension longer than the one libhdf5
+    /// writes for the same extent.
+    #[test]
+    fn a_decoded_message_with_no_maximum_re_encodes_without_one() {
+        let mut buf = vec![1, 1, 0, 0];
+        buf.extend_from_slice(&[0u8; 4]);
+        buf.extend_from_slice(&100u64.to_le_bytes());
+
+        let (msg, _) = DataspaceMessage::decode(&buf, &ctx8()).unwrap();
+        assert_eq!(msg.max_dims, None);
+        assert_eq!(
+            msg.encode_for(&ctx8(), crate::format::ObjectFormat::Legacy),
+            buf
+        );
+
+        let modern = msg.encode_for(&ctx8(), crate::format::ObjectFormat::Modern);
+        assert_eq!(modern.len(), 12, "4-byte prefix and one dimension");
+        assert_eq!(modern[2], 0, "H5S_VALID_MAX stays clear");
+        let (round, _) = DataspaceMessage::decode(&modern, &ctx8()).unwrap();
+        assert_eq!(round, msg);
+    }
+
+    /// The constructors fill the maximum in the way `H5S_set_extent_simple`
+    /// does (H5S.c:1293-1299), so nothing the crate builds reaches the encoder
+    /// without one — the absent maximum above is only ever read from a file.
+    #[test]
+    fn a_constructed_simple_dataspace_carries_its_maximum() {
+        assert_eq!(DataspaceMessage::simple(&[3, 4]).max_dims, Some(vec![3, 4]));
+        assert_eq!(DataspaceMessage::simple(&[]).max_dims, None);
+        assert_eq!(DataspaceMessage::scalar().max_dims, None);
+        assert_eq!(DataspaceMessage::null().max_dims, None);
     }
 
     #[test]

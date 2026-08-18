@@ -301,6 +301,18 @@ def compare(ref, probe):
 # --------------------------------------------------------------------------
 
 
+def access_argv(access):
+    """A case's dataset-access properties as `oracle_probe dump` flags."""
+    argv = []
+    if not access:
+        return argv
+    if "view" in access:
+        argv += ["--virtual-view", access["view"]]
+    if "printf_gap" in access:
+        argv += ["--printf-gap", str(access["printf_gap"])]
+    return argv
+
+
 def run(cmd, **kw):
     return subprocess.run(
         cmd, capture_output=True, text=True, timeout=600, **kw
@@ -340,7 +352,7 @@ class Oracle:
             return out, None
 
         try:
-            ref_text = canon.dump(str(ref_path))
+            ref_text = canon.dump(str(ref_path), case.access)
         except Exception:
             out["verdict"] = "GEN-ERROR"
             out["detail"] = "canon.py could not describe the reference: " + tail(
@@ -348,7 +360,7 @@ class Oracle:
             )
             return out, None
 
-        proc = run([self.probe, "dump", str(ref_path)])
+        proc = run([self.probe, "dump"] + access_argv(case.access) + [str(ref_path)])
         if proc.returncode != 0:
             out["verdict"] = "READ-ERROR"
             out["detail"] = tail(proc.stdout + proc.stderr)
@@ -408,7 +420,7 @@ class Oracle:
             return out
 
         try:
-            written_text = canon.dump(str(out_path))
+            written_text = canon.dump(str(out_path), case.access)
         except Exception:
             out["verdict"] = "INVALID"
             out["detail"] = "h5py could not read the rust-written file: " + tail(
@@ -416,7 +428,7 @@ class Oracle:
             )
             return out
 
-        ref, _ = parse_dump(canon.dump(str(ref_path)))
+        ref, _ = parse_dump(canon.dump(str(ref_path), case.access))
         got, _ = parse_dump(written_text)
         # An object h5py cannot open in the rust-written file makes every one
         # of its fields diverge; report the object once instead, the same way

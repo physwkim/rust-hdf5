@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::dataset::{DatasetAccess, VirtualView};
 use crate::format::btree_v1::{BTreeV1Config, BTreeV1Node, ChunkBTreeV1Node};
 use crate::format::bytes::read_le_uint as read_uint;
 use crate::format::creation_order::CreationOrder;
@@ -40,7 +41,7 @@ use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
 use crate::format::reference::{
     decode_object_element, decode_region_element, decode_region_heap_object, decode_revised_body,
-    decode_revised_element, Reference, ReferenceTarget, RevisedElement,
+    decode_revised_element, DecodedReference, Reference, ReferenceTarget, RevisedElement,
 };
 use crate::format::selection::{Hyperslab, PointSelection, RegularHyperslab, Selection};
 use crate::format::sohm::SohmMasterTable;
@@ -203,13 +204,24 @@ pub struct DatasetReadInfo {
     /// `None` for every non-virtual dataset and for a virtual one with no
     /// mapping list.
     pub virtual_resolution: Option<Vec<MappingResolution>>,
+    /// The extent this dataset's dataspace message stores, kept because
+    /// `dataspace.dims` holds the extent the *sources* gave it once
+    /// `resolve_virtual_extents` has run. `H5D__virtual_set_extent_unlim`
+    /// resolves from the space freshly loaded from the object header on
+    /// every `H5Dopen` (H5Dvirtual.c:1386), so a later open under different
+    /// [`DatasetAccess`] must resolve from this, not from its own last
+    /// answer.
+    ///
+    /// `Some` exactly for a virtual dataset whose extent has been resolved;
+    /// `None` for every dataset whose extent is simply its stored one.
+    pub virtual_stored_dims: Option<Vec<u64>>,
 }
 
 /// What one virtual-dataset mapping resolved to at open time —
 /// `H5D__virtual_set_extent_unlim` (H5Dvirtual.c), which libhdf5 runs when
 /// the dataset is opened and which both the dataset's reported extent and
 /// every read of it depend on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MappingResolution {
     /// Neither selection grows: the mapping is already concrete, and the
     /// dataset's stored extent is its extent.
@@ -221,19 +233,16 @@ pub enum MappingResolution {
     /// values `H5S_hyper_clip_unlim` clips the mapping's selections to.
     Unlimited { virtual_clip: u64, source_clip: u64 },
     /// A printf mapping (unlimited virtual selection, limited source
-    /// selection, `%b` in a source name): `blocks` source datasets were
-    /// found, filling blocks `0..blocks` of the virtual selection.
-    /// Upstream's `first_missing` — it stops at the first block whose source
-    /// is absent, plus `printf_gap` more (`H5D_ACS_VDS_PRINTF_GAP_DEF` is 0,
-    /// and it is a dataset-access property never stored in the file).
-    Printf { blocks: u64 },
+    /// selection, `%b` in a source name).
+    ///
+    /// `blocks` is upstream's `first_missing`: the scan stops at the first
+    /// block whose source is absent and then looks
+    /// [`DatasetAccess::virtual_printf_gap`] blocks further, so blocks
+    /// `0..blocks` are the ones the extent covers. `present` lists which of
+    /// them actually have a source — with a non-zero gap the others are
+    /// inside the extent but read as the fill value.
+    Printf { blocks: u64, present: Vec<u64> },
 }
-
-/// `H5D_ACS_VDS_PRINTF_GAP_DEF`: how many consecutive missing printf source
-/// datasets a reader looks past before it stops. `H5Pset_virtual_printf_gap`
-/// sets a *dataset access* property, never written to the file, so a reader
-/// opening a file it did not create always sees this default.
-const PRINTF_GAP: u64 = 0;
 
 /// The class of one link record in a group: what `H5Lget_info` reports,
 /// carrying the value `H5Lget_val` returns for the classes that have one.
@@ -944,6 +953,19 @@ pub struct Hdf5Reader {
     /// discovery walk reached plus the root group. This is what turns the
     /// address an object reference stores back into a name.
     object_paths: std::collections::HashMap<u64, String>,
+    /// The dataset-access properties in force for each virtual dataset,
+    /// keyed by canonical path (no leading `/`); an absent entry means
+    /// [`DatasetAccess::default`].
+    ///
+    /// libhdf5 keeps this per open handle — `H5D__virtual_init` copies the
+    /// dapl into the dataset's own layout storage (H5Dvirtual.c:2224-2226) —
+    /// but this reader keeps one resolved extent per dataset, so the entry
+    /// here is what the most recent [`open_dataset_with`](Self::open_dataset_with)
+    /// asked for. It is the single owner of that answer: the resolution
+    /// reads it and nothing else writes it, so a SWMR
+    /// [`refresh`](Self::refresh) re-resolves under the same properties
+    /// rather than reverting to the defaults.
+    virtual_access: std::collections::BTreeMap<String, DatasetAccess>,
 }
 
 /// The absolute form of a discovery-walk path (which carries no leading `/`):
@@ -1167,13 +1189,15 @@ fn concrete_virtual_mappings(
             // One printf mapping is a whole family: block `j` of the virtual
             // selection (`H5S_hyper_get_unlim_block`) is filled by the source
             // dataset whose name substitutes `j`, taking the mapping's whole
-            // (limited) source selection.
-            Some(MappingResolution::Printf { blocks }) => {
+            // (limited) source selection. Only the blocks that have a source
+            // become mappings — a non-zero printf gap leaves the others
+            // inside the extent, reading as the fill value.
+            Some(MappingResolution::Printf { present, .. }) => {
                 let Some(r) = regular_hyperslab(&m.virtual_selection) else {
                     continue;
                 };
                 let rank = r.start.len();
-                for j in 0..*blocks {
+                for &j in present {
                     out.push(VirtualMapping {
                         virtual_selection: Selection::Hyperslab {
                             rank,
@@ -1635,6 +1659,7 @@ impl Hdf5Reader {
             locking: origin.locking,
             external: Default::default(),
             external_resolved: Default::default(),
+            virtual_access: Default::default(),
             // Overwritten by `open_with_locking` once this returns.
             source_dir: PathBuf::new(),
         })
@@ -1720,6 +1745,7 @@ impl Hdf5Reader {
             locking: origin.locking,
             external: Default::default(),
             external_resolved: Default::default(),
+            virtual_access: Default::default(),
             // Overwritten by `open_with_locking` once this returns.
             source_dir: PathBuf::new(),
         })
@@ -2225,10 +2251,11 @@ impl Hdf5Reader {
                 alloc_time,
                 external_files,
                 virtual_mappings,
-                // Filled in by `resolve_virtual_extents` once the reader has
-                // the directory source names resolve against; a catalog on
-                // its own cannot open another file.
+                // Both filled in by `resolve_virtual_extents` once the
+                // reader has the directory source names resolve against; a
+                // catalog on its own cannot open another file.
                 virtual_resolution: None,
+                virtual_stored_dims: None,
             })),
             // The three messages are present and none of them reported an
             // error, so this is unreachable; report it as unreadable rather
@@ -2618,6 +2645,19 @@ impl Hdf5Reader {
                 resolved
             }
         };
+        self.cross_file(resolved)
+    }
+
+    /// Open `resolved`, or hand back the handle a previous crossing to the
+    /// same file already opened.
+    ///
+    /// The single owner of every file this reader opens on another file's
+    /// behalf, so a path named by any number of external links and external
+    /// references is opened once and read through one handle. What resolved
+    /// the name to this path is the caller's business, and differs by kind:
+    /// an external link runs `H5F_prefix_open_file`'s search order, a
+    /// reference has no search order at all.
+    fn cross_file(&mut self, resolved: PathBuf) -> IoResult<&mut Hdf5Reader> {
         let locking = self.locking;
         match self.external.entry(resolved) {
             std::collections::btree_map::Entry::Occupied(e) => Ok(&mut **e.into_mut()),
@@ -2673,15 +2713,23 @@ impl Hdf5Reader {
         self.datasets.iter().find(|d| d.name == name)
     }
 
-    /// Open `name` as a dataset the way `H5Dopen` does, reporting *why* it
+    /// Open `name` as a dataset the way `H5Dopen2` does, reporting *why* it
     /// cannot be opened instead of collapsing every cause into absence: a
     /// soft link whose target does not exist is a dangling link, and a path
     /// through an external link is resolved in the file that link names.
     ///
-    /// This is the gate every typed dataset access goes through.
-    pub fn open_dataset(&mut self, name: &str) -> IoResult<&DatasetReadInfo> {
+    /// This is the gate every typed dataset access goes through. `access` is
+    /// the dapl the open names; its properties are put in force for the
+    /// dataset first, so the extent this returns is the one they resolve it
+    /// to.
+    pub fn open_dataset_with(
+        &mut self,
+        name: &str,
+        access: DatasetAccess,
+    ) -> IoResult<&DatasetReadInfo> {
         if self.external_edge(name).is_some() {
             let (owner, path, edge) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            owner.apply_dataset_access(&path, access)?;
             return match owner.open_dataset_local(&path) {
                 // The name is absent in the target file, which makes the link
                 // that pointed there dangling — not the caller's path absent.
@@ -2691,6 +2739,7 @@ impl Hdf5Reader {
                 other => other,
             };
         }
+        self.apply_dataset_access(name, access)?;
         self.open_dataset_local(name)
     }
 
@@ -3097,7 +3146,11 @@ impl Hdf5Reader {
             ReferenceEncoding::Old(OldReferenceKind::Object) => {
                 match decode_object_element(elem, &self.meta.ctx)? {
                     None => Ok(Reference::Null),
-                    Some(address) => Ok(self.resolve_reference(address, ReferenceTarget::Object)),
+                    Some(address) => Ok(self.resolve_reference(DecodedReference {
+                        address,
+                        file: None,
+                        target: ReferenceTarget::Object,
+                    })),
                 }
             }
             ReferenceEncoding::Old(OldReferenceKind::DatasetRegion) => {
@@ -3107,21 +3160,30 @@ impl Hdf5Reader {
                 };
                 let obj = self.heap_object(coll_addr, obj_index, heaps)?;
                 let (address, selection) = decode_region_heap_object(obj, &self.meta.ctx)?;
-                Ok(self.resolve_reference(address, ReferenceTarget::Region(selection)))
+                Ok(self.resolve_reference(DecodedReference {
+                    address,
+                    file: None,
+                    target: ReferenceTarget::Region(selection),
+                }))
             }
             ReferenceEncoding::Revised => {
-                let (kind, body) = match decode_revised_element(elem, &self.meta.ctx)? {
+                let (kind, external, body) = match decode_revised_element(elem, &self.meta.ctx)? {
                     RevisedElement::Null => return Ok(Reference::Null),
-                    RevisedElement::Inline { kind, body } => (kind, body.to_vec()),
+                    RevisedElement::Inline { kind, body } => (kind, false, body.to_vec()),
                     RevisedElement::Heap {
                         kind,
+                        external,
                         collection,
                         index,
-                    } => (kind, self.heap_object(collection, index, heaps)?.to_vec()),
+                    } => (
+                        kind,
+                        external,
+                        self.heap_object(collection, index, heaps)?.to_vec(),
+                    ),
                 };
-                match decode_revised_body(kind, &body, &self.meta.ctx)? {
+                match decode_revised_body(kind, external, &body, &self.meta.ctx)? {
                     None => Ok(Reference::Null),
-                    Some((address, target)) => Ok(self.resolve_reference(address, target)),
+                    Some(decoded) => Ok(self.resolve_reference(decoded)),
                 }
             }
         }
@@ -3129,17 +3191,43 @@ impl Hdf5Reader {
 
     /// Attach the target's path to a decoded reference — the one place an
     /// address becomes a [`Reference`], so every kind resolves the same way.
-    fn resolve_reference(&self, address: u64, target: ReferenceTarget) -> Reference {
-        let path = self.path_for_object(address).map(str::to_string);
+    ///
+    /// A reference naming another file is looked up in that file, which this
+    /// opens by the name the reference carries and nothing else:
+    /// `H5R__reopen_file` hands the name straight to `H5VL_file_open` with no
+    /// prefix search, so it is read against the process working directory the
+    /// way `H5Ropen_object` would read it (H5Rint.c:466, :487). A file that is
+    /// not there leaves the path unresolved while the reference still names
+    /// it, which is `H5Rget_file_name` answering from the reference alone
+    /// while `H5Ropen_object` fails (H5R.c:1036-1039).
+    fn resolve_reference(&mut self, decoded: DecodedReference) -> Reference {
+        let DecodedReference {
+            address,
+            file,
+            target,
+        } = decoded;
+        let path = match &file {
+            None => self.path_for_object(address).map(str::to_string),
+            Some(name) => self
+                .cross_file(PathBuf::from(name))
+                .ok()
+                .and_then(|target| target.path_for_object(address).map(str::to_string)),
+        };
         match target {
-            ReferenceTarget::Object => Reference::Object { address, path },
+            ReferenceTarget::Object => Reference::Object {
+                address,
+                file,
+                path,
+            },
             ReferenceTarget::Region(selection) => Reference::Region {
                 address,
+                file,
                 path,
                 selection,
             },
             ReferenceTarget::Attribute(name) => Reference::Attr {
                 address,
+                file,
                 path,
                 name,
             },
@@ -3353,13 +3441,64 @@ impl Hdf5Reader {
             .filter(|&i| self.datasets[i].virtual_mappings.is_some())
             .collect();
         for i in targets {
-            let mappings = self.datasets[i].virtual_mappings.clone().unwrap();
-            let curr_dims = self.datasets[i].dataspace.dims.clone();
-            let (resolution, dims) = self.resolve_one_virtual_extent(&mappings, &curr_dims)?;
-            self.datasets[i].dataspace.dims = dims;
-            self.datasets[i].virtual_resolution = Some(resolution);
+            // The catalog is freshly built, so `dataspace.dims` is still the
+            // extent the dataspace message stores. Record it before the
+            // resolution replaces it: that is what a later open under other
+            // access properties has to resolve from.
+            let stored = self.datasets[i].dataspace.dims.clone();
+            self.datasets[i].virtual_stored_dims = Some(stored.clone());
+            self.resolve_virtual_extent_of(i, &stored)?;
         }
         Ok(())
+    }
+
+    /// Resolve one virtual dataset's extent from its *stored* dims under the
+    /// [`DatasetAccess`] in force for it, and stamp both the extent and the
+    /// per-mapping resolutions in.
+    fn resolve_virtual_extent_of(&mut self, i: usize, stored: &[u64]) -> IoResult<()> {
+        let Some(mappings) = self.datasets[i].virtual_mappings.clone() else {
+            return Ok(());
+        };
+        let access = self.access_in_force(&self.datasets[i].name.clone());
+        let (resolution, dims) = self.resolve_one_virtual_extent(&mappings, stored, access)?;
+        self.datasets[i].dataspace.dims = dims;
+        self.datasets[i].virtual_resolution = Some(resolution);
+        Ok(())
+    }
+
+    /// The dataset-access properties in force for `name` (already canonical),
+    /// libhdf5's defaults when no open has named others.
+    fn access_in_force(&self, canonical: &str) -> DatasetAccess {
+        self.virtual_access
+            .get(canonical)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Put `access` in force for `name` and re-resolve its extent under it —
+    /// what `H5Dopen` with a non-default dapl does, since `H5D__virtual_init`
+    /// stores the dapl on the dataset and `H5D__virtual_set_extent_unlim`
+    /// then runs against it (H5Dvirtual.c:2178-2188, :1386).
+    ///
+    /// A name that is not a resolved virtual dataset takes nothing: the two
+    /// properties this models are the two that only a virtual dataset reads.
+    fn apply_dataset_access(&mut self, name: &str, access: DatasetAccess) -> IoResult<()> {
+        let canonical = self.canonical_path(name);
+        let Some(i) = self.datasets.iter().position(|d| d.name == canonical) else {
+            return Ok(());
+        };
+        let Some(stored) = self.datasets[i].virtual_stored_dims.clone() else {
+            return Ok(());
+        };
+        if self.access_in_force(&canonical) == access {
+            return Ok(());
+        }
+        self.virtual_access.insert(canonical, access);
+        // A source may be a virtual dataset in this same file, and the
+        // access propagates to it (H5Dvirtual.c:2224-2226), so this can
+        // re-enter; the depth counter is the same cycle guard the open-time
+        // resolution uses.
+        VirtualResolveDepth::enter(|| self.resolve_virtual_extent_of(i, &stored))
     }
 
     /// [`resolve_virtual_extents`](Self::resolve_virtual_extents) for one
@@ -3368,6 +3507,7 @@ impl Hdf5Reader {
         &mut self,
         mappings: &VirtualMappingList,
         curr_dims: &[u64],
+        access: DatasetAccess,
     ) -> IoResult<(Vec<MappingResolution>, Vec<u64>)> {
         let rank = curr_dims.len();
         let mut resolution = Vec::with_capacity(mappings.mappings.len());
@@ -3375,13 +3515,25 @@ impl Hdf5Reader {
         // `H5D_virtual_update_min_dims`: whatever the unlimited dimension
         // resolves to, the extent must still hold every bounded mapping.
         let mut min_dims = vec![0u64; rank];
+        // `H5S_hyper_get_clip_extent_match`'s `incl_trail`: a
+        // `H5D_VDS_FIRST_MISSING` view stops where the trailing partial
+        // block would begin (H5Dvirtual.c:1447-1451).
+        let incl_trail = access.view() == VirtualView::FirstMissing;
+        // Where two mappings disagree about the unlimited dimension,
+        // `H5D_VDS_FIRST_MISSING` takes the smallest clip and
+        // `H5D_VDS_LAST_AVAILABLE` the largest (H5Dvirtual.c:1662-1667).
+        let take_clip = |slot: &mut Option<u64>, clip: u64| {
+            if slot.is_none_or(|d| if incl_trail { clip < d } else { clip > d }) {
+                *slot = Some(clip);
+            }
+        };
 
         for m in &mappings.mappings {
             let unlim_virtual = m.virtual_selection.unlim_dim();
             let res = match (unlim_virtual, m.source_selection.unlim_dim()) {
                 (Some(vd), Some(sd)) => {
                     let source_clip = self
-                        .virtual_source_dims(m)
+                        .virtual_source_dims(m, access)
                         .ok()
                         .flatten()
                         .and_then(|d| d.get(sd).copied())
@@ -3392,13 +3544,15 @@ impl Hdf5Reader {
                     ) {
                         // `H5S_hyper_get_clip_extent_match`: how many slices
                         // the source supplies, then the virtual extent that
-                        // covers exactly that many.
-                        (Some(v), Some(sr)) => v.clip_extent(sr.num_slices(source_clip), false),
+                        // covers exactly that many. Its `incl_trail`
+                        // argument is `view == H5D_VDS_FIRST_MISSING`
+                        // (H5Dvirtual.c:1447-1451).
+                        (Some(v), Some(sr)) => {
+                            v.clip_extent(sr.num_slices(source_clip), incl_trail)
+                        }
                         _ => 0,
                     };
-                    if new_dims[vd].is_none_or(|d| virtual_clip > d) {
-                        new_dims[vd] = Some(virtual_clip);
-                    }
+                    take_clip(&mut new_dims[vd], virtual_clip);
                     MappingResolution::Unlimited {
                         virtual_clip,
                         source_clip,
@@ -3409,21 +3563,26 @@ impl Hdf5Reader {
                 // virtual selection come from successively-named source
                 // datasets.
                 (Some(vd), None) => {
-                    let blocks = self.printf_blocks_present(m);
+                    let (blocks, present) = self.printf_blocks_present(m, access);
                     let virtual_clip = match (blocks, regular_hyperslab(&m.virtual_selection)) {
+                        // `H5D__virtual_set_extent_unlim`'s "check for no
+                        // datasets" arm, which is 0 under either view
+                        // (H5Dvirtual.c:1623-1626).
                         (0, _) | (_, None) => 0,
-                        // `H5D__virtual_set_extent_unlim`'s printf arm under
-                        // the default view: the extent ends just past the
-                        // last block that has a source.
-                        (n, Some(r)) => {
-                            let last = r.unlim_block(n - 1);
-                            last.start[vd] + last.block[vd]
-                        }
+                        // The extent ends just past the last block that has
+                        // a source under `H5D_VDS_LAST_AVAILABLE`, and where
+                        // the first missing block starts under
+                        // `H5D_VDS_FIRST_MISSING` (H5Dvirtual.c:1630-1653).
+                        (n, Some(r)) => match access.view() {
+                            VirtualView::LastAvailable => {
+                                let last = r.unlim_block(n - 1);
+                                last.start[vd] + last.block[vd]
+                            }
+                            VirtualView::FirstMissing => r.unlim_block(n).start[vd],
+                        },
                     };
-                    if new_dims[vd].is_none_or(|d| virtual_clip > d) {
-                        new_dims[vd] = Some(virtual_clip);
-                    }
-                    MappingResolution::Printf { blocks }
+                    take_clip(&mut new_dims[vd], virtual_clip);
+                    MappingResolution::Printf { blocks, present }
                 }
                 _ => MappingResolution::Bounded,
             };
@@ -3450,38 +3609,67 @@ impl Hdf5Reader {
     /// cannot be reached — `H5D__virtual_open_source_dset` leaving the source
     /// closed, which upstream reads as "no data there yet" rather than an
     /// error.
-    fn virtual_source_dims(&mut self, m: &VirtualMapping) -> IoResult<Option<Vec<u64>>> {
+    fn virtual_source_dims(
+        &mut self,
+        m: &VirtualMapping,
+        access: DatasetAccess,
+    ) -> IoResult<Option<Vec<u64>>> {
         let m = built_names(m, 0)?;
-        Ok(self.source_dims(&m.source_file_name, &m.source_dset_name))
+        Ok(self.source_dims(&m.source_file_name, &m.source_dset_name, access))
     }
 
-    /// How many of a printf mapping's source datasets exist, counting from
-    /// block 0 — upstream's `first_missing` (`H5D__virtual_set_extent_unlim`),
-    /// which stops at the first block whose source cannot be opened and looks
-    /// [`PRINTF_GAP`] blocks past it before giving up.
-    fn printf_blocks_present(&mut self, m: &VirtualMapping) -> u64 {
+    /// A printf mapping's `first_missing` and the blocks below it that
+    /// actually have a source — upstream's search loop in
+    /// `H5D__virtual_set_extent_unlim` (H5Dvirtual.c:1519-1614), which stops
+    /// at the first block whose source cannot be opened and looks
+    /// [`DatasetAccess::virtual_printf_gap`] blocks past it before giving up.
+    ///
+    /// The loop bound is upstream's `j <= printf_gap + first_missing`
+    /// rearranged so a large gap cannot overflow the sum: `first_missing` is
+    /// never above `j` when the test runs, because it only ever becomes the
+    /// *previous* `j` plus one.
+    fn printf_blocks_present(
+        &mut self,
+        m: &VirtualMapping,
+        access: DatasetAccess,
+    ) -> (u64, Vec<u64>) {
+        let gap = access.effective_printf_gap();
         let mut first_missing = 0u64;
+        let mut present = Vec::new();
         let mut j = 0u64;
-        while j <= PRINTF_GAP + first_missing {
+        while j - first_missing <= gap {
             let Ok(built) = built_names(m, j) else {
                 break;
             };
             if self
-                .source_dims(&built.source_file_name, &built.source_dset_name)
+                .source_dims(&built.source_file_name, &built.source_dset_name, access)
                 .is_some()
             {
                 first_missing = j + 1;
+                present.push(j);
             }
             j += 1;
         }
-        first_missing
+        (first_missing, present)
     }
 
     /// The extent of one named source dataset, or `None` when the file or
     /// the dataset in it cannot be opened.
-    fn source_dims(&mut self, file_name: &str, dset_name: &str) -> Option<Vec<u64>> {
+    ///
+    /// `access` is the virtual dataset's own: `H5D__virtual_init` copies the
+    /// dapl into the layout as `source_dapl` (H5Dvirtual.c:2224-2226) and
+    /// every source is opened with it (H5Dvirtual.c:901-902), so a source
+    /// that is itself a virtual dataset resolves under the same view and
+    /// printf gap.
+    fn source_dims(
+        &mut self,
+        file_name: &str,
+        dset_name: &str,
+        access: DatasetAccess,
+    ) -> Option<Vec<u64>> {
         let dset_name = dset_name.trim_start_matches('/');
         if file_name == "." {
+            self.apply_dataset_access(dset_name, access).ok()?;
             return self
                 .dataset_info_local(dset_name)
                 .map(|i| i.dataspace.dims.clone());
@@ -3489,6 +3677,7 @@ impl Hdf5Reader {
         let prefix = resolve_vdsfile_prefix(&self.source_dir);
         let full_path = combine_prefixed_path(prefix.as_deref(), file_name);
         let mut reader = Hdf5Reader::open_with_locking(&full_path, FileLocking::Disabled).ok()?;
+        reader.apply_dataset_access(dset_name, access).ok()?;
         reader
             .dataset_info(dset_name)
             .map(|i| i.dataspace.dims.clone())
@@ -3504,6 +3693,17 @@ impl Hdf5Reader {
     /// the concrete mappings its open-time resolution made it
     /// (`H5D_VDS_LAST_AVAILABLE`, the default view — see
     /// [`Hdf5Reader::resolve_virtual_extents`]).
+    ///
+    /// A mapping whose source cannot be opened — the file is absent, or the
+    /// dataset is not in it — contributes nothing and leaves its virtual
+    /// region at the fill value, rather than failing the read.
+    /// `H5D__virtual_open_source_dset` treats both as "no data there yet":
+    /// it asks `H5F_prefix_open_file` to *try* the file and accepts a null
+    /// one, and clears the error stack when the dataset is missing
+    /// (H5Dvirtual.c:877-909); `H5D__virtual_read_one` then performs I/O
+    /// "only ... if there is a projected memory space, otherwise there were
+    /// no elements in the projection or the source dataset could not be
+    /// opened" (H5Dvirtual.c:2661-2665).
     ///
     /// `depth` counts virtual-dataset nesting — a mapping whose source is
     /// itself a virtual dataset, possibly in another file — so a crafted
@@ -3532,6 +3732,10 @@ impl Hdf5Reader {
         let resolution = info.virtual_resolution.clone().unwrap_or_default();
         let mappings = concrete_virtual_mappings(&mappings, &resolution)?;
         let source_dir = self.source_dir.clone();
+        // The same properties the extent resolved under reach every source
+        // (H5Dvirtual.c:2224-2226, :901-902), so a source that is itself a
+        // virtual dataset is read the same way this one is.
+        let access = self.access_in_force(&self.canonical_path(name));
 
         // Cross-file source readers, opened at most once per distinct
         // resolved path for the duration of this call.
@@ -3552,17 +3756,13 @@ impl Hdf5Reader {
             let source_name = mapping.source_dset_name.trim_start_matches('/');
 
             if mapping.source_file_name == "." {
-                let src_dims = self
+                self.apply_dataset_access(source_name, access)?;
+                let Some(src_dims) = self
                     .dataset_info(source_name)
-                    .ok_or_else(|| {
-                        crate::io::IoError::InvalidState(format!(
-                            "dataset {name:?}: virtual mapping source dataset \
-                             {source_name:?} not found in the same file"
-                        ))
-                    })?
-                    .dataspace
-                    .dims
-                    .clone();
+                    .map(|i| i.dataspace.dims.clone())
+                else {
+                    continue;
+                };
                 let source_boxes = mapping.source_selection.to_boxes(&src_dims).map_err(|e| {
                     crate::io::IoError::InvalidState(format!(
                         "dataset {name:?}: virtual mapping's source selection is not \
@@ -3583,29 +3783,21 @@ impl Hdf5Reader {
                 let cache_key =
                     std::fs::canonicalize(&full_path).unwrap_or_else(|_| full_path.clone());
                 if !cross_file_cache.contains_key(&cache_key) {
-                    let reader = Hdf5Reader::open_with_locking(&full_path, FileLocking::Disabled)
-                        .map_err(|e| {
-                        crate::io::IoError::InvalidState(format!(
-                            "dataset {name:?}: unable to open virtual dataset source \
-                                 file {}: {e}",
-                            full_path.display()
-                        ))
-                    })?;
+                    let Ok(reader) =
+                        Hdf5Reader::open_with_locking(&full_path, FileLocking::Disabled)
+                    else {
+                        continue;
+                    };
                     cross_file_cache.insert(cache_key.clone(), reader);
                 }
                 let src_reader = cross_file_cache.get_mut(&cache_key).unwrap();
-                let src_dims = src_reader
+                src_reader.apply_dataset_access(source_name, access)?;
+                let Some(src_dims) = src_reader
                     .dataset_info(source_name)
-                    .ok_or_else(|| {
-                        crate::io::IoError::InvalidState(format!(
-                            "dataset {name:?}: virtual mapping source dataset \
-                             {source_name:?} not found in {}",
-                            full_path.display()
-                        ))
-                    })?
-                    .dataspace
-                    .dims
-                    .clone();
+                    .map(|i| i.dataspace.dims.clone())
+                else {
+                    continue;
+                };
                 let source_boxes = mapping.source_selection.to_boxes(&src_dims).map_err(|e| {
                     crate::io::IoError::InvalidState(format!(
                         "dataset {name:?}: virtual mapping's source selection is not \
