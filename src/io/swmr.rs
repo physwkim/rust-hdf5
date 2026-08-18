@@ -946,6 +946,38 @@ mod swmr_hardlink_tests {
         );
     }
 
+    /// A read decodes the dataset's chunk index and the reader keeps it, so
+    /// `refresh` has to leave nothing of it behind: the frames appended after
+    /// that read live in chunks the decoded index has no entry for, and after
+    /// the re-finalize at an address nothing in it points at.
+    #[test]
+    fn a_refresh_drops_the_chunk_index_the_last_read_decoded() {
+        use crate::io::locking::FileLocking;
+
+        let dir = TmpDir::new("refresh_index");
+        let path = dir.file();
+
+        let mut w = SwmrWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+        let idx = w
+            .create_streaming_dataset("frames", DatatypeMessage::u8_type(), &[2, 2])
+            .unwrap();
+        w.start_swmr().unwrap();
+        w.append_frame(idx, &[1u8, 2, 3, 4]).unwrap();
+        w.flush().unwrap();
+
+        let mut r = Hdf5Reader::open_swmr_with_locking(&path, FileLocking::Disabled).unwrap();
+        assert_eq!(r.read_dataset_raw("frames").unwrap(), vec![1u8, 2, 3, 4]);
+
+        w.append_frame(idx, &[5u8, 6, 7, 8]).unwrap();
+        w.close().unwrap();
+
+        r.refresh().unwrap();
+        assert_eq!(
+            r.read_dataset_raw("frames").unwrap(),
+            vec![1u8, 2, 3, 4, 5, 6, 7, 8]
+        );
+    }
+
     /// A group created after `start_swmr` is a structural change; the full
     /// re-finalize at close rebuilds every group/root header, so the group
     /// reaches the final file.
