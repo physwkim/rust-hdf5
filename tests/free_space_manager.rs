@@ -239,6 +239,67 @@ fn the_managers_the_crate_wrote_are_readable_by_both_libraries() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A file this crate creates with `fs_persist` carries the strategy, keeps
+/// real managers once an append frees anything, and stays a file libhdf5
+/// reads, checks and appends to.
+#[test]
+fn a_crate_created_persisting_file_is_one_libhdf5_accepts() {
+    let Some(py) = python() else { return };
+    let path = tmp("created");
+    {
+        let file = H5File::options()
+            .file_space(FileSpaceStrategy::FsmAggr, true, 1)
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape([16usize])
+            .create("keep")
+            .unwrap()
+            .write_raw(&(0..16i32).collect::<Vec<_>>())
+            .unwrap();
+        file.create_group("grp").unwrap();
+        file.new_dataset::<f64>()
+            .shape([8usize])
+            .create("grp/inner")
+            .unwrap()
+            .write_raw(&(0..8).map(f64::from).collect::<Vec<_>>())
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let created = h5stat_space(py, &path);
+    assert_eq!(
+        created.tracked, 0,
+        "nothing was freed while the file was created: {created:?}"
+    );
+    let info = H5File::open(&path)
+        .unwrap()
+        .superblock_extension()
+        .file_space_info
+        .expect("the created file declares its strategy");
+    assert_eq!(info.strategy, FileSpaceStrategy::FsmAggr);
+    assert!(info.persist);
+    h5clear_accepts(py, &path);
+
+    // The append supersedes the root header and the extension; that is the
+    // first free space this file has, and the managers are where it goes.
+    crate_appends(&path, "added");
+    let appended = h5stat_space(py, &path);
+    assert!(
+        appended.tracked > 0,
+        "the append recorded nothing: {appended:?}"
+    );
+    h5clear_accepts(py, &path);
+    h5py_reads_and_appends(py, &path, "by_libhdf5");
+
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.dataset_names();
+    names.sort();
+    assert_eq!(names, ["added", "by_libhdf5", "grp/inner", "keep"]);
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// `sohm_paged.h5` is the paged fixture, and it persists nothing: `gen_sohm.c`
 /// passes `persist = 0` to `H5Pset_file_space_strategy`, so its file-space
 /// info message names no manager and `h5stat -S` reports no tracked free space

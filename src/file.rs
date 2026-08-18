@@ -18,9 +18,10 @@
 
 use std::path::Path;
 
+use crate::format::messages::superblock_ext::FileSpaceStrategy;
 use crate::io::locking::FileLocking;
 use crate::io::reader::SuperblockExtension;
-use crate::io::writer::SharedMessageConfig;
+use crate::io::writer::{FileSpaceConfig, SharedMessageConfig};
 use crate::io::{Hdf5Reader, Hdf5Writer};
 
 use crate::dataset::{DatasetBuilder, H5Dataset};
@@ -625,6 +626,24 @@ impl H5File {
         }
     }
 
+    /// Bytes this file's on-disk free-space managers record as free —
+    /// libhdf5's `H5Fget_freespace`, and the number `h5stat -S` prints as
+    /// "Amount of tracked free space".
+    ///
+    /// Zero for a file that persists no managers, which is every file created
+    /// without [`H5FileOptions::file_space`] asking for `persist`. Read mode
+    /// only: an open writer's freed blocks are not on disk yet, so the two
+    /// would be different questions with one name.
+    pub fn tracked_free_space(&self) -> Result<u64> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => Ok(reader.tracked_free_space()?),
+            _ => Err(Hdf5Error::InvalidState(
+                "tracked_free_space is only available in read mode".into(),
+            )),
+        }
+    }
+
     /// Size in bytes of the userblock this file was written with — the
     /// application-owned prefix the superblock follows (`H5Pget_userblock`).
     /// Zero for a file without one, whichever mode the handle is in.
@@ -1098,6 +1117,7 @@ pub struct H5FileOptions {
     libver: Option<LibverBound>,
     userblock: u64,
     shared_messages: SharedMessageConfig,
+    file_space: Option<FileSpaceConfig>,
 }
 
 impl H5FileOptions {
@@ -1251,6 +1271,48 @@ impl H5FileOptions {
         self
     }
 
+    /// Create the file under a file-space handling strategy — libhdf5's
+    /// `H5Pset_file_space_strategy`, h5py's `File(..., fs_strategy=...,
+    /// fs_persist=..., fs_threshold=...)`.
+    ///
+    /// `strategy` picks how released space is reused:
+    /// [`FileSpaceStrategy::FsmAggr`] keeps free-space managers and the
+    /// metadata/raw-data aggregators (the library default),
+    /// [`FileSpaceStrategy::Aggr`] the aggregators alone, and
+    /// [`FileSpaceStrategy::None`] neither, so every allocation comes from the
+    /// end of the file. [`FileSpaceStrategy::Page`] is refused: a paged file
+    /// allocates on file-space page boundaries and sorts its free sections
+    /// into twelve page-typed managers, which this writer does not model.
+    ///
+    /// `persist` writes the free-space managers into the file on close, so a
+    /// later session — this crate or libhdf5 — finds the space this one
+    /// released instead of appending past it. `threshold` is the smallest
+    /// section a manager records; anything smaller is space the file leaks
+    /// rather than tracks. Both are ignored for the two strategies that have
+    /// no managers, exactly as `H5P__set_file_space_strategy` ignores them.
+    ///
+    /// Only [`create`](Self::create) reads this. A file that already exists
+    /// declares its own strategy in its superblock extension, and this crate
+    /// honours what it finds there.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::{FileSpaceStrategy, H5File};
+    /// let file = H5File::options()
+    ///     .file_space(FileSpaceStrategy::FsmAggr, true, 1)
+    ///     .create("persisting.h5")
+    ///     .unwrap();
+    /// # let _ = file;
+    /// ```
+    pub fn file_space(
+        mut self,
+        strategy: FileSpaceStrategy,
+        persist: bool,
+        threshold: u64,
+    ) -> Self {
+        self.file_space = Some(FileSpaceConfig::new(strategy, persist, threshold));
+        self
+    }
+
     fn resolved_locking(&self) -> FileLocking {
         match self.locking {
             Some(p) => p,
@@ -1288,6 +1350,9 @@ impl H5FileOptions {
         if self.shared_messages != SharedMessageConfig::default() {
             offending.push("shared_messages");
         }
+        if self.file_space.is_some() {
+            offending.push("file_space");
+        }
         if offending.is_empty() {
             Ok(())
         } else {
@@ -1309,6 +1374,7 @@ impl H5FileOptions {
                 libver: self.libver,
                 userblock: self.userblock,
                 shared_messages: self.shared_messages,
+                file_space: self.file_space.unwrap_or_default(),
             },
         )?;
         Ok(H5File {

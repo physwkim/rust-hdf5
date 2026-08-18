@@ -2391,6 +2391,21 @@ impl Hdf5Reader {
         &self.ext
     }
 
+    /// Bytes the file's on-disk free-space managers record as free —
+    /// `H5Fget_freespace`, the number `h5stat -S` prints as "Amount of tracked
+    /// free space".
+    ///
+    /// Zero for a file whose file-space info message names no manager, which
+    /// includes every file written without `persist`. The strategy is not
+    /// consulted: a manager's header and section-info blocks have one layout
+    /// whichever strategy allocated the space they describe.
+    pub fn tracked_free_space(&mut self) -> IoResult<u64> {
+        let Some(info) = self.ext.file_space_info.clone() else {
+            return Ok(0);
+        };
+        crate::io::free_space_io::tracked_free_space(&mut self.handle, &self.meta.ctx, &info)
+    }
+
     /// Size in bytes of the userblock preceding the superblock: the offset the
     /// signature was found at, which is also the file's base address. Zero for
     /// a file without a userblock.

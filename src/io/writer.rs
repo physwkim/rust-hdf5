@@ -42,7 +42,7 @@ use crate::format::messages::group_info::GroupInfoMessage;
 use crate::format::messages::link::{CharacterSet, LinkMessage, LinkTarget};
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::superblock_ext::{
-    FileSpaceInfoMessage, FileSpaceStrategy, SharedMessageTableMessage,
+    FileSpaceInfoMessage, FileSpaceStrategy, SharedMessageTableMessage, FS_ADDR_COUNT_V1,
 };
 use crate::format::messages::virtual_mapping::{VirtualMapping, VirtualMappingList};
 use crate::format::messages::*;
@@ -3197,40 +3197,56 @@ struct CarriedExtension {
     addr: Slot<Option<u64>>,
 }
 
-/// The on-disk free-space managers of a `persist: true` file, as read, and the
-/// blocks they occupy.
-///
-/// A file whose file-space info message says `persist` records the space its
-/// own edits released in one free-space manager per allocation type: a header
-/// block (`FSHD`) naming a sections block (`FSSE`) that lists every free
-/// region. Nothing else in the file says those regions are free, so a session
-/// that rewrites the file without reading them either leaks the space it frees
-/// or hands out space a manager still claims.
-///
-/// INVARIANT: the sections read here are handed to [`FileAllocator`] and
-/// tracked there alone, so there is one account of the file's free space and
-/// not two. What stays here is only what the allocator has no place for: the
-/// message to rewrite, and the managers' own blocks, which are not free space
-/// until the close that replaces them frees them.
-/// What a reopen learns from those managers, split by who owns it: the
-/// sections go to the allocator and the rest stays with the writer.
+/// What a reopen learns from a file's free-space managers, split by who owns
+/// it: the sections go to the allocator and the rest stays with the writer.
 struct ReopenedFreeSpace {
     /// `None` for a file this writer records no free space for.
-    persisted: Option<Box<PersistedFreeSpace>>,
+    state: Option<Box<FileSpaceState>>,
     /// Every section the managers held, merged across them, address-ordered.
-    /// Empty whenever `persisted` is `None`.
+    /// Empty whenever `state` is `None`.
     sections: Vec<(u64, u64)>,
 }
 
-struct PersistedFreeSpace {
-    /// The file-space info message the extension carries, decoded. It is the
+/// The file-space info message this session is responsible for, and the
+/// manager blocks it supersedes.
+///
+/// A file whose message says `persist` records the space its own edits
+/// released in one free-space manager per allocation type: a header block
+/// (`FSHD`) naming a sections block (`FSSE`) that lists every free region.
+/// Nothing else in the file says those regions are free, so a session that
+/// rewrites the file without reading them either leaks the space it frees or
+/// hands out space a manager still claims.
+///
+/// Present for a file this writer *created* with non-default file-space
+/// properties as well, where there is nothing to read and the message is this
+/// session's to write. `None` — the field, not this struct — is the third
+/// case: a reopened file whose message this session must not touch, which the
+/// carried extension re-emits byte for byte.
+///
+/// INVARIANT: the sections read are handed to [`FileAllocator`] and tracked
+/// there alone, so there is one account of the file's free space and not two.
+/// What stays here is only what the allocator has no place for: the message to
+/// write, and the managers' own blocks, which are not free space until the
+/// close that replaces them frees them.
+struct FileSpaceState {
+    /// The message, as read or as the creation options declared it. It is the
     /// only place the manager addresses are recorded, so the close that moves
     /// them rewrites this message.
     info: FileSpaceInfoMessage,
     /// The manager blocks themselves — one header, and one sections block per
     /// manager that had any sections. Freed by the close that lays their
     /// replacements out, the rule every other superseded structure follows.
+    /// Empty for a created file, which supersedes nothing.
     superseded: Vec<(u64, u64)>,
+}
+
+impl FileSpaceState {
+    /// Whether this file keeps free-space managers on disk. The two
+    /// non-manager strategies and `persist: false` all still carry the
+    /// message; they just have nothing to write into it.
+    fn records_free_space(&self) -> bool {
+        self.info.persist && self.info.strategy == FileSpaceStrategy::FsmAggr
+    }
 }
 
 /// Where a free-space manager's own two blocks go, and what it records.
@@ -3542,11 +3558,11 @@ pub struct Hdf5Writer {
     /// went; see [`CarriedExtension`].
     extension: Box<CarriedExtension>,
     /// The free-space managers a reopened `persist: true` file carries; see
-    /// [`PersistedFreeSpace`]. `None` for every other file — one with no
+    /// [`FileSpaceState`]. `None` for every other file — one with no
     /// file-space info message, one that does not persist, one under paged
     /// aggregation, and every file this session created — and those files get
     /// no free-space manager written either.
-    free_space: Option<Box<PersistedFreeSpace>>,
+    free_space: Option<Box<FileSpaceState>>,
     /// The file's shared-message indexes, when it was created with any.
     /// `None` — the default — is a file with no shared-message table, where
     /// [`share_message`](Self::share_message) is the identity.
@@ -3724,7 +3740,115 @@ pub struct FileCreateOptions {
     pub userblock: u64,
     /// Shared object header message indexes; see [`SharedMessageConfig`].
     pub shared_messages: SharedMessageConfig,
+    /// How the file manages its own space; see [`FileSpaceConfig`].
+    pub file_space: FileSpaceConfig,
 }
+
+/// The file-space handling properties a new file is created with —
+/// `H5Pset_file_space_strategy`'s three arguments.
+///
+/// The page size (`H5Pset_file_space_page_size`) is the fourth property
+/// `H5F__super_init` reads and is not here: it only means anything under the
+/// paged strategy, which [`validate`](Self::validate) refuses, so it stays at
+/// libhdf5's default of 4096 and reaches the file only as the value the
+/// message must carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileSpaceConfig {
+    /// `H5F_fspace_strategy_t`.
+    pub strategy: FileSpaceStrategy,
+    /// Whether the free-space managers are written to the file on close.
+    pub persist: bool,
+    /// The smallest section a manager records; a block freed below it is
+    /// space the file leaks rather than tracks.
+    pub threshold: u64,
+}
+
+impl Default for FileSpaceConfig {
+    /// `H5F_FILE_SPACE_STRATEGY_DEF`, `H5F_FREE_SPACE_PERSIST_DEF` and
+    /// `H5F_FREE_SPACE_THRESHOLD_DEF` (H5Fprivate.h:326-332).
+    fn default() -> Self {
+        Self {
+            strategy: FileSpaceStrategy::FsmAggr,
+            persist: false,
+            threshold: 1,
+        }
+    }
+}
+
+impl FileSpaceConfig {
+    /// The properties as `H5P__set_file_space_strategy` (H5Pfcpl.c:1176)
+    /// stores them: `persist` and `threshold` are set only for the two
+    /// strategies that have free-space managers to persist, and keep their
+    /// defaults for the two that do not.
+    pub fn new(strategy: FileSpaceStrategy, persist: bool, threshold: u64) -> Self {
+        let uses_managers = matches!(
+            strategy,
+            FileSpaceStrategy::FsmAggr | FileSpaceStrategy::Page
+        );
+        Self {
+            strategy,
+            persist: uses_managers && persist,
+            threshold: if uses_managers {
+                threshold
+            } else {
+                Self::default().threshold
+            },
+        }
+    }
+
+    /// Whether the file has to say any of this on disk. `H5F__super_init`
+    /// writes the file-space info message only for a file that differs from
+    /// the library defaults in one of the four properties (H5Fsuper.c:1092),
+    /// and raises such a file's superblock to version 2 so it has an
+    /// extension to write it into (H5Fsuper.c:1144).
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Refuse what this writer cannot make. `H5Pset_file_space_strategy`
+    /// itself only refuses a strategy outside the enum (H5Pfcpl.c:1223); the
+    /// paged refusal is this crate's, and is by name because a paged file is a
+    /// different allocator — page-aligned allocations whose misaligned tail is
+    /// returned to one of twelve page-typed managers
+    /// (`H5MF__alloc_pagefs`, H5MF.c:858) — not a different message.
+    fn validate(&self) -> IoResult<()> {
+        match self.strategy {
+            FileSpaceStrategy::FsmAggr | FileSpaceStrategy::Aggr | FileSpaceStrategy::None => {
+                Ok(())
+            }
+            FileSpaceStrategy::Page => Err(crate::io::IoError::InvalidState(
+                "the paged file-space strategy is not implemented: it allocates on                  file-space page boundaries and sorts free sections into twelve                  page-typed managers, neither of which this writer models"
+                    .into(),
+            )),
+            FileSpaceStrategy::Unknown(b) => Err(crate::io::IoError::InvalidState(format!(
+                "invalid file-space strategy {b}"
+            ))),
+        }
+    }
+
+    /// The message a created file carries, before anything is allocated:
+    /// every manager address undefined and no end-of-allocation recorded,
+    /// which is what `H5F__super_init` writes (H5Fsuper.c:1369-1382).
+    fn message(&self) -> FileSpaceInfoMessage {
+        FileSpaceInfoMessage {
+            version: 1,
+            strategy: self.strategy,
+            persist: self.persist,
+            threshold: self.threshold,
+            page_size: DEFAULT_FILE_SPACE_PAGE_SIZE,
+            pgend_meta_thres: 0,
+            eoa_pre_fsm_fsalloc: UNDEF_ADDR,
+            fs_addr: if self.persist {
+                vec![UNDEF_ADDR; FS_ADDR_COUNT_V1]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+}
+
+/// `H5F_FILE_SPACE_PAGE_SIZE_DEF` (H5Fprivate.h:335).
+const DEFAULT_FILE_SPACE_PAGE_SIZE: u64 = 4096;
 
 /// The shared object header message indexes a new file is created with.
 ///
@@ -4050,8 +4174,10 @@ impl Hdf5Writer {
             libver,
             userblock,
             shared_messages,
+            file_space,
         } = options;
         shared_messages.validate()?;
+        file_space.validate()?;
         if userblock != 0 && (userblock < MIN_USERBLOCK || !userblock.is_power_of_two()) {
             return Err(crate::io::IoError::InvalidState(format!(
                 "a userblock is {MIN_USERBLOCK} bytes or a power of two above it, \
@@ -4088,12 +4214,17 @@ impl Hdf5Writer {
         // are.
         let classic = libver == Some(LibverBound::Earliest);
         let legacy = classic.then(|| Box::new(LegacyFile::created(ctx, userblock)));
-        let superblock_version =
-            SuperblockVersion::Chosen(if classic && shared_messages.specs().is_empty() {
+        // Non-default file-space properties raise the superblock the same way
+        // a shared-message table does, and for the same reason: the message
+        // that declares them lives in an extension, and only a version-2
+        // superblock has one (H5Fsuper.c:1144).
+        let superblock_version = SuperblockVersion::Chosen(
+            if classic && shared_messages.specs().is_empty() && file_space.is_default() {
                 SUPERBLOCK_V0
             } else {
                 SUPERBLOCK_V2
-            });
+            },
+        );
 
         // Reserve the superblock at offset 0. Which version it gets is only
         // known once the file's content is (see `superblock_version_for`),
@@ -4147,9 +4278,15 @@ impl Hdf5Writer {
             // equivalent on this writer's creation path.
             btree: BTreeV1Config::default(),
             extension: Box::default(),
-            // A created file declares no file-space strategy, so it has no
-            // free-space manager to read and none to write.
-            free_space: None,
+            // A file created at the library defaults declares no file-space
+            // strategy, so it has no message to write and no manager to keep;
+            // one created with any other properties owns both.
+            free_space: (!file_space.is_default()).then(|| {
+                Box::new(FileSpaceState {
+                    info: file_space.message(),
+                    superseded: Vec::new(),
+                })
+            }),
             sohm: (!shared_messages.specs().is_empty())
                 .then(|| Box::new(SohmState::new(shared_messages.specs().to_vec(), Vec::new()))),
             source_dir: source_dir_of(path)?,
@@ -4802,7 +4939,7 @@ impl Hdf5Writer {
         ext: &crate::io::reader::SuperblockExtension,
     ) -> IoResult<ReopenedFreeSpace> {
         let none = || ReopenedFreeSpace {
-            persisted: None,
+            state: None,
             sections: Vec::new(),
         };
         let Some(info) = ext.file_space_info.as_ref().filter(|i| i.persist) else {
@@ -4811,36 +4948,13 @@ impl Hdf5Writer {
         if info.strategy != FileSpaceStrategy::FsmAggr {
             return Ok(none());
         }
-        let ctx = &meta.ctx;
-        let hdr_size = FreeSpaceHeader::encoded_size(ctx);
-        let mut superseded = Vec::new();
-        let mut blocks: Vec<(u64, u64)> = Vec::new();
-        for &addr in info.fs_addr.iter().filter(|&&a| a != UNDEF_ADDR && a != 0) {
-            let hdr = FreeSpaceHeader::decode(&handle.read_at(addr, hdr_size)?, ctx)?;
-            superseded.push((addr, hdr_size as u64));
-            if hdr.sect_addr == UNDEF_ADDR || hdr.sect_size == 0 {
-                continue;
-            }
-            let image = handle.read_at(hdr.sect_addr, hdr.sect_size as usize)?;
-            let sections = free_space::decode_sections(&image, &hdr, addr, ctx)?;
-            superseded.push((hdr.sect_addr, hdr.alloc_sect_size.max(hdr.sect_size)));
-            blocks.extend(sections.iter().map(|s| (s.addr, s.len)));
-        }
-        // One address-ordered set across the managers: this writer's allocator
-        // is typeless, so what the close writes back is one manager holding
-        // everything, and two sections that were adjacent in different
-        // managers are one section here.
-        let sections = free_space::merge_sections(&blocks).map_err(|why| {
-            crate::io::IoError::InvalidState(format!(
-                "the free-space managers of this file overlap: {why}"
-            ))
-        })?;
+        let found = crate::io::free_space_io::read_managers(handle, &meta.ctx, info)?;
         Ok(ReopenedFreeSpace {
-            persisted: Some(Box::new(PersistedFreeSpace {
+            state: Some(Box::new(FileSpaceState {
                 info: info.clone(),
-                superseded,
+                superseded: found.blocks,
             })),
-            sections: sections.iter().map(|s| (s.addr, s.len)).collect(),
+            sections: found.sections.iter().map(|s| (s.addr, s.len)).collect(),
         })
     }
 
@@ -5511,7 +5625,7 @@ impl Hdf5Writer {
             // v1-B-tree and symbol-table node this session writes is sized by.
             btree: meta.btree,
             extension,
-            free_space: reopened_free_space.persisted,
+            free_space: reopened_free_space.state,
             // The indexes the file was created with, and the blocks its
             // current table occupies; the next finalize lays a new table out
             // over them from the whole message set.
@@ -8508,13 +8622,20 @@ impl Hdf5Writer {
     /// over blocks reserved in an earlier phase and is the only thing that
     /// runs in between.
     ///
-    /// Returns `None` for every file that persists nothing — see
-    /// [`PersistedFreeSpace`] — which leaves the file byte-identical to what
-    /// the same close wrote before free space was recorded at all.
+    /// Returns `None` for a file with no message of its own to write — a
+    /// reopen whose carried message this session must not touch, and a file
+    /// created at the library defaults — which leaves both byte-identical to
+    /// what the same close wrote before free space was recorded at all. A file
+    /// that carries the message but keeps no managers (either non-manager
+    /// strategy, or `persist: false`) gets the message back with every address
+    /// undefined, which is what `H5F__super_init` writes for it.
     fn write_free_space_managers(&self) -> IoResult<Option<Vec<u8>>> {
         let Some(fs) = self.free_space.as_deref() else {
             return Ok(None);
         };
+        if !fs.records_free_space() {
+            return Ok(Some(fs.info.encode(&self.ctx)));
+        }
         // The managers a reopen found are superseded whole by the ones below,
         // so their blocks go back before the section set is taken: the space
         // the old manager occupied is free space the new one records, and the
@@ -8690,12 +8811,38 @@ impl Hdf5Writer {
                 .lock()
                 .map(|addr| (sohm.indexes.len(), addr))
         });
-        if self.extension.carried.is_empty() && table.is_none() {
+        // A file with file-space properties of its own needs an extension
+        // too: the message that declares them is the only place they are
+        // recorded, and a file created with them carries nothing else.
+        if self.extension.carried.is_empty() && table.is_none() && self.free_space.is_none() {
             return Ok(());
         }
 
         let mut messages: Vec<crate::io::object_header_io::ExtensionMessage> =
             self.extension.carried.clone();
+        if let Some(fs) = self.free_space.as_deref() {
+            // The declared message, at exactly the length the one written
+            // below will have — every field of it is fixed-width, and only
+            // `persist` changes the count of addresses. The image is sized and
+            // its block allocated before the managers can be laid out, so the
+            // message has to reach its final *length* here even though its
+            // content is settled later. This is also what makes a file
+            // carrying the deprecated version-0 message come back as the
+            // version-1 one libhdf5 rewrites it to (H5Fsuper.c:868-880), whose
+            // body is longer than the one read.
+            let declared = fs.info.encode(&self.ctx);
+            match messages
+                .iter_mut()
+                .find(|m| m.msg_type == MSG_FILE_SPACE_INFO)
+            {
+                Some(msg) => msg.body = declared,
+                None => messages.push(crate::io::object_header_io::ExtensionMessage {
+                    msg_type: MSG_FILE_SPACE_INFO,
+                    flags: MSG_FLAG_DONTSHARE | MSG_FLAG_MARK_IF_UNKNOWN,
+                    body: declared,
+                }),
+            }
+        }
         if let Some((nindexes, table_addr)) = table {
             let nindexes = u8::try_from(nindexes).map_err(|_| {
                 crate::io::IoError::InvalidState(format!("{nindexes} shared-message indexes"))
@@ -8729,9 +8876,7 @@ impl Hdf5Writer {
 
         // Every block of this file now has an address, so the allocator holds
         // exactly the file's free space: settle the free-space managers over
-        // it and say in this extension where they went. The rewritten
-        // file-space info message is the same length as the one read — its
-        // fields are fixed-width — so the image measured above still fits.
+        // it and say in this extension where they went.
         let image = match self.write_free_space_managers()? {
             None => image,
             Some(body) => {
@@ -8743,19 +8888,17 @@ impl Hdf5Writer {
                             "a persisting file lost its file-space info message".into(),
                         )
                     })?;
-                if body.len() > msg.body.len() {
+                // Same length as the declared body put in above, so the
+                // image measured before the block was allocated still fits.
+                if body.len() != msg.body.len() {
                     return Err(crate::io::IoError::InvalidState(format!(
-                        "the rewritten file-space info message is {} bytes, more than the {} \
-                         the file holds",
-                        body.len(),
-                        msg.body.len()
+                        "the file-space info message was laid out at {} bytes and \
+                         written back at {}",
+                        msg.body.len(),
+                        body.len()
                     )));
                 }
-                // Over the front of the body read, not in place of it: a
-                // version-1 object header pads every message to eight bytes
-                // and the padding is part of what was read, so replacing the
-                // whole body would drop it and shorten the message.
-                msg.body[..body.len()].copy_from_slice(&body);
+                msg.body = body;
                 encode(&messages)?
             }
         };
@@ -18191,6 +18334,139 @@ mod tests {
             );
         }
         drop(writer);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A file created with non-default file-space properties carries the
+    /// message that declares them, and one created to persist gets real
+    /// managers as soon as anything is freed.
+    #[test]
+    fn a_created_file_declares_the_strategy_it_was_made_with() {
+        let path = temp_path("fsm_create");
+        {
+            let w = Hdf5Writer::create_with_options(
+                &path,
+                FileCreateOptions {
+                    file_space: FileSpaceConfig::new(FileSpaceStrategy::FsmAggr, true, 1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let i = w
+                .create_dataset("keep", DatatypeMessage::i32_type(), &[8])
+                .unwrap();
+            w.write_dataset_raw(i, &[0u8; 32]).unwrap();
+            w.close().unwrap();
+        }
+
+        let info = read_only_append(&path)
+            .free_space
+            .as_deref()
+            .expect("the created file declares a strategy")
+            .info
+            .clone();
+        assert_eq!(info.strategy, FileSpaceStrategy::FsmAggr);
+        assert!(info.persist);
+        assert_eq!(info.threshold, 1);
+        assert_eq!(info.page_size, 4096);
+        // Nothing was freed while the file was created, so it names no
+        // manager yet — `H5F__super_init` writes every address undefined.
+        assert!(info.fs_addr.iter().all(|&a| a == UNDEF_ADDR));
+
+        // An append supersedes the root header and the extension, and that
+        // freed space is what the managers now record.
+        append_one(&path, "added", false);
+        assert!(
+            tracked_free_space(&path) > 0,
+            "the append recorded no free space"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The two strategies without managers, and the default. All three are
+    /// `H5Pset_file_space_strategy` settings; only the default leaves the file
+    /// without the message.
+    #[test]
+    fn a_strategy_without_managers_still_declares_itself() {
+        for (strategy, persist) in [
+            (FileSpaceStrategy::Aggr, true),
+            (FileSpaceStrategy::None, false),
+        ] {
+            let path = temp_path("fsm_nomgr");
+            {
+                let w = Hdf5Writer::create_with_options(
+                    &path,
+                    FileCreateOptions {
+                        file_space: FileSpaceConfig::new(strategy, persist, 7),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                w.create_dataset("d", DatatypeMessage::f64_type(), &[4])
+                    .unwrap();
+                w.close().unwrap();
+            }
+            // Read through the reader, not the writer: a reopen only builds
+            // free-space state for a file it will rewrite managers for, and
+            // these two have none.
+            let info = declared_file_space(&path).expect("the strategy is declared");
+            assert_eq!(info.strategy, strategy);
+            // `H5P__set_file_space_strategy` stores neither for a strategy
+            // that has no managers, so both keep the library defaults.
+            assert!(!info.persist);
+            assert_eq!(info.threshold, 1);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// The library defaults are what a file says by saying nothing.
+    #[test]
+    fn the_default_strategy_writes_no_message() {
+        let path = temp_path("fsm_default");
+        {
+            let w = Hdf5Writer::create_with_options(
+                &path,
+                FileCreateOptions {
+                    file_space: FileSpaceConfig::new(FileSpaceStrategy::FsmAggr, false, 1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            w.create_dataset("d", DatatypeMessage::f64_type(), &[4])
+                .unwrap();
+            w.close().unwrap();
+        }
+        assert!(declared_file_space(&path).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The file-space info message a file carries, read back the way any
+    /// reader sees it.
+    fn declared_file_space(path: &std::path::Path) -> Option<FileSpaceInfoMessage> {
+        crate::io::reader::Hdf5Reader::open(path)
+            .unwrap()
+            .superblock_extension()
+            .file_space_info
+            .clone()
+    }
+
+    /// Paged is refused by name rather than half-written.
+    #[test]
+    fn the_paged_strategy_is_refused_at_creation() {
+        let path = temp_path("fsm_paged_refused");
+        let Err(err) = Hdf5Writer::create_with_options(
+            &path,
+            FileCreateOptions {
+                file_space: FileSpaceConfig::new(FileSpaceStrategy::Page, true, 1),
+                ..Default::default()
+            },
+        ) else {
+            panic!("the paged strategy was accepted");
+        };
+        assert!(
+            format!("{err}").contains("paged file-space strategy is not implemented"),
+            "{err}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

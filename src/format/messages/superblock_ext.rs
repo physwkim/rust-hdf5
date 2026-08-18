@@ -160,7 +160,7 @@ impl FileSpaceStrategy {
 
 /// Number of page-type free-space managers whose addresses a persisting
 /// version-1 message stores (`H5F_MEM_PAGE_SUPER` .. `H5F_MEM_PAGE_LARGE_OHDR`).
-const FS_ADDR_COUNT_V1: usize = 12;
+pub const FS_ADDR_COUNT_V1: usize = 12;
 
 /// Number of memory-type free-space managers a persisting version-0 message
 /// stores (`H5FD_MEM_SUPER` .. `H5FD_MEM_OHDR`).
