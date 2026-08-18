@@ -16224,13 +16224,18 @@ impl Hdf5Writer {
         let layout_msg = layout.encode(&self.ctx);
         header.add_message(MSG_DATA_LAYOUT, 0x00, layout_msg);
 
-        // Filter Pipeline message (type 0x0B) -- only if filters are configured
+        // Filter Pipeline message (type 0x0B) -- only if filters are
+        // configured. `H5D__layout_oh_create` appends it with
+        // `H5O_MSG_FLAG_CONSTANT` (H5Dlayout.c:462), as does the group
+        // pipeline for dense links (H5Gobj.c:264): the pipeline is a creation
+        // property, and every chunk already written was filtered through it,
+        // so it can never be rewritten in place.
         if let Some(ref pipeline) = m.filter_pipeline {
             if !pipeline.filters.is_empty() {
                 let (flags, filter_msg) = self.share_message(
                     owner,
                     MSG_FILTER_PIPELINE,
-                    0x00,
+                    MSG_FLAG_CONSTANT,
                     pipeline.encode_for(format),
                 );
                 header.add_message(MSG_FILTER_PIPELINE, flags, filter_msg);
