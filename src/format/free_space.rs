@@ -76,6 +76,57 @@ fn write_var(buf: &mut Vec<u8>, v: u64, n: usize) {
     buf.extend_from_slice(&v.to_le_bytes()[..n]);
 }
 
+/// Which of a file's free-space managers a block belongs to.
+///
+/// `H5MF_ALLOC_TO_FS_AGGR_TYPE` (H5MF.c:56) maps an allocation's `H5FD_mem_t`
+/// through the driver's free-list map, `f_sh->fs_type_map`, taking the type
+/// unchanged only where the map says `H5FD_MEM_DEFAULT`. The sec2 driver — the
+/// only one this crate writes for — installs `H5FD_FLMAP_DICHOTOMY`
+/// (H5FDsec2.c:157), which is
+///
+/// ```text
+/// DEFAULT -> SUPER   SUPER -> SUPER   BTREE -> SUPER
+/// DRAW    -> DRAW    GHEAP -> DRAW    LHEAP -> SUPER   OHDR -> SUPER
+/// ```
+///
+/// (H5FDdevelop.h:163). No entry of it is `H5FD_MEM_DEFAULT`, so the map alone
+/// decides and the six allocation types collapse onto two managers. Every
+/// aliased type resolves through the same table: the fractal heap's header and
+/// indirect blocks are `H5FD_MEM_OHDR`, its direct blocks `H5FD_MEM_LHEAP`,
+/// the extensible and fixed arrays' blocks `H5FD_MEM_OHDR`/`H5FD_MEM_BTREE`/
+/// `H5FD_MEM_LHEAP`, a free-space manager's own header `H5FD_MEM_OHDR` and its
+/// section info `H5FD_MEM_LHEAP` (H5FDdevelop.h:53-139) — all metadata. Only
+/// dataset raw data, a fractal heap's huge objects and the global heap reach
+/// `H5FD_MEM_DRAW`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FreeSpaceClass {
+    /// `H5FD_MEM_SUPER`: the superblock and its extension, object headers,
+    /// B-trees, local heaps, chunk-index structures, and a free-space
+    /// manager's own two blocks.
+    Metadata,
+    /// `H5FD_MEM_DRAW`: dataset raw data, whether contiguous or in chunks, and
+    /// the global heap collections that hold variable-length element data.
+    RawData,
+}
+
+impl FreeSpaceClass {
+    /// Both managers, in `fs_addr` order.
+    pub const ALL: [Self; 2] = [Self::Metadata, Self::RawData];
+
+    /// Which slot of the file-space info message names this manager.
+    ///
+    /// `H5F__super_read` copies `fsinfo.fs_addr[u - 1]` into
+    /// `f->shared->fs_addr[u]` (H5Fsuper.c:831-833), so message slot `i` is the
+    /// manager for `H5FD_mem_t` value `i + 1`: `H5FD_MEM_SUPER` is 1 and lands
+    /// in slot 0, `H5FD_MEM_DRAW` is 3 and lands in slot 2.
+    pub fn message_slot(self) -> usize {
+        match self {
+            Self::Metadata => 0,
+            Self::RawData => 2,
+        }
+    }
+}
+
 /// One free region of the file, as a manager records it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FreeSection {

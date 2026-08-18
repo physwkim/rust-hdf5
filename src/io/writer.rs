@@ -22,7 +22,7 @@ use crate::format::chunk_index::fixed_array::{
 use crate::format::creation_order::CreationOrder;
 use crate::format::dense_attr::build_dense_attributes;
 use crate::format::dense_link::build_dense_links;
-use crate::format::free_space::{self, FreeSection, FreeSpaceHeader};
+use crate::format::free_space::{self, FreeSection, FreeSpaceClass, FreeSpaceHeader};
 use crate::format::local_heap::{
     local_heap_header_size, LocalHeapHeader, LocalHeapImage, LOCAL_HEAP_FREE_NULL,
 };
@@ -56,7 +56,7 @@ use crate::format::sohm_write::{
 use crate::format::superblock::*;
 use crate::format::{FormatContext, LibverBound, ObjectFormat, UNDEF_ADDR};
 
-use crate::io::allocator::FileAllocator;
+use crate::io::allocator::{FileAllocator, FreeBlock};
 use crate::io::file_handle::FileHandle;
 use crate::io::hyperslab::{for_each_contiguous_run, for_each_dual_run};
 use crate::io::symbol_table_io::{free_stab, write_stab, Stab, StabExtents, StabLink, StabTarget};
@@ -3202,9 +3202,10 @@ struct CarriedExtension {
 struct ReopenedFreeSpace {
     /// `None` for a file this writer records no free space for.
     state: Option<Box<FileSpaceState>>,
-    /// Every section the managers held, merged across them, address-ordered.
-    /// Empty whenever `state` is `None`.
-    sections: Vec<(u64, u64)>,
+    /// Every section the managers held, each tagged with the manager it came
+    /// out of and merged only within it, address-ordered. Empty whenever
+    /// `state` is `None`.
+    sections: Vec<FreeBlock>,
 }
 
 /// The file-space info message this session is responsible for, and the
@@ -3249,14 +3250,17 @@ impl FileSpaceState {
     }
 }
 
-/// Where a free-space manager's own two blocks go, and what it records.
+/// Where one free-space manager's own two blocks go, and what it records.
 ///
 /// An address is `None` when nothing free was big enough and the block has to
 /// come from past the end of the file; the caller allocates those in the order
-/// the fields are declared.
-struct FsmLayout {
-    /// The sections the manager records once its own blocks are out of them,
-    /// in serialization order.
+/// [`settle_free_space_managers`](Hdf5Writer::settle_free_space_managers)
+/// carved them.
+struct ManagerLayout {
+    /// The sections this manager records once every manager's own blocks are
+    /// out of them, in serialization order. Empty when the manager has nothing
+    /// to record, which is when it gets no address at all
+    /// (`H5MF__close_delete_fstype`).
     sections: Vec<FreeSection>,
     /// Header block address, or `None` for one past the end of the file.
     hdr_addr: Option<u64>,
@@ -3264,6 +3268,27 @@ struct FsmLayout {
     sect_addr: Option<u64>,
     /// Bytes the sections image needs, which is also the block's size.
     sect_size: u64,
+}
+
+/// Both managers a non-paged file can have, in the order they settle.
+struct FsmLayout {
+    /// `H5FD_MEM_DRAW`, settled first: its own two blocks are metadata
+    /// allocations, so they come out of the other manager's sections.
+    raw_data: ManagerLayout,
+    /// `H5FD_MEM_SUPER`, settled second, having funded all four blocks.
+    metadata: ManagerLayout,
+}
+
+impl FsmLayout {
+    /// The managers with something to record, paired with their class.
+    fn written(&self) -> impl Iterator<Item = (FreeSpaceClass, &ManagerLayout)> {
+        [
+            (FreeSpaceClass::RawData, &self.raw_data),
+            (FreeSpaceClass::Metadata, &self.metadata),
+        ]
+        .into_iter()
+        .filter(|(_, m)| !m.sections.is_empty())
+    }
 }
 
 /// The manager header for `sections`, before its own blocks have addresses.
@@ -4954,7 +4979,7 @@ impl Hdf5Writer {
                 info: info.clone(),
                 superseded: found.blocks,
             })),
-            sections: found.sections.iter().map(|s| (s.addr, s.len)).collect(),
+            sections: found.sections,
         })
     }
 
@@ -6197,14 +6222,14 @@ impl Hdf5Writer {
                 let data = self.handle.read_at(addr, size as usize)?;
                 self.release_vlen_references(&data)?;
             }
-            self.allocator.free(addr, size);
+            self.allocator.free(addr, size, FreeSpaceClass::RawData);
         }
         for attr in &attrs {
             self.release_attr_vlen(attr)?;
         }
         self.release_superseded_dense_attrs(AttrScope::Dataset(index))?;
         if let Some((addr, size)) = header_block {
-            self.allocator.free(addr, size);
+            self.allocator.free(addr, size, FreeSpaceClass::Metadata);
         }
         Ok(())
     }
@@ -6232,7 +6257,7 @@ impl Hdf5Writer {
         self.release_superseded_dense_attrs(AttrScope::Group(gidx))?;
         self.release_superseded_dense_links(LinkScope::Group(gidx))?;
         if let Some((addr, size)) = header_block {
-            self.allocator.free(addr, size);
+            self.allocator.free(addr, size, FreeSpaceClass::Metadata);
         }
         Ok(())
     }
@@ -6329,7 +6354,7 @@ impl Hdf5Writer {
             extents.extend(collect_btree_v2_extents(addr, &self.ctx, &mut reader)?);
         }
         for (addr, len) in extents {
-            self.allocator.free(addr, len);
+            self.allocator.free(addr, len, FreeSpaceClass::Metadata);
         }
         Ok(())
     }
@@ -6402,7 +6427,8 @@ impl Hdf5Writer {
                                 .into(),
                         ));
                     }
-                    self.allocator.free(a, dblk_size(s.dblk_nelmts));
+                    self.allocator
+                        .free(a, dblk_size(s.dblk_nelmts), FreeSpaceClass::Metadata);
                 }
             }
             for (off, &sa) in sblk_addrs.iter().enumerate() {
@@ -6422,25 +6448,35 @@ impl Hdf5Writer {
                     ExtensibleArraySuperBlock::decode(&buf, &self.ctx, bits, s.ndblks as usize, 0)?;
                 for &da in &sb.dblk_addrs {
                     if da != UNDEF_ADDR {
-                        self.allocator.free(da, dblk_size(s.dblk_nelmts));
+                        self.allocator
+                            .free(da, dblk_size(s.dblk_nelmts), FreeSpaceClass::Metadata);
                     }
                 }
-                self.allocator
-                    .free(sa, sb.encode(&self.ctx, bits).len() as u64);
+                self.allocator.free(
+                    sa,
+                    sb.encode(&self.ctx, bits).len() as u64,
+                    FreeSpaceClass::Metadata,
+                );
             }
-            self.allocator.free(c.ea_iblk_addr, iblk_size);
             self.allocator
-                .free(c.ea_header_addr, c.ea_header.encoded_size(&self.ctx) as u64);
+                .free(c.ea_iblk_addr, iblk_size, FreeSpaceClass::Metadata);
+            self.allocator.free(
+                c.ea_header_addr,
+                c.ea_header.encoded_size(&self.ctx) as u64,
+                FreeSpaceClass::Metadata,
+            );
             return Ok(());
         }
         if let Some(fa) = m.fixed_array.take() {
             self.allocator.free(
                 fa.fa_dblk_addr,
                 fixed_array_dblk_disk_size(&self.ctx, &fa.fa_header),
+                FreeSpaceClass::Metadata,
             );
             self.allocator.free(
                 fa.fa_header_addr,
                 fa.fa_header.encode(&self.ctx).len() as u64,
+                FreeSpaceClass::Metadata,
             );
             return Ok(());
         }
@@ -6448,7 +6484,8 @@ impl Hdf5Writer {
         // chunk space it was given at create — which is the whole of its
         // storage, so nothing else can be leaked or double-freed here.
         if let Some(imp) = m.implicit.take() {
-            self.allocator.free(imp.data_addr, imp.data_size);
+            self.allocator
+                .free(imp.data_addr, imp.data_size, FreeSpaceClass::RawData);
             return Ok(());
         }
         // The single-chunk index has no structure of its own either: its one
@@ -6460,7 +6497,8 @@ impl Hdf5Writer {
         if let Some(sc) = m.single_chunk.take() {
             if sc.data_addr != UNDEF_ADDR {
                 let len = if is_filtered { sc.nbytes } else { sc.data_size };
-                self.allocator.free(sc.data_addr, len);
+                self.allocator
+                    .free(sc.data_addr, len, FreeSpaceClass::RawData);
             }
             return Ok(());
         }
@@ -6473,18 +6511,21 @@ impl Hdf5Writer {
                 .build_tree(element_size, self.ctx.sizeof_addr as usize)
                 .node_size();
             for &a in &bt1.node_addrs {
-                self.allocator.free(a, node_size as u64);
+                self.allocator
+                    .free(a, node_size as u64, FreeSpaceClass::Metadata);
             }
             return Ok(());
         }
         if let Some(bt2) = m.btree_v2.take() {
             let tree = bt2.index.build_tree(&self.ctx);
             for &a in &bt2.node_addrs {
-                self.allocator.free(a, tree.node_size as u64);
+                self.allocator
+                    .free(a, tree.node_size as u64, FreeSpaceClass::Metadata);
             }
             self.allocator.free(
                 bt2.bt2_header_addr,
                 tree.header(UNDEF_ADDR).encode(&self.ctx).len() as u64,
+                FreeSpaceClass::Metadata,
             );
         }
         Ok(())
@@ -8591,7 +8632,7 @@ impl Hdf5Writer {
         // every open/close cycle. Taken, not read: a second finalize must not
         // free the same blocks twice.
         for (addr, len) in std::mem::take(&mut *sohm.superseded.lock()) {
-            self.allocator.free(addr, len);
+            self.allocator.free(addr, len, FreeSpaceClass::Metadata);
         }
         let built =
             build_shared_messages(&indexes, &self.ctx, &mut |len| self.allocator.allocate(len))?;
@@ -8641,7 +8682,7 @@ impl Hdf5Writer {
         // the old manager occupied is free space the new one records, and the
         // new one may be laid out in it.
         for &(addr, len) in &fs.superseded {
-            self.allocator.free(addr, len);
+            self.allocator.free(addr, len, FreeSpaceClass::Metadata);
         }
         // Out of the allocator entirely while the layout is chosen: the
         // manager's own blocks come out of this set, and nothing else may be
@@ -8651,136 +8692,180 @@ impl Hdf5Writer {
         // freed against a section the file already had is one section here
         // rather than two.
         let free = self.allocator.take_all_free();
-        let mut sections = free_space::merge_sections(&free).map_err(|why| {
-            crate::io::IoError::InvalidState(format!(
-                "this session freed overlapping blocks: {why}"
-            ))
-        })?;
-        // `H5FS_sect_add` refuses a section below the file's threshold, so a
-        // block smaller than it is space the file leaks rather than records —
-        // the same trade the threshold is there to make.
-        sections.retain(|s| s.len >= fs.info.threshold);
+        let mut sets = Vec::new();
+        for class in FreeSpaceClass::ALL {
+            let blocks: Vec<(u64, u64)> = free
+                .iter()
+                .filter(|b| b.class == class)
+                .map(|b| (b.addr, b.len))
+                .collect();
+            let mut sections = free_space::merge_sections(&blocks).map_err(|why| {
+                crate::io::IoError::InvalidState(format!(
+                    "this session freed overlapping blocks: {why}"
+                ))
+            })?;
+            // `H5FS_sect_add` refuses a section below the file's threshold, so
+            // a block smaller than it is space the file leaks rather than
+            // records — the same trade the threshold is there to make.
+            sections.retain(|s| s.len >= fs.info.threshold);
+            sets.push(sections);
+        }
+        let (metadata, raw_data) = (&sets[0], &sets[1]);
 
-        let layout = Self::settle_free_space_manager(&sections, &self.ctx);
+        let layout = Self::settle_free_space_managers(metadata, raw_data, &self.ctx);
         let hdr_size = FreeSpaceHeader::encoded_size(&self.ctx) as u64;
         let mut info = fs.info.clone();
         info.fs_addr = vec![UNDEF_ADDR; info.fs_addr.len()];
 
-        if layout.sections.is_empty() {
-            // Nothing to record: `H5MF__close_delete_fstype` deletes a manager
-            // that ends up with no sections and leaves its address undefined.
-            self.allocator.reset_free_list(&[]);
-            info.eoa_pre_fsm_fsalloc = self.allocator.eof();
-            return Ok(Some(info.encode(&self.ctx)));
+        // Each manager's two blocks in the order the layout carved them, so an
+        // address it left open comes from past the end of the file, where the
+        // allocator now has nothing to reuse.
+        let mut remaining: Vec<FreeBlock> = Vec::new();
+        for (class, manager) in layout.written() {
+            let hdr_addr = match manager.hdr_addr {
+                Some(addr) => addr,
+                None => self.allocator.allocate(hdr_size),
+            };
+            let sect_addr = match manager.sect_addr {
+                Some(addr) => addr,
+                None => self.allocator.allocate(manager.sect_size),
+            };
+
+            let mut header = manager_header(&manager.sections);
+            // The layout's own rounds sized the block; that the encode agrees
+            // is the invariant that makes `sect_size` a length a reader can
+            // trust.
+            let needed = free_space::sinfo_encoded_size(&header, &manager.sections, &self.ctx);
+            if needed > manager.sect_size {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "the free-space sections need {needed} bytes, not the {} laid out",
+                    manager.sect_size
+                )));
+            }
+            header.sect_addr = sect_addr;
+            header.sect_size = manager.sect_size;
+            header.alloc_sect_size = manager.sect_size;
+            self.handle.write_at(
+                sect_addr,
+                &free_space::encode_sections(
+                    &header,
+                    hdr_addr,
+                    &manager.sections,
+                    manager.sect_size as usize,
+                    &self.ctx,
+                ),
+            )?;
+            self.handle.write_at(hdr_addr, &header.encode(&self.ctx))?;
+            // `H5MF__close_delete_fstype` leaves a manager with no sections
+            // without an address, so only the ones written name themselves.
+            info.fs_addr[class.message_slot()] = hdr_addr;
+            remaining.extend(manager.sections.iter().map(|s| FreeBlock {
+                addr: s.addr,
+                len: s.len,
+                class,
+            }));
         }
 
-        // Header first, then the sections block, in the order the layout chose
-        // them: an address it left open comes from past the end of the file,
-        // where the allocator now has nothing to reuse.
-        let hdr_addr = match layout.hdr_addr {
-            Some(addr) => addr,
-            None => self.allocator.allocate(hdr_size),
-        };
-        let sect_addr = match layout.sect_addr {
-            Some(addr) => addr,
-            None => self.allocator.allocate(layout.sect_size),
-        };
-
-        let mut header = manager_header(&layout.sections);
-        // The layout's own rounds sized the block; that the encode agrees is
-        // the invariant that makes `sect_size` a length a reader can trust.
-        let needed = free_space::sinfo_encoded_size(&header, &layout.sections, &self.ctx);
-        if needed > layout.sect_size {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "the free-space sections need {needed} bytes, not the {} laid out",
-                layout.sect_size
-            )));
-        }
-        header.sect_addr = sect_addr;
-        header.sect_size = layout.sect_size;
-        header.alloc_sect_size = layout.sect_size;
-        self.handle.write_at(
-            sect_addr,
-            &free_space::encode_sections(
-                &header,
-                hdr_addr,
-                &layout.sections,
-                layout.sect_size as usize,
-                &self.ctx,
-            ),
-        )?;
-        self.handle.write_at(hdr_addr, &header.encode(&self.ctx))?;
-
-        // What the layout left over is the file's free space, and the two
-        // blocks just written are not part of it.
-        let remaining: Vec<(u64, u64)> = layout.sections.iter().map(|s| (s.addr, s.len)).collect();
+        // What the layouts left over is the file's free space, and the blocks
+        // just written are not part of it.
         self.allocator.reset_free_list(&remaining);
-
-        // One manager, in the slot a non-paged file's metadata allocations use
-        // (`H5FD_MEM_SUPER`, which `H5F__super_read` reads out of `fs_addr[0]`).
-        // This writer's allocator does not tag a released block with the
-        // allocation type it held, so segregating the sections the way
-        // `H5MF_ALLOC_TO_FS_AGGR_TYPE` does is not something it can reproduce;
-        // recording them all under the metadata manager keeps every byte
-        // tracked, at the cost of offering raw-data space to metadata.
-        info.fs_addr[0] = hdr_addr;
         info.eoa_pre_fsm_fsalloc = self.allocator.eof();
         Ok(Some(info.encode(&self.ctx)))
     }
 
-    /// Choose where a manager's own two blocks go, given the sections it is
-    /// about to record.
+    /// Choose where each manager's own two blocks go, given the sections they
+    /// are about to record.
     ///
-    /// Self-referential, which is the whole difficulty: the header and the
-    /// sections block come out of the sections the manager records, and taking
+    /// Self-referential, which is the whole difficulty: a manager's header and
+    /// sections block come out of the sections a manager records, and taking
     /// them changes the set, which changes how many bytes the sections block
     /// needs. Upstream reruns its allocation pass until no manager allocates
     /// anything further (`H5MF__continue_alloc_fsm`); this reruns the layout
     /// until a round's carve leaves the size it was planned for. The fallback
-    /// terminates by construction: placing both blocks past the end of the
-    /// file leaves the section set untouched, so the size computed from it is
+    /// terminates by construction: placing the blocks past the end of the file
+    /// leaves the section sets untouched, so the sizes computed from them are
     /// exact.
-    fn settle_free_space_manager(sections: &[FreeSection], ctx: &FormatContext) -> FsmLayout {
+    ///
+    /// All four blocks come out of the *metadata* set. `H5FD_MEM_FSPACE_HDR`
+    /// and `H5FD_MEM_FSPACE_SINFO` are `H5FD_MEM_OHDR` and `H5FD_MEM_LHEAP`
+    /// (H5FDdevelop.h:75-80), so even the raw-data manager's own blocks are
+    /// metadata allocations — which is exactly why upstream settles the
+    /// raw-data manager first and the metadata managers second (H5C.c:689-696,
+    /// and `H5MF_settle_raw_data_fsm`'s own prologue). The raw-data set is
+    /// therefore untouched by the layout and its section block's size is exact
+    /// from the first round.
+    fn settle_free_space_managers(
+        metadata: &[FreeSection],
+        raw_data: &[FreeSection],
+        ctx: &FormatContext,
+    ) -> FsmLayout {
         /// Rounds before the layout is placed past the end of the file
         /// instead. A round changes the plan only by adding or removing a
         /// section or a distinct size, so two or three settle it in practice.
         const ROUNDS: usize = 8;
 
         let hdr_size = FreeSpaceHeader::encoded_size(ctx) as u64;
-        let ordered = free_space::serialization_order(sections);
-        if ordered.is_empty() {
-            return FsmLayout {
-                sections: ordered,
-                hdr_addr: None,
-                sect_addr: None,
-                sect_size: 0,
-            };
-        }
         let size_of =
             |set: &[FreeSection]| free_space::sinfo_encoded_size(&manager_header(set), set, ctx);
-        let mut sect_size = size_of(&ordered);
+
+        let raw = free_space::serialization_order(raw_data);
+        let meta = free_space::serialization_order(metadata);
+        let raw_sect_size = if raw.is_empty() { 0 } else { size_of(&raw) };
+        let build = |raw_hdr,
+                     raw_sect,
+                     meta_sections: Vec<FreeSection>,
+                     meta_hdr,
+                     meta_sect,
+                     meta_sect_size| FsmLayout {
+            raw_data: ManagerLayout {
+                sections: raw.clone(),
+                hdr_addr: raw_hdr,
+                sect_addr: raw_sect,
+                sect_size: raw_sect_size,
+            },
+            metadata: ManagerLayout {
+                sections: meta_sections,
+                hdr_addr: meta_hdr,
+                sect_addr: meta_sect,
+                sect_size: meta_sect_size,
+            },
+        };
+        if meta.is_empty() {
+            // Nothing metadata-side to fund any block: whatever the raw-data
+            // manager needs comes from past the end of the file.
+            return build(None, None, meta, None, None, 0);
+        }
+
+        let mut meta_sect_size = size_of(&meta);
         for _ in 0..ROUNDS {
-            let mut trial = ordered.clone();
-            let hdr_addr = carve(&mut trial, hdr_size);
-            let sect_addr = carve(&mut trial, sect_size);
+            let mut trial = meta.clone();
+            // Raw first, in `H5MF_settle_raw_data_fsm`'s order.
+            let (raw_hdr, raw_sect) = if raw.is_empty() {
+                (None, None)
+            } else {
+                (
+                    carve(&mut trial, hdr_size),
+                    carve(&mut trial, raw_sect_size),
+                )
+            };
+            let meta_hdr = carve(&mut trial, hdr_size);
+            let meta_sect = carve(&mut trial, meta_sect_size);
             let trial = free_space::serialization_order(&trial);
             let next = size_of(&trial);
-            if next == sect_size {
-                return FsmLayout {
-                    sections: trial,
-                    hdr_addr,
-                    sect_addr,
-                    sect_size,
-                };
+            if next == meta_sect_size {
+                return build(
+                    raw_hdr,
+                    raw_sect,
+                    trial,
+                    meta_hdr,
+                    meta_sect,
+                    meta_sect_size,
+                );
             }
-            sect_size = next;
+            meta_sect_size = next;
         }
-        FsmLayout {
-            sect_size: size_of(&ordered),
-            sections: ordered,
-            hdr_addr: None,
-            sect_addr: None,
-        }
+        let meta_sect_size = size_of(&meta);
+        build(None, None, meta, None, None, meta_sect_size)
     }
 
     /// Write the file's superblock extension, and the sole owner of that
@@ -8870,7 +8955,7 @@ impl Hdf5Writer {
         // instead of stranding one per open/close cycle — the rule every other
         // superseded structure follows.
         if let Some((addr, len)) = self.extension.superseded {
-            self.allocator.free(addr, len);
+            self.allocator.free(addr, len, FreeSpaceClass::Metadata);
         }
         let addr = self.allocator.allocate(image.len() as u64);
 
@@ -9648,7 +9733,7 @@ impl Hdf5Writer {
                 // (H5D__chunk_file_alloc skips H5MF_xfree when the file is
                 // open for SWMR writing); do the same.
                 if !self.swmr_active {
-                    self.allocator.free(addr, len);
+                    self.allocator.free(addr, len, FreeSpaceClass::RawData);
                 }
                 self.allocator.allocate(new_len)
             }
@@ -11450,7 +11535,8 @@ impl Hdf5Writer {
                 continue;
             }
             if gcol.is_empty() {
-                self.allocator.free(addr, declared as u64);
+                self.allocator
+                    .free(addr, declared as u64, FreeSpaceClass::RawData);
                 // The block is gone; a lingering entry would let an insert
                 // pack into space the allocator can hand to anything.
                 cwfs.retain(|e| e.addr != addr);
@@ -14154,7 +14240,8 @@ impl Hdf5Writer {
                                 }
                             }
                             if !self.swmr_active {
-                                self.allocator.free(e.addr, e.nbytes);
+                                self.allocator
+                                    .free(e.addr, e.nbytes, FreeSpaceClass::RawData);
                             }
                             fiblk.elements[elem] = FilteredChunkEntry {
                                 addr: UNDEF_ADDR,
@@ -14173,7 +14260,7 @@ impl Hdf5Writer {
                                 }
                             }
                             if !self.swmr_active {
-                                self.allocator.free(a, chunk_bytes);
+                                self.allocator.free(a, chunk_bytes, FreeSpaceClass::RawData);
                             }
                             c.ea_iblk.elements[elem] = UNDEF_ADDR;
                         }
@@ -14273,7 +14360,8 @@ impl Hdf5Writer {
                                     }
                                 }
                                 if !self.swmr_active {
-                                    self.allocator.free(e.addr, e.nbytes);
+                                    self.allocator
+                                        .free(e.addr, e.nbytes, FreeSpaceClass::RawData);
                                 }
                                 d.elements[l.offset_in_dblk as usize] = FilteredChunkEntry {
                                     addr: UNDEF_ADDR,
@@ -14294,7 +14382,7 @@ impl Hdf5Writer {
                                     }
                                 }
                                 if !self.swmr_active {
-                                    self.allocator.free(a, chunk_bytes);
+                                    self.allocator.free(a, chunk_bytes, FreeSpaceClass::RawData);
                                 }
                                 d.elements[l.offset_in_dblk as usize] = UNDEF_ADDR;
                                 *dirty = true;
@@ -14357,7 +14445,7 @@ impl Hdf5Writer {
                     }
                 }
                 if !self.swmr_active {
-                    self.allocator.free(addr, stored);
+                    self.allocator.free(addr, stored, FreeSpaceClass::RawData);
                 }
                 if is_filtered {
                     fa.fa_dblk.filtered_elements[lidx] = FixedArrayFilteredChunkElement {
@@ -14445,7 +14533,8 @@ impl Hdf5Writer {
                         }
                     }
                     if !swmr {
-                        self.allocator.free(r.chunk_address, r.chunk_size);
+                        self.allocator
+                            .free(r.chunk_address, r.chunk_size, FreeSpaceClass::RawData);
                     }
                 } else {
                     if chunk_straddles_extent(&r.scaled_offsets, &geo.chunk_dims, new_dims) {
@@ -14471,7 +14560,8 @@ impl Hdf5Writer {
                         }
                     }
                     if !swmr {
-                        self.allocator.free(r.chunk_address, chunk_bytes);
+                        self.allocator
+                            .free(r.chunk_address, chunk_bytes, FreeSpaceClass::RawData);
                     }
                 } else {
                     if chunk_straddles_extent(&r.scaled_offsets, &geo.chunk_dims, new_dims) {
@@ -14518,7 +14608,8 @@ impl Hdf5Writer {
                     }
                 }
                 if !swmr {
-                    self.allocator.free(r.address, r.nbytes as u64);
+                    self.allocator
+                        .free(r.address, r.nbytes as u64, FreeSpaceClass::RawData);
                 }
             } else {
                 if chunk_straddles_extent(&r.scaled, &geo.chunk_dims, new_dims) {
@@ -14605,7 +14696,8 @@ impl Hdf5Writer {
             // applies to a relocated chunk.
             for addr in node_addrs.split_off(tree.nodes.len()) {
                 if !self.swmr_active {
-                    self.allocator.free(addr, tree.node_size as u64);
+                    self.allocator
+                        .free(addr, tree.node_size as u64, FreeSpaceClass::Metadata);
                 }
             }
 
@@ -14648,7 +14740,8 @@ impl Hdf5Writer {
             // classic file, which `start_swmr` refuses outright (and upstream
             // says the same in `H5D_COPS_BTREE`).
             for addr in node_addrs.split_off(tree.node_count()) {
-                self.allocator.free(addr, node_size);
+                self.allocator
+                    .free(addr, node_size, FreeSpaceClass::Metadata);
             }
             for (image, &addr) in tree.encode(&node_addrs)?.iter().zip(&node_addrs) {
                 self.handle.write_at(addr, image)?;
@@ -15105,7 +15198,11 @@ impl Hdf5Writer {
                 if !self.swmr_active && m.obj_header_encoded_size > 0 {
                     let old = m.obj_header_written_addr.take().unwrap();
                     if freed_headers.insert(old) {
-                        self.allocator.free(old, m.obj_header_encoded_size as u64);
+                        self.allocator.free(
+                            old,
+                            m.obj_header_encoded_size as u64,
+                            FreeSpaceClass::Metadata,
+                        );
                     }
                     m.obj_header_encoded_size = 0;
                 }
@@ -15119,7 +15216,11 @@ impl Hdf5Writer {
                 if g.obj_header_encoded_size > 0 {
                     if let Some(old) = g.obj_header_written_addr.take() {
                         if freed_headers.insert(old) {
-                            self.allocator.free(old, g.obj_header_encoded_size as u64);
+                            self.allocator.free(
+                                old,
+                                g.obj_header_encoded_size as u64,
+                                FreeSpaceClass::Metadata,
+                            );
                         }
                         g.obj_header_encoded_size = 0;
                     }
@@ -15127,7 +15228,7 @@ impl Hdf5Writer {
             }
             if let Some((addr, len)) = self.superseded_root_header.take() {
                 if freed_headers.insert(addr) {
-                    self.allocator.free(addr, len);
+                    self.allocator.free(addr, len, FreeSpaceClass::Metadata);
                 }
             }
         }
@@ -16221,7 +16322,7 @@ mod tests {
         let spacer = writer.allocator.allocate(8192);
         assert_eq!(spacer, addr + 4096, "spacer not adjacent; layout changed");
         writer.allocator.allocate(8);
-        writer.allocator.free(spacer, 8192);
+        writer.allocator.free(spacer, 8192, FreeSpaceClass::RawData);
 
         let big = vec![0x42u8; 5000];
         let p2 = writer.insert_vlen_objects(&[big.as_slice()]).unwrap();
@@ -18603,18 +18704,101 @@ mod tests {
                 .unwrap();
             w.write_dataset_raw(i, &[0u8; 32]).unwrap();
             w.finalize(true).unwrap();
-            let blocks = w.allocator.free_blocks();
+            let blocks = w.allocator.free_extents();
             w.closed = true;
             blocks
         };
         assert!(!internal.is_empty(), "the append freed nothing");
 
+        // Classes included: a section read back out of the wrong manager is a
+        // section libhdf5 would offer to the wrong kind of allocation.
         let reread = {
             let w = read_only_append(&path);
             assert!(w.free_space.is_some(), "managers were written");
-            w.allocator.free_blocks()
+            w.allocator.free_extents()
         };
         assert_eq!(internal, reread);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A block released from a dataset's raw data is recorded by the manager
+    /// `H5MF_ALLOC_TO_FS_AGGR_TYPE` maps `H5FD_MEM_DRAW` to, and nothing else
+    /// is: the dichotomy the sec2 driver installs is what decides, and the two
+    /// managers it collapses to are the file-space info message's slots 0 and
+    /// 2.
+    #[test]
+    fn a_released_raw_block_lands_in_the_raw_data_manager() {
+        let path = temp_path("fsm_dichotomy");
+        {
+            let w = Hdf5Writer::create_with_options(
+                &path,
+                FileCreateOptions {
+                    file_space: FileSpaceConfig::new(FileSpaceStrategy::FsmAggr, true, 1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let i = w
+                .create_dataset("bulk", DatatypeMessage::i32_type(), &[256])
+                .unwrap();
+            w.write_dataset_raw(i, &vec![0u8; 1024]).unwrap();
+            w.create_dataset("keep", DatatypeMessage::i32_type(), &[8])
+                .unwrap();
+            w.close().unwrap();
+        }
+        let (raw_addr, raw_len) = {
+            let w = read_only_append(&path);
+            let i = w.dataset_index("bulk").unwrap();
+            let ds = w.ds(i);
+            let m = ds.lock();
+            (m.data_addr, m.data_size)
+        };
+        assert!(raw_len >= 1024, "the raw block is {raw_len} bytes");
+        {
+            let w = Hdf5Writer::open_append(&path).unwrap();
+            w.delete_dataset("bulk").unwrap();
+            w.close().unwrap();
+        }
+
+        let mut w = read_only_append(&path);
+        let info = w
+            .free_space
+            .as_deref()
+            .expect("the file persists managers")
+            .info
+            .clone();
+        assert_ne!(info.fs_addr[0], UNDEF_ADDR, "no metadata manager");
+        assert_ne!(info.fs_addr[2], UNDEF_ADDR, "no raw-data manager");
+        for (slot, &addr) in info.fs_addr.iter().enumerate() {
+            if slot != 0 && slot != 2 {
+                assert_eq!(addr, UNDEF_ADDR, "slot {slot} names a manager");
+            }
+        }
+
+        let found = crate::io::free_space_io::read_managers(&mut w.handle, &w.ctx, &info).unwrap();
+        let inside = |b: &FreeBlock| b.addr >= raw_addr && b.addr + b.len <= raw_addr + raw_len;
+        let raw: Vec<&FreeBlock> = found
+            .sections
+            .iter()
+            .filter(|b| b.class == FreeSpaceClass::RawData)
+            .collect();
+        assert!(
+            !raw.is_empty(),
+            "the deleted dataset's bytes were not recorded"
+        );
+        assert!(
+            raw.iter().all(|b| inside(b)),
+            "a raw-data section is outside the deleted dataset's block: {raw:?}"
+        );
+        assert!(
+            found
+                .sections
+                .iter()
+                .filter(|b| b.class == FreeSpaceClass::Metadata)
+                .all(|b| !inside(b)),
+            "raw-data bytes were recorded by the metadata manager"
+        );
+        drop(w);
         let _ = std::fs::remove_file(&path);
     }
 

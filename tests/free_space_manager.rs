@@ -300,6 +300,83 @@ fn a_crate_created_persisting_file_is_one_libhdf5_accepts() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Freed metadata and freed raw data go to different managers, and both are
+/// ones libhdf5 reads.
+///
+/// `H5MF_ALLOC_TO_FS_AGGR_TYPE` (H5MF.c:56) maps every allocation type through
+/// the sec2 driver's `H5FD_FLMAP_DICHOTOMY` (H5FDsec2.c:157), which sends
+/// `H5FD_MEM_DRAW` and `H5FD_MEM_GHEAP` to one manager and the other five types
+/// to another. Their addresses are message slots 2 and 0, `H5F__super_read`
+/// reading `fsinfo.fs_addr[u - 1]` into `f->shared->fs_addr[u]`
+/// (H5Fsuper.c:831-833).
+#[test]
+fn a_delete_fills_both_of_the_managers_the_dichotomy_defines() {
+    let Some(py) = python() else { return };
+    let path = tmp("dichotomy");
+    {
+        let file = H5File::options()
+            .file_space(FileSpaceStrategy::FsmAggr, true, 1)
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape([512usize])
+            .create("bulk")
+            .unwrap()
+            .write_raw(&(0..512i32).collect::<Vec<_>>())
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape([8usize])
+            .create("keep")
+            .unwrap()
+            .write_raw(&(0..8i32).collect::<Vec<_>>())
+            .unwrap();
+        file.close().unwrap();
+    }
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.delete_dataset("bulk").unwrap();
+        file.close().unwrap();
+    }
+
+    let info = H5File::open(&path)
+        .unwrap()
+        .superblock_extension()
+        .file_space_info
+        .expect("the file declares its strategy");
+    assert_ne!(info.fs_addr[0], u64::MAX, "no metadata manager: {info:?}");
+    assert_ne!(info.fs_addr[2], u64::MAX, "no raw-data manager: {info:?}");
+    for (slot, &addr) in info.fs_addr.iter().enumerate() {
+        if slot != 0 && slot != 2 {
+            assert_eq!(
+                addr,
+                u64::MAX,
+                "slot {slot} names a manager libhdf5 would not"
+            );
+        }
+    }
+
+    // The two libraries agree on what those managers hold.
+    let space = h5stat_space(py, &path);
+    assert_eq!(
+        H5File::open(&path).unwrap().tracked_free_space().unwrap(),
+        space.tracked,
+        "the crate and h5stat disagree about the tracked free space: {space:?}"
+    );
+    assert!(space.tracked > 0, "nothing was recorded: {space:?}");
+    h5clear_accepts(py, &path);
+    let script = format!(
+        "import h5py, numpy as np\n\
+         f = h5py.File(r'{}', 'r+')\n\
+         assert list(f.keys()) == ['keep'], list(f.keys())\n\
+         assert list(f['keep'][:]) == list(range(8)), list(f['keep'][:])\n\
+         f.create_dataset('by_libhdf5', data=np.arange(4, dtype='i4'))\n\
+         f.close()\n",
+        path.display()
+    );
+    run(py, &["-c", &script], "h5py read-back after the delete");
+    let _ = std::fs::remove_file(&path);
+}
+
 /// `sohm_paged.h5` is the paged fixture, and it persists nothing: `gen_sohm.c`
 /// passes `persist = 0` to `H5Pset_file_space_strategy`, so its file-space
 /// info message names no manager and `h5stat -S` reports no tracked free space

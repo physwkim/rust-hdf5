@@ -1,11 +1,20 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// One released, reusable region of the file.
+use crate::format::free_space::FreeSpaceClass;
+
+/// One released, reusable region of the file, and the free-space manager it
+/// belongs to.
+///
+/// The class travels with the block because it is decided where the block is
+/// released — the caller is the only place that knows what the bytes held —
+/// and read again on close, when the sections are split across the managers
+/// `H5MF_ALLOC_TO_FS_AGGR_TYPE` would have put them in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FreeBlock {
-    addr: u64,
-    len: u64,
+pub(crate) struct FreeBlock {
+    pub(crate) addr: u64,
+    pub(crate) len: u64,
+    pub(crate) class: FreeSpaceClass,
 }
 
 /// File space allocator: bump-the-end-of-file, with reuse of released blocks.
@@ -26,12 +35,22 @@ struct FreeBlock {
 /// libhdf5's `H5MF_xfree`, called when a rewritten chunk no longer fits its
 /// old location. Where the list comes from and where it goes both follow the
 /// file. A file whose file-space info message says `persist` opens with the
-/// sections its on-disk free-space manager recorded already in the list, so
+/// sections its on-disk free-space managers recorded already in the list, so
 /// this session allocates out of them the way `H5MF_alloc` does, and gets
-/// what is left written back to the manager on close
+/// what is left written back to the managers on close
 /// (`Hdf5Writer::write_free_space_managers`). Every other file starts with an
 /// empty list, and — like libhdf5's default, non-persistent strategy — a
 /// block it released but did not reuse stays as slack.
+///
+/// Every released block carries the [`FreeSpaceClass`] its bytes belonged to,
+/// which is what lets the close split the list across the managers
+/// `H5MF_ALLOC_TO_FS_AGGR_TYPE` would have chosen, and what stops two adjacent
+/// blocks in different managers from merging into one section no manager could
+/// hold. Reuse does not read it: `allocate` takes the best fit from the whole
+/// list where `H5MF_alloc` would search only the manager for its own type,
+/// so a metadata allocation here can be handed raw-data space. What that
+/// changes is which free block a request gets, never whether the block is
+/// free or which manager records what is left of it.
 pub struct FileAllocator {
     eof: AtomicU64,
     alignment: u64,
@@ -97,20 +116,24 @@ impl FileAllocator {
     /// a chunk: the index entry must be about to point elsewhere). Adjacent
     /// blocks merge, so a repeatedly grown-and-shrunk chunk does not shred the
     /// list into unusable fragments.
-    pub fn free(&self, addr: u64, len: u64) {
+    pub fn free(&self, addr: u64, len: u64, class: FreeSpaceClass) {
         if len == 0 {
             return;
         }
         let mut list = self.free_list.lock().unwrap();
         let pos = list.partition_point(|b| b.addr < addr);
-        list.insert(pos, FreeBlock { addr, len });
+        list.insert(pos, FreeBlock { addr, len, class });
         // Merge with the following block, then with the preceding one, so a
         // block that fills the gap between two free blocks yields one block.
-        if pos + 1 < list.len() && list[pos].addr + list[pos].len == list[pos + 1].addr {
+        // Only within a class: two adjacent sections in different managers are
+        // two sections upstream as well, because `H5FS__sect_merge` only ever
+        // sees the one manager it was called for.
+        let joins = |a: &FreeBlock, b: &FreeBlock| a.addr + a.len == b.addr && a.class == b.class;
+        if pos + 1 < list.len() && joins(&list[pos], &list[pos + 1]) {
             list[pos].len += list[pos + 1].len;
             list.remove(pos + 1);
         }
-        if pos > 0 && list[pos - 1].addr + list[pos - 1].len == list[pos].addr {
+        if pos > 0 && joins(&list[pos - 1], &list[pos]) {
             list[pos - 1].len += list[pos].len;
             list.remove(pos);
         }
@@ -146,10 +169,12 @@ impl FileAllocator {
         let head = FreeBlock {
             addr: block.addr,
             len: addr - block.addr,
+            class: block.class,
         };
         let tail = FreeBlock {
             addr: addr + used,
             len: block.addr + block.len - addr - used,
+            class: block.class,
         };
         // Both remainders stay free: the head is what alignment cost, and
         // dropping it would leave bytes no free-space manager records.
@@ -206,6 +231,7 @@ impl FileAllocator {
             list[pos] = FreeBlock {
                 addr: block.addr + used,
                 len: block.len - used,
+                class: block.class,
             };
         } else {
             list.remove(pos);
@@ -235,6 +261,12 @@ impl FileAllocator {
             .collect()
     }
 
+    /// Snapshot of the free list with each block's class, the form the close
+    /// splits across the file's managers.
+    pub(crate) fn free_extents(&self) -> Vec<FreeBlock> {
+        self.free_list.lock().unwrap().clone()
+    }
+
     /// Empty the free list, returning what was in it.
     ///
     /// Leaves [`allocate`](Self::allocate) with nothing to reuse, so every
@@ -242,9 +274,9 @@ impl FileAllocator {
     /// close settle a free-space manager over the list: the blocks the manager
     /// itself needs must come out of a set nothing else can allocate from
     /// while the layout is being chosen.
-    pub(crate) fn take_all_free(&self) -> Vec<(u64, u64)> {
+    pub(crate) fn take_all_free(&self) -> Vec<FreeBlock> {
         let mut list = self.free_list.lock().unwrap();
-        let taken = list.iter().map(|b| (b.addr, b.len)).collect();
+        let taken = list.clone();
         list.clear();
         self.free_count.store(0, Ordering::Release);
         taken
@@ -260,12 +292,8 @@ impl FileAllocator {
     /// unsearchable. `blocks` must still be non-overlapping, and need not be
     /// aligned: this is also how a reopen installs the sections a file's
     /// manager recorded, which sit at whatever addresses the file gave them.
-    pub(crate) fn reset_free_list(&self, blocks: &[(u64, u64)]) {
-        let mut sorted: Vec<FreeBlock> = blocks
-            .iter()
-            .filter(|b| b.1 > 0)
-            .map(|&(addr, len)| FreeBlock { addr, len })
-            .collect();
+    pub(crate) fn reset_free_list(&self, blocks: &[FreeBlock]) {
+        let mut sorted: Vec<FreeBlock> = blocks.iter().copied().filter(|b| b.len > 0).collect();
         sorted.sort_unstable_by_key(|b| b.addr);
         let mut list = self.free_list.lock().unwrap();
         *list = sorted;
@@ -276,6 +304,101 @@ impl FileAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const META: FreeSpaceClass = FreeSpaceClass::Metadata;
+    const RAW: FreeSpaceClass = FreeSpaceClass::RawData;
+
+    /// A metadata free block, which is what every test that does not care
+    /// about the class is exercising.
+    fn block(addr: u64, len: u64) -> FreeBlock {
+        FreeBlock {
+            addr,
+            len,
+            class: META,
+        }
+    }
+
+    /// Adjacent blocks merge only inside one manager: `H5FS__sect_merge` is
+    /// called per manager, so two sections that touch across the metadata /
+    /// raw-data line are two sections upstream too.
+    #[test]
+    fn adjacent_blocks_of_different_classes_do_not_merge() {
+        let alloc = FileAllocator::new(1024);
+        alloc.free(100, 50, META);
+        alloc.free(150, 50, RAW);
+        assert_eq!(
+            alloc.free_extents(),
+            vec![
+                FreeBlock {
+                    addr: 100,
+                    len: 50,
+                    class: META
+                },
+                FreeBlock {
+                    addr: 150,
+                    len: 50,
+                    class: RAW
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn adjacent_blocks_of_one_class_merge() {
+        let alloc = FileAllocator::new(1024);
+        alloc.free(100, 50, RAW);
+        alloc.free(150, 50, RAW);
+        assert_eq!(
+            alloc.free_extents(),
+            vec![FreeBlock {
+                addr: 100,
+                len: 100,
+                class: RAW
+            }]
+        );
+    }
+
+    /// The block that fills a gap merges with a same-class neighbour on each
+    /// side and leaves an other-class neighbour alone.
+    #[test]
+    fn a_gap_filler_merges_only_with_its_own_class() {
+        let alloc = FileAllocator::new(1024);
+        alloc.free(100, 20, META);
+        alloc.free(140, 20, RAW);
+        alloc.free(120, 20, META);
+        assert_eq!(
+            alloc.free_extents(),
+            vec![
+                FreeBlock {
+                    addr: 100,
+                    len: 40,
+                    class: META
+                },
+                FreeBlock {
+                    addr: 140,
+                    len: 20,
+                    class: RAW
+                },
+            ]
+        );
+    }
+
+    /// The remainder of a carved block keeps the class of the block it came
+    /// from, whichever class asked for the space.
+    #[test]
+    fn the_remainder_of_a_reused_block_keeps_its_class() {
+        let alloc = FileAllocator::new(1024);
+        alloc.free(200, 64, RAW);
+        assert_eq!(alloc.allocate(16), 200);
+        assert_eq!(
+            alloc.free_extents(),
+            vec![FreeBlock {
+                addr: 216,
+                len: 48,
+                class: RAW
+            }]
+        );
+    }
 
     #[test]
     fn basic_allocation() {
@@ -370,7 +493,7 @@ mod tests {
         alloc.allocate(64);
         let eof_before = alloc.eof();
 
-        alloc.free(a, 64);
+        alloc.free(a, 64, META);
         assert_eq!(alloc.allocate(64), a, "exact-fit reuse");
         assert_eq!(alloc.eof(), eof_before, "file must not grow on reuse");
         assert!(free_blocks(&alloc).is_empty());
@@ -383,7 +506,7 @@ mod tests {
         alloc.allocate(8);
         let eof_before = alloc.eof();
 
-        alloc.free(a, 64);
+        alloc.free(a, 64, META);
         // 10 bytes round up to 16, so 48 bytes remain at a + 16.
         assert_eq!(alloc.allocate(10), a);
         assert_eq!(free_blocks(&alloc), vec![(a + 16, 48)]);
@@ -398,7 +521,7 @@ mod tests {
         alloc.allocate(32);
         let eof_before = alloc.eof();
 
-        alloc.free(a, 32);
+        alloc.free(a, 32, META);
         let big = alloc.allocate(33);
         assert_eq!(big, eof_before, "must come from the end of the file");
         assert_eq!(
@@ -419,9 +542,9 @@ mod tests {
         alloc.allocate(8);
         let big = alloc.allocate(64);
         alloc.allocate(8);
-        alloc.free(big, 64);
-        alloc.free(small, 16);
-        alloc.free(mid, 32);
+        alloc.free(big, 64, META);
+        alloc.free(small, 16, META);
+        alloc.free(mid, 32, META);
 
         assert_eq!(alloc.allocate(20), mid, "20 fits 32 more tightly than 64");
         assert_eq!(alloc.allocate(16), small);
@@ -437,13 +560,13 @@ mod tests {
         alloc.allocate(8);
 
         // Free the outer two first: they are not adjacent, so they stay apart.
-        alloc.free(a, 32);
-        alloc.free(c, 32);
+        alloc.free(a, 32, META);
+        alloc.free(c, 32, META);
         assert_eq!(free_blocks(&alloc), vec![(a, 32), (c, 32)]);
 
         // Filling the hole between them collapses all three into one block,
         // which is then large enough for a 96-byte request.
-        alloc.free(b, 32);
+        alloc.free(b, 32, META);
         assert_eq!(free_blocks(&alloc), vec![(a, 96)]);
         let eof_before = alloc.eof();
         assert_eq!(alloc.allocate(96), a);
@@ -466,7 +589,7 @@ mod tests {
         let a = alloc.allocate(64);
         let b = alloc.allocate(64);
         alloc.allocate(8); // pin: the freed block is not at EOF
-        alloc.free(b, 64);
+        alloc.free(b, 64, META);
 
         assert!(alloc.try_extend(a, 64, 16));
         assert_eq!(free_blocks(&alloc), vec![(b + 16, 48)]);
@@ -481,7 +604,7 @@ mod tests {
         let a = alloc.allocate(64);
         alloc.allocate(64); // live block right after `a`
         let c = alloc.allocate(16);
-        alloc.free(c, 16); // free space exists, but not at a + 64
+        alloc.free(c, 16, META); // free space exists, but not at a + 64
 
         assert!(!alloc.try_extend(a, 64, 8));
         assert_eq!(free_blocks(&alloc), vec![(c, 16)], "nothing consumed");
@@ -493,7 +616,7 @@ mod tests {
         let a = alloc.allocate(64);
         let b = alloc.allocate(32);
         alloc.allocate(8);
-        alloc.free(b, 32);
+        alloc.free(b, 32, META);
 
         assert!(!alloc.try_extend(a, 64, 40), "32 free < 40 wanted");
         assert_eq!(free_blocks(&alloc), vec![(b, 32)], "nothing consumed");
@@ -505,7 +628,7 @@ mod tests {
     #[test]
     fn an_unaligned_block_is_carved_from_its_first_aligned_address() {
         let alloc = FileAllocator::new(4096);
-        alloc.reset_free_list(&[(185, 15)]);
+        alloc.reset_free_list(&[block(185, 15)]);
 
         assert_eq!(alloc.allocate(8), 192);
         // The seven bytes before 192 stay on the list; the block ends exactly
@@ -523,7 +646,7 @@ mod tests {
     #[test]
     fn carving_an_unaligned_block_keeps_the_head_and_the_tail() {
         let alloc = FileAllocator::new(4096);
-        alloc.reset_free_list(&[(2038, 100)]);
+        alloc.reset_free_list(&[block(2038, 100)]);
 
         assert_eq!(alloc.allocate(16), 2040);
         assert_eq!(free_blocks(&alloc), vec![(2038, 2), (2056, 82)]);
@@ -534,7 +657,7 @@ mod tests {
     #[test]
     fn a_block_with_no_room_to_round_up_is_taken_whole() {
         let alloc = FileAllocator::new(4096);
-        alloc.reset_free_list(&[(2038, 12)]);
+        alloc.reset_free_list(&[block(2038, 12)]);
 
         // 10 rounds up to 16, which the block cannot give: it holds 10 usable
         // bytes from 2040, so those 10 are the allocation and the block goes.
@@ -547,7 +670,7 @@ mod tests {
     #[test]
     fn best_fit_measures_the_usable_part_of_a_block() {
         let alloc = FileAllocator::new(4096);
-        alloc.reset_free_list(&[(1001, 9), (2000, 8)]);
+        alloc.reset_free_list(&[block(1001, 9), block(2000, 8)]);
 
         assert_eq!(alloc.allocate(8), 2000);
         assert_eq!(free_blocks(&alloc), vec![(1001, 9)]);
@@ -559,10 +682,10 @@ mod tests {
     fn freeing_nothing_is_a_no_op() {
         let alloc = FileAllocator::new(0);
         let a = alloc.allocate(16);
-        alloc.free(a, 0);
+        alloc.free(a, 0, META);
         assert!(free_blocks(&alloc).is_empty());
         // A zero-size request never consumes a free block either.
-        alloc.free(a, 16);
+        alloc.free(a, 16, META);
         assert_eq!(alloc.allocate(0), alloc.eof());
         assert_eq!(free_blocks(&alloc), vec![(a, 16)]);
     }
