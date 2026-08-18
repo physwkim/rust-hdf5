@@ -2637,26 +2637,9 @@ impl Hdf5Reader {
         let mut name = name.trim_start_matches('/').to_string();
         let mut via = None;
         for _ in 0..MAX_TRAVERSALS {
-            // Take the longest matching prefix so a nested alias wins over a
-            // shorter one that also covers the path.
-            let covers = |prefix: &str| name == prefix || name.starts_with(&format!("{prefix}/"));
-            let mut best: Option<(&str, Rewrite<'_>)> = None;
-            for (alias, first) in &self.group_aliases {
-                if covers(alias) && best.is_none_or(|(p, _)| alias.len() > p.len()) {
-                    best = Some((alias, Rewrite::Alias(first)));
-                }
-            }
-            for (link, class) in &self.links {
-                let rewrite = match class {
-                    LinkClass::Soft { path } => Rewrite::Soft(path),
-                    LinkClass::External { file, path } => Rewrite::External { file, path },
-                    _ => continue,
-                };
-                if covers(link) && best.is_none_or(|(p, _)| link.len() > p.len()) {
-                    best = Some((link, rewrite));
-                }
-            }
-            let Some((prefix, rewrite)) = best else { break };
+            let Some((prefix, rewrite)) = self.longest_rewrite(&name) else {
+                break;
+            };
             let rest = name[prefix.len()..].to_string();
             match rewrite {
                 Rewrite::Alias(first) => {
@@ -2684,6 +2667,39 @@ impl Hdf5Reader {
             }
         }
         Traversal::Path { path: name, via }
+    }
+
+    /// The rewrite one traversal step applies to `path`, and the prefix it
+    /// matched: the longest prefix of `path` that is a group hard-link alias
+    /// or a soft/external link, so a nested alias wins over a shorter one
+    /// that also covers the path, and an alias wins over a link naming the
+    /// same prefix.
+    ///
+    /// A prefix covers `path` only when it *is* `path` or ends at one of its
+    /// `/` boundaries, so the candidates are `path` and its own ancestors —
+    /// walking those from the longest down asks the catalogs by key instead
+    /// of comparing every alias and every link against the path, which is
+    /// what made each traversal cost a pass over the file's whole link table.
+    fn longest_rewrite<'a>(&'a self, path: &str) -> Option<(&'a str, Rewrite<'a>)> {
+        let mut end = path.len();
+        loop {
+            let candidate = &path[..end];
+            if let Some((alias, first)) = self.group_aliases.get_key_value(candidate) {
+                return Some((alias.as_str(), Rewrite::Alias(first)));
+            }
+            match self.links.get_key_value(candidate) {
+                Some((link, LinkClass::Soft { path })) => {
+                    return Some((link.as_str(), Rewrite::Soft(path)))
+                }
+                Some((link, LinkClass::External { file, path })) => {
+                    return Some((link.as_str(), Rewrite::External { file, path }))
+                }
+                // A hard or user-defined link rewrites nothing, and a shorter
+                // prefix of the path may still rewrite it.
+                _ => {}
+            }
+            end = candidate.rfind('/')?;
+        }
     }
 
     /// The messages read from the superblock extension object header. All
