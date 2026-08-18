@@ -175,6 +175,6 @@ None.
 ## Known modelling gaps in the canonical format
 
 - The string pad of a *variable-length* string is reported in the separate `strpad` field rather than inline in `dtype`; a fixed string keeps its pad inline. Both sides answer both forms — the split is a layout choice of this format, not a gap.
-- `chunkindex` is derived on the libhdf5 side from the DCPL and the dataspace, following the library's own selection rules: neither h5py nor the h5 CLI tools report the stored index type.
+- `chunkindex` is read on the libhdf5 side from the on-disk layout message via `h5debug`, like `filters`; the selection rules it was once derived from changed under HDF5 2.0 (see oracle/CANON.md).
 - h5py 3.x exposes neither `get_offset` nor `get_precision` on a bitfield type, so a sub-width bitfield would be reported at full width. No case exercises that.
 

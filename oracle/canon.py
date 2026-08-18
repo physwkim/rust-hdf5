@@ -422,29 +422,47 @@ def attr_payload(obj, name, aid, tid, sid):
 # --------------------------------------------------------------------------
 
 
-def derive_chunk_index(dcpl, shape, maxshape, superblock):
-    """Which chunk index libhdf5 picks, per H5D__layout_set_version/H5D__chunk_construct.
+_H5DEBUG_LAYOUT_MSG_RE = re.compile(
+    r"`layout'.*?(?=\nMessage \d+\.\.\.|\Z)", re.DOTALL
+)
+_H5DEBUG_INDEX_TYPE_RE = re.compile(r"Index Type:\s*(.+)")
 
-    Neither h5py nor the h5 CLI tools report the stored index type, so this
-    mirrors the library's selection rules instead. Marked as derived in the
-    report.
+# H5O__layout_debug's names for H5D_chunk_index_t, printed for every chunked
+# layout message regardless of its version (a v3 message decodes as a v1
+# B-tree index).
+_INDEX_TYPES = {
+    "v1 B-tree": "btree1",
+    "Implicit": "implicit",
+    "Single Chunk": "single",
+    "Fixed Array": "farray",
+    "Extensible Array": "earray",
+    "v2 B-tree": "btree2",
+}
+
+
+def chunk_index_str(dset):
+    """The chunk index stored in the on-disk layout message, via `h5debug`.
+
+    This used to be derived from the superblock version and the dataspace,
+    mirroring H5D__layout_set_version: through 1.14 `H5F__super_read` raised
+    the file's low bound for every open (superblock v3 implies the v1.10
+    indexes). HDF5 2.0 raises it only for SWMR-write opens, so one file can
+    hold a Fixed Array dataset from its libver=latest session next to a v1
+    B-tree dataset appended through a default reopen — no static property of
+    the dataset decides it. Measured, not derived, same route as `filters`.
     """
-    # Layout message v4 (and with it the v1.10 index types) is only written
-    # when the file's low library bound is at least v110, which is exactly
-    # when the superblock is version 3.
-    if superblock < 3:
-        return "btree1"
-    n_unlim = sum(1 for d in maxshape if d is None)
-    if n_unlim >= 2:
-        return "btree2"
-    if n_unlim == 1:
-        return "earray"
-    chunk = dcpl.get_chunk()
-    if tuple(chunk) == tuple(shape) and tuple(shape) == tuple(maxshape):
-        return "single"
-    if dcpl.get_nfilters() == 0 and dcpl.get_alloc_time() == h5d.ALLOC_TIME_EARLY:
-        return "implicit"
-    return "farray"
+    addr = h5o.get_info(dset.id).addr
+    proc = subprocess.run(
+        [_h5debug_bin(), dset.file.filename, str(addr)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    msg = _H5DEBUG_LAYOUT_MSG_RE.search(proc.stdout)
+    if not msg:
+        raise RuntimeError("no layout message in h5debug output")
+    name = _H5DEBUG_INDEX_TYPE_RE.search(msg.group(0)).group(1).strip()
+    return _INDEX_TYPES.get(name, name)
 
 
 _FILTER_NAMES = {
@@ -736,11 +754,7 @@ class Dumper:
 
         if layout == "chunked":
             self.emit("%s#chunk" % path, dims_str(dcpl.get_chunk()))
-            self.field(
-                path,
-                "chunkindex",
-                lambda: derive_chunk_index(dcpl, shape, maxshape, self.superblock),
-            )
+            self.field(path, "chunkindex", lambda: chunk_index_str(dset))
         else:
             self.emit("%s#chunk" % path, "-")
             self.emit("%s#chunkindex" % path, "-")

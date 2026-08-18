@@ -844,9 +844,9 @@ def write_report(results, gaps, meta, md_path, json_path):
         "layout choice of this format, not a gap."
     )
     L.append(
-        "- `chunkindex` is derived on the libhdf5 side from the DCPL and the "
-        "dataspace, following the library's own selection rules: neither h5py "
-        "nor the h5 CLI tools report the stored index type."
+        "- `chunkindex` is read on the libhdf5 side from the on-disk layout "
+        "message via `h5debug`, like `filters`; the selection rules it was "
+        "once derived from changed under HDF5 2.0 (see oracle/CANON.md)."
     )
     L.append(
         "- h5py 3.x exposes neither `get_offset` nor `get_precision` on a "

@@ -88,10 +88,14 @@ the link lands on — the target's shape and payload for a dataset, `dangling`
 when the target file or the target object is not there — which is what
 separates a reader that follows external links from one that only lists them.
 
-`chunkindex` is *derived* on the h5py side from the DCPL and the dataspace
-following libhdf5's selection rules (`H5D__layout_set_version` /
-`H5D__chunk_construct`), because neither h5py nor the h5 CLI tools expose the
-chosen index type. It is marked as derived in the report.
+`chunkindex` is read on the h5py side from the on-disk layout message via
+`h5debug`, the same route as `filters`. It was originally *derived* from the
+DCPL and the dataspace following libhdf5's selection rules
+(`H5D__layout_set_version` / `H5D__chunk_construct`), but those rules moved
+under HDF5 2.0: `H5F__super_read` raises the file's low bound only for
+SWMR-write opens there, where 1.14 raised it for every open, so a superblock-3
+file can mix v1.10 indexes with v1 B-trees and no static property of the
+dataset decides which — only the stored message does.
 
 `filters` is read on the h5py side from the on-disk filter-pipeline message
 via `h5debug`, not from `dcpl.get_filter()` (`H5Pget_filter2`). Opening a
