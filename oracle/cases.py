@@ -635,6 +635,31 @@ def gen_vds_view_trail(path):
         lowlevel_dataset(f, "vds", h5t.STD_I32LE, vsid, dcpl=dcpl)
 
 
+def gen_vds_split(path):
+    """A mapping whose two selections decompose into different box counts.
+
+    The virtual side is two 1x4 blocks — rows 0 and 2 of a 4x4 dataset — and
+    the source side one `H5S_SEL_ALL` over a 2x4 one, so there is no
+    positional pairing of boxes to be had. `H5S_select_project_intersection`
+    (H5Sselect.c:2402) runs one selection iterator per side and matches the
+    two element streams off one against one; the only thing it asks of the
+    pair is that the element counts agree, which is also the only thing
+    `H5D_virtual_check_mapping_pre` checks when the mapping is created
+    (H5Dvirtual.c:254-257).
+    """
+    with h5py.File(path, "w") as f:
+        f.create_dataset("src", data=ramp("<i4", 8).reshape(2, 4))
+        vsid = h5s.create_simple((4, 4))
+        vsid.select_hyperslab((0, 0), (2, 1), stride=(2, 1), block=(1, 4))
+        ssid = h5s.create_simple((2, 4))
+        ssid.select_all()
+        dcpl = h5p.create(h5p.DATASET_CREATE)
+        dcpl.set_layout(h5d.VIRTUAL)
+        dcpl.set_fill_value(np.array(-9, dtype="<i4"))
+        dcpl.set_virtual(vsid, b".", b"/src", ssid)
+        lowlevel_dataset(f, "vds", h5t.STD_I32LE, vsid, dcpl=dcpl)
+
+
 def gen_chunkidx_btree2(path):
     with h5py.File(path, "w", libver="latest") as f:
         ds = f.create_dataset(
@@ -709,6 +734,9 @@ LAYOUT_CASES = [
          "the same file under H5D_VDS_FIRST_MISSING — the extent runs on to "
          "where the next block would start",
          access={"view": "first_missing"}),
+    Case("vds_split", "layout", gen_vds_split, "vds_split",
+         "a same-file mapping whose virtual and source selections decompose "
+         "into different numbers of boxes"),
     Case("vds_printf_unlim", "layout", gen_vds_printf_unlim, "vds_printf_unlim",
          "printf-pattern source name over an unlimited virtual selection — "
          "one source file per block",

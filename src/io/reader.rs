@@ -43,7 +43,9 @@ use crate::format::reference::{
     decode_object_element, decode_region_element, decode_region_heap_object, decode_revised_body,
     decode_revised_element, DecodedReference, Reference, ReferenceTarget, RevisedElement,
 };
-use crate::format::selection::{Hyperslab, PointSelection, RegularHyperslab, Selection};
+use crate::format::selection::{
+    Hyperslab, PointSelection, RegularHyperslab, ResolvedSelection, Selection,
+};
 use crate::format::sohm::SohmMasterTable;
 use crate::format::storage_kind::{AttributeStorage, LinkStorage};
 use crate::format::superblock::{
@@ -55,7 +57,7 @@ use crate::format::{BlockReader, FormatContext, UNDEF_ADDR};
 use crate::io::file_handle::FileHandle;
 #[cfg(feature = "mmap")]
 use crate::io::file_handle::MmapFileHandle;
-use crate::io::hyperslab::{compute_strides, for_each_contiguous_run, for_each_dual_run};
+use crate::io::hyperslab::{compute_strides, for_each_contiguous_run};
 use crate::io::locking::FileLocking;
 use crate::io::{FileMeta, IoResult};
 
@@ -1267,77 +1269,81 @@ fn regular_hyperslab(sel: &Selection) -> Option<&RegularHyperslab> {
     }
 }
 
-/// Read each of `source_boxes` (via `read_source_box`) and scatter it into
-/// `out` (shaped `virtual_dims`) at the same-indexed box in
-/// `virtual_boxes`.
+/// Read `source` (via `read_source_box`, one call per box) and scatter it
+/// into `out` at the elements `target` selects.
 ///
-/// The two box lists must have equal length, and each pair of boxes must be
-/// the same shape under `H5S_select_shape_same` (H5Sselect.c) — which
-/// compares the two from the fast end and requires the extra *leading*
-/// dimensions of the higher-rank side to be flat, so a rank-1 source box
-/// legitimately fills a rank-2 virtual box of the same trailing shape (the
-/// usual printf-mapping arrangement: one 1-D dataset per row of a 2-D
-/// virtual dataset). A mapping whose selections diverge beyond that — same
-/// point count but a different box decomposition on each side — would need
-/// the general element-by-element linear-order match H5S's own iterator
-/// does; rather than risk a silently wrong scatter, that case is rejected
-/// here.
-/// Whether two boxes select the same elements in the same order —
-/// `H5S_select_shape_same`'s rule (H5Sselect.c), which aligns the two shapes
-/// at their fast end and requires every extra leading dimension of the
-/// higher-rank side to be flat.
-fn shape_same(a: &[u64], b: &[u64]) -> bool {
-    let common = a.len().min(b.len());
-    a[a.len() - common..] == b[b.len() - common..]
-        && a[..a.len() - common].iter().all(|&d| d == 1)
-        && b[..b.len() - common].iter().all(|&d| d == 1)
-}
-
-fn copy_matched_boxes(
+/// The two selections are paired element by element in their own linear
+/// order — `H5S_select_project_intersection` (H5Sselect.c:2402) walks a VDS
+/// mapping's virtual and source selections with one iterator each and
+/// matches the two streams off one against one. Its only precondition is the
+/// one asserted there and enforced by `H5D_virtual_check_mapping_pre` when
+/// the mapping is written (H5Dvirtual.c:254-257): the two hold the same
+/// number of elements. Ranks may differ, and so may the boxes each side
+/// decomposes into — a source `H5S_SEL_ALL` over a 2x4 dataset legitimately
+/// fills two 1x4 blocks of a virtual dataset.
+///
+/// Each source box is read whole, once, and the runs the pairing places from
+/// it are copied out of that one buffer.
+fn copy_matched_selections(
     mut read_source_box: impl FnMut(&[u64], &[u64], &mut [u8]) -> IoResult<()>,
-    source_boxes: &[(Vec<u64>, Vec<u64>)],
-    virtual_boxes: &[(Vec<u64>, Vec<u64>)],
-    virtual_dims: &[u64],
+    source: &ResolvedSelection,
+    target: &ResolvedSelection,
     element_size: u64,
     out: &mut [u8],
 ) -> IoResult<()> {
-    if source_boxes.len() != virtual_boxes.len() {
+    let (n_source, n_target) = (source.n_elements(), target.n_elements());
+    if n_source != n_target {
         return Err(crate::io::IoError::InvalidState(format!(
-            "virtual dataset mapping's source and virtual selections decompose into a \
-             different number of boxes ({} vs {}), which is not supported",
-            source_boxes.len(),
-            virtual_boxes.len()
+            "virtual dataset mapping's source selection holds {n_source} elements and its              virtual selection {n_target}, which H5D_virtual_check_mapping_pre refuses"
         )));
     }
-    for ((src_start, src_count), (dst_start, dst_count)) in source_boxes.iter().zip(virtual_boxes) {
-        if !shape_same(src_count, dst_count) {
-            return Err(crate::io::IoError::InvalidState(format!(
-                "virtual dataset mapping's source box shape {src_count:?} does not match its \
-                 virtual box shape {dst_count:?}, which is not supported"
-            )));
+    // Pair the two element streams, splitting a run of either side wherever
+    // the other side's run ends first, and file each matched segment under
+    // the source box it must be read out of.
+    let mut per_box: Vec<Vec<(u64, u64, u64)>> = vec![Vec::new(); source.boxes.len()];
+    let (mut si, mut ti) = (0usize, 0usize);
+    let (mut s_done, mut t_done) = (0u64, 0u64);
+    while si < source.runs.len() && ti < target.runs.len() {
+        let (s, t) = (source.runs[si], target.runs[ti]);
+        let len = (s.len - s_done).min(t.len - t_done);
+        per_box[s.box_index].push((s.offset_in_box + s_done, t.offset_in_extent + t_done, len));
+        s_done += len;
+        t_done += len;
+        if s_done == s.len {
+            si += 1;
+            s_done = 0;
         }
-        let nbytes = saturating_byte_len(src_count, element_size) as usize;
-        let mut buf = alloc_tiled_fill(nbytes, None)?;
-        read_source_box(src_start, src_count, &mut buf)?;
+        if t_done == t.len {
+            ti += 1;
+            t_done = 0;
+        }
+    }
 
-        // `buf` holds the box in source linear order, and shape-same boxes
-        // differ only by flat leading dimensions, so it can be walked at the
-        // virtual box's own rank.
-        let src_origin = vec![0u64; dst_count.len()];
-        for_each_dual_run(
-            virtual_dims,
-            dst_start,
-            dst_count,
-            &src_origin,
-            dst_count,
-            element_size,
-            |dst_off, src_off, len| {
-                let dst_off = dst_off as usize;
-                let src_off = src_off as usize;
-                out[dst_off..dst_off + len].copy_from_slice(&buf[src_off..src_off + len]);
-                Ok(())
-            },
-        )?;
+    for (segments, (box_start, box_count)) in per_box.iter().zip(&source.boxes) {
+        if segments.is_empty() {
+            continue;
+        }
+        let nbytes = saturating_byte_len(box_count, element_size) as usize;
+        let mut buf = alloc_tiled_fill(nbytes, None)?;
+        read_source_box(box_start, box_count, &mut buf)?;
+        for &(from, to, len) in segments {
+            let (from, to, len) = (
+                (from * element_size) as usize,
+                (to * element_size) as usize,
+                (len * element_size) as usize,
+            );
+            let src = buf.get(from..from + len).ok_or_else(|| {
+                crate::io::IoError::InvalidState(
+                    "virtual dataset mapping's source selection reaches past its source box".into(),
+                )
+            })?;
+            let dst = out.get_mut(to..to + len).ok_or_else(|| {
+                crate::io::IoError::InvalidState(
+                    "virtual dataset mapping's virtual selection reaches past the dataset".into(),
+                )
+            })?;
+            dst.copy_from_slice(src);
+        }
     }
     Ok(())
 }
@@ -3743,13 +3749,13 @@ impl Hdf5Reader {
             std::collections::HashMap::new();
 
         for mapping in &mappings {
-            let virtual_boxes = mapping.virtual_selection.to_boxes(&dims).map_err(|e| {
+            let virtual_sel = mapping.virtual_selection.resolve(&dims).map_err(|e| {
                 crate::io::IoError::InvalidState(format!(
                     "dataset {name:?}: virtual mapping's virtual selection is not \
                      supported: {e}"
                 ))
             })?;
-            if virtual_boxes.is_empty() {
+            if virtual_sel.runs.is_empty() {
                 continue;
             }
 
@@ -3763,17 +3769,16 @@ impl Hdf5Reader {
                 else {
                     continue;
                 };
-                let source_boxes = mapping.source_selection.to_boxes(&src_dims).map_err(|e| {
+                let source_sel = mapping.source_selection.resolve(&src_dims).map_err(|e| {
                     crate::io::IoError::InvalidState(format!(
                         "dataset {name:?}: virtual mapping's source selection is not \
                          supported: {e}"
                     ))
                 })?;
-                copy_matched_boxes(
+                copy_matched_selections(
                     |s, c, buf| self.read_slice_into_unconverted(source_name, s, c, buf, depth + 1),
-                    &source_boxes,
-                    &virtual_boxes,
-                    &dims,
+                    &source_sel,
+                    &virtual_sel,
                     element_size,
                     out,
                 )?;
@@ -3798,19 +3803,18 @@ impl Hdf5Reader {
                 else {
                     continue;
                 };
-                let source_boxes = mapping.source_selection.to_boxes(&src_dims).map_err(|e| {
+                let source_sel = mapping.source_selection.resolve(&src_dims).map_err(|e| {
                     crate::io::IoError::InvalidState(format!(
                         "dataset {name:?}: virtual mapping's source selection is not \
                          supported: {e}"
                     ))
                 })?;
-                copy_matched_boxes(
+                copy_matched_selections(
                     |s, c, buf| {
                         src_reader.read_slice_into_unconverted(source_name, s, c, buf, depth + 1)
                     },
-                    &source_boxes,
-                    &virtual_boxes,
-                    &dims,
+                    &source_sel,
+                    &virtual_sel,
                     element_size,
                     out,
                 )?;
@@ -5585,13 +5589,13 @@ impl Hdf5Reader {
     ///
     /// Built on the same selection-decomposition primitives the virtual
     /// dataset reader uses for its per-mapping scatter
-    /// ([`Selection::to_boxes`], [`copy_matched_boxes`]) rather than a
+    /// ([`Selection::resolve`], [`copy_matched_selections`]) rather than a
     /// second box walker: the requested selection and a densely-packed
-    /// "output" selection sharing the same `count` decompose into the same
-    /// number of same-shaped boxes in the same row-major order, so each
-    /// source box is read with the ordinary per-layout selective read
-    /// ([`read_slice_into_unconverted`](Self::read_slice_into_unconverted))
-    /// and scattered straight into its matching output box.
+    /// "output" selection sharing the same `count` hold the same elements in
+    /// the same order, so pairing the two element streams places each one
+    /// where h5py's stepped slicing puts it, and each source box is read with
+    /// the ordinary per-layout selective read
+    /// ([`read_slice_into_unconverted`](Self::read_slice_into_unconverted)).
     pub fn read_hyperslab(
         &mut self,
         name: &str,
@@ -5636,11 +5640,10 @@ impl Hdf5Reader {
         let out_dims: Vec<u64> = (0..rank)
             .map(|d| count[d].saturating_mul(block[d]))
             .collect();
-        // A densely-packed selection sharing the same `count`: its boxes
-        // decompose in the same row-major order as `src_sel`'s (the nested
-        // loop `Selection::to_boxes` drives is indexed purely by `count`),
-        // so `src_boxes[i]` and `dst_boxes[i]` are always the same logical
-        // block, letting `copy_matched_boxes` pair them positionally.
+        // A densely-packed selection sharing the same `count`: it holds the
+        // same elements as `src_sel` in the same order, and its extent is the
+        // output buffer, so pairing the two element streams lands every
+        // source element at its h5py stepped-slicing position.
         let dst_sel = Selection::Hyperslab {
             rank,
             form: Hyperslab::Regular(RegularHyperslab {
@@ -5650,16 +5653,13 @@ impl Hdf5Reader {
                 block: block.to_vec(),
             }),
         };
-        let src_boxes = src_sel.to_boxes(&dims)?;
-        let dst_boxes = dst_sel.to_boxes(&out_dims)?;
 
         let total = saturating_byte_len(&out_dims, element_size) as usize;
         let mut out = alloc_tiled_fill(total, None)?;
-        copy_matched_boxes(
+        copy_matched_selections(
             |bstart, bcount, buf| self.read_slice_into_unconverted(name, bstart, bcount, buf, 0),
-            &src_boxes,
-            &dst_boxes,
-            &out_dims,
+            &src_sel.resolve(&dims)?,
+            &dst_sel.resolve(&out_dims)?,
             element_size,
             &mut out,
         )?;

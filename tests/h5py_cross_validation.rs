@@ -4544,6 +4544,113 @@ fn vds_partial_hyperslab_mapping_with_fill_value_readable_by_rust() {
     std::fs::remove_file(&src_path).ok();
 }
 
+/// Virtual dataset whose two selections decompose into *different* numbers
+/// of boxes: the virtual side is two 1x4 blocks (rows 0 and 2), the source
+/// side one `H5S_SEL_ALL` box over a 2x4 dataset. Nothing pairs the boxes
+/// positionally here — `H5S_select_project_intersection` (H5Sselect.c:2402)
+/// runs one selection iterator per side and matches the two element streams
+/// off one against one, asking only that the counts agree
+/// (`H5D_virtual_check_mapping_pre`, H5Dvirtual.c:254-257). This is the
+/// mapping h5py writes for the ordinary `layout[0:3:2, :] = source` and
+/// libhdf5 reads it without complaint, so the crate must too.
+#[test]
+fn vds_mapping_whose_sides_decompose_differently_readable_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("vds_split");
+    let src_path = path.with_file_name(format!(
+        "{}_src.h5",
+        path.file_stem().unwrap().to_str().unwrap()
+    ));
+    write_with_h5py(
+        py,
+        &src_path,
+        "f.create_dataset('src', data=np.arange(8, dtype='<i4').reshape(2, 4))\n",
+    );
+    write_with_h5py(
+        py,
+        &path,
+        &format!(
+            "layout = h5py.VirtualLayout(shape=(4, 4), dtype='<i4')\n\
+             layout[0:3:2, :] = h5py.VirtualSource(r'{}', 'src', shape=(2, 4))\n\
+             f.create_virtual_dataset('vds', layout, fillvalue=-9)\n",
+            src_path.display()
+        ),
+    );
+    let expected: Vec<i32> = vec![
+        0, 1, 2, 3, //
+        -9, -9, -9, -9, //
+        4, 5, 6, 7, //
+        -9, -9, -9, -9,
+    ];
+    read_back_with_h5py(
+        py,
+        &path,
+        "assert f['vds'][...].ravel().tolist() == \
+         [0,1,2,3,-9,-9,-9,-9,4,5,6,7,-9,-9,-9,-9], f['vds'][...]\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("vds").unwrap();
+    assert_eq!(ds.shape(), vec![4, 4]);
+    assert_eq!(ds.read_raw::<i32>().unwrap(), expected);
+    // The mapped row 2 through the slice path, which resolves the same
+    // mapping against a sub-extent of the same dataset.
+    assert_eq!(
+        ds.read_slice::<i32>(&[2, 0], &[1, 4]).unwrap(),
+        [4, 5, 6, 7]
+    );
+    drop(file);
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&src_path).ok();
+}
+
+/// The same divergence the other way round: the *source* side is two 1x4
+/// blocks (`src[0:3:2, :]`) and the virtual side one 2x4 block. Two source
+/// boxes feed one virtual box, so the pairing must split the virtual run
+/// rather than the source one.
+#[test]
+fn vds_mapping_whose_source_has_the_extra_boxes_readable_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("vds_split_src");
+    let src_path = path.with_file_name(format!(
+        "{}_src.h5",
+        path.file_stem().unwrap().to_str().unwrap()
+    ));
+    write_with_h5py(
+        py,
+        &src_path,
+        "f.create_dataset('src', data=np.arange(16, dtype='<i4').reshape(4, 4))\n",
+    );
+    write_with_h5py(
+        py,
+        &path,
+        &format!(
+            "layout = h5py.VirtualLayout(shape=(4, 4), dtype='<i4')\n\
+             vs = h5py.VirtualSource(r'{}', 'src', shape=(4, 4))\n\
+             layout[0:2, :] = vs[0:3:2, :]\n\
+             f.create_virtual_dataset('vds', layout, fillvalue=-9)\n",
+            src_path.display()
+        ),
+    );
+    let expected: Vec<i32> = vec![
+        0, 1, 2, 3, //
+        8, 9, 10, 11, //
+        -9, -9, -9, -9, //
+        -9, -9, -9, -9,
+    ];
+    read_back_with_h5py(
+        py,
+        &path,
+        "assert f['vds'][...].ravel().tolist() == \
+         [0,1,2,3,8,9,10,11,-9,-9,-9,-9,-9,-9,-9,-9], f['vds'][...]\n",
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("vds").unwrap();
+    assert_eq!(ds.read_raw::<i32>().unwrap(), expected);
+    drop(file);
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&src_path).ok();
+}
+
 /// Virtual dataset, same-file mapping: h5py normalizes a source file whose
 /// resolved path equals the enclosing VDS file's own path down to the
 /// literal string `"."` on the wire (confirmed by parsing the raw global

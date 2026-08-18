@@ -2173,6 +2173,36 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "vds_split" => {
+            // Two 1x4 virtual blocks fed by one 2x4 `H5S_SEL_ALL` source
+            // selection: the two sides decompose into different numbers of
+            // boxes and are paired element by element instead.
+            let file = earliest_file(path)?;
+            file.new_dataset::<i32>()
+                .shape([2usize, 4])
+                .create("src")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.new_dataset::<i32>()
+                .shape([4usize, 4])
+                .fill_value(-9i32)
+                .virtual_mapping(
+                    Selection::Hyperslab {
+                        rank: 2,
+                        form: Hyperslab::Regular(rust_hdf5::RegularHyperslab {
+                            start: vec![0, 0],
+                            stride: vec![2, 1],
+                            count: vec![2, 1],
+                            block: vec![1, 4],
+                        }),
+                    },
+                    ".",
+                    "/src",
+                    Selection::All,
+                )
+                .create("vds")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "vds_view_trail" => {
             // Stride 3 over blocks of 2, so the third source row is followed
             // by a gap: whether the extent stops before it or runs on to

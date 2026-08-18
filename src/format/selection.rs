@@ -237,6 +237,144 @@ pub struct PointSelection {
     pub points: Vec<Vec<u64>>,
 }
 
+/// One maximal run of consecutive selected elements, as it sits both in the
+/// box it came from and in the full extent that box was resolved against.
+///
+/// A run is contiguous in the fastest-varying dimension, so it is one
+/// unbroken stretch of elements in a row-major buffer of either shape — the
+/// unit a transfer can move with a single copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SelectionRun {
+    /// Index into [`ResolvedSelection::boxes`] of the box this run lies in.
+    pub box_index: usize,
+    /// Element offset of the run's first element within a row-major buffer
+    /// shaped like that box.
+    pub offset_in_box: u64,
+    /// Element offset of the run's first element within a row-major buffer
+    /// shaped like the whole extent.
+    pub offset_in_extent: u64,
+    /// How many consecutive elements the run covers.
+    pub len: u64,
+}
+
+/// A selection bound to a concrete extent — [`Selection::resolve`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedSelection {
+    /// The disjoint `(start, count)` boxes covering the selected elements,
+    /// in [`Selection::to_boxes`] order.
+    pub boxes: Vec<(Vec<u64>, Vec<u64>)>,
+    /// Every selected element exactly once, grouped into runs and ordered
+    /// the way H5S's own selection iterator visits them.
+    pub runs: Vec<SelectionRun>,
+}
+
+impl ResolvedSelection {
+    /// How many elements the selection holds — `H5S_GET_SELECT_NPOINTS`.
+    pub(crate) fn n_elements(&self) -> u64 {
+        self.runs.iter().map(|r| r.len).sum()
+    }
+}
+
+/// Row-major element strides of an extent: `strides[d]` is how far one step
+/// in dimension `d` moves within a densely-packed buffer of shape `dims`.
+fn row_major_strides(dims: &[u64]) -> FormatResult<Vec<u64>> {
+    let mut strides = vec![1u64; dims.len()];
+    for d in (0..dims.len().saturating_sub(1)).rev() {
+        strides[d] = strides[d + 1].checked_mul(dims[d + 1]).ok_or_else(|| {
+            FormatError::InvalidData(format!(
+                "extent {dims:?} holds more elements than u64 counts"
+            ))
+        })?;
+    }
+    Ok(strides)
+}
+
+/// Append the runs one box contributes, in the box's own row-major order.
+///
+/// Consecutive runs that are adjacent in *both* the box and the extent are
+/// merged into one, which is the "trailing dimension fully selected on both
+/// sides" coalescing a dual-array walk performs: a box covering a whole
+/// trailing region comes out as a single run rather than one run per row.
+fn push_box_runs(
+    box_index: usize,
+    start: &[u64],
+    count: &[u64],
+    dims: &[u64],
+    strides: &[u64],
+    runs: &mut Vec<SelectionRun>,
+) -> FormatResult<()> {
+    let rank = dims.len();
+    if start.len() != rank || count.len() != rank {
+        return Err(FormatError::InvalidData(format!(
+            "selection box of rank {} against a {rank}-dimensional extent",
+            start.len()
+        )));
+    }
+    for d in 0..rank {
+        let end = start[d]
+            .checked_add(count[d])
+            .ok_or_else(|| FormatError::InvalidData("selection box coordinate overflows".into()))?;
+        if end > dims[d] {
+            return Err(FormatError::InvalidData(format!(
+                "selection box covers [{}, {end}) of dimension {d}, past the extent {}",
+                start[d], dims[d]
+            )));
+        }
+    }
+    if count.contains(&0) {
+        return Ok(());
+    }
+    if rank == 0 {
+        // A scalar dataspace holds exactly one element and admits only the
+        // all/none selections, so its one box is one run of one element.
+        runs.push(SelectionRun {
+            box_index,
+            offset_in_box: 0,
+            offset_in_extent: 0,
+            len: 1,
+        });
+        return Ok(());
+    }
+    let box_strides = row_major_strides(count)?;
+    let run_len = count[rank - 1];
+    let n_outer = count[..rank - 1]
+        .iter()
+        .try_fold(1u64, |acc, &c| acc.checked_mul(c))
+        .ok_or_else(|| FormatError::InvalidData("selection box element count overflows".into()))?;
+    let mut coords = vec![0u64; rank - 1];
+    for _ in 0..n_outer {
+        let mut offset_in_extent = start[rank - 1];
+        let mut offset_in_box = 0u64;
+        for d in 0..rank - 1 {
+            offset_in_extent += (start[d] + coords[d]) * strides[d];
+            offset_in_box += coords[d] * box_strides[d];
+        }
+        match runs.last_mut() {
+            Some(prev)
+                if prev.box_index == box_index
+                    && prev.offset_in_extent + prev.len == offset_in_extent
+                    && prev.offset_in_box + prev.len == offset_in_box =>
+            {
+                prev.len += run_len;
+            }
+            _ => runs.push(SelectionRun {
+                box_index,
+                offset_in_box,
+                offset_in_extent,
+                len: run_len,
+            }),
+        }
+        for d in (0..rank - 1).rev() {
+            coords[d] += 1;
+            if coords[d] < count[d] {
+                break;
+            }
+            coords[d] = 0;
+        }
+    }
+    Ok(())
+}
+
 /// A decoded H5S dataspace selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
@@ -355,6 +493,46 @@ impl Selection {
                 }
             }
         }
+    }
+
+    /// Bind this selection to a concrete extent: the boxes it covers plus
+    /// the element runs those boxes contribute, in H5S selection order.
+    ///
+    /// Where [`to_boxes`](Self::to_boxes) answers "which regions", this
+    /// answers "which elements, in which order" — the order
+    /// `H5S_select_iter_next` walks a selection in, which is what pairs one
+    /// selection with another. `H5S_select_project_intersection`
+    /// (H5Sselect.c:2402) matches a virtual dataset mapping's two selections
+    /// off one element against one element in exactly this order, and asks
+    /// of them only `H5S_GET_SELECT_NPOINTS(src) == NPOINTS(dst)` — the same
+    /// single condition `H5D_virtual_check_mapping_pre` enforces when the
+    /// mapping is created (H5Dvirtual.c:254-257). Neither the two ranks nor
+    /// the two box decompositions need agree.
+    ///
+    /// Unlike [`to_boxes`](Self::to_boxes) this *is* the caller that
+    /// validates against `dims`: a run's offset within the extent only means
+    /// anything if its box lies inside it, so a box reaching past `dims` is
+    /// [`FormatError::InvalidData`] rather than an offset pointing at some
+    /// other element.
+    pub(crate) fn resolve(&self, dims: &[u64]) -> FormatResult<ResolvedSelection> {
+        let boxes = self.to_boxes(dims)?;
+        let strides = row_major_strides(dims)?;
+        let mut runs = Vec::new();
+        for (i, (start, count)) in boxes.iter().enumerate() {
+            push_box_runs(i, start, count, dims, &strides, &mut runs)?;
+        }
+        // Every selection but a point list is walked in increasing row-major
+        // coordinate order, and the runs of one box come out in that order
+        // already; ordering the boxes against each other is what the sort
+        // adds. Disjoint boxes hold disjoint elements, so their runs hold
+        // disjoint offset intervals and sorting by the first offset is a
+        // total order. A point list keeps the order its coordinates were
+        // given in (`H5S__point_iter_next`, H5Spoint.c) and must not be
+        // sorted — selection order is the point order.
+        if !matches!(self, Self::Points(_)) {
+            runs.sort_unstable_by_key(|r| r.offset_in_extent);
+        }
+        Ok(ResolvedSelection { boxes, runs })
     }
 
     /// Encode this selection into its `H5S_select_serialize` wire form
@@ -1612,6 +1790,121 @@ mod tests {
             boxes,
             vec![(vec![0, 0], vec![2, 2]), (vec![2, 2], vec![2, 2])]
         );
+    }
+
+    /// Runs come out in H5S element order, which for a multi-block
+    /// hyperslab is *not* the order the boxes come out in: the 2x2-block
+    /// grid over a 4x4 extent decomposes into boxes
+    /// `(0,0) (0,2) (2,0) (2,2)`, but the elements are visited row by row,
+    /// so the run list is `(0,0) (0,2) (1,0) (1,2) (2,0) ...`.
+    #[test]
+    fn resolve_orders_runs_by_element_not_by_box() {
+        let sel = Selection::Hyperslab {
+            rank: 2,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: vec![0, 0],
+                stride: vec![2, 2],
+                count: vec![2, 2],
+                block: vec![2, 2],
+            }),
+        };
+        let resolved = sel.resolve(&[4, 4]).unwrap();
+        assert_eq!(resolved.n_elements(), 16);
+        // Every element of the 4x4 extent, once, in row-major order.
+        let mut covered = Vec::new();
+        for r in &resolved.runs {
+            for k in 0..r.len {
+                covered.push(r.offset_in_extent + k);
+            }
+        }
+        assert_eq!(covered, (0..16).collect::<Vec<u64>>());
+        // The first two runs are the two halves of row 0, taken from
+        // different boxes.
+        assert_eq!(resolved.runs[0].box_index, 0);
+        assert_eq!(resolved.runs[1].box_index, 1);
+        assert_eq!(resolved.runs[0].len, 2);
+        // Row 1 of box 0 sits two elements into that box's own buffer.
+        assert_eq!(resolved.runs[2].box_index, 0);
+        assert_eq!(resolved.runs[2].offset_in_box, 2);
+    }
+
+    /// A box that covers a whole trailing region is contiguous in both the
+    /// box and the extent, so it collapses to one run rather than one per
+    /// row — the same merge a dual-array walk performs.
+    #[test]
+    fn resolve_coalesces_a_box_that_fills_its_extent() {
+        let resolved = Selection::All.resolve(&[3, 4]).unwrap();
+        assert_eq!(resolved.runs.len(), 1);
+        assert_eq!(resolved.runs[0].len, 12);
+        assert_eq!(resolved.n_elements(), 12);
+    }
+
+    /// A partial box cannot coalesce across its second dimension: rows are
+    /// separated by the extent's stride.
+    #[test]
+    fn resolve_keeps_one_run_per_row_of_a_partial_box() {
+        let sel = Selection::Hyperslab {
+            rank: 2,
+            form: Hyperslab::Blocks(vec![HyperslabBlock {
+                start: vec![1, 1],
+                end: vec![2, 2],
+            }]),
+        };
+        let resolved = sel.resolve(&[4, 4]).unwrap();
+        assert_eq!(resolved.runs.len(), 2);
+        assert_eq!(resolved.runs[0].offset_in_extent, 5);
+        assert_eq!(resolved.runs[0].offset_in_box, 0);
+        assert_eq!(resolved.runs[1].offset_in_extent, 9);
+        assert_eq!(resolved.runs[1].offset_in_box, 2);
+    }
+
+    /// Selection order for a point list is the order the coordinates were
+    /// given in (`H5S__point_iter_next`, H5Spoint.c), not coordinate order,
+    /// so the runs must not be sorted.
+    #[test]
+    fn resolve_keeps_point_selection_order() {
+        let sel = Selection::Points(PointSelection {
+            rank: 2,
+            points: vec![vec![2, 3], vec![0, 1], vec![1, 0]],
+        });
+        let resolved = sel.resolve(&[4, 4]).unwrap();
+        assert_eq!(
+            resolved
+                .runs
+                .iter()
+                .map(|r| r.offset_in_extent)
+                .collect::<Vec<u64>>(),
+            vec![11, 1, 4]
+        );
+        assert!(resolved.runs.iter().all(|r| r.len == 1));
+    }
+
+    /// `to_boxes` deliberately does not clip a block against the extent, so
+    /// `resolve` — which needs every box's offset within that extent to mean
+    /// something — is the caller that rejects one reaching past it.
+    #[test]
+    fn resolve_rejects_a_box_past_the_extent() {
+        let sel = Selection::Hyperslab {
+            rank: 1,
+            form: Hyperslab::Blocks(vec![HyperslabBlock {
+                start: vec![2],
+                end: vec![5],
+            }]),
+        };
+        let err = sel.resolve(&[4]).unwrap_err();
+        assert!(
+            format!("{err}").contains("past the extent"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A scalar dataspace holds one element and takes only all/none.
+    #[test]
+    fn resolve_of_a_scalar_extent_holds_one_element() {
+        let all = Selection::All.resolve(&[]).unwrap();
+        assert_eq!(all.n_elements(), 1);
+        assert_eq!(all.runs[0].len, 1);
+        assert_eq!(Selection::None.resolve(&[]).unwrap().n_elements(), 0);
     }
 
     #[test]
