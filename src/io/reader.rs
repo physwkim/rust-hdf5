@@ -959,15 +959,34 @@ pub struct Hdf5Reader {
     /// keyed by canonical path (no leading `/`); an absent entry means
     /// [`DatasetAccess::default`].
     ///
-    /// libhdf5 keeps this per open handle — `H5D__virtual_init` copies the
-    /// dapl into the dataset's own layout storage (H5Dvirtual.c:2224-2226) —
-    /// but this reader keeps one resolved extent per dataset, so the entry
-    /// here is what the most recent [`open_dataset_with`](Self::open_dataset_with)
-    /// asked for. It is the single owner of that answer: the resolution
-    /// reads it and nothing else writes it, so a SWMR
-    /// [`refresh`](Self::refresh) re-resolves under the same properties
-    /// rather than reverting to the defaults.
-    virtual_access: std::collections::BTreeMap<String, DatasetAccess>,
+    /// libhdf5 keeps this in the dataset's *shared* open-object info —
+    /// `H5D__virtual_init` puts the view and the printf gap into
+    /// `dset->shared->layout.storage.u.virt` (H5Dvirtual.c:2178-2188) — which
+    /// is why the first open of a dataset fixes them for every later one
+    /// ([`apply_dataset_access`](Self::apply_dataset_access)). It is the
+    /// single owner of that answer: the resolution reads it and nothing else
+    /// writes it, so a SWMR [`refresh`](Self::refresh) re-resolves under the
+    /// same properties rather than reverting to the defaults.
+    virtual_access: std::collections::BTreeMap<String, AccessInForce>,
+}
+
+/// A live open on a dataset.
+///
+/// The reader holds only a [`Weak`](std::sync::Weak) to it and every handle
+/// an open handed out holds the strong one, so "is this dataset still open"
+/// is answered by the handles themselves — nothing has to tell the reader
+/// when one is dropped, and a handle's drop takes no lock on the file.
+pub(crate) type DatasetOpenToken = std::sync::Arc<()>;
+
+/// The dataset-access properties one dataset was resolved under, and the
+/// opens that fixed them.
+struct AccessInForce {
+    access: DatasetAccess,
+    /// Live while at least one handle from the open that set `access` is
+    /// alive. Once it is dead the properties are only a record of how the
+    /// stamped extent was arrived at (what a SWMR refresh re-resolves
+    /// under); the next open resolves afresh under its own.
+    open: std::sync::Weak<()>,
 }
 
 /// The absolute form of a discovery-walk path (which carries no leading `/`):
@@ -2728,25 +2747,30 @@ impl Hdf5Reader {
     /// the dapl the open names; its properties are put in force for the
     /// dataset first, so the extent this returns is the one they resolve it
     /// to.
+    ///
+    /// Returns the token that holds the open alive alongside the extent: the
+    /// caller must keep it for as long as its handle lives, because the
+    /// properties this open put in force stay in force exactly that long
+    /// ([`apply_dataset_access`](Self::apply_dataset_access)).
     pub fn open_dataset_with(
         &mut self,
         name: &str,
         access: DatasetAccess,
-    ) -> IoResult<&DatasetReadInfo> {
+    ) -> IoResult<(Option<DatasetOpenToken>, &DatasetReadInfo)> {
         if self.external_edge(name).is_some() {
             let (owner, path, edge) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
-            owner.apply_dataset_access(&path, access)?;
+            let open = owner.apply_dataset_access(&path, access)?;
             return match owner.open_dataset_local(&path) {
                 // The name is absent in the target file, which makes the link
                 // that pointed there dangling — not the caller's path absent.
                 Err(crate::io::IoError::NotFound(_)) => {
                     Err(edge.map_or_else(|| crate::io::IoError::NotFound(path), |e| e.dangling()))
                 }
-                other => other,
+                other => other.map(|info| (open, info)),
             };
         }
-        self.apply_dataset_access(name, access)?;
-        self.open_dataset_local(name)
+        let open = self.apply_dataset_access(name, access)?;
+        self.open_dataset_local(name).map(|info| (open, info))
     }
 
     /// [`open_dataset`](Self::open_dataset) restricted to this file.
@@ -3477,34 +3501,68 @@ impl Hdf5Reader {
     fn access_in_force(&self, canonical: &str) -> DatasetAccess {
         self.virtual_access
             .get(canonical)
-            .copied()
+            .map(|e| e.access)
             .unwrap_or_default()
     }
 
-    /// Put `access` in force for `name` and re-resolve its extent under it —
-    /// what `H5Dopen` with a non-default dapl does, since `H5D__virtual_init`
-    /// stores the dapl on the dataset and `H5D__virtual_set_extent_unlim`
-    /// then runs against it (H5Dvirtual.c:2178-2188, :1386).
+    /// Open `name` under `access`: put those properties in force and
+    /// re-resolve its extent under them, or — when the dataset already has a
+    /// live handle — join that open and drop `access` on the floor.
     ///
-    /// A name that is not a resolved virtual dataset takes nothing: the two
-    /// properties this models are the two that only a virtual dataset reads.
-    fn apply_dataset_access(&mut self, name: &str, access: DatasetAccess) -> IoResult<()> {
+    /// First open wins, which is `H5D_open`'s own rule. Only the open that
+    /// finds no shared info for the dataset runs `H5D__open_oid(dataset,
+    /// dapl_id)` and so reaches `H5D__virtual_init`, where the view and the
+    /// printf gap are read out of the dapl into the *shared* layout storage
+    /// (H5Dvirtual.c:2178-2188); an open that finds the dataset in
+    /// `H5FO_opened` just points at that shared info and increments its
+    /// count, never looking at its own dapl at all (H5Dint.c:1496-1500,
+    /// :1523-1528). The shared info goes away with the last handle, so the
+    /// next open after that resolves afresh. Measured against libhdf5 1.14.6
+    /// and 2.0.0: a second open of a printf-gap VDS with a different gap
+    /// reports the first open's extent and reads the first open's data —
+    /// even through a second `H5Fopen` of the same file — and only once
+    /// every handle is closed does a new open see its own gap.
+    ///
+    /// Returns the token that keeps the open alive; the caller hands it to
+    /// the dataset handle it builds. A name that is not a resolved virtual
+    /// dataset takes nothing and returns `None`: the two properties this
+    /// models are the two that only a virtual dataset reads.
+    fn apply_dataset_access(
+        &mut self,
+        name: &str,
+        access: DatasetAccess,
+    ) -> IoResult<Option<DatasetOpenToken>> {
         let canonical = self.canonical_path(name);
         let Some(i) = self.datasets.iter().position(|d| d.name == canonical) else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(stored) = self.datasets[i].virtual_stored_dims.clone() else {
-            return Ok(());
+            return Ok(None);
         };
-        if self.access_in_force(&canonical) == access {
-            return Ok(());
+        if let Some(open) = self
+            .virtual_access
+            .get(&canonical)
+            .and_then(|e| e.open.upgrade())
+        {
+            return Ok(Some(open));
         }
-        self.virtual_access.insert(canonical, access);
-        // A source may be a virtual dataset in this same file, and the
-        // access propagates to it (H5Dvirtual.c:2224-2226), so this can
-        // re-enter; the depth counter is the same cycle guard the open-time
-        // resolution uses.
-        VirtualResolveDepth::enter(|| self.resolve_virtual_extent_of(i, &stored))
+        let token: DatasetOpenToken = std::sync::Arc::new(());
+        let unchanged = self.access_in_force(&canonical) == access;
+        self.virtual_access.insert(
+            canonical,
+            AccessInForce {
+                access,
+                open: std::sync::Arc::downgrade(&token),
+            },
+        );
+        if !unchanged {
+            // A source may be a virtual dataset in this same file, and the
+            // access propagates to it (H5Dvirtual.c:2224-2226), so this can
+            // re-enter; the depth counter is the same cycle guard the
+            // open-time resolution uses.
+            VirtualResolveDepth::enter(|| self.resolve_virtual_extent_of(i, &stored))?;
+        }
+        Ok(Some(token))
     }
 
     /// [`resolve_virtual_extents`](Self::resolve_virtual_extents) for one
@@ -3762,6 +3820,10 @@ impl Hdf5Reader {
             let source_name = mapping.source_dset_name.trim_start_matches('/');
 
             if mapping.source_file_name == "." {
+                // `H5D__virtual_open_source_dset` opens the source for the
+                // read and `H5D__virtual_reset_source_dset` closes it again,
+                // so this open holds nothing past the mapping — dropping the
+                // token is what that close does.
                 self.apply_dataset_access(source_name, access)?;
                 let Some(src_dims) = self
                     .dataset_info(source_name)
