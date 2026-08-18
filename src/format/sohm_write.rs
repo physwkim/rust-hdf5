@@ -10,19 +10,23 @@
 //! Reference: `H5SM.c` (`H5SM_init`, `H5SM__create_index`, `H5SM__write_mesg`),
 //! `H5SMcache.c` (the table and list images).
 //!
-//! # Where this departs from libhdf5
+//! # Where a body lives
 //!
 //! `H5SM__write_mesg` has two ways to record a message. A class carrying
 //! `H5O_SHARE_IN_OHDR` — datatype, dataspace, fill value, filter pipeline —
 //! leaves the *first* copy literal in the header that wrote it and files an
-//! object-header record for it; only when a second object wants the same body
-//! does the body move to the heap. Every other shareable class, attributes in
-//! particular, goes to the heap on first use. This module takes the second
-//! path for all of them, which is the branch libhdf5 itself takes whenever the
-//! owning header is not open (`open_oh == NULL`). Every record is therefore
-//! `H5SM_IN_HEAP`, and a body used once is a heap object with a reference
-//! count of one — the shape the reference files already show for a dataspace
-//! that only one attribute uses.
+//! `H5SM_IN_OH` record naming that header (H5SM.c:1400-1417); only when a
+//! second object wants the same body does the body move to the heap and the
+//! record become `H5SM_IN_HEAP` with a reference count of two
+//! (H5SM.c:1298-1306). Every other shareable class, attributes in particular,
+//! goes to the heap on first use, as does any class whose owning header is not
+//! open (`open_oh == NULL`, the path an attribute's nested datatype and
+//! dataspace take, H5Aint.c:375-377).
+//!
+//! The caller decides which of the two a body took and says so through
+//! [`SharedMessage::ohdr_addr`]; this module only lays out what that decision
+//! implies — a body kept in a header is not a heap object, so it is skipped
+//! when the heap is sized and filled.
 
 use std::collections::HashMap;
 
@@ -31,8 +35,8 @@ use crate::format::fractal_heap::HeapParams;
 use crate::format::fractal_heap_write::{plan_heap, HeapBlock};
 use crate::format::sohm::{
     encode_list, list_size, message_hash, record_size, SohmIndexHeader, SohmMasterTable,
-    SohmRecord, BT2_TYPE_SOHM_INDEX, SOHM_B2_NODE_SIZE, SOHM_HEAP_ID_LEN, SOHM_INDEX_BTREE,
-    SOHM_INDEX_LIST,
+    SohmRecord, SohmRecordLocation, BT2_TYPE_SOHM_INDEX, SOHM_B2_NODE_SIZE, SOHM_HEAP_ID_LEN,
+    SOHM_INDEX_BTREE, SOHM_INDEX_LIST,
 };
 use crate::format::{FormatContext, FormatError, FormatResult};
 
@@ -93,6 +97,27 @@ pub struct SharedMessage {
     pub nested: Vec<NestedShare>,
     /// References to this body (`H5SM_sohm_t::ref_count`).
     pub ref_count: u32,
+    /// Address of the object header that kept the first copy of this body
+    /// literal, for a class carrying `H5O_SHARE_IN_OHDR`; `None` when the
+    /// body went to the heap the first time it was offered.
+    ///
+    /// It decides only what a *single*-reference record looks like: with one
+    /// reference the body has no heap object at all and the record names the
+    /// header (`H5SM_IN_OH`), and with more the body is in the heap and the
+    /// literal copy is one of the references the count covers
+    /// (H5SM.c:1298-1306).
+    pub ohdr_addr: Option<u64>,
+}
+
+impl SharedMessage {
+    /// The object header keeping this body literal, when that is where it
+    /// stays: a share-in-object-header class with one reference has no heap
+    /// object at all and its record names the header (H5SM.c:1400-1417). A
+    /// second reference is what moves the body to the heap, so anything
+    /// counted more than once is heaped however it started.
+    pub fn kept_in_ohdr(&self) -> Option<u64> {
+        self.ohdr_addr.filter(|_| self.ref_count <= 1)
+    }
 }
 
 /// One index and the messages it was asked to hold.
@@ -139,7 +164,12 @@ pub fn build_shared_messages(
     // could name known.
     let mut plans = Vec::with_capacity(indexes.len());
     for index in indexes {
-        let lengths: Vec<usize> = index.messages.iter().map(|m| m.body.len()).collect();
+        let lengths: Vec<usize> = index
+            .messages
+            .iter()
+            .filter(|m| m.kept_in_ohdr().is_none())
+            .map(|m| m.body.len())
+            .collect();
         plans.push(plan_heap(
             &HeapParams::object_header(),
             ctx,
@@ -154,14 +184,9 @@ pub fn build_shared_messages(
     // and the stored one are the same bytes.
     let mut collected: HashMap<SharedKey, [u8; SOHM_HEAP_ID_LEN]> = HashMap::new();
     for (index, plan) in indexes.iter().zip(&plans) {
-        for (message, id) in index.messages.iter().zip(plan.ids()) {
-            let heap_id: [u8; SOHM_HEAP_ID_LEN] = id.as_slice().try_into().map_err(|_| {
-                FormatError::InvalidData(format!(
-                    "shared-message heap returned a {}-byte id, expected {SOHM_HEAP_ID_LEN}",
-                    id.len()
-                ))
-            })?;
-            collected.insert((message.msg_type, message.body.clone()), heap_id);
+        let heaped = index.messages.iter().filter(|m| m.kept_in_ohdr().is_none());
+        for (message, id) in heaped.zip(plan.ids()) {
+            collected.insert((message.msg_type, message.body.clone()), heap_id(id)?);
         }
     }
 
@@ -179,22 +204,43 @@ pub fn build_shared_messages(
         }
         let heap_addr = plan.header_addr();
         let ids = plan.ids().to_vec();
-        blocks.extend(plan.finish(&bodies)?.blocks);
+        // The heap holds exactly the bodies no object header kept, in the
+        // order they were planned in; `finish` rejects any other set.
+        let heaped: Vec<Vec<u8>> = index
+            .messages
+            .iter()
+            .zip(&bodies)
+            .filter(|(m, _)| m.kept_in_ohdr().is_none())
+            .map(|(_, body)| body.clone())
+            .collect();
+        blocks.extend(plan.finish(&heaped)?.blocks);
 
         let mut records = Vec::with_capacity(index.messages.len());
-        for ((message, body), id) in index.messages.iter().zip(bodies).zip(ids) {
-            let heap_id: [u8; SOHM_HEAP_ID_LEN] = id
-                .as_slice()
-                .try_into()
-                .expect("the plan's ids were checked above");
-            // Keyed by what a header will hold: for a nesting body that is
-            // this resolved one, not the one the collect pass offered.
-            heap_ids.insert((message.msg_type, body.clone()), heap_id);
+        let mut heaped_at = 0usize;
+        for (message, body) in index.messages.iter().zip(bodies) {
+            let location = match message.kept_in_ohdr() {
+                Some(oh_addr) => SohmRecordLocation::InObjectHeader {
+                    msg_type: message.msg_type,
+                    index: 0,
+                    oh_addr,
+                },
+                None => {
+                    let id = heap_id(&ids[heaped_at])?;
+                    heaped_at += 1;
+                    // Keyed by what a header will hold: for a nesting body
+                    // that is this resolved one, not the one the collect pass
+                    // offered.
+                    heap_ids.insert((message.msg_type, body.clone()), id);
+                    SohmRecordLocation::InHeap {
+                        ref_count: message.ref_count,
+                        heap_id: id,
+                    }
+                }
+            };
             records.push((
                 SohmRecord {
                     hash: message_hash(&body, message.msg_type),
-                    ref_count: message.ref_count,
-                    heap_id,
+                    location,
                 },
                 body,
             ));
@@ -252,6 +298,17 @@ pub fn build_shared_messages(
 /// count a *deletion* would convert below — has no say here.
 fn is_btree(spec: &SohmIndexSpec, num_messages: u16) -> bool {
     spec.list_max == 0 || num_messages > spec.list_max
+}
+
+/// One heap ID as the format wants it, from the variable-length one a heap
+/// plan hands back.
+fn heap_id(id: &[u8]) -> FormatResult<[u8; SOHM_HEAP_ID_LEN]> {
+    id.try_into().map_err(|_| {
+        FormatError::InvalidData(format!(
+            "shared-message heap returned a {}-byte id, expected {SOHM_HEAP_ID_LEN}",
+            id.len()
+        ))
+    })
 }
 
 /// The body a header holds for `message`: its collected bytes with every heap
@@ -400,6 +457,7 @@ mod tests {
             body: (0..len).map(|i| seed.wrapping_add(i as u8)).collect(),
             nested: Vec::new(),
             ref_count,
+            ohdr_addr: None,
         }
     }
 
@@ -437,15 +495,30 @@ mod tests {
             collect_btree_v2_records(&bt2, &ctx(), file).unwrap()
         };
         raw.chunks_exact(size)
-            .map(|r| {
-                assert_eq!(r[0], SOHM_IN_HEAP);
-                SohmRecord {
-                    hash: u32::from_le_bytes(r[1..5].try_into().unwrap()),
-                    ref_count: u32::from_le_bytes(r[5..9].try_into().unwrap()),
-                    heap_id: r[9..17].try_into().unwrap(),
-                }
+            .map(|r| SohmRecord {
+                hash: u32::from_le_bytes(r[1..5].try_into().unwrap()),
+                location: if r[0] == SOHM_IN_HEAP {
+                    SohmRecordLocation::InHeap {
+                        ref_count: u32::from_le_bytes(r[5..9].try_into().unwrap()),
+                        heap_id: r[9..17].try_into().unwrap(),
+                    }
+                } else {
+                    SohmRecordLocation::InObjectHeader {
+                        msg_type: r[6],
+                        index: u16::from_le_bytes(r[7..9].try_into().unwrap()),
+                        oh_addr: u64::from_le_bytes(r[9..17].try_into().unwrap()),
+                    }
+                },
             })
             .collect()
+    }
+
+    /// The heap side of a record, for a test that expects one there.
+    fn in_heap(record: &SohmRecord) -> (u32, [u8; SOHM_HEAP_ID_LEN]) {
+        match record.location {
+            SohmRecordLocation::InHeap { ref_count, heap_id } => (ref_count, heap_id),
+            other => panic!("expected a heap record, got {other:?}"),
+        }
     }
 
     /// Pull a message body back out of an index's heap by its record.
@@ -453,7 +526,7 @@ mod tests {
         let heap =
             FractalHeapHeader::decode(&file.read_block(heap_addr, 512).unwrap(), &ctx()).unwrap();
         let blocks = collect_managed_blocks(&heap, &ctx(), file).unwrap();
-        let id = HeapId::parse(&record.heap_id, &heap, &ctx()).unwrap();
+        let id = HeapId::parse(&in_heap(record).1, &heap, &ctx()).unwrap();
         read_heap_object(&id, &heap, &ctx(), &blocks, file).unwrap()
     }
 
@@ -489,7 +562,7 @@ mod tests {
         assert_eq!(records.len(), 4);
         for (message, record) in messages.iter().zip(&records) {
             assert_eq!(record.hash, message_hash(&message.body, message.msg_type));
-            assert_eq!(record.ref_count, message.ref_count);
+            assert_eq!(in_heap(record).0, message.ref_count);
             assert_eq!(read_body(&mut file, header.heap_addr, record), message.body);
         }
 
@@ -543,7 +616,7 @@ mod tests {
         for message in &messages {
             let hash = message_hash(&message.body, message.msg_type);
             let record = records.iter().find(|r| r.hash == hash).unwrap();
-            assert_eq!(record.ref_count, message.ref_count);
+            assert_eq!(in_heap(record).0, message.ref_count);
             assert_eq!(read_body(&mut file, header.heap_addr, record), message.body);
         }
     }
@@ -559,6 +632,7 @@ mod tests {
                 body: i.to_le_bytes().repeat(6),
                 nested: Vec::new(),
                 ref_count: i + 1,
+                ohdr_addr: None,
             })
             .collect();
         let (mut file, built) = lay_out(&[SohmIndexContent {

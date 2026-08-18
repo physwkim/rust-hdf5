@@ -885,6 +885,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                     chunk_index: None,
                     is_null: true,
                 },
+                _open: None,
             });
         }
 
@@ -952,6 +953,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                     chunk_index: None,
                     is_null: false,
                 },
+                _open: None,
             });
         }
 
@@ -1009,6 +1011,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                     chunk_index: None,
                     is_null: false,
                 },
+                _open: None,
             });
         }
 
@@ -1226,6 +1229,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                     chunk_index: Some(kind),
                     is_null: false,
                 },
+                _open: None,
             })
         } else {
             // Contiguous dataset (original path)
@@ -1286,6 +1290,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                     chunk_index: None,
                     is_null: false,
                 },
+                _open: None,
             })
         }
     }
@@ -1340,6 +1345,16 @@ enum DatasetInfo {
 pub struct H5Dataset {
     file_inner: SharedInner,
     info: DatasetInfo,
+    /// Keeps this dataset's *open* alive for as long as the handle is, so
+    /// the reader can tell whether a later open of the same name joins this
+    /// one or starts fresh — libhdf5's `H5FO_opened` shared-info count
+    /// (H5Dint.c:1496-1500). `None` for a write-mode handle and for a read
+    /// of anything but a virtual dataset, the only kind whose open carries
+    /// properties.
+    ///
+    /// Held, never read: its whole job is to keep the reader's `Weak` on it
+    /// upgradable until this handle goes away.
+    _open: Option<crate::io::reader::DatasetOpenToken>,
 }
 
 /// One chunk's bytes on the way to the file, and who filtered them.
@@ -1779,6 +1794,7 @@ impl H5Dataset {
         name: String,
         shape: Vec<usize>,
         element_size: usize,
+        open: Option<crate::io::reader::DatasetOpenToken>,
     ) -> Self {
         Self {
             file_inner,
@@ -1787,6 +1803,7 @@ impl H5Dataset {
                 shape,
                 element_size,
             },
+            _open: open,
         }
     }
 
@@ -1816,6 +1833,7 @@ impl H5Dataset {
                 chunk_index,
                 is_null: false,
             },
+            _open: None,
         }
     }
 
@@ -9712,6 +9730,97 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// A relatively-named source is found next to the virtual dataset even
+    /// when the process is somewhere else entirely: `H5F_prefix_open_file`
+    /// tries the primary file's `H5F_EXTPATH` — the directory it was opened
+    /// from — before the bare relative name against the working directory
+    /// (H5Fint.c:952-977). Measured against libhdf5 1.14.6 through h5py: a
+    /// `VirtualSource("src.h5", ...)` beside its VDS reads its data with
+    /// `HDF5_VDS_PREFIX` unset and the working directory elsewhere; before
+    /// the reader took that step it read back all fill value.
+    #[test]
+    fn a_relative_source_resolves_next_to_the_virtual_dataset() {
+        use crate::Selection;
+        let dir = std::env::temp_dir().join(format!(
+            "rust_hdf5_vds_beside_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let file = H5File::create(dir.join("src.h5")).unwrap();
+            file.new_dataset::<i32>()
+                .shape([2usize, 4])
+                .create("data")
+                .unwrap()
+                .write_raw(&(0..8i32).collect::<Vec<_>>())
+                .unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::create(dir.join("v.h5")).unwrap();
+            file.new_dataset::<i32>()
+                .shape([2usize, 4])
+                .fill_value(-9i32)
+                // Named relatively, as h5py's `VirtualSource("src.h5", ...)`
+                // stores it — nothing in the file says where it lives.
+                .virtual_mapping(Selection::All, "src.h5", "data", Selection::All)
+                .create("v")
+                .unwrap();
+            file.close().unwrap();
+        }
+        // The working directory is the crate root under `cargo test`, not
+        // `dir`, so only the extpath step can find `src.h5`.
+        assert_ne!(std::env::current_dir().unwrap(), dir);
+        let file = H5File::open(dir.join("v.h5")).unwrap();
+        let ds = file.dataset("v").unwrap();
+        assert_eq!(ds.read_raw::<i32>().unwrap(), (0..8i32).collect::<Vec<_>>());
+        drop(file);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The first open of a virtual dataset fixes its access properties for
+    /// every open that overlaps it: only the open that finds no shared info
+    /// in `H5FO_opened` runs `H5D__open_oid(dataset, dapl_id)`, and a later
+    /// one just points at that shared info without ever reading its own dapl
+    /// (H5Dint.c:1496-1500, :1523-1528) — the view and the gap live in the
+    /// shared layout storage `H5D__virtual_init` filled from that first dapl
+    /// (H5Dvirtual.c:2178-2188). Measured against libhdf5 1.14.6 and 2.0.0
+    /// through `h5d.open(..., dapl=...)` on the printf-gap VDS below: opening
+    /// gap 0 then gap 1 gives both handles two rows; with every handle closed,
+    /// opening gap 1 then gap 0 gives both four rows and the gap row reads as
+    /// fill; with every handle closed again, gap 0 alone is back to two rows.
+    #[test]
+    fn the_first_open_of_a_virtual_dataset_fixes_the_properties_for_later_opens() {
+        use crate::DatasetAccess;
+        let path = printf_gap_file("vds_printf_first_open");
+        let file = H5File::open(&path).unwrap();
+        let gap = |g: u64| DatasetAccess::new().virtual_printf_gap(g);
+        {
+            let a = file.dataset_with("vds", gap(0)).unwrap();
+            let b = file.dataset_with("vds", gap(1)).unwrap();
+            assert_eq!(a.shape(), vec![2, 2]);
+            assert_eq!(b.shape(), vec![2, 2]);
+            assert_eq!(b.read_raw::<i32>().unwrap(), vec![0, 1, 100, 101]);
+        }
+        {
+            let c = file.dataset_with("vds", gap(1)).unwrap();
+            let d = file.dataset_with("vds", gap(0)).unwrap();
+            assert_eq!(c.shape(), vec![4, 2]);
+            assert_eq!(d.shape(), vec![4, 2]);
+            assert_eq!(
+                d.read_raw::<i32>().unwrap(),
+                vec![0, 1, 100, 101, -7, -7, 300, 301]
+            );
+        }
+        let e = file.dataset_with("vds", gap(0)).unwrap();
+        assert_eq!(e.shape(), vec![2, 2]);
+        assert_eq!(e.read_raw::<i32>().unwrap(), vec![0, 1, 100, 101]);
+        drop(e);
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
     /// `H5D_VDS_FIRST_MISSING` ignores the printf gap: `H5D__virtual_init`
     /// reads the gap property only under `H5D_VDS_LAST_AVAILABLE` and forces
     /// it to 0 otherwise (H5Dvirtual.c:2182-2188). Measured against libhdf5
@@ -9782,9 +9891,12 @@ mod tests {
             file.close().unwrap();
         }
         let file = H5File::open(&path).unwrap();
-        let last = file.dataset("vds").unwrap();
-        assert_eq!(last.shape(), vec![2, 2]);
-        assert_eq!(last.read_raw::<i32>().unwrap(), vec![0, 1, 2, 3]);
+        {
+            let last = file.dataset("vds").unwrap();
+            assert_eq!(last.shape(), vec![2, 2]);
+            assert_eq!(last.read_raw::<i32>().unwrap(), vec![0, 1, 2, 3]);
+        }
+        // The handle above is gone, so this open is the one that resolves.
         let first = file
             .dataset_with(
                 "vds",

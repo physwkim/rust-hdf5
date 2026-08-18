@@ -264,3 +264,78 @@ fn swmr_disabled_locking_allows_concurrent_writer() {
         other_writer.err()
     );
 }
+
+/// A virtual dataset's source file is opened under the *virtual* file's
+/// locking policy, not under one of its own. `H5D__virtual_open_source_dset`
+/// hands `H5F_prefix_open_file` `source_fapl` (H5Dvirtual.c:877-882), which
+/// `H5D__virtual_init` made as a copy of the virtual file's own file-access
+/// property list (H5Dvirtual.c:2193-2194) — and `H5F_get_access_plist` copies
+/// `use_file_locking` into it verbatim (H5Fint.c:389). Measured against
+/// libhdf5 1.14.6 by watching `flock` on the source across a VDS read: locked
+/// under the default, unlocked under `HDF5_USE_FILE_LOCKING=FALSE`.
+///
+/// The source is opened lazily, on the read that needs it — libhdf5 opens it
+/// in `H5D__virtual_read_one`'s path, not at `H5Dopen`, and the same
+/// measurement shows the source's descriptor appearing only after the read.
+#[test]
+fn a_virtual_source_takes_the_virtual_file_s_lock() {
+    use rust_hdf5::Selection;
+    let src = unique_tmp("vds_source");
+    let vds = src.parent().unwrap().join("vds_holder.h5");
+    enabled()
+        .create(&src)
+        .unwrap()
+        .new_dataset::<i32>()
+        .shape([2usize, 4])
+        .create("data")
+        .unwrap()
+        .write_raw(&(0..8i32).collect::<Vec<_>>())
+        .unwrap();
+    {
+        let file = enabled().create(&vds).unwrap();
+        file.new_dataset::<i32>()
+            .shape([2usize, 4])
+            .fill_value(-9i32)
+            .virtual_mapping(
+                Selection::All,
+                src.to_str().unwrap(),
+                "data",
+                Selection::All,
+            )
+            .create("v")
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let want: Vec<i32> = (0..8).collect();
+    {
+        let reader = enabled().open(&vds).unwrap();
+        let ds = reader.dataset("v").unwrap();
+        assert!(
+            enabled().open_rw(&src).is_ok(),
+            "the source is not opened until the read that needs it"
+        );
+        assert_eq!(ds.read_raw::<i32>().unwrap(), want);
+        assert!(
+            enabled().open_rw(&src).is_err(),
+            "expected the source to be locked by the virtual file's reader"
+        );
+    }
+    assert!(
+        enabled().open_rw(&src).is_ok(),
+        "expected the source lock to go with the virtual file's reader"
+    );
+
+    // The same read under a virtual file opened with locking off leaves the
+    // source unlocked, because the source inherits that policy too.
+    {
+        let reader = H5File::options().no_locking().open(&vds).unwrap();
+        let ds = reader.dataset("v").unwrap();
+        assert_eq!(ds.read_raw::<i32>().unwrap(), want);
+        assert!(
+            enabled().open_rw(&src).is_ok(),
+            "expected no lock on the source when the virtual file disabled locking"
+        );
+    }
+    let _ = std::fs::remove_dir_all(src.parent().unwrap());
+}

@@ -21,12 +21,14 @@ use rust_hdf5::format::fractal_heap::{
 };
 use rust_hdf5::format::messages::attribute::{ATTR_FLAG_SPACE_SHARED, ATTR_FLAG_TYPE_SHARED};
 use rust_hdf5::format::messages::dataspace::DataspaceMessage;
-use rust_hdf5::format::messages::{MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE};
+use rust_hdf5::format::messages::{
+    MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE, MSG_FLAG_SHAREABLE, MSG_FLAG_SHARED,
+};
 use rust_hdf5::format::object_header::ObjectHeader;
 use rust_hdf5::format::sohm::{
     record_size, type_flag, SharedLocation, SharedMessagePointer, SohmMasterTable,
     BT2_TYPE_SOHM_INDEX, SMLI_SIGNATURE, SOHM_B2_NODE_SIZE, SOHM_HEAP_ID_LEN, SOHM_INDEX_BTREE,
-    SOHM_INDEX_LIST,
+    SOHM_INDEX_LIST, SOHM_IN_HEAP, SOHM_IN_OH,
 };
 use rust_hdf5::format::superblock::{SuperblockV0V1, SuperblockV2V3};
 use rust_hdf5::format::{BlockReader, FormatContext, FormatResult, UNDEF_ADDR};
@@ -214,6 +216,10 @@ fn census(path: &PathBuf) -> Vec<(Role, u32)> {
             collect_btree_v2_records(&bt2, &ctx, &mut Bytes(&bytes)).unwrap()
         };
         for entry in entries.chunks_exact(size) {
+            assert_eq!(
+                entry[0], SOHM_IN_HEAP,
+                "this census reads heap bodies; the record is in an object header"
+            );
             let id: [u8; SOHM_HEAP_ID_LEN] = entry[9..9 + SOHM_HEAP_ID_LEN].try_into().unwrap();
             let parsed = HeapId::parse(&id, &heap, &ctx).unwrap();
             let body = read_heap_object(&parsed, &heap, &ctx, &blocks, &mut reader).unwrap();
@@ -369,6 +375,124 @@ fn a_created_file_shares_the_bodies_its_index_covers() {
     cleanup(&path);
 }
 
+/// A body only one object uses never reaches the heap: it stays literal in
+/// the header that offered it, carrying `H5O_MSG_FLAG_SHAREABLE` instead of
+/// becoming a pointer (H5SM.c:1112), and the index files an `H5SM_IN_OH`
+/// record naming that header (H5SM.c:1400-1417).
+///
+/// libhdf5 writes the same file here, so the record is compared byte for
+/// byte apart from the header address the two writers place differently.
+#[test]
+fn a_body_only_one_object_uses_stays_in_its_header() {
+    let path = unique_tmp("in_ohdr");
+    let dataspace = type_flag(MSG_DATASPACE).unwrap();
+    {
+        let file = H5File::options()
+            .shared_messages(&[(dataspace, 0)], 50, 40)
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape([8usize])
+            .create("only")
+            .unwrap()
+            .write_raw(&(0..8i32).collect::<Vec<_>>())
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let ctx = FormatContext::default_v3();
+    let bytes = std::fs::read(&path).unwrap();
+    let table = read_master_table(&path);
+    assert_eq!(table.indexes.len(), 1);
+    let index = &table.indexes[0];
+    assert_eq!(index.num_messages, 1);
+
+    let at = index.index_addr as usize;
+    assert_eq!(&bytes[at..at + 4], &SMLI_SIGNATURE);
+    let record = &bytes[at + 4..at + 4 + record_size(&ctx)];
+    assert_eq!(record[0], SOHM_IN_OH);
+    assert_eq!(record[6], MSG_DATASPACE, "the class the record names");
+    let oh_addr = u64::from_le_bytes(record[9..17].try_into().unwrap());
+
+    // The header the record names holds the body itself, marked shareable
+    // and not shared.
+    let (header, _) = ObjectHeader::decode(&bytes[oh_addr as usize..]).unwrap();
+    let dataspace_msg = header
+        .messages
+        .iter()
+        .find(|m| m.msg_type == MSG_DATASPACE)
+        .expect("the header the record names has a dataspace message");
+    assert_eq!(dataspace_msg.flags & MSG_FLAG_SHARED, 0);
+    assert_ne!(dataspace_msg.flags & MSG_FLAG_SHAREABLE, 0);
+    DataspaceMessage::decode(&dataspace_msg.data, &ctx).expect("the body is a dataspace, literal");
+
+    // And the file still reads back.
+    let file = H5File::open(&path).unwrap();
+    let data: Vec<i32> = file.dataset("only").unwrap().read_raw().unwrap();
+    assert_eq!(data, (0..8i32).collect::<Vec<_>>());
+    drop(file);
+
+    libhdf5_writes_the_same_single_use_record(record);
+    cleanup(&path);
+}
+
+/// The libhdf5 half of [`a_body_only_one_object_uses_stays_in_its_header`]:
+/// the same one-dataset file written by libhdf5 itself, whose record must
+/// take the same form, hash the same body and name the same class. Only the
+/// header address differs, the two writers laying a file out differently.
+///
+/// h5py exposes no `H5Pset_shared_mesg_*`, so the creation properties are set
+/// through `ctypes` on the libhdf5 h5py is linked against — the same library
+/// `tests/fixtures/gen_sohm.c` was run against.
+fn libhdf5_writes_the_same_single_use_record(record: &[u8]) {
+    let Some(py) = python() else { return };
+    let theirs = unique_tmp("in_ohdr_h5py");
+    let script = format!(
+        "import ctypes, glob, os, sys, h5py, numpy as np\n\
+         so = sorted(glob.glob(os.path.join(sys.prefix, 'lib', 'libhdf5.so.*')))\n\
+         if not so:\n\
+         \x20   raise SystemExit(0)\n\
+         h5 = ctypes.CDLL(so[0])\n\
+         h5.H5Pcreate.restype = h5.H5Fcreate.restype = ctypes.c_int64\n\
+         h5.H5Pcreate.argtypes = [ctypes.c_int64]\n\
+         h5.H5Fcreate.argtypes = [ctypes.c_char_p, ctypes.c_uint, ctypes.c_int64, ctypes.c_int64]\n\
+         h5.H5Pset_shared_mesg_nindexes.argtypes = [ctypes.c_int64, ctypes.c_uint]\n\
+         h5.H5Pset_shared_mesg_index.argtypes = [ctypes.c_int64, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]\n\
+         h5.H5Pset_shared_mesg_phase_change.argtypes = [ctypes.c_int64, ctypes.c_uint, ctypes.c_uint]\n\
+         h5.H5Pclose.argtypes = h5.H5Fclose.argtypes = [ctypes.c_int64]\n\
+         fcpl = h5.H5Pcreate(ctypes.c_int64.in_dll(h5, 'H5P_CLS_FILE_CREATE_ID_g').value)\n\
+         assert fcpl >= 0\n\
+         assert h5.H5Pset_shared_mesg_nindexes(fcpl, 1) >= 0\n\
+         assert h5.H5Pset_shared_mesg_index(fcpl, 0, 0x0002, 0) >= 0\n\
+         assert h5.H5Pset_shared_mesg_phase_change(fcpl, 50, 40) >= 0\n\
+         fid = h5.H5Fcreate(r'{}'.encode(), 2, fcpl, 0)\n\
+         assert fid >= 0\n\
+         h5.H5Pclose(fcpl)\n\
+         h5.H5Fclose(fid)\n\
+         f = h5py.File(r'{}', 'r+')\n\
+         f.create_dataset('only', data=np.arange(8, dtype='<i4'))\n\
+         f.close()\n",
+        theirs.display(),
+        theirs.display(),
+    );
+    run(py, &["-c", &script], "libhdf5 single-use shared dataspace");
+    if !theirs.exists() {
+        return;
+    }
+
+    let ctx = FormatContext::default_v3();
+    let bytes = std::fs::read(&theirs).unwrap();
+    let table = read_master_table(&theirs);
+    let index = &table.indexes[0];
+    assert_eq!(index.num_messages, 1);
+    let at = index.index_addr as usize + 4;
+    let theirs_record = &bytes[at..at + record_size(&ctx)];
+    // Location, hash, reserved byte, class and creation index — everything
+    // but the address, which is where the two layouts part.
+    assert_eq!(theirs_record[..9], record[..9]);
+    cleanup(&theirs);
+}
+
 /// The shared attribute this crate writes holds pointers to its own datatype
 /// and dataspace, and the file reads back through those pointers.
 ///
@@ -378,6 +502,62 @@ fn a_created_file_shares_the_bodies_its_index_covers() {
 /// (H5Oattr.c:346-360). The components end at one reference each — the
 /// pointer lives in the one heap object every dataset's header names, not in
 /// each header.
+/// The public accessor the oracle's `shared` field is read through, checked
+/// against `h5debug` on the libhdf5-written fixture.
+///
+/// `h5debug tests/fixtures/sohm_list.h5 <addr>` prints, per object:
+/// `/shared0` dataspace `<SA>` and attribute `<S>`/SOHM; `/shared1..3`
+/// dataspace and attribute both `<S>`/SOHM; `/uses_named` dataspace
+/// `<S>`/SOHM and datatype `<C, S>`/Obj Hdr; `/named_i32` and the root group
+/// nothing at all. The first is the case `H5Oget_info`'s `hdr.mesg.shared`
+/// mask cannot express: `H5SM__write_mesg` left the body literal in the
+/// header that offered it (H5SM.c:1400-1417), so the flag is
+/// `H5O_MSG_FLAG_SHAREABLE` and the mask, which counts only
+/// `H5O_MSG_FLAG_SHARED`, reads zero (H5Oint.c:2072-2073).
+#[test]
+fn the_storage_accessor_answers_what_h5debug_prints_for_the_fixture() {
+    use rust_hdf5::format::messages::shared::MessageStorage;
+    use rust_hdf5::format::sohm::SharedLocation;
+
+    let file = H5File::open(fixture("sohm_list.h5")).unwrap();
+    let seen: Vec<(&str, Vec<(u8, MessageStorage)>)> =
+        ["/", "/named_i32", "/shared0", "/shared1", "/uses_named"]
+            .into_iter()
+            .map(|p| (p, file.object_message_storage(p).unwrap()))
+            .collect();
+    assert_eq!(
+        seen,
+        vec![
+            ("/", vec![]),
+            ("/named_i32", vec![]),
+            (
+                "/shared0",
+                vec![
+                    (MSG_DATASPACE, MessageStorage::Shareable),
+                    (MSG_ATTRIBUTE, MessageStorage::Shared(SharedLocation::Sohm)),
+                ]
+            ),
+            (
+                "/shared1",
+                vec![
+                    (MSG_DATASPACE, MessageStorage::Shared(SharedLocation::Sohm)),
+                    (MSG_ATTRIBUTE, MessageStorage::Shared(SharedLocation::Sohm)),
+                ]
+            ),
+            (
+                "/uses_named",
+                vec![
+                    (MSG_DATASPACE, MessageStorage::Shared(SharedLocation::Sohm)),
+                    (
+                        MSG_DATATYPE,
+                        MessageStorage::Shared(SharedLocation::Committed)
+                    ),
+                ]
+            ),
+        ]
+    );
+}
+
 #[test]
 fn a_shared_attribute_points_at_its_own_datatype_and_dataspace() {
     let path = unique_tmp("nested");
@@ -587,11 +767,15 @@ fn libhdf5_reads_the_file_and_diffs_it_clean_against_its_twin() {
 /// libhdf5's.
 ///
 /// The dataspace bit is asserted too, so a rule that simply stopped sharing
-/// would fail this rather than pass it. It is checked on `shared1` rather
-/// than `shared0` because the first object is where the two writers still
-/// differ: `H5SM__write_mesg` leaves a first copy literal in the header that
-/// wrote it when that header is open, which is not the branch this crate
-/// takes (see the module docs of `src/format/sohm_write.rs`).
+/// would fail this rather than pass it.
+///
+/// `shared0` is the object the two writers used to disagree about, so its
+/// whole mask is compared rather than probed bit by bit: `H5SM__write_mesg`
+/// leaves the first copy of a share-in-object-header class literal in the
+/// header that offered it (H5SM.c:1400-1417), and `H5O__get_hdr_info` only
+/// counts a message the header stores as a pointer (H5Oint.c:2072-2073), so
+/// the dataspace bit is *clear* on the first of the four datasets and set on
+/// the rest.
 #[test]
 fn h5py_sees_the_predefined_datatype_left_out_of_the_index() {
     let Some(py) = python() else { return };
@@ -601,12 +785,17 @@ fn h5py_sees_the_predefined_datatype_left_out_of_the_index() {
     let script = format!(
         "import h5py\n\
          DTYPE, SDSPACE, ATTR = 1 << 3, 1 << 1, 1 << 12\n\
+         masks = []\n\
          for name in (r'{}', r'{}'):\n\
          \x20   f = h5py.File(name, 'r')\n\
          \x20   m = h5py.h5o.get_info(f['shared1'].id).hdr.mesg.shared\n\
          \x20   assert not m & DTYPE, (name, hex(m))\n\
          \x20   assert m & SDSPACE and m & ATTR, (name, hex(m))\n\
-         \x20   f.close()\n",
+         \x20   first = h5py.h5o.get_info(f['shared0'].id).hdr.mesg.shared\n\
+         \x20   assert not first & SDSPACE, (name, hex(first))\n\
+         \x20   masks.append((first, m))\n\
+         \x20   f.close()\n\
+         assert masks[0] == masks[1], masks\n",
         path.display(),
         fixture("sohm_list.h5").display(),
     );

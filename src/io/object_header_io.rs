@@ -24,7 +24,8 @@ use crate::format::fractal_heap::{
 };
 use crate::format::messages::attribute::{ATTR_FLAG_SPACE_SHARED, ATTR_FLAG_TYPE_SHARED};
 use crate::format::messages::datatype::DatatypeMessage;
-use crate::format::messages::shared::MSG_FLAG_SHARED;
+use crate::format::messages::shared::{MessageStorage, MSG_FLAG_SHARED};
+use crate::format::messages::MSG_FLAG_SHAREABLE;
 use crate::format::messages::{
     MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE, MSG_LINK, MSG_LINK_INFO,
     MSG_OBJ_HEADER_CONTINUATION, MSG_SYMBOL_TABLE,
@@ -96,6 +97,32 @@ pub(crate) fn read_object_header_with_blocks(
     let (mut header, blocks) = read_header_chain(handle, meta, addr)?;
     resolve_shared_messages(handle, meta, &mut header, addr, 0)?;
     Ok((header, blocks))
+}
+
+/// How the object header at `addr` stores each message that is not private,
+/// as `(message type, storage)` in header order.
+///
+/// Read from the raw chain, before [`resolve_shared_messages`] substitutes
+/// bodies and clears the flag: the flags byte is the observable here, so a
+/// reader that has already resolved the header cannot answer this.
+pub(crate) fn read_header_message_storage(
+    handle: &mut FileHandle,
+    meta: &FileMeta,
+    addr: u64,
+) -> IoResult<Vec<(u8, MessageStorage)>> {
+    let (header, _) = read_header_chain(handle, meta, addr)?;
+    let mut out = Vec::new();
+    for msg in &header.messages {
+        let storage = if msg.flags & MSG_FLAG_SHARED != 0 {
+            MessageStorage::Shared(SharedMessagePointer::decode(&msg.data, &meta.ctx)?.location)
+        } else if msg.flags & MSG_FLAG_SHAREABLE != 0 {
+            MessageStorage::Shareable
+        } else {
+            continue;
+        };
+        out.push((msg.msg_type, storage));
+    }
+    Ok(out)
 }
 
 /// One message of a superblock extension, kept as it was read.

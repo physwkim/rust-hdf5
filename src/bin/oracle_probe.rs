@@ -30,6 +30,12 @@ use rust_hdf5::format::messages::filter::{
     FILTER_FLETCHER32, FILTER_LZ4, FILTER_LZF, FILTER_NBIT, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
     FILTER_SZIP, FILTER_ZSTD, FLAG_MANDATORY,
 };
+use rust_hdf5::format::messages::shared::MessageStorage;
+use rust_hdf5::format::messages::{
+    MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE, MSG_FILL_VALUE, MSG_FILL_VALUE_OLD,
+    MSG_FILTER_PIPELINE,
+};
+use rust_hdf5::format::sohm::SharedLocation;
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
     AllocTime, AttributeStorage, ChunkIndex, CreationOrder, DatasetAccess, ExternalFileSegment,
@@ -39,7 +45,7 @@ use rust_hdf5::{
 };
 use rust_hdf5::{FileSpaceInfoMessage, FileSpaceStrategy};
 
-const CANON_VERSION: &str = "7";
+const CANON_VERSION: &str = "8";
 const RAW_LIMIT: usize = 1024;
 const MAX_DEPTH: usize = 32;
 
@@ -775,6 +781,50 @@ fn crt_order_str(order: CreationOrder) -> &'static str {
     }
 }
 
+/// The message classes a shared-message index can cover, by the names
+/// `h5debug` prints for them (`H5O_msg_class_t.name`): `dataspace`
+/// (H5Osdspace.c:59), `datatype` (H5Odtype.c:87), `fill`/`fill_new`
+/// (H5Ofill.c:103, :127), `filter pipeline` (H5Opline.c:63) and `attribute`
+/// (H5Oattr.c:66). Any other class is named by its id, which no writer should
+/// produce — `H5SM__can_share_common` refuses a class without
+/// `H5O_SHARE_IS_SHARABLE` (H5SM.c:895-899).
+fn message_class_name(msg_type: u8) -> String {
+    match msg_type {
+        MSG_DATASPACE => "dataspace".into(),
+        MSG_DATATYPE => "datatype".into(),
+        MSG_FILL_VALUE_OLD => "fill".into(),
+        MSG_FILL_VALUE => "fill_new".into(),
+        MSG_FILTER_PIPELINE => "filter_pipeline".into(),
+        MSG_ATTRIBUTE => "attribute".into(),
+        other => format!("msg0x{other:02x}"),
+    }
+}
+
+/// The twin of `canon.py`'s `shared_str`: what the object header at `path`
+/// says about every message it does not hold privately, as
+/// `class:storage` pairs sorted so two writers can be compared whatever order
+/// they laid the messages out in.
+fn shared_str(file: &H5File, path: &str) -> std::result::Result<String, String> {
+    let mut parts: Vec<String> = file
+        .object_message_storage(path)
+        .map_err(oneline)?
+        .into_iter()
+        .map(|(msg_type, storage)| {
+            let where_ = match storage {
+                MessageStorage::Private => "private",
+                MessageStorage::Shareable => "shareable",
+                MessageStorage::Shared(SharedLocation::Sohm) => "sohm",
+                MessageStorage::Shared(SharedLocation::Committed) => "committed",
+                MessageStorage::Shared(SharedLocation::Here) => "here",
+                MessageStorage::Shared(SharedLocation::Unshared) => "unshared",
+            };
+            format!("{}:{where_}", message_class_name(msg_type))
+        })
+        .collect();
+    parts.sort();
+    Ok(format!("[{}]", parts.join(",")))
+}
+
 /// The twin of `canon.py`'s `dump_attrs`'s `attrstore` lambda: `"compact"` or
 /// `"dense"`, the same two strings h5py's `meta_size.attr.index_size` check
 /// produces.
@@ -819,6 +869,7 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
             .map(str::to_string)
             .map_err(oneline)
     });
+    d.field(path, "shared", || shared_str(file, path));
     dump_group_attrs(d, path, group);
 
     if depth >= MAX_DEPTH {
@@ -948,7 +999,7 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
                 let lookup = cpath.trim_start_matches('/').to_string();
                 let access = d.access;
                 match guarded(|| file.dataset_with(&lookup, access)) {
-                    Ok(Ok(ds)) => dump_dataset(d, &cpath, &ds),
+                    Ok(Ok(ds)) => dump_dataset(d, file, &cpath, &ds),
                     Ok(Err(e)) => {
                         d.emit(&format!("{cpath}#kind"), unsupported("kind", &oneline(e)))
                     }
@@ -1013,7 +1064,7 @@ fn resolve_extlink(file: &H5File, cpath: &str) -> std::result::Result<String, St
     }
 }
 
-fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
+fn dump_dataset(d: &mut Dump, file: &H5File, path: &str, ds: &H5Dataset) {
     d.emit(&format!("{path}#kind"), "dataset");
 
     let dtype = guarded(|| ds.datatype()).ok().and_then(|r| r.ok());
@@ -1155,6 +1206,7 @@ fn dump_dataset(d: &mut Dump, path: &str, ds: &H5Dataset) {
             .map_err(oneline)
     });
 
+    d.field(path, "shared", || shared_str(file, path));
     dump_object_attrs(d, path, ds);
 
     d.field(path, "data", || dataset_payload(ds, dtype.as_ref()));
@@ -2167,6 +2219,36 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                     unlim_rows,
                     &format!("{stem}_b%b.h5"),
                     "data",
+                    Selection::All,
+                )
+                .create("vds")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "vds_split" => {
+            // Two 1x4 virtual blocks fed by one 2x4 `H5S_SEL_ALL` source
+            // selection: the two sides decompose into different numbers of
+            // boxes and are paired element by element instead.
+            let file = earliest_file(path)?;
+            file.new_dataset::<i32>()
+                .shape([2usize, 4])
+                .create("src")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.new_dataset::<i32>()
+                .shape([4usize, 4])
+                .fill_value(-9i32)
+                .virtual_mapping(
+                    Selection::Hyperslab {
+                        rank: 2,
+                        form: Hyperslab::Regular(rust_hdf5::RegularHyperslab {
+                            start: vec![0, 0],
+                            stride: vec![2, 1],
+                            count: vec![2, 1],
+                            block: vec![1, 4],
+                        }),
+                    },
+                    ".",
+                    "/src",
                     Selection::All,
                 )
                 .create("vds")?;

@@ -28,6 +28,7 @@ use crate::dataset::{DatasetAccess, DatasetBuilder, H5Dataset};
 use crate::error::{Hdf5Error, Result};
 use crate::format::messages::datatype::DatatypeMessage;
 use crate::format::messages::filter::FilterPipeline;
+use crate::format::messages::shared::MessageStorage;
 use crate::format::LibverBound;
 use crate::group::H5Group;
 use crate::types::H5Type;
@@ -633,6 +634,23 @@ impl H5File {
         }
     }
 
+    /// How the object header at `path` stores each message it does not hold
+    /// privately, as `(message type, storage)` in header order.
+    ///
+    /// This is the flags byte `h5debug` prints as `<S>` / `<SA>`, and the
+    /// pointer kind beneath a shared one — the only place a file says whether
+    /// a message body is the message or a reference to one held elsewhere.
+    /// Read mode only.
+    pub fn object_message_storage(&self, path: &str) -> Result<Vec<(u8, MessageStorage)>> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => Ok(reader.object_message_storage(path)?),
+            _ => Err(Hdf5Error::InvalidState(
+                "object_message_storage is only available in read mode".into(),
+            )),
+        }
+    }
+
     /// Bytes this file's on-disk free-space managers record as free —
     /// libhdf5's `H5Fget_freespace`, and the number `h5stat -S` prints as
     /// "Amount of tracked free space".
@@ -935,11 +953,19 @@ impl H5File {
     /// reads back; for every other dataset it is exactly
     /// [`dataset`](Self::dataset).
     ///
-    /// The properties stay in force for that dataset until another open
-    /// names different ones. libhdf5 binds them to the open handle instead,
-    /// so two of its handles on one virtual dataset can hold two views at
-    /// once; this reader resolves each virtual dataset's extent once and
-    /// every handle on it sees that one answer.
+    /// First open wins: while any handle on that dataset is alive, a later
+    /// open of it joins that open and its own `access` is ignored, exactly
+    /// as `H5Dopen2` ignores the dapl of an open that finds the dataset
+    /// already in `H5FO_opened` (H5Dint.c:1496-1500, :1523-1528) — only the
+    /// open that creates the shared info reaches `H5D__virtual_init`, which
+    /// is where the view and the printf gap are read out of the dapl
+    /// (H5Dvirtual.c:2178-2188). Once every handle is dropped the next open
+    /// resolves afresh under its own properties.
+    ///
+    /// libhdf5 keys that shared info on the *file* rather than on one
+    /// `H5Fopen`, so there a second `H5Fopen` of the same path still joins
+    /// the first open's view; here each [`H5File`] is its own reader and
+    /// binds independently.
     ///
     /// # Errors
     ///
@@ -956,7 +982,7 @@ impl H5File {
                 // The reader's open gate reports *why* a name cannot be
                 // opened — a dangling soft link and an unsupported object are
                 // both present in the listing, and neither is an absence.
-                let info = reader.open_dataset_with(name, access)?;
+                let (open, info) = reader.open_dataset_with(name, access)?;
                 let shape: Vec<usize> = info.dataspace.dims.iter().map(|&d| d as usize).collect();
                 let element_size = info.datatype.element_size() as usize;
                 Ok(H5Dataset::new_reader(
@@ -964,6 +990,7 @@ impl H5File {
                     name.to_string(),
                     shape,
                     element_size,
+                    open,
                 ))
             }
             H5FileInner::Writer(_) => Err(Hdf5Error::InvalidState(
