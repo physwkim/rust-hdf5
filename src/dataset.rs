@@ -7478,6 +7478,100 @@ mod tests {
     /// compressed (mask 0), the next stored raw with deflate skipped (mask 1),
     /// in the same dataset. A correct reader skips deflate for chunk 1 only;
     /// ignoring the mask would feed raw bytes through inflate and corrupt them.
+    /// A chunk whose stored stream decodes to less than its image places no
+    /// run at all: the whole chunk reads as the fill value, whether the read
+    /// laid the fill down first (a plan that leaves output uncovered — here the
+    /// unallocated middle chunk) or fills only what nothing wrote. The decode
+    /// writes into the output image itself, so the bytes a short image leaves
+    /// behind are the ones this covers.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn a_chunk_that_decodes_short_of_its_image_reads_as_fill() {
+        use crate::format::messages::filter::{apply_filters, FilterPipeline};
+        let path = temp_path("short_chunk_image_is_fill");
+        let pipeline = FilterPipeline::deflate(4);
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0])
+                .chunk(&[4])
+                .max_shape(&[None])
+                .fill_value(-1i32)
+                .deflate(4)
+                .create("v")
+                .unwrap();
+            // Chunk 0 carries two elements where its image wants four.
+            let short: Vec<u8> = [7i32, 8].iter().flat_map(|v| v.to_le_bytes()).collect();
+            ds.write_chunk_raw(0, &apply_filters(&pipeline, &short).unwrap(), 0)
+                .unwrap();
+            // Chunk 1 is never written; chunk 2 is whole.
+            let whole: Vec<u8> = [9i32, 10, 11, 12]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            ds.write_chunk_raw(2, &apply_filters(&pipeline, &whole).unwrap(), 0)
+                .unwrap();
+            ds.set_extent(&[12]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("v").unwrap();
+            assert_eq!(
+                ds.read_raw::<i32>().unwrap(),
+                vec![-1, -1, -1, -1, -1, -1, -1, -1, 9, 10, 11, 12]
+            );
+            // The same verdict when the plan covers every output byte, so no
+            // fill goes down first: chunks 0 and 2 alone.
+            assert_eq!(ds.read_slice::<i32>(&[0], &[4]).unwrap(), vec![-1; 4]);
+            assert_eq!(
+                ds.read_slice::<i32>(&[8], &[4]).unwrap(),
+                vec![9, 10, 11, 12]
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The staged spelling of the case above: a selection that takes only part
+    /// of the short chunk decodes it into a buffer sized from the layout, and
+    /// what that buffer holds past the stream is cut off rather than kept — a
+    /// run inside the decoded bytes is real data, a run reaching past them is
+    /// fill.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn a_staged_chunk_carries_only_what_its_stream_decoded() {
+        use crate::format::messages::filter::{apply_filters, FilterPipeline};
+        let path = temp_path("short_chunk_image_staged");
+        let pipeline = FilterPipeline::deflate(4);
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0])
+                .chunk(&[4])
+                .max_shape(&[None])
+                .fill_value(-1i32)
+                .deflate(4)
+                .create("v")
+                .unwrap();
+            let short: Vec<u8> = [7i32, 8].iter().flat_map(|v| v.to_le_bytes()).collect();
+            ds.write_chunk_raw(0, &apply_filters(&pipeline, &short).unwrap(), 0)
+                .unwrap();
+            ds.set_extent(&[4]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("v").unwrap();
+            // Inside the decoded bytes.
+            assert_eq!(ds.read_slice::<i32>(&[0], &[2]).unwrap(), vec![7, 8]);
+            // Straddling their end: the run is not placed at all.
+            assert_eq!(ds.read_slice::<i32>(&[1], &[2]).unwrap(), vec![-1, -1]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
     #[cfg(feature = "deflate")]
     #[test]
     fn write_chunk_raw_ea_per_chunk_mask_roundtrip() {

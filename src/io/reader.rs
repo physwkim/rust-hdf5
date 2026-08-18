@@ -159,6 +159,24 @@ struct ChunkPlacement<'a> {
     counts: &'a [u64],
 }
 
+impl ChunkOutputGeometry<'_> {
+    /// Bytes one whole chunk's image holds — the product of the chunk shape,
+    /// element-wide. `None` only for geometry a corrupt file can carry: a
+    /// shape whose product overflows, or an empty image.
+    ///
+    /// The size the layout says a decoded chunk is. Both the destination a
+    /// chunk decodes into and the buffer a staged chunk decodes into come from
+    /// here, so neither has to discover it by growing.
+    fn image_bytes(&self) -> Option<u64> {
+        self.chunk_dims
+            .iter()
+            .copied()
+            .try_fold(1u64, |a, d| a.checked_mul(d))
+            .and_then(|elems| elems.checked_mul(self.element_size))
+            .filter(|b| *b > 0)
+    }
+}
+
 impl<'a> ChunkPlacement<'a> {
     /// Resolve a read target against the geometry it reads through. `zeros`
     /// lends a full read the origin it fills from and does not carry itself.
@@ -2098,10 +2116,29 @@ fn place_chunk_jobs(
         }
     }
     if jobs.iter().any(Option::is_some) {
-        let placed = read_and_decompress_chunks(handle, pipeline, jobs)?;
-        for (i, chunk_data) in placed.iter().enumerate() {
-            if let Some(data) = chunk_data {
-                copy_chunk_runs(data, output, &place, at(i), &mut skipped);
+        // Every chunk whose image is a contiguous stretch of `output` decodes
+        // into that stretch; the rest come back as images to scatter. The
+        // borrow of `output` the sinks hold ends with the call, which returns
+        // nothing that points into it.
+        let decoded = {
+            let sinks = carve_sinks(output, &jobs, coords, &place);
+            read_and_decompress_chunks(handle, pipeline, jobs, sinks, geo.image_bytes())?
+        };
+        for (i, chunk) in decoded.into_iter().enumerate() {
+            match chunk {
+                ChunkDecoded::Absent => {}
+                ChunkDecoded::Image(data) => {
+                    copy_chunk_runs(&data, output, &place, at(i), &mut skipped)
+                }
+                // A chunk that decoded short of its image placed no usable run
+                // — the same verdict `copy_chunk_runs` passes on a run reaching
+                // past a short image — so the whole stretch reverts to fill,
+                // not just the part past the image: a decode writes its output
+                // in blocks and may have reached past the byte it stopped on.
+                ChunkDecoded::InPlace { dst, len, bytes } if bytes < len => {
+                    fill_tiled_into(&mut output[dst..dst + len], fill_value)
+                }
+                ChunkDecoded::InPlace { .. } => {}
             }
         }
     }
@@ -2113,16 +2150,164 @@ fn place_chunk_jobs(
     Ok(())
 }
 
-/// Run the reverse filter pipeline (if any) over one chunk's raw bytes.
+/// Where one planned chunk's decoded image lands.
+enum ChunkSink<'a> {
+    /// The chunk's whole image is this stretch of the read's output, starting
+    /// at output offset `dst`: the decoder writes it in place and nothing is
+    /// copied afterwards.
+    Direct { dst: usize, out: &'a mut [u8] },
+    /// The image has no contiguous home in the output; it is materialized and
+    /// then placed run by run.
+    Staged,
+}
+
+/// What one planned chunk left for the placement step.
+enum ChunkDecoded {
+    /// The slot planned no chunk (`jobs[i]` was `None`).
+    Absent,
+    /// The image is here and still has to be placed run by run.
+    Image(Vec<u8>),
+    /// The image went straight into `output[dst..dst + len]`. `bytes` is the
+    /// length the pipeline produced there: short of `len` only for a stored
+    /// chunk that decoded to less than its image.
+    InPlace {
+        dst: usize,
+        len: usize,
+        bytes: usize,
+    },
+}
+
+/// Hand every chunk whose image is one contiguous stretch of `output` that
+/// stretch to decode into, and stage every other chunk.
+///
+/// A chunk's image *is* the output's own bytes exactly when its intersection
+/// with the read box is a single run that starts at the image's first byte and
+/// carries the image's whole length — the whole chunk, laid down contiguously.
+/// The runs come from [`for_each_chunk_run`], the same walk that would have
+/// copied the image out, so a stretch handed out here is byte-for-byte the
+/// stretch the copy would have written.
+///
+/// Distinct chunk-grid slots own disjoint boxes of the output, so their
+/// stretches never overlap; a corrupt index naming one slot twice would break
+/// that, so a stretch overlapping one already handed out is staged instead.
+fn carve_sinks<'a>(
+    output: &'a mut [u8],
+    jobs: &[Option<ChunkReadJob>],
+    coords: &[u64],
+    place: &ChunkPlacement,
+) -> Vec<ChunkSink<'a>> {
+    let mut sinks = Vec::with_capacity(jobs.len());
+    sinks.resize_with(jobs.len(), || ChunkSink::Staged);
+    let rank = place.geo.dims.len();
+    let out_len = output.len();
+    if rank == 0 {
+        return sinks;
+    }
+    let Some(image_bytes) = place.geo.image_bytes() else {
+        return sinks;
+    };
+    // A chunk is whole inside the read box only if the box is at least a chunk
+    // wide in every dimension: a narrower selection has no direct chunk at all,
+    // and testing it once here spares it the per-chunk walk.
+    if place
+        .counts
+        .iter()
+        .zip(place.geo.chunk_dims)
+        .any(|(c, k)| c < k)
+    {
+        return sinks;
+    }
+
+    let mut wanted: Vec<(usize, usize)> = Vec::new();
+    for (i, job) in jobs.iter().enumerate() {
+        if job.is_none() {
+            continue;
+        }
+        let mut runs = 0usize;
+        let mut first = (0u64, 0u64, 0usize);
+        for_each_chunk_run(place, &coords[i * rank..(i + 1) * rank], |src, dst, len| {
+            if runs == 0 {
+                first = (src, dst, len);
+            }
+            runs += 1;
+        });
+        let (src, dst, len) = first;
+        if runs == 1
+            && src == 0
+            && len as u64 == image_bytes
+            && dst.saturating_add(len as u64) <= out_len as u64
+        {
+            wanted.push((dst as usize, i));
+        }
+    }
+    wanted.sort_unstable();
+
+    let len = image_bytes as usize;
+    let mut rest: &'a mut [u8] = output;
+    let mut base = 0usize;
+    for (dst, i) in wanted {
+        if dst < base {
+            continue;
+        }
+        let (_, tail) = std::mem::take(&mut rest).split_at_mut(dst - base);
+        let (mine, tail) = tail.split_at_mut(len);
+        sinks[i] = ChunkSink::Direct { dst, out: mine };
+        rest = tail;
+        base = dst + len;
+    }
+    sinks
+}
+
+/// Run the reverse filter pipeline (if any) over one chunk's raw bytes,
+/// straight into `out`, returning the length of the image it produced.
+///
+/// The counterpart of [`decompress_chunk`] for a chunk whose image is already
+/// the output's own bytes. A length below `out.len()` means the stored chunk
+/// decoded short; a length above it means the surplus was discarded, which is
+/// what copying `out.len()` bytes out of a materialized image does too.
+fn decompress_chunk_into(
+    pipeline: Option<&FilterPipeline>,
+    raw: &[u8],
+    mask: u32,
+    out: &mut [u8],
+) -> IoResult<usize> {
+    match pipeline {
+        Some(pl) => Ok(filter::reverse_filters_masked_into(pl, raw, mask, out)?),
+        None => {
+            let n = raw.len().min(out.len());
+            out[..n].copy_from_slice(&raw[..n]);
+            Ok(raw.len())
+        }
+    }
+}
+
+/// Run the reverse filter pipeline (if any) over one chunk's raw bytes into a
+/// fresh image, for a chunk whose bytes have no contiguous home in the output.
+///
+/// `image_bytes` is what the layout says the chunk decodes to
+/// ([`ChunkOutputGeometry::image_bytes`]), so the image is allocated once at
+/// its real size instead of being grown to it — a filter that has to discover
+/// the size re-enters its decoder once per doubling. Bytes past what the
+/// pipeline produced are cut off, so a chunk that decoded short is as short
+/// here as the growing spelling left it and [`copy_chunk_runs`] passes the
+/// same verdict on the runs reaching past it. Bytes past `image_bytes` are cut
+/// off too: no run of a chunk reaches past its own image.
 fn decompress_chunk(
     pipeline: Option<&FilterPipeline>,
     raw: Vec<u8>,
     mask: u32,
+    image_bytes: Option<u64>,
 ) -> IoResult<Vec<u8>> {
-    match pipeline {
-        Some(pl) => Ok(filter::reverse_filters_masked(pl, &raw, mask)?),
-        None => Ok(raw),
-    }
+    let Some(pl) = pipeline else { return Ok(raw) };
+    let Some(image_bytes) = image_bytes.and_then(|b| usize::try_from(b).ok()) else {
+        // Geometry a corrupt file can carry says nothing about the size; the
+        // pipeline discovers it.
+        return Ok(filter::reverse_filters_masked(pl, &raw, mask)?);
+    };
+    let mut image = vec![0u8; image_bytes];
+    let produced = filter::reverse_filters_masked_into(pl, &raw, mask, &mut image)?;
+    image.truncate(produced.min(image_bytes));
+    Ok(image)
 }
 
 /// Planned chunk bytes a batch must carry before the rayon pool earns its
@@ -2175,31 +2360,48 @@ fn read_and_decompress_chunks(
     handle: &FileHandle,
     pipeline: Option<&FilterPipeline>,
     jobs: Vec<Option<ChunkReadJob>>,
-) -> IoResult<Vec<Option<Vec<u8>>>> {
+    sinks: Vec<ChunkSink<'_>>,
+    image_bytes: Option<u64>,
+) -> IoResult<Vec<ChunkDecoded>> {
+    // Decompress one chunk's raw bytes into whatever its sink says.
+    let deliver = |raw: Vec<u8>, mask: u32, sink: ChunkSink<'_>| -> IoResult<ChunkDecoded> {
+        match sink {
+            ChunkSink::Direct { dst, out } => {
+                let len = out.len();
+                let bytes = decompress_chunk_into(pipeline, &raw, mask, out)?;
+                Ok(ChunkDecoded::InPlace { dst, len, bytes })
+            }
+            ChunkSink::Staged => Ok(ChunkDecoded::Image(decompress_chunk(
+                pipeline,
+                raw,
+                mask,
+                image_bytes,
+            )?)),
+        }
+    };
     #[cfg(all(feature = "parallel", any(unix, windows)))]
     {
         use rayon::prelude::*;
         // Fused read + decompress for one job.
-        let decode = |job: Option<ChunkReadJob>| -> IoResult<Option<Vec<u8>>> {
-            match job {
-                Some(j) => Ok(Some(decompress_chunk(
-                    pipeline,
-                    read_chunk_raw(handle, &j)?,
-                    j.mask,
-                )?)),
-                None => Ok(None),
-            }
-        };
+        let decode =
+            |(job, sink): (Option<ChunkReadJob>, ChunkSink<'_>)| -> IoResult<ChunkDecoded> {
+                match job {
+                    Some(j) => deliver(read_chunk_raw(handle, &j)?, j.mask, sink),
+                    None => Ok(ChunkDecoded::Absent),
+                }
+            };
         // Run on rust-hdf5's private half-cores pool, not rayon's global pool;
         // fall back to serial if the pool could not be built, and for a batch
         // too small to repay entering it.
-        match crate::parallel::io_pool().filter(|_| worth_parallel(&jobs)) {
+        let pool = crate::parallel::io_pool().filter(|_| worth_parallel(&jobs));
+        let work: Vec<_> = jobs.into_iter().zip(sinks).collect();
+        match pool {
             Some(pool) => pool.install(|| {
-                jobs.into_par_iter()
+                work.into_par_iter()
                     .map(&decode)
                     .collect::<IoResult<Vec<_>>>()
             }),
-            None => jobs.into_iter().map(decode).collect::<IoResult<Vec<_>>>(),
+            None => work.into_iter().map(decode).collect::<IoResult<Vec<_>>>(),
         }
     }
     #[cfg(all(feature = "parallel", not(any(unix, windows))))]
@@ -2216,33 +2418,32 @@ fn read_and_decompress_chunks(
                 None => Ok(None),
             })
             .collect::<IoResult<Vec<_>>>()?;
-        let decode = |r: Option<(Vec<u8>, u32)>| -> IoResult<Option<Vec<u8>>> {
-            match r {
-                Some((raw, mask)) => Ok(Some(decompress_chunk(pipeline, raw, mask)?)),
-                None => Ok(None),
-            }
-        };
+        let decode =
+            |(r, sink): (Option<(Vec<u8>, u32)>, ChunkSink<'_>)| -> IoResult<ChunkDecoded> {
+                match r {
+                    Some((raw, mask)) => deliver(raw, mask, sink),
+                    None => Ok(ChunkDecoded::Absent),
+                }
+            };
+        let work: Vec<_> = raws.into_iter().zip(sinks).collect();
         // Fall back to serial if the private pool could not be built, and for
         // a batch too small to repay entering it.
         match crate::parallel::io_pool().filter(|_| parallel) {
             Some(pool) => pool.install(|| {
-                raws.into_par_iter()
+                work.into_par_iter()
                     .map(&decode)
                     .collect::<IoResult<Vec<_>>>()
             }),
-            None => raws.into_iter().map(decode).collect::<IoResult<Vec<_>>>(),
+            None => work.into_iter().map(decode).collect::<IoResult<Vec<_>>>(),
         }
     }
     #[cfg(not(feature = "parallel"))]
     {
         jobs.into_iter()
-            .map(|job| match job {
-                Some(j) => Ok(Some(decompress_chunk(
-                    pipeline,
-                    read_chunk_raw(handle, &j)?,
-                    j.mask,
-                )?)),
-                None => Ok(None),
+            .zip(sinks)
+            .map(|(job, sink)| match job {
+                Some(j) => deliver(read_chunk_raw(handle, &j)?, j.mask, sink),
+                None => Ok(ChunkDecoded::Absent),
             })
             .collect()
     }
