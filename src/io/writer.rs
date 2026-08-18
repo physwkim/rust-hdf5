@@ -6990,6 +6990,15 @@ impl Hdf5Writer {
             .unwrap_or_else(|| m.dataspace.dims.clone())
     }
 
+    /// Whether a dataset stores its raw data through a filter pipeline.
+    ///
+    /// The write paths ask before choosing how to hand a chunk over: an
+    /// unfiltered chunk's bytes go to the file exactly as the caller holds
+    /// them, while a filtered one has to be compressed first.
+    pub(crate) fn dataset_is_filtered(&self, index: usize) -> bool {
+        self.ds(index).lock().filter_pipeline.is_some()
+    }
+
     /// Return the datatype a dataset declares on disk.
     ///
     /// The typed write paths need it to store bytes in the declared byte
