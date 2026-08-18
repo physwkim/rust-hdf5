@@ -23,6 +23,17 @@
   strings, so implicit copies became moves. `Clone` is still derived —
   add `.clone()` where a copy was relied on.
 
+### Performance
+
+- A hyperslab read of an unfiltered chunked dataset now reads only the
+  byte ranges the selection intersects, as libhdf5 does, instead of every
+  overlapping chunk whole: the 1000 64 KiB slices of a 128 MiB dataset
+  chunked at 2 MiB that took 331 ms take 15 ms, and a full read of the
+  same dataset drops from 223 ms to 161 ms by landing each chunk's bytes
+  straight in the output. A filtered chunk still reads and decodes whole,
+  and so does an unfiltered one whose selected runs are too small for a
+  positioned read each to pay for itself.
+
 ### Fixed
 
 - Declaring a fill value on a dataset stored through an external file
