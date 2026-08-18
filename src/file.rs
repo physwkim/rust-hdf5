@@ -28,6 +28,7 @@ use crate::dataset::{DatasetAccess, DatasetBuilder, H5Dataset};
 use crate::error::{Hdf5Error, Result};
 use crate::format::messages::datatype::DatatypeMessage;
 use crate::format::messages::filter::FilterPipeline;
+use crate::format::messages::shared::MessageStorage;
 use crate::format::LibverBound;
 use crate::group::H5Group;
 use crate::types::H5Type;
@@ -630,6 +631,23 @@ impl H5File {
         match &*inner {
             H5FileInner::Reader(reader) => reader.superblock_extension().clone(),
             _ => SuperblockExtension::default(),
+        }
+    }
+
+    /// How the object header at `path` stores each message it does not hold
+    /// privately, as `(message type, storage)` in header order.
+    ///
+    /// This is the flags byte `h5debug` prints as `<S>` / `<SA>`, and the
+    /// pointer kind beneath a shared one — the only place a file says whether
+    /// a message body is the message or a reference to one held elsewhere.
+    /// Read mode only.
+    pub fn object_message_storage(&self, path: &str) -> Result<Vec<(u8, MessageStorage)>> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => Ok(reader.object_message_storage(path)?),
+            _ => Err(Hdf5Error::InvalidState(
+                "object_message_storage is only available in read mode".into(),
+            )),
         }
     }
 

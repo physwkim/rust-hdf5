@@ -502,6 +502,62 @@ fn libhdf5_writes_the_same_single_use_record(record: &[u8]) {
 /// (H5Oattr.c:346-360). The components end at one reference each — the
 /// pointer lives in the one heap object every dataset's header names, not in
 /// each header.
+/// The public accessor the oracle's `shared` field is read through, checked
+/// against `h5debug` on the libhdf5-written fixture.
+///
+/// `h5debug tests/fixtures/sohm_list.h5 <addr>` prints, per object:
+/// `/shared0` dataspace `<SA>` and attribute `<S>`/SOHM; `/shared1..3`
+/// dataspace and attribute both `<S>`/SOHM; `/uses_named` dataspace
+/// `<S>`/SOHM and datatype `<C, S>`/Obj Hdr; `/named_i32` and the root group
+/// nothing at all. The first is the case `H5Oget_info`'s `hdr.mesg.shared`
+/// mask cannot express: `H5SM__write_mesg` left the body literal in the
+/// header that offered it (H5SM.c:1400-1417), so the flag is
+/// `H5O_MSG_FLAG_SHAREABLE` and the mask, which counts only
+/// `H5O_MSG_FLAG_SHARED`, reads zero (H5Oint.c:2072-2073).
+#[test]
+fn the_storage_accessor_answers_what_h5debug_prints_for_the_fixture() {
+    use rust_hdf5::format::messages::shared::MessageStorage;
+    use rust_hdf5::format::sohm::SharedLocation;
+
+    let file = H5File::open(fixture("sohm_list.h5")).unwrap();
+    let seen: Vec<(&str, Vec<(u8, MessageStorage)>)> =
+        ["/", "/named_i32", "/shared0", "/shared1", "/uses_named"]
+            .into_iter()
+            .map(|p| (p, file.object_message_storage(p).unwrap()))
+            .collect();
+    assert_eq!(
+        seen,
+        vec![
+            ("/", vec![]),
+            ("/named_i32", vec![]),
+            (
+                "/shared0",
+                vec![
+                    (MSG_DATASPACE, MessageStorage::Shareable),
+                    (MSG_ATTRIBUTE, MessageStorage::Shared(SharedLocation::Sohm)),
+                ]
+            ),
+            (
+                "/shared1",
+                vec![
+                    (MSG_DATASPACE, MessageStorage::Shared(SharedLocation::Sohm)),
+                    (MSG_ATTRIBUTE, MessageStorage::Shared(SharedLocation::Sohm)),
+                ]
+            ),
+            (
+                "/uses_named",
+                vec![
+                    (MSG_DATASPACE, MessageStorage::Shared(SharedLocation::Sohm)),
+                    (
+                        MSG_DATATYPE,
+                        MessageStorage::Shared(SharedLocation::Committed)
+                    ),
+                ]
+            ),
+        ]
+    );
+}
+
 #[test]
 fn a_shared_attribute_points_at_its_own_datatype_and_dataspace() {
     let path = unique_tmp("nested");

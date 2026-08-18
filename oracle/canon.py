@@ -25,7 +25,7 @@ import hdf5env  # noqa: F401  (must precede h5py; see the module docstring)
 import h5py
 from h5py import h5d, h5o, h5p, h5s, h5t
 
-CANON_VERSION = "7"
+CANON_VERSION = "8"
 RAW_LIMIT = 1024
 MAX_DEPTH = 32
 
@@ -554,6 +554,80 @@ def filters_str(dset):
     return "[" + ",".join(parts) + "]"
 
 
+# `hdr.mesg.shared` from `H5Oget_info` would answer most of this, but only as
+# a bitmask of classes stored as a *pointer*: it cannot see the first copy of a
+# share-in-object-header class, which `H5SM__write_mesg` leaves literal in the
+# header that offered it under `H5O_MSG_FLAG_SHAREABLE` rather than
+# `H5O_MSG_FLAG_SHARED` (H5SM.c:1112, H5SM.c:1400-1417) — and that flag is the
+# whole difference between "the body is the message" and "the body is a
+# reference". `h5debug` prints the flags byte itself (`H5O__debug_real`,
+# H5Odbg.c:409-455) and, beneath a shared message, which storage the pointer
+# names (`H5O__shared_debug`, H5Oshared.c:682-706), so the field is read from
+# there.
+#
+# Deliberately *not* `hdr.mesg.present`: that mask counts the null and
+# continuation messages too (H5Oint.c:2067-2069), and where those fall is the
+# writer's allocation strategy rather than anything a reader sees. libhdf5
+# creates a dataset header at a 256-byte size hint (H5D_MINHDR_SIZE,
+# H5Dpkg.h:42; H5Dint.c:898, :993) whose unused tail stays one null message
+# (H5Oint.c:516-522), and a committed datatype at the exact size of its
+# datatype message (H5Tcommit.c:468, :475), so the reference count message
+# added afterwards forces a second chunk and a continuation. A null message has
+# no decode, encode, size or copy method at all (H5Onull.c:28-49) — it is free
+# space wearing a message header — so a field that measured the present mask
+# would be comparing padding.
+
+_H5DEBUG_MSG_SPLIT_RE = re.compile(r"^Message \d+\.\.\.$", re.M)
+_H5DEBUG_MSG_NAME_RE = re.compile(
+    r"Message ID \(sequence number\):\s+0x[0-9a-fA-F]+ `([^']+)'"
+)
+_H5DEBUG_MSG_FLAGS_RE = re.compile(r"Message flags:\s+<([^>]*)>")
+_H5DEBUG_SHARED_TYPE_RE = re.compile(r"Shared Message type:\s+(.+?)\s*$", re.M)
+
+# `H5O_msg_class_t.name` for the classes a shared-message index can cover,
+# mapped to the names `oracle_probe`'s `message_class_name` uses.
+_SHARED_CLASS_NAMES = {
+    "filter pipeline": "filter_pipeline",
+}
+
+# What `H5O__shared_debug` prints for each `H5O_shared_t.type`.
+_SHARED_LOCATIONS = {
+    "SOHM": "sohm",
+    "Obj Hdr": "committed",
+    "Here": "here",
+    "Unshared": "unshared",
+}
+
+
+def shared_str(obj_id, filename):
+    """The `shared` field: how the object header stores each message it does
+    not hold privately, as sorted `class:storage` pairs."""
+    addr = h5o.get_info(obj_id).addr
+    proc = subprocess.run(
+        [_h5debug_bin(), filename, str(addr)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    parts = []
+    for block in _H5DEBUG_MSG_SPLIT_RE.split(proc.stdout)[1:]:
+        name = _H5DEBUG_MSG_NAME_RE.search(block)
+        flags = _H5DEBUG_MSG_FLAGS_RE.search(block)
+        if not name or not flags:
+            continue
+        tokens = [t.strip() for t in flags.group(1).split(",")]
+        if "S" in tokens:
+            where = _H5DEBUG_SHARED_TYPE_RE.search(block)
+            where = _SHARED_LOCATIONS.get(where.group(1), where.group(1)) if where else "?"
+        elif "SA" in tokens:
+            where = "shareable"
+        else:
+            continue
+        cls = name.group(1)
+        parts.append("%s:%s" % (_SHARED_CLASS_NAMES.get(cls, cls), where))
+    return "[" + ",".join(sorted(parts)) + "]"
+
+
 _LAYOUTS = {
     h5d.COMPACT: "compact",
     h5d.CONTIGUOUS: "contiguous",
@@ -819,6 +893,7 @@ class Dumper:
             )
         )
         self.field(path, "linkstore", lambda: link_storage_str(gid))
+        self.field(path, "shared", lambda: shared_str(gid, grp.file.filename))
         self.dump_attrs(path, grp)
         if depth >= MAX_DEPTH:
             self.emit("%s#truncated" % path, "depth")
@@ -910,6 +985,7 @@ class Dumper:
         self.field(path, "fillvalue", lambda: self.fill_value(dset, dcpl))
         self.field(path, "filltime", lambda: self.fill_time(dcpl))
         self.field(path, "alloctime", lambda: self.alloc_time(dcpl))
+        self.field(path, "shared", lambda: shared_str(dsid, dset.file.filename))
         self.dump_attrs(path, dset)
         self.field(path, "data", lambda: dataset_payload(dset))
 

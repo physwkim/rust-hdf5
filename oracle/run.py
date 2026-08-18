@@ -82,6 +82,7 @@ B_TOLERATED_FIELDS = {
     "linkorder",
     "attrorder",
     "linkstore",
+    "shared",
 }
 
 # Direction-B metadata deviations that are known, understood and stable: the

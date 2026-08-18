@@ -30,7 +30,7 @@ use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::link::LinkMessage;
 use crate::format::messages::link::LinkTarget;
 use crate::format::messages::link_info::LinkInfoMessage;
-use crate::format::messages::shared::MSG_FLAG_SHARED;
+use crate::format::messages::shared::{MessageStorage, MSG_FLAG_SHARED};
 use crate::format::messages::superblock_ext::{
     BtreeKMessage, DriverInfoMessage, FileSpaceInfoMessage, SharedMessageTableMessage,
 };
@@ -402,6 +402,10 @@ struct Catalog {
     links: std::collections::BTreeMap<String, LinkClass>,
     /// Committed (named) datatype objects, keyed by path.
     datatypes: std::collections::BTreeMap<String, CommittedDatatypeInfo>,
+    /// Committed datatype object header address → its path (no leading `/`).
+    /// The third object kind needs the same address→name entry groups and
+    /// datasets have, or a path that names one resolves to nothing.
+    datatype_object_paths: std::collections::HashMap<u64, String>,
 }
 
 impl Catalog {
@@ -419,6 +423,9 @@ impl Catalog {
         }
         for ds in &self.datasets {
             paths.insert(ds.object_header_address, absolute_path(&ds.name));
+        }
+        for (addr, path) in &self.datatype_object_paths {
+            paths.insert(*addr, absolute_path(path));
         }
         paths
     }
@@ -661,6 +668,9 @@ impl<'a> CatalogWalk<'a> {
             // so it must not be recorded as either; the link record above
             // already carries its name.
             ObjectKind::CommittedDatatype(info) => {
+                self.catalog
+                    .datatype_object_paths
+                    .insert(addr, full_name.clone());
                 self.catalog.datatypes.insert(full_name, *info);
                 return Ok(());
             }
@@ -3083,6 +3093,37 @@ impl Hdf5Reader {
     /// walk never traversed, or a stale one).
     pub fn path_for_object(&self, addr: u64) -> Option<&str> {
         self.object_paths.get(&addr).map(String::as_str)
+    }
+
+    /// How the object header of `path` stores each message it does not hold
+    /// privately, as `(message type, storage)` in header order.
+    ///
+    /// The observable is the message's flags byte, so this reads the raw
+    /// header chain: every other read path resolves shared pointers into
+    /// bodies and clears the flag on the way through, which is exactly the
+    /// evidence wanted here.
+    pub fn object_message_storage(&mut self, path: &str) -> IoResult<Vec<(u8, MessageStorage)>> {
+        if self.external_edge(path).is_some() {
+            return Err(crate::io::IoError::NotFound(format!(
+                "{path} is in another file; its header is not this file's to read"
+            )));
+        }
+        // By name first, then by address: `object_paths` keeps one path per
+        // object header, so a hard link — two names, one header — is only
+        // ever found under whichever name the walk reached first.
+        let addr = match self.dataset_info(path) {
+            Some(info) => info.object_header_address,
+            None => {
+                let want = absolute_path(&self.canonical_path(path));
+                *self
+                    .object_paths
+                    .iter()
+                    .find(|(_, p)| **p == want)
+                    .map(|(addr, _)| addr)
+                    .ok_or_else(|| crate::io::IoError::NotFound(path.to_string()))?
+            }
+        };
+        crate::io::object_header_io::read_header_message_storage(&mut self.handle, &self.meta, addr)
     }
 
     /// Read a reference dataset's elements, resolved to the objects they name.

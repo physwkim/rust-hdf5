@@ -20,3 +20,22 @@
 /// Defined with the rest of the message-envelope flags and re-exported here,
 /// where the readers that consult it look for it.
 pub use super::MSG_FLAG_SHARED;
+
+/// How an object header stores one message, as its flags byte says.
+///
+/// The three cases are what `H5O__debug_real` prints as the message's flags
+/// and, for a shared one, what `H5O__shared_debug` prints beneath it
+/// (H5Odbg.c:409-455, H5Oshared.c:682-706).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageStorage {
+    /// The body is the message and no index names it.
+    Private,
+    /// [`MSG_FLAG_SHAREABLE`](super::MSG_FLAG_SHAREABLE): the body is still
+    /// the message, and a shared-message index holds an `H5SM_IN_OH` record
+    /// naming it here — the first copy of a share-in-object-header class
+    /// (H5SM.c:1400-1417).
+    Shareable,
+    /// [`MSG_FLAG_SHARED`]: the body is a pointer to where the message
+    /// really lives.
+    Shared(crate::format::sohm::SharedLocation),
+}
