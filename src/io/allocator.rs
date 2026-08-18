@@ -110,6 +110,33 @@ impl FileAllocator {
         }
     }
 
+    /// Grow the file by exactly `size` bytes, starting where it currently
+    /// ends rather than at the next aligned address.
+    ///
+    /// The one allocation that must not leave an alignment gap in front of
+    /// it. A persisting close places each free-space manager's own header and
+    /// sections block *after* [`take_all_free`](Self::take_all_free) has
+    /// frozen the section set those blocks record, so a gap skipped here
+    /// could no longer be recorded anywhere — it would be a byte no structure
+    /// holds and no manager names, which is what `h5stat -S` counts as
+    /// unaccounted space. Nothing requires the blocks to start on a boundary:
+    /// the file-space info message names each one by address and the header
+    /// gives the sections block its length.
+    pub fn allocate_at_end(&self, size: u64) -> u64 {
+        let mut cur = self.eof.load(Ordering::Acquire);
+        loop {
+            match self.eof.compare_exchange_weak(
+                cur,
+                cur + size,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return cur,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
     /// Release `len` bytes at `addr` for reuse by later allocations.
     ///
     /// The caller must have already dropped every reference to the block (for
@@ -525,6 +552,26 @@ mod tests {
         assert_eq!(alloc.allocate(48), a + 16);
         assert_eq!(free_blocks(&alloc), vec![(a + 10, 6)]);
         assert_eq!(alloc.eof(), eof_before);
+    }
+
+    /// `allocate` leaves the bytes between an unaligned end of file and the
+    /// next boundary behind; `allocate_at_end` starts on them, which is why a
+    /// persisting close places the managers' own blocks through it. Without
+    /// that, those bytes are outside every account — the section set they
+    /// would belong to was frozen before the block was placed.
+    #[test]
+    fn allocating_at_the_end_leaves_no_alignment_gap() {
+        let alloc = FileAllocator::new(0);
+        alloc.allocate(5);
+        assert_eq!(alloc.eof(), 5);
+
+        assert_eq!(alloc.allocate_at_end(16), 5, "starts where the file ends");
+        assert_eq!(alloc.eof(), 21);
+        assert!(free_blocks(&alloc).is_empty());
+
+        // What the ordinary path does with the same file: 21 is not a
+        // multiple of eight, so 21..24 is skipped and recorded nowhere.
+        assert_eq!(alloc.allocate(16), 24);
     }
 
     #[test]

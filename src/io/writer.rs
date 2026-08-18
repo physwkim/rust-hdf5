@@ -9035,11 +9035,11 @@ impl Hdf5Writer {
         for (class, manager) in layout.written() {
             let hdr_addr = match manager.hdr_addr {
                 Some(addr) => addr,
-                None => self.allocator.allocate(hdr_size),
+                None => self.allocator.allocate_at_end(hdr_size),
             };
             let sect_addr = match manager.sect_addr {
                 Some(addr) => addr,
-                None => self.allocator.allocate(manager.sect_size),
+                None => self.allocator.allocate_at_end(manager.sect_size),
             };
 
             let mut header = manager_header(&manager.sections);
