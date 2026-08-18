@@ -14693,7 +14693,7 @@ impl Hdf5Writer {
             // compression below runs off the lock.
             let pipeline = self.ds(ds_index).lock().filter_pipeline.clone();
             if let Some(ref pipeline) = pipeline {
-                let chunk_data: Vec<Vec<u8>> = chunks.iter().map(|(_, d)| d.to_vec()).collect();
+                let chunk_data: Vec<&[u8]> = chunks.iter().map(|&(_, d)| d).collect();
                 // Propagate a filter error rather than storing raw bytes under a
                 // filter_mask that claims the pipeline ran (see
                 // apply_filters_parallel). Ok reaching here means every chunk
@@ -14734,7 +14734,7 @@ impl Hdf5Writer {
             // compression below runs off the lock.
             let pipeline = self.ds(ds_index).lock().filter_pipeline.clone();
             if let Some(ref pipeline) = pipeline {
-                let chunk_data: Vec<Vec<u8>> = chunks.iter().map(|(_, d)| d.to_vec()).collect();
+                let chunk_data: Vec<&[u8]> = chunks.iter().map(|&(_, d)| d).collect();
                 // Same single owner as the EA batch: apply_filters_parallel
                 // propagates a filter error instead of storing raw bytes under a
                 // filter_mask that claims the pipeline ran. Ok here means every

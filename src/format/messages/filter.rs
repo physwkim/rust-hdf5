@@ -1105,7 +1105,7 @@ fn fletcher32(data: &[u8]) -> u32 {
 #[cfg(feature = "parallel")]
 pub fn apply_filters_parallel(
     pipeline: &FilterPipeline,
-    chunks: &[Vec<u8>],
+    chunks: &[&[u8]],
 ) -> FormatResult<Vec<Vec<u8>>> {
     use rayon::prelude::*;
     // Run on rust-hdf5's private half-cores pool, not rayon's global pool; fall
@@ -2743,7 +2743,8 @@ mod tests {
             .map(|i| vec![(i as u8).wrapping_mul(42); 1024])
             .collect();
 
-        let compressed = apply_filters_parallel(&pipeline, &chunks).unwrap();
+        let borrowed: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let compressed = apply_filters_parallel(&pipeline, &borrowed).unwrap();
         assert_eq!(compressed.len(), 8);
         // Each compressed chunk should be smaller (repeated data compresses well)
         for c in &compressed {
@@ -2773,7 +2774,7 @@ mod tests {
                 cd_values: vec![],
             }],
         };
-        let chunks: Vec<Vec<u8>> = vec![vec![1u8; 64], vec![2u8; 64]];
+        let chunks: [&[u8]; 2] = [&[1u8; 64], &[2u8; 64]];
         assert!(
             apply_filters_parallel(&pipeline, &chunks).is_err(),
             "scale-offset compress error must propagate, not be swallowed"
