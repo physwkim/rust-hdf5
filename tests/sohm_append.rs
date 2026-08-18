@@ -263,14 +263,18 @@ fn all_messages(bytes: &[u8], at: usize) -> Vec<ObjectHeaderMessage> {
 /// A file with shared messages has a version-2 superblock over symbol-table
 /// groups, so a census that followed only Link messages would stop at the root
 /// and find no pointers at all.
-fn symbol_table_targets(bytes: &[u8], ctx: &FormatContext, body: &[u8]) -> Vec<u64> {
+fn symbol_table_targets(bytes: &[u8], ctx: &FormatContext, body: &[u8]) -> Vec<(String, u64)> {
     use rust_hdf5::format::btree_v1::{BTreeV1Config, BTreeV1Node};
+    use rust_hdf5::format::local_heap::{local_heap_get_string, LocalHeapHeader};
     use rust_hdf5::format::symbol_table::SymbolTableNode;
     use rust_hdf5::format::UNDEF_ADDR;
 
     let sa = ctx.sizeof_addr as usize;
     let ss = ctx.sizeof_size as usize;
     let btree_addr = u64::from_le_bytes(body[..8].try_into().unwrap());
+    let heap_addr = u64::from_le_bytes(body[8..16].try_into().unwrap());
+    let heap = LocalHeapHeader::decode(&bytes[heap_addr as usize..], sa, ss).unwrap();
+    let heap_data = &bytes[heap.data_addr as usize..][..heap.data_size as usize];
     // A version-2 superblock keeps its "K" ranks in a B-tree-K message, which
     // none of these fixtures carries: every node in them is the library-default
     // width. (`tests/superblock_extension.rs` covers a file that does carry
@@ -300,8 +304,13 @@ fn symbol_table_targets(bytes: &[u8], ctx: &FormatContext, body: &[u8]) -> Vec<u
         out.extend(
             snod.entries
                 .iter()
-                .map(|e| e.obj_header_addr)
-                .filter(|&a| a != UNDEF_ADDR && a != 0),
+                .filter(|e| e.obj_header_addr != UNDEF_ADDR && e.obj_header_addr != 0)
+                .map(|e| {
+                    (
+                        local_heap_get_string(heap_data, e.name_offset).unwrap(),
+                        e.obj_header_addr,
+                    )
+                }),
         );
     }
     out
@@ -331,11 +340,8 @@ fn every_header(bytes: &[u8], ctx: &FormatContext) -> Vec<(String, u64, Vec<Obje
                     }
                 }
                 MSG_SYMBOL_TABLE => {
-                    for (i, target) in symbol_table_targets(bytes, ctx, &m.data)
-                        .into_iter()
-                        .enumerate()
-                    {
-                        queue.push((format!("{path}stab{i}/"), target));
+                    for (name, target) in symbol_table_targets(bytes, ctx, &m.data) {
+                        queue.push((format!("{path}{name}/"), target));
                     }
                 }
                 _ => {}
@@ -681,6 +687,69 @@ fn a_list_index_file_takes_a_new_dataset() {
     assert_eq!(
         (a.mesg_types, a.min_mesg_size, a.list_max, a.btree_min),
         (b.mesg_types, b.min_mesg_size, b.list_max, b.btree_min)
+    );
+    cleanup(&path);
+}
+
+/// A reopen re-encodes every header it rewrites, so the encoding it picks has
+/// to be the one the file already holds.
+///
+/// libhdf5 never rewrites a message it did not touch. Opening a version-2
+/// superblock raises the low bound to `H5F_LIBVER_V18` (hdf5_1.14.6
+/// H5Fsuper.c:460-462), and that bound governs only the objects the reopening
+/// session goes on to create. `sohm_list.h5` was written at
+/// `H5F_LIBVER_EARLIEST`, so its four datasets carry version-1 dataspaces (24
+/// bytes for one dimension with a maximum) and immutable `H5T_STD_I32LE`
+/// datatypes that `H5SM__can_share_common` refuses (H5SM.c:895-899,
+/// H5Odtype.c:1893-1901); the dataset the append adds gets the version-2
+/// dataspace (20 bytes) and the shareable copied type the raised bound calls
+/// for (H5Dint.c:569-572).
+///
+/// This writer has to lay the whole header out again whenever the
+/// shared-message heap moves, so the preservation is a decision it makes
+/// rather than one it inherits from not touching the bytes.
+#[test]
+fn an_append_keeps_the_encoding_the_datasets_it_found_were_written_in() {
+    let path = copy_fixture("sohm_list.h5", "keeps_encoding");
+    append_dataset(&path, "appended", 200);
+    check_fixture_contents(&path, &[("appended", 200)]);
+
+    let bytes = std::fs::read(&path).unwrap();
+    let ctx = FormatContext::default_v3();
+    let mut seen = Vec::new();
+    for (path, _, messages) in every_header(&bytes, &ctx) {
+        let name = path.trim_matches('/').to_string();
+        if !name.starts_with("shared") && name != "appended" {
+            continue;
+        }
+        let space = messages
+            .iter()
+            .find(|m| m.msg_type == MSG_DATASPACE)
+            .expect("a dataset says its shape");
+        // A shared dataspace is a heap pointer, not an extent, so only the
+        // literal first copy answers which version was encoded.
+        let version = (space.flags & MSG_FLAG_SHARED == 0).then(|| space.data[0]);
+        let dtype = messages
+            .iter()
+            .find(|m| m.msg_type == MSG_DATATYPE)
+            .expect("a dataset says its type");
+        seen.push((
+            name,
+            version,
+            space.data.len(),
+            dtype.flags & MSG_FLAG_SHAREABLE != 0,
+        ));
+    }
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("appended".into(), Some(2), 20, true),
+            ("shared0".into(), Some(1), 24, false),
+            ("shared1".into(), None, 10, false),
+            ("shared2".into(), None, 10, false),
+            ("shared3".into(), None, 10, false),
+        ]
     );
     cleanup(&path);
 }

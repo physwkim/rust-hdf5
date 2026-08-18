@@ -802,6 +802,19 @@ pub struct DatasetInfo {
     pub committed_type: Option<CommittedTypeRef>,
     /// Dataspace (dimensionality).
     pub dataspace: DataspaceMessage,
+    /// The object format the reopen found this dataset's messages written in,
+    /// `None` for a dataset this session created.
+    ///
+    /// A rewrite re-encodes the whole header — the shared-message table is
+    /// laid out whole, so every heap ID moves and every header naming one has
+    /// to be written again. Re-deriving the message format from the reopened
+    /// session's bounds would upgrade messages the file already has, which
+    /// libhdf5 never does: it grows a header in place and leaves every
+    /// message it did not touch alone. The same rule the reopen already
+    /// applies to a group it found in a symbol table
+    /// ([`uses_symbol_table`](Hdf5Writer::uses_symbol_table)) — what the file
+    /// says governs, not what this session's bound would have chosen.
+    pub read_format: Option<ObjectFormat>,
     /// File offset of the dataset's object header (set during finalize).
     pub obj_header_addr: u64,
     /// File offset of the raw data block (contiguous only).
@@ -2018,6 +2031,16 @@ struct DatasetParts {
     /// leave `H5Tcommitted` false.
     committed_type: Option<u64>,
     dataspace: crate::format::messages::dataspace::DataspaceMessage,
+    /// The object format the reopen found this dataset's messages written in,
+    /// read from the dataspace message's own version byte.
+    ///
+    /// A version-2 superblock does not settle it: `H5F__super_init` raises the
+    /// superblock for a shared-message table or non-default file-space
+    /// properties without touching `H5F_LOW_BOUND` (H5Fsuper.c:1135, :1144), so
+    /// a file created at the earliest bound with either can hold version-1
+    /// messages under a version-2 superblock — which is what
+    /// `tests/fixtures/sohm_*.h5` are.
+    read_format: ObjectFormat,
     layout: crate::format::messages::data_layout::DataLayoutMessage,
     filter_pipeline: Option<FilterPipeline>,
     fill_value: Option<Vec<u8>>,
@@ -2239,8 +2262,9 @@ impl<'a> ReopenWalk<'a> {
                 }
                 MSG_DATASPACE => {
                     dataset_shaped = true;
+                    let version = msg.data.first().copied().unwrap_or(1);
                     let (ds, _) = consume!(DataspaceMessage::decode(&msg.data, ctx), "dataspace");
-                    dataspace = Some(ds);
+                    dataspace = Some((ds, version));
                 }
                 MSG_DATA_LAYOUT => {
                     dataset_shaped = true;
@@ -2387,7 +2411,7 @@ impl<'a> ReopenWalk<'a> {
                     layout.describe()
                 )))
             }
-            (Some(datatype), Some(dataspace), Some(layout)) => {
+            (Some(datatype), Some((dataspace, dataspace_version)), Some(layout)) => {
                 // Asked of the raw chain, not of `header`: the read above has
                 // already put the named type's message in place of the pointer.
                 let committed_type = match crate::io::object_header_io::committed_datatype_address(
@@ -2405,6 +2429,11 @@ impl<'a> ReopenWalk<'a> {
                     datatype,
                     committed_type,
                     dataspace,
+                    read_format: if dataspace_version <= 1 {
+                        ObjectFormat::Legacy
+                    } else {
+                        ObjectFormat::Modern
+                    },
                     layout,
                     filter_pipeline,
                     fill_value,
@@ -2553,6 +2582,7 @@ fn rebuild_dataset(
         datatype: dt,
         committed_type,
         dataspace: ds,
+        read_format,
         layout: dl,
         filter_pipeline: fp,
         fill_value,
@@ -2571,6 +2601,7 @@ fn rebuild_dataset(
         // address the walk read the pointer from is the address it will still
         // be at when this header is written back.
         committed_type: committed_type.map(CommittedTypeRef::Preserved),
+        read_format: Some(read_format),
         external,
         virtual_storage: None,
         dataspace: ds,
@@ -8882,7 +8913,10 @@ impl Hdf5Writer {
     /// A dataset's type reaches that predicate still immutable only when
     /// `H5D__init_type` kept the caller's own `H5T_t` rather than copying it,
     /// which it does exactly when the type is immutable, is not relocatable,
-    /// and the file's low bound is below `H5F_LIBVER_V18` (H5Dint.c:569-572).
+    /// and the low bound this dataset's messages are written at is below
+    /// `H5F_LIBVER_V18` (H5Dint.c:569-572) — the bound the dataset was
+    /// *created* under, which for a dataset a reopen found is not this
+    /// session's.
     /// Any of the three failing produces an `H5T_COPY_ALL` copy, which is
     /// `H5T_STATE_RDONLY` rather than immutable (H5T.c:4461-4462) and so is
     /// shareable — which is why `H5Tcopy(H5T_STD_I32LE)` shares where
@@ -8891,10 +8925,8 @@ impl Hdf5Writer {
     /// An attribute has no such branch: `H5A__create` copies unconditionally
     /// (H5Aint.c:341), so its datatype is always eligible and
     /// [`share_attribute`](Self::share_attribute) offers it without asking.
-    fn dataset_datatype_shareable(&self, datatype: &DatatypeMessage) -> bool {
-        !datatype.is_predefined()
-            || datatype.is_relocatable()
-            || self.encoding_libver() >= LibverBound::V18
+    fn dataset_datatype_shareable(&self, datatype: &DatatypeMessage, libver: LibverBound) -> bool {
+        !datatype.is_predefined() || datatype.is_relocatable() || libver >= LibverBound::V18
     }
 
     /// Whether the first copy of a `msg_type` message may stay literal in the
@@ -9530,6 +9562,7 @@ impl Hdf5Writer {
                 external: None,
                 virtual_storage: None,
                 dataspace,
+                read_format: None,
                 obj_header_addr: 0, // set during finalize
                 data_addr,
                 data_size,
@@ -9735,6 +9768,7 @@ impl Hdf5Writer {
                 external: Some(external),
                 virtual_storage: None,
                 dataspace,
+                read_format: None,
                 obj_header_addr: 0, // set during finalize
                 // No block of this file's own: the layout message declares
                 // contiguous storage at an undefined address, which is what
@@ -9848,6 +9882,7 @@ impl Hdf5Writer {
                     mappings: mappings.to_vec(),
                 }),
                 dataspace,
+                read_format: None,
                 obj_header_addr: 0, // set during finalize
                 // Not a block of this file at all: every element is read out
                 // of a source dataset, so there is nothing here to allocate
@@ -9929,6 +9964,7 @@ impl Hdf5Writer {
                 external: None,
                 virtual_storage: None,
                 dataspace,
+                read_format: None,
                 obj_header_addr: 0, // set during finalize
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
@@ -9980,6 +10016,7 @@ impl Hdf5Writer {
                 external: None,
                 virtual_storage: None,
                 dataspace: DataspaceMessage::null(),
+                read_format: None,
                 obj_header_addr: 0, // set during finalize
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
@@ -10093,6 +10130,7 @@ impl Hdf5Writer {
                 external: None,
                 virtual_storage: None,
                 dataspace,
+                read_format: None,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
@@ -11329,6 +11367,7 @@ impl Hdf5Writer {
                 external: None,
                 virtual_storage: None,
                 dataspace,
+                read_format: None,
                 obj_header_addr: 0,
                 data_addr,
                 data_size: data_size as u64,
@@ -11452,6 +11491,7 @@ impl Hdf5Writer {
                 external: None,
                 virtual_storage: None,
                 dataspace,
+                read_format: None,
                 obj_header_addr: 0,
                 data_addr,
                 data_size: data_size as u64,
@@ -11597,6 +11637,7 @@ impl Hdf5Writer {
                 external: None,
                 virtual_storage: None,
                 dataspace,
+                read_format: None,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
@@ -13184,6 +13225,7 @@ impl Hdf5Writer {
                 external: None,
                 virtual_storage: None,
                 dataspace,
+                read_format: None,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
@@ -13285,6 +13327,7 @@ impl Hdf5Writer {
                 external: None,
                 virtual_storage: None,
                 dataspace,
+                read_format: None,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
@@ -13380,6 +13423,7 @@ impl Hdf5Writer {
                 external: None,
                 virtual_storage: None,
                 dataspace,
+                read_format: None,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
@@ -13461,6 +13505,7 @@ impl Hdf5Writer {
                 external: None,
                 virtual_storage: None,
                 dataspace,
+                read_format: None,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
@@ -13548,6 +13593,7 @@ impl Hdf5Writer {
                 external: None,
                 virtual_storage: None,
                 dataspace,
+                read_format: None,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
@@ -13707,6 +13753,7 @@ impl Hdf5Writer {
                 external: None,
                 virtual_storage: None,
                 dataspace,
+                read_format: None,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
@@ -13824,6 +13871,7 @@ impl Hdf5Writer {
                 external: None,
                 virtual_storage: None,
                 dataspace,
+                read_format: None,
                 obj_header_addr: 0,
                 data_addr: UNDEF_ADDR,
                 data_size: 0,
@@ -15940,8 +15988,23 @@ impl Hdf5Writer {
         let mut header = ObjectHeader::new();
         header.times = touched_times(m.times);
 
+        // Every message below is written in the format this dataset already
+        // has, not the one this session would pick. libhdf5 grows a header in
+        // place and never re-encodes a message it did not touch, so reopening
+        // a superblock-v2 file — which raises the low bound to V18
+        // (hdf5_1.14.6 H5Fsuper.c:460-462) — leaves the version-1 dataspaces
+        // an EARLIEST-bound creating session wrote exactly as they are. This
+        // writer has to lay the whole header out again whenever the
+        // shared-message heap moves, so preserving the encoding is the only
+        // way to land on the same bytes.
+        let format = m.read_format.unwrap_or_else(|| self.message_format());
+        let libver = match format {
+            ObjectFormat::Legacy => LibverBound::Earliest,
+            ObjectFormat::Modern => self.encoding_libver(),
+        };
+
         // Dataspace message (type 0x01)
-        let ds_msg = m.dataspace.encode_for(&self.ctx, self.message_format());
+        let ds_msg = m.dataspace.encode_for(&self.ctx, format);
         let owner = ShareOwner::Header(m.obj_header_addr);
         let (flags, ds_msg) = self.share_message(owner, MSG_DATASPACE, 0x00, ds_msg);
         header.add_message(MSG_DATASPACE, flags, ds_msg);
@@ -15957,8 +16020,8 @@ impl Hdf5Writer {
                 SharedMessagePointer::encode_committed(addr, &self.ctx),
             ),
             None => {
-                let body = m.datatype.encode_at(&self.ctx, self.encoding_libver());
-                let (flags, body) = if self.dataset_datatype_shareable(&m.datatype) {
+                let body = m.datatype.encode_at(&self.ctx, libver);
+                let (flags, body) = if self.dataset_datatype_shareable(&m.datatype, libver) {
                     self.share_message(owner, MSG_DATATYPE, MSG_FLAG_CONSTANT, body)
                 } else {
                     (MSG_FLAG_CONSTANT, body)
@@ -16035,7 +16098,7 @@ impl Hdf5Writer {
                 fill_value: None,
             }
         };
-        let fv_msg = fv.encode_for(self.message_format());
+        let fv_msg = fv.encode_for(format);
         let (flags, fv_msg) = self.share_message(owner, MSG_FILL_VALUE, 0x00, fv_msg);
         header.add_message(MSG_FILL_VALUE, flags, fv_msg);
 
@@ -16047,7 +16110,7 @@ impl Hdf5Writer {
         // reader that predates the new message still finds the value. The body
         // is the size and the bytes and nothing else: no allocation time, no
         // write time, no defined flag (`H5O__fill_old_encode`, H5Ofill.c:512).
-        if matches!(self.message_format(), ObjectFormat::Legacy) {
+        if matches!(format, ObjectFormat::Legacy) {
             if let Some(ref bytes) = m.fill_value {
                 let mut old = Vec::with_capacity(4 + bytes.len());
                 old.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -16149,7 +16212,7 @@ impl Hdf5Writer {
                     owner,
                     MSG_FILTER_PIPELINE,
                     0x00,
-                    pipeline.encode_for(self.message_format()),
+                    pipeline.encode_for(format),
                 );
                 header.add_message(MSG_FILTER_PIPELINE, flags, filter_msg);
             }
