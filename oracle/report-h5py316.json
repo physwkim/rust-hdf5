@@ -4,8 +4,8 @@
   "h5py_version": "3.16.0",
   "numpy_version": "2.5.2",
   "python": "/home/stevek/micromamba/envs/h5py316/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-shared-962750cc-1/target/release/oracle_probe",
-  "cases": 109
+  "probe": "/home/stevek/work/rust-hdf5/target/release/oracle_probe",
+  "cases": 111
  },
  "results": [
   {
@@ -1320,6 +1320,28 @@
    "group": "layout",
    "note": "the same file under H5D_VDS_FIRST_MISSING \u2014 the extent runs on to where the next block would start",
    "rust_case": "vds_view_trail",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 50,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "vds_split",
+   "group": "layout",
+   "note": "a same-file mapping whose virtual and source selections decompose into different numbers of boxes",
+   "rust_case": "vds_split",
    "a": {
     "verdict": "PASS",
     "divergences": [],
@@ -4044,9 +4066,39 @@
     "h5diff_rc": 0,
     "h5dump_rc": 0
    }
+  },
+  {
+   "case": "vds_late_layout",
+   "group": "layout",
+   "note": "virtual datasets built by H5Pset_virtual with and without a prior H5Pset_layout \u2014 the pairs differ only in allocation time (H5Pdcpl.c:2146 pokes the layout past H5P__set_layout's default)",
+   "rust_case": null,
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 126,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "UNSUPPORTED-API",
+    "detail": "no rust writer arm: the public API cannot express this case",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": null,
+    "h5dump_rc": null
+   }
   }
  ],
  "findings": [
+  {
+   "kind": "write-unsupported",
+   "signature": "no rust writer arm: the public API cannot express this case",
+   "cases": [
+    "vds_late_layout"
+   ],
+   "example": ""
+  },
   {
    "kind": "structural",
    "signature": "shape \u2014 H5Attribute exposes no shape() accessor",
