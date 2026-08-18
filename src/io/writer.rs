@@ -45,6 +45,7 @@ use crate::format::messages::filter::{self, FilterPipeline};
 use crate::format::messages::group_info::GroupInfoMessage;
 use crate::format::messages::link::{CharacterSet, LinkMessage, LinkTarget};
 use crate::format::messages::link_info::LinkInfoMessage;
+use crate::format::messages::mod_time::ModificationTime;
 use crate::format::messages::superblock_ext::{
     FileSpaceInfoMessage, FileSpaceStrategy, SharedMessageTableMessage,
     DEFAULT_FILE_SPACE_PAGE_SIZE, FS_ADDR_COUNT_V1, PAGE_SIZE_MAX, PAGE_SIZE_MIN,
@@ -913,11 +914,16 @@ pub struct DatasetInfo {
     /// preserved from the file on reopen, and emitted verbatim at finalize.
     /// Contiguous datasets ignore it.
     pub layout_version: u8,
-    /// The four times this object's header stores, when it was created with
-    /// `H5Pset_obj_track_times(true)`. `None` for a dataset this writer
-    /// created — it offers no way to ask for times — and whatever the file
-    /// held for a reopened one, so a rewrite hands them back rather than
-    /// dropping the flag that announces them.
+    /// The times this object tracks: `Some` exactly when it was created with
+    /// `H5Pset_obj_track_times(true)`, `None` when it was not.
+    ///
+    /// One meaning on both header versions, which store them differently and
+    /// store different amounts of them: a version-2 header keeps all four in
+    /// its prefix, and a version-1 dataset keeps one, in an `H5O_MTIME_NEW`
+    /// message. [`touch_oh`] is the single place that turns this into either
+    /// of those, so the four fields are here whichever version the object
+    /// has, exactly as `H5O_t` carries `atime`/`mtime`/`ctime`/`btime` for a
+    /// version-1 header it never serialises them from.
     pub times: Option<ObjectTimes>,
 }
 
@@ -1282,6 +1288,42 @@ fn recover_track_order(
     TrackOrder {
         links,
         attrs: header.attribute_creation_order(),
+    }
+}
+
+/// `H5O_touch_oh` (H5Oint.c:1273): put an object's tracked times where its
+/// header version keeps them.
+///
+/// INVARIANT: every object header this writer builds passes its times through
+/// here. The version decides the storage and nothing else does — a caller that
+/// set `ObjectHeader::times` itself would hand a version-1 encode a prefix
+/// field that version has no room for, and one that added the message itself
+/// would put a second copy in a version-2 header.
+///
+/// `force` is upstream's own parameter, and it is what splits datasets from
+/// everything else: it creates the version-1 `H5O_MTIME_NEW` message when the
+/// header has none, and only `H5D__update_oh_info` passes it true
+/// (H5Dint.c:1022-1026). Every other caller passes false and so creates no
+/// message at all, which is why a version-1 group or committed datatype
+/// records no time even when it is tracking them. A version-2 header keeps all
+/// four times in its prefix whatever `force` says.
+fn touch_oh(
+    header: &mut ObjectHeader,
+    format: ObjectFormat,
+    times: Option<ObjectTimes>,
+    force: bool,
+) {
+    let Some(times) = touched_times(times) else {
+        return;
+    };
+    match format {
+        ObjectFormat::Modern => header.times = Some(times),
+        ObjectFormat::Legacy if force => header.add_message(
+            crate::format::messages::MSG_MOD_TIME,
+            0x00,
+            ModificationTime(times.change).encode(),
+        ),
+        ObjectFormat::Legacy => {}
     }
 }
 
@@ -1761,8 +1803,10 @@ pub struct GroupInfo {
     /// finalize: a later change of policy must not rewrite an object already
     /// made.
     pub track_order: TrackOrder,
-    /// This group's stored times, on the same terms as
-    /// [`DatasetInfo::times`].
+    /// The times this group tracks, on the same terms as
+    /// [`DatasetInfo::times`]. A version-1 group header records none of them:
+    /// nothing calls `H5O_touch_oh` with `force` for a group, so the message a
+    /// version-1 dataset gets is never created for one.
     pub times: Option<ObjectTimes>,
 }
 
@@ -1866,6 +1910,10 @@ pub struct CommittedDatatype {
     pub datatype: DatatypeMessage,
     /// When the link naming it was created; see [`GroupInfo::creation_seq`].
     pub creation_seq: u64,
+    /// The times it tracks, on the same terms as [`DatasetInfo::times`]. A
+    /// version-1 committed datatype header records none of them, for the same
+    /// reason a version-1 group's does not.
+    pub times: Option<ObjectTimes>,
     /// File offset of its object header (set during finalize).
     pub obj_header_addr: u64,
 }
@@ -2054,9 +2102,9 @@ struct DatasetParts {
     /// read it from the writer instead would stamp this session's policy onto
     /// an object libhdf5 created under another.
     track_order: TrackOrder,
-    /// The times the on-disk header stores, for the same reason: whether an
+    /// The times the on-disk header records, for the same reason: whether an
     /// object tracks them is settled when it is created, not when it is
-    /// rewritten.
+    /// rewritten. Recovered by [`ObjectHeader::recorded_times`].
     times: Option<ObjectTimes>,
     /// The dense storage the rewrite supersedes and must free.
     dense: DenseCarry,
@@ -2179,7 +2227,7 @@ impl<'a> ReopenWalk<'a> {
         // from the whole chain: all three are properties of the object, not of
         // any one message the loop below happens to reach.
         let track_order = recover_track_order(&header, ctx);
-        let times = header.times;
+        let times = header.recorded_times();
         let (dense_attrs, dense_links) = superseded_dense(&header, ctx);
 
         // Attributes come from the reader's collector rather than from the
@@ -2255,6 +2303,18 @@ impl<'a> ReopenWalk<'a> {
                 };
             }
             match msg.msg_type {
+                // The pre-1.6 modification time, a formatted date string
+                // (`H5O_MTIME`, type 0x0E). `recorded_times` reads only the
+                // modern form, and a rewrite emits only that, so an object
+                // carrying this one would come back out with the time it
+                // recorded gone. Keeping its bytes is the same answer an
+                // undecodable message already gets.
+                crate::format::messages::MSG_MOD_TIME_OLD => {
+                    return Ok(ObjectPlan::preserve(
+                        "it carries a pre-1.6 modification time message, which this writer \
+                         reads but does not write",
+                    ))
+                }
                 MSG_DATATYPE => {
                     dataset_shaped = true;
                     let (dt, _) = consume!(DatatypeMessage::decode(&msg.data, ctx), "datatype");
@@ -3582,6 +3642,14 @@ pub struct Hdf5Writer {
     /// [`set_track_order`](Self::set_track_order). Each object captures this
     /// at creation, so changing it never rewrites an object already made.
     track_order: TrackOrder,
+    /// Whether an object created from now on records the times its header can
+    /// hold — `H5Pset_obj_track_times`, whose default is on
+    /// (`H5O_CRT_OHDR_FLAGS_DEF` is `H5O_HDR_STORE_TIMES`, H5Opkg.h:74).
+    /// Captured by each object at creation for the same reason
+    /// [`track_order`](Self::track_order) is: it belongs to the creation
+    /// property list, so a later change must not rewrite an object already
+    /// made.
+    track_times: bool,
     /// The root group's own captured policy. The root is created with the
     /// file, so its value comes from
     /// [`create_with_options`](Self::create_with_options) — or, on reopen,
@@ -3875,6 +3943,9 @@ pub struct FileCreateOptions {
     /// Creation-order policy for the root group, and the default for every
     /// object created afterwards; see [`Hdf5Writer::set_track_order`].
     pub track_order: bool,
+    /// Time-tracking policy for the root group, and the default for every
+    /// object created afterwards; see [`Hdf5Writer::set_track_times`].
+    pub track_times: bool,
     /// The file's low library-version bound (`H5Pset_libver_bounds`'s `low`),
     /// or `None` when the caller named none.
     ///
@@ -4361,6 +4432,7 @@ impl Hdf5Writer {
         let FileCreateOptions {
             locking,
             track_order,
+            track_times,
             libver,
             userblock,
             shared_messages,
@@ -4477,8 +4549,11 @@ impl Hdf5Writer {
             dense_links: Slot::new(HashMap::new()),
             superseded_dense: Slot::new(None),
             track_order: TrackOrder::uniform(track_order),
+            track_times,
             root_track_order: TrackOrder::uniform(track_order),
-            root_times: None,
+            // The root group is created with the file, so it captures the
+            // policy the same instant every other field of it is settled.
+            root_times: track_times.then(|| ObjectTimes::created_at(now_seconds())),
             next_creation_seq: Slot::new(0),
             pending_object_references: Slot::new(Vec::new()),
             pending_heap_references: Slot::new(Vec::new()),
@@ -4899,6 +4974,39 @@ impl Hdf5Writer {
     /// [`create_with_options`](Self::create_with_options) instead.
     pub fn set_track_order(&mut self, track: bool) {
         self.track_order = TrackOrder::uniform(track);
+    }
+
+    /// Record the times of every object created after this call —
+    /// `H5Pset_obj_track_times` on the creation property lists those objects
+    /// are made with.
+    ///
+    /// Off by default, which is h5py's default and not libhdf5's: h5py's
+    /// high-level API sets `track_times=False` on every object it makes
+    /// (`_hl/files.py:189`, `_hl/dataset.py:39`, `_hl/group.py:42`), while a
+    /// bare creation property list leaves it on (`H5O_CRT_OHDR_FLAGS_DEF` is
+    /// `H5O_HDR_STORE_TIMES`, H5Opkg.h:74). A caller after libhdf5's own
+    /// bytes turns it on here.
+    ///
+    /// Objects already created keep the policy they were made under, and the
+    /// root group takes its own from
+    /// [`create_with_options`](Self::create_with_options) — the same split
+    /// [`set_track_order`](Self::set_track_order) has, and for the same
+    /// reason: this is a creation property, not a file-wide setting.
+    pub fn set_track_times(&mut self, track: bool) {
+        self.track_times = track;
+    }
+
+    /// The times an object created right now records — all four set to the
+    /// current time, as `H5O_apply_ohdr` initialises them (H5Oint.c:411-414),
+    /// or `None` when this session is not tracking times.
+    ///
+    /// INVARIANT: every object this writer registers takes its `times` from
+    /// here. The policy belongs to the creation property list, so reading
+    /// [`track_times`](Self::track_times) at any later moment — a finalize, a
+    /// header rewrite — would stamp a policy the object was not made under.
+    fn created_object_times(&self) -> Option<ObjectTimes> {
+        self.track_times
+            .then(|| ObjectTimes::created_at(now_seconds()))
     }
 
     /// Layout message version for a new chunked dataset on one of the v1.10
@@ -5827,6 +5935,12 @@ impl Hdf5Writer {
             dense_links: Slot::new(HashMap::new()),
             superseded_dense: Slot::new(superseded),
             track_order: root_track_order,
+            // Not recovered from the file the way the creation-order policy
+            // is: a version-1 header leaves no trace of whether the object was
+            // tracking times, so there is nothing on disk to read the policy
+            // back from. An object added to a reopened file gets this writer's
+            // own default, the same one a created file starts at.
+            track_times: false,
             next_creation_seq: Slot::new(creation_seq),
             pending_object_references: Slot::new(Vec::new()),
             pending_heap_references: Slot::new(Vec::new()),
@@ -6790,7 +6904,7 @@ impl Hdf5Writer {
             parent: parent_idx,
             creation_seq: self.take_creation_seq(),
             track_order: self.track_order,
-            times: None,
+            times: self.created_object_times(),
             child_datasets: Vec::new(),
             child_groups: Vec::new(),
             obj_header_addr: 0,
@@ -7104,6 +7218,7 @@ impl Hdf5Writer {
             parent: create.parent,
             datatype,
             creation_seq: self.take_creation_seq(),
+            times: self.created_object_times(),
             obj_header_addr: 0,
         };
         let mut reg = self.committed_datatypes.lock();
@@ -7373,11 +7488,17 @@ impl Hdf5Writer {
     /// message, and only when more than one link reaches the object. A
     /// version-1 header carries it in its prefix and gets no message at all —
     /// `H5O_link_oh` gates every refcount-message operation on
-    /// `oh->version > H5O_VERSION_1` (H5Oint.c:876), so a version-1 header
+    /// `oh->version > H5O_VERSION_1` (H5Oint.c:851), so a version-1 header
     /// holding one is a shape libhdf5 never writes.
+    ///
+    /// The message carries `H5O_MSG_FLAG_DONTSHARE`, which both refcount
+    /// operations pass (H5Oint.c:874 append, H5Oint.c:864 write): the count is
+    /// a property of this one object header, so a shared-message index that
+    /// pointed several headers at one copy would make every object with the
+    /// same link count share a single number.
     fn emit_refcount(&self, header: &mut ObjectHeader, rc: u32, format: ObjectFormat) {
         if rc > 1 && format == ObjectFormat::Modern {
-            header.add_message(MSG_OBJ_REF_COUNT, 0x00, encode_refcount(rc));
+            header.add_message(MSG_OBJ_REF_COUNT, MSG_FLAG_DONTSHARE, encode_refcount(rc));
         }
     }
 
@@ -8353,7 +8474,20 @@ impl Hdf5Writer {
             info
         });
         header.add_message(MSG_LINK_INFO, 0x00, link_info.encode(&self.ctx));
-        header.add_message(MSG_GROUP_INFO, 0x00, GroupInfoMessage::default().encode());
+        // The link info message takes no flags and the group info message
+        // takes `H5O_MSG_FLAG_CONSTANT`, exactly as `H5G__obj_create_real`
+        // creates the pair (H5Gobj.c:255, :259) and as
+        // `H5G__obj_insert`'s phase change re-creates it (H5Gobj.c:526). The
+        // asymmetry is real: the link info message records the group's
+        // storage and its creation-order counter, both of which change as
+        // links come and go, while the group info message holds the phase
+        // change and estimated-name-length constants of the creation property
+        // list, which nothing after creation rewrites.
+        header.add_message(
+            MSG_GROUP_INFO,
+            MSG_FLAG_CONSTANT,
+            GroupInfoMessage::default().encode(),
+        );
         if dense {
             return;
         }
@@ -9587,7 +9721,7 @@ impl Hdf5Writer {
                 fill_value: None,
                 fill_time: FILL_TIME_IFSET,
                 layout_version: 4,
-                times: None,
+                times: self.created_object_times(),
             },
         );
 
@@ -9796,7 +9930,7 @@ impl Hdf5Writer {
                 fill_value: None,
                 fill_time: FILL_TIME_IFSET,
                 layout_version: 4,
-                times: None,
+                times: self.created_object_times(),
             },
         );
 
@@ -9910,7 +10044,7 @@ impl Hdf5Writer {
                 fill_value: None,
                 fill_time: FILL_TIME_IFSET,
                 layout_version: 4,
-                times: None,
+                times: self.created_object_times(),
             },
         );
 
@@ -9989,7 +10123,7 @@ impl Hdf5Writer {
                 fill_value: None,
                 fill_time: FILL_TIME_IFSET,
                 layout_version: 4,
-                times: None,
+                times: self.created_object_times(),
             },
         );
 
@@ -10041,7 +10175,7 @@ impl Hdf5Writer {
                 fill_value: None,
                 fill_time: FILL_TIME_IFSET,
                 layout_version: 4,
-                times: None,
+                times: self.created_object_times(),
             },
         );
 
@@ -10148,7 +10282,7 @@ impl Hdf5Writer {
                 fill_value: None,
                 fill_time: FILL_TIME_IFSET,
                 layout_version,
-                times: None,
+                times: self.created_object_times(),
                 fixed_array: None,
                 implicit: None,
                 single_chunk: None,
@@ -11385,7 +11519,7 @@ impl Hdf5Writer {
                 fill_value: None,
                 fill_time: FILL_TIME_IFSET,
                 layout_version: 4,
-                times: None,
+                times: self.created_object_times(),
                 chunked: None,
                 fixed_array: None,
                 implicit: None,
@@ -11509,7 +11643,7 @@ impl Hdf5Writer {
                 fill_value: None,
                 fill_time: FILL_TIME_IFSET,
                 layout_version: 4,
-                times: None,
+                times: self.created_object_times(),
                 chunked: None,
                 fixed_array: None,
                 implicit: None,
@@ -11655,7 +11789,7 @@ impl Hdf5Writer {
                 fill_value: None,
                 fill_time: FILL_TIME_IFSET,
                 layout_version,
-                times: None,
+                times: self.created_object_times(),
                 fixed_array: None,
                 implicit: None,
                 single_chunk: None,
@@ -13243,7 +13377,7 @@ impl Hdf5Writer {
                 fill_value: None,
                 fill_time: FILL_TIME_IFSET,
                 layout_version,
-                times: None,
+                times: self.created_object_times(),
                 chunked: None,
                 btree_v2: None,
                 implicit: None,
@@ -13345,7 +13479,7 @@ impl Hdf5Writer {
                 fill_value: None,
                 fill_time: FILL_TIME_IFSET,
                 layout_version,
-                times: None,
+                times: self.created_object_times(),
                 chunked: None,
                 btree_v2: None,
                 fixed_array: None,
@@ -13441,7 +13575,7 @@ impl Hdf5Writer {
                 fill_value: None,
                 fill_time: FILL_TIME_IFSET,
                 layout_version,
-                times: None,
+                times: self.created_object_times(),
                 chunked: None,
                 btree_v2: None,
                 fixed_array: None,
@@ -13523,7 +13657,7 @@ impl Hdf5Writer {
                 fill_value: None,
                 fill_time: FILL_TIME_IFSET,
                 layout_version,
-                times: None,
+                times: self.created_object_times(),
                 chunked: None,
                 btree_v2: None,
                 fixed_array: None,
@@ -13616,7 +13750,7 @@ impl Hdf5Writer {
                 // the version-4 gate — a bound whose row is lower does not
                 // push the message down, it only keeps the v1.10 indexes out.
                 layout_version: LAYOUT_VERSION_DEFAULT,
-                times: None,
+                times: self.created_object_times(),
                 chunked: None,
                 fixed_array: None,
                 btree_v2: None,
@@ -13771,7 +13905,7 @@ impl Hdf5Writer {
                 fill_value: None,
                 fill_time: FILL_TIME_IFSET,
                 layout_version,
-                times: None,
+                times: self.created_object_times(),
                 chunked: None,
                 fixed_array: None,
                 implicit: None,
@@ -13889,7 +14023,7 @@ impl Hdf5Writer {
                 fill_value: None,
                 fill_time: FILL_TIME_IFSET,
                 layout_version,
-                times: None,
+                times: self.created_object_times(),
                 fixed_array: None,
                 implicit: None,
                 single_chunk: None,
@@ -15986,7 +16120,6 @@ impl Hdf5Writer {
         let ds = self.ds(index);
         let m = ds.lock();
         let mut header = ObjectHeader::new();
-        header.times = touched_times(m.times);
 
         // Every message below is written in the format this dataset already
         // has, not the one this session would pick. libhdf5 grows a header in
@@ -16098,8 +16231,14 @@ impl Hdf5Writer {
                 fill_value: None,
             }
         };
+        // `H5O_MSG_FLAG_CONSTANT`, as `H5D__update_oh_info` appends it
+        // (H5Dint.c:965) — the same flag the datatype message beside it
+        // carries (H5Dint.c:961) and the old fill value below (H5Dint.c:981).
+        // A dataset's fill value is fixed at creation: `H5Pset_fill_value` is
+        // a creation property, so nothing can rewrite the message in place and
+        // libhdf5 tells the header so.
         let fv_msg = fv.encode_for(format);
-        let (flags, fv_msg) = self.share_message(owner, MSG_FILL_VALUE, 0x00, fv_msg);
+        let (flags, fv_msg) = self.share_message(owner, MSG_FILL_VALUE, MSG_FLAG_CONSTANT, fv_msg);
         header.add_message(MSG_FILL_VALUE, flags, fv_msg);
 
         // The "fill value (old)" message (type 0x04) beside the new one, for a
@@ -16202,29 +16341,63 @@ impl Hdf5Writer {
         } else {
             DataLayoutMessage::contiguous(m.data_addr, m.data_size)
         };
+        // `H5D__layout_oh_create` (H5Dlayout.c:530-536) marks the layout
+        // message constant only where the storage it names is certain to be
+        // there already: allocation time is early, the class is not compact,
+        // no filter can change a chunk's size, and the dataspace holds at
+        // least one element. Anything else leaves the address undefined at
+        // creation and rewrites the message when the space is allocated, so
+        // the flag would be a lie. `H5S_GET_EXTENT_NPOINTS` is zero for a
+        // NULL dataspace and for any extent with a zero-length dimension.
+        let npoints: u64 = if m.dataspace.is_null() {
+            0
+        } else {
+            m.dataspace.dims.iter().product()
+        };
+        let filtered = m
+            .filter_pipeline
+            .as_ref()
+            .is_some_and(|p| !p.filters.is_empty());
+        let layout_flags = if alloc_time == 1 && m.compact.is_none() && !filtered && npoints != 0 {
+            MSG_FLAG_CONSTANT
+        } else {
+            0x00
+        };
         let layout_msg = layout.encode(&self.ctx);
-        header.add_message(MSG_DATA_LAYOUT, 0x00, layout_msg);
+        header.add_message(MSG_DATA_LAYOUT, layout_flags, layout_msg);
 
-        // Filter Pipeline message (type 0x0B) -- only if filters are configured
+        // Filter Pipeline message (type 0x0B) -- only if filters are
+        // configured. `H5D__layout_oh_create` appends it with
+        // `H5O_MSG_FLAG_CONSTANT` (H5Dlayout.c:462), as does the group
+        // pipeline for dense links (H5Gobj.c:264): the pipeline is a creation
+        // property, and every chunk already written was filtered through it,
+        // so it can never be rewritten in place.
         if let Some(ref pipeline) = m.filter_pipeline {
             if !pipeline.filters.is_empty() {
                 let (flags, filter_msg) = self.share_message(
                     owner,
                     MSG_FILTER_PIPELINE,
-                    0x00,
+                    MSG_FLAG_CONSTANT,
                     pipeline.encode_for(format),
                 );
                 header.add_message(MSG_FILTER_PIPELINE, flags, filter_msg);
             }
         }
 
-        // Attribute Info (type 0x15) + attribute messages (type 0x0C)
         // A dataset has no links, so only attribute creation order can raise
         // its header past version 1 (`H5O__set_version`).
         let format = self.header_format(TrackOrder {
             links: CreationOrder::default(),
             attrs: m.track_attr_order,
         });
+
+        // Modification time, here and not earlier: `H5D__update_oh_info` makes
+        // this the last message it writes (H5Dint.c:1022-1026), and the
+        // attributes below it are added by `H5A` calls that come after the
+        // dataset exists.
+        touch_oh(&mut header, format, m.times, true);
+
+        // Attribute Info (type 0x15) + attribute messages (type 0x0C).
         self.emit_attributes(
             &mut header,
             AttrScope::Dataset(index),
@@ -16259,7 +16432,10 @@ impl Hdf5Writer {
                 // nothing in the file could reach the header.
                 continue;
             }
-            let encoded = self.build_committed_datatype_header(i, rc).encode()?;
+            let format = self.committed_datatype_header_format();
+            let encoded = self
+                .build_committed_datatype_header(i, rc, format)
+                .encode_for(format, rc)?;
             let addr = self
                 .allocator
                 .allocate(encoded.len() as u64, FreeSpaceClass::Metadata);
@@ -16269,10 +16445,29 @@ impl Hdf5Writer {
         Ok(())
     }
 
+    /// The header format a committed datatype gets.
+    ///
+    /// `H5T__commit` creates the header from the datatype creation property
+    /// list (H5Tcommit.c:468), which carries no link order and, by default, no
+    /// attribute order — so the version is the file's floor exactly as
+    /// `H5O__set_version` computes it, and a committed datatype in a classic
+    /// file is a version-1 header like every other object in it.
+    fn committed_datatype_header_format(&self) -> ObjectFormat {
+        self.header_format(TrackOrder::default())
+    }
+
     /// Build the object header for a committed datatype: the type, and the
     /// reference count when more than one name reaches it.
-    fn build_committed_datatype_header(&self, index: usize, rc: u32) -> ObjectHeader {
-        let datatype = self.committed_datatypes.lock()[index].datatype.clone();
+    fn build_committed_datatype_header(
+        &self,
+        index: usize,
+        rc: u32,
+        format: ObjectFormat,
+    ) -> ObjectHeader {
+        let (datatype, times) = {
+            let reg = self.committed_datatypes.lock();
+            (reg[index].datatype.clone(), reg[index].times)
+        };
         let mut header = ObjectHeader::new();
         // No attributes to emit, so nothing else would apply the file-wide
         // floor to this header. `store_msg_crt_idx` is a property of the file,
@@ -16287,9 +16482,12 @@ impl Hdf5Writer {
             MSG_FLAG_CONSTANT | MSG_FLAG_DONTSHARE,
             datatype.encode_at(&self.ctx, self.encoding_libver()),
         );
-        if rc > 1 {
-            header.add_message(MSG_OBJ_REF_COUNT, 0x00, encode_refcount(rc));
-        }
+        touch_oh(&mut header, format, times, false);
+        // Through the same owner as every other object's count: a dataset
+        // sharing this type raises it (`H5O__shared_link_adj`, H5Oshared.c:249)
+        // just as a second name does, and where that count is recorded is the
+        // header version's business, not the caller's.
+        self.emit_refcount(&mut header, rc, format);
         header
     }
 
@@ -16311,7 +16509,7 @@ impl Hdf5Writer {
             )
         };
         let attributes = self.object_attributes(AttrScope::Group(group_idx))?;
-        header.times = touched_times(times);
+        touch_oh(&mut header, self.header_format(track_order), times, false);
 
         let links = self.group_links(LinkScope::Group(group_idx), track_order.links);
         self.emit_links(
@@ -16344,7 +16542,12 @@ impl Hdf5Writer {
 
     fn build_root_group_header(&self) -> IoResult<ObjectHeader> {
         let mut header = ObjectHeader::new();
-        header.times = touched_times(self.root_times);
+        touch_oh(
+            &mut header,
+            self.header_format(self.root_track_order),
+            self.root_times,
+            false,
+        );
 
         // Link Info (type 0x02) + Group Info (type 0x0A) + the links
         // themselves, compact or dense.

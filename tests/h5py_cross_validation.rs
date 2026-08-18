@@ -2190,6 +2190,170 @@ fn committed_datatypes_read_back_through_h5py() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A committed datatype's object header is created from the datatype creation
+/// property list and nothing else (`H5T__commit`, H5Tcommit.c:468), so
+/// `H5O__set_version` gives it the file's floor exactly as it gives every
+/// other object one: version 1 in a classic file, version 2 where the bound
+/// raises it. That decides where the hard link count is recorded — the
+/// version-1 prefix's `nlink` field, or a Reference Count message, which
+/// `H5O__link_oh` only ever creates for `oh->version > H5O_VERSION_1`
+/// (H5Oint.c:851). The two bounds are the boundary: a type shared by a dataset
+/// has `rc == 2` under both, and only the version says whether a second
+/// message carries it.
+#[test]
+fn a_committed_datatype_takes_the_header_version_its_file_calls_for() {
+    use rust_hdf5::LibverBound;
+    let Some(py) = python() else { return };
+    for (bound, version, nmesgs) in [
+        (LibverBound::Earliest, 1u32, 1u32),
+        (LibverBound::V112, 2, 2),
+    ] {
+        let path = tmp(&format!("committed_hdr_{bound:?}"));
+        {
+            // The bound has to be named at create: a classic file is one whose
+            // superblock says so, and `set_libver_bound` after the fact moves
+            // only the message encoders.
+            let file = H5File::options().libver(bound).create(&path).unwrap();
+            file.commit_datatype("t", DatatypeMessage::i32_type())
+                .unwrap();
+            file.new_dataset::<i32>()
+                .committed_type("t")
+                .shape([8])
+                .create("shared")
+                .unwrap()
+                .write_raw(&(0..8i32).collect::<Vec<_>>())
+                .unwrap();
+            file.close().unwrap();
+        }
+        read_back_with_h5py(
+            py,
+            &path,
+            &format!(
+                "hdr = h5py.h5o.get_info(f['t'].id).hdr\n\
+                 assert hdr.version == {version}, hdr.version\n\
+                 assert hdr.nmesgs == {nmesgs}, hdr.nmesgs\n\
+                 assert h5py.h5o.get_info(f['t'].id).rc == 2\n\
+                 assert f['shared'].id.get_type().committed()\n"
+            ),
+        );
+        std::fs::remove_file(&path).ok();
+    }
+}
+
+/// `H5Pset_obj_track_times` decides whether an object records its times, and
+/// the object header version decides where they go — one boundary per pair.
+///
+/// A version-2 header holds all four in its prefix under `H5O_HDR_STORE_TIMES`
+/// whatever the object is. A version-1 header holds at most one, in an
+/// `H5O_MTIME_NEW` message, and only a dataset ever gets it: `H5O_touch_oh`
+/// creates the message only when called with `force` (H5Oint.c:1273-1310), and
+/// `H5D__update_oh_info` is the one caller that passes it (H5Dint.c:1022-1026)
+/// — so a version-1 group or committed datatype records nothing even while
+/// tracking times. libhdf5 reports the version-1 message as `ctime` and leaves
+/// `btime` at zero, which is what separates the two storages here.
+#[test]
+fn where_an_object_records_its_times_is_its_header_version_s_business() {
+    use rust_hdf5::LibverBound;
+    let Some(py) = python() else { return };
+    // (bound, tracking, root/group/type `ctime`, dataset `ctime`, any `btime`)
+    for (bound, track, other_ctime, dataset_ctime, btime) in [
+        (LibverBound::Earliest, true, false, true, false),
+        (LibverBound::Earliest, false, false, false, false),
+        (LibverBound::V112, true, true, true, true),
+        (LibverBound::V112, false, false, false, false),
+    ] {
+        let path = tmp(&format!("track_times_{bound:?}_{track}"));
+        {
+            let file = H5File::options()
+                .libver(bound)
+                .track_times(track)
+                .create(&path)
+                .unwrap();
+            file.root_group().create_group("g").unwrap();
+            file.commit_datatype("t", DatatypeMessage::i32_type())
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([8])
+                .create("d")
+                .unwrap()
+                .write_raw(&(0..8i32).collect::<Vec<_>>())
+                .unwrap();
+            file.close().unwrap();
+        }
+        let want = |b: bool| if b { "!=" } else { "==" };
+        read_back_with_h5py(
+            py,
+            &path,
+            &format!(
+                "def t(n):\n\
+                 \x20   return h5py.h5o.get_info(f[n].id if n != '/' else f['/'].id)\n\
+                 for n in ['/', 'g', 't']:\n\
+                 \x20   assert t(n).ctime {} 0, (n, t(n).ctime)\n\
+                 assert t('d').ctime {} 0, t('d').ctime\n\
+                 for n in ['/', 'g', 't', 'd']:\n\
+                 \x20   assert t(n).btime {} 0, (n, t(n).btime)\n",
+                want(other_ctime),
+                want(dataset_ctime),
+                want(btime),
+            ),
+        );
+        std::fs::remove_file(&path).ok();
+    }
+}
+
+/// The version-1 modification time message survives a rewrite of the header it
+/// is in.
+///
+/// It is the only trace a version-1 header keeps of `H5Pset_obj_track_times`,
+/// so a reopen that did not read it back would hand the dataset to the next
+/// close as one that never tracked times — and the rewrite would drop the
+/// message, silently turning the property off. The dataset here is
+/// `h5d.create` with a bare creation property list, which is what leaves the
+/// property on (`H5O_CRT_OHDR_FLAGS_DEF` is `H5O_HDR_STORE_TIMES`,
+/// H5Opkg.h:74) where h5py's own API turns it off.
+#[test]
+fn a_classic_dataset_keeps_its_modification_time_through_a_rewrite() {
+    let Some(py) = python() else { return };
+    let path = tmp("mtime_rewrite");
+    write_with_h5py(
+        py,
+        &path,
+        "sid = h5py.h5s.create_simple((4,))\n\
+         d = h5py.h5d.create(f.id, b'd', h5py.h5t.STD_I32LE, sid)\n\
+         d.write(h5py.h5s.ALL, h5py.h5s.ALL, np.arange(4, dtype='<i4'))\n",
+    );
+    read_back_with_h5py(
+        py,
+        &path,
+        "assert h5py.h5o.get_info(f['d'].id).hdr.version == 1\n\
+         assert h5py.h5o.get_info(f['d'].id).ctime != 0\n",
+    );
+
+    // An attribute dirties the header, so the close rewrites it rather than
+    // leaving the bytes h5py wrote alone.
+    {
+        let file = H5File::open_rw(&path).unwrap();
+        file.dataset_writer("d")
+            .unwrap()
+            .new_attr::<i32>()
+            .shape(())
+            .create("gain")
+            .unwrap()
+            .write_numeric(&7i32)
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "assert h5py.h5o.get_info(f['d'].id).hdr.version == 1\n\
+         assert h5py.h5o.get_info(f['d'].id).ctime != 0, 'the mtime message was dropped'\n\
+         assert f['d'].attrs['gain'] == 7\n\
+         assert list(f['d'][...]) == [0, 1, 2, 3]\n",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// A committed datatype's attributes have no rust-hdf5 write path
 /// (`H5NamedDatatype` is read-only), so the only way to exercise
 /// `named_datatype_attr_names`'s ordering is a datatype h5py commits and

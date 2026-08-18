@@ -172,6 +172,33 @@ impl ObjectHeader {
         }
     }
 
+    /// The times this header records, wherever its version keeps them.
+    ///
+    /// One answer for both versions, which store a different number of times
+    /// in different places: version 2 keeps all four in the prefix under
+    /// `H5O_HDR_STORE_TIMES`, and version 1 keeps at most one, in an
+    /// `H5O_MTIME_NEW` message. `None` means the object was created with
+    /// `H5Pset_obj_track_times(false)` — or is a version-1 group or committed
+    /// datatype, whose header has nowhere to record a time even while the
+    /// property is on, since only `H5D__update_oh_info` calls `H5O_touch_oh`
+    /// with the `force` that creates the message (H5Dint.c:1022-1026).
+    ///
+    /// The one time a version-1 header stores fills all four fields. Only
+    /// [`ObjectTimes::change`] is written back for that version — it is the
+    /// field `H5O_touch_oh` moves to now on both versions (H5Oint.c:1290-1345)
+    /// — so the other three are there to keep one struct across both versions
+    /// rather than to claim the file said anything about them.
+    pub fn recorded_times(&self) -> Option<ObjectTimes> {
+        if let Some(times) = self.times {
+            return Some(times);
+        }
+        self.messages
+            .iter()
+            .find(|m| m.msg_type == crate::format::messages::MSG_MOD_TIME)
+            .and_then(|m| crate::format::messages::mod_time::ModificationTime::decode(&m.data).ok())
+            .map(|t| ObjectTimes::created_at(t.0))
+    }
+
     /// Append a message to the object header.
     pub fn add_message(&mut self, msg_type: u8, flags: u8, data: Vec<u8>) {
         self.add_message_indexed(msg_type, flags, data, 0);
@@ -710,11 +737,11 @@ impl ObjectHeader {
     ///
     /// Refuses a header carrying [`times`](Self::times) for the same reason.
     /// The four times and the `H5O_HDR_STORE_TIMES` bit that announces them
-    /// are version-2 prefix fields; a version-1 header records only its
-    /// modification time, in an `H5O_MTIME_NEW` message, which this writer
-    /// does not emit. Refusing keeps the version gate at the one encoder that
-    /// knows which prefix it is writing, instead of letting a v2-shaped header
-    /// reach `encode_v1` and come back out with its times gone.
+    /// are version-2 prefix fields; a version-1 header records at most a
+    /// modification time, in an `H5O_MTIME_NEW` message among the messages
+    /// below. Refusing keeps the version gate at the one encoder that knows
+    /// which prefix it is writing, instead of letting a v2-shaped header reach
+    /// `encode_v1` and come back out with its times gone.
     pub fn encode_v1(&self, nlink: u32) -> FormatResult<Vec<u8>> {
         if self.flags & (FLAG_ATTR_CREATION_ORDER_TRACKED | FLAG_ATTR_CREATION_ORDER_INDEXED) != 0 {
             return Err(FormatError::InvalidData(

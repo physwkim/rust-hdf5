@@ -22,7 +22,9 @@ use rust_hdf5::format::fractal_heap::{
 use rust_hdf5::format::messages::attribute::{ATTR_FLAG_SPACE_SHARED, ATTR_FLAG_TYPE_SHARED};
 use rust_hdf5::format::messages::dataspace::DataspaceMessage;
 use rust_hdf5::format::messages::{
-    MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE, MSG_FLAG_SHAREABLE, MSG_FLAG_SHARED,
+    MSG_ATTRIBUTE, MSG_ATTR_INFO, MSG_DATASPACE, MSG_DATATYPE, MSG_DATA_LAYOUT, MSG_FILL_VALUE,
+    MSG_FLAG_CONSTANT, MSG_FLAG_DONTSHARE, MSG_FLAG_SHAREABLE, MSG_FLAG_SHARED, MSG_OBJ_REF_COUNT,
+    MSG_SYMBOL_TABLE,
 };
 use rust_hdf5::format::object_header::ObjectHeader;
 use rust_hdf5::format::sohm::{
@@ -556,6 +558,74 @@ fn the_storage_accessor_answers_what_h5debug_prints_for_the_fixture() {
             ),
         ]
     );
+}
+
+/// The two public accessors the oracle's `msgflags` and `hdrtimes` fields are
+/// read through, checked against `h5debug` on the same libhdf5-written
+/// fixture.
+///
+/// `h5debug tests/fixtures/sohm_list.h5 <addr>` prints every object at header
+/// version 2 with `Timestamps: Enabled`, and the messages below with exactly
+/// these flags — `/named_i32` a `datatype <C, DS>` and a `refcount <DS>`,
+/// every dataset a `datatype <C>` and a `fill_new <C>`, `/shared0` its
+/// `dataspace <SA>` where `/shared1` and `/uses_named` have `<S>`. The null
+/// and continuation messages it also prints are the two the accessor drops:
+/// free space inside a chunk and the chain that reaches the next one.
+#[test]
+fn the_flags_accessor_answers_what_h5debug_prints_for_the_fixture() {
+    let file = H5File::open(fixture("sohm_list.h5")).unwrap();
+    let paths = ["/", "/named_i32", "/shared0", "/shared1", "/uses_named"];
+    let seen: Vec<(&str, Vec<(u8, u8)>)> = paths
+        .into_iter()
+        .map(|p| (p, file.object_message_flags(p).unwrap()))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            ("/", vec![(MSG_SYMBOL_TABLE, 0)]),
+            (
+                "/named_i32",
+                vec![
+                    (MSG_DATATYPE, MSG_FLAG_CONSTANT | MSG_FLAG_DONTSHARE),
+                    (MSG_OBJ_REF_COUNT, MSG_FLAG_DONTSHARE),
+                ]
+            ),
+            (
+                "/shared0",
+                vec![
+                    (MSG_DATASPACE, MSG_FLAG_SHAREABLE),
+                    (MSG_DATATYPE, MSG_FLAG_CONSTANT),
+                    (MSG_FILL_VALUE, MSG_FLAG_CONSTANT),
+                    (MSG_DATA_LAYOUT, 0),
+                    (MSG_ATTR_INFO, MSG_FLAG_DONTSHARE),
+                    (MSG_ATTRIBUTE, MSG_FLAG_SHARED),
+                ]
+            ),
+            (
+                "/shared1",
+                vec![
+                    (MSG_DATASPACE, MSG_FLAG_SHARED),
+                    (MSG_DATATYPE, MSG_FLAG_CONSTANT),
+                    (MSG_FILL_VALUE, MSG_FLAG_CONSTANT),
+                    (MSG_DATA_LAYOUT, 0),
+                    (MSG_ATTR_INFO, MSG_FLAG_DONTSHARE),
+                    (MSG_ATTRIBUTE, MSG_FLAG_SHARED),
+                ]
+            ),
+            (
+                "/uses_named",
+                vec![
+                    (MSG_DATASPACE, MSG_FLAG_SHARED),
+                    (MSG_DATATYPE, MSG_FLAG_CONSTANT | MSG_FLAG_SHARED),
+                    (MSG_FILL_VALUE, MSG_FLAG_CONSTANT),
+                    (MSG_DATA_LAYOUT, 0),
+                ]
+            ),
+        ]
+    );
+    for p in paths {
+        assert!(file.object_records_times(p).unwrap(), "{p} Timestamps");
+    }
 }
 
 #[test]

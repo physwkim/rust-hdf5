@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Canonical h5py-side dump of an HDF5 file — the reference half of the oracle.
 
-Emits the `!canon 7` format described in oracle/CANON.md. The rust-hdf5 side
+Emits the `!canon 9` format described in oracle/CANON.md. The rust-hdf5 side
 (`src/bin/oracle_probe.rs`, `dump` subcommand) emits the same format from the
 same file, so the two are comparable line by line and field by field.
 
@@ -10,6 +10,7 @@ Usage:  canon.py <file.h5>
 Only the standard library, numpy and h5py are used.
 """
 
+import functools
 import hashlib
 import os
 import pathlib
@@ -25,7 +26,7 @@ import hdf5env  # noqa: F401  (must precede h5py; see the module docstring)
 import h5py
 from h5py import h5d, h5o, h5p, h5s, h5t
 
-CANON_VERSION = "8"
+CANON_VERSION = "9"
 RAW_LIMIT = 1024
 MAX_DEPTH = 32
 
@@ -452,13 +453,8 @@ def chunk_index_str(dset):
     the dataset decides it. Measured, not derived, same route as `filters`.
     """
     addr = h5o.get_info(dset.id).addr
-    proc = subprocess.run(
-        [_h5debug_bin(), dset.file.filename, str(addr)],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    msg = _H5DEBUG_LAYOUT_MSG_RE.search(proc.stdout)
+    out = _h5debug_header(dset.file.filename, addr)
+    msg = _H5DEBUG_LAYOUT_MSG_RE.search(out)
     if not msg:
         raise RuntimeError("no layout message in h5debug output")
     name = _H5DEBUG_INDEX_TYPE_RE.search(msg.group(0)).group(1).strip()
@@ -527,6 +523,23 @@ def _h5debug_bin():
     return _tool_bin("h5debug")
 
 
+@functools.lru_cache(maxsize=None)
+def _h5debug_header(filename, addr):
+    """`h5debug`'s dump of the object header at `addr`.
+
+    Cached because five fields read the same header — `chunkindex`,
+    `filters`, `shared`, `msgflags`, `hdrtimes` — and a dump does not write
+    the file it is reading.
+    """
+    proc = subprocess.run(
+        [_h5debug_bin(), filename, str(addr)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return proc.stdout
+
+
 def filters_str(dset):
     """The `filters` field, read from the on-disk filter-pipeline message
     via `h5debug` rather than `dcpl.get_filter()` — see the note above.
@@ -536,13 +549,8 @@ def filters_str(dset):
     in a different file than the one this dump started from.
     """
     addr = h5o.get_info(dset.id).addr
-    proc = subprocess.run(
-        [_h5debug_bin(), dset.file.filename, str(addr)],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    msg = _H5DEBUG_FILTER_MSG_RE.search(proc.stdout)
+    out = _h5debug_header(dset.file.filename, addr)
+    msg = _H5DEBUG_FILTER_MSG_RE.search(out)
     if not msg:
         return "[]"
     parts = []
@@ -583,12 +591,45 @@ _H5DEBUG_MSG_NAME_RE = re.compile(
 )
 _H5DEBUG_MSG_FLAGS_RE = re.compile(r"Message flags:\s+<([^>]*)>")
 _H5DEBUG_SHARED_TYPE_RE = re.compile(r"Shared Message type:\s+(.+?)\s*$", re.M)
+_H5DEBUG_TIMESTAMPS_RE = re.compile(r"^Timestamps:\s+(\w+)", re.M)
 
-# `H5O_msg_class_t.name` for the classes a shared-message index can cover,
-# mapped to the names `oracle_probe`'s `message_class_name` uses.
-_SHARED_CLASS_NAMES = {
+
+def _h5debug_messages(filename, addr):
+    """One text block per message in the object header at `addr`, in the
+    order `h5debug` walked the chunk chain."""
+    return _H5DEBUG_MSG_SPLIT_RE.split(_h5debug_header(filename, addr))[1:]
+
+# `H5O_msg_class_t.name` — the string `h5debug` prints for a message class
+# (H5Odbg.c:393) — mapped to the name `oracle_probe`'s `message_class_name`
+# gives the same class. Only the names holding a space or a quote need an
+# entry; the rest are already one word and pass through unchanged. The
+# spelling is upstream's own, from the class tables in src/H5O*.c:
+# `H5O_MSG_EFL` "external file list" (H5Oefl.c:37), `H5O_MSG_PLINE`
+# "filter pipeline" (H5Opline.c:63), `H5O_MSG_SHMESG` "shared message table"
+# (H5Oshmesg.c:36), `H5O_MSG_CONT` "hdr continuation" (H5Ocont.c:45),
+# `H5O_MSG_BTREEK` "v1 B-tree 'K' values" (H5Obtreek.c:36),
+# `H5O_MSG_DRVINFO` "driver info" (H5Odrvinfo.c:36), and the two bogus
+# classes (H5Obogus.c:46, :70).
+_MSG_CLASS_NAMES = {
+    "external file list": "external_file_list",
+    "bogus valid": "bogus_valid",
     "filter pipeline": "filter_pipeline",
+    "shared message table": "shared_message_table",
+    "hdr continuation": "hdr_continuation",
+    "v1 B-tree 'K' values": "btreek",
+    "driver info": "driver_info",
+    "bogus invalid": "bogus_invalid",
 }
+
+# The classes `msgflags` does not report, on both sides. A null message is
+# reclaimed space and a continuation is the chunk chain that holds it: both
+# are the writer's allocation strategy, which CANON.md already declares
+# unmeasured, and neither carries anything a reader can see.
+_MSGFLAGS_SKIP = ("null", "hdr continuation")
+
+# The tokens `H5O_debug_real` prints for each bit of a message's flags byte,
+# in its order (H5Odbg.c:410-442).
+_MSG_FLAG_TOKENS = ("C", "S", "DS", "FIUW", "MIU", "WU", "SA", "FIUA")
 
 # What `H5O__shared_debug` prints for each `H5O_shared_t.type`.
 _SHARED_LOCATIONS = {
@@ -603,14 +644,8 @@ def shared_str(obj_id, filename):
     """The `shared` field: how the object header stores each message it does
     not hold privately, as sorted `class:storage` pairs."""
     addr = h5o.get_info(obj_id).addr
-    proc = subprocess.run(
-        [_h5debug_bin(), filename, str(addr)],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
     parts = []
-    for block in _H5DEBUG_MSG_SPLIT_RE.split(proc.stdout)[1:]:
+    for block in _h5debug_messages(filename, addr):
         name = _H5DEBUG_MSG_NAME_RE.search(block)
         flags = _H5DEBUG_MSG_FLAGS_RE.search(block)
         if not name or not flags:
@@ -624,8 +659,56 @@ def shared_str(obj_id, filename):
         else:
             continue
         cls = name.group(1)
-        parts.append("%s:%s" % (_SHARED_CLASS_NAMES.get(cls, cls), where))
+        parts.append("%s:%s" % (_MSG_CLASS_NAMES.get(cls, cls), where))
     return "[" + ",".join(sorted(parts)) + "]"
+
+
+def msgflags_str(obj_id, filename):
+    """The `msgflags` field: the flags byte every message in the object
+    header carries, as sorted `class:flags` pairs.
+
+    Sorted, not in header order, for the same reason `shared` is: which
+    chunk a message lands in and where in that chunk is the writer's
+    allocation strategy, while the flags are what every reader of the
+    message acts on — `H5O_MSG_FLAG_CONSTANT` stops `H5O_msg_write` from
+    modifying it in place (H5Omessage.c:340), `H5O_MSG_FLAG_SHAREABLE` is
+    what `H5SM_try_share` looks for, and an unknown message's
+    `H5O_MSG_FLAG_FAIL_IF_UNKNOWN_*` bits decide whether the open fails
+    (H5Ocache.c:1373-1374).
+    """
+    addr = h5o.get_info(obj_id).addr
+    parts = []
+    for block in _h5debug_messages(filename, addr):
+        name = _H5DEBUG_MSG_NAME_RE.search(block)
+        flags = _H5DEBUG_MSG_FLAGS_RE.search(block)
+        if not name or not flags or name.group(1) in _MSGFLAGS_SKIP:
+            continue
+        cls = _MSG_CLASS_NAMES.get(name.group(1), name.group(1))
+        tokens = [t.strip() for t in flags.group(1).split(",")]
+        tokens = [t for t in _MSG_FLAG_TOKENS if t in tokens]
+        parts.append("%s:%s" % (cls, "+".join(tokens) if tokens else "none"))
+    return "[" + ",".join(sorted(parts)) + "]"
+
+
+def hdrtimes_str(obj_id, filename):
+    """The `hdrtimes` field: whether the object header records the times it
+    can hold, `yes` or `no`.
+
+    Where they live is the header version's business, so this is read from
+    whichever place the version keeps them. A version-2 header stores four
+    of them in its prefix under `H5O_HDR_STORE_TIMES`, which `h5debug`
+    prints as `Timestamps` (H5Odbg.c:304); a version-1 header has an
+    `mtime_new` message or nothing at all, because `H5O_touch_oh` only
+    creates that message when a caller forces it and `H5D__update_oh_info`
+    is the one caller that does (H5Oint.c:1273-1310, H5Dint.c:1022-1026).
+    """
+    addr = h5o.get_info(obj_id).addr
+    out = _h5debug_header(filename, addr)
+    stamps = _H5DEBUG_TIMESTAMPS_RE.search(out)
+    if stamps:
+        return "yes" if stamps.group(1) == "Enabled" else "no"
+    names = (_H5DEBUG_MSG_NAME_RE.search(b) for b in _h5debug_messages(filename, addr))
+    return "yes" if any(n and n.group(1) == "mtime_new" for n in names) else "no"
 
 
 _LAYOUTS = {
@@ -894,6 +977,8 @@ class Dumper:
         )
         self.field(path, "linkstore", lambda: link_storage_str(gid))
         self.field(path, "shared", lambda: shared_str(gid, grp.file.filename))
+        self.field(path, "msgflags", lambda: msgflags_str(gid, grp.file.filename))
+        self.field(path, "hdrtimes", lambda: hdrtimes_str(gid, grp.file.filename))
         self.dump_attrs(path, grp)
         if depth >= MAX_DEPTH:
             self.emit("%s#truncated" % path, "depth")
@@ -927,6 +1012,14 @@ class Dumper:
                 self.emit("%s#kind" % child, "committed-datatype")
                 self.field(child, "dtype", lambda o=obj: canon_dtype(o.id))
                 self.field(child, "strpad", lambda o=obj: strpad_str(o.id))
+                self.field(
+                    child, "msgflags",
+                    lambda o=obj: msgflags_str(o.id, o.file.filename),
+                )
+                self.field(
+                    child, "hdrtimes",
+                    lambda o=obj: hdrtimes_str(o.id, o.file.filename),
+                )
                 self.dump_attrs(child, obj)
             else:
                 self.emit("%s#kind" % child, "unknown")
@@ -986,6 +1079,8 @@ class Dumper:
         self.field(path, "filltime", lambda: self.fill_time(dcpl))
         self.field(path, "alloctime", lambda: self.alloc_time(dcpl))
         self.field(path, "shared", lambda: shared_str(dsid, dset.file.filename))
+        self.field(path, "msgflags", lambda: msgflags_str(dsid, dset.file.filename))
+        self.field(path, "hdrtimes", lambda: hdrtimes_str(dsid, dset.file.filename))
         self.dump_attrs(path, dset)
         self.field(path, "data", lambda: dataset_payload(dset))
 

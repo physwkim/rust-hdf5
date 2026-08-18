@@ -32,8 +32,11 @@ use rust_hdf5::format::messages::filter::{
 };
 use rust_hdf5::format::messages::shared::MessageStorage;
 use rust_hdf5::format::messages::{
-    MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE, MSG_FILL_VALUE, MSG_FILL_VALUE_OLD,
-    MSG_FILTER_PIPELINE,
+    MSG_ATTRIBUTE, MSG_ATTR_INFO, MSG_BTREE_K, MSG_DATASPACE, MSG_DATATYPE, MSG_DATA_LAYOUT,
+    MSG_DRIVER_INFO, MSG_EXTERNAL_FILE_LIST, MSG_FILE_SPACE_INFO, MSG_FILL_VALUE,
+    MSG_FILL_VALUE_OLD, MSG_FILTER_PIPELINE, MSG_GROUP_INFO, MSG_LINK, MSG_LINK_INFO, MSG_MOD_TIME,
+    MSG_MOD_TIME_OLD, MSG_NULL, MSG_OBJ_HEADER_CONTINUATION, MSG_OBJ_REF_COUNT,
+    MSG_SHARED_MESSAGE_TABLE, MSG_SYMBOL_TABLE,
 };
 use rust_hdf5::format::sohm::SharedLocation;
 use rust_hdf5::types::VarLenUnicode;
@@ -45,7 +48,7 @@ use rust_hdf5::{
 };
 use rust_hdf5::{FileSpaceInfoMessage, FileSpaceStrategy};
 
-const CANON_VERSION: &str = "8";
+const CANON_VERSION: &str = "9";
 const RAW_LIMIT: usize = 1024;
 const MAX_DEPTH: usize = 32;
 
@@ -790,14 +793,89 @@ fn crt_order_str(order: CreationOrder) -> &'static str {
 /// `H5O_SHARE_IS_SHARABLE` (H5SM.c:895-899).
 fn message_class_name(msg_type: u8) -> String {
     match msg_type {
+        MSG_NULL => "null".into(),
         MSG_DATASPACE => "dataspace".into(),
+        MSG_LINK_INFO => "linfo".into(),
         MSG_DATATYPE => "datatype".into(),
         MSG_FILL_VALUE_OLD => "fill".into(),
         MSG_FILL_VALUE => "fill_new".into(),
+        MSG_LINK => "link".into(),
+        MSG_EXTERNAL_FILE_LIST => "external_file_list".into(),
+        MSG_DATA_LAYOUT => "layout".into(),
+        MSG_GROUP_INFO => "ginfo".into(),
         MSG_FILTER_PIPELINE => "filter_pipeline".into(),
         MSG_ATTRIBUTE => "attribute".into(),
+        MSG_MOD_TIME_OLD => "mtime".into(),
+        MSG_SHARED_MESSAGE_TABLE => "shared_message_table".into(),
+        MSG_OBJ_HEADER_CONTINUATION => "hdr_continuation".into(),
+        MSG_SYMBOL_TABLE => "stab".into(),
+        MSG_MOD_TIME => "mtime_new".into(),
+        MSG_BTREE_K => "btreek".into(),
+        MSG_DRIVER_INFO => "driver_info".into(),
+        MSG_ATTR_INFO => "ainfo".into(),
+        MSG_OBJ_REF_COUNT => "refcount".into(),
+        MSG_FILE_SPACE_INFO => "fsinfo".into(),
         other => format!("msg0x{other:02x}"),
     }
+}
+
+/// The twin of `canon.py`'s `msgflags_str`: the flags byte every message in
+/// the object header at `path` carries, as sorted `class:flags` pairs.
+///
+/// Sorted for the reason `shared_str`'s pairs are: where a writer puts a
+/// message is its own business, while the flags are what a reader acts on.
+/// Null and continuation messages are left out on both sides — the crate
+/// drops them in `object_message_flags`, `canon.py` in `msgflags_str` — as
+/// the chunk allocation CANON.md already declares unmeasured.
+fn msgflags_str(file: &H5File, path: &str) -> std::result::Result<String, String> {
+    let mut parts: Vec<String> = file
+        .object_message_flags(path)
+        .map_err(oneline)?
+        .into_iter()
+        .map(|(msg_type, flags)| {
+            format!(
+                "{}:{}",
+                message_class_name(msg_type),
+                message_flags_name(flags)
+            )
+        })
+        .collect();
+    parts.sort();
+    Ok(format!("[{}]", parts.join(",")))
+}
+
+/// The tokens `H5O_debug_real` prints for a message's flags byte, in its
+/// order (H5Odbg.c:410-442), joined with `+`; `none` for a byte with no bit
+/// set, which is what upstream renders as `<none>`.
+fn message_flags_name(flags: u8) -> String {
+    const TOKENS: [(u8, &str); 8] = [
+        (0x01, "C"),
+        (0x02, "S"),
+        (0x04, "DS"),
+        (0x08, "FIUW"),
+        (0x10, "MIU"),
+        (0x20, "WU"),
+        (0x40, "SA"),
+        (0x80, "FIUA"),
+    ];
+    let set: Vec<&str> = TOKENS
+        .iter()
+        .filter(|(bit, _)| flags & bit != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    if set.is_empty() {
+        "none".to_string()
+    } else {
+        set.join("+")
+    }
+}
+
+/// The twin of `canon.py`'s `hdrtimes_str`: whether the object header at
+/// `path` records the times it can hold.
+fn hdrtimes_str(file: &H5File, path: &str) -> std::result::Result<String, String> {
+    file.object_records_times(path)
+        .map(|yes| if yes { "yes" } else { "no" }.to_string())
+        .map_err(oneline)
 }
 
 /// The twin of `canon.py`'s `shared_str`: what the object header at `path`
@@ -870,6 +948,8 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
             .map_err(oneline)
     });
     d.field(path, "shared", || shared_str(file, path));
+    d.field(path, "msgflags", || msgflags_str(file, path));
+    d.field(path, "hdrtimes", || hdrtimes_str(file, path));
     dump_group_attrs(d, path, group);
 
     if depth >= MAX_DEPTH {
@@ -1010,7 +1090,7 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
                 }
             }
             Child::NamedDatatype => match guarded(|| group.named_datatype(&name)) {
-                Ok(Ok(t)) => dump_named_datatype(d, &cpath, &t),
+                Ok(Ok(t)) => dump_named_datatype(d, file, &cpath, &t),
                 Ok(Err(e)) => d.emit(&format!("{cpath}#kind"), unsupported("kind", &oneline(e))),
                 Err(p) => d.emit(
                     &format!("{cpath}#kind"),
@@ -1207,6 +1287,8 @@ fn dump_dataset(d: &mut Dump, file: &H5File, path: &str, ds: &H5Dataset) {
     });
 
     d.field(path, "shared", || shared_str(file, path));
+    d.field(path, "msgflags", || msgflags_str(file, path));
+    d.field(path, "hdrtimes", || hdrtimes_str(file, path));
     dump_object_attrs(d, path, ds);
 
     d.field(path, "data", || dataset_payload(ds, dtype.as_ref()));
@@ -1311,7 +1393,7 @@ impl AttrSource for H5NamedDatatype {
 }
 
 /// A committed (named) datatype: the type it commits, then its attributes.
-fn dump_named_datatype(d: &mut Dump, path: &str, t: &H5NamedDatatype) {
+fn dump_named_datatype(d: &mut Dump, file: &H5File, path: &str, t: &H5NamedDatatype) {
     d.emit(&format!("{path}#kind"), "committed-datatype");
 
     let dtype = guarded(|| t.datatype()).ok().and_then(|r| r.ok());
@@ -1320,6 +1402,8 @@ fn dump_named_datatype(d: &mut Dump, path: &str, t: &H5NamedDatatype) {
         None => Err("H5NamedDatatype::datatype() failed or is unavailable".into()),
     });
     d.field(path, "strpad", || strpad_field(dtype.as_ref()));
+    d.field(path, "msgflags", || msgflags_str(file, path));
+    d.field(path, "hdrtimes", || hdrtimes_str(file, path));
 
     dump_object_attrs(d, path, t);
 }
@@ -1691,6 +1775,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 (1u8, 0u8)
             };
             let file = earliest_file(path)?;
+            lowlevel_creation(&file)?;
             raw_typed(
                 &file,
                 "data",
@@ -1707,6 +1792,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         }
         "str_fixed_utf8" => {
             let file = earliest_file(path)?;
+            lowlevel_creation(&file)?;
             raw_typed(
                 &file,
                 "data",
@@ -1861,6 +1947,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             };
             let bytes: Vec<u8> = (0..12u64).flat_map(|i| (i as f64).to_le_bytes()).collect();
             let file = earliest_file(path)?;
+            lowlevel_creation(&file)?;
             raw_typed(&file, "data", dt, &[2], &bytes)?;
             file.close()?;
             Ok(Ok(()))
@@ -1941,6 +2028,10 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 .shape([8usize])
                 .create("data")?
                 .write_raw(&ramp_n::<i32>(8))?;
+            // Only `shared` is a `lowlevel_dataset` on the reference side —
+            // `h5d.create` from the committed TypeID. `t` and `data` above
+            // come through h5py's own API.
+            lowlevel_creation(&file)?;
             file.new_dataset::<i32>()
                 .committed_type("t")
                 .shape([8usize])
@@ -1951,6 +2042,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         }
         "opaque" => {
             let file = earliest_file(path)?;
+            lowlevel_creation(&file)?;
             let bytes: Vec<u8> = (0u8..12).collect();
             raw_typed(
                 &file,
@@ -1967,6 +2059,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         }
         "bitfield" => {
             let file = earliest_file(path)?;
+            lowlevel_creation(&file)?;
             raw_typed(
                 &file,
                 "data",
@@ -2022,6 +2115,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         "layout_contiguous" => simple_ramp::<i32>(path, ramp_n::<i32>(16)),
         "layout_compact" => {
             let file = earliest_file(path)?;
+            lowlevel_creation(&file)?;
             let ds = file
                 .new_dataset::<i32>()
                 .shape([16usize])
@@ -2074,6 +2168,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             src.close()?;
 
             let file = earliest_file(path)?;
+            lowlevel_creation(&file)?;
             file.new_dataset::<i32>()
                 .shape([16usize])
                 .virtual_mapping(Selection::All, &src_name, "src", Selection::All)
@@ -2135,6 +2230,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 }),
             };
             let file = earliest_file(path)?;
+            lowlevel_creation(&file)?;
             file.new_dataset::<i32>()
                 .shape([1usize, 2])
                 .max_shape(&[None, Some(2)])
@@ -2171,6 +2267,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 }),
             };
             let file = earliest_file(path)?;
+            lowlevel_creation(&file)?;
             file.new_dataset::<i32>()
                 .shape([1usize, 4])
                 .max_shape(&[None, Some(4)])
@@ -2211,6 +2308,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 }),
             };
             let file = earliest_file(path)?;
+            lowlevel_creation(&file)?;
             file.new_dataset::<i32>()
                 .shape([1usize, 4])
                 .max_shape(&[None, Some(4)])
@@ -2234,6 +2332,10 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 .shape([2usize, 4])
                 .create("src")?
                 .write_raw(&ramp_n::<i32>(8))?;
+            // After `src`: the source is a plain `create_dataset` on the
+            // reference side and only the virtual dataset below is built the
+            // low-level way.
+            lowlevel_creation(&file)?;
             file.new_dataset::<i32>()
                 .shape([4usize, 4])
                 .fill_value(-9i32)
@@ -2275,6 +2377,8 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 .chunk(&[1, 2])
                 .create("src")?
                 .write_raw(&ramp_n::<i32>(6))?;
+            // After `src`, for the reason `vds_split` gives.
+            lowlevel_creation(&file)?;
             file.new_dataset::<i32>()
                 .shape([1usize, 2])
                 .max_shape(&[None, Some(2)])
@@ -2307,6 +2411,7 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             // libhdf5 picks the implicit index under, which is the index of
             // no structure at all.
             let file = H5File::create(path)?;
+            lowlevel_creation(&file)?;
             let ds = file
                 .new_dataset::<i32>()
                 .shape([16usize])
@@ -2942,8 +3047,12 @@ fn sohm_file(path: &str, max_list: u16, min_btree: u16) -> rust_hdf5::Result<Wri
     // `gen_sohm.c` passes `H5P_DEFAULT` for the fapl, so the file is written
     // at `H5F_LIBVER_EARLIEST` — symbol-table groups and version-1 messages
     // under the version-2 superblock the shared-message table forces.
-    let file = H5File::options()
+    // `gen_sohm.c` builds the reference, so every object in this file — the
+    // root group included — takes libhdf5's own defaults rather than h5py's,
+    // and `track_times` is the one that differs between them.
+    let file = H5FileOptions::new()
         .libver(LibverBound::Earliest)
+        .track_times(true)
         .shared_messages(&[(types, 0)], max_list, min_btree)
         .create(path)?;
 
@@ -2995,7 +3104,12 @@ fn ochk_root_file(path: &str) -> rust_hdf5::Result<WriteResult> {
     /// takes it to 256.
     const TEXT: usize = 256;
 
-    let file = H5File::options().libver(LibverBound::V18).create(path)?;
+    // `gen_ochk.c` again: libhdf5's defaults throughout, `track_times` among
+    // them.
+    let file = H5FileOptions::new()
+        .libver(LibverBound::V18)
+        .track_times(true)
+        .create(path)?;
     file.new_dataset::<i32>()
         .shape([8usize])
         .create("data")?
@@ -3047,6 +3161,19 @@ where
 /// newer bound.
 fn earliest_file(path: impl AsRef<std::path::Path>) -> rust_hdf5::Result<H5File> {
     H5File::options().libver(LibverBound::Earliest).create(path)
+}
+
+/// Make every object created after this one a `lowlevel_dataset`'s equal:
+/// `h5d.create` with a bare creation property list, which is how the reference
+/// generator writes the cases h5py's own API cannot express.
+///
+/// The one thing that reaches the file is `H5Pset_obj_track_times`, left on by
+/// a bare property list (`H5O_CRT_OHDR_FLAGS_DEF` is `H5O_HDR_STORE_TIMES`,
+/// H5Opkg.h:74) and turned off by every high-level h5py call
+/// (`_hl/dataset.py:39`, `_hl/group.py:42`, `_hl/files.py:189`) — so a case
+/// built this way records times where its neighbours do not.
+fn lowlevel_creation(file: &H5File) -> rust_hdf5::Result<()> {
+    file.set_track_times(true)
 }
 
 fn simple_ramp<T: rust_hdf5::H5Type>(path: &str, data: Vec<T>) -> rust_hdf5::Result<WriteResult> {

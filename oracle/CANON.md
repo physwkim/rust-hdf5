@@ -1,4 +1,4 @@
-# The canonical dump format (`!canon 8`)
+# The canonical dump format (`!canon 9`)
 
 Both sides of the oracle — `oracle/canon.py` (h5py / libhdf5 1.14.6) and
 `src/bin/oracle_probe.rs` (rust-hdf5 public API) — emit this format, so the
@@ -8,7 +8,7 @@ two dumps of the same file are comparable as text and, more usefully, as a
 ## Grammar
 
     line   := header | record
-    header := "!canon" TAB "8"
+    header := "!canon" TAB "9"
     record := key TAB value
     key    := path [ "@" attrname ] "#" field
     value  := <no TAB, no LF>
@@ -73,13 +73,15 @@ decodes.
 `committed-datatype`, `unknown`.
 
 Group fields: `kind`, `linkorder`, `attrorder`, `linkstore`, `shared`,
-`nattrs`, then attributes.
+`msgflags`, `hdrtimes`, `nattrs`, then attributes.
 
 Dataset fields, in order: `kind`, `dtype`, `strpad`, `shape`, `maxshape`,
 `layout`, `chunk`, `chunkindex`, `external`, `virtual`, `filters`,
-`fillvalue`, `filltime`, `alloctime`, `shared`, `nattrs`, attributes, `data`.
+`fillvalue`, `filltime`, `alloctime`, `shared`, `msgflags`, `hdrtimes`,
+`nattrs`, attributes, `data`.
 
-Committed datatype fields: `kind`, `dtype`, `strpad`, `nattrs`, attributes.
+Committed datatype fields: `kind`, `dtype`, `strpad`, `msgflags`,
+`hdrtimes`, `nattrs`, attributes.
 
 Link fields: `kind`, `target`, and for an external link `resolved`.
 
@@ -103,6 +105,8 @@ Link fields: `kind`, `target`, and for an external link `resolved`.
 | `attrorder`  | as `linkorder`, for attributes                                            |
 | `strpad`     | `-`, or `.=null;.member=spacepad` for each vlen string in the type tree   |
 | `shared`     | `[]`, or `[dataspace:shareable,attribute:sohm,...]` — `class:storage`      |
+| `msgflags`   | `[datatype:C,layout:none,...]` — `class:flags` for every message           |
+| `hdrtimes`   | `yes` \| `no` — whether the header records the times it can hold           |
 | `data`       | see below                                                                 |
 | `target`     | soft: the link path; external: `<file>::<path>`                           |
 | `resolved`   | external only: `dataset <shape> <data>` \| `group` \| `committed-datatype` \| `dangling` |
@@ -166,6 +170,31 @@ afterwards forces a second chunk and a continuation. A null message has no
 decode, encode, size or copy method at all (H5Onull.c:28-49) — it is free
 space wearing a message header — so a field over the present mask would be
 comparing padding.
+
+`msgflags` is the flags byte of *every* message in the header — the same
+sorted `class:flags` shape as `shared`, with the tokens `H5O__debug_real`
+prints (`C`, `S`, `DS`, `FIUW`, `MIU`, `WU`, `SA`, `FIUA`, H5Odbg.c:410-442)
+joined by `+`, or `none` for a byte with no bit set. The byte is not
+decoration: `H5O_MSG_FLAG_CONSTANT` is what stops `H5O_msg_write` from
+modifying a message in place (H5Omessage.c:340), `H5O_MSG_FLAG_SHAREABLE` is
+what `H5SM_try_share` looks for, and the two `FAIL_IF_UNKNOWN` bits decide
+whether an unknown message fails the open outright (H5Ocache.c:1373-1374).
+Null and continuation messages are left out for the reason given just above,
+which is also why this is a sibling of `shared` and not an extra column in
+it: `shared` reports only the messages a shared-message index touches, and
+`msgflags` has to report the ones it does not.
+
+`hdrtimes` is whether the object header records the times it can hold —
+`H5Pget_obj_track_times` read back off the disk. Where they live is the
+header version's business, so each side reads whichever place the version
+keeps them: a version-2 header holds four of them in its prefix behind
+`H5O_HDR_STORE_TIMES`, which `h5debug` prints as `Timestamps`
+(H5Odbg.c:304); a version-1 header holds one `mtime_new` message or nothing
+at all, because `H5O_touch_oh` creates that message only for a caller that
+forces it (H5Oint.c:1273-1310) and `H5D__update_oh_info` is the only caller
+that does (H5Dint.c:1022-1026) — so a version-1 group or committed datatype
+is `no` however it was created. The rust side answers the same question
+through `H5File::object_records_times`.
 
 ## `data`
 

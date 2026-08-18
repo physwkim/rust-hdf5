@@ -3240,27 +3240,59 @@ impl Hdf5Reader {
     /// bodies and clears the flag on the way through, which is exactly the
     /// evidence wanted here.
     pub fn object_message_storage(&mut self, path: &str) -> IoResult<Vec<(u8, MessageStorage)>> {
+        let addr = self.object_header_address(path)?;
+        crate::io::object_header_io::read_header_message_storage(&mut self.handle, &self.meta, addr)
+    }
+
+    /// The flags byte of every message the object header of `path` holds, as
+    /// `(message type, flags)` in header order, null and continuation
+    /// messages left out.
+    ///
+    /// The byte `h5debug` renders as `<C>`, `<DS>`, `<S>` and the rest
+    /// (`H5O__debug_real`, H5Odbg.c:409-455). It says which messages the
+    /// library may cache as never-changing and which it refuses to share, and
+    /// nothing else in the file records either.
+    pub fn object_message_flags(&mut self, path: &str) -> IoResult<Vec<(u8, u8)>> {
+        let addr = self.object_header_address(path)?;
+        crate::io::object_header_io::read_header_message_flags(&mut self.handle, &self.meta, addr)
+    }
+
+    /// Whether the object at `path` records its times —
+    /// `H5Pget_obj_track_times` on the property list it was created with, read
+    /// back from the header that answers it; see
+    /// [`ObjectHeader::recorded_times`](crate::format::object_header::ObjectHeader::recorded_times).
+    pub fn object_records_times(&mut self, path: &str) -> IoResult<bool> {
+        let addr = self.object_header_address(path)?;
+        Ok(crate::io::object_header_io::read_header_recorded_times(
+            &mut self.handle,
+            &self.meta,
+            addr,
+        )?
+        .is_some())
+    }
+
+    /// The object header address `path` names.
+    ///
+    /// By name first, then by address: `object_paths` keeps one path per
+    /// object header, so a hard link — two names, one header — is only ever
+    /// found under whichever name the walk reached first.
+    fn object_header_address(&mut self, path: &str) -> IoResult<u64> {
         if self.external_edge(path).is_some() {
             return Err(crate::io::IoError::NotFound(format!(
                 "{path} is in another file; its header is not this file's to read"
             )));
         }
-        // By name first, then by address: `object_paths` keeps one path per
-        // object header, so a hard link — two names, one header — is only
-        // ever found under whichever name the walk reached first.
-        let addr = match self.dataset_info(path) {
-            Some(info) => info.object_header_address,
+        match self.dataset_info(path) {
+            Some(info) => Ok(info.object_header_address),
             None => {
                 let want = absolute_path(&self.canonical_path(path));
-                *self
-                    .object_paths
+                self.object_paths
                     .iter()
                     .find(|(_, p)| **p == want)
-                    .map(|(addr, _)| addr)
-                    .ok_or_else(|| crate::io::IoError::NotFound(path.to_string()))?
+                    .map(|(addr, _)| *addr)
+                    .ok_or_else(|| crate::io::IoError::NotFound(path.to_string()))
             }
-        };
-        crate::io::object_header_io::read_header_message_storage(&mut self.handle, &self.meta, addr)
+        }
     }
 
     /// Read a reference dataset's elements, resolved to the objects they name.

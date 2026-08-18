@@ -27,7 +27,7 @@ use crate::format::messages::datatype::DatatypeMessage;
 use crate::format::messages::shared::{MessageStorage, MSG_FLAG_SHARED};
 use crate::format::messages::MSG_FLAG_SHAREABLE;
 use crate::format::messages::{
-    MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE, MSG_LINK, MSG_LINK_INFO,
+    MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE, MSG_LINK, MSG_LINK_INFO, MSG_NULL,
     MSG_OBJ_HEADER_CONTINUATION, MSG_SYMBOL_TABLE,
 };
 use crate::format::object_header::{ObjectHeader, ObjectHeaderMessage};
@@ -125,6 +125,47 @@ pub(crate) fn read_header_message_storage(
     Ok(out)
 }
 
+/// The flags byte of every message the object header at `addr` holds, as
+/// `(message type, flags)` in header order.
+///
+/// Read from the raw chain for the same reason
+/// [`read_header_message_storage`] is: the flags are the observable, and
+/// [`resolve_shared_messages`] clears the shared bit as it substitutes bodies.
+///
+/// Null and continuation messages are left out. A null message has no decode,
+/// encode, size or copy method at all (H5Onull.c:28-49) — it is free space
+/// wearing a message header — and where a chunk ends is the writer's
+/// allocation strategy, so both say what the header was sized at rather than
+/// what it holds.
+pub(crate) fn read_header_message_flags(
+    handle: &mut FileHandle,
+    meta: &FileMeta,
+    addr: u64,
+) -> IoResult<Vec<(u8, u8)>> {
+    let (header, _) = read_header_chain(handle, meta, addr)?;
+    Ok(header
+        .messages
+        .iter()
+        .filter(|m| !matches!(m.msg_type, MSG_NULL | MSG_OBJ_HEADER_CONTINUATION))
+        .map(|m| (m.msg_type, m.flags))
+        .collect())
+}
+
+/// The times the object header at `addr` records, wherever its version keeps
+/// them — see [`ObjectHeader::recorded_times`].
+///
+/// Read from the raw chain like its two neighbours above: a version-1 header
+/// keeps its time in a message, and the resolving read path is one more thing
+/// between the bytes and the answer than this question needs.
+pub(crate) fn read_header_recorded_times(
+    handle: &mut FileHandle,
+    meta: &FileMeta,
+    addr: u64,
+) -> IoResult<Option<crate::format::object_header::ObjectTimes>> {
+    let (header, _) = read_header_chain(handle, meta, addr)?;
+    Ok(header.recorded_times())
+}
+
 /// One message of a superblock extension, kept as it was read.
 ///
 /// Uninterpreted on purpose: what a rewrite must reproduce is the message, not
@@ -155,9 +196,6 @@ pub(crate) fn superblock_extension_messages(
 ) -> IoResult<(Vec<ExtensionMessage>, HeaderBlocks)> {
     use crate::format::messages::MSG_SHARED_MESSAGE_TABLE;
 
-    /// `H5O_MSG_NULL`: free space inside a chunk, not content.
-    const MSG_NIL: u8 = 0x00;
-
     let (header, blocks) = read_header_chain(handle, meta, addr)?;
     let carried = header
         .messages
@@ -165,7 +203,7 @@ pub(crate) fn superblock_extension_messages(
         .filter(|m| {
             !matches!(
                 m.msg_type,
-                MSG_NIL | MSG_OBJ_HEADER_CONTINUATION | MSG_SHARED_MESSAGE_TABLE
+                MSG_NULL | MSG_OBJ_HEADER_CONTINUATION | MSG_SHARED_MESSAGE_TABLE
             )
         })
         .map(|m| ExtensionMessage {

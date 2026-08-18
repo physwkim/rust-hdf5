@@ -272,6 +272,29 @@ impl H5File {
         }
     }
 
+    /// Record the times of every object created after this call —
+    /// `H5Pset_obj_track_times` on the creation property lists those objects
+    /// are made with, h5py's `track_times=` argument to `create_dataset` and
+    /// `create_group`.
+    ///
+    /// Off by default; see [`H5FileOptions::track_times`] for why that is
+    /// h5py's answer and not libhdf5's. Like creation-order tracking it
+    /// belongs to the object, so objects made before this call keep the policy
+    /// they were made under, and the root group takes its own from
+    /// [`H5FileOptions::track_times`].
+    ///
+    /// Errors in read mode.
+    pub fn set_track_times(&self, track: bool) -> Result<()> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                writer.set_track_times(track);
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
+        }
+    }
+
     /// Return a handle to the root group.
     ///
     /// The root group can be used to create datasets and sub-groups.
@@ -647,6 +670,43 @@ impl H5File {
             H5FileInner::Reader(reader) => Ok(reader.object_message_storage(path)?),
             _ => Err(Hdf5Error::InvalidState(
                 "object_message_storage is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// The flags byte of every message the object header at `path` holds, as
+    /// `(message type, flags)` in header order, null and continuation
+    /// messages left out.
+    ///
+    /// What `h5debug` prints as `<C>`, `<DS>`, `<S>` and the rest
+    /// (`H5O__debug_real`, H5Odbg.c:409-455): which messages the library may
+    /// cache as never-changing, which it refuses to move to the shared-message
+    /// heap, and which are already there. Read mode only.
+    pub fn object_message_flags(&self, path: &str) -> Result<Vec<(u8, u8)>> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => Ok(reader.object_message_flags(path)?),
+            _ => Err(Hdf5Error::InvalidState(
+                "object_message_flags is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Whether the object at `path` records its times —
+    /// `H5Pget_obj_track_times` on the creation property list it was made
+    /// with, read back from the header that answers it.
+    ///
+    /// A version-2 header says so with `H5O_HDR_STORE_TIMES` and the four
+    /// times behind it; a version-1 dataset says so by carrying an
+    /// `H5O_MTIME_NEW` message. A version-1 group or committed datatype says
+    /// nothing either way — it has nowhere to record a time — so this is
+    /// `false` for one however it was created. Read mode only.
+    pub fn object_records_times(&self, path: &str) -> Result<bool> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => Ok(reader.object_records_times(path)?),
+            _ => Err(Hdf5Error::InvalidState(
+                "object_records_times is only available in read mode".into(),
             )),
         }
     }
@@ -1175,6 +1235,7 @@ impl H5File {
 pub struct H5FileOptions {
     locking: Option<FileLocking>,
     track_order: bool,
+    track_times: bool,
     libver: Option<LibverBound>,
     userblock: u64,
     shared_messages: SharedMessageConfig,
@@ -1216,6 +1277,30 @@ impl H5FileOptions {
     /// later objects with [`H5File::set_track_order`].
     pub fn track_order(mut self, track: bool) -> Self {
         self.track_order = track;
+        self
+    }
+
+    /// Create the file's root group recording its times, and make that the
+    /// policy for objects created in it — `H5Pset_obj_track_times`, h5py's
+    /// `File(path, "w", track_times=True)`.
+    ///
+    /// An object recording times keeps the ones its header version can hold:
+    /// four in a version-2 header's prefix, one modification time in a
+    /// version-1 dataset's `H5O_MTIME_NEW` message, and none at all in a
+    /// version-1 group or committed datatype, which have nowhere to put one.
+    ///
+    /// Off unless this says otherwise — h5py's default, not libhdf5's. h5py's
+    /// high-level API passes `track_times=False` for every object it makes
+    /// (`_hl/files.py:189`, `_hl/dataset.py:39`, `_hl/group.py:42`), while a
+    /// bare creation property list leaves it on (`H5O_CRT_OHDR_FLAGS_DEF` is
+    /// `H5O_HDR_STORE_TIMES`, H5Opkg.h:74), which is what `h5py.h5d.create`
+    /// and libhdf5's own C API get.
+    ///
+    /// Only [`create`](Self::create) reads this; the root group of an existing
+    /// file was made under whatever created it. Change it for later objects
+    /// with [`H5File::set_track_times`].
+    pub fn track_times(mut self, track: bool) -> Self {
+        self.track_times = track;
         self
     }
 
@@ -1433,8 +1518,9 @@ impl H5FileOptions {
 
     /// Refuse an `open`/`open_rw` call that set an option only [`create`]
     /// reads — the fcpl/fapl split each of those setters' docs already
-    /// describe: `track_order`, `libver`, `userblock` and `shared_messages`
-    /// all bake into a file at creation, so an existing file's root group,
+    /// describe: `track_order`, `track_times`, `libver`, `userblock` and
+    /// `shared_messages` all bake into a file at creation, so an existing
+    /// file's root group,
     /// superblock and shared-message table are already fixed by whatever
     /// created it. Silently ignoring the option, the previous behavior,
     /// hides a builder call that has no effect at all; one gate here checks
@@ -1451,6 +1537,9 @@ impl H5FileOptions {
         let mut offending = Vec::new();
         if self.track_order {
             offending.push("track_order");
+        }
+        if self.track_times {
+            offending.push("track_times");
         }
         if self.libver.is_some() {
             offending.push("libver");
@@ -1485,6 +1574,7 @@ impl H5FileOptions {
             crate::io::writer::FileCreateOptions {
                 locking: self.resolved_locking(),
                 track_order: self.track_order,
+                track_times: self.track_times,
                 libver: self.libver,
                 userblock: self.userblock,
                 shared_messages: self.shared_messages,
