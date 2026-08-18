@@ -84,6 +84,17 @@
   under `threadsafe`, where concurrent writers would take turns flushing
   each other's bytes.
 
+- A reader now decodes a chunked dataset's index once and keeps it,
+  dropped the moment the dataset's catalog entry changes or a SWMR
+  refresh replaces the catalog, so repeated slice reads stop re-walking
+  the B-tree per call: the 1000-slice `perf/run.py` workload fell from
+  5228 syscalls to 1233 and from 1.79x of libhdf5 1.14.6 to 0.91x.
+  A typed hyperslab or point read lands in the vector it returns
+  instead of staging a byte image, the fill pass covers only what the
+  chunk plan proves it must, and a batch below two live chunks or
+  256 KiB stays off the rayon pool — entering it per batch was what
+  held the `parallel` build's slice read at 108 ms; it reads 8.7 ms now.
+
 ### Fixed
 
 - Declaring a fill value on a dataset stored through an external file
