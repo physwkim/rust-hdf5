@@ -9691,7 +9691,14 @@ impl Hdf5Writer {
             DataspaceMessage::scalar()
         } else {
             let mut ds = DataspaceMessage::simple(dims);
-            ds.max_dims = max_dims.map(<[u64]>::to_vec);
+            // A caller that named no maximum gets the current dimensions, the
+            // maximum `simple` already filled in: `H5Screate_simple(rank,
+            // dims, NULL)` reaches the encoder with `extent.max` set
+            // (H5S.c:1293-1299), so leaving it absent here would write a
+            // message no upstream API call can produce.
+            if let Some(max) = max_dims {
+                ds.max_dims = Some(max.to_vec());
+            }
             ds
         };
 

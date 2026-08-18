@@ -168,12 +168,12 @@ enum Role {
     /// The decoded datatype, printed. Both writers encode these identically
     /// here, so the whole value is compared.
     Datatype(String),
-    /// Dataspace class and current dimensions. The maximum dimensions are
-    /// left out on purpose: `H5Screate_simple` sets them from `dims` and
-    /// libhdf5 stores them, while this crate writes a version-2 dataspace
-    /// without them. That is a difference in how a dataspace is encoded, not
-    /// in what the index holds.
-    Dataspace(String, Vec<u64>),
+    /// Dataspace class, current dimensions and maximum dimensions. The
+    /// maximum is part of the comparison because both writers store one:
+    /// `H5S_set_extent_simple` fills `extent.max` in from `dims` when the
+    /// caller named no maximum (H5S.c:1293-1299), and the crate's
+    /// constructors do the same.
+    Dataspace(String, Vec<u64>, Option<Vec<u64>>),
     /// An attribute body: its name, its flags byte, and — in field order —
     /// the role and reference count of each record its own datatype and
     /// dataspace fields name.
@@ -276,7 +276,7 @@ fn role(
     }
     let (ds, n) = DataspaceMessage::decode(body, ctx).expect("a heap body is one of the three");
     assert_eq!(n, body.len());
-    Role::Dataspace(format!("{:?}", ds.class), ds.dims)
+    Role::Dataspace(format!("{:?}", ds.class), ds.dims, ds.max_dims)
 }
 
 /// `body` as an attribute, or `None` when it is not one: the header must
@@ -330,7 +330,11 @@ fn attribute_role(
         fields: vec![
             (Role::Datatype(format!("{datatype:?}")), dt_refs),
             (
-                Role::Dataspace(format!("{:?}", dataspace.class), dataspace.dims),
+                Role::Dataspace(
+                    format!("{:?}", dataspace.class),
+                    dataspace.dims,
+                    dataspace.max_dims,
+                ),
                 ds_refs,
             ),
         ],
@@ -401,7 +405,7 @@ fn a_shared_attribute_points_at_its_own_datatype_and_dataspace() {
     );
     assert_eq!(
         fields[1],
-        (Role::Dataspace("Simple".into(), vec![3]), 1),
+        (Role::Dataspace("Simple".into(), vec![3], Some(vec![3])), 1),
         "and so is its dataspace"
     );
 
