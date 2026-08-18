@@ -617,11 +617,17 @@ impl FilterPipeline {
 /// Returns the compressed data. If no filters are configured, returns the
 /// input unchanged.
 pub fn apply_filters(pipeline: &FilterPipeline, data: &[u8]) -> FormatResult<Vec<u8>> {
-    let mut buf = data.to_vec();
+    let mut buf: Option<Vec<u8>> = None;
     for filter in &pipeline.filters {
-        buf = apply_single_filter(filter, &buf, true)?;
+        buf = Some(apply_single_filter(
+            filter,
+            buf.as_deref().unwrap_or(data),
+            true,
+        )?);
     }
-    Ok(buf)
+    // Only an empty pipeline leaves `buf` unset, and only then is a copy of
+    // the input the answer; every stage already produces a fresh buffer.
+    Ok(buf.unwrap_or_else(|| data.to_vec()))
 }
 
 /// Reverse the filter pipeline, skipping any filter whose bit is set in
@@ -639,14 +645,20 @@ pub fn reverse_filters_masked(
     data: &[u8],
     filter_mask: u32,
 ) -> FormatResult<Vec<u8>> {
-    let mut buf = data.to_vec();
+    let mut buf: Option<Vec<u8>> = None;
     for (i, filter) in pipeline.filters.iter().enumerate().rev() {
         if i < 32 && filter_mask & (1u32 << i) != 0 {
             continue;
         }
-        buf = apply_single_filter(filter, &buf, false)?;
+        buf = Some(apply_single_filter(
+            filter,
+            buf.as_deref().unwrap_or(data),
+            false,
+        )?);
     }
-    Ok(buf)
+    // Reached only when every filter was masked off (or the pipeline is
+    // empty): the stored bytes are already the chunk's data.
+    Ok(buf.unwrap_or_else(|| data.to_vec()))
 }
 
 /// Reverse filter pipeline to decompress raw chunk data (the full pipeline,
