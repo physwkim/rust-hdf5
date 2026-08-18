@@ -37,8 +37,9 @@ use rust_hdf5::{
     Hyperslab, HyperslabBlock, LibverBound, LinkClass, LinkStorage, Reference, Selection,
     StorageLayout, VirtualMapping,
 };
+use rust_hdf5::{FileSpaceInfoMessage, FileSpaceStrategy};
 
-const CANON_VERSION: &str = "5";
+const CANON_VERSION: &str = "6";
 const RAW_LIMIT: usize = 1024;
 const MAX_DEPTH: usize = 32;
 
@@ -694,9 +695,44 @@ fn dump_file(path: &str) -> std::result::Result<String, String> {
     // canon can be compared against rather than an API gap.
     d.field("", "userblock", || Ok(file.userblock_size().to_string()));
 
+    // The twin of `canon.py`'s `fspace_str`. The h5py side reads the file
+    // creation property list, which libhdf5 fills from this same message and
+    // leaves at the library defaults when the file has none.
+    d.field("", "fspace", || {
+        Ok(fspace_str(
+            file.superblock_extension().file_space_info.as_ref(),
+        ))
+    });
+
+    // The twin of `canon.py`'s `freespace_str`, which parses `h5stat -S`.
+    d.field("", "freespace", || {
+        file.tracked_free_space()
+            .map(|bytes| if bytes > 0 { "tracked" } else { "none" }.to_string())
+            .map_err(oneline)
+    });
+
     let root = file.root_group();
     dump_group(&mut d, &file, "/", &root, 0);
     Ok(d.lines.join("\n") + "\n")
+}
+
+/// The twin of `canon.py`'s `fspace_str`: `<strategy>/<persist>/<threshold>`.
+///
+/// A file with no file-space info message reports the library defaults
+/// (`H5F_FILE_SPACE_STRATEGY_DEF`, no persist, threshold 1) — the same values
+/// the h5py side reads off an untouched creation property list.
+fn fspace_str(info: Option<&FileSpaceInfoMessage>) -> String {
+    let Some(info) = info else {
+        return "fsmaggr/false/1".to_string();
+    };
+    let strategy = match info.strategy {
+        FileSpaceStrategy::FsmAggr => "fsmaggr".to_string(),
+        FileSpaceStrategy::Page => "page".to_string(),
+        FileSpaceStrategy::Aggr => "aggr".to_string(),
+        FileSpaceStrategy::None => "none".to_string(),
+        FileSpaceStrategy::Unknown(v) => format!("unknown({v})"),
+    };
+    format!("{strategy}/{}/{}", info.persist, info.threshold)
 }
 
 /// The twin of `canon.py`'s `crt_order_str`: `-`, `tracked`, or
@@ -2570,6 +2606,30 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         "libver_v108" => libver_case(path, LibverBound::V18),
         "libver_v110" => libver_case(path, LibverBound::V110),
         "libver_latest" => libver_case(path, LibverBound::V200),
+        "fsm_persist" => {
+            let file = H5File::options()
+                .libver(LibverBound::Earliest)
+                .file_space(FileSpaceStrategy::FsmAggr, true, 1)
+                .create(path)?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("data")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.new_dataset::<i32>()
+                .shape([256usize])
+                .create("bulk")?
+                .write_raw(&(0..256).collect::<Vec<i32>>())?;
+            file.root_group().create_group("g")?;
+            file.close()?;
+            let file = H5File::open_rw(path)?;
+            file.delete_dataset("bulk")?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("appended")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "reopen_append_earliest" => reopen_append_case(path, LibverBound::Earliest),
         "reopen_append_v108" => reopen_append_case(path, LibverBound::V18),
         "reopen_append_latest" => reopen_append_case(path, LibverBound::V200),

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Canonical h5py-side dump of an HDF5 file — the reference half of the oracle.
 
-Emits the `!canon 2` format described in oracle/CANON.md. The rust-hdf5 side
+Emits the `!canon 6` format described in oracle/CANON.md. The rust-hdf5 side
 (`src/bin/oracle_probe.rs`, `dump` subcommand) emits the same format from the
 same file, so the two are comparable line by line and field by field.
 
@@ -25,7 +25,7 @@ import hdf5env  # noqa: F401  (must precede h5py; see the module docstring)
 import h5py
 from h5py import h5d, h5o, h5p, h5s, h5t
 
-CANON_VERSION = "5"
+CANON_VERSION = "6"
 RAW_LIMIT = 1024
 MAX_DEPTH = 32
 
@@ -513,13 +513,18 @@ _H5DEBUG_FLAGS_RE = re.compile(r"Flags:\s*0x([0-9a-fA-F]+)")
 _H5DEBUG_CD_RE = re.compile(r"CD value \d+\s+(-?\d+)")
 
 
-def _h5debug_bin():
-    """Locate `h5debug` the way `run.py` locates `h5dump`/`h5diff`: alongside
-    this interpreter unless `RUST_HDF5_ORACLE_BINDIR` overrides it."""
+def _tool_bin(name):
+    """Locate an HDF5 command-line tool the way `run.py` locates
+    `h5dump`/`h5diff`: alongside this interpreter unless
+    `RUST_HDF5_ORACLE_BINDIR` overrides it."""
     bindir = os.environ.get(
         "RUST_HDF5_ORACLE_BINDIR", str(pathlib.Path(sys.executable).parent)
     )
-    return str(pathlib.Path(bindir) / "h5debug")
+    return str(pathlib.Path(bindir) / name)
+
+
+def _h5debug_bin():
+    return _tool_bin("h5debug")
 
 
 def filters_str(dset):
@@ -663,6 +668,8 @@ class Dumper:
         self.emit("!canon", CANON_VERSION)
         self.emit("#superblock", self.superblock)
         self.emit("#userblock", self.userblock)
+        self.field("", "fspace", lambda: fspace_str(self.path))
+        self.field("", "freespace", lambda: freespace_str(self.path))
         with h5py.File(self.path, "r") as f:
             _REF_FILE = f
             try:
@@ -867,6 +874,57 @@ def read_superblock(path):
             return data[offset + 8], offset
         offset = 512 if offset == 0 else offset * 2
     return "ERROR(superblock): no signature at any user-block offset", 0
+
+
+# H5F_fspace_strategy_t (H5Fpublic.h) as the canon names it.
+_FS_STRATEGY_NAMES = {0: "fsmaggr", 1: "page", 2: "aggr", 3: "none"}
+
+
+def fspace_str(path):
+    """The `fspace` field: `<strategy>/<persist>/<threshold>`.
+
+    Read from the file creation property list, which `H5F__super_read` fills
+    from the on-disk file-space info message when the file carries one and
+    leaves at the library defaults (`H5F_FILE_SPACE_STRATEGY_DEF` = FSM_AGGR,
+    no persist, threshold 1) when it does not. That is the same question the
+    rust side answers from the message itself, so a file without the message
+    reports the defaults on both sides.
+    """
+    with h5py.File(path, "r") as f:
+        strategy, persist, threshold = f.id.get_create_plist().get_file_space_strategy()
+    return "%s/%s/%d" % (
+        _FS_STRATEGY_NAMES.get(strategy, "unknown(%d)" % strategy),
+        "true" if persist else "false",
+        threshold,
+    )
+
+
+_H5STAT_FREE_RE = re.compile(r"tracked free space:\s*(\d+)\s*bytes")
+
+
+def freespace_str(path):
+    """The `freespace` field: `tracked` or `none`.
+
+    Whether the file's on-disk free-space managers record any space at all,
+    read from `h5stat -S`'s "Amount/Percent of tracked free space" line —
+    `H5Fget_freespace` has no h5py binding.
+
+    A *count* would not be comparable: the two writers lay a file out
+    differently, so the same sequence of creates and appends frees different
+    numbers of bytes. Whether any manager holds anything is the property the
+    two must agree on, and it is the one that separates a file whose freed
+    space is recorded from a file that leaked it.
+    """
+    proc = subprocess.run(
+        [_tool_bin("h5stat"), "-S", path],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    match = _H5STAT_FREE_RE.search(proc.stdout)
+    if match is None:
+        raise ValueError("h5stat -S printed no tracked-free-space line")
+    return "tracked" if int(match.group(1)) > 0 else "none"
 
 
 def dump(path):

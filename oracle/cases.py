@@ -1106,9 +1106,32 @@ def gen_large_multi_mb(path):
         f.create_dataset("big", data=data, chunks=(64, 512))
 
 
+def gen_fsm_persist(path):
+    """A persisting free-space-manager file, reopened and appended to.
+
+    `fs_persist` is what makes the free-space managers on-disk structures
+    rather than in-memory bookkeeping: the close writes an H5FS header and
+    section-info block per allocation type and names them in the file-space
+    info message. Nothing is freed by the create alone, so the reopen and
+    append are the half that matters — superseding the superblock extension
+    and the root group's object header is what puts sections in a manager,
+    and `#freespace` is `tracked` only if they were written back.
+    """
+    with h5py.File(path, "w", fs_strategy="fsm", fs_persist=True, fs_threshold=1) as f:
+        f.create_dataset("data", data=ramp("<i4"))
+        f.create_dataset("bulk", data=ramp("<i4", 256))
+        f.create_group("g")
+    with h5py.File(path, "a") as f:
+        del f["bulk"]
+        f.create_dataset("appended", data=ramp("<i4"))
+
+
 MISC_CASES = [
     Case("swmr_created", "swmr", gen_swmr_created, "swmr_created",
          "file created through the SWMR writer path and appended frame by frame"),
+    Case("fsm_persist", "freespace", gen_fsm_persist, "fsm_persist",
+         "persisting FSM_AGGR file reopened and appended — the freed blocks "
+         "must come back as free-space manager sections"),
     Case("large_multi_mb", "bulk", gen_large_multi_mb, "large_multi_mb",
          "2 MiB chunked f64 dataset — payload compared by SHA-256"),
 ]

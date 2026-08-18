@@ -76,16 +76,26 @@ pub(crate) fn read_object_header_full(
     read_object_header_at(handle, meta, addr, 0)
 }
 
-/// The size of the chunk-0 block the object header at `addr` occupies — what
-/// a rewrite of that header supersedes and frees.
-pub(crate) fn object_header_block_size(handle: &mut FileHandle, addr: u64) -> IoResult<usize> {
-    let mut buf = handle.read_at_most(addr, HEADER_PROBE)?;
-    if let Err(FormatError::BufferTooShort { needed, .. }) = ObjectHeader::decode_any(&buf) {
-        if needed > buf.len() {
-            buf = handle.read_at_most(addr, needed)?;
-        }
-    }
-    Ok(ObjectHeader::decode_any(&buf)?.1)
+/// The blocks one object header occupies, as `(address, length)` in read
+/// order: chunk zero first, then each continuation the chain names. A rewrite
+/// supersedes all of them, so freeing only the first leaves the rest
+/// allocated with nothing naming them.
+pub(crate) type HeaderBlocks = Vec<(u64, u64)>;
+
+/// [`read_object_header_full`], plus every block the header occupies.
+///
+/// A rewrite re-encodes the whole chain into one fresh chunk, so what it
+/// supersedes is not chunk 0 but all of them: a caller that frees only the
+/// first leaves each continuation block behind as space no free-space manager
+/// records and no object claims.
+pub(crate) fn read_object_header_with_blocks(
+    handle: &mut FileHandle,
+    meta: &FileMeta,
+    addr: u64,
+) -> IoResult<(ObjectHeader, HeaderBlocks)> {
+    let (mut header, blocks) = read_header_chain(handle, meta, addr)?;
+    resolve_shared_messages(handle, meta, &mut header, addr, 0)?;
+    Ok((header, blocks))
 }
 
 /// One message of a superblock extension, kept as it was read.
@@ -93,6 +103,7 @@ pub(crate) fn object_header_block_size(handle: &mut FileHandle, addr: u64) -> Io
 /// Uninterpreted on purpose: what a rewrite must reproduce is the message, not
 /// this crate's understanding of it, so a type it has no decoder for survives
 /// exactly as one it does.
+#[derive(Clone)]
 pub(crate) struct ExtensionMessage {
     pub msg_type: u8,
     pub flags: u8,
@@ -100,7 +111,7 @@ pub(crate) struct ExtensionMessage {
 }
 
 /// Every message of the superblock extension at `addr` that a rewrite must
-/// carry, and the size of the block it occupies.
+/// carry, and every block the extension's header chain occupies.
 ///
 /// Read from the raw chain rather than from the decoded
 /// [`SuperblockExtension`](crate::io::reader::SuperblockExtension): that view
@@ -114,13 +125,13 @@ pub(crate) fn superblock_extension_messages(
     handle: &mut FileHandle,
     meta: &FileMeta,
     addr: u64,
-) -> IoResult<(Vec<ExtensionMessage>, usize)> {
+) -> IoResult<(Vec<ExtensionMessage>, HeaderBlocks)> {
     use crate::format::messages::MSG_SHARED_MESSAGE_TABLE;
 
     /// `H5O_MSG_NULL`: free space inside a chunk, not content.
     const MSG_NIL: u8 = 0x00;
 
-    let header = read_header_chain(handle, meta, addr)?;
+    let (header, blocks) = read_header_chain(handle, meta, addr)?;
     let carried = header
         .messages
         .iter()
@@ -136,7 +147,7 @@ pub(crate) fn superblock_extension_messages(
             body: m.data.clone(),
         })
         .collect();
-    Ok((carried, object_header_block_size(handle, addr)?))
+    Ok((carried, blocks))
 }
 
 /// [`read_object_header_full`], with the committed-message indirection depth
@@ -147,18 +158,20 @@ fn read_object_header_at(
     addr: u64,
     depth: usize,
 ) -> IoResult<ObjectHeader> {
-    let mut header = read_header_chain(handle, meta, addr)?;
+    let (mut header, _) = read_header_chain(handle, meta, addr)?;
     resolve_shared_messages(handle, meta, &mut header, addr, depth)?;
     Ok(header)
 }
 
 /// Chunk 0 and every continuation block it leads to, flattened into one
-/// message list and nothing else done to them.
+/// message list and nothing else done to them, with the `(address, length)` of
+/// every block that list was read out of — chunk 0 first, then the
+/// continuations in the order they were followed.
 fn read_header_chain(
     handle: &mut FileHandle,
     meta: &FileMeta,
     addr: u64,
-) -> IoResult<ObjectHeader> {
+) -> IoResult<(ObjectHeader, HeaderBlocks)> {
     let ctx = &meta.ctx;
     let mut buf = handle.read_at_most(addr, HEADER_PROBE)?;
     if let Err(FormatError::BufferTooShort { needed, .. }) = ObjectHeader::decode_any(&buf) {
@@ -166,7 +179,8 @@ fn read_header_chain(
             buf = handle.read_at_most(addr, needed)?;
         }
     }
-    let (mut header, _) = ObjectHeader::decode_any(&buf)?;
+    let (mut header, chunk0_len) = ObjectHeader::decode_any(&buf)?;
+    let mut blocks = vec![(addr, chunk0_len as u64)];
 
     // A v1 header has no "OHDR" signature; detect by it.
     let is_v2 = buf.len() >= 4 && buf[0..4] == crate::format::object_header::OHDR_SIGNATURE;
@@ -177,7 +191,7 @@ fn read_header_chain(
     let ss = ctx.sizeof_size as usize;
 
     // Collect continuation references from a slice of messages.
-    let collect = |msgs: &[ObjectHeaderMessage], out: &mut Vec<(u64, u64)>| {
+    let collect = |msgs: &[ObjectHeaderMessage], out: &mut HeaderBlocks| {
         for msg in msgs {
             if msg.msg_type == MSG_OBJ_HEADER_CONTINUATION && msg.data.len() >= sa + ss {
                 let cont_addr = read_uint(&msg.data, sa);
@@ -187,7 +201,7 @@ fn read_header_chain(
         }
     };
 
-    let mut pending: Vec<(u64, u64)> = Vec::new();
+    let mut pending: HeaderBlocks = Vec::new();
     collect(&header.messages, &mut pending);
 
     let mut visited = std::collections::HashSet::new();
@@ -209,13 +223,14 @@ fn read_header_chain(
         // chunk's checksum covers exactly that image: a short read would check
         // a different buffer than the writer hashed.
         let cont_buf = handle.read_at(cont_addr, cont_len as usize)?;
+        blocks.push((cont_addr, cont_len));
         let mut new_msgs = Vec::new();
         parse_continuation_block(&cont_buf, is_v2, track_creation_order, &mut new_msgs)?;
         collect(&new_msgs, &mut pending);
         header.messages.extend(new_msgs);
     }
 
-    Ok(header)
+    Ok((header, blocks))
 }
 
 /// Why the object at `addr` cannot keep its bytes across a rewrite of the
@@ -243,7 +258,7 @@ pub(crate) fn blocks_shared_message_rebuild(
     meta: &FileMeta,
     addr: u64,
 ) -> IoResult<Option<&'static str>> {
-    let header = read_header_chain(handle, meta, addr)?;
+    let (header, _) = read_header_chain(handle, meta, addr)?;
     let in_heap = |bytes: &[u8]| {
         SharedMessagePointer::decode(bytes, &meta.ctx)
             .is_ok_and(|p| p.location == SharedLocation::Sohm)
@@ -285,7 +300,7 @@ pub(crate) fn committed_datatype_address(
     meta: &FileMeta,
     addr: u64,
 ) -> IoResult<Option<u64>> {
-    let header = read_header_chain(handle, meta, addr)?;
+    let (header, _) = read_header_chain(handle, meta, addr)?;
     for msg in &header.messages {
         if msg.msg_type != MSG_DATATYPE || msg.flags & MSG_FLAG_SHARED == 0 {
             continue;

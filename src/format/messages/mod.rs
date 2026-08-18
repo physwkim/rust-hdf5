@@ -48,3 +48,7 @@ pub const MSG_FLAG_SHARED: u8 = 0x02;
 /// `H5O_MSG_FLAG_DONTSHARE`: the message must never be moved to the shared
 /// message heap.
 pub const MSG_FLAG_DONTSHARE: u8 = 0x04;
+/// `H5O_MSG_FLAG_MARK_IF_UNKNOWN`: a writer that does not understand this
+/// message must mark it as one it may have invalidated, so a later reader
+/// knows the object was edited by a library that could not maintain it.
+pub const MSG_FLAG_MARK_IF_UNKNOWN: u8 = 0x10;

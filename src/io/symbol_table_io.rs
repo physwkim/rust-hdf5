@@ -19,6 +19,7 @@
 //! needs, where incremental insertion would have to split to get there.
 
 use crate::format::btree_v1::BTreeV1Node;
+use crate::format::free_space::FreeSpaceClass;
 use crate::format::local_heap::{
     local_heap_get_string, local_heap_header_size, LocalHeapHeader, LocalHeapImage,
     LOCAL_HEAP_FREE_NULL,
@@ -374,10 +375,14 @@ pub(crate) fn write_stab(
 }
 
 /// Return the blocks one superseded symbol table occupied to the allocator.
+///
+/// Metadata throughout: the version-1 B-tree is `H5FD_MEM_BTREE` and the name
+/// heap `H5FD_MEM_LHEAP` (H5B.c, H5HL.c:123), both of which
+/// `H5FD_FLMAP_DICHOTOMY` sends to `H5FD_MEM_SUPER`.
 pub(crate) fn free_stab(allocator: &FileAllocator, extents: &StabExtents) {
     for &(addr, len) in &extents.blocks {
         if addr != 0 && addr != UNDEF_ADDR && len > 0 {
-            allocator.free(addr, len);
+            allocator.free(addr, len, FreeSpaceClass::Metadata);
         }
     }
 }
