@@ -749,10 +749,31 @@ def oneline(exc):
 
 
 class Dumper:
-    def __init__(self, path):
+    def __init__(self, path, access=None):
         self.path = path
+        self.access = access
         self.out = []
         self.superblock, self.userblock = read_superblock(path)
+
+    def dapl(self):
+        """The `H5P_DATASET_ACCESS` list this dump opens datasets with.
+
+        `None` when the case names no access properties, which is `H5Dopen2`
+        with `H5P_DEFAULT`. The two properties it can carry are read only by
+        a virtual dataset (`H5D__virtual_init`, H5Dvirtual.c:2178-2188), so
+        applying the list to every dataset changes nothing else.
+        """
+        if not self.access:
+            return None
+        plist = h5p.create(h5p.DATASET_ACCESS)
+        if "view" in self.access:
+            plist.set_virtual_view(
+                {"first_missing": h5d.VDS_FIRST_MISSING,
+                 "last_available": h5d.VDS_LAST_AVAILABLE}[self.access["view"]]
+            )
+        if "printf_gap" in self.access:
+            plist.set_virtual_printf_gap(self.access["printf_gap"])
+        return plist
 
     def emit(self, key, value):
         self.out.append("%s\t%s" % (key, str(value).replace("\t", " ")))
@@ -819,7 +840,7 @@ class Dumper:
                 self.emit("%s#resolved" % child, resolve_extlink(grp, name))
                 continue
             try:
-                obj = grp[name]
+                obj = self.open_child(grp, name)
             except Exception as exc:
                 self.emit("%s#kind" % child, "ERROR(kind): %s" % oneline(exc))
                 continue
@@ -834,6 +855,22 @@ class Dumper:
                 self.dump_attrs(child, obj)
             else:
                 self.emit("%s#kind" % child, "unknown")
+
+    def open_child(self, grp, name):
+        """Open `name` under `grp` with the case's dataset access list.
+
+        The list is read by the open that first brings the dataset into
+        memory and by no later one: `H5D_open` hands `dapl_id` to
+        `H5D__open_oid` only when the object is not already in the file's
+        open-object list, and otherwise adopts the existing shared struct
+        unexamined (H5Dint.c:1496-1525). Reopening a dataset h5py has
+        already handed out under a second list therefore changes nothing,
+        so the list has to ride on the first open.
+        """
+        dapl = self.dapl()
+        if dapl is None or grp.get(name, getclass=True) is not h5py.Dataset:
+            return grp[name]
+        return h5py.Dataset(h5d.open(grp.id, name.encode("utf-8"), dapl=dapl))
 
     def dump_dataset(self, path, dset):
         self.emit("%s#kind" % path, "dataset")
@@ -1035,16 +1072,26 @@ def freespace_str(path):
     return "tracked" if int(match.group(1)) > 0 else "none"
 
 
-def dump(path):
-    return Dumper(path).run()
+def dump(path, access=None):
+    return Dumper(path, access).run()
 
 
 def main(argv):
-    if len(argv) != 2:
-        sys.stderr.write("usage: canon.py <file.h5>\n")
+    """usage: canon.py [--virtual-view V] [--printf-gap N] <file.h5>"""
+    access, args = {}, []
+    it = iter(argv[1:])
+    for arg in it:
+        if arg == "--virtual-view":
+            access["view"] = next(it)
+        elif arg == "--printf-gap":
+            access["printf_gap"] = int(next(it))
+        else:
+            args.append(arg)
+    if len(args) != 1:
+        sys.stderr.write(main.__doc__.partition(": ")[2] + "\n")
         return 64
     try:
-        sys.stdout.write(dump(argv[1]))
+        sys.stdout.write(dump(args[0], access or None))
     except Exception:
         traceback.print_exc()
         return 1

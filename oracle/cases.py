@@ -53,13 +53,19 @@ def chunked_dcpl(chunk, alloc_time=None, layout=h5d.CHUNKED):
 
 
 class Case:
-    def __init__(self, name, group, gen, rust=None, note="", ext_files=()):
+    def __init__(self, name, group, gen, rust=None, note="", ext_files=(), access=None):
         self.name = name
         self.group = group
         self.gen = gen
         self.rust = rust
         self.note = note
         self.ext_files = ext_files
+        # Dataset-access properties both sides open every dataset under —
+        # `{"view": "first_missing"|"last_available", "printf_gap": int}`.
+        # They are not stored in the file, so they belong to the case, not to
+        # the generator: the same bytes describe differently under different
+        # ones.
+        self.access = access
 
     def __repr__(self):
         return "Case(%s)" % self.name
@@ -578,6 +584,50 @@ def gen_vds_printf_unlim(path):
         f.create_virtual_dataset("vds", layout)
 
 
+def gen_vds_printf_gap(path):
+    """A printf mapping over blocks 0, 1 and 3 — block 2 is not written.
+
+    What the extent is depends entirely on the dataset access properties the
+    open names, and the file records none of them: with the default gap of 0
+    the scan stops at block 2 and the dataset is two rows tall, and the cases
+    reading this same file with a gap look past it to block 3 and see four,
+    the third filled (`H5D__virtual_set_extent_unlim`, H5Dvirtual.c:1519).
+    """
+    stem = path.stem
+    for b in (0, 1, 3):
+        with h5py.File(path.parent / ("%s_b%d.h5" % (stem, b)), "w") as g:
+            g.create_dataset("data", data=ramp("<i4", 4) + 10 * b)
+    layout = h5py.VirtualLayout(shape=(1, 4), dtype="<i4", maxshape=(None, 4))
+    vsrc = h5py.VirtualSource("%s_b%%b.h5" % stem, "data", shape=(4,))
+    layout[: h5s.UNLIMITED, :] = vsrc
+    with h5py.File(path, "w") as f:
+        f.create_virtual_dataset("vds", layout, fillvalue=-7)
+
+
+def gen_vds_view_trail(path):
+    """A mapping unlimited on both sides whose stride is wider than its block.
+
+    `H5S_hyper_get_clip_extent_match` takes `incl_trail` from the view
+    (H5Dvirtual.c:1447-1451), and it only changes the answer when the last
+    mapped block is followed by a gap: three source rows under stride 3,
+    block 2 give a two-row extent under `H5D_VDS_LAST_AVAILABLE` and a
+    three-row one under `H5D_VDS_FIRST_MISSING`.
+    """
+    with h5py.File(path, "w") as f:
+        f.create_dataset(
+            "src", data=ramp("<i4", 6).reshape(3, 2), maxshape=(None, 2),
+            chunks=(1, 2),
+        )
+        vsid = h5s.create_simple((1, 2), (h5s.UNLIMITED, 2))
+        vsid.select_hyperslab((0, 0), (h5s.UNLIMITED, 1), stride=(3, 1), block=(2, 2))
+        ssid = h5s.create_simple((1, 2), (h5s.UNLIMITED, 2))
+        ssid.select_hyperslab((0, 0), (h5s.UNLIMITED, 1), stride=(3, 1), block=(2, 2))
+        dcpl = h5p.create(h5p.DATASET_CREATE)
+        dcpl.set_fill_value(np.array(-9, dtype="<i4"))
+        dcpl.set_virtual(vsid, b".", b"/src", ssid)
+        lowlevel_dataset(f, "vds", h5t.STD_I32LE, vsid, dcpl=dcpl)
+
+
 def gen_chunkidx_btree2(path):
     with h5py.File(path, "w", libver="latest") as f:
         ds = f.create_dataset(
@@ -634,6 +684,24 @@ LAYOUT_CASES = [
          "virtual dataset whose mapping is unlimited on both sides — the "
          "extent comes from the source",
          ext_files=("_src.h5",)),
+    Case("vds_printf_gap", "layout", gen_vds_printf_gap, None,
+         "printf mapping with block 2 missing, read at the default printf "
+         "gap of 0 — the extent stops at the gap"),
+    Case("vds_printf_gap_1", "layout", gen_vds_printf_gap, None,
+         "the same file read with H5Pset_virtual_printf_gap(1) — block 3 is "
+         "reached and block 2 reads as the fill value",
+         access={"printf_gap": 1}),
+    Case("vds_printf_gap_first_missing", "layout", gen_vds_printf_gap, None,
+         "the same file under H5D_VDS_FIRST_MISSING with a gap of 2, which "
+         "H5D__virtual_init forces back to 0 (H5Dvirtual.c:2182-2188)",
+         access={"view": "first_missing", "printf_gap": 2}),
+    Case("vds_view_trail", "layout", gen_vds_view_trail, None,
+         "unlimited mapping whose stride exceeds its block, read at the "
+         "default H5D_VDS_LAST_AVAILABLE view"),
+    Case("vds_view_trail_first_missing", "layout", gen_vds_view_trail, None,
+         "the same file under H5D_VDS_FIRST_MISSING — the extent runs on to "
+         "where the next block would start",
+         access={"view": "first_missing"}),
     Case("vds_printf_unlim", "layout", gen_vds_printf_unlim, "vds_printf_unlim",
          "printf-pattern source name over an unlimited virtual selection — "
          "one source file per block",

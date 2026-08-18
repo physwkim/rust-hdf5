@@ -32,10 +32,10 @@ use rust_hdf5::format::messages::filter::{
 };
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
-    AllocTime, AttributeStorage, ChunkIndex, CreationOrder, ExternalFileSegment, FillTime,
-    FillValue, H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error,
-    Hyperslab, HyperslabBlock, LibverBound, LinkClass, LinkStorage, Reference, Selection,
-    StorageLayout, VirtualMapping,
+    AllocTime, AttributeStorage, ChunkIndex, CreationOrder, DatasetAccess, ExternalFileSegment,
+    FillTime, FillValue, H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype,
+    Hdf5Error, Hyperslab, HyperslabBlock, LibverBound, LinkClass, LinkStorage, Reference,
+    Selection, StorageLayout, VirtualMapping, VirtualView,
 };
 use rust_hdf5::{FileSpaceInfoMessage, FileSpaceStrategy};
 
@@ -623,11 +623,18 @@ fn guarded<T>(f: impl FnOnce() -> T) -> std::result::Result<T, String> {
 
 struct Dump {
     lines: Vec<String>,
+    /// The dataset-access properties every dataset in this walk is opened
+    /// under — the twin of `canon.py`'s `Dumper.dapl`. Defaults to libhdf5's
+    /// own defaults, which is `H5Dopen2` with `H5P_DEFAULT`.
+    access: DatasetAccess,
 }
 
 impl Dump {
-    fn new() -> Self {
-        Self { lines: Vec::new() }
+    fn new(access: DatasetAccess) -> Self {
+        Self {
+            lines: Vec::new(),
+            access,
+        }
     }
 
     fn emit(&mut self, key: &str, value: impl AsRef<str>) {
@@ -672,8 +679,8 @@ fn child_path(parent: &str, name: &str) -> String {
     }
 }
 
-fn dump_file(path: &str) -> std::result::Result<String, String> {
-    let mut d = Dump::new();
+fn dump_file(path: &str, access: DatasetAccess) -> std::result::Result<String, String> {
+    let mut d = Dump::new(access);
     d.emit("!canon", CANON_VERSION);
 
     let file = match guarded(|| H5File::open(path)) {
@@ -925,7 +932,8 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
             },
             Child::Dataset => {
                 let lookup = cpath.trim_start_matches('/').to_string();
-                match guarded(|| file.dataset(&lookup)) {
+                let access = d.access;
+                match guarded(|| file.dataset_with(&lookup, access)) {
                     Ok(Ok(ds)) => dump_dataset(d, &cpath, &ds),
                     Ok(Err(e)) => {
                         d.emit(&format!("{cpath}#kind"), unsupported("kind", &oneline(e)))
@@ -2974,9 +2982,36 @@ fn layout_at_libver(
 // ===========================================================================
 
 fn usage() -> i32 {
-    eprintln!("usage: oracle_probe dump <file.h5>");
+    eprintln!(
+        "usage: oracle_probe dump [--virtual-view first_missing|last_available] \
+         [--printf-gap N] <file.h5>"
+    );
     eprintln!("       oracle_probe write <case> <file.h5>");
     64
+}
+
+/// `dump`'s arguments: the file, plus the dataset-access properties the
+/// canonical dump opens every dataset under — the twin of `canon.py`'s
+/// `--virtual-view` / `--printf-gap`.
+fn parse_dump_args(args: &[String]) -> Option<(String, DatasetAccess)> {
+    let mut path = None;
+    let mut access = DatasetAccess::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--virtual-view" => {
+                access = access.virtual_view(match it.next()?.as_str() {
+                    "first_missing" => VirtualView::FirstMissing,
+                    "last_available" => VirtualView::LastAvailable,
+                    _ => return None,
+                })
+            }
+            "--printf-gap" => access = access.virtual_printf_gap(it.next()?.parse().ok()?),
+            _ if path.is_none() => path = Some(arg.clone()),
+            _ => return None,
+        }
+    }
+    Some((path?, access))
 }
 
 fn main() {
@@ -2986,15 +3021,18 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let code = match args.get(1).map(String::as_str) {
-        Some("dump") if args.len() == 3 => match dump_file(&args[2]) {
-            Ok(text) => {
-                print!("{text}");
-                0
-            }
-            Err(e) => {
-                println!("!open-error\t{e}");
-                1
-            }
+        Some("dump") => match parse_dump_args(&args[2..]) {
+            Some((path, access)) => match dump_file(&path, access) {
+                Ok(text) => {
+                    print!("{text}");
+                    0
+                }
+                Err(e) => {
+                    println!("!open-error\t{e}");
+                    1
+                }
+            },
+            None => usage(),
         },
         Some("write") if args.len() == 4 => {
             let outcome = guarded(|| write_case(&args[2], &args[3]));
