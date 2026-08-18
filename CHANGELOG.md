@@ -17,6 +17,16 @@
 
 ### Changed
 
+- The `deflate` feature now also pulls in `zlib-rs`, which inflates
+  filtered chunks; `flate2`/`miniz_oxide` still compresses them. Neither
+  engine is the better choice for both directions — zlib-rs inflates
+  1.1x to 1.4x faster, while its deflate below level 9 gives up as much
+  as 2.5x of the compression ratio on periodic data. Written files are
+  byte-for-byte what they were. Reading a 64 MiB deflated dataset in
+  2 MiB chunks went from 123 ms to 92 ms against libhdf5 1.14.6's 46 ms,
+  a third of which came from replacing `read_to_end` with an inflate
+  loop over one grown buffer.
+
 - **Breaking.** `DatasetAccess` no longer implements `Copy`. It gained
   the dapl prefix properties `virtual_prefix` and `efile_prefix`
   (`H5Pset_virtual_prefix` / `H5Pset_efile_prefix`), which are owned
