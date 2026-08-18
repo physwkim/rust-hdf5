@@ -20,6 +20,14 @@
  *                  on the committed datatype. A committed datatype is kept by
  *                  its bytes across a reopen, so this is a file where an
  *                  object that keeps its bytes holds a heap pointer.
+ *   sohm_nested.h5 the list form again, with the datasets' datatype a copy of
+ *                  H5T_STD_I32LE rather than the predefined type itself. A
+ *                  predefined type is immutable, and H5O__dtype_can_share
+ *                  refuses to share an immutable or committed type, so the
+ *                  other files' datasets keep their datatype literal. The
+ *                  copy is shareable, which makes this the file whose record
+ *                  census a crate-written twin can be compared against
+ *                  one-for-one (tests/sohm_write.rs).
  *   sohm_group.h5  the list form again, plus a subgroup ("g") whose only
  *                  content is one hard link (named GROUP_LINK_NAME below).
  *                  Neither H5Pset_shared_mesg_* nor H5Pset_libver_bounds is
@@ -57,12 +65,15 @@
  * only way a file gets an extension message the shared-message table does not
  * account for. `named_attr` puts the shared attribute on the committed
  * datatype as well, which is the only way an object no writer can re-encode
- * ends up holding a shared-message pointer. */
+ * ends up holding a shared-message pointer. `copy_dtype` gives the datasets a
+ * copy of H5T_STD_I32LE instead of the predefined type, which is what makes
+ * their datatype shareable at all. */
 static int
-write_file(const char *path, unsigned max_list, unsigned min_btree, int paged, int named_attr)
+write_file(const char *path, unsigned max_list, unsigned min_btree, int paged, int named_attr,
+           int copy_dtype)
 {
     hid_t   fcpl = H5Pcreate(H5P_FILE_CREATE);
-    hid_t   file, space, dset, attr, aspace, atype;
+    hid_t   file, space, dset, attr, aspace, atype, dtype;
     hsize_t dims[1]  = {8};
     hsize_t adims[1] = {3};
     int     data[8];
@@ -91,6 +102,8 @@ write_file(const char *path, unsigned max_list, unsigned min_btree, int paged, i
     CHECK(aspace);
     atype = H5Tcopy(H5T_IEEE_F64LE);
     CHECK(atype);
+    dtype = copy_dtype ? H5Tcopy(H5T_STD_I32LE) : H5T_STD_I32LE;
+    CHECK(dtype);
 
     /* Four datasets with the identical datatype/dataspace: after the first,
      * every later header stores a shared-message pointer instead of the
@@ -99,7 +112,7 @@ write_file(const char *path, unsigned max_list, unsigned min_btree, int paged, i
         for (j = 0; j < 8; j++)
             data[j] = i * 10 + j;
         snprintf(name, sizeof(name), "shared%d", i);
-        dset = H5Dcreate2(file, name, H5T_STD_I32LE, space, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        dset = H5Dcreate2(file, name, dtype, space, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
         CHECK(dset);
         CHECK(H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, data));
 
@@ -134,6 +147,8 @@ write_file(const char *path, unsigned max_list, unsigned min_btree, int paged, i
         CHECK(H5Tclose(named));
     }
 
+    if (copy_dtype)
+        CHECK(H5Tclose(dtype));
     CHECK(H5Tclose(atype));
     CHECK(H5Sclose(aspace));
     CHECK(H5Sclose(space));
@@ -212,22 +227,27 @@ main(int argc, char **argv)
     char        path[512];
 
     snprintf(path, sizeof(path), "%s/sohm_list.h5", dir);
-    if (write_file(path, 50, 40, 0, 0) < 0)
+    if (write_file(path, 50, 40, 0, 0, 0) < 0)
         return 1;
     printf("wrote %s\n", path);
 
     snprintf(path, sizeof(path), "%s/sohm_btree.h5", dir);
-    if (write_file(path, 0, 0, 0, 0) < 0)
+    if (write_file(path, 0, 0, 0, 0, 0) < 0)
         return 1;
     printf("wrote %s\n", path);
 
     snprintf(path, sizeof(path), "%s/sohm_paged.h5", dir);
-    if (write_file(path, 50, 40, 1, 0) < 0)
+    if (write_file(path, 50, 40, 1, 0, 0) < 0)
         return 1;
     printf("wrote %s\n", path);
 
     snprintf(path, sizeof(path), "%s/sohm_named_attr.h5", dir);
-    if (write_file(path, 50, 40, 0, 1) < 0)
+    if (write_file(path, 50, 40, 0, 1, 0) < 0)
+        return 1;
+    printf("wrote %s\n", path);
+
+    snprintf(path, sizeof(path), "%s/sohm_nested.h5", dir);
+    if (write_file(path, 50, 40, 0, 0, 1) < 0)
         return 1;
     printf("wrote %s\n", path);
 
