@@ -51,6 +51,21 @@
 
 ### Performance
 
+- A reader now keeps the decompressed image of a filtered chunk a read
+  did not consume whole, so the next read that wants the rest of that
+  chunk places bytes out of it instead of inflating it again — libhdf5's
+  per-dataset raw chunk cache, at its own 1 MiB / 521-slot defaults, and
+  what makes a region-of-interest or row-at-a-time walk of a compressed
+  dataset cost one inflate per chunk rather than one per read. On the
+  `perf/run.py` deflate-slice workload (1024 sequential 8192-element
+  slices of 64 MiB of f64 in 256 KiB deflated chunks, four slices to a
+  chunk) that is 33.6 ms down to 12.0 ms against libhdf5 1.14.6's
+  28.1 ms. A read that takes every chunk entire — any whole-dataset read
+  — keeps nothing and pays nothing, and an unfiltered chunk still reads
+  only the byte ranges the selection intersects. Read results are
+  unchanged, byte for byte. The images live inside the dataset's decoded
+  chunk index, so whatever drops that index drops them with it.
+
 - A filtered chunk whose bytes land whole and contiguous in a read's
   output — every full chunk of a full read — now decodes straight into
   those output bytes instead of into a buffer of its own that was then
