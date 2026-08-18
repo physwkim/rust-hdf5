@@ -7373,11 +7373,17 @@ impl Hdf5Writer {
     /// message, and only when more than one link reaches the object. A
     /// version-1 header carries it in its prefix and gets no message at all —
     /// `H5O_link_oh` gates every refcount-message operation on
-    /// `oh->version > H5O_VERSION_1` (H5Oint.c:876), so a version-1 header
+    /// `oh->version > H5O_VERSION_1` (H5Oint.c:851), so a version-1 header
     /// holding one is a shape libhdf5 never writes.
+    ///
+    /// The message carries `H5O_MSG_FLAG_DONTSHARE`, which both refcount
+    /// operations pass (H5Oint.c:874 append, H5Oint.c:864 write): the count is
+    /// a property of this one object header, so a shared-message index that
+    /// pointed several headers at one copy would make every object with the
+    /// same link count share a single number.
     fn emit_refcount(&self, header: &mut ObjectHeader, rc: u32, format: ObjectFormat) {
         if rc > 1 && format == ObjectFormat::Modern {
-            header.add_message(MSG_OBJ_REF_COUNT, 0x00, encode_refcount(rc));
+            header.add_message(MSG_OBJ_REF_COUNT, MSG_FLAG_DONTSHARE, encode_refcount(rc));
         }
     }
 
@@ -16334,7 +16340,7 @@ impl Hdf5Writer {
             datatype.encode_at(&self.ctx, self.encoding_libver()),
         );
         if rc > 1 {
-            header.add_message(MSG_OBJ_REF_COUNT, 0x00, encode_refcount(rc));
+            header.add_message(MSG_OBJ_REF_COUNT, MSG_FLAG_DONTSHARE, encode_refcount(rc));
         }
         header
     }
