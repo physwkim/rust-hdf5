@@ -118,6 +118,34 @@ EXPECTED_DEVIATIONS = [
             "deviation at all."
         ),
     },
+    {
+        "id": "shared-v2-superblock-low-bound",
+        "field": "shared",
+        "ref": "[dataspace:sohm,datatype:shareable]",
+        "rust": "[dataspace:shareable,datatype:shareable]",
+        "min_hdf5": (2, 0),
+        "why": (
+            "The same low_bound change as chunkindex-v3-superblock-low-bound, "
+            "seen through the shared-message flags instead of the chunk "
+            "index. gen_sohm.c writes sohm_list.h5 at H5F_LIBVER_EARLIEST, so "
+            "its four datasets carry version-1 dataspaces. 1.14.6 raises the "
+            "low bound to V18 on opening the version-2 superblock the "
+            "shared-message table forces (H5Fsuper.c:460-462), so the dataset "
+            "the append creates gets a version-2 dataspace — a body no "
+            "existing record matches, which H5SM__write_mesg leaves literal "
+            "in the new header under H5O_MSG_FLAG_SHAREABLE "
+            "(H5SM.c:1400-1417). 2.0.0 raises the bound only under "
+            "H5F_ACC_SWMR_WRITE (H5Fsuper.c:448-454), so the appended dataset "
+            "gets a version-1 dataspace equal to the four already indexed, "
+            "the matching record's reference count rises and the body moves "
+            "to the heap. Witnessed on the reference files themselves: "
+            "h5debug reports /appended's dataspace message as 20 bytes <SA> "
+            "under 1.14.6 and 10 bytes <S> under 2.0.0, with /shared0's "
+            "unchanged at 24 bytes <SA> in both. Pinned to 1.14.6 by "
+            "decision, this crate writes what the 1.14.6 reference writes, "
+            "and that run declares no deviation."
+        ),
+    },
 ]
 
 _HDF5_VERSION = None
