@@ -714,6 +714,48 @@ fn unshuffle(data: &[u8], bytesoftype: usize) -> Vec<u8> {
     dest
 }
 
+/// Inflate one zlib stream, growing a single output buffer.
+///
+/// `Read::read_to_end` was the obvious spelling but the wrong one for chunk
+/// data: it grows the buffer up from nothing and re-enters the decoder once
+/// per growth step, which on a 2 MiB chunk that compresses well costs about
+/// as much as the inflate itself.
+///
+/// HDF5 records the uncompressed chunk size nowhere the filter can see, so
+/// the buffer starts at the next power of two above the compressed length and
+/// doubles. Chunk sizes are themselves powers of two often enough that this
+/// usually lands on the exact size in two or three steps; growing by doubling
+/// from the compressed length instead overshoots by up to 2x and costs more
+/// than `read_to_end` did.
+#[cfg(feature = "deflate")]
+fn inflate_zlib(data: &[u8]) -> FormatResult<Vec<u8>> {
+    use flate2::{Decompress, FlushDecompress, Status};
+
+    let err = |what: &str| FormatError::InvalidData(format!("deflate decompress error: {what}"));
+    let mut inflate = Decompress::new(true);
+    let mut out = vec![0u8; data.len().max(4096).next_power_of_two()];
+    loop {
+        let consumed = inflate.total_in() as usize;
+        let filled = inflate.total_out() as usize;
+        if filled == out.len() {
+            out.resize(out.len() * 2, 0);
+        }
+        let status = inflate
+            .decompress(&data[consumed..], &mut out[filled..], FlushDecompress::None)
+            .map_err(|e| err(&e.to_string()))?;
+        if status == Status::StreamEnd {
+            break;
+        }
+        // Neither side moved with output still to spare: the stored bytes end
+        // before the stream does.
+        if inflate.total_in() as usize == consumed && inflate.total_out() as usize == filled {
+            return Err(err("truncated stream"));
+        }
+    }
+    out.truncate(inflate.total_out() as usize);
+    Ok(out)
+}
+
 fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatResult<Vec<u8>> {
     match filter.id {
         #[cfg(feature = "deflate")]
@@ -732,15 +774,7 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
                     .finish()
                     .map_err(|e| FormatError::InvalidData(format!("deflate finish error: {}", e)))
             } else {
-                use flate2::read::ZlibDecoder;
-                use std::io::Read;
-
-                let mut decoder = ZlibDecoder::new(data);
-                let mut out = Vec::new();
-                decoder.read_to_end(&mut out).map_err(|e| {
-                    FormatError::InvalidData(format!("deflate decompress error: {}", e))
-                })?;
-                Ok(out)
+                inflate_zlib(data)
             }
         }
         #[cfg(not(feature = "deflate"))]
@@ -2636,6 +2670,40 @@ mod tests {
             reverse_filters_masked(&pipeline, &compressed, 1u32 << 31).unwrap(),
             original
         );
+    }
+
+    /// Boundaries of the growing inflate buffer in [`inflate_zlib`]: output
+    /// below the first guess, exactly on a power-of-two step, and several
+    /// doublings past it.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn deflate_output_sizes_around_the_buffer_boundary() {
+        let pipeline = FilterPipeline::deflate(6);
+        for len in [0usize, 1, 4095, 4096, 4097, 65_536, 1 << 20] {
+            let original: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let compressed = apply_filters(&pipeline, &original).unwrap();
+            let decompressed = reverse_filters(&pipeline, &compressed).unwrap();
+            assert_eq!(decompressed, original, "length {len}");
+        }
+    }
+
+    /// A chunk read `at_most` can carry bytes past the end of the stream (the
+    /// reader does not always know the exact stored length); inflate stops at
+    /// the stream end and ignores them. A stream cut short is an error.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn deflate_tolerates_trailing_bytes_but_not_a_cut_stream() {
+        let pipeline = FilterPipeline::deflate(6);
+        let original: Vec<u8> = (0..40_000).map(|i| (i % 13) as u8).collect();
+        let compressed = apply_filters(&pipeline, &original).unwrap();
+
+        let mut padded = compressed.clone();
+        padded.extend_from_slice(&[0xAB; 64]);
+        assert_eq!(reverse_filters(&pipeline, &padded).unwrap(), original);
+
+        let cut = &compressed[..compressed.len() / 2];
+        assert!(reverse_filters(&pipeline, cut).is_err());
+        assert!(reverse_filters(&pipeline, &[]).is_err());
     }
 
     #[cfg(feature = "deflate")]
