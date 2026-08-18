@@ -1963,6 +1963,109 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "external_unlimited" => {
+            // The unlimited slot is the only reservation a growable dataset
+            // can have: `H5D__efl_construct` refuses a finite one over an
+            // unlimited dataspace, since no finite total could cover it.
+            use rust_hdf5::format::messages::external_file_list::UNLIMITED;
+            let raw = format!(
+                "{}_ext.raw",
+                std::path::Path::new(path)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            );
+            let file = earliest_file(path)?;
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([16usize])
+                .max_shape(&[None])
+                .external(&[(raw.as_str(), 0, UNLIMITED)])
+                .create("data")?;
+            ds.write_raw(&ramp_n::<i32>(16))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "vds_unlim" => {
+            // Unlimited on both sides: the mapping says "as many rows as the
+            // source has", and the seed extent is the one block it starts on.
+            let src_name = format!(
+                "{}_src.h5",
+                std::path::Path::new(path)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            );
+            let src_path = std::path::Path::new(path).with_file_name(&src_name);
+            let src = earliest_file(src_path.to_string_lossy().as_ref())?;
+            let sds = src
+                .new_dataset::<i32>()
+                .shape([10usize, 2])
+                .max_shape(&[None, Some(2)])
+                .chunk(&[5, 2])
+                .create("src")?;
+            sds.write_raw(&ramp_n::<i32>(20))?;
+            src.close()?;
+
+            let unlim = || Selection::Hyperslab {
+                rank: 2,
+                form: Hyperslab::Regular(rust_hdf5::RegularHyperslab {
+                    start: vec![0, 0],
+                    stride: vec![1, 1],
+                    count: vec![rust_hdf5::format::selection::UNLIMITED, 1],
+                    block: vec![1, 2],
+                }),
+            };
+            let file = earliest_file(path)?;
+            file.new_dataset::<i32>()
+                .shape([1usize, 2])
+                .max_shape(&[None, Some(2)])
+                .virtual_mapping(unlim(), &src_name, "src", unlim())
+                .create("vds")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "vds_printf_unlim" => {
+            // One source file per block, named by the `%b` the mapping carries;
+            // the virtual selection is unlimited in the row dimension, so the
+            // extent is however many blocks are on disk when it is read.
+            let stem = std::path::Path::new(path)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            for b in 0..3u64 {
+                let block = std::path::Path::new(path).with_file_name(format!("{stem}_b{b}.h5"));
+                let src = earliest_file(block.to_string_lossy().as_ref())?;
+                src.new_dataset::<i32>()
+                    .shape([4usize])
+                    .create("data")?
+                    .write_raw(&(0..4i32).map(|i| i + 10 * b as i32).collect::<Vec<_>>())?;
+                src.close()?;
+            }
+            let unlim_rows = Selection::Hyperslab {
+                rank: 2,
+                form: Hyperslab::Regular(rust_hdf5::RegularHyperslab {
+                    start: vec![0, 0],
+                    stride: vec![1, 1],
+                    count: vec![rust_hdf5::format::selection::UNLIMITED, 1],
+                    block: vec![1, 4],
+                }),
+            };
+            let file = earliest_file(path)?;
+            file.new_dataset::<i32>()
+                .shape([1usize, 4])
+                .max_shape(&[None, Some(4)])
+                .virtual_mapping(
+                    unlim_rows,
+                    &format!("{stem}_b%b.h5"),
+                    "data",
+                    Selection::All,
+                )
+                .create("vds")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "layout_contiguous_v108" => layout_at_libver(path, LibverBound::V18, None),
         "layout_contiguous_v110" => layout_at_libver(path, LibverBound::V110, None),
         "layout_chunked_v108" => layout_at_libver(path, LibverBound::V18, Some(&[16])),
