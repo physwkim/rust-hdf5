@@ -4,6 +4,8 @@
 //! [`H5File::new_dataset`](crate::file::H5File::new_dataset). Once created,
 //! the [`H5Dataset`] handle can read or write raw typed data.
 
+use std::borrow::Cow;
+
 use crate::attribute::AttrBuilder;
 use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
@@ -2828,50 +2830,93 @@ impl H5Dataset {
             coords
         };
 
-        if !matches!(
-            kind,
-            ChunkIndexKind::ExtensibleArray | ChunkIndexKind::FixedArray
-        ) {
-            // No batch entry point to use: only the two array indexes have
-            // one. Each chunk goes through the writer's single
-            // coordinate-addressed owner instead, one at a time.
+        // The batch entry points exist for one reason: to run the filter
+        // pipeline over a window of chunks in parallel. An unfiltered dataset
+        // has no pipeline to run, so it takes the plain per-chunk owner
+        // whatever its index is, and only a filtered extensible or fixed array
+        // — the two indexes with a batch entry point — takes the window below.
+        let batched = writer.dataset_is_filtered(index)
+            && matches!(
+                kind,
+                ChunkIndexKind::ExtensibleArray | ChunkIndexKind::FixedArray
+            );
+        if !batched {
+            // One staging buffer for the whole image, reused chunk after
+            // chunk: a chunk that already sits as one complete run of `bytes`
+            // needs no staging at all and goes to the file straight out of the
+            // caller's slice, so only an n-D interleave or a short edge pays
+            // for a gather.
+            let mut staging = Vec::new();
             for linear in 0..total_chunks {
                 let coords = coords_of(linear);
-                let chunk_buf =
-                    Self::gather_chunk(bytes, &dims, &chunk_dims, &coords, element_size);
-                writer.write_chunk_at_coords(index, &coords, &chunk_buf)?;
+                let chunk =
+                    match Self::contiguous_chunk_span(&dims, &chunk_dims, &coords, element_size) {
+                        Some(span) => &bytes[span],
+                        None => {
+                            Self::gather_chunk_into(
+                                &mut staging,
+                                bytes,
+                                &dims,
+                                &chunk_dims,
+                                &coords,
+                                element_size,
+                            );
+                            &staging[..]
+                        }
+                    };
+                writer.write_chunk_at_coords(index, &coords, chunk)?;
             }
         } else {
-            // Extensible array and fixed array both compress each chunk through
-            // the filter pipeline. Gather chunks and write them through the
-            // per-index batch path so the pipeline compresses them in parallel
-            // (with the `parallel` feature). A fixed-size window bounds peak
-            // memory instead of materializing every chunk at once; 256 keeps
-            // every rayon worker fed while capping the transient buffers to
-            // window * chunk bytes. The two indexes differ only in how a chunk
-            // is addressed: EA by its linear grid index, FA by grid coordinates.
+            // Hand the pipeline a window of chunks so it compresses them in
+            // parallel (with the `parallel` feature). A fixed-size window
+            // bounds peak memory instead of materializing every chunk at once;
+            // 256 keeps every rayon worker fed while capping the transient
+            // buffers to window * chunk bytes. The compressors read the window
+            // concurrently, so a gathered chunk here cannot share one reused
+            // buffer the way the sequential path above does — but a chunk that
+            // is already a complete run of `bytes` is borrowed, not copied.
+            // The two indexes differ only in how a chunk is addressed: EA by
+            // its linear grid index, FA by grid coordinates.
             const BATCH_WINDOW: u64 = 256;
             let mut start = 0u64;
             while start < total_chunks {
                 let end = (start + BATCH_WINDOW).min(total_chunks);
-                let items: Vec<(Vec<u64>, Vec<u8>)> = (start..end)
+                let items: Vec<(Vec<u64>, Cow<'_, [u8]>)> = (start..end)
                     .map(|counter| {
                         let coords = coords_of(counter);
-                        let buf =
-                            Self::gather_chunk(bytes, &dims, &chunk_dims, &coords, element_size);
-                        (coords, buf)
+                        let data = match Self::contiguous_chunk_span(
+                            &dims,
+                            &chunk_dims,
+                            &coords,
+                            element_size,
+                        ) {
+                            Some(span) => Cow::Borrowed(&bytes[span]),
+                            None => {
+                                let mut buf = Vec::new();
+                                Self::gather_chunk_into(
+                                    &mut buf,
+                                    bytes,
+                                    &dims,
+                                    &chunk_dims,
+                                    &coords,
+                                    element_size,
+                                );
+                                Cow::Owned(buf)
+                            }
+                        };
+                        (coords, data)
                     })
                     .collect();
                 if kind == ChunkIndexKind::FixedArray {
                     let pairs: Vec<(&[u64], &[u8])> = items
                         .iter()
-                        .map(|(c, d)| (c.as_slice(), d.as_slice()))
+                        .map(|(c, d)| (c.as_slice(), d.as_ref()))
                         .collect();
                     writer.write_chunks_fixed_array_batch_inner(index, &pairs)?;
                 } else {
                     let mut pairs: Vec<(u64, &[u8])> = Vec::with_capacity(items.len());
                     for (c, d) in &items {
-                        pairs.push((writer.chunk_slot(index, c)?, d.as_slice()));
+                        pairs.push((writer.chunk_slot(index, c)?, d.as_ref()));
                     }
                     writer.write_chunks_batch_inner(index, &pairs)?;
                 }
@@ -2881,27 +2926,62 @@ impl H5Dataset {
         Ok(())
     }
 
-    /// Gather one chunk's bytes from a row-major full-dataset image.
+    /// The byte range one chunk occupies in a row-major full-dataset image,
+    /// for a chunk that needs no gather at all: its elements are one
+    /// contiguous run of `source` *and* they fill the chunk shape exactly, so
+    /// the bytes that go to the file are already sitting in the caller's
+    /// buffer.
     ///
-    /// `coords` are the chunk's grid coordinates. The returned buffer is
-    /// exactly `product(chunk_dims) * element_size` bytes, zero-padded where
-    /// the chunk extends past the dataset edge.
-    fn gather_chunk(
+    /// Both halves hold when every dimension after the first spans the whole
+    /// dataset (`chunk_dims[d] == dims[d]`, leaving nothing interleaved and no
+    /// padding along those axes) and the chunk does not hang off the far edge
+    /// of the first — which is every full chunk of a 1-D dataset. `None` means
+    /// the chunk has to be gathered.
+    fn contiguous_chunk_span(
+        dims: &[u64],
+        chunk_dims: &[u64],
+        coords: &[u64],
+        element_size: usize,
+    ) -> Option<std::ops::Range<usize>> {
+        let rank = dims.len();
+        if rank == 0 || chunk_dims[1..] != dims[1..] {
+            return None;
+        }
+        if (coords[0] + 1) * chunk_dims[0] > dims[0] {
+            return None;
+        }
+        let plane: u64 = dims[1..].iter().product::<u64>() * element_size as u64;
+        let start = usize::try_from(coords[0] * chunk_dims[0] * plane).ok()?;
+        let len = usize::try_from(chunk_dims[0] * plane).ok()?;
+        Some(start..start.checked_add(len)?)
+    }
+
+    /// Gather one chunk's bytes from a row-major full-dataset image into
+    /// `out`, replacing whatever it held.
+    ///
+    /// `coords` are the chunk's grid coordinates. `out` is left exactly
+    /// `product(chunk_dims) * element_size` bytes long, holding the chunk's
+    /// elements and zero where the chunk extends past the dataset edge — so a
+    /// caller may hand the same buffer to one chunk after another.
+    fn gather_chunk_into(
+        out: &mut Vec<u8>,
         source: &[u8],
         dims: &[u64],
         chunk_dims: &[u64],
         coords: &[u64],
         element_size: usize,
-    ) -> Vec<u8> {
+    ) {
         let rank = dims.len();
         let chunk_elems: u64 = chunk_dims.iter().product();
-        let mut out = vec![0u8; chunk_elems as usize * element_size];
+        let chunk_bytes = chunk_elems as usize * element_size;
         if rank == 0 {
             // Scalar dataset: a single element, no chunking dimension.
+            out.clear();
+            out.resize(chunk_bytes, 0);
             if source.len() >= element_size {
                 out[..element_size].copy_from_slice(&source[..element_size]);
             }
-            return out;
+            return;
         }
 
         // Actual extent of this chunk along each dimension (edge chunks are
@@ -2912,8 +2992,18 @@ impl H5Dataset {
             let end = ((coords[d] + 1) * chunk_dims[d]).min(dims[d]);
             extent[d] = end.saturating_sub(start);
         }
+        // Size the buffer, then zero it only when this chunk leaves part of
+        // its shape uncovered: a full chunk has every byte overwritten below,
+        // while an edge chunk's padding must read as zero even though a
+        // reused buffer still holds the previous chunk's bytes.
+        if out.len() != chunk_bytes {
+            out.clear();
+            out.resize(chunk_bytes, 0);
+        } else if extent != chunk_dims {
+            out.fill(0);
+        }
         if extent.contains(&0) {
-            return out; // nothing of the dataset falls in this chunk
+            return; // nothing of the dataset falls in this chunk
         }
 
         // Row-major strides (in elements) for the source (over `dims`) and the
@@ -2954,7 +3044,6 @@ impl H5Dataset {
                 idx[d] = 0;
             }
         }
-        out
     }
 
     /// Write a single chunk to a chunked dataset.
@@ -5241,6 +5330,54 @@ mod tests {
     // full row-major image across a multi-chunk grid, including edge chunks
     // (7/3 -> 3,3,1 along dim0; 5/2 -> 2,2,1 along dim1).
     #[cfg(feature = "deflate")]
+    #[test]
+    fn an_edge_chunk_pads_with_zero_not_the_chunk_written_before_it() {
+        // 4x5 over a 2x3 chunk: the second chunk of each row covers only two
+        // of its three columns, so a third of it is padding. The image write
+        // stages every chunk of a shape like this through one reused buffer,
+        // and the padding has to reach the file as zero rather than as
+        // whatever the chunk before it left in that buffer.
+        let path = temp_path("edge_chunk_padding");
+        let data: Vec<i32> = (1..=20).collect(); // no zeros of its own
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([4, 5])
+                .chunk(&[2, 3])
+                .create("grid")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("grid").unwrap();
+            let as_i32 = |bytes: Vec<u8>| -> Vec<i32> {
+                bytes
+                    .chunks_exact(4)
+                    .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+                    .collect()
+            };
+            // The chunk that precedes each edge chunk is full, so a leak would
+            // show as its 3rd and 6th elements (3 and 8, then 13 and 18).
+            assert_eq!(
+                as_i32(ds.read_chunk_raw_at(&[0, 0]).unwrap().0),
+                [1, 2, 3, 6, 7, 8]
+            );
+            assert_eq!(
+                as_i32(ds.read_chunk_raw_at(&[0, 1]).unwrap().0),
+                [4, 5, 0, 9, 10, 0]
+            );
+            assert_eq!(
+                as_i32(ds.read_chunk_raw_at(&[1, 1]).unwrap().0),
+                [14, 15, 0, 19, 20, 0]
+            );
+            assert_eq!(ds.read_raw::<i32>().unwrap(), data);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn write_raw_multichunk_edge_roundtrips() {
         let path = temp_path("multichunk_edge");

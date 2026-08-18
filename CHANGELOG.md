@@ -50,6 +50,17 @@
   and so does an unfiltered one whose selected runs are too small for a
   positioned read each to pay for itself.
 
+- Writing a whole image into a chunked dataset no longer stages every
+  chunk in a buffer of its own. A chunk whose bytes are already one
+  complete run of the image — every full chunk of a 1-D dataset, and any
+  chunk that spans the trailing axes whole — goes to the file straight
+  out of the caller's slice, and the chunks that do need a gather share
+  one buffer. On the `perf/run.py` chunked-write workload (128 MiB of
+  f64 in 2 MiB chunks) that is 112 ms down to 47 ms, against libhdf5
+  1.14.6's 49 ms, with the spread between the median and the minimum
+  gone. The filtered batch writers compress from borrowed bytes for the
+  same reason, halving what a window in flight holds.
+
 ### Fixed
 
 - Declaring a fill value on a dataset stored through an external file
