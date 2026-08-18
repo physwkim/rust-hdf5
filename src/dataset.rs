@@ -4035,6 +4035,11 @@ impl H5Dataset {
     /// attribute reference as [`Reference::Attr`], which adds the attribute's
     /// name.
     ///
+    /// A 1.12 reference written into a file other than its target's carries
+    /// that file's name, and [`Reference::file`] reports it; the path is then
+    /// a path inside that file, resolved by opening it under the name the
+    /// reference carries, and `None` when nothing is there.
+    ///
     /// ```no_run
     /// # use rust_hdf5::H5File;
     /// let file = H5File::open("refs.h5").unwrap();

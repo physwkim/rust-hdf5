@@ -440,9 +440,17 @@ fn renders_as_values(dt: &DatatypeMessage) -> bool {
 /// the target's path, plus the selection's bounding box for a region
 /// reference. An address the reader could not name is printed as the address,
 /// which compares unequal to h5py's path — a difference, not a silent match.
+///
+/// A reference naming another file prints that file ahead of the path, the way
+/// `h5dump` joins the two. No oracle case can reach it: h5py refuses the
+/// `H5T_STD_REF` datatype an external reference is always stored as.
 fn render_ref(r: &Reference) -> String {
-    fn target(path: &Option<String>, address: u64) -> String {
-        path.clone().unwrap_or_else(|| format!("<{address:#x}>"))
+    fn target(file: &Option<String>, path: &Option<String>, address: u64) -> String {
+        let named = path.clone().unwrap_or_else(|| format!("<{address:#x}>"));
+        match file {
+            None => named,
+            Some(file) => format!("{file}{named}"),
+        }
     }
     fn coords(dims: &[u64]) -> String {
         let parts: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
@@ -450,27 +458,33 @@ fn render_ref(r: &Reference) -> String {
     }
     match r {
         Reference::Null => "objref:null".to_string(),
-        Reference::Object { address, path } => format!("objref:{}", target(path, *address)),
+        Reference::Object {
+            address,
+            file,
+            path,
+        } => format!("objref:{}", target(file, path, *address)),
         Reference::Region {
             address,
+            file,
             path,
             selection,
         } => match selection.bounds() {
             Some((lo, hi)) => format!(
                 "regref:{}:{}-{}",
-                target(path, *address),
+                target(file, path, *address),
                 coords(&lo),
                 coords(&hi)
             ),
-            None => format!("regref:{}:unbounded", target(path, *address)),
+            None => format!("regref:{}:unbounded", target(file, path, *address)),
         },
         // No h5py-generated case can reach this arm: h5py 3.x refuses the
         // `H5T_STD_REF` datatype an attribute reference needs.
         Reference::Attr {
             address,
+            file,
             path,
             name,
-        } => format!("attrref:{}:{name}", target(path, *address)),
+        } => format!("attrref:{}:{name}", target(file, path, *address)),
     }
 }
 

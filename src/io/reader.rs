@@ -41,7 +41,7 @@ use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
 use crate::format::reference::{
     decode_object_element, decode_region_element, decode_region_heap_object, decode_revised_body,
-    decode_revised_element, Reference, ReferenceTarget, RevisedElement,
+    decode_revised_element, DecodedReference, Reference, ReferenceTarget, RevisedElement,
 };
 use crate::format::selection::{Hyperslab, PointSelection, RegularHyperslab, Selection};
 use crate::format::sohm::SohmMasterTable;
@@ -2645,6 +2645,19 @@ impl Hdf5Reader {
                 resolved
             }
         };
+        self.cross_file(resolved)
+    }
+
+    /// Open `resolved`, or hand back the handle a previous crossing to the
+    /// same file already opened.
+    ///
+    /// The single owner of every file this reader opens on another file's
+    /// behalf, so a path named by any number of external links and external
+    /// references is opened once and read through one handle. What resolved
+    /// the name to this path is the caller's business, and differs by kind:
+    /// an external link runs `H5F_prefix_open_file`'s search order, a
+    /// reference has no search order at all.
+    fn cross_file(&mut self, resolved: PathBuf) -> IoResult<&mut Hdf5Reader> {
         let locking = self.locking;
         match self.external.entry(resolved) {
             std::collections::btree_map::Entry::Occupied(e) => Ok(&mut **e.into_mut()),
@@ -3133,7 +3146,11 @@ impl Hdf5Reader {
             ReferenceEncoding::Old(OldReferenceKind::Object) => {
                 match decode_object_element(elem, &self.meta.ctx)? {
                     None => Ok(Reference::Null),
-                    Some(address) => Ok(self.resolve_reference(address, ReferenceTarget::Object)),
+                    Some(address) => Ok(self.resolve_reference(DecodedReference {
+                        address,
+                        file: None,
+                        target: ReferenceTarget::Object,
+                    })),
                 }
             }
             ReferenceEncoding::Old(OldReferenceKind::DatasetRegion) => {
@@ -3143,21 +3160,30 @@ impl Hdf5Reader {
                 };
                 let obj = self.heap_object(coll_addr, obj_index, heaps)?;
                 let (address, selection) = decode_region_heap_object(obj, &self.meta.ctx)?;
-                Ok(self.resolve_reference(address, ReferenceTarget::Region(selection)))
+                Ok(self.resolve_reference(DecodedReference {
+                    address,
+                    file: None,
+                    target: ReferenceTarget::Region(selection),
+                }))
             }
             ReferenceEncoding::Revised => {
-                let (kind, body) = match decode_revised_element(elem, &self.meta.ctx)? {
+                let (kind, external, body) = match decode_revised_element(elem, &self.meta.ctx)? {
                     RevisedElement::Null => return Ok(Reference::Null),
-                    RevisedElement::Inline { kind, body } => (kind, body.to_vec()),
+                    RevisedElement::Inline { kind, body } => (kind, false, body.to_vec()),
                     RevisedElement::Heap {
                         kind,
+                        external,
                         collection,
                         index,
-                    } => (kind, self.heap_object(collection, index, heaps)?.to_vec()),
+                    } => (
+                        kind,
+                        external,
+                        self.heap_object(collection, index, heaps)?.to_vec(),
+                    ),
                 };
-                match decode_revised_body(kind, &body, &self.meta.ctx)? {
+                match decode_revised_body(kind, external, &body, &self.meta.ctx)? {
                     None => Ok(Reference::Null),
-                    Some((address, target)) => Ok(self.resolve_reference(address, target)),
+                    Some(decoded) => Ok(self.resolve_reference(decoded)),
                 }
             }
         }
@@ -3165,17 +3191,43 @@ impl Hdf5Reader {
 
     /// Attach the target's path to a decoded reference — the one place an
     /// address becomes a [`Reference`], so every kind resolves the same way.
-    fn resolve_reference(&self, address: u64, target: ReferenceTarget) -> Reference {
-        let path = self.path_for_object(address).map(str::to_string);
+    ///
+    /// A reference naming another file is looked up in that file, which this
+    /// opens by the name the reference carries and nothing else:
+    /// `H5R__reopen_file` hands the name straight to `H5VL_file_open` with no
+    /// prefix search, so it is read against the process working directory the
+    /// way `H5Ropen_object` would read it (H5Rint.c:466, :487). A file that is
+    /// not there leaves the path unresolved while the reference still names
+    /// it, which is `H5Rget_file_name` answering from the reference alone
+    /// while `H5Ropen_object` fails (H5R.c:1036-1039).
+    fn resolve_reference(&mut self, decoded: DecodedReference) -> Reference {
+        let DecodedReference {
+            address,
+            file,
+            target,
+        } = decoded;
+        let path = match &file {
+            None => self.path_for_object(address).map(str::to_string),
+            Some(name) => self
+                .cross_file(PathBuf::from(name))
+                .ok()
+                .and_then(|target| target.path_for_object(address).map(str::to_string)),
+        };
         match target {
-            ReferenceTarget::Object => Reference::Object { address, path },
+            ReferenceTarget::Object => Reference::Object {
+                address,
+                file,
+                path,
+            },
             ReferenceTarget::Region(selection) => Reference::Region {
                 address,
+                file,
                 path,
                 selection,
             },
             ReferenceTarget::Attribute(name) => Reference::Attr {
                 address,
+                file,
                 path,
                 name,
             },
