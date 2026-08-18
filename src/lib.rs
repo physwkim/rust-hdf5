@@ -98,6 +98,9 @@ pub mod dataset;
 pub mod error;
 pub mod file;
 pub mod group;
+/// Zero-copy views of a dataset's stored bytes. Requires the `mmap` feature.
+#[cfg(feature = "mmap")]
+pub mod mapped;
 pub mod named_datatype;
 pub mod swmr;
 pub mod types;
@@ -129,5 +132,7 @@ pub use io::reader::ExternalFileSegment;
 pub use io::reader::LinkClass;
 pub use io::reader::SuperblockExtension;
 pub use io::writer::{MAX_COMPACT_DATA, MIN_USERBLOCK};
+#[cfg(feature = "mmap")]
+pub use mapped::{MappedView, ViewRefusal};
 pub use named_datatype::H5NamedDatatype;
 pub use types::{Complex32, Complex64, CompoundType, H5Type, HBool, VarLenUnicode};

@@ -27,6 +27,10 @@ pub enum Hdf5Error {
     /// listing. `target` is the link value: a path for a soft link,
     /// `file::path` for an external one.
     DanglingLink { link: String, target: String },
+    /// A zero-copy view of a dataset was asked for and the dataset cannot be
+    /// viewed. The reason names why; a copying read still works.
+    #[cfg(feature = "mmap")]
+    NotViewable(crate::mapped::ViewRefusal),
     /// An external link whose target *file* could not be opened, listing the
     /// candidate paths that were tried.
     ExternalFileNotFound {
@@ -90,6 +94,10 @@ impl std::fmt::Display for Hdf5Error {
                 "link '{}' points to '{}', which does not exist",
                 link, target
             ),
+            #[cfg(feature = "mmap")]
+            Self::NotViewable(reason) => {
+                write!(f, "the dataset cannot be viewed in place: {reason}")
+            }
             Self::ExternalFileNotFound {
                 link,
                 file,

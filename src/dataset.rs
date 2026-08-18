@@ -1486,6 +1486,34 @@ fn byte_order_action(datatype: &DatatypeMessage, width: usize) -> ByteOrderActio
     }
 }
 
+/// Why the stored image of an element is not already the host image of a
+/// value of width `width` — `None` when it is, and a copying read would only
+/// be memcpy-ing bytes it does not touch.
+///
+/// The two ways a stored element can need work before it is a value are the
+/// two conversions a copying read performs in place: a byte-order swap
+/// ([`to_host_byte_order`]) and the n-bit/scale-offset unpacking
+/// (`Hdf5Reader::apply_post_filter_conversion`). Asking one question of both
+/// is what lets a zero-copy view refuse exactly the datatypes a copying read
+/// would have had to rewrite.
+#[cfg(feature = "mmap")]
+pub(crate) fn stored_image_mismatch(
+    datatype: &DatatypeMessage,
+    width: usize,
+) -> Option<&'static str> {
+    match byte_order_action(datatype, width) {
+        ByteOrderAction::SwapElements => return Some("they are stored in the foreign byte order"),
+        ByteOrderAction::Refuse => {
+            return Some("it is a composite storing members in the foreign byte order")
+        }
+        ByteOrderAction::Keep => {}
+    }
+    if crate::format::nbit_scaleoffset::datatype_needs_bit_conversion(datatype) {
+        return Some("the significant bits do not fill the stored element");
+    }
+    None
+}
+
 /// Put a raw element image into host byte order, in place, for a typed read.
 ///
 /// Every path that reinterprets the on-disk image as `T` — `read_raw`,
@@ -4399,6 +4427,114 @@ impl H5Dataset {
                 "cannot read from a dataset in write mode".into(),
             )),
         }
+    }
+
+    /// View the entire dataset as `&[T]` pointing straight into the file's
+    /// memory map — no read, no copy, no allocation.
+    ///
+    /// The returned [`MappedView<T>`](crate::MappedView) dereferences to
+    /// `&[T]` holding exactly what [`read_raw`](Self::read_raw) would have
+    /// returned, bit for bit.
+    ///
+    /// # When it works
+    ///
+    /// The file must be open read-only and mapped (which a read-only open
+    /// does whenever the OS allows), the dataset's raw data must be one
+    /// contiguous stretch of that file, and its stored elements must already
+    /// be the host image of a `T` — same width, host byte order, significant
+    /// bits filling the element. That is the ordinary case for an
+    /// uncompressed, non-chunked numeric dataset written by either this crate
+    /// or libhdf5.
+    ///
+    /// # When it refuses
+    ///
+    /// Zero-copy is a contract, not an optimization: when the bytes cannot be
+    /// handed over as they lie, this returns
+    /// [`Hdf5Error::NotViewable`](crate::Hdf5Error::NotViewable) naming the
+    /// reason and never quietly falls back to copying. Every
+    /// [`ViewRefusal`](crate::ViewRefusal) is a case where
+    /// [`read_raw`](Self::read_raw) still works: the file is not mapped, the
+    /// layout is chunked, compact, virtual, or external, no storage is
+    /// allocated (the dataset reads as its fill value), `T` is the wrong
+    /// width, the stored elements need a byte-order swap or bit unpacking,
+    /// the data lands at an offset `T`'s alignment does not permit, or the
+    /// image runs past the end of the map.
+    ///
+    /// # Snapshot semantics
+    ///
+    /// The view owns a share of the map rather than borrowing the file
+    /// handle, so it stays readable after the dataset and the file are
+    /// dropped, and after a SWMR refresh has retaken the map — a live view
+    /// keeps showing the file as it was when *its* map was taken, while the
+    /// refreshed handle reads the new one. Nothing about a view is
+    /// invalidated by anything this process does.
+    ///
+    /// # Truncation
+    ///
+    /// The pages are the file's own. Another process writing the file in
+    /// place is seen through the view, and one *truncating* it under the map
+    /// faults with `SIGBUS` on the pages that went away. That is the standing
+    /// risk of mapping the file at all; a view does not add to it, and no
+    /// guard inside this process can close it.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open("data.h5")?;
+    /// let ds = file.dataset("matrix")?;
+    /// let view = ds.read_mapped::<f64>()?;
+    /// let total: f64 = view.iter().sum();
+    /// # Ok::<(), rust_hdf5::Hdf5Error>(())
+    /// ```
+    #[cfg(feature = "mmap")]
+    pub fn read_mapped<T: H5Type>(&self) -> Result<crate::mapped::MappedView<T>> {
+        self.mapped_view(crate::mapped::ViewRange::Whole)
+    }
+
+    /// View a contiguous sub-range of the dataset as `&[T]` pointing straight
+    /// into the file's memory map.
+    ///
+    /// `starts` and `counts` name the same N-dimensional selection
+    /// [`read_slice`](Self::read_slice) takes, and the view holds exactly what
+    /// that call would have returned — but only when the selection is one
+    /// contiguous run of the stored image: a trailing group of dimensions
+    /// taken whole, the dimension before it taken as one span, and a single
+    /// index along every dimension before that. Anything else steps over
+    /// elements a single slice cannot skip, and is refused with
+    /// [`ViewRefusal::Range`](crate::ViewRefusal::Range) rather than gathered
+    /// into a copy.
+    ///
+    /// Everything [`read_mapped`](Self::read_mapped) documents about when a
+    /// dataset can be viewed, snapshot semantics, and truncation applies here
+    /// unchanged.
+    #[cfg(feature = "mmap")]
+    pub fn read_mapped_slice<T: H5Type>(
+        &self,
+        starts: &[usize],
+        counts: &[usize],
+    ) -> Result<crate::mapped::MappedView<T>> {
+        self.mapped_view(crate::mapped::ViewRange::Slab { starts, counts })
+    }
+
+    /// The one route from a dataset handle to the file's map: ask the reader
+    /// that owns the dataset for the facts, and hand them to
+    /// [`crate::mapped::view`], which is the only thing that can turn them
+    /// into a view.
+    #[cfg(feature = "mmap")]
+    fn mapped_view<T: H5Type>(
+        &self,
+        range: crate::mapped::ViewRange<'_>,
+    ) -> Result<crate::mapped::MappedView<T>> {
+        let DatasetInfo::Reader { name, .. } = &self.info else {
+            return Err(Hdf5Error::InvalidState(
+                "cannot read from a dataset in write mode".into(),
+            ));
+        };
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        let H5FileInner::Reader(reader) = &mut *inner else {
+            return Err(Hdf5Error::InvalidState("file is not in read mode".into()));
+        };
+        let src = reader.dataset_view_source(name)?;
+        crate::mapped::view::<T>(&src, range).map_err(Hdf5Error::NotViewable)
     }
 
     /// Read the raw byte image of a dataset without an `H5Type` carrier.

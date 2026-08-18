@@ -239,6 +239,41 @@ pub struct ExternalFileSegment {
     pub size: u64,
 }
 
+/// Where a dataset's stored image lies, as far as a zero-copy view of it is
+/// concerned.
+///
+/// [`Hdf5Reader::dataset_view_source`] is the only producer; it reports what
+/// the layout message says and judges nothing.
+#[cfg(feature = "mmap")]
+pub(crate) enum ViewStorage {
+    /// One stretch of this file: `len` bytes at absolute file offset
+    /// `offset`, with the userblock already added, so it indexes the map
+    /// directly.
+    Contiguous { offset: u64, len: u64 },
+    /// No storage is allocated. Every element reads as the fill value, which
+    /// is a property of the header, not bytes anywhere in the file.
+    Unallocated,
+    /// The image is not one stretch of this file. The phrase says what it is
+    /// instead, and lands verbatim in the refusal.
+    Elsewhere(&'static str),
+}
+
+/// Everything a zero-copy view of one dataset rests on, gathered from the
+/// file that owns it.
+#[cfg(feature = "mmap")]
+pub(crate) struct DatasetViewSource {
+    /// The owning file's whole-file map, or `None` when that file is read
+    /// through `pread`.
+    pub map: Option<std::sync::Arc<memmap2::Mmap>>,
+    /// Where the dataset's image lies in that file.
+    pub storage: ViewStorage,
+    /// How one element is stored, which decides whether the stored bytes are
+    /// already the host image of a `T`.
+    pub datatype: DatatypeMessage,
+    /// The dataset's extent, for turning a requested range into a byte run.
+    pub dims: Vec<u64>,
+}
+
 /// Read-side metadata for a single dataset.
 pub struct DatasetReadInfo {
     /// Dataset name (the link name in the root group).
@@ -4733,6 +4768,65 @@ impl Hdf5Reader {
             .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
         Ok(Self::raw_size_of(info))
+    }
+
+    /// Everything a zero-copy view of `name` needs to know: the map of the
+    /// file that owns the dataset, where in that file the dataset's image
+    /// lies, and how its elements are stored.
+    ///
+    /// Facts only — whether they add up to a view `T` may be handed is
+    /// [`crate::mapped::view`]'s decision, which is the single place that
+    /// weighs them. Resolved in the file that owns the dataset, so a name
+    /// crossing an external link answers with the target's map and the
+    /// target's addresses rather than this file's.
+    #[cfg(feature = "mmap")]
+    pub(crate) fn dataset_view_source(&mut self, name: &str) -> IoResult<DatasetViewSource> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.dataset_view_source(&path);
+        }
+        let base = self.handle.base();
+        let map = self.handle.map_snapshot();
+        let info = self
+            .dataset_info_local(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let len = Self::raw_size_of(info);
+        let storage = match &info.layout {
+            // An external file list overrides contiguous storage: the layout
+            // still says `Contiguous`, but the bytes are in other files
+            // (H5Dlayout.c swaps the storage ops out whenever the message is
+            // present), so nothing in this map holds them.
+            DataLayoutMessage::Contiguous { .. } if !info.external_files.is_empty() => {
+                ViewStorage::Elsewhere("its raw data is in external data files")
+            }
+            DataLayoutMessage::Contiguous { address, .. } if *address == UNDEF_ADDR => {
+                ViewStorage::Unallocated
+            }
+            DataLayoutMessage::Contiguous { address, .. } => {
+                let offset = address.checked_add(base).ok_or_else(|| {
+                    crate::io::IoError::InvalidState(format!(
+                        "dataset '{name}' claims raw data at {address}, which overflows \
+                         past the userblock at {base}"
+                    ))
+                })?;
+                ViewStorage::Contiguous { offset, len }
+            }
+            DataLayoutMessage::Compact { .. } => {
+                ViewStorage::Elsewhere("its raw data is compact, stored inside the object header")
+            }
+            DataLayoutMessage::ChunkedV3 { .. } | DataLayoutMessage::ChunkedV4 { .. } => {
+                ViewStorage::Elsewhere("it is chunked")
+            }
+            DataLayoutMessage::Virtual { .. } => {
+                ViewStorage::Elsewhere("it is virtual, mapped from other datasets")
+            }
+        };
+        Ok(DatasetViewSource {
+            map,
+            storage,
+            datatype: info.datatype.clone(),
+            dims: info.dataspace.dims.clone(),
+        })
     }
 
     /// Read the raw bytes of a dataset.

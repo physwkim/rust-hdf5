@@ -107,6 +107,36 @@ fn main() {
                 assert_eq!(v.len(), CONTIG_N);
             });
         }
+        // The read side with the copy taken out, and the one workload whose
+        // two builds do different work on purpose: under `mmap` the data is
+        // obtained as a view straight into the file's pages, everywhere else
+        // it is read into a vector first. So the mmap column is
+        // `read_mapped` and the default column is `read_raw` over the same
+        // file, on the same core, interleaved — which is the comparison the
+        // view exists to win. The C mirror does what libhdf5 offers for this:
+        // `H5Dget_offset` plus a map of the file, since `H5Dread` cannot hand
+        // back the file's own bytes.
+        "contig-view" => {
+            let path = p("rs-contig-in.h5");
+            write_contig(&path, &ramp(CONTIG_N));
+            timed(&workload, reps, || {
+                let file = H5File::open(&path).unwrap();
+                let ds = file.dataset("data").unwrap();
+                #[cfg(feature = "mmap")]
+                let total: f64 = {
+                    let view = ds.read_mapped::<f64>().unwrap();
+                    assert_eq!(view.len(), CONTIG_N);
+                    view.iter().sum()
+                };
+                #[cfg(not(feature = "mmap"))]
+                let total: f64 = {
+                    let v = ds.read_raw::<f64>().unwrap();
+                    assert_eq!(v.len(), CONTIG_N);
+                    v.iter().sum()
+                };
+                std::hint::black_box(total);
+            });
+        }
         "chunked-write" => {
             let data = ramp(CONTIG_N);
             let path = p("rs-chunked.h5");

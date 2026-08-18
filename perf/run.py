@@ -25,6 +25,10 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 WORKLOADS = [
     ("contig-write", 5),
     ("contig-read", 5),
+    # The mmap column runs read_mapped, every other column read_raw: the
+    # workload is "obtain the data and sum it", and the view is what changes
+    # between builds. See src/bin/perf_probe.rs.
+    ("contig-view", 5),
     ("chunked-write", 5),
     ("chunked-read", 5),
     ("deflate-write", 3),

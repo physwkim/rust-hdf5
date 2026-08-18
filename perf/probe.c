@@ -5,12 +5,15 @@
  * Usage: probe_c <workdir> <workload> <reps>
  * Output: one "BENCH <workload> rep <i> ns <elapsed>" line per rep. */
 
+#include <fcntl.h>
 #include <hdf5.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
+#include <unistd.h>
 
 #define CONTIG_N (16 * 1024 * 1024)
 #define CHUNK_ELEMS (256 * 1024)
@@ -109,6 +112,45 @@ static double *read_full(const char *path, hsize_t expect) {
     return buf;
 }
 
+/* Keeps a summed-over-every-element workload from being optimized into
+ * nothing; the Rust probe's black_box does the same job. */
+static volatile double sink;
+
+/* The libhdf5 idiom for reading a contiguous dataset without a copy:
+ * H5Dget_offset says where its image starts in the file, and the caller maps
+ * the file itself. H5Dread has no way to hand back the file's own bytes, so
+ * this — not H5Dread — is what the Rust view is measured against. */
+static double view_and_sum(const char *path, size_t n) {
+    hid_t f = H5Fopen(path, H5F_ACC_RDONLY, H5P_DEFAULT);
+    CHECK(f);
+    hid_t d = H5Dopen2(f, "data", H5P_DEFAULT);
+    CHECK(d);
+    haddr_t off = H5Dget_offset(d);
+    if (off == HADDR_UNDEF) {
+        fprintf(stderr, "FAIL dataset has no contiguous offset\n");
+        exit(1);
+    }
+    size_t span = (size_t)off + n * sizeof(double);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        exit(1);
+    }
+    const char *m = mmap(NULL, span, PROT_READ, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) {
+        perror("mmap");
+        exit(1);
+    }
+    const double *v = (const double *)(m + off);
+    double total = 0;
+    for (size_t i = 0; i < n; i++) total += v[i];
+    munmap((void *)m, span);
+    close(fd);
+    H5Dclose(d);
+    H5Fclose(f);
+    return total;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) {
         fprintf(stderr, "usage: probe_c <workdir> <workload> <reps>\n");
@@ -140,6 +182,12 @@ int main(int argc, char **argv) {
         snprintf(path, sizeof path, "%s/c-contig-in.h5", workdir);
         write_contig(path, data, CONTIG_N);
         TIMED({ free(read_full(path, CONTIG_N)); });
+    } else if (strcmp(wl, "contig-view") == 0) {
+        double *data = ramp(CONTIG_N);
+        snprintf(path, sizeof path, "%s/c-contig-in.h5", workdir);
+        write_contig(path, data, CONTIG_N);
+        free(data);
+        TIMED({ sink = view_and_sum(path, CONTIG_N); });
     } else if (strcmp(wl, "chunked-write") == 0) {
         double *data = ramp(CONTIG_N);
         snprintf(path, sizeof path, "%s/c-chunked.h5", workdir);
