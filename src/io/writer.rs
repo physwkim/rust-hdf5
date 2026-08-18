@@ -3207,9 +3207,21 @@ struct CarriedExtension {
 /// that rewrites the file without reading them either leaks the space it frees
 /// or hands out space a manager still claims.
 ///
-/// INVARIANT: `sections` is address-ordered, coalesced and disjoint from every
-/// block in `superseded` — the managers' own storage is not free space, it is
-/// what the close that rewrites them returns to the allocator.
+/// INVARIANT: the sections read here are handed to [`FileAllocator`] and
+/// tracked there alone, so there is one account of the file's free space and
+/// not two. What stays here is only what the allocator has no place for: the
+/// message to rewrite, and the managers' own blocks, which are not free space
+/// until the close that replaces them frees them.
+/// What a reopen learns from those managers, split by who owns it: the
+/// sections go to the allocator and the rest stays with the writer.
+struct ReopenedFreeSpace {
+    /// `None` for a file this writer records no free space for.
+    persisted: Option<Box<PersistedFreeSpace>>,
+    /// Every section the managers held, merged across them, address-ordered.
+    /// Empty whenever `persisted` is `None`.
+    sections: Vec<(u64, u64)>,
+}
+
 struct PersistedFreeSpace {
     /// The file-space info message the extension carries, decoded. It is the
     /// only place the manager addresses are recorded, so the close that moves
@@ -3219,8 +3231,6 @@ struct PersistedFreeSpace {
     /// manager that had any sections. Freed by the close that lays their
     /// replacements out, the rule every other superseded structure follows.
     superseded: Vec<(u64, u64)>,
-    /// Every section the managers recorded, merged across managers.
-    sections: Vec<FreeSection>,
 }
 
 /// Where a free-space manager's own two blocks go, and what it records.
@@ -4790,12 +4800,16 @@ impl Hdf5Writer {
         handle: &mut FileHandle,
         meta: &crate::io::FileMeta,
         ext: &crate::io::reader::SuperblockExtension,
-    ) -> IoResult<Option<Box<PersistedFreeSpace>>> {
+    ) -> IoResult<ReopenedFreeSpace> {
+        let none = || ReopenedFreeSpace {
+            persisted: None,
+            sections: Vec::new(),
+        };
         let Some(info) = ext.file_space_info.as_ref().filter(|i| i.persist) else {
-            return Ok(None);
+            return Ok(none());
         };
         if info.strategy != FileSpaceStrategy::FsmAggr {
-            return Ok(None);
+            return Ok(none());
         }
         let ctx = &meta.ctx;
         let hdr_size = FreeSpaceHeader::encoded_size(ctx);
@@ -4821,11 +4835,13 @@ impl Hdf5Writer {
                 "the free-space managers of this file overlap: {why}"
             ))
         })?;
-        Ok(Some(Box::new(PersistedFreeSpace {
-            info: info.clone(),
-            superseded,
-            sections,
-        })))
+        Ok(ReopenedFreeSpace {
+            persisted: Some(Box::new(PersistedFreeSpace {
+                info: info.clone(),
+                superseded,
+            })),
+            sections: sections.iter().map(|s| (s.addr, s.len)).collect(),
+        })
     }
 
     fn reopen_shared_messages(
@@ -4985,7 +5001,7 @@ impl Hdf5Writer {
         // The managers that extension's file-space info message names, read
         // before anything allocates: the sections they hold are file space
         // this session may hand out, and the close rewrites them.
-        let free_space = Self::reopen_free_space(&mut handle, &meta, &ext)?;
+        let reopened_free_space = Self::reopen_free_space(&mut handle, &meta, &ext)?;
 
         // Discover links from root group (and subgroups recursively). Every
         // object is classified before it is registered, and the root is the
@@ -5375,6 +5391,11 @@ impl Hdf5Writer {
         }
 
         let allocator = FileAllocator::new(file_size);
+        // The sections the file's own managers recorded are free space, so
+        // they are what this session allocates from first — `H5MF_alloc` asks
+        // the free-space manager before it bumps the end of the file, and a
+        // reopen that skipped this would grow a file that had room.
+        allocator.reset_free_list(&reopened_free_space.sections);
 
         // Now that every object has its registry index, key the dense storage
         // found on disk by the scope that will supersede it. A group the link
@@ -5490,7 +5511,7 @@ impl Hdf5Writer {
             // v1-B-tree and symbol-table node this session writes is sized by.
             btree: meta.btree,
             extension,
-            free_space,
+            free_space: reopened_free_space.persisted,
             // The indexes the file was created with, and the blocks its
             // current table occupies; the next finalize lays a new table out
             // over them from the whole message set.
@@ -8503,12 +8524,12 @@ impl Hdf5Writer {
         }
         // Out of the allocator entirely while the layout is chosen: the
         // manager's own blocks come out of this set, and nothing else may be
-        // handed a byte of it in the meantime. What the reopen read joins what
-        // this session released — the merge is `H5FS__sect_merge`'s, so a
-        // block freed against a section the file already had comes out as one
-        // section rather than two.
-        let mut free = self.allocator.take_all_free();
-        free.extend(fs.sections.iter().map(|s| (s.addr, s.len)));
+        // handed a byte of it in the meantime. The list already holds what the
+        // reopen read as well as what this session released, and the allocator
+        // merged the two as it went — `H5FS__sect_merge`'s rule, so a block
+        // freed against a section the file already had is one section here
+        // rather than two.
+        let free = self.allocator.take_all_free();
         let mut sections = free_space::merge_sections(&free).map_err(|why| {
             crate::io::IoError::InvalidState(format!(
                 "this session freed overlapping blocks: {why}"
@@ -18138,8 +18159,8 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
     /// `fsm_persist.h5` persists two managers — metadata and raw data. The
-    /// reopen reads both, merges their sections into one address-ordered set,
-    /// and claims the four blocks the managers themselves occupy.
+    /// reopen reads both, hands their merged sections to the allocator, and
+    /// claims the four blocks the managers themselves occupy.
     #[test]
     fn a_persisting_file_reopens_with_its_free_sections() {
         let path = fixture_copy("fsm_persist.h5", "fsm_read");
@@ -18150,21 +18171,22 @@ mod tests {
         assert_eq!(fs.info.strategy, FileSpaceStrategy::FsmAggr);
         assert_eq!(fs.info.threshold, 1);
 
+        let sections = writer.allocator.free_blocks();
         // h5stat -S reports 1910 bytes of tracked free space for this file.
-        assert_eq!(fs.sections.iter().map(|s| s.len).sum::<u64>(), 1910);
-        // Address-ordered, and no two sections touch: `merge_sections`
-        // coalesced what the two managers held separately.
-        for w in fs.sections.windows(2) {
-            assert!(w[0].addr + w[0].len < w[1].addr, "{:?}", fs.sections);
+        assert_eq!(sections.iter().map(|s| s.1).sum::<u64>(), 1910);
+        // Address-ordered, and no two sections touch: what the two managers
+        // held separately came out coalesced.
+        for w in sections.windows(2) {
+            assert!(w[0].0 + w[0].1 < w[1].0, "{sections:?}");
         }
         // Two headers plus the two sections blocks they name.
         assert_eq!(fs.superseded.len(), 4);
         for &(addr, len) in &fs.superseded {
             assert!(len > 0);
             assert!(
-                !fs.sections
+                !sections
                     .iter()
-                    .any(|s| addr < s.addr + s.len && s.addr < addr + len),
+                    .any(|&(a, l)| addr < a + l && a < addr + len),
                 "manager block {addr:#x}+{len} sits in a free section"
             );
         }
@@ -18202,13 +18224,15 @@ mod tests {
     }
     /// Sum of the sections the managers a file names actually hold — what
     /// `h5stat -S` prints as "Amount of tracked free space", read back through
-    /// this crate's own decoder so a test can assert on it.
+    /// this crate's own decoder so a test can assert on it. A reopen seeds the
+    /// allocator with exactly those sections, so its free list is the number.
     fn tracked_free_space(path: &std::path::Path) -> u64 {
         read_only_append(path)
-            .free_space
-            .as_deref()
-            .map(|fs| fs.sections.iter().map(|s| s.len).sum())
-            .unwrap_or(0)
+            .allocator
+            .free_blocks()
+            .iter()
+            .map(|b| b.1)
+            .sum()
     }
 
     /// Open for append and mark the writer closed, so dropping it releases the
@@ -18225,7 +18249,11 @@ mod tests {
     fn append_one(path: &std::path::Path, name: &str, disable_managers: bool) {
         let mut w = Hdf5Writer::open_append(path).unwrap();
         if disable_managers {
+            // Both halves of the change, so the control is the file as this
+            // crate wrote it before: the session neither allocates from the
+            // recorded sections nor writes any back.
             w.free_space = None;
+            w.allocator.reset_free_list(&[]);
         }
         let i = w
             .create_dataset(name, DatatypeMessage::i32_type(), &[8])
@@ -18238,31 +18266,47 @@ mod tests {
         w.close().unwrap();
     }
 
-    /// An append on a persisting file records what it freed: the space the
-    /// manager tracks grows by the blocks the rewrite superseded, and every
-    /// section the file already had is still there.
+    /// An append on a persisting file both spends and records the space its
+    /// managers track: the new dataset comes out of the sections the file
+    /// already had, and what the rewrite frees goes back into them.
     #[test]
-    fn an_append_records_the_blocks_it_frees() {
+    fn an_append_reuses_and_records_the_space_the_managers_track() {
         let path = fixture_copy("fsm_persist.h5", "fsm_write");
+        let original = std::fs::metadata(&path).unwrap().len();
         let before = tracked_free_space(&path);
         assert_eq!(before, 1910, "the fixture's own managers");
 
         append_one(&path, "added", false);
-        let after = tracked_free_space(&path);
-        assert!(
-            after > before,
-            "tracked free space went from {before} to {after}"
-        );
+        let size = std::fs::metadata(&path).unwrap().len();
+        let tracked = tracked_free_space(&path);
 
-        // Negative control: the same append with the manager rewrite off
-        // leaves the managers the fixture came with, which is what this crate
-        // wrote before it recorded free space at all.
+        // Negative control: the same append with both halves of this off — no
+        // allocating out of the recorded sections and no writing any back —
+        // which is what this crate did before it read free space at all.
         let control = fixture_copy("fsm_persist.h5", "fsm_write_control");
         append_one(&control, "added", true);
+        let control_size = std::fs::metadata(&control).unwrap().len();
         assert_eq!(
             tracked_free_space(&control),
             before,
             "with the manager rewrite disabled the number must not move"
+        );
+
+        // The whole append — dataset, header, rewritten extension and
+        // managers — fits in what the file already held free, so the file
+        // does not grow. Without the reuse it does.
+        assert_eq!(size, original, "the append grew a file that had room");
+        assert!(
+            control_size > original,
+            "the control has to grow or it proves nothing"
+        );
+        // Space no manager and no object claims — `h5stat -S`'s "unaccounted
+        // space" — is what the leak was, and it is smaller now.
+        assert!(
+            size - tracked < control_size - before,
+            "unaccounted space went from {} to {}",
+            control_size - before,
+            size - tracked
         );
 
         for p in [&path, &control] {
@@ -18291,11 +18335,8 @@ mod tests {
 
         let reread = {
             let w = read_only_append(&path);
-            let fs = w.free_space.as_deref().expect("managers were written");
-            fs.sections
-                .iter()
-                .map(|s| (s.addr, s.len))
-                .collect::<Vec<_>>()
+            assert!(w.free_space.is_some(), "managers were written");
+            w.allocator.free_blocks()
         };
         assert_eq!(internal, reread);
         let _ = std::fs::remove_file(&path);

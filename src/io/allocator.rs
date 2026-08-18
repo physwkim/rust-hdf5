@@ -24,15 +24,21 @@ struct FreeBlock {
 ///
 /// [`free`](Self::free) returns a block for reuse — the counterpart of
 /// libhdf5's `H5MF_xfree`, called when a rewritten chunk no longer fits its
-/// old location. Where the list goes at `close` follows the file: like
-/// libhdf5's default (non-persistent) strategy, a block released but not
-/// reused stays as slack in a file that records no free space, while a file
-/// whose file-space info message says `persist` gets what is left written to
-/// its on-disk free-space manager (`Hdf5Writer::write_free_space_managers`).
+/// old location. Where the list comes from and where it goes both follow the
+/// file. A file whose file-space info message says `persist` opens with the
+/// sections its on-disk free-space manager recorded already in the list, so
+/// this session allocates out of them the way `H5MF_alloc` does, and gets
+/// what is left written back to the manager on close
+/// (`Hdf5Writer::write_free_space_managers`). Every other file starts with an
+/// empty list, and — like libhdf5's default, non-persistent strategy — a
+/// block it released but did not reuse stays as slack.
 pub struct FileAllocator {
     eof: AtomicU64,
     alignment: u64,
-    /// Released blocks, sorted by address with adjacent blocks merged.
+    /// Free regions of the file, sorted by address with adjacent regions
+    /// merged: blocks this session released, and — for a persisting file —
+    /// the sections it opened holding. Only the former are guaranteed to
+    /// start on the alignment boundary.
     ///
     /// A plain `Mutex` regardless of the `threadsafe` feature: the allocator
     /// is shared across threads in both builds (see
@@ -118,28 +124,43 @@ impl FileAllocator {
             return None;
         }
         let mut list = self.free_list.lock().unwrap();
+        // What a block can actually hand out. A block this allocator released
+        // itself starts aligned, but one read out of a file's free-space
+        // manager starts wherever the file put it, and the bytes before the
+        // first aligned address in it can hold no allocation.
+        let usable = |b: &FreeBlock| b.len.saturating_sub(self.align_up(b.addr) - b.addr);
         // Best fit: the smallest sufficient block, so a large released region
         // stays available for a large chunk.
         let pos = list
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.len >= size)
-            .min_by_key(|(_, b)| b.len)
+            .filter(|(_, b)| usable(b) >= size)
+            .min_by_key(|(_, b)| usable(b))
             .map(|(i, _)| i)?;
         let block = list[pos];
-        // `block.addr` is aligned (every allocation is) and `used` is a
-        // multiple of the alignment, so the remainder stays aligned too.
-        let used = self.align_up(size);
-        if block.len > used {
-            list[pos] = FreeBlock {
-                addr: block.addr + used,
-                len: block.len - used,
-            };
-        } else {
-            list.remove(pos);
+        let addr = self.align_up(block.addr);
+        // `size` rounded up, except where that would run past the block: one
+        // with fewer than `alignment` bytes to spare is taken whole rather
+        // than over-drawn.
+        let used = self.align_up(size).min(block.addr + block.len - addr);
+        let head = FreeBlock {
+            addr: block.addr,
+            len: addr - block.addr,
+        };
+        let tail = FreeBlock {
+            addr: addr + used,
+            len: block.addr + block.len - addr - used,
+        };
+        // Both remainders stay free: the head is what alignment cost, and
+        // dropping it would leave bytes no free-space manager records.
+        list.remove(pos);
+        for b in [tail, head] {
+            if b.len > 0 {
+                list.insert(pos, b);
+            }
         }
         self.free_count.store(list.len() as u64, Ordering::Release);
-        Some(block.addr)
+        Some(addr)
     }
 
     /// Try to grow the allocation `[addr, addr + len)` by `extra` bytes in
@@ -151,7 +172,9 @@ impl FileAllocator {
     /// (published by compare-and-swap, so a concurrent `allocate` cannot be
     /// handed the same region); or a released block starts exactly at
     /// `addr + len` and is large enough, so the front of it is consumed
-    /// (`extra` rounded up to the alignment, keeping the remainder aligned).
+    /// (`extra` rounded up to the alignment, which leaves the remainder at
+    /// whatever alignment the block had — an extension is contiguous by
+    /// definition, so there is no address to choose here).
     pub fn try_extend(&self, addr: u64, len: u64, extra: u64) -> bool {
         if extra == 0 {
             return true;
@@ -234,7 +257,9 @@ impl FileAllocator {
     /// [`free`](Self::free) and [`try_extend`](Self::try_extend) search by, so
     /// a caller that handed the blocks over in some other order — a free-space
     /// manager's layout orders its sections by size — would leave the list
-    /// unsearchable. `blocks` must still be non-overlapping.
+    /// unsearchable. `blocks` must still be non-overlapping, and need not be
+    /// aligned: this is also how a reopen installs the sections a file's
+    /// manager recorded, which sit at whatever addresses the file gave them.
     pub(crate) fn reset_free_list(&self, blocks: &[(u64, u64)]) {
         let mut sorted: Vec<FreeBlock> = blocks
             .iter()
@@ -472,6 +497,62 @@ mod tests {
 
         assert!(!alloc.try_extend(a, 64, 40), "32 free < 40 wanted");
         assert_eq!(free_blocks(&alloc), vec![(b, 32)], "nothing consumed");
+    }
+
+    /// A section read out of a file's free-space manager starts wherever the
+    /// file put it. The allocation still comes back aligned, and the bytes
+    /// alignment skipped stay free rather than becoming untracked slack.
+    #[test]
+    fn an_unaligned_block_is_carved_from_its_first_aligned_address() {
+        let alloc = FileAllocator::new(4096);
+        alloc.reset_free_list(&[(185, 15)]);
+
+        assert_eq!(alloc.allocate(8), 192);
+        // The seven bytes before 192 stay on the list; the block ends exactly
+        // where the allocation does, so there is no tail.
+        assert_eq!(free_blocks(&alloc), vec![(185, 7)]);
+        assert_eq!(
+            alloc.eof(),
+            4096,
+            "the file must not grow while it has room"
+        );
+    }
+
+    /// Both remainders at once: the head alignment skipped and the tail the
+    /// allocation did not reach.
+    #[test]
+    fn carving_an_unaligned_block_keeps_the_head_and_the_tail() {
+        let alloc = FileAllocator::new(4096);
+        alloc.reset_free_list(&[(2038, 100)]);
+
+        assert_eq!(alloc.allocate(16), 2040);
+        assert_eq!(free_blocks(&alloc), vec![(2038, 2), (2056, 82)]);
+    }
+
+    /// A block with fewer than one alignment unit to spare is taken whole
+    /// rather than over-drawn past its end.
+    #[test]
+    fn a_block_with_no_room_to_round_up_is_taken_whole() {
+        let alloc = FileAllocator::new(4096);
+        alloc.reset_free_list(&[(2038, 12)]);
+
+        // 10 rounds up to 16, which the block cannot give: it holds 10 usable
+        // bytes from 2040, so those 10 are the allocation and the block goes.
+        assert_eq!(alloc.allocate(10), 2040);
+        assert_eq!(free_blocks(&alloc), vec![(2038, 2)]);
+    }
+
+    /// Best fit is by what a block can hand out, not by its length: the longer
+    /// but badly aligned block loses to the shorter aligned one.
+    #[test]
+    fn best_fit_measures_the_usable_part_of_a_block() {
+        let alloc = FileAllocator::new(4096);
+        alloc.reset_free_list(&[(1001, 9), (2000, 8)]);
+
+        assert_eq!(alloc.allocate(8), 2000);
+        assert_eq!(free_blocks(&alloc), vec![(1001, 9)]);
+        // Nothing left can hold eight aligned bytes, so the file grows.
+        assert_eq!(alloc.allocate(8), 4096);
     }
 
     #[test]
