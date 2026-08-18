@@ -1118,6 +1118,7 @@ pub struct H5FileOptions {
     userblock: u64,
     shared_messages: SharedMessageConfig,
     file_space: Option<FileSpaceConfig>,
+    file_space_page_size: Option<u64>,
 }
 
 impl H5FileOptions {
@@ -1282,8 +1283,8 @@ impl H5FileOptions {
     /// [`FileSpaceStrategy::None`] neither, so every allocation comes from the
     /// end of the file. [`FileSpaceStrategy::Page`] allocates on file-space
     /// page boundaries instead, packing everything smaller than a page into
-    /// pages of its own kind; its page size is libhdf5's default of 4096,
-    /// `H5Pset_file_space_page_size` having no setter here.
+    /// pages of its own kind; [`file_space_page_size`](Self::file_space_page_size)
+    /// sets how big those pages are.
     ///
     /// `persist` writes the free-space managers into the file on close, so a
     /// later session — this crate or libhdf5 — finds the space this one
@@ -1312,6 +1313,54 @@ impl H5FileOptions {
     ) -> Self {
         self.file_space = Some(FileSpaceConfig::new(strategy, persist, threshold));
         self
+    }
+
+    /// `H5Pset_file_space_page_size`, h5py's `File(..., fs_page_size=...)`.
+    ///
+    /// The file-space page is the unit [`FileSpaceStrategy::Page`] allocates
+    /// in: a request smaller than one page is packed into a page holding only
+    /// that kind of data, and a larger one is page-aligned. `size` is between
+    /// 512 (`H5F_FILE_SPACE_PAGE_SIZE_MIN`) and 1 GiB — no power of two
+    /// required — and anything outside that is refused by
+    /// [`create`](Self::create), as `H5Pset_file_space_page_size` refuses it.
+    ///
+    /// Setting it is enough on its own to give the file a file-space info
+    /// message, because the page size is one of the four properties
+    /// `H5F__super_init` compares against the library defaults. Under any
+    /// other strategy that is all it does: the file records the size and
+    /// allocates without it.
+    ///
+    /// Only [`create`](Self::create) reads this. A reopened file keeps the
+    /// page size its own message carries.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::{FileSpaceStrategy, H5File};
+    /// let file = H5File::options()
+    ///     .file_space(FileSpaceStrategy::Page, true, 1)
+    ///     .file_space_page_size(8192)
+    ///     .create("paged.h5")
+    ///     .unwrap();
+    /// # let _ = file;
+    /// ```
+    pub fn file_space_page_size(mut self, size: u64) -> Self {
+        self.file_space_page_size = Some(size);
+        self
+    }
+
+    /// The one [`FileSpaceConfig`] the two file-space builders describe
+    /// between them.
+    ///
+    /// They are separate properties of one property list —
+    /// `H5Pset_file_space_strategy` and `H5Pset_file_space_page_size` write
+    /// different fcpl entries and neither reads the other — so each is
+    /// recorded by whether it was called, and joining them here is what keeps
+    /// either call order meaning the same thing.
+    fn resolved_file_space(&self) -> FileSpaceConfig {
+        let config = self.file_space.unwrap_or_default();
+        match self.file_space_page_size {
+            Some(size) => config.with_page_size(size),
+            None => config,
+        }
     }
 
     fn resolved_locking(&self) -> FileLocking {
@@ -1354,6 +1403,9 @@ impl H5FileOptions {
         if self.file_space.is_some() {
             offending.push("file_space");
         }
+        if self.file_space_page_size.is_some() {
+            offending.push("file_space_page_size");
+        }
         if offending.is_empty() {
             Ok(())
         } else {
@@ -1375,7 +1427,7 @@ impl H5FileOptions {
                 libver: self.libver,
                 userblock: self.userblock,
                 shared_messages: self.shared_messages,
-                file_space: self.file_space.unwrap_or_default(),
+                file_space: self.resolved_file_space(),
             },
         )?;
         Ok(H5File {

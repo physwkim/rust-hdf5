@@ -745,6 +745,100 @@ fn a_crate_append_rewrites_a_paged_files_managers() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The page size the builder names is the one libhdf5 reads back off the file:
+/// a non-default size lays the file out and comes back through the fcpl,
+/// exactly as `H5Pget_file_space_page_size` reports what
+/// `H5Pset_file_space_page_size` set.
+#[test]
+fn a_crate_created_paged_file_keeps_a_non_default_page_size() {
+    let Some(py) = python() else { return };
+    const PAGE: u64 = 8192;
+    let path = tmp("paged_page_size");
+    {
+        let file = H5File::options()
+            .file_space(FileSpaceStrategy::Page, true, 1)
+            .file_space_page_size(PAGE)
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape([16usize])
+            .create("keep")
+            .unwrap()
+            .write_raw(&(0..16i32).collect::<Vec<_>>())
+            .unwrap();
+        file.create_group("grp").unwrap();
+        file.new_dataset::<f64>()
+            .shape([8usize])
+            .create("grp/inner")
+            .unwrap()
+            .write_raw(&(0..8).map(f64::from).collect::<Vec<_>>())
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let created = h5stat_space(py, &path);
+    assert_eq!(
+        created.unaccounted, 0,
+        "the created file leaks space: {created:?}"
+    );
+    assert_eq!(
+        created.total % PAGE,
+        0,
+        "the file ends on one of its {PAGE}-byte pages: {created:?}"
+    );
+    let info = H5File::open(&path)
+        .unwrap()
+        .superblock_extension()
+        .file_space_info
+        .expect("the created file declares its strategy");
+    assert_eq!(info.page_size, PAGE);
+    h5clear_accepts(py, &path);
+
+    let script = format!(
+        "import h5py\n\
+         f = h5py.File(r'{}', 'r')\n\
+         size = f.id.get_create_plist().get_file_space_page_size()\n\
+         assert size == {PAGE}, size\n\
+         assert list(f['keep'][:]) == list(range(16)), list(f['keep'][:])\n\
+         assert list(f['grp/inner'][:]) == list(range(8)), list(f['grp/inner'][:])\n\
+         f.close()\n",
+        path.display()
+    );
+    run(py, &["-c", &script], "h5py page-size read-back");
+
+    h5py_reads_and_appends(py, &path, "by_libhdf5");
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.dataset_names();
+    names.sort();
+    assert_eq!(names, ["by_libhdf5", "grp/inner", "keep"]);
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `H5Pset_file_space_page_size` refuses a size below 512 outright
+/// (H5Pfcpl.c:1389); this crate's builder cannot fail on the call itself, so
+/// the same bound is enforced where the file is made.
+#[test]
+fn a_page_size_below_the_library_minimum_is_refused() {
+    let path = tmp("paged_page_size_small");
+    let Err(err) = H5File::options()
+        .file_space(FileSpaceStrategy::Page, true, 1)
+        .file_space_page_size(256)
+        .create(&path)
+    else {
+        panic!("a 256-byte file-space page was accepted");
+    };
+    assert!(
+        format!("{err}").contains("between 512 bytes and 1073741824"),
+        "{err}"
+    );
+    assert!(
+        !path.exists() || std::fs::metadata(&path).unwrap().len() == 0,
+        "a refused create left a file behind"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
 /// A paged file this crate creates is one libhdf5 opens, appends to and finds
 /// fully accounted for.
 #[test]

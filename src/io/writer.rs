@@ -45,7 +45,7 @@ use crate::format::messages::link::{CharacterSet, LinkMessage, LinkTarget};
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::superblock_ext::{
     FileSpaceInfoMessage, FileSpaceStrategy, SharedMessageTableMessage,
-    DEFAULT_FILE_SPACE_PAGE_SIZE, FS_ADDR_COUNT_V1,
+    DEFAULT_FILE_SPACE_PAGE_SIZE, FS_ADDR_COUNT_V1, PAGE_SIZE_MAX, PAGE_SIZE_MIN,
 };
 use crate::format::messages::virtual_mapping::{VirtualMapping, VirtualMappingList};
 use crate::format::messages::*;
@@ -3746,14 +3746,15 @@ pub struct FileCreateOptions {
     pub file_space: FileSpaceConfig,
 }
 
-/// The file-space handling properties a new file is created with —
-/// `H5Pset_file_space_strategy`'s three arguments.
+/// The file-space handling properties a new file is created with — the three
+/// arguments of `H5Pset_file_space_strategy` and the one of
+/// `H5Pset_file_space_page_size`.
 ///
-/// The page size (`H5Pset_file_space_page_size`) is the fourth property
-/// `H5F__super_init` reads and is not here: a file this crate creates keeps
-/// libhdf5's default of 4096 (`H5F_FILE_SPACE_PAGE_SIZE_DEF`). A reopened
-/// paged file is allocated on the page size its own message carries, so only
-/// creation is fixed.
+/// The four together are what `H5F__super_init` compares against the library
+/// defaults to decide whether the file needs a file-space info message at all
+/// (H5Fsuper.c:1092-1097), which is why the page size belongs here even though
+/// only paged aggregation allocates by it: a file that names a page size and
+/// nothing else still carries the message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileSpaceConfig {
     /// `H5F_fspace_strategy_t`.
@@ -3763,16 +3764,22 @@ pub struct FileSpaceConfig {
     /// The smallest section a manager records; a block freed below it is
     /// space the file leaks rather than tracks.
     pub threshold: u64,
+    /// `H5Pset_file_space_page_size`: the file-space page every allocation of
+    /// a paged file is shaped by, and the value the message carries whatever
+    /// the strategy.
+    pub page_size: u64,
 }
 
 impl Default for FileSpaceConfig {
-    /// `H5F_FILE_SPACE_STRATEGY_DEF`, `H5F_FREE_SPACE_PERSIST_DEF` and
-    /// `H5F_FREE_SPACE_THRESHOLD_DEF` (H5Fprivate.h:326-332).
+    /// `H5F_FILE_SPACE_STRATEGY_DEF`, `H5F_FREE_SPACE_PERSIST_DEF`,
+    /// `H5F_FREE_SPACE_THRESHOLD_DEF` and `H5F_FILE_SPACE_PAGE_SIZE_DEF`
+    /// (H5Fprivate.h:326-336).
     fn default() -> Self {
         Self {
             strategy: FileSpaceStrategy::FsmAggr,
             persist: false,
             threshold: 1,
+            page_size: DEFAULT_FILE_SPACE_PAGE_SIZE,
         }
     }
 }
@@ -3795,7 +3802,21 @@ impl FileSpaceConfig {
             } else {
                 Self::default().threshold
             },
+            ..Self::default()
         }
+    }
+
+    /// `H5Pset_file_space_page_size`, the fourth file-space property and the
+    /// one libhdf5 sets on its own call.
+    ///
+    /// Independent of the strategy, as upstream is: the value reaches the
+    /// file-space info message whatever the strategy is, and only paged
+    /// aggregation allocates by it. Out-of-range sizes are refused where the
+    /// file is created ([`validate`](Self::validate)) rather than here, so a
+    /// builder chain stays a builder chain.
+    pub fn with_page_size(mut self, page_size: u64) -> Self {
+        self.page_size = page_size;
+        self
     }
 
     /// Whether the file has to say any of this on disk. `H5F__super_init`
@@ -3809,8 +3830,16 @@ impl FileSpaceConfig {
 
     /// Refuse what this writer cannot make. `H5Pset_file_space_strategy`
     /// itself only refuses a strategy outside the enum (H5Pfcpl.c:1223), and
-    /// so does this.
+    /// `H5Pset_file_space_page_size` a page size outside `[512, 1 GiB]`
+    /// (H5Pfcpl.c:1389-1393) — no power of two required, only the bounds.
     fn validate(&self) -> IoResult<()> {
+        if !(PAGE_SIZE_MIN..=PAGE_SIZE_MAX).contains(&self.page_size) {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "a file-space page size is between {PAGE_SIZE_MIN} bytes and \
+                 {PAGE_SIZE_MAX}, not {}",
+                self.page_size
+            )));
+        }
         match self.strategy {
             FileSpaceStrategy::FsmAggr
             | FileSpaceStrategy::Aggr
@@ -3834,7 +3863,7 @@ impl FileSpaceConfig {
             strategy: self.strategy,
             persist: self.persist,
             threshold: self.threshold,
-            page_size: DEFAULT_FILE_SPACE_PAGE_SIZE,
+            page_size: self.page_size,
             pgend_meta_thres: 0,
             eoa_pre_fsm_fsalloc: UNDEF_ADDR,
             fs_addr: vec![UNDEF_ADDR; FS_ADDR_COUNT_V1],
@@ -18660,6 +18689,106 @@ mod tests {
             format!("{err}").contains("multiple of its 4096-byte"),
             "{err}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A page size the builder names is the page the file is actually laid
+    /// out in, not just a number the message repeats: every allocation is
+    /// shaped by it and the file ends on one of its boundaries.
+    #[test]
+    fn a_file_created_at_a_non_default_page_size_allocates_by_it() {
+        let path = temp_path("fsm_page_size_8k");
+        {
+            let w = Hdf5Writer::create_with_options(
+                &path,
+                FileCreateOptions {
+                    file_space: FileSpaceConfig::new(FileSpaceStrategy::Page, true, 1)
+                        .with_page_size(8192),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let i = w
+                .create_dataset("keep", DatatypeMessage::i32_type(), &[8])
+                .unwrap();
+            w.write_dataset_raw(i, &[0u8; 32]).unwrap();
+            w.close().unwrap();
+        }
+        let info = read_only_append(&path)
+            .free_space
+            .as_deref()
+            .expect("the created file declares a strategy")
+            .info
+            .clone();
+        assert_eq!(info.page_size, 8192);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() % 8192,
+            0,
+            "the file ends on one of the pages it was created with"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The page size is the fourth of the four properties `H5F__super_init`
+    /// compares against the library defaults (H5Fsuper.c:1092-1097), so
+    /// naming it is on its own enough to give a file the message — under the
+    /// default strategy, which allocates without it.
+    #[test]
+    fn a_non_default_page_size_alone_gives_the_file_a_message() {
+        let path = temp_path("fsm_page_size_only");
+        {
+            let w = Hdf5Writer::create_with_options(
+                &path,
+                FileCreateOptions {
+                    file_space: FileSpaceConfig::default().with_page_size(1024),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            w.close().unwrap();
+        }
+        let info = declared_file_space(&path)
+            .expect("a file naming only a page size still carries the message");
+        assert_eq!(info.strategy, FileSpaceStrategy::FsmAggr);
+        assert!(!info.persist);
+        assert_eq!(info.page_size, 1024);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `H5Pset_file_space_page_size` refuses anything below 512 or above
+    /// 1 GiB (H5Pfcpl.c:1389-1393), and nothing between: no power of two is
+    /// required, so a size the bounds admit is one the file may carry.
+    #[test]
+    fn a_page_size_outside_the_library_bounds_is_refused() {
+        for size in [0, 1, 511, PAGE_SIZE_MAX + 1] {
+            let path = temp_path(&format!("fsm_page_size_bad_{size}"));
+            let Err(err) = Hdf5Writer::create_with_options(
+                &path,
+                FileCreateOptions {
+                    file_space: FileSpaceConfig::new(FileSpaceStrategy::Page, true, 1)
+                        .with_page_size(size),
+                    ..Default::default()
+                },
+            ) else {
+                panic!("a {size}-byte file-space page was accepted");
+            };
+            assert!(
+                format!("{err}").contains("between 512 bytes and 1073741824"),
+                "{err}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+        let path = temp_path("fsm_page_size_odd");
+        let w = Hdf5Writer::create_with_options(
+            &path,
+            FileCreateOptions {
+                file_space: FileSpaceConfig::new(FileSpaceStrategy::Page, true, 1)
+                    .with_page_size(513),
+                ..Default::default()
+            },
+        )
+        .expect("513 is inside the bounds, and no power of two is required");
+        w.close().unwrap();
         let _ = std::fs::remove_file(&path);
     }
 
