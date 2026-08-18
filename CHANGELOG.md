@@ -23,6 +23,32 @@
 
 ### Changed
 
+- The `mmap` feature now does something: a file opened for reading maps
+  itself and serves its reads out of the map instead of `pread`, chosen
+  once inside `FileHandle` so every read entry point goes through it and
+  a mapping that cannot be taken falls back to the descriptor invisibly.
+  Reads above 8 KiB stay on `pread` — mapping helps only where the
+  syscall is the larger half of the work, and a big read into a
+  freshly allocated buffer is dominated by faulting that buffer in, which
+  the map only adds to. Against libhdf5 1.14.6 on the `perf/` probes,
+  opening and reading 2000 small datasets goes from 0.28x to 0.21x of its
+  time; no other workload moves by more than 2%, and the default build is
+  untouched. A writable handle is never mapped, so the accumulator's
+  flush-before-read contract is unaffected. What the map does not do is
+  make a large read cheaper: that needs the read to hand back a borrowed
+  view of the mapped bytes rather than a `Vec`, which is an API addition
+  this does not make.
+
+  The mapped bytes are the file as of the moment the map was taken, so a
+  SWMR reader picks up its writer's appends when `refresh` retakes the
+  map, and a read past the mapped length fails the way a read past the
+  end of a file does.
+
+- `Hdf5Reader::open_mmap` and `MmapFileHandle` are gone. They mapped a
+  second copy of the file and handed it to the caller, who had no way to
+  make the reader read through it; the mapping now lives under the one
+  handle the reader already reads from.
+
 - Reading a whole dataset is faster and no longer scales with how many
   datasets the file holds. A typed full read now lands in the vector it
   returns instead of being zeroed, read, and copied into a second buffer
@@ -50,6 +76,21 @@
   add `.clone()` where a copy was relied on.
 
 ### Performance
+
+- A reader now keeps the decompressed image of a filtered chunk a read
+  did not consume whole, so the next read that wants the rest of that
+  chunk places bytes out of it instead of inflating it again — libhdf5's
+  per-dataset raw chunk cache, at its own 1 MiB / 521-slot defaults, and
+  what makes a region-of-interest or row-at-a-time walk of a compressed
+  dataset cost one inflate per chunk rather than one per read. On the
+  `perf/run.py` deflate-slice workload (1024 sequential 8192-element
+  slices of 64 MiB of f64 in 256 KiB deflated chunks, four slices to a
+  chunk) that is 33.6 ms down to 12.0 ms against libhdf5 1.14.6's
+  28.1 ms. A read that takes every chunk entire — any whole-dataset read
+  — keeps nothing and pays nothing, and an unfiltered chunk still reads
+  only the byte ranges the selection intersects. Read results are
+  unchanged, byte for byte. The images live inside the dataset's decoded
+  chunk index, so whatever drops that index drops them with it.
 
 - A filtered chunk whose bytes land whole and contiguous in a read's
   output — every full chunk of a full read — now decodes straight into

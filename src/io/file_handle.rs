@@ -49,6 +49,10 @@ compile_error!(
 /// coalesces them.
 pub struct FileHandle {
     file: File,
+    /// Where this handle's reads come from. Every read entry point goes
+    /// through it; `file` is private, so no caller can reach the descriptor
+    /// around it.
+    source: ReadSource,
     /// The write accumulator. Only [`write_at`](Self::write_at) puts bytes in
     /// it and only [`flush`](Self::flush) takes them out; `file` is private, so
     /// no caller can reach the descriptor around it.
@@ -72,6 +76,197 @@ pub struct FileHandle {
     /// it, which is what `H5FD_set_base_addr` does for the C library's
     /// drivers — no caller can forget to add it.
     base: u64,
+}
+
+/// Where a [`FileHandle`]'s bytes come from — the one place that decides, so
+/// that no read entry point picks for itself and none can be added that skips
+/// the choice.
+///
+/// INVARIANT: a handle is `Mapped` only when it was opened read-only.
+/// [`FileHandle::new_read_only`] is the only constructor that installs a map
+/// and the only one that passes `writable: false`, and
+/// [`FileHandle::refresh_read_source`] can only retake a map on a handle that
+/// already has one. So a writable handle is never mapped, and a map can never
+/// go stale against the write accumulator: on a mapped handle
+/// [`FileHandle::write_at`] refuses before it can stage a byte.
+///
+/// A mapped handle serves the file as it was when the map was taken, and its
+/// [`ReadSource::len`] is the mapped length — so a read past it fails with
+/// `UnexpectedEof` exactly as a `pread` past the end of a file of that length
+/// does. Bytes a concurrent SWMR writer appends are outside the map until
+/// [`FileHandle::refresh_read_source`] retakes it.
+enum ReadSource {
+    /// Positioned reads (`pread`) against the descriptor.
+    Pread,
+    /// A read-only map of the whole file as of the moment it was taken.
+    /// Reads up to [`MAP_MAX_READ`] come out of it; larger ones still go
+    /// through `pread` — see there for why.
+    #[cfg(feature = "mmap")]
+    Mapped(memmap2::Mmap),
+}
+
+/// Largest read a mapped handle serves out of its map.
+///
+/// A mapped read trades one syscall entry for faulting the source pages in.
+/// Which side of that trade wins depends on the size of the read and on
+/// whether the buffer it lands in is one the caller already owns. Measured on
+/// this box (tmpfs, 128 MiB file read through in pieces of the given size,
+/// fresh map per round, minimum of eight), as the mapped read's time over the
+/// same read through `pread`:
+///
+/// ```text
+/// piece      4 KiB  16 KiB  64 KiB  256 KiB  1 MiB   4 MiB  128 MiB
+/// warm dst    0.69    0.84    0.94     0.94   0.94    0.94     0.65
+/// cold dst    0.92    1.08    1.12     1.14   1.14    1.13     1.24
+/// ```
+///
+/// "Cold" is a buffer freshly allocated for the read, whose own pages have to
+/// be faulted in as they are filled; "warm" is one the reader already had.
+/// With a cold destination the fault cost of the destination dominates
+/// everything, and the map's source-side faults are pure addition — `pread`
+/// reaches the same page cache through the kernel's own huge-page mapping and
+/// pays nothing per page for it. So the map only pays off for reads small
+/// enough that the syscall is the larger half of the work.
+///
+/// 8 KiB is where this library's reads divide. Metadata windows, small
+/// datasets, and filtered chunk images are at or below it — opening and
+/// reading 2000 small datasets is 2000 reads of 1 KiB and 2000 of 8 KiB, and
+/// it runs 27% faster mapped. A selected run out of a chunked dataset is
+/// 64 KiB and a whole chunk is megabytes; those stay on `pread`, and it
+/// matters that they do: at a 64 KiB ceiling the 1000-random-slice read
+/// workload lost 7.7%, which this ceiling gives back.
+#[cfg(feature = "mmap")]
+const MAP_MAX_READ: usize = 8 << 10;
+
+impl ReadSource {
+    /// The best source a read-only handle can have: a whole-file map when one
+    /// can be had, positioned reads otherwise.
+    ///
+    /// Mapping failure is not an open failure. An empty file (`mmap` rejects a
+    /// zero length), a file longer than the address space holds, a filesystem
+    /// or platform that refuses `mmap` — each lands on `Pread`, which every
+    /// caller already cannot tell from a map.
+    fn for_read_only(file: &File) -> Self {
+        #[cfg(feature = "mmap")]
+        {
+            let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            if len > 0 && usize::try_from(len).is_ok() {
+                // SAFETY: mapping a file is unsafe because another process
+                // can change its bytes, or truncate it out from under the
+                // mapping, while it is mapped. The read-only opener took a
+                // shared lock first (unless the policy waived it), which is
+                // the same protection the C library's `H5FD_lock` gives its
+                // drivers, and the reader treats the mapped bytes as a
+                // snapshot: nothing here caches a borrowed slice, so a
+                // concurrent modification can only be seen or not seen, never
+                // half-seen.
+                if let Ok(map) = unsafe { memmap2::Mmap::map(file) } {
+                    return ReadSource::Mapped(map);
+                }
+            }
+        }
+        let _ = file;
+        ReadSource::Pread
+    }
+
+    /// The map to serve a read of `len` bytes from, or `None` when this read
+    /// goes to the descriptor — either because the handle has no map, or
+    /// because the read is too big to be worth taking out of one
+    /// ([`MAP_MAX_READ`]). The one place that decides, so that no read entry
+    /// point can pick for itself and none can be added that skips the choice.
+    #[cfg(feature = "mmap")]
+    fn map_for(&self, len: usize) -> Option<&memmap2::Mmap> {
+        match self {
+            ReadSource::Mapped(map) if len <= MAP_MAX_READ => Some(map),
+            _ => None,
+        }
+    }
+
+    /// Bytes this source can serve, counted from the start of the file.
+    fn len(&self, file: &File) -> std::io::Result<u64> {
+        match self {
+            #[cfg(feature = "mmap")]
+            ReadSource::Mapped(map) => Ok(map.len() as u64),
+            ReadSource::Pread => Ok(file.metadata()?.len()),
+        }
+    }
+
+    /// Exactly `len` bytes at absolute offset `at`, in a fresh `Vec`.
+    ///
+    /// The map gets its own copy rather than the `pread` path's
+    /// zero-then-fill: the bytes are already there to be copied, and zeroing
+    /// a buffer that is about to be overwritten is a second pass over it.
+    fn read_vec(&self, file: &File, at: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        #[cfg(feature = "mmap")]
+        if let Some(map) = self.map_for(len) {
+            return Ok(mapped_range(map, at, len)?.to_vec());
+        }
+        let mut buf = vec![0u8; len];
+        pread_exact(file, at, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Up to `max_len` bytes at absolute offset `at`, stopping at the end of
+    /// what the source holds.
+    fn read_vec_upto(&self, file: &File, at: u64, max_len: usize) -> std::io::Result<Vec<u8>> {
+        #[cfg(feature = "mmap")]
+        if let Some(map) = self.map_for(max_len) {
+            let avail = (map.len() as u64).saturating_sub(at) as usize;
+            return Ok(mapped_range(map, at, max_len.min(avail))?.to_vec());
+        }
+        let mut buf = vec![0u8; max_len];
+        let mut total = 0;
+        while total < buf.len() {
+            match pread(file, at + total as u64, &mut buf[total..]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        buf.truncate(total);
+        Ok(buf)
+    }
+
+    /// Exactly `buf.len()` bytes at absolute offset `at`, straight into
+    /// `buf`. Fails with `UnexpectedEof` when the source is too short, which
+    /// is what a short `pread` reports.
+    fn read_exact_into(&self, file: &File, at: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        #[cfg(feature = "mmap")]
+        if let Some(map) = self.map_for(buf.len()) {
+            buf.copy_from_slice(mapped_range(map, at, buf.len())?);
+            return Ok(());
+        }
+        pread_exact(file, at, buf)
+    }
+}
+
+/// `len` bytes of `map` at absolute offset `at`, or the `UnexpectedEof` a
+/// `pread` that could not fill its buffer returns.
+///
+/// Every mapped read comes through here, so a length or address the file
+/// itself supplied can only ever produce that error — never an out-of-bounds
+/// slice, and never the `SIGBUS` a raw pointer walk off the end of the
+/// mapping would take.
+#[cfg(feature = "mmap")]
+fn mapped_range(map: &memmap2::Mmap, at: u64, len: usize) -> std::io::Result<&[u8]> {
+    if len == 0 {
+        // A read of nothing succeeds wherever it is asked for, which is what
+        // `read_exact_at` does with an empty buffer: it fills it without
+        // looking at the offset at all.
+        return Ok(&[]);
+    }
+    let end = at.checked_add(len as u64);
+    let range = usize::try_from(at)
+        .ok()
+        .zip(end.and_then(|e| usize::try_from(e).ok()));
+    match range.and_then(|(s, e)| map.get(s..e)) {
+        Some(slice) => Ok(slice),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        )),
+    }
 }
 
 /// Upper bound on the buffered range, as `H5F_ACCUM_MAX_SIZE` bounds
@@ -240,6 +435,7 @@ impl FileHandle {
     fn new(file: File, writable: bool, lock_policy: FileLocking, lock_held: bool) -> Self {
         Self {
             file,
+            source: ReadSource::Pread,
             accum: Mutex::new(Accum::new()),
             accum_dirty: AtomicBool::new(false),
             writable,
@@ -247,6 +443,16 @@ impl FileHandle {
             lock_held,
             base: 0,
         }
+    }
+
+    /// Wrap a file opened read-only. The only constructor that can install a
+    /// map, and the only one that hands `new` a `writable` of `false` — which
+    /// is what makes `Mapped` imply read-only (see [`ReadSource`]).
+    fn new_read_only(file: File, lock_policy: FileLocking, lock_held: bool) -> Self {
+        let source = ReadSource::for_read_only(&file);
+        let mut handle = Self::new(file, false, lock_policy, lock_held);
+        handle.source = source;
+        handle
     }
 
     /// Create a new file with the env-var-derived locking policy.
@@ -316,8 +522,10 @@ impl FileHandle {
     /// policy. A shared lock is taken so multiple readers can coexist.
     pub fn open_read_with_locking(path: &Path, policy: FileLocking) -> std::io::Result<Self> {
         let file = OpenOptions::new().read(true).open(path)?;
+        // The lock goes on before the map is taken, so the map cannot capture
+        // a file another opener is in the middle of writing.
         let lock_held = locking::try_acquire(&file, LockMode::Shared, policy)?;
-        Ok(Self::new(file, false, policy, lock_held))
+        Ok(Self::new_read_only(file, policy, lock_held))
     }
 
     /// Open an existing file for read/write access with an explicit locking
@@ -351,12 +559,12 @@ impl FileHandle {
     pub fn locate_signature(&self) -> std::io::Result<Option<u64>> {
         use crate::format::superblock::HDF5_SIGNATURE;
         self.flush()?;
-        let file_len = self.file.metadata()?.len();
+        let file_len = self.source.len(&self.file)?;
         let mut buf = [0u8; HDF5_SIGNATURE.len()];
         let mut addr = 0u64;
         loop {
             if addr + HDF5_SIGNATURE.len() as u64 <= file_len {
-                pread_exact(&self.file, addr, &mut buf)?;
+                self.source.read_exact_into(&self.file, addr, &mut buf)?;
                 if buf == HDF5_SIGNATURE {
                     return Ok(Some(addr));
                 }
@@ -459,7 +667,7 @@ impl FileHandle {
         // `offset`/`len` are often file-derived; reject a request larger than
         // the file before allocating, so a corrupt size field cannot drive an
         // unbounded allocation.
-        let file_len = self.file.metadata()?.len();
+        let file_len = self.source.len(&self.file)?;
         let start = self.abs(offset)?;
         let end = start.checked_add(len as u64);
         if end.is_none_or(|e| e > file_len) {
@@ -468,9 +676,7 @@ impl FileHandle {
                 format!("read past end: offset={offset} len={len} file_size={file_len}"),
             ));
         }
-        let mut buf = vec![0u8; len];
-        pread_exact(&self.file, start, &mut buf)?;
-        Ok(buf)
+        self.source.read_vec(&self.file, start, len)
     }
 
     /// Read exactly `buf.len()` bytes at `offset` directly into `buf`.
@@ -488,29 +694,52 @@ impl FileHandle {
     /// paying a per-call `fstat` on the hot coalesced-read path.
     pub fn read_exact_at_into(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
         self.flush()?;
-        pread_exact(&self.file, self.abs(offset)?, buf)
+        self.source
+            .read_exact_into(&self.file, self.abs(offset)?, buf)
     }
 
     /// Read up to `max_len` bytes starting at the given byte offset.
     pub fn read_at_most(&self, offset: u64, max_len: usize) -> std::io::Result<Vec<u8>> {
         self.flush()?;
         // Clamp the allocation to what the file can actually hold.
-        let file_len = self.file.metadata()?.len();
+        let file_len = self.source.len(&self.file)?;
         let start = self.abs(offset)?;
         let avail = file_len.saturating_sub(start);
         let max_len = (max_len as u64).min(avail) as usize;
-        let mut buf = vec![0u8; max_len];
-        let mut total = 0;
-        while total < buf.len() {
-            match pread(&self.file, start + total as u64, &mut buf[total..]) {
-                Ok(0) => break,
-                Ok(n) => total += n,
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
+        self.source.read_vec_upto(&self.file, start, max_len)
+    }
+
+    /// Retake this handle's read source against the file as it is now.
+    ///
+    /// A mapped handle serves the file as it was when the map was taken, so a
+    /// SWMR writer's appends are past its end — and read as such — until the
+    /// map is retaken. Every refresh comes through here before it decodes
+    /// anything, so the bytes a refreshed reader decodes are as new as the
+    /// metadata it decodes them with.
+    ///
+    /// Only a handle that already has a map takes a new one: `Mapped` implies
+    /// read-only (see [`ReadSource`]), so this cannot hand a map to a writable
+    /// handle, and a handle that never mapped has nothing that can go stale.
+    /// A remap that fails leaves the handle on `Pread`, which no caller can
+    /// tell from a mapped one.
+    pub fn refresh_read_source(&mut self) {
+        #[cfg(feature = "mmap")]
+        if matches!(self.source, ReadSource::Mapped(_)) {
+            // Drop the old mapping before taking the new one so the address
+            // space of a large file is not held twice.
+            self.source = ReadSource::Pread;
+            self.source = ReadSource::for_read_only(&self.file);
         }
-        buf.truncate(total);
-        Ok(buf)
+    }
+
+    /// Whether this handle reads through a map. Only the tests that pin the
+    /// map's boundary behaviour ask; every other caller is meant not to be
+    /// able to tell.
+    #[cfg(test)]
+    fn is_mapped(&self) -> bool {
+        // Written against `Pread` rather than `Mapped` so it reads the same
+        // in a build that has no `Mapped` variant to name.
+        !matches!(self.source, ReadSource::Pread)
     }
 
     /// Translate an HDF5 address into a file offset. Fails rather than wraps
@@ -545,7 +774,7 @@ impl FileHandle {
     /// `H5FD_get_eof` returns for the same reason).
     pub fn file_size(&self) -> std::io::Result<u64> {
         self.flush()?;
-        Ok(self.file.metadata()?.len().saturating_sub(self.base))
+        Ok(self.source.len(&self.file)?.saturating_sub(self.base))
     }
 
     /// Set the file's length to `eof` in this handle's address space —
@@ -716,100 +945,6 @@ fn pread_exact(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> 
     let mut f = file;
     f.seek(SeekFrom::Start(offset))?;
     f.read_exact(buf)
-}
-
-/// A memory-mapped read-only file handle for zero-copy reads.
-///
-/// Available when the `mmap` feature is enabled.
-#[cfg(feature = "mmap")]
-pub struct MmapFileHandle {
-    mmap: memmap2::Mmap,
-    /// Keep the underlying file alive so the OS lock survives for the
-    /// lifetime of this handle. (The mmap itself doesn't pin the fd.)
-    _file: File,
-    /// Userblock size, as in [`FileHandle::base`]: this handle shares the
-    /// address space of the [`FileHandle`] the same file was opened with, so
-    /// an address is read from the same bytes through either.
-    base: u64,
-}
-
-#[cfg(feature = "mmap")]
-impl MmapFileHandle {
-    /// Open a file with memory mapping for read-only access, using the
-    /// env-var-derived locking policy.
-    pub fn open(path: &Path) -> std::io::Result<Self> {
-        Self::open_with_locking(path, FileLocking::from_env_or(FileLocking::default()))
-    }
-
-    /// Open a file with memory mapping with an explicit locking policy.
-    /// A shared lock is taken (mmap is read-only) so the handle blocks
-    /// concurrent writers as long as it lives.
-    pub fn open_with_locking(path: &Path, policy: FileLocking) -> std::io::Result<Self> {
-        let file = File::open(path)?;
-        // Take the shared lock BEFORE mmapping so the mmap doesn't
-        // capture a snapshot of a file that's being concurrently
-        // modified.
-        let _ = locking::try_acquire(&file, LockMode::Shared, policy)?;
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        Ok(Self {
-            mmap,
-            _file: file,
-            base: 0,
-        })
-    }
-
-    /// Move this handle's address space to start at `base`, as
-    /// [`FileHandle::set_base`] does.
-    pub fn set_base(&mut self, base: u64) {
-        self.base = base;
-    }
-
-    /// Return the size of the mapped file's HDF5 address space — the mapping
-    /// less the userblock, so the result bounds the offsets this handle takes.
-    pub fn len(&self) -> usize {
-        self.mmap.len().saturating_sub(self.base as usize)
-    }
-
-    /// Return whether the file is empty.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Read exactly `len` bytes at `offset`. Zero-copy: returns a slice.
-    pub fn read_at(&self, offset: u64, len: usize) -> std::io::Result<&[u8]> {
-        // `offset`/`len` are file-derived; compute the end in u64 and reject
-        // overflow so a hostile value cannot wrap past the bounds check.
-        let start = offset.checked_add(self.base);
-        let end = start
-            .and_then(|s| s.checked_add(len as u64))
-            .filter(|&e| e <= self.mmap.len() as u64);
-        match (start, end) {
-            (Some(start), Some(end)) => Ok(&self.mmap[start as usize..end as usize]),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "mmap read past end: offset={} len={} file_size={}",
-                    offset,
-                    len,
-                    self.mmap.len()
-                ),
-            )),
-        }
-    }
-
-    /// Read up to `max_len` bytes at `offset`. Returns a slice.
-    pub fn read_at_most(&self, offset: u64, max_len: usize) -> &[u8] {
-        let Some(start) = offset
-            .checked_add(self.base)
-            .filter(|&s| s < self.mmap.len() as u64)
-        else {
-            return &[];
-        };
-        let end = start
-            .saturating_add(max_len as u64)
-            .min(self.mmap.len() as u64) as usize;
-        &self.mmap[start as usize..end]
-    }
 }
 
 #[cfg(test)]
@@ -988,5 +1123,236 @@ mod tests {
         assert_eq!(handle.file_size().unwrap(), 16);
         assert_eq!(std::fs::read(&path).unwrap().len(), 528);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+}
+
+/// The read source's boundary behaviour.
+///
+/// A read-only handle reads through a memory map when the `mmap` feature is
+/// on and the platform allows one, and through `pread` otherwise. The two
+/// must be indistinguishable: same bytes, same error at the same boundary.
+/// Every test here runs in both builds and asserts the behaviour that must
+/// hold either way; the `mmap`-gated assertions pin what is specific to the
+/// map (that it is taken at all, and that it is a snapshot until retaken).
+#[cfg(test)]
+mod read_source_tests {
+    use super::*;
+
+    fn dir(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::AtomicU64;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "rust_hdf5_source_{}_{}_{}",
+            label,
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A read-only open maps; a writable one never does, which is what keeps
+    /// a map from ever coexisting with buffered writes.
+    #[test]
+    fn only_a_read_only_open_maps() {
+        let d = dir("only_read_only");
+        let path = d.join("f.bin");
+        std::fs::write(&path, vec![7u8; 4096]).unwrap();
+
+        let writable =
+            FileHandle::open_readwrite_with_locking(&path, FileLocking::Disabled).unwrap();
+        assert!(!writable.is_mapped());
+        drop(writable);
+
+        let created = FileHandle::create(&d.join("created.bin")).unwrap();
+        assert!(!created.is_mapped());
+        drop(created);
+
+        let read_only = FileHandle::open_read(&path).unwrap();
+        assert_eq!(read_only.is_mapped(), cfg!(feature = "mmap"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A read that ends exactly at the end of the file is a read, not an
+    /// error — including the zero-length one that starts there.
+    #[test]
+    fn a_read_ending_at_eof_succeeds() {
+        let d = dir("at_eof");
+        let path = d.join("f.bin");
+        let bytes: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let handle = FileHandle::open_read(&path).unwrap();
+        assert_eq!(handle.file_size().unwrap(), 1000);
+        assert_eq!(handle.read_at(990, 10).unwrap(), bytes[990..].to_vec());
+        assert_eq!(handle.read_at(1000, 0).unwrap(), Vec::<u8>::new());
+        assert_eq!(handle.read_at_most(1000, 64).unwrap(), Vec::<u8>::new());
+        assert_eq!(handle.read_at_most(990, 64).unwrap(), bytes[990..].to_vec());
+        let mut out = [0u8; 10];
+        handle.read_exact_at_into(990, &mut out).unwrap();
+        assert_eq!(&out, &bytes[990..]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A read reaching past the end fails with the error a short `pread`
+    /// gives — never a panic, and never the `SIGBUS` a walk off the end of a
+    /// mapping would take.
+    #[test]
+    fn a_read_past_eof_fails_as_unexpected_eof() {
+        let d = dir("past_eof");
+        let path = d.join("f.bin");
+        std::fs::write(&path, vec![3u8; 1000]).unwrap();
+
+        let handle = FileHandle::open_read(&path).unwrap();
+        for (offset, len) in [(1000u64, 1usize), (999, 2), (0, 1001)] {
+            let err = handle.read_at(offset, len).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::UnexpectedEof,
+                "read_at({offset}, {len})"
+            );
+            let mut out = vec![0u8; len];
+            let err = handle.read_exact_at_into(offset, &mut out).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::UnexpectedEof,
+                "read_exact_at_into({offset}, {len})"
+            );
+        }
+        // An offset past what the OS will take an address for is refused by
+        // both sources, though not with the same word for it: the descriptor
+        // reports `InvalidInput` where the map reports `UnexpectedEof`. What
+        // the two owe each other is that neither reads.
+        assert!(handle.read_at(u64::MAX, 8).is_err());
+        assert!(handle.read_exact_at_into(u64::MAX, &mut [0u8; 8]).is_err());
+
+        // `read_at_most` is the one that reports a short read by returning
+        // what there was, so past the end it returns nothing.
+        assert!(handle.read_at_most(1000, 64).unwrap().is_empty());
+        assert!(handle.read_at_most(u64::MAX, 64).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A userblock shifts the address space for the map exactly as it does
+    /// for `pread`: the same address reads the same bytes through either.
+    #[test]
+    fn a_userblock_shifts_the_source_the_same_way() {
+        let d = dir("userblock");
+        let path = d.join("f.bin");
+        let mut bytes = vec![0xEEu8; 512];
+        bytes.extend((0..500u32).map(|i| i as u8));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut handle = FileHandle::open_read(&path).unwrap();
+        handle.set_base(512);
+        assert_eq!(handle.file_size().unwrap(), 500);
+        assert_eq!(handle.read_at(0, 4).unwrap(), vec![0, 1, 2, 3]);
+        assert_eq!(handle.read_at(499, 1).unwrap(), vec![243]);
+        assert_eq!(
+            handle.read_at(500, 1).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A file that grows under a SWMR writer: the new bytes are past the end
+    /// of what the handle reads from until the source is retaken, and a read
+    /// of them until then fails the way a read past the end of a shorter file
+    /// does.
+    #[test]
+    fn growth_is_picked_up_when_the_source_is_retaken() {
+        use std::io::Write;
+        let d = dir("growth");
+        let path = d.join("f.bin");
+        std::fs::write(&path, vec![1u8; 4096]).unwrap();
+
+        let mut handle = FileHandle::open_read(&path).unwrap();
+        assert_eq!(handle.file_size().unwrap(), 4096);
+
+        let mut appender = OpenOptions::new().append(true).open(&path).unwrap();
+        appender.write_all(&vec![2u8; 4096]).unwrap();
+        appender.flush().unwrap();
+
+        // A map is a snapshot: the appended bytes are outside it, and reading
+        // them errors rather than faulting.
+        #[cfg(feature = "mmap")]
+        {
+            assert!(handle.is_mapped());
+            assert_eq!(handle.file_size().unwrap(), 4096);
+            assert_eq!(
+                handle.read_at(4096, 4096).unwrap_err().kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+        }
+
+        handle.refresh_read_source();
+        assert_eq!(handle.file_size().unwrap(), 8192);
+        assert_eq!(handle.read_at(4096, 4096).unwrap(), vec![2u8; 4096]);
+        assert_eq!(handle.read_at(0, 4096).unwrap(), vec![1u8; 4096]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// An empty file cannot be mapped. The handle falls back and reads from
+    /// the descriptor, so an opener cannot tell the mapping failed.
+    #[test]
+    fn an_empty_file_falls_back_to_the_descriptor() {
+        let d = dir("empty");
+        let path = d.join("f.bin");
+        std::fs::write(&path, []).unwrap();
+
+        let mut handle = FileHandle::open_read(&path).unwrap();
+        assert!(!handle.is_mapped());
+        assert_eq!(handle.file_size().unwrap(), 0);
+        assert!(handle.read_at_most(0, 64).unwrap().is_empty());
+        assert_eq!(
+            handle.read_at(0, 1).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert!(handle.locate_signature().unwrap().is_none());
+        // Retaking the source on a handle that never mapped leaves it alone:
+        // a map begets a map, so a fallback can never turn into one.
+        handle.refresh_read_source();
+        assert!(!handle.is_mapped());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The two sources return the same bytes for the same request, at every
+    /// shape of request the reader makes — including the reads either side of
+    /// the size above which a mapped handle goes back to the descriptor, so
+    /// that the rule about where bytes come from cannot change what they are.
+    #[test]
+    fn a_map_and_a_descriptor_read_the_same_bytes() {
+        let d = dir("differential");
+        let path = d.join("f.bin");
+        let bytes: Vec<u8> = (0..70_000u32).map(|i| (i * 31) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let handle = FileHandle::open_read(&path).unwrap();
+        for (offset, len) in [
+            (0u64, 8usize),
+            (1, 1),
+            (4095, 4098),
+            // Either side of the size above which a mapped handle hands the
+            // read back to the descriptor.
+            (100, 8 * 1024 - 1),
+            (100, 8 * 1024),
+            (100, 8 * 1024 + 1),
+            (65_536, 4464),
+            (69_999, 1),
+            (0, 70_000),
+        ] {
+            let want = &bytes[offset as usize..offset as usize + len];
+            assert_eq!(handle.read_at(offset, len).unwrap(), want, "read_at");
+            assert_eq!(
+                handle.read_at_most(offset, len + 100).unwrap(),
+                &bytes[offset as usize..(offset as usize + len + 100).min(bytes.len())],
+                "read_at_most"
+            );
+            let mut out = vec![0u8; len];
+            handle.read_exact_at_into(offset, &mut out).unwrap();
+            assert_eq!(out, want, "read_exact_at_into");
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
