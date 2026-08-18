@@ -853,14 +853,8 @@ impl H5File {
         match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_string_dataset(name, strings, charset)?;
-                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(idx);
-                Ok(H5Dataset::new_writer(
-                    clone_inner(&self.inner),
-                    idx,
-                    shape,
-                    element_size,
-                    chunk_index,
-                ))
+                let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
+                Ok(H5Dataset::new_writer(clone_inner(&self.inner), idx, parts))
             }
             H5FileInner::Reader(_) => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
@@ -904,14 +898,8 @@ impl H5File {
         match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_sequence_dataset(name, T::hdf5_type(), &images)?;
-                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(idx);
-                Ok(H5Dataset::new_writer(
-                    clone_inner(&self.inner),
-                    idx,
-                    shape,
-                    element_size,
-                    chunk_index,
-                ))
+                let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
+                Ok(H5Dataset::new_writer(clone_inner(&self.inner), idx, parts))
             }
             H5FileInner::Reader(_) => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
@@ -938,14 +926,8 @@ impl H5File {
             H5FileInner::Writer(writer) => {
                 let idx = writer
                     .create_vlen_string_dataset_compressed(name, strings, chunk_size, pipeline)?;
-                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(idx);
-                Ok(H5Dataset::new_writer(
-                    clone_inner(&self.inner),
-                    idx,
-                    shape,
-                    element_size,
-                    chunk_index,
-                ))
+                let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
+                Ok(H5Dataset::new_writer(clone_inner(&self.inner), idx, parts))
             }
             H5FileInner::Reader(_) => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
@@ -969,14 +951,8 @@ impl H5File {
             H5FileInner::Writer(writer) => {
                 let idx =
                     writer.create_appendable_vlen_string_dataset(name, chunk_size, pipeline)?;
-                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(idx);
-                Ok(H5Dataset::new_writer(
-                    clone_inner(&self.inner),
-                    idx,
-                    shape,
-                    element_size,
-                    chunk_index,
-                ))
+                let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
+                Ok(H5Dataset::new_writer(clone_inner(&self.inner), idx, parts))
             }
             H5FileInner::Reader(_) => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
@@ -1123,17 +1099,46 @@ impl H5File {
     /// Returns [`Hdf5Error::NotFound`] if no live dataset with that name
     /// exists, and an error in read mode (use [`dataset`](Self::dataset)).
     pub fn dataset_writer(&self, name: &str) -> Result<H5Dataset> {
+        self.dataset_writer_with(name, DatasetAccess::default())
+    }
+
+    /// [`dataset_writer`](Self::dataset_writer) under named dataset-access
+    /// properties — `H5Dopen2` with a dapl instead of `H5P_DEFAULT`, in write
+    /// mode.
+    ///
+    /// The one property that reaches a write is
+    /// [`DatasetAccess::efile_prefix`]: `H5D__efl_write` joins each slot name
+    /// of an external file list against `dset->shared->extfile_prefix`
+    /// (H5Defl.c:429-431), which the open that settled the dataset's shared
+    /// info built from its dapl. So this is how a dataset reopened from an
+    /// existing file is told where its raw data files are before being
+    /// written to; the other properties decide a *virtual* dataset's extent,
+    /// which this writer never resolves.
+    ///
+    /// First open wins, and a joining open may not disagree about that
+    /// prefix — see
+    /// [`H5File::dataset_with`](Self::dataset_with) for the same rule on the
+    /// read side. A dataset this session created settled its prefix from
+    /// [`DatasetBuilder::efile_prefix`](crate::DatasetBuilder::efile_prefix),
+    /// so while its handle is alive this call must name the same one;
+    /// once every handle is dropped the next call settles it afresh.
+    ///
+    /// # Errors
+    ///
+    /// [`dataset_writer`](Self::dataset_writer)'s errors, plus a refusal when
+    /// `access` names an external file prefix that disagrees with the one an
+    /// open of this dataset is still holding.
+    pub fn dataset_writer_with(&self, name: &str, access: DatasetAccess) -> Result<H5Dataset> {
+        access.validate()?;
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
                 let index = writer.open_dataset_index(name)?;
-                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(index);
+                let parts = writer.dataset_handle_parts(index, &access)?;
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.inner),
                     index,
-                    shape,
-                    element_size,
-                    chunk_index,
+                    parts,
                 ))
             }
             H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(

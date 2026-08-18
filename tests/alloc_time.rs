@@ -145,3 +145,49 @@ fn alloc_time_unavailable_in_write_mode() {
     assert!(ds.alloc_time().is_err());
     std::fs::remove_file(&path).ok();
 }
+
+/// `H5D__alloc_storage` allocates nothing for a dataset stored through an
+/// external file list — "we assume that external storage is already allocated
+/// by the caller, or at least will be before I/O is performed" — and the
+/// `H5D__init_storage` that would tile the fill value into that storage sits
+/// inside the same skipped block (H5Dint.c:2270-2274). So declaring a fill
+/// value does not bring the raw data file into existence; only a write does.
+///
+/// Measured under libhdf5 1.14.6 and 2.0.0: with a user fill value,
+/// `H5D_FILL_TIME_ALLOC` and `H5D_ALLOC_TIME_EARLY` all set, `H5Dcreate2`
+/// leaves the raw data file uncreated and a read before any write fails with
+/// "unable to open external raw data file" instead of reporting the fill.
+#[test]
+fn creating_an_external_dataset_with_a_fill_value_writes_no_raw_data_file() {
+    let dir = tmp("external_fill").with_extension("");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("ext.h5");
+    {
+        let file = H5File::create(&path).unwrap();
+        file.new_dataset::<i32>()
+            .shape([4])
+            .external(&[("raw.bin", 0, 16)])
+            .efile_prefix(dir.display().to_string())
+            .fill_value(7i32)
+            .create("d")
+            .unwrap();
+        file.close().unwrap();
+    }
+    assert!(
+        !dir.join("raw.bin").exists(),
+        "the fill value must not reach storage this writer never allocated"
+    );
+
+    let file = H5File::open(&path).unwrap();
+    assert!(
+        file.dataset_with(
+            "d",
+            rust_hdf5::DatasetAccess::new().efile_prefix(dir.display().to_string())
+        )
+        .unwrap()
+        .read_raw::<i32>()
+        .is_err(),
+        "reading before any write fails on the missing file rather than reporting the fill"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

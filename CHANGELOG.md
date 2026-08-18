@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Added
+
+- `DatasetBuilder::efile_prefix` (`H5Pset_efile_prefix` on the dapl
+  `H5Dcreate2` takes) and `H5File::dataset_writer_with` /
+  `H5Group::dataset_writer_with` (`H5Dopen2` with a dapl, in write mode):
+  where the raw data files of an external file list are created and
+  looked for on the way out. The write side used to consult only
+  `HDF5_EXTFILE_PREFIX`, so a dataset written under a prefix a reader
+  then named could not be read back. The prefix is settled once by the
+  open, as `H5D__build_file_prefix` settles `shared->extfile_prefix`, and
+  a second open that disagrees is refused for as long as the first is
+  held.
+
 ### Changed
 
 - **Breaking.** `DatasetAccess` no longer implements `Copy`. It gained
@@ -9,6 +22,14 @@
   (`H5Pset_virtual_prefix` / `H5Pset_efile_prefix`), which are owned
   strings, so implicit copies became moves. `Clone` is still derived —
   add `.clone()` where a copy was relied on.
+
+### Fixed
+
+- Declaring a fill value on a dataset stored through an external file
+  list no longer creates and fills its raw data files. `H5D__alloc_storage`
+  allocates nothing for such a dataset and so never reaches the
+  `H5D__init_storage` that would tile the fill into it; the files come
+  into existence when something writes them.
 
 ## 0.4.3
 

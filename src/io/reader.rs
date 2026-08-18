@@ -1181,9 +1181,9 @@ fn fill_tiled_into(out: &mut [u8], fill_value: Option<&[u8]>) {
 /// variable — `HDF5_EXTFILE_PREFIX` for External Data Files
 /// ([`resolve_extfile_prefix`]), `HDF5_VDS_PREFIX` for Virtual Dataset
 /// sources ([`resolve_vdsfile_prefix`]); both features route through the
-/// same C function, just keyed on a different variable. There is no dataset
-/// access property list here to fall back to, so unset behaves exactly as
-/// an unset/empty DAPL property would.
+/// same C function, just keyed on a different variable. `prop` is the dapl
+/// property the variable falls back to, `None` when the caller has none —
+/// which behaves exactly as an unset or empty one would.
 ///
 /// `${ORIGIN}` expands to `source_dir` (the directory holding the open
 /// HDF5 file); any other value is used as a literal prefix; unset, empty,
@@ -1218,10 +1218,16 @@ fn resolve_file_prefix(env_var: &str, prop: Option<&str>, source_dir: &Path) -> 
     })
 }
 
-pub(crate) fn resolve_extfile_prefix(source_dir: &Path) -> Option<PathBuf> {
-    // `H5Pset_efile_prefix`, the property `H5D__build_file_prefix` falls back
-    // to here (H5Dint.c:1085-1090), has no equivalent in this crate's API yet.
-    resolve_file_prefix("HDF5_EXTFILE_PREFIX", None, source_dir)
+/// Resolve the directory an external file list's stored names are joined
+/// against — `HDF5_EXTFILE_PREFIX`, or `H5Pset_efile_prefix` when the
+/// environment names none (see [`resolve_file_prefix`]).
+///
+/// The single owner of that rule for both directions of I/O: `H5D__efl_read`
+/// and `H5D__efl_write` join against the same `shared->extfile_prefix`
+/// (H5Defl.c:315-317, :429-431), which `H5D__build_file_prefix` built once
+/// for the open that created the dataset's shared info.
+pub(crate) fn resolve_extfile_prefix(prop: Option<&str>, source_dir: &Path) -> Option<PathBuf> {
+    resolve_file_prefix("HDF5_EXTFILE_PREFIX", prop, source_dir)
 }
 
 /// Resolve the directory Virtual Dataset source file names are joined
@@ -3962,11 +3968,7 @@ impl Hdf5Reader {
     /// (H5Dint.c:1084-1090), whose answer libhdf5 keeps in
     /// `dset->shared->extfile_prefix`.
     fn extfile_prefix_of(&self, access: &DatasetAccess) -> Option<PathBuf> {
-        resolve_file_prefix(
-            "HDF5_EXTFILE_PREFIX",
-            access.efile_prefix_value(),
-            &self.source_dir,
-        )
+        resolve_extfile_prefix(access.efile_prefix_value(), &self.source_dir)
     }
 
     /// The external file prefix in force for the open dataset `name` — the
