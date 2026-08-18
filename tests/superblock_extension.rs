@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rust_hdf5::{FileSpaceStrategy, H5File};
+use rust_hdf5::{FileSpaceInfoMessage, FileSpaceStrategy, H5File, SuperblockExtension};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -271,10 +271,37 @@ fn a_reopened_extension_comes_back_whole() {
     // second reads back what the re-emission itself encoded.
     for round in 0..2 {
         append_dataset(&path, &format!("appended{round}"));
+        let after = H5File::open(&path).unwrap().superblock_extension();
+        // Everything but the two fields the close owns: this file persists its
+        // free space, so the managers move and the file grows.
+        let fsinfo = after.file_space_info.clone().unwrap();
         assert_eq!(
-            H5File::open(&path).unwrap().superblock_extension(),
+            SuperblockExtension {
+                file_space_info: before.file_space_info.clone(),
+                ..after
+            },
             before,
             "round {round} rewrote the extension without reproducing it"
+        );
+        let reference = before.file_space_info.clone().unwrap();
+        assert_eq!(
+            FileSpaceInfoMessage {
+                eoa_pre_fsm_fsalloc: reference.eoa_pre_fsm_fsalloc,
+                fs_addr: reference.fs_addr.clone(),
+                ..fsinfo.clone()
+            },
+            reference,
+            "round {round} changed more of the file-space info message than the managers"
+        );
+        assert_eq!(
+            fsinfo.eoa_pre_fsm_fsalloc,
+            std::fs::metadata(&path).unwrap().len(),
+            "round {round} did not record the end of the file it wrote"
+        );
+        assert_ne!(
+            fsinfo.fs_addr[0],
+            u64::MAX,
+            "round {round} left the file with no free-space manager"
         );
     }
 
@@ -359,10 +386,11 @@ fn the_rewritten_symbol_table_is_sized_by_the_files_k_ranks() {
 }
 
 /// A file whose extension carries persisted free-space managers: the message
-/// names twelve manager addresses, and the append neither drops it nor
-/// allocates over what it points at.
+/// names twelve manager addresses, and the append rewrites the managers it
+/// points at while every other property of the message stays what the file was
+/// created with.
 #[test]
-fn a_paged_file_keeps_its_persisted_free_space_managers() {
+fn a_paged_file_rewrites_its_persisted_free_space_managers() {
     let path = copy_fixture("sbext_paged.h5", "paged");
     let before = H5File::open(&path).unwrap().superblock_extension();
     let fs = before.file_space_info.clone().expect("file space info");
@@ -372,7 +400,16 @@ fn a_paged_file_keeps_its_persisted_free_space_managers() {
     append_dataset(&path, "appended");
 
     let file = H5File::open(&path).unwrap();
-    assert_eq!(file.superblock_extension(), before);
+    let after = file
+        .superblock_extension()
+        .file_space_info
+        .expect("file space info");
+    assert_eq!(after.strategy, fs.strategy);
+    assert_eq!(after.persist, fs.persist);
+    assert_eq!(after.threshold, fs.threshold);
+    assert_eq!(after.page_size, fs.page_size);
+    assert_eq!(after.fs_addr.len(), fs.fs_addr.len());
+    assert_ne!(after.fs_addr, fs.fs_addr, "the managers were not rewritten");
     drop(file);
     if let Some(text) = tool_output("h5dump", &["-pBH", path.to_str().unwrap()]) {
         assert!(

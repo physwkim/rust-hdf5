@@ -13,6 +13,7 @@ pub mod dense_attr;
 pub mod dense_link;
 pub mod fractal_heap;
 pub mod fractal_heap_write;
+pub mod free_space;
 pub mod global_heap;
 pub mod local_heap;
 pub mod messages;

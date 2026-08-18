@@ -33,6 +33,10 @@ pub const SMLI_SIGNATURE: [u8; 4] = *b"SMLI";
 /// the SOHM heap's ID length is fixed by the format, not read from the heap.
 pub const SOHM_HEAP_ID_LEN: usize = 8;
 
+/// Offset of the heap ID inside a heap-shared pointer: past the version and
+/// type bytes [`SharedMessagePointer::encode_sohm`] writes.
+pub const SOHM_POINTER_HEAP_ID_AT: usize = 2;
+
 /// `H5SM_IN_HEAP`: the record's message body is in the index's fractal heap.
 pub const SOHM_IN_HEAP: u8 = 0;
 /// `H5SM_IN_OH`: the record's message body is a message of an object header.

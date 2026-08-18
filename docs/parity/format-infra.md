@@ -39,18 +39,18 @@ in `src/io/writer.rs`.
 | SB.3 | Superblock v2 (compact, extension, no root symbol-table entry) | `H5Fprivate.h:302`; `H5Fsuper_cache.c:403` `H5F__cache_superblock_deserialize` (v≥2 body :582-627) | Implemented | Partial — encode is generic over version 2/3, but `write_superblock` never passes 2 | `src/format/superblock.rs:47-175` (`SuperblockV2V3` encode/decode, version param); `src/io/writer.rs:7093` (hardcoded `SUPERBLOCK_V3`) | M |
 | SB.4 | Superblock v3 (adds SWMR-writer bit) | `H5Fprivate.h:303-305`; `H5Fsuper.c:1129-1131` (SWMR write forces v3); `H5Fpkg.h:52` `H5F_SUPER_SWMR_WRITE_ACCESS` | Implemented | Implemented | `src/format/superblock.rs:20,29` (`SUPERBLOCK_V3`, `FLAG_SWMR_WRITE`); `src/io/writer.rs:7093,7210` | H |
 | SB.5 | Driver info block (`H5FD_MULTI`/`H5FD_FAMILY`) | `H5Fsuper_cache.c:66-72,103-118` (`H5AC_DRVRINFO`); `H5Fsuper.c:589-627` (read), `:216` `H5F__update_super_ext_driver_msg` (write) | Missing — address decoded, block content never fetched | Missing — no field/path exists on `SuperblockV2V3` | `src/format/superblock.rs:418,507` (`driver_info_address` decoded, never dereferenced); `rg -n "NCSAmulti\|NCSAfami\|driver_info_block" src/` → 0 hits | L |
-| SB.6 | Superblock extension object header (create/locate/read its messages) | `H5Fsuper.c:89` `H5F__super_ext_create`; `:141` `H5F__super_ext_open` (called from `H5F__super_read` at `:666`); `:1311` (create on write) | Missing — address decoded, extension OH never opened | Missing — always written as `UNDEF_ADDR` | `src/format/superblock.rs:160,505` (field decoded, never consumed downstream); `src/io/writer.rs:967,7098` (`superblock_extension_address: UNDEF_ADDR`, no other write site); zero OH-open/create call for it in `reader.rs`/`writer.rs` | **H** |
+| SB.6 | Superblock extension object header (create/locate/read its messages) | `H5Fsuper.c:89` `H5F__super_ext_create`; `:141` `H5F__super_ext_open` (called from `H5F__super_read` at `:666`); `:1311` (create on write) | Implemented — the extension OH is opened and its messages consumed at every open and reopen | Implemented — created only when a message needs it, else still `UNDEF_ADDR` | read: `src/io/reader.rs:1588,3668` (`read_extension_and_meta`); write: `src/io/writer.rs:9201` (`write_superblock_extension`), `:15286` (address published into the superblock); multi-chunk extensions survive a reopen (`writer.rs:18960`) | **H** |
 | SB.7 | File consistency flags / checksum trailer (v2/v3) | `H5Fpkg.h:50-53`; `H5Fsuper_cache.c:403` (verify), `:707` `H5F__cache_superblock_serialize` (write) | Implemented | Implemented | `src/format/superblock.rs:22-29` (flag consts), `:96-98` (checksum computed+appended), `:141-155` (verified on decode); `src/format/checksum.rs` (Jenkins lookup3) | H |
 | SB.8 | Root addressing: symbol-table entry (v0/v1) vs root-group OH address (v2/v3) | `H5Fsuper_cache.c:605-627`; `H5Groot.c:188` (`super_vers < 2` branch uses STE) | Implemented (both paths, via `RootGroupInfo` enum) | Partial — only the v2/v3 root-OH-address form is ever written | `src/format/superblock.rs:372-385,406-420`; `src/io/reader.rs:125-143,432-434,452-524`; `src/io/writer.rs:7092-7101` (only `root_group_object_header_address` ever set) | H |
 
-**Notes.** SB.5 and SB.6 are exhaustively confirmed Missing on both read and write (repo-wide `rg` for the
-block signatures and for any OH-open/create call site at those addresses — no hits). **SB.6 is the
-structural root cause behind several other sections below**: because the superblock extension is never
-opened, the v1-B-tree-K message (MSG.20), driver-info message (MSG.21), free-space-manager-info message
-(MSG.24 / §6), and the SOHM table pointer (MSG.17 / §5) are all unreachable regardless of whether their own
-codecs exist. Writing `superblock_extension_address = UNDEF_ADDR` is spec-legal (the extension is optional
-at v2/v3), so rust never *falsely claims* an extension exists — this is a completeness gap, not a
-corruption risk, for files rust itself writes.
+**Notes.** SB.5 remains confirmed Missing on both read and write (repo-wide `rg` for the driver-info block
+signatures — no hits). **SB.6 was the structural gate behind several sections below and is now open**: the
+extension object header is created when a message needs it and opened on every read, which is what makes
+the free-space-manager-info message (MSG.22 / §6) and the SOHM table pointer (MSG.16 / §5) reachable.
+The v1-B-tree-K message (MSG.18) is read from the extension and applied to the B-tree config; it is still
+never written, and the driver-info message (MSG.19) remains unimplemented in both directions. An extension is created only when
+there is a message to put in it, so a file with nothing to record still writes
+`superblock_extension_address = UNDEF_ADDR`, as upstream does.
 
 ---
 
@@ -65,7 +65,7 @@ Rust: `src/format/object_header.rs`, continuation-chunk handling in `src/io/read
 | OH.2 | Object header v2 (`OHDR` sig, flags incl. track-times/attr-crt-order/attr-phase-change/timestamps-present, optional times/thresholds, gap+checksum per chunk) | `H5Ocache.c:1007-1093` (v2 branch); `H5Opublic.h:61-66` (flag bits); `H5Opkg.h:85-106` | Partial — sig/version/flags/chunk0-size parsed; timestamps/thresholds skipped by correct byte count but discarded, never exposed | Partial — encode has conditional paths, but no writer call site ever sets those flag bits; `ObjectHeader::new()` hardcodes flags=0x02, so STORE_TIMES/ATTR_CRT_ORDER_TRACKED/ATTR_STORE_PHASE_CHANGE are never written | `src/format/object_header.rs:195-230` (parse+discard), `:269-284` (checksum verify); `:74-79` (`new()` hardcodes flags=0x02) | M |
 | OH.3 | Object header continuation (msg 0x0010 CONT; v2's own `OCHK`-prefixed continuation chunk) — multi-chunk headers | `H5Ocache.c:1168-1240` `H5O__chunk_deserialize`, `:1417-1433` (CONT detection), `:1559-1619` (serialize) | Partial — follows CONT chains, parses bare-v1 and `OCHK`-prefixed v2 continuation blocks, but **the v2 branch strips the trailing 4-byte checksum without ever comparing it** | Missing — no code ever emits a CONT message or an `OCHK` block; a header that outgrows chunk 0 is a hard write error, not a spill into a continuation chunk | `src/io/reader.rs:1017-1088` (`read_object_header_full`), `:1094-1148` (`parse_continuation_block`, checksum stripped not verified at `:1100-1125`); `src/io/writer.rs:7126-7132` ("header grew … cannot rewrite in place") | **H** |
 | OH.4 | Attribute creation-order tracking (v2 flag bit 2, 2-byte per-message index) | `H5Ocache.c:1299-1306`; `H5Opkg.h:113-126` | Partial — flag recognized, index bytes skipped structurally but discarded, no field to hold it | Missing — flag bit 2 never set by the writer | `src/format/object_header.rs:43,103-105,287,306-309` | L |
-| OH.5 | Per-message flags byte (constant/shared/don't-share/fail-if-unknown-\*/mark-if-unknown/shareable) | `H5Oprivate.h:73-84`; `H5Ocache.c:1280-1287,1373-1399,1404-1407` | Partial — raw byte captured on both chunk0 and continuation decode, **but no bit is ever validated or acted on**: no fail-if-unknown enforcement, no shared-message (SOHM) dereferencing | Partial — byte round-tripped as given; only `CONSTANT` (0x01) is ever emitted (on datatype messages) | `src/format/object_header.rs:50-57,301-303`; `src/io/writer.rs:7415-7417`; `rg "SharedMessage\|SOHM" src/` → 0 hits | M |
+| OH.5 | Per-message flags byte (constant/shared/don't-share/fail-if-unknown-\*/mark-if-unknown/shareable) | `H5Oprivate.h:73-84`; `H5Ocache.c:1280-1287,1373-1399,1404-1407` | Partial — `SHARED` (0x02) is now honored: a message carrying it is decoded as a pointer and resolved through the SOHM heap before any per-type decode sees it. The fail-if-unknown bits are still captured and not enforced | Partial — `CONSTANT` (0x01) on datatype messages, and `SHARED` (0x02) on every message the SOHM indexes take ownership of | `src/format/object_header.rs:50-57,301-303`; `src/io/object_header_io.rs:263,267,305,368` (resolve, and clear the bit once resolved); `src/format/messages/shared.rs` (`MSG_FLAG_SHARED`) | M |
 | OH.6 | Checksum on v2 OH chunks (Jenkins lookup3, 4-byte trailer per chunk) | `H5checksum.c:365`; `H5Ocache.c:217-245` (chunk0 verify), `:624-649` (continuation verify), `:1608-1614` (write) | Partial — chunk0 verified before parsing; `OCHK` continuation trailer stripped but never verified (same gap as OH.3) | Implemented for chunk0; N/A for continuation chunks (never written) | `src/format/object_header.rs:175-177,269-284`; `src/io/reader.rs:1102-1105` | M |
 
 **Notes.** OH.3 is one of the highest-severity findings in this slice: any real HDF5 file whose object
@@ -90,13 +90,13 @@ mod.rs:14-29`.
 |---|---|---|---|---|---|---|
 | MSG.1 | NULL (0x0000) | `H5Onull.c:28-49` (opaque gap-filler) | Implemented — v1 skips type-0; v2 stores it, transparently ignored downstream | Partial — never explicitly constructed as padding | `src/format/object_header.rs:424` (v1 skip), `:321-325` (v2 push) | L |
 | MSG.2 | Dataspace (0x0001), v1/v2, SCALAR/SIMPLE/NULL | `H5Osdspace.c:104` decode, `:249` encode | Partial — SCALAR/SIMPLE round-trip; **H5S_NULL unsupported**, no class field on the struct, v2 decode reads-then-discards the type byte | Partial — type derived purely from ndims==0 vs >0; no way to emit H5S_NULL | `src/format/messages/dataspace.rs:22-29` (no class field), `:118` (`let _ds_type = buf[3];`) | M |
-| MSG.3 | Datatype (0x0003) — dispatch overview | `H5Odtype.c:119/955` (helpers), `:1493/1567` (msg decode/encode) | Partial — upstream accepts version 1-5 uniformly; rust has **no class entries for Time(2)/Bitfield(4)/Opaque(5)/Reference(7)/Complex(11, 2.0-dev-only)** | Partial — missing classes can't be constructed | `src/format/messages/datatype.rs:33-39` (`CLASS_*` consts — only 0,1,3,6,8,9,10 defined); `:1021-1025` (`UnsupportedFeature` fallback) | H |
+| MSG.3 | Datatype (0x0003) — dispatch overview | `H5Odtype.c:119/955` (helpers), `:1493/1567` (msg decode/encode) | Partial — the version gate is now `1..=5` uniformly, validated once before the class dispatch as upstream does; **no class entries for Time(2)/Complex(11, 2.0-dev-only)** | Partial — missing classes can't be constructed | `src/format/messages/datatype.rs:148-157` (`CLASS_*` consts — 0,1,3,4,5,6,7,8,9,10); `:1238` (version gate); `:1558` (`UnsupportedFeature` fallback) | H |
 | MSG.3a | Datatype: fixed-point/integer | `H5Odtype.c:167-187/974-1044` | Implemented (v1-3) | Implemented (always v1) | `datatype.rs:703-736,386-419` | L |
 | MSG.3b | Datatype: float, incl. VAX order | `H5Odtype.c:189-273/1046-1149` | Partial — IEEE LE/BE correct; **VAX order (flag bit 0x40) silently misread as big-endian**, no VAX variant | Partial — VAX cannot be constructed | `datatype.rs:737-778,42-46,420-466` | L |
 | MSG.3c | Datatype: string (fixed + vlen) | `H5Odtype.c:285-297,757-786` | Fixed: Implemented. Vlen: Partial — pad-type nibble (NULLPAD/SPACEPAD) never extracted, struct has no field | Fixed: Implemented. Vlen: Partial — always hardcodes NULLTERM | `datatype.rs:779-796,467-489,113-117,938-964,568-602` | M |
-| MSG.3d | Datatype: bitfield + opaque (classes 4, 5) | `H5Odtype.c:299-343/1185-1259` | Missing — no enum variant, falls to `UnsupportedFeature` | Missing | `datatype.rs:33-39,1021-1025` | M |
+| MSG.3d | Datatype: bitfield + opaque (classes 4, 5) | `H5Odtype.c:299-343/1185-1259` | Implemented — bit field carries the same offset/precision properties as a fixed-point type; opaque carries its ASCII tag, and a tag field whose length is not a multiple of 8 is rejected as upstream requires | Implemented | `datatype.rs:151-152` (`CLASS_BITFIELD`/`CLASS_OPAQUE`), `:946`/`:967` (encode), `:1302`/`:1322` (decode); oracle cases `bitfield`, `opaque` | M |
 | MSG.3e | Datatype: compound, incl. legacy member packing | `H5Odtype.c:345-635/1261-1331` | **Partial — real bug**: member-name 8-byte padding applied only `if version == 1`; upstream pads for v1 **and** v2 (`H5Odtype.c:414-428`, only v3 drops padding). A genuine v2 compound (used whenever a member is `H5T_ARRAY`, or produced under an older libver bound) is mis-parsed — every subsequent member's name/offset desyncs. Independently re-verified against `H5Odtype.c:414-451` in this session. | Partial — always emits v3 only, so the read bug is upstream-file-only | `datatype.rs:826-832` (`if version == 1`, should be `version < 3`) vs `H5Odtype.c:415,451` | **H** |
-| MSG.3f | Datatype: reference (object + region, old and revised) | `H5Odtype.c:637-672/1333-1337`; revised forms need msg v4 | Missing — class 7 entirely absent; decode failure is **swallowed silently** one layer up (`if let Ok(...)`), so a reference-typed dataset/attribute vanishes from the catalog instead of erroring | Missing | `datatype.rs:33-39,1021-1025`; `src/io/reader.rs:1170-1220` (silent drop) | **H** |
+| MSG.3f | Datatype: reference (object + region, old and revised) | `H5Odtype.c:637-672/1333-1337`; revised forms need msg v4 | Implemented — class 7 decodes to a `ReferenceKind` covering all five kinds; the 1.12 kinds carry their encoding version in the class bit field and a version this port does not know is refused rather than guessed | Implemented — all five kinds; the three 1.12 kinds force message v4 | `datatype.rs:154,319,1187,1537`; `src/format/reference.rs` (element codecs, global-heap blob split) | **H** |
 | MSG.3g | Datatype: enum | `H5Odtype.c:674-755/1339-1373` | Implemented (v1-3, incl. v1/v2-pads-to-8 vs v3-no-pad) | Implemented (always v1) | `datatype.rs:877-937,528-567` | L |
 | MSG.3h | Datatype: vlen-sequence + array | `H5Odtype.c:757-863/1375-1426` | Array: Implemented. **Vlen-sequence: Partial — rejects any version other than exactly 1**, but upstream legitimately bumps a vlen's version to match its nested base (e.g. base is array or v3 compound) | Array: Implemented (always v3). Vlen: Partial — always hardcodes v1 regardless of base's actual version, can violate parent-version-≥-child-version | `datatype.rs:938-963` (`version != DT_VERSION`), `:965-1021`, `:603-631` | **H** |
 | MSG.4 | Old Fill Value (0x0004) | `H5Ofill.c:328/502`; emitted only for `H5F_LIBVER_EARLIEST`-bound files | Missing — constant defined, never matched | Missing — only 0x0005 ever built | `src/format/messages/mod.rs:17`; `src/io/reader.rs:1204` `_ => {}`; `src/io/writer.rs:7419-7441` | M |
@@ -111,7 +111,7 @@ mod.rs:14-29`.
 | MSG.9 | Object name/comment (0x000d) | `H5Oname.c:74/114` | Missing | Missing | no `MSG_NAME` constant anywhere; `rg` negative | L |
 | MSG.10 | Modification time — old (0x000e) + new (0x0012) | `H5Omtime.c:168/260` (old); `:110/224` (new) | Missing (both) | Missing (both) | `src/format/messages/mod_time.rs:1` (entire file is a stub comment, no code); OH v2 embedded-timestamps path also stubbed (see OH.2) | M |
 | MSG.11 | Object Header Continuation (0x0010) | `H5Ocont.c:79/128` | Implemented | Missing | `src/io/reader.rs:1051-1109` (follows chains, cycle-guarded, bounded); `MSG_OBJ_HEADER_CONTINUATION` zero refs in writer.rs | M |
-| MSG.12 | External File List (0x0007) | `H5Oefl.c:74/209` | Missing | Missing | no `MSG_EFL` constant; no `efl.rs`; `rg` negative | M |
+| MSG.12 | External File List (0x0007) | `H5Oefl.c:74/209` | Implemented — incl. the `H5O_EFL_UNLIMITED` size sentinel on the last slot | Implemented | `src/format/messages/mod.rs:25` (`MSG_EXTERNAL_FILE_LIST`); `src/format/messages/external_file_list.rs:41,75,93`; `src/io/writer.rs:2999,9399` | M |
 
 ### 3b. Link / group / superblock-extension / misc messages
 
@@ -120,13 +120,13 @@ mod.rs:14-29`.
 | MSG.13 | Link Information (0x0002) | `H5Olinfo.c:102/192` | Partial — decoded, fractal-heap addr drives dense-link discovery; `max_creation_order`/`creation_order_btree_address` decoded but never consulted | Partial — only `LinkInfoMessage::compact()` ever emitted | `src/format/messages/link_info.rs:87,56`; `src/io/reader.rs:625-629`; `src/io/writer.rs:7509-7511,7580-7582` | M |
 | MSG.14 | Link (0x0006) | `H5Olink.c:104/290` | Partial — hard links fully surfaced; **soft links decoded then silently dropped by the group-walk**; external/UD links (type ≥64) rejected with `UnsupportedFeature` and silently skipped by caller | Partial/Missing — only hard links ever constructed; `HardLinkTarget` has only Dataset/Group variants, no soft/external/UD constructor | `src/format/messages/link.rs:128,213-218`; `src/io/reader.rs:634-635` (soft-link discard); `link.rs:49,68` | M |
 | MSG.15 | Group Information (0x000a) | `H5Oginfo.c:85/162` | Partial — used only as a group-classifier marker; `decode()` never actually called from reader.rs | Partial — always `GroupInfoMessage::default()` (flags=0); no threshold ever set → compact→dense promotion never triggers (see GRP.6) | `src/format/messages/mod.rs:21`; `src/io/reader.rs:665,898` (marker use only); `src/io/writer.rs:7514-7516,7585-7587` | L |
-| MSG.16 | Shared Message table info (0x000f) | `H5Oshmesg.c:68/117` | Missing — no `MSG_SHMESG` module; blocked by SB.6 | Missing — blocked by SB.6 | `rg "shmesg\|SHMESG" src/` → no dedicated module | L (gated behind §5 SOHM, itself M/H) |
+| MSG.16 | Shared Message table info (0x000f) | `H5Oshmesg.c:68/117` | Implemented — read from the superblock extension and used to locate the SOHM master table | Implemented — written whenever `H5FileOptions::shared_messages` asks for an index | `src/format/messages/mod.rs:30` (`MSG_SHARED_MESSAGE_TABLE`); `src/io/reader.rs:1816`; `src/io/writer.rs:9245` | L (see §5) |
 | MSG.17 | Symbol Table (0x0011) | `H5Ostab.c:84/126` | Implemented — field layout matches upstream exactly, resolves v0/v1 root/old-style subgroups | Missing — never emitted; every group is unconditionally new-style | `src/io/reader.rs:541-551,501,941`; `src/format/symbol_table.rs:33`; zero `MSG_SYMBOL_TABLE` write sites | L |
-| MSG.18 | v1 B-tree 'K' values (0x0013) | `H5Obtreek.c:71/124` | Missing — const defined, never referenced again; blocked by SB.6 | Missing — no encode fn/struct | `src/format/messages/mod.rs:27` (sole occurrence in crate) | L |
+| MSG.18 | v1 B-tree 'K' values (0x0013) | `H5Obtreek.c:71/124` | Implemented — decoded from the extension and applied to the v1-B-tree config, so a file with non-default K values reads correctly | Missing — no encode path; this writer only ever uses the library defaults, which need no message | `src/io/reader.rs:1820` (decode), `:1746` (applied) | L |
 | MSG.19 | Driver info (0x0014) | `H5Odrvinfo.c:71/132` | Missing — no module; blocked by SB.6 | Missing — `SuperblockV2V3` has no such field | `src/format/superblock.rs:418,507` (only the legacy v0/v1 address field exists, unconsumed) | L |
 | MSG.20 | Attribute Info (0x0015) | `H5Oainfo.c:93/185` | **Missing — const defined, never matched, falls to catch-all**; same root cause as MSG.8's dense-attribute gap | Missing | `src/format/messages/mod.rs:28`; `src/io/reader.rs:1169-1206` (`_ => {}` at :1204) | **H** (duplicate of MSG.8) |
 | MSG.21 | Reference Count (0x0016) | `H5Orefcount.c:82/130` | **Missing on read** — falls to catch-all; even the v1-header `obj_ref_count` prefix is parsed and explicitly discarded | **Implemented on write** — `encode_refcount()` invoked on hard-link creation, gated on `rc > 1`, matching upstream's "only when refcount != 1" rule | decode: absent (reader.rs catch-all); `src/format/object_header.rs:376` (discard); `src/io/writer.rs:853-861,7404,7495-7499,7568-7570` | M |
-| MSG.22 | Free-space Manager Info (0x0017) | `H5Ofsinfo.c:90/230` | Missing — no constant; blocked by SB.6 | Missing — allocator is documented session-only/non-persistent | no "0x17"/FSINFO hits in `src/`; `src/io/allocator.rs:11-30` (non-persistence doc) | L (see §6, mostly M there) |
+| MSG.22 | Free-space Manager Info (0x0017) | `H5Ofsinfo.c:90/230` | Implemented — v0 and v1; a v0 message is read for its strategy/threshold, which is all it carries | Implemented — v1; the six manager addresses are filled in on close when `persist` is set, else all `UNDEF_ADDR` | `src/format/messages/superblock_ext.rs:206` (`FileSpaceInfoMessage`); `src/io/reader.rs:1822`; `src/io/writer.rs:9230,9279` | L (see §6) |
 | MSG.23 | Metadata Cache Image (0x0018) | `H5Ocache_image.c:88/146` | Implemented in a degenerate/harmless sense — no dedicated logic, but the generic message store round-trips unknown bytes safely and the dispatch's `_ => {}` skips it; moot since the extension it lives in (SB.6) is never opened | Missing (expected — pure perf optimization, upstream itself treats absence as normal) | `src/format/object_header.rs:291-326` (unvalidated generic store) | L |
 | MSG.24/25 | Unknown (0x0019) / Deleted (0x001a) placeholders + unrecognized-ID dispatch | `H5Ounknown.c`/`H5Odeleted.c`; flag-driven fail/mark semantics in `H5Ocache.c:1352-1399` | Rust has **no exhaustive dispatch table** analogous to `H5O_msg_class_g[27]`: every byte 0x00-0xFF is stored generically regardless of type; two `match msg.msg_type` blocks (reader.rs, writer.rs) cover only ~10 of the 25 real IDs, everything else — recognized-but-unimplemented or genuinely future — is silently skipped via `_ => {}`, never an error or a per-flag fail/mark decision | N/A — rust never constructs an unknown/deleted sentinel | `src/io/reader.rs:1169-1206` (:1204 catch-all); `src/io/writer.rs:1247-1284` (:1282 catch-all); `src/format/messages/mod.rs:14-29` (only 10 of 25 IDs have a named constant with a live consumer) | L |
 
@@ -163,7 +163,7 @@ subtypes (2 more, `H5B2_TEST_ID`/`H5B2_TEST2_ID`, are test-only and excluded).
 | BT2.13 | Record type: dense-attribute **creation-order** index (`H5A_BT2_CORDER`) | `H5B2private.h:52-53`; `H5Abtree2.c:109` | Missing — same root cause | Missing | same as BT2.12 | **H** |
 | BT2.14 | Record type: chunked dataset, non-filtered, >1 unlimited dim (`H5D_BT2`) | `H5B2private.h:54`; `H5Dbtree2.c:194` | Implemented | Implemented | `btree_v2.rs:47,132-146,1146-1195`; `src/io/reader.rs:2057-2150`; `src/io/writer.rs:5521-5610` | H |
 | BT2.15 | Record type: chunked dataset, filtered, >1 unlimited dim (`H5D_BT2_FILT`) | `H5B2private.h:55`; `H5Dbtree2.c:209` | Implemented | Implemented | `btree_v2.rs:49,152-167` | H |
-| BT2.16 | Record type: SOHM index (`H5SM_INDEX`) | `H5B2private.h:49`; `H5SMbtree2.c:51` | **Missing — and worse than absent**: the per-message "shared" flag bit is stored but never inspected on read (see OH.5), so a SOHM-enabled file has shared messages **misdecoded as literal content**, not merely un-optimized | Missing | zero `SOHM`/`H5SM` hits anywhere in `src/` | **H** |
+| BT2.16 | Record type: SOHM index (`H5SM_INDEX`) | `H5B2private.h:49`; `H5SMbtree2.c:51` | Implemented — the shared flag is honored and the pointer resolved through the master table before any per-type decode (see OH.5) | Implemented — an index past its `list_max` is written as a v2 B-tree | `src/format/sohm_write.rs:253` (`is_btree`), `:309` (`build_btree`); `src/io/object_header_io.rs:263` | **H** |
 | BT2.17 | Fractal-heap huge-object **direct**-block tracking (`H5HF_HUGE_BT2_DIR`/`_FILT_DIR`) | `H5B2private.h:44-45`; `H5HFbtree2.c:133,148` | Missing | Missing | same evidence as BT2.9 | M |
 | BT2.18 | v2 B-tree checksum (Jenkins lookup3) on all 3 node types | `H5B2cache.c` (verify+serialize in each `*_deserialize`/`*_serialize`) | Implemented | Implemented | `src/format/checksum.rs`; applied at all encode/decode sites in `btree_v2.rs` | H |
 
@@ -176,49 +176,51 @@ legacy chunked layout v3 (BT1.1-BT1.3). SOHM's list→B-tree conversion (`H5SM.c
 
 ## 5. Shared Object Header Messages (SOHM)
 
-Upstream: `H5SM.c`, `H5SMbtree2.c`, `H5SMcache.c`, `H5SMmessage.c`. Ground truth search
-(`rg -in 'sohm|shared.?message' src/`) returns **zero matches** anywhere in the port.
+Upstream: `H5SM.c`, `H5SMbtree2.c`, `H5SMcache.c`, `H5SMmessage.c`. Opt-in on both sides:
+`H5FileOptions::shared_messages` (`src/file.rs:1271`) is the port's `H5Pset_shared_mesg_nindexes`/
+`_index`/`_phase_change`, and a file that does not ask for it writes no table at all.
 
 | # | Feature | Upstream anchor (file:symbol) | READ | WRITE | Evidence (rust file:line) | Impact |
 |---|---|---|---|---|---|---|
-| SOHM.1 | SOHM master table decode/encode | `H5SM.c:H5SM_init`; `H5SMcache.c` `H5SM_TABLE_MAGIC` | Missing | Missing | blocked by SB.6 (`superblock_extension_address` always `UNDEF_ADDR`, never followed) — `src/io/writer.rs:967,7098` | M |
-| SOHM.2 | SOHM index — "list" form | `H5SMcache.c` `H5SM_LIST_MAGIC`; `H5SM.c:610` `H5SM__create_list` | Missing | Missing | no list-decode code anywhere in `src/` | M |
-| SOHM.3 | SOHM index — "btree" form + list→btree threshold | `H5SMbtree2.c:51` (`H5SM_INDEX`); `H5SM.c:682,120,145-147` | Missing | Missing | see BT2.16 | M |
-| SOHM.4 | Shared-message hashing/dedup on write (flag 0x02) | `H5SM.c:1041` `H5SM_try_share`; `:1224` `H5SM__write_mesg` | N/A | Missing — rust always duplicates messages per object header, never sets flag 0x02 anywhere | `rg -n 'flags\s*=\s*0x02' src/io/writer.rs src/format/messages/*.rs` → 0 matches | M |
-| SOHM.5 | Reading a message with the shared flag (0x02) set | `H5Oprivate.h:74` `H5O_MSG_FLAG_SHARED`; `H5Oshared.c:289` `H5O__shared_decode` | **Missing, silently** — `msg.flags` captured but never tested against 0x02 anywhere; shared-message-pointer bytes are fed straight into the normal per-type decoder, whose failures are swallowed by `if let Ok(...)` call sites | N/A | `src/io/reader.rs:1168-1201` (no flag check; decode-failure swallow) | M |
+| SOHM.1 | SOHM master table decode/encode | `H5SM.c:H5SM_init`; `H5SMcache.c` `H5SM_TABLE_MAGIC` | Implemented | Implemented | `src/format/sohm.rs:28` (`SMTB_SIGNATURE`), `:295` (`SohmMasterTable`), `:315`/`:376` (decode/encode); located via MSG.16 in the superblock extension | M |
+| SOHM.2 | SOHM index — "list" form | `H5SMcache.c` `H5SM_LIST_MAGIC`; `H5SM.c:610` `H5SM__create_list` | Implemented | Implemented | `src/format/sohm.rs:30` (`SMLI_SIGNATURE`), `:109`/`:119` (`list_size`/`encode_list`) | M |
+| SOHM.3 | SOHM index — "btree" form + list→btree threshold | `H5SMbtree2.c:51` (`H5SM_INDEX`); `H5SM.c:682,120,145-147` | Implemented | Implemented — one-way, as upstream is: an index at or past `list_max` is written as a B-tree and nothing converts it back, so `btree_min` is decoded and stored but never acts | `src/format/sohm_write.rs:253` (`is_btree`), `:309` (`build_btree`) | M |
+| SOHM.4 | Shared-message hashing/dedup on write (flag 0x02) | `H5SM.c:1041` `H5SM_try_share`; `:1224` `H5SM__write_mesg` | N/A | Implemented, incl. nesting — a body is hashed with its type as seed, deduplicated by `(msg_type, body)`, and the object header keeps a pointer with flag 0x02. An attribute's own datatype and dataspace are shared first and their heap IDs patched into the attribute body before it is hashed, matching `H5A__create` (H5Aint.c:375-377) | `src/format/sohm.rs:63` (`message_hash`), `:409` (`type_flag`); `src/format/sohm_write.rs:73` (`NestedShare`), `:126` (`build_shared_messages`); `src/io/writer.rs:3738` (`SohmCollector`), `:3794` (`release`, giving back a body whose owner did not survive) | M |
+| SOHM.5 | Reading a message with the shared flag (0x02) set | `H5Oprivate.h:74` `H5O_MSG_FLAG_SHARED`; `H5Oshared.c:289` `H5O__shared_decode` | Implemented — a message with the bit set is decoded as `SharedMessagePointer`, resolved through the master table's heap for its class, and the bit cleared, so every per-type decoder downstream sees a body | N/A | `src/io/object_header_io.rs:263,267,305,368,384`; `src/format/sohm.rs:156` (`SharedMessagePointer`) | M |
 
-**Notes.** SOHM is opt-in upstream (not enabled by h5py by default), so the baseline impact of "feature
-absent" is M rather than H. SOHM.5 is the more dangerous half: a file that *does* use SOHM doesn't just miss
-an optimization, it can hand a shared-message pointer's raw bytes to a datatype/dataspace/attribute decoder
-that has no idea it's looking at a pointer, not a payload — the failure mode is call-site-dependent (some
-silently drop the field, none currently produce wrong-but-plausible data in the traced paths, but this was
-not exhaustively fuzzed).
+**Notes.** SOHM is opt-in upstream (not enabled by h5py by default) and opt-in here. Two divergences
+remain in what the port chooses to share rather than in how it shares it: this writer shares a dataset's
+datatype where libhdf5 keeps an immutable predefined type as a literal (`H5O__dtype_can_share`), and a
+dataspace read from a file that stored no maximum re-encodes carrying one, which libhdf5 preserves as
+absent. Both change which bodies hash equal, not the on-disk structures.
 
 ---
 
 ## 6. Free-space manager (H5FS) + file-space strategies incl. paged aggregation
 
 Upstream: `H5FS.c`, `H5FScache.c`, `H5FSsection.c`; strategies in `H5Fpublic.h:196-201`; `H5MFaggr.c`,
-`H5MF.c`, `H5MFsection.c`. Rust allocator: `src/io/allocator.rs` — read in full: a pure in-process
-bump-the-EOF allocator with an **in-memory-only** free list, never serialized to disk.
+`H5MF.c`, `H5MFsection.c`. Rust allocator: `src/io/allocator.rs` — a bump-the-EOF allocator with a
+best-fit free list, whose sections are serialized to disk on close when the file asks to persist them
+(`src/format/free_space.rs`).
 
 | # | Feature | Upstream anchor (file:symbol) | READ | WRITE | Evidence (rust file:line) | Impact |
 |---|---|---|---|---|---|---|
-| FS.6 | Free-space manager header (`FSHD`) | `H5FScache.c:242,695` `H5FS_HDR_MAGIC` | Missing | Missing | `rg -in 'H5FS\|free.?space.?manager\|FreeSpace' src/` → only a comment in `allocator.rs:30` | M |
-| FS.7 | Free-space serialized sections (`FSSE`) | `H5FScache.c:953,1221` `H5FS_SINFO_MAGIC` | Missing | Missing | no section-block (de)serialization code anywhere | M |
-| FS.8 | Free-space section classes (`H5MF_FSPACE_SECT_CLS_*` / `H5HF_FSPACE_SECT_CLS_*`) | `H5MFsection.c:81,107,133`; `H5HFsection.c:154,183,209,238` | Missing | Missing | `src/io/allocator.rs:1-442` — pure bump allocator + in-memory `Vec<FreeBlock>`, no on-disk section machinery at all | M |
-| FS.9 | Strategy `FSM_AGGR` (upstream default: FSM + small aggregators) | `H5Fpublic.h:196` | N/A | Not implemented — only the in-memory half exists | `allocator.rs:25-30` (explicit comment: session-only, no persisted FSM) | M |
-| FS.10 | Strategy `AGGR` (aggregators only, no persisted FSM) | `H5Fpublic.h:200` | N/A | Partial — architecturally closest match, but never recorded via an FSINFO message | same as FS.9 | M |
-| FS.11 | Strategy `PAGE` (paged aggregation) | `H5Fpublic.h:198`; `H5MFaggr.c` page-alignment logic | Missing | Missing | `rg -in 'fsinfo\|paged.?aggregation\|page.?buffer' src/` → 0 hits; allocator has one fixed 8-byte alignment, no page-size concept | M |
-| FS.12 | Strategy `NONE` (no cross-close reuse) | `H5Fpublic.h:201` | N/A | Effectively matches on close/reopen (space never reclaimed across sessions), but **stronger within one open session** (rust does reuse freed blocks in-process, which real NONE would not) | `allocator.rs` free_list is session-only in-memory state | M |
-| FS.13 | Persisting free space across close/reopen (fsinfo `persist` flag) | `H5Ofsinfo.c:121,178,245`; default `H5F_FREE_SPACE_PERSIST_DEF = false` | Missing | Missing — no FSINFO message ever written (blocked by SB.6) | `src/io/writer.rs:967,7098` (`superblock_extension_address` always `UNDEF_ADDR`) | M |
+| FS.6 | Free-space manager header (`FSHD`) | `H5FScache.c:242,695` `H5FS_HDR_MAGIC` | Implemented | Implemented | `src/format/free_space.rs:24` (`FSHD_SIGNATURE`), `:143` (`FreeSpaceHeader`), `:193`/`:255` (decode/encode) | M |
+| FS.7 | Free-space serialized sections (`FSSE`) | `H5FScache.c:953,1221` `H5FS_SINFO_MAGIC` | Implemented | Implemented | `src/format/free_space.rs:26` (`FSSE_SIGNATURE`), `:309` (`serialization_order`), `:354`/`:392` (encode/decode sections) | M |
+| FS.8 | Free-space section classes (`H5MF_FSPACE_SECT_CLS_*` / `H5HF_FSPACE_SECT_CLS_*`) | `H5MFsection.c:81,107,133`; `H5HFsection.c:154,183,209,238` | Implemented for the file-level classes | Implemented for the file-level classes | `src/format/free_space.rs:139` (`FreeSpaceManager::{Metadata,RawData,Large}` — `H5F_mem_page_t` paged, `H5FD_mem_t` unpaged), `:154` (`message_slot`), `:236` (`section_class`, which class each manager writes). The fractal-heap section classes (`H5HFsection.c`) have no counterpart — heap free space is not tracked | M |
+| FS.9 | Strategy `FSM_AGGR` (upstream default: FSM + small aggregators) | `H5Fpublic.h:196` | Implemented | Partial — the FSM half is real and persists; there are no small/large aggregators, so allocation sizes never route through an aggregator first | `src/file.rs:1315` (`file_space`); `src/io/writer.rs:9012`, `:5051`; `src/io/allocator.rs:156` (`allocate_aggr`) | M |
+| FS.10 | Strategy `AGGR` (aggregators only, no persisted FSM) | `H5Fpublic.h:200` | Implemented | Implemented as recorded — the strategy round-trips through the fsinfo message; behaviorally it is still the same allocator, since there are no aggregators to be the difference | `src/format/messages/superblock_ext.rs:133` | M |
+| FS.11 | Strategy `PAGE` (paged aggregation) | `H5Fpublic.h:198`; `H5MF.c:858` `H5MF__alloc_pagefs` | Implemented — a paged file's three managers are read back and its sections reused | Implemented — a request of at least one page is page-aligned and its misaligned tail (`H5MF_EOA_MISALIGN`) becomes a large-manager section; a smaller one takes a whole page and the remainder becomes a section of the small manager for its own class, which is what keeps a page to one kind of data | `src/io/allocator.rs:190` (`allocate_paged`); `src/format/free_space.rs:183` (`SpacePolicy`); `src/file.rs:1352` (`file_space_page_size` = `H5Pset_file_space_page_size`); oracle cases `fsm_persist_page`, `fsm_page_size` | M |
+| FS.12 | Strategy `NONE` (no cross-close reuse) | `H5Fpublic.h:201` | Implemented | Implemented as recorded — still **stronger than real NONE within one open session**, since freed blocks are reused in-process | `src/io/allocator.rs` (`take_free`, per manager) | M |
+| FS.13 | Persisting free space across close/reopen (fsinfo `persist` flag) | `H5Ofsinfo.c:121,178,245`; default `H5F_FREE_SPACE_PERSIST_DEF = false` | Implemented — a reopen reads every manager's sections back into the allocator's free list | Implemented — the managers' own blocks are settled the way `H5MF_settle_meta_data_fsm` settles them, rerunning the allocation pass until nothing moves (`H5MF.c:3213-3247`), then written and named in the fsinfo message; `persist` defaults false, as upstream | `src/io/writer.rs:9012` (`write_free_space_managers`), `:9130` (`settle_free_space_managers`), `:5051` (`reopen_free_space`); `src/file.rs:644` (`tracked_free_space`) | M |
 
-**Notes.** Rust never *falsely claims* a persisted strategy — `superblock_extension_address` is always
-`UNDEF_ADDR`, which is spec-legal, so this is a completeness/size-bloat gap (files never shrink or reclaim
-space across a close+reopen cycle by a *different* rust-hdf5 process — within one open `File` handle, space
-*is* reused via the in-memory free list) rather than a corruption risk. All 8 rows are M, not H, per the
-rubric: no evidence rust writes a superblock/fsinfo that claims a strategy or persistence it doesn't
-implement.
+**Notes.** Every strategy the message can name is now written and read back, paged aggregation included,
+and a request is served only out of its own manager — which `H5MF_alloc` has always done and paged
+aggregation cannot do without. What is still absent is the aggregator layer itself: upstream's `FSM_AGGR`
+and `AGGR` route small allocations through the metadata and small-data aggregators before the managers see
+them, and this allocator has no counterpart, so those two strategies differ from upstream in which byte a
+block comes from rather than in what the file records. `h5stat -S` reports zero unaccounted space on files
+this writer produces.
 
 ---
 
@@ -294,8 +296,8 @@ Upstream: `H5checksum.c` `H5_checksum_lookup3` (Jenkins lookup3). Rust: `src/for
 | CKS.6 | v1 B-tree | `H5Bcache.c` — `verify_chksum` is `NULL` | Correct | Correct | `src/format/btree_v1.rs` — no checksum code | L |
 | CKS.7 | v2 B-tree header/internal/leaf | `H5B2cache.c` (verify+serialize ×3) | Validates all three, rejects on mismatch, regression-tested | Correct for all three | `src/format/chunk_index/btree_v2.rs` (header/leaf/internal encode+decode sites) | L |
 | CKS.8 | Fractal heap header/direct-block/indirect-block | `H5HFcache.c` (verify+serialize ×3) | Validates all three, rejects on mismatch | N/A — **read-only module** (`fractal_heap.rs` doc comment: "Fractal heap reader (read-only)"); writer never emits any fractal-heap structure | `src/format/fractal_heap.rs:1,175,354,482` | L (read correct; write gap is completeness, not a checksum-correctness defect) |
-| CKS.9 | Free-space manager header + sections | `H5FScache.c` (verify+serialize) | N/A — unimplemented (§6) | N/A — unimplemented (§6) | no `H5FS` code in `src/format` | L |
-| CKS.10 | SOHM table + list/btree index | `H5SMcache.c` (verify+serialize) | N/A — unimplemented (§5); message type 0x0f falls into the generic skip arm, no error | N/A — unimplemented | `src/format/messages/mod.rs:14-29` (no `MSG_SHMESG` const); `src/io/reader.rs:1204` skip | M (silently ignoring is correct for checksum purposes specifically, but shared-message semantics are unhandled — see SOHM.5) |
+| CKS.9 | Free-space manager header + sections | `H5FScache.c` (verify+serialize) | Validates, rejects on mismatch | Correct | `src/format/free_space.rs:206`, `:282` (header); `:352` (sections — the pad before the checksum is left zeroed, as upstream does) | L |
+| CKS.10 | SOHM table + list/btree index | `H5SMcache.c` (verify+serialize) | Validates, rejects on mismatch | Correct — a list image checksums exactly the records in use, not the `list_max`-sized buffer | `src/format/sohm.rs:124` (list), `:325`/`:390` (table verify/write) | L |
 | CKS.11 | Group Info / Link Info messages (inline in v2 OH) | `H5Ocache.c` — checksum coverage is chunk-level only, no per-message checksum field exists upstream | Correctly relies on the containing OH-chunk checksum; no erroneous independent checksum added | Correct | `src/format/messages/{group_info,link_info}.rs` — no checksum hits, confirmed no erroneous addition | L |
 | CKS.12 | Fixed Array header/data-block/page | `H5FAcache.c` (verify+serialize ×3) | Validates all three, regression-tested | Correct for all three | `src/format/chunk_index/fixed_array.rs` (multiple encode/decode sites) | L |
 | CKS.13 | Extensible Array header/index-block/super-block/data-block/page | `H5EAcache.c` (verify+serialize ×5) | Validates all five, regression-tested | Correct for all five | `src/format/chunk_index/extensible_array.rs` (multiple encode/decode sites) | L |
@@ -316,17 +318,16 @@ write-side corruption risk.
    angles (MSG.8/MSG.20, BT2.12/BT2.13, HEAP.11) and directly re-verified in this session. *(§3a MSG.8, §3b
    MSG.20, §4 BT2.12/13)*
 
-2. **The superblock extension object header is never opened, on read or write** (`superblock_extension_address`
-   is decoded but never dereferenced; always written as `UNDEF_ADDR`). This is the single structural gate
-   behind SOHM (§5), persisted free-space info (§6 FS.13), the driver-info message (MSG.19), and the v1-B-tree-K
-   message (MSG.18) all at once — closing it is higher-leverage than fixing any one of those independently.
-   Independently re-verified in this session (`rg -n superblock_extension_address` → only `UNDEF_ADDR` write
-   sites, zero reader.rs references). *(§1 SB.6)*
+2. **Closed. The superblock extension object header is created and opened in both directions.** It was the
+   single structural gate behind SOHM (§5), persisted free-space info (§6 FS.13), the driver-info message
+   (MSG.19) and the v1-B-tree-K message (MSG.18); three of those four are now implemented, and driver-info
+   remains open for want of its own codec rather than for want of a way to reach it. *(§1 SB.6)*
 
-3. **Datatype class 7 (object/region reference) is entirely unimplemented, and the decode failure is silently
-   swallowed** (`if let Ok(...)` at the object-header layer) — a dataset or attribute using a reference dtype
-   simply vanishes from the catalog instead of surfacing an error. Reference types are common in real-world
-   scientific HDF5 files (region references, dataset cross-links). *(§3a MSG.3f)*
+3. **Closed. Datatype class 7 round-trips for all five reference kinds** — the two 1.8 encodings and the
+   three 1.12 ones (`H5R_OBJECT2`, `H5R_DATASET_REGION2`, `H5R_ATTR`), on datasets and on attributes. A
+   region reference's selection is written into a global-heap object and its rank taken from the target's
+   own extent. What is still refused is an element flagged `H5R_IS_EXTERNAL`, which names a target in
+   another file. *(§3a MSG.3f)*
 
 4. **Compound datatype v2 member-name padding uses the wrong version guard** (`if version == 1` where upstream
    pads for v1 **and** v2, only v3 drops padding — `H5Odtype.c:414-451`). A genuine v2 compound message (any
@@ -347,9 +348,10 @@ write-side corruption risk.
    A legitimate, simple h5py option (no filters + early allocation) makes the whole dataset unreadable rather
    than silently failing one attribute or falling back. *(§3a MSG.6b, §8 CI.3)*
 
-8. **SOHM is completely unimplemented, and the per-message "shared" flag bit is never even checked on read** —
-   worse than a missing optimization: a file using SOHM has shared-message-pointer bytes fed straight into the
-   normal per-type decoder as if they were literal payload. *(§5 SOHM.5, §4 BT2.16)*
+8. **Closed. SOHM is implemented in both directions, list and B-tree index forms alike, and the shared flag
+   is honored on read** — a message carrying it is resolved through the master table before any per-type
+   decoder sees it. Attribute nesting is included: an attribute's datatype and dataspace are shared first and
+   their heap IDs patched into the attribute body, as `H5A__create` does. *(§5 SOHM.4/SOHM.5, §4 BT2.16)*
 
 9. **Vlen-sequence datatype rejects any wire version other than exactly 1**, but upstream legitimately bumps a
    vlen's version to match its nested base type (vlen-of-array, vlen-of-v3-compound) — such files fail to
@@ -361,6 +363,6 @@ write-side corruption risk.
 
 **Runners-up not in the top 10** (still real, lower-frequency or lower-severity): dense-group-link name index
 missing (§4 BT2.10, mitigated by a working linear-scan fallback); v1-groups' symbolic-link scratch pad
-silently dropped (§7 GRP.1); fletcher32 filter checksum stripped without verification (§3a MSG.7a); free-space
-manager / persistent file-space strategy entirely absent (§6, mostly M — no false claims of a strategy rust
-doesn't implement, so it degrades to file-size bloat across close/reopen rather than corruption).
+silently dropped (§7 GRP.1); fletcher32 filter checksum stripped without verification (§3a MSG.7a); no
+aggregator layer under `FSM_AGGR`/`AGGR`, so small allocations reach the managers directly (§6 FS.9,
+FS.10).

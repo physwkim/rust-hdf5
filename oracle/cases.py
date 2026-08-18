@@ -519,6 +519,65 @@ def gen_vds(path):
         f.create_virtual_dataset("vds", layout)
 
 
+def gen_external_unlimited(path):
+    """The last EFL slot sized H5O_EFL_UNLIMITED over an unlimited dataspace.
+
+    `H5D__efl_construct` requires exactly this pairing: a dataset whose
+    dataspace can grow has no finite reservation that could cover it, so its
+    last — and here only — external slot must be unlimited.
+    """
+    raw = path.parent / (path.stem + "_ext.raw")
+    raw.write_bytes(ramp("<i4", 16).tobytes())
+    with h5py.File(path, "w") as f:
+        f.create_dataset(
+            "data",
+            shape=(16,),
+            maxshape=(None,),
+            dtype="<i4",
+            external=[(raw.name, 0, h5py.h5f.UNLIMITED)],
+        )
+
+
+def gen_vds_unlim(path):
+    """A mapping unlimited on both sides: the extent follows the source.
+
+    `H5D__virtual_set_extent_unlim` clips the virtual selection against what
+    the source actually holds, so the dataset created one row tall reads back
+    as tall as its source is.
+    """
+    src = path.parent / (path.stem + "_src.h5")
+    with h5py.File(src, "w") as g:
+        g.create_dataset(
+            "src", data=ramp("<i4", 20).reshape(10, 2), maxshape=(None, 2),
+            chunks=(5, 2),
+        )
+    layout = h5py.VirtualLayout(shape=(1, 2), dtype="<i4", maxshape=(None, 2))
+    vsrc = h5py.VirtualSource(src.name, "src", shape=(1, 2), maxshape=(None, 2))
+    layout[: h5s.UNLIMITED, :] = vsrc[: h5s.UNLIMITED, :]
+    with h5py.File(path, "w") as f:
+        f.create_virtual_dataset("vds", layout)
+
+
+def gen_vds_printf_unlim(path):
+    """A printf-pattern source name over an unlimited virtual selection.
+
+    The two features only exist together: `H5D_virtual_check_mapping_post`
+    refuses a `%b` in a source name unless the virtual selection is unlimited
+    and the source selection is not, which is the mapping that says "one source
+    file per block, as many as are there". Three blocks are present, so the
+    extent `H5D__virtual_set_extent_unlim` gives the dataset is three rows.
+    """
+    stem = path.stem
+    for b in range(3):
+        with h5py.File(path.parent / ("%s_b%d.h5" % (stem, b)), "w") as g:
+            g.create_dataset("data", data=ramp("<i4", 4) + 10 * b)
+    layout = h5py.VirtualLayout(shape=(1, 4), dtype="<i4", maxshape=(None, 4))
+    vsrc = h5py.VirtualSource("%s_b%%b.h5" % stem, "data", shape=(4,))
+    layout[: h5s.UNLIMITED, :] = vsrc
+    with h5py.File(path, "w") as f:
+        f.create_virtual_dataset("vds", layout)
+
+
 def gen_chunkidx_btree2(path):
     with h5py.File(path, "w", libver="latest") as f:
         ds = f.create_dataset(
@@ -567,6 +626,18 @@ LAYOUT_CASES = [
     Case("vds", "layout", gen_vds, "vds",
          "virtual dataset mapped onto a dataset in a sibling file",
          ext_files=("_src.h5",)),
+    Case("external_unlimited", "layout", gen_external_unlimited,
+         "external_unlimited",
+         "H5O_EFL_UNLIMITED on the last external slot of an unlimited dataset",
+         ext_files=("_ext.raw",)),
+    Case("vds_unlim", "layout", gen_vds_unlim, "vds_unlim",
+         "virtual dataset whose mapping is unlimited on both sides — the "
+         "extent comes from the source",
+         ext_files=("_src.h5",)),
+    Case("vds_printf_unlim", "layout", gen_vds_printf_unlim, "vds_printf_unlim",
+         "printf-pattern source name over an unlimited virtual selection — "
+         "one source file per block",
+         ext_files=("_b0.h5", "_b1.h5", "_b2.h5")),
 ]
 
 
@@ -1035,9 +1106,79 @@ def gen_large_multi_mb(path):
         f.create_dataset("big", data=data, chunks=(64, 512))
 
 
+def gen_fsm_persist(path):
+    """A persisting free-space-manager file, reopened and appended to.
+
+    `fs_persist` is what makes the free-space managers on-disk structures
+    rather than in-memory bookkeeping: the close writes an H5FS header and
+    section-info block per allocation type and names them in the file-space
+    info message. Nothing is freed by the create alone, so the reopen and
+    append are the half that matters — superseding the superblock extension
+    and the root group's object header is what puts sections in a manager,
+    and `#freespace` is `tracked` only if they were written back.
+    """
+    with h5py.File(path, "w", fs_strategy="fsm", fs_persist=True, fs_threshold=1) as f:
+        f.create_dataset("data", data=ramp("<i4"))
+        f.create_dataset("bulk", data=ramp("<i4", 256))
+        f.create_group("g")
+    with h5py.File(path, "a") as f:
+        del f["bulk"]
+        f.create_dataset("appended", data=ramp("<i4"))
+
+
+def gen_fsm_persist_page(path):
+    """[`gen_fsm_persist`] under paged aggregation.
+
+    `H5F_FSPACE_STRATEGY_PAGE` packs everything smaller than the file-space
+    page into pages of one kind and page-aligns everything else
+    (`H5MF__alloc_pagefs`), so the same edits leave a different free-space
+    manager set: sections that never cross a page boundary, and — under sec2,
+    which declares no `H5FD_FEAT_PAGED_AGGR` — at most the three managers
+    `H5MF__alloc_to_fs_type` can reach.
+    """
+    with h5py.File(path, "w", fs_strategy="page", fs_persist=True, fs_threshold=1) as f:
+        f.create_dataset("data", data=ramp("<i4"))
+        f.create_dataset("bulk", data=ramp("<i4", 256))
+        f.create_group("g")
+    with h5py.File(path, "a") as f:
+        del f["bulk"]
+        f.create_dataset("appended", data=ramp("<i4"))
+
+
+def gen_fsm_page_size(path):
+    """[`gen_fsm_persist_page`] on a page size that is not the library default.
+
+    `H5Pset_file_space_page_size` takes anything from 512
+    (`H5F_FILE_SPACE_PAGE_SIZE_MIN`) to 1 GiB with no power-of-two
+    requirement, and the size decides which side of `H5MF__alloc_to_fs_type`
+    every request falls on. At 512 the `bulk` dataset's raw data is larger
+    than a page and is page-aligned as `H5F_MEM_PAGE_GENERIC`, where at the
+    4096-byte default the same bytes are packed into a page — so this is a
+    different manager set, not the same file with a different number in the
+    message.
+    """
+    with h5py.File(path, "w", fs_strategy="page", fs_persist=True,
+                   fs_threshold=1, fs_page_size=512) as f:
+        f.create_dataset("data", data=ramp("<i4"))
+        f.create_dataset("bulk", data=ramp("<i4", 256))
+        f.create_group("g")
+    with h5py.File(path, "a") as f:
+        del f["bulk"]
+        f.create_dataset("appended", data=ramp("<i4"))
+
+
 MISC_CASES = [
     Case("swmr_created", "swmr", gen_swmr_created, "swmr_created",
          "file created through the SWMR writer path and appended frame by frame"),
+    Case("fsm_persist", "freespace", gen_fsm_persist, "fsm_persist",
+         "persisting FSM_AGGR file reopened and appended — the freed blocks "
+         "must come back as free-space manager sections"),
+    Case("fsm_persist_page", "freespace", gen_fsm_persist_page, "fsm_persist_page",
+         "persisting PAGE file reopened and appended — the freed blocks must "
+         "come back as page-shaped free-space manager sections"),
+    Case("fsm_page_size", "freespace", gen_fsm_page_size, "fsm_page_size",
+         "persisting PAGE file on a 512-byte file-space page — the non-default "
+         "size must reach the message and shape the allocation"),
     Case("large_multi_mb", "bulk", gen_large_multi_mb, "large_multi_mb",
          "2 MiB chunked f64 dataset — payload compared by SHA-256"),
 ]

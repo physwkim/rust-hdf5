@@ -37,8 +37,9 @@ use rust_hdf5::{
     Hyperslab, HyperslabBlock, LibverBound, LinkClass, LinkStorage, Reference, Selection,
     StorageLayout, VirtualMapping,
 };
+use rust_hdf5::{FileSpaceInfoMessage, FileSpaceStrategy};
 
-const CANON_VERSION: &str = "5";
+const CANON_VERSION: &str = "7";
 const RAW_LIMIT: usize = 1024;
 const MAX_DEPTH: usize = 32;
 
@@ -694,9 +695,52 @@ fn dump_file(path: &str) -> std::result::Result<String, String> {
     // canon can be compared against rather than an API gap.
     d.field("", "userblock", || Ok(file.userblock_size().to_string()));
 
+    // The twin of `canon.py`'s `fspace_str`. The h5py side reads the file
+    // creation property list, which libhdf5 fills from this same message and
+    // leaves at the library defaults when the file has none.
+    d.field("", "fspace", || {
+        Ok(fspace_str(
+            file.superblock_extension().file_space_info.as_ref(),
+        ))
+    });
+
+    // The twin of `canon.py`'s `freespace_str`, which parses `h5stat -S`.
+    d.field("", "freespace", || {
+        file.tracked_free_space()
+            .map(|bytes| if bytes > 0 { "tracked" } else { "none" }.to_string())
+            .map_err(oneline)
+    });
+
     let root = file.root_group();
     dump_group(&mut d, &file, "/", &root, 0);
     Ok(d.lines.join("\n") + "\n")
+}
+
+/// The twin of `canon.py`'s `fspace_str`:
+/// `<strategy>/<persist>/<threshold>/<page size>`.
+///
+/// A file with no file-space info message reports the library defaults
+/// (`H5F_FILE_SPACE_STRATEGY_DEF`, no persist, threshold 1, page size 4096) —
+/// the same values the h5py side reads off an untouched creation property
+/// list. All four are the properties `H5F__super_init` weighs against those
+/// defaults when deciding whether to write the message at all.
+fn fspace_str(info: Option<&FileSpaceInfoMessage>) -> String {
+    let Some(info) = info else {
+        // `H5F_FILE_SPACE_PAGE_SIZE_DEF` (H5Fprivate.h:335), spelled out
+        // here as the other three defaults already are.
+        return "fsmaggr/false/1/4096".to_string();
+    };
+    let strategy = match info.strategy {
+        FileSpaceStrategy::FsmAggr => "fsmaggr".to_string(),
+        FileSpaceStrategy::Page => "page".to_string(),
+        FileSpaceStrategy::Aggr => "aggr".to_string(),
+        FileSpaceStrategy::None => "none".to_string(),
+        FileSpaceStrategy::Unknown(v) => format!("unknown({v})"),
+    };
+    format!(
+        "{strategy}/{}/{}/{}",
+        info.persist, info.threshold, info.page_size
+    )
 }
 
 /// The twin of `canon.py`'s `crt_order_str`: `-`, `tracked`, or
@@ -1963,6 +2007,109 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "external_unlimited" => {
+            // The unlimited slot is the only reservation a growable dataset
+            // can have: `H5D__efl_construct` refuses a finite one over an
+            // unlimited dataspace, since no finite total could cover it.
+            use rust_hdf5::format::messages::external_file_list::UNLIMITED;
+            let raw = format!(
+                "{}_ext.raw",
+                std::path::Path::new(path)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            );
+            let file = earliest_file(path)?;
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([16usize])
+                .max_shape(&[None])
+                .external(&[(raw.as_str(), 0, UNLIMITED)])
+                .create("data")?;
+            ds.write_raw(&ramp_n::<i32>(16))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "vds_unlim" => {
+            // Unlimited on both sides: the mapping says "as many rows as the
+            // source has", and the seed extent is the one block it starts on.
+            let src_name = format!(
+                "{}_src.h5",
+                std::path::Path::new(path)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            );
+            let src_path = std::path::Path::new(path).with_file_name(&src_name);
+            let src = earliest_file(src_path.to_string_lossy().as_ref())?;
+            let sds = src
+                .new_dataset::<i32>()
+                .shape([10usize, 2])
+                .max_shape(&[None, Some(2)])
+                .chunk(&[5, 2])
+                .create("src")?;
+            sds.write_raw(&ramp_n::<i32>(20))?;
+            src.close()?;
+
+            let unlim = || Selection::Hyperslab {
+                rank: 2,
+                form: Hyperslab::Regular(rust_hdf5::RegularHyperslab {
+                    start: vec![0, 0],
+                    stride: vec![1, 1],
+                    count: vec![rust_hdf5::format::selection::UNLIMITED, 1],
+                    block: vec![1, 2],
+                }),
+            };
+            let file = earliest_file(path)?;
+            file.new_dataset::<i32>()
+                .shape([1usize, 2])
+                .max_shape(&[None, Some(2)])
+                .virtual_mapping(unlim(), &src_name, "src", unlim())
+                .create("vds")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "vds_printf_unlim" => {
+            // One source file per block, named by the `%b` the mapping carries;
+            // the virtual selection is unlimited in the row dimension, so the
+            // extent is however many blocks are on disk when it is read.
+            let stem = std::path::Path::new(path)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            for b in 0..3u64 {
+                let block = std::path::Path::new(path).with_file_name(format!("{stem}_b{b}.h5"));
+                let src = earliest_file(block.to_string_lossy().as_ref())?;
+                src.new_dataset::<i32>()
+                    .shape([4usize])
+                    .create("data")?
+                    .write_raw(&(0..4i32).map(|i| i + 10 * b as i32).collect::<Vec<_>>())?;
+                src.close()?;
+            }
+            let unlim_rows = Selection::Hyperslab {
+                rank: 2,
+                form: Hyperslab::Regular(rust_hdf5::RegularHyperslab {
+                    start: vec![0, 0],
+                    stride: vec![1, 1],
+                    count: vec![rust_hdf5::format::selection::UNLIMITED, 1],
+                    block: vec![1, 4],
+                }),
+            };
+            let file = earliest_file(path)?;
+            file.new_dataset::<i32>()
+                .shape([1usize, 4])
+                .max_shape(&[None, Some(4)])
+                .virtual_mapping(
+                    unlim_rows,
+                    &format!("{stem}_b%b.h5"),
+                    "data",
+                    Selection::All,
+                )
+                .create("vds")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "layout_contiguous_v108" => layout_at_libver(path, LibverBound::V18, None),
         "layout_contiguous_v110" => layout_at_libver(path, LibverBound::V110, None),
         "layout_chunked_v108" => layout_at_libver(path, LibverBound::V18, Some(&[16])),
@@ -2467,6 +2614,79 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
         "libver_v108" => libver_case(path, LibverBound::V18),
         "libver_v110" => libver_case(path, LibverBound::V110),
         "libver_latest" => libver_case(path, LibverBound::V200),
+        "fsm_persist" => {
+            let file = H5File::options()
+                .libver(LibverBound::Earliest)
+                .file_space(FileSpaceStrategy::FsmAggr, true, 1)
+                .create(path)?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("data")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.new_dataset::<i32>()
+                .shape([256usize])
+                .create("bulk")?
+                .write_raw(&(0..256).collect::<Vec<i32>>())?;
+            file.root_group().create_group("g")?;
+            file.close()?;
+            let file = H5File::open_rw(path)?;
+            file.delete_dataset("bulk")?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("appended")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "fsm_persist_page" => {
+            let file = H5File::options()
+                .libver(LibverBound::Earliest)
+                .file_space(FileSpaceStrategy::Page, true, 1)
+                .create(path)?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("data")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.new_dataset::<i32>()
+                .shape([256usize])
+                .create("bulk")?
+                .write_raw(&(0..256).collect::<Vec<i32>>())?;
+            file.root_group().create_group("g")?;
+            file.close()?;
+            let file = H5File::open_rw(path)?;
+            file.delete_dataset("bulk")?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("appended")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "fsm_page_size" => {
+            let file = H5File::options()
+                .libver(LibverBound::Earliest)
+                .file_space(FileSpaceStrategy::Page, true, 1)
+                .file_space_page_size(512)
+                .create(path)?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("data")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.new_dataset::<i32>()
+                .shape([256usize])
+                .create("bulk")?
+                .write_raw(&(0..256).collect::<Vec<i32>>())?;
+            file.root_group().create_group("g")?;
+            file.close()?;
+            let file = H5File::open_rw(path)?;
+            file.delete_dataset("bulk")?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("appended")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "reopen_append_earliest" => reopen_append_case(path, LibverBound::Earliest),
         "reopen_append_v108" => reopen_append_case(path, LibverBound::V18),
         "reopen_append_latest" => reopen_append_case(path, LibverBound::V200),

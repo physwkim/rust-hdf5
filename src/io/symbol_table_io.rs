@@ -19,6 +19,7 @@
 //! needs, where incremental insertion would have to split to get there.
 
 use crate::format::btree_v1::BTreeV1Node;
+use crate::format::free_space::FreeSpaceClass;
 use crate::format::local_heap::{
     local_heap_get_string, local_heap_header_size, LocalHeapHeader, LocalHeapImage,
     LOCAL_HEAP_FREE_NULL,
@@ -278,8 +279,8 @@ pub(crate) fn write_stab(
     // The heap comes first so the tree's keys can name offsets in it.
     let heap_bytes = heap.as_bytes().to_vec();
     let heap_hdr_size = local_heap_header_size(sa, ss) as u64;
-    let heap_addr = allocator.allocate(heap_hdr_size);
-    let heap_data_addr = allocator.allocate(heap_bytes.len() as u64);
+    let heap_addr = allocator.allocate(heap_hdr_size, FreeSpaceClass::Metadata);
+    let heap_data_addr = allocator.allocate(heap_bytes.len() as u64, FreeSpaceClass::Metadata);
     let heap_hdr = LocalHeapHeader {
         data_size: heap_bytes.len() as u64,
         // A rebuilt heap holds exactly its objects, so there is no free block
@@ -301,7 +302,7 @@ pub(crate) fn write_stab(
         let node = SymbolTableNode {
             entries: chunk.iter().map(|(_, e)| e.clone()).collect(),
         };
-        let addr = allocator.allocate(snod_size as u64);
+        let addr = allocator.allocate(snod_size as u64, FreeSpaceClass::Metadata);
         pending.push((addr, node.encode(snod_size, sa, ss)?));
         level.push((addr, chunk[chunk.len() - 1].1.name_offset));
     }
@@ -323,7 +324,7 @@ pub(crate) fn write_stab(
         // encoded: each node stores both its siblings' addresses.
         let addrs: Vec<u64> = groups
             .iter()
-            .map(|_| allocator.allocate(node_size as u64))
+            .map(|_| allocator.allocate(node_size as u64, FreeSpaceClass::Metadata))
             .collect();
         let mut next: Vec<(u64, u64)> = Vec::with_capacity(groups.len());
         for (i, group) in groups.iter().enumerate() {
@@ -374,10 +375,14 @@ pub(crate) fn write_stab(
 }
 
 /// Return the blocks one superseded symbol table occupied to the allocator.
+///
+/// Metadata throughout: the version-1 B-tree is `H5FD_MEM_BTREE` and the name
+/// heap `H5FD_MEM_LHEAP` (H5B.c, H5HL.c:123), both of which
+/// `H5FD_FLMAP_DICHOTOMY` sends to `H5FD_MEM_SUPER`.
 pub(crate) fn free_stab(allocator: &FileAllocator, extents: &StabExtents) {
     for &(addr, len) in &extents.blocks {
         if addr != 0 && addr != UNDEF_ADDR && len > 0 {
-            allocator.free(addr, len);
+            allocator.free(addr, len, FreeSpaceClass::Metadata);
         }
     }
 }

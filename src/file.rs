@@ -18,9 +18,10 @@
 
 use std::path::Path;
 
+use crate::format::messages::superblock_ext::FileSpaceStrategy;
 use crate::io::locking::FileLocking;
 use crate::io::reader::SuperblockExtension;
-use crate::io::writer::SharedMessageConfig;
+use crate::io::writer::{FileSpaceConfig, SharedMessageConfig};
 use crate::io::{Hdf5Reader, Hdf5Writer};
 
 use crate::dataset::{DatasetBuilder, H5Dataset};
@@ -101,8 +102,12 @@ pub(crate) fn new_shared(inner: H5FileInner) -> SharedInner {
 /// Enable the `threadsafe` feature to use `Arc<Mutex<>>` instead, making
 /// `H5File` `Send + Sync`.
 pub(crate) enum H5FileInner {
-    Writer(Hdf5Writer),
-    Reader(Hdf5Reader),
+    // Boxed: `Hdf5Writer` and `Hdf5Reader` are both far larger than the
+    // zero-sized `Closed` sentinel, and inlining either here would size
+    // every `H5FileInner` to that variant's footprint regardless of which
+    // mode a given file is actually in.
+    Writer(Box<Hdf5Writer>),
+    Reader(Box<Hdf5Reader>),
     /// Sentinel value used during `close()` to take ownership of the writer.
     Closed,
 }
@@ -121,7 +126,7 @@ impl H5File {
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
         let writer = Hdf5Writer::create(path.as_ref())?;
         Ok(Self {
-            inner: new_shared(H5FileInner::Writer(writer)),
+            inner: new_shared(H5FileInner::Writer(Box::new(writer))),
         })
     }
 
@@ -129,7 +134,7 @@ impl H5File {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let reader = Hdf5Reader::open(path.as_ref())?;
         Ok(Self {
-            inner: new_shared(H5FileInner::Reader(reader)),
+            inner: new_shared(H5FileInner::Reader(Box::new(reader))),
         })
     }
 
@@ -149,7 +154,7 @@ impl H5File {
     pub fn open_rw<P: AsRef<Path>>(path: P) -> Result<Self> {
         let writer = Hdf5Writer::open_append(path.as_ref())?;
         Ok(Self {
-            inner: new_shared(H5FileInner::Writer(writer)),
+            inner: new_shared(H5FileInner::Writer(Box::new(writer))),
         })
     }
 
@@ -197,11 +202,14 @@ impl H5File {
     ///
     /// Errors in read mode.
     pub fn set_libver_latest(&self, latest: bool) -> Result<()> {
-        self.set_libver_bound(if latest {
-            LibverBound::V200
-        } else {
-            LibverBound::Earliest
-        })
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                writer.set_libver_latest(latest)?;
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
+        }
     }
 
     /// Set the file's low libver bound — `H5Pset_libver_bounds`'s `low`
@@ -622,6 +630,24 @@ impl H5File {
         match &*inner {
             H5FileInner::Reader(reader) => reader.superblock_extension().clone(),
             _ => SuperblockExtension::default(),
+        }
+    }
+
+    /// Bytes this file's on-disk free-space managers record as free —
+    /// libhdf5's `H5Fget_freespace`, and the number `h5stat -S` prints as
+    /// "Amount of tracked free space".
+    ///
+    /// Zero for a file that persists no managers, which is every file created
+    /// without [`H5FileOptions::file_space`] asking for `persist`. Read mode
+    /// only: an open writer's freed blocks are not on disk yet, so the two
+    /// would be different questions with one name.
+    pub fn tracked_free_space(&self) -> Result<u64> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => Ok(reader.tracked_free_space()?),
+            _ => Err(Hdf5Error::InvalidState(
+                "tracked_free_space is only available in read mode".into(),
+            )),
         }
     }
 
@@ -1098,6 +1124,8 @@ pub struct H5FileOptions {
     libver: Option<LibverBound>,
     userblock: u64,
     shared_messages: SharedMessageConfig,
+    file_space: Option<FileSpaceConfig>,
+    file_space_page_size: Option<u64>,
 }
 
 impl H5FileOptions {
@@ -1251,6 +1279,97 @@ impl H5FileOptions {
         self
     }
 
+    /// Create the file under a file-space handling strategy — libhdf5's
+    /// `H5Pset_file_space_strategy`, h5py's `File(..., fs_strategy=...,
+    /// fs_persist=..., fs_threshold=...)`.
+    ///
+    /// `strategy` picks how released space is reused:
+    /// [`FileSpaceStrategy::FsmAggr`] keeps free-space managers and the
+    /// metadata/raw-data aggregators (the library default),
+    /// [`FileSpaceStrategy::Aggr`] the aggregators alone, and
+    /// [`FileSpaceStrategy::None`] neither, so every allocation comes from the
+    /// end of the file. [`FileSpaceStrategy::Page`] allocates on file-space
+    /// page boundaries instead, packing everything smaller than a page into
+    /// pages of its own kind; [`file_space_page_size`](Self::file_space_page_size)
+    /// sets how big those pages are.
+    ///
+    /// `persist` writes the free-space managers into the file on close, so a
+    /// later session — this crate or libhdf5 — finds the space this one
+    /// released instead of appending past it. `threshold` is the smallest
+    /// section a manager records; anything smaller is space the file leaks
+    /// rather than tracks. Both are ignored for the two strategies that have
+    /// no managers, exactly as `H5P__set_file_space_strategy` ignores them.
+    ///
+    /// Only [`create`](Self::create) reads this. A file that already exists
+    /// declares its own strategy in its superblock extension, and this crate
+    /// honours what it finds there.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::{FileSpaceStrategy, H5File};
+    /// let file = H5File::options()
+    ///     .file_space(FileSpaceStrategy::FsmAggr, true, 1)
+    ///     .create("persisting.h5")
+    ///     .unwrap();
+    /// # let _ = file;
+    /// ```
+    pub fn file_space(
+        mut self,
+        strategy: FileSpaceStrategy,
+        persist: bool,
+        threshold: u64,
+    ) -> Self {
+        self.file_space = Some(FileSpaceConfig::new(strategy, persist, threshold));
+        self
+    }
+
+    /// `H5Pset_file_space_page_size`, h5py's `File(..., fs_page_size=...)`.
+    ///
+    /// The file-space page is the unit [`FileSpaceStrategy::Page`] allocates
+    /// in: a request smaller than one page is packed into a page holding only
+    /// that kind of data, and a larger one is page-aligned. `size` is between
+    /// 512 (`H5F_FILE_SPACE_PAGE_SIZE_MIN`) and 1 GiB — no power of two
+    /// required — and anything outside that is refused by
+    /// [`create`](Self::create), as `H5Pset_file_space_page_size` refuses it.
+    ///
+    /// Setting it is enough on its own to give the file a file-space info
+    /// message, because the page size is one of the four properties
+    /// `H5F__super_init` compares against the library defaults. Under any
+    /// other strategy that is all it does: the file records the size and
+    /// allocates without it.
+    ///
+    /// Only [`create`](Self::create) reads this. A reopened file keeps the
+    /// page size its own message carries.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::{FileSpaceStrategy, H5File};
+    /// let file = H5File::options()
+    ///     .file_space(FileSpaceStrategy::Page, true, 1)
+    ///     .file_space_page_size(8192)
+    ///     .create("paged.h5")
+    ///     .unwrap();
+    /// # let _ = file;
+    /// ```
+    pub fn file_space_page_size(mut self, size: u64) -> Self {
+        self.file_space_page_size = Some(size);
+        self
+    }
+
+    /// The one [`FileSpaceConfig`] the two file-space builders describe
+    /// between them.
+    ///
+    /// They are separate properties of one property list —
+    /// `H5Pset_file_space_strategy` and `H5Pset_file_space_page_size` write
+    /// different fcpl entries and neither reads the other — so each is
+    /// recorded by whether it was called, and joining them here is what keeps
+    /// either call order meaning the same thing.
+    fn resolved_file_space(&self) -> FileSpaceConfig {
+        let config = self.file_space.unwrap_or_default();
+        match self.file_space_page_size {
+            Some(size) => config.with_page_size(size),
+            None => config,
+        }
+    }
+
     fn resolved_locking(&self) -> FileLocking {
         match self.locking {
             Some(p) => p,
@@ -1288,6 +1407,12 @@ impl H5FileOptions {
         if self.shared_messages != SharedMessageConfig::default() {
             offending.push("shared_messages");
         }
+        if self.file_space.is_some() {
+            offending.push("file_space");
+        }
+        if self.file_space_page_size.is_some() {
+            offending.push("file_space_page_size");
+        }
         if offending.is_empty() {
             Ok(())
         } else {
@@ -1309,10 +1434,11 @@ impl H5FileOptions {
                 libver: self.libver,
                 userblock: self.userblock,
                 shared_messages: self.shared_messages,
+                file_space: self.resolved_file_space(),
             },
         )?;
         Ok(H5File {
-            inner: new_shared(H5FileInner::Writer(writer)),
+            inner: new_shared(H5FileInner::Writer(Box::new(writer))),
         })
     }
 
@@ -1321,7 +1447,7 @@ impl H5FileOptions {
         self.refuse_create_only_options()?;
         let reader = Hdf5Reader::open_with_locking(path.as_ref(), self.resolved_locking())?;
         Ok(H5File {
-            inner: new_shared(H5FileInner::Reader(reader)),
+            inner: new_shared(H5FileInner::Reader(Box::new(reader))),
         })
     }
 
@@ -1330,7 +1456,7 @@ impl H5FileOptions {
         self.refuse_create_only_options()?;
         let writer = Hdf5Writer::open_append_with_locking(path.as_ref(), self.resolved_locking())?;
         Ok(H5File {
-            inner: new_shared(H5FileInner::Writer(writer)),
+            inner: new_shared(H5FileInner::Writer(Box::new(writer))),
         })
     }
 }

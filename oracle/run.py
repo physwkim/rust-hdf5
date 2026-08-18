@@ -91,7 +91,56 @@ B_TOLERATED_FIELDS = {
 # A deviation that matches none of these is reported as unexpected, and an
 # entry that matches nothing in a run is reported as no longer observed — so
 # a rerun after a writer fix shows the change rather than hiding it.
-EXPECTED_DEVIATIONS = []
+#
+# `min_hdf5` scopes an entry to a reference library at or above that version.
+# It is for a deviation that exists only because the reference changed
+# behaviour, never for one the crate could fix: an entry gated this way must
+# name the upstream change and the evidence for it.
+EXPECTED_DEVIATIONS = [
+    {
+        "id": "chunkindex-v3-superblock-low-bound",
+        "field": "chunkindex",
+        "ref": "btree1",
+        "rust": "farray",
+        "min_hdf5": (2, 0),
+        "why": (
+            "Reopening a v3-superblock file to append: libhdf5 1.14.6 raises "
+            "the file's low_bound on every open from the superblock version "
+            "it finds — v2 to V18, v3 to V110 (H5Fsuper.c:460-466) — so the "
+            "reopened file writes a V110 chunk index. 2.0.0 raises it only "
+            "under H5F_ACC_SWMR_WRITE (H5Fsuper.c:448-454), so the same file "
+            "reopened non-SWMR keeps the default bound and libhdf5 writes a "
+            "version-1 B-tree index where it used to write a fixed/extensible "
+            "array. This crate's write rule is pinned to 1.14.6 semantics by "
+            "decision, so under a 2.0 reference the two disagree; against the "
+            "pinned 1.14.6 reference they do not, and that run declares no "
+            "deviation at all."
+        ),
+    },
+]
+
+_HDF5_VERSION = None
+
+
+def hdf5_version_tuple():
+    """The reference library's version, cached. Imported lazily because this
+    module re-execs itself under the interpreter that has h5py."""
+    global _HDF5_VERSION
+    if _HDF5_VERSION is None:
+        import h5py
+
+        _HDF5_VERSION = tuple(h5py.version.hdf5_version_tuple)
+    return _HDF5_VERSION
+
+
+def deviation_applies(exp):
+    """Whether a declared deviation is in force for the running reference."""
+    return "min_hdf5" not in exp or hdf5_version_tuple() >= exp["min_hdf5"]
+
+
+def declared_deviations():
+    """The EXPECTED_DEVIATIONS in force for this run."""
+    return [exp for exp in EXPECTED_DEVIATIONS if deviation_applies(exp)]
 
 
 def expected_deviation(entry):
@@ -101,7 +150,7 @@ def expected_deviation(entry):
         # One side does not describe the field at all. That is a missing
         # object or a missing field, never one of the declared deviations.
         return None
-    for exp in EXPECTED_DEVIATIONS:
+    for exp in declared_deviations():
         if exp["field"] != entry["field"]:
             continue
         if exp["ref"] is not None and exp["ref"] != ref:
@@ -454,8 +503,9 @@ def deviation_tables(results):
     Expected rows keep the declared order and carry the cases that hit them,
     so an entry that stops firing stays visible as `observed: no`.
     """
-    hits = {exp["id"]: [] for exp in EXPECTED_DEVIATIONS}
-    seen = {exp["id"]: (None, None) for exp in EXPECTED_DEVIATIONS}
+    declared = declared_deviations()
+    hits = {exp["id"]: [] for exp in declared}
+    seen = {exp["id"]: (None, None) for exp in declared}
     unexpected = {}
     for r in results:
         for d in r["b"].get("metadata_diffs", []):
@@ -468,7 +518,7 @@ def deviation_tables(results):
                 hits[eid].append(r["case"])
                 seen[eid] = (d["ref"], d["rust"])
     expected = []
-    for exp in EXPECTED_DEVIATIONS:
+    for exp in declared:
         ref, rust = seen[exp["id"]]
         expected.append(
             {
@@ -727,11 +777,24 @@ def write_report(results, gaps, meta, md_path, json_path):
     L.append("## Direction B expected deviations")
     L.append("")
     if not expected:
+        gated = len(EXPECTED_DEVIATIONS) - len(declared_deviations())
+        if gated:
+            version = ".".join(str(n) for n in hdf5_version_tuple())
+            why = (
+                "no `EXPECTED_DEVIATIONS` entry (oracle/run.py) applies to "
+                "libhdf5 %s — %s scoped to a later one"
+                % (
+                    version,
+                    "1 entry is" if gated == 1 else "%d entries are" % gated,
+                )
+            )
+        else:
+            why = "`EXPECTED_DEVIATIONS` (oracle/run.py) is empty"
         L.append(
-            "None: `EXPECTED_DEVIATIONS` (oracle/run.py) is empty, so every "
-            "case in this run describes itself the way libhdf5 describes the "
-            "same file. Any metadata deviation from here on matches no entry "
-            "and is reported as unexpected below."
+            "None: %s, so every case in this run describes itself the way "
+            "libhdf5 describes the same file. Any metadata deviation from "
+            "here on matches no entry and is reported as unexpected below."
+            % why
         )
     else:
         L.append(

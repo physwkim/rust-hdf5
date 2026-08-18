@@ -58,6 +58,7 @@ pub struct FileHandle {
 
 impl FileHandle {
     /// Create a new file with the env-var-derived locking policy.
+    #[cfg(test)]
     pub fn create(path: &Path) -> std::io::Result<Self> {
         Self::create_with_locking(path, FileLocking::from_env_or(FileLocking::default()))
     }
@@ -126,6 +127,7 @@ impl FileHandle {
 
     /// Open an existing file for read-only access with the env-var-derived
     /// locking policy.
+    #[cfg(test)]
     pub fn open_read(path: &Path) -> std::io::Result<Self> {
         Self::open_read_with_locking(path, FileLocking::from_env_or(FileLocking::default()))
     }
@@ -142,12 +144,6 @@ impl FileHandle {
             lock_held,
             base: 0,
         })
-    }
-
-    /// Open an existing file for read/write access with the env-var-derived
-    /// locking policy.
-    pub fn open_readwrite(path: &Path) -> std::io::Result<Self> {
-        Self::open_readwrite_with_locking(path, FileLocking::from_env_or(FileLocking::default()))
     }
 
     /// Open an existing file for read/write access with an explicit locking
@@ -202,16 +198,6 @@ impl FileHandle {
                 return Ok(None);
             }
         }
-    }
-
-    /// Locking policy this handle was opened with.
-    pub fn lock_policy(&self) -> FileLocking {
-        self.lock_policy
-    }
-
-    /// Whether a lock is currently held on this handle.
-    pub fn lock_held(&self) -> bool {
-        self.lock_held
     }
 
     /// Release the OS-level lock so concurrent SWMR readers (and other
@@ -339,6 +325,23 @@ impl FileHandle {
     /// `H5FD_get_eof` returns for the same reason).
     pub fn file_size(&self) -> std::io::Result<u64> {
         Ok(self.file.metadata()?.len().saturating_sub(self.base))
+    }
+
+    /// Set the file's length to `eof` in this handle's address space —
+    /// `H5FD_truncate`, which every close calls so the file on disk ends where
+    /// the superblock says the address space does.
+    ///
+    /// A file shorter than its recorded end of file is one libhdf5 refuses as
+    /// truncated (`H5F__super_read`, H5Fsuper.c:573); a longer one has bytes
+    /// no structure in it accounts for, which is what `h5stat -S` reports as
+    /// unaccounted space. Both are closed here rather than by a rule that
+    /// every allocation must be written, which nothing can enforce.
+    pub fn set_eof(&self, eof: u64) -> std::io::Result<()> {
+        let want = eof + self.base;
+        if self.file.metadata()?.len() != want {
+            self.file.set_len(want)?;
+        }
+        Ok(())
     }
 }
 

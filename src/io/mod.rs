@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! I/O engine for the pure Rust HDF5 library.
 //!
 //! Provides buffered file I/O, append-only allocation, dataset reading/writing,
@@ -7,6 +6,7 @@
 pub mod allocator;
 pub(crate) mod chunk_grid;
 pub mod file_handle;
+pub(crate) mod free_space_io;
 pub(crate) mod hyperslab;
 pub mod locking;
 pub(crate) mod object_header_io;

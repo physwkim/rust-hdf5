@@ -33,7 +33,9 @@ use crate::format::messages::shared::MSG_FLAG_SHARED;
 use crate::format::messages::superblock_ext::{
     BtreeKMessage, DriverInfoMessage, FileSpaceInfoMessage, SharedMessageTableMessage,
 };
-use crate::format::messages::virtual_mapping::VirtualMappingList;
+use crate::format::messages::virtual_mapping::{
+    parse_source_name, VirtualMapping, VirtualMappingList,
+};
 use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
 use crate::format::reference::{
@@ -96,15 +98,6 @@ enum ChunkTarget<'a> {
 }
 
 impl<'a> ChunkTarget<'a> {
-    /// Dimensions of the produced output buffer: the dataset dims for `Full`,
-    /// the selection extent for `Slice`.
-    fn out_dims(&self, dims: &'a [u64]) -> &'a [u64] {
-        match self {
-            ChunkTarget::Full => dims,
-            ChunkTarget::Slice { counts, .. } => counts,
-        }
-    }
-
     /// Whether a chunk at chunk-grid `coords` (extent `chunk_dims`) intersects
     /// the target. `Full` always intersects; a `Slice` intersects iff every
     /// dimension's chunk span `[origin, origin+chunk_dims)` overlaps the
@@ -120,6 +113,19 @@ impl<'a> ChunkTarget<'a> {
             }),
         }
     }
+}
+
+/// The dataset extent, chunk shape and element size a chunk-placement call
+/// reads through — constant across every chunk of one read, so
+/// [`Hdf5Reader::copy_chunk_to_output`], [`Hdf5Reader::copy_chunk_to_slice`]
+/// and [`Hdf5Reader::scatter_chunk`] take this once instead of the three
+/// fields separately, leaving only what actually varies per chunk (its data
+/// and grid coordinates) as their own parameters.
+#[derive(Clone, Copy)]
+struct ChunkOutputGeometry<'a> {
+    dims: &'a [u64],
+    chunk_dims: &'a [u64],
+    element_size: u64,
 }
 
 /// One resolved external-file slot (H5O_EFL_ID): the on-disk message
@@ -191,7 +197,43 @@ pub struct DatasetReadInfo {
     /// names a mapping list (`heap_index != 0`); `None` for every other
     /// layout, and for a virtual dataset that has no mappings yet.
     pub virtual_mappings: Option<VirtualMappingList>,
+    /// What each mapping in [`virtual_mappings`](Self::virtual_mappings)
+    /// resolved to when the file was opened, in the same order — see
+    /// [`MappingResolution`] and `Hdf5Reader::resolve_virtual_extents`.
+    /// `None` for every non-virtual dataset and for a virtual one with no
+    /// mapping list.
+    pub virtual_resolution: Option<Vec<MappingResolution>>,
 }
+
+/// What one virtual-dataset mapping resolved to at open time —
+/// `H5D__virtual_set_extent_unlim` (H5Dvirtual.c), which libhdf5 runs when
+/// the dataset is opened and which both the dataset's reported extent and
+/// every read of it depend on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MappingResolution {
+    /// Neither selection grows: the mapping is already concrete, and the
+    /// dataset's stored extent is its extent.
+    Bounded,
+    /// Both selections are unlimited (`unlim_dim_virtual >= 0` and
+    /// `unlim_dim_source >= 0`). `virtual_clip` is how far this mapping
+    /// reaches in its unlimited virtual dimension, `source_clip` the source
+    /// dataset's own extent in its unlimited source dimension — the two
+    /// values `H5S_hyper_clip_unlim` clips the mapping's selections to.
+    Unlimited { virtual_clip: u64, source_clip: u64 },
+    /// A printf mapping (unlimited virtual selection, limited source
+    /// selection, `%b` in a source name): `blocks` source datasets were
+    /// found, filling blocks `0..blocks` of the virtual selection.
+    /// Upstream's `first_missing` — it stops at the first block whose source
+    /// is absent, plus `printf_gap` more (`H5D_ACS_VDS_PRINTF_GAP_DEF` is 0,
+    /// and it is a dataset-access property never stored in the file).
+    Printf { blocks: u64 },
+}
+
+/// `H5D_ACS_VDS_PRINTF_GAP_DEF`: how many consecutive missing printf source
+/// datasets a reader looks past before it stops. `H5Pset_virtual_printf_gap`
+/// sets a *dataset access* property, never written to the file, so a reader
+/// opening a file it did not create always sees this default.
+const PRINTF_GAP: u64 = 0;
 
 /// The class of one link record in a group: what `H5Lget_info` reports,
 /// carrying the value `H5Lget_val` returns for the classes that have one.
@@ -799,22 +841,6 @@ impl CommittedDatatypeInfo {
     }
 }
 
-/// Internal enum to represent what we know about the root group from the
-/// superblock. For v2/v3 we have the root group object header address; for
-/// v0/v1 we have a B-tree and local heap that index the root group's children.
-/// These are stored for potential future use (e.g., SWMR refresh).
-#[allow(dead_code)]
-enum RootGroupInfo {
-    V2V3 {
-        root_group_object_header_address: u64,
-    },
-    V0V1 {
-        root_obj_header_addr: u64,
-        btree_addr: u64,
-        heap_addr: u64,
-    },
-}
-
 /// Everything the superblock extension object header contributes to the
 /// file-level view.
 ///
@@ -847,8 +873,6 @@ pub struct Hdf5Reader {
     /// `detect_superblock_version` and never re-derived: 0/1 is the legacy
     /// symbol-table root, 2/3 the link-message root.
     superblock_version: u8,
-    #[allow(dead_code)]
-    root_group_info: RootGroupInfo,
     datasets: Vec<DatasetReadInfo>,
     /// Dataset-shaped objects this crate cannot read, keyed by path (no
     /// leading `/`), the value naming what stopped it. They are listed with
@@ -998,8 +1022,6 @@ fn fill_tiled_into(out: &mut [u8], fill_value: Option<&[u8]>) {
     }
 }
 
-use crate::format::messages::external_file_list::UNLIMITED as EFL_UNLIMITED_SIZE;
-
 /// Resolve the directory a raw-data file name is joined against, matching
 /// libhdf5's `H5D__build_file_prefix` (H5Dint.c) for the given environment
 /// variable — `HDF5_EXTFILE_PREFIX` for External Data Files
@@ -1062,6 +1084,12 @@ pub(crate) fn combine_prefixed_path(prefix: Option<&Path>, name: &str) -> PathBu
 /// it — but a read past the *total* declared size of the file list is
 /// still an error, matching `H5D__efl_read`'s own "read past logical end
 /// of file" check.
+///
+/// An `H5O_EFL_UNLIMITED` last slot needs no special case: the walk below
+/// never steps past it (`skip >= u64::MAX` is never true), which is upstream's
+/// `H5O_EFL_UNLIMITED == size || addr < cur + size`, and the read it then
+/// takes is the whole remainder, bounded by whatever the file physically
+/// holds.
 fn read_external_file_bytes(
     external_files: &[ExternalFileSegment],
     extfile_prefix: Option<&Path>,
@@ -1081,11 +1109,6 @@ fn read_external_file_bytes(
                 "read past the logical end of the external file list".into(),
             ));
         };
-        if slot.size == EFL_UNLIMITED_SIZE {
-            return Err(crate::io::IoError::InvalidState(
-                "unlimited (growable) external file slots are not supported".into(),
-            ));
-        }
         let full_path = combine_prefixed_path(extfile_prefix, &slot.name);
         let ext_handle = FileHandle::open_read_with_locking(&full_path, FileLocking::Disabled)
             .map_err(|e| {
@@ -1118,43 +1141,134 @@ fn read_external_file_bytes(
 /// overflows; real VDS chains do not nest anywhere near this deep.
 const MAX_VIRTUAL_DEPTH: usize = 16;
 
-/// Detect a printf-style `%b` block-index substitution pattern in a
-/// virtual dataset source name (`H5D_virtual_parse_source_name`,
-/// H5Dvirtual.c) — used for unlimited/growable mappings whose source
-/// expands across a sequence of files or datasets indexed by block
-/// number. `%%` is an escaped literal percent, not a pattern; any other
-/// `%`-led sequence (including `%b` itself) marks a name this reader does
-/// not resolve.
-fn has_virtual_printf_pattern(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'%' {
-                i += 2;
-                continue;
+/// Replace every unlimited mapping with the concrete mapping its open-time
+/// resolution makes it — the clipped selections `H5D__virtual_set_extent_unlim`
+/// leaves in `clipped_virtual_select` / `clipped_source_select` for a read to
+/// use (`H5D__virtual_read` never sees the unclipped ones).
+///
+/// A mapping with no resolution recorded is passed through unchanged, which is
+/// what a bounded mapping needs and what a mapping list written before this
+/// pass existed reduces to.
+fn concrete_virtual_mappings(
+    list: &VirtualMappingList,
+    resolution: &[MappingResolution],
+) -> IoResult<Vec<VirtualMapping>> {
+    let mut out = Vec::with_capacity(list.mappings.len());
+    for (i, m) in list.mappings.iter().enumerate() {
+        match resolution.get(i) {
+            Some(MappingResolution::Unlimited {
+                virtual_clip,
+                source_clip,
+            }) => out.push(VirtualMapping {
+                virtual_selection: m.virtual_selection.clip_unlimited(*virtual_clip)?,
+                source_selection: m.source_selection.clip_unlimited(*source_clip)?,
+                ..built_names(m, 0)?
+            }),
+            // One printf mapping is a whole family: block `j` of the virtual
+            // selection (`H5S_hyper_get_unlim_block`) is filled by the source
+            // dataset whose name substitutes `j`, taking the mapping's whole
+            // (limited) source selection.
+            Some(MappingResolution::Printf { blocks }) => {
+                let Some(r) = regular_hyperslab(&m.virtual_selection) else {
+                    continue;
+                };
+                let rank = r.start.len();
+                for j in 0..*blocks {
+                    out.push(VirtualMapping {
+                        virtual_selection: Selection::Hyperslab {
+                            rank,
+                            form: Hyperslab::Regular(r.unlim_block(j)),
+                        },
+                        ..built_names(m, j)?
+                    });
+                }
             }
-            return true;
+            _ => out.push(built_names(m, 0)?),
         }
-        i += 1;
     }
-    false
+    Ok(out)
+}
+
+/// One mapping with both source names built for block `blockno` —
+/// `H5D__virtual_build_source_name`. A mapping with no substitutions still
+/// goes through this, because that is where `%%` is unescaped: upstream uses
+/// the parsed name rather than the stored one for an ordinary mapping too
+/// (`H5D__virtual_load_layout`).
+fn built_names(m: &VirtualMapping, blockno: u64) -> IoResult<VirtualMapping> {
+    Ok(VirtualMapping {
+        source_file_name: parse_source_name(&m.source_file_name)?.build(blockno),
+        source_dset_name: parse_source_name(&m.source_dset_name)?.build(blockno),
+        ..m.clone()
+    })
+}
+
+/// Recursion bound for open-time virtual-extent resolution.
+///
+/// Resolving a virtual dataset's extent opens the source datasets its
+/// unlimited mappings name, and a source may itself be a virtual dataset in
+/// another file whose own open resolves its own extent. A crafted cyclic
+/// chain would otherwise recurse until the stack overflows, so the nesting is
+/// counted per thread and the resolution is skipped once it reaches
+/// [`MAX_VIRTUAL_DEPTH`] — a dataset that deep keeps its stored extent
+/// instead of taking one from a cycle.
+struct VirtualResolveDepth;
+
+thread_local! {
+    static VIRTUAL_RESOLVE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl VirtualResolveDepth {
+    fn enter<F: FnOnce() -> IoResult<()>>(f: F) -> IoResult<()> {
+        let depth = VIRTUAL_RESOLVE_DEPTH.with(std::cell::Cell::get);
+        if depth >= MAX_VIRTUAL_DEPTH {
+            return Ok(());
+        }
+        VIRTUAL_RESOLVE_DEPTH.with(|d| d.set(depth + 1));
+        let out = f();
+        VIRTUAL_RESOLVE_DEPTH.with(|d| d.set(depth));
+        out
+    }
+}
+
+/// The regular (start, stride, count, block) form behind a selection, or
+/// `None` — the only form `H5S_UNLIMITED` can appear in, so every unlimited
+/// computation goes through it.
+fn regular_hyperslab(sel: &Selection) -> Option<&RegularHyperslab> {
+    match sel {
+        Selection::Hyperslab {
+            form: Hyperslab::Regular(r),
+            ..
+        } => Some(r),
+        _ => None,
+    }
 }
 
 /// Read each of `source_boxes` (via `read_source_box`) and scatter it into
 /// `out` (shaped `virtual_dims`) at the same-indexed box in
 /// `virtual_boxes`.
 ///
-/// The two box lists must have equal length with identical per-dimension
-/// `count` at each index — H5S requires a mapping's source and virtual
-/// selections to select the same number of points, and this is the
-/// well-defined case where they also decompose into the same box shapes
-/// in the same order (every selection form h5py's `VirtualLayout` writes,
-/// and any hand-built mapping whose two sides were selected the same way).
-/// A mapping whose selections diverge beyond that — same point count but a
-/// different box decomposition on each side — would need the general
-/// element-by-element linear-order match H5S's own iterator does; rather
-/// than risk a silently wrong scatter, that case is rejected here.
+/// The two box lists must have equal length, and each pair of boxes must be
+/// the same shape under `H5S_select_shape_same` (H5Sselect.c) — which
+/// compares the two from the fast end and requires the extra *leading*
+/// dimensions of the higher-rank side to be flat, so a rank-1 source box
+/// legitimately fills a rank-2 virtual box of the same trailing shape (the
+/// usual printf-mapping arrangement: one 1-D dataset per row of a 2-D
+/// virtual dataset). A mapping whose selections diverge beyond that — same
+/// point count but a different box decomposition on each side — would need
+/// the general element-by-element linear-order match H5S's own iterator
+/// does; rather than risk a silently wrong scatter, that case is rejected
+/// here.
+/// Whether two boxes select the same elements in the same order —
+/// `H5S_select_shape_same`'s rule (H5Sselect.c), which aligns the two shapes
+/// at their fast end and requires every extra leading dimension of the
+/// higher-rank side to be flat.
+fn shape_same(a: &[u64], b: &[u64]) -> bool {
+    let common = a.len().min(b.len());
+    a[a.len() - common..] == b[b.len() - common..]
+        && a[..a.len() - common].iter().all(|&d| d == 1)
+        && b[..b.len() - common].iter().all(|&d| d == 1)
+}
+
 fn copy_matched_boxes(
     mut read_source_box: impl FnMut(&[u64], &[u64], &mut [u8]) -> IoResult<()>,
     source_boxes: &[(Vec<u64>, Vec<u64>)],
@@ -1172,7 +1286,7 @@ fn copy_matched_boxes(
         )));
     }
     for ((src_start, src_count), (dst_start, dst_count)) in source_boxes.iter().zip(virtual_boxes) {
-        if src_count != dst_count {
+        if !shape_same(src_count, dst_count) {
             return Err(crate::io::IoError::InvalidState(format!(
                 "virtual dataset mapping's source box shape {src_count:?} does not match its \
                  virtual box shape {dst_count:?}, which is not supported"
@@ -1182,12 +1296,14 @@ fn copy_matched_boxes(
         let mut buf = alloc_tiled_fill(nbytes, None)?;
         read_source_box(src_start, src_count, &mut buf)?;
 
-        let src_dims = src_count.clone();
-        let src_origin = vec![0u64; src_count.len()];
+        // `buf` holds the box in source linear order, and shape-same boxes
+        // differ only by flat leading dimensions, so it can be walked at the
+        // virtual box's own rank.
+        let src_origin = vec![0u64; dst_count.len()];
         for_each_dual_run(
             virtual_dims,
             dst_start,
-            &src_dims,
+            dst_count,
             &src_origin,
             dst_count,
             element_size,
@@ -1453,6 +1569,9 @@ impl Hdf5Reader {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_default();
+        // Only now, with `source_dir` set, can a source name be resolved —
+        // and a virtual dataset's extent is not final until they are.
+        VirtualResolveDepth::enter(|| reader.resolve_virtual_extents())?;
         Ok(reader)
     }
 
@@ -1501,9 +1620,6 @@ impl Hdf5Reader {
             ext,
             _eof: sb.end_of_file_address,
             superblock_version: sb.version,
-            root_group_info: RootGroupInfo::V2V3 {
-                root_group_object_header_address: sb.root_group_object_header_address,
-            },
             object_paths: catalog.object_paths(sb.root_group_object_header_address),
             datasets: catalog.datasets,
             unreadable: catalog.unreadable,
@@ -1553,7 +1669,6 @@ impl Hdf5Reader {
         let ste = &sb.root_symbol_table_entry;
         let root_obj_addr = ste.obj_header_addr;
         let ste_stab = ste.cached_symbol_table();
-        let (ste_btree_addr, ste_heap_addr) = ste_stab.unwrap_or((UNDEF_ADDR, UNDEF_ADDR));
 
         // Read the root group's object header (following continuations).
         let root_hdr = Self::read_object_header_full(&mut handle, &meta, root_obj_addr).ok();
@@ -1590,11 +1705,6 @@ impl Hdf5Reader {
             ext,
             _eof: sb.end_of_file_address,
             superblock_version: sb.version,
-            root_group_info: RootGroupInfo::V0V1 {
-                root_obj_header_addr: root_obj_addr,
-                btree_addr: ste_btree_addr,
-                heap_addr: ste_heap_addr,
-            },
             object_paths: catalog.object_paths(root_obj_addr),
             datasets: catalog.datasets,
             unreadable: catalog.unreadable,
@@ -2115,6 +2225,10 @@ impl Hdf5Reader {
                 alloc_time,
                 external_files,
                 virtual_mappings,
+                // Filled in by `resolve_virtual_extents` once the reader has
+                // the directory source names resolve against; a catalog on
+                // its own cannot open another file.
+                virtual_resolution: None,
             })),
             // The three messages are present and none of them reported an
             // error, so this is unreachable; report it as unreadable rather
@@ -2391,6 +2505,21 @@ impl Hdf5Reader {
         &self.ext
     }
 
+    /// Bytes the file's on-disk free-space managers record as free —
+    /// `H5Fget_freespace`, the number `h5stat -S` prints as "Amount of tracked
+    /// free space".
+    ///
+    /// Zero for a file whose file-space info message names no manager, which
+    /// includes every file written without `persist`. The strategy is not
+    /// consulted: a manager's header and section-info blocks have one layout
+    /// whichever strategy allocated the space they describe.
+    pub fn tracked_free_space(&mut self) -> IoResult<u64> {
+        let Some(info) = self.ext.file_space_info.clone() else {
+            return Ok(0);
+        };
+        crate::io::free_space_io::tracked_free_space(&mut self.handle, &self.meta.ctx, &info)
+    }
+
     /// Size in bytes of the userblock preceding the superblock: the offset the
     /// signature was found at, which is also the file's base address. Zero for
     /// a file without a userblock.
@@ -2403,12 +2532,6 @@ impl Hdf5Reader {
     /// the file's contents but never its own format version.
     pub fn superblock_version(&self) -> u8 {
         self.superblock_version
-    }
-
-    /// The v1 B-tree split ranks in force for this file, after the superblock
-    /// and the extension's K message have both been applied.
-    pub fn btree_config(&self) -> BTreeV1Config {
-        self.meta.btree
     }
 
     /// Rewrite a path (no leading `/`) into the path of the object it reaches
@@ -3201,16 +3324,186 @@ impl Hdf5Reader {
         Ok(())
     }
 
+    /// Set every virtual dataset's extent from the sources its unlimited
+    /// mappings can reach — `H5D__virtual_set_extent_unlim` (H5Dvirtual.c),
+    /// which libhdf5 runs when it opens such a dataset.
+    ///
+    /// INVARIANT: a virtual dataset's `dataspace.dims` are the extent its
+    /// available sources give it. This is the single owner of that
+    /// resolution: the dims a VDS with an unlimited mapping reports are not
+    /// the ones its dataspace message stores, and every shape query, read and
+    /// slice bound must see the same value, so the resolved extent is stamped
+    /// in once — here, immediately after a catalog is built — rather than
+    /// recomputed per call. The per-mapping clip sizes the extent came from
+    /// are kept beside it in
+    /// [`virtual_resolution`](DatasetReadInfo::virtual_resolution) so a read
+    /// walks exactly the sources the extent was derived from.
+    ///
+    /// A source that cannot be opened contributes a clip size of 0, never an
+    /// error: a virtual dataset whose sources are not written yet is legal,
+    /// and reads back as the fill value (upstream's "clip_size = 0" arm when
+    /// `H5D__virtual_open_source_dset` leaves the dataset closed).
+    ///
+    /// The default view is assumed throughout — `H5D_VDS_LAST_AVAILABLE` is
+    /// `H5D_ACS_VDS_VIEW_DEF`, and `H5Pset_virtual_view` sets a *dataset
+    /// access* property that is never stored in the file, so a reader opening
+    /// a file it did not create always sees the default.
+    fn resolve_virtual_extents(&mut self) -> IoResult<()> {
+        let targets: Vec<usize> = (0..self.datasets.len())
+            .filter(|&i| self.datasets[i].virtual_mappings.is_some())
+            .collect();
+        for i in targets {
+            let mappings = self.datasets[i].virtual_mappings.clone().unwrap();
+            let curr_dims = self.datasets[i].dataspace.dims.clone();
+            let (resolution, dims) = self.resolve_one_virtual_extent(&mappings, &curr_dims)?;
+            self.datasets[i].dataspace.dims = dims;
+            self.datasets[i].virtual_resolution = Some(resolution);
+        }
+        Ok(())
+    }
+
+    /// [`resolve_virtual_extents`](Self::resolve_virtual_extents) for one
+    /// dataset: the per-mapping resolutions and the extent they imply.
+    fn resolve_one_virtual_extent(
+        &mut self,
+        mappings: &VirtualMappingList,
+        curr_dims: &[u64],
+    ) -> IoResult<(Vec<MappingResolution>, Vec<u64>)> {
+        let rank = curr_dims.len();
+        let mut resolution = Vec::with_capacity(mappings.mappings.len());
+        let mut new_dims: Vec<Option<u64>> = vec![None; rank];
+        // `H5D_virtual_update_min_dims`: whatever the unlimited dimension
+        // resolves to, the extent must still hold every bounded mapping.
+        let mut min_dims = vec![0u64; rank];
+
+        for m in &mappings.mappings {
+            let unlim_virtual = m.virtual_selection.unlim_dim();
+            let res = match (unlim_virtual, m.source_selection.unlim_dim()) {
+                (Some(vd), Some(sd)) => {
+                    let source_clip = self
+                        .virtual_source_dims(m)
+                        .ok()
+                        .flatten()
+                        .and_then(|d| d.get(sd).copied())
+                        .unwrap_or(0);
+                    let virtual_clip = match (
+                        regular_hyperslab(&m.virtual_selection),
+                        regular_hyperslab(&m.source_selection),
+                    ) {
+                        // `H5S_hyper_get_clip_extent_match`: how many slices
+                        // the source supplies, then the virtual extent that
+                        // covers exactly that many.
+                        (Some(v), Some(sr)) => v.clip_extent(sr.num_slices(source_clip), false),
+                        _ => 0,
+                    };
+                    if new_dims[vd].is_none_or(|d| virtual_clip > d) {
+                        new_dims[vd] = Some(virtual_clip);
+                    }
+                    MappingResolution::Unlimited {
+                        virtual_clip,
+                        source_clip,
+                    }
+                }
+                // Unlimited virtual selection, limited source selection:
+                // the printf shape, where the successive blocks of the
+                // virtual selection come from successively-named source
+                // datasets.
+                (Some(vd), None) => {
+                    let blocks = self.printf_blocks_present(m);
+                    let virtual_clip = match (blocks, regular_hyperslab(&m.virtual_selection)) {
+                        (0, _) | (_, None) => 0,
+                        // `H5D__virtual_set_extent_unlim`'s printf arm under
+                        // the default view: the extent ends just past the
+                        // last block that has a source.
+                        (n, Some(r)) => {
+                            let last = r.unlim_block(n - 1);
+                            last.start[vd] + last.block[vd]
+                        }
+                    };
+                    if new_dims[vd].is_none_or(|d| virtual_clip > d) {
+                        new_dims[vd] = Some(virtual_clip);
+                    }
+                    MappingResolution::Printf { blocks }
+                }
+                _ => MappingResolution::Bounded,
+            };
+            if let Some((_, hi)) = m.virtual_selection.bounds() {
+                for (d, &e) in hi.iter().enumerate().take(rank) {
+                    if Some(d) != unlim_virtual && e + 1 > min_dims[d] {
+                        min_dims[d] = e + 1;
+                    }
+                }
+            }
+            resolution.push(res);
+        }
+
+        let dims = (0..rank)
+            .map(|d| match new_dims[d] {
+                Some(v) => v.max(min_dims[d]),
+                None => curr_dims[d],
+            })
+            .collect();
+        Ok((resolution, dims))
+    }
+
+    /// The extent of the source dataset one mapping names, or `None` when it
+    /// cannot be reached — `H5D__virtual_open_source_dset` leaving the source
+    /// closed, which upstream reads as "no data there yet" rather than an
+    /// error.
+    fn virtual_source_dims(&mut self, m: &VirtualMapping) -> IoResult<Option<Vec<u64>>> {
+        let m = built_names(m, 0)?;
+        Ok(self.source_dims(&m.source_file_name, &m.source_dset_name))
+    }
+
+    /// How many of a printf mapping's source datasets exist, counting from
+    /// block 0 — upstream's `first_missing` (`H5D__virtual_set_extent_unlim`),
+    /// which stops at the first block whose source cannot be opened and looks
+    /// [`PRINTF_GAP`] blocks past it before giving up.
+    fn printf_blocks_present(&mut self, m: &VirtualMapping) -> u64 {
+        let mut first_missing = 0u64;
+        let mut j = 0u64;
+        while j <= PRINTF_GAP + first_missing {
+            let Ok(built) = built_names(m, j) else {
+                break;
+            };
+            if self
+                .source_dims(&built.source_file_name, &built.source_dset_name)
+                .is_some()
+            {
+                first_missing = j + 1;
+            }
+            j += 1;
+        }
+        first_missing
+    }
+
+    /// The extent of one named source dataset, or `None` when the file or
+    /// the dataset in it cannot be opened.
+    fn source_dims(&mut self, file_name: &str, dset_name: &str) -> Option<Vec<u64>> {
+        let dset_name = dset_name.trim_start_matches('/');
+        if file_name == "." {
+            return self
+                .dataset_info_local(dset_name)
+                .map(|i| i.dataspace.dims.clone());
+        }
+        let prefix = resolve_vdsfile_prefix(&self.source_dir);
+        let full_path = combine_prefixed_path(prefix.as_deref(), file_name);
+        let mut reader = Hdf5Reader::open_with_locking(&full_path, FileLocking::Disabled).ok()?;
+        reader
+            .dataset_info(dset_name)
+            .map(|i| i.dataspace.dims.clone())
+    }
+
     /// Fill `out` (shaped like the virtual dataset's own extent) by
     /// stitching each mapping's source bytes in order (`H5D__virtual_read`,
     /// H5Dvirtual.c). `out` must already be pre-filled with the tiled fill
     /// value — every element no mapping covers is left exactly as the
-    /// caller filled it, matching the fixed-extent default of
-    /// `H5Pset_virtual_view` (`H5D_VDS_LAST_AVAILABLE`/`FIRST_MISSING` only
-    /// change how an *unlimited* mapping's extent is computed, which this
-    /// reader does not support — see [`has_virtual_printf_pattern`]).
-    /// Mappings apply in list order, so a later mapping's bytes win over an
-    /// earlier one's on overlap, exactly like the C reader.
+    /// caller filled it. Mappings apply in list order, so a later mapping's
+    /// bytes win over an earlier one's on overlap, exactly like the C
+    /// reader; an unlimited or printf mapping has already been replaced by
+    /// the concrete mappings its open-time resolution made it
+    /// (`H5D_VDS_LAST_AVAILABLE`, the default view — see
+    /// [`Hdf5Reader::resolve_virtual_extents`]).
     ///
     /// `depth` counts virtual-dataset nesting — a mapping whose source is
     /// itself a virtual dataset, possibly in another file — so a crafted
@@ -3233,6 +3526,11 @@ impl Hdf5Reader {
             // `out` is already the fill value the caller pre-filled it with.
             return Ok(());
         };
+        // Every unlimited mapping is replaced by the concrete one its
+        // open-time resolution makes it, so the walk below only ever sees
+        // bounded selections.
+        let resolution = info.virtual_resolution.clone().unwrap_or_default();
+        let mappings = concrete_virtual_mappings(&mappings, &resolution)?;
         let source_dir = self.source_dir.clone();
 
         // Cross-file source readers, opened at most once per distinct
@@ -3240,17 +3538,7 @@ impl Hdf5Reader {
         let mut cross_file_cache: std::collections::HashMap<PathBuf, Hdf5Reader> =
             std::collections::HashMap::new();
 
-        for mapping in &mappings.mappings {
-            if has_virtual_printf_pattern(&mapping.source_file_name)
-                || has_virtual_printf_pattern(&mapping.source_dset_name)
-            {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "dataset {name:?}: virtual mapping to {:?}/{:?} uses a printf-style \
-                     (%b) unlimited source name pattern, which is not supported",
-                    mapping.source_file_name, mapping.source_dset_name
-                )));
-            }
-
+        for mapping in &mappings {
             let virtual_boxes = mapping.virtual_selection.to_boxes(&dims).map_err(|e| {
                 crate::io::IoError::InvalidState(format!(
                     "dataset {name:?}: virtual mapping's virtual selection is not \
@@ -3419,6 +3707,10 @@ impl Hdf5Reader {
         self.group_aliases = catalog.group_aliases;
         self.links = catalog.links;
         self.datatypes = catalog.datatypes;
+        // The catalog is freshly built, so every virtual dataset's resolved
+        // extent went with the old one — a SWMR refresh is exactly when a
+        // source may have grown.
+        self.resolve_virtual_extents()?;
 
         Ok(())
     }
@@ -3491,25 +3783,16 @@ impl Hdf5Reader {
                 // the dataset extent (Full) or the selection (Slice) into the
                 // caller's pre-filled buffer.
                 let coords = vec![0u64; dims.len()];
+                let geo = ChunkOutputGeometry {
+                    dims: &dims,
+                    chunk_dims,
+                    element_size,
+                };
                 match target {
-                    ChunkTarget::Full => self.copy_chunk_to_output(
-                        &data,
-                        output,
-                        &dims,
-                        chunk_dims,
-                        &coords,
-                        element_size,
-                    ),
-                    ChunkTarget::Slice { starts, counts } => self.copy_chunk_to_slice(
-                        &data,
-                        output,
-                        &dims,
-                        chunk_dims,
-                        &coords,
-                        element_size,
-                        starts,
-                        counts,
-                    ),
+                    ChunkTarget::Full => self.copy_chunk_to_output(&data, output, &geo, &coords),
+                    ChunkTarget::Slice { starts, counts } => {
+                        self.copy_chunk_to_slice(&data, output, &geo, &coords, starts, counts)
+                    }
                 }
                 Ok(())
             }
@@ -3631,18 +3914,15 @@ impl Hdf5Reader {
 
                 let decompressed = read_and_decompress_chunks(&self.handle, pipeline, jobs)?;
 
+                let geo = ChunkOutputGeometry {
+                    dims: &dims,
+                    chunk_dims,
+                    element_size,
+                };
                 for (i, chunk_data) in decompressed.iter().enumerate() {
                     if let Some(data) = chunk_data {
                         let coords = chunk_coords(i as u64);
-                        self.scatter_chunk(
-                            target,
-                            data,
-                            output,
-                            &dims,
-                            chunk_dims,
-                            coords,
-                            element_size,
-                        );
+                        self.scatter_chunk(target, data, output, &geo, coords);
                     }
                 }
 
@@ -3902,18 +4182,15 @@ impl Hdf5Reader {
         // Read + decompress (in parallel where positioned reads are race-free),
         // then place each chunk into output.
         let decompressed = read_and_decompress_chunks(&self.handle, pipeline, jobs)?;
+        let geo = ChunkOutputGeometry {
+            dims: &dims,
+            chunk_dims,
+            element_size,
+        };
         for (linear_idx, chunk_data) in decompressed.iter().enumerate() {
             let Some(data) = chunk_data else { continue };
             let coords = chunk_coords(linear_idx as u64);
-            self.scatter_chunk(
-                target,
-                data,
-                output,
-                &dims,
-                chunk_dims,
-                coords,
-                element_size,
-            );
+            self.scatter_chunk(target, data, output, &geo, coords);
         }
 
         Ok(())
@@ -3997,17 +4274,14 @@ impl Hdf5Reader {
             .collect();
 
         let decompressed = read_and_decompress_chunks(&self.handle, None, jobs)?;
+        let geo = ChunkOutputGeometry {
+            dims: &dims,
+            chunk_dims,
+            element_size,
+        };
         for (i, chunk_data) in decompressed.iter().enumerate() {
             if let Some(data) = chunk_data {
-                self.scatter_chunk(
-                    target,
-                    data,
-                    output,
-                    &dims,
-                    chunk_dims,
-                    &slot_coords[i],
-                    element_size,
-                );
+                self.scatter_chunk(target, data, output, &geo, &slot_coords[i]);
             }
         }
 
@@ -4152,17 +4426,14 @@ impl Hdf5Reader {
         // Read + decompress (in parallel where positioned reads are race-free),
         // then place each chunk N-dimensionally by its scaled offsets.
         let placed = read_and_decompress_chunks(&self.handle, pipeline, jobs)?;
+        let geo = ChunkOutputGeometry {
+            dims: &dims,
+            chunk_dims,
+            element_size,
+        };
         for (i, chunk_data) in placed.iter().enumerate() {
             if let Some(data) = chunk_data {
-                self.scatter_chunk(
-                    target,
-                    data,
-                    output,
-                    &dims,
-                    chunk_dims,
-                    coords[i],
-                    element_size,
-                );
+                self.scatter_chunk(target, data, output, &geo, coords[i]);
             }
         }
 
@@ -4251,17 +4522,14 @@ impl Hdf5Reader {
         // Read + decompress (in parallel where positioned reads are race-free),
         // then place each chunk N-dimensionally by its scaled offsets.
         let placed = read_and_decompress_chunks(&self.handle, pipeline, jobs)?;
+        let geo = ChunkOutputGeometry {
+            dims: &dims,
+            chunk_dims,
+            element_size,
+        };
         for (i, chunk_data) in placed.iter().enumerate() {
             if let Some(data) = chunk_data {
-                self.scatter_chunk(
-                    target,
-                    data,
-                    output,
-                    &dims,
-                    chunk_dims,
-                    &coords[i],
-                    element_size,
-                );
+                self.scatter_chunk(target, data, output, &geo, &coords[i]);
             }
         }
 
@@ -4347,11 +4615,14 @@ impl Hdf5Reader {
         &self,
         chunk_data: &[u8],
         output: &mut [u8],
-        dims: &[u64],
-        chunk_dims: &[u64],
+        geo: &ChunkOutputGeometry,
         chunk_coords: &[u64],
-        element_size: u64,
     ) {
+        let ChunkOutputGeometry {
+            dims,
+            chunk_dims,
+            element_size,
+        } = *geo;
         let ndims = dims.len();
         if ndims == 0 {
             return;
@@ -4433,18 +4704,20 @@ impl Hdf5Reader {
     /// is innermost in both the chunk and the output, each fixed setting of the
     /// outer box dimensions copies one contiguous run of
     /// `(hi[last]-lo[last])` elements — no per-element loop.
-    #[allow(clippy::too_many_arguments)]
     fn copy_chunk_to_slice(
         &self,
         chunk_data: &[u8],
         output: &mut [u8],
-        dims: &[u64],
-        chunk_dims: &[u64],
+        geo: &ChunkOutputGeometry,
         chunk_coords: &[u64],
-        element_size: u64,
         starts: &[u64],
         counts: &[u64],
     ) {
+        let ChunkOutputGeometry {
+            dims,
+            chunk_dims,
+            element_size,
+        } = *geo;
         let ndims = dims.len();
         if ndims == 0 {
             return;
@@ -4499,36 +4772,19 @@ impl Hdf5Reader {
 
     /// Scatter one decoded chunk into the output for the given target: the
     /// whole dataset (`Full`) or a hyperslab (`Slice`).
-    #[allow(clippy::too_many_arguments)]
     fn scatter_chunk(
         &self,
         target: ChunkTarget,
         chunk_data: &[u8],
         output: &mut [u8],
-        dims: &[u64],
-        chunk_dims: &[u64],
+        geo: &ChunkOutputGeometry,
         chunk_coords: &[u64],
-        element_size: u64,
     ) {
         match target {
-            ChunkTarget::Full => self.copy_chunk_to_output(
-                chunk_data,
-                output,
-                dims,
-                chunk_dims,
-                chunk_coords,
-                element_size,
-            ),
-            ChunkTarget::Slice { starts, counts } => self.copy_chunk_to_slice(
-                chunk_data,
-                output,
-                dims,
-                chunk_dims,
-                chunk_coords,
-                element_size,
-                starts,
-                counts,
-            ),
+            ChunkTarget::Full => self.copy_chunk_to_output(chunk_data, output, geo, chunk_coords),
+            ChunkTarget::Slice { starts, counts } => {
+                self.copy_chunk_to_slice(chunk_data, output, geo, chunk_coords, starts, counts)
+            }
         }
     }
 
@@ -4622,8 +4878,8 @@ impl Hdf5Reader {
             }
 
             // Read or get cached global heap collection
-            #[allow(clippy::map_entry)]
-            if !heap_cache.contains_key(&collection_addr) {
+            if let std::collections::hash_map::Entry::Vacant(e) = heap_cache.entry(collection_addr)
+            {
                 let coll = self.read_heap_collection(collection_addr)?;
                 let lookup: std::collections::HashMap<u16, usize> = coll
                     .objects
@@ -4631,7 +4887,7 @@ impl Hdf5Reader {
                     .enumerate()
                     .map(|(i, o)| (o.index, i))
                     .collect();
-                heap_cache.insert(collection_addr, (coll, lookup));
+                e.insert((coll, lookup));
             }
 
             let idx = u16::try_from(obj_index).map_err(|_| {
@@ -5515,13 +5771,6 @@ pub struct ObjectAttributes {
 }
 
 impl ObjectAttributes {
-    /// Whether this object has nothing to say about attributes: none read,
-    /// and no failure to report. An incomplete empty set is *not* empty — the
-    /// reason is the thing worth keeping.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.incomplete.is_none()
-    }
-
     /// Record an attribute this collector could name.
     fn push(&mut self, entry: AttributeEntry) {
         self.entries.push(entry);
@@ -5575,11 +5824,6 @@ impl ObjectAttributes {
     /// without replaying its v1-header/v2-header branch here.
     pub fn header_count(&self, owner: &str) -> IoResult<u64> {
         Ok(self.complete(owner)?.len() as u64)
-    }
-
-    /// Nothing worth recording: no attribute read, and no failure to report.
-    pub(crate) fn is_absent(&self) -> bool {
-        self.entries.is_empty() && self.incomplete.is_none()
     }
 
     /// The entries, once the set is known to be whole.
