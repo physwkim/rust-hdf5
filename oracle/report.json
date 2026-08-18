@@ -5,7 +5,7 @@
   "numpy_version": "1.26.4",
   "python": "/home/stevek/micromamba/envs/tomo/bin/python",
   "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-fsm-0cc7afd1-1/target/release/oracle_probe",
-  "cases": 99
+  "cases": 100
  },
  "results": [
   {
@@ -3295,6 +3295,28 @@
    "group": "freespace",
    "note": "persisting FSM_AGGR file reopened and appended \u2014 the freed blocks must come back as free-space manager sections",
    "rust_case": "fsm_persist",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 54,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "fsm_persist_page",
+   "group": "freespace",
+   "note": "persisting PAGE file reopened and appended \u2014 the freed blocks must come back as page-shaped free-space manager sections",
+   "rust_case": "fsm_persist_page",
    "a": {
     "verdict": "PASS",
     "divergences": [],
