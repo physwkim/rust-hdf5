@@ -1736,10 +1736,11 @@ pub enum VirtualView {
 ///     .virtual_printf_gap(2);
 /// let ds = file.dataset_with("vds", access).unwrap();
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DatasetAccess {
     view: VirtualView,
     printf_gap: u64,
+    virtual_prefix: Option<String>,
 }
 
 impl DatasetAccess {
@@ -1777,11 +1778,42 @@ impl DatasetAccess {
         self.view
     }
 
+    /// `H5Pset_virtual_prefix` (H5Pdapl.c:1478): a directory a virtual
+    /// dataset's *source file names* are looked for under, before the
+    /// virtual file's own directory and after `HDF5_VDS_PREFIX`.
+    ///
+    /// It is the third step of `H5F_prefix_open_file`'s search order
+    /// (H5Fint.c:938-950), and it is reached only when `HDF5_VDS_PREFIX` is
+    /// unset or empty: `H5D__build_file_prefix` reads the environment first
+    /// and falls back to this property (H5Dint.c:1077-1082), so an
+    /// environment prefix shadows this one outright rather than being tried
+    /// alongside it.
+    ///
+    /// A leading `${ORIGIN}` stands for the directory holding the virtual
+    /// dataset's own file (H5Dint.c:1105-1113), and `"."` or `""` means "no
+    /// prefix" (:1096-1100), both exactly as for the environment variable.
+    ///
+    /// Like the other two, this is a *dataset access* property that is never
+    /// stored in the file, and the first open of a virtual dataset fixes it
+    /// for every open that overlaps it.
+    pub fn virtual_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.virtual_prefix = Some(prefix.into());
+        self
+    }
+
     /// `H5Pget_virtual_printf_gap` (H5Pdapl.c:1243) — the value set, not the
     /// one the extent resolution ends up using; see
     /// [`VirtualView::FirstMissing`].
     pub fn printf_gap(&self) -> u64 {
         self.printf_gap
+    }
+
+    /// `H5Pget_virtual_prefix` (H5Pdapl.c:1510) — the property as set, before
+    /// `HDF5_VDS_PREFIX` gets to shadow it and before `${ORIGIN}` is
+    /// expanded. `None` is `H5D_ACS_VDS_PREFIX_DEF`, a null prefix
+    /// (H5Pdapl.c:72).
+    pub fn virtual_prefix_value(&self) -> Option<&str> {
+        self.virtual_prefix.as_deref()
     }
 
     /// The printf gap `H5D__virtual_set_extent_unlim` actually scans with:

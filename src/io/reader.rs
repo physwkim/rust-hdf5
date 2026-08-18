@@ -955,11 +955,16 @@ pub struct Hdf5Reader {
     /// the whole chain open.
     external: std::collections::BTreeMap<PathBuf, CrossFileEntry>,
     /// What each virtual mapping's stored source file name resolved to,
-    /// keyed by that name exactly as the mapping holds it. Separate from
+    /// keyed by the canonical path of the virtual dataset that named it and
+    /// that name exactly as the mapping holds it. Separate from
     /// [`external_resolved`](Self::external_resolved) because the two
     /// searches read different environment variables and property lists, so
-    /// one name can resolve two ways depending on which named it.
-    vds_resolved: std::collections::BTreeMap<String, PathBuf>,
+    /// one name can resolve two ways depending on which named it — and keyed
+    /// by the virtual dataset as well because
+    /// [`DatasetAccess::virtual_prefix`] is a per-open property, so two
+    /// virtual datasets naming one source file name can legitimately reach
+    /// two different files.
+    vds_resolved: std::collections::BTreeMap<(String, String), PathBuf>,
     /// What each external link's stored file name resolved to, keyed by that
     /// name exactly as the link holds it.
     ///
@@ -1174,8 +1179,19 @@ fn fill_tiled_into(out: &mut [u8], fill_value: Option<&[u8]>) {
 /// HDF5 file); any other value is used as a literal prefix; unset, empty,
 /// or `"."` means "no prefix" (`H5_combine_path`'s own default), so a
 /// relative name resolves against the process's current directory instead.
-fn resolve_file_prefix(env_var: &str, source_dir: &Path) -> Option<PathBuf> {
-    let prefix = std::env::var(env_var).ok()?;
+fn resolve_file_prefix(env_var: &str, prop: Option<&str>, source_dir: &Path) -> Option<PathBuf> {
+    // `H5D__build_file_prefix` reads the environment variable first and only
+    // falls back to the property list when it is unset or empty
+    // (H5Dint.c:1077-1082, :1085-1090) — so an environment prefix *shadows*
+    // the property rather than being tried before it. What
+    // `H5F_prefix_open_file` then tries before this is the raw environment
+    // string, split on `:` and unexpanded, which is a different candidate
+    // from the expansion built here.
+    let env = std::env::var(env_var).ok().filter(|v| !v.is_empty());
+    let prefix = match env.as_deref() {
+        Some(v) => v,
+        None => prop.filter(|v| !v.is_empty())?,
+    };
     if prefix.is_empty() || prefix == "." {
         return None;
     }
@@ -1193,13 +1209,16 @@ fn resolve_file_prefix(env_var: &str, source_dir: &Path) -> Option<PathBuf> {
 }
 
 pub(crate) fn resolve_extfile_prefix(source_dir: &Path) -> Option<PathBuf> {
-    resolve_file_prefix("HDF5_EXTFILE_PREFIX", source_dir)
+    // `H5Pset_efile_prefix`, the property `H5D__build_file_prefix` falls back
+    // to here (H5Dint.c:1085-1090), has no equivalent in this crate's API yet.
+    resolve_file_prefix("HDF5_EXTFILE_PREFIX", None, source_dir)
 }
 
 /// Resolve the directory Virtual Dataset source file names are joined
-/// against (`HDF5_VDS_PREFIX`; see [`resolve_file_prefix`]).
-fn resolve_vdsfile_prefix(source_dir: &Path) -> Option<PathBuf> {
-    resolve_file_prefix("HDF5_VDS_PREFIX", source_dir)
+/// against — `HDF5_VDS_PREFIX`, or `H5Pset_virtual_prefix` when the
+/// environment names none (see [`resolve_file_prefix`]).
+fn resolve_vdsfile_prefix(prop: Option<&str>, source_dir: &Path) -> Option<PathBuf> {
+    resolve_file_prefix("HDF5_VDS_PREFIX", prop, source_dir)
 }
 
 /// Join a raw-data file `name` against a resolved prefix, matching
@@ -2776,13 +2795,13 @@ impl Hdf5Reader {
     }
 
     /// [`prefix_open_candidates`](Self::prefix_open_candidates) for a
-    /// virtual dataset's source. The property-list step is
-    /// `HDF5_VDS_PREFIX` with `${ORIGIN}` expanded, which is what
-    /// `H5D__build_file_prefix` puts there when the environment names one
-    /// (H5Dint.c:1076-1119); `H5Pset_virtual_prefix`, the property it falls
-    /// back to, has no equivalent in this crate's API yet.
-    fn vds_candidates(&self, file: &str) -> Vec<PathBuf> {
-        let prop = resolve_vdsfile_prefix(&self.source_dir);
+    /// virtual dataset's source. The property-list step is whatever
+    /// `H5D__build_file_prefix` puts in `dset->shared->vds_prefix`
+    /// (H5Dint.c:1076-1119): `HDF5_VDS_PREFIX` if the environment names one,
+    /// otherwise [`DatasetAccess::virtual_prefix`], either way with
+    /// `${ORIGIN}` expanded.
+    fn vds_candidates(&self, access: &DatasetAccess, file: &str) -> Vec<PathBuf> {
+        let prop = resolve_vdsfile_prefix(access.virtual_prefix_value(), &self.source_dir);
         self.prefix_open_candidates("HDF5_VDS_PREFIX", prop.as_deref(), file)
     }
 
@@ -2919,15 +2938,16 @@ impl Hdf5Reader {
         // does too: it re-runs `H5D__virtual_open_source_dset` whenever the
         // source dataset is still unopened (H5Dvirtual.c:1421-1423,
         // :2558-2561).
-        let resolved = match self.vds_resolved.get(file_name) {
+        let key = (vds.to_string(), file_name.to_string());
+        let resolved = match self.vds_resolved.get(&key) {
             Some(resolved) => resolved.clone(),
             None => {
+                let access = self.access_in_force(vds);
                 let resolved = self
-                    .vds_candidates(file_name)
+                    .vds_candidates(&access, file_name)
                     .into_iter()
                     .find(|p| p.is_file())?;
-                self.vds_resolved
-                    .insert(file_name.to_string(), resolved.clone());
+                self.vds_resolved.insert(key, resolved.clone());
                 resolved
             }
         };
@@ -2997,7 +3017,7 @@ impl Hdf5Reader {
     pub fn open_dataset_with(
         &mut self,
         name: &str,
-        access: DatasetAccess,
+        access: &DatasetAccess,
     ) -> IoResult<(Option<DatasetOpenToken>, &DatasetReadInfo)> {
         if self.external_edge(name).is_some() {
             let (owner, path, edge) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
@@ -3819,7 +3839,7 @@ impl Hdf5Reader {
         let vds = self.datasets[i].name.clone();
         let access = self.access_in_force(&vds);
         let (resolution, dims) =
-            self.resolve_one_virtual_extent(&vds, &mappings, stored, access)?;
+            self.resolve_one_virtual_extent(&vds, &mappings, stored, &access)?;
         self.datasets[i].dataspace.dims = dims;
         self.datasets[i].virtual_resolution = Some(resolution);
         Ok(())
@@ -3830,7 +3850,7 @@ impl Hdf5Reader {
     fn access_in_force(&self, canonical: &str) -> DatasetAccess {
         self.virtual_access
             .get(canonical)
-            .map(|e| e.access)
+            .map(|e| e.access.clone())
             .unwrap_or_default()
     }
 
@@ -3859,7 +3879,7 @@ impl Hdf5Reader {
     fn apply_dataset_access(
         &mut self,
         name: &str,
-        access: DatasetAccess,
+        access: &DatasetAccess,
     ) -> IoResult<Option<DatasetOpenToken>> {
         let canonical = self.canonical_path(name);
         let Some(i) = self.datasets.iter().position(|d| d.name == canonical) else {
@@ -3876,7 +3896,8 @@ impl Hdf5Reader {
             return Ok(Some(open));
         }
         let token: DatasetOpenToken = std::sync::Arc::new(());
-        let unchanged = self.access_in_force(&canonical) == access;
+        let unchanged = &self.access_in_force(&canonical) == access;
+        let access = access.clone();
         self.virtual_access.insert(
             canonical,
             AccessInForce {
@@ -3901,7 +3922,7 @@ impl Hdf5Reader {
         vds: &str,
         mappings: &VirtualMappingList,
         curr_dims: &[u64],
-        access: DatasetAccess,
+        access: &DatasetAccess,
     ) -> IoResult<(Vec<MappingResolution>, Vec<u64>)> {
         let rank = curr_dims.len();
         let mut resolution = Vec::with_capacity(mappings.mappings.len());
@@ -4007,7 +4028,7 @@ impl Hdf5Reader {
         &mut self,
         vds: &str,
         m: &VirtualMapping,
-        access: DatasetAccess,
+        access: &DatasetAccess,
     ) -> IoResult<Option<Vec<u64>>> {
         let m = built_names(m, 0)?;
         Ok(self.source_dims(vds, &m.source_file_name, &m.source_dset_name, access))
@@ -4027,7 +4048,7 @@ impl Hdf5Reader {
         &mut self,
         vds: &str,
         m: &VirtualMapping,
-        access: DatasetAccess,
+        access: &DatasetAccess,
     ) -> (u64, Vec<u64>) {
         let gap = access.effective_printf_gap();
         let mut first_missing = 0u64;
@@ -4067,7 +4088,7 @@ impl Hdf5Reader {
         vds: &str,
         file_name: &str,
         dset_name: &str,
-        access: DatasetAccess,
+        access: &DatasetAccess,
     ) -> Option<Vec<u64>> {
         let dset_name = dset_name.trim_start_matches('/');
         if file_name == "." {
@@ -4155,7 +4176,7 @@ impl Hdf5Reader {
                 // read and `H5D__virtual_reset_source_dset` closes it again,
                 // so this open holds nothing past the mapping — dropping the
                 // token is what that close does.
-                self.apply_dataset_access(source_name, access)?;
+                self.apply_dataset_access(source_name, &access)?;
                 let Some(src_dims) = self
                     .dataset_info(source_name)
                     .map(|i| i.dataspace.dims.clone())
@@ -4180,7 +4201,7 @@ impl Hdf5Reader {
                 else {
                     continue;
                 };
-                src_reader.apply_dataset_access(source_name, access)?;
+                src_reader.apply_dataset_access(source_name, &access)?;
                 let Some(src_dims) = src_reader
                     .dataset_info(source_name)
                     .map(|i| i.dataspace.dims.clone())

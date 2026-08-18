@@ -1084,7 +1084,7 @@ impl H5File {
                 // The reader's open gate reports *why* a name cannot be
                 // opened — a dangling soft link and an unsupported object are
                 // both present in the listing, and neither is an absence.
-                let (open, info) = reader.open_dataset_with(name, access)?;
+                let (open, info) = reader.open_dataset_with(name, &access)?;
                 let shape: Vec<usize> = info.dataspace.dims.iter().map(|&d| d as usize).collect();
                 let element_size = info.datatype.element_size() as usize;
                 Ok(H5Dataset::new_reader(
