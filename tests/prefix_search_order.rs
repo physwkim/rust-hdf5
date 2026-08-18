@@ -34,8 +34,40 @@ use std::path::{Path, PathBuf, MAIN_SEPARATOR as MAIN};
 
 use rust_hdf5::{DatasetAccess, H5File, Selection};
 
-/// Per-test unique root; nextest gives each test its own process, so the
-/// environment variables set below cannot reach another test.
+/// The process environment is one global shared by every test thread, and
+/// the `HDF5_*_PREFIX` variables shadow or feed prefix resolution, so every
+/// test here holds this lock for its whole body.
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Restores the variable to the value it held when the guard was taken — a
+/// panicking test must not leak its prefix into the tests after it.
+struct EnvVarGuard {
+    name: &'static str,
+    prior: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn capture(name: &'static str) -> Self {
+        Self {
+            name,
+            prior: std::env::var_os(name),
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.prior {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
+/// Per-test unique root, so no two tests resolve into each other's files.
 fn root(label: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -137,6 +169,7 @@ fn dir_str(root: &Path, sub: &str) -> String {
 /// answers.
 #[test]
 fn a_virtual_prefix_is_searched_before_the_virtual_file_s_own_directory() {
+    let _env = env_lock();
     let root = root("vds_prop");
     sources(&root);
     let vds = virtual_file(&root);
@@ -184,6 +217,8 @@ fn a_virtual_prefix_is_searched_before_the_virtual_file_s_own_directory() {
 /// directory that has the source, it answers whatever the property says.
 #[test]
 fn the_virtual_prefix_environment_variable_shadows_the_property() {
+    let _env = env_lock();
+    let _restore = EnvVarGuard::capture("HDF5_VDS_PREFIX");
     let root = root("vds_shadow");
     sources(&root);
     let vds = virtual_file(&root);
@@ -223,6 +258,7 @@ fn the_virtual_prefix_environment_variable_shadows_the_property() {
 /// step is skipped and the virtual file's own directory answers.
 #[test]
 fn a_virtual_prefix_expands_origin_and_treats_dot_as_no_prefix() {
+    let _env = env_lock();
     let root = root("vds_origin");
     sources(&root);
     neighbour(&root);
@@ -259,6 +295,7 @@ fn a_virtual_prefix_expands_origin_and_treats_dot_as_no_prefix() {
 /// 1, still 1 with a neighbouring `home/src.h5` present.
 #[test]
 fn an_elink_prefix_is_searched_before_the_linking_file_s_own_directory() {
+    let _env = env_lock();
     let root = root("elink_prop");
     sources(&root);
     let master = linking_file(&root);
@@ -295,6 +332,8 @@ fn an_elink_prefix_is_searched_before_the_linking_file_s_own_directory() {
 /// that holds no target and the property naming one that does reads 1.
 #[test]
 fn the_elink_prefix_environment_variable_does_not_shadow_the_property() {
+    let _env = env_lock();
+    let _restore = EnvVarGuard::capture("HDF5_EXT_PREFIX");
     let root = root("elink_shadow");
     sources(&root);
     let master = linking_file(&root);
@@ -326,6 +365,7 @@ fn the_elink_prefix_environment_variable_does_not_shadow_the_property() {
 /// this case reads 1.
 #[test]
 fn an_elink_prefix_leaves_origin_alone() {
+    let _env = env_lock();
     let root = root("elink_origin");
     sources(&root);
     neighbour(&root);
@@ -357,6 +397,7 @@ fn an_elink_prefix_leaves_origin_alone() {
 /// prefix, the two-hop read succeeds.
 #[test]
 fn an_elink_prefix_reaches_the_second_hop_of_a_chain() {
+    let _env = env_lock();
     let root = root("elink_chain");
     source(&root.join("far"), 1);
     // home/b.h5 -> "src.h5", which only `far/` holds.
@@ -385,6 +426,7 @@ fn an_elink_prefix_reaches_the_second_hop_of_a_chain() {
 /// accepting a setting it would never consult.
 #[test]
 fn a_write_mode_open_refuses_an_elink_prefix() {
+    let _env = env_lock();
     let root = root("elink_write");
     let path = root.join("home").join("w.h5");
     assert!(H5File::options()
@@ -455,6 +497,7 @@ fn efl_reads(path: &Path, access: DatasetAccess) -> Option<i32> {
 /// naming `far` reads 1, and still 1 with that neighbour present.
 #[test]
 fn an_efile_prefix_is_the_only_place_a_raw_data_file_is_looked_for() {
+    let _env = env_lock();
     let root = root("efile_prop");
     raw(&root.join("far"), 1);
     let ext = external_file(&root);
@@ -486,6 +529,8 @@ fn an_efile_prefix_is_the_only_place_a_raw_data_file_is_looked_for() {
 /// the property is not tried.
 #[test]
 fn the_efile_prefix_environment_variable_shadows_the_property() {
+    let _env = env_lock();
+    let _restore = EnvVarGuard::capture("HDF5_EXTFILE_PREFIX");
     let root = root("efile_shadow");
     raw(&root.join("far"), 1);
     raw(&root.join("other"), 7);
@@ -530,6 +575,7 @@ fn the_efile_prefix_environment_variable_shadows_the_property() {
 /// `cwd/` reads 5 — as does naming no prefix at all.
 #[test]
 fn an_efile_prefix_expands_origin_and_treats_dot_as_no_prefix() {
+    let _env = env_lock();
     let root = root("efile_origin");
     raw(&root.join("far"), 1);
     raw(&root.join("cwd"), 5);
@@ -580,6 +626,7 @@ fn an_efile_prefix_expands_origin_and_treats_dot_as_no_prefix() {
 /// sets its own prefix and reads the other file.
 #[test]
 fn a_second_open_may_not_disagree_about_the_efile_prefix() {
+    let _env = env_lock();
     let root = root("efile_join");
     raw(&root.join("far"), 1);
     raw(&root.join("other"), 7);
@@ -627,6 +674,8 @@ fn a_second_open_may_not_disagree_about_the_efile_prefix() {
 /// which without it is refused.
 #[test]
 fn the_efile_prefix_join_check_compares_what_the_environment_left() {
+    let _env = env_lock();
+    let _restore = EnvVarGuard::capture("HDF5_EXTFILE_PREFIX");
     let root = root("efile_join_env");
     raw(&root.join("far"), 1);
     let ext = external_file(&root);
@@ -693,6 +742,7 @@ fn written(dir: &Path) -> Option<i32> {
 /// current directory empty, and a read under the same prefix gets them back.
 #[test]
 fn an_efile_prefix_decides_where_a_write_creates_its_raw_data_file() {
+    let _env = env_lock();
     let root = root("efile_write_prop");
     std::env::set_current_dir(root.join("cwd")).unwrap();
     let ext = external_file_written(&root, Some(&dir_str(&root, "far")), 1);
@@ -728,6 +778,7 @@ fn an_efile_prefix_decides_where_a_write_creates_its_raw_data_file() {
 /// synchronously write data (external raw data file does not exist)".
 #[test]
 fn a_write_does_not_create_the_directory_an_efile_prefix_names() {
+    let _env = env_lock();
     let root = root("efile_write_missing");
     let file = H5File::create(root.join("home").join("ext.h5")).unwrap();
     let ds = file
@@ -755,6 +806,8 @@ fn a_write_does_not_create_the_directory_an_efile_prefix_names() {
 /// is reached again.
 #[test]
 fn the_efile_prefix_environment_variable_shadows_the_property_on_a_write() {
+    let _env = env_lock();
+    let _restore = EnvVarGuard::capture("HDF5_EXTFILE_PREFIX");
     let root = root("efile_write_shadow");
 
     std::env::set_var("HDF5_EXTFILE_PREFIX", dir_str(&root, "other"));
@@ -789,6 +842,7 @@ fn the_efile_prefix_environment_variable_shadows_the_property_on_a_write() {
 /// write to the current directory.
 #[test]
 fn a_written_efile_prefix_expands_origin_and_treats_dot_as_no_prefix() {
+    let _env = env_lock();
     let root = root("efile_write_origin");
     // nextest runs each test in its own process, so moving the current
     // directory here cannot reach another test.
@@ -830,6 +884,7 @@ fn a_written_efile_prefix_expands_origin_and_treats_dot_as_no_prefix() {
 /// dropped a disagreeing open is taken and settles its own prefix.
 #[test]
 fn a_second_write_open_may_not_disagree_about_the_efile_prefix() {
+    let _env = env_lock();
     let root = root("efile_write_join");
     let file = H5File::create(root.join("home").join("ext.h5")).unwrap();
     let far = || DatasetAccess::new().efile_prefix(dir_str(&root, "far"));
@@ -876,6 +931,7 @@ fn a_second_write_open_may_not_disagree_about_the_efile_prefix() {
 /// naming `far` puts a subsequent write's bytes in `far/raw.bin`.
 #[test]
 fn a_reopened_external_dataset_is_written_under_the_prefix_its_open_names() {
+    let _env = env_lock();
     let root = root("efile_write_reopen");
     std::env::set_current_dir(root.join("cwd")).unwrap();
     let path = root.join("home").join("ext.h5");

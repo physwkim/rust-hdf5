@@ -11,6 +11,39 @@ use rust_hdf5::{H5File, Hdf5Error, LinkClass};
 
 const PINNED_PYTHON: &str = "/home/stevek/micromamba/envs/tomo/bin/python";
 
+/// The process environment is one global shared by every test thread, and
+/// the `HDF5_*_PREFIX` variables shadow or feed prefix resolution, so every
+/// test here holds this lock for its whole body.
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Restores the variable to the value it held when the guard was taken — a
+/// panicking test must not leak its prefix into the tests after it.
+struct EnvVarGuard {
+    name: &'static str,
+    prior: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn capture(name: &'static str) -> Self {
+        Self {
+            name,
+            prior: std::env::var_os(name),
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.prior {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
 fn python() -> Option<&'static str> {
     static PY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     PY.get_or_init(|| {
@@ -83,6 +116,7 @@ fn h5py_write(py: &str, path: &std::path::Path, body: &str) {
 /// lists the name and `H5Dopen` follows it, so both must here too.
 #[test]
 fn soft_link_is_listed_and_followed_in_both_group_layouts() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     for bound in ["earliest", "latest"] {
         let path = tmp(&format!("softlink_{bound}"));
@@ -125,6 +159,7 @@ fn soft_link_is_listed_and_followed_in_both_group_layouts() {
 /// link that names a group so the traversal has to rewrite a path *prefix*.
 #[test]
 fn soft_link_resolves_relative_values_and_group_prefixes() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let path = tmp("softlink_shapes");
     h5py_write(
@@ -158,6 +193,7 @@ fn soft_link_resolves_relative_values_and_group_prefixes() {
 /// the open must name the link and its unreachable target.
 #[test]
 fn dangling_soft_link_is_listed_and_reported_as_dangling() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let path = tmp("softlink_dangling");
     h5py_write(
@@ -192,6 +228,7 @@ fn dangling_soft_link_is_listed_and_reported_as_dangling() {
 /// `link_class`, and opening through it reads the dataset in the other file.
 #[test]
 fn external_link_is_listed_with_its_target() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let target = tmp("extlink_target");
     let path = tmp("extlink");
@@ -240,6 +277,7 @@ fn external_link_is_listed_with_its_target() {
 /// this test pins from both sides.
 #[test]
 fn contiguous_and_chunked_v110_both_list_and_read() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let path = tmp("layout_v110");
     h5py_write(
@@ -272,6 +310,7 @@ fn contiguous_and_chunked_v110_both_list_and_read() {
 /// and `v108` emit version 3. All four must list the dataset and the group.
 #[test]
 fn contiguous_lists_at_every_libver_bound() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     for bound in ["earliest", "v108", "v110", "latest"] {
         let path = tmp(&format!("libver_{bound}"));
@@ -369,6 +408,7 @@ fn retype_layout_class_as_unknown(path: &std::path::Path, expected: usize) {
 /// virtual datasets were cases here until each became readable.
 #[test]
 fn a_dataset_whose_message_does_not_decode_is_listed_and_says_why() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     enum Patch {
         OpaqueToTime,
@@ -448,6 +488,7 @@ fn a_dataset_whose_message_does_not_decode_is_listed_and_says_why() {
 /// and value intact.
 #[test]
 fn reopening_for_write_preserves_soft_and_external_links() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let target = tmp("preserve_extlink_target");
     let path = tmp("preserve_links");
@@ -534,6 +575,7 @@ fn reopening_for_write_preserves_soft_and_external_links() {
 /// the link with it.
 #[test]
 fn reopening_for_write_keeps_a_group_holding_only_a_soft_link() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let path = tmp("preserve_lone_softlink");
     h5py_write(
@@ -574,6 +616,7 @@ fn reopening_for_write_keeps_a_group_holding_only_a_soft_link() {
 /// file rather than a replacement.
 #[test]
 fn creating_over_a_preserved_link_name_is_refused() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let path = tmp("preserve_name_clash");
     h5py_write(
@@ -603,6 +646,7 @@ fn creating_over_a_preserved_link_name_is_refused() {
 /// second external link.
 #[test]
 fn external_link_resolves_against_the_parent_directory_and_nests() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let dir = tmp_dir("extlink_relative");
     let (first, second, third) = (
@@ -659,6 +703,8 @@ fn external_link_resolves_against_the_parent_directory_and_nests() {
 /// and the failure without it names every path that was tried.
 #[test]
 fn external_link_target_is_found_through_hdf5_ext_prefix() {
+    let _env = env_lock();
+    let _restore = EnvVarGuard::capture("HDF5_EXT_PREFIX");
     let Some(py) = python() else { return };
     let home = tmp_dir("extprefix_home");
     let away = tmp_dir("extprefix_away");
@@ -720,6 +766,7 @@ fn external_link_target_is_found_through_hdf5_ext_prefix() {
 /// missing: the file it names, or the object inside it.
 #[test]
 fn a_dangling_external_link_reports_the_file_or_the_object() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let dir = tmp_dir("extlink_dangling");
     let master = dir.join("master.h5");
@@ -770,6 +817,7 @@ fn a_dangling_external_link_reports_the_file_or_the_object() {
 #[cfg(unix)]
 #[test]
 fn links_to_one_external_file_share_one_open_handle() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let dir = tmp_dir("extlink_cache");
     let master = dir.join("master.h5");
@@ -811,6 +859,7 @@ fn links_to_one_external_file_share_one_open_handle() {
 /// stack or the file-descriptor table runs out.
 #[test]
 fn an_external_link_cycle_stops_at_the_link_bound() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let dir = tmp_dir("extlink_cycle");
     let (a, b) = (dir.join("a.h5"), dir.join("b.h5"));
@@ -847,6 +896,7 @@ fn an_external_link_cycle_stops_at_the_link_bound() {
 /// itself survives the session intact.
 #[test]
 fn write_mode_refuses_every_path_through_an_external_link() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let dir = tmp_dir("extlink_write");
     let master = dir.join("master.h5");
@@ -926,6 +976,7 @@ fn write_mode_refuses_every_path_through_an_external_link() {
 /// handle whose every listing comes back empty.
 #[test]
 fn a_group_path_across_an_external_link_is_named_not_empty() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let dir = tmp_dir("extlink_group");
     let master = dir.join("master.h5");
@@ -972,6 +1023,7 @@ fn a_group_path_across_an_external_link_is_named_not_empty() {
 /// Both directions of the mismatch are here.
 #[test]
 fn a_group_keeps_its_children_when_its_storage_differs_from_its_parents() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
 
     // Symbol-table child under a link-storage root: `track_order` on the file
@@ -1052,6 +1104,7 @@ fn a_group_keeps_its_children_when_its_storage_differs_from_its_parents() {
 /// read.
 #[test]
 fn a_dataset_that_shares_a_committed_datatype_reads_through_the_reference() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let path = tmp("shared_datatype");
     h5py_write(
@@ -1093,6 +1146,7 @@ fn a_dataset_that_shares_a_committed_datatype_reads_through_the_reference() {
 /// listed, and every accessor answered as if the object were not there.
 #[test]
 fn a_committed_datatype_is_listed_and_opens_as_an_object_of_its_own() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let path = tmp("named_datatype");
     h5py_write(
@@ -1144,6 +1198,7 @@ fn a_committed_datatype_is_listed_and_opens_as_an_object_of_its_own() {
 /// own — `H5Aopen` works on it exactly as on a dataset.
 #[test]
 fn a_committed_datatype_in_a_group_carries_its_own_attributes() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let path = tmp("named_datatype_attrs");
     h5py_write(
@@ -1185,6 +1240,7 @@ fn a_committed_datatype_in_a_group_carries_its_own_attributes() {
 /// reason lands on the type rather than turning the object into an absence.
 #[test]
 fn a_committed_datatype_this_crate_cannot_decode_is_still_listed() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let path = tmp("named_datatype_opaque");
     h5py_write(
@@ -1218,6 +1274,7 @@ fn a_committed_datatype_this_crate_cannot_decode_is_still_listed() {
 /// the file that holds it.
 #[test]
 fn a_committed_datatype_reached_through_an_external_link_resolves() {
+    let _env = env_lock();
     let Some(py) = python() else { return };
     let dir = tmp_dir("named_datatype_extlink");
     let (master, target) = (dir.join("master.h5"), dir.join("target.h5"));
