@@ -884,6 +884,12 @@ def main():
     ap.add_argument("--work", default="", help="directory for generated .h5 files")
     ap.add_argument("--keep", action="store_true", help="keep the generated files")
     ap.add_argument("--no-build", action="store_true", help="do not run cargo build")
+    ap.add_argument(
+        "--variant",
+        default="",
+        help="suffix for the report paths, so a run against a second "
+        "h5py/libhdf5 build does not overwrite the pinned report",
+    )
     args = ap.parse_args()
 
     import h5py
@@ -937,12 +943,13 @@ def main():
         "probe": probe,
         "cases": len(results),
     }
+    suffix = "-%s" % args.variant if args.variant else ""
     write_report(
         results,
         gaps,
         meta,
-        REPO / "doc" / "oracle-report.md",
-        REPO / "oracle" / "report.json",
+        REPO / "doc" / ("oracle-report%s.md" % suffix),
+        REPO / "oracle" / ("report%s.json" % suffix),
     )
 
     if not args.keep:
@@ -968,7 +975,9 @@ def main():
             sum(1 for r in results if r["b"]["verdict"] == "UNSUPPORTED-API"),
         )
     )
-    sys.stderr.write("report: doc/oracle-report.md, oracle/report.json\n")
+    sys.stderr.write(
+        "report: doc/oracle-report%s.md, oracle/report%s.json\n" % (suffix, suffix)
+    )
     return 0 if (a_bad == 0 and b_bad == 0) else 0
 
 
