@@ -6189,10 +6189,13 @@ impl Hdf5Reader {
             return owner.read_slice(&path, starts, counts);
         }
         let (datatype, out_bytes) = self.slice_size_and_datatype(name, counts)?;
-        let mut data = alloc_tiled_fill(out_bytes as usize, None)?;
-        self.read_slice_into_unconverted(name, starts, counts, &mut data, 0)?;
-        Self::apply_post_filter_conversion(&mut data, &datatype)?;
-        Ok(data)
+        // The selection lands in the vector this returns:
+        // `read_slice_into_unconverted` defines every byte of the buffer it is
+        // handed, so there is nothing to zero first and nothing to copy after.
+        read_image_into_new::<u8, _, _>(out_bytes as usize, |image| {
+            self.read_slice_into_unconverted(name, starts, counts, image, 0)?;
+            Self::apply_post_filter_conversion(image, &datatype)
+        })
     }
 
     /// Read a hyperslab straight into a caller-provided buffer (no allocation).
@@ -6443,14 +6446,15 @@ impl Hdf5Reader {
 
     /// Read a strided hyperslab — h5py's stepped slicing (`ds[a:b:s]`) or
     /// the general `start`/`stride`/`count`/`block` form of
-    /// `H5Sselect_hyperslab` — into a returned buffer.
+    /// `H5Sselect_hyperslab` — into a caller-provided buffer.
     ///
     /// One tuple per dimension: `start[d]` is the first index, `stride[d]`
     /// the spacing between selected blocks (`1` = the classic contiguous
     /// selection [`read_slice`](Self::read_slice) reads), `count[d]` how
     /// many blocks, and `block[d]` how many contiguous elements each block
-    /// covers. The returned buffer is row-major over `count[d] * block[d]`
-    /// per dimension — exactly the shape h5py's stepped slicing produces.
+    /// covers. `out` is row-major over `count[d] * block[d]` per dimension —
+    /// exactly the shape h5py's stepped slicing produces — and `out.len()`
+    /// must equal that times the element size.
     ///
     /// Built on the same selection-decomposition primitives the virtual
     /// dataset reader uses for its per-mapping scatter
@@ -6461,17 +6465,23 @@ impl Hdf5Reader {
     /// where h5py's stepped slicing puts it, and each source box is read with
     /// the ordinary per-layout selective read
     /// ([`read_slice_into_unconverted`](Self::read_slice_into_unconverted)).
-    pub fn read_hyperslab(
+    ///
+    /// The single owner of read-destination semantics for stepped selections:
+    /// it defines every byte of `out` before returning `Ok`, so a typed caller
+    /// reads straight into the vector it keeps rather than into a byte buffer
+    /// it then copies.
+    pub fn read_hyperslab_into(
         &mut self,
         name: &str,
         start: &[u64],
         stride: &[u64],
         count: &[u64],
         block: &[u64],
-    ) -> IoResult<Vec<u8>> {
+        out: &mut [u8],
+    ) -> IoResult<()> {
         if self.external_edge(name).is_some() {
             let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
-            return owner.read_hyperslab(&path, start, stride, count, block);
+            return owner.read_hyperslab_into(&path, start, stride, count, block, out);
         }
         let info = self
             .dataset_info_local(name)
@@ -6491,6 +6501,18 @@ impl Hdf5Reader {
             return Err(crate::io::IoError::InvalidState(
                 "hyperslab stride must be nonzero in every dimension".into(),
             ));
+        }
+        let out_bytes = saturating_byte_len(
+            &(0..rank)
+                .map(|d| count[d].saturating_mul(block[d]))
+                .collect::<Vec<u64>>(),
+            element_size,
+        );
+        if out.len() as u64 != out_bytes {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "read_hyperslab_into: buffer is {} bytes but selection needs {out_bytes}",
+                out.len(),
+            )));
         }
 
         let src_sel = Selection::Hyperslab {
@@ -6519,38 +6541,49 @@ impl Hdf5Reader {
             }),
         };
 
-        let total = saturating_byte_len(&out_dims, element_size) as usize;
-        let mut out = alloc_tiled_fill(total, None)?;
+        // `copy_matched_selections` is shared with the virtual-dataset
+        // scatter, where a target selection may legitimately leave elements
+        // untouched, so it carries no whole-output guarantee of its own: zero
+        // first, exactly as the allocating form always did.
+        fill_tiled_into(out, None);
         copy_matched_selections(
             |bstart, bcount, buf| self.read_slice_into_unconverted(name, bstart, bcount, buf, 0),
             &src_sel.resolve(&dims)?,
             &dst_sel.resolve(&out_dims)?,
             element_size,
-            &mut out,
+            out,
         )?;
-        Self::apply_post_filter_conversion(&mut out, &datatype)?;
-        Ok(out)
+        Self::apply_post_filter_conversion(out, &datatype)
     }
 
     /// Read a list of coordinates in one call — h5py fancy indexing with a
-    /// coordinate list (`H5S_SEL_POINTS`) — into a returned buffer.
+    /// coordinate list (`H5S_SEL_POINTS`) — into a caller-provided buffer.
     ///
-    /// `points[i]` is a `rank`-length coordinate; the returned buffer holds
-    /// one element per point, `element_size` bytes each, in the same order
-    /// as `points` (point selection order is significant, see
-    /// [`PointSelection`]). Backed by [`Selection::Points`] and
-    /// [`Selection::to_boxes`] — the same decomposition
-    /// [`read_hyperslab`](Self::read_hyperslab) and the virtual dataset
-    /// reader use — each point's 1-element box is read with the ordinary
-    /// per-layout selective read
+    /// `points[i]` is a `rank`-length coordinate; `out` holds one element per
+    /// point, `element_size` bytes each, in the same order as `points` (point
+    /// selection order is significant, see [`PointSelection`]), so `out.len()`
+    /// must equal `points.len() * element_size`. Backed by
+    /// [`Selection::Points`] and [`Selection::to_boxes`] — the same
+    /// decomposition [`read_hyperslab_into`](Self::read_hyperslab_into) and
+    /// the virtual dataset reader use — each point's 1-element box is read
+    /// with the ordinary per-layout selective read
     /// ([`read_slice_into_unconverted`](Self::read_slice_into_unconverted)).
     /// A 1-element box is already a flat `element_size`-byte run, so
     /// placing it needs no further run-decomposition
     /// ([`for_each_dual_run`] would degenerate to exactly this copy).
-    pub fn read_points(&mut self, name: &str, points: &[Vec<u64>]) -> IoResult<Vec<u8>> {
+    ///
+    /// One element-sized box per point covers the buffer exactly, so every
+    /// byte of `out` is defined before it returns `Ok` and a typed caller
+    /// reads straight into the vector it keeps.
+    pub fn read_points_into(
+        &mut self,
+        name: &str,
+        points: &[Vec<u64>],
+        out: &mut [u8],
+    ) -> IoResult<()> {
         if self.external_edge(name).is_some() {
             let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
-            return owner.read_points(&path, points);
+            return owner.read_points_into(&path, points, out);
         }
         let info = self
             .dataset_info_local(name)
@@ -6577,7 +6610,14 @@ impl Hdf5Reader {
         let boxes = sel.to_boxes(&dims)?;
 
         let es = element_size as usize;
-        let mut out = alloc_tiled_fill(points.len() * es, None)?;
+        if out.len() != points.len() * es {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "read_points_into: buffer is {} bytes but {} points need {}",
+                out.len(),
+                points.len(),
+                points.len() * es
+            )));
+        }
         for (i, (bstart, bcount)) in boxes.iter().enumerate() {
             self.read_slice_into_unconverted(
                 name,
@@ -6587,8 +6627,7 @@ impl Hdf5Reader {
                 0,
             )?;
         }
-        Self::apply_post_filter_conversion(&mut out, &datatype)?;
-        Ok(out)
+        Self::apply_post_filter_conversion(out, &datatype)
     }
 
     /// Read one chunk's raw (still-filtered) bytes and its filter mask —
