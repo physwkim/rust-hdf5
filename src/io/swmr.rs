@@ -878,10 +878,8 @@ mod swmr_hardlink_tests {
         let (addr, size) = {
             let ds = w.writer_mut().ds(gone);
             let m = ds.lock();
-            (
-                m.obj_header_written_addr.expect("header written"),
-                m.obj_header_encoded_size,
-            )
+            let &(addr, size) = m.obj_header_blocks.first().expect("header written");
+            (addr, size as usize)
         };
         let sentinel = vec![0xABu8; size];
         w.writer_mut().handle().write_at(addr, &sentinel).unwrap();

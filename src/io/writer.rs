@@ -788,7 +788,11 @@ pub struct DatasetInfo {
     /// File offset where the dataset object header was written (for SWMR in-place rewrites).
     pub obj_header_written_addr: Option<u64>,
     /// Encoded size of the dataset object header (for verifying in-place rewrites fit).
-    pub obj_header_encoded_size: usize,
+    /// Every block the object's on-disk header occupies, chunk 0 first, or
+    /// empty when it has none yet. All of them are freed together: a rewrite
+    /// re-encodes the whole chain into one fresh chunk, so a continuation
+    /// block left behind is space no free-space manager records.
+    pub obj_header_blocks: crate::io::object_header_io::HeaderBlocks,
     /// Filter pipeline for compressed chunks.
     pub filter_pipeline: Option<FilterPipeline>,
     /// Soft-deleted: excluded from finalize output.
@@ -1672,7 +1676,11 @@ pub struct GroupInfo {
     /// finalize can free the block it supersedes.
     pub obj_header_written_addr: Option<u64>,
     /// Encoded size of that on-disk header (first block).
-    pub obj_header_encoded_size: usize,
+    /// Every block the object's on-disk header occupies, chunk 0 first, or
+    /// empty when it has none yet. All of them are freed together: a rewrite
+    /// re-encodes the whole chain into one fresh chunk, so a continuation
+    /// block left behind is space no free-space manager records.
+    pub obj_header_blocks: crate::io::object_header_io::HeaderBlocks,
     /// Soft-deleted: excluded from finalize output.
     pub deleted: bool,
     /// Attributes attached to this group (e.g. NeXus `NX_class`).
@@ -1944,8 +1952,10 @@ impl ObjectPlan {
 
 /// The messages a dataset's rewrite is built from, all decoded.
 struct DatasetParts {
-    /// Chunk-0 size: the block the rewrite supersedes and frees.
-    header_size: usize,
+    /// Every block the header chain occupies, chunk 0 first. All of them are
+    /// superseded: the rewrite re-encodes the whole chain into one fresh
+    /// chunk, so a continuation left unfreed is space nothing claims.
+    header_blocks: crate::io::object_header_io::HeaderBlocks,
     datatype: DatatypeMessage,
     /// The committed datatype object header `datatype` was read *through*,
     /// when the header stores a pointer instead of a message of its own.
@@ -1989,7 +1999,7 @@ struct DatasetParts {
 /// The same for a group, plus the links it holds — decoded once, with the
 /// bytes they came from, so the walk and the rewrite agree on its contents.
 struct GroupParts {
-    header_size: usize,
+    header_blocks: crate::io::object_header_io::HeaderBlocks,
     attributes: Vec<AttributeEntry>,
     links: Vec<(crate::format::messages::link::LinkMessage, Vec<u8>)>,
     track_order: TrackOrder,
@@ -2020,7 +2030,7 @@ struct DenseCarry {
 enum CollectedObject {
     Dataset(Box<DatasetParts>),
     Group {
-        header_size: usize,
+        header_blocks: crate::io::object_header_io::HeaderBlocks,
         attributes: Vec<AttributeEntry>,
         track_order: TrackOrder,
         times: Option<ObjectTimes>,
@@ -2067,7 +2077,7 @@ impl<'a> ReopenWalk<'a> {
     /// and an object is modelled only when each message the model consumes
     /// decoded. See [`ObjectPlan`] for why anything else must keep its bytes.
     fn plan(&mut self, addr: u64) -> IoResult<ObjectPlan> {
-        let (handle, meta, file_size) = (&mut *self.handle, self.meta, self.file_size);
+        let (handle, meta) = (&mut *self.handle, self.meta);
         let ctx = &meta.ctx;
         use crate::format::messages::data_layout::DataLayoutMessage;
         use crate::format::messages::dataspace::DataspaceMessage;
@@ -2079,29 +2089,19 @@ impl<'a> ReopenWalk<'a> {
             MSG_FILL_VALUE, MSG_FILTER_PIPELINE, MSG_LINK, MSG_LINK_INFO, MSG_SYMBOL_TABLE,
         };
 
-        // Chunk 0 only, for its encoded size: that is the block the rewrite
-        // supersedes and frees.
-        let buf = handle.read_at_most(addr, file_size.saturating_sub(addr) as usize)?;
-        let header_size = match crate::format::object_header::ObjectHeader::decode_any(&buf) {
-            Ok((_, size)) => size,
-            Err(e) => {
-                return Ok(ObjectPlan::preserve(format!(
-                    "its object header does not decode: {e}"
-                )))
-            }
-        };
-        // The messages, on the other hand, must come from the whole chain: a
-        // filter pipeline or an attribute that spilled into a continuation is
-        // one the rewrite would otherwise drop.
-        let header = match crate::io::object_header_io::read_object_header_full(handle, meta, addr)
-        {
-            Ok(h) => h,
-            Err(e) => {
-                return Ok(ObjectPlan::preserve(format!(
-                    "its object header chain does not read: {e}"
-                )))
-            }
-        };
+        // The whole chain, messages and blocks alike: a filter pipeline or an
+        // attribute that spilled into a continuation is one the rewrite would
+        // otherwise drop, and a continuation block it does not know about is
+        // one the rewrite would orphan.
+        let (header, header_blocks) =
+            match crate::io::object_header_io::read_object_header_with_blocks(handle, meta, addr) {
+                Ok(h) => h,
+                Err(e) => {
+                    return Ok(ObjectPlan::preserve(format!(
+                        "its object header chain does not read: {e}"
+                    )))
+                }
+            };
 
         // The policy, the times and the storage the header declares, read once
         // from the whole chain: all three are properties of the object, not of
@@ -2352,7 +2352,7 @@ impl<'a> ReopenWalk<'a> {
                     }
                 };
                 Ok(ObjectPlan::Dataset(Box::new(DatasetParts {
-                    header_size,
+                    header_blocks,
                     datatype,
                     committed_type,
                     dataspace,
@@ -2389,7 +2389,7 @@ impl<'a> ReopenWalk<'a> {
                  dataset is built from; this writer models only groups and datasets",
             )),
             _ => Ok(ObjectPlan::Group(GroupParts {
-                header_size,
+                header_blocks,
                 attributes,
                 links,
                 track_order,
@@ -2462,7 +2462,7 @@ impl<'a> ReopenWalk<'a> {
                     self.out.hard.push((
                         entry,
                         CollectedObject::Group {
-                            header_size: parts.header_size,
+                            header_blocks: parts.header_blocks,
                             attributes: parts.attributes,
                             track_order: parts.track_order,
                             times: parts.times,
@@ -2500,7 +2500,7 @@ fn rebuild_dataset(
 ) -> IoResult<DatasetInfo> {
     let ctx = &meta.ctx;
     let DatasetParts {
-        header_size: ds_header_size,
+        header_blocks,
         datatype: dt,
         committed_type,
         dataspace: ds,
@@ -2538,7 +2538,7 @@ fn rebuild_dataset(
         append: None,
         attributes: attrs,
         obj_header_written_addr: Some(obj_addr),
-        obj_header_encoded_size: ds_header_size,
+        obj_header_blocks: header_blocks,
         filter_pipeline: fp,
         deleted: false,
         extent_dirty: false,
@@ -3184,10 +3184,13 @@ impl LegacyFile {
 /// so a message this crate does not model survives exactly as a modelled one
 /// does.
 struct CarriedExtension {
-    /// The block the extension header occupied, freed once the replacement is
-    /// laid out. `None` for a file with no extension, and for one whose
-    /// extension this session is the first to write.
-    superseded: Option<(u64, u64)>,
+    /// Every block the extension header occupied — chunk 0 and each
+    /// continuation it named — freed once the replacement is laid out. Empty
+    /// for a file with no extension, and for one whose extension this session
+    /// is the first to write. A rewrite re-encodes the whole chain into one
+    /// chunk, so freeing only the first would leave the rest as space no
+    /// free-space manager records and no object claims.
+    superseded: crate::io::object_header_io::HeaderBlocks,
     /// Every message that header held — the shared-message table,
     /// continuations and null padding excepted. The first two are structure
     /// rather than content; the third is free space.
@@ -3342,7 +3345,7 @@ impl Default for CarriedExtension {
     /// re-emit, and no address until a shared-message table gives it one.
     fn default() -> Self {
         Self {
-            superseded: None,
+            superseded: Vec::new(),
             carried: Vec::new(),
             addr: Slot::new(None),
         }
@@ -3500,7 +3503,7 @@ pub struct Hdf5Writer {
     root_group_encoded_size: usize,
     /// The on-disk root header block a reopen found, `(addr, len)`, so
     /// finalize can free the block its rewrite supersedes.
-    superseded_root_header: Option<(u64, u64)>,
+    superseded_root_header: crate::io::object_header_io::HeaderBlocks,
     /// Where this file's superblock version comes from. The single owner of
     /// both halves of the reopen invariant — see [`SuperblockVersion`],
     /// [`superblock_version_for`](Self::superblock_version_for) and
@@ -4278,7 +4281,7 @@ impl Hdf5Writer {
             cwfs: Slot::new(Vec::new()),
             root_group_addr: None,
             root_group_encoded_size: 0,
-            superseded_root_header: None,
+            superseded_root_header: Vec::new(),
             // A new file starts at the oldest superblock the generation it was
             // created in allows, and finalize raises it if the content needs a
             // newer one.
@@ -5122,13 +5125,13 @@ impl Hdf5Writer {
         let extension = if ext_addr == UNDEF_ADDR || ext_addr == 0 {
             Box::<CarriedExtension>::default()
         } else {
-            let (carried, size) = crate::io::object_header_io::superblock_extension_messages(
+            let (carried, blocks) = crate::io::object_header_io::superblock_extension_messages(
                 &mut handle,
                 &meta,
                 ext_addr,
             )?;
             Box::new(CarriedExtension {
-                superseded: Some((ext_addr, size as u64)),
+                superseded: blocks,
                 carried,
                 addr: Slot::new(None),
             })
@@ -5162,8 +5165,7 @@ impl Hdf5Writer {
                 )));
             }
         };
-        // Chunk 0 is the block the rewrite supersedes.
-        let root_header_size = root.header_size;
+        let root_header_blocks = root.header_blocks;
         let root_attributes = root.attributes;
         let root_track_order = root.track_order;
         let root_times = root.times;
@@ -5202,13 +5204,14 @@ impl Hdf5Writer {
         let walk_order: Vec<String> = link_entries.iter().map(|(e, _)| e.path.clone()).collect();
 
         let mut existing_datasets = Vec::new();
-        // Non-dataset link targets (groups): header block `(addr, len)` by
-        // link path — so finalize can free the block its rewrite supersedes —
-        // plus the attributes the header carries, which the group registry
-        // below must keep or finalize rewrites the group without them.
+        // Non-dataset link targets (groups): the header's chunk-0 address and
+        // every block its chain occupies, by link path — so finalize can free
+        // the blocks its rewrite supersedes — plus the attributes the header
+        // carries, which the group registry below must keep or finalize
+        // rewrites the group without them.
         type GroupHeaderInfo = (
             u64,
-            usize,
+            crate::io::object_header_io::HeaderBlocks,
             Vec<AttributeEntry>,
             TrackOrder,
             Option<ObjectTimes>,
@@ -5233,7 +5236,7 @@ impl Hdf5Writer {
             } = entry;
             let parts = match object {
                 CollectedObject::Group {
-                    header_size,
+                    header_blocks,
                     attributes,
                     track_order,
                     times,
@@ -5246,7 +5249,7 @@ impl Hdf5Writer {
                     }
                     group_headers.insert(
                         name,
-                        (obj_addr, header_size, attributes, track_order, times),
+                        (obj_addr, header_blocks, attributes, track_order, times),
                     );
                     continue;
                 }
@@ -5318,16 +5321,13 @@ impl Hdf5Writer {
                     group_index_map.get(&parent_path).copied()
                 };
                 let gidx = groups.len();
-                let (
-                    obj_header_written_addr,
-                    obj_header_encoded_size,
-                    attributes,
-                    track_order,
-                    times,
-                ) = group_headers.remove(path.trim_start_matches('/')).map_or(
-                    (None, 0, Vec::new(), TrackOrder::default(), None),
-                    |(addr, len, attrs, track, times)| (Some(addr), len, attrs, track, times),
-                );
+                let (obj_header_written_addr, obj_header_blocks, attributes, track_order, times) =
+                    group_headers.remove(path.trim_start_matches('/')).map_or(
+                        (None, Vec::new(), Vec::new(), TrackOrder::default(), None),
+                        |(addr, blocks, attrs, track, times)| {
+                            (Some(addr), blocks, attrs, track, times)
+                        },
+                    );
                 groups.push(GroupInfo {
                     name: path.clone(),
                     parent,
@@ -5338,7 +5338,7 @@ impl Hdf5Writer {
                     child_groups: Vec::new(),
                     obj_header_addr: 0,
                     obj_header_written_addr,
-                    obj_header_encoded_size,
+                    obj_header_blocks,
                     deleted: false,
                     attributes,
                 });
@@ -5624,7 +5624,7 @@ impl Hdf5Writer {
             cwfs: Slot::new(Vec::new()),
             root_group_addr: None,
             root_group_encoded_size: 0,
-            superseded_root_header: Some((root_addr, root_header_size as u64)),
+            superseded_root_header: root_header_blocks,
             // The version the file already has. It is written back unchanged
             // and it floors every bound this session writes at, so the append
             // hands the file back in the generation it found it in.
@@ -6159,7 +6159,7 @@ impl Hdf5Writer {
     /// SWMR — the delete entry points refuse first.
     fn release_dataset_storage(&self, index: usize) -> IoResult<()> {
         use crate::format::messages::datatype::DatatypeMessage;
-        let (indexed, ndims, contiguous, is_vlen, attrs, header_block, mapping_list) = {
+        let (indexed, ndims, contiguous, is_vlen, attrs, header_blocks, mapping_list) = {
             let ds = self.ds(index);
             let mut m = ds.lock();
             // Buffered rows were never written to a chunk; they die with
@@ -6189,19 +6189,15 @@ impl Hdf5Writer {
                 DatatypeMessage::VarLenString { .. } | DatatypeMessage::VarLenSequence { .. }
             );
             let attrs = std::mem::take(&mut m.attributes);
-            let header_block = m
-                .obj_header_written_addr
-                .take()
-                .filter(|_| m.obj_header_encoded_size > 0)
-                .map(|a| (a, m.obj_header_encoded_size as u64));
-            m.obj_header_encoded_size = 0;
+            m.obj_header_written_addr = None;
+            let header_blocks = std::mem::take(&mut m.obj_header_blocks);
             (
                 indexed,
                 m.dataspace.dims.len(),
                 contiguous,
                 is_vlen,
                 attrs,
-                header_block,
+                header_blocks,
                 mapping_list,
             )
         };
@@ -6225,7 +6221,7 @@ impl Hdf5Writer {
             self.release_attr_vlen(attr)?;
         }
         self.release_superseded_dense_attrs(AttrScope::Dataset(index))?;
-        if let Some((addr, size)) = header_block {
+        for (addr, size) in header_blocks {
             self.allocator.free(addr, size, FreeSpaceClass::Metadata);
         }
         Ok(())
@@ -6236,24 +6232,19 @@ impl Hdf5Writer {
     /// group counterpart of
     /// [`release_dataset_storage`](Self::release_dataset_storage).
     fn release_group_storage(&self, gidx: usize) -> IoResult<()> {
-        let (attrs, header_block) = {
+        let (attrs, header_blocks) = {
             let grp = self.grp(gidx);
             let mut g = grp.lock();
             let attrs = std::mem::take(&mut g.attributes);
-            let header_block = g
-                .obj_header_written_addr
-                .take()
-                .filter(|_| g.obj_header_encoded_size > 0)
-                .map(|a| (a, g.obj_header_encoded_size as u64));
-            g.obj_header_encoded_size = 0;
-            (attrs, header_block)
+            g.obj_header_written_addr = None;
+            (attrs, std::mem::take(&mut g.obj_header_blocks))
         };
         for attr in &attrs {
             self.release_attr_vlen(attr)?;
         }
         self.release_superseded_dense_attrs(AttrScope::Group(gidx))?;
         self.release_superseded_dense_links(LinkScope::Group(gidx))?;
-        if let Some((addr, size)) = header_block {
+        for (addr, size) in header_blocks {
             self.allocator.free(addr, size, FreeSpaceClass::Metadata);
         }
         Ok(())
@@ -6622,7 +6613,7 @@ impl Hdf5Writer {
             child_groups: Vec::new(),
             obj_header_addr: 0,
             obj_header_written_addr: None,
-            obj_header_encoded_size: 0,
+            obj_header_blocks: Vec::new(),
             deleted: false,
             attributes: Vec::new(),
         });
@@ -8949,7 +8940,7 @@ impl Hdf5Writer {
         // Freed before the replacement is placed, so a reopen reuses the block
         // instead of stranding one per open/close cycle — the rule every other
         // superseded structure follows.
-        if let Some((addr, len)) = self.extension.superseded {
+        for &(addr, len) in &self.extension.superseded {
             self.allocator.free(addr, len, FreeSpaceClass::Metadata);
         }
         let addr = self.allocator.allocate(image.len() as u64);
@@ -9043,7 +9034,7 @@ impl Hdf5Writer {
                 append: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
+                obj_header_blocks: Vec::new(),
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
@@ -9199,7 +9190,7 @@ impl Hdf5Writer {
                 append: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
+                obj_header_blocks: Vec::new(),
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
@@ -9303,7 +9294,7 @@ impl Hdf5Writer {
                 append: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
+                obj_header_blocks: Vec::new(),
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
@@ -9381,7 +9372,7 @@ impl Hdf5Writer {
                 append: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
+                obj_header_blocks: Vec::new(),
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
@@ -9432,7 +9423,7 @@ impl Hdf5Writer {
                 append: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
+                obj_header_blocks: Vec::new(),
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
@@ -9534,7 +9525,7 @@ impl Hdf5Writer {
                 compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
+                obj_header_blocks: Vec::new(),
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
@@ -10759,7 +10750,7 @@ impl Hdf5Writer {
                 compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
+                obj_header_blocks: Vec::new(),
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
@@ -10875,7 +10866,7 @@ impl Hdf5Writer {
                 compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
+                obj_header_blocks: Vec::new(),
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
@@ -11016,7 +11007,7 @@ impl Hdf5Writer {
                 compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
+                obj_header_blocks: Vec::new(),
                 filter_pipeline: Some(pipeline),
                 deleted: false,
                 extent_dirty: false,
@@ -12604,7 +12595,7 @@ impl Hdf5Writer {
                 compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
+                obj_header_blocks: Vec::new(),
                 filter_pipeline: pipeline,
                 deleted: false,
                 extent_dirty: false,
@@ -12705,7 +12696,7 @@ impl Hdf5Writer {
                 compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
+                obj_header_blocks: Vec::new(),
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
@@ -12800,7 +12791,7 @@ impl Hdf5Writer {
                 compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
+                obj_header_blocks: Vec::new(),
                 filter_pipeline: None,
                 deleted: false,
                 extent_dirty: false,
@@ -12881,7 +12872,7 @@ impl Hdf5Writer {
                 compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
+                obj_header_blocks: Vec::new(),
                 filter_pipeline: Some(pipeline),
                 deleted: false,
                 extent_dirty: false,
@@ -12968,7 +12959,7 @@ impl Hdf5Writer {
                 compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
+                obj_header_blocks: Vec::new(),
                 filter_pipeline: pipeline,
                 deleted: false,
                 extent_dirty: false,
@@ -13125,7 +13116,7 @@ impl Hdf5Writer {
                 compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
+                obj_header_blocks: Vec::new(),
                 filter_pipeline: pipeline,
                 deleted: false,
                 extent_dirty: false,
@@ -13239,7 +13230,7 @@ impl Hdf5Writer {
                 compact: None,
                 attributes: Vec::new(),
                 obj_header_written_addr: None,
-                obj_header_encoded_size: 0,
+                obj_header_blocks: Vec::new(),
                 filter_pipeline: Some(pipeline),
                 deleted: false,
                 extent_dirty: false,
@@ -14996,10 +14987,16 @@ impl Hdf5Writer {
         let (addr, original_size) = {
             let ds = self.ds(index);
             let m = ds.lock();
-            let addr = m.obj_header_written_addr.ok_or_else(|| {
-                crate::io::IoError::InvalidState("dataset header not yet written".into())
-            })?;
-            (addr, m.obj_header_encoded_size)
+            // One block, because a finalize writes every header as one
+            // chunk: an in-place rewrite has that block's room and no more.
+            match m.obj_header_blocks.as_slice() {
+                [(addr, size)] => (*addr, *size as usize),
+                _ => {
+                    return Err(crate::io::IoError::InvalidState(
+                        "dataset header not yet written as a single chunk".into(),
+                    ))
+                }
+            }
         };
 
         let header = self.build_dataset_header(index)?;
@@ -15072,7 +15069,7 @@ impl Hdf5Writer {
             let ds = self.ds(i);
             let mut m = ds.lock();
             m.obj_header_written_addr = Some(addr);
-            m.obj_header_encoded_size = size;
+            m.obj_header_blocks = vec![(addr, size as u64)];
         }
         self.root_group_encoded_size = layout.root.1;
 
@@ -15190,16 +15187,14 @@ impl Hdf5Writer {
                     m.obj_header_addr = m.obj_header_written_addr.unwrap();
                     continue;
                 }
-                if !self.swmr_active && m.obj_header_encoded_size > 0 {
+                if !self.swmr_active && !m.obj_header_blocks.is_empty() {
                     let old = m.obj_header_written_addr.take().unwrap();
+                    let blocks = std::mem::take(&mut m.obj_header_blocks);
                     if freed_headers.insert(old) {
-                        self.allocator.free(
-                            old,
-                            m.obj_header_encoded_size as u64,
-                            FreeSpaceClass::Metadata,
-                        );
+                        for (addr, len) in blocks {
+                            self.allocator.free(addr, len, FreeSpaceClass::Metadata);
+                        }
                     }
-                    m.obj_header_encoded_size = 0;
                 }
             }
             rewritten.push(i);
@@ -15208,21 +15203,25 @@ impl Hdf5Writer {
             for gi in 0..self.group_count() {
                 let grp = self.grp(gi);
                 let mut g = grp.lock();
-                if g.obj_header_encoded_size > 0 {
-                    if let Some(old) = g.obj_header_written_addr.take() {
-                        if freed_headers.insert(old) {
-                            self.allocator.free(
-                                old,
-                                g.obj_header_encoded_size as u64,
-                                FreeSpaceClass::Metadata,
-                            );
+                if let Some(old) = g
+                    .obj_header_written_addr
+                    .take()
+                    .filter(|_| !g.obj_header_blocks.is_empty())
+                {
+                    let blocks = std::mem::take(&mut g.obj_header_blocks);
+                    if freed_headers.insert(old) {
+                        for (addr, len) in blocks {
+                            self.allocator.free(addr, len, FreeSpaceClass::Metadata);
                         }
-                        g.obj_header_encoded_size = 0;
                     }
                 }
             }
-            if let Some((addr, len)) = self.superseded_root_header.take() {
-                if freed_headers.insert(addr) {
+            let root_blocks = std::mem::take(&mut self.superseded_root_header);
+            if root_blocks
+                .first()
+                .is_some_and(|&(addr, _)| freed_headers.insert(addr))
+            {
+                for (addr, len) in root_blocks {
                     self.allocator.free(addr, len, FreeSpaceClass::Metadata);
                 }
             }
@@ -18636,6 +18635,22 @@ mod tests {
         )
         .unwrap();
         w.close().unwrap();
+    }
+
+    /// The block list a reopen carries for the superblock extension covers
+    /// every chunk of the header, not just the first. The fixture's extension
+    /// is a two-chunk header — libhdf5 put the file-space info message in a
+    /// continuation — and freeing chunk zero alone left the continuation
+    /// allocated with nothing naming it.
+    #[test]
+    fn a_reopen_carries_every_chunk_of_the_superblock_extension() {
+        let path = fixture_copy("fsm_persist.h5", "fsm_ext_chunks");
+        let blocks = read_only_append(&path).extension.superseded.clone();
+        assert!(
+            blocks.len() > 1,
+            "the fixture's extension is one chunk, so this proves nothing: {blocks:?}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// An append on a persisting file both spends and records the space its
