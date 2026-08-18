@@ -881,6 +881,60 @@ pub struct SuperblockExtension {
     pub file_space_info: Option<FileSpaceInfoMessage>,
 }
 
+/// The datasets the discovery walk found, in the order it found them, with
+/// an index from canonical path to position.
+///
+/// Every open and every read resolves a dataset by name, so a plain `Vec` a
+/// lookup scans made each of them cost a pass over the whole catalog — a file
+/// holding thousands of datasets paid that per access. The index is derived
+/// in [`DatasetTable::new`], which is the only way to build one, so it cannot
+/// fall out of step with the list it indexes.
+struct DatasetTable {
+    list: Vec<DatasetReadInfo>,
+    /// Canonical path (no leading `/`) → position in `list`. A name the walk
+    /// recorded twice keeps its first position, which is the entry a scan
+    /// from the front would have found.
+    by_name: std::collections::HashMap<String, usize>,
+}
+
+impl DatasetTable {
+    fn new(list: Vec<DatasetReadInfo>) -> Self {
+        let mut by_name = std::collections::HashMap::with_capacity(list.len());
+        for (i, ds) in list.iter().enumerate() {
+            by_name.entry(ds.name.clone()).or_insert(i);
+        }
+        Self { list, by_name }
+    }
+
+    /// Where the dataset named `name` sits in the list, or `None` when the
+    /// catalog holds no such name.
+    fn position(&self, name: &str) -> Option<usize> {
+        self.by_name.get(name).copied()
+    }
+
+    fn get(&self, name: &str) -> Option<&DatasetReadInfo> {
+        self.list.get(self.position(name)?)
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, DatasetReadInfo> {
+        self.list.iter()
+    }
+}
+
+impl std::ops::Index<usize> for DatasetTable {
+    type Output = DatasetReadInfo;
+
+    fn index(&self, i: usize) -> &DatasetReadInfo {
+        &self.list[i]
+    }
+}
+
+impl std::ops::IndexMut<usize> for DatasetTable {
+    fn index_mut(&mut self, i: usize) -> &mut DatasetReadInfo {
+        &mut self.list[i]
+    }
+}
+
 /// HDF5 file reader.
 pub struct Hdf5Reader {
     handle: FileHandle,
@@ -894,7 +948,7 @@ pub struct Hdf5Reader {
     /// `detect_superblock_version` and never re-derived: 0/1 is the legacy
     /// symbol-table root, 2/3 the link-message root.
     superblock_version: u8,
-    datasets: Vec<DatasetReadInfo>,
+    datasets: DatasetTable,
     /// Dataset-shaped objects this crate cannot read, keyed by path (no
     /// leading `/`), the value naming what stopped it. They are listed with
     /// the readable datasets and refuse typed access with that reason: an
@@ -1801,7 +1855,7 @@ impl Hdf5Reader {
             _eof: sb.end_of_file_address,
             superblock_version: sb.version,
             object_paths: catalog.object_paths(sb.root_group_object_header_address),
-            datasets: catalog.datasets,
+            datasets: DatasetTable::new(catalog.datasets),
             unreadable: catalog.unreadable,
             root_attributes,
             root_link_storage,
@@ -1889,7 +1943,7 @@ impl Hdf5Reader {
             _eof: sb.end_of_file_address,
             superblock_version: sb.version,
             object_paths: catalog.object_paths(root_obj_addr),
-            datasets: catalog.datasets,
+            datasets: DatasetTable::new(catalog.datasets),
             unreadable: catalog.unreadable,
             root_attributes,
             root_link_storage,
@@ -3046,7 +3100,7 @@ impl Hdf5Reader {
     /// selected and the path is local to it.
     fn dataset_info_local(&self, name: &str) -> Option<&DatasetReadInfo> {
         let name = self.canonical_path(name);
-        self.datasets.iter().find(|d| d.name == name)
+        self.datasets.get(&name)
     }
 
     /// Open `name` as a dataset the way `H5Dopen2` does, reporting *why* it
@@ -3091,7 +3145,7 @@ impl Hdf5Reader {
             // remaining path resolves locally, so no caller can land here.
             return Err(crate::io::IoError::NotFound(name.to_string()));
         };
-        if let Some(info) = self.datasets.iter().find(|d| d.name == path) {
+        if let Some(info) = self.datasets.get(&path) {
             return Ok(info);
         }
         if let Some(why) = self.unreadable.get(&path) {
@@ -3856,8 +3910,12 @@ impl Hdf5Reader {
     /// access* property that is never stored in the file, so a reader opening
     /// a file it did not create always sees the default.
     fn resolve_virtual_extents(&mut self) -> IoResult<()> {
-        let targets: Vec<usize> = (0..self.datasets.len())
-            .filter(|&i| self.datasets[i].virtual_mappings.is_some())
+        let targets: Vec<usize> = self
+            .datasets
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.virtual_mappings.is_some())
+            .map(|(i, _)| i)
             .collect();
         for i in targets {
             // The catalog is freshly built, so `dataspace.dims` is still the
@@ -3940,7 +3998,7 @@ impl Hdf5Reader {
         access: &DatasetAccess,
     ) -> IoResult<Option<DatasetOpenToken>> {
         let canonical = self.canonical_path(name);
-        let Some(i) = self.datasets.iter().position(|d| d.name == canonical) else {
+        let Some(i) = self.datasets.position(&canonical) else {
             return Ok(None);
         };
         if let Some(open) = self
@@ -4380,7 +4438,7 @@ impl Hdf5Reader {
         self.meta = meta;
         self.ext = ext;
         self.object_paths = catalog.object_paths(sb.root_group_object_header_address);
-        self.datasets = catalog.datasets;
+        self.datasets = DatasetTable::new(catalog.datasets);
         self.unreadable = catalog.unreadable;
         self.root_link_storage = root_link_storage;
         self.group_attributes = catalog.group_attributes;
