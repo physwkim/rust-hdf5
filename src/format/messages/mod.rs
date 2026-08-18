@@ -48,6 +48,14 @@ pub const MSG_FLAG_SHARED: u8 = 0x02;
 /// `H5O_MSG_FLAG_DONTSHARE`: the message must never be moved to the shared
 /// message heap.
 pub const MSG_FLAG_DONTSHARE: u8 = 0x04;
+/// `H5O_MSG_FLAG_SHAREABLE`: the message body *is* the message, and a
+/// shared-message index also holds a record naming it here
+/// (`H5SM_IN_OH`). `H5SM__write_mesg` leaves the first copy of a
+/// share-in-object-header class where it was written and only moves the body
+/// to the heap when a second object wants it (H5SM.c:1400-1417), so a reader
+/// must take the body literally — unlike [`MSG_FLAG_SHARED`], this flag says
+/// nothing about the bytes that follow.
+pub const MSG_FLAG_SHAREABLE: u8 = 0x40;
 /// `H5O_MSG_FLAG_MARK_IF_UNKNOWN`: a writer that does not understand this
 /// message must mark it as one it may have invalidated, so a later reader
 /// knows the object was edited by a library that could not maintain it.

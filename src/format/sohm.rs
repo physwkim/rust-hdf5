@@ -73,21 +73,44 @@ pub fn record_size(ctx: &FormatContext) -> usize {
     1 + 4 + (4 + SOHM_HEAP_ID_LEN).max(1 + 1 + 2 + sa)
 }
 
-/// One index record naming a message body in the index's fractal heap
-/// (`H5SM_sohm_t` with `location == H5SM_IN_HEAP`).
-///
-/// The object-header form — the shape a message left literal in the header
-/// that first used it is recorded under — is decoded by readers but never
-/// written here: this crate moves a message to the heap the first time it
-/// shares it, so no record ever names an object header.
+/// One index record: the hash every record carries, and whichever of the two
+/// bodies `H5SM_sohm_t` holds (`H5SM__message_encode`, H5SMmessage.c:265-292).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SohmRecord {
     /// [`message_hash`] of the body this record names.
     pub hash: u32,
-    /// Object header messages pointing at this body.
-    pub ref_count: u32,
-    /// Fractal-heap ID of the body.
-    pub heap_id: [u8; SOHM_HEAP_ID_LEN],
+    /// Where that body is.
+    pub location: SohmRecordLocation,
+}
+
+/// The two forms a record's body takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SohmRecordLocation {
+    /// `H5SM_IN_HEAP`: the body is a heap object of the index's fractal heap.
+    InHeap {
+        /// Messages referring to this body — pointers plus, when a first copy
+        /// was left literal, that copy (`H5SM__write_mesg` opens the count at
+        /// 2 when it moves an in-header body to the heap, H5SM.c:1298-1306).
+        ref_count: u32,
+        /// Fractal-heap ID of the body.
+        heap_id: [u8; SOHM_HEAP_ID_LEN],
+    },
+    /// `H5SM_IN_OH`: the body is still a literal message of the object header
+    /// that first wrote it, which carries [`MSG_FLAG_SHAREABLE`] and no
+    /// pointer (H5SM.c:1400-1417).
+    ///
+    /// [`MSG_FLAG_SHAREABLE`]: crate::format::messages::MSG_FLAG_SHAREABLE
+    InObjectHeader {
+        /// Class of the message that holds the body.
+        msg_type: u8,
+        /// Its creation index within that header, which
+        /// `H5O_msg_get_crt_index` reports as 0 for every class carrying
+        /// `H5O_SHARE_IN_OHDR` — only the attribute class has a
+        /// `get_crt_index` callback (H5Oattr.c:82).
+        index: u16,
+        /// Address of the object header holding it.
+        oh_addr: u64,
+    },
 }
 
 impl SohmRecord {
@@ -95,10 +118,27 @@ impl SohmRecord {
     pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
         let size = record_size(ctx);
         let mut buf = Vec::with_capacity(size);
-        buf.push(SOHM_IN_HEAP);
-        buf.extend_from_slice(&self.hash.to_le_bytes());
-        buf.extend_from_slice(&self.ref_count.to_le_bytes());
-        buf.extend_from_slice(&self.heap_id);
+        match self.location {
+            SohmRecordLocation::InHeap { ref_count, heap_id } => {
+                buf.push(SOHM_IN_HEAP);
+                buf.extend_from_slice(&self.hash.to_le_bytes());
+                buf.extend_from_slice(&ref_count.to_le_bytes());
+                buf.extend_from_slice(&heap_id);
+            }
+            SohmRecordLocation::InObjectHeader {
+                msg_type,
+                index,
+                oh_addr,
+            } => {
+                buf.push(SOHM_IN_OH);
+                buf.extend_from_slice(&self.hash.to_le_bytes());
+                // A reserved byte libhdf5 writes zero and never reads.
+                buf.push(0);
+                buf.push(msg_type);
+                buf.extend_from_slice(&index.to_le_bytes());
+                buf.extend_from_slice(&oh_addr.to_le_bytes()[..ctx.sizeof_addr as usize]);
+            }
+        }
         buf.resize(size, 0);
         buf
     }
@@ -660,27 +700,15 @@ mod tests {
     /// checksum that follows the last one rather than the end of the block.
     #[test]
     fn list_index_encodes_the_fixture_image() {
+        let heaped = |hash, ref_count, heap_id| SohmRecord {
+            hash,
+            location: SohmRecordLocation::InHeap { ref_count, heap_id },
+        };
         let records = [
-            SohmRecord {
-                hash: 701521455,
-                ref_count: 5,
-                heap_id: [0x00, 0x42, 0, 0, 0, 0, 0x18, 0x00],
-            },
-            SohmRecord {
-                hash: 3573483313,
-                ref_count: 1,
-                heap_id: [0x00, 0x16, 0, 0, 0, 0, 0x14, 0x00],
-            },
-            SohmRecord {
-                hash: 826238635,
-                ref_count: 1,
-                heap_id: [0x00, 0x2a, 0, 0, 0, 0, 0x18, 0x00],
-            },
-            SohmRecord {
-                hash: 2575530442,
-                ref_count: 4,
-                heap_id: [0x00, 0x7a, 0, 0, 0, 0, 0x38, 0x00],
-            },
+            heaped(701521455, 5, [0x00, 0x42, 0, 0, 0, 0, 0x18, 0x00]),
+            heaped(3573483313, 1, [0x00, 0x16, 0, 0, 0, 0, 0x14, 0x00]),
+            heaped(826238635, 1, [0x00, 0x2a, 0, 0, 0, 0, 0x18, 0x00]),
+            heaped(2575530442, 4, [0x00, 0x7a, 0, 0, 0, 0, 0x38, 0x00]),
         ];
         let image = encode_list(&records, &ctx());
         let want = concat!(
@@ -696,6 +724,33 @@ mod tests {
         // image stops after the ones in use.
         assert_eq!(list_size(&ctx(), 50), 858);
         assert!(image.len() < list_size(&ctx(), 50));
+    }
+
+    /// The other record form (`H5SM__message_encode`'s `else` branch): a
+    /// location byte, the hash, a reserved zero, the message class, a
+    /// creation index and the address of the header holding the body.
+    #[test]
+    fn an_object_header_record_names_the_header_holding_the_body() {
+        let record = SohmRecord {
+            hash: 701521455,
+            location: SohmRecordLocation::InObjectHeader {
+                msg_type: MSG_DATASPACE,
+                index: 0,
+                oh_addr: 0x0349,
+            },
+        };
+        assert_eq!(
+            hex(&record.encode(&ctx())),
+            concat!(
+                "01",               // H5SM_IN_OH
+                "2f5ed029",         // hash, little-endian
+                "00",               // reserved
+                "01",               // message type: dataspace
+                "0000",             // creation index
+                "4903000000000000", // object header address
+            )
+        );
+        assert_eq!(record.encode(&ctx()).len(), record_size(&ctx()));
     }
 
     fn hex(bytes: &[u8]) -> String {
