@@ -17,7 +17,7 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 
 `PASS` tolerates the 0 accessors that are missing from the API *everywhere* () — they are counted once each in the findings table below rather than against every case that happens to contain a dataset.
 
-**Direction B** (rust-hdf5 writes, h5py/libhdf5 reads) — `PASS` h5py read it, every core field (kind, dtype, shape, data, attributes, link targets) matched the reference and `h5diff`/`h5dump` were clean; `INVALID` one of those failed; `UNSUPPORTED-API` the public API cannot express the case. Differences confined to `attrorder`, `chunkindex`, `fillvalue`, `filters`, `layout`, `linkorder`, `linkstore`, `maxshape`, `superblock` are recorded as metadata deviations and do not fail a case, because the values libhdf5 reads are identical.
+**Direction B** (rust-hdf5 writes, h5py/libhdf5 reads) — `PASS` h5py read it, every core field (kind, dtype, shape, data, attributes, link targets) matched the reference and `h5diff`/`h5dump` were clean; `INVALID` one of those failed; `UNSUPPORTED-API` the public API cannot express the case. Differences confined to `attrorder`, `chunkindex`, `fillvalue`, `filters`, `layout`, `linkorder`, `linkstore`, `maxshape`, `shared`, `superblock` are recorded as metadata deviations and do not fail a case, because the values libhdf5 reads are identical.
 
 ## Headline
 
@@ -163,7 +163,7 @@ None.
 
 ## Direction B expected deviations
 
-None: no `EXPECTED_DEVIATIONS` entry (oracle/run.py) applies to libhdf5 1.14.6 — 1 entry is scoped to a later one, so every case in this run describes itself the way libhdf5 describes the same file. Any metadata deviation from here on matches no entry and is reported as unexpected below.
+None: no `EXPECTED_DEVIATIONS` entry (oracle/run.py) applies to libhdf5 1.14.6 — 2 entries are scoped to a later one, so every case in this run describes itself the way libhdf5 describes the same file. Any metadata deviation from here on matches no entry and is reported as unexpected below.
 
 ## Direction B unexpected deviations
 
