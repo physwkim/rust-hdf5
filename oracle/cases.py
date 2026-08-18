@@ -1055,12 +1055,34 @@ def gen_fsm_persist(path):
         f.create_dataset("appended", data=ramp("<i4"))
 
 
+def gen_fsm_persist_page(path):
+    """[`gen_fsm_persist`] under paged aggregation.
+
+    `H5F_FSPACE_STRATEGY_PAGE` packs everything smaller than the file-space
+    page into pages of one kind and page-aligns everything else
+    (`H5MF__alloc_pagefs`), so the same edits leave a different free-space
+    manager set: sections that never cross a page boundary, and — under sec2,
+    which declares no `H5FD_FEAT_PAGED_AGGR` — at most the three managers
+    `H5MF__alloc_to_fs_type` can reach.
+    """
+    with h5py.File(path, "w", fs_strategy="page", fs_persist=True, fs_threshold=1) as f:
+        f.create_dataset("data", data=ramp("<i4"))
+        f.create_dataset("bulk", data=ramp("<i4", 256))
+        f.create_group("g")
+    with h5py.File(path, "a") as f:
+        del f["bulk"]
+        f.create_dataset("appended", data=ramp("<i4"))
+
+
 MISC_CASES = [
     Case("swmr_created", "swmr", gen_swmr_created, "swmr_created",
          "file created through the SWMR writer path and appended frame by frame"),
     Case("fsm_persist", "freespace", gen_fsm_persist, "fsm_persist",
          "persisting FSM_AGGR file reopened and appended — the freed blocks "
          "must come back as free-space manager sections"),
+    Case("fsm_persist_page", "freespace", gen_fsm_persist_page, "fsm_persist_page",
+         "persisting PAGE file reopened and appended — the freed blocks must "
+         "come back as page-shaped free-space manager sections"),
     Case("large_multi_mb", "bulk", gen_large_multi_mb, "large_multi_mb",
          "2 MiB chunked f64 dataset — payload compared by SHA-256"),
 ]

@@ -1,20 +1,21 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use crate::format::free_space::FreeSpaceClass;
+use crate::format::free_space::{FreeSpaceClass, FreeSpaceManager, SpacePolicy};
 
-/// One released, reusable region of the file, and the free-space manager it
-/// belongs to.
+/// One released, reusable region of the file, and the free-space manager that
+/// records it.
 ///
-/// The class travels with the block because it is decided where the block is
-/// released — the caller is the only place that knows what the bytes held —
-/// and read again on close, when the sections are split across the managers
-/// `H5MF_ALLOC_TO_FS_AGGR_TYPE` would have put them in.
+/// The manager is decided where the block is released, from the class the
+/// caller names and the block's own length — `H5MF_xfree` asks
+/// `H5MF__alloc_to_fs_type` the same question with the same two arguments —
+/// and read again on close, when the list is split across the managers the
+/// file-space info message names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FreeBlock {
     pub(crate) addr: u64,
     pub(crate) len: u64,
-    pub(crate) class: FreeSpaceClass,
+    pub(crate) manager: FreeSpaceManager,
 }
 
 /// File space allocator: bump-the-end-of-file, with reuse of released blocks.
@@ -42,18 +43,19 @@ pub(crate) struct FreeBlock {
 /// empty list, and — like libhdf5's default, non-persistent strategy — a
 /// block it released but did not reuse stays as slack.
 ///
-/// Every released block carries the [`FreeSpaceClass`] its bytes belonged to,
-/// which is what lets the close split the list across the managers
-/// `H5MF_ALLOC_TO_FS_AGGR_TYPE` would have chosen, and what stops two adjacent
-/// blocks in different managers from merging into one section no manager could
-/// hold. Reuse does not read it: `allocate` takes the best fit from the whole
-/// list where `H5MF_alloc` would search only the manager for its own type,
-/// so a metadata allocation here can be handed raw-data space. What that
-/// changes is which free block a request gets, never whether the block is
-/// free or which manager records what is left of it.
+/// Every released block carries the [`FreeSpaceManager`] its bytes belong to,
+/// which is what lets the close split the list across the managers the file's
+/// strategy defines, and what stops two adjacent blocks in different managers
+/// from merging into one section no manager could hold. Reuse reads it too:
+/// a request is served only out of its own manager's sections, the one
+/// `H5MF_alloc` searches, so a block's manager is fixed for the life of the
+/// file and the two accounts cannot drift apart.
 pub struct FileAllocator {
     eof: AtomicU64,
     alignment: u64,
+    /// How the file's strategy maps requests onto managers and pages. Fixed
+    /// for the allocator's life: it is a file creation property.
+    policy: SpacePolicy,
     /// Free regions of the file, sorted by address with adjacent regions
     /// merged: blocks this session released, and — for a persisting file —
     /// the sections it opened holding. Only the former are guaranteed to
@@ -70,79 +72,302 @@ pub struct FileAllocator {
 }
 
 impl FileAllocator {
-    /// Create a new allocator whose free region starts at `initial_eof`.
+    /// Create a new allocator whose free region starts at `initial_eof`, for
+    /// a file with no page structure.
     pub fn new(initial_eof: u64) -> Self {
+        Self::with_policy(initial_eof, SpacePolicy::Aggr)
+    }
+
+    /// [`new`](Self::new) for a file whose strategy is known.
+    ///
+    /// A paged file aligns nothing to eight bytes: a small allocation is
+    /// carved from a page and a large one is page-aligned, so the only
+    /// boundary that exists is the page. An unpaged file keeps this crate's
+    /// eight-byte alignment, which libhdf5 does not have (`H5Pset_alignment`
+    /// defaults to a threshold and an alignment of one) but which every file
+    /// this crate has written so far does.
+    pub fn with_policy(initial_eof: u64, policy: SpacePolicy) -> Self {
         Self {
             eof: AtomicU64::new(initial_eof),
-            alignment: 8,
+            alignment: match policy {
+                SpacePolicy::Aggr => 8,
+                SpacePolicy::Paged { .. } => 1,
+            },
+            policy,
             free_list: Mutex::new(Vec::new()),
             free_count: AtomicU64::new(0),
         }
     }
 
-    /// Round `size` up to the allocator's alignment.
-    fn align_up(&self, size: u64) -> u64 {
-        (size + self.alignment - 1) & !(self.alignment - 1)
+    /// How this file's strategy maps requests onto managers and pages.
+    pub(crate) fn policy(&self) -> SpacePolicy {
+        self.policy
     }
 
-    /// Allocate `size` bytes, returning the aligned starting offset.
+    /// Round `size` up to `alignment`, which must be a power of two.
+    fn round_up(size: u64, alignment: u64) -> u64 {
+        (size + alignment - 1) & !(alignment - 1)
+    }
+
+    /// The boundary an allocation drawn from `manager` must start on.
     ///
-    /// A released block large enough to hold `size` is reused before the file
-    /// grows; otherwise the end-of-file pointer is bumped. The bump is
-    /// lock-free: it is published with a compare-and-swap loop, so concurrent
-    /// callers never overlap (alignment makes a plain `fetch_add`
+    /// `H5MF__open_fstype` (H5MF.c:325-330) gives a paged file's large manager
+    /// an alignment of one page and every other manager `H5F_ALIGN_DEF`, which
+    /// is one byte. Unpaged, this crate uses its own eight.
+    fn draw_alignment(&self, manager: FreeSpaceManager) -> u64 {
+        match (self.policy, manager) {
+            (SpacePolicy::Paged { page }, FreeSpaceManager::Large) => page,
+            (SpacePolicy::Paged { .. }, _) => 1,
+            (SpacePolicy::Aggr, _) => self.alignment,
+        }
+    }
+
+    /// Allocate `size` bytes for `class`, returning the starting offset.
+    ///
+    /// A released block in the manager the request maps to is reused before
+    /// the file grows; otherwise the end-of-file pointer is bumped. The bump
+    /// is lock-free: it is published with a compare-and-swap loop, so
+    /// concurrent callers never overlap (alignment makes a plain `fetch_add`
     /// insufficient, hence the CAS).
-    pub fn allocate(&self, size: u64) -> u64 {
-        if let Some(addr) = self.take_free(size) {
+    ///
+    /// `class` is `H5MF_alloc`'s `alloc_type` reduced through the sec2
+    /// driver's dichotomy. It decides which manager the request is served
+    /// from and which one records whatever the request leaves over — the
+    /// alignment fragment before it, the page remainder after it. Without it
+    /// those bytes would be held by nothing and recorded by no manager, which
+    /// is what `h5stat -S` counts as unaccounted space.
+    pub fn allocate(&self, size: u64, class: FreeSpaceClass) -> u64 {
+        match self.policy {
+            SpacePolicy::Aggr => self.allocate_aggr(size, class),
+            SpacePolicy::Paged { page } => self.allocate_paged(size, class, page),
+        }
+    }
+
+    /// [`allocate`](Self::allocate) for a file with no page structure.
+    ///
+    /// Rounding the end-of-file pointer up skips the bytes between the old
+    /// pointer and the aligned address; nothing else will ever name them, so
+    /// they go on the free list under the class of the allocation that
+    /// displaced them. That is `H5MF__aggr_alloc`'s own alignment fragment,
+    /// which it hands to `H5MF_xfree(f, alloc_type, eoa_frag_addr,
+    /// eoa_frag_size)` (H5MFaggr.c:339-341).
+    fn allocate_aggr(&self, size: u64, class: FreeSpaceClass) -> u64 {
+        if let Some(addr) = self.take_free(size, self.policy.manager(class, size)) {
             return addr;
         }
         let mut cur = self.eof.load(Ordering::Acquire);
-        loop {
-            let aligned = (cur + self.alignment - 1) & !(self.alignment - 1);
-            let next = aligned + size;
-            match self
-                .eof
-                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => return aligned,
+        let aligned = loop {
+            let aligned = Self::round_up(cur, self.alignment);
+            match self.eof.compare_exchange_weak(
+                cur,
+                aligned + size,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break aligned,
                 Err(actual) => cur = actual,
             }
+        };
+        if aligned > cur {
+            self.free(cur, aligned - cur, class);
         }
+        aligned
+    }
+
+    /// [`allocate`](Self::allocate) under paged aggregation —
+    /// `H5MF__alloc_pagefs` (H5MF.c:858).
+    ///
+    /// A request of at least one page is served from the end of the file and
+    /// the misaligned tail between it and the next page boundary
+    /// (`H5MF_EOA_MISALIGN`) becomes a section of the large manager, which
+    /// keeps the end-of-file pointer on a page boundary for the next one. A
+    /// smaller request takes a whole page — itself a large request, so it
+    /// comes from a free page if there is one — and the rest of that page
+    /// becomes a section of the small manager for the request's own class,
+    /// which is what keeps one page to one kind of data.
+    fn allocate_paged(&self, size: u64, class: FreeSpaceClass, page: u64) -> u64 {
+        if size == 0 {
+            return self.eof.load(Ordering::Acquire);
+        }
+        let manager = self.policy.manager(class, size);
+        if let Some(addr) = self.take_free(size, manager) {
+            return addr;
+        }
+        if manager != FreeSpaceManager::Large {
+            let new_page = self.allocate(page, class);
+            self.record(new_page + size, page - size, manager);
+            return new_page;
+        }
+        let mut cur = self.eof.load(Ordering::Acquire);
+        let (start, addr, frag) = loop {
+            // `H5MF__alloc_pagefs` asserts the end of the file is on a page
+            // boundary and computes only the tail fragment
+            // (`H5MF_EOA_MISALIGN`). The head below is what makes that true
+            // rather than assumed: every allocation here leaves the end on a
+            // boundary, so the only way `cur` is off one is a reopened file
+            // whose end was, and rounding up puts the file back on its own
+            // grid instead of laying a page-aligned block at an unaligned
+            // address.
+            let addr = Self::round_up(cur, page);
+            let frag = (page - (addr + size) % page) % page;
+            match self.eof.compare_exchange_weak(
+                cur,
+                addr + size + frag,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break (cur, addr, frag),
+                Err(actual) => cur = actual,
+            }
+        };
+        if addr > start {
+            self.record(start, addr - start, FreeSpaceManager::Large);
+        }
+        if frag > 0 {
+            self.record(addr + size, frag, FreeSpaceManager::Large);
+        }
+        addr
     }
 
     /// Release `len` bytes at `addr` for reuse by later allocations.
     ///
     /// The caller must have already dropped every reference to the block (for
-    /// a chunk: the index entry must be about to point elsewhere). Adjacent
-    /// blocks merge, so a repeatedly grown-and-shrunk chunk does not shred the
-    /// list into unusable fragments.
+    /// a chunk: the index entry must be about to point elsewhere). Which
+    /// manager records it is `H5MF__alloc_to_fs_type`'s answer for the class
+    /// the caller names and the length being freed, so a released block of at
+    /// least one page goes to a paged file's large manager whatever it held.
     pub fn free(&self, addr: u64, len: u64, class: FreeSpaceClass) {
         if len == 0 {
             return;
         }
+        self.record(addr, len, self.policy.manager(class, len));
+    }
+
+    /// Put one section into `manager`, merging it with what is already there.
+    fn record(&self, addr: u64, len: u64, manager: FreeSpaceManager) {
+        if len == 0 {
+            return;
+        }
         let mut list = self.free_list.lock().unwrap();
-        let pos = list.partition_point(|b| b.addr < addr);
-        list.insert(pos, FreeBlock { addr, len, class });
-        // Merge with the following block, then with the preceding one, so a
-        // block that fills the gap between two free blocks yields one block.
-        // Only within a class: two adjacent sections in different managers are
-        // two sections upstream as well, because `H5FS__sect_merge` only ever
-        // sees the one manager it was called for.
-        let joins = |a: &FreeBlock, b: &FreeBlock| a.addr + a.len == b.addr && a.class == b.class;
-        if pos + 1 < list.len() && joins(&list[pos], &list[pos + 1]) {
-            list[pos].len += list[pos + 1].len;
-            list.remove(pos + 1);
-        }
-        if pos > 0 && joins(&list[pos - 1], &list[pos]) {
-            list[pos - 1].len += list[pos].len;
-            list.remove(pos);
-        }
+        self.insert_section(&mut list, FreeBlock { addr, len, manager });
         self.free_count.store(list.len() as u64, Ordering::Release);
+    }
+
+    /// Whether `a` and the section that follows it merge into one.
+    ///
+    /// Only within one manager: `H5FS__sect_merge` only ever sees the manager
+    /// it was called for, so two adjacent sections in different managers are
+    /// two sections upstream as well. A paged file's small sections carry the
+    /// further rule that the merged section may not cross a page boundary
+    /// (`H5MF__sect_small_can_merge`, H5MFsection.c:684-686); its large
+    /// sections merge like simple ones.
+    fn joins(&self, a: &FreeBlock, b: &FreeBlock) -> bool {
+        if a.addr + a.len != b.addr || a.manager != b.manager {
+            return false;
+        }
+        match self.policy {
+            SpacePolicy::Paged { page } if a.manager != FreeSpaceManager::Large => {
+                a.addr / page == (b.addr + b.len - 1) / page
+            }
+            _ => true,
+        }
+    }
+
+    /// Insert `block` in address order and merge it with its neighbours.
+    ///
+    /// A small section that grows to exactly one page stops being a small
+    /// section: `H5MF__sect_small_merge` (H5MFsection.c:728-733) hands the
+    /// whole page back through `H5MF_xfree`, which re-maps it to the large
+    /// manager, where it can then merge with the pages around it. The loop is
+    /// that hand-back.
+    fn insert_section(&self, list: &mut Vec<FreeBlock>, block: FreeBlock) {
+        let mut block = block;
+        loop {
+            let mut pos = list.partition_point(|x| x.addr < block.addr);
+            list.insert(pos, block);
+            if pos + 1 < list.len() && self.joins(&list[pos], &list[pos + 1]) {
+                list[pos].len += list[pos + 1].len;
+                list.remove(pos + 1);
+            }
+            if pos > 0 && self.joins(&list[pos - 1], &list[pos]) {
+                list[pos - 1].len += list[pos].len;
+                list.remove(pos);
+                pos -= 1;
+            }
+            match self.policy {
+                SpacePolicy::Paged { page }
+                    if list[pos].manager != FreeSpaceManager::Large && list[pos].len == page =>
+                {
+                    block = FreeBlock {
+                        manager: FreeSpaceManager::Large,
+                        ..list[pos]
+                    };
+                    list.remove(pos);
+                }
+                _ => {
+                    self.shrink_to(list, pos);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Give the file back the section at `pos` if it is the end of the file.
+    ///
+    /// Space past the end of the file is not free space, it is space that was
+    /// never allocated: recording it would have a manager name bytes the
+    /// superblock's own end-of-file address says are not there. `H5MF_xfree`
+    /// hands such a section to `H5MF__sect_simple_shrink`, which lowers the
+    /// EOA by the whole of it (H5MFsection.c:428-460); a paged file's large
+    /// section gives back only whole pages and keeps the part below the page
+    /// boundary, so the end stays on the grid
+    /// (`H5MF__sect_large_shrink`, H5MFsection.c:902-940), and a small section
+    /// never reaches the end at all because it lives inside a page.
+    ///
+    /// The end of file is moved by compare-and-swap against the exact value
+    /// this section ends at, so a concurrent [`allocate`](Self::allocate) that
+    /// already moved it wins and the section simply stays on the list.
+    fn shrink_to(&self, list: &mut Vec<FreeBlock>, pos: usize) {
+        let block = list[pos];
+        let keep = match self.policy {
+            SpacePolicy::Aggr => 0,
+            SpacePolicy::Paged { page } if block.manager == FreeSpaceManager::Large => {
+                if block.len < page {
+                    return;
+                }
+                (page - block.addr % page) % page
+            }
+            SpacePolicy::Paged { .. } => return,
+        };
+        if self
+            .eof
+            .compare_exchange(
+                block.addr + block.len,
+                block.addr + keep,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        if keep == 0 {
+            list.remove(pos);
+        } else {
+            list[pos].len = keep;
+        }
     }
 
     /// Take the smallest released block that fits `size`, splitting off the
     /// remainder. Returns `None` when nothing fits (or nothing was freed).
-    fn take_free(&self, size: u64) -> Option<u64> {
+    ///
+    /// Only `manager`'s own sections are searched, which is what `H5MF_alloc`
+    /// does — it asks `fs_man[fs_type]` and nothing else. That a block belongs
+    /// to one manager for its whole life is what makes the manager a property
+    /// of the bytes: a request served out of another manager's section would
+    /// hand those bytes back to its own manager when it released them, and the
+    /// two accounts would drift a block apart on every reuse.
+    fn take_free(&self, size: u64, manager: FreeSpaceManager) -> Option<u64> {
         if size == 0 || self.free_count.load(Ordering::Acquire) == 0 {
             return None;
         }
@@ -151,17 +376,21 @@ impl FileAllocator {
         // itself starts aligned, but one read out of a file's free-space
         // manager starts wherever the file put it, and the bytes before the
         // first aligned address in it can hold no allocation.
-        let usable = |b: &FreeBlock| b.len.saturating_sub(self.align_up(b.addr) - b.addr);
+        let usable = |b: &FreeBlock| {
+            let align = self.draw_alignment(b.manager);
+            b.len.saturating_sub(Self::round_up(b.addr, align) - b.addr)
+        };
         // Best fit: the smallest sufficient block, so a large released region
         // stays available for a large chunk.
         let pos = list
             .iter()
             .enumerate()
+            .filter(|(_, b)| b.manager == manager)
             .filter(|(_, b)| usable(b) >= size)
             .min_by_key(|(_, b)| usable(b))
             .map(|(i, _)| i)?;
         let block = list[pos];
-        let addr = self.align_up(block.addr);
+        let addr = Self::round_up(block.addr, self.draw_alignment(block.manager));
         // Exactly `size`: what a caller is handed is what it will hand back,
         // so a block released later returns every byte drawn here. Rounding
         // the draw up to the alignment instead left the difference inside a
@@ -171,18 +400,20 @@ impl FileAllocator {
         let head = FreeBlock {
             addr: block.addr,
             len: addr - block.addr,
-            class: block.class,
+            manager: block.manager,
         };
         let tail = FreeBlock {
             addr: addr + used,
             len: block.addr + block.len - addr - used,
-            class: block.class,
+            manager: block.manager,
         };
-        // Both remainders stay free: the head is what alignment cost and the
-        // tail is what the request did not use. A remainder too short to
-        // start an aligned allocation is kept anyway — `usable` will pass it
-        // over, but it stays recorded, and it merges the moment a neighbour
-        // is released.
+        // Both remainders stay free, and stay in the manager the block was in
+        // — `H5MF__find_sect` re-adds the remainder to the manager it carved
+        // it from, so a large section carved below a page is still a large
+        // section. The head is what alignment cost and the tail is what the
+        // request did not use. A remainder too short to start an aligned
+        // allocation is kept anyway: `usable` will pass it over, but it stays
+        // recorded, and it merges the moment a neighbour is released.
         list.remove(pos);
         for b in [tail, head] {
             if b.len > 0 {
@@ -204,20 +435,55 @@ impl FileAllocator {
     /// `addr + len` and is large enough, so the front of it is consumed —
     /// exactly `extra` bytes of it, an extension being contiguous by
     /// definition, so there is no address to choose here.
-    pub fn try_extend(&self, addr: u64, len: u64, extra: u64) -> bool {
+    ///
+    /// `class` names the manager the extension may draw from, the one
+    /// `H5FS_sect_try_extend` is called on. On a paged file the end-of-file
+    /// route also lays down the page fragment the growth leaves behind, so
+    /// the file's end stays on a page boundary.
+    pub fn try_extend(&self, addr: u64, len: u64, extra: u64, class: FreeSpaceClass) -> bool {
         if extra == 0 {
             return true;
         }
         let end = addr + len;
+        // The manager is the one for the block as it stands, not as it will
+        // stand: `H5MF_try_extend` maps `size`, not `size + extra_requested`
+        // (H5MF.c:1304), so a small block grows within the small manager and
+        // never becomes a large one by growing.
+        let manager = self.policy.manager(class, len);
+        if let SpacePolicy::Paged { page } = self.policy {
+            // A small block lives inside one page, so it can only grow while
+            // it stays there (H5MF.c:1285-1289); growing across the boundary
+            // would make one block out of two pages of possibly different
+            // kinds.
+            if manager != FreeSpaceManager::Large && addr / page != (end + extra - 1) / page {
+                return false;
+            }
+        }
         let mut cur = self.eof.load(Ordering::Acquire);
         while cur == end {
+            // Only a large block reaches the end of a paged file — the end is
+            // on a page boundary, so a small block that ended there could not
+            // have grown without crossing it — which is what
+            // `H5MF_try_extend` asserts before it lays the fragment down
+            // (H5MF.c:1325-1327).
+            let frag = match self.policy {
+                SpacePolicy::Paged { page } if manager == FreeSpaceManager::Large => {
+                    (page - (end + extra) % page) % page
+                }
+                _ => 0,
+            };
             match self.eof.compare_exchange_weak(
                 end,
-                end + extra,
+                end + extra + frag,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    if frag > 0 {
+                        self.record(end + extra, frag, FreeSpaceManager::Large);
+                    }
+                    return true;
+                }
                 Err(actual) => cur = actual,
             }
         }
@@ -228,7 +494,10 @@ impl FileAllocator {
         let mut list = self.free_list.lock().unwrap();
         // Exactly `extra`, for the reason `take_free` draws exactly `size`.
         let used = extra;
-        let Some(pos) = list.iter().position(|b| b.addr == end && b.len >= used) else {
+        let Some(pos) = list
+            .iter()
+            .position(|b| b.addr == end && b.len >= used && b.manager == manager)
+        else {
             return false;
         };
         let block = list[pos];
@@ -236,7 +505,7 @@ impl FileAllocator {
             list[pos] = FreeBlock {
                 addr: block.addr + used,
                 len: block.len - used,
-                class: block.class,
+                manager: block.manager,
             };
         } else {
             list.remove(pos);
@@ -272,36 +541,22 @@ impl FileAllocator {
         self.free_list.lock().unwrap().clone()
     }
 
-    /// Empty the free list, returning what was in it.
+    /// Install `blocks` as the whole free list, replacing what is there.
     ///
-    /// Leaves [`allocate`](Self::allocate) with nothing to reuse, so every
-    /// call after this one bumps the end of the file. That is what lets the
-    /// close settle a free-space manager over the list: the blocks the manager
-    /// itself needs must come out of a set nothing else can allocate from
-    /// while the layout is being chosen.
-    pub(crate) fn take_all_free(&self) -> Vec<FreeBlock> {
-        let mut list = self.free_list.lock().unwrap();
-        let taken = list.clone();
-        list.clear();
-        self.free_count.store(0, Ordering::Release);
-        taken
-    }
-
-    /// Put `blocks` back as the whole free list, replacing what is there.
-    ///
-    /// The counterpart of [`take_all_free`](Self::take_all_free). The list is
-    /// sorted here rather than by the caller: address order is what
-    /// [`free`](Self::free) and [`try_extend`](Self::try_extend) search by, so
-    /// a caller that handed the blocks over in some other order — a free-space
-    /// manager's layout orders its sections by size — would leave the list
-    /// unsearchable. `blocks` must still be non-overlapping, and need not be
-    /// aligned: this is also how a reopen installs the sections a file's
-    /// manager recorded, which sit at whatever addresses the file gave them.
+    /// How a reopen puts the sections a file's free-space managers recorded
+    /// back into circulation. They go in one at a time through the same
+    /// [`insert_section`](Self::insert_section) every release uses, so the
+    /// merge rules have one owner: sections that libhdf5 left separate because
+    /// they sit in different managers, or in different pages of one, stay
+    /// separate here too, and two that it would have merged merge. `blocks`
+    /// must be non-overlapping, and need not be aligned — a file's sections
+    /// sit at whatever addresses the file gave them.
     pub(crate) fn reset_free_list(&self, blocks: &[FreeBlock]) {
-        let mut sorted: Vec<FreeBlock> = blocks.iter().copied().filter(|b| b.len > 0).collect();
-        sorted.sort_unstable_by_key(|b| b.addr);
         let mut list = self.free_list.lock().unwrap();
-        *list = sorted;
+        list.clear();
+        for &block in blocks.iter().filter(|b| b.len > 0) {
+            self.insert_section(&mut list, block);
+        }
         self.free_count.store(list.len() as u64, Ordering::Release);
     }
 }
@@ -319,7 +574,7 @@ mod tests {
         FreeBlock {
             addr,
             len,
-            class: META,
+            manager: FreeSpaceManager::Metadata,
         }
     }
 
@@ -337,12 +592,12 @@ mod tests {
                 FreeBlock {
                     addr: 100,
                     len: 50,
-                    class: META
+                    manager: FreeSpaceManager::Metadata
                 },
                 FreeBlock {
                     addr: 150,
                     len: 50,
-                    class: RAW
+                    manager: FreeSpaceManager::RawData
                 },
             ]
         );
@@ -358,7 +613,7 @@ mod tests {
             vec![FreeBlock {
                 addr: 100,
                 len: 100,
-                class: RAW
+                manager: FreeSpaceManager::RawData
             }]
         );
     }
@@ -377,38 +632,51 @@ mod tests {
                 FreeBlock {
                     addr: 100,
                     len: 40,
-                    class: META
+                    manager: FreeSpaceManager::Metadata
                 },
                 FreeBlock {
                     addr: 140,
                     len: 20,
-                    class: RAW
+                    manager: FreeSpaceManager::RawData
                 },
             ]
         );
     }
 
-    /// The remainder of a carved block keeps the class of the block it came
-    /// from, whichever class asked for the space.
+    /// The remainder of a carved block stays in the manager the block was in
+    /// — `H5MF__find_sect` re-adds it to the manager it carved it from.
     #[test]
-    fn the_remainder_of_a_reused_block_keeps_its_class() {
+    fn the_remainder_of_a_reused_block_keeps_its_manager() {
         let alloc = FileAllocator::new(1024);
         alloc.free(200, 64, RAW);
-        assert_eq!(alloc.allocate(16), 200);
+        assert_eq!(alloc.allocate(16, RAW), 200);
         assert_eq!(
             alloc.free_extents(),
             vec![FreeBlock {
                 addr: 216,
                 len: 48,
-                class: RAW
+                manager: FreeSpaceManager::RawData
             }]
         );
+    }
+
+    /// A request is served out of its own manager and no other, which is what
+    /// `H5MF_alloc` does — it asks `fs_man[fs_type]` alone. Space the raw-data
+    /// manager holds is not space a metadata request may take, however well it
+    /// would fit: the byte would come back to the metadata manager when it was
+    /// released, and the file's two accounts would drift a block apart.
+    #[test]
+    fn a_request_is_not_served_out_of_another_managers_section() {
+        let alloc = FileAllocator::new(1024);
+        alloc.free(200, 64, RAW);
+        assert_eq!(alloc.allocate(16, META), 1024, "took the raw-data section");
+        assert_eq!(free_blocks(&alloc), vec![(200, 64)]);
     }
 
     #[test]
     fn basic_allocation() {
         let alloc = FileAllocator::new(48);
-        let a = alloc.allocate(100);
+        let a = alloc.allocate(100, META);
         assert_eq!(a, 48);
         assert_eq!(alloc.eof(), 148);
     }
@@ -416,7 +684,7 @@ mod tests {
     #[test]
     fn alignment() {
         let alloc = FileAllocator::new(50); // not 8-aligned
-        let a = alloc.allocate(10);
+        let a = alloc.allocate(10, META);
         assert_eq!(a, 56); // aligned to 8
         assert_eq!(alloc.eof(), 66);
     }
@@ -424,7 +692,7 @@ mod tests {
     #[test]
     fn zero_size_allocation() {
         let alloc = FileAllocator::new(48);
-        let a = alloc.allocate(0);
+        let a = alloc.allocate(0, META);
         assert_eq!(a, 48);
         assert_eq!(alloc.eof(), 48);
     }
@@ -432,9 +700,9 @@ mod tests {
     #[test]
     fn successive_allocations() {
         let alloc = FileAllocator::new(0);
-        let a1 = alloc.allocate(10);
-        let a2 = alloc.allocate(20);
-        let a3 = alloc.allocate(5);
+        let a1 = alloc.allocate(10, META);
+        let a2 = alloc.allocate(20, META);
+        let a3 = alloc.allocate(5, META);
         assert_eq!(a1, 0);
         assert_eq!(a2, 16); // 10 -> aligned to 16
         assert_eq!(a3, 40); // 36 -> aligned to 40
@@ -459,7 +727,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 let mut offs = Vec::with_capacity(per_thread);
                 for _ in 0..per_thread {
-                    offs.push(a.allocate(size));
+                    offs.push(a.allocate(size, META));
                 }
                 offs
             }));
@@ -494,12 +762,12 @@ mod tests {
     #[test]
     fn freed_block_is_reused_before_the_file_grows() {
         let alloc = FileAllocator::new(0);
-        let a = alloc.allocate(64);
-        alloc.allocate(64);
+        let a = alloc.allocate(64, META);
+        alloc.allocate(64, META);
         let eof_before = alloc.eof();
 
         alloc.free(a, 64, META);
-        assert_eq!(alloc.allocate(64), a, "exact-fit reuse");
+        assert_eq!(alloc.allocate(64, META), a, "exact-fit reuse");
         assert_eq!(alloc.eof(), eof_before, "file must not grow on reuse");
         assert!(free_blocks(&alloc).is_empty());
     }
@@ -511,16 +779,16 @@ mod tests {
     #[test]
     fn reusing_part_of_a_block_leaves_exactly_the_undrawn_remainder() {
         let alloc = FileAllocator::new(0);
-        let a = alloc.allocate(64);
-        alloc.allocate(8);
+        let a = alloc.allocate(64, META);
+        alloc.allocate(8, META);
         let eof_before = alloc.eof();
 
         alloc.free(a, 64, META);
-        assert_eq!(alloc.allocate(10), a);
+        assert_eq!(alloc.allocate(10, META), a);
         assert_eq!(free_blocks(&alloc), vec![(a + 10, 54)]);
         // The next draw still starts aligned; the six bytes that costs stay on
         // the list instead of disappearing into the allocation before them.
-        assert_eq!(alloc.allocate(48), a + 16);
+        assert_eq!(alloc.allocate(48, META), a + 16);
         assert_eq!(free_blocks(&alloc), vec![(a + 10, 6)]);
         assert_eq!(alloc.eof(), eof_before);
     }
@@ -528,12 +796,12 @@ mod tests {
     #[test]
     fn a_request_larger_than_every_free_block_grows_the_file() {
         let alloc = FileAllocator::new(0);
-        let a = alloc.allocate(32);
-        alloc.allocate(32);
+        let a = alloc.allocate(32, META);
+        alloc.allocate(32, META);
         let eof_before = alloc.eof();
 
         alloc.free(a, 32, META);
-        let big = alloc.allocate(33);
+        let big = alloc.allocate(33, META);
         assert_eq!(big, eof_before, "must come from the end of the file");
         assert_eq!(
             free_blocks(&alloc),
@@ -547,28 +815,32 @@ mod tests {
         let alloc = FileAllocator::new(0);
         // Separators keep the three blocks apart, so freeing them cannot
         // merge them into one and the choice between them is a real one.
-        let small = alloc.allocate(16);
-        alloc.allocate(8);
-        let mid = alloc.allocate(32);
-        alloc.allocate(8);
-        let big = alloc.allocate(64);
-        alloc.allocate(8);
+        let small = alloc.allocate(16, META);
+        alloc.allocate(8, META);
+        let mid = alloc.allocate(32, META);
+        alloc.allocate(8, META);
+        let big = alloc.allocate(64, META);
+        alloc.allocate(8, META);
         alloc.free(big, 64, META);
         alloc.free(small, 16, META);
         alloc.free(mid, 32, META);
 
-        assert_eq!(alloc.allocate(20), mid, "20 fits 32 more tightly than 64");
-        assert_eq!(alloc.allocate(16), small);
-        assert_eq!(alloc.allocate(64), big);
+        assert_eq!(
+            alloc.allocate(20, META),
+            mid,
+            "20 fits 32 more tightly than 64"
+        );
+        assert_eq!(alloc.allocate(16, META), small);
+        assert_eq!(alloc.allocate(64, META), big);
     }
 
     #[test]
     fn adjacent_freed_blocks_merge() {
         let alloc = FileAllocator::new(0);
-        let a = alloc.allocate(32);
-        let b = alloc.allocate(32);
-        let c = alloc.allocate(32);
-        alloc.allocate(8);
+        let a = alloc.allocate(32, META);
+        let b = alloc.allocate(32, META);
+        let c = alloc.allocate(32, META);
+        alloc.allocate(8, META);
 
         // Free the outer two first: they are not adjacent, so they stay apart.
         alloc.free(a, 32, META);
@@ -580,56 +852,57 @@ mod tests {
         alloc.free(b, 32, META);
         assert_eq!(free_blocks(&alloc), vec![(a, 96)]);
         let eof_before = alloc.eof();
-        assert_eq!(alloc.allocate(96), a);
+        assert_eq!(alloc.allocate(96, META), a);
         assert_eq!(alloc.eof(), eof_before);
     }
 
     #[test]
     fn try_extend_grows_the_file_when_the_block_ends_at_eof() {
         let alloc = FileAllocator::new(0);
-        let a = alloc.allocate(64);
-        assert!(alloc.try_extend(a, 64, 32));
+        let a = alloc.allocate(64, META);
+        assert!(alloc.try_extend(a, 64, 32, META));
         assert_eq!(alloc.eof(), 96);
         // The extension owns [64, 96): the next allocation starts after it.
-        assert_eq!(alloc.allocate(8), 96);
+        assert_eq!(alloc.allocate(8, META), 96);
     }
 
     #[test]
     fn try_extend_consumes_the_front_of_an_adjacent_free_block() {
         let alloc = FileAllocator::new(0);
-        let a = alloc.allocate(64);
-        let b = alloc.allocate(64);
-        alloc.allocate(8); // pin: the freed block is not at EOF
+        let a = alloc.allocate(64, META);
+        let b = alloc.allocate(64, META);
+        alloc.allocate(8, META); // pin: the freed block is not at EOF
         alloc.free(b, 64, META);
 
-        assert!(alloc.try_extend(a, 64, 16));
+        assert!(alloc.try_extend(a, 64, 16, META));
         assert_eq!(free_blocks(&alloc), vec![(b + 16, 48)]);
         // Growing into the whole remainder empties the list.
-        assert!(alloc.try_extend(a, 80, 48));
+        assert!(alloc.try_extend(a, 80, 48, META));
         assert!(free_blocks(&alloc).is_empty());
     }
 
     #[test]
     fn try_extend_fails_without_room_past_the_block() {
         let alloc = FileAllocator::new(0);
-        let a = alloc.allocate(64);
-        alloc.allocate(64); // live block right after `a`
-        let c = alloc.allocate(16);
+        let a = alloc.allocate(64, META);
+        alloc.allocate(64, META); // live block right after `a`
+        let c = alloc.allocate(16, META);
+        alloc.allocate(8, META); // keeps `c` off the end of the file
         alloc.free(c, 16, META); // free space exists, but not at a + 64
 
-        assert!(!alloc.try_extend(a, 64, 8));
+        assert!(!alloc.try_extend(a, 64, 8, META));
         assert_eq!(free_blocks(&alloc), vec![(c, 16)], "nothing consumed");
     }
 
     #[test]
     fn try_extend_fails_when_the_adjacent_block_is_too_small() {
         let alloc = FileAllocator::new(0);
-        let a = alloc.allocate(64);
-        let b = alloc.allocate(32);
-        alloc.allocate(8);
+        let a = alloc.allocate(64, META);
+        let b = alloc.allocate(32, META);
+        alloc.allocate(8, META);
         alloc.free(b, 32, META);
 
-        assert!(!alloc.try_extend(a, 64, 40), "32 free < 40 wanted");
+        assert!(!alloc.try_extend(a, 64, 40, META), "32 free < 40 wanted");
         assert_eq!(free_blocks(&alloc), vec![(b, 32)], "nothing consumed");
     }
 
@@ -641,7 +914,7 @@ mod tests {
         let alloc = FileAllocator::new(4096);
         alloc.reset_free_list(&[block(185, 15)]);
 
-        assert_eq!(alloc.allocate(8), 192);
+        assert_eq!(alloc.allocate(8, META), 192);
         // The seven bytes before 192 stay on the list; the block ends exactly
         // where the allocation does, so there is no tail.
         assert_eq!(free_blocks(&alloc), vec![(185, 7)]);
@@ -659,7 +932,7 @@ mod tests {
         let alloc = FileAllocator::new(4096);
         alloc.reset_free_list(&[block(2038, 100)]);
 
-        assert_eq!(alloc.allocate(16), 2040);
+        assert_eq!(alloc.allocate(16, META), 2040);
         assert_eq!(free_blocks(&alloc), vec![(2038, 2), (2056, 82)]);
     }
 
@@ -672,7 +945,7 @@ mod tests {
         alloc.reset_free_list(&[block(2038, 12)]);
 
         // Ten usable bytes from 2040, and ten are asked for.
-        assert_eq!(alloc.allocate(10), 2040);
+        assert_eq!(alloc.allocate(10, META), 2040);
         assert_eq!(free_blocks(&alloc), vec![(2038, 2)]);
     }
 
@@ -683,21 +956,71 @@ mod tests {
         let alloc = FileAllocator::new(4096);
         alloc.reset_free_list(&[block(1001, 9), block(2000, 8)]);
 
-        assert_eq!(alloc.allocate(8), 2000);
+        assert_eq!(alloc.allocate(8, META), 2000);
         assert_eq!(free_blocks(&alloc), vec![(1001, 9)]);
         // Nothing left can hold eight aligned bytes, so the file grows.
-        assert_eq!(alloc.allocate(8), 4096);
+        assert_eq!(alloc.allocate(8, META), 4096);
     }
 
     #[test]
     fn freeing_nothing_is_a_no_op() {
         let alloc = FileAllocator::new(0);
-        let a = alloc.allocate(16);
+        let a = alloc.allocate(16, META);
+        alloc.allocate(8, META); // keeps `a` off the end of the file
         alloc.free(a, 0, META);
         assert!(free_blocks(&alloc).is_empty());
         // A zero-size request never consumes a free block either.
         alloc.free(a, 16, META);
-        assert_eq!(alloc.allocate(0), alloc.eof());
+        assert_eq!(alloc.allocate(0, META), alloc.eof());
         assert_eq!(free_blocks(&alloc), vec![(a, 16)]);
+    }
+
+    /// Space at the end of the file is given back to the file rather than
+    /// recorded: `H5MF__sect_simple_shrink` lowers the EOA by the whole
+    /// section, because a manager that recorded it would be naming bytes the
+    /// superblock's own end-of-file address says are not there.
+    #[test]
+    fn freeing_the_end_of_the_file_shrinks_it() {
+        let alloc = FileAllocator::new(0);
+        alloc.allocate(64, META);
+        let b = alloc.allocate(32, META);
+        alloc.free(b, 32, META);
+        assert_eq!(alloc.eof(), 64);
+        assert!(free_blocks(&alloc).is_empty());
+    }
+
+    /// The shrink takes the merged section, not the block just released:
+    /// `H5FS__sect_merge` runs before the shrink callback, so a block released
+    /// against a section that already reached the end gives back both.
+    #[test]
+    fn a_release_that_merges_into_the_end_of_the_file_shrinks_all_of_it() {
+        let alloc = FileAllocator::new(0);
+        alloc.allocate(64, META);
+        let b = alloc.allocate(32, META);
+        let c = alloc.allocate(16, META);
+        alloc.allocate(8, RAW); // raw-data space, which cannot merge with `c`
+        alloc.free(c, 16, META);
+        assert_eq!(alloc.eof(), 120, "a metadata block behind live space");
+        alloc.free(112, 8, RAW);
+        assert_eq!(alloc.eof(), 112, "only the raw-data block came back");
+        alloc.free(b, 32, META);
+        assert_eq!(alloc.eof(), 64, "the merged metadata section came back");
+        assert!(free_blocks(&alloc).is_empty());
+    }
+
+    /// A paged file gives back whole pages and keeps what is below the page
+    /// boundary, so its end stays on the grid — `H5MF__sect_large_shrink`.
+    #[test]
+    fn a_paged_file_shrinks_by_whole_pages() {
+        let page = 4096;
+        let alloc = FileAllocator::with_policy(0, SpacePolicy::Paged { page });
+        alloc.allocate(64, META); // takes page 0, records the rest of it
+        let big = alloc.allocate(3 * page, META);
+        assert_eq!(big, page);
+        assert_eq!(alloc.eof(), 4 * page);
+        // Giving back two of the three pages leaves the end on a boundary.
+        alloc.free(2 * page, 2 * page, META);
+        assert_eq!(alloc.eof(), 2 * page);
+        assert_eq!(free_blocks(&alloc), vec![(64, page - 64)]);
     }
 }

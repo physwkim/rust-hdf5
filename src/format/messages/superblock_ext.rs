@@ -182,6 +182,12 @@ const FS_ADDR_COUNT_V0: usize = 6;
 /// Maximum file-space page size libhdf5 accepts (`H5F_FILE_SPACE_PAGE_SIZE_MAX`).
 const PAGE_SIZE_MAX: u64 = 1024 * 1024 * 1024;
 
+/// Smallest file-space page size libhdf5 accepts
+/// (`H5F_FILE_SPACE_PAGE_SIZE_MIN`, H5Fprivate.h:336) — the floor
+/// `H5Pset_file_space_page_size` enforces, and what a paged file's allocation
+/// rules assume.
+pub const PAGE_SIZE_MIN: u64 = 512;
+
 /// `H5F_FILE_SPACE_PAGE_SIZE_DEF` (H5Fprivate.h:335) — the page size a file
 /// gets when nothing says otherwise, which is also the one the version-0
 /// encoding implies.

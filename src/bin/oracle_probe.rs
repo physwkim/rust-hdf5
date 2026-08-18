@@ -2527,6 +2527,30 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "fsm_persist_page" => {
+            let file = H5File::options()
+                .libver(LibverBound::Earliest)
+                .file_space(FileSpaceStrategy::Page, true, 1)
+                .create(path)?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("data")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.new_dataset::<i32>()
+                .shape([256usize])
+                .create("bulk")?
+                .write_raw(&(0..256).collect::<Vec<i32>>())?;
+            file.root_group().create_group("g")?;
+            file.close()?;
+            let file = H5File::open_rw(path)?;
+            file.delete_dataset("bulk")?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("appended")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "reopen_append_earliest" => reopen_append_case(path, LibverBound::Earliest),
         "reopen_append_v108" => reopen_append_case(path, LibverBound::V18),
         "reopen_append_latest" => reopen_append_case(path, LibverBound::V200),

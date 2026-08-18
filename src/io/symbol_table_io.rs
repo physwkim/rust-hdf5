@@ -279,8 +279,8 @@ pub(crate) fn write_stab(
     // The heap comes first so the tree's keys can name offsets in it.
     let heap_bytes = heap.as_bytes().to_vec();
     let heap_hdr_size = local_heap_header_size(sa, ss) as u64;
-    let heap_addr = allocator.allocate(heap_hdr_size);
-    let heap_data_addr = allocator.allocate(heap_bytes.len() as u64);
+    let heap_addr = allocator.allocate(heap_hdr_size, FreeSpaceClass::Metadata);
+    let heap_data_addr = allocator.allocate(heap_bytes.len() as u64, FreeSpaceClass::Metadata);
     let heap_hdr = LocalHeapHeader {
         data_size: heap_bytes.len() as u64,
         // A rebuilt heap holds exactly its objects, so there is no free block
@@ -302,7 +302,7 @@ pub(crate) fn write_stab(
         let node = SymbolTableNode {
             entries: chunk.iter().map(|(_, e)| e.clone()).collect(),
         };
-        let addr = allocator.allocate(snod_size as u64);
+        let addr = allocator.allocate(snod_size as u64, FreeSpaceClass::Metadata);
         pending.push((addr, node.encode(snod_size, sa, ss)?));
         level.push((addr, chunk[chunk.len() - 1].1.name_offset));
     }
@@ -324,7 +324,7 @@ pub(crate) fn write_stab(
         // encoded: each node stores both its siblings' addresses.
         let addrs: Vec<u64> = groups
             .iter()
-            .map(|_| allocator.allocate(node_size as u64))
+            .map(|_| allocator.allocate(node_size as u64, FreeSpaceClass::Metadata))
             .collect();
         let mut next: Vec<(u64, u64)> = Vec::with_capacity(groups.len());
         for (i, group) in groups.iter().enumerate() {

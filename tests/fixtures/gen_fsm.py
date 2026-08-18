@@ -12,10 +12,14 @@ sections block (`FSSE`).
                        writes managers for. Two managers end up populated:
                        metadata (`fs_addr[0]`) and raw data (`fs_addr[2]`),
                        because the sec2 driver's free-list map is dichotomous.
-  fsm_persist_page.h5  H5F_FSPACE_STRATEGY_PAGE, whose twelve page-typed
-                       managers and page-aligned sections this crate reads but
-                       does not write; the fixture pins that a reopen leaves
-                       such a file's managers alone.
+  fsm_persist_page.h5  H5F_FSPACE_STRATEGY_PAGE. Under the sec2 driver only
+                       three of the twelve page-typed managers can be filled —
+                       `H5MF__alloc_to_fs_type` sends every request of a page
+                       or more to `H5F_MEM_PAGE_GENERIC` unless the driver
+                       declares `H5FD_FEAT_PAGED_AGGR`, which sec2 does not —
+                       so the message names `fs_addr[0]`, `fs_addr[2]` and
+                       `fs_addr[6]`. Sections never cross a page boundary and
+                       each page holds one kind of data.
 
 The free space is real: each file is written, closed, reopened and has one
 dataset deleted, so the manager records what the delete released rather than

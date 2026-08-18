@@ -1280,9 +1280,10 @@ impl H5FileOptions {
     /// metadata/raw-data aggregators (the library default),
     /// [`FileSpaceStrategy::Aggr`] the aggregators alone, and
     /// [`FileSpaceStrategy::None`] neither, so every allocation comes from the
-    /// end of the file. [`FileSpaceStrategy::Page`] is refused: a paged file
-    /// allocates on file-space page boundaries and sorts its free sections
-    /// into twelve page-typed managers, which this writer does not model.
+    /// end of the file. [`FileSpaceStrategy::Page`] allocates on file-space
+    /// page boundaries instead, packing everything smaller than a page into
+    /// pages of its own kind; its page size is libhdf5's default of 4096,
+    /// `H5Pset_file_space_page_size` having no setter here.
     ///
     /// `persist` writes the free-space managers into the file on close, so a
     /// later session — this crate or libhdf5 — finds the space this one
