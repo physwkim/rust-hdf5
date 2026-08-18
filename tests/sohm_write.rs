@@ -352,11 +352,12 @@ fn a_created_file_shares_the_bodies_its_index_covers() {
     assert_eq!(index.mesg_types, all_three());
     assert_eq!(index.list_max, 50);
     assert_eq!(index.btree_min, 40);
-    // The dataspace every dataset has, the datatype the four that describe
-    // their own share, the attribute body, and the datatype and dataspace
-    // that body points at. `uses_named` reaches its type through the
+    // The dataspace every dataset has, the attribute body, and the datatype
+    // and dataspace that body points at. The datasets' own datatype is the
+    // predefined `H5T_STD_I32LE`, which `H5O__dtype_can_share` refuses
+    // (H5Odtype.c:1893), and `uses_named` reaches its type through the
     // committed datatype, which is shared by address instead.
-    assert_eq!(index.num_messages, 5);
+    assert_eq!(index.num_messages, 4);
 
     let bytes = std::fs::read(&path).unwrap();
     let at = index.index_addr as usize;
@@ -420,24 +421,69 @@ fn a_shared_attribute_points_at_its_own_datatype_and_dataspace() {
     cleanup(&path);
 }
 
-/// Census parity: for the construction `sohm_nested.h5` was written from,
-/// this crate's index holds the same records with the same reference counts
+/// Census parity: for the construction `sohm_list.h5` was written from, this
+/// crate's index holds the same records with the same reference counts
 /// libhdf5's does.
 ///
-/// The fixture gives its datasets a copy of `H5T_STD_I32LE` rather than the
-/// predefined type, because `H5O__dtype_can_share` refuses an immutable type
-/// (H5Odtype.c) and this crate has no notion of one — with the predefined
-/// type libhdf5 keeps the datasets' datatype literal and the two censuses
-/// would differ over something that is not about sharing at all.
+/// That fixture gives its datasets the predefined `H5T_STD_I32LE` itself,
+/// which is what `new_dataset::<i32>()` names too — and what
+/// `H5O__dtype_can_share` refuses, being immutable (H5Odtype.c:1893). So the
+/// datasets' datatype is in neither file's index, and the four records are the
+/// datasets' dataspace, the attribute body, and the datatype and dataspace
+/// that body points at.
 #[test]
 fn the_record_census_matches_libhdf5_for_the_same_construction() {
     let path = unique_tmp("parity");
     write_sohm_file(&path, all_three(), 0, 50, 40);
 
-    let theirs = census(&fixture("sohm_nested.h5"));
+    let theirs = census(&fixture("sohm_list.h5"));
     let ours = census(&path);
-    assert_eq!(theirs.len(), 5, "five records: {theirs:#?}");
+    assert_eq!(theirs.len(), 4, "four records: {theirs:#?}");
+    assert!(
+        !theirs
+            .iter()
+            .any(|(role, _)| matches!(role, Role::Datatype(t) if t.contains("FixedPoint"))),
+        "libhdf5 leaves the predefined datatype out of the index: {theirs:#?}"
+    );
     assert_eq!(ours, theirs);
+    cleanup(&path);
+}
+
+/// The other side of that rule: a datatype no predefined type matches is
+/// shared, because the libhdf5 program writing it would have had to build it
+/// with `H5Tcopy`/`H5Tset_size` and so hands `H5Dcreate2` a mutable type.
+///
+/// `sohm_nested.h5` is the fixture for this half — its datasets take
+/// `H5Tcopy(H5T_STD_I32LE)`, whose message is byte-identical to the
+/// predefined type's, so the difference is one of type state and not of
+/// bytes. This crate has no `H5Tcopy`, so the shareable case it can express
+/// is a type whose *definition* no predefined type has: an eight-byte fixed
+/// string is `H5Tcopy(H5T_C_S1)` plus `H5Tset_size` in every writer.
+#[test]
+fn a_datatype_no_predefined_type_matches_is_still_shared() {
+    let path = unique_tmp("mutable_dtype");
+    let file = H5File::options()
+        .shared_messages(&[(all_three(), 0)], 50, 40)
+        .create(&path)
+        .unwrap();
+    for i in 0..3 {
+        file.new_dataset::<u8>()
+            .datatype(DatatypeMessage::fixed_string(8))
+            .shape([2usize])
+            .create(&format!("s{i}"))
+            .unwrap();
+    }
+    file.close().unwrap();
+
+    let census = census(&path);
+    let types: Vec<&Role> = census.iter().map(|(role, _)| role).collect();
+    assert!(
+        census.iter().any(
+            |(role, refs)| matches!(role, Role::Datatype(t) if t.contains("FixedString"))
+                && *refs == 3
+        ),
+        "the fixed-string datatype is one record named by all three datasets: {types:#?}"
+    );
     cleanup(&path);
 }
 
@@ -483,15 +529,15 @@ fn run(program: impl AsRef<std::ffi::OsStr>, args: &[&str], what: &str) {
     );
 }
 
-/// h5py reads the nested file this crate wrote, and h5diff finds no
-/// difference between it and the libhdf5-written twin.
+/// h5py reads the file this crate wrote, and h5diff finds no difference
+/// between it and the libhdf5-written twin.
 ///
 /// The census test says the two files hold the same records; this says
 /// libhdf5 itself agrees about what those records mean.
 #[test]
-fn libhdf5_reads_the_nested_file_and_diffs_it_clean_against_its_twin() {
+fn libhdf5_reads_the_file_and_diffs_it_clean_against_its_twin() {
     let Some(py) = python() else { return };
-    let path = unique_tmp("h5py_nested");
+    let path = unique_tmp("h5py_readback");
     write_sohm_file(&path, all_three(), 0, 50, 40);
 
     let script = format!(
@@ -522,11 +568,45 @@ fn libhdf5_reads_the_nested_file_and_diffs_it_clean_against_its_twin() {
             &[
                 "-c",
                 path.to_str().unwrap(),
-                fixture("sohm_nested.h5").to_str().unwrap(),
+                fixture("sohm_list.h5").to_str().unwrap(),
             ],
             "h5diff against the libhdf5-written twin",
         );
     }
+    cleanup(&path);
+}
+
+/// The eligibility rule as libhdf5 itself reports it: `H5Oget_info`'s
+/// `hdr.mesg.shared` bitmask says which message classes a header holds as a
+/// shared-message pointer, and for the predefined-datatype construction the
+/// datatype bit must be clear in this crate's file exactly as it is in
+/// libhdf5's.
+///
+/// The dataspace bit is asserted too, so a rule that simply stopped sharing
+/// would fail this rather than pass it. It is checked on `shared1` rather
+/// than `shared0` because the first object is where the two writers still
+/// differ: `H5SM__write_mesg` leaves a first copy literal in the header that
+/// wrote it when that header is open, which is not the branch this crate
+/// takes (see the module docs of `src/format/sohm_write.rs`).
+#[test]
+fn h5py_sees_the_predefined_datatype_left_out_of_the_index() {
+    let Some(py) = python() else { return };
+    let path = unique_tmp("h5py_shared_mask");
+    write_sohm_file(&path, all_three(), 0, 50, 40);
+
+    let script = format!(
+        "import h5py\n\
+         DTYPE, SDSPACE, ATTR = 1 << 3, 1 << 1, 1 << 12\n\
+         for name in (r'{}', r'{}'):\n\
+         \x20   f = h5py.File(name, 'r')\n\
+         \x20   m = h5py.h5o.get_info(f['shared1'].id).hdr.mesg.shared\n\
+         \x20   assert not m & DTYPE, (name, hex(m))\n\
+         \x20   assert m & SDSPACE and m & ATTR, (name, hex(m))\n\
+         \x20   f.close()\n",
+        path.display(),
+        fixture("sohm_list.h5").display(),
+    );
+    run(py, &["-c", &script], "h5py shared-message mask check");
     cleanup(&path);
 }
 
@@ -541,7 +621,7 @@ fn a_zero_list_maximum_writes_a_btree_index() {
     let table = read_master_table(&path);
     let index = &table.indexes[0];
     assert_eq!(index.index_type, SOHM_INDEX_BTREE);
-    assert_eq!(index.num_messages, 5);
+    assert_eq!(index.num_messages, 4);
 
     let bytes = std::fs::read(&path).unwrap();
     let at = index.index_addr as usize;
