@@ -717,8 +717,8 @@ fn unshuffle(data: &[u8], bytesoftype: usize) -> Vec<u8> {
 /// Inflate one zlib stream, growing a single output buffer.
 ///
 /// The engine is zlib-rs rather than the miniz_oxide behind `flate2`: on the
-/// same level-6 streams it inflates 1.1x faster on incompressible chunks and
-/// up to 1.8x faster on text-like ones. Compression stays on miniz_oxide
+/// same level-6 streams it inflates 1.2x faster on incompressible chunks and
+/// 1.7x faster on text-like ones. Compression stays on miniz_oxide
 /// ([`apply_single_filter`]) because zlib-rs's deflate below level 9 gives up
 /// a large part of the ratio on periodic data.
 ///
