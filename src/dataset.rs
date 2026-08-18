@@ -13,7 +13,7 @@ use crate::format::messages::virtual_mapping::VirtualMapping;
 use crate::format::reference::{Reference, ReferenceTarget};
 use crate::format::selection::Selection;
 use crate::format::storage_kind::AttributeStorage;
-use crate::io::reader::ExternalFileSegment;
+use crate::io::reader::{read_image_into_new, ExternalFileSegment};
 use crate::io::writer::ChunkIndexKind;
 use crate::types::H5Type;
 
@@ -4330,44 +4330,25 @@ impl H5Dataset {
                 }
 
                 let datatype = self.datatype()?;
-                let mut raw = {
-                    let mut inner = borrow_inner_mut(&self.file_inner);
-                    match &mut *inner {
-                        H5FileInner::Reader(reader) => reader.read_dataset_raw(name)?,
-                        _ => {
-                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()));
-                        }
-                    }
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                let H5FileInner::Reader(reader) = &mut *inner else {
+                    return Err(Hdf5Error::InvalidState("file is not in read mode".into()));
                 };
-                to_host_byte_order(&mut raw, &datatype, T::element_size())?;
-
-                if raw.len() % T::element_size() != 0 {
+                let total = reader.dataset_raw_size(name)? as usize;
+                if !total.is_multiple_of(T::element_size()) {
                     return Err(Hdf5Error::TypeMismatch(format!(
-                        "raw data size {} is not a multiple of element size {}",
-                        raw.len(),
+                        "raw data size {total} is not a multiple of element size {}",
                         T::element_size(),
                     )));
                 }
 
-                let count = raw.len() / T::element_size();
-                let mut result = Vec::<T>::with_capacity(count);
-
-                // Safety: T is Copy + 'static (required by H5Type). We verified
-                // the byte count matches count * size_of::<T>() above.
-                // copy_nonoverlapping fills the memory with valid bit patterns
-                // for all H5Type implementors (numeric primitives).
-                // We call set_len AFTER the copy so that if an unexpected panic
-                // occurs, uninitialized memory is never exposed.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        raw.as_ptr(),
-                        result.as_mut_ptr() as *mut u8,
-                        raw.len(),
-                    );
-                    result.set_len(count);
-                }
-
-                Ok(result)
+                // The image is read into the vector this returns, so the
+                // bytes are touched once rather than being zeroed, read, and
+                // then copied into a second buffer of the same size.
+                read_image_into_new(total / T::element_size(), |image| {
+                    reader.read_dataset_raw_into(name, image)?;
+                    to_host_byte_order(image, &datatype, T::element_size())
+                })
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "cannot read from a dataset in write mode".into(),

@@ -1211,6 +1211,60 @@ fn alloc_tiled_fill(total: usize, fill_value: Option<&[u8]>) -> IoResult<Vec<u8>
     })
 }
 
+/// Build a `Vec<T>` of `count` elements out of the bytes `define` writes.
+///
+/// `define` receives the vector's whole byte image — `count *
+/// size_of::<T>()` bytes — and **must define every one of them** before it
+/// returns `Ok`; only then are the elements claimed. That contract is what
+/// lets a full-image read land in its destination directly: the buffer a read
+/// fills is already the buffer the caller keeps, so a 128 MiB image is
+/// touched once by the read instead of once to zero it, once to read it and
+/// once to copy it into a typed vector.
+///
+/// [`Hdf5Reader::read_dataset_raw_into_unconverted`] is the read side of that
+/// contract — it is the single owner of read-destination semantics precisely
+/// because it defines every byte of the buffer it is handed — and
+/// [`read_dataset_raw_into`](Hdf5Reader::read_dataset_raw_into) inherits it.
+///
+/// `count` on a read path comes from untrusted file fields, so the
+/// reservation is fallible: a crafted file declaring an absurd dataset size
+/// gets a clean error rather than an allocator abort.
+pub(crate) fn read_image_into_new<T, E, F>(count: usize, define: F) -> Result<Vec<T>, E>
+where
+    T: crate::types::H5Type,
+    F: FnOnce(&mut [u8]) -> Result<(), E>,
+    E: From<crate::io::IoError>,
+{
+    let too_big = || {
+        E::from(crate::io::IoError::InvalidState(format!(
+            "cannot allocate {count} elements of {} bytes for a dataset buffer \
+             (file may be corrupt)",
+            std::mem::size_of::<T>()
+        )))
+    };
+    let bytes = count
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(too_big)?;
+    let mut out: Vec<T> = Vec::new();
+    out.try_reserve_exact(count).map_err(|_| too_big())?;
+
+    // Safety: `try_reserve_exact` succeeded, so the allocation holds `bytes`
+    // contiguous bytes aligned for `T`, and `as_mut_ptr` is non-null (a
+    // dangling-but-aligned pointer with `bytes == 0`, which an empty slice
+    // permits). The slice is the only live reference to that memory while
+    // `define` runs. `define` writes every byte before returning `Ok` — its
+    // documented contract — so the elements are initialized by the time
+    // `set_len` claims them, and every byte pattern is a valid `T`, the same
+    // property of `H5Type` implementors that a typed read reinterpreting the
+    // stored image already rests on. A `define` that fails returns before
+    // `set_len`, so the vector drops empty and nothing reads the bytes it
+    // left undefined.
+    let image = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes) };
+    define(image)?;
+    unsafe { out.set_len(count) };
+    Ok(out)
+}
+
 /// Fill an existing buffer in place with the dataset's tiled fill value (or
 /// zero when no fill value is set), matching [`try_tiled_fill`]'s tiling.
 ///
@@ -3739,20 +3793,41 @@ impl Hdf5Reader {
 
     /// Logical byte size of a dataset's full image (`product(dims) *
     /// element_size`), with the datatype needed for the post-filter conversion.
-    ///
-    /// The NULL dataspace (`dataspace.is_null()`) holds zero elements — not
-    /// one, the way an empty `dims` would suggest by the same product-of-dims
-    /// arithmetic a scalar dataspace uses (`dims` is empty for both).
     fn raw_size_and_datatype(&self, name: &str) -> IoResult<(DatatypeMessage, u64)> {
         let info = self
             .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
-        let total = if info.dataspace.is_null() {
+        Ok((info.datatype.clone(), Self::raw_size_of(info)))
+    }
+
+    /// Logical byte size of `info`'s full image.
+    ///
+    /// The NULL dataspace (`dataspace.is_null()`) holds zero elements — not
+    /// one, the way an empty `dims` would suggest by the same product-of-dims
+    /// arithmetic a scalar dataspace uses (`dims` is empty for both).
+    fn raw_size_of(info: &DatasetReadInfo) -> u64 {
+        if info.dataspace.is_null() {
             0
         } else {
             saturating_byte_len(&info.dataspace.dims, info.datatype.element_size() as u64)
-        };
-        Ok((info.datatype.clone(), total))
+        }
+    }
+
+    /// Logical byte size of a dataset's full image: how many bytes
+    /// [`read_dataset_raw`](Self::read_dataset_raw) returns, and how large a
+    /// buffer [`read_dataset_raw_into`](Self::read_dataset_raw_into) needs.
+    ///
+    /// Resolved in the file that owns the dataset, so a name crossing an
+    /// external link answers with the target's size rather than an absence.
+    pub fn dataset_raw_size(&mut self, name: &str) -> IoResult<u64> {
+        if self.external_edge(name).is_some() {
+            let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
+            return owner.dataset_raw_size(&path);
+        }
+        let info = self
+            .dataset_info_local(name)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        Ok(Self::raw_size_of(info))
     }
 
     /// Read the raw bytes of a dataset.
@@ -3762,10 +3837,10 @@ impl Hdf5Reader {
             return owner.read_dataset_raw(&path);
         }
         let (datatype, total) = self.raw_size_and_datatype(name)?;
-        let mut data = alloc_tiled_fill(total as usize, None)?;
-        self.read_dataset_raw_into_unconverted(name, &mut data)?;
-        Self::apply_post_filter_conversion(&mut data, &datatype)?;
-        Ok(data)
+        read_image_into_new(total as usize, |data| {
+            self.read_dataset_raw_into_unconverted(name, data)?;
+            Self::apply_post_filter_conversion(data, &datatype)
+        })
     }
 
     /// Read the full raw dataset image into a caller-provided buffer.
