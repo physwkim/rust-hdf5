@@ -1760,7 +1760,9 @@ fn read_chunk_runs_into(
 /// the file ([`read_chunk_runs_into`]) or whether the chunk has to be read and
 /// decoded whole first ([`copy_chunk_runs`]). A filtered chunk's stored bytes
 /// have no byte-range correspondence to the dataset's, so it always reads
-/// whole. `coords[i]` is job `i`'s chunk-grid position.
+/// whole. `coords` is the packed chunk-grid position table
+/// ([`crate::io::chunk_grid::coords_table`]): job `i` sits at rank-many values
+/// from `i * rank`.
 ///
 /// `output` must already carry the tiled fill value: a chunk the plan skipped —
 /// unallocated, or outside the selection — is never written here.
@@ -1768,17 +1770,19 @@ fn place_chunk_jobs(
     handle: &FileHandle,
     pipeline: Option<&FilterPipeline>,
     mut jobs: Vec<Option<ChunkReadJob>>,
-    coords: &[impl AsRef<[u64]>],
+    coords: &[u64],
     target: ChunkTarget,
     geo: &ChunkOutputGeometry,
     output: &mut [u8],
 ) -> IoResult<()> {
-    let zeros = vec![0u64; geo.dims.len()];
+    let rank = geo.dims.len();
+    let zeros = vec![0u64; rank];
     let place = ChunkPlacement::resolve(geo, target, &zeros);
+    let at = |i: usize| &coords[i * rank..(i + 1) * rank];
     if pipeline.is_none() {
         for (i, job) in jobs.iter_mut().enumerate() {
             let Some(j) = job.as_ref() else { continue };
-            if read_chunk_runs_into(handle, j.addr, j.len, &place, coords[i].as_ref(), output) {
+            if read_chunk_runs_into(handle, j.addr, j.len, &place, at(i), output) {
                 *job = None;
             }
         }
@@ -1786,7 +1790,7 @@ fn place_chunk_jobs(
     let placed = read_and_decompress_chunks(handle, pipeline, jobs)?;
     for (i, chunk_data) in placed.iter().enumerate() {
         if let Some(data) = chunk_data {
-            copy_chunk_runs(data, output, &place, coords[i].as_ref());
+            copy_chunk_runs(data, output, &place, at(i));
         }
     }
     Ok(())
@@ -4687,7 +4691,7 @@ impl Hdf5Reader {
                 // The lone chunk spans the whole dataset; place it respecting
                 // the dataset extent (Full) or the selection (Slice) into the
                 // caller's pre-filled buffer.
-                let coords = [vec![0u64; dims.len()]];
+                let coords = vec![0u64; dims.len()];
                 let geo = ChunkOutputGeometry {
                     dims: &dims,
                     chunk_dims,
@@ -4757,16 +4761,14 @@ impl Hdf5Reader {
                 // (row-major, against the index grid) to chunk-grid
                 // coordinates, so sub-frame chunks (a chunk smaller than a
                 // full frame) land correctly.
-                let mut slot_coords = Vec::with_capacity(n_chunks);
-                for i in 0..n_chunks as u64 {
-                    slot_coords.push(crate::io::chunk_grid::coords_of(
-                        &dims,
-                        max_dims.as_deref(),
-                        chunk_dims,
-                        i,
-                    )?);
-                }
-                let chunk_coords = |i: u64| -> &[u64] { &slot_coords[i as usize] };
+                let rank = dims.len();
+                let slot_coords = crate::io::chunk_grid::coords_table(
+                    &dims,
+                    max_dims.as_deref(),
+                    chunk_dims,
+                    n_chunks,
+                )?;
+                let chunk_coords = |i: usize| -> &[u64] { &slot_coords[i * rank..(i + 1) * rank] };
 
                 // Build one read job per chunk (no I/O yet), then read +
                 // decompress them together (in parallel where positioned reads
@@ -4785,7 +4787,7 @@ impl Hdf5Reader {
                                 || nbytes == 0
                                 || addr >= file_size
                                 || nbytes > file_size
-                                || !target.overlaps(chunk_coords(i as u64), chunk_dims)
+                                || !target.overlaps(chunk_coords(i), chunk_dims)
                             {
                                 None
                             } else {
@@ -4803,9 +4805,7 @@ impl Hdf5Reader {
                         .iter()
                         .enumerate()
                         .map(|(i, &(addr, nbytes, _))| {
-                            if addr == UNDEF_ADDR
-                                || !target.overlaps(chunk_coords(i as u64), chunk_dims)
-                            {
+                            if addr == UNDEF_ADDR || !target.overlaps(chunk_coords(i), chunk_dims) {
                                 None
                             } else {
                                 Some(ChunkReadJob {
@@ -5038,16 +5038,13 @@ impl Hdf5Reader {
         // beyond the current extent still decodes to its true position and
         // then simply falls outside the read target). A zero chunk dimension
         // from a malformed layout message is rejected inside.
-        let mut slot_coords = Vec::with_capacity(chunk_entries.len());
-        for i in 0..chunk_entries.len() as u64 {
-            slot_coords.push(crate::io::chunk_grid::coords_of(
-                &dims,
-                max_dims.as_deref(),
-                chunk_dims,
-                i,
-            )?);
-        }
-        let chunk_coords = |i: u64| -> &[u64] { &slot_coords[i as usize] };
+        let slot_coords = crate::io::chunk_grid::coords_table(
+            &dims,
+            max_dims.as_deref(),
+            chunk_dims,
+            chunk_entries.len(),
+        )?;
+        let chunk_coords = |i: usize| -> &[u64] { &slot_coords[i * ndims..(i + 1) * ndims] };
 
         // Build one read job per chunk (no I/O yet). Filtered chunks carry
         // their exact compressed size (read at-most, since a zero size means
@@ -5058,9 +5055,7 @@ impl Hdf5Reader {
             .iter()
             .enumerate()
             .map(|(linear_idx, &(addr, comp_size, mask))| {
-                if addr == UNDEF_ADDR
-                    || !target.overlaps(chunk_coords(linear_idx as u64), chunk_dims)
-                {
+                if addr == UNDEF_ADDR || !target.overlaps(chunk_coords(linear_idx), chunk_dims) {
                     None
                 } else if pipeline.is_some() {
                     let read_len = if comp_size > 0 {
@@ -5154,19 +5149,16 @@ impl Hdf5Reader {
         // read from disk, so there is no "unallocated chunk" case here the
         // way a sparse index has one: `at_most: false` because
         // `H5D__none_idx_create` guarantees the whole block is present.
-        let mut slot_coords = Vec::with_capacity(chunks_total as usize);
-        for i in 0..chunks_total {
-            slot_coords.push(crate::io::chunk_grid::coords_of(
-                &dims,
-                max_dims.as_deref(),
-                chunk_dims,
-                i,
-            )?);
-        }
+        let slot_coords = crate::io::chunk_grid::coords_table(
+            &dims,
+            max_dims.as_deref(),
+            chunk_dims,
+            chunks_total as usize,
+        )?;
 
         let jobs: Vec<Option<ChunkReadJob>> = (0..chunks_total)
             .map(|i| {
-                let coords = &slot_coords[i as usize];
+                let coords = &slot_coords[i as usize * ndims..(i as usize + 1) * ndims];
                 if !target.overlaps(coords, chunk_dims) {
                     None
                 } else {
@@ -5309,7 +5301,10 @@ impl Hdf5Reader {
         // scaled (chunk-grid) offsets alongside for the scatter. For a slice,
         // chunks outside the selection become None and are never read.
         let mut jobs: Vec<Option<ChunkReadJob>> = Vec::with_capacity(entries.len());
-        let coords: Vec<&Vec<u64>> = entries.iter().map(|(_, _, scaled, _)| scaled).collect();
+        let coords: Vec<u64> = entries
+            .iter()
+            .flat_map(|(_, _, scaled, _)| scaled.iter().copied())
+            .collect();
         for (addr, read_size, scaled, mask) in &entries {
             if *addr == UNDEF_ADDR || *read_size == 0 || !target.overlaps(scaled, chunk_dims) {
                 jobs.push(None);
@@ -5386,18 +5381,18 @@ impl Hdf5Reader {
         // scaled (chunk-grid) coordinates alongside for the scatter. The
         // trailing element-size dimension offset is always 0 and is dropped.
         let mut jobs: Vec<Option<ChunkReadJob>> = Vec::with_capacity(entries.len());
-        let mut coords: Vec<Vec<u64>> = Vec::with_capacity(entries.len());
+        let mut coords: Vec<u64> = Vec::with_capacity(entries.len() * ndims);
         for (offsets, addr, chunk_size, mask) in &entries {
-            let mut scaled = Vec::with_capacity(ndims);
+            let base = coords.len();
             for d in 0..ndims {
                 let cd = chunk_dims[d];
-                scaled.push(offsets[d].checked_div(cd).unwrap_or(0));
+                coords.push(offsets[d].checked_div(cd).unwrap_or(0));
             }
             let skip = *addr == UNDEF_ADDR
                 || *chunk_size == 0
                 || *addr >= file_size
                 || *chunk_size as u64 > file_size
-                || !target.overlaps(&scaled, chunk_dims);
+                || !target.overlaps(&coords[base..], chunk_dims);
             jobs.push(if skip {
                 None
             } else {
@@ -5408,7 +5403,6 @@ impl Hdf5Reader {
                     mask: *mask,
                 })
             });
-            coords.push(scaled);
         }
 
         // Read and place each chunk N-dimensionally by its scaled offsets.
