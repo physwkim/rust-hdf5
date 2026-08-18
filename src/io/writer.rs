@@ -9059,6 +9059,18 @@ impl Hdf5Writer {
             // without an address, so only the ones written name themselves.
             info.fs_addr[placed.manager.message_slot()] = placed.hdr_addr;
         }
+        // The end of the file *after* the settle above, not before it, which
+        // the field's name denies: it is 1.10 vintage, where two EOAs were
+        // kept — one taken before the self-referential managers were placed
+        // and one after (H5MF.c:3305 and 3382 in 1.10.11) — and the message
+        // carried the first (1.10.11 H5MF.c:1833, 1999). 1.14 keeps one,
+        // `f->shared->eoa_fsm_fsalloc`, read once the allocation loop has run
+        // (H5MF.c:3234-3240) and encoded into this field by both close paths
+        // (H5MF.c:1759, 1923); H5Fsuper.c:826 names it "the final eoa". A
+        // 1.10 reader wants that value and not the older one: equal EOAs are
+        // the case `H5MF_tidy_self_referential_fsm_hack` returns on
+        // (1.10.11 H5MF.c:3620-3622), which is what leaves the managers this
+        // close wrote in place.
         info.eoa_pre_fsm_fsalloc = self.allocator.eof();
         Ok(Some(info.encode(&self.ctx)?))
     }
