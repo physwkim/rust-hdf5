@@ -68,6 +68,69 @@ pub struct VirtualMapping {
     pub virtual_selection: Selection,
 }
 
+/// A source name split around its `printf`-style block substitutions —
+/// `H5D_virtual_parse_source_name` (H5Dvirtual.c).
+///
+/// A virtual dataset whose virtual selection is unlimited and whose source
+/// selection is not draws each block of the virtual selection from a
+/// *different* source dataset, named by substituting the block index into
+/// the stored name. Only two conversions are legal: `%b`, the block index,
+/// and `%%`, an escaped literal `%`. Anything else is "invalid format
+/// specifier", and libhdf5 raises it both when the mapping is set and when
+/// the layout is loaded back out of the file, so a name that does not parse
+/// makes the dataset unopenable rather than merely unwritable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSourceName {
+    /// The literal text around the substitutions, `%%` already unescaped to
+    /// a single `%` — upstream's `H5O_storage_virtual_name_seg_t` chain.
+    /// Always exactly one longer than the substitution count, so joining the
+    /// segments with the printed block index is the whole of
+    /// `H5D__virtual_build_source_name`.
+    segments: Vec<String>,
+}
+
+impl ParsedSourceName {
+    /// How many `%b` substitutions the name carries — upstream's `nsubs`,
+    /// the quantity `H5D_virtual_check_mapping_post` tests to decide whether
+    /// a mapping is a printf mapping at all.
+    pub fn nsubs(&self) -> usize {
+        self.segments.len() - 1
+    }
+
+    /// The name block `blockno` resolves to —
+    /// `H5D__virtual_build_source_name`. With no substitutions this is the
+    /// unescaped name, which is what upstream uses for an ordinary mapping
+    /// too (`H5D__virtual_load_layout` takes `parsed_name->name_segment`,
+    /// not the stored string, whenever the name parsed into one).
+    pub fn build(&self, blockno: u64) -> String {
+        self.segments.join(&blockno.to_string())
+    }
+}
+
+/// Split a source file or dataset name around its `%b` substitutions —
+/// `H5D_virtual_parse_source_name` (H5Dvirtual.c). See [`ParsedSourceName`].
+pub fn parse_source_name(name: &str) -> FormatResult<ParsedSourceName> {
+    let mut segments = vec![String::new()];
+    let mut rest = name;
+    while let Some(pct) = rest.find('%') {
+        let (literal, tail) = rest.split_at(pct);
+        segments.last_mut().expect("never empty").push_str(literal);
+        match tail.as_bytes().get(1) {
+            Some(b'b') => segments.push(String::new()),
+            Some(b'%') => segments.last_mut().expect("never empty").push('%'),
+            _ => {
+                return Err(FormatError::InvalidData(format!(
+                    "invalid format specifier in virtual dataset source name {name:?}: only \
+                     %b (block index) and %% (escaped percent) are legal"
+                )))
+            }
+        }
+        rest = &tail[2.min(tail.len())..];
+    }
+    segments.last_mut().expect("never empty").push_str(rest);
+    Ok(ParsedSourceName { segments })
+}
+
 /// A decoded Virtual Dataset mapping list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtualMappingList {
@@ -178,6 +241,12 @@ impl VirtualMappingList {
             pos += consumed;
             let (virtual_selection, consumed) = Selection::decode(&buf[pos..])?;
             pos += consumed;
+
+            // `H5D__virtual_load_layout` parses both names as it decodes the
+            // entry, so a name with an illegal conversion fails the load
+            // rather than surfacing later as a source that cannot be found.
+            parse_source_name(&source_file_name)?;
+            parse_source_name(&source_dset_name)?;
 
             mappings.push(VirtualMapping {
                 source_file_name,
@@ -584,5 +653,65 @@ mod tests {
         buf.push(0xAB);
         let err = VirtualMappingList::decode(&buf, &ctx8()).unwrap_err();
         assert!(matches!(err, FormatError::InvalidData(_)));
+    }
+    /// `H5D_virtual_parse_source_name`: `%b` splits the name, `%%` is an
+    /// escaped literal, and anything else after a `%` is an error. The build
+    /// side is `H5D__virtual_build_source_name`.
+    #[test]
+    fn source_names_parse_and_build_the_way_libhdf5_does() {
+        for (name, nsubs, block7) in [
+            ("plain.h5", 0, "plain.h5"),
+            ("f%b.h5", 1, "f7.h5"),
+            ("%b", 1, "7"),
+            ("a%b%bc", 2, "a77c"),
+            // `%%` is a literal percent and no substitution at all, so the
+            // name a mapping resolves against is the unescaped one.
+            ("od%%d", 0, "od%d"),
+            ("%%%b%%", 1, "%7%"),
+        ] {
+            let parsed = parse_source_name(name).unwrap();
+            assert_eq!(parsed.nsubs(), nsubs, "{name}");
+            assert_eq!(parsed.build(7), block7, "{name}");
+        }
+        // Two-digit block numbers are printed in full, once per specifier.
+        assert_eq!(parse_source_name("b%b_%b").unwrap().build(123), "b123_123");
+        for bad in ["%z", "50%", "%d.h5", "%"] {
+            let err = parse_source_name(bad).unwrap_err();
+            assert!(
+                matches!(&err, FormatError::InvalidData(m) if m.contains("invalid format specifier")),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+
+    /// `H5D__virtual_load_layout` parses both names while decoding, so a
+    /// stored name with an illegal conversion makes the layout unreadable
+    /// rather than surfacing later as a source that cannot be found.
+    #[test]
+    fn decode_rejects_an_illegal_format_specifier_in_a_stored_name() {
+        let list = VirtualMappingList {
+            mappings: vec![VirtualMapping {
+                source_file_name: "src.h5".into(),
+                source_dset_name: "d".into(),
+                source_selection: Selection::All,
+                virtual_selection: Selection::All,
+            }],
+        };
+        let mut buf = list.encode(&ctx8()).unwrap();
+        // Rewrite "src.h5" as "s%z.h5" in place (same length), then fix the
+        // trailing checksum so only the name is what decode objects to.
+        let at = buf
+            .windows(6)
+            .position(|w| w == b"src.h5")
+            .expect("name is inline");
+        buf[at..at + 6].copy_from_slice(b"s%z.h5");
+        let end = buf.len() - 4;
+        let cksum = checksum_metadata(&buf[..end]);
+        buf[end..].copy_from_slice(&cksum.to_le_bytes());
+        let err = VirtualMappingList::decode(&buf, &ctx8()).unwrap_err();
+        assert!(
+            matches!(&err, FormatError::InvalidData(m) if m.contains("invalid format specifier")),
+            "{err:?}"
+        );
     }
 }

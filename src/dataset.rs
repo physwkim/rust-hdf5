@@ -513,9 +513,14 @@ impl<T: H5Type> DatasetBuilder<T> {
     /// dimension is whatever the sources reachable when it is opened supply
     /// (`H5D__virtual_set_extent_unlim`). Give it a
     /// [`max_shape`](Self::max_shape) unlimited in the same dimension, as
-    /// libhdf5 requires of the dataspace behind one. `printf`-style source
-    /// names (libhdf5's `%b` block substitution) are refused at
-    /// [`create`](Self::create) rather than written as literal text.
+    /// libhdf5 requires of the dataspace behind one.
+    ///
+    /// A source name may carry libhdf5's `printf`-style substitutions: `%b`
+    /// is the block index and `%%` an escaped literal `%`. One such mapping
+    /// stands for the family of source datasets that fill the successive
+    /// blocks of an unlimited virtual selection, so it is legal only with an
+    /// unlimited virtual selection over a limited source selection, and the
+    /// dataset's extent stops at the first block whose source is missing.
     ///
     /// ```no_run
     /// # use rust_hdf5::{H5File, Selection};
@@ -9189,11 +9194,14 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// `%` in a source name is libhdf5's printf-style block substitution, not
-    /// part of the name, so a name holding one is refused instead of written
-    /// as something the library would read back differently.
+    /// A `%b` substitution only means something when the virtual selection is
+    /// unlimited and the source selection is not: that is the shape where
+    /// each block draws from a different source dataset. On any other mapping
+    /// there is only one block, so `H5D_virtual_check_mapping_post` refuses
+    /// the specifier — and an illegal conversion is refused wherever it
+    /// appears.
     #[test]
-    fn a_printf_style_source_name_is_refused() {
+    fn a_printf_source_name_needs_the_mapping_shape_that_uses_it() {
         use crate::Selection;
         let path = temp_path("vds_printf");
         let file = H5File::create(&path).unwrap();
@@ -9204,12 +9212,90 @@ mod tests {
                 .virtual_mapping(Selection::All, f, d, Selection::All)
                 .create("vds")
             {
-                Ok(_) => panic!("'%' in a source name is a printf specifier to libhdf5"),
+                Ok(_) => panic!("a bounded mapping has one block, so %b names nothing"),
                 Err(e) => e.to_string(),
             };
-            assert!(err.contains("printf"), "{err}");
+            assert!(err.contains("printf specifier"), "{err}");
         }
+        // `%z` is not a conversion libhdf5 has, in any mapping shape.
+        let err = match file
+            .new_dataset::<i32>()
+            .shape([1usize, 2])
+            .max_shape(&[None, Some(2)])
+            .virtual_mapping(unlimited_rows(), "src_%z.h5", "src", Selection::All)
+            .create("vds_bad")
+        {
+            Ok(_) => panic!("%z is not a legal conversion"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("invalid format specifier"), "{err}");
         file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A printf mapping stitches one source dataset per block of its
+    /// unlimited virtual selection, and the extent stops at the first block
+    /// with no source (`H5D__virtual_set_extent_unlim`'s printf arm, at the
+    /// default `H5D_VDS_LAST_AVAILABLE` view and `printf_gap` 0).
+    #[test]
+    fn a_printf_mapping_stitches_one_source_per_block() {
+        use crate::Selection;
+        let path = temp_path("vds_printf_blocks");
+        {
+            let file = H5File::create(&path).unwrap();
+            for (b, base) in [(0, 0i32), (1, 100), (3, 300)] {
+                file.new_dataset::<i32>()
+                    .shape([2usize])
+                    .create(&format!("block{b}"))
+                    .unwrap()
+                    .write_raw(&[base, base + 1])
+                    .unwrap();
+            }
+            file.new_dataset::<i32>()
+                .shape([1usize, 2])
+                .max_shape(&[None, Some(2)])
+                .virtual_mapping(unlimited_rows(), ".", "block%b", Selection::All)
+                .create("vds")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("vds").unwrap();
+        // `block2` is missing, so `block3` is never reached: two rows.
+        assert_eq!(ds.shape(), vec![2, 2]);
+        assert_eq!(ds.read_raw::<i32>().unwrap(), vec![0, 1, 100, 101]);
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `%%` is an escaped literal `%`, not a substitution: the mapping is an
+    /// ordinary bounded one, and the source it resolves against is the name
+    /// with a single `%` in it.
+    #[test]
+    fn an_escaped_percent_is_a_literal_in_a_source_name() {
+        use crate::Selection;
+        let path = temp_path("vds_escaped_pct");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .create("od%d")
+                .unwrap()
+                .write_raw(&[5i32, 6, 7, 8])
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .virtual_mapping(Selection::All, ".", "od%%d", Selection::All)
+                .create("vds")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("vds").unwrap();
+        assert_eq!(ds.read_raw::<i32>().unwrap(), vec![5, 6, 7, 8]);
+        // The stored name keeps its escape; only the resolution unescapes.
+        assert_eq!(ds.virtual_mappings().unwrap()[0].source_dset_name, "od%%d");
+        drop(file);
         std::fs::remove_file(&path).ok();
     }
 

@@ -4669,6 +4669,137 @@ fn vds_unlimited_mapping_written_by_rust_read_by_h5py() {
     std::fs::remove_file(&src_path).ok();
 }
 
+/// Virtual dataset with a printf source name (h5py -> rust): one mapping
+/// stands for a whole family of source datasets, `%b` in the file name
+/// substituting the index of the block of the unlimited virtual selection it
+/// fills (`H5D_virtual_parse_source_name` /
+/// `H5D__virtual_build_source_name`, H5Dvirtual.c). The sources are rank-1
+/// and the virtual selection rank-2, which `H5S_select_shape_same` allows
+/// because the extra leading dimension is flat.
+///
+/// `HDF5_VDS_PREFIX=${ORIGIN}` is what makes the relative pattern resolve
+/// against the VDS file's own directory, the same way the oracle's VDS cases
+/// are run.
+#[test]
+fn vds_printf_source_name_readable_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("vds_printf");
+    let dir = path.parent().unwrap().to_path_buf();
+    let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
+    let block = |b: usize| dir.join(format!("{stem}_b{b}.h5"));
+    // Blocks 0, 1 and 3: the gap at 2 stops the extent at two rows, since
+    // `printf_gap` defaults to 0.
+    for b in [0usize, 1, 3] {
+        write_with_h5py(
+            py,
+            &block(b),
+            &format!(
+                "f.create_dataset('data', data=np.arange(4, dtype='<i4') + {})\n",
+                10 * b
+            ),
+        );
+    }
+    write_with_h5py(
+        py,
+        &path,
+        &format!(
+            "layout = h5py.VirtualLayout(shape=(1, 4), dtype='<i4', maxshape=(None, 4))\n\
+             vsrc = h5py.VirtualSource('{stem}_b%b.h5', 'data', shape=(4,))\n\
+             layout[:h5py.h5s.UNLIMITED, :] = vsrc\n\
+             f.create_virtual_dataset('vds', layout)\n"
+        ),
+    );
+    std::env::set_var("HDF5_VDS_PREFIX", "${ORIGIN}");
+    {
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("vds").unwrap();
+        assert_eq!(ds.shape(), vec![2, 4]);
+        assert_eq!(
+            ds.read_raw::<i32>().unwrap(),
+            vec![0, 1, 2, 3, 10, 11, 12, 13]
+        );
+        // The stored mapping keeps the pattern; only the resolution expands it.
+        let mappings = ds.virtual_mappings().unwrap();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].source_file_name, format!("{stem}_b%b.h5"));
+    }
+    std::env::remove_var("HDF5_VDS_PREFIX");
+    std::fs::remove_file(&path).ok();
+    for b in [0usize, 1, 3] {
+        std::fs::remove_file(block(b)).ok();
+    }
+}
+
+/// Virtual dataset with a printf source name (rust -> h5py): the mirror.
+/// libhdf5 must accept the mapping `H5Pset_virtual` would have built —
+/// unlimited virtual selection, limited source selection, `%b` in the source
+/// file name — and stitch the same rows out of it.
+#[test]
+fn vds_printf_source_name_written_by_rust_read_by_h5py() {
+    let Some(py) = python() else { return };
+    let path = tmp("vds_printf_w");
+    let dir = path.parent().unwrap().to_path_buf();
+    let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
+    let block = |b: usize| dir.join(format!("{stem}_b{b}.h5"));
+    for b in [0usize, 1, 2] {
+        let file = H5File::create(block(b)).unwrap();
+        file.new_dataset::<i32>()
+            .shape([4usize])
+            .create("data")
+            .unwrap()
+            .write_raw(&(0..4i32).map(|i| i + 10 * b as i32).collect::<Vec<_>>())
+            .unwrap();
+        file.close().unwrap();
+    }
+    let pattern = dir.join(format!("{stem}_b%b.h5"));
+    let unlim_rows = Selection::Hyperslab {
+        rank: 2,
+        form: Hyperslab::Regular(RegularHyperslab {
+            start: vec![0, 0],
+            stride: vec![1, 1],
+            count: vec![rust_hdf5::format::selection::UNLIMITED, 1],
+            block: vec![1, 4],
+        }),
+    };
+    {
+        let file = H5File::create(&path).unwrap();
+        file.new_dataset::<i32>()
+            .shape([1usize, 4])
+            .max_shape(&[None, Some(4)])
+            .virtual_mapping(
+                unlim_rows,
+                pattern.to_str().unwrap(),
+                "data",
+                Selection::All,
+            )
+            .create("vds")
+            .unwrap();
+        file.close().unwrap();
+    }
+    read_back_with_h5py(
+        py,
+        &path,
+        "d = f['vds']\n\
+         assert d.is_virtual, 'not virtual'\n\
+         assert d.shape == (3, 4), d.shape\n\
+         want = [0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23]\n\
+         assert list(d[...].ravel()) == want, list(d[...].ravel())\n",
+    );
+    {
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("vds").unwrap();
+        assert_eq!(ds.shape(), vec![3, 4]);
+        assert_eq!(
+            ds.read_raw::<i32>().unwrap(),
+            vec![0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23]
+        );
+    }
+    std::fs::remove_file(&path).ok();
+    for b in [0usize, 1, 2] {
+        std::fs::remove_file(block(b)).ok();
+    }
+}
+
 /// A virtual dataset survives a reopen that rewrites the file around it.
 ///
 /// Its layout is one this writer creates but does not rebuild from a file, so

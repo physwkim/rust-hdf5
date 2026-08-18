@@ -92,4 +92,4 @@ Conflict hotspots: `src/io/reader.rs` (2,3,4,5), `src/io/writer.rs` (2,3,4),
   `H5File::dataset()` name convention
 - `src/io/reader.rs` internal test module's hardcoded macOS `TEST_PYTHON`
   (ignores `RUST_HDF5_TEST_PYTHON`)
-- EFL `H5O_EFL_UNLIMITED` slot; VDS printf-pattern mappings
+- EFL `H5O_EFL_UNLIMITED` slot

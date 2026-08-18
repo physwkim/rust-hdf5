@@ -41,7 +41,9 @@ use crate::format::messages::group_info::GroupInfoMessage;
 use crate::format::messages::link::{CharacterSet, LinkMessage, LinkTarget};
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::superblock_ext::SharedMessageTableMessage;
-use crate::format::messages::virtual_mapping::{VirtualMapping, VirtualMappingList};
+use crate::format::messages::virtual_mapping::{
+    parse_source_name, VirtualMapping, VirtualMappingList,
+};
 use crate::format::messages::*;
 use crate::format::object_header::{ObjectHeader, ObjectTimes, MAX_MESSAGE_SIZE};
 use crate::format::reference::encode_object_element;
@@ -665,27 +667,6 @@ impl ContiguousTarget {
 /// that covers it into the source dataset holding it (`H5D__virtual_write`);
 /// this writer never opens a source file, so it refuses rather than dropping
 /// the bytes somewhere they cannot be read back from.
-/// Refuse a virtual-dataset source name libhdf5 would read as a `printf`
-/// pattern rather than as the name itself.
-///
-/// `H5D_virtual_parse_source_name` splits a source file or dataset name on
-/// every `%`: `%b` substitutes the mapping's block index (one mapping then
-/// stands for a whole family of source datasets) and `%%` is an escaped
-/// literal. So a name holding a `%` cannot be written verbatim — libhdf5
-/// would read back something else, or reject the specifier outright — and
-/// this writer builds no pattern of its own.
-fn reject_printf_source_name(dataset: &str, what: &str, name: &str) -> IoResult<()> {
-    if name.contains('%') {
-        return Err(crate::io::IoError::Unsupported(format!(
-            "virtual dataset '{dataset}' names the source {what} '{name}', whose '%' \
-             libhdf5 reads as a printf-style specifier (`%b` substitutes the block \
-             index); this writer emits names literally and does not build pattern \
-             mappings"
-        )));
-    }
-    Ok(())
-}
-
 /// The legality checks `H5Pset_virtual` runs over one mapping —
 /// `H5D_virtual_check_mapping_pre` and `H5D_virtual_check_mapping_post`
 /// (H5Dvirtual.c).
@@ -730,19 +711,37 @@ fn check_virtual_mapping(dataset: &str, m: &VirtualMapping) -> IoResult<()> {
         }
     }
 
-    // The other half of `H5D_virtual_check_mapping_post`: an unlimited
-    // virtual selection over a limited source selection is the printf shape,
-    // where each block of the virtual selection is filled by a *different*
-    // source dataset named by substitution. Without a `%b` in either source
-    // name there is no second dataset for the second block, and upstream
-    // refuses the mapping outright.
+    // `H5D_virtual_check_mapping_post`: an unlimited virtual selection over a
+    // limited source selection is the printf shape, where each block of the
+    // virtual selection is filled by a *different* source dataset named by
+    // substituting that block's index. It needs a `%b` to name them, and a
+    // hyperslab virtual selection to have blocks at all; every other shape
+    // needs the opposite, since a substitution with only one block to fill
+    // has nothing to vary over.
+    let nsubs = parse_source_name(&m.source_file_name)
+        .and_then(|f| Ok(f.nsubs() + parse_source_name(&m.source_dset_name)?.nsubs()))
+        .map_err(|e| {
+            crate::io::IoError::InvalidState(format!(
+                "virtual dataset '{dataset}' source name: {e}"
+            ))
+        })?;
     if unlim_virtual && !unlim_source {
+        if nsubs == 0 {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "virtual dataset '{dataset}' has an unlimited virtual selection, a limited \
+                 source selection, and no printf specifiers in source names"
+            )));
+        }
+        if !matches!(m.virtual_selection, Selection::Hyperslab { .. }) {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "virtual dataset '{dataset}' has a printf mapping whose virtual selection is \
+                 not a hyperslab; the substitution runs over the blocks of that hyperslab"
+            )));
+        }
+    } else if nsubs > 0 {
         return Err(crate::io::IoError::InvalidState(format!(
-            "virtual dataset '{dataset}' has an unlimited virtual selection over a limited \
-             source selection, which H5D_virtual_check_mapping_post only accepts with a \
-             printf substitution in a source name (\"unlimited virtual selection, limited \
-             source selection, and no printf specifiers in source names\") — and a printf \
-             source name is refused here"
+            "virtual dataset '{dataset}' has printf specifier(s) in source name(s) without \
+             an unlimited virtual selection and limited source selection"
         )));
     }
     Ok(())
@@ -8671,10 +8670,10 @@ impl Hdf5Writer {
     /// An unlimited (`H5S_UNLIMITED`) selection is written as one: the
     /// mapping grows with its source, and the virtual dataset's extent in
     /// that dimension is whatever the sources reachable at read time supply
-    /// (`H5D__virtual_set_extent_unlim`). What `H5Pset_virtual` takes and
-    /// this does not is a `printf`-style source name (`%b` block
-    /// substitution, which turns one mapping into a family of them), refused
-    /// rather than written as literal text.
+    /// (`H5D__virtual_set_extent_unlim`). A `printf`-style source name is
+    /// written as one too: `%b` substitutes the block index, so one mapping
+    /// stands for the family of source datasets that fill the successive
+    /// blocks of an unlimited virtual selection.
     pub fn create_virtual_dataset(
         &self,
         name: &str,
@@ -8690,8 +8689,6 @@ impl Hdf5Writer {
             )));
         }
         for m in mappings {
-            reject_printf_source_name(name, "file", &m.source_file_name)?;
-            reject_printf_source_name(name, "dataset", &m.source_dset_name)?;
             check_virtual_mapping(name, m)?;
         }
 

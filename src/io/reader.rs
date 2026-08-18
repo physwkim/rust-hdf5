@@ -33,7 +33,9 @@ use crate::format::messages::shared::MSG_FLAG_SHARED;
 use crate::format::messages::superblock_ext::{
     BtreeKMessage, DriverInfoMessage, FileSpaceInfoMessage, SharedMessageTableMessage,
 };
-use crate::format::messages::virtual_mapping::{VirtualMapping, VirtualMappingList};
+use crate::format::messages::virtual_mapping::{
+    parse_source_name, VirtualMapping, VirtualMappingList,
+};
 use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
 use crate::format::reference::{
@@ -214,7 +216,20 @@ pub enum MappingResolution {
     /// dataset's own extent in its unlimited source dimension — the two
     /// values `H5S_hyper_clip_unlim` clips the mapping's selections to.
     Unlimited { virtual_clip: u64, source_clip: u64 },
+    /// A printf mapping (unlimited virtual selection, limited source
+    /// selection, `%b` in a source name): `blocks` source datasets were
+    /// found, filling blocks `0..blocks` of the virtual selection.
+    /// Upstream's `first_missing` — it stops at the first block whose source
+    /// is absent, plus `printf_gap` more (`H5D_ACS_VDS_PRINTF_GAP_DEF` is 0,
+    /// and it is a dataset-access property never stored in the file).
+    Printf { blocks: u64 },
 }
+
+/// `H5D_ACS_VDS_PRINTF_GAP_DEF`: how many consecutive missing printf source
+/// datasets a reader looks past before it stops. `H5Pset_virtual_printf_gap`
+/// sets a *dataset access* property, never written to the file, so a reader
+/// opening a file it did not create always sees this default.
+const PRINTF_GAP: u64 = 0;
 
 /// The class of one link record in a group: what `H5Lget_info` reports,
 /// carrying the value `H5Lget_val` returns for the classes that have one.
@@ -1162,12 +1177,44 @@ fn concrete_virtual_mappings(
             }) => out.push(VirtualMapping {
                 virtual_selection: m.virtual_selection.clip_unlimited(*virtual_clip)?,
                 source_selection: m.source_selection.clip_unlimited(*source_clip)?,
-                ..m.clone()
+                ..built_names(m, 0)?
             }),
-            _ => out.push(m.clone()),
+            // One printf mapping is a whole family: block `j` of the virtual
+            // selection (`H5S_hyper_get_unlim_block`) is filled by the source
+            // dataset whose name substitutes `j`, taking the mapping's whole
+            // (limited) source selection.
+            Some(MappingResolution::Printf { blocks }) => {
+                let Some(r) = regular_hyperslab(&m.virtual_selection) else {
+                    continue;
+                };
+                let rank = r.start.len();
+                for j in 0..*blocks {
+                    out.push(VirtualMapping {
+                        virtual_selection: Selection::Hyperslab {
+                            rank,
+                            form: Hyperslab::Regular(r.unlim_block(j)),
+                        },
+                        ..built_names(m, j)?
+                    });
+                }
+            }
+            _ => out.push(built_names(m, 0)?),
         }
     }
     Ok(out)
+}
+
+/// One mapping with both source names built for block `blockno` —
+/// `H5D__virtual_build_source_name`. A mapping with no substitutions still
+/// goes through this, because that is where `%%` is unescaped: upstream uses
+/// the parsed name rather than the stored one for an ordinary mapping too
+/// (`H5D__virtual_load_layout`).
+fn built_names(m: &VirtualMapping, blockno: u64) -> IoResult<VirtualMapping> {
+    Ok(VirtualMapping {
+        source_file_name: parse_source_name(&m.source_file_name)?.build(blockno),
+        source_dset_name: parse_source_name(&m.source_dset_name)?.build(blockno),
+        ..m.clone()
+    })
 }
 
 /// Recursion bound for open-time virtual-extent resolution.
@@ -1211,43 +1258,32 @@ fn regular_hyperslab(sel: &Selection) -> Option<&RegularHyperslab> {
     }
 }
 
-/// Detect a printf-style `%b` block-index substitution pattern in a
-/// virtual dataset source name (`H5D_virtual_parse_source_name`,
-/// H5Dvirtual.c) — used for unlimited/growable mappings whose source
-/// expands across a sequence of files or datasets indexed by block
-/// number. `%%` is an escaped literal percent, not a pattern; any other
-/// `%`-led sequence (including `%b` itself) marks a name this reader does
-/// not resolve.
-fn has_virtual_printf_pattern(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'%' {
-                i += 2;
-                continue;
-            }
-            return true;
-        }
-        i += 1;
-    }
-    false
-}
-
 /// Read each of `source_boxes` (via `read_source_box`) and scatter it into
 /// `out` (shaped `virtual_dims`) at the same-indexed box in
 /// `virtual_boxes`.
 ///
-/// The two box lists must have equal length with identical per-dimension
-/// `count` at each index — H5S requires a mapping's source and virtual
-/// selections to select the same number of points, and this is the
-/// well-defined case where they also decompose into the same box shapes
-/// in the same order (every selection form h5py's `VirtualLayout` writes,
-/// and any hand-built mapping whose two sides were selected the same way).
-/// A mapping whose selections diverge beyond that — same point count but a
-/// different box decomposition on each side — would need the general
-/// element-by-element linear-order match H5S's own iterator does; rather
-/// than risk a silently wrong scatter, that case is rejected here.
+/// The two box lists must have equal length, and each pair of boxes must be
+/// the same shape under `H5S_select_shape_same` (H5Sselect.c) — which
+/// compares the two from the fast end and requires the extra *leading*
+/// dimensions of the higher-rank side to be flat, so a rank-1 source box
+/// legitimately fills a rank-2 virtual box of the same trailing shape (the
+/// usual printf-mapping arrangement: one 1-D dataset per row of a 2-D
+/// virtual dataset). A mapping whose selections diverge beyond that — same
+/// point count but a different box decomposition on each side — would need
+/// the general element-by-element linear-order match H5S's own iterator
+/// does; rather than risk a silently wrong scatter, that case is rejected
+/// here.
+/// Whether two boxes select the same elements in the same order —
+/// `H5S_select_shape_same`'s rule (H5Sselect.c), which aligns the two shapes
+/// at their fast end and requires every extra leading dimension of the
+/// higher-rank side to be flat.
+fn shape_same(a: &[u64], b: &[u64]) -> bool {
+    let common = a.len().min(b.len());
+    a[a.len() - common..] == b[b.len() - common..]
+        && a[..a.len() - common].iter().all(|&d| d == 1)
+        && b[..b.len() - common].iter().all(|&d| d == 1)
+}
+
 fn copy_matched_boxes(
     mut read_source_box: impl FnMut(&[u64], &[u64], &mut [u8]) -> IoResult<()>,
     source_boxes: &[(Vec<u64>, Vec<u64>)],
@@ -1265,7 +1301,7 @@ fn copy_matched_boxes(
         )));
     }
     for ((src_start, src_count), (dst_start, dst_count)) in source_boxes.iter().zip(virtual_boxes) {
-        if src_count != dst_count {
+        if !shape_same(src_count, dst_count) {
             return Err(crate::io::IoError::InvalidState(format!(
                 "virtual dataset mapping's source box shape {src_count:?} does not match its \
                  virtual box shape {dst_count:?}, which is not supported"
@@ -1275,12 +1311,14 @@ fn copy_matched_boxes(
         let mut buf = alloc_tiled_fill(nbytes, None)?;
         read_source_box(src_start, src_count, &mut buf)?;
 
-        let src_dims = src_count.clone();
-        let src_origin = vec![0u64; src_count.len()];
+        // `buf` holds the box in source linear order, and shape-same boxes
+        // differ only by flat leading dimensions, so it can be walked at the
+        // virtual box's own rank.
+        let src_origin = vec![0u64; dst_count.len()];
         for_each_dual_run(
             virtual_dims,
             dst_start,
-            &src_dims,
+            dst_count,
             &src_origin,
             dst_count,
             element_size,
@@ -3381,6 +3419,27 @@ impl Hdf5Reader {
                         source_clip,
                     }
                 }
+                // Unlimited virtual selection, limited source selection:
+                // the printf shape, where the successive blocks of the
+                // virtual selection come from successively-named source
+                // datasets.
+                (Some(vd), None) => {
+                    let blocks = self.printf_blocks_present(m);
+                    let virtual_clip = match (blocks, regular_hyperslab(&m.virtual_selection)) {
+                        (0, _) | (_, None) => 0,
+                        // `H5D__virtual_set_extent_unlim`'s printf arm under
+                        // the default view: the extent ends just past the
+                        // last block that has a source.
+                        (n, Some(r)) => {
+                            let last = r.unlim_block(n - 1);
+                            last.start[vd] + last.block[vd]
+                        }
+                    };
+                    if new_dims[vd].is_none_or(|d| virtual_clip > d) {
+                        new_dims[vd] = Some(virtual_clip);
+                    }
+                    MappingResolution::Printf { blocks }
+                }
                 _ => MappingResolution::Bounded,
             };
             if let Some((_, hi)) = m.virtual_selection.bounds() {
@@ -3407,33 +3466,59 @@ impl Hdf5Reader {
     /// closed, which upstream reads as "no data there yet" rather than an
     /// error.
     fn virtual_source_dims(&mut self, m: &VirtualMapping) -> IoResult<Option<Vec<u64>>> {
-        let source_name = m.source_dset_name.trim_start_matches('/');
-        if m.source_file_name == "." {
-            return Ok(self
-                .dataset_info_local(source_name)
-                .map(|i| i.dataspace.dims.clone()));
+        let m = built_names(m, 0)?;
+        Ok(self.source_dims(&m.source_file_name, &m.source_dset_name))
+    }
+
+    /// How many of a printf mapping's source datasets exist, counting from
+    /// block 0 — upstream's `first_missing` (`H5D__virtual_set_extent_unlim`),
+    /// which stops at the first block whose source cannot be opened and looks
+    /// [`PRINTF_GAP`] blocks past it before giving up.
+    fn printf_blocks_present(&mut self, m: &VirtualMapping) -> u64 {
+        let mut first_missing = 0u64;
+        let mut j = 0u64;
+        while j <= PRINTF_GAP + first_missing {
+            let Ok(built) = built_names(m, j) else {
+                break;
+            };
+            if self
+                .source_dims(&built.source_file_name, &built.source_dset_name)
+                .is_some()
+            {
+                first_missing = j + 1;
+            }
+            j += 1;
+        }
+        first_missing
+    }
+
+    /// The extent of one named source dataset, or `None` when the file or
+    /// the dataset in it cannot be opened.
+    fn source_dims(&mut self, file_name: &str, dset_name: &str) -> Option<Vec<u64>> {
+        let dset_name = dset_name.trim_start_matches('/');
+        if file_name == "." {
+            return self
+                .dataset_info_local(dset_name)
+                .map(|i| i.dataspace.dims.clone());
         }
         let prefix = resolve_vdsfile_prefix(&self.source_dir);
-        let full_path = combine_prefixed_path(prefix.as_deref(), &m.source_file_name);
-        let Ok(mut reader) = Hdf5Reader::open_with_locking(&full_path, FileLocking::Disabled)
-        else {
-            return Ok(None);
-        };
-        Ok(reader
-            .dataset_info(source_name)
-            .map(|i| i.dataspace.dims.clone()))
+        let full_path = combine_prefixed_path(prefix.as_deref(), file_name);
+        let mut reader = Hdf5Reader::open_with_locking(&full_path, FileLocking::Disabled).ok()?;
+        reader
+            .dataset_info(dset_name)
+            .map(|i| i.dataspace.dims.clone())
     }
 
     /// Fill `out` (shaped like the virtual dataset's own extent) by
     /// stitching each mapping's source bytes in order (`H5D__virtual_read`,
     /// H5Dvirtual.c). `out` must already be pre-filled with the tiled fill
     /// value — every element no mapping covers is left exactly as the
-    /// caller filled it, matching the fixed-extent default of
-    /// `H5Pset_virtual_view` (`H5D_VDS_LAST_AVAILABLE`/`FIRST_MISSING` only
-    /// change how an *unlimited* mapping's extent is computed, which this
-    /// reader does not support — see [`has_virtual_printf_pattern`]).
-    /// Mappings apply in list order, so a later mapping's bytes win over an
-    /// earlier one's on overlap, exactly like the C reader.
+    /// caller filled it. Mappings apply in list order, so a later mapping's
+    /// bytes win over an earlier one's on overlap, exactly like the C
+    /// reader; an unlimited or printf mapping has already been replaced by
+    /// the concrete mappings its open-time resolution made it
+    /// (`H5D_VDS_LAST_AVAILABLE`, the default view — see
+    /// [`Hdf5Reader::resolve_virtual_extents`]).
     ///
     /// `depth` counts virtual-dataset nesting — a mapping whose source is
     /// itself a virtual dataset, possibly in another file — so a crafted
@@ -3469,16 +3554,6 @@ impl Hdf5Reader {
             std::collections::HashMap::new();
 
         for mapping in &mappings {
-            if has_virtual_printf_pattern(&mapping.source_file_name)
-                || has_virtual_printf_pattern(&mapping.source_dset_name)
-            {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "dataset {name:?}: virtual mapping to {:?}/{:?} uses a printf-style \
-                     (%b) unlimited source name pattern, which is not supported",
-                    mapping.source_file_name, mapping.source_dset_name
-                )));
-            }
-
             let virtual_boxes = mapping.virtual_selection.to_boxes(&dims).map_err(|e| {
                 crate::io::IoError::InvalidState(format!(
                     "dataset {name:?}: virtual mapping's virtual selection is not \
