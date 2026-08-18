@@ -51,6 +51,17 @@
 
 ### Performance
 
+- A filtered chunk whose bytes land whole and contiguous in a read's
+  output — every full chunk of a full read — now decodes straight into
+  those output bytes instead of into a buffer of its own that was then
+  copied out, which is the shape the unfiltered read already had. The
+  chunks that do need scattering decode into an image sized from the
+  chunk shape rather than one grown to it by doubling. On the
+  `perf/run.py` deflate-read workload (64 MiB of f64 in 2 MiB chunks at
+  level 6) that is 54 ms down to 23 ms against libhdf5 1.14.6's 46 ms,
+  and a selection that stages every chunk instead goes from 39 ms to
+  36 ms. Read results are unchanged, byte for byte.
+
 - A hyperslab read of an unfiltered chunked dataset now reads only the
   byte ranges the selection intersects, as libhdf5 does, instead of every
   overlapping chunk whole: the 1000 64 KiB slices of a 128 MiB dataset
