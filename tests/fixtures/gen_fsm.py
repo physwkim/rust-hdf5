@@ -17,9 +17,11 @@ sections block (`FSSE`).
                        `H5MF__alloc_to_fs_type` sends every request of a page
                        or more to `H5F_MEM_PAGE_GENERIC` unless the driver
                        declares `H5FD_FEAT_PAGED_AGGR`, which sec2 does not —
-                       so the message names `fs_addr[0]`, `fs_addr[2]` and
-                       `fs_addr[6]`. Sections never cross a page boundary and
-                       each page holds one kind of data.
+                       but this file's delete leaves only sub-page sections,
+                       so the message names `fs_addr[0]` and `fs_addr[2]` and
+                       the generic slot (`fs_addr[6]`) stays undefined.
+                       Sections never cross a page boundary and each page
+                       holds one kind of data.
 
 The free space is real: each file is written, closed, reopened and has one
 dataset deleted, so the manager records what the delete released rather than
