@@ -777,11 +777,24 @@ def write_report(results, gaps, meta, md_path, json_path):
     L.append("## Direction B expected deviations")
     L.append("")
     if not expected:
+        gated = len(EXPECTED_DEVIATIONS) - len(declared_deviations())
+        if gated:
+            version = ".".join(str(n) for n in hdf5_version_tuple())
+            why = (
+                "no `EXPECTED_DEVIATIONS` entry (oracle/run.py) applies to "
+                "libhdf5 %s — %s scoped to a later one"
+                % (
+                    version,
+                    "1 entry is" if gated == 1 else "%d entries are" % gated,
+                )
+            )
+        else:
+            why = "`EXPECTED_DEVIATIONS` (oracle/run.py) is empty"
         L.append(
-            "None: `EXPECTED_DEVIATIONS` (oracle/run.py) is empty, so every "
-            "case in this run describes itself the way libhdf5 describes the "
-            "same file. Any metadata deviation from here on matches no entry "
-            "and is reported as unexpected below."
+            "None: %s, so every case in this run describes itself the way "
+            "libhdf5 describes the same file. Any metadata deviation from "
+            "here on matches no entry and is reported as unexpected below."
+            % why
         )
     else:
         L.append(
