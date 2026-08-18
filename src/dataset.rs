@@ -9415,6 +9415,58 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// A mapping whose source cannot be opened reads back as the fill value,
+    /// not as an error: `H5D__virtual_open_source_dset` accepts a null source
+    /// file and clears the error stack for a missing source dataset
+    /// (H5Dvirtual.c:877-909), so `H5D__virtual_read_one` finds no projected
+    /// memory space and reads nothing for it (H5Dvirtual.c:2661-2665).
+    #[test]
+    fn a_source_that_cannot_be_opened_reads_as_the_fill_value() {
+        use crate::{Hyperslab, HyperslabBlock, Selection};
+        let block = |start: u64, end: u64| Selection::Hyperslab {
+            rank: 1,
+            form: Hyperslab::Blocks(vec![HyperslabBlock {
+                start: vec![start],
+                end: vec![end],
+            }]),
+        };
+        let path = temp_path("vds_absent_source");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .create("here")
+                .unwrap()
+                .write_raw(&[1i32, 2, 3, 4])
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([12usize])
+                .fill_value(-3i32)
+                .virtual_mapping(block(0, 3), ".", "here", block(0, 3))
+                // A dataset that is not in this file.
+                .virtual_mapping(block(4, 7), ".", "absent", block(0, 3))
+                // A file that does not exist beside this one.
+                .virtual_mapping(block(8, 11), "no_such_vds_source.h5", "src", block(0, 3))
+                .create("vds")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("vds").unwrap();
+        assert_eq!(
+            ds.read_raw::<i32>().unwrap(),
+            vec![1, 2, 3, 4, -3, -3, -3, -3, -3, -3, -3, -3]
+        );
+        // The same rule on the slice path, which stitches the whole image
+        // before extracting the region.
+        assert_eq!(
+            ds.read_slice::<i32>(&[2], &[6]).unwrap(),
+            vec![3, 4, -3, -3, -3, -3]
+        );
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
     /// `%%` is an escaped literal `%`, not a substitution: the mapping is an
     /// ordinary bounded one, and the source it resolves against is the name
     /// with a single `%` in it.

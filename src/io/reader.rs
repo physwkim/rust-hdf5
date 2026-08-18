@@ -3505,6 +3505,17 @@ impl Hdf5Reader {
     /// (`H5D_VDS_LAST_AVAILABLE`, the default view — see
     /// [`Hdf5Reader::resolve_virtual_extents`]).
     ///
+    /// A mapping whose source cannot be opened — the file is absent, or the
+    /// dataset is not in it — contributes nothing and leaves its virtual
+    /// region at the fill value, rather than failing the read.
+    /// `H5D__virtual_open_source_dset` treats both as "no data there yet":
+    /// it asks `H5F_prefix_open_file` to *try* the file and accepts a null
+    /// one, and clears the error stack when the dataset is missing
+    /// (H5Dvirtual.c:877-909); `H5D__virtual_read_one` then performs I/O
+    /// "only ... if there is a projected memory space, otherwise there were
+    /// no elements in the projection or the source dataset could not be
+    /// opened" (H5Dvirtual.c:2661-2665).
+    ///
     /// `depth` counts virtual-dataset nesting — a mapping whose source is
     /// itself a virtual dataset, possibly in another file — so a crafted
     /// cyclic mapping chain fails cleanly instead of recursing until the
@@ -3552,17 +3563,12 @@ impl Hdf5Reader {
             let source_name = mapping.source_dset_name.trim_start_matches('/');
 
             if mapping.source_file_name == "." {
-                let src_dims = self
+                let Some(src_dims) = self
                     .dataset_info(source_name)
-                    .ok_or_else(|| {
-                        crate::io::IoError::InvalidState(format!(
-                            "dataset {name:?}: virtual mapping source dataset \
-                             {source_name:?} not found in the same file"
-                        ))
-                    })?
-                    .dataspace
-                    .dims
-                    .clone();
+                    .map(|i| i.dataspace.dims.clone())
+                else {
+                    continue;
+                };
                 let source_boxes = mapping.source_selection.to_boxes(&src_dims).map_err(|e| {
                     crate::io::IoError::InvalidState(format!(
                         "dataset {name:?}: virtual mapping's source selection is not \
@@ -3583,29 +3589,20 @@ impl Hdf5Reader {
                 let cache_key =
                     std::fs::canonicalize(&full_path).unwrap_or_else(|_| full_path.clone());
                 if !cross_file_cache.contains_key(&cache_key) {
-                    let reader = Hdf5Reader::open_with_locking(&full_path, FileLocking::Disabled)
-                        .map_err(|e| {
-                        crate::io::IoError::InvalidState(format!(
-                            "dataset {name:?}: unable to open virtual dataset source \
-                                 file {}: {e}",
-                            full_path.display()
-                        ))
-                    })?;
+                    let Ok(reader) =
+                        Hdf5Reader::open_with_locking(&full_path, FileLocking::Disabled)
+                    else {
+                        continue;
+                    };
                     cross_file_cache.insert(cache_key.clone(), reader);
                 }
                 let src_reader = cross_file_cache.get_mut(&cache_key).unwrap();
-                let src_dims = src_reader
+                let Some(src_dims) = src_reader
                     .dataset_info(source_name)
-                    .ok_or_else(|| {
-                        crate::io::IoError::InvalidState(format!(
-                            "dataset {name:?}: virtual mapping source dataset \
-                             {source_name:?} not found in {}",
-                            full_path.display()
-                        ))
-                    })?
-                    .dataspace
-                    .dims
-                    .clone();
+                    .map(|i| i.dataspace.dims.clone())
+                else {
+                    continue;
+                };
                 let source_boxes = mapping.source_selection.to_boxes(&src_dims).map_err(|e| {
                     crate::io::IoError::InvalidState(format!(
                         "dataset {name:?}: virtual mapping's source selection is not \
