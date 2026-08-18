@@ -14,16 +14,29 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rust_hdf5::format::chunk_index::btree_v2::{collect_btree_v2_records, Bt2Header};
 use rust_hdf5::format::creation_order::CreationOrder;
+use rust_hdf5::format::fractal_heap::{
+    collect_managed_blocks, read_heap_object, FractalHeapHeader, HeapId,
+};
+use rust_hdf5::format::messages::attribute::{ATTR_FLAG_SPACE_SHARED, ATTR_FLAG_TYPE_SHARED};
+use rust_hdf5::format::messages::dataspace::DataspaceMessage;
 use rust_hdf5::format::messages::{MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE};
 use rust_hdf5::format::object_header::ObjectHeader;
 use rust_hdf5::format::sohm::{
-    type_flag, SohmMasterTable, BT2_TYPE_SOHM_INDEX, SMLI_SIGNATURE, SOHM_B2_NODE_SIZE,
-    SOHM_INDEX_BTREE, SOHM_INDEX_LIST,
+    record_size, type_flag, SharedLocation, SharedMessagePointer, SohmMasterTable,
+    BT2_TYPE_SOHM_INDEX, SMLI_SIGNATURE, SOHM_B2_NODE_SIZE, SOHM_HEAP_ID_LEN, SOHM_INDEX_BTREE,
+    SOHM_INDEX_LIST,
 };
 use rust_hdf5::format::superblock::{SuperblockV0V1, SuperblockV2V3};
-use rust_hdf5::format::{FormatContext, UNDEF_ADDR};
+use rust_hdf5::format::{BlockReader, FormatContext, FormatResult, UNDEF_ADDR};
 use rust_hdf5::{DatatypeMessage, H5File};
+
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
 
 /// Per-test unique temp path; cargo runs tests in parallel.
 fn unique_tmp(label: &str) -> PathBuf {
@@ -134,6 +147,196 @@ fn read_root_header(path: &PathBuf) -> ObjectHeader {
     ObjectHeader::decode(&bytes[at..]).unwrap().0
 }
 
+// -------------------------------------------------------------- the census
+
+/// A `BlockReader` over a whole file already in memory.
+struct Bytes<'a>(&'a [u8]);
+
+impl BlockReader for Bytes<'_> {
+    fn read_block(&mut self, offset: u64, len: usize) -> FormatResult<Vec<u8>> {
+        let at = offset as usize;
+        let end = (at + len).min(self.0.len());
+        Ok(self.0[at..end].to_vec())
+    }
+}
+
+/// What one shared-message record holds, said in terms two writers can agree
+/// on: the decoded meaning of the body rather than the bytes, since the
+/// message version a writer picks is its own business.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Role {
+    /// The decoded datatype, printed. Both writers encode these identically
+    /// here, so the whole value is compared.
+    Datatype(String),
+    /// Dataspace class and current dimensions. The maximum dimensions are
+    /// left out on purpose: `H5Screate_simple` sets them from `dims` and
+    /// libhdf5 stores them, while this crate writes a version-2 dataspace
+    /// without them. That is a difference in how a dataspace is encoded, not
+    /// in what the index holds.
+    Dataspace(String, Vec<u64>),
+    /// An attribute body: its name, its flags byte, and — in field order —
+    /// the role and reference count of each record its own datatype and
+    /// dataspace fields name.
+    Attribute {
+        name: String,
+        flags: u8,
+        fields: Vec<(Role, u32)>,
+    },
+}
+
+/// Every record of every index of `path`, as `(role, reference count)`,
+/// sorted so two files can be compared whatever order their indexes grew in.
+///
+/// This is the census libhdf5's own `h5debug` prints for a SOHM list, read
+/// out of the bytes instead: one entry per heap object, carrying the count
+/// the record claims.
+fn census(path: &PathBuf) -> Vec<(Role, u32)> {
+    let ctx = FormatContext::default_v3();
+    let table = read_master_table(path);
+    let bytes = std::fs::read(path).unwrap();
+
+    // Every record of every index first, so that an attribute body can name a
+    // datatype that lives in a different index's heap.
+    let mut records: Vec<(usize, [u8; SOHM_HEAP_ID_LEN], u32, Vec<u8>)> = Vec::new();
+    for (i, header) in table.indexes.iter().enumerate() {
+        let mut reader = Bytes(&bytes);
+        let raw = reader.read_block(header.heap_addr, 512).unwrap();
+        let heap = FractalHeapHeader::decode(&raw, &ctx).unwrap();
+        let blocks = collect_managed_blocks(&heap, &ctx, &mut reader).unwrap();
+
+        let size = record_size(&ctx);
+        let at = header.index_addr as usize;
+        let entries = if header.index_type == SOHM_INDEX_LIST {
+            assert_eq!(&bytes[at..at + 4], &SMLI_SIGNATURE);
+            bytes[at + 4..at + 4 + size * header.num_messages as usize].to_vec()
+        } else {
+            let bt2 = Bt2Header::decode(&bytes[at..], &ctx).unwrap();
+            collect_btree_v2_records(&bt2, &ctx, &mut Bytes(&bytes)).unwrap()
+        };
+        for entry in entries.chunks_exact(size) {
+            let id: [u8; SOHM_HEAP_ID_LEN] = entry[9..9 + SOHM_HEAP_ID_LEN].try_into().unwrap();
+            let parsed = HeapId::parse(&id, &heap, &ctx).unwrap();
+            let body = read_heap_object(&parsed, &heap, &ctx, &blocks, &mut reader).unwrap();
+            let ref_count = u32::from_le_bytes(entry[5..9].try_into().unwrap());
+            records.push((i, id, ref_count, body));
+        }
+    }
+
+    let mut out: Vec<(Role, u32)> = records
+        .iter()
+        .map(|(_, _, ref_count, body)| (role(&ctx, body, &table, &records), *ref_count))
+        .collect();
+    out.sort();
+    out
+}
+
+/// The message bytes a shared pointer names, with the reference count of the
+/// record it named.
+fn target(
+    ctx: &FormatContext,
+    field: &[u8],
+    msg_type: u8,
+    table: &SohmMasterTable,
+    records: &[(usize, [u8; SOHM_HEAP_ID_LEN], u32, Vec<u8>)],
+) -> (Vec<u8>, u32) {
+    let pointer = SharedMessagePointer::decode(field, ctx).unwrap();
+    assert_eq!(pointer.location, SharedLocation::Sohm);
+    // Which heap the ID belongs to is decided by the pointer's message class,
+    // the way `H5SM_get_fheap_addr` resolves one.
+    let heap = table.heap_addr(msg_type).unwrap();
+    let index = table
+        .indexes
+        .iter()
+        .position(|h| h.heap_addr == heap)
+        .unwrap();
+    let (_, _, ref_count, body) = records
+        .iter()
+        .find(|(i, id, _, _)| *i == index && *id == pointer.heap_id)
+        .expect("a shared pointer inside a heap body names a record of that index");
+    (body.clone(), *ref_count)
+}
+
+/// Classify one heap body by which message decoder accepts all of it.
+fn role(
+    ctx: &FormatContext,
+    body: &[u8],
+    table: &SohmMasterTable,
+    records: &[(usize, [u8; SOHM_HEAP_ID_LEN], u32, Vec<u8>)],
+) -> Role {
+    // A record carries no message class, so the body has to say what it is.
+    // An attribute is the only one of the three whose header accounts for its
+    // own total length, so try that first and let the exact fit decide.
+    if let Some(role) = attribute_role(ctx, body, table, records) {
+        return role;
+    }
+    if let Ok((dt, n)) = DatatypeMessage::decode(body, ctx) {
+        if n == body.len() {
+            return Role::Datatype(format!("{dt:?}"));
+        }
+    }
+    let (ds, n) = DataspaceMessage::decode(body, ctx).expect("a heap body is one of the three");
+    assert_eq!(n, body.len());
+    Role::Dataspace(format!("{:?}", ds.class), ds.dims)
+}
+
+/// `body` as an attribute, or `None` when it is not one: the header must
+/// account for every byte, down to the elements its own datatype and
+/// dataspace describe.
+fn attribute_role(
+    ctx: &FormatContext,
+    body: &[u8],
+    table: &SohmMasterTable,
+    records: &[(usize, [u8; SOHM_HEAP_ID_LEN], u32, Vec<u8>)],
+) -> Option<Role> {
+    if body.len() < 9 || !(2..=3).contains(&body[0]) {
+        return None;
+    }
+    let flags = body[1];
+    let name_size = u16::from_le_bytes([body[2], body[3]]) as usize;
+    let dt_size = u16::from_le_bytes([body[4], body[5]]) as usize;
+    let ds_size = u16::from_le_bytes([body[6], body[7]]) as usize;
+    let name_at: usize = if body[0] >= 3 { 9 } else { 8 };
+    let name_end = name_at.checked_add(name_size)?;
+    let dt_end = name_end.checked_add(dt_size)?;
+    let ds_end = dt_end.checked_add(ds_size)?;
+    if ds_end > body.len() || name_size == 0 {
+        return None;
+    }
+    let name = String::from_utf8(body[name_at..name_end - 1].to_vec()).ok()?;
+
+    // A shared field is a pointer to the record holding the message; a
+    // literal one is the message. Either way the bytes decode the same, and
+    // only a shared one carries a reference count of its own.
+    let field = |range: std::ops::Range<usize>, msg_type: u8, mask: u8| {
+        if flags & mask != 0 {
+            target(ctx, &body[range], msg_type, table, records)
+        } else {
+            (body[range].to_vec(), 0)
+        }
+    };
+    let (dt_bytes, dt_refs) = field(name_end..dt_end, MSG_DATATYPE, ATTR_FLAG_TYPE_SHARED);
+    let (ds_bytes, ds_refs) = field(dt_end..ds_end, MSG_DATASPACE, ATTR_FLAG_SPACE_SHARED);
+    let (datatype, _) = DatatypeMessage::decode(&dt_bytes, ctx).ok()?;
+    let (dataspace, _) = DataspaceMessage::decode(&ds_bytes, ctx).ok()?;
+
+    let elements: u64 = dataspace.dims.iter().copied().product::<u64>().max(1);
+    let width = u64::from(datatype.element_size_ctx(ctx));
+    if ds_end as u64 + elements * width != body.len() as u64 {
+        return None;
+    }
+    Some(Role::Attribute {
+        name,
+        flags,
+        fields: vec![
+            (Role::Datatype(format!("{datatype:?}")), dt_refs),
+            (
+                Role::Dataspace(format!("{:?}", dataspace.class), dataspace.dims),
+                ds_refs,
+            ),
+        ],
+    })
+}
+
 /// One index over all three classes: the bodies five datasets share end up in
 /// the heap once each, and the file still reads back whole.
 #[test]
@@ -150,13 +353,180 @@ fn a_created_file_shares_the_bodies_its_index_covers() {
     assert_eq!(index.list_max, 50);
     assert_eq!(index.btree_min, 40);
     // The dataspace every dataset has, the datatype the four that describe
-    // their own share, and the attribute body. `uses_named` reaches its type
-    // through the committed datatype, which is shared by address instead.
-    assert_eq!(index.num_messages, 3);
+    // their own share, the attribute body, and the datatype and dataspace
+    // that body points at. `uses_named` reaches its type through the
+    // committed datatype, which is shared by address instead.
+    assert_eq!(index.num_messages, 5);
 
     let bytes = std::fs::read(&path).unwrap();
     let at = index.index_addr as usize;
     assert_eq!(&bytes[at..at + 4], &SMLI_SIGNATURE);
+    cleanup(&path);
+}
+
+/// The shared attribute this crate writes holds pointers to its own datatype
+/// and dataspace, and the file reads back through those pointers.
+///
+/// `H5A__create` shares an attribute's datatype and dataspace before the
+/// attribute itself (H5Aint.c:375-378), so `H5O__attr_encode` writes each as
+/// a version-3 shared pointer and records which in the attribute's flags byte
+/// (H5Oattr.c:346-360). The components end at one reference each — the
+/// pointer lives in the one heap object every dataset's header names, not in
+/// each header.
+#[test]
+fn a_shared_attribute_points_at_its_own_datatype_and_dataspace() {
+    let path = unique_tmp("nested");
+    write_sohm_file(&path, all_three(), 0, 50, 40);
+
+    let census = census(&path);
+    let (attribute, refs) = census
+        .iter()
+        .find(|(role, _)| matches!(role, Role::Attribute { .. }))
+        .expect("the index holds the attribute body");
+    let Role::Attribute {
+        name,
+        flags,
+        fields,
+    } = attribute
+    else {
+        unreachable!()
+    };
+    assert_eq!(name, "cal");
+    assert_eq!(*flags, ATTR_FLAG_TYPE_SHARED | ATTR_FLAG_SPACE_SHARED);
+    assert_eq!(*refs, 4, "one reference per dataset holding the attribute");
+    assert!(
+        matches!(fields[0], (Role::Datatype(_), 1)),
+        "the attribute's datatype is a record of its own, named once: {fields:?}"
+    );
+    assert_eq!(
+        fields[1],
+        (Role::Dataspace("Simple".into(), vec![3]), 1),
+        "and so is its dataspace"
+    );
+
+    // The reader resolves what the writer nested: each attribute comes back
+    // with the datatype and the values it was written with.
+    let file = H5File::open(&path).unwrap();
+    for i in 0..4i32 {
+        let attr = file
+            .dataset(&format!("shared{i}"))
+            .unwrap()
+            .attr("cal")
+            .unwrap();
+        assert_eq!(attr.datatype().unwrap(), DatatypeMessage::f64_type());
+        let values: Vec<f64> = attr.read_numeric_as().unwrap();
+        assert_eq!(values, vec![0.5, 1.5, 2.5]);
+    }
+    cleanup(&path);
+}
+
+/// Census parity: for the construction `sohm_nested.h5` was written from,
+/// this crate's index holds the same records with the same reference counts
+/// libhdf5's does.
+///
+/// The fixture gives its datasets a copy of `H5T_STD_I32LE` rather than the
+/// predefined type, because `H5O__dtype_can_share` refuses an immutable type
+/// (H5Odtype.c) and this crate has no notion of one — with the predefined
+/// type libhdf5 keeps the datasets' datatype literal and the two censuses
+/// would differ over something that is not about sharing at all.
+#[test]
+fn the_record_census_matches_libhdf5_for_the_same_construction() {
+    let path = unique_tmp("parity");
+    write_sohm_file(&path, all_three(), 0, 50, 40);
+
+    let theirs = census(&fixture("sohm_nested.h5"));
+    let ours = census(&path);
+    assert_eq!(theirs.len(), 5, "five records: {theirs:#?}");
+    assert_eq!(ours, theirs);
+    cleanup(&path);
+}
+
+// -------------------------------------------------------------- libhdf5
+
+/// The same Python-install probe the other cross-check suites use: the tools
+/// beside it belong to the libhdf5 h5py is linked against.
+const TEST_PYTHONS: [&str; 2] = [
+    "/Users/stevek/mamba/envs/bs2026.1/bin/python",
+    "/home/stevek/micromamba/envs/tomo/bin/python",
+];
+
+fn python() -> Option<&'static str> {
+    static PY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PY.get_or_init(|| {
+        let candidates: Vec<String> = match std::env::var("RUST_HDF5_TEST_PYTHON") {
+            Ok(p) => vec![p],
+            Err(_) => TEST_PYTHONS.iter().map(|p| p.to_string()).collect(),
+        };
+        let found = candidates
+            .iter()
+            .find(|c| std::path::Path::new(c).exists())
+            .cloned();
+        if found.is_none() {
+            eprintln!("skipping SOHM write cross-check: none of {candidates:?} present");
+        }
+        found
+    })
+    .as_deref()
+}
+
+fn run(program: impl AsRef<std::ffi::OsStr>, args: &[&str], what: &str) {
+    let out = std::process::Command::new(&program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {what}: {e}"));
+    assert!(
+        out.status.success(),
+        "{what} failed ({}):\n{}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// h5py reads the nested file this crate wrote, and h5diff finds no
+/// difference between it and the libhdf5-written twin.
+///
+/// The census test says the two files hold the same records; this says
+/// libhdf5 itself agrees about what those records mean.
+#[test]
+fn libhdf5_reads_the_nested_file_and_diffs_it_clean_against_its_twin() {
+    let Some(py) = python() else { return };
+    let path = unique_tmp("h5py_nested");
+    write_sohm_file(&path, all_three(), 0, 50, 40);
+
+    let script = format!(
+        "import h5py\n\
+         f = h5py.File(r'{}', 'r')\n\
+         assert sorted(f) == ['named_i32', 'shared0', 'shared1', 'shared2', 'shared3', \
+         'uses_named'], sorted(f)\n\
+         for i in range(4):\n\
+         \x20   d = f['shared%d' % i]\n\
+         \x20   assert list(d[()]) == [i * 10 + j for j in range(8)], list(d[()])\n\
+         \x20   a = d.attrs['cal']\n\
+         \x20   assert a.dtype == '<f8', a.dtype\n\
+         \x20   assert a.shape == (3,), a.shape\n\
+         \x20   assert list(a) == [0.5, 1.5, 2.5], list(a)\n\
+         assert list(f['uses_named'][()]) == list(range(100, 108))\n\
+         assert f['uses_named'].id.get_type().committed()\n",
+        path.display()
+    );
+    run(py, &["-c", &script], "h5py read-back of the nested file");
+
+    let tools = std::path::Path::new(py).parent().unwrap();
+    let h5diff = tools.join("h5diff");
+    if h5diff.exists() {
+        // `-c` also reports an object that is in one file and not the
+        // other, which a plain run passes over.
+        run(
+            &h5diff,
+            &[
+                "-c",
+                path.to_str().unwrap(),
+                fixture("sohm_nested.h5").to_str().unwrap(),
+            ],
+            "h5diff against the libhdf5-written twin",
+        );
+    }
     cleanup(&path);
 }
 
@@ -171,7 +541,7 @@ fn a_zero_list_maximum_writes_a_btree_index() {
     let table = read_master_table(&path);
     let index = &table.indexes[0];
     assert_eq!(index.index_type, SOHM_INDEX_BTREE);
-    assert_eq!(index.num_messages, 3);
+    assert_eq!(index.num_messages, 5);
 
     let bytes = std::fs::read(&path).unwrap();
     let at = index.index_addr as usize;
@@ -191,7 +561,9 @@ fn a_zero_list_maximum_writes_a_btree_index() {
 
 /// An index takes only the classes its mask names. Covering just dataspaces
 /// leaves the datatype and attribute messages in the headers, so the index
-/// holds one body.
+/// holds the two dataspaces this file has: the datasets' and the one the
+/// attributes carry, which `H5A__create` offers whether or not the attribute
+/// around it is itself shared (H5Aint.c:375-378).
 #[test]
 fn an_index_takes_only_the_classes_its_mask_names() {
     let path = unique_tmp("mask");
@@ -199,7 +571,7 @@ fn an_index_takes_only_the_classes_its_mask_names() {
     check_contents(&path);
 
     let table = read_master_table(&path);
-    assert_eq!(table.indexes[0].num_messages, 1);
+    assert_eq!(table.indexes[0].num_messages, 2);
     cleanup(&path);
 }
 
@@ -274,10 +646,12 @@ fn two_indexes_split_the_message_classes_between_them() {
 
     let table = read_master_table(&path);
     assert_eq!(table.indexes.len(), 2);
-    // One attribute body in the first index; the shared dataspace and the
-    // shared datatype in the second.
+    // One attribute body in the first index; in the second, the datasets'
+    // dataspace, the datatype the datasets and the attribute share, and the
+    // scalar dataspace the attribute body points at across the index
+    // boundary.
     assert_eq!(table.indexes[0].num_messages, 1);
-    assert_eq!(table.indexes[1].num_messages, 2);
+    assert_eq!(table.indexes[1].num_messages, 3);
     assert_ne!(table.indexes[0].heap_addr, table.indexes[1].heap_addr);
     assert_eq!(
         table.heap_addr(MSG_ATTRIBUTE),

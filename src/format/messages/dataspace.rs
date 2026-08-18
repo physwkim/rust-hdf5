@@ -124,6 +124,29 @@ impl DataspaceMessage {
         needed.max(format.dataspace_version())
     }
 
+    /// The maximum dimensions this message is written with.
+    ///
+    /// A simple dataspace always has them. `H5S_set_extent_simple` allocates
+    /// the maximum array for every simple extent and fills it from the
+    /// current dimensions when the caller passed none (H5S.c:1292-1299), so
+    /// `H5Screate_simple(rank, dims, NULL)` reaches the encoder with
+    /// `extent.max` set; `H5O__sdspace_encode` then raises `H5S_VALID_MAX`
+    /// for any non-null maximum array (H5Osdspace.c:269-272) and writes it
+    /// after the current dimensions (H5Osdspace.c:289-293). A scalar or NULL
+    /// extent has no dimensions to bound and no maximum array, so it keeps
+    /// the flag clear.
+    ///
+    /// `None` here means "the caller named no maximum", not "the file has
+    /// none": the two used to encode alike, which made the same logical
+    /// extent two different messages depending on which side it came from.
+    fn encoded_max_dims(&self) -> Option<&[u64]> {
+        match (&self.max_dims, self.class) {
+            (Some(max), _) => Some(max),
+            (None, DataspaceClass::Simple) => Some(&self.dims),
+            (None, _) => None,
+        }
+    }
+
     /// Encode for a file of the given object format.
     ///
     /// A version-1 dataspace differs only in its prefix: no type byte, and
@@ -133,7 +156,8 @@ impl DataspaceMessage {
         let version = self.version_for(format);
         let ndims = self.dims.len();
         let ss = ctx.sizeof_size as usize;
-        let has_max = self.max_dims.is_some();
+        let max_dims = self.encoded_max_dims();
+        let has_max = max_dims.is_some();
         let flags: u8 = if has_max { FLAG_MAX_DIMS } else { 0 };
 
         let ds_type = match self.class {
@@ -163,7 +187,7 @@ impl DataspaceMessage {
         }
 
         // max dimensions
-        if let Some(ref maxes) = self.max_dims {
+        if let Some(maxes) = max_dims {
             for &m in maxes {
                 buf.extend_from_slice(&m.to_le_bytes()[..ss]);
             }
@@ -354,26 +378,35 @@ mod tests {
         assert_eq!(decoded, msg);
     }
 
+    /// A simple dataspace whose maximum the caller left implicit is written
+    /// with the maximum `H5S_set_extent_simple` fills in from the current
+    /// dimensions (H5S.c:1292-1299), so the message names them and is that
+    /// much longer.
     #[test]
     fn roundtrip_simple_1d() {
         let msg = DataspaceMessage::simple(&[100]);
         let encoded = msg.encode(&ctx8());
-        // 4 header + 1*8 dims = 12
-        assert_eq!(encoded.len(), 12);
+        // 4 header + 1*8 dims + 1*8 max dims = 20
+        assert_eq!(encoded.len(), 20);
+        assert_eq!(encoded[2], FLAG_MAX_DIMS);
         let (decoded, consumed) = DataspaceMessage::decode(&encoded, &ctx8()).unwrap();
-        assert_eq!(consumed, 12);
-        assert_eq!(decoded, msg);
+        assert_eq!(consumed, 20);
+        assert_eq!(decoded.class, msg.class);
+        assert_eq!(decoded.dims, msg.dims);
+        assert_eq!(decoded.max_dims, Some(vec![100]));
     }
 
     #[test]
     fn roundtrip_simple_3d_ctx4() {
         let msg = DataspaceMessage::simple(&[10, 20, 30]);
         let encoded = msg.encode(&ctx4());
-        // 4 + 3*4 = 16
-        assert_eq!(encoded.len(), 16);
+        // 4 + 3*4 dims + 3*4 max dims = 28
+        assert_eq!(encoded.len(), 28);
         let (decoded, consumed) = DataspaceMessage::decode(&encoded, &ctx4()).unwrap();
-        assert_eq!(consumed, 16);
-        assert_eq!(decoded, msg);
+        assert_eq!(consumed, 28);
+        assert_eq!(decoded.class, msg.class);
+        assert_eq!(decoded.dims, msg.dims);
+        assert_eq!(decoded.max_dims, Some(vec![10, 20, 30]));
     }
 
     #[test]
