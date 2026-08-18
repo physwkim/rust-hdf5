@@ -10,7 +10,7 @@ use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, Shar
 use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
 use crate::format::messages::filter::Filter;
 use crate::format::messages::virtual_mapping::VirtualMapping;
-use crate::format::reference::Reference;
+use crate::format::reference::{Reference, ReferenceTarget};
 use crate::format::selection::Selection;
 use crate::format::storage_kind::AttributeStorage;
 use crate::io::reader::ExternalFileSegment;
@@ -67,9 +67,15 @@ pub struct DatasetBuilder<T: H5Type> {
 /// [`DatatypeMessage::region_reference`]: crate::format::messages::datatype::DatatypeMessage::region_reference
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReferenceElement {
+    /// `H5T_STD_REF_OBJ`.
     Object,
-    StdObject,
+    /// `H5T_STD_REF_DSETREG`.
     Region,
+    /// `H5T_STD_REF`, the 1.12 form. One datatype for all three 1.12 kinds:
+    /// the element leads with the kind it holds, so `H5T__ref_disk_getsize`
+    /// sizes every element for the widest of them and a dataset of this type
+    /// may hold objects, regions and attributes alike.
+    Revised,
 }
 
 impl ReferenceElement {
@@ -81,8 +87,8 @@ impl ReferenceElement {
         use crate::format::messages::datatype::DatatypeMessage;
         match self {
             Self::Object => DatatypeMessage::object_reference(ctx),
-            Self::StdObject => DatatypeMessage::std_object_reference(ctx),
             Self::Region => DatatypeMessage::region_reference(ctx),
+            Self::Revised => DatatypeMessage::std_object_reference(ctx),
         }
     }
 }
@@ -415,8 +421,69 @@ impl<T: H5Type> DatasetBuilder<T> {
     /// ```
     #[must_use]
     pub fn std_object_references(mut self) -> Self {
-        self.references = Some(ReferenceElement::StdObject);
+        self.references = Some(ReferenceElement::Revised);
         self
+    }
+
+    /// Store revised region references — `H5R_DATASET_REGION2`, written into
+    /// the same `H5T_STD_REF` datatype
+    /// [`std_object_references`](Self::std_object_references) makes.
+    ///
+    /// The elements are written with
+    /// [`write_std_region_references`](H5Dataset::write_std_region_references).
+    /// What distinguishes them from the pre-1.12
+    /// [`region_references`](Self::region_references) is the element, not the
+    /// datatype: a 1.12 element names its own kind, so one dataset of this type
+    /// may hold object, region and attribute references together. h5py 3.15
+    /// cannot read any of them, so prefer the pre-1.12 form for files h5py will
+    /// open.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::{H5File, Hyperslab, HyperslabBlock, LibverBound, Selection};
+    /// let file = H5File::options().libver(LibverBound::V112).create("stdregions.h5").unwrap();
+    /// file.new_dataset::<i32>().shape([8]).create("target").unwrap();
+    /// let refs = file.new_dataset::<u64>()
+    ///     .std_region_references()
+    ///     .shape([1])
+    ///     .create("refs")
+    ///     .unwrap();
+    /// let rows = Selection::Hyperslab {
+    ///     rank: 1,
+    ///     form: Hyperslab::Blocks(vec![HyperslabBlock { start: vec![0], end: vec![2] }]),
+    /// };
+    /// refs.write_std_region_references(&[("/target", rows)]).unwrap();
+    /// file.close().unwrap();
+    /// ```
+    #[must_use]
+    pub fn std_region_references(self) -> Self {
+        self.std_object_references()
+    }
+
+    /// Store attribute references — `H5R_ATTR`, the one reference kind with no
+    /// pre-1.12 form, in the same `H5T_STD_REF` datatype
+    /// [`std_object_references`](Self::std_object_references) makes.
+    ///
+    /// The elements are written with
+    /// [`write_attribute_references`](H5Dataset::write_attribute_references) and
+    /// name an object and one of its attributes. h5py 3.15 cannot read them.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::{H5File, LibverBound};
+    /// let file = H5File::options().libver(LibverBound::V112).create("attrrefs.h5").unwrap();
+    /// let target = file.new_dataset::<i32>().shape([4]).create("target").unwrap();
+    /// target.new_attr::<i32>().shape([3]).create("note").unwrap()
+    ///     .write_array(&[7i32, 8, 9]).unwrap();
+    /// let refs = file.new_dataset::<u64>()
+    ///     .attribute_references()
+    ///     .shape([1])
+    ///     .create("refs")
+    ///     .unwrap();
+    /// refs.write_attribute_references(&[("/target", "note")]).unwrap();
+    /// file.close().unwrap();
+    /// ```
+    #[must_use]
+    pub fn attribute_references(self) -> Self {
+        self.std_object_references()
     }
 
     /// Store dataset region references — h5py's `h5py.regionref_dtype`.
@@ -465,6 +532,14 @@ impl<T: H5Type> DatasetBuilder<T> {
     /// The named files are created on first write and never truncated, so
     /// several datasets may own disjoint ranges of one file.
     ///
+    /// The last entry may take the unlimited size
+    /// [`external_file_list::UNLIMITED`](crate::format::messages::external_file_list::UNLIMITED)
+    /// (`H5O_EFL_UNLIMITED`), which makes it absorb the whole rest of the
+    /// dataset however far it grows. A dataset whose
+    /// [`max_shape`](Self::max_shape) is unlimited must have one, since no
+    /// finite reservation could cover it, and only the first dimension may be
+    /// extendible — both `H5D__efl_construct`'s rules.
+    ///
     /// ```no_run
     /// # use rust_hdf5::H5File;
     /// let file = H5File::create("ext.h5").unwrap();
@@ -508,9 +583,19 @@ impl<T: H5Type> DatasetBuilder<T> {
     /// kind — and makes writing to it an error, since its elements belong to
     /// the source datasets.
     ///
-    /// `printf`-style source names (libhdf5's `%b` block substitution) and
-    /// unlimited (`H5S_UNLIMITED`) selections are refused at
-    /// [`create`](Self::create) rather than written as something else.
+    /// An unlimited (`H5S_UNLIMITED`) selection is written as one: such a
+    /// mapping grows with its source, and the dataset's extent in that
+    /// dimension is whatever the sources reachable when it is opened supply
+    /// (`H5D__virtual_set_extent_unlim`). Give it a
+    /// [`max_shape`](Self::max_shape) unlimited in the same dimension, as
+    /// libhdf5 requires of the dataspace behind one.
+    ///
+    /// A source name may carry libhdf5's `printf`-style substitutions: `%b`
+    /// is the block index and `%%` an escaped literal `%`. One such mapping
+    /// stands for the family of source datasets that fill the successive
+    /// blocks of an unlimited virtual selection, so it is legal only with an
+    /// unlimited virtual selection over a limited source selection, and the
+    /// dataset's extent stops at the first block whose source is missing.
     ///
     /// ```no_run
     /// # use rust_hdf5::{H5File, Selection};
@@ -879,6 +964,14 @@ impl<T: H5Type> DatasetBuilder<T> {
                             &full_name,
                             datatype,
                             &dims_u64,
+                            self.max_shape
+                                .as_ref()
+                                .map(|max| {
+                                    max.iter()
+                                        .map(|m| m.map_or(u64::MAX, |v| v as u64))
+                                        .collect::<Vec<u64>>()
+                                })
+                                .as_deref(),
                             &self.virtual_mappings,
                         )?;
                         // The fill value is what a read of an unmapped — or
@@ -1147,7 +1240,18 @@ impl<T: H5Type> DatasetBuilder<T> {
                                     .map(|(name, offset, size)| (name.as_str(), *offset, *size))
                                     .collect();
                                 writer.create_external_dataset(
-                                    &full_name, datatype, &dims_u64, &slots,
+                                    &full_name,
+                                    datatype,
+                                    &dims_u64,
+                                    self.max_shape
+                                        .as_ref()
+                                        .map(|max| {
+                                            max.iter()
+                                                .map(|m| m.map_or(u64::MAX, |v| v as u64))
+                                                .collect::<Vec<u64>>()
+                                        })
+                                        .as_deref(),
+                                    &slots,
                                 )?
                             }
                             None => writer.create_dataset(&full_name, datatype, &dims_u64)?,
@@ -3724,6 +3828,67 @@ impl H5Dataset {
                 match &*inner {
                     H5FileInner::Writer(writer) => {
                         writer.write_region_references(*index, 0, targets)?;
+                        Ok(())
+                    }
+                    _ => Err(Hdf5Error::InvalidState(
+                        "file is no longer in write mode".into(),
+                    )),
+                }
+            }
+            DatasetInfo::Reader { .. } => {
+                Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
+            }
+        }
+    }
+
+    /// Write revised region references over `targets` into elements
+    /// `0..targets.len()` — `H5Rcreate_region` plus `H5Dwrite` of an
+    /// `H5T_STD_REF` dataset.
+    ///
+    /// The dataset must have been created with
+    /// [`std_region_references`](DatasetBuilder::std_region_references) or one
+    /// of its two siblings, which make the same datatype. Each target is the
+    /// path of an existing *dataset* and a [`Selection`] over it, which must
+    /// fit that dataset's extent. What reaches the file is a global-heap blob
+    /// holding the target's object header address (assigned when the file is
+    /// finalized) and the serialized selection, and an element carrying the
+    /// blob's id and its byte count. Elements left unwritten read back as null
+    /// references.
+    pub fn write_std_region_references(&self, targets: &[(&str, Selection)]) -> Result<()> {
+        let targets: Vec<(&str, ReferenceTarget)> = targets
+            .iter()
+            .map(|(path, selection)| (*path, ReferenceTarget::Region(selection.clone())))
+            .collect();
+        self.write_revised_references(&targets)
+    }
+
+    /// Write attribute references naming `targets` into elements
+    /// `0..targets.len()` — `H5Rcreate_attr` plus `H5Dwrite` of an
+    /// `H5T_STD_REF` dataset.
+    ///
+    /// Each target is the path of an existing object — a dataset, a group, or
+    /// `/` for the root group — and the name of an attribute it already
+    /// carries. There is no pre-1.12 form of this reference kind, so the
+    /// dataset must have been created with
+    /// [`attribute_references`](DatasetBuilder::attribute_references) or one of
+    /// its two siblings. Elements left unwritten read back as null references.
+    pub fn write_attribute_references(&self, targets: &[(&str, &str)]) -> Result<()> {
+        let targets: Vec<(&str, ReferenceTarget)> = targets
+            .iter()
+            .map(|(path, name)| (*path, ReferenceTarget::Attribute((*name).to_string())))
+            .collect();
+        self.write_revised_references(&targets)
+    }
+
+    /// Store `targets` as 1.12 reference elements, whatever mix of kinds they
+    /// are: the one path both revised-reference writers take.
+    fn write_revised_references(&self, targets: &[(&str, ReferenceTarget)]) -> Result<()> {
+        match &self.info {
+            DatasetInfo::Writer { index, .. } => {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Writer(writer) => {
+                        writer.write_revised_references(*index, 0, targets)?;
                         Ok(())
                     }
                     _ => Err(Hdf5Error::InvalidState(
@@ -9176,11 +9341,14 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// `%` in a source name is libhdf5's printf-style block substitution, not
-    /// part of the name, so a name holding one is refused instead of written
-    /// as something the library would read back differently.
+    /// A `%b` substitution only means something when the virtual selection is
+    /// unlimited and the source selection is not: that is the shape where
+    /// each block draws from a different source dataset. On any other mapping
+    /// there is only one block, so `H5D_virtual_check_mapping_post` refuses
+    /// the specifier — and an illegal conversion is refused wherever it
+    /// appears.
     #[test]
-    fn a_printf_style_source_name_is_refused() {
+    fn a_printf_source_name_needs_the_mapping_shape_that_uses_it() {
         use crate::Selection;
         let path = temp_path("vds_printf");
         let file = H5File::create(&path).unwrap();
@@ -9191,43 +9359,163 @@ mod tests {
                 .virtual_mapping(Selection::All, f, d, Selection::All)
                 .create("vds")
             {
-                Ok(_) => panic!("'%' in a source name is a printf specifier to libhdf5"),
+                Ok(_) => panic!("a bounded mapping has one block, so %b names nothing"),
                 Err(e) => e.to_string(),
             };
-            assert!(err.contains("printf"), "{err}");
+            assert!(err.contains("printf specifier"), "{err}");
         }
+        // `%z` is not a conversion libhdf5 has, in any mapping shape.
+        let err = match file
+            .new_dataset::<i32>()
+            .shape([1usize, 2])
+            .max_shape(&[None, Some(2)])
+            .virtual_mapping(unlimited_rows(), "src_%z.h5", "src", Selection::All)
+            .create("vds_bad")
+        {
+            Ok(_) => panic!("%z is not a legal conversion"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("invalid format specifier"), "{err}");
         file.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
 
-    /// An unlimited mapping is clipped against its source's extent at every
-    /// open, which this writer does not model — refused rather than written
-    /// as the all-ones count it would encode to.
+    /// A printf mapping stitches one source dataset per block of its
+    /// unlimited virtual selection, and the extent stops at the first block
+    /// with no source (`H5D__virtual_set_extent_unlim`'s printf arm, at the
+    /// default `H5D_VDS_LAST_AVAILABLE` view and `printf_gap` 0).
     #[test]
-    fn an_unlimited_mapping_selection_is_refused() {
+    fn a_printf_mapping_stitches_one_source_per_block() {
+        use crate::Selection;
+        let path = temp_path("vds_printf_blocks");
+        {
+            let file = H5File::create(&path).unwrap();
+            for (b, base) in [(0, 0i32), (1, 100), (3, 300)] {
+                file.new_dataset::<i32>()
+                    .shape([2usize])
+                    .create(&format!("block{b}"))
+                    .unwrap()
+                    .write_raw(&[base, base + 1])
+                    .unwrap();
+            }
+            file.new_dataset::<i32>()
+                .shape([1usize, 2])
+                .max_shape(&[None, Some(2)])
+                .virtual_mapping(unlimited_rows(), ".", "block%b", Selection::All)
+                .create("vds")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("vds").unwrap();
+        // `block2` is missing, so `block3` is never reached: two rows.
+        assert_eq!(ds.shape(), vec![2, 2]);
+        assert_eq!(ds.read_raw::<i32>().unwrap(), vec![0, 1, 100, 101]);
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `%%` is an escaped literal `%`, not a substitution: the mapping is an
+    /// ordinary bounded one, and the source it resolves against is the name
+    /// with a single `%` in it.
+    #[test]
+    fn an_escaped_percent_is_a_literal_in_a_source_name() {
+        use crate::Selection;
+        let path = temp_path("vds_escaped_pct");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .create("od%d")
+                .unwrap()
+                .write_raw(&[5i32, 6, 7, 8])
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .virtual_mapping(Selection::All, ".", "od%%d", Selection::All)
+                .create("vds")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("vds").unwrap();
+        assert_eq!(ds.read_raw::<i32>().unwrap(), vec![5, 6, 7, 8]);
+        // The stored name keeps its escape; only the resolution unescapes.
+        assert_eq!(ds.virtual_mappings().unwrap()[0].source_dset_name, "od%%d");
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An unlimited mapping takes its extent from the source it names, so a
+    /// virtual dataset written with one reports the source's rows, not the
+    /// seed extent its dataspace message stores
+    /// (`H5D__virtual_set_extent_unlim`). Same file, so the resolution runs
+    /// without opening another one.
+    #[test]
+    fn an_unlimited_mapping_takes_its_extent_from_its_source() {
+        let path = temp_path("vds_unlimited");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([5usize, 2])
+                .chunk(&[5, 2])
+                .max_shape(&[None, Some(2)])
+                .create("src")
+                .unwrap()
+                .write_raw(&(0..10i32).collect::<Vec<_>>())
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([1usize, 2])
+                .max_shape(&[None, Some(2)])
+                .virtual_mapping(unlimited_rows(), ".", "src", unlimited_rows())
+                .create("vds")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("vds").unwrap();
+        assert_eq!(ds.shape(), vec![5, 2]);
+        assert_eq!(ds.read_raw::<i32>().unwrap(), (0..10).collect::<Vec<i32>>());
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The rank-2 `count = (H5S_UNLIMITED, 1)`, `block = (1, 2)` selection
+    /// both sides of an unlimited row-wise mapping use.
+    fn unlimited_rows() -> crate::Selection {
         use crate::format::selection::UNLIMITED;
         use crate::{Hyperslab, RegularHyperslab, Selection};
-        let path = temp_path("vds_unlimited");
-        let file = H5File::create(&path).unwrap();
-        let unlimited = Selection::Hyperslab {
-            rank: 1,
+        Selection::Hyperslab {
+            rank: 2,
             form: Hyperslab::Regular(RegularHyperslab {
-                start: vec![0],
-                stride: vec![1],
-                count: vec![UNLIMITED],
-                block: vec![1],
+                start: vec![0, 0],
+                stride: vec![1, 1],
+                count: vec![UNLIMITED, 1],
+                block: vec![1, 2],
             }),
-        };
+        }
+    }
+
+    /// An unlimited virtual selection over a *limited* source selection is
+    /// the printf shape, and without a `%b` in a source name there is no
+    /// second dataset to fill the second block —
+    /// `H5D_virtual_check_mapping_post` refuses it, and so does this.
+    #[test]
+    fn an_unlimited_virtual_selection_over_a_limited_source_is_refused() {
+        use crate::Selection;
+        let path = temp_path("vds_unlim_limited_src");
+        let file = H5File::create(&path).unwrap();
         let err = match file
             .new_dataset::<i32>()
-            .shape([16usize])
-            .virtual_mapping(unlimited, "src.h5", "src", Selection::All)
+            .shape([1usize, 2])
+            .max_shape(&[None, Some(2)])
+            .virtual_mapping(unlimited_rows(), "src.h5", "src", Selection::All)
             .create("vds")
         {
-            Ok(_) => panic!("an unlimited mapping needs clipping this writer does not do"),
+            Ok(_) => panic!("no printf substitution names the mapping's later blocks"),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("H5S_UNLIMITED"), "{err}");
+        assert!(err.contains("printf"), "{err}");
         file.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
@@ -9464,6 +9752,104 @@ mod tests {
             file.dataset("set").unwrap().fill_value().unwrap(),
             FillValue::UserDefined((-7i32).to_le_bytes().to_vec())
         );
+    }
+
+    /// The three `H5D__efl_construct` / `H5Pset_external` rules an
+    /// `H5O_EFL_UNLIMITED` slot lives inside: it may only be the last slot,
+    /// an unlimited dataspace must have one, and only the first dimension
+    /// may be extendible.
+    #[test]
+    fn the_unlimited_external_slot_keeps_its_three_rules() {
+        use crate::format::messages::external_file_list::UNLIMITED;
+        let path = temp_path("efl_unlim_rules");
+        let file = H5File::create(&path).unwrap();
+
+        // "previous file size is unlimited": nothing behind an unlimited slot
+        // could ever be reached.
+        let err = match file
+            .new_dataset::<i32>()
+            .shape([8usize])
+            .external(&[("a.raw", 0, UNLIMITED), ("b.raw", 0, 32)])
+            .create("mid")
+        {
+            Ok(_) => panic!("an unlimited slot absorbs everything behind it"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("only be the last"), "{err}");
+
+        // "unlimited dataspace but finite storage".
+        let err = match file
+            .new_dataset::<i32>()
+            .shape([8usize])
+            .max_shape(&[None])
+            .external(&[("a.raw", 0, 32)])
+            .create("finite")
+        {
+            Ok(_) => panic!("no finite reservation covers an unlimited extent"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("unlimited dataspace"), "{err}");
+
+        // "only the first dimension can be extendible".
+        let err = match file
+            .new_dataset::<i32>()
+            .shape([2usize, 4])
+            .max_shape(&[Some(2), None])
+            .external(&[("a.raw", 0, UNLIMITED)])
+            .create("dim1")
+        {
+            Ok(_) => panic!("only the slowest-varying dimension may be extendible"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("only the first dimension"), "{err}");
+
+        // And the legal shape: an unlimited last slot under an unlimited
+        // first dimension.
+        file.new_dataset::<i32>()
+            .shape([8usize])
+            .max_shape(&[None])
+            .external(&[("a.raw", 0, 16), ("b.raw", 0, UNLIMITED)])
+            .create("ok")
+            .unwrap()
+            .write_raw(&(0..8i32).collect::<Vec<_>>())
+            .unwrap();
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+        for raw in ["a.raw", "b.raw"] {
+            std::fs::remove_file(raw).ok();
+        }
+    }
+
+    /// An unlimited slot reserves nothing, so a read of it is bounded by the
+    /// dataset's extent and by what the file physically holds: the tail past
+    /// the end of a short raw file reads back as zero, exactly as
+    /// `H5D__efl_read` fills it.
+    #[test]
+    fn an_unlimited_external_slot_reads_zero_past_the_end_of_its_file() {
+        use crate::format::messages::external_file_list::UNLIMITED;
+        let dir = std::env::temp_dir().join(format!("rh5_efl_short_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.h5");
+        let raw = dir.join("short.raw");
+        // Four elements' worth of bytes for an eight-element dataset.
+        std::fs::write(&raw, [0u8; 16]).unwrap();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .max_shape(&[None])
+                .external(&[(raw.to_str().unwrap(), 0, UNLIMITED)])
+                .create("data")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("data").unwrap().read_raw::<i32>().unwrap(),
+            vec![0i32; 8]
+        );
+        drop(file);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// [`H5Dataset::external_files`] reports the stored segment list in

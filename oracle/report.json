@@ -4,8 +4,8 @@
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
   "python": "/home/stevek/micromamba/envs/tomo/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-sohm-nest-1c3d1155-1/target/release/oracle_probe",
-  "cases": 98
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-vdsref-d5a21df9-1/target/release/oracle_probe",
+  "cases": 101
  },
  "results": [
   {
@@ -1166,6 +1166,72 @@
    "group": "layout",
    "note": "virtual dataset mapped onto a dataset in a sibling file",
    "rust_case": "vds",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "external_unlimited",
+   "group": "layout",
+   "note": "H5O_EFL_UNLIMITED on the last external slot of an unlimited dataset",
+   "rust_case": "external_unlimited",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "vds_unlim",
+   "group": "layout",
+   "note": "virtual dataset whose mapping is unlimited on both sides \u2014 the extent comes from the source",
+   "rust_case": "vds_unlim",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "vds_printf_unlim",
+   "group": "layout",
+   "note": "printf-pattern source name over an unlimited virtual selection \u2014 one source file per block",
+   "rust_case": "vds_printf_unlim",
    "a": {
     "verdict": "PASS",
     "divergences": [],
