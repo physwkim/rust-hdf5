@@ -3,8 +3,8 @@
   "hdf5_version": "1.14.6",
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
-  "python": "/home/stevek/micromamba/envs/tomo/bin/python3",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-alloctime-68ae4317-1/target/release/oracle_probe",
+  "python": "/home/stevek/micromamba/envs/tomo/bin/python",
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-sohm-nest-1c3d1155-1/target/release/oracle_probe",
   "cases": 98
  },
  "results": [
