@@ -10,3 +10,4 @@ Cargo.lock
 .DS_Store
 /kodex-out/
 /oracle/__pycache__/
+.caucus/
