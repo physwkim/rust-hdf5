@@ -1036,8 +1036,6 @@ fn fill_tiled_into(out: &mut [u8], fill_value: Option<&[u8]>) {
     }
 }
 
-use crate::format::messages::external_file_list::UNLIMITED as EFL_UNLIMITED_SIZE;
-
 /// Resolve the directory a raw-data file name is joined against, matching
 /// libhdf5's `H5D__build_file_prefix` (H5Dint.c) for the given environment
 /// variable — `HDF5_EXTFILE_PREFIX` for External Data Files
@@ -1100,6 +1098,12 @@ pub(crate) fn combine_prefixed_path(prefix: Option<&Path>, name: &str) -> PathBu
 /// it — but a read past the *total* declared size of the file list is
 /// still an error, matching `H5D__efl_read`'s own "read past logical end
 /// of file" check.
+///
+/// An `H5O_EFL_UNLIMITED` last slot needs no special case: the walk below
+/// never steps past it (`skip >= u64::MAX` is never true), which is upstream's
+/// `H5O_EFL_UNLIMITED == size || addr < cur + size`, and the read it then
+/// takes is the whole remainder, bounded by whatever the file physically
+/// holds.
 fn read_external_file_bytes(
     external_files: &[ExternalFileSegment],
     extfile_prefix: Option<&Path>,
@@ -1119,11 +1123,6 @@ fn read_external_file_bytes(
                 "read past the logical end of the external file list".into(),
             ));
         };
-        if slot.size == EFL_UNLIMITED_SIZE {
-            return Err(crate::io::IoError::InvalidState(
-                "unlimited (growable) external file slots are not supported".into(),
-            ));
-        }
         let full_path = combine_prefixed_path(extfile_prefix, &slot.name);
         let ext_handle = FileHandle::open_read_with_locking(&full_path, FileLocking::Disabled)
             .map_err(|e| {

@@ -3020,6 +3020,9 @@ fn write_external_file_bytes(
     mut skip: u64,
     data: &[u8],
 ) -> IoResult<()> {
+    // `H5D__efl_write`'s slot walk: an `H5O_EFL_UNLIMITED` slot matches every
+    // remaining offset (`skip >= u64::MAX` is never true), so the search stops
+    // there and the write below takes the whole rest of the data.
     let mut slot_idx = 0usize;
     while slot_idx < files.len() && skip >= files[slot_idx].size {
         skip -= files[slot_idx].size;
@@ -3033,11 +3036,6 @@ fn write_external_file_bytes(
                 "write past the logical end of the external file list".into(),
             ));
         };
-        if slot.size == UNLIMITED {
-            return Err(crate::io::IoError::InvalidState(
-                "unlimited (growable) external file slots are not supported".into(),
-            ));
-        }
         let full_path = crate::io::reader::combine_prefixed_path(extfile_prefix, &slot.name);
         let ext_handle = FileHandle::open_or_create_readwrite_with_locking(
             &full_path,
@@ -8512,14 +8510,18 @@ impl Hdf5Writer {
     /// slots — or several datasets — may own disjoint ranges of one file, the
     /// way `H5D__efl_write` opens them.
     ///
-    /// The unlimited/growable slot size (`H5O_EFL_UNLIMITED`) is refused: it
-    /// only means anything for a dataset with an unlimited dataspace, which
-    /// contiguous storage cannot have here.
+    /// The last slot may take the unlimited size `H5O_EFL_UNLIMITED`, which
+    /// makes it absorb however many bytes the dataset comes to hold; a
+    /// dataset whose dataspace is unlimited must have one, since nothing
+    /// finite could cover it (`H5D__efl_construct`: "unlimited dataspace but
+    /// finite storage"). Only the first dimension may be extendible, which is
+    /// the same function's other rule.
     pub fn create_external_dataset(
         &self,
         name: &str,
         datatype: DatatypeMessage,
         dims: &[u64],
+        max_dims: Option<&[u64]>,
         files: &[(&str, u64, u64)],
     ) -> IoResult<usize> {
         if files.is_empty() {
@@ -8539,18 +8541,22 @@ impl Hdf5Writer {
 
         let mut heap = LocalHeapImage::with_empty_string();
         let mut entries = Vec::with_capacity(files.len());
-        for &(file_name, offset, size) in files {
+        for (i, &(file_name, offset, size)) in files.iter().enumerate() {
             if file_name.is_empty() {
                 return Err(crate::io::IoError::InvalidState(format!(
                     "external dataset '{name}' has a slot with an empty file name"
                 )));
             }
-            if size == UNLIMITED {
+            // `H5Pset_external` refuses to add a slot behind an unlimited one
+            // ("previous file size is unlimited"): the unlimited slot already
+            // owns every byte from its own start onwards, so nothing after it
+            // could ever be reached.
+            if size == UNLIMITED && i + 1 != files.len() {
                 return Err(crate::io::IoError::InvalidState(format!(
-                    "external dataset '{name}' slot '{file_name}' asks for the unlimited \
-                     (growable) size H5O_EFL_UNLIMITED, which this writer does not emit: \
-                     it is only valid on the last slot of a dataset with an unlimited \
-                     dataspace, and contiguous storage has none"
+                    "external dataset '{name}' gives slot {i} ('{file_name}') the unlimited \
+                     size H5O_EFL_UNLIMITED with {} slot(s) behind it; an unlimited slot \
+                     absorbs the rest of the dataset, so it can only be the last",
+                    files.len() - i - 1
                 )));
             }
             if offset.checked_add(size).is_none() {
@@ -8572,14 +8578,51 @@ impl Hdf5Writer {
             heap_addr: UNDEF_ADDR,
             files: entries,
         };
-        // `H5D__efl_construct`: the slots must reserve at least the dataset's
-        // own bytes, or part of it would have nowhere to live.
-        let reserved = external.total_size();
-        if reserved < data_size {
+        // `H5D__efl_construct`, over the dataset's *maximum* extent: the
+        // slots must reserve at least every byte the dataset could come to
+        // hold, and an unlimited extent can only be covered by an unlimited
+        // last slot ("unlimited dataspace but finite storage").
+        let max_dims = max_dims.unwrap_or(dims);
+        if max_dims.len() != dims.len() {
             return Err(crate::io::IoError::InvalidState(format!(
-                "external dataset '{name}' needs {data_size} bytes but its files reserve \
-                 only {reserved}"
+                "external dataset '{name}' has {} dimensions but {} maximum ones",
+                dims.len(),
+                max_dims.len()
             )));
+        }
+        for (d, (&max, &cur)) in max_dims.iter().zip(dims).enumerate().skip(1) {
+            if max > cur {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "external dataset '{name}' makes dimension {d} extendible ({cur} of \
+                     {max}); only the first dimension can be extendible for external storage"
+                )));
+            }
+        }
+        let reserved = external.total_size();
+        if max_dims.contains(&u64::MAX) {
+            if reserved != UNLIMITED {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "external dataset '{name}' has an unlimited dataspace but its files \
+                     reserve only {reserved} bytes; the last slot must take the unlimited \
+                     size H5O_EFL_UNLIMITED"
+                )));
+            }
+        } else {
+            let max_bytes = max_dims
+                .iter()
+                .try_fold(datatype.element_size() as u64, |acc, &d| acc.checked_mul(d))
+                .ok_or_else(|| {
+                    crate::io::IoError::InvalidState(format!(
+                        "external dataset '{name}' maximum extent times its element size \
+                         overflows 64 bits"
+                    ))
+                })?;
+            if reserved < max_bytes {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "external dataset '{name}' needs {max_bytes} bytes but its files reserve \
+                     only {reserved}"
+                )));
+            }
         }
 
         // The names' heap, written now: it is ordinary metadata of this file,
@@ -8607,7 +8650,11 @@ impl Hdf5Writer {
         let dataspace = if dims.is_empty() {
             DataspaceMessage::scalar()
         } else {
-            DataspaceMessage::simple(dims)
+            let mut ds = DataspaceMessage::simple(dims);
+            if max_dims != dims {
+                ds.max_dims = Some(max_dims.to_vec());
+            }
+            ds
         };
 
         let idx = self.push_dataset(

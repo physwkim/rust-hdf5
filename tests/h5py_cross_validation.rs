@@ -4310,6 +4310,99 @@ fn external_file_list_written_by_rust_read_by_h5py() {
     std::fs::remove_file(&raw_b).ok();
 }
 
+/// External file list with an `H5O_EFL_UNLIMITED` last slot (h5py -> rust):
+/// h5py's `external="name"` shorthand is exactly this — one slot at offset 0
+/// with size `H5F_UNLIMITED` — and it is what an unlimited dataspace over
+/// external storage requires (`H5D__efl_construct`: "unlimited dataspace but
+/// finite storage"). The slot reserves nothing, so a read is bounded by the
+/// dataset's extent and by what the raw file physically holds.
+#[test]
+fn external_file_list_with_an_unlimited_slot_written_by_h5py_read_by_rust() {
+    let Some(py) = python() else { return };
+    let path = tmp("efl_unlim");
+    let raw = path.with_extension("raw");
+    write_with_h5py(
+        py,
+        &path,
+        &format!(
+            "d = f.create_dataset('data', shape=(6,), maxshape=(None,), dtype='<i4', \
+             external=r'{}')\n\
+             d[...] = np.arange(6, dtype='<i4')\n",
+            raw.display()
+        ),
+    );
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.shape(), vec![6]);
+    assert_eq!(ds.max_shape().unwrap(), vec![None]);
+    assert_eq!(
+        ds.external_files().unwrap()[0].size,
+        rust_hdf5::format::messages::external_file_list::UNLIMITED
+    );
+    assert_eq!(ds.read_raw::<i32>().unwrap(), (0..6).collect::<Vec<i32>>());
+    assert_eq!(ds.read_slice::<i32>(&[2], &[3]).unwrap(), vec![2, 3, 4]);
+    drop(file);
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&raw).ok();
+}
+
+/// External file list with an `H5O_EFL_UNLIMITED` last slot (rust -> h5py):
+/// the mirror. A bounded first slot then an unlimited second one, so the
+/// write crosses into the slot that absorbs whatever is left
+/// (`H5D__efl_write`'s `MIN(slot.size - skip, size)` with an unlimited
+/// `slot.size`), and libhdf5 must read the same bytes back out of both files.
+#[test]
+fn external_file_list_with_an_unlimited_slot_written_by_rust_read_by_h5py() {
+    let Some(py) = python() else { return };
+    use rust_hdf5::format::messages::external_file_list::UNLIMITED;
+    let path = tmp("efl_unlim_w");
+    let raw_a = path.with_extension("a.raw");
+    let raw_b = path.with_extension("b.raw");
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([16usize])
+            .max_shape(&[None])
+            .external(&[
+                (raw_a.to_str().unwrap(), 0, 24),
+                (raw_b.to_str().unwrap(), 0, UNLIMITED),
+            ])
+            .create("data")
+            .unwrap();
+        ds.write_raw(&(0..16i32).collect::<Vec<_>>()).unwrap();
+        file.close().unwrap();
+    }
+    // The bounded slot took its 24 reserved bytes; the unlimited one took
+    // every byte left, which no reservation of its own bounded.
+    assert_eq!(std::fs::metadata(&raw_a).unwrap().len(), 24);
+    assert_eq!(std::fs::metadata(&raw_b).unwrap().len(), 40);
+
+    let expected: Vec<i32> = (0..16).collect();
+    read_back_with_h5py(
+        py,
+        &path,
+        &format!(
+            "d = f['data']\n\
+             assert d.shape == (16,), d.shape\n\
+             assert d.maxshape == (None,), d.maxshape\n\
+             assert list(d[...]) == {expected:?}, list(d[...])\n\
+             assert d.external == [({:?}, 0, 24), ({:?}, 0, 2**64 - 1)], d.external\n",
+            raw_a.to_str().unwrap(),
+            raw_b.to_str().unwrap()
+        ),
+    );
+    {
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("data").unwrap();
+        assert_eq!(ds.read_raw::<i32>().unwrap(), expected);
+        assert_eq!(ds.read_slice::<i32>(&[4], &[4]).unwrap(), expected[4..8]);
+    }
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&raw_a).ok();
+    std::fs::remove_file(&raw_b).ok();
+}
+
 /// An external dataset survives a header rewrite. Reopening the file and
 /// setting an attribute makes the dataset's object header stale, so the close
 /// rebuilds it from the registry — and the registry has to still carry the

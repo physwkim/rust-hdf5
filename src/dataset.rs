@@ -465,6 +465,14 @@ impl<T: H5Type> DatasetBuilder<T> {
     /// The named files are created on first write and never truncated, so
     /// several datasets may own disjoint ranges of one file.
     ///
+    /// The last entry may take the unlimited size
+    /// [`external_file_list::UNLIMITED`](crate::format::messages::external_file_list::UNLIMITED)
+    /// (`H5O_EFL_UNLIMITED`), which makes it absorb the whole rest of the
+    /// dataset however far it grows. A dataset whose
+    /// [`max_shape`](Self::max_shape) is unlimited must have one, since no
+    /// finite reservation could cover it, and only the first dimension may be
+    /// extendible — both `H5D__efl_construct`'s rules.
+    ///
     /// ```no_run
     /// # use rust_hdf5::H5File;
     /// let file = H5File::create("ext.h5").unwrap();
@@ -1165,7 +1173,18 @@ impl<T: H5Type> DatasetBuilder<T> {
                                     .map(|(name, offset, size)| (name.as_str(), *offset, *size))
                                     .collect();
                                 writer.create_external_dataset(
-                                    &full_name, datatype, &dims_u64, &slots,
+                                    &full_name,
+                                    datatype,
+                                    &dims_u64,
+                                    self.max_shape
+                                        .as_ref()
+                                        .map(|max| {
+                                            max.iter()
+                                                .map(|m| m.map_or(u64::MAX, |v| v as u64))
+                                                .collect::<Vec<u64>>()
+                                        })
+                                        .as_deref(),
+                                    &slots,
                                 )?
                             }
                             None => writer.create_dataset(&full_name, datatype, &dims_u64)?,
@@ -9605,6 +9624,104 @@ mod tests {
             file.dataset("set").unwrap().fill_value().unwrap(),
             FillValue::UserDefined((-7i32).to_le_bytes().to_vec())
         );
+    }
+
+    /// The three `H5D__efl_construct` / `H5Pset_external` rules an
+    /// `H5O_EFL_UNLIMITED` slot lives inside: it may only be the last slot,
+    /// an unlimited dataspace must have one, and only the first dimension
+    /// may be extendible.
+    #[test]
+    fn the_unlimited_external_slot_keeps_its_three_rules() {
+        use crate::format::messages::external_file_list::UNLIMITED;
+        let path = temp_path("efl_unlim_rules");
+        let file = H5File::create(&path).unwrap();
+
+        // "previous file size is unlimited": nothing behind an unlimited slot
+        // could ever be reached.
+        let err = match file
+            .new_dataset::<i32>()
+            .shape([8usize])
+            .external(&[("a.raw", 0, UNLIMITED), ("b.raw", 0, 32)])
+            .create("mid")
+        {
+            Ok(_) => panic!("an unlimited slot absorbs everything behind it"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("only be the last"), "{err}");
+
+        // "unlimited dataspace but finite storage".
+        let err = match file
+            .new_dataset::<i32>()
+            .shape([8usize])
+            .max_shape(&[None])
+            .external(&[("a.raw", 0, 32)])
+            .create("finite")
+        {
+            Ok(_) => panic!("no finite reservation covers an unlimited extent"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("unlimited dataspace"), "{err}");
+
+        // "only the first dimension can be extendible".
+        let err = match file
+            .new_dataset::<i32>()
+            .shape([2usize, 4])
+            .max_shape(&[Some(2), None])
+            .external(&[("a.raw", 0, UNLIMITED)])
+            .create("dim1")
+        {
+            Ok(_) => panic!("only the slowest-varying dimension may be extendible"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("only the first dimension"), "{err}");
+
+        // And the legal shape: an unlimited last slot under an unlimited
+        // first dimension.
+        file.new_dataset::<i32>()
+            .shape([8usize])
+            .max_shape(&[None])
+            .external(&[("a.raw", 0, 16), ("b.raw", 0, UNLIMITED)])
+            .create("ok")
+            .unwrap()
+            .write_raw(&(0..8i32).collect::<Vec<_>>())
+            .unwrap();
+        file.close().unwrap();
+        std::fs::remove_file(&path).ok();
+        for raw in ["a.raw", "b.raw"] {
+            std::fs::remove_file(raw).ok();
+        }
+    }
+
+    /// An unlimited slot reserves nothing, so a read of it is bounded by the
+    /// dataset's extent and by what the file physically holds: the tail past
+    /// the end of a short raw file reads back as zero, exactly as
+    /// `H5D__efl_read` fills it.
+    #[test]
+    fn an_unlimited_external_slot_reads_zero_past_the_end_of_its_file() {
+        use crate::format::messages::external_file_list::UNLIMITED;
+        let dir = std::env::temp_dir().join(format!("rh5_efl_short_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.h5");
+        let raw = dir.join("short.raw");
+        // Four elements' worth of bytes for an eight-element dataset.
+        std::fs::write(&raw, [0u8; 16]).unwrap();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .max_shape(&[None])
+                .external(&[(raw.to_str().unwrap(), 0, UNLIMITED)])
+                .create("data")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("data").unwrap().read_raw::<i32>().unwrap(),
+            vec![0i32; 8]
+        );
+        drop(file);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// [`H5Dataset::external_files`] reports the stored segment list in
