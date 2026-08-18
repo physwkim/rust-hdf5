@@ -7891,6 +7891,7 @@ mod tests {
         use super::*;
 
         /// `d` = a ramp of `n` f64 in chunks of `chunk`, deflated or not.
+        #[cfg(feature = "deflate")]
         fn dataset(name: &str, n: usize, chunk: usize, deflate: bool) -> std::path::PathBuf {
             let path = temp_path(name);
             let data: Vec<f64> = (0..n).map(|i| (i % 251) as f64).collect();
@@ -7948,6 +7949,7 @@ mod tests {
         /// times: the first decodes it, the other three place it out of the
         /// image it left, and all four read what the file holds.
         #[test]
+        #[cfg(feature = "deflate")]
         fn a_partial_read_keeps_the_chunk_it_did_not_finish() {
             let path = dataset("images_partial", 4096, 1024, true);
             let mut r = Hdf5Reader::open(&path).unwrap();
@@ -7974,6 +7976,7 @@ mod tests {
         /// offer in the first place; here every chunk really is materialized,
         /// and only "the read consumed it" keeps it out of the cache.
         #[test]
+        #[cfg(feature = "deflate")]
         fn a_whole_dataset_read_keeps_nothing() {
             let path = dataset_2d("images_full", 256, 256, [64, 64], true);
             let mut r = Hdf5Reader::open(&path).unwrap();
@@ -7986,6 +7989,7 @@ mod tests {
         /// look partial: what that chunk has to give is what the extent
         /// reaches, and the read took all of it.
         #[test]
+        #[cfg(feature = "deflate")]
         fn a_whole_read_of_a_ragged_extent_keeps_nothing() {
             let path = dataset("images_ragged", 3000, 1024, true);
             let mut r = Hdf5Reader::open(&path).unwrap();
@@ -8017,6 +8021,7 @@ mod tests {
         /// region-of-interest case the cache exists for: each column of chunks
         /// inflates once however many columns are read out of it.
         #[test]
+        #[cfg(feature = "deflate")]
         fn a_filtered_column_walk_reuses_each_chunk() {
             let path = dataset_2d("images_column", 256, 256, [64, 64], true);
             let mut warm = Hdf5Reader::open(&path).unwrap();
@@ -8037,6 +8042,7 @@ mod tests {
         /// A chunk whose image is larger than the whole budget would evict
         /// everything to hold one entry, so it is never kept.
         #[test]
+        #[cfg(feature = "deflate")]
         fn a_chunk_over_the_budget_is_never_kept() {
             let over = CHUNK_CACHE_BYTES / 8 + 1;
             let path = dataset("images_oversize", over * 2, over, true);
@@ -8081,6 +8087,7 @@ mod tests {
         /// The budget is bytes: eight partial reads of eight 256 KiB chunks
         /// leave the four the budget pays for, not eight.
         #[test]
+        #[cfg(feature = "deflate")]
         fn the_cache_holds_no_more_than_its_byte_budget() {
             let chunk = 32 * 1024; // f64 -> 256 KiB
             let path = dataset("images_budget", chunk * 8, chunk, true);
@@ -8100,6 +8107,7 @@ mod tests {
         /// the images live in that index — so what a read cached against the
         /// old entry cannot be served against the new one.
         #[test]
+        #[cfg(feature = "deflate")]
         fn changing_an_entry_drops_the_chunk_images() {
             let path = dataset("images_entry_mut", 4096, 1024, true);
             let mut r = Hdf5Reader::open(&path).unwrap();
@@ -8116,6 +8124,7 @@ mod tests {
         /// that never cached anything returns, over slices that start inside
         /// a chunk, end inside one, and span several.
         #[test]
+        #[cfg(feature = "deflate")]
         fn a_cached_chunk_places_what_a_cold_read_places() {
             let path = dataset("images_differential", 4096, 1024, true);
             let mut warm = Hdf5Reader::open(&path).unwrap();
@@ -9327,6 +9336,7 @@ mod h5py_debug_tests {
     /// Both sinks are driven off one array here, so naive extraction is the
     /// shared oracle for the two of them and for every run shape in between.
     #[test]
+    #[cfg(feature = "deflate")]
     fn slice_reads_agree_however_the_chunk_reaches_the_output() {
         let path = temp_path("slice_run_placement");
         let (rows, cols) = (8usize, 4096usize); // a chunk row is 32 KiB

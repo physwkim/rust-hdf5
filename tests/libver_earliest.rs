@@ -584,6 +584,7 @@ fn a_chunked_dataset_created_at_earliest_uses_the_version_1_btree() {
 /// chunks go in the same version-1 B-tree an unfiltered dataset uses; its
 /// keys already carry the stored size and the filter mask.
 #[test]
+#[cfg(feature = "deflate")]
 fn a_filtered_dataset_created_at_earliest_gets_a_version_1_pipeline() {
     let Some(py) = python() else { return };
     let path = tmp("filtered");

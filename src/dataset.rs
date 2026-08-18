@@ -5471,6 +5471,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "deflate")]
     fn write_raw_multichunk_edge_roundtrips() {
         let path = temp_path("multichunk_edge");
         let data: Vec<i32> = (0..35).collect(); // 7 x 5 row-major
@@ -7128,6 +7129,7 @@ mod tests {
     /// chunk — sends it to the single-chunk index instead of Fixed Array;
     /// see `one_whole_dataset_chunk_writes_the_single_chunk_index`.)
     #[test]
+    #[cfg(feature = "deflate")]
     fn early_allocation_only_picks_implicit_where_libhdf5_does() {
         // Every case writes and reads back its data, so a mis-selected index
         // shows up as wrong bytes and not just as a different structure.

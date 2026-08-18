@@ -11,7 +11,9 @@
 //! The invariant they share: the file comes back in the format it went in, so
 //! a reader that could open it before the append can open it after.
 
-use rust_hdf5::{H5File, LibverBound, Selection};
+#[cfg(feature = "deflate")]
+use rust_hdf5::Selection;
+use rust_hdf5::{H5File, LibverBound};
 
 /// Interpreters tried in order when `RUST_HDF5_TEST_PYTHON` is unset, matching
 /// `h5py_cross_validation`. `h5dump` and `h5clear` are taken from the same
@@ -611,6 +613,7 @@ fn a_classic_chunk_tree_grows_past_one_node_and_past_its_extent() {
 /// `H5D__virtual_construct` raises that one message and checks only the high
 /// bound (H5Dvirtual.c:2679), so it belongs in a version-0 file too.
 #[test]
+#[cfg(feature = "deflate")]
 fn a_classic_file_takes_every_layout() {
     let Some(py) = python() else { return };
     let path = tmp("storage_matrix");
@@ -719,6 +722,7 @@ fn a_classic_file_takes_every_layout() {
 /// mandatory-flag form — a count, not a presence, or h5py's own copy would
 /// answer for the writer's.
 #[test]
+#[cfg(feature = "deflate")]
 fn a_filtered_dataset_in_a_classic_file_gets_a_version_1_pipeline() {
     let Some(py) = python() else { return };
     let path = tmp("pline_v1");
