@@ -71,6 +71,30 @@
   gone. The filtered batch writers compress from borrowed bytes for the
   same reason, halving what a window in flight holds.
 
+- Creating many objects in one file no longer walks the whole file model
+  per create, and the small metadata writes each one makes now leave as
+  one write. Names are checked against an index instead of the six
+  registries in turn, and `FileHandle` stages writes below 8 KiB into a
+  1 MiB run that is emitted when the next write leaves it, so a gap the
+  run bridges is read back and written out unchanged rather than
+  invented. On the `perf/run.py` small-write workload (2000 datasets of
+  128 f64) that is 15.5 ms down to 6.0 ms against libhdf5 1.14.6's
+  13.0 ms, and 4072 `pwrite` calls down to 7 against its 2364. Written
+  files are byte-for-byte what they were. The accumulator stays off
+  under `threadsafe`, where concurrent writers would take turns flushing
+  each other's bytes.
+
+- A reader now decodes a chunked dataset's index once and keeps it,
+  dropped the moment the dataset's catalog entry changes or a SWMR
+  refresh replaces the catalog, so repeated slice reads stop re-walking
+  the B-tree per call: the 1000-slice `perf/run.py` workload fell from
+  5228 syscalls to 1233 and from 1.79x of libhdf5 1.14.6 to 0.91x.
+  A typed hyperslab or point read lands in the vector it returns
+  instead of staging a byte image, the fill pass covers only what the
+  chunk plan proves it must, and a batch below two live chunks or
+  256 KiB stays off the rayon pool — entering it per batch was what
+  held the `parallel` build's slice read at 108 ms; it reads 8.7 ms now.
+
 ### Fixed
 
 - Declaring a fill value on a dataset stored through an external file

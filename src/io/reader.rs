@@ -118,6 +118,21 @@ impl<'a> ChunkTarget<'a> {
     }
 }
 
+/// What one chunked read wants of every chunk, apart from which dataset it is
+/// reading: the filter pipeline the chunks were stored through, the box of the
+/// dataset it fills, and the fill value every byte no chunk covers takes.
+///
+/// Carried as one value because all three are constant across a read and are
+/// threaded unchanged from the entry point through each index type down to
+/// [`place_chunk_jobs`] — so a new index reader cannot pick up the target and
+/// forget the fill.
+#[derive(Clone, Copy)]
+struct ChunkReadRequest<'a> {
+    pipeline: Option<&'a FilterPipeline>,
+    target: ChunkTarget<'a>,
+    fill_value: Option<&'a [u8]>,
+}
+
 /// The dataset extent, chunk shape and element size a chunk-placement call
 /// reads through — constant across every chunk of one read, so
 /// [`for_each_chunk_run`] and the two sinks built on it take this once instead
@@ -918,51 +933,121 @@ pub struct SuperblockExtension {
 /// holding thousands of datasets paid that per access. The index is derived
 /// in [`DatasetTable::new`], which is the only way to build one, so it cannot
 /// fall out of step with the list it indexes.
-struct DatasetTable {
-    list: Vec<DatasetReadInfo>,
-    /// Canonical path (no leading `/`) → position in `list`. A name the walk
-    /// recorded twice keeps its first position, which is the entry a scan
-    /// from the front would have found.
-    by_name: std::collections::HashMap<String, usize>,
+/// One dataset's chunk index, as decoded from the file: `(chunk address,
+/// on-disk byte count, filter mask)` per chunk the index records, in the
+/// order the index walks them, alongside each chunk's chunk-grid coordinates
+/// (`coords[i * rank .. (i + 1) * rank]`).
+///
+/// Only what the file decides lives here. What a read then does with an entry
+/// is that read's own business — a chunk outside the selection is never
+/// fetched, a filtered chunk is read to its recorded size — so nothing about
+/// one call can be cached by mistake.
+struct DecodedChunkIndex {
+    entries: Vec<(u64, u64, u32)>,
+    coords: Vec<u64>,
 }
 
-impl DatasetTable {
-    fn new(list: Vec<DatasetReadInfo>) -> Self {
-        let mut by_name = std::collections::HashMap::with_capacity(list.len());
-        for (i, ds) in list.iter().enumerate() {
-            by_name.entry(ds.name.clone()).or_insert(i);
+/// The reader's dataset catalog, and the one place a decoded chunk index
+/// lives.
+///
+/// A cached [`DecodedChunkIndex`] MUST describe the file exactly as the
+/// catalog entry beside it does, and MUST NOT be handed out for an index
+/// address other than the one it was decoded from. The fields are private to
+/// the module, so an entry is reachable read-only (`get`, `iter`, `Index`) or
+/// through [`DatasetTable::entry_mut`], which drops that entry's cached index
+/// before handing out the reference: changing what an entry says about the
+/// file cannot leave a stale index behind it. Rebuilding the table — what a
+/// SWMR refresh does — drops every cached index with it.
+mod dataset_table {
+    use super::{DatasetReadInfo, DecodedChunkIndex};
+    use std::sync::Arc;
+
+    pub(super) struct DatasetTable {
+        list: Vec<DatasetReadInfo>,
+        /// Canonical path (no leading `/`) → position in `list`. A name the
+        /// walk recorded twice keeps its first position, which is the entry a
+        /// scan from the front would have found.
+        by_name: std::collections::HashMap<String, usize>,
+        /// Per entry, the index address a chunk index was decoded from and
+        /// what it decoded to. Parallel to `list`.
+        chunk_index: Vec<Option<(u64, Arc<DecodedChunkIndex>)>>,
+    }
+
+    impl DatasetTable {
+        pub(super) fn new(list: Vec<DatasetReadInfo>) -> Self {
+            let mut by_name = std::collections::HashMap::with_capacity(list.len());
+            for (i, ds) in list.iter().enumerate() {
+                by_name.entry(ds.name.clone()).or_insert(i);
+            }
+            let chunk_index = list.iter().map(|_| None).collect();
+            Self {
+                list,
+                by_name,
+                chunk_index,
+            }
         }
-        Self { list, by_name }
+
+        /// Where the dataset named `name` sits in the list, or `None` when the
+        /// catalog holds no such name.
+        pub(super) fn position(&self, name: &str) -> Option<usize> {
+            self.by_name.get(name).copied()
+        }
+
+        pub(super) fn get(&self, name: &str) -> Option<&DatasetReadInfo> {
+            self.list.get(self.position(name)?)
+        }
+
+        pub(super) fn iter(&self) -> std::slice::Iter<'_, DatasetReadInfo> {
+            self.list.iter()
+        }
+
+        /// The entry at `i`, mutably. Whatever the caller changes about it may
+        /// be what a decoded chunk index was read against, so that index goes
+        /// first: this is the only way to a `&mut DatasetReadInfo`, which is
+        /// what keeps the cache from outliving the entry it describes.
+        pub(super) fn entry_mut(&mut self, i: usize) -> &mut DatasetReadInfo {
+            self.chunk_index[i] = None;
+            &mut self.list[i]
+        }
+
+        /// The chunk index cached for entry `i`, if one was decoded from
+        /// `index_address`. A different address means the entry now points at
+        /// another structure, and the cached one does not answer for it.
+        pub(super) fn chunk_index(
+            &self,
+            i: usize,
+            index_address: u64,
+        ) -> Option<&Arc<DecodedChunkIndex>> {
+            match self.chunk_index.get(i)? {
+                Some((addr, index)) if *addr == index_address => Some(index),
+                _ => None,
+            }
+        }
+
+        /// Keep `index` as entry `i`'s decoded chunk index for
+        /// `index_address`, and hand it back.
+        pub(super) fn cache_chunk_index(
+            &mut self,
+            i: usize,
+            index_address: u64,
+            index: DecodedChunkIndex,
+        ) -> Arc<DecodedChunkIndex> {
+            let index = Arc::new(index);
+            self.chunk_index[i] = Some((index_address, Arc::clone(&index)));
+            index
+        }
     }
 
-    /// Where the dataset named `name` sits in the list, or `None` when the
-    /// catalog holds no such name.
-    fn position(&self, name: &str) -> Option<usize> {
-        self.by_name.get(name).copied()
-    }
+    impl std::ops::Index<usize> for DatasetTable {
+        type Output = DatasetReadInfo;
 
-    fn get(&self, name: &str) -> Option<&DatasetReadInfo> {
-        self.list.get(self.position(name)?)
-    }
-
-    fn iter(&self) -> std::slice::Iter<'_, DatasetReadInfo> {
-        self.list.iter()
+        fn index(&self, i: usize) -> &DatasetReadInfo {
+            &self.list[i]
+        }
     }
 }
 
-impl std::ops::Index<usize> for DatasetTable {
-    type Output = DatasetReadInfo;
-
-    fn index(&self, i: usize) -> &DatasetReadInfo {
-        &self.list[i]
-    }
-}
-
-impl std::ops::IndexMut<usize> for DatasetTable {
-    fn index_mut(&mut self, i: usize) -> &mut DatasetReadInfo {
-        &mut self.list[i]
-    }
-}
+use dataset_table::DatasetTable;
 
 /// HDF5 file reader.
 pub struct Hdf5Reader {
@@ -1698,6 +1783,90 @@ fn read_chunk_raw(handle: &FileHandle, j: &ChunkReadJob) -> IoResult<Vec<u8>> {
 /// read on their own instead of reading the chunk whole and copying them out.
 const PREAD_COST_BYTES: u64 = 16 * 1024;
 
+/// One chunk's intersection with the read box, in global dataset indices.
+///
+/// The single derivation of chunk ∩ selection ∩ extent:
+/// [`for_each_chunk_run`] decomposes this box into contiguous runs and
+/// [`ChunkOverlap::bytes`] measures it, so what a plan is measured to cover
+/// and what the same plan places can never disagree.
+struct ChunkOverlap {
+    lo: Vec<u64>,
+    hi: Vec<u64>,
+}
+
+impl ChunkOverlap {
+    /// `None` when the chunk and the read box do not meet. A corrupt index can
+    /// place a chunk past the extent, so the arithmetic saturates and an empty
+    /// span simply yields `None`.
+    fn of(place: &ChunkPlacement, chunk_coords: &[u64]) -> Option<Self> {
+        let ChunkPlacement {
+            geo: ChunkOutputGeometry {
+                dims, chunk_dims, ..
+            },
+            starts,
+            counts,
+        } = *place;
+        let ndims = dims.len();
+        if ndims == 0 {
+            return None;
+        }
+        let mut lo = vec![0u64; ndims];
+        let mut hi = vec![0u64; ndims];
+        for d in 0..ndims {
+            let origin = chunk_coords[d].saturating_mul(chunk_dims[d]);
+            let chunk_end = origin.saturating_add(chunk_dims[d]).min(dims[d]);
+            let sel_end = starts[d].saturating_add(counts[d]);
+            lo[d] = origin.max(starts[d]);
+            hi[d] = chunk_end.min(sel_end);
+            if lo[d] >= hi[d] {
+                return None;
+            }
+        }
+        Some(Self { lo, hi })
+    }
+
+    /// Output bytes this overlap covers — exactly the summed length of the
+    /// runs [`for_each_chunk_run`] yields for the same chunk.
+    fn bytes(&self, element_size: u64) -> u64 {
+        self.lo
+            .iter()
+            .zip(&self.hi)
+            .map(|(&l, &h)| h - l)
+            .product::<u64>()
+            .saturating_mul(element_size)
+    }
+}
+
+/// Output bytes a chunk plan covers, counting each chunk-grid slot once.
+///
+/// Distinct slots own disjoint boxes of the index space and one chunk's runs
+/// are disjoint from each other, so this sum is the exact volume of their
+/// union — provided a slot a corrupt index names twice is counted once, which
+/// is what `seen` is for. The caller compares it against the output length:
+/// anything short means some output byte belongs to a chunk this plan will not
+/// place, and only then does the fill value have to go down first.
+fn planned_coverage(place: &ChunkPlacement, jobs: &[Option<ChunkReadJob>], coords: &[u64]) -> u64 {
+    let rank = place.geo.dims.len();
+    if rank == 0 {
+        return 0;
+    }
+    let mut seen: std::collections::HashSet<&[u64]> = std::collections::HashSet::new();
+    let mut covered = 0u64;
+    for (i, job) in jobs.iter().enumerate() {
+        if job.is_none() {
+            continue;
+        }
+        let c = &coords[i * rank..(i + 1) * rank];
+        if !seen.insert(c) {
+            continue;
+        }
+        if let Some(overlap) = ChunkOverlap::of(place, c) {
+            covered = covered.saturating_add(overlap.bytes(place.geo.element_size));
+        }
+    }
+    covered
+}
+
 /// Walk the contiguous byte runs of one chunk's intersection with the read box
 /// `[starts, starts + counts)`, as `(offset in the chunk image, offset in the
 /// output, run length in bytes)`.
@@ -1726,24 +1895,11 @@ fn for_each_chunk_run(
         counts,
     } = *place;
     let ndims = dims.len();
-    if ndims == 0 {
+    // Global intersection box [lo, hi) of chunk ∩ selection ∩ dataset; `None`
+    // covers the rank-0 case the indexing below could not survive.
+    let Some(ChunkOverlap { lo, hi }) = ChunkOverlap::of(place, chunk_coords) else {
         return;
-    }
-    // Global intersection box [lo, hi) of chunk ∩ selection ∩ dataset. A
-    // corrupt index can place a chunk past the extent, so the arithmetic
-    // saturates and an empty span simply places nothing.
-    let mut lo = vec![0u64; ndims];
-    let mut hi = vec![0u64; ndims];
-    for d in 0..ndims {
-        let origin = chunk_coords[d].saturating_mul(chunk_dims[d]);
-        let chunk_end = origin.saturating_add(chunk_dims[d]).min(dims[d]);
-        let sel_end = starts[d].saturating_add(counts[d]);
-        lo[d] = origin.max(starts[d]);
-        hi[d] = chunk_end.min(sel_end);
-        if lo[d] >= hi[d] {
-            return; // no overlap in this dimension
-        }
-    }
+    };
 
     let chunk_strides = compute_strides(chunk_dims, element_size);
     let out_strides = compute_strides(counts, element_size);
@@ -1779,20 +1935,35 @@ fn for_each_chunk_run(
 /// `output`.
 ///
 /// A run reaching past the image — a chunk read short at the end of the file —
-/// or past the output is skipped, leaving the caller's pre-filled fill value
-/// there.
+/// or past the output cannot be copied; it is appended to `skipped` as the
+/// output range `(offset, length)` nothing wrote, which is what
+/// [`place_chunk_jobs`] fills with the fill value.
 fn copy_chunk_runs(
     chunk_data: &[u8],
     output: &mut [u8],
     place: &ChunkPlacement,
     chunk_coords: &[u64],
+    skipped: &mut Vec<(usize, usize)>,
 ) {
     for_each_chunk_run(place, chunk_coords, |src, dst, len| {
         let (s, d) = (src as usize, dst as usize);
         if s + len <= chunk_data.len() && d + len <= output.len() {
             output[d..d + len].copy_from_slice(&chunk_data[s..s + len]);
+        } else {
+            push_skipped(skipped, output.len(), d, len);
         }
     });
+}
+
+/// Record the output range `[dst, dst + len)` as one nothing wrote, clamped to
+/// the output so a range a corrupt geometry pushed past the end never widens
+/// into a slice the fill would panic on.
+fn push_skipped(skipped: &mut Vec<(usize, usize)>, out_len: usize, dst: usize, len: usize) {
+    let start = dst.min(out_len);
+    let end = dst.saturating_add(len).min(out_len);
+    if start < end {
+        skipped.push((start, end - start));
+    }
 }
 
 /// Read one unfiltered chunk's intersection with the read box straight from
@@ -1807,7 +1978,9 @@ fn copy_chunk_runs(
 /// [`copy_chunk_runs`] would have placed out of that image.
 ///
 /// Returns whether the chunk's bytes landed in `output`; `false` means the
-/// caller must still read the chunk whole. That happens when the runs are too
+/// caller must still read the chunk whole, and the `skipped` ranges this call
+/// appended are the caller's to discard (the whole-chunk path records its
+/// own). That happens when the runs are too
 /// small for a read each to beat one whole-chunk read plus the copy out of it,
 /// and when a read fails — the whole-chunk path owns both the error and the
 /// short read a truncated file gives, and re-places any run already placed
@@ -1820,13 +1993,16 @@ fn read_chunk_runs_into(
     place: &ChunkPlacement,
     chunk_coords: &[u64],
     output: &mut [u8],
+    skipped: &mut Vec<(usize, usize)>,
 ) -> bool {
     // (file offset, offset in output, length), coalesced as they are planned.
     let mut runs: Vec<(u64, usize, usize)> = Vec::new();
     let mut selected = 0u64;
+    let out_len = output.len();
     for_each_chunk_run(place, chunk_coords, |src, dst, len| {
         let (s, d) = (src as usize, dst as usize);
-        if s + len > image_len || d + len > output.len() {
+        if s + len > image_len || d + len > out_len {
+            push_skipped(skipped, out_len, d, len);
             return;
         }
         selected += len as u64;
@@ -1872,33 +2048,66 @@ fn read_chunk_runs_into(
 /// ([`crate::io::chunk_grid::coords_table`]): job `i` sits at rank-many values
 /// from `i * rank`.
 ///
-/// `output` must already carry the tiled fill value: a chunk the plan skipped —
-/// unallocated, or outside the selection — is never written here.
+/// It is also the single owner of the fill: every byte of `output` this
+/// returns `Ok` on is either a byte some chunk placed or a byte filled with
+/// the tiled fill value, so callers hand it an arbitrary (even uninitialized)
+/// buffer and a chunked read that reaches no chunk at all still routes through
+/// here with an empty job list. The fill is derived from the plan rather than
+/// laid down blanket-first: when [`planned_coverage`] proves the plan covers
+/// the whole output, a 128 MiB read never pays a 128 MiB memset it is about to
+/// overwrite, and only the runs a short chunk image left unwritten are filled
+/// afterwards.
 fn place_chunk_jobs(
     handle: &FileHandle,
-    pipeline: Option<&FilterPipeline>,
     mut jobs: Vec<Option<ChunkReadJob>>,
     coords: &[u64],
-    target: ChunkTarget,
+    req: ChunkReadRequest,
     geo: &ChunkOutputGeometry,
     output: &mut [u8],
 ) -> IoResult<()> {
+    let ChunkReadRequest {
+        pipeline,
+        target,
+        fill_value,
+    } = req;
     let rank = geo.dims.len();
     let zeros = vec![0u64; rank];
     let place = ChunkPlacement::resolve(geo, target, &zeros);
     let at = |i: usize| &coords[i * rank..(i + 1) * rank];
+
+    // Fill first unless the plan already accounts for every output byte; then
+    // only the runs placement could not honour need filling afterwards.
+    let prefilled = planned_coverage(&place, &jobs, coords) != output.len() as u64;
+    if prefilled {
+        fill_tiled_into(output, fill_value);
+    }
+    let mut skipped: Vec<(usize, usize)> = Vec::new();
+
     if pipeline.is_none() {
         for (i, job) in jobs.iter_mut().enumerate() {
             let Some(j) = job.as_ref() else { continue };
-            if read_chunk_runs_into(handle, j.addr, j.len, &place, at(i), output) {
+            let mark = skipped.len();
+            if read_chunk_runs_into(handle, j.addr, j.len, &place, at(i), output, &mut skipped) {
                 *job = None;
+            } else {
+                // The whole-chunk path re-places this chunk and records what
+                // it could not place; a half-planned attempt must not leave a
+                // range behind that the fill would then write over good bytes.
+                skipped.truncate(mark);
             }
         }
     }
-    let placed = read_and_decompress_chunks(handle, pipeline, jobs)?;
-    for (i, chunk_data) in placed.iter().enumerate() {
-        if let Some(data) = chunk_data {
-            copy_chunk_runs(data, output, &place, at(i));
+    if jobs.iter().any(Option::is_some) {
+        let placed = read_and_decompress_chunks(handle, pipeline, jobs)?;
+        for (i, chunk_data) in placed.iter().enumerate() {
+            if let Some(data) = chunk_data {
+                copy_chunk_runs(data, output, &place, at(i), &mut skipped);
+            }
+        }
+    }
+    if !prefilled {
+        for (dst, len) in skipped {
+            fill_tiled_into(&mut output[dst..dst + len], fill_value);
         }
     }
     Ok(())
@@ -1914,6 +2123,35 @@ fn decompress_chunk(
         Some(pl) => Ok(filter::reverse_filters_masked(pl, &raw, mask)?),
         None => Ok(raw),
     }
+}
+
+/// Planned chunk bytes a batch must carry before the rayon pool earns its
+/// entry cost.
+///
+/// `ThreadPool::install` injects a job and blocks on a latch; with the workers
+/// parked that costs tens of microseconds, which is more than a small
+/// selection's entire read. One 64 KiB slice of a chunked dataset plans one or
+/// two chunks, so it decodes on the thread that planned it and never pays the
+/// dispatch.
+#[cfg(feature = "parallel")]
+const PARALLEL_MIN_JOB_BYTES: u64 = 256 * 1024;
+
+/// Whether a batch is worth handing to the pool: more than one chunk to read,
+/// and enough bytes behind them to repay [`PARALLEL_MIN_JOB_BYTES`]. Skipped
+/// chunks (`None`) count for nothing — a slice whose chunks were all placed by
+/// [`read_chunk_runs_into`] leaves no work at all.
+#[cfg(feature = "parallel")]
+fn worth_parallel(jobs: &[Option<ChunkReadJob>]) -> bool {
+    let mut n = 0usize;
+    let mut bytes = 0u64;
+    for j in jobs.iter().flatten() {
+        n += 1;
+        bytes = bytes.saturating_add(j.len as u64);
+        if n > 1 && bytes >= PARALLEL_MIN_JOB_BYTES {
+            return true;
+        }
+    }
+    false
 }
 
 /// Read and decompress a batch of chunk jobs, preserving job order.
@@ -1953,8 +2191,9 @@ fn read_and_decompress_chunks(
             }
         };
         // Run on rust-hdf5's private half-cores pool, not rayon's global pool;
-        // fall back to serial if the pool could not be built.
-        match crate::parallel::io_pool() {
+        // fall back to serial if the pool could not be built, and for a batch
+        // too small to repay entering it.
+        match crate::parallel::io_pool().filter(|_| worth_parallel(&jobs)) {
             Some(pool) => pool.install(|| {
                 jobs.into_par_iter()
                     .map(&decode)
@@ -1969,6 +2208,7 @@ fn read_and_decompress_chunks(
         // No positioned read API here: concurrent reads would race the shared
         // file cursor, so read serially, then parallelize decompression on
         // rust-hdf5's private half-cores pool (not rayon's global pool).
+        let parallel = worth_parallel(&jobs);
         let raws: Vec<Option<(Vec<u8>, u32)>> = jobs
             .into_iter()
             .map(|job| match job {
@@ -1982,8 +2222,9 @@ fn read_and_decompress_chunks(
                 None => Ok(None),
             }
         };
-        // Fall back to serial if the private pool could not be built.
-        match crate::parallel::io_pool() {
+        // Fall back to serial if the private pool could not be built, and for
+        // a batch too small to repay entering it.
+        match crate::parallel::io_pool().filter(|_| parallel) {
             Some(pool) => pool.install(|| {
                 raws.into_par_iter()
                     .map(&decode)
@@ -3398,6 +3639,17 @@ impl Hdf5Reader {
         self.datasets.get(&name)
     }
 
+    /// Where `name` sits in this file's catalog, resolving the same soft
+    /// links and group hard links [`dataset_info_local`](Self::dataset_info_local)
+    /// does. Read paths that need the entry more than once take the position
+    /// once and index with it, rather than walking the path again per lookup.
+    fn dataset_position(&self, name: &str) -> IoResult<usize> {
+        let canonical = self.canonical_path(name);
+        self.datasets
+            .position(&canonical)
+            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))
+    }
+
     /// Open `name` as a dataset the way `H5Dopen2` does, reporting *why* it
     /// cannot be opened instead of collapsing every cause into absence: a
     /// soft link whose target does not exist is a dangling link, and a path
@@ -4155,17 +4407,20 @@ impl Hdf5Reader {
                 chunk_dims,
                 b_tree_address,
             } => {
-                // Pre-fill so any chunk gap reads back as fill, then scatter.
-                fill_tiled_into(out, fill_value.as_deref());
                 // The layout's chunk_dims include the element size as the
-                // trailing dimension. Strip it for chunk indexing.
+                // trailing dimension. Strip it for chunk indexing. The chunk
+                // read defines every byte of `out`, filling whatever no chunk
+                // covers.
                 let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
                 self.read_chunked_btree_v1(
                     name,
                     real_chunk_dims,
                     *b_tree_address,
-                    pipeline.as_ref(),
-                    ChunkTarget::Full,
+                    ChunkReadRequest {
+                        pipeline: pipeline.as_ref(),
+                        target: ChunkTarget::Full,
+                        fill_value: fill_value.as_deref(),
+                    },
                     out,
                 )?;
             }
@@ -4177,7 +4432,6 @@ impl Hdf5Reader {
                 single_chunk_filter,
                 ..
             } => {
-                fill_tiled_into(out, fill_value.as_deref());
                 let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
                 self.read_chunked_v4(
                     name,
@@ -4188,8 +4442,11 @@ impl Hdf5Reader {
                         earray_params: earray_params.as_ref(),
                         single_chunk_filter: *single_chunk_filter,
                     },
-                    pipeline.as_ref(),
-                    ChunkTarget::Full,
+                    ChunkReadRequest {
+                        pipeline: pipeline.as_ref(),
+                        target: ChunkTarget::Full,
+                        fill_value: fill_value.as_deref(),
+                    },
                     out,
                 )?;
             }
@@ -4239,7 +4496,7 @@ impl Hdf5Reader {
             // resolution replaces it: that is what a later open under other
             // access properties has to resolve from.
             let stored = self.datasets[i].dataspace.dims.clone();
-            self.datasets[i].virtual_stored_dims = Some(stored.clone());
+            self.datasets.entry_mut(i).virtual_stored_dims = Some(stored.clone());
             self.resolve_virtual_extent_of(i, &stored)?;
         }
         // This resolution belongs to no dataset open: libhdf5 runs its
@@ -4263,8 +4520,9 @@ impl Hdf5Reader {
         let access = self.access_in_force(&vds);
         let (resolution, dims) =
             self.resolve_one_virtual_extent(&vds, &mappings, stored, &access)?;
-        self.datasets[i].dataspace.dims = dims;
-        self.datasets[i].virtual_resolution = Some(resolution);
+        let entry = self.datasets.entry_mut(i);
+        entry.dataspace.dims = dims;
+        entry.virtual_resolution = Some(resolution);
         Ok(())
     }
 
@@ -4771,33 +5029,63 @@ impl Hdf5Reader {
         Ok(())
     }
 
+    /// The dataset at `pos`'s chunk index, from the cache when it already
+    /// holds one decoded from `index_address`, otherwise by running `decode`
+    /// once and keeping what it returns.
+    ///
+    /// The single owner of the chunk-index cache: nothing else reads or
+    /// writes it. Every chunked read of a dataset asks the same question of
+    /// the same on-disk structure — a thousand small slice reads re-walked
+    /// the fixed array a thousand times — and only a change to the catalog
+    /// entry can change the answer, which drops the entry's cache
+    /// (`DatasetTable::entry_mut`, and a SWMR refresh rebuilding the table).
+    fn decoded_chunk_index<F>(
+        &mut self,
+        pos: usize,
+        index_address: u64,
+        decode: F,
+    ) -> IoResult<std::sync::Arc<DecodedChunkIndex>>
+    where
+        F: FnOnce(&mut Self) -> IoResult<DecodedChunkIndex>,
+    {
+        if let Some(hit) = self.datasets.chunk_index(pos, index_address) {
+            return Ok(std::sync::Arc::clone(hit));
+        }
+        let decoded = decode(self)?;
+        Ok(self.datasets.cache_chunk_index(pos, index_address, decoded))
+    }
+
     /// Read chunked dataset data by walking the chunk index.
     ///
     /// `desc` bundles the version-4 chunk-index descriptor extracted from the
     /// data-layout message (kind, address, and per-kind parameters), so this
     /// entry point takes one descriptor rather than a long parameter list.
     ///
-    /// Scatters only; `output` must already be sized to the target extent and
-    /// pre-filled with the tiled fill value by the caller (so unallocated or
-    /// non-overlapping regions read back as fill).
+    /// Scatters only; `output` must already be sized to the target extent.
+    /// Every byte of it is defined before this returns `Ok`: what no chunk
+    /// covers is filled with the tiled fill value by
+    /// [`place_chunk_jobs`], the one exit every branch here takes.
     fn read_chunked_v4(
         &mut self,
         name: &str,
         chunk_dims: &[u64],
         desc: ChunkIndexDesc<'_>,
-        pipeline: Option<&FilterPipeline>,
-        target: ChunkTarget,
+        req: ChunkReadRequest,
         output: &mut [u8],
     ) -> IoResult<()> {
+        let ChunkReadRequest {
+            pipeline,
+            target,
+            fill_value: _,
+        } = req;
         let ChunkIndexDesc {
             index_type,
             index_address,
             earray_params,
             single_chunk_filter,
         } = desc;
-        let info = self
-            .dataset_info_local(name)
-            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let pos = self.dataset_position(name)?;
+        let info = &self.datasets[pos];
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
 
@@ -4805,11 +5093,15 @@ impl Hdf5Reader {
             data_layout::ChunkIndexType::SingleChunk => {
                 // Single chunk: the index_address IS the chunk address
                 let total_size: u64 = saturating_byte_len(&dims, element_size);
+                let geo = ChunkOutputGeometry {
+                    dims: &dims,
+                    chunk_dims,
+                    element_size,
+                };
                 if index_address == UNDEF_ADDR || total_size == 0 {
-                    // Unallocated single chunk: `output` is already the
-                    // pre-filled fill/zero buffer, so there is nothing to read
-                    // or scatter.
-                    return Ok(());
+                    // Unallocated single chunk: nothing to read, so the empty
+                    // plan makes the whole output fill.
+                    return place_chunk_jobs(&self.handle, Vec::new(), &[], req, &geo, output);
                 }
                 // A filtered single chunk records its exact on-disk size and
                 // per-chunk filter mask in the layout message. Use them to
@@ -4838,51 +5130,32 @@ impl Hdf5Reader {
                     },
                 };
                 // The lone chunk spans the whole dataset; place it respecting
-                // the dataset extent (Full) or the selection (Slice) into the
-                // caller's pre-filled buffer.
+                // the dataset extent (Full) or the selection (Slice).
                 let coords = vec![0u64; dims.len()];
-                let geo = ChunkOutputGeometry {
-                    dims: &dims,
-                    chunk_dims,
-                    element_size,
-                };
-                place_chunk_jobs(
-                    &self.handle,
-                    pipeline,
-                    vec![Some(job)],
-                    &coords,
-                    target,
-                    &geo,
-                    output,
-                )
+                place_chunk_jobs(&self.handle, vec![Some(job)], &coords, req, &geo, output)
             }
             data_layout::ChunkIndexType::Implicit => {
-                self.read_chunked_implicit(name, chunk_dims, index_address, target, output)
+                self.read_chunked_implicit(name, chunk_dims, index_address, req, output)
             }
-            data_layout::ChunkIndexType::FixedArray => self.read_chunked_fixed_array(
-                name,
-                chunk_dims,
-                index_address,
-                pipeline,
-                target,
-                output,
-            ),
-            data_layout::ChunkIndexType::BTreeV2 => self.read_chunked_btree_v2(
-                name,
-                chunk_dims,
-                index_address,
-                pipeline,
-                target,
-                output,
-            ),
+            data_layout::ChunkIndexType::FixedArray => {
+                self.read_chunked_fixed_array(name, chunk_dims, index_address, req, output)
+            }
+            data_layout::ChunkIndexType::BTreeV2 => {
+                self.read_chunked_btree_v2(name, chunk_dims, index_address, req, output)
+            }
             data_layout::ChunkIndexType::ExtensibleArray => {
                 let params = earray_params.ok_or_else(|| {
                     crate::io::IoError::InvalidState("missing earray params".into())
                 })?;
 
                 if index_address == UNDEF_ADDR {
-                    // Unallocated: `output` is already the pre-filled buffer.
-                    return Ok(());
+                    // Unallocated: the empty plan makes the whole output fill.
+                    let geo = ChunkOutputGeometry {
+                        dims: &dims,
+                        chunk_dims,
+                        element_size,
+                    };
+                    return place_chunk_jobs(&self.handle, Vec::new(), &[], req, &geo, output);
                 }
 
                 // Total slot count of the index grid. The maximum extent
@@ -4890,33 +5163,36 @@ impl Hdf5Reader {
                 // unlimited dimension 0 is bounded by the current extent for
                 // this read — a slot beyond it (written before a shrink) is
                 // not visible.
-                let max_dims = info.dataspace.max_dims.clone();
-                let grid =
-                    crate::io::chunk_grid::index_grid(&dims, max_dims.as_deref(), chunk_dims)?;
-                let chunks_total: u64 = grid.iter().fold(1u64, |acc, &n| acc.saturating_mul(n));
-
-                let chunk_entries = self.collect_ea_chunk_entries(
-                    index_address,
-                    params,
-                    &dims,
-                    max_dims.as_deref(),
-                    chunk_dims,
-                    element_size,
-                )?;
-
-                let n_chunks = std::cmp::min(chunks_total as usize, chunk_entries.len());
+                let max_dims = self.datasets[pos].dataspace.max_dims.clone();
 
                 // Chunks are placed N-dimensionally: each slot decodes
                 // (row-major, against the index grid) to chunk-grid
                 // coordinates, so sub-frame chunks (a chunk smaller than a
                 // full frame) land correctly.
                 let rank = dims.len();
-                let slot_coords = crate::io::chunk_grid::coords_table(
-                    &dims,
-                    max_dims.as_deref(),
-                    chunk_dims,
-                    n_chunks,
-                )?;
+                let index = self.decoded_chunk_index(pos, index_address, |reader| {
+                    let grid =
+                        crate::io::chunk_grid::index_grid(&dims, max_dims.as_deref(), chunk_dims)?;
+                    let chunks_total: u64 = grid.iter().fold(1u64, |acc, &n| acc.saturating_mul(n));
+                    let mut entries = reader.collect_ea_chunk_entries(
+                        index_address,
+                        params,
+                        &dims,
+                        max_dims.as_deref(),
+                        chunk_dims,
+                        element_size,
+                    )?;
+                    entries.truncate(std::cmp::min(chunks_total as usize, entries.len()));
+                    let coords = crate::io::chunk_grid::coords_table(
+                        &dims,
+                        max_dims.as_deref(),
+                        chunk_dims,
+                        entries.len(),
+                    )?;
+                    Ok(DecodedChunkIndex { entries, coords })
+                })?;
+                let chunk_entries = &index.entries;
+                let slot_coords = &index.coords;
                 let chunk_coords = |i: usize| -> &[u64] { &slot_coords[i * rank..(i + 1) * rank] };
 
                 // Build one read job per chunk (no I/O yet), then read +
@@ -4928,7 +5204,7 @@ impl Hdf5Reader {
                 // per branch.
                 let jobs: Vec<Option<ChunkReadJob>> = if pipeline.is_some() {
                     let file_size = self.handle.file_size()?;
-                    chunk_entries[..n_chunks]
+                    chunk_entries
                         .iter()
                         .enumerate()
                         .map(|(i, &(addr, nbytes, mask))| {
@@ -4950,7 +5226,7 @@ impl Hdf5Reader {
                         })
                         .collect()
                 } else {
-                    chunk_entries[..n_chunks]
+                    chunk_entries
                         .iter()
                         .enumerate()
                         .map(|(i, &(addr, nbytes, _))| {
@@ -4973,15 +5249,7 @@ impl Hdf5Reader {
                     chunk_dims,
                     element_size,
                 };
-                place_chunk_jobs(
-                    &self.handle,
-                    pipeline,
-                    jobs,
-                    &slot_coords,
-                    target,
-                    &geo,
-                    output,
-                )
+                place_chunk_jobs(&self.handle, jobs, slot_coords, req, &geo, output)
             }
         }
     }
@@ -5155,52 +5423,64 @@ impl Hdf5Reader {
 
     /// Read a dataset indexed by a fixed array.
     ///
-    /// Scatters only; `output` must already be sized to the target extent and
-    /// pre-filled with the tiled fill value by the caller.
+    /// Scatters only; `output` must already be sized to the target extent.
+    /// Every byte of it is defined before this returns `Ok`: what no chunk
+    /// covers is filled with the tiled fill value by
+    /// [`place_chunk_jobs`], the one exit every branch here takes.
     fn read_chunked_fixed_array(
         &mut self,
         name: &str,
         chunk_dims: &[u64],
         index_address: u64,
-        pipeline: Option<&FilterPipeline>,
-        target: ChunkTarget,
+        req: ChunkReadRequest,
         output: &mut [u8],
     ) -> IoResult<()> {
-        let info = self
-            .dataset_info_local(name)
-            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let ChunkReadRequest {
+            pipeline, target, ..
+        } = req;
+        let pos = self.dataset_position(name)?;
+        let info = &self.datasets[pos];
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
         let max_dims = info.dataspace.max_dims.clone();
         let ndims = dims.len();
-
-        let chunk_entries =
-            self.collect_fa_chunk_entries(chunk_dims, ndims, element_size, index_address)?;
-        if chunk_entries.is_empty() {
-            // Unallocated index/data block: `output` is already pre-filled.
-            return Ok(());
-        }
-        let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
+        let geo = ChunkOutputGeometry {
+            dims: &dims,
+            chunk_dims,
+            element_size,
+        };
 
         // Index-grid slot -> chunk-grid coordinates (row-major, against the
         // maximum extent — the array was sized from its chunk grid, so a slot
         // beyond the current extent still decodes to its true position and
         // then simply falls outside the read target). A zero chunk dimension
         // from a malformed layout message is rejected inside.
-        let slot_coords = crate::io::chunk_grid::coords_table(
-            &dims,
-            max_dims.as_deref(),
-            chunk_dims,
-            chunk_entries.len(),
-        )?;
-        let chunk_coords = |i: usize| -> &[u64] { &slot_coords[i * ndims..(i + 1) * ndims] };
+        let index = self.decoded_chunk_index(pos, index_address, |reader| {
+            let entries =
+                reader.collect_fa_chunk_entries(chunk_dims, ndims, element_size, index_address)?;
+            let coords = crate::io::chunk_grid::coords_table(
+                &dims,
+                max_dims.as_deref(),
+                chunk_dims,
+                entries.len(),
+            )?;
+            Ok(DecodedChunkIndex { entries, coords })
+        })?;
+        if index.entries.is_empty() {
+            // Unallocated index/data block: the empty plan makes the whole
+            // output fill.
+            return place_chunk_jobs(&self.handle, Vec::new(), &[], req, &geo, output);
+        }
+        let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
+        let chunk_coords = |i: usize| -> &[u64] { &index.coords[i * ndims..(i + 1) * ndims] };
 
         // Build one read job per chunk (no I/O yet). Filtered chunks carry
         // their exact compressed size (read at-most, since a zero size means
         // "unknown" and falls back to a generous estimate); unfiltered chunks
         // read the exact chunk byte count. For a slice, chunks outside the
         // selection become None and are never read.
-        let jobs: Vec<Option<ChunkReadJob>> = chunk_entries
+        let jobs: Vec<Option<ChunkReadJob>> = index
+            .entries
             .iter()
             .enumerate()
             .map(|(linear_idx, &(addr, comp_size, mask))| {
@@ -5231,20 +5511,7 @@ impl Hdf5Reader {
 
         // Read and place each chunk: the selected byte runs straight out of
         // the file where that beats reading the chunk whole.
-        let geo = ChunkOutputGeometry {
-            dims: &dims,
-            chunk_dims,
-            element_size,
-        };
-        place_chunk_jobs(
-            &self.handle,
-            pipeline,
-            jobs,
-            &slot_coords,
-            target,
-            &geo,
-            output,
-        )
+        place_chunk_jobs(&self.handle, jobs, &index.coords, req, &geo, output)
     }
 
     /// Read a dataset indexed by the implicit ("none") chunk index.
@@ -5259,26 +5526,43 @@ impl Hdf5Reader {
     /// early allocation and no filters, so there is no per-chunk allocation
     /// flag, compressed size, or filter mask to track.
     ///
-    /// Scatters only; `output` must already be sized to the target extent and
-    /// pre-filled with the tiled fill value by the caller.
+    /// Scatters only; `output` must already be sized to the target extent.
+    /// Every byte of it is defined before this returns `Ok`: what no chunk
+    /// covers is filled with the tiled fill value by
+    /// [`place_chunk_jobs`], the one exit every branch here takes.
     fn read_chunked_implicit(
         &mut self,
         name: &str,
         chunk_dims: &[u64],
         index_address: u64,
-        target: ChunkTarget,
+        req: ChunkReadRequest,
         output: &mut [u8],
     ) -> IoResult<()> {
-        let info = self
-            .dataset_info(name)
-            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let target = req.target;
+        let pos = self.dataset_position(name)?;
+        let info = &self.datasets[pos];
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
         let ndims = dims.len();
 
         if index_address == UNDEF_ADDR {
-            // Unallocated: `output` is already the pre-filled buffer.
-            return Ok(());
+            // Unallocated: the empty plan makes the whole output fill.
+            let geo = ChunkOutputGeometry {
+                dims: &dims,
+                chunk_dims,
+                element_size,
+            };
+            return place_chunk_jobs(
+                &self.handle,
+                Vec::new(),
+                &[],
+                ChunkReadRequest {
+                    pipeline: None,
+                    ..req
+                },
+                &geo,
+                output,
+            );
         }
 
         if chunk_dims.len() != ndims {
@@ -5289,31 +5573,41 @@ impl Hdf5Reader {
             )));
         }
 
-        let max_dims = info.dataspace.max_dims.clone();
+        let max_dims = self.datasets[pos].dataspace.max_dims.clone();
         let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
-        let grid = crate::io::chunk_grid::index_grid(&dims, max_dims.as_deref(), chunk_dims)?;
-        let chunks_total: u64 = grid.iter().fold(1u64, |acc, &n| acc.saturating_mul(n));
 
         // Every slot's coordinates and address are computed directly, not
         // read from disk, so there is no "unallocated chunk" case here the
         // way a sparse index has one: `at_most: false` because
         // `H5D__none_idx_create` guarantees the whole block is present.
-        let slot_coords = crate::io::chunk_grid::coords_table(
-            &dims,
-            max_dims.as_deref(),
-            chunk_dims,
-            chunks_total as usize,
-        )?;
+        let index = self.decoded_chunk_index(pos, index_address, |_| {
+            let grid = crate::io::chunk_grid::index_grid(&dims, max_dims.as_deref(), chunk_dims)?;
+            let chunks_total: u64 = grid.iter().fold(1u64, |acc, &n| acc.saturating_mul(n));
+            let coords = crate::io::chunk_grid::coords_table(
+                &dims,
+                max_dims.as_deref(),
+                chunk_dims,
+                chunks_total as usize,
+            )?;
+            let entries = (0..chunks_total)
+                .map(|i| (index_address + i * chunk_bytes, chunk_bytes, 0))
+                .collect();
+            Ok(DecodedChunkIndex { entries, coords })
+        })?;
+        let slot_coords = &index.coords;
 
-        let jobs: Vec<Option<ChunkReadJob>> = (0..chunks_total)
-            .map(|i| {
-                let coords = &slot_coords[i as usize * ndims..(i as usize + 1) * ndims];
+        let jobs: Vec<Option<ChunkReadJob>> = index
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, &(addr, len, _))| {
+                let coords = &slot_coords[i * ndims..(i + 1) * ndims];
                 if !target.overlaps(coords, chunk_dims) {
                     None
                 } else {
                     Some(ChunkReadJob {
-                        addr: index_address + i * chunk_bytes,
-                        len: chunk_bytes as usize,
+                        addr,
+                        len: len as usize,
                         at_most: false,
                         mask: 0,
                     })
@@ -5326,7 +5620,17 @@ impl Hdf5Reader {
             chunk_dims,
             element_size,
         };
-        place_chunk_jobs(&self.handle, None, jobs, &slot_coords, target, &geo, output)
+        place_chunk_jobs(
+            &self.handle,
+            jobs,
+            slot_coords,
+            ChunkReadRequest {
+                pipeline: None,
+                ..req
+            },
+            &geo,
+            output,
+        )
     }
 
     /// Collect a v2-B-tree-indexed dataset's per-chunk `(address, read
@@ -5421,59 +5725,69 @@ impl Hdf5Reader {
 
     /// Read a dataset indexed by a B-tree v2.
     ///
-    /// Scatters only; `output` must already be sized to the target extent and
-    /// pre-filled with the tiled fill value by the caller.
+    /// Scatters only; `output` must already be sized to the target extent.
+    /// Every byte of it is defined before this returns `Ok`: what no chunk
+    /// covers is filled with the tiled fill value by
+    /// [`place_chunk_jobs`], the one exit every branch here takes.
     fn read_chunked_btree_v2(
         &mut self,
         name: &str,
         chunk_dims: &[u64],
         index_address: u64,
-        pipeline: Option<&FilterPipeline>,
-        target: ChunkTarget,
+        req: ChunkReadRequest,
         output: &mut [u8],
     ) -> IoResult<()> {
-        let info = self
-            .dataset_info_local(name)
-            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let target = req.target;
+        let pos = self.dataset_position(name)?;
+        let info = &self.datasets[pos];
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
         let ndims = dims.len();
-
-        let entries =
-            self.collect_bt2_chunk_entries(chunk_dims, ndims, element_size, index_address)?;
-        if entries.is_empty() {
-            // Unallocated index or no records: `output` is already pre-filled.
-            return Ok(());
-        }
-
-        // Build one read job per chunk (no I/O yet), keeping each chunk's
-        // scaled (chunk-grid) offsets alongside for the scatter. For a slice,
-        // chunks outside the selection become None and are never read.
-        let mut jobs: Vec<Option<ChunkReadJob>> = Vec::with_capacity(entries.len());
-        let coords: Vec<u64> = entries
-            .iter()
-            .flat_map(|(_, _, scaled, _)| scaled.iter().copied())
-            .collect();
-        for (addr, read_size, scaled, mask) in &entries {
-            if *addr == UNDEF_ADDR || *read_size == 0 || !target.overlaps(scaled, chunk_dims) {
-                jobs.push(None);
-            } else {
-                jobs.push(Some(ChunkReadJob {
-                    addr: *addr,
-                    len: *read_size,
-                    at_most: false,
-                    mask: *mask,
-                }));
-            }
-        }
-
-        // Read and place each chunk N-dimensionally by its scaled offsets.
         let geo = ChunkOutputGeometry {
             dims: &dims,
             chunk_dims,
             element_size,
         };
-        place_chunk_jobs(&self.handle, pipeline, jobs, &coords, target, &geo, output)
+
+        // A record carries its own scaled (chunk-grid) offsets, always `ndims`
+        // of them, so flattening them into the coordinate table loses nothing.
+        let index = self.decoded_chunk_index(pos, index_address, |reader| {
+            let records =
+                reader.collect_bt2_chunk_entries(chunk_dims, ndims, element_size, index_address)?;
+            let mut entries = Vec::with_capacity(records.len());
+            let mut coords = Vec::with_capacity(records.len() * ndims);
+            for (addr, read_size, scaled, mask) in records {
+                entries.push((addr, read_size as u64, mask));
+                coords.extend_from_slice(&scaled);
+            }
+            Ok(DecodedChunkIndex { entries, coords })
+        })?;
+        if index.entries.is_empty() {
+            // Unallocated index or no records: the empty plan makes the whole
+            // output fill.
+            return place_chunk_jobs(&self.handle, Vec::new(), &[], req, &geo, output);
+        }
+
+        // Build one read job per chunk (no I/O yet), placing each by its
+        // scaled offsets. For a slice, chunks outside the selection become
+        // None and are never read.
+        let mut jobs: Vec<Option<ChunkReadJob>> = Vec::with_capacity(index.entries.len());
+        for (i, &(addr, read_size, mask)) in index.entries.iter().enumerate() {
+            let scaled = &index.coords[i * ndims..(i + 1) * ndims];
+            if addr == UNDEF_ADDR || read_size == 0 || !target.overlaps(scaled, chunk_dims) {
+                jobs.push(None);
+            } else {
+                jobs.push(Some(ChunkReadJob {
+                    addr,
+                    len: read_size as usize,
+                    at_most: false,
+                    mask,
+                }));
+            }
+        }
+
+        // Read and place each chunk N-dimensionally by its scaled offsets.
+        place_chunk_jobs(&self.handle, jobs, &index.coords, req, &geo, output)
     }
 
     /// Read a chunked dataset indexed by a version-1 B-tree (layout
@@ -5481,20 +5795,23 @@ impl Hdf5Reader {
     ///
     /// `chunk_dims` excludes the trailing element-size dimension.
     ///
-    /// Scatters only; `output` must already be sized to the target extent and
-    /// pre-filled with the tiled fill value by the caller.
+    /// Scatters only; `output` must already be sized to the target extent.
+    /// Every byte of it is defined before this returns `Ok`: what no chunk
+    /// covers is filled with the tiled fill value by
+    /// [`place_chunk_jobs`], the one exit every branch here takes.
     fn read_chunked_btree_v1(
         &mut self,
         name: &str,
         chunk_dims: &[u64],
         b_tree_address: u64,
-        pipeline: Option<&FilterPipeline>,
-        target: ChunkTarget,
+        req: ChunkReadRequest,
         output: &mut [u8],
     ) -> IoResult<()> {
-        let info = self
-            .dataset_info_local(name)
-            .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        let ChunkReadRequest {
+            pipeline, target, ..
+        } = req;
+        let pos = self.dataset_position(name)?;
+        let info = &self.datasets[pos];
         let dims = info.dataspace.dims.clone();
         let element_size = info.datatype.element_size() as u64;
         let ndims = dims.len();
@@ -5511,45 +5828,55 @@ impl Hdf5Reader {
 
         let total_size: u64 = saturating_byte_len(&dims, element_size);
         if b_tree_address == UNDEF_ADDR || total_size == 0 {
-            // Unallocated: `output` is already the pre-filled buffer.
-            return Ok(());
+            // Unallocated: the empty plan makes the whole output fill.
+            let geo = ChunkOutputGeometry {
+                dims: &dims,
+                chunk_dims,
+                element_size,
+            };
+            return place_chunk_jobs(&self.handle, Vec::new(), &[], req, &geo, output);
         }
 
         // Walk the B-tree, collecting every leaf entry as
-        // (element_offsets, chunk_address, chunk_size, filter_mask).
-        // `chunk_dims.len()` is the chunk rank; the B-tree keys carry
-        // rank + 1 offsets (the extra one is the element-size dimension).
-        let mut entries: Vec<(Vec<u64>, u64, u32, u32)> = Vec::new();
+        // (element_offsets, chunk_address, chunk_size, filter_mask), and turn
+        // each key's element offsets into chunk-grid coordinates. The keys
+        // carry rank + 1 offsets; the trailing element-size dimension offset
+        // is always 0 and is dropped.
         let file_size = self.handle.file_size()?;
-        self.collect_btree_v1_chunks(b_tree_address, ndims, file_size, 0, &mut entries)?;
+        let index = self.decoded_chunk_index(pos, b_tree_address, |reader| {
+            let mut leaves: Vec<(Vec<u64>, u64, u32, u32)> = Vec::new();
+            reader.collect_btree_v1_chunks(b_tree_address, ndims, file_size, 0, &mut leaves)?;
+            let mut entries = Vec::with_capacity(leaves.len());
+            let mut coords = Vec::with_capacity(leaves.len() * ndims);
+            for (offsets, addr, chunk_size, mask) in leaves {
+                for (d, &cd) in chunk_dims.iter().enumerate().take(ndims) {
+                    coords.push(offsets[d].checked_div(cd).unwrap_or(0));
+                }
+                entries.push((addr, chunk_size as u64, mask));
+            }
+            Ok(DecodedChunkIndex { entries, coords })
+        })?;
 
         // The uncompressed byte size of a full chunk.
         let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
 
-        // Build one read job per chunk (no I/O yet), keeping each chunk's
-        // scaled (chunk-grid) coordinates alongside for the scatter. The
-        // trailing element-size dimension offset is always 0 and is dropped.
-        let mut jobs: Vec<Option<ChunkReadJob>> = Vec::with_capacity(entries.len());
-        let mut coords: Vec<u64> = Vec::with_capacity(entries.len() * ndims);
-        for (offsets, addr, chunk_size, mask) in &entries {
-            let base = coords.len();
-            for d in 0..ndims {
-                let cd = chunk_dims[d];
-                coords.push(offsets[d].checked_div(cd).unwrap_or(0));
-            }
-            let skip = *addr == UNDEF_ADDR
-                || *chunk_size == 0
-                || *addr >= file_size
-                || *chunk_size as u64 > file_size
-                || !target.overlaps(&coords[base..], chunk_dims);
+        // Build one read job per chunk (no I/O yet), placing each by its
+        // scaled coordinates.
+        let mut jobs: Vec<Option<ChunkReadJob>> = Vec::with_capacity(index.entries.len());
+        for (i, &(addr, chunk_size, mask)) in index.entries.iter().enumerate() {
+            let skip = addr == UNDEF_ADDR
+                || chunk_size == 0
+                || addr >= file_size
+                || chunk_size > file_size
+                || !target.overlaps(&index.coords[i * ndims..(i + 1) * ndims], chunk_dims);
             jobs.push(if skip {
                 None
             } else {
                 Some(ChunkReadJob {
-                    addr: *addr,
-                    len: *chunk_size as usize,
+                    addr,
+                    len: chunk_size as usize,
                     at_most: false,
-                    mask: *mask,
+                    mask,
                 })
             });
         }
@@ -5560,14 +5887,14 @@ impl Hdf5Reader {
             chunk_dims,
             element_size,
         };
-        place_chunk_jobs(&self.handle, pipeline, jobs, &coords, target, &geo, output)?;
+        place_chunk_jobs(&self.handle, jobs, &index.coords, req, &geo, output)?;
 
         // libhdf5 stores raw byte sizes; verify the uncompressed chunk
         // size is consistent for unfiltered datasets so a corrupt index
         // surfaces instead of silently producing garbage.
         if pipeline.is_none() {
-            for (_, addr, chunk_size, _) in &entries {
-                if *addr != UNDEF_ADDR && *chunk_size as u64 != chunk_bytes && *chunk_size != 0 {
+            for &(addr, chunk_size, _) in &index.entries {
+                if addr != UNDEF_ADDR && chunk_size != chunk_bytes && chunk_size != 0 {
                     return Err(crate::io::IoError::InvalidState(format!(
                         "chunk B-tree v1: unfiltered chunk size {} != expected {}",
                         chunk_size, chunk_bytes
@@ -5984,10 +6311,13 @@ impl Hdf5Reader {
             return owner.read_slice(&path, starts, counts);
         }
         let (datatype, out_bytes) = self.slice_size_and_datatype(name, counts)?;
-        let mut data = alloc_tiled_fill(out_bytes as usize, None)?;
-        self.read_slice_into_unconverted(name, starts, counts, &mut data, 0)?;
-        Self::apply_post_filter_conversion(&mut data, &datatype)?;
-        Ok(data)
+        // The selection lands in the vector this returns:
+        // `read_slice_into_unconverted` defines every byte of the buffer it is
+        // handed, so there is nothing to zero first and nothing to copy after.
+        read_image_into_new::<u8, _, _>(out_bytes as usize, |image| {
+            self.read_slice_into_unconverted(name, starts, counts, image, 0)?;
+            Self::apply_post_filter_conversion(image, &datatype)
+        })
     }
 
     /// Read a hyperslab straight into a caller-provided buffer (no allocation).
@@ -6159,17 +6489,19 @@ impl Hdf5Reader {
             } => {
                 // Walk the v1 B-tree index reading only chunks that overlap the
                 // selection, scattering each chunk∩selection into the slice
-                // buffer. Pre-fill so any unwritten gap reads back as fill. The
+                // buffer; whatever no chunk covers is filled there. The
                 // unconverted read keeps the post-filter conversion to exactly
                 // once, in the wrappers.
-                fill_tiled_into(out, fill_value.as_deref());
                 let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
                 self.read_chunked_btree_v1(
                     name,
                     real_chunk_dims,
                     *b_tree_address,
-                    pipeline.as_ref(),
-                    ChunkTarget::Slice { starts, counts },
+                    ChunkReadRequest {
+                        pipeline: pipeline.as_ref(),
+                        target: ChunkTarget::Slice { starts, counts },
+                        fill_value: fill_value.as_deref(),
+                    },
                     out,
                 )?;
             }
@@ -6185,7 +6517,6 @@ impl Hdf5Reader {
                 // (single chunk, fixed/extensible array, B-tree v2): only
                 // overlapping chunks are read and only their intersection with
                 // the selection is scattered into the slice output.
-                fill_tiled_into(out, fill_value.as_deref());
                 let real_chunk_dims = &chunk_dims[..chunk_dims.len() - 1];
                 self.read_chunked_v4(
                     name,
@@ -6196,8 +6527,11 @@ impl Hdf5Reader {
                         earray_params: earray_params.as_ref(),
                         single_chunk_filter: *single_chunk_filter,
                     },
-                    pipeline.as_ref(),
-                    ChunkTarget::Slice { starts, counts },
+                    ChunkReadRequest {
+                        pipeline: pipeline.as_ref(),
+                        target: ChunkTarget::Slice { starts, counts },
+                        fill_value: fill_value.as_deref(),
+                    },
                     out,
                 )?;
             }
@@ -6210,8 +6544,9 @@ impl Hdf5Reader {
                 // contiguously, so there is no cheaper selective path
                 // without duplicating `read_virtual_into`'s mapping walk
                 // for a bounded region — correctness, not I/O pruning, is
-                // what a VDS slice read needs here.
-                fill_tiled_into(out, fill_value.as_deref());
+                // what a VDS slice read needs here. The extraction below
+                // writes every byte of `out`, so no pre-fill is needed on top
+                // of the full image's own.
                 let total = saturating_byte_len(&dims, element_size) as usize;
                 let mut full = alloc_tiled_fill(total, fill_value.as_deref())?;
                 self.read_virtual_into(name, &mut full, depth)?;
@@ -6233,14 +6568,15 @@ impl Hdf5Reader {
 
     /// Read a strided hyperslab — h5py's stepped slicing (`ds[a:b:s]`) or
     /// the general `start`/`stride`/`count`/`block` form of
-    /// `H5Sselect_hyperslab` — into a returned buffer.
+    /// `H5Sselect_hyperslab` — into a caller-provided buffer.
     ///
     /// One tuple per dimension: `start[d]` is the first index, `stride[d]`
     /// the spacing between selected blocks (`1` = the classic contiguous
     /// selection [`read_slice`](Self::read_slice) reads), `count[d]` how
     /// many blocks, and `block[d]` how many contiguous elements each block
-    /// covers. The returned buffer is row-major over `count[d] * block[d]`
-    /// per dimension — exactly the shape h5py's stepped slicing produces.
+    /// covers. `out` is row-major over `count[d] * block[d]` per dimension —
+    /// exactly the shape h5py's stepped slicing produces — and `out.len()`
+    /// must equal that times the element size.
     ///
     /// Built on the same selection-decomposition primitives the virtual
     /// dataset reader uses for its per-mapping scatter
@@ -6251,17 +6587,23 @@ impl Hdf5Reader {
     /// where h5py's stepped slicing puts it, and each source box is read with
     /// the ordinary per-layout selective read
     /// ([`read_slice_into_unconverted`](Self::read_slice_into_unconverted)).
-    pub fn read_hyperslab(
+    ///
+    /// The single owner of read-destination semantics for stepped selections:
+    /// it defines every byte of `out` before returning `Ok`, so a typed caller
+    /// reads straight into the vector it keeps rather than into a byte buffer
+    /// it then copies.
+    pub fn read_hyperslab_into(
         &mut self,
         name: &str,
         start: &[u64],
         stride: &[u64],
         count: &[u64],
         block: &[u64],
-    ) -> IoResult<Vec<u8>> {
+        out: &mut [u8],
+    ) -> IoResult<()> {
         if self.external_edge(name).is_some() {
             let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
-            return owner.read_hyperslab(&path, start, stride, count, block);
+            return owner.read_hyperslab_into(&path, start, stride, count, block, out);
         }
         let info = self
             .dataset_info_local(name)
@@ -6281,6 +6623,18 @@ impl Hdf5Reader {
             return Err(crate::io::IoError::InvalidState(
                 "hyperslab stride must be nonzero in every dimension".into(),
             ));
+        }
+        let out_bytes = saturating_byte_len(
+            &(0..rank)
+                .map(|d| count[d].saturating_mul(block[d]))
+                .collect::<Vec<u64>>(),
+            element_size,
+        );
+        if out.len() as u64 != out_bytes {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "read_hyperslab_into: buffer is {} bytes but selection needs {out_bytes}",
+                out.len(),
+            )));
         }
 
         let src_sel = Selection::Hyperslab {
@@ -6309,38 +6663,49 @@ impl Hdf5Reader {
             }),
         };
 
-        let total = saturating_byte_len(&out_dims, element_size) as usize;
-        let mut out = alloc_tiled_fill(total, None)?;
+        // `copy_matched_selections` is shared with the virtual-dataset
+        // scatter, where a target selection may legitimately leave elements
+        // untouched, so it carries no whole-output guarantee of its own: zero
+        // first, exactly as the allocating form always did.
+        fill_tiled_into(out, None);
         copy_matched_selections(
             |bstart, bcount, buf| self.read_slice_into_unconverted(name, bstart, bcount, buf, 0),
             &src_sel.resolve(&dims)?,
             &dst_sel.resolve(&out_dims)?,
             element_size,
-            &mut out,
+            out,
         )?;
-        Self::apply_post_filter_conversion(&mut out, &datatype)?;
-        Ok(out)
+        Self::apply_post_filter_conversion(out, &datatype)
     }
 
     /// Read a list of coordinates in one call — h5py fancy indexing with a
-    /// coordinate list (`H5S_SEL_POINTS`) — into a returned buffer.
+    /// coordinate list (`H5S_SEL_POINTS`) — into a caller-provided buffer.
     ///
-    /// `points[i]` is a `rank`-length coordinate; the returned buffer holds
-    /// one element per point, `element_size` bytes each, in the same order
-    /// as `points` (point selection order is significant, see
-    /// [`PointSelection`]). Backed by [`Selection::Points`] and
-    /// [`Selection::to_boxes`] — the same decomposition
-    /// [`read_hyperslab`](Self::read_hyperslab) and the virtual dataset
-    /// reader use — each point's 1-element box is read with the ordinary
-    /// per-layout selective read
+    /// `points[i]` is a `rank`-length coordinate; `out` holds one element per
+    /// point, `element_size` bytes each, in the same order as `points` (point
+    /// selection order is significant, see [`PointSelection`]), so `out.len()`
+    /// must equal `points.len() * element_size`. Backed by
+    /// [`Selection::Points`] and [`Selection::to_boxes`] — the same
+    /// decomposition [`read_hyperslab_into`](Self::read_hyperslab_into) and
+    /// the virtual dataset reader use — each point's 1-element box is read
+    /// with the ordinary per-layout selective read
     /// ([`read_slice_into_unconverted`](Self::read_slice_into_unconverted)).
     /// A 1-element box is already a flat `element_size`-byte run, so
     /// placing it needs no further run-decomposition
     /// ([`for_each_dual_run`] would degenerate to exactly this copy).
-    pub fn read_points(&mut self, name: &str, points: &[Vec<u64>]) -> IoResult<Vec<u8>> {
+    ///
+    /// One element-sized box per point covers the buffer exactly, so every
+    /// byte of `out` is defined before it returns `Ok` and a typed caller
+    /// reads straight into the vector it keeps.
+    pub fn read_points_into(
+        &mut self,
+        name: &str,
+        points: &[Vec<u64>],
+        out: &mut [u8],
+    ) -> IoResult<()> {
         if self.external_edge(name).is_some() {
             let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
-            return owner.read_points(&path, points);
+            return owner.read_points_into(&path, points, out);
         }
         let info = self
             .dataset_info_local(name)
@@ -6367,7 +6732,14 @@ impl Hdf5Reader {
         let boxes = sel.to_boxes(&dims)?;
 
         let es = element_size as usize;
-        let mut out = alloc_tiled_fill(points.len() * es, None)?;
+        if out.len() != points.len() * es {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "read_points_into: buffer is {} bytes but {} points need {}",
+                out.len(),
+                points.len(),
+                points.len() * es
+            )));
+        }
         for (i, (bstart, bcount)) in boxes.iter().enumerate() {
             self.read_slice_into_unconverted(
                 name,
@@ -6377,8 +6749,7 @@ impl Hdf5Reader {
                 0,
             )?;
         }
-        Self::apply_post_filter_conversion(&mut out, &datatype)?;
-        Ok(out)
+        Self::apply_post_filter_conversion(out, &datatype)
     }
 
     /// Read one chunk's raw (still-filtered) bytes and its filter mask —
@@ -6820,6 +7191,219 @@ mod tests {
             std::process::id(),
             n
         ))
+    }
+
+    /// Write `bytes` to a fresh temp file and open a read handle on it.
+    fn handle_over(name: &str, bytes: &[u8]) -> (std::path::PathBuf, FileHandle) {
+        let path = temp_path(name);
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+        let handle =
+            FileHandle::open_read_with_locking(&path, crate::io::locking::FileLocking::Disabled)
+                .unwrap();
+        (path, handle)
+    }
+
+    /// The chunk-index cache. A decoded index MUST describe the file exactly
+    /// as the catalog entry beside it does, and MUST NOT be served for an
+    /// index address other than the one it was decoded from.
+    /// [`Hdf5Reader::decoded_chunk_index`] is the single owner — the only
+    /// reader and writer of the cache — and `DatasetTable` is what keeps a
+    /// stale index unreachable: `entry_mut` is the one way to a mutable
+    /// entry and it drops that entry's index first, where the `IndexMut` it
+    /// replaced would have left it standing.
+    mod chunk_index_cache {
+        use super::*;
+
+        /// `d` = `[0, 1, .., 7]` in two chunks of four, fixed extent, so the
+        /// layout points at a fixed array a read has to walk.
+        fn chunked_file(name: &str) -> (std::path::PathBuf, Hdf5Reader) {
+            let path = temp_path(name);
+            {
+                let file = crate::H5File::create(&path).unwrap();
+                let ds = file
+                    .new_dataset::<u8>()
+                    .shape([8usize])
+                    .chunk(&[4])
+                    .create("d")
+                    .unwrap();
+                ds.write_raw(&(0u8..8).collect::<Vec<u8>>()).unwrap();
+                file.close().unwrap();
+            }
+            let reader = Hdf5Reader::open(&path).unwrap();
+            (path, reader)
+        }
+
+        /// The address of the chunk index `d`'s layout points at.
+        fn index_address(reader: &Hdf5Reader, pos: usize) -> u64 {
+            match &reader.datasets[pos].layout {
+                DataLayoutMessage::ChunkedV4 { index_address, .. } => *index_address,
+                _ => panic!("expected a version-4 chunked layout"),
+            }
+        }
+
+        #[test]
+        fn a_read_leaves_its_decoded_index_for_the_next_read() {
+            let (path, mut r) = chunked_file("index_cache_hit");
+            let pos = r.dataset_position("d").unwrap();
+            let addr = index_address(&r, pos);
+            assert!(
+                r.datasets.chunk_index(pos, addr).is_none(),
+                "a reader that has read nothing holds a decoded index"
+            );
+
+            assert_eq!(r.read_slice("d", &[0], &[4]).unwrap(), vec![0u8, 1, 2, 3]);
+            let cached = r
+                .datasets
+                .chunk_index(pos, addr)
+                .expect("the read did not keep the index it decoded");
+            assert_eq!(cached.entries.len(), 2, "one entry per chunk");
+            assert_eq!(cached.coords, vec![0, 1], "slot 0 and slot 1 of the grid");
+
+            // The second read answers from it and reaches the same bytes.
+            assert_eq!(r.read_slice("d", &[4], &[4]).unwrap(), vec![4u8, 5, 6, 7]);
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn an_index_is_never_served_for_another_address() {
+            let (path, mut r) = chunked_file("index_cache_addr");
+            let pos = r.dataset_position("d").unwrap();
+            let addr = index_address(&r, pos);
+            r.read_slice("d", &[0], &[4]).unwrap();
+
+            assert!(
+                r.datasets.chunk_index(pos, addr.wrapping_add(1)).is_none(),
+                "an index decoded from {addr:#x} answered for another address"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn changing_an_entry_drops_the_index_decoded_against_it() {
+            let (path, mut r) = chunked_file("index_cache_entry_mut");
+            let pos = r.dataset_position("d").unwrap();
+            let addr = index_address(&r, pos);
+            r.read_slice("d", &[0], &[4]).unwrap();
+            assert!(r.datasets.chunk_index(pos, addr).is_some());
+
+            // What a caller reaches an entry mutably for — the virtual extent
+            // resolution rewrites `dataspace.dims` — is what the coordinates
+            // in a decoded index were built against.
+            let _ = r.datasets.entry_mut(pos);
+            assert!(
+                r.datasets.chunk_index(pos, addr).is_none(),
+                "a mutable entry left its decoded index behind"
+            );
+            assert_eq!(r.read_slice("d", &[4], &[4]).unwrap(), vec![4u8, 5, 6, 7]);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// `place_chunk_jobs` is the single owner of "every byte of a chunked
+    /// read's output is defined": it skips the blanket fill only when
+    /// [`planned_coverage`] proves the plan reaches every output byte, and
+    /// fills whatever a plan or a short image leaves behind. The buffer these
+    /// hand it is poisoned, so a byte no one defines shows up as `0xAA`.
+    mod chunk_fill_plan {
+        use super::*;
+
+        /// dims [8] of 1-byte elements in chunks of 4: slot 0 holds `ABCD` at
+        /// file offset 0, slot 1 holds `EFGH` at offset 4.
+        const DIMS: [u64; 1] = [8];
+        const CHUNKS: [u64; 1] = [4];
+        const FILL: [u8; 1] = [0x7E];
+
+        fn place(
+            name: &str,
+            jobs: Vec<Option<ChunkReadJob>>,
+            coords: &[u64],
+        ) -> (std::path::PathBuf, Vec<u8>) {
+            let (path, handle) = handle_over(name, b"ABCDEFGH");
+            let geo = ChunkOutputGeometry {
+                dims: &DIMS,
+                chunk_dims: &CHUNKS,
+                element_size: 1,
+            };
+            let mut out = vec![0xAAu8; 8];
+            place_chunk_jobs(
+                &handle,
+                jobs,
+                coords,
+                ChunkReadRequest {
+                    pipeline: None,
+                    target: ChunkTarget::Full,
+                    fill_value: Some(&FILL),
+                },
+                &geo,
+                &mut out,
+            )
+            .unwrap();
+            (path, out)
+        }
+
+        fn job(addr: u64, len: usize) -> Option<ChunkReadJob> {
+            Some(ChunkReadJob {
+                addr,
+                len,
+                at_most: true,
+                mask: 0,
+            })
+        }
+
+        /// The owner path: a plan that tiles the output places every byte, so
+        /// nothing is filled and nothing is left poisoned.
+        #[test]
+        fn a_plan_that_covers_the_output_leaves_no_byte_to_fill() {
+            let geo = ChunkOutputGeometry {
+                dims: &DIMS,
+                chunk_dims: &CHUNKS,
+                element_size: 1,
+            };
+            let zeros = [0u64];
+            let placement = ChunkPlacement::resolve(&geo, ChunkTarget::Full, &zeros);
+            let jobs = vec![job(0, 4), job(4, 4)];
+            assert_eq!(
+                planned_coverage(&placement, &jobs, &[0, 1]),
+                8,
+                "a tiling plan must measure as covering the whole output"
+            );
+            let (path, out) = place("cover_full", jobs, &[0, 1]);
+            assert_eq!(out, b"ABCDEFGH");
+            let _ = std::fs::remove_file(path);
+        }
+
+        /// A slot the plan never reaches reads back as the tiled fill value,
+        /// which is what the blanket pre-fill used to guarantee.
+        #[test]
+        fn a_slot_the_plan_skips_reads_back_as_fill() {
+            let (path, out) = place("cover_gap", vec![job(0, 4), None], &[0, 1]);
+            assert_eq!(out, b"ABCD~~~~");
+            let _ = std::fs::remove_file(path);
+        }
+
+        /// A corrupt index naming one chunk-grid slot twice must not be
+        /// mistaken for a plan that covers two slots: counting the duplicate
+        /// once leaves the coverage short, so the fill still goes down and the
+        /// slot no entry named reads as fill rather than as poison.
+        #[test]
+        fn duplicate_chunk_coordinates_still_leave_defined_output() {
+            let (path, out) = place("cover_dup", vec![job(0, 4), job(0, 4)], &[0, 0]);
+            assert_eq!(out, b"ABCD~~~~");
+            let _ = std::fs::remove_file(path);
+        }
+
+        /// A chunk whose stored image is shorter than the read box needs it to
+        /// be places no run at all; the plan counted it, so the shortfall is
+        /// filled after placement instead of before it.
+        #[test]
+        fn a_chunk_read_short_has_its_runs_filled_after_placement() {
+            let (path, out) = place("cover_short", vec![job(0, 4), job(4, 2)], &[0, 1]);
+            assert_eq!(out, b"ABCD~~~~");
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     /// Helper: write a little-endian u64 truncated to `n` bytes.
