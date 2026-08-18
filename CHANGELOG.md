@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Breaking.** `DatasetAccess` no longer implements `Copy`. It gained
+  the dapl prefix properties `virtual_prefix` and `efile_prefix`
+  (`H5Pset_virtual_prefix` / `H5Pset_efile_prefix`), which are owned
+  strings, so implicit copies became moves. `Clone` is still derived —
+  add `.clone()` where a copy was relied on.
+
 ## 0.4.3
 
 ### Changed
