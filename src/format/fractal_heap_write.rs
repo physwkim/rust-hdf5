@@ -65,6 +65,134 @@ pub struct BuiltHeap {
     pub ids: Vec<Vec<u8>>,
 }
 
+/// A heap whose layout is settled but whose objects have not been written.
+///
+/// Every block has its address and every object its heap ID, and none of that
+/// depends on what the objects contain — only on how long they are. The split
+/// exists because a shared-message heap holds objects that name other objects
+/// in the same heap by heap ID: `H5A__create` shares an attribute's datatype
+/// and dataspace before `H5O__attr_create` shares the attribute itself
+/// (H5Aint.c:375-377), so the attribute body that goes into the heap already
+/// carries their IDs. A caller reads [`ids`](Self::ids), finishes its objects
+/// against them, and hands the result to [`finish`](Self::finish).
+pub struct PlannedHeap {
+    header: FractalHeapHeader,
+    ctx: FormatContext,
+    header_addr: u64,
+    /// The lengths the layout was computed from; [`finish`](Self::finish)
+    /// refuses objects that no longer match them.
+    lengths: Vec<usize>,
+    ids: Vec<Vec<u8>>,
+    /// Indirect blocks: their content is addresses, not objects.
+    managed_meta: Vec<HeapBlock>,
+    /// The huge-object index, likewise.
+    huge_meta: Vec<HeapBlock>,
+    managed: ManagedPlan,
+    huge: Vec<HugeSlot>,
+}
+
+/// Where the managed objects go, once their direct blocks are placed.
+struct ManagedPlan {
+    built: Vec<DirectBlock>,
+    addrs: Vec<u64>,
+    /// Object indices, in placement order, each with the direct block it went
+    /// into and the offset of its bytes in that block's object area.
+    slots: Vec<(usize, usize, usize)>,
+    overhead: usize,
+}
+
+/// One huge object's own allocation.
+struct HugeSlot {
+    addr: u64,
+    len: u64,
+    object: usize,
+}
+
+impl PlannedHeap {
+    /// One heap ID per object, in the order the lengths were given.
+    pub fn ids(&self) -> &[Vec<u8>] {
+        &self.ids
+    }
+
+    /// Write the objects into the layout this planned.
+    ///
+    /// Every object must still be the length it was planned at — the heap IDs
+    /// already handed out record each object's length, so a different one
+    /// would describe bytes that are not there.
+    pub fn finish(self, objects: &[Vec<u8>]) -> FormatResult<BuiltHeap> {
+        if objects.len() != self.lengths.len()
+            || objects
+                .iter()
+                .zip(&self.lengths)
+                .any(|(o, &n)| o.len() != n)
+        {
+            return Err(FormatError::InvalidData(
+                "fractal heap objects do not match the lengths their layout was planned from"
+                    .into(),
+            ));
+        }
+        let Self {
+            header,
+            ctx,
+            header_addr,
+            ids,
+            managed_meta,
+            huge_meta,
+            managed,
+            huge,
+            ..
+        } = self;
+
+        let mut blocks = managed_meta;
+        let mut images: Vec<Vec<u8>> = managed
+            .built
+            .iter()
+            .map(|b| direct_prefix(&header, &ctx, header_addr, b.block_off, b.size))
+            .collect();
+        for &(object, bi, off) in &managed.slots {
+            let start = managed.overhead + off;
+            images[bi][start..start + objects[object].len()].copy_from_slice(&objects[object]);
+        }
+        for (image, b) in images.iter_mut().zip(&managed.built) {
+            finish_direct_block(&header, &ctx, image, b.size as usize);
+        }
+        for (image, (&addr, b)) in images
+            .into_iter()
+            .zip(managed.addrs.iter().zip(&managed.built))
+        {
+            blocks.push(HeapBlock {
+                addr,
+                len: b.size,
+                image,
+            });
+        }
+        for slot in huge {
+            blocks.push(HeapBlock {
+                addr: slot.addr,
+                len: slot.len,
+                image: objects[slot.object].clone(),
+            });
+        }
+        blocks.extend(huge_meta);
+
+        let image = header.encode(&ctx);
+        blocks.insert(
+            0,
+            HeapBlock {
+                addr: header_addr,
+                len: image.len() as u64,
+                image,
+            },
+        );
+
+        Ok(BuiltHeap {
+            header_addr,
+            blocks,
+            ids,
+        })
+    }
+}
+
 /// Lay `objects` out as a fractal heap.
 ///
 /// `alloc` allocates `len` bytes of file space and returns the address; it is
@@ -77,6 +205,20 @@ pub fn build_heap(
     objects: &[Vec<u8>],
     alloc: &mut dyn FnMut(u64) -> u64,
 ) -> FormatResult<BuiltHeap> {
+    let lengths: Vec<usize> = objects.iter().map(Vec::len).collect();
+    plan_heap(params, ctx, &lengths, alloc)?.finish(objects)
+}
+
+/// Decide where objects of these `lengths` would go, without needing them.
+///
+/// The half of [`build_heap`] that takes the file space; see [`PlannedHeap`]
+/// for why a caller ever wants the two halves apart.
+pub fn plan_heap(
+    params: &HeapParams,
+    ctx: &FormatContext,
+    lengths: &[usize],
+    alloc: &mut dyn FnMut(u64) -> u64,
+) -> FormatResult<PlannedHeap> {
     let mut header = FractalHeapHeader::new(params, ctx);
 
     // The header address comes first: every direct and indirect block names it
@@ -84,52 +226,49 @@ pub fn build_heap(
     // size does not depend on any of them.
     let header_addr = alloc(FractalHeapHeader::encoded_size(ctx) as u64);
 
-    let mut blocks = Vec::new();
-    let mut ids: Vec<Vec<u8>> = vec![Vec::new(); objects.len()];
+    let mut ids: Vec<Vec<u8>> = vec![Vec::new(); lengths.len()];
 
     // Partition by the same rule as `H5HF_insert`: the size decides, not the
     // caller.
-    let managed: Vec<usize> = (0..objects.len())
-        .filter(|&i| (objects[i].len() as u64) < params.max_man_size as u64)
+    let managed: Vec<usize> = (0..lengths.len())
+        .filter(|&i| (lengths[i] as u64) < params.max_man_size as u64)
         .collect();
-    let huge: Vec<usize> = (0..objects.len())
-        .filter(|&i| (objects[i].len() as u64) >= params.max_man_size as u64)
+    let huge: Vec<usize> = (0..lengths.len())
+        .filter(|&i| (lengths[i] as u64) >= params.max_man_size as u64)
         .collect();
 
-    place_managed(
+    let mut managed_meta = Vec::new();
+    let managed = plan_managed(
         &mut header,
         ctx,
-        objects,
+        lengths,
         &managed,
         header_addr,
         alloc,
-        &mut blocks,
+        &mut managed_meta,
         &mut ids,
     )?;
-    place_huge(
+    let mut huge_meta = Vec::new();
+    let huge = plan_huge(
         &mut header,
         ctx,
-        objects,
+        lengths,
         &huge,
         alloc,
-        &mut blocks,
+        &mut huge_meta,
         &mut ids,
     );
 
-    let image = header.encode(ctx);
-    blocks.insert(
-        0,
-        HeapBlock {
-            addr: header_addr,
-            len: image.len() as u64,
-            image,
-        },
-    );
-
-    Ok(BuiltHeap {
+    Ok(PlannedHeap {
+        header,
+        ctx: *ctx,
         header_addr,
-        blocks,
+        lengths: lengths.to_vec(),
         ids,
+        managed_meta,
+        huge_meta,
+        managed,
+        huge,
     })
 }
 
@@ -231,19 +370,28 @@ fn nth_direct_block(
 }
 
 /// Pack the managed objects into direct blocks and record their heap IDs.
+///
+/// Only the lengths are needed: a managed heap ID is the object's heap-space
+/// offset and its length, and a direct block's address comes from `alloc`, so
+/// nothing here reads an object's bytes.
 #[allow(clippy::too_many_arguments)]
-fn place_managed(
+fn plan_managed(
     header: &mut FractalHeapHeader,
     ctx: &FormatContext,
-    objects: &[Vec<u8>],
+    lengths: &[usize],
     managed: &[usize],
     header_addr: u64,
     alloc: &mut dyn FnMut(u64) -> u64,
     blocks: &mut Vec<HeapBlock>,
     ids: &mut [Vec<u8>],
-) -> FormatResult<()> {
+) -> FormatResult<ManagedPlan> {
     if managed.is_empty() {
-        return Ok(());
+        return Ok(ManagedPlan {
+            built: Vec::new(),
+            addrs: Vec::new(),
+            slots: Vec::new(),
+            overhead: 0,
+        });
     }
     let overhead = direct_overhead(header, ctx);
     let counts = direct_block_counts(header);
@@ -256,7 +404,7 @@ fn place_managed(
     let mut cursor = 0usize;
 
     for &i in managed {
-        let len = objects[i].len();
+        let len = lengths[i];
         loop {
             let Some((size, block_off)) = nth_direct_block(header, &counts, 0, root_rows, cursor)
             else {
@@ -298,23 +446,19 @@ fn place_managed(
         }
     }
 
-    // Assign addresses in block order, then fill each image.
+    // Assign addresses in block order, then the heap ID each object's slot
+    // gives it. The bytes go in once the caller has finished them
+    // ([`PlannedHeap::finish`]).
     let addrs: Vec<u64> = built.iter().map(|b| alloc(b.size)).collect();
-    let mut images: Vec<Vec<u8>> = built
-        .iter()
-        .map(|b| direct_prefix(header, ctx, header_addr, b.block_off, b.size))
-        .collect();
+    let mut slots = Vec::with_capacity(managed.len());
     for (&i, &(bi, off)) in managed.iter().zip(&placement) {
         let start = overhead + off;
-        images[bi][start..start + objects[i].len()].copy_from_slice(&objects[i]);
+        slots.push((i, bi, off));
         ids[i] = managed_id(
             header,
             built[bi].block_off + start as u64,
-            objects[i].len() as u64,
+            lengths[i] as u64,
         );
-    }
-    for (image, b) in images.iter_mut().zip(&built) {
-        finish_direct_block(header, ctx, image, b.size as usize);
     }
 
     let last = built.last().expect("a managed object built a block");
@@ -363,14 +507,12 @@ fn place_managed(
     header.total_man_free = 0;
     header.fs_addr = UNDEF_ADDR;
 
-    for (image, (&addr, b)) in images.into_iter().zip(addrs.iter().zip(&built)) {
-        blocks.push(HeapBlock {
-            addr,
-            len: b.size,
-            image,
-        });
-    }
-    Ok(())
+    Ok(ManagedPlan {
+        built,
+        addrs,
+        slots,
+        overhead,
+    })
 }
 
 /// The fixed prefix of a direct block, zero-padded to its full size.
@@ -484,18 +626,18 @@ fn managed_id(header: &FractalHeapHeader, offset: u64, length: u64) -> Vec<u8> {
     id
 }
 
-/// Write each huge object in its own allocation and index them by ID.
-fn place_huge(
+/// Give each huge object its own allocation and index them by ID.
+fn plan_huge(
     header: &mut FractalHeapHeader,
     ctx: &FormatContext,
-    objects: &[Vec<u8>],
+    lengths: &[usize],
     huge: &[usize],
     alloc: &mut dyn FnMut(u64) -> u64,
     blocks: &mut Vec<HeapBlock>,
     ids: &mut [Vec<u8>],
-) {
+) -> Vec<HugeSlot> {
     if huge.is_empty() {
-        return;
+        return Vec::new();
     }
     let sa = ctx.sizeof_addr as usize;
     let ss = ctx.sizeof_size as usize;
@@ -504,15 +646,16 @@ fn place_huge(
     // `H5HF__huge_new_id` pre-increments, so IDs start at 1 and 0 never
     // appears; the B-tree orders records by that ID, which insertion order
     // already gives.
+    let mut slots = Vec::with_capacity(huge.len());
     let mut records = Vec::with_capacity(huge.len() * record_size as usize);
     for (n, &i) in huge.iter().enumerate() {
-        let len = objects[i].len() as u64;
+        let len = lengths[i] as u64;
         let addr = alloc(len);
         let huge_id = n as u64 + 1;
-        blocks.push(HeapBlock {
+        slots.push(HugeSlot {
             addr,
             len,
-            image: objects[i].clone(),
+            object: i,
         });
         records.extend_from_slice(&addr.to_le_bytes()[..sa]);
         records.extend_from_slice(&len.to_le_bytes()[..ss]);
@@ -557,6 +700,7 @@ fn place_huge(
         image,
     });
     header.huge_bt2_addr = bt2_addr;
+    slots
 }
 
 #[cfg(test)]
