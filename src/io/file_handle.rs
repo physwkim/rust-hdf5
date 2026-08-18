@@ -58,6 +58,7 @@ pub struct FileHandle {
 
 impl FileHandle {
     /// Create a new file with the env-var-derived locking policy.
+    #[cfg(test)]
     pub fn create(path: &Path) -> std::io::Result<Self> {
         Self::create_with_locking(path, FileLocking::from_env_or(FileLocking::default()))
     }
@@ -126,6 +127,7 @@ impl FileHandle {
 
     /// Open an existing file for read-only access with the env-var-derived
     /// locking policy.
+    #[cfg(test)]
     pub fn open_read(path: &Path) -> std::io::Result<Self> {
         Self::open_read_with_locking(path, FileLocking::from_env_or(FileLocking::default()))
     }
@@ -142,12 +144,6 @@ impl FileHandle {
             lock_held,
             base: 0,
         })
-    }
-
-    /// Open an existing file for read/write access with the env-var-derived
-    /// locking policy.
-    pub fn open_readwrite(path: &Path) -> std::io::Result<Self> {
-        Self::open_readwrite_with_locking(path, FileLocking::from_env_or(FileLocking::default()))
     }
 
     /// Open an existing file for read/write access with an explicit locking
@@ -202,16 +198,6 @@ impl FileHandle {
                 return Ok(None);
             }
         }
-    }
-
-    /// Locking policy this handle was opened with.
-    pub fn lock_policy(&self) -> FileLocking {
-        self.lock_policy
-    }
-
-    /// Whether a lock is currently held on this handle.
-    pub fn lock_held(&self) -> bool {
-        self.lock_held
     }
 
     /// Release the OS-level lock so concurrent SWMR readers (and other

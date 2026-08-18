@@ -96,15 +96,6 @@ enum ChunkTarget<'a> {
 }
 
 impl<'a> ChunkTarget<'a> {
-    /// Dimensions of the produced output buffer: the dataset dims for `Full`,
-    /// the selection extent for `Slice`.
-    fn out_dims(&self, dims: &'a [u64]) -> &'a [u64] {
-        match self {
-            ChunkTarget::Full => dims,
-            ChunkTarget::Slice { counts, .. } => counts,
-        }
-    }
-
     /// Whether a chunk at chunk-grid `coords` (extent `chunk_dims`) intersects
     /// the target. `Full` always intersects; a `Slice` intersects iff every
     /// dimension's chunk span `[origin, origin+chunk_dims)` overlaps the
@@ -120,6 +111,19 @@ impl<'a> ChunkTarget<'a> {
             }),
         }
     }
+}
+
+/// The dataset extent, chunk shape and element size a chunk-placement call
+/// reads through — constant across every chunk of one read, so
+/// [`Hdf5Reader::copy_chunk_to_output`], [`Hdf5Reader::copy_chunk_to_slice`]
+/// and [`Hdf5Reader::scatter_chunk`] take this once instead of the three
+/// fields separately, leaving only what actually varies per chunk (its data
+/// and grid coordinates) as their own parameters.
+#[derive(Clone, Copy)]
+struct ChunkOutputGeometry<'a> {
+    dims: &'a [u64],
+    chunk_dims: &'a [u64],
+    element_size: u64,
 }
 
 /// One resolved external-file slot (H5O_EFL_ID): the on-disk message
@@ -799,22 +803,6 @@ impl CommittedDatatypeInfo {
     }
 }
 
-/// Internal enum to represent what we know about the root group from the
-/// superblock. For v2/v3 we have the root group object header address; for
-/// v0/v1 we have a B-tree and local heap that index the root group's children.
-/// These are stored for potential future use (e.g., SWMR refresh).
-#[allow(dead_code)]
-enum RootGroupInfo {
-    V2V3 {
-        root_group_object_header_address: u64,
-    },
-    V0V1 {
-        root_obj_header_addr: u64,
-        btree_addr: u64,
-        heap_addr: u64,
-    },
-}
-
 /// Everything the superblock extension object header contributes to the
 /// file-level view.
 ///
@@ -847,8 +835,6 @@ pub struct Hdf5Reader {
     /// `detect_superblock_version` and never re-derived: 0/1 is the legacy
     /// symbol-table root, 2/3 the link-message root.
     superblock_version: u8,
-    #[allow(dead_code)]
-    root_group_info: RootGroupInfo,
     datasets: Vec<DatasetReadInfo>,
     /// Dataset-shaped objects this crate cannot read, keyed by path (no
     /// leading `/`), the value naming what stopped it. They are listed with
@@ -1501,9 +1487,6 @@ impl Hdf5Reader {
             ext,
             _eof: sb.end_of_file_address,
             superblock_version: sb.version,
-            root_group_info: RootGroupInfo::V2V3 {
-                root_group_object_header_address: sb.root_group_object_header_address,
-            },
             object_paths: catalog.object_paths(sb.root_group_object_header_address),
             datasets: catalog.datasets,
             unreadable: catalog.unreadable,
@@ -1553,7 +1536,6 @@ impl Hdf5Reader {
         let ste = &sb.root_symbol_table_entry;
         let root_obj_addr = ste.obj_header_addr;
         let ste_stab = ste.cached_symbol_table();
-        let (ste_btree_addr, ste_heap_addr) = ste_stab.unwrap_or((UNDEF_ADDR, UNDEF_ADDR));
 
         // Read the root group's object header (following continuations).
         let root_hdr = Self::read_object_header_full(&mut handle, &meta, root_obj_addr).ok();
@@ -1590,11 +1572,6 @@ impl Hdf5Reader {
             ext,
             _eof: sb.end_of_file_address,
             superblock_version: sb.version,
-            root_group_info: RootGroupInfo::V0V1 {
-                root_obj_header_addr: root_obj_addr,
-                btree_addr: ste_btree_addr,
-                heap_addr: ste_heap_addr,
-            },
             object_paths: catalog.object_paths(root_obj_addr),
             datasets: catalog.datasets,
             unreadable: catalog.unreadable,
@@ -2403,12 +2380,6 @@ impl Hdf5Reader {
     /// the file's contents but never its own format version.
     pub fn superblock_version(&self) -> u8 {
         self.superblock_version
-    }
-
-    /// The v1 B-tree split ranks in force for this file, after the superblock
-    /// and the extension's K message have both been applied.
-    pub fn btree_config(&self) -> BTreeV1Config {
-        self.meta.btree
     }
 
     /// Rewrite a path (no leading `/`) into the path of the object it reaches
@@ -3491,25 +3462,16 @@ impl Hdf5Reader {
                 // the dataset extent (Full) or the selection (Slice) into the
                 // caller's pre-filled buffer.
                 let coords = vec![0u64; dims.len()];
+                let geo = ChunkOutputGeometry {
+                    dims: &dims,
+                    chunk_dims,
+                    element_size,
+                };
                 match target {
-                    ChunkTarget::Full => self.copy_chunk_to_output(
-                        &data,
-                        output,
-                        &dims,
-                        chunk_dims,
-                        &coords,
-                        element_size,
-                    ),
-                    ChunkTarget::Slice { starts, counts } => self.copy_chunk_to_slice(
-                        &data,
-                        output,
-                        &dims,
-                        chunk_dims,
-                        &coords,
-                        element_size,
-                        starts,
-                        counts,
-                    ),
+                    ChunkTarget::Full => self.copy_chunk_to_output(&data, output, &geo, &coords),
+                    ChunkTarget::Slice { starts, counts } => {
+                        self.copy_chunk_to_slice(&data, output, &geo, &coords, starts, counts)
+                    }
                 }
                 Ok(())
             }
@@ -3631,18 +3593,15 @@ impl Hdf5Reader {
 
                 let decompressed = read_and_decompress_chunks(&self.handle, pipeline, jobs)?;
 
+                let geo = ChunkOutputGeometry {
+                    dims: &dims,
+                    chunk_dims,
+                    element_size,
+                };
                 for (i, chunk_data) in decompressed.iter().enumerate() {
                     if let Some(data) = chunk_data {
                         let coords = chunk_coords(i as u64);
-                        self.scatter_chunk(
-                            target,
-                            data,
-                            output,
-                            &dims,
-                            chunk_dims,
-                            coords,
-                            element_size,
-                        );
+                        self.scatter_chunk(target, data, output, &geo, coords);
                     }
                 }
 
@@ -3902,18 +3861,15 @@ impl Hdf5Reader {
         // Read + decompress (in parallel where positioned reads are race-free),
         // then place each chunk into output.
         let decompressed = read_and_decompress_chunks(&self.handle, pipeline, jobs)?;
+        let geo = ChunkOutputGeometry {
+            dims: &dims,
+            chunk_dims,
+            element_size,
+        };
         for (linear_idx, chunk_data) in decompressed.iter().enumerate() {
             let Some(data) = chunk_data else { continue };
             let coords = chunk_coords(linear_idx as u64);
-            self.scatter_chunk(
-                target,
-                data,
-                output,
-                &dims,
-                chunk_dims,
-                coords,
-                element_size,
-            );
+            self.scatter_chunk(target, data, output, &geo, coords);
         }
 
         Ok(())
@@ -3997,17 +3953,14 @@ impl Hdf5Reader {
             .collect();
 
         let decompressed = read_and_decompress_chunks(&self.handle, None, jobs)?;
+        let geo = ChunkOutputGeometry {
+            dims: &dims,
+            chunk_dims,
+            element_size,
+        };
         for (i, chunk_data) in decompressed.iter().enumerate() {
             if let Some(data) = chunk_data {
-                self.scatter_chunk(
-                    target,
-                    data,
-                    output,
-                    &dims,
-                    chunk_dims,
-                    &slot_coords[i],
-                    element_size,
-                );
+                self.scatter_chunk(target, data, output, &geo, &slot_coords[i]);
             }
         }
 
@@ -4152,17 +4105,14 @@ impl Hdf5Reader {
         // Read + decompress (in parallel where positioned reads are race-free),
         // then place each chunk N-dimensionally by its scaled offsets.
         let placed = read_and_decompress_chunks(&self.handle, pipeline, jobs)?;
+        let geo = ChunkOutputGeometry {
+            dims: &dims,
+            chunk_dims,
+            element_size,
+        };
         for (i, chunk_data) in placed.iter().enumerate() {
             if let Some(data) = chunk_data {
-                self.scatter_chunk(
-                    target,
-                    data,
-                    output,
-                    &dims,
-                    chunk_dims,
-                    coords[i],
-                    element_size,
-                );
+                self.scatter_chunk(target, data, output, &geo, coords[i]);
             }
         }
 
@@ -4251,17 +4201,14 @@ impl Hdf5Reader {
         // Read + decompress (in parallel where positioned reads are race-free),
         // then place each chunk N-dimensionally by its scaled offsets.
         let placed = read_and_decompress_chunks(&self.handle, pipeline, jobs)?;
+        let geo = ChunkOutputGeometry {
+            dims: &dims,
+            chunk_dims,
+            element_size,
+        };
         for (i, chunk_data) in placed.iter().enumerate() {
             if let Some(data) = chunk_data {
-                self.scatter_chunk(
-                    target,
-                    data,
-                    output,
-                    &dims,
-                    chunk_dims,
-                    &coords[i],
-                    element_size,
-                );
+                self.scatter_chunk(target, data, output, &geo, &coords[i]);
             }
         }
 
@@ -4347,11 +4294,14 @@ impl Hdf5Reader {
         &self,
         chunk_data: &[u8],
         output: &mut [u8],
-        dims: &[u64],
-        chunk_dims: &[u64],
+        geo: &ChunkOutputGeometry,
         chunk_coords: &[u64],
-        element_size: u64,
     ) {
+        let ChunkOutputGeometry {
+            dims,
+            chunk_dims,
+            element_size,
+        } = *geo;
         let ndims = dims.len();
         if ndims == 0 {
             return;
@@ -4433,18 +4383,20 @@ impl Hdf5Reader {
     /// is innermost in both the chunk and the output, each fixed setting of the
     /// outer box dimensions copies one contiguous run of
     /// `(hi[last]-lo[last])` elements — no per-element loop.
-    #[allow(clippy::too_many_arguments)]
     fn copy_chunk_to_slice(
         &self,
         chunk_data: &[u8],
         output: &mut [u8],
-        dims: &[u64],
-        chunk_dims: &[u64],
+        geo: &ChunkOutputGeometry,
         chunk_coords: &[u64],
-        element_size: u64,
         starts: &[u64],
         counts: &[u64],
     ) {
+        let ChunkOutputGeometry {
+            dims,
+            chunk_dims,
+            element_size,
+        } = *geo;
         let ndims = dims.len();
         if ndims == 0 {
             return;
@@ -4499,36 +4451,19 @@ impl Hdf5Reader {
 
     /// Scatter one decoded chunk into the output for the given target: the
     /// whole dataset (`Full`) or a hyperslab (`Slice`).
-    #[allow(clippy::too_many_arguments)]
     fn scatter_chunk(
         &self,
         target: ChunkTarget,
         chunk_data: &[u8],
         output: &mut [u8],
-        dims: &[u64],
-        chunk_dims: &[u64],
+        geo: &ChunkOutputGeometry,
         chunk_coords: &[u64],
-        element_size: u64,
     ) {
         match target {
-            ChunkTarget::Full => self.copy_chunk_to_output(
-                chunk_data,
-                output,
-                dims,
-                chunk_dims,
-                chunk_coords,
-                element_size,
-            ),
-            ChunkTarget::Slice { starts, counts } => self.copy_chunk_to_slice(
-                chunk_data,
-                output,
-                dims,
-                chunk_dims,
-                chunk_coords,
-                element_size,
-                starts,
-                counts,
-            ),
+            ChunkTarget::Full => self.copy_chunk_to_output(chunk_data, output, geo, chunk_coords),
+            ChunkTarget::Slice { starts, counts } => {
+                self.copy_chunk_to_slice(chunk_data, output, geo, chunk_coords, starts, counts)
+            }
         }
     }
 
@@ -4622,8 +4557,8 @@ impl Hdf5Reader {
             }
 
             // Read or get cached global heap collection
-            #[allow(clippy::map_entry)]
-            if !heap_cache.contains_key(&collection_addr) {
+            if let std::collections::hash_map::Entry::Vacant(e) = heap_cache.entry(collection_addr)
+            {
                 let coll = self.read_heap_collection(collection_addr)?;
                 let lookup: std::collections::HashMap<u16, usize> = coll
                     .objects
@@ -4631,7 +4566,7 @@ impl Hdf5Reader {
                     .enumerate()
                     .map(|(i, o)| (o.index, i))
                     .collect();
-                heap_cache.insert(collection_addr, (coll, lookup));
+                e.insert((coll, lookup));
             }
 
             let idx = u16::try_from(obj_index).map_err(|_| {
@@ -5515,13 +5450,6 @@ pub struct ObjectAttributes {
 }
 
 impl ObjectAttributes {
-    /// Whether this object has nothing to say about attributes: none read,
-    /// and no failure to report. An incomplete empty set is *not* empty — the
-    /// reason is the thing worth keeping.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.incomplete.is_none()
-    }
-
     /// Record an attribute this collector could name.
     fn push(&mut self, entry: AttributeEntry) {
         self.entries.push(entry);
@@ -5575,11 +5503,6 @@ impl ObjectAttributes {
     /// without replaying its v1-header/v2-header branch here.
     pub fn header_count(&self, owner: &str) -> IoResult<u64> {
         Ok(self.complete(owner)?.len() as u64)
-    }
-
-    /// Nothing worth recording: no attribute read, and no failure to report.
-    pub(crate) fn is_absent(&self) -> bool {
-        self.entries.is_empty() && self.incomplete.is_none()
     }
 
     /// The entries, once the set is known to be whole.

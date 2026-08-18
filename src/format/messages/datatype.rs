@@ -1192,16 +1192,19 @@ impl DatatypeMessage {
     }
 
     /// Decode from a byte buffer.  Returns `(message, bytes_consumed)`.
-    pub fn decode(buf: &[u8], ctx: &FormatContext) -> FormatResult<(Self, usize)> {
-        Self::decode_inner(buf, ctx, 0)
+    ///
+    /// `_ctx` is accepted for signature symmetry with the other message
+    /// types' `decode`, several of which do need it; a datatype message is
+    /// fully self-describing on disk, so decoding never reads it.
+    pub fn decode(buf: &[u8], _ctx: &FormatContext) -> FormatResult<(Self, usize)> {
+        Self::decode_inner(buf, 0)
     }
 
     /// Recursive worker for [`decode`]. `depth` bounds datatype nesting:
     /// compound/enum/vlen/array types embed a base datatype recursively, and
     /// a crafted message can nest these deeply enough to exhaust the stack.
     /// libhdf5-written types nest only a handful of levels.
-    #[allow(clippy::only_used_in_recursion)]
-    fn decode_inner(buf: &[u8], ctx: &FormatContext, depth: usize) -> FormatResult<(Self, usize)> {
+    fn decode_inner(buf: &[u8], depth: usize) -> FormatResult<(Self, usize)> {
         const MAX_DATATYPE_DEPTH: usize = 256;
         if depth > MAX_DATATYPE_DEPTH {
             return Err(FormatError::InvalidData(
@@ -1393,7 +1396,7 @@ impl DatatypeMessage {
                     }
 
                     // Member datatype (recursive)
-                    let (member_dt, dt_consumed) = Self::decode_inner(&buf[pos..], ctx, depth + 1)?;
+                    let (member_dt, dt_consumed) = Self::decode_inner(&buf[pos..], depth + 1)?;
                     pos += dt_consumed;
 
                     members.push(CompoundMember {
@@ -1412,7 +1415,7 @@ impl DatatypeMessage {
                 let mut pos = 8;
 
                 // Base datatype
-                let (base_dt, base_consumed) = Self::decode_inner(&buf[pos..], ctx, depth + 1)?;
+                let (base_dt, base_consumed) = Self::decode_inner(&buf[pos..], depth + 1)?;
                 pos += base_consumed;
 
                 // Member names (null-terminated, padded to 8-byte boundary for v1)
@@ -1459,7 +1462,7 @@ impl DatatypeMessage {
                 let mut pos = 8;
 
                 // Properties: base (parent) datatype
-                let (base_dt, base_consumed) = Self::decode_inner(&buf[pos..], ctx, depth + 1)?;
+                let (base_dt, base_consumed) = Self::decode_inner(&buf[pos..], depth + 1)?;
                 pos += base_consumed;
 
                 if vlen_type == 1 {
@@ -1520,7 +1523,7 @@ impl DatatypeMessage {
                 }
 
                 // Base datatype
-                let (base_dt, base_consumed) = Self::decode_inner(&buf[pos..], ctx, depth + 1)?;
+                let (base_dt, base_consumed) = Self::decode_inner(&buf[pos..], depth + 1)?;
                 pos += base_consumed;
 
                 Ok((

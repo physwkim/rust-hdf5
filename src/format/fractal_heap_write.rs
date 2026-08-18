@@ -84,7 +84,6 @@ pub fn build_heap(
     // size does not depend on any of them.
     let header_addr = alloc(FractalHeapHeader::encoded_size(ctx) as u64);
 
-    let mut blocks = Vec::new();
     let mut ids: Vec<Vec<u8>> = vec![Vec::new(); objects.len()];
 
     // Partition by the same rule as `H5HF_insert`: the size decides, not the
@@ -96,27 +95,17 @@ pub fn build_heap(
         .filter(|&i| (objects[i].len() as u64) >= params.max_man_size as u64)
         .collect();
 
-    place_managed(
-        &mut header,
+    let mut builder = HeapBuilder {
         ctx,
-        objects,
-        &managed,
         header_addr,
         alloc,
-        &mut blocks,
-        &mut ids,
-    )?;
-    place_huge(
-        &mut header,
-        ctx,
-        objects,
-        &huge,
-        alloc,
-        &mut blocks,
-        &mut ids,
-    );
+        blocks: Vec::new(),
+    };
+    builder.place_managed(&mut header, objects, &managed, &mut ids)?;
+    builder.place_huge(&mut header, objects, &huge, &mut ids);
 
     let image = header.encode(ctx);
+    let mut blocks = builder.blocks;
     blocks.insert(
         0,
         HeapBlock {
@@ -131,6 +120,20 @@ pub fn build_heap(
         blocks,
         ids,
     })
+}
+
+/// The state every heap-build placement function writes through: the file
+/// context, the heap header's own address (every block prefix names it), the
+/// allocator, and the blocks accumulated so far. Held together so
+/// [`place_managed`](Self::place_managed), [`place_huge`](Self::place_huge)
+/// and the recursive [`encode_indirect`](Self::encode_indirect) take only the
+/// header and the objects being placed — the shared build state stays on
+/// `self`, the way the v2 B-tree record walk holds its constant state.
+struct HeapBuilder<'a> {
+    ctx: &'a FormatContext,
+    header_addr: u64,
+    alloc: &'a mut dyn FnMut(u64) -> u64,
+    blocks: Vec<HeapBlock>,
 }
 
 /// Bytes a direct block spends before its object area
@@ -230,147 +233,276 @@ fn nth_direct_block(
     None
 }
 
-/// Pack the managed objects into direct blocks and record their heap IDs.
-#[allow(clippy::too_many_arguments)]
-fn place_managed(
-    header: &mut FractalHeapHeader,
-    ctx: &FormatContext,
-    objects: &[Vec<u8>],
-    managed: &[usize],
-    header_addr: u64,
-    alloc: &mut dyn FnMut(u64) -> u64,
-    blocks: &mut Vec<HeapBlock>,
-    ids: &mut [Vec<u8>],
-) -> FormatResult<()> {
-    if managed.is_empty() {
-        return Ok(());
-    }
-    let overhead = direct_overhead(header, ctx);
-    let counts = direct_block_counts(header);
-    let root_rows = header.row_block_size.len();
-    let mut built: Vec<DirectBlock> = Vec::new();
-    // Which block each managed object went into, and where inside its object
-    // area — the heap ID cannot be encoded until the block's own offset is
-    // known, which it is from the start, so this is recorded as it goes.
-    let mut placement: Vec<(usize, usize)> = Vec::with_capacity(managed.len());
-    let mut cursor = 0usize;
+impl HeapBuilder<'_> {
+    /// Pack the managed objects into direct blocks and record their heap IDs.
+    fn place_managed(
+        &mut self,
+        header: &mut FractalHeapHeader,
+        objects: &[Vec<u8>],
+        managed: &[usize],
+        ids: &mut [Vec<u8>],
+    ) -> FormatResult<()> {
+        if managed.is_empty() {
+            return Ok(());
+        }
+        let overhead = direct_overhead(header, self.ctx);
+        let counts = direct_block_counts(header);
+        let root_rows = header.row_block_size.len();
+        let mut built: Vec<DirectBlock> = Vec::new();
+        // Which block each managed object went into, and where inside its object
+        // area — the heap ID cannot be encoded until the block's own offset is
+        // known, which it is from the start, so this is recorded as it goes.
+        let mut placement: Vec<(usize, usize)> = Vec::with_capacity(managed.len());
+        let mut cursor = 0usize;
 
-    for &i in managed {
-        let len = objects[i].len();
-        loop {
-            let Some((size, block_off)) = nth_direct_block(header, &counts, 0, root_rows, cursor)
-            else {
-                return Err(FormatError::UnsupportedFeature(format!(
-                    "fractal heap needs more than the {} bytes its {}-bit address space \
-                     addresses",
-                    row_span(header, root_rows),
-                    header.max_heap_size_bits
-                )));
-            };
-            let capacity = size as usize - overhead;
-            // A row whose blocks are too small for this object can never take
-            // it; skip the row rather than allocating a block it will not fit.
-            if len > capacity {
-                cursor += 1;
-                continue;
-            }
-            let last = built.len().wrapping_sub(1);
-            match built.last().map(|b| (b.seq, b.used)) {
-                Some((seq, used)) if seq == cursor && used + len <= capacity => {
-                    placement.push((last, used));
-                    built[last].used += len;
-                    break;
-                }
-                // The current block is full: move on to the next one, leaving
-                // its tail unused. `H5HF__man_insert` reaches the same layout
-                // whenever its free-space search comes up empty.
-                Some((seq, _)) if seq == cursor => {
+        for &i in managed {
+            let len = objects[i].len();
+            loop {
+                let Some((size, block_off)) =
+                    nth_direct_block(header, &counts, 0, root_rows, cursor)
+                else {
+                    return Err(FormatError::UnsupportedFeature(format!(
+                        "fractal heap needs more than the {} bytes its {}-bit address space \
+                         addresses",
+                        row_span(header, root_rows),
+                        header.max_heap_size_bits
+                    )));
+                };
+                let capacity = size as usize - overhead;
+                // A row whose blocks are too small for this object can never take
+                // it; skip the row rather than allocating a block it will not fit.
+                if len > capacity {
                     cursor += 1;
                     continue;
                 }
-                _ => built.push(DirectBlock {
-                    seq: cursor,
-                    size,
-                    block_off,
-                    used: 0,
-                }),
+                let last = built.len().wrapping_sub(1);
+                match built.last().map(|b| (b.seq, b.used)) {
+                    Some((seq, used)) if seq == cursor && used + len <= capacity => {
+                        placement.push((last, used));
+                        built[last].used += len;
+                        break;
+                    }
+                    // The current block is full: move on to the next one, leaving
+                    // its tail unused. `H5HF__man_insert` reaches the same layout
+                    // whenever its free-space search comes up empty.
+                    Some((seq, _)) if seq == cursor => {
+                        cursor += 1;
+                        continue;
+                    }
+                    _ => built.push(DirectBlock {
+                        seq: cursor,
+                        size,
+                        block_off,
+                        used: 0,
+                    }),
+                }
             }
         }
-    }
 
-    // Assign addresses in block order, then fill each image.
-    let addrs: Vec<u64> = built.iter().map(|b| alloc(b.size)).collect();
-    let mut images: Vec<Vec<u8>> = built
-        .iter()
-        .map(|b| direct_prefix(header, ctx, header_addr, b.block_off, b.size))
-        .collect();
-    for (&i, &(bi, off)) in managed.iter().zip(&placement) {
-        let start = overhead + off;
-        images[bi][start..start + objects[i].len()].copy_from_slice(&objects[i]);
-        ids[i] = managed_id(
-            header,
-            built[bi].block_off + start as u64,
-            objects[i].len() as u64,
-        );
-    }
-    for (image, b) in images.iter_mut().zip(&built) {
-        finish_direct_block(header, ctx, image, b.size as usize);
-    }
-
-    let last = built.last().expect("a managed object built a block");
-    let root_is_direct = built.len() == 1 && last.block_off == 0;
-    if root_is_direct {
-        header.table_addr = addrs[0];
-        header.curr_root_rows = 0;
-        header.man_size = header.start_block_size;
-        // libhdf5 leaves the iterator at zero while the root is a lone direct
-        // block (`H5HF__hdr_reset_iter`), and only starts advancing it once a
-        // root indirect block exists.
-        header.man_iter_off = 0;
-    } else {
-        // The root needs whatever rows it takes to reach the last block used.
-        // libhdf5 grows the root by doubling and can end up with more; either
-        // is legal, because `curr_root_rows` is what a reader goes by.
-        let end = last.block_off + last.size;
-        let nrows = (1..=root_rows)
-            .find(|&r| row_span(header, r) >= end)
-            .expect("the placement loop never runs past the addressable rows");
-        let block_addrs: HashMap<u64, u64> = built
+        // Assign addresses in block order, then fill each image.
+        let addrs: Vec<u64> = built.iter().map(|b| (self.alloc)(b.size)).collect();
+        let mut images: Vec<Vec<u8>> = built
             .iter()
-            .zip(&addrs)
-            .map(|(b, &addr)| (b.block_off, addr))
+            .map(|b| direct_prefix(header, self.ctx, self.header_addr, b.block_off, b.size))
             .collect();
-        let iblock_addr = encode_indirect(
-            header,
-            ctx,
-            header_addr,
-            0,
-            nrows,
-            &block_addrs,
-            alloc,
-            blocks,
-        );
-        header.table_addr = iblock_addr;
-        header.curr_root_rows = nrows as u16;
-        header.man_size = row_span(header, nrows);
-        header.man_iter_off = end;
-    }
-    header.man_alloc_size = built.iter().map(|b| b.size).sum();
-    header.man_nobjs = managed.len() as u64;
-    // Every unused byte past the last object stays unused: this writer keeps
-    // no free-space manager, so it claims no free space either rather than
-    // advertising bytes nothing can hand out.
-    header.total_man_free = 0;
-    header.fs_addr = UNDEF_ADDR;
+        for (&i, &(bi, off)) in managed.iter().zip(&placement) {
+            let start = overhead + off;
+            images[bi][start..start + objects[i].len()].copy_from_slice(&objects[i]);
+            ids[i] = managed_id(
+                header,
+                built[bi].block_off + start as u64,
+                objects[i].len() as u64,
+            );
+        }
+        for (image, b) in images.iter_mut().zip(&built) {
+            finish_direct_block(header, self.ctx, image, b.size as usize);
+        }
 
-    for (image, (&addr, b)) in images.into_iter().zip(addrs.iter().zip(&built)) {
-        blocks.push(HeapBlock {
-            addr,
-            len: b.size,
+        let last = built.last().expect("a managed object built a block");
+        let root_is_direct = built.len() == 1 && last.block_off == 0;
+        if root_is_direct {
+            header.table_addr = addrs[0];
+            header.curr_root_rows = 0;
+            header.man_size = header.start_block_size;
+            // libhdf5 leaves the iterator at zero while the root is a lone direct
+            // block (`H5HF__hdr_reset_iter`), and only starts advancing it once a
+            // root indirect block exists.
+            header.man_iter_off = 0;
+        } else {
+            // The root needs whatever rows it takes to reach the last block used.
+            // libhdf5 grows the root by doubling and can end up with more; either
+            // is legal, because `curr_root_rows` is what a reader goes by.
+            let end = last.block_off + last.size;
+            let nrows = (1..=root_rows)
+                .find(|&r| row_span(header, r) >= end)
+                .expect("the placement loop never runs past the addressable rows");
+            let block_addrs: HashMap<u64, u64> = built
+                .iter()
+                .zip(&addrs)
+                .map(|(b, &addr)| (b.block_off, addr))
+                .collect();
+            let iblock_addr = self.encode_indirect(header, &block_addrs, 0, nrows);
+            header.table_addr = iblock_addr;
+            header.curr_root_rows = nrows as u16;
+            header.man_size = row_span(header, nrows);
+            header.man_iter_off = end;
+        }
+        header.man_alloc_size = built.iter().map(|b| b.size).sum();
+        header.man_nobjs = managed.len() as u64;
+        // Every unused byte past the last object stays unused: this writer keeps
+        // no free-space manager, so it claims no free space either rather than
+        // advertising bytes nothing can hand out.
+        header.total_man_free = 0;
+        header.fs_addr = UNDEF_ADDR;
+
+        for (image, (&addr, b)) in images.into_iter().zip(addrs.iter().zip(&built)) {
+            self.blocks.push(HeapBlock {
+                addr,
+                len: b.size,
+                image,
+            });
+        }
+        Ok(())
+    }
+
+    /// Encode the indirect block covering `base_off` with `nrows` rows,
+    /// appending its image — and those of every child indirect block under
+    /// it — to `self.blocks`. Returns its address.
+    ///
+    /// A row below `max_direct_rows` names direct blocks, which `block_addrs`
+    /// already places by heap offset; a row at or above it names child
+    /// indirect blocks, each covering that row's block size, which this
+    /// builds on the way past. An entry with nothing under it is
+    /// `UNDEF_ADDR`, exactly as `H5HF__cache_iblock_serialize` writes an
+    /// unallocated child.
+    ///
+    /// `header` and `block_addrs` are constant for the whole recursion, so
+    /// only `base_off` and `nrows` — what changes per level — are threaded
+    /// through; the file context, header address, allocator and output blocks
+    /// live on `self`.
+    fn encode_indirect(
+        &mut self,
+        header: &FractalHeapHeader,
+        block_addrs: &HashMap<u64, u64>,
+        base_off: u64,
+        nrows: usize,
+    ) -> u64 {
+        let sa = self.ctx.sizeof_addr as usize;
+        let width = header.table_width as usize;
+        let entries = nrows * width;
+        let mut image =
+            Vec::with_capacity(4 + 1 + sa + header.heap_off_size as usize + entries * sa + 4);
+        image.extend_from_slice(&FHIB_SIGNATURE);
+        image.push(0); // version
+        image.extend_from_slice(&self.header_addr.to_le_bytes()[..sa]);
+        image.extend_from_slice(&base_off.to_le_bytes()[..header.heap_off_size as usize]);
+        for row in 0..nrows {
+            let size = header.row_block_size[row];
+            for col in 0..width {
+                let off = base_off + header.row_block_off[row] + size * col as u64;
+                let addr = if row < header.max_direct_rows as usize {
+                    block_addrs.get(&off).copied().unwrap_or(UNDEF_ADDR)
+                } else if block_addrs
+                    .keys()
+                    .any(|&b| b >= off && b < off.saturating_add(size))
+                {
+                    self.encode_indirect(
+                        header,
+                        block_addrs,
+                        off,
+                        indirect_nrows(header, size) as usize,
+                    )
+                } else {
+                    UNDEF_ADDR
+                };
+                image.extend_from_slice(&addr.to_le_bytes()[..sa]);
+            }
+        }
+        let cksum = checksum_metadata(&image);
+        image.extend_from_slice(&cksum.to_le_bytes());
+
+        let len = image.len() as u64;
+        let addr = (self.alloc)(len);
+        self.blocks.push(HeapBlock { addr, len, image });
+        addr
+    }
+
+    /// Write each huge object in its own allocation and index them by ID.
+    fn place_huge(
+        &mut self,
+        header: &mut FractalHeapHeader,
+        objects: &[Vec<u8>],
+        huge: &[usize],
+        ids: &mut [Vec<u8>],
+    ) {
+        if huge.is_empty() {
+            return;
+        }
+        let sa = self.ctx.sizeof_addr as usize;
+        let ss = self.ctx.sizeof_size as usize;
+        let record_size = (sa + ss + ss) as u16;
+
+        // `H5HF__huge_new_id` pre-increments, so IDs start at 1 and 0 never
+        // appears; the B-tree orders records by that ID, which insertion order
+        // already gives.
+        let mut records = Vec::with_capacity(huge.len() * record_size as usize);
+        for (n, &i) in huge.iter().enumerate() {
+            let len = objects[i].len() as u64;
+            let addr = (self.alloc)(len);
+            let huge_id = n as u64 + 1;
+            self.blocks.push(HeapBlock {
+                addr,
+                len,
+                image: objects[i].clone(),
+            });
+            records.extend_from_slice(&addr.to_le_bytes()[..sa]);
+            records.extend_from_slice(&len.to_le_bytes()[..ss]);
+            records.extend_from_slice(&huge_id.to_le_bytes()[..ss]);
+
+            let mut id = Vec::with_capacity(header.id_len as usize);
+            id.push(ID_FLAGS_HUGE);
+            id.extend_from_slice(&huge_id.to_le_bytes()[..header.huge_id_size as usize]);
+            id.resize(header.id_len as usize, 0);
+            ids[i] = id;
+
+            header.huge_size += len;
+        }
+        header.huge_nobjs = huge.len() as u64;
+        header.huge_next_id = huge.len() as u64;
+
+        let tree = Bt2Tree::build(
+            BT2_TYPE_FHEAP_HUGE_INDIR,
+            record_size,
+            HUGE_BT2_NODE_SIZE,
+            self.ctx.sizeof_addr,
+            &records,
+        );
+        let bt2_addr = (self.alloc)(tree.header(UNDEF_ADDR).encoded_size(self.ctx) as u64);
+        let node_addrs: Vec<u64> = tree
+            .nodes
+            .iter()
+            .map(|_| (self.alloc)(tree.node_size as u64))
+            .collect();
+        for (image, &addr) in tree
+            .encode(self.ctx, &node_addrs)
+            .into_iter()
+            .zip(&node_addrs)
+        {
+            self.blocks.push(HeapBlock {
+                addr,
+                len: tree.node_size as u64,
+                image,
+            });
+        }
+        let root_addr = node_addrs.last().copied().unwrap_or(UNDEF_ADDR);
+        let image = tree.header(root_addr).encode(self.ctx);
+        self.blocks.push(HeapBlock {
+            addr: bt2_addr,
+            len: image.len() as u64,
             image,
         });
+        header.huge_bt2_addr = bt2_addr;
     }
-    Ok(())
 }
 
 /// The fixed prefix of a direct block, zero-padded to its full size.
@@ -410,70 +542,6 @@ fn finish_direct_block(
     image[at..at + 4].copy_from_slice(&cksum.to_le_bytes());
 }
 
-/// Encode the indirect block covering `base_off` with `nrows` rows, appending
-/// its image — and those of every child indirect block under it — to `blocks`.
-/// Returns its address.
-///
-/// A row below `max_direct_rows` names direct blocks, which `block_addrs`
-/// already places by heap offset; a row at or above it names child indirect
-/// blocks, each covering that row's block size, which this builds on the way
-/// past. An entry with nothing under it is `UNDEF_ADDR`, exactly as
-/// `H5HF__cache_iblock_serialize` writes an unallocated child.
-#[allow(clippy::too_many_arguments)]
-fn encode_indirect(
-    header: &FractalHeapHeader,
-    ctx: &FormatContext,
-    header_addr: u64,
-    base_off: u64,
-    nrows: usize,
-    block_addrs: &HashMap<u64, u64>,
-    alloc: &mut dyn FnMut(u64) -> u64,
-    blocks: &mut Vec<HeapBlock>,
-) -> u64 {
-    let sa = ctx.sizeof_addr as usize;
-    let width = header.table_width as usize;
-    let entries = nrows * width;
-    let mut image =
-        Vec::with_capacity(4 + 1 + sa + header.heap_off_size as usize + entries * sa + 4);
-    image.extend_from_slice(&FHIB_SIGNATURE);
-    image.push(0); // version
-    image.extend_from_slice(&header_addr.to_le_bytes()[..sa]);
-    image.extend_from_slice(&base_off.to_le_bytes()[..header.heap_off_size as usize]);
-    for row in 0..nrows {
-        let size = header.row_block_size[row];
-        for col in 0..width {
-            let off = base_off + header.row_block_off[row] + size * col as u64;
-            let addr = if row < header.max_direct_rows as usize {
-                block_addrs.get(&off).copied().unwrap_or(UNDEF_ADDR)
-            } else if block_addrs
-                .keys()
-                .any(|&b| b >= off && b < off.saturating_add(size))
-            {
-                encode_indirect(
-                    header,
-                    ctx,
-                    header_addr,
-                    off,
-                    indirect_nrows(header, size) as usize,
-                    block_addrs,
-                    alloc,
-                    blocks,
-                )
-            } else {
-                UNDEF_ADDR
-            };
-            image.extend_from_slice(&addr.to_le_bytes()[..sa]);
-        }
-    }
-    let cksum = checksum_metadata(&image);
-    image.extend_from_slice(&cksum.to_le_bytes());
-
-    let len = image.len() as u64;
-    let addr = alloc(len);
-    blocks.push(HeapBlock { addr, len, image });
-    addr
-}
-
 /// A managed heap ID: flags, the object's heap-space offset, its length.
 fn managed_id(header: &FractalHeapHeader, offset: u64, length: u64) -> Vec<u8> {
     let mut id = Vec::with_capacity(header.id_len as usize);
@@ -482,81 +550,6 @@ fn managed_id(header: &FractalHeapHeader, offset: u64, length: u64) -> Vec<u8> {
     id.extend_from_slice(&length.to_le_bytes()[..header.heap_len_size as usize]);
     id.resize(header.id_len as usize, 0);
     id
-}
-
-/// Write each huge object in its own allocation and index them by ID.
-fn place_huge(
-    header: &mut FractalHeapHeader,
-    ctx: &FormatContext,
-    objects: &[Vec<u8>],
-    huge: &[usize],
-    alloc: &mut dyn FnMut(u64) -> u64,
-    blocks: &mut Vec<HeapBlock>,
-    ids: &mut [Vec<u8>],
-) {
-    if huge.is_empty() {
-        return;
-    }
-    let sa = ctx.sizeof_addr as usize;
-    let ss = ctx.sizeof_size as usize;
-    let record_size = (sa + ss + ss) as u16;
-
-    // `H5HF__huge_new_id` pre-increments, so IDs start at 1 and 0 never
-    // appears; the B-tree orders records by that ID, which insertion order
-    // already gives.
-    let mut records = Vec::with_capacity(huge.len() * record_size as usize);
-    for (n, &i) in huge.iter().enumerate() {
-        let len = objects[i].len() as u64;
-        let addr = alloc(len);
-        let huge_id = n as u64 + 1;
-        blocks.push(HeapBlock {
-            addr,
-            len,
-            image: objects[i].clone(),
-        });
-        records.extend_from_slice(&addr.to_le_bytes()[..sa]);
-        records.extend_from_slice(&len.to_le_bytes()[..ss]);
-        records.extend_from_slice(&huge_id.to_le_bytes()[..ss]);
-
-        let mut id = Vec::with_capacity(header.id_len as usize);
-        id.push(ID_FLAGS_HUGE);
-        id.extend_from_slice(&huge_id.to_le_bytes()[..header.huge_id_size as usize]);
-        id.resize(header.id_len as usize, 0);
-        ids[i] = id;
-
-        header.huge_size += len;
-    }
-    header.huge_nobjs = huge.len() as u64;
-    header.huge_next_id = huge.len() as u64;
-
-    let tree = Bt2Tree::build(
-        BT2_TYPE_FHEAP_HUGE_INDIR,
-        record_size,
-        HUGE_BT2_NODE_SIZE,
-        ctx.sizeof_addr,
-        &records,
-    );
-    let bt2_addr = alloc(tree.header(UNDEF_ADDR).encoded_size(ctx) as u64);
-    let node_addrs: Vec<u64> = tree
-        .nodes
-        .iter()
-        .map(|_| alloc(tree.node_size as u64))
-        .collect();
-    for (image, &addr) in tree.encode(ctx, &node_addrs).into_iter().zip(&node_addrs) {
-        blocks.push(HeapBlock {
-            addr,
-            len: tree.node_size as u64,
-            image,
-        });
-    }
-    let root_addr = node_addrs.last().copied().unwrap_or(UNDEF_ADDR);
-    let image = tree.header(root_addr).encode(ctx);
-    blocks.push(HeapBlock {
-        addr: bt2_addr,
-        len: image.len() as u64,
-        image,
-    });
-    header.huge_bt2_addr = bt2_addr;
 }
 
 #[cfg(test)]

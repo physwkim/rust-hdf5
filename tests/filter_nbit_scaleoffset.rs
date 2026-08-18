@@ -11,9 +11,6 @@
 //! dataset reader) isolates the filter codec from the unrelated chunked-
 //! dataset discovery path.
 
-// Test vectors embed values close to mathematical constants by coincidence.
-#![allow(clippy::approx_constant)]
-
 use rust_hdf5::format::messages::filter::{apply_filters, reverse_filters, Filter, FilterPipeline};
 
 fn pipeline(id: u16, cd_values: Vec<u32>) -> FilterPipeline {
@@ -307,7 +304,14 @@ fn scaleoffset_integer_full_precision_has_no_header() {
     assert_eq!(out, expected);
 }
 
+// 3.14159 is the literal libhdf5 was fed when this reference chunk was
+// captured, not a stand-in for PI: swapping in `std::f64::consts::PI` changes
+// the scale-offset filter's stored minval bytes (verified — the `back ==
+// chunk` byte comparison below fails with PI, since the filter's minval
+// encoding is sensitive to the exact double, not just its rounded display),
+// so the value is load-bearing and the digits must stay exactly as spelled.
 #[test]
+#[allow(clippy::approx_constant)]
 fn scaleoffset_float64() {
     // float64 D-scale, 3 decimal digits, fill value defined (= 0.0).
     let chunk = hex(concat!(

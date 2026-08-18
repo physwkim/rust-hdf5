@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! I/O engine for the pure Rust HDF5 library.
 //!
 //! Provides buffered file I/O, append-only allocation, dataset reading/writing,

@@ -51,19 +51,34 @@ fn mask_u32(n: usize) -> u32 {
     }
 }
 
-/// Decompress one atomic byte, mirroring `H5Z__nbit_decompress_one_byte`.
-#[allow(clippy::too_many_arguments)]
-fn nbit_decompress_one_byte(
-    data: &mut [u8],
+/// Which datatype field one nbit byte loop is packing, and the endpoints of
+/// the byte range that field spans — everything [`nbit_decompress_one_byte`]
+/// and [`nbit_compress_one_byte`] need that stays constant across the whole
+/// loop, so only `k`, which byte of the range, is left as a call parameter.
+#[derive(Clone, Copy)]
+struct NbitByteRange<'p> {
     data_offset: usize,
-    k: u32,
     begin_i: u32,
     end_i: u32,
+    p: &'p NbitAtomic,
+    datatype_len: u32,
+}
+
+/// Decompress one atomic byte, mirroring `H5Z__nbit_decompress_one_byte`.
+fn nbit_decompress_one_byte(
+    data: &mut [u8],
+    k: u32,
     buffer: &[u8],
     cur: &mut NbitCursor,
-    p: &NbitAtomic,
-    datatype_len: u32,
+    range: &NbitByteRange,
 ) -> FormatResult<()> {
+    let NbitByteRange {
+        data_offset,
+        begin_i,
+        end_i,
+        p,
+        datatype_len,
+    } = *range;
     if cur.j >= buffer.len() {
         return Err(FormatError::InvalidData("nbit: buffer too short".into()));
     }
@@ -110,18 +125,20 @@ fn nbit_decompress_one_byte(
 }
 
 /// Compress one atomic byte, mirroring `H5Z__nbit_compress_one_byte`.
-#[allow(clippy::too_many_arguments)]
 fn nbit_compress_one_byte(
     data: &[u8],
-    data_offset: usize,
     k: u32,
-    begin_i: u32,
-    end_i: u32,
     buffer: &mut [u8],
     cur: &mut NbitCursor,
-    p: &NbitAtomic,
-    datatype_len: u32,
+    range: &NbitByteRange,
 ) {
+    let NbitByteRange {
+        data_offset,
+        begin_i,
+        end_i,
+        p,
+        datatype_len,
+    } = *range;
     let mut val = data[data_offset + k as usize];
     let mut dat_len: usize;
 
@@ -224,19 +241,16 @@ fn nbit_decompress_one_atomic(
             (p.precision + p.offset) / 8 - 1
         };
         let end_i = p.offset / 8;
+        let range = NbitByteRange {
+            data_offset,
+            begin_i,
+            end_i,
+            p,
+            datatype_len,
+        };
         let mut k = begin_i as i64;
         while k >= end_i as i64 {
-            nbit_decompress_one_byte(
-                data,
-                data_offset,
-                k as u32,
-                begin_i,
-                end_i,
-                buffer,
-                cur,
-                p,
-                datatype_len,
-            )?;
+            nbit_decompress_one_byte(data, k as u32, buffer, cur, &range)?;
             k -= 1;
         }
     } else {
@@ -246,18 +260,15 @@ fn nbit_decompress_one_atomic(
         } else {
             (datatype_len - p.offset) / 8 - 1
         };
+        let range = NbitByteRange {
+            data_offset,
+            begin_i,
+            end_i,
+            p,
+            datatype_len,
+        };
         for k in begin_i..=end_i {
-            nbit_decompress_one_byte(
-                data,
-                data_offset,
-                k,
-                begin_i,
-                end_i,
-                buffer,
-                cur,
-                p,
-                datatype_len,
-            )?;
+            nbit_decompress_one_byte(data, k, buffer, cur, &range)?;
         }
     }
     Ok(())
@@ -279,19 +290,16 @@ fn nbit_compress_one_atomic(
             (p.precision + p.offset) / 8 - 1
         };
         let end_i = p.offset / 8;
+        let range = NbitByteRange {
+            data_offset,
+            begin_i,
+            end_i,
+            p,
+            datatype_len,
+        };
         let mut k = begin_i as i64;
         while k >= end_i as i64 {
-            nbit_compress_one_byte(
-                data,
-                data_offset,
-                k as u32,
-                begin_i,
-                end_i,
-                buffer,
-                cur,
-                p,
-                datatype_len,
-            );
+            nbit_compress_one_byte(data, k as u32, buffer, cur, &range);
             k -= 1;
         }
     } else {
@@ -301,18 +309,15 @@ fn nbit_compress_one_atomic(
         } else {
             (datatype_len - p.offset) / 8 - 1
         };
+        let range = NbitByteRange {
+            data_offset,
+            begin_i,
+            end_i,
+            p,
+            datatype_len,
+        };
         for k in begin_i..=end_i {
-            nbit_compress_one_byte(
-                data,
-                data_offset,
-                k,
-                begin_i,
-                end_i,
-                buffer,
-                cur,
-                p,
-                datatype_len,
-            );
+            nbit_compress_one_byte(data, k, buffer, cur, &range);
         }
     }
 }
@@ -941,19 +946,34 @@ fn mask_u64(n: usize) -> u64 {
     }
 }
 
-/// Decompress one scale-offset byte, mirroring
-/// `H5Z__scaleoffset_decompress_one_byte`.
-#[allow(clippy::too_many_arguments)]
-fn so_decompress_one_byte(
-    data: &mut [u8],
+/// Which byte starts the range one scale-offset byte loop is packing, and
+/// the datatype's minimum bit count and bit length — everything
+/// [`so_decompress_one_byte`] and [`so_compress_one_byte`] need that stays
+/// constant across the whole loop, so only `k`, which byte of the range, is
+/// left as a call parameter.
+#[derive(Clone, Copy)]
+struct SoByteRange {
     data_offset: usize,
-    k: u32,
     begin_i: u32,
-    buffer: &[u8],
-    cur: &mut NbitCursor,
     minbits: u32,
     dtype_len: u32,
+}
+
+/// Decompress one scale-offset byte, mirroring
+/// `H5Z__scaleoffset_decompress_one_byte`.
+fn so_decompress_one_byte(
+    data: &mut [u8],
+    k: u32,
+    buffer: &[u8],
+    cur: &mut NbitCursor,
+    range: &SoByteRange,
 ) -> FormatResult<()> {
+    let SoByteRange {
+        data_offset,
+        begin_i,
+        minbits,
+        dtype_len,
+    } = *range;
     if cur.j >= buffer.len() {
         return Err(FormatError::InvalidData(
             "scaleoffset: buffer too short".into(),
@@ -1003,33 +1023,27 @@ fn so_decompress_one_atomic(
     let dtype_len = size * 8;
     if order == SO_ORDER_LE {
         let begin_i = size - 1 - (dtype_len - minbits) / 8;
+        let range = SoByteRange {
+            data_offset,
+            begin_i,
+            minbits,
+            dtype_len,
+        };
         let mut k = begin_i as i64;
         while k >= 0 {
-            so_decompress_one_byte(
-                data,
-                data_offset,
-                k as u32,
-                begin_i,
-                buffer,
-                cur,
-                minbits,
-                dtype_len,
-            )?;
+            so_decompress_one_byte(data, k as u32, buffer, cur, &range)?;
             k -= 1;
         }
     } else {
         let begin_i = (dtype_len - minbits) / 8;
+        let range = SoByteRange {
+            data_offset,
+            begin_i,
+            minbits,
+            dtype_len,
+        };
         for k in begin_i..=(size - 1) {
-            so_decompress_one_byte(
-                data,
-                data_offset,
-                k,
-                begin_i,
-                buffer,
-                cur,
-                minbits,
-                dtype_len,
-            )?;
+            so_decompress_one_byte(data, k, buffer, cur, &range)?;
         }
     }
     Ok(())
@@ -1040,17 +1054,19 @@ fn so_decompress_one_atomic(
 ///
 /// `cur.buf_len` is the C's `bits_to_fill`: how much room is left in the
 /// buffer byte the cursor sits on.
-#[allow(clippy::too_many_arguments)]
 fn so_compress_one_byte(
     data: &[u8],
-    data_offset: usize,
     k: u32,
-    begin_i: u32,
     buffer: &mut [u8],
     cur: &mut NbitCursor,
-    minbits: u32,
-    dtype_len: u32,
+    range: &SoByteRange,
 ) {
+    let SoByteRange {
+        data_offset,
+        begin_i,
+        minbits,
+        dtype_len,
+    } = *range;
     let val = data[data_offset + k as usize];
     let mut bits_to_copy: usize = if k == begin_i {
         8 - ((dtype_len - minbits) % 8) as usize
@@ -1090,33 +1106,27 @@ fn so_compress_one_atomic(
     let dtype_len = size * 8;
     if order == SO_ORDER_LE {
         let begin_i = size - 1 - (dtype_len - minbits) / 8;
+        let range = SoByteRange {
+            data_offset,
+            begin_i,
+            minbits,
+            dtype_len,
+        };
         let mut k = begin_i as i64;
         while k >= 0 {
-            so_compress_one_byte(
-                data,
-                data_offset,
-                k as u32,
-                begin_i,
-                buffer,
-                cur,
-                minbits,
-                dtype_len,
-            );
+            so_compress_one_byte(data, k as u32, buffer, cur, &range);
             k -= 1;
         }
     } else {
         let begin_i = (dtype_len - minbits) / 8;
+        let range = SoByteRange {
+            data_offset,
+            begin_i,
+            minbits,
+            dtype_len,
+        };
         for k in begin_i..=(size - 1) {
-            so_compress_one_byte(
-                data,
-                data_offset,
-                k,
-                begin_i,
-                buffer,
-                cur,
-                minbits,
-                dtype_len,
-            );
+            so_compress_one_byte(data, k, buffer, cur, &range);
         }
     }
 }
@@ -1227,19 +1237,7 @@ pub fn reverse_scaleoffset(data: &[u8], cd_values: &[u32]) -> FormatResult<Vec<u
     // minbits == 0: out stays all-zero (all elements identical, no fill value).
 
     // Postprocess: add back minval (and apply float scaling).
-    postdecompress(
-        &mut out,
-        d_nelmts,
-        size,
-        order,
-        p.dtype_class,
-        p.dtype_sign,
-        minbits,
-        minval,
-        p.scale_factor,
-        p.fill_defined,
-        p.filval,
-    );
+    postdecompress(&mut out, &p, minbits, minval);
 
     Ok(out)
 }
@@ -1588,20 +1586,23 @@ fn sign_extend(v: u64, size: usize) -> i64 {
 }
 
 /// Postprocess decompressed scale-offset data.
-#[allow(clippy::too_many_arguments)]
-fn postdecompress(
-    out: &mut [u8],
-    d_nelmts: usize,
-    size: usize,
-    order: u32,
-    dtype_class: u32,
-    dtype_sign: u32,
-    minbits: u32,
-    minval: u64,
-    scale_factor: i32,
-    fill_defined: bool,
-    filval: u64,
-) {
+///
+/// `minbits` and `minval` come from the per-chunk header rather than
+/// `p`, so they stay explicit parameters; everything else `postdecompress`
+/// needs is exactly what [`SoParams`] already parsed once for both filter
+/// directions.
+fn postdecompress(out: &mut [u8], p: &SoParams, minbits: u32, minval: u64) {
+    let SoParams {
+        scale_factor,
+        d_nelmts,
+        dtype_class,
+        size,
+        dtype_sign,
+        order,
+        fill_defined,
+        filval,
+    } = *p;
+
     // Sentinel: a fully decompressed value equal to (1 << minbits) - 1 is
     // restored to the fill value rather than offset-added.
     let sentinel: u64 = if (minbits as usize) >= 64 {
