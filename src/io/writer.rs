@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::dataset::DatasetAccess;
 use crate::format::btree_v1::{BTreeV1Config, ChunkBTreeV1Node, ChunkBTreeV1Tree, ChunkKey};
 use crate::format::chunk_index::btree_v2::Bt2ChunkIndex;
 use crate::format::chunk_index::extensible_array::{
@@ -593,13 +594,41 @@ pub struct ExternalFile {
 /// The data layout message of such a dataset still says `Contiguous`, with
 /// its address left undefined: it is this message's presence that makes
 /// libhdf5 route the dataset's I/O through `H5D_LOPS_EFL` (H5Dlayout.c).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ExternalStorage {
     /// Address of the local heap header holding every slot's name.
     pub heap_addr: u64,
     /// The files, in the order their regions concatenate into the dataset's
     /// logical byte range.
     pub files: Vec<ExternalFile>,
+    /// The prefix every one of those names is joined against, and the open
+    /// that settled it. Lives here rather than on [`DatasetInfo`] so a
+    /// dataset with no external storage cannot carry a prefix and a dataset
+    /// with external storage cannot lack one.
+    prefix: EfilePrefix,
+}
+
+/// The expanded external file prefix in force for one dataset, and the open
+/// that decided it — libhdf5's `dset->shared->extfile_prefix`.
+///
+/// `H5D__build_file_prefix` runs it once per open of the shared info, from
+/// the dapl of `H5D__create` (H5Dint.c:1318) or of the `H5D__open` that
+/// found no shared info yet (:1537), and both `H5D__efl_read` and
+/// `H5D__efl_write` then join against that one answer (H5Defl.c:315-317,
+/// :429-431). Measured under libhdf5 1.14.6 and 2.0.0: `H5Dcreate2` with a
+/// dapl naming a directory creates the raw data file there at `H5Dwrite`,
+/// and `HDF5_EXTFILE_PREFIX` shadows that property on the write path exactly
+/// as it does on the read path.
+#[derive(Debug, Clone, Default)]
+struct EfilePrefix {
+    /// The expansion itself; `None` is "no prefix", which leaves a stored
+    /// name to resolve against the process's current directory.
+    expanded: Option<PathBuf>,
+    /// The open that decided [`expanded`](Self::expanded). An expired handle
+    /// means no open is holding the answer any more, so the next one settles
+    /// it afresh — which is the state a dataset this session reopened starts
+    /// in, `H5Fopen` opening no dataset of its own.
+    open: std::sync::Weak<()>,
 }
 
 impl ExternalStorage {
@@ -657,11 +686,28 @@ pub struct VirtualStorage {
 enum ContiguousTarget {
     /// A block in this file, starting at this address.
     Local(u64),
-    /// The files an External File List names, in dataset order.
-    External(Vec<ExternalFile>),
+    /// The files an External File List names, in dataset order, and the
+    /// prefix in force for the open doing the writing — carried together
+    /// because a slot name means nothing without it.
+    External {
+        files: Vec<ExternalFile>,
+        prefix: Option<PathBuf>,
+    },
     /// Nowhere: the dataset is virtual, and every element of it is stored in
     /// whichever source dataset its mappings send that element to.
     Virtual,
+}
+
+/// What a writer-mode `H5Dataset` handle is built from — the shape and
+/// element width it answers questions with, the chunk index it writes
+/// through, and the open it holds.
+pub(crate) struct DatasetHandleParts {
+    pub(crate) shape: Vec<usize>,
+    pub(crate) element_size: usize,
+    /// `None` for storage that is not chunked.
+    pub(crate) chunk_index: Option<ChunkIndexKind>,
+    /// Keeps this open alive; see [`Hdf5Writer::bind_efile_prefix`].
+    pub(crate) open: Option<crate::io::reader::DatasetOpenToken>,
 }
 
 impl ContiguousTarget {
@@ -990,7 +1036,10 @@ impl DatasetInfo {
             return Some(ContiguousTarget::Virtual);
         }
         match &self.external {
-            Some(ext) => Some(ContiguousTarget::External(ext.files.clone())),
+            Some(ext) => Some(ContiguousTarget::External {
+                files: ext.files.clone(),
+                prefix: ext.prefix.expanded.clone(),
+            }),
             None => {
                 (self.data_addr != UNDEF_ADDR).then_some(ContiguousTarget::Local(self.data_addr))
             }
@@ -2368,6 +2417,10 @@ impl<'a> ReopenWalk<'a> {
                     };
                     external = Some(ExternalStorage {
                         heap_addr: efl.heap_addr,
+                        // `H5Fopen` opens no dataset, so nothing has read a
+                        // dapl for this one yet; the first handle it hands
+                        // out settles the prefix.
+                        prefix: EfilePrefix::default(),
                         files: efl
                             .slots
                             .iter()
@@ -6005,19 +6058,79 @@ impl Hdf5Writer {
     }
 
     /// Reconstruct the fields a writer-mode `H5Dataset` handle needs for the
-    /// dataset at `index`: `(shape, element_size, chunk_index)`, where the
-    /// last is `None` for storage that is not chunked. Single owner of this
+    /// dataset at `index`, and open it under `access`. Single owner of this
     /// mapping so `H5File::dataset_writer`, `H5Group::dataset_writer`, and
-    /// the vlen-string helpers all agree.
+    /// the vlen-string helpers all agree — including on
+    /// [`bind_efile_prefix`](Self::bind_efile_prefix), which no handle site
+    /// can then forget to run.
     pub(crate) fn dataset_handle_parts(
         &self,
         index: usize,
-    ) -> (Vec<usize>, usize, Option<ChunkIndexKind>) {
+        access: &DatasetAccess,
+    ) -> IoResult<DatasetHandleParts> {
+        let open = self.bind_efile_prefix(index, access)?;
         let ds = self.ds(index);
         let g = ds.lock();
-        let shape: Vec<usize> = g.dataspace.dims.iter().map(|&d| d as usize).collect();
-        let element_size = g.datatype.element_size() as usize;
-        (shape, element_size, g.chunk_index_kind())
+        Ok(DatasetHandleParts {
+            shape: g.dataspace.dims.iter().map(|&d| d as usize).collect(),
+            element_size: g.datatype.element_size() as usize,
+            chunk_index: g.chunk_index_kind(),
+            open,
+        })
+    }
+
+    /// Put `access`'s external file prefix in force for the dataset at
+    /// `index`, or join the open that already settled one.
+    ///
+    /// INVARIANT: every write of an externally stored dataset's raw bytes
+    /// joins its slot names against the prefix an *open* settled, and this is
+    /// the only place that settles one. `write_contiguous_bytes` reads it and
+    /// nothing else writes it, so a write cannot resolve a prefix of its own
+    /// and land bytes where a read under the same properties would not look
+    /// for them.
+    ///
+    /// First open wins, and a joining open may not disagree: `H5D__open_name`
+    /// compares its own expanded prefix against the open dataset's and fails
+    /// when they differ (H5Dint.c:1533-1545). Measured under libhdf5 1.14.6
+    /// and 2.0.0, with a dataset created through a dapl naming a directory
+    /// and its handle still alive: a second open naming another directory is
+    /// refused, one naming the same directory joins, one naming none is
+    /// refused too, and with `HDF5_EXTFILE_PREFIX` set — which shadows every
+    /// property, so all three expand alike — none of them is. Dropping every
+    /// handle releases the answer and the next open settles it afresh, which
+    /// the same measurement confirms.
+    ///
+    /// Returns the token that keeps the open alive, `None` for a dataset
+    /// whose raw data is in this file and which therefore has no prefix to
+    /// agree about.
+    pub(crate) fn bind_efile_prefix(
+        &self,
+        index: usize,
+        access: &DatasetAccess,
+    ) -> IoResult<Option<crate::io::reader::DatasetOpenToken>> {
+        let ds = self.ds(index);
+        let mut g = ds.lock();
+        let source_dir = &self.source_dir;
+        let Some(ext) = g.external.as_mut() else {
+            return Ok(None);
+        };
+        let want =
+            crate::io::reader::resolve_extfile_prefix(access.efile_prefix_value(), source_dir);
+        if let Some(open) = ext.prefix.open.upgrade() {
+            if ext.prefix.expanded != want {
+                let name = g.name.clone();
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "dataset {name:?} is already open under a different external file                      prefix, and libhdf5 refuses to join an open that disagrees about one"
+                )));
+            }
+            return Ok(Some(open));
+        }
+        let token: crate::io::reader::DatasetOpenToken = std::sync::Arc::new(());
+        ext.prefix = EfilePrefix {
+            expanded: want,
+            open: std::sync::Arc::downgrade(&token),
+        };
+        Ok(Some(token))
     }
 
     /// Reject a name some other link in the file already occupies.
@@ -7401,11 +7514,13 @@ impl Hdf5Writer {
         let m = ds.lock();
         match m.contiguous_target() {
             Some(ContiguousTarget::Local(addr)) => Ok(addr),
-            Some(ContiguousTarget::External(_)) => Err(crate::io::IoError::InvalidState(format!(
-                "{what} are stamped into the dataset's own contiguous block, and \
+            Some(ContiguousTarget::External { .. }) => {
+                Err(crate::io::IoError::InvalidState(format!(
+                    "{what} are stamped into the dataset's own contiguous block, and \
                  dataset '{}' has none: its raw data lives in external files",
-                m.name
-            ))),
+                    m.name
+                )))
+            }
             Some(ContiguousTarget::Virtual) => Err(crate::io::IoError::InvalidState(format!(
                 "{what} are stamped into the dataset's own contiguous block, and \
                  dataset '{}' has none: it is virtual, and its elements come from \
@@ -9810,6 +9925,9 @@ impl Hdf5Writer {
             // address; the names' offsets within it are already final.
             heap_addr: UNDEF_ADDR,
             files: entries,
+            // Settled by the open this create hands a handle out for, which
+            // is `H5D__create` reading the dapl at H5Dint.c:1318.
+            prefix: EfilePrefix::default(),
         };
         // `H5D__efl_construct`, over the dataset's *maximum* extent: the
         // slots must reserve at least every byte the dataset could come to
@@ -10321,10 +10439,11 @@ impl Hdf5Writer {
     ) -> IoResult<()> {
         match target {
             ContiguousTarget::Local(addr) => Ok(self.handle.write_at(addr + off, data)?),
-            ContiguousTarget::External(files) => {
-                // Resolved through the read side's own prefix logic, so a
-                // relative name lands in the same place a later read looks.
-                let prefix = crate::io::reader::resolve_extfile_prefix(&self.source_dir);
+            ContiguousTarget::External { files, prefix } => {
+                // The prefix the open settled, not one resolved here:
+                // `H5D__efl_write` joins against `dset->shared->extfile_prefix`
+                // (H5Defl.c:429-431), the same field `H5D__efl_read` joins
+                // against, so a relative name lands where a later read looks.
                 write_external_file_bytes(files, prefix.as_deref(), off, data)
             }
             ContiguousTarget::Virtual => Err(virtual_write_refused()),

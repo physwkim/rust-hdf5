@@ -651,3 +651,263 @@ fn the_efile_prefix_join_check_compares_what_the_environment_left() {
     std::env::remove_var("HDF5_EXTFILE_PREFIX");
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ---------------------------------------------------------------------------
+// External file list raw data files, on the way out
+// ---------------------------------------------------------------------------
+
+/// `home/ext.h5` with the same dataset [`external_file`] builds, created
+/// through a dapl naming `prefix` — `H5Dcreate2`'s own dapl, which
+/// `H5D__create` reads at H5Dint.c:1318.
+fn external_file_written(root: &Path, prefix: Option<&str>, value: i32) -> PathBuf {
+    let path = root.join("home").join("ext.h5");
+    let file = H5File::create(&path).unwrap();
+    let mut builder = file
+        .new_dataset::<i32>()
+        .shape([4usize])
+        .external(&[("raw.bin", 0, 16)]);
+    if let Some(prefix) = prefix {
+        builder = builder.efile_prefix(prefix);
+    }
+    builder.create("d").unwrap().write_raw(&[value; 4]).unwrap();
+    file.close().unwrap();
+    path
+}
+
+/// What `dir/raw.bin` holds, or `None` when the write never created it.
+fn written(dir: &Path) -> Option<i32> {
+    let bytes = std::fs::read(dir.join("raw.bin")).ok()?;
+    assert_eq!(bytes.len(), 16);
+    let mut first = [0u8; 4];
+    first.copy_from_slice(&bytes[..4]);
+    Some(i32::from_ne_bytes(first))
+}
+
+/// The prefix decides where a write *creates* the raw data file, not only
+/// where a read looks for one: `H5D__efl_write` joins the slot name against
+/// `dset->shared->extfile_prefix` with the same `H5_combine_path` the read
+/// side uses and opens that one path `O_CREAT` (H5Defl.c:429-433).
+///
+/// Measured (both references): a create through a dapl naming `far` puts the
+/// bytes in `far/raw.bin` and leaves the HDF5 file's own directory and the
+/// current directory empty, and a read under the same prefix gets them back.
+#[test]
+fn an_efile_prefix_decides_where_a_write_creates_its_raw_data_file() {
+    let root = root("efile_write_prop");
+    std::env::set_current_dir(root.join("cwd")).unwrap();
+    let ext = external_file_written(&root, Some(&dir_str(&root, "far")), 1);
+
+    assert_eq!(written(&root.join("far")), Some(1));
+    assert_eq!(
+        written(&root.join("home")),
+        None,
+        "the write does not fall back to the directory holding the HDF5 file"
+    );
+    assert_eq!(
+        written(&root.join("cwd")),
+        None,
+        "nor to the current directory, which is where no prefix would put it"
+    );
+    assert_eq!(
+        efl_reads(
+            &ext,
+            DatasetAccess::new().efile_prefix(dir_str(&root, "far"))
+        ),
+        Some(1),
+        "a read naming the same prefix finds what the write left"
+    );
+    std::env::set_current_dir("/").unwrap();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A prefix naming a directory that is not there fails the write rather than
+/// creating it: `H5D__efl_write` opens `O_CREAT` and reports "external raw
+/// data file does not exist" when that fails (H5Defl.c:432-437).
+///
+/// Measured (both references): the same arrangement raises "Can't
+/// synchronously write data (external raw data file does not exist)".
+#[test]
+fn a_write_does_not_create_the_directory_an_efile_prefix_names() {
+    let root = root("efile_write_missing");
+    let file = H5File::create(root.join("home").join("ext.h5")).unwrap();
+    let ds = file
+        .new_dataset::<i32>()
+        .shape([4usize])
+        .external(&[("raw.bin", 0, 16)])
+        .efile_prefix(dir_str(&root, "absent"))
+        .create("d")
+        .unwrap();
+
+    assert!(
+        ds.write_raw(&[1i32; 4]).is_err(),
+        "a prefix naming no directory fails the write"
+    );
+    assert!(!root.join("absent").exists());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// `HDF5_EXTFILE_PREFIX` shadows the create-time property exactly as it
+/// shadows the open-time one — one `H5D__build_file_prefix` serves both
+/// (H5Dint.c:1084-1090, reached from :1318 for a create).
+///
+/// Measured (both references): with the variable naming `other`, a create
+/// through a dapl naming `far` writes to `other`; with it empty the property
+/// is reached again.
+#[test]
+fn the_efile_prefix_environment_variable_shadows_the_property_on_a_write() {
+    let root = root("efile_write_shadow");
+
+    std::env::set_var("HDF5_EXTFILE_PREFIX", dir_str(&root, "other"));
+    external_file_written(&root, Some(&dir_str(&root, "far")), 7);
+    assert_eq!(written(&root.join("other")), Some(7));
+    assert_eq!(
+        written(&root.join("far")),
+        None,
+        "the property named it, the environment overrode it"
+    );
+
+    std::env::set_var("HDF5_EXTFILE_PREFIX", "");
+    external_file_written(&root, Some(&dir_str(&root, "far")), 1);
+    assert_eq!(
+        written(&root.join("far")),
+        Some(1),
+        "an empty variable is no variable, so the property answers"
+    );
+
+    std::env::remove_var("HDF5_EXTFILE_PREFIX");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The expansion rules reach the write side unchanged, `H5D__build_file_prefix`
+/// being run once per open whichever direction the I/O then goes:
+/// `${ORIGIN}` is the directory holding the HDF5 file (H5Dint.c:1105-1113),
+/// `"."` and `""` are no prefix at all (:1098-1102), which leaves the stored
+/// name to be created relative to the process's current directory.
+///
+/// Measured (both references): `${ORIGIN}` writes next to the HDF5 file,
+/// `${ORIGIN}/../far` writes to `far`, and `"."`, `""` and no property alike
+/// write to the current directory.
+#[test]
+fn a_written_efile_prefix_expands_origin_and_treats_dot_as_no_prefix() {
+    let root = root("efile_write_origin");
+    // nextest runs each test in its own process, so moving the current
+    // directory here cannot reach another test.
+    std::env::set_current_dir(root.join("cwd")).unwrap();
+
+    external_file_written(&root, Some("${ORIGIN}"), 9);
+    assert_eq!(written(&root.join("home")), Some(9));
+
+    external_file_written(&root, Some(&format!("${{ORIGIN}}{}..{}far", MAIN, MAIN)), 1);
+    assert_eq!(written(&root.join("far")), Some(1));
+
+    external_file_written(&root, Some("."), 5);
+    assert_eq!(written(&root.join("cwd")), Some(5));
+
+    std::fs::remove_file(root.join("cwd").join("raw.bin")).unwrap();
+    external_file_written(&root, Some(""), 6);
+    assert_eq!(written(&root.join("cwd")), Some(6), "\"\" is no prefix");
+
+    std::fs::remove_file(root.join("cwd").join("raw.bin")).unwrap();
+    external_file_written(&root, None, 7);
+    assert_eq!(
+        written(&root.join("cwd")),
+        Some(7),
+        "naming no prefix resolves the same way"
+    );
+
+    std::env::set_current_dir("/").unwrap();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The join rule holds between two *write* opens, the create being one of
+/// them: `H5D__create` puts its expanded prefix in the shared info
+/// (H5Dint.c:1318) that `H5D__open_name` then refuses to disagree with
+/// (:1533-1545).
+///
+/// Measured (both references), with the created dataset's handle still open:
+/// a second open naming another directory is refused, one naming none is
+/// refused, one naming the same directory joins, and once every handle is
+/// dropped a disagreeing open is taken and settles its own prefix.
+#[test]
+fn a_second_write_open_may_not_disagree_about_the_efile_prefix() {
+    let root = root("efile_write_join");
+    let file = H5File::create(root.join("home").join("ext.h5")).unwrap();
+    let far = || DatasetAccess::new().efile_prefix(dir_str(&root, "far"));
+    let other = || DatasetAccess::new().efile_prefix(dir_str(&root, "other"));
+    let held = file
+        .new_dataset::<i32>()
+        .shape([4usize])
+        .external(&[("raw.bin", 0, 16)])
+        .efile_prefix(dir_str(&root, "far"))
+        .create("d")
+        .unwrap();
+
+    assert!(
+        file.dataset_writer_with("d", other()).is_err(),
+        "a second write open naming another directory is refused"
+    );
+    assert!(
+        file.dataset_writer("d").is_err(),
+        "a second write open naming no prefix is refused too"
+    );
+    let joined = file
+        .dataset_writer_with("d", far())
+        .expect("naming the same directory joins the create");
+    joined.write_raw(&[1i32; 4]).unwrap();
+    assert_eq!(written(&root.join("far")), Some(1));
+
+    drop(held);
+    drop(joined);
+    file.dataset_writer_with("d", other())
+        .expect("with every handle dropped the next open settles its own prefix")
+        .write_raw(&[7i32; 4])
+        .unwrap();
+    assert_eq!(written(&root.join("other")), Some(7));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A dataset reopened from an existing file has no prefix until an open
+/// gives it one — `H5Fopen` opens no dataset, so the first `H5Dopen2` is what
+/// runs `H5D__build_file_prefix` (H5Dint.c:1537) and the `H5Dwrite` after it
+/// joins against that answer.
+///
+/// Measured (both references): creating the dataset without writing it,
+/// closing the file, reopening it and opening the dataset through a dapl
+/// naming `far` puts a subsequent write's bytes in `far/raw.bin`.
+#[test]
+fn a_reopened_external_dataset_is_written_under_the_prefix_its_open_names() {
+    let root = root("efile_write_reopen");
+    std::env::set_current_dir(root.join("cwd")).unwrap();
+    let path = root.join("home").join("ext.h5");
+    let file = H5File::create(&path).unwrap();
+    file.new_dataset::<i32>()
+        .shape([4usize])
+        .external(&[("raw.bin", 0, 16)])
+        .create("d")
+        .unwrap();
+    file.close().unwrap();
+    assert_eq!(
+        written(&root.join("cwd")),
+        None,
+        "creating the dataset writes none of its bytes"
+    );
+
+    let file = H5File::open_rw(&path).unwrap();
+    file.dataset_writer_with(
+        "d",
+        DatasetAccess::new().efile_prefix(dir_str(&root, "far")),
+    )
+    .unwrap()
+    .write_raw(&[1i32; 4])
+    .unwrap();
+    file.close().unwrap();
+
+    assert_eq!(written(&root.join("far")), Some(1));
+    assert_eq!(
+        written(&root.join("cwd")),
+        None,
+        "the reopen's own prefix answers, not the default the create had"
+    );
+    std::env::set_current_dir("/").unwrap();
+    std::fs::remove_dir_all(&root).ok();
+}

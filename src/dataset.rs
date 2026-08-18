@@ -51,6 +51,7 @@ pub struct DatasetBuilder<T: H5Type> {
     committed_type: Option<String>,
     references: Option<ReferenceElement>,
     external: Option<Vec<(String, u64, u64)>>,
+    efile_prefix: Option<String>,
     virtual_mappings: Vec<VirtualMapping>,
     _marker: std::marker::PhantomData<T>,
 }
@@ -113,6 +114,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             committed_type: None,
             references: None,
             external: None,
+            efile_prefix: None,
             virtual_mappings: Vec::new(),
             _marker: std::marker::PhantomData,
         }
@@ -137,6 +139,7 @@ impl<T: H5Type> DatasetBuilder<T> {
             committed_type: None,
             references: None,
             external: None,
+            efile_prefix: None,
             virtual_mappings: Vec::new(),
             _marker: std::marker::PhantomData,
         }
@@ -558,6 +561,36 @@ impl<T: H5Type> DatasetBuilder<T> {
                 .map(|&(name, offset, size)| (name.to_string(), offset, size))
                 .collect(),
         );
+        self
+    }
+
+    /// `H5Pset_efile_prefix` on the dapl `H5Dcreate2` takes — the directory
+    /// the raw data files named by [`external`](Self::external) are created
+    /// under, and looked for under on every later write through this handle.
+    ///
+    /// `H5D__create` builds `dset->shared->extfile_prefix` from the dapl
+    /// (H5Dint.c:1318) and `H5D__efl_write` joins each slot name against it
+    /// with the same single-path `H5_combine_path` the read side uses
+    /// (H5Defl.c:429-431) — so this decides where the bytes land, and the
+    /// prefix a later reader names must agree for it to find them.
+    ///
+    /// Measured under libhdf5 1.14.6 and 2.0.0: writing through a dapl that
+    /// names a directory creates the raw data file there and nowhere else,
+    /// and a directory that does not exist fails the write outright rather
+    /// than being created.
+    ///
+    /// It shares [`DatasetAccess::efile_prefix`]'s rules, both being
+    /// `H5D__build_file_prefix`: `HDF5_EXTFILE_PREFIX` shadows this outright
+    /// (H5Dint.c:1084-1090), a leading `${ORIGIN}` stands for the directory
+    /// holding the HDF5 file (:1105-1113), and `"."` or `""` means no prefix
+    /// (:1098-1102), which leaves a stored name to resolve against the
+    /// process's current directory.
+    ///
+    /// Ignored by a dataset that names no external files, which has no slot
+    /// name to join.
+    #[must_use]
+    pub fn efile_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.efile_prefix = Some(prefix.into());
         self
     }
 
@@ -1233,7 +1266,11 @@ impl<T: H5Type> DatasetBuilder<T> {
             })
         } else {
             // Contiguous dataset (original path)
-            let index = {
+            let efile_access = match self.efile_prefix.as_deref() {
+                Some(p) => DatasetAccess::new().efile_prefix(p),
+                None => DatasetAccess::new(),
+            };
+            let (index, open) = {
                 let inner = borrow_inner(&self.file_inner);
                 match &*inner {
                     H5FileInner::Writer(writer) => {
@@ -1260,6 +1297,12 @@ impl<T: H5Type> DatasetBuilder<T> {
                             }
                             None => writer.create_dataset(&full_name, datatype, &dims_u64)?,
                         };
+                        // Before anything that can write raw bytes: the
+                        // prefix an external dataset's slot names are joined
+                        // against is settled by the create, as
+                        // `H5D__build_file_prefix` settles it for
+                        // `H5D__create` (H5Dint.c:1318).
+                        let open = writer.bind_efile_prefix(idx, &efile_access)?;
                         // Set before the fill value: NEVER must be in place
                         // before that call decides whether to eager-tile it.
                         if let Some(time) = self.fill_time {
@@ -1268,7 +1311,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                         if let Some(ref fv) = fill_value {
                             writer.set_dataset_fill_value(idx, fv.clone())?;
                         }
-                        idx
+                        (idx, open)
                     }
                     H5FileInner::Reader(_) => {
                         return Err(Hdf5Error::InvalidState(
@@ -1290,7 +1333,7 @@ impl<T: H5Type> DatasetBuilder<T> {
                     chunk_index: None,
                     is_null: false,
                 },
-                _open: None,
+                _open: open,
             })
         }
     }
@@ -1346,11 +1389,11 @@ pub struct H5Dataset {
     file_inner: SharedInner,
     info: DatasetInfo,
     /// Keeps this dataset's *open* alive for as long as the handle is, so
-    /// the reader can tell whether a later open of the same name joins this
-    /// one or starts fresh — libhdf5's `H5FO_opened` shared-info count
-    /// (H5Dint.c:1496-1500). `None` for a write-mode handle and for a read
-    /// of anything but a virtual dataset, the only kind whose open carries
-    /// properties.
+    /// the reader or the writer can tell whether a later open of the same
+    /// name joins this one or starts fresh — libhdf5's `H5FO_opened`
+    /// shared-info count (H5Dint.c:1496-1500). `None` for a dataset with no
+    /// per-open answer to hold: in write mode, one whose raw data is in this
+    /// file rather than in the files an external file list names.
     ///
     /// Held, never read: its whole job is to keep the reader's `Weak` on it
     /// upgradable until this handle goes away.
@@ -1366,13 +1409,17 @@ impl Drop for H5Dataset {
     /// where the reader is told.
     ///
     /// The token is dropped *before* the reader is asked, so the reader's
-    /// `Weak` already reads dead for the handle going away here. Handles on
-    /// anything but a virtual dataset carry no token and take no lock.
+    /// `Weak` already reads dead for the handle going away here. A write-mode
+    /// handle's token belongs to the writer's own external file prefix, which
+    /// has no source files to close, so it takes no lock either.
     fn drop(&mut self) {
         let Some(open) = self._open.take() else {
             return;
         };
         drop(open);
+        if matches!(self.info, DatasetInfo::Writer { .. }) {
+            return;
+        }
         let Some(mut inner) = crate::file::try_borrow_inner_mut(&self.file_inner) else {
             return;
         };
@@ -1925,20 +1972,18 @@ impl H5Dataset {
     pub(crate) fn new_writer(
         file_inner: SharedInner,
         index: usize,
-        shape: Vec<usize>,
-        element_size: usize,
-        chunk_index: Option<ChunkIndexKind>,
+        parts: crate::io::writer::DatasetHandleParts,
     ) -> Self {
         Self {
             file_inner,
             info: DatasetInfo::Writer {
                 index,
-                shape,
-                element_size,
-                chunk_index,
+                shape: parts.shape,
+                element_size: parts.element_size,
+                chunk_index: parts.chunk_index,
                 is_null: false,
             },
-            _open: None,
+            _open: parts.open,
         }
     }
 

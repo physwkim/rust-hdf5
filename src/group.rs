@@ -17,7 +17,7 @@
 //!     .unwrap();
 //! ```
 
-use crate::dataset::{DatasetBuilder, H5Dataset};
+use crate::dataset::{DatasetAccess, DatasetBuilder, H5Dataset};
 use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
 use crate::format::creation_order::CreationOrder;
@@ -363,13 +363,11 @@ impl H5Group {
         match &*inner {
             H5FileInner::Writer(writer) => {
                 let idx = writer.create_vlen_string_dataset(&full_name, strings, charset)?;
-                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(idx);
+                let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.file_inner),
                     idx,
-                    shape,
-                    element_size,
-                    chunk_index,
+                    parts,
                 ))
             }
             H5FileInner::Reader(_) => {
@@ -411,13 +409,11 @@ impl H5Group {
             H5FileInner::Writer(writer) => {
                 let idx =
                     writer.create_vlen_sequence_dataset(&full_name, T::hdf5_type(), &images)?;
-                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(idx);
+                let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.file_inner),
                     idx,
-                    shape,
-                    element_size,
-                    chunk_index,
+                    parts,
                 ))
             }
             H5FileInner::Reader(_) => {
@@ -451,13 +447,11 @@ impl H5Group {
                 let idx = writer.create_vlen_string_dataset_compressed(
                     &full_name, strings, chunk_size, pipeline,
                 )?;
-                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(idx);
+                let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.file_inner),
                     idx,
-                    shape,
-                    element_size,
-                    chunk_index,
+                    parts,
                 ))
             }
             H5FileInner::Reader(_) => {
@@ -490,13 +484,11 @@ impl H5Group {
             H5FileInner::Writer(writer) => {
                 let idx = writer
                     .create_appendable_vlen_string_dataset(&full_name, chunk_size, pipeline)?;
-                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(idx);
+                let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.file_inner),
                     idx,
-                    shape,
-                    element_size,
-                    chunk_index,
+                    parts,
                 ))
             }
             H5FileInner::Reader(_) => {
@@ -536,6 +528,15 @@ impl H5Group {
     /// (including via the vlen-string helpers) can be reopened to attach
     /// attributes or append chunks. `name` is the link name within this group.
     pub fn dataset_writer(&self, name: &str) -> Result<H5Dataset> {
+        self.dataset_writer_with(name, DatasetAccess::default())
+    }
+
+    /// [`dataset_writer`](Self::dataset_writer) under named dataset-access
+    /// properties, mirroring
+    /// [`H5File::dataset_writer_with`](crate::file::H5File::dataset_writer_with)
+    /// — which is where the properties that reach a write are described.
+    pub fn dataset_writer_with(&self, name: &str, access: DatasetAccess) -> Result<H5Dataset> {
+        access.validate()?;
         let full_name = if self.name == "/" {
             name.to_string()
         } else {
@@ -547,13 +548,11 @@ impl H5Group {
         match &*inner {
             H5FileInner::Writer(writer) => {
                 let index = writer.open_dataset_index(&full_name)?;
-                let (shape, element_size, chunk_index) = writer.dataset_handle_parts(index);
+                let parts = writer.dataset_handle_parts(index, &access)?;
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.file_inner),
                     index,
-                    shape,
-                    element_size,
-                    chunk_index,
+                    parts,
                 ))
             }
             H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
