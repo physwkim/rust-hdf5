@@ -1152,6 +1152,9 @@ mod tests {
         handle.write_at(8, &[4u8; 8]).unwrap();
         handle.flush().unwrap();
         assert_eq!(handle.file_size().unwrap(), 16);
+        // The handle's lock is mandatory on Windows: reading through a
+        // second handle needs it gone first.
+        drop(handle);
         assert_eq!(std::fs::read(&path).unwrap().len(), 528);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -1298,7 +1301,10 @@ mod read_source_tests {
         let path = d.join("f.bin");
         std::fs::write(&path, vec![1u8; 4096]).unwrap();
 
-        let mut handle = FileHandle::open_read(&path).unwrap();
+        // No lock: the appender below writes through a second handle while
+        // this one is open, which a shared lock forbids on Windows — the
+        // topology a SWMR reader opens with (`open_swmr_with_locking`).
+        let mut handle = FileHandle::open_read_with_locking(&path, FileLocking::Disabled).unwrap();
         assert_eq!(handle.file_size().unwrap(), 4096);
 
         let mut appender = OpenOptions::new().append(true).open(&path).unwrap();

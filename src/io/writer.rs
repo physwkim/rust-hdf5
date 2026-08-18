@@ -19430,6 +19430,10 @@ mod tests {
         assert_eq!(writer.superblock_version_for(0), SUPERBLOCK_V2);
 
         writer.finalize_for_swmr().unwrap();
+        // What `start_swmr` does after finalizing, and what lets a second
+        // handle read the file while this writer lives — the writer's
+        // exclusive lock is mandatory on Windows.
+        writer.handle().release_lock().unwrap();
         assert_eq!(std::fs::read(&path).unwrap()[8], SUPERBLOCK_V3);
 
         // The close-time finalize carries no SWMR flag; the file is still an
