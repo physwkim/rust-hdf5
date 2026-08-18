@@ -1,25 +1,36 @@
-//! `H5F_prefix_open_file`'s search order (H5Fint.c:826-1025), one test per
-//! step that can decide it, for both kinds of cross-file name.
+//! Where a file named from inside an HDF5 file is looked for, one test per
+//! step that can decide it, for each of the three kinds of name: a virtual
+//! dataset's source, an external link's target, and an external file list's
+//! raw data file.
+//!
+//! The first two are searched — `H5F_prefix_open_file` walks six steps in
+//! order (H5Fint.c:826-1025) and takes the first that opens. The third is
+//! not: `H5D__efl_read` joins the prefix to the stored name and opens that
+//! one path (H5Defl.c:315-317), so a raw data file that is not where the
+//! prefix says has nowhere else to be found.
 //!
 //! Every expected value below was measured first, against libhdf5 1.14.6
 //! (h5py 3.15.1) and 2.0.0 (h5py 3.16.0), by running the same arrangement
-//! through `h5d.open(..., dapl)` with `H5Pset_virtual_prefix` and
-//! `h5o.open(..., lapl)` with `H5Pset_elink_prefix`; both libraries answered
-//! identically. The fixtures here are written by this crate rather than by
-//! h5py because what is under test is the *search*, not the bytes — the file
-//! contents these read back are already h5py-validated elsewhere.
+//! through `h5d.open(..., dapl)` with `H5Pset_virtual_prefix` or
+//! `H5Pset_efile_prefix` and `h5o.open(..., lapl)` with
+//! `H5Pset_elink_prefix`; both libraries answered identically. The fixtures
+//! here are written by this crate rather than by h5py because what is under
+//! test is where the name resolves, not the bytes — the file contents these
+//! read back are already h5py-validated elsewhere.
 //!
-//! The layout is the same in every test, with the target file named by the
-//! bare relative name `src.h5` from a file in `home/`:
+//! The layout is the same in every test, with the target named by a bare
+//! relative name — `src.h5` for the two searched kinds, `raw.bin` for the
+//! external file list — from a file in `home/`:
 //!
 //! ```text
-//! far/src.h5     [1, 1, 1, 1]   named by a prefix
-//! other/src.h5   [7, 7, 7, 7]   named by the other prefix
-//! empty/         nothing        a prefix that resolves nowhere
-//! home/src.h5    [9, 9, 9, 9]   the neighbouring-file step, when present
+//! far/     [1, 1, 1, 1]   named by a prefix
+//! other/   [7, 7, 7, 7]   named by the other prefix
+//! empty/   nothing        a prefix that resolves nowhere
+//! home/    [9, 9, 9, 9]   next to the HDF5 file, when present
+//! cwd/     [5, 5, 5, 5]   the process's current directory, when set there
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, MAIN_SEPARATOR as MAIN};
 
 use rust_hdf5::{DatasetAccess, H5File, Selection};
 
@@ -35,7 +46,7 @@ fn root(label: &str) -> PathBuf {
         std::process::id(),
         n
     ));
-    for sub in ["home", "far", "other", "empty"] {
+    for sub in ["home", "far", "other", "empty", "cwd"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
     dir
@@ -389,5 +400,254 @@ fn a_write_mode_open_refuses_an_elink_prefix() {
         .elink_prefix(dir_str(&root, "far"))
         .open(&path)
         .is_ok());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// External file list raw data files
+// ---------------------------------------------------------------------------
+
+/// `raw.bin` in `dir`, four `i32` all `value`, laid out the way this crate
+/// stores a native-order `i32` dataset.
+fn raw(dir: &Path, value: i32) {
+    let mut bytes = Vec::with_capacity(16);
+    for _ in 0..4 {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    std::fs::write(dir.join("raw.bin"), bytes).unwrap();
+}
+
+/// `home/ext.h5` whose dataset `d` keeps its four elements in the bare name
+/// `raw.bin` rather than in the HDF5 file itself.
+fn external_file(root: &Path) -> PathBuf {
+    let path = root.join("home").join("ext.h5");
+    let file = H5File::create(&path).unwrap();
+    file.new_dataset::<i32>()
+        .shape([4usize])
+        .external(&[("raw.bin", 0, 16)])
+        .create("d")
+        .unwrap();
+    file.close().unwrap();
+    path
+}
+
+/// What the external-file-list dataset reads back under `access`, or `None`
+/// when its raw data file is not where the prefix in force says it is.
+fn efl_reads(path: &Path, access: DatasetAccess) -> Option<i32> {
+    let file = H5File::open(path).unwrap();
+    let data = file
+        .dataset_with("d", access)
+        .unwrap()
+        .read_raw::<i32>()
+        .ok()?;
+    assert_eq!(data.len(), 4);
+    assert!(data.iter().all(|&v| v == data[0]), "{data:?}");
+    Some(data[0])
+}
+
+/// `H5Pset_efile_prefix` is not a step of a search — it is the whole answer.
+/// `H5D__efl_read` builds one path with `H5_combine_path` and opens it
+/// (H5Defl.c:315-317), so the neighbouring-file step that saves a virtual
+/// source or a link target does not exist here.
+///
+/// Measured (both references): with `home/raw.bin` sitting right next to the
+/// HDF5 file and no prefix named, the read fails outright; the property
+/// naming `far` reads 1, and still 1 with that neighbour present.
+#[test]
+fn an_efile_prefix_is_the_only_place_a_raw_data_file_is_looked_for() {
+    let root = root("efile_prop");
+    raw(&root.join("far"), 1);
+    let ext = external_file(&root);
+    raw(&root.join("home"), 9);
+
+    assert_eq!(
+        efl_reads(&ext, DatasetAccess::new()),
+        None,
+        "a raw data file next to the HDF5 file is not looked for there"
+    );
+    assert_eq!(
+        efl_reads(
+            &ext,
+            DatasetAccess::new().efile_prefix(dir_str(&root, "far"))
+        ),
+        Some(1),
+        "the property is where the raw data file is looked for"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// `HDF5_EXTFILE_PREFIX` shadows the property exactly as `HDF5_VDS_PREFIX`
+/// shadows [`DatasetAccess::virtual_prefix`] — both prefixes are built by the
+/// same `H5D__build_file_prefix`, which reads the environment first and falls
+/// back to the property only when it is unset or empty (H5Dint.c:1084-1090).
+///
+/// Measured (both references): with the variable naming a directory holding
+/// no raw data file and the property naming one that does, the read fails —
+/// the property is not tried.
+#[test]
+fn the_efile_prefix_environment_variable_shadows_the_property() {
+    let root = root("efile_shadow");
+    raw(&root.join("far"), 1);
+    raw(&root.join("other"), 7);
+    let ext = external_file(&root);
+    let far = DatasetAccess::new().efile_prefix(dir_str(&root, "far"));
+
+    std::env::set_var("HDF5_EXTFILE_PREFIX", dir_str(&root, "empty"));
+    assert_eq!(
+        efl_reads(&ext, far.clone()),
+        None,
+        "an environment prefix that resolves nowhere still shadows the property"
+    );
+
+    std::env::set_var("HDF5_EXTFILE_PREFIX", dir_str(&root, "far"));
+    assert_eq!(
+        efl_reads(
+            &ext,
+            DatasetAccess::new().efile_prefix(dir_str(&root, "other"))
+        ),
+        Some(1),
+        "the environment variable answers, not the property"
+    );
+
+    std::env::remove_var("HDF5_EXTFILE_PREFIX");
+    assert_eq!(
+        efl_reads(&ext, far),
+        Some(1),
+        "unset, the property is reached"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The other half of what `H5D__build_file_prefix` gives both prefixes: a
+/// leading `${ORIGIN}` becomes the directory holding the HDF5 file
+/// (H5Dint.c:1105-1113), and `"."` or an empty prefix means no prefix at all
+/// (:1098-1102) — which for an external file list leaves the stored name to
+/// resolve against the process's current directory, not against the HDF5
+/// file's own.
+///
+/// Measured (both references): `${ORIGIN}` reads the neighbour's 9,
+/// `${ORIGIN}/../far` reads 1, and `"."` with the current directory moved to
+/// `cwd/` reads 5 — as does naming no prefix at all.
+#[test]
+fn an_efile_prefix_expands_origin_and_treats_dot_as_no_prefix() {
+    let root = root("efile_origin");
+    raw(&root.join("far"), 1);
+    raw(&root.join("cwd"), 5);
+    let ext = external_file(&root);
+    raw(&root.join("home"), 9);
+
+    assert_eq!(
+        efl_reads(&ext, DatasetAccess::new().efile_prefix("${ORIGIN}")),
+        Some(9),
+        "${{ORIGIN}} is the directory holding the HDF5 file"
+    );
+    assert_eq!(
+        efl_reads(
+            &ext,
+            DatasetAccess::new().efile_prefix(format!("${{ORIGIN}}{}..{}far", MAIN, MAIN))
+        ),
+        Some(1),
+        "the expansion keeps whatever follows ${{ORIGIN}}"
+    );
+
+    // nextest runs each test in its own process, so moving the current
+    // directory here cannot reach another test.
+    std::env::set_current_dir(root.join("cwd")).unwrap();
+    assert_eq!(
+        efl_reads(&ext, DatasetAccess::new().efile_prefix(".")),
+        Some(5),
+        "\".\" is no prefix, so the name resolves against the current directory"
+    );
+    assert_eq!(
+        efl_reads(&ext, DatasetAccess::new()),
+        Some(5),
+        "naming no prefix resolves the same way"
+    );
+    std::env::set_current_dir("/").unwrap();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The one property a joining open may not disagree about. Where a second
+/// open of a virtual dataset silently inherits the first open's view, a
+/// second open under a different *expanded* external file prefix is refused:
+/// `H5D__open_name` compares it against the open dataset's and fails
+/// (H5Dint.c:1533-1545).
+///
+/// Measured (both references): the second open raises "new external file
+/// prefix does not match external file prefix of already open dataset" both
+/// when it names a different directory and when it names none at all; naming
+/// the same one joins normally; and once every handle is closed the next open
+/// sets its own prefix and reads the other file.
+#[test]
+fn a_second_open_may_not_disagree_about_the_efile_prefix() {
+    let root = root("efile_join");
+    raw(&root.join("far"), 1);
+    raw(&root.join("other"), 7);
+    let ext = external_file(&root);
+    let far = || DatasetAccess::new().efile_prefix(dir_str(&root, "far"));
+    let other = || DatasetAccess::new().efile_prefix(dir_str(&root, "other"));
+
+    let file = H5File::open(&ext).unwrap();
+    let held = file.dataset_with("d", far()).unwrap();
+    assert_eq!(held.read_raw::<i32>().unwrap(), vec![1; 4]);
+
+    assert!(
+        file.dataset_with("d", other()).is_err(),
+        "a second open naming another directory is refused"
+    );
+    assert!(
+        file.dataset_with("d", DatasetAccess::new()).is_err(),
+        "a second open naming no prefix is refused too"
+    );
+    assert_eq!(
+        file.dataset_with("d", far())
+            .unwrap()
+            .read_raw::<i32>()
+            .unwrap(),
+        vec![1; 4],
+        "a second open naming the same directory joins the first"
+    );
+
+    drop(held);
+    assert_eq!(
+        file.dataset_with("d", other())
+            .unwrap()
+            .read_raw::<i32>()
+            .unwrap(),
+        vec![7; 4],
+        "with every handle closed the next open sets its own prefix"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// An open that differs only in a property `HDF5_EXTFILE_PREFIX` shadows
+/// still agrees, because what `H5D__open_name` compares is the *expanded*
+/// prefix (H5Dint.c:1533-1545) — measured under both references: with the
+/// variable set, an open naming no prefix joins one that named a directory,
+/// which without it is refused.
+#[test]
+fn the_efile_prefix_join_check_compares_what_the_environment_left() {
+    let root = root("efile_join_env");
+    raw(&root.join("far"), 1);
+    let ext = external_file(&root);
+
+    std::env::set_var("HDF5_EXTFILE_PREFIX", dir_str(&root, "far"));
+    let file = H5File::open(&ext).unwrap();
+    let held = file
+        .dataset_with(
+            "d",
+            DatasetAccess::new().efile_prefix(dir_str(&root, "other")),
+        )
+        .unwrap();
+    assert_eq!(held.read_raw::<i32>().unwrap(), vec![1; 4]);
+    assert_eq!(
+        file.dataset_with("d", DatasetAccess::new())
+            .unwrap()
+            .read_raw::<i32>()
+            .unwrap(),
+        vec![1; 4],
+        "both opens expand to the environment's prefix, so they agree"
+    );
+    std::env::remove_var("HDF5_EXTFILE_PREFIX");
     std::fs::remove_dir_all(&root).ok();
 }

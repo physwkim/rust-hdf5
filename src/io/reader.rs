@@ -986,19 +986,22 @@ pub struct Hdf5Reader {
     /// discovery walk reached plus the root group. This is what turns the
     /// address an object reference stores back into a name.
     object_paths: std::collections::HashMap<u64, String>,
-    /// The dataset-access properties in force for each virtual dataset,
-    /// keyed by canonical path (no leading `/`); an absent entry means
+    /// The dataset-access properties in force for each *open* dataset, keyed
+    /// by canonical path (no leading `/`); an absent entry means
     /// [`DatasetAccess::default`].
     ///
-    /// libhdf5 keeps this in the dataset's *shared* open-object info —
+    /// libhdf5 keeps this in the dataset's *shared* open-object info, which
+    /// is why the first open of a dataset fixes it for every later one
+    /// ([`apply_dataset_access`](Self::apply_dataset_access)):
     /// `H5D__virtual_init` puts the view and the printf gap into
-    /// `dset->shared->layout.storage.u.virt` (H5Dvirtual.c:2178-2188) — which
-    /// is why the first open of a dataset fixes them for every later one
-    /// ([`apply_dataset_access`](Self::apply_dataset_access)). It is the
-    /// single owner of that answer: the resolution reads it and nothing else
-    /// writes it, so a SWMR [`refresh`](Self::refresh) re-resolves under the
-    /// same properties rather than reverting to the defaults.
-    virtual_access: std::collections::BTreeMap<String, AccessInForce>,
+    /// `dset->shared->layout.storage.u.virt` (H5Dvirtual.c:2178-2188), and
+    /// `H5D__open_name` puts both file prefixes into `shared->extfile_prefix`
+    /// and `shared->vds_prefix` (H5Dint.c:1488-1521) — for every dataset,
+    /// not only a virtual one. It is the single owner of that answer: the
+    /// extent resolution and the external-file read both read it and nothing
+    /// else writes it, so a SWMR [`refresh`](Self::refresh) re-resolves under
+    /// the same properties rather than reverting to the defaults.
+    dataset_access: std::collections::BTreeMap<String, AccessInForce>,
 }
 
 /// A live open on a dataset.
@@ -1807,7 +1810,7 @@ impl Hdf5Reader {
             elink_prefix: None,
             external: Default::default(),
             external_resolved: Default::default(),
-            virtual_access: Default::default(),
+            dataset_access: Default::default(),
             vds_resolved: Default::default(),
             // Overwritten by `open_with_locking` once this returns.
             source_dir: PathBuf::new(),
@@ -1895,7 +1898,7 @@ impl Hdf5Reader {
             elink_prefix: None,
             external: Default::default(),
             external_resolved: Default::default(),
-            virtual_access: Default::default(),
+            dataset_access: Default::default(),
             vds_resolved: Default::default(),
             // Overwritten by `open_with_locking` once this returns.
             source_dir: PathBuf::new(),
@@ -2910,7 +2913,7 @@ impl Hdf5Reader {
             .iter()
             .filter(|(_, e)| match &e.owner {
                 CrossFileOwner::Reader => false,
-                CrossFileOwner::VirtualOpens(vds) => !vds.iter().any(|v| self.is_open_virtual(v)),
+                CrossFileOwner::VirtualOpens(vds) => !vds.iter().any(|v| self.is_open_dataset(v)),
             })
             .map(|(p, _)| p.clone())
             .collect();
@@ -2919,11 +2922,11 @@ impl Hdf5Reader {
         }
     }
 
-    /// Whether the virtual dataset at canonical path `vds` still has a live
-    /// handle — libhdf5's "is this dataset in `H5FO_opened`".
-    fn is_open_virtual(&self, vds: &str) -> bool {
-        self.virtual_access
-            .get(vds)
+    /// Whether the dataset at canonical path `name` still has a live handle
+    /// — libhdf5's "is this dataset in `H5FO_opened`".
+    fn is_open_dataset(&self, name: &str) -> bool {
+        self.dataset_access
+            .get(name)
             .is_some_and(|e| e.open.strong_count() > 0)
     }
 
@@ -3737,7 +3740,7 @@ impl Hdf5Reader {
 
         match &layout {
             DataLayoutMessage::Contiguous { .. } if !external_files.is_empty() => {
-                let prefix = resolve_extfile_prefix(&self.source_dir);
+                let prefix = self.extfile_prefix_in_force(name);
                 read_external_file_bytes(&external_files, prefix.as_deref(), 0, out)?;
             }
             DataLayoutMessage::Contiguous { address, .. } => {
@@ -3872,7 +3875,7 @@ impl Hdf5Reader {
     /// The dataset-access properties in force for `name` (already canonical),
     /// libhdf5's defaults when no open has named others.
     fn access_in_force(&self, canonical: &str) -> DatasetAccess {
-        self.virtual_access
+        self.dataset_access
             .get(canonical)
             .map(|e| e.access.clone())
             .unwrap_or_default()
@@ -3896,10 +3899,19 @@ impl Hdf5Reader {
     /// even through a second `H5Fopen` of the same file — and only once
     /// every handle is closed does a new open see its own gap.
     ///
+    /// The one exception to "first open wins" is the external file prefix,
+    /// which the joining open is not allowed to disagree about:
+    /// `H5D__open_name` compares its own expanded prefix against the open
+    /// dataset's and fails the open when they differ (H5Dint.c:1533-1545).
+    /// Expanded, so two opens differing only in a property
+    /// `HDF5_EXTFILE_PREFIX` shadows still agree — measured under libhdf5
+    /// 1.14.6 and 2.0.0: with that variable set, an open naming no prefix
+    /// joins one that named a directory, and without it the same pair is
+    /// refused.
+    ///
     /// Returns the token that keeps the open alive; the caller hands it to
-    /// the dataset handle it builds. A name that is not a resolved virtual
-    /// dataset takes nothing and returns `None`: the two properties this
-    /// models are the two that only a virtual dataset reads.
+    /// the dataset handle it builds. A name no dataset in this file answers
+    /// to takes nothing and returns `None`.
     fn apply_dataset_access(
         &mut self,
         name: &str,
@@ -3909,20 +3921,24 @@ impl Hdf5Reader {
         let Some(i) = self.datasets.iter().position(|d| d.name == canonical) else {
             return Ok(None);
         };
-        let Some(stored) = self.datasets[i].virtual_stored_dims.clone() else {
-            return Ok(None);
-        };
         if let Some(open) = self
-            .virtual_access
+            .dataset_access
             .get(&canonical)
             .and_then(|e| e.open.upgrade())
         {
+            let in_force = self.extfile_prefix_of(&self.access_in_force(&canonical));
+            if in_force != self.extfile_prefix_of(access) {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "dataset {canonical:?} is already open under a different external file \
+                     prefix, and libhdf5 refuses to join an open that disagrees about one"
+                )));
+            }
             return Ok(Some(open));
         }
         let token: DatasetOpenToken = std::sync::Arc::new(());
         let unchanged = &self.access_in_force(&canonical) == access;
         let access = access.clone();
-        self.virtual_access.insert(
+        self.dataset_access.insert(
             canonical,
             AccessInForce {
                 access,
@@ -3930,13 +3946,36 @@ impl Hdf5Reader {
             },
         );
         if !unchanged {
-            // A source may be a virtual dataset in this same file, and the
-            // access propagates to it (H5Dvirtual.c:2224-2226), so this can
-            // re-enter; the depth counter is the same cycle guard the
-            // open-time resolution uses.
-            VirtualResolveDepth::enter(|| self.resolve_virtual_extent_of(i, &stored))?;
+            if let Some(stored) = self.datasets[i].virtual_stored_dims.clone() {
+                // A source may be a virtual dataset in this same file, and the
+                // access propagates to it (H5Dvirtual.c:2224-2226), so this can
+                // re-enter; the depth counter is the same cycle guard the
+                // open-time resolution uses.
+                VirtualResolveDepth::enter(|| self.resolve_virtual_extent_of(i, &stored))?;
+            }
         }
         Ok(Some(token))
+    }
+
+    /// The directory an external file list's stored names are joined against
+    /// under `access` — `H5D__build_file_prefix(dset, H5F_PREFIX_EFILE)`
+    /// (H5Dint.c:1084-1090), whose answer libhdf5 keeps in
+    /// `dset->shared->extfile_prefix`.
+    fn extfile_prefix_of(&self, access: &DatasetAccess) -> Option<PathBuf> {
+        resolve_file_prefix(
+            "HDF5_EXTFILE_PREFIX",
+            access.efile_prefix_value(),
+            &self.source_dir,
+        )
+    }
+
+    /// The external file prefix in force for the open dataset `name` — the
+    /// one the open that is still holding it named, not whatever a later
+    /// caller might have asked for
+    /// ([`apply_dataset_access`](Self::apply_dataset_access)).
+    fn extfile_prefix_in_force(&self, name: &str) -> Option<PathBuf> {
+        let canonical = self.canonical_path(name);
+        self.extfile_prefix_of(&self.access_in_force(&canonical))
     }
 
     /// [`resolve_virtual_extents`](Self::resolve_virtual_extents) for one
@@ -5460,7 +5499,7 @@ impl Hdf5Reader {
 
         let raw = match &layout {
             DataLayoutMessage::Contiguous { size, .. } if !external_files.is_empty() => {
-                let prefix = resolve_extfile_prefix(&self.source_dir);
+                let prefix = self.extfile_prefix_in_force(name);
                 let mut buf = vec![0u8; *size as usize];
                 read_external_file_bytes(&external_files, prefix.as_deref(), 0, &mut buf)?;
                 buf
@@ -5867,7 +5906,7 @@ impl Hdf5Reader {
                 // list instead of straight from this file (H5D__efl_read,
                 // H5Defl.c) — `src_off` is already dataset-relative, which
                 // is exactly what `read_external_file_bytes` walks slots by.
-                let prefix = resolve_extfile_prefix(&self.source_dir);
+                let prefix = self.extfile_prefix_in_force(name);
                 for_each_contiguous_run(
                     &dims,
                     starts,

@@ -1050,10 +1050,11 @@ impl H5File {
     /// [`dataset`](Self::dataset) under named dataset-access properties —
     /// `H5Dopen2` with a dapl instead of `H5P_DEFAULT`.
     ///
-    /// Both properties [`DatasetAccess`] carries decide how a *virtual*
-    /// dataset's extent is resolved, so this changes what `name` reports and
-    /// reads back; for every other dataset it is exactly
-    /// [`dataset`](Self::dataset).
+    /// Three of the properties [`DatasetAccess`] carries decide how a
+    /// *virtual* dataset's extent is resolved and where its sources are
+    /// looked for; [`DatasetAccess::efile_prefix`] says where the raw data
+    /// files of a dataset stored through an external file list are. For a
+    /// dataset that is neither, this is exactly [`dataset`](Self::dataset).
     ///
     /// First open wins: while any handle on that dataset is alive, a later
     /// open of it joins that open and its own `access` is ignored, exactly
@@ -1074,6 +1075,11 @@ impl H5File {
     /// Beyond [`dataset`](Self::dataset)'s own errors, a
     /// [`DatasetAccess::virtual_printf_gap`] of `u64::MAX` — libhdf5's
     /// `HSIZE_UNDEF` — is refused, as `H5Pset_virtual_printf_gap` refuses it.
+    ///
+    /// The one property a joining open may not disagree about is
+    /// [`DatasetAccess::efile_prefix`]: `H5D__open_name` refuses an open
+    /// whose expanded external file prefix differs from the open dataset's
+    /// (H5Dint.c:1533-1545), and so does this.
     pub fn dataset_with(&self, name: &str, access: DatasetAccess) -> Result<H5Dataset> {
         access.validate()?;
         // Mutable: a name that crosses an external link opens the file that
