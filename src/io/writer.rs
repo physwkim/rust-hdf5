@@ -3573,6 +3573,78 @@ impl SuperblockVersion {
     }
 }
 
+/// A registry entry that has held some name.
+///
+/// Datasets, groups and committed datatypes keep stable indices — their
+/// registries only grow, deletion being a flag — so the index can name the
+/// exact entry. The link registries shrink as links are unlinked, and a
+/// link's path is derived from its parent group's current name, so for those
+/// the index records only that the kind once claimed the name and the (short)
+/// list itself answers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NameHit {
+    Dataset(usize),
+    Group(usize),
+    Datatype(usize),
+    HardLink,
+    SymbolicLink,
+    PreservedLink,
+}
+
+/// Which names the file model already holds, so creating an object does not
+/// have to walk every registry to find out.
+///
+/// INVARIANT: while `map` is `Some`, every name a registry entry currently
+/// holds has an entry in `map` covering that entry. The converse is not
+/// required: a hit whose object was since deleted, or whose name has since
+/// changed, stays in the map and is filtered out by
+/// [`Hdf5Writer::name_holder`], which re-runs the very predicates the linear
+/// scan used. The index may therefore answer "maybe", never "free" for a name
+/// that is taken.
+///
+/// MUST NOT: no code may give a registry entry a name, or move the path a
+/// link is emitted under, without either registering the new name through
+/// [`Hdf5Writer::register_name`] or dropping the index through
+/// [`Hdf5Writer::forget_name_index`]. State a constructor puts straight into
+/// the registries needs neither — `map` starts `None`, and the first query
+/// builds it from the registries as they then stand.
+struct NameIndex {
+    map: Option<HashMap<String, Vec<NameHit>>>,
+    /// Bumped whenever the registries move under a build in flight, so that
+    /// build's result is discarded instead of being installed stale.
+    epoch: u64,
+}
+
+impl NameIndex {
+    fn new() -> Self {
+        NameIndex {
+            map: None,
+            epoch: 0,
+        }
+    }
+
+    /// Record that `hit` holds `name`. With no map built there is nothing to
+    /// record, but the registries have moved, so any build in flight is
+    /// invalidated rather than trusted.
+    fn insert(&mut self, name: &str, hit: NameHit) {
+        match self.map.as_mut() {
+            None => self.epoch += 1,
+            Some(map) => {
+                let hits = map.entry(name.to_string()).or_default();
+                if !hits.contains(&hit) {
+                    hits.push(hit);
+                }
+            }
+        }
+    }
+
+    /// Throw the index away: the next query rebuilds it from the registries.
+    fn forget(&mut self) {
+        self.map = None;
+        self.epoch += 1;
+    }
+}
+
 /// HDF5 file writer.
 ///
 /// Usage:
@@ -3606,6 +3678,10 @@ pub struct Hdf5Writer {
     /// through every header rewrite by their encoded bytes. Always empty for
     /// a freshly created file; see [`PreservedLink`].
     pub(crate) preserved_links: Slot<Vec<PreservedLink>>,
+    /// Which names the registries above already hold; see [`NameIndex`].
+    /// Boxed so this side table costs the writer one pointer: inline, its
+    /// map shifted every field after it and cost the attribute path ~5%.
+    name_index: Slot<Box<NameIndex>>,
     /// Attributes attached to the root group (file-level attributes).
     pub(crate) root_attributes: Slot<Vec<crate::format::messages::attribute::AttributeEntry>>,
     /// Serializes object creation so name-uniqueness check and registry insert
@@ -4604,6 +4680,7 @@ impl Hdf5Writer {
             symbolic_links: Slot::new(Vec::new()),
             committed_datatypes: Slot::new(Vec::new()),
             preserved_links: Slot::new(Vec::new()),
+            name_index: Slot::new(Box::new(NameIndex::new())),
             root_attributes: Slot::new(Vec::new()),
             create_lock: Slot::new(()),
             libver,
@@ -5220,12 +5297,14 @@ impl Hdf5Writer {
     /// The [`CreateGuard`] proves the caller entered through
     /// [`Self::begin_create`] and still holds the gate.
     pub(crate) fn push_dataset(&self, create: &CreateGuard<'_>, info: DatasetInfo) -> usize {
+        let name = info.name.clone();
         let idx = {
             let mut reg = self.datasets.lock();
             let idx = reg.len();
             reg.push(Shared::new(DatasetCell::new(info)));
             idx
         };
+        self.register_name(&name, NameHit::Dataset(idx));
         // The spine guard is dropped before the group slot is taken: the lock
         // order is spine -> slot and never the reverse.
         if let Some(pidx) = create.parent {
@@ -5236,9 +5315,14 @@ impl Hdf5Writer {
 
     /// Push a freshly-built group into the registry and return its index.
     pub(crate) fn push_group(&self, info: GroupInfo) -> usize {
-        let mut reg = self.groups.lock();
-        let idx = reg.len();
-        reg.push(Shared::new(Slot::new(info)));
+        let name = info.name.trim_start_matches('/').to_string();
+        let idx = {
+            let mut reg = self.groups.lock();
+            let idx = reg.len();
+            reg.push(Shared::new(Slot::new(info)));
+            idx
+        };
+        self.register_name(&name, NameHit::Group(idx));
         idx
     }
 
@@ -5982,6 +6066,7 @@ impl Hdf5Writer {
             symbolic_links: Slot::new(Vec::new()),
             committed_datatypes: Slot::new(Vec::new()),
             preserved_links: Slot::new(preserved_links),
+            name_index: Slot::new(Box::new(NameIndex::new())),
             root_attributes: Slot::new(root_attributes),
             create_lock: Slot::new(()),
             // A reopen names no bound: the file already is whichever
@@ -6162,51 +6247,205 @@ impl Hdf5Writer {
     /// is written down, so a creator cannot be blind to a kind it does not
     /// itself make — nor a kind added after it.
     fn ensure_name_free(&self, name: &str) -> IoResult<()> {
-        let taken = |kind: &str| {
-            Err(crate::io::IoError::InvalidState(format!(
+        let holder = self.name_holder(name);
+        // The index is a filter over the registries, not a second copy of
+        // them, so a debug build re-derives the answer on every create: a
+        // name it failed to record surfaces as a failing assertion in the
+        // suite rather than as two links of one name in somebody's file.
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            holder,
+            self.scan_name_holder(name),
+            "the name index disagrees with the registries for '{name}'"
+        );
+        match holder {
+            None => Ok(()),
+            Some(kind) => Err(crate::io::IoError::InvalidState(format!(
                 "a {kind} named '{name}' already exists"
-            )))
+            ))),
+        }
+    }
+
+    /// What already holds `name`, or `None` if it is free.
+    ///
+    /// The kinds answer in a fixed order — dataset, group, committed
+    /// datatype, hard link, symbolic link, preserved link — because the
+    /// refusal names the first one that holds it. [`NameIndex`] narrows each
+    /// kind to the entries that ever took this name; every candidate is then
+    /// put through the same predicate the full scan used, so a hit left
+    /// behind by a delete or a rename answers exactly as an absent one does.
+    fn name_holder(&self, name: &str) -> Option<&'static str> {
+        self.build_name_index();
+        let hits: Vec<NameHit> = {
+            let index = self.name_index.lock();
+            index.map.as_ref().and_then(|m| m.get(name))?.clone()
         };
+        for hit in &hits {
+            if let NameHit::Dataset(i) = *hit {
+                let ds = self.ds(i);
+                let d = ds.lock();
+                if !d.deleted && d.name == name {
+                    return Some("dataset");
+                }
+            }
+        }
+        for hit in &hits {
+            if let NameHit::Group(i) = *hit {
+                let grp = self.grp(i);
+                let g = grp.lock();
+                if !g.deleted && g.name.trim_start_matches('/') == name {
+                    return Some("group");
+                }
+            }
+        }
+        for hit in &hits {
+            if let NameHit::Datatype(i) = *hit {
+                // The registry lock goes before `parent_alive` takes a group
+                // slot, never across it.
+                let (parent, held) = {
+                    let reg = self.committed_datatypes.lock();
+                    (reg[i].parent, reg[i].name == name)
+                };
+                if held && self.parent_alive(parent) {
+                    return Some("committed datatype");
+                }
+            }
+        }
+        if hits.contains(&NameHit::HardLink)
+            && self
+                .hard_links_vec()
+                .iter()
+                .any(|l| self.hard_link_emitted(l) && self.hard_link_full_path(l) == name)
+        {
+            return Some("hard link");
+        }
+        if hits.contains(&NameHit::SymbolicLink)
+            && self
+                .symbolic_links_vec()
+                .iter()
+                .any(|l| self.symbolic_link_emitted(l) && self.symbolic_link_full_path(l) == name)
+        {
+            return Some("link");
+        }
+        // A preserved link occupies its name in the group just as a modelled
+        // one does; both are emitted, and two link messages of one name in a
+        // group is an invalid file.
+        if hits.contains(&NameHit::PreservedLink)
+            && self.preserved_link_paths().iter().any(|(p, _)| *p == name)
+        {
+            return Some("link");
+        }
+        None
+    }
+
+    /// The same answer read straight off the registries, which is what the
+    /// index is checked against in a debug build.
+    #[cfg(debug_assertions)]
+    fn scan_name_holder(&self, name: &str) -> Option<&'static str> {
         if self.dataset_refs().iter().any(|d| {
             let g = d.lock();
             !g.deleted && g.name == name
         }) {
-            return taken("dataset");
+            return Some("dataset");
         }
         if self.group_refs().iter().any(|g| {
             let gg = g.lock();
             !gg.deleted && gg.name.trim_start_matches('/') == name
         }) {
-            return taken("group");
+            return Some("group");
         }
         if self
             .committed_datatypes_vec()
             .iter()
             .any(|c| self.parent_alive(c.parent) && c.name == name)
         {
-            return taken("committed datatype");
+            return Some("committed datatype");
         }
         if self
             .hard_links_vec()
             .iter()
             .any(|l| self.hard_link_emitted(l) && self.hard_link_full_path(l) == name)
         {
-            return taken("hard link");
+            return Some("hard link");
         }
         if self
             .symbolic_links_vec()
             .iter()
             .any(|l| self.symbolic_link_emitted(l) && self.symbolic_link_full_path(l) == name)
         {
-            return taken("link");
+            return Some("link");
         }
-        // A preserved link occupies its name in the group just as a modelled
-        // one does; both are emitted, and two link messages of one name in a
-        // group is an invalid file.
         if self.preserved_link_paths().iter().any(|(p, _)| *p == name) {
-            return taken("link");
+            return Some("link");
         }
-        Ok(())
+        None
+    }
+
+    /// Build the name index unless it is already built.
+    ///
+    /// The walk takes the registry spines and their slots, so it runs with no
+    /// index lock held — the writer never holds one lock across another — and
+    /// the result is kept only if nothing renamed, created or unlinked
+    /// anything while it ran.
+    fn build_name_index(&self) {
+        let epoch = {
+            let index = self.name_index.lock();
+            if index.map.is_some() {
+                return;
+            }
+            index.epoch
+        };
+        let mut map: HashMap<String, Vec<NameHit>> = HashMap::new();
+        for (i, ds) in self.dataset_refs().iter().enumerate() {
+            let d = ds.lock();
+            if !d.deleted {
+                map.entry(d.name.clone())
+                    .or_default()
+                    .push(NameHit::Dataset(i));
+            }
+        }
+        for (i, grp) in self.group_refs().iter().enumerate() {
+            let g = grp.lock();
+            if !g.deleted {
+                map.entry(g.name.trim_start_matches('/').to_string())
+                    .or_default()
+                    .push(NameHit::Group(i));
+            }
+        }
+        for (i, c) in self.committed_datatypes_vec().iter().enumerate() {
+            map.entry(c.name.clone())
+                .or_default()
+                .push(NameHit::Datatype(i));
+        }
+        for l in self.hard_links_vec().iter() {
+            map.entry(self.hard_link_full_path(l))
+                .or_default()
+                .push(NameHit::HardLink);
+        }
+        for l in self.symbolic_links_vec().iter() {
+            map.entry(self.symbolic_link_full_path(l))
+                .or_default()
+                .push(NameHit::SymbolicLink);
+        }
+        for (path, _) in self.preserved_link_paths() {
+            map.entry(path).or_default().push(NameHit::PreservedLink);
+        }
+        let mut index = self.name_index.lock();
+        if index.map.is_none() && index.epoch == epoch {
+            index.map = Some(map);
+        }
+    }
+
+    /// Record that `hit` now holds `name` — the one way a new name enters the
+    /// index, called from every push that gives a registry entry a name.
+    fn register_name(&self, name: &str, hit: NameHit) {
+        self.name_index.lock().insert(name, hit);
+    }
+
+    /// Drop the index because something moved names wholesale (a group
+    /// rename carries its subtree and every link path under it).
+    fn forget_name_index(&self) {
+        self.name_index.lock().forget();
     }
 
     /// Delete a dataset name, with libhdf5's `H5Ldelete` semantics: a name
@@ -6457,7 +6696,8 @@ impl Hdf5Writer {
         if let Some(pi) = link.parent {
             self.grp(pi).lock().child_datasets.push(idx);
         }
-        self.ds(idx).lock().name = new_name;
+        self.ds(idx).lock().name = new_name.clone();
+        self.register_name(&new_name, NameHit::Dataset(idx));
     }
 
     /// The group counterpart of
@@ -6516,6 +6756,9 @@ impl Hdf5Writer {
                 d.name = n;
             }
         }
+        // A group carries its subtree and every link path under it, so far
+        // more names moved than this function can enumerate: start over.
+        self.forget_name_index();
     }
 
     /// Drop link entries that can no longer be emitted — their parent group
@@ -7171,6 +7414,7 @@ impl Hdf5Writer {
             target,
             creation_seq: self.take_creation_seq(),
         });
+        self.register_name(&self.link_full_path(parent, link_name), NameHit::HardLink);
         Ok(())
     }
 
@@ -7308,6 +7552,10 @@ impl Hdf5Writer {
             target,
             creation_seq: self.take_creation_seq(),
         });
+        self.register_name(
+            &self.link_full_path(parent, link_name),
+            NameHit::SymbolicLink,
+        );
         Ok(())
     }
 
@@ -7362,9 +7610,14 @@ impl Hdf5Writer {
             times: self.created_object_times(),
             obj_header_addr: 0,
         };
-        let mut reg = self.committed_datatypes.lock();
-        let idx = reg.len();
-        reg.push(entry);
+        let name = entry.name.clone();
+        let idx = {
+            let mut reg = self.committed_datatypes.lock();
+            let idx = reg.len();
+            reg.push(entry);
+            idx
+        };
+        self.register_name(&name, NameHit::Datatype(idx));
         Ok(idx)
     }
 
