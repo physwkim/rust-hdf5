@@ -7360,6 +7360,9 @@ impl Hdf5Writer {
         let mut inline: Vec<(u64, String)> = Vec::new();
         for (i, (path, target)) in targets.iter().enumerate() {
             let element = start + i as u64;
+            // The rank of the extent the selection is over, which only a region
+            // reference encodes and takes from the target's dataspace.
+            let mut extent_rank = 0;
             let (kind, pending) = match target {
                 ReferenceTarget::Object => {
                     self.object_reference_target(path)?;
@@ -7370,6 +7373,7 @@ impl Hdf5Writer {
                     let ds = self.region_reference_target(path)?;
                     let dims = self.ds(ds).lock().dataspace.dims.clone();
                     validate_region_selection(selection, &dims, path)?;
+                    extent_rank = dims.len();
                     (
                         ReferenceKind::DatasetRegion2,
                         PendingHeapTarget::Dataset((*path).to_string()),
@@ -7400,7 +7404,7 @@ impl Hdf5Writer {
                 element,
                 kind,
                 pending,
-                encode_revised_blob(0, target, &self.ctx)?,
+                encode_revised_blob(0, target, extent_rank, &self.ctx)?,
             ));
         }
 

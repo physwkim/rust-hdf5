@@ -217,7 +217,7 @@ fn region2_references_written_here_resolve_in_libhdf5() {
     let refs = file
         .new_dataset::<u64>()
         .std_region_references()
-        .shape([2])
+        .shape([3])
         .create("regrefs")
         .unwrap();
     let rows = Selection::Hyperslab {
@@ -233,17 +233,22 @@ fn region2_references_written_here_resolve_in_libhdf5() {
         rank: 2,
         points: vec![vec![0, 1], vec![3, 5]],
     });
-    refs.write_std_region_references(&[("/matrix", rows), ("/matrix", points)])
+    let whole = Selection::All;
+    refs.write_std_region_references(&[("/matrix", rows), ("/matrix", points), ("/matrix", whole)])
         .unwrap();
     file.close().unwrap();
 
     let file = H5File::open(&path).unwrap();
     let read = file.dataset("regrefs").unwrap().read_references().unwrap();
-    assert_eq!(read.len(), 2);
+    assert_eq!(read.len(), 3);
     assert_eq!(read[0].path(), Some("/matrix"));
     assert_eq!(read[0].bounds(), Some((vec![1, 2], vec![2, 4])));
     assert_eq!(read[1].path(), Some("/matrix"));
     assert_eq!(read[1].bounds(), Some((vec![0, 1], vec![3, 5])));
+    // `H5S_SEL_ALL` carries no rank of its own; the blob says the target's,
+    // which is what libhdf5 rebuilds the dataspace from.
+    assert_eq!(read[2].path(), Some("/matrix"));
+    assert_eq!(read[2].selection(), Some(&Selection::All));
     drop(file);
 
     if let Some(h5dump) = h5dump() {
@@ -262,6 +267,11 @@ fn region2_references_written_here_resolve_in_libhdf5() {
         assert!(text.contains("REGION_TYPE POINT"), "{text}");
         assert!(text.contains("(0,1)"), "{text}");
         assert!(text.contains("(3,5)"), "{text}");
+        // All three elements dereference; the whole-extent one prints its
+        // target and no region, which is what h5dump prints for libhdf5's own
+        // `H5S_SEL_ALL` region references.
+        assert_eq!(text.matches("/matrix\"").count(), 3, "{text}");
+        assert_eq!(text.matches("REGION_TYPE").count(), 2, "{text}");
     }
     cleanup(&path);
 }

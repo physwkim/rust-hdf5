@@ -308,9 +308,16 @@ pub fn encode_reference_element(
 /// The token is written as `address`; a caller that does not know the
 /// target's object header address yet passes 0 and patches those `sa` bytes
 /// at offset [`REVISED_BLOB_TOKEN_OFFSET`] once it does.
+///
+/// `extent_rank` is the rank of the dataspace the reference's selection is
+/// over, which is what `H5R__encode_region` encodes and where it takes it
+/// from — `H5S_get_simple_extent_ndims` of the space, not the serialized
+/// selection, which is why an `H5S_SEL_ALL` region still says a rank. It is 0
+/// for the two kinds that carry no selection.
 pub fn encode_revised_blob(
     address: u64,
     target: &ReferenceTarget,
+    extent_rank: usize,
     ctx: &FormatContext,
 ) -> FormatResult<Vec<u8>> {
     let sa = ctx.sizeof_addr as usize;
@@ -323,17 +330,8 @@ pub fn encode_revised_blob(
         // extent's rank, then the selection.
         ReferenceTarget::Region(selection) => {
             let bytes = selection.encode()?;
-            let rank = match selection {
-                Selection::Hyperslab { rank, .. } => *rank,
-                Selection::Points(ps) => ps.rank,
-                _ => {
-                    return Err(FormatError::UnsupportedFeature(
-                        "a region reference over a selection that carries no rank".into(),
-                    ))
-                }
-            };
             blob.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            blob.extend_from_slice(&(rank as u32).to_le_bytes());
+            blob.extend_from_slice(&(extent_rank as u32).to_le_bytes());
             blob.extend_from_slice(&bytes);
         }
         // `H5R__encode_string`: a 16-bit length, then the unterminated name.
@@ -887,7 +885,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            encode_revised_blob(address, &target, &ctx()).unwrap(),
+            encode_revised_blob(address, &target, 0, &ctx()).unwrap(),
             ATTR_BLOB
         );
 
@@ -896,10 +894,10 @@ mod tests {
             (ReferenceKind::DatasetRegion2, &REGION2_POINT_BLOB[..]),
         ] {
             let (address, target) = decode_revised_body(kind, golden, &ctx()).unwrap().unwrap();
-            let blob = encode_revised_blob(address, &target, &ctx()).unwrap();
+            let blob = encode_revised_blob(address, &target, 2, &ctx()).unwrap();
             // Token and rank are byte-identical; the selection is re-encoded.
             assert_eq!(blob[..9], golden[..9]);
-            assert_eq!(blob[13..17], golden[13..17]);
+            assert_eq!(blob[13..17], golden[13..17], "the extent rank");
             let selection_len = u32::from_le_bytes(blob[9..13].try_into().unwrap()) as usize;
             assert_eq!(blob.len(), 17 + selection_len);
             let (back, read) = decode_revised_body(kind, &blob, &ctx()).unwrap().unwrap();
@@ -917,10 +915,20 @@ mod tests {
             assert_eq!(was.bounds(), now.bounds());
         }
 
+        // `H5S_SEL_ALL` serializes without a rank, and the blob says one
+        // anyway, because `H5R__encode_region` reads it from the dataspace.
+        let all =
+            encode_revised_blob(0xC3, &ReferenceTarget::Region(Selection::All), 3, &ctx()).unwrap();
+        assert_eq!(u32::from_le_bytes(all[13..17].try_into().unwrap()), 3);
+        assert_eq!(
+            decode_revised_body(ReferenceKind::DatasetRegion2, &all, &ctx()).unwrap(),
+            Some((0xC3, ReferenceTarget::Region(Selection::All)))
+        );
+
         // An object reference's blob is the token alone; that is also the body
         // an `H5R_OBJECT2` element carries inline.
         assert_eq!(
-            encode_revised_blob(0xC3, &ReferenceTarget::Object, &ctx()).unwrap(),
+            encode_revised_blob(0xC3, &ReferenceTarget::Object, 0, &ctx()).unwrap(),
             OBJ2_ELEMENT[2..11]
         );
     }
