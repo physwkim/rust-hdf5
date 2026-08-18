@@ -24,7 +24,7 @@ use crate::io::reader::SuperblockExtension;
 use crate::io::writer::{FileSpaceConfig, SharedMessageConfig};
 use crate::io::{Hdf5Reader, Hdf5Writer};
 
-use crate::dataset::{DatasetBuilder, H5Dataset};
+use crate::dataset::{DatasetAccess, DatasetBuilder, H5Dataset};
 use crate::error::{Hdf5Error, Result};
 use crate::format::messages::datatype::DatatypeMessage;
 use crate::format::messages::filter::FilterPipeline;
@@ -920,7 +920,34 @@ impl H5File {
     }
 
     /// Open an existing dataset by name (read mode).
+    ///
+    /// Uses libhdf5's default dataset-access properties; name others with
+    /// [`dataset_with`](Self::dataset_with).
     pub fn dataset(&self, name: &str) -> Result<H5Dataset> {
+        self.dataset_with(name, DatasetAccess::default())
+    }
+
+    /// [`dataset`](Self::dataset) under named dataset-access properties —
+    /// `H5Dopen2` with a dapl instead of `H5P_DEFAULT`.
+    ///
+    /// Both properties [`DatasetAccess`] carries decide how a *virtual*
+    /// dataset's extent is resolved, so this changes what `name` reports and
+    /// reads back; for every other dataset it is exactly
+    /// [`dataset`](Self::dataset).
+    ///
+    /// The properties stay in force for that dataset until another open
+    /// names different ones. libhdf5 binds them to the open handle instead,
+    /// so two of its handles on one virtual dataset can hold two views at
+    /// once; this reader resolves each virtual dataset's extent once and
+    /// every handle on it sees that one answer.
+    ///
+    /// # Errors
+    ///
+    /// Beyond [`dataset`](Self::dataset)'s own errors, a
+    /// [`DatasetAccess::virtual_printf_gap`] of `u64::MAX` — libhdf5's
+    /// `HSIZE_UNDEF` — is refused, as `H5Pset_virtual_printf_gap` refuses it.
+    pub fn dataset_with(&self, name: &str, access: DatasetAccess) -> Result<H5Dataset> {
+        access.validate()?;
         // Mutable: a name that crosses an external link opens the file that
         // link names, and the reader caches that handle for the next one.
         let mut inner = borrow_inner_mut(&self.inner);
@@ -929,7 +956,7 @@ impl H5File {
                 // The reader's open gate reports *why* a name cannot be
                 // opened — a dangling soft link and an unsupported object are
                 // both present in the listing, and neither is an absence.
-                let info = reader.open_dataset(name)?;
+                let info = reader.open_dataset_with(name, access)?;
                 let shape: Vec<usize> = info.dataspace.dims.iter().map(|&d| d as usize).collect();
                 let element_size = info.datatype.element_size() as usize;
                 Ok(H5Dataset::new_reader(
