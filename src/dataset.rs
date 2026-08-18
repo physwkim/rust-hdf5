@@ -10,7 +10,7 @@ use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, Shar
 use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
 use crate::format::messages::filter::Filter;
 use crate::format::messages::virtual_mapping::VirtualMapping;
-use crate::format::reference::Reference;
+use crate::format::reference::{Reference, ReferenceTarget};
 use crate::format::selection::Selection;
 use crate::format::storage_kind::AttributeStorage;
 use crate::io::reader::ExternalFileSegment;
@@ -67,9 +67,15 @@ pub struct DatasetBuilder<T: H5Type> {
 /// [`DatatypeMessage::region_reference`]: crate::format::messages::datatype::DatatypeMessage::region_reference
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReferenceElement {
+    /// `H5T_STD_REF_OBJ`.
     Object,
-    StdObject,
+    /// `H5T_STD_REF_DSETREG`.
     Region,
+    /// `H5T_STD_REF`, the 1.12 form. One datatype for all three 1.12 kinds:
+    /// the element leads with the kind it holds, so `H5T__ref_disk_getsize`
+    /// sizes every element for the widest of them and a dataset of this type
+    /// may hold objects, regions and attributes alike.
+    Revised,
 }
 
 impl ReferenceElement {
@@ -81,8 +87,8 @@ impl ReferenceElement {
         use crate::format::messages::datatype::DatatypeMessage;
         match self {
             Self::Object => DatatypeMessage::object_reference(ctx),
-            Self::StdObject => DatatypeMessage::std_object_reference(ctx),
             Self::Region => DatatypeMessage::region_reference(ctx),
+            Self::Revised => DatatypeMessage::std_object_reference(ctx),
         }
     }
 }
@@ -415,8 +421,69 @@ impl<T: H5Type> DatasetBuilder<T> {
     /// ```
     #[must_use]
     pub fn std_object_references(mut self) -> Self {
-        self.references = Some(ReferenceElement::StdObject);
+        self.references = Some(ReferenceElement::Revised);
         self
+    }
+
+    /// Store revised region references — `H5R_DATASET_REGION2`, written into
+    /// the same `H5T_STD_REF` datatype
+    /// [`std_object_references`](Self::std_object_references) makes.
+    ///
+    /// The elements are written with
+    /// [`write_std_region_references`](H5Dataset::write_std_region_references).
+    /// What distinguishes them from the pre-1.12
+    /// [`region_references`](Self::region_references) is the element, not the
+    /// datatype: a 1.12 element names its own kind, so one dataset of this type
+    /// may hold object, region and attribute references together. h5py 3.15
+    /// cannot read any of them, so prefer the pre-1.12 form for files h5py will
+    /// open.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::{H5File, Hyperslab, HyperslabBlock, LibverBound, Selection};
+    /// let file = H5File::options().libver(LibverBound::V112).create("stdregions.h5").unwrap();
+    /// file.new_dataset::<i32>().shape([8]).create("target").unwrap();
+    /// let refs = file.new_dataset::<u64>()
+    ///     .std_region_references()
+    ///     .shape([1])
+    ///     .create("refs")
+    ///     .unwrap();
+    /// let rows = Selection::Hyperslab {
+    ///     rank: 1,
+    ///     form: Hyperslab::Blocks(vec![HyperslabBlock { start: vec![0], end: vec![2] }]),
+    /// };
+    /// refs.write_std_region_references(&[("/target", rows)]).unwrap();
+    /// file.close().unwrap();
+    /// ```
+    #[must_use]
+    pub fn std_region_references(self) -> Self {
+        self.std_object_references()
+    }
+
+    /// Store attribute references — `H5R_ATTR`, the one reference kind with no
+    /// pre-1.12 form, in the same `H5T_STD_REF` datatype
+    /// [`std_object_references`](Self::std_object_references) makes.
+    ///
+    /// The elements are written with
+    /// [`write_attribute_references`](H5Dataset::write_attribute_references) and
+    /// name an object and one of its attributes. h5py 3.15 cannot read them.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::{H5File, LibverBound};
+    /// let file = H5File::options().libver(LibverBound::V112).create("attrrefs.h5").unwrap();
+    /// let target = file.new_dataset::<i32>().shape([4]).create("target").unwrap();
+    /// target.new_attr::<i32>().shape([3]).create("note").unwrap()
+    ///     .write_array(&[7i32, 8, 9]).unwrap();
+    /// let refs = file.new_dataset::<u64>()
+    ///     .attribute_references()
+    ///     .shape([1])
+    ///     .create("refs")
+    ///     .unwrap();
+    /// refs.write_attribute_references(&[("/target", "note")]).unwrap();
+    /// file.close().unwrap();
+    /// ```
+    #[must_use]
+    pub fn attribute_references(self) -> Self {
+        self.std_object_references()
     }
 
     /// Store dataset region references — h5py's `h5py.regionref_dtype`.
@@ -3761,6 +3828,67 @@ impl H5Dataset {
                 match &*inner {
                     H5FileInner::Writer(writer) => {
                         writer.write_region_references(*index, 0, targets)?;
+                        Ok(())
+                    }
+                    _ => Err(Hdf5Error::InvalidState(
+                        "file is no longer in write mode".into(),
+                    )),
+                }
+            }
+            DatasetInfo::Reader { .. } => {
+                Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
+            }
+        }
+    }
+
+    /// Write revised region references over `targets` into elements
+    /// `0..targets.len()` — `H5Rcreate_region` plus `H5Dwrite` of an
+    /// `H5T_STD_REF` dataset.
+    ///
+    /// The dataset must have been created with
+    /// [`std_region_references`](DatasetBuilder::std_region_references) or one
+    /// of its two siblings, which make the same datatype. Each target is the
+    /// path of an existing *dataset* and a [`Selection`] over it, which must
+    /// fit that dataset's extent. What reaches the file is a global-heap blob
+    /// holding the target's object header address (assigned when the file is
+    /// finalized) and the serialized selection, and an element carrying the
+    /// blob's id and its byte count. Elements left unwritten read back as null
+    /// references.
+    pub fn write_std_region_references(&self, targets: &[(&str, Selection)]) -> Result<()> {
+        let targets: Vec<(&str, ReferenceTarget)> = targets
+            .iter()
+            .map(|(path, selection)| (*path, ReferenceTarget::Region(selection.clone())))
+            .collect();
+        self.write_revised_references(&targets)
+    }
+
+    /// Write attribute references naming `targets` into elements
+    /// `0..targets.len()` — `H5Rcreate_attr` plus `H5Dwrite` of an
+    /// `H5T_STD_REF` dataset.
+    ///
+    /// Each target is the path of an existing object — a dataset, a group, or
+    /// `/` for the root group — and the name of an attribute it already
+    /// carries. There is no pre-1.12 form of this reference kind, so the
+    /// dataset must have been created with
+    /// [`attribute_references`](DatasetBuilder::attribute_references) or one of
+    /// its two siblings. Elements left unwritten read back as null references.
+    pub fn write_attribute_references(&self, targets: &[(&str, &str)]) -> Result<()> {
+        let targets: Vec<(&str, ReferenceTarget)> = targets
+            .iter()
+            .map(|(path, name)| (*path, ReferenceTarget::Attribute((*name).to_string())))
+            .collect();
+        self.write_revised_references(&targets)
+    }
+
+    /// Store `targets` as 1.12 reference elements, whatever mix of kinds they
+    /// are: the one path both revised-reference writers take.
+    fn write_revised_references(&self, targets: &[(&str, ReferenceTarget)]) -> Result<()> {
+        match &self.info {
+            DatasetInfo::Writer { index, .. } => {
+                let inner = borrow_inner(&self.file_inner);
+                match &*inner {
+                    H5FileInner::Writer(writer) => {
+                        writer.write_revised_references(*index, 0, targets)?;
                         Ok(())
                     }
                     _ => Err(Hdf5Error::InvalidState(

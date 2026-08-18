@@ -1,7 +1,7 @@
 //! The 1.12 reference kinds — `H5R_OBJECT2`, `H5R_DATASET_REGION2` and
-//! `H5R_ATTR`, all stored as `H5T_STD_REF`. Reading covers all three; writing
-//! covers `H5R_OBJECT2`, the one kind whose element carries its target inline
-//! rather than through the global heap.
+//! `H5R_ATTR`, all stored as `H5T_STD_REF`. Reading and writing both cover all
+//! three: the object form carries its target inline, the other two through a
+//! global-heap blob whose id the element holds.
 //!
 //! The fixture is libhdf5 1.14.6 output built by `tests/fixtures/gen_revised_refs.c`;
 //! h5py 3.x cannot stand in for it, as it raises "Unknown reference type" on
@@ -17,7 +17,9 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rust_hdf5::{H5File, LibverBound, PointSelection, Reference, Selection};
+use rust_hdf5::{
+    H5File, Hyperslab, LibverBound, PointSelection, Reference, RegularHyperslab, Selection,
+};
 
 const REVISED_REFS: &[u8] = include_bytes!("fixtures/revised_refs.h5");
 
@@ -192,6 +194,218 @@ fn attribute_references_name_the_attribute() {
         .unwrap();
     let note = target.attr(refs[0].attribute_name().unwrap()).unwrap();
     assert_eq!(note.read_numeric_as::<i32>().unwrap(), vec![7, 8, 9]);
+    drop(file);
+    cleanup(&path);
+}
+
+/// A `H5R_DATASET_REGION2` written here is a heap blob whose token this crate
+/// stamps at finalize; both this crate and libhdf5 follow it to the region it
+/// names.
+#[test]
+fn region2_references_written_here_resolve_in_libhdf5() {
+    let path = write_path("region2");
+    let file = H5File::options()
+        .libver(LibverBound::V112)
+        .create(&path)
+        .unwrap();
+    let matrix = file
+        .new_dataset::<i32>()
+        .shape([4, 6])
+        .create("matrix")
+        .unwrap();
+    matrix.write_raw(&(0..24).collect::<Vec<i32>>()).unwrap();
+    let refs = file
+        .new_dataset::<u64>()
+        .std_region_references()
+        .shape([2])
+        .create("regrefs")
+        .unwrap();
+    let rows = Selection::Hyperslab {
+        rank: 2,
+        form: Hyperslab::Regular(RegularHyperslab {
+            start: vec![1, 2],
+            stride: vec![1, 1],
+            count: vec![2, 3],
+            block: vec![1, 1],
+        }),
+    };
+    let points = Selection::Points(PointSelection {
+        rank: 2,
+        points: vec![vec![0, 1], vec![3, 5]],
+    });
+    refs.write_std_region_references(&[("/matrix", rows), ("/matrix", points)])
+        .unwrap();
+    file.close().unwrap();
+
+    let file = H5File::open(&path).unwrap();
+    let read = file.dataset("regrefs").unwrap().read_references().unwrap();
+    assert_eq!(read.len(), 2);
+    assert_eq!(read[0].path(), Some("/matrix"));
+    assert_eq!(read[0].bounds(), Some((vec![1, 2], vec![2, 4])));
+    assert_eq!(read[1].path(), Some("/matrix"));
+    assert_eq!(read[1].bounds(), Some((vec![0, 1], vec![3, 5])));
+    drop(file);
+
+    if let Some(h5dump) = h5dump() {
+        let out = std::process::Command::new(&h5dump)
+            .args(["-d", "/regrefs", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "h5dump failed:\n{text}");
+        assert!(text.contains("H5T_REFERENCE { H5T_STD_REF }"), "{text}");
+        // h5dump prints a dereferenced region reference as the target's name
+        // followed by the selection it holds, so both lines prove libhdf5 read
+        // the blob this crate wrote.
+        assert!(text.contains("REGION_TYPE BLOCK"), "{text}");
+        assert!(text.contains("(1,2)-(2,4)"), "{text}");
+        assert!(text.contains("REGION_TYPE POINT"), "{text}");
+        assert!(text.contains("(0,1)"), "{text}");
+        assert!(text.contains("(3,5)"), "{text}");
+    }
+    cleanup(&path);
+}
+
+/// An `H5R_ATTR` written here names the attribute libhdf5 dereferences it to.
+#[test]
+fn attribute_references_written_here_resolve_in_libhdf5() {
+    let path = write_path("attr");
+    let file = H5File::options()
+        .libver(LibverBound::V112)
+        .create(&path)
+        .unwrap();
+    let matrix = file
+        .new_dataset::<i32>()
+        .shape([4])
+        .create("matrix")
+        .unwrap();
+    matrix.write_raw(&[10i32, 20, 30, 40]).unwrap();
+    matrix
+        .new_attr::<i32>()
+        .shape([3])
+        .create("note")
+        .unwrap()
+        .write_array(&[7i32, 8, 9])
+        .unwrap();
+    let grp = file.create_group("grp").unwrap();
+    grp.set_attr_array_numeric("tag", &[1i32, 2]).unwrap();
+    let refs = file
+        .new_dataset::<u64>()
+        .attribute_references()
+        .shape([2])
+        .create("attrrefs")
+        .unwrap();
+    refs.write_attribute_references(&[("/matrix", "note"), ("/grp", "tag")])
+        .unwrap();
+    file.close().unwrap();
+
+    let file = H5File::open(&path).unwrap();
+    let read = file.dataset("attrrefs").unwrap().read_references().unwrap();
+    assert_eq!(read.len(), 2);
+    assert_eq!(read[0].path(), Some("/matrix"));
+    assert_eq!(read[0].attribute_name(), Some("note"));
+    assert_eq!(read[1].path(), Some("/grp"));
+    assert_eq!(read[1].attribute_name(), Some("tag"));
+    let note = file.dataset("matrix").unwrap().attr("note").unwrap();
+    assert_eq!(note.read_numeric_as::<i32>().unwrap(), vec![7, 8, 9]);
+    drop(file);
+
+    if let Some(h5dump) = h5dump() {
+        let out = std::process::Command::new(&h5dump)
+            .args(["-d", "/attrrefs", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "h5dump failed:\n{text}");
+        assert!(text.contains("H5T_REFERENCE { H5T_STD_REF }"), "{text}");
+        // h5dump dereferences an attribute reference to the attribute itself:
+        // the owner's path, the attribute's name, and the type and shape it
+        // found there.
+        assert!(text.contains("/matrix/note\""), "{text}");
+        assert!(text.contains("/grp/tag\""), "{text}");
+        assert_eq!(text.matches("ATTRIBUTE \"").count(), 2, "{text}");
+        assert!(text.contains("SIMPLE { ( 3 ) / ( 3 ) }"), "{text}");
+        assert!(text.contains("SIMPLE { ( 2 ) / ( 2 ) }"), "{text}");
+    }
+    cleanup(&path);
+}
+
+/// The three rules a revised reference write applies before anything reaches
+/// the file: the datatype has to be `H5T_STD_REF`, a region target has to be a
+/// dataset, and an attribute reference has to name an attribute that exists.
+#[test]
+fn revised_reference_writes_refuse_what_h5r_refuses() {
+    let path = write_path("refused");
+    let file = H5File::options()
+        .libver(LibverBound::V112)
+        .create(&path)
+        .unwrap();
+    file.new_dataset::<i32>().shape([4]).create("m").unwrap();
+    file.create_group("g").unwrap();
+
+    let whole = Selection::Hyperslab {
+        rank: 1,
+        form: Hyperslab::Regular(RegularHyperslab {
+            start: vec![0],
+            stride: vec![1],
+            count: vec![4],
+            block: vec![1],
+        }),
+    };
+
+    // The pre-1.12 region datatype does not hold 1.12 elements.
+    let legacy = file
+        .new_dataset::<u64>()
+        .region_references()
+        .shape([1])
+        .create("legacy")
+        .unwrap();
+    assert!(legacy
+        .write_std_region_references(&[("/m", whole.clone())])
+        .is_err());
+
+    let refs = file
+        .new_dataset::<u64>()
+        .std_region_references()
+        .shape([2])
+        .create("refs")
+        .unwrap();
+    // A group is not a region.
+    assert!(refs
+        .write_std_region_references(&[("/g", whole.clone())])
+        .is_err());
+    // A selection its target's extent does not admit.
+    let past_end = Selection::Hyperslab {
+        rank: 1,
+        form: Hyperslab::Regular(RegularHyperslab {
+            start: vec![2],
+            stride: vec![1],
+            count: vec![4],
+            block: vec![1],
+        }),
+    };
+    assert!(refs
+        .write_std_region_references(&[("/m", past_end)])
+        .is_err());
+    // An attribute that does not exist, and an object that does not exist.
+    assert!(refs
+        .write_attribute_references(&[("/m", "missing")])
+        .is_err());
+    assert!(refs
+        .write_attribute_references(&[("/nope", "note")])
+        .is_err());
+    // What is left is written, and nothing the refusals touched is on disk.
+    refs.write_std_region_references(&[("/m", whole)]).unwrap();
+    file.close().unwrap();
+
+    let file = H5File::open(&path).unwrap();
+    let read = file.dataset("refs").unwrap().read_references().unwrap();
+    assert_eq!(read[0].bounds(), Some((vec![0], vec![3])));
+    assert_eq!(
+        read[1],
+        Reference::Null,
+        "the second element was never written"
+    );
     drop(file);
     cleanup(&path);
 }

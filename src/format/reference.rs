@@ -208,53 +208,152 @@ pub fn decode_revised_element<'a>(
     })
 }
 
-/// The element image an object reference naming `address` has, at the `size`
-/// its datatype declares.
+/// What one reference element holds — the encode-side mirror of
+/// [`RevisedElement`], which is what a reader splits an element back into.
 ///
-/// The single owner of object-reference element encoding, for both the
-/// pre-1.12 and the 1.12 form, so the two element layouts this module
-/// documents are written where they are read. Anything past what the layout
-/// needs is left zero, which is where libhdf5 leaves it too: it sizes every
-/// element for the largest reference the dataset may hold and writes only as
-/// much of it as the reference uses.
+/// The variant carries everything its own layout needs, so
+/// [`encode_reference_element`] is total: there is no kind it cannot write,
+/// and no way to hand it a body its layout has no room for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceElementImage {
+    /// `H5R_OBJECT1`: the element is the target's object header address and
+    /// nothing else.
+    Legacy(u64),
+    /// `H5R_OBJECT2` naming an object in this file: short enough that the
+    /// whole encoded reference sits in the element
+    /// (`H5T__ref_disk_getsize`'s direct-copy arm).
+    Inline(u64),
+    /// Every other 1.12 element: the encoded reference lives in a global-heap
+    /// blob and the element carries the blob's byte count and its id
+    /// (`H5T__ref_disk_write`, which copies the two-byte header across, then
+    /// the size, then what `H5VL__native_blob_put` leaves).
+    Blob {
+        /// The kind the element's own type byte names.
+        kind: ReferenceKind,
+        /// The blob's byte count: the encoded reference less its two-byte
+        /// header, which the element keeps instead.
+        size: u32,
+        /// Address of the collection holding the blob.
+        collection: u64,
+        /// Index of the blob's object within that collection.
+        index: u32,
+    },
+}
+
+/// The image one reference element has, at the `size` its datatype declares.
 ///
-/// A region or attribute reference is not encodable here — its encoded
-/// reference is a global-heap blob, so the element is a blob id whose object
-/// only the writer holding the heap can place.
-pub fn encode_object_element(
-    kind: ReferenceKind,
+/// The single owner of reference-element encoding, so every element layout
+/// this module documents is written where it is read. Anything past what the
+/// layout needs is left zero, which is where libhdf5 leaves it too: it sizes
+/// every element for the largest reference the dataset may hold and writes
+/// only as much of it as the reference uses.
+pub fn encode_reference_element(
+    image: &ReferenceElementImage,
     size: usize,
-    address: u64,
     ctx: &FormatContext,
 ) -> FormatResult<Vec<u8>> {
     let sa = ctx.sizeof_addr as usize;
     let mut elem = vec![0u8; size];
-    let token_at = match kind {
-        // The whole element is the address.
-        ReferenceKind::Object1 => 0,
-        // Type, flags, then the encoded reference inline: the token's length
-        // and the token itself (`H5R__encode_obj_token`).
-        ReferenceKind::Object2 => {
-            elem[0] = kind.code();
-            elem[1] = 0;
-            elem[2] = sa as u8;
-            REVISED_HEADER + 1
-        }
-        other => {
-            return Err(FormatError::UnsupportedFeature(format!(
-                "{other:?} elements are global-heap blob ids, not an encodable image"
-            )))
-        }
+    let (what, needed) = match image {
+        ReferenceElementImage::Legacy(_) => ("an H5R_OBJECT1", sa),
+        ReferenceElementImage::Inline(_) => ("an H5R_OBJECT2", REVISED_HEADER + 1 + sa),
+        ReferenceElementImage::Blob { kind, .. } => (
+            match kind {
+                ReferenceKind::DatasetRegion2 => "an H5R_DATASET_REGION2",
+                ReferenceKind::Attr => "an H5R_ATTR",
+                _ => "a blob-backed",
+            },
+            REVISED_HEADER + 4 + sa + 4,
+        ),
     };
-    let end = token_at + sa;
-    if end > size {
+    if needed > size {
         return Err(FormatError::InvalidData(format!(
-            "a {kind:?} element needs {end} bytes but its datatype declares {size}"
+            "{what} element needs {needed} bytes but its datatype declares {size}"
         )));
     }
-    elem[token_at..end].copy_from_slice(&address.to_le_bytes()[..sa]);
+    match *image {
+        ReferenceElementImage::Legacy(address) => {
+            elem[..sa].copy_from_slice(&address.to_le_bytes()[..sa]);
+        }
+        // Type, flags, then the encoded reference inline: the token's length
+        // and the token itself (`H5R__encode_obj_token`).
+        ReferenceElementImage::Inline(address) => {
+            elem[0] = ReferenceKind::Object2.code();
+            elem[1] = 0;
+            elem[2] = sa as u8;
+            let at = REVISED_HEADER + 1;
+            elem[at..at + sa].copy_from_slice(&address.to_le_bytes()[..sa]);
+        }
+        ReferenceElementImage::Blob {
+            kind,
+            size: blob_size,
+            collection,
+            index,
+        } => {
+            elem[0] = kind.code();
+            elem[1] = 0;
+            elem[REVISED_HEADER..REVISED_HEADER + 4].copy_from_slice(&blob_size.to_le_bytes());
+            let at = REVISED_HEADER + 4;
+            elem[at..at + sa].copy_from_slice(&collection.to_le_bytes()[..sa]);
+            elem[at + sa..at + sa + 4].copy_from_slice(&index.to_le_bytes());
+        }
+    }
     Ok(elem)
 }
+
+/// The encoded reference a 1.12 blob holds, less the two-byte header the
+/// element keeps — `H5R__encode` from the token onwards, which is exactly
+/// what [`decode_revised_body`] reads back.
+///
+/// The token is written as `address`; a caller that does not know the
+/// target's object header address yet passes 0 and patches those `sa` bytes
+/// at offset [`REVISED_BLOB_TOKEN_OFFSET`] once it does.
+pub fn encode_revised_blob(
+    address: u64,
+    target: &ReferenceTarget,
+    ctx: &FormatContext,
+) -> FormatResult<Vec<u8>> {
+    let sa = ctx.sizeof_addr as usize;
+    let mut blob = Vec::with_capacity(1 + sa + 16);
+    blob.push(sa as u8);
+    blob.extend_from_slice(&address.to_le_bytes()[..sa]);
+    match target {
+        ReferenceTarget::Object => {}
+        // `H5R__encode_region`: the serialized selection's length, then the
+        // extent's rank, then the selection.
+        ReferenceTarget::Region(selection) => {
+            let bytes = selection.encode()?;
+            let rank = match selection {
+                Selection::Hyperslab { rank, .. } => *rank,
+                Selection::Points(ps) => ps.rank,
+                _ => {
+                    return Err(FormatError::UnsupportedFeature(
+                        "a region reference over a selection that carries no rank".into(),
+                    ))
+                }
+            };
+            blob.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            blob.extend_from_slice(&(rank as u32).to_le_bytes());
+            blob.extend_from_slice(&bytes);
+        }
+        // `H5R__encode_string`: a 16-bit length, then the unterminated name.
+        ReferenceTarget::Attribute(name) => {
+            let len = u16::try_from(name.len()).map_err(|_| {
+                FormatError::InvalidData(format!(
+                    "attribute name of {} bytes does not fit a reference's 16-bit length",
+                    name.len()
+                ))
+            })?;
+            blob.extend_from_slice(&len.to_le_bytes());
+            blob.extend_from_slice(name.as_bytes());
+        }
+    }
+    Ok(blob)
+}
+
+/// Where the object token sits inside a blob [`encode_revised_blob`] built:
+/// behind the one byte that gives its length.
+pub const REVISED_BLOB_TOKEN_OFFSET: usize = 1;
 
 /// What a reference names beyond the object its token points at.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -707,6 +806,122 @@ mod tests {
             decode_revised_body(kind, body, &ctx()).unwrap(),
             None,
             "a zero token names no object"
+        );
+    }
+
+    /// Every 1.12 element this crate writes is the image libhdf5 wrote for the
+    /// same reference: the inline object form, and the blob id the other two
+    /// kinds carry.
+    #[test]
+    fn revised_elements_encode_to_the_libhdf5_images() {
+        assert_eq!(
+            encode_reference_element(&ReferenceElementImage::Inline(0xC3), 18, &ctx()).unwrap(),
+            OBJ2_ELEMENT
+        );
+        assert_eq!(
+            encode_reference_element(
+                &ReferenceElementImage::Blob {
+                    kind: ReferenceKind::DatasetRegion2,
+                    size: REGION2_HYPERSLAB_BLOB.len() as u32,
+                    collection: 0x8A8,
+                    index: 1,
+                },
+                18,
+                &ctx()
+            )
+            .unwrap(),
+            REGION2_ELEMENT
+        );
+        assert_eq!(
+            encode_reference_element(
+                &ReferenceElementImage::Blob {
+                    kind: ReferenceKind::Attr,
+                    size: ATTR_BLOB.len() as u32,
+                    collection: 0x8A8,
+                    index: 3,
+                },
+                18,
+                &ctx()
+            )
+            .unwrap(),
+            ATTR_ELEMENT
+        );
+        // The pre-1.12 element is the address and nothing else.
+        assert_eq!(
+            encode_reference_element(&ReferenceElementImage::Legacy(0xC3), 8, &ctx()).unwrap(),
+            [0xC3, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    /// A blob-backed element needs more room than an inline one; a datatype
+    /// too narrow for the layout is reported rather than truncated.
+    #[test]
+    fn an_element_narrower_than_its_layout_is_refused() {
+        let err = encode_reference_element(
+            &ReferenceElementImage::Blob {
+                kind: ReferenceKind::Attr,
+                size: 15,
+                collection: 0x8A8,
+                index: 3,
+            },
+            11,
+            &ctx(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, FormatError::InvalidData(_)), "{err:?}");
+        assert!(encode_reference_element(&ReferenceElementImage::Inline(0xC3), 11, &ctx()).is_ok());
+    }
+
+    /// A blob this crate encodes says the same reference the libhdf5 blob it
+    /// came from says, and is read back by the same decoder.
+    ///
+    /// Byte equality holds for everything but the serialized selection, which
+    /// this crate writes in the version-1 block-list form every bounded
+    /// selection takes here while the fixture's `latest` bound produced the
+    /// version-3 one. Both are `H5S_decode` input; the length field ahead of
+    /// the selection is what bounds it, and it is written from the bytes
+    /// actually produced.
+    #[test]
+    fn revised_blobs_encode_to_what_libhdf5_reads_back() {
+        let (address, target) = decode_revised_body(ReferenceKind::Attr, &ATTR_BLOB, &ctx())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            encode_revised_blob(address, &target, &ctx()).unwrap(),
+            ATTR_BLOB
+        );
+
+        for (kind, golden) in [
+            (ReferenceKind::DatasetRegion2, &REGION2_HYPERSLAB_BLOB[..]),
+            (ReferenceKind::DatasetRegion2, &REGION2_POINT_BLOB[..]),
+        ] {
+            let (address, target) = decode_revised_body(kind, golden, &ctx()).unwrap().unwrap();
+            let blob = encode_revised_blob(address, &target, &ctx()).unwrap();
+            // Token and rank are byte-identical; the selection is re-encoded.
+            assert_eq!(blob[..9], golden[..9]);
+            assert_eq!(blob[13..17], golden[13..17]);
+            let selection_len = u32::from_le_bytes(blob[9..13].try_into().unwrap()) as usize;
+            assert_eq!(blob.len(), 17 + selection_len);
+            let (back, read) = decode_revised_body(kind, &blob, &ctx()).unwrap().unwrap();
+            assert_eq!(back, address);
+            let (ReferenceTarget::Region(was), ReferenceTarget::Region(now)) = (&target, &read)
+            else {
+                panic!("a region reference names a selection");
+            };
+            // Version 1 spells a regular hyperslab as the blocks it covers, so
+            // what survives is the region, not the form it was written in.
+            assert_eq!(
+                was.to_boxes(&[4, 6]).unwrap(),
+                now.to_boxes(&[4, 6]).unwrap()
+            );
+            assert_eq!(was.bounds(), now.bounds());
+        }
+
+        // An object reference's blob is the token alone; that is also the body
+        // an `H5R_OBJECT2` element carries inline.
+        assert_eq!(
+            encode_revised_blob(0xC3, &ReferenceTarget::Object, &ctx()).unwrap(),
+            OBJ2_ELEMENT[2..11]
         );
     }
 

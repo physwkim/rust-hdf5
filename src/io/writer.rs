@@ -46,7 +46,10 @@ use crate::format::messages::virtual_mapping::{
 };
 use crate::format::messages::*;
 use crate::format::object_header::{ObjectHeader, ObjectTimes, MAX_MESSAGE_SIZE};
-use crate::format::reference::encode_object_element;
+use crate::format::reference::{
+    encode_reference_element, encode_revised_blob, ReferenceElementImage, ReferenceTarget,
+    REVISED_BLOB_TOKEN_OFFSET,
+};
 use crate::format::selection::Selection;
 use crate::format::sohm::{type_flag, SharedMessagePointer, MAX_SOHM_INDEXES, SOHM_HEAP_ID_LEN};
 use crate::format::sohm_write::{
@@ -3462,8 +3465,9 @@ pub struct Hdf5Writer {
     /// Object-reference elements waiting for their target's object header
     /// address, which only exists once finalize has placed every header.
     pending_object_references: Slot<Vec<PendingObjectReference>>,
-    /// Region-reference heap objects waiting for the same address.
-    pending_region_references: Slot<Vec<PendingRegionReference>>,
+    /// Heap-backed reference objects waiting for the same address — the
+    /// pre-1.12 region form and every 1.12 form whose element is a blob id.
+    pending_heap_references: Slot<Vec<PendingHeapReference>>,
     /// What each object-reference attribute's value *means*, so
     /// [`object_attributes`](Hdf5Writer::object_attributes) can say it in
     /// addresses every time an object header is built.
@@ -3778,22 +3782,45 @@ pub(crate) struct PendingObjectReference {
     target: String,
 }
 
-/// One region-reference heap object written before its target's address could
+/// One heap-backed reference object written before its target's address could
 /// be known.
 ///
-/// The *element* of a `H5R_DATASET_REGION1` is final at write time — it is the
-/// global-heap id of the object the write inserted. What waits is the leading
-/// `sizeof_addr` bytes of that heap object, the target's object header address
-/// (`H5R__encode_token_region_compat` puts the token there, the serialized
-/// selection after it), which [`Hdf5Writer::write_region_reference_values`]
-/// stamps in.
-pub(crate) struct PendingRegionReference {
+/// The *element* of a `H5R_DATASET_REGION1`, and of every 1.12 reference whose
+/// encoding does not fit inline, is final at write time — it is the global-heap
+/// id of the object the write inserted. What waits is the `sizeof_addr` bytes
+/// of that heap object holding the target's object header address, which
+/// [`Hdf5Writer::write_heap_reference_values`] stamps in.
+pub(crate) struct PendingHeapReference {
     /// Address of the global-heap collection holding the object.
     collection: u64,
     /// The object's index within that collection.
     index: u16,
-    /// Path of the dataset the selection is over.
-    target: String,
+    /// Where the target's token sits inside that object. The pre-1.12 region
+    /// form leads with it (`H5R__encode_token_region_compat`); every 1.12 form
+    /// puts the token's length byte first (`H5R__encode_obj_token`).
+    token_offset: usize,
+    /// What the reference names, and how strictly its path must resolve.
+    target: PendingHeapTarget,
+}
+
+/// What the path of a heap-backed reference must resolve to.
+///
+/// The two rules `H5R` applies: a region reference names a *dataset*, since
+/// `H5Rcreate_region` takes one dataset's dataspace and every reader
+/// dereferences it as one, while an attribute reference names the attribute's
+/// owner, which `H5Rcreate_attr` lets be any object.
+#[derive(Debug, Clone)]
+pub(crate) enum PendingHeapTarget {
+    Dataset(String),
+    Object(String),
+}
+
+impl PendingHeapTarget {
+    fn path(&self) -> &str {
+        match self {
+            Self::Dataset(p) | Self::Object(p) => p,
+        }
+    }
 }
 
 /// The value of an attribute whose elements are object references, kept as
@@ -4078,7 +4105,7 @@ impl Hdf5Writer {
             root_times: None,
             next_creation_seq: Slot::new(0),
             pending_object_references: Slot::new(Vec::new()),
-            pending_region_references: Slot::new(Vec::new()),
+            pending_heap_references: Slot::new(Vec::new()),
             attribute_references: Slot::new(Vec::new()),
             legacy,
             symbol_tables: SymbolTables::none_found(),
@@ -5368,7 +5395,7 @@ impl Hdf5Writer {
             track_order: root_track_order,
             next_creation_seq: Slot::new(creation_seq),
             pending_object_references: Slot::new(Vec::new()),
-            pending_region_references: Slot::new(Vec::new()),
+            pending_heap_references: Slot::new(Vec::new()),
             attribute_references: Slot::new(Vec::new()),
             legacy,
             symbol_tables,
@@ -6863,7 +6890,7 @@ impl Hdf5Writer {
             match &m.datatype {
                 // Both generations of object reference: `H5T_STD_REF_OBJ` and
                 // the 1.12 `H5T_STD_REF`. They differ only in the element
-                // image, which `encode_object_element` owns.
+                // image, which `encode_reference_element` owns.
                 DatatypeMessage::Reference {
                     kind: ReferenceKind::Object1 | ReferenceKind::Object2,
                     ..
@@ -7181,7 +7208,16 @@ impl Hdf5Writer {
                 };
                 (*kind, *size as usize)
             };
-            let image = encode_object_element(kind, width, addr, &self.ctx)?;
+            let image = match kind {
+                ReferenceKind::Object1 => ReferenceElementImage::Legacy(addr),
+                ReferenceKind::Object2 => ReferenceElementImage::Inline(addr),
+                other => {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "dataset {dataset} now holds {other:?} elements, not object references"
+                    )))
+                }
+            };
+            let image = encode_reference_element(&image, width, &self.ctx)?;
             let data_addr = self.local_element_block(*dataset, "object references")?;
             let at = data_addr + element * width as u64;
             self.handle.write_at(at, &image)?;
@@ -7198,7 +7234,7 @@ impl Hdf5Writer {
     /// object header address followed by the serialized selection
     /// (`H5R__encode_token_region_compat`). Both the object and the element are
     /// written here; only the address inside the object waits for
-    /// [`Self::write_region_reference_values`]. Elements never written keep the
+    /// [`Self::write_heap_reference_values`]. Elements never written keep the
     /// zero image libhdf5 reads back as a null reference.
     pub fn write_region_references(
         &self,
@@ -7251,17 +7287,159 @@ impl Hdf5Writer {
         let placements = self.insert_vlen_objects(&items)?;
 
         let width = (sa + 4) as u64;
-        let mut pending = self.pending_region_references.lock();
+        let mut pending = self.pending_heap_references.lock();
         for (i, &(collection, obj_index)) in placements.iter().enumerate() {
             let mut elem = Vec::with_capacity(width as usize);
             elem.extend_from_slice(&collection.to_le_bytes()[..sa]);
             elem.extend_from_slice(&u32::from(obj_index).to_le_bytes());
             self.handle
                 .write_at(data_addr + (start + i as u64) * width, &elem)?;
-            pending.push(PendingRegionReference {
+            pending.push(PendingHeapReference {
                 collection,
                 index: obj_index,
-                target: targets[i].0.to_string(),
+                token_offset: 0,
+                target: PendingHeapTarget::Dataset(targets[i].0.to_string()),
+            });
+        }
+        Ok(())
+    }
+
+    /// Store 1.12 references over `targets` into the elements of dataset
+    /// `index` starting at `start` — the `H5T_STD_REF` trio.
+    ///
+    /// One datatype holds all three kinds, because a 1.12 element leads with
+    /// the kind it holds; which is why this takes a [`ReferenceTarget`] per
+    /// element rather than a fixed kind. `H5R_OBJECT2` needs nothing but the
+    /// target's address, so its element is written inline by the same finalize
+    /// pass every object reference goes through. The other two encode a
+    /// selection or an attribute name alongside the token, which does not fit
+    /// an element, so what is stored is a global-heap blob and the element is
+    /// its id (`H5T__ref_disk_write`). Elements never written keep the zero
+    /// image `H5T__ref_disk_isnull` reads back as a null reference.
+    pub fn write_revised_references(
+        &self,
+        index: usize,
+        start: u64,
+        targets: &[(&str, ReferenceTarget)],
+    ) -> IoResult<()> {
+        let (width, elements) = {
+            let ds = self.ds(index);
+            let m = ds.lock();
+            match &m.datatype {
+                DatatypeMessage::Reference {
+                    kind: ReferenceKind::Object2,
+                    size,
+                } => (
+                    *size as u64,
+                    m.dataspace
+                        .dims
+                        .iter()
+                        .fold(1u64, |a, &d| a.saturating_mul(d)),
+                ),
+                other => {
+                    return Err(crate::io::IoError::InvalidState(format!(
+                        "dataset '{}' has datatype {other}, not the 1.12 H5T_STD_REF",
+                        m.name
+                    )))
+                }
+            }
+        };
+        let data_addr = self.local_element_block(index, "references")?;
+        let end = start.saturating_add(targets.len() as u64);
+        if end > elements {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "elements {start}..{end} are outside the dataset's {elements}"
+            )));
+        }
+
+        // Build every blob before inserting any, so a path that names nothing,
+        // a selection an extent does not admit or an attribute that does not
+        // exist is reported at the call that got it wrong rather than after
+        // half the batch is on disk.
+        let mut blobs: Vec<(u64, ReferenceKind, PendingHeapTarget, Vec<u8>)> = Vec::new();
+        let mut inline: Vec<(u64, String)> = Vec::new();
+        for (i, (path, target)) in targets.iter().enumerate() {
+            let element = start + i as u64;
+            let (kind, pending) = match target {
+                ReferenceTarget::Object => {
+                    self.object_reference_target(path)?;
+                    inline.push((element, (*path).to_string()));
+                    continue;
+                }
+                ReferenceTarget::Region(selection) => {
+                    let ds = self.region_reference_target(path)?;
+                    let dims = self.ds(ds).lock().dataspace.dims.clone();
+                    validate_region_selection(selection, &dims, path)?;
+                    (
+                        ReferenceKind::DatasetRegion2,
+                        PendingHeapTarget::Dataset((*path).to_string()),
+                    )
+                }
+                ReferenceTarget::Attribute(name) => {
+                    let scope = match self.object_reference_target(path)? {
+                        Some(HardLinkTarget::Dataset(i)) => AttrScope::Dataset(i),
+                        Some(HardLinkTarget::Group(i)) => AttrScope::Group(i),
+                        None => AttrScope::Root,
+                    };
+                    if !self
+                        .object_attributes(scope)?
+                        .iter()
+                        .any(|a| a.name() == name)
+                    {
+                        return Err(crate::io::IoError::NotFound(format!(
+                            "attribute '{name}' of reference target '{path}'"
+                        )));
+                    }
+                    (
+                        ReferenceKind::Attr,
+                        PendingHeapTarget::Object((*path).to_string()),
+                    )
+                }
+            };
+            blobs.push((
+                element,
+                kind,
+                pending,
+                encode_revised_blob(0, target, &self.ctx)?,
+            ));
+        }
+
+        let items: Vec<&[u8]> = blobs.iter().map(|(_, _, _, b)| b.as_slice()).collect();
+        let placements = self.insert_vlen_objects(&items)?;
+
+        let mut pending = self.pending_heap_references.lock();
+        for ((element, kind, target, blob), &(collection, obj_index)) in
+            blobs.iter().zip(&placements)
+        {
+            // The size the element declares is the heap object's own byte
+            // count: `H5VL__native_blob_get` refuses to read one whose size
+            // does not match what the element says.
+            let image = encode_reference_element(
+                &ReferenceElementImage::Blob {
+                    kind: *kind,
+                    size: blob.len() as u32,
+                    collection,
+                    index: u32::from(obj_index),
+                },
+                width as usize,
+                &self.ctx,
+            )?;
+            self.handle.write_at(data_addr + element * width, &image)?;
+            pending.push(PendingHeapReference {
+                collection,
+                index: obj_index,
+                token_offset: REVISED_BLOB_TOKEN_OFFSET,
+                target: target.clone(),
+            });
+        }
+        drop(pending);
+
+        let mut pending = self.pending_object_references.lock();
+        for (element, path) in inline {
+            pending.push(PendingObjectReference {
+                dataset: index,
+                element,
+                target: path,
             });
         }
         Ok(())
@@ -7283,42 +7461,49 @@ impl Hdf5Writer {
         }
     }
 
-    /// Stamp every pending region reference's heap object with its target's
+    /// Stamp every pending heap-backed reference's object with its target's
     /// object header address.
     ///
-    /// The one reference kind that is still stamped rather than written once:
-    /// the *element* is a global-heap id, so the heap object has to exist at
-    /// the call that stores the reference, long before any address does. The
-    /// object was inserted with that field zeroed, so its size does not change
-    /// here: each collection is read once, patched, and rewritten at its own
-    /// declared size, which leaves every element's heap id valid.
-    fn write_region_reference_values(&mut self) -> IoResult<()> {
+    /// The references that are still stamped rather than written once: the
+    /// *element* is a global-heap id, so the heap object has to exist at the
+    /// call that stores the reference, long before any address does. The object
+    /// was inserted with its token zeroed, so its size does not change here:
+    /// each collection is read once, patched, and rewritten at its own declared
+    /// size, which leaves every element's heap id valid — and leaves the
+    /// object's byte count equal to the size the 1.12 element declares, which
+    /// `H5VL__native_blob_get` refuses to read past.
+    fn write_heap_reference_values(&mut self) -> IoResult<()> {
         use crate::format::global_heap::GlobalHeapCollection;
 
         // Snapshot rather than drain, for the same reason the object-reference
         // pass does: a SWMR session finalizes twice and the close-time finalize
         // rebuilds every header at a fresh address.
-        let pending: Vec<(u64, u16, String)> = self
-            .pending_region_references
+        let pending: Vec<(u64, u16, usize, PendingHeapTarget)> = self
+            .pending_heap_references
             .lock()
             .iter()
-            .map(|p| (p.collection, p.index, p.target.clone()))
+            .map(|p| (p.collection, p.index, p.token_offset, p.target.clone()))
             .collect();
         if pending.is_empty() {
             return Ok(());
         }
         let sa = self.ctx.sizeof_addr as usize;
-        // Group by collection so one holding several region references is read
-        // and rewritten once.
-        let mut per_collection: std::collections::BTreeMap<u64, Vec<(u16, u64)>> =
+        // Group by collection so one holding several references is read and
+        // rewritten once.
+        let mut per_collection: std::collections::BTreeMap<u64, Vec<(u16, usize, u64)>> =
             Default::default();
-        for (collection, index, target) in &pending {
-            let target = self.region_reference_target(target)?;
-            let addr = self.ds(target).lock().obj_header_addr;
+        for (collection, index, token_offset, target) in &pending {
+            let addr = match target {
+                PendingHeapTarget::Dataset(path) => {
+                    let ds = self.region_reference_target(path)?;
+                    self.ds(ds).lock().obj_header_addr
+                }
+                PendingHeapTarget::Object(path) => self.object_reference_address(path)?,
+            };
             per_collection
                 .entry(*collection)
                 .or_default()
-                .push((*index, addr));
+                .push((*index, *token_offset, addr));
         }
         for (collection, patches) in per_collection {
             // A collection is at least 4096 bytes (H5HG_MINALLOC) and most are
@@ -7329,16 +7514,16 @@ impl Hdf5Writer {
                 image = self.handle.read_at(collection, declared)?;
             }
             let (mut gcol, _) = GlobalHeapCollection::decode(&image[..declared], &self.ctx)?;
-            for (index, addr) in patches {
+            for (index, token_offset, addr) in patches {
                 let token = gcol
                     .objects
                     .iter_mut()
                     .find(|o| o.index == index)
-                    .and_then(|o| o.data.get_mut(..sa))
+                    .and_then(|o| o.data.get_mut(token_offset..token_offset + sa))
                     .ok_or_else(|| {
                         crate::io::IoError::InvalidState(format!(
                             "object {index} of global heap collection {collection:#x} is no \
-                             longer the region reference written into it"
+                             longer the reference written into it"
                         ))
                     })?;
                 token.copy_from_slice(&addr.to_le_bytes()[..sa]);
@@ -7367,7 +7552,7 @@ impl Hdf5Writer {
     /// the header is built.
     fn write_reference_values(&mut self) -> IoResult<()> {
         self.write_object_reference_values()?;
-        self.write_region_reference_values()
+        self.write_heap_reference_values()
     }
 
     /// Append every user-created hard link whose parent group is `parent`
