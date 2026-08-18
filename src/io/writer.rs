@@ -1056,30 +1056,45 @@ impl DatasetInfo {
     /// run is file space this writer allocated, and it is the *only* storage a
     /// chunk of such a dataset can occupy — the builder refuses external and
     /// virtual storage together with chunked storage, which is why
-    /// [`raw_storage_run`](Self::raw_storage_run) can name it
+    /// [`allocated_storage_run`](Self::allocated_storage_run) can name it
     /// [`ContiguousTarget::Local`] and no chunk write can reach the other two.
     fn implicit_grid(&self) -> Option<(u64, u64)> {
         let imp = self.implicit.as_ref()?;
         (imp.data_addr != UNDEF_ADDR).then_some((imp.data_addr, imp.data_size))
     }
 
-    /// The whole of this dataset's raw storage as one run — the target to
-    /// write it through and its size — or `None` when it has no such run.
+    /// The run of raw storage this writer *allocated* for the dataset — the
+    /// target to initialise it through and its size — or `None` when it
+    /// allocated none.
     ///
     /// The two storage forms that are one run of bytes: a contiguous
     /// dataset's data block, and an implicitly indexed dataset's chunk grid.
     /// A compact dataset is excluded (its bytes are its layout message) and so
     /// is every other chunk index, whose chunks are placed one at a time.
     ///
-    /// INVARIANT: a write that covers a dataset's whole storage picks its
-    /// destination here, so the external and virtual destinations stay
-    /// reachable only from the storage forms that can have them.
-    fn raw_storage_run(&self) -> Option<(ContiguousTarget, u64)> {
+    /// External storage is excluded because this writer does not allocate it:
+    /// `H5D__alloc_storage` skips its whole body — the space reservation and
+    /// the `H5D__init_storage` that would tile the fill value into it — for a
+    /// dataset with an external file list or an empty extent, "we assume that
+    /// external storage is already allocated by the caller, or at least will
+    /// be before I/O is performed" (H5Dint.c:2270-2274). Measured under
+    /// libhdf5 1.14.6 and 2.0.0: a user fill value, `H5D_FILL_TIME_ALLOC` and
+    /// `H5D_ALLOC_TIME_EARLY` together leave the raw data file uncreated at
+    /// `H5Dcreate2`, and a read before any write fails with "unable to open
+    /// external raw data file" rather than reporting the fill.
+    ///
+    /// INVARIANT: only storage whose bytes this file owns is initialised as
+    /// one run, so the allocate-time fill cannot reach the files an external
+    /// file list names or the sources a virtual dataset maps.
+    fn allocated_storage_run(&self) -> Option<(ContiguousTarget, u64)> {
         match self.implicit_grid() {
             Some((addr, size)) => Some((ContiguousTarget::Local(addr), size)),
             // Not a fallthrough for an unallocated implicit grid:
             // `contiguous_target` answers `None` for every chunked dataset.
-            None => self.contiguous_target().map(|t| (t, self.data_size)),
+            None => match self.contiguous_target() {
+                Some(t @ ContiguousTarget::Local(_)) => Some((t, self.data_size)),
+                _ => None,
+            },
         }
     }
 
@@ -12581,9 +12596,10 @@ impl Hdf5Writer {
                 ));
             } else {
                 // An implicit index's chunk grid is filled as one run, the
-                // same way a contiguous block is; `raw_storage_run` is where
-                // that equivalence is decided.
-                let run = ds.raw_storage_run();
+                // same way a contiguous block is, and storage this file did
+                // not allocate is not filled at all; `allocated_storage_run`
+                // is where both of those are decided.
+                let run = ds.allocated_storage_run();
                 if let Some((target, data_size)) = run.filter(|&(_, size)| size > 0) {
                     let filled = crate::format::messages::fill_value::tiled_fill(
                         data_size as usize,
