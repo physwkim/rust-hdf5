@@ -575,15 +575,105 @@ def external_str(dcpl):
     return "[" + ",".join(parts) + "]"
 
 
-def _bounds_str(sid):
-    try:
-        lo, hi = sid.get_select_bounds()
-    except Exception:
+_H5DUMP_EXTENT_RE = re.compile(r"DATASPACE\s+SIMPLE\s*\{\s*\(([^)]*)\)")
+_H5DUMP_MAPPING_RE = re.compile(r"MAPPING\s+\d+\s*")
+_H5DUMP_TUPLE_RE = re.compile(r"(START|STRIDE|COUNT|BLOCK)\s*\(([^)]*)\)")
+
+
+def _brace_block(text, pos):
+    """Body of the block whose opening brace is the first one at or after
+    `pos`, and the offset just past its close.
+
+    Brace-matched rather than pattern-matched because `h5dump` nests these:
+    a `MAPPING` holds a `VIRTUAL` and a `SOURCE`, each holding a `SELECTION`.
+    """
+    open_at = text.index("{", pos)
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_at + 1 : i], i + 1
+    raise ValueError("unbalanced braces in h5dump output")
+
+
+def _h5dump_mappings(dump):
+    """The body of every `MAPPING n` block, in order."""
+    out = []
+    pos = 0
+    while True:
+        m = _H5DUMP_MAPPING_RE.search(dump, pos)
+        if not m:
+            return out
+        body, pos = _brace_block(dump, m.end())
+        out.append(body)
+
+
+def _h5dump_side(mapping, name):
+    """The `VIRTUAL` or `SOURCE` half of one mapping."""
+    m = re.search(r"\b%s\b\s*" % name, mapping)
+    if not m:
+        return ""
+    return _brace_block(mapping, m.end())[0]
+
+
+def _h5dump_layout(dset):
+    """The `STORAGE_LAYOUT` block `h5dump -p -H` prints for one dataset, and
+    the dataset's own extent, as text.
+
+    The virtual mapping is read from here rather than from the creation
+    property list because libhdf5 2.0 resolves the layout before handing the
+    DCPL back — `H5D__flush_layout_to_dcpl` (H5Dint.c:4086), called from
+    `H5D__get_create_plist` (H5Dint.c:3643) — so `H5Pget_virtual_srcspace`
+    reports the extent the mapping currently resolves to rather than the one
+    the file stores. `h5dump` prints the stored message, and prints it
+    identically under 1.14.6 and 2.1.
+    """
+    proc = subprocess.run(
+        [_tool_bin("h5dump"), "-p", "-H", "-d", dset.name, dset.file.filename],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return proc.stdout
+
+
+def _selection_bounds(text, extent):
+    """The bounds of one `SELECTION` block as `lo-hi`, or `?` when the file
+    does not pin them down.
+
+    `ALL` needs an extent to have bounds at all: the virtual side has one (the
+    dataset's own), the source side does not — the mapping stores a selection
+    and no source extent — so a source `ALL` is `?`, which is what
+    `H5Sget_select_bounds` used to raise on. A hyperslab that runs to
+    `H5S_UNLIMITED` has no upper bound until it is resolved against the files
+    that exist, so it is `?` as well.
+    """
+    if "SELECTION ALL" in text:
+        if extent is None:
+            return "?"
+        return "%s-%s" % (dims_str([0] * len(extent)), dims_str([d - 1 for d in extent]))
+    if "REGULAR_HYPERSLAB" not in text:
         return "?"
-    return "%s-%s" % (dims_str(lo), dims_str(hi))
+    got = {}
+    for name, body in _H5DUMP_TUPLE_RE.findall(text):
+        got[name] = [v.strip() for v in body.split(",")]
+    if set(got) != {"START", "STRIDE", "COUNT", "BLOCK"}:
+        return "?"
+    if any("UNLIMITED" in v for vs in got.values() for v in vs):
+        return "?"
+    start, stride, count, block = (
+        [int(v) for v in got[k]] for k in ("START", "STRIDE", "COUNT", "BLOCK")
+    )
+    hi = [
+        st + sr * (c - 1) + b - 1 for st, sr, c, b in zip(start, stride, count, block)
+    ]
+    return "%s-%s" % (dims_str(start), dims_str(hi))
 
 
-def virtual_str(dcpl):
+def virtual_str(dset, dcpl):
     """Virtual dataset mappings, `-` when the dataset is not virtual."""
     # get_virtual_count() raises on any other layout.
     if not hasattr(h5d, "VIRTUAL") or dcpl.get_layout() != h5d.VIRTUAL:
@@ -591,6 +681,17 @@ def virtual_str(dcpl):
     count = dcpl.get_virtual_count()
     if not count:
         return "-"
+    dump = _h5dump_layout(dset)
+    extent_m = _H5DUMP_EXTENT_RE.search(dump)
+    extent = None
+    if extent_m and extent_m.group(1).strip():
+        extent = [int(v) for v in extent_m.group(1).split(",")]
+    mappings = _h5dump_mappings(dump)
+    if len(mappings) != count:
+        raise ValueError(
+            "h5dump printed %d mappings where the DCPL has %d"
+            % (len(mappings), count)
+        )
     parts = []
     for i in range(count):
         parts.append(
@@ -598,8 +699,8 @@ def virtual_str(dcpl):
             % (
                 esc(dcpl.get_virtual_filename(i)),
                 esc(dcpl.get_virtual_dsetname(i)),
-                _bounds_str(dcpl.get_virtual_srcspace(i)),
-                _bounds_str(dcpl.get_virtual_vspace(i)),
+                _selection_bounds(_h5dump_side(mappings[i], "SOURCE"), None),
+                _selection_bounds(_h5dump_side(mappings[i], "VIRTUAL"), extent),
             )
         )
     return "[" + ",".join(parts) + "]"
@@ -767,7 +868,7 @@ class Dumper:
             self.emit("%s#chunkindex" % path, "-")
 
         self.field(path, "external", lambda: external_str(dcpl))
-        self.field(path, "virtual", lambda: virtual_str(dcpl))
+        self.field(path, "virtual", lambda: virtual_str(dset, dcpl))
         self.field(path, "filters", lambda: filters_str(dset))
         self.field(path, "fillvalue", lambda: self.fill_value(dset, dcpl))
         self.field(path, "filltime", lambda: self.fill_time(dcpl))
