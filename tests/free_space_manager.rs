@@ -418,3 +418,203 @@ fn the_paged_fixture_persists_no_manager_to_rewrite() {
     run(py, &["-c", &script], "h5py read-back and append");
     let _ = std::fs::remove_file(&path);
 }
+
+/// Rewrite a file's version-1 file-space info message as the deprecated
+/// version-0 one, in place.
+///
+/// No writer produces a version-0 message: libhdf5 has encoded version 1 since
+/// 1.10.1 (`H5O_fsinfo_set_version` starts at version 1 and only raises it,
+/// and `H5O_fsinfo_ver_bounds` maps every `libver` bound to version 1 or to
+/// "no such message"), so no `h5py.File(..., libver=...)` call can ask for the
+/// older form. A 1.10.0-written file is the only source of one, and this is
+/// the byte surgery that stands in for it.
+///
+/// The two bodies differ in length — 125 bytes against 58 — so the message the
+/// version-0 one replaces is followed by a NIL message covering the rest of
+/// the space it occupied, which is what libhdf5 itself leaves behind when it
+/// shrinks a message (`H5O__release_mesg`). The chunk keeps its size and the
+/// header's message count goes up by one.
+fn downgrade_fsinfo_to_version_0(path: &std::path::Path) {
+    const FSINFO: u16 = 0x0017;
+    let mut bytes = std::fs::read(path).unwrap();
+    assert_eq!(&bytes[..8], b"\x89HDF\r\n\x1a\n", "not an HDF5 file");
+    assert!(
+        bytes[8] >= 2,
+        "a version-{} superblock has no extension",
+        bytes[8]
+    );
+    let ext = u64::from_le_bytes(bytes[20..28].try_into().unwrap()) as usize;
+    assert_eq!(
+        bytes[ext], 1,
+        "the superblock extension is not a version-1 header"
+    );
+    let nmesgs = u16::from_le_bytes(bytes[ext + 2..ext + 4].try_into().unwrap());
+    let chunk = u32::from_le_bytes(bytes[ext + 8..ext + 12].try_into().unwrap()) as usize;
+
+    let mut pos = ext + 16;
+    let end = pos + chunk;
+    let (at, old_len, flags) = loop {
+        assert!(
+            pos + 8 <= end,
+            "the extension carries no file-space info message"
+        );
+        let msg_type = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+        let len = u16::from_le_bytes(bytes[pos + 2..pos + 4].try_into().unwrap()) as usize;
+        if msg_type == FSINFO {
+            break (pos, len, bytes[pos + 4]);
+        }
+        pos += 8 + len;
+    };
+
+    // The version-1 body, by field: version, strategy, persist, threshold,
+    // page size, page-end metadata threshold, EOA, then twelve addresses.
+    let body = &bytes[at + 8..at + 8 + old_len];
+    assert_eq!(body[0], 1, "the message is already at version {}", body[0]);
+    assert_eq!(body[1], 0, "only the FSM_AGGR strategy predates version 1");
+    assert_eq!(body[2], 1, "this fixture wants a persisting message");
+    let threshold = &body[3..11];
+
+    // The version-0 body: strategy 1 is H5F_FILE_SPACE_ALL_PERSIST, and its
+    // six addresses are the first six of the twelve.
+    let mut v0 = vec![0u8, 1u8];
+    v0.extend_from_slice(threshold);
+    v0.extend_from_slice(&body[29..29 + 6 * 8]);
+    assert_eq!(v0.len(), 58);
+    let v0_padded = 64;
+    let nil_len = old_len - v0_padded - 8;
+
+    let mut spliced = Vec::with_capacity(8 + old_len);
+    spliced.extend_from_slice(&FSINFO.to_le_bytes());
+    spliced.extend_from_slice(&(v0_padded as u16).to_le_bytes());
+    spliced.push(flags);
+    spliced.extend_from_slice(&[0u8; 3]);
+    spliced.extend_from_slice(&v0);
+    spliced.resize(8 + v0_padded, 0);
+    spliced.extend_from_slice(&0u16.to_le_bytes()); // H5O_NULL_ID
+    spliced.extend_from_slice(&(nil_len as u16).to_le_bytes());
+    spliced.resize(8 + v0_padded + 8 + nil_len, 0);
+    assert_eq!(spliced.len(), 8 + old_len);
+
+    bytes[at..at + 8 + old_len].copy_from_slice(&spliced);
+    bytes[ext + 2..ext + 4].copy_from_slice(&(nmesgs + 1).to_le_bytes());
+    std::fs::write(path, &bytes).unwrap();
+}
+
+/// A file carrying the deprecated version-0 file-space info message takes an
+/// append that leaves it a version-0 file.
+///
+/// libhdf5 would upgrade it: `H5O__fsinfo_decode` marks a version-0 message
+/// `mapped`, and `H5F__super_read` then removes it and writes a version-1
+/// replacement on read-write open (H5Fsuper.c:843-885). This crate re-emits
+/// the form it read instead — a file's on-disk format is not this writer's to
+/// change — and the case pins both halves of that: the crate leaves version 0
+/// alone across two appends, and libhdf5 still reads, checks and appends to
+/// what it wrote, upgrading it on its own terms when it does.
+///
+/// The file carries a shared-message table it does not otherwise need, to
+/// steer around a libhdf5 1.14.6 crash that has nothing to do with this crate.
+/// When the version-0 message is the *only* message in the extension,
+/// `H5F__super_ext_remove_msg` finds the chunk all-NULL after taking it out
+/// and calls `H5O_delete` on the extension itself (its `nchunks == 1` branch);
+/// `H5F__super_ext_write_msg` then has to re-create the extension from inside
+/// `H5F__super_read`, where `f->shared` is not yet set up, and segfaults. A
+/// second message keeps the chunk non-empty and the upgrade on the ordinary
+/// path.
+#[test]
+fn an_append_leaves_a_version_zero_file_space_message_at_version_zero() {
+    let Some(py) = python() else { return };
+    let path = tmp("fsinfo_v0");
+    {
+        // The shared-message table is here to keep libhdf5 alive, not
+        // because the case is about it: see the note above on the
+        // empty-extension crash. Everything asserted below is the file-space
+        // message.
+        use rust_hdf5::format::messages::{MSG_DATASPACE, MSG_DATATYPE};
+        use rust_hdf5::format::sohm::type_flag;
+        let types = type_flag(MSG_DATATYPE).unwrap() | type_flag(MSG_DATASPACE).unwrap();
+        let file = H5File::options()
+            .shared_messages(&[(types, 0)], 50, 40)
+            .file_space(FileSpaceStrategy::FsmAggr, true, 1)
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape([64usize])
+            .create("keep")
+            .unwrap()
+            .write_raw(&(0..64i32).collect::<Vec<_>>())
+            .unwrap();
+        file.close().unwrap();
+    }
+    // Managers first, so the version-0 message the surgery leaves behind names
+    // real ones and the reopen below has something to read out of them.
+    crate_appends(&path, "before_downgrade");
+    let v1 = h5stat_space(py, &path);
+    assert!(
+        v1.tracked > 0,
+        "nothing to carry into the older message: {v1:?}"
+    );
+    downgrade_fsinfo_to_version_0(&path);
+
+    let info = H5File::open(&path)
+        .unwrap()
+        .superblock_extension()
+        .file_space_info
+        .expect("the downgraded file still declares its strategy");
+    assert_eq!(info.version, 0);
+    assert_eq!(info.strategy, FileSpaceStrategy::FsmAggr);
+    assert!(info.persist);
+    assert_eq!(
+        H5File::open(&path).unwrap().tracked_free_space().unwrap(),
+        v1.tracked,
+        "the older message lost sight of the managers it names"
+    );
+
+    // Read-only checks only until the appends are done: `h5clear -s` opens
+    // read-write, which is the upgrade the last block below is for.
+    for round in 0..2 {
+        crate_appends(&path, &format!("appended{round}"));
+        let info = H5File::open(&path)
+            .unwrap()
+            .superblock_extension()
+            .file_space_info
+            .expect("the append kept the message");
+        assert_eq!(info.version, 0, "round {round} upgraded the message");
+        assert_eq!(info.strategy, FileSpaceStrategy::FsmAggr);
+        assert!(info.persist);
+        assert_ne!(
+            info.fs_addr[0],
+            u64::MAX,
+            "round {round} left the file with no metadata manager"
+        );
+        let after = h5stat_space(py, &path);
+        assert!(
+            after.tracked > 0,
+            "round {round} recorded nothing: {after:?}"
+        );
+    }
+
+    // libhdf5's turn: it reads the version-0 message, and its own read-write
+    // open rewrites it as version 1 — the upgrade this crate declines to make.
+    h5clear_accepts(py, &path);
+    let script = format!(
+        "import h5py, numpy as np\n\
+         f = h5py.File(r'{}', 'r+')\n\
+         assert list(f['keep'][:]) == list(range(64)), list(f['keep'][:])\n\
+         assert sorted(f.keys()) == ['appended0', 'appended1', 'before_downgrade', 'keep'], \
+sorted(f.keys())\n\
+         f.create_dataset('by_libhdf5', data=np.arange(4, dtype='i4'))\n\
+         f.close()\n",
+        path.display()
+    );
+    run(py, &["-c", &script], "h5py read-back and append");
+    let upgraded = H5File::open(&path)
+        .unwrap()
+        .superblock_extension()
+        .file_space_info
+        .expect("libhdf5 kept the message");
+    assert_eq!(
+        upgraded.version, 1,
+        "libhdf5 no longer upgrades a mapped file-space info message"
+    );
+    let _ = std::fs::remove_file(&path);
+}

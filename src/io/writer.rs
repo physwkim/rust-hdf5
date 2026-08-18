@@ -42,7 +42,8 @@ use crate::format::messages::group_info::GroupInfoMessage;
 use crate::format::messages::link::{CharacterSet, LinkMessage, LinkTarget};
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::superblock_ext::{
-    FileSpaceInfoMessage, FileSpaceStrategy, SharedMessageTableMessage, FS_ADDR_COUNT_V1,
+    FileSpaceInfoMessage, FileSpaceStrategy, SharedMessageTableMessage,
+    DEFAULT_FILE_SPACE_PAGE_SIZE, FS_ADDR_COUNT_V1,
 };
 use crate::format::messages::virtual_mapping::{VirtualMapping, VirtualMappingList};
 use crate::format::messages::*;
@@ -3856,6 +3857,9 @@ impl FileSpaceConfig {
     /// which is what `H5F__super_init` writes (H5Fsuper.c:1369-1382).
     fn message(&self) -> FileSpaceInfoMessage {
         FileSpaceInfoMessage {
+            // `H5O_fsinfo_set_version` starts at version 1 and only ever
+            // raises it, so a created file never carries the version-0 form
+            // however low its version bounds are.
             version: 1,
             strategy: self.strategy,
             persist: self.persist,
@@ -3863,17 +3867,10 @@ impl FileSpaceConfig {
             page_size: DEFAULT_FILE_SPACE_PAGE_SIZE,
             pgend_meta_thres: 0,
             eoa_pre_fsm_fsalloc: UNDEF_ADDR,
-            fs_addr: if self.persist {
-                vec![UNDEF_ADDR; FS_ADDR_COUNT_V1]
-            } else {
-                Vec::new()
-            },
+            fs_addr: vec![UNDEF_ADDR; FS_ADDR_COUNT_V1],
         }
     }
 }
-
-/// `H5F_FILE_SPACE_PAGE_SIZE_DEF` (H5Fprivate.h:335).
-const DEFAULT_FILE_SPACE_PAGE_SIZE: u64 = 4096;
 
 /// The shared object header message indexes a new file is created with.
 ///
@@ -8675,7 +8672,7 @@ impl Hdf5Writer {
             return Ok(None);
         };
         if !fs.records_free_space() {
-            return Ok(Some(fs.info.encode(&self.ctx)));
+            return Ok(Some(fs.info.encode(&self.ctx)?));
         }
         // The managers a reopen found are superseded whole by the ones below,
         // so their blocks go back before the section set is taken: the space
@@ -8770,7 +8767,7 @@ impl Hdf5Writer {
         // just written are not part of it.
         self.allocator.reset_free_list(&remaining);
         info.eoa_pre_fsm_fsalloc = self.allocator.eof();
-        Ok(Some(info.encode(&self.ctx)))
+        Ok(Some(info.encode(&self.ctx)?))
     }
 
     /// Choose where each manager's own two blocks go, given the sections they
@@ -8908,14 +8905,12 @@ impl Hdf5Writer {
         if let Some(fs) = self.free_space.as_deref() {
             // The declared message, at exactly the length the one written
             // below will have — every field of it is fixed-width, and only
-            // `persist` changes the count of addresses. The image is sized and
-            // its block allocated before the managers can be laid out, so the
-            // message has to reach its final *length* here even though its
-            // content is settled later. This is also what makes a file
-            // carrying the deprecated version-0 message come back as the
-            // version-1 one libhdf5 rewrites it to (H5Fsuper.c:868-880), whose
-            // body is longer than the one read.
-            let declared = fs.info.encode(&self.ctx);
+            // `persist` and the message version change the count of
+            // addresses, neither of which the close alters. The image is sized
+            // and its block allocated before the managers can be laid out, so
+            // the message has to reach its final *length* here even though its
+            // content is settled later.
+            let declared = fs.info.encode(&self.ctx)?;
             match messages
                 .iter_mut()
                 .find(|m| m.msg_type == MSG_FILE_SPACE_INFO)

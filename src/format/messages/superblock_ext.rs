@@ -156,6 +156,18 @@ impl FileSpaceStrategy {
             other => Self::Unknown(other),
         }
     }
+
+    /// The `H5F_fspace_strategy_t` value, the inverse of
+    /// [`from_byte`](Self::from_byte).
+    fn to_byte(self) -> u8 {
+        match self {
+            Self::FsmAggr => 0,
+            Self::Page => 1,
+            Self::Aggr => 2,
+            Self::None => 3,
+            Self::Unknown(b) => b,
+        }
+    }
 }
 
 /// Number of page-type free-space managers whose addresses a persisting
@@ -163,21 +175,39 @@ impl FileSpaceStrategy {
 pub const FS_ADDR_COUNT_V1: usize = 12;
 
 /// Number of memory-type free-space managers a persisting version-0 message
-/// stores (`H5FD_MEM_SUPER` .. `H5FD_MEM_OHDR`).
+/// stores (`H5FD_MEM_SUPER` .. `H5FD_MEM_OHDR`). They are the first six of
+/// the twelve slots, which is why the same array serves both encodings.
 const FS_ADDR_COUNT_V0: usize = 6;
 
 /// Maximum file-space page size libhdf5 accepts (`H5F_FILE_SPACE_PAGE_SIZE_MAX`).
 const PAGE_SIZE_MAX: u64 = 1024 * 1024 * 1024;
 
+/// `H5F_FILE_SPACE_PAGE_SIZE_DEF` (H5Fprivate.h:335) — the page size a file
+/// gets when nothing says otherwise, which is also the one the version-0
+/// encoding implies.
+pub(crate) const DEFAULT_FILE_SPACE_PAGE_SIZE: u64 = 4096;
+
 /// File-space info message (0x0017) — `H5Ofsinfo.c`.
 ///
-/// The version-0 form is the deprecated 1.10.0 encoding; like upstream, it is
-/// mapped onto the version-1 fields on decode, so a consumer only ever sees
-/// one shape.
+/// The version-0 form is the deprecated 1.10.0 encoding. Its four strategy
+/// values are mapped onto the version-1 `strategy`/`persist`/`threshold`
+/// fields on decode (`H5O__fsinfo_decode`), so every consumer of this struct
+/// sees one shape whatever the file carries.
+///
+/// What decode does *not* discard is which encoding the file used:
+/// [`version`](Self::version) keeps it and [`encode`](Self::encode) re-emits
+/// at that version, so appending to a version-0 file leaves it a version-0
+/// file. Upstream instead upgrades — `H5O__fsinfo_encode` has no version-0
+/// branch, and `H5F__super_read` removes a mapped message and writes a
+/// version-1 replacement on read-write open (H5Fsuper.c:843-885) — which is a
+/// format change this crate has no reason to make on the user's behalf, and
+/// which libhdf5 will still make on its own next open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSpaceInfoMessage {
-    /// Message version as normalized by decode: always 1, even for a file
-    /// carrying the deprecated version-0 encoding.
+    /// The encoding this message uses on disk: 0 for the deprecated 1.10.0
+    /// form, 1 for the current one. Decode records what it read and encode
+    /// writes that same form back; nothing else in the crate branches on it,
+    /// because decode has already normalized the fields below.
     pub version: u8,
     /// File-space handling strategy.
     pub strategy: FileSpaceStrategy,
@@ -191,8 +221,16 @@ pub struct FileSpaceInfoMessage {
     pub pgend_meta_thres: u16,
     /// End-of-address before free-space header/section allocation.
     pub eoa_pre_fsm_fsalloc: u64,
-    /// Addresses of the persisted free-space managers, empty when `persist`
-    /// is false.
+    /// Addresses of the free-space managers, indexed by
+    /// [`FreeSpaceClass::message_slot`](crate::format::free_space::FreeSpaceClass::message_slot).
+    ///
+    /// Always [`FS_ADDR_COUNT_V1`] entries, undefined where there is no
+    /// manager — including for a non-persisting message, which stores none of
+    /// them, and for a version-0 message, which stores only the first
+    /// [`FS_ADDR_COUNT_V0`]. Upstream keeps the same full-width array for the
+    /// same reason (`H5O__fsinfo_decode` fills all twelve with `HADDR_UNDEF`
+    /// before reading any): a caller indexes a slot without first asking which
+    /// encoding the slot came from.
     pub fs_addr: Vec<u64>,
 }
 
@@ -228,22 +266,30 @@ impl FileSpaceInfoMessage {
                 }
             };
 
-            let mut fs_addr = Vec::new();
+            // The six memory-type managers this encoding knows land in the
+            // first six of the twelve slots; the rest stay undefined.
+            let mut fs_addr = vec![crate::format::UNDEF_ADDR; FS_ADDR_COUNT_V1];
             if persist {
                 need(buf, pos + FS_ADDR_COUNT_V0 * sa)?;
-                for _ in 0..FS_ADDR_COUNT_V0 {
-                    fs_addr.push(read_uint(&buf[pos..], sa));
+                for slot in fs_addr.iter_mut().take(FS_ADDR_COUNT_V0) {
+                    *slot = read_uint(&buf[pos..], sa);
                     pos += sa;
                 }
             }
 
             return Ok(Self {
-                version: 1,
+                version: 0,
                 strategy,
                 persist,
                 threshold,
-                // Defaults the version-0 encoding does not carry.
-                page_size: 4096,
+                // Values the version-0 encoding does not carry, set to the
+                // library defaults `H5O__fsinfo_decode` gives them. The one
+                // that is not a constant is `eoa_pre_fsm_fsalloc`, which
+                // upstream fills with the file's current end of allocation:
+                // the field means "end of allocation before the managers were
+                // laid out", and a file that never recorded one has no
+                // narrower answer than the whole file.
+                page_size: DEFAULT_FILE_SPACE_PAGE_SIZE,
                 pgend_meta_thres: 0,
                 eoa_pre_fsm_fsalloc: crate::format::UNDEF_ADDR,
                 fs_addr,
@@ -273,11 +319,11 @@ impl FileSpaceInfoMessage {
         let eoa_pre_fsm_fsalloc = read_uint(&buf[pos..], sa);
         pos += sa;
 
-        let mut fs_addr = Vec::new();
+        let mut fs_addr = vec![crate::format::UNDEF_ADDR; FS_ADDR_COUNT_V1];
         if persist {
             need(buf, pos + FS_ADDR_COUNT_V1 * sa)?;
-            for _ in 0..FS_ADDR_COUNT_V1 {
-                fs_addr.push(read_uint(&buf[pos..], sa));
+            for slot in fs_addr.iter_mut() {
+                *slot = read_uint(&buf[pos..], sa);
                 pos += sa;
             }
         }
@@ -293,24 +339,21 @@ impl FileSpaceInfoMessage {
             fs_addr,
         })
     }
-    /// Encode the message body at version 1 (`H5O__fsinfo_encode`).
+    /// Encode the message body at the version it was decoded at
+    /// (`H5O__fsinfo_encode`, plus the version-0 layout upstream only reads).
     ///
-    /// Version 1 only: the version-0 form is the deprecated 1.10.0 encoding
-    /// that [`decode`](Self::decode) maps onto these fields, and re-emitting a
-    /// file's version-0 message as version 1 would change its length and the
-    /// number of manager addresses it carries.
-    pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
+    /// Fails only for a version-0 message carrying something that encoding
+    /// cannot express, which decode cannot produce and only a caller that
+    /// edited the message can reach — see [`encode_v0`](Self::encode_v0).
+    pub fn encode(&self, ctx: &FormatContext) -> FormatResult<Vec<u8>> {
+        if self.version == 0 {
+            return self.encode_v0(ctx);
+        }
         let sa = ctx.sizeof_addr as usize;
         let ss = ctx.sizeof_size as usize;
-        let mut buf = Vec::with_capacity(3 + 2 * ss + 2 + sa + self.fs_addr.len() * sa);
+        let mut buf = Vec::with_capacity(3 + 2 * ss + 2 + sa + FS_ADDR_COUNT_V1 * sa);
         buf.push(1);
-        buf.push(match self.strategy {
-            FileSpaceStrategy::FsmAggr => 0,
-            FileSpaceStrategy::Page => 1,
-            FileSpaceStrategy::Aggr => 2,
-            FileSpaceStrategy::None => 3,
-            FileSpaceStrategy::Unknown(b) => b,
-        });
+        buf.push(self.strategy.to_byte());
         buf.push(self.persist as u8);
         buf.extend_from_slice(&self.threshold.to_le_bytes()[..ss]);
         buf.extend_from_slice(&self.page_size.to_le_bytes()[..ss]);
@@ -321,7 +364,78 @@ impl FileSpaceInfoMessage {
                 buf.extend_from_slice(&addr.to_le_bytes()[..sa]);
             }
         }
-        buf
+        Ok(buf)
+    }
+
+    /// Encode the deprecated 1.10.0 body, the inverse of what
+    /// `H5O__fsinfo_decode`'s version-0 branch reads.
+    ///
+    /// Upstream has no such encoder: it decodes version 0, marks the message
+    /// `mapped`, and rewrites it as version 1 on the next read-write open
+    /// (H5Fsuper.c:866-880). This crate re-emits instead, so appending to a
+    /// version-0 file does not silently change its on-disk format — but that
+    /// is only sound while every field still fits, so the ones the encoding
+    /// cannot hold are checked rather than assumed:
+    ///
+    /// * `strategy`/`persist` must be one of the four `H5F_file_space_type_t`
+    ///   combinations; paged aggregation postdates this encoding.
+    /// * `threshold` is stored only for the two `FSM_AGGR` values; the other
+    ///   two are decoded as 1 and must still be 1.
+    /// * the managers past the sixth must be undefined, there being no slot
+    ///   for them.
+    ///
+    /// `page_size`, `pgend_meta_thres` and `eoa_pre_fsm_fsalloc` are *not*
+    /// checked, because the version-0 encoding never carried them: decode
+    /// synthesizes all three, and the next decode synthesizes them again from
+    /// the same rule. Writing back the first two would be writing back
+    /// constants; the third is re-derived from the file's end of allocation,
+    /// which is the value it would have anyway.
+    pub fn encode_v0(&self, ctx: &FormatContext) -> FormatResult<Vec<u8>> {
+        let sa = ctx.sizeof_addr as usize;
+        let ss = ctx.sizeof_size as usize;
+        // The inverse of the version-0 branch's strategy mapping.
+        let legacy = match (self.strategy, self.persist) {
+            (FileSpaceStrategy::FsmAggr, true) => 1,
+            (FileSpaceStrategy::FsmAggr, false) => 2,
+            (FileSpaceStrategy::Aggr, false) => 3,
+            (FileSpaceStrategy::None, false) => 4,
+            (strategy, persist) => {
+                return Err(FormatError::InvalidData(format!(
+                    "strategy {strategy:?} with persist {persist} has no version-0 \
+                     file-space info encoding"
+                )))
+            }
+        };
+        if legacy > 2 && self.threshold != 1 {
+            return Err(FormatError::InvalidData(format!(
+                "version-0 file-space strategy {legacy} cannot carry threshold {}",
+                self.threshold
+            )));
+        }
+        if self.fs_addr.len() > FS_ADDR_COUNT_V0
+            && self.fs_addr[FS_ADDR_COUNT_V0..]
+                .iter()
+                .any(|&a| a != crate::format::UNDEF_ADDR)
+        {
+            return Err(FormatError::InvalidData(
+                "a version-0 file-space info message has no slot for a page-type \
+                 free-space manager"
+                    .into(),
+            ));
+        }
+
+        let mut buf = Vec::with_capacity(2 + ss + FS_ADDR_COUNT_V0 * sa);
+        buf.push(0);
+        buf.push(legacy);
+        buf.extend_from_slice(&self.threshold.to_le_bytes()[..ss]);
+        if self.persist {
+            let undef = [crate::format::UNDEF_ADDR];
+            for slot in 0..FS_ADDR_COUNT_V0 {
+                let addr = self.fs_addr.get(slot).unwrap_or(&undef[0]);
+                buf.extend_from_slice(&addr.to_le_bytes()[..sa]);
+            }
+        }
+        Ok(buf)
     }
 }
 
@@ -457,7 +571,7 @@ mod tests {
         assert_eq!(m.strategy, FileSpaceStrategy::Page);
         assert!(!m.persist);
         assert_eq!(m.page_size, 4096);
-        assert!(m.fs_addr.is_empty());
+        assert!(m.fs_addr.iter().all(|&a| a == crate::format::UNDEF_ADDR));
     }
 
     #[test]
@@ -480,19 +594,24 @@ mod tests {
     }
 
     #[test]
-    fn fsinfo_v0_all_persist_maps_to_v1() {
+    fn fsinfo_v0_all_persist_maps_onto_the_version_one_fields() {
         let mut buf = vec![0u8, 1u8];
         buf.extend_from_slice(&7u64.to_le_bytes()); // threshold
         for i in 0..FS_ADDR_COUNT_V0 {
             buf.extend_from_slice(&(0x100u64 + i as u64).to_le_bytes());
         }
         let m = FileSpaceInfoMessage::decode(&buf, &ctx()).unwrap();
-        assert_eq!(m.version, 1);
+        assert_eq!(m.version, 0);
         assert_eq!(m.strategy, FileSpaceStrategy::FsmAggr);
         assert!(m.persist);
         assert_eq!(m.threshold, 7);
-        assert_eq!(m.fs_addr.len(), FS_ADDR_COUNT_V0);
+        // Twelve slots whatever the encoding: the six the version-0 body
+        // carries, then the page-type ones it has no room for.
+        assert_eq!(m.fs_addr.len(), FS_ADDR_COUNT_V1);
         assert_eq!(m.fs_addr[5], 0x105);
+        assert!(m.fs_addr[FS_ADDR_COUNT_V0..]
+            .iter()
+            .all(|&a| a == crate::format::UNDEF_ADDR));
     }
 
     #[test]
@@ -502,7 +621,94 @@ mod tests {
         let m = FileSpaceInfoMessage::decode(&buf, &ctx()).unwrap();
         assert_eq!(m.strategy, FileSpaceStrategy::None);
         assert!(!m.persist);
-        assert!(m.fs_addr.is_empty());
+        assert!(m.fs_addr.iter().all(|&a| a == crate::format::UNDEF_ADDR));
+    }
+
+    /// The four version-0 bodies, hand-built: every `H5F_file_space_type_t`
+    /// value `H5O__fsinfo_decode` accepts. No writer produces these — libhdf5
+    /// has emitted version 1 since 1.10.1 and h5py cannot ask for the older
+    /// form at any `libver` bound — so a byte fixture is the only way to
+    /// exercise the path a 1.10.0-written file takes.
+    fn fsinfo_v0(legacy: u8, threshold: u64) -> Vec<u8> {
+        let mut buf = vec![0u8, legacy];
+        buf.extend_from_slice(&threshold.to_le_bytes());
+        if legacy == 1 {
+            for i in 0..FS_ADDR_COUNT_V0 {
+                buf.extend_from_slice(&(0x400u64 + 0x40 * i as u64).to_le_bytes());
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn fsinfo_v0_round_trips_as_version_zero() {
+        for (legacy, threshold) in [(1u8, 9u64), (2, 9), (3, 1), (4, 1)] {
+            let bytes = fsinfo_v0(legacy, threshold);
+            let m = FileSpaceInfoMessage::decode(&bytes, &ctx()).unwrap();
+            assert_eq!(m.version, 0, "strategy {legacy}");
+            assert_eq!(
+                m.encode(&ctx()).unwrap(),
+                bytes,
+                "strategy {legacy} did not re-emit the body it was read from"
+            );
+        }
+    }
+
+    #[test]
+    fn a_version_zero_message_re_emits_a_moved_manager() {
+        // What an append does to the message: the managers move, and nothing
+        // else about it changes.
+        let mut m = FileSpaceInfoMessage::decode(&fsinfo_v0(1, 9), &ctx()).unwrap();
+        m.fs_addr[0] = 0x2000;
+        m.fs_addr[2] = 0x3000;
+        m.eoa_pre_fsm_fsalloc = 0x9000;
+        let bytes = m.encode(&ctx()).unwrap();
+        assert_eq!(bytes.len(), fsinfo_v0(1, 9).len());
+        let again = FileSpaceInfoMessage::decode(&bytes, &ctx()).unwrap();
+        assert_eq!(again.fs_addr[0], 0x2000);
+        assert_eq!(again.fs_addr[2], 0x3000);
+        // The one field the older encoding cannot carry: decode synthesizes it
+        // from the file's end of allocation, as `H5O__fsinfo_decode` does.
+        assert_eq!(again.eoa_pre_fsm_fsalloc, crate::format::UNDEF_ADDR);
+        assert_eq!(
+            FileSpaceInfoMessage {
+                eoa_pre_fsm_fsalloc: m.eoa_pre_fsm_fsalloc,
+                ..again
+            },
+            m
+        );
+    }
+
+    #[test]
+    fn fsinfo_v0_refuses_what_it_cannot_encode() {
+        let paged = FileSpaceInfoMessage::decode(&fsinfo_v1(true), &ctx()).unwrap();
+        assert!(matches!(
+            paged.encode_v0(&ctx()).unwrap_err(),
+            FormatError::InvalidData(_)
+        ));
+
+        let mut aggr = FileSpaceInfoMessage::decode(&fsinfo_v0(3, 1), &ctx()).unwrap();
+        aggr.threshold = 64;
+        assert!(matches!(
+            aggr.encode(&ctx()).unwrap_err(),
+            FormatError::InvalidData(_)
+        ));
+
+        let mut paged_manager = FileSpaceInfoMessage::decode(&fsinfo_v0(1, 9), &ctx()).unwrap();
+        paged_manager.fs_addr[FS_ADDR_COUNT_V0] = 0x800;
+        assert!(matches!(
+            paged_manager.encode(&ctx()).unwrap_err(),
+            FormatError::InvalidData(_)
+        ));
+    }
+
+    #[test]
+    fn fsinfo_v1_round_trips() {
+        for persist in [false, true] {
+            let bytes = fsinfo_v1(persist);
+            let m = FileSpaceInfoMessage::decode(&bytes, &ctx()).unwrap();
+            assert_eq!(m.encode(&ctx()).unwrap(), bytes);
+        }
     }
 
     #[test]
