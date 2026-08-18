@@ -32,10 +32,10 @@ use rust_hdf5::format::messages::filter::{
 };
 use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::{
-    AllocTime, AttributeStorage, ChunkIndex, CreationOrder, ExternalFileSegment, FillTime,
-    FillValue, H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype, Hdf5Error,
-    Hyperslab, HyperslabBlock, LibverBound, LinkClass, LinkStorage, Reference, Selection,
-    StorageLayout, VirtualMapping,
+    AllocTime, AttributeStorage, ChunkIndex, CreationOrder, DatasetAccess, ExternalFileSegment,
+    FillTime, FillValue, H5Attribute, H5Dataset, H5File, H5FileOptions, H5Group, H5NamedDatatype,
+    Hdf5Error, Hyperslab, HyperslabBlock, LibverBound, LinkClass, LinkStorage, Reference,
+    Selection, StorageLayout, VirtualMapping, VirtualView,
 };
 use rust_hdf5::{FileSpaceInfoMessage, FileSpaceStrategy};
 
@@ -440,9 +440,17 @@ fn renders_as_values(dt: &DatatypeMessage) -> bool {
 /// the target's path, plus the selection's bounding box for a region
 /// reference. An address the reader could not name is printed as the address,
 /// which compares unequal to h5py's path — a difference, not a silent match.
+///
+/// A reference naming another file prints that file ahead of the path, the way
+/// `h5dump` joins the two. No oracle case can reach it: h5py refuses the
+/// `H5T_STD_REF` datatype an external reference is always stored as.
 fn render_ref(r: &Reference) -> String {
-    fn target(path: &Option<String>, address: u64) -> String {
-        path.clone().unwrap_or_else(|| format!("<{address:#x}>"))
+    fn target(file: &Option<String>, path: &Option<String>, address: u64) -> String {
+        let named = path.clone().unwrap_or_else(|| format!("<{address:#x}>"));
+        match file {
+            None => named,
+            Some(file) => format!("{file}{named}"),
+        }
     }
     fn coords(dims: &[u64]) -> String {
         let parts: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
@@ -450,27 +458,33 @@ fn render_ref(r: &Reference) -> String {
     }
     match r {
         Reference::Null => "objref:null".to_string(),
-        Reference::Object { address, path } => format!("objref:{}", target(path, *address)),
+        Reference::Object {
+            address,
+            file,
+            path,
+        } => format!("objref:{}", target(file, path, *address)),
         Reference::Region {
             address,
+            file,
             path,
             selection,
         } => match selection.bounds() {
             Some((lo, hi)) => format!(
                 "regref:{}:{}-{}",
-                target(path, *address),
+                target(file, path, *address),
                 coords(&lo),
                 coords(&hi)
             ),
-            None => format!("regref:{}:unbounded", target(path, *address)),
+            None => format!("regref:{}:unbounded", target(file, path, *address)),
         },
         // No h5py-generated case can reach this arm: h5py 3.x refuses the
         // `H5T_STD_REF` datatype an attribute reference needs.
         Reference::Attr {
             address,
+            file,
             path,
             name,
-        } => format!("attrref:{}:{name}", target(path, *address)),
+        } => format!("attrref:{}:{name}", target(file, path, *address)),
     }
 }
 
@@ -623,11 +637,18 @@ fn guarded<T>(f: impl FnOnce() -> T) -> std::result::Result<T, String> {
 
 struct Dump {
     lines: Vec<String>,
+    /// The dataset-access properties every dataset in this walk is opened
+    /// under — the twin of `canon.py`'s `Dumper.dapl`. Defaults to libhdf5's
+    /// own defaults, which is `H5Dopen2` with `H5P_DEFAULT`.
+    access: DatasetAccess,
 }
 
 impl Dump {
-    fn new() -> Self {
-        Self { lines: Vec::new() }
+    fn new(access: DatasetAccess) -> Self {
+        Self {
+            lines: Vec::new(),
+            access,
+        }
     }
 
     fn emit(&mut self, key: &str, value: impl AsRef<str>) {
@@ -672,8 +693,8 @@ fn child_path(parent: &str, name: &str) -> String {
     }
 }
 
-fn dump_file(path: &str) -> std::result::Result<String, String> {
-    let mut d = Dump::new();
+fn dump_file(path: &str, access: DatasetAccess) -> std::result::Result<String, String> {
+    let mut d = Dump::new(access);
     d.emit("!canon", CANON_VERSION);
 
     let file = match guarded(|| H5File::open(path)) {
@@ -925,7 +946,8 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
             },
             Child::Dataset => {
                 let lookup = cpath.trim_start_matches('/').to_string();
-                match guarded(|| file.dataset(&lookup)) {
+                let access = d.access;
+                match guarded(|| file.dataset_with(&lookup, access)) {
                     Ok(Ok(ds)) => dump_dataset(d, &cpath, &ds),
                     Ok(Err(e)) => {
                         d.emit(&format!("{cpath}#kind"), unsupported("kind", &oneline(e)))
@@ -2110,6 +2132,76 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "vds_printf_gap" => {
+            // Blocks 0, 1 and 3: what the reader makes of the hole at 2 is
+            // the dataset access properties' business, not the file's.
+            let stem = std::path::Path::new(path)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            for b in [0u64, 1, 3] {
+                let block = std::path::Path::new(path).with_file_name(format!("{stem}_b{b}.h5"));
+                let src = earliest_file(block.to_string_lossy().as_ref())?;
+                src.new_dataset::<i32>()
+                    .shape([4usize])
+                    .create("data")?
+                    .write_raw(&(0..4i32).map(|i| i + 10 * b as i32).collect::<Vec<_>>())?;
+                src.close()?;
+            }
+            let unlim_rows = Selection::Hyperslab {
+                rank: 2,
+                form: Hyperslab::Regular(rust_hdf5::RegularHyperslab {
+                    start: vec![0, 0],
+                    stride: vec![1, 1],
+                    count: vec![rust_hdf5::format::selection::UNLIMITED, 1],
+                    block: vec![1, 4],
+                }),
+            };
+            let file = earliest_file(path)?;
+            file.new_dataset::<i32>()
+                .shape([1usize, 4])
+                .max_shape(&[None, Some(4)])
+                .fill_value(-7i32)
+                .virtual_mapping(
+                    unlim_rows,
+                    &format!("{stem}_b%b.h5"),
+                    "data",
+                    Selection::All,
+                )
+                .create("vds")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "vds_view_trail" => {
+            // Stride 3 over blocks of 2, so the third source row is followed
+            // by a gap: whether the extent stops before it or runs on to
+            // where the next block would start is the view's business.
+            let strided = || Selection::Hyperslab {
+                rank: 2,
+                form: Hyperslab::Regular(rust_hdf5::RegularHyperslab {
+                    start: vec![0, 0],
+                    stride: vec![3, 1],
+                    count: vec![rust_hdf5::format::selection::UNLIMITED, 1],
+                    block: vec![2, 2],
+                }),
+            };
+            let file = earliest_file(path)?;
+            file.new_dataset::<i32>()
+                .shape([3usize, 2])
+                .max_shape(&[None, Some(2)])
+                .chunk(&[1, 2])
+                .create("src")?
+                .write_raw(&ramp_n::<i32>(6))?;
+            file.new_dataset::<i32>()
+                .shape([1usize, 2])
+                .max_shape(&[None, Some(2)])
+                .fill_value(-9i32)
+                .virtual_mapping(strided(), ".", "/src", strided())
+                .create("vds")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "layout_contiguous_v108" => layout_at_libver(path, LibverBound::V18, None),
         "layout_contiguous_v110" => layout_at_libver(path, LibverBound::V110, None),
         "layout_chunked_v108" => layout_at_libver(path, LibverBound::V18, Some(&[16])),
@@ -2974,9 +3066,36 @@ fn layout_at_libver(
 // ===========================================================================
 
 fn usage() -> i32 {
-    eprintln!("usage: oracle_probe dump <file.h5>");
+    eprintln!(
+        "usage: oracle_probe dump [--virtual-view first_missing|last_available] \
+         [--printf-gap N] <file.h5>"
+    );
     eprintln!("       oracle_probe write <case> <file.h5>");
     64
+}
+
+/// `dump`'s arguments: the file, plus the dataset-access properties the
+/// canonical dump opens every dataset under — the twin of `canon.py`'s
+/// `--virtual-view` / `--printf-gap`.
+fn parse_dump_args(args: &[String]) -> Option<(String, DatasetAccess)> {
+    let mut path = None;
+    let mut access = DatasetAccess::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--virtual-view" => {
+                access = access.virtual_view(match it.next()?.as_str() {
+                    "first_missing" => VirtualView::FirstMissing,
+                    "last_available" => VirtualView::LastAvailable,
+                    _ => return None,
+                })
+            }
+            "--printf-gap" => access = access.virtual_printf_gap(it.next()?.parse().ok()?),
+            _ if path.is_none() => path = Some(arg.clone()),
+            _ => return None,
+        }
+    }
+    Some((path?, access))
 }
 
 fn main() {
@@ -2986,15 +3105,18 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let code = match args.get(1).map(String::as_str) {
-        Some("dump") if args.len() == 3 => match dump_file(&args[2]) {
-            Ok(text) => {
-                print!("{text}");
-                0
-            }
-            Err(e) => {
-                println!("!open-error\t{e}");
-                1
-            }
+        Some("dump") => match parse_dump_args(&args[2..]) {
+            Some((path, access)) => match dump_file(&path, access) {
+                Ok(text) => {
+                    print!("{text}");
+                    0
+                }
+                Err(e) => {
+                    println!("!open-error\t{e}");
+                    1
+                }
+            },
+            None => usage(),
         },
         Some("write") if args.len() == 4 => {
             let outcome = guarded(|| write_case(&args[2], &args[3]));

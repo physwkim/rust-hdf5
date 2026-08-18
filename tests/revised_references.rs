@@ -13,6 +13,14 @@
 //!
 //! That h5py blind spot is also why the write case is judged by `h5dump`,
 //! which dereferences an `H5T_STD_REF` element and prints what it names.
+//!
+//! `ext_refs.h5` and `ext_ref_target.h5`, from
+//! `tests/fixtures/gen_external_refs.c`, are the same three kinds written
+//! across files, which is the only way to make libhdf5 set `H5R_IS_EXTERNAL`
+//! and record a file name. `h5dump` is the witness there too: run from the
+//! package root it resolves every one of them, run from anywhere else it
+//! prints the file name and `UNKNOWN`, because the name is used verbatim
+//! against the working directory.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -416,6 +424,101 @@ fn revised_reference_writes_refuse_what_h5r_refuses() {
         Reference::Null,
         "the second element was never written"
     );
+    drop(file);
+    cleanup(&path);
+}
+
+/// The name an external reference in `ext_refs.h5` carries, and the path the
+/// fixture pair is read back by. `H5R__reopen_file` opens the name a reference
+/// carries verbatim against the process working directory, with no prefix
+/// search of any kind (H5Rint.c:466, :487), so the target has to be where the
+/// generator created it: `tests/fixtures/`, relative to the package root Cargo
+/// runs a test binary in.
+const EXT_TARGET: &str = "tests/fixtures/ext_ref_target.h5";
+
+/// The holder file, whose three datasets reference into `EXT_TARGET`.
+const EXT_HOLDER: &str = "tests/fixtures/ext_refs.h5";
+
+/// All three 1.12 kinds cross files, and each names the file it crosses into
+/// as well as the path inside it.
+#[test]
+fn external_references_name_the_file_they_cross_into() {
+    let file = H5File::open(EXT_HOLDER).unwrap();
+
+    let objs = file
+        .dataset("extobjrefs")
+        .unwrap()
+        .read_references()
+        .unwrap();
+    assert_eq!(
+        objs.iter().map(Reference::file).collect::<Vec<_>>(),
+        vec![Some(EXT_TARGET), Some(EXT_TARGET)]
+    );
+    assert_eq!(
+        objs.iter().map(Reference::path).collect::<Vec<_>>(),
+        vec![Some("/matrix"), Some("/grp")]
+    );
+
+    let regs = file
+        .dataset("extregrefs")
+        .unwrap()
+        .read_references()
+        .unwrap();
+    assert_eq!(regs[0].file(), Some(EXT_TARGET));
+    assert_eq!(regs[0].path(), Some("/matrix"));
+    assert_eq!(regs[0].bounds(), Some((vec![1, 2], vec![2, 4])));
+
+    let attrs = file
+        .dataset("extattrrefs")
+        .unwrap()
+        .read_references()
+        .unwrap();
+    assert_eq!(attrs[0].file(), Some(EXT_TARGET));
+    assert_eq!(attrs[0].path(), Some("/matrix"));
+    assert_eq!(attrs[0].attribute_name(), Some("note"));
+
+    // The three together reach the value: open the file the reference names,
+    // then the path and attribute name inside it.
+    let target = H5File::open(attrs[0].file().unwrap()).unwrap();
+    let matrix = target
+        .dataset(attrs[0].path().unwrap().trim_start_matches('/'))
+        .unwrap();
+    let note = matrix.attr(attrs[0].attribute_name().unwrap()).unwrap();
+    assert_eq!(note.read_numeric_as::<i32>().unwrap(), vec![7, 8, 9]);
+}
+
+/// A reference whose file is not there still says which file it wanted.
+///
+/// `H5Rget_file_name` answers from the reference alone and needs no open,
+/// while `H5Ropen_object` fails (H5R.c:1036-1039) — which is what `h5dump`
+/// prints as `UNKNOWN "<the file name>"` for this same file.
+#[test]
+fn an_external_reference_to_an_absent_file_still_names_it() {
+    // The fixture with its file name pointed at a name nothing is under. The
+    // replacement is the same length, so nothing else in the file moves, and
+    // the heap the name sits in carries no checksum to invalidate.
+    let (was, now) = (b"ext_ref_target.h5", b"ext_ref_absent.h5");
+    let mut bytes = std::fs::read(EXT_HOLDER).unwrap();
+    let mut hits = 0;
+    for at in 0..bytes.len() - was.len() {
+        if &bytes[at..at + was.len()] == was {
+            bytes[at..at + now.len()].copy_from_slice(now);
+            hits += 1;
+        }
+    }
+    assert_eq!(hits, 4, "one name per reference in the fixture");
+    let path = write_path("ext_absent");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let file = H5File::open(&path).unwrap();
+    let refs = file
+        .dataset("extobjrefs")
+        .unwrap()
+        .read_references()
+        .unwrap();
+    assert_eq!(refs[0].file(), Some("tests/fixtures/ext_ref_absent.h5"));
+    assert_eq!(refs[0].path(), None, "nothing is under that name");
+    assert_eq!(refs[0].address(), Some(0x320));
     drop(file);
     cleanup(&path);
 }

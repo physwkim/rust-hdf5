@@ -1653,6 +1653,125 @@ pub enum AllocTime {
     Incr,
 }
 
+/// Which mapped data an unlimited virtual dataset's extent covers —
+/// libhdf5's `H5D_vds_view_t`, set with `H5Pset_virtual_view` and read back
+/// with `H5Pget_virtual_view` (H5Pdapl.c:1067, :1102).
+///
+/// A *dataset access* property: it is never stored in the file, so it says
+/// how *this* open reads a virtual dataset, not what its writer intended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VirtualView {
+    /// `H5D_VDS_LAST_AVAILABLE` — the extent reaches the end of the last
+    /// mapped block that has a source, so a gap before it reads as the fill
+    /// value. libhdf5's default (`H5D_ACS_VDS_VIEW_DEF`, H5Pdapl.c:62).
+    #[default]
+    LastAvailable,
+    /// `H5D_VDS_FIRST_MISSING` — the extent stops where the first missing
+    /// mapped block begins, so no unmapped block is inside it.
+    ///
+    /// Under this view libhdf5 ignores
+    /// [`virtual_printf_gap`](DatasetAccess::virtual_printf_gap) entirely:
+    /// `H5D__virtual_init` reads the gap property only for
+    /// [`LastAvailable`](Self::LastAvailable) and forces it to 0 otherwise
+    /// (H5Dvirtual.c:2182-2188).
+    FirstMissing,
+}
+
+/// The dataset *access* properties this crate models — libhdf5's
+/// `H5P_DATASET_ACCESS` property list, as much of it as affects reading.
+///
+/// Both knobs govern how a virtual dataset's extent is resolved when it is
+/// opened (`H5D__virtual_set_extent_unlim`, H5Dvirtual.c:1386), and neither
+/// is stored in the file: opening a virtual dataset without naming them
+/// reads it exactly as libhdf5's default dapl does.
+///
+/// Pass one to [`H5File::dataset_with`](crate::H5File::dataset_with).
+///
+/// ```no_run
+/// use rust_hdf5::{DatasetAccess, H5File, VirtualView};
+///
+/// let file = H5File::open("vds.h5").unwrap();
+/// let access = DatasetAccess::new()
+///     .virtual_view(VirtualView::LastAvailable)
+///     .virtual_printf_gap(2);
+/// let ds = file.dataset_with("vds", access).unwrap();
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DatasetAccess {
+    view: VirtualView,
+    printf_gap: u64,
+}
+
+impl DatasetAccess {
+    /// A property list holding libhdf5's defaults —
+    /// [`VirtualView::LastAvailable`] and a printf gap of 0, the values
+    /// `H5D_ACS_VDS_VIEW_DEF` and `H5D_ACS_VDS_PRINTF_GAP_DEF` register
+    /// (H5Pdapl.c:62, :67).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `H5Pset_virtual_view` (H5Pdapl.c:1067). The two legal values are the
+    /// two [`VirtualView`] variants, so the "not a valid bounds option"
+    /// argument check that call makes has nothing to reject here.
+    pub fn virtual_view(mut self, view: VirtualView) -> Self {
+        self.view = view;
+        self
+    }
+
+    /// `H5Pset_virtual_printf_gap` (H5Pdapl.c:1207): how many consecutive
+    /// missing printf-named source datasets the extent resolution looks past
+    /// before it stops. 0 — the default — stops at the first one missing.
+    ///
+    /// `u64::MAX` is libhdf5's `HSIZE_UNDEF`, which that call rejects as "not
+    /// a valid printf gap size"; here the rejection surfaces from the open
+    /// that uses the property, since a builder method has no way to report
+    /// it.
+    pub fn virtual_printf_gap(mut self, gap: u64) -> Self {
+        self.printf_gap = gap;
+        self
+    }
+
+    /// `H5Pget_virtual_view` (H5Pdapl.c:1102).
+    pub fn view(&self) -> VirtualView {
+        self.view
+    }
+
+    /// `H5Pget_virtual_printf_gap` (H5Pdapl.c:1243) — the value set, not the
+    /// one the extent resolution ends up using; see
+    /// [`VirtualView::FirstMissing`].
+    pub fn printf_gap(&self) -> u64 {
+        self.printf_gap
+    }
+
+    /// The printf gap `H5D__virtual_set_extent_unlim` actually scans with:
+    /// the property under [`VirtualView::LastAvailable`], and 0 under
+    /// [`VirtualView::FirstMissing`], because `H5D__virtual_init` only reads
+    /// the property in the first case (H5Dvirtual.c:2182-2188).
+    ///
+    /// The single owner of that rule — the resolution never reads
+    /// [`printf_gap`](Self::printf_gap) directly.
+    pub(crate) fn effective_printf_gap(&self) -> u64 {
+        match self.view {
+            VirtualView::LastAvailable => self.printf_gap,
+            VirtualView::FirstMissing => 0,
+        }
+    }
+
+    /// Reject what `H5Pset_virtual_printf_gap` rejects, at the open that uses
+    /// the property.
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.printf_gap == u64::MAX {
+            return Err(Hdf5Error::InvalidState(
+                "virtual_printf_gap(u64::MAX) is libhdf5's HSIZE_UNDEF, which \
+                 H5Pset_virtual_printf_gap refuses as \"not a valid printf gap size\""
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl H5Dataset {
     /// Create a reader-mode dataset handle (called internally by `H5File::dataset`).
     pub(crate) fn new_reader(
@@ -3915,6 +4034,11 @@ impl H5Dataset {
     /// selection's bounding box — libhdf5's `H5Sget_select_bounds` — and an
     /// attribute reference as [`Reference::Attr`], which adds the attribute's
     /// name.
+    ///
+    /// A 1.12 reference written into a file other than its target's carries
+    /// that file's name, and [`Reference::file`] reports it; the path is then
+    /// a path inside that file, resolved by opening it under the name the
+    /// reference carries, and `None` when nothing is there.
     ///
     /// ```no_run
     /// # use rust_hdf5::H5File;
@@ -9415,6 +9539,58 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// A mapping whose source cannot be opened reads back as the fill value,
+    /// not as an error: `H5D__virtual_open_source_dset` accepts a null source
+    /// file and clears the error stack for a missing source dataset
+    /// (H5Dvirtual.c:877-909), so `H5D__virtual_read_one` finds no projected
+    /// memory space and reads nothing for it (H5Dvirtual.c:2661-2665).
+    #[test]
+    fn a_source_that_cannot_be_opened_reads_as_the_fill_value() {
+        use crate::{Hyperslab, HyperslabBlock, Selection};
+        let block = |start: u64, end: u64| Selection::Hyperslab {
+            rank: 1,
+            form: Hyperslab::Blocks(vec![HyperslabBlock {
+                start: vec![start],
+                end: vec![end],
+            }]),
+        };
+        let path = temp_path("vds_absent_source");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .create("here")
+                .unwrap()
+                .write_raw(&[1i32, 2, 3, 4])
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([12usize])
+                .fill_value(-3i32)
+                .virtual_mapping(block(0, 3), ".", "here", block(0, 3))
+                // A dataset that is not in this file.
+                .virtual_mapping(block(4, 7), ".", "absent", block(0, 3))
+                // A file that does not exist beside this one.
+                .virtual_mapping(block(8, 11), "no_such_vds_source.h5", "src", block(0, 3))
+                .create("vds")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("vds").unwrap();
+        assert_eq!(
+            ds.read_raw::<i32>().unwrap(),
+            vec![1, 2, 3, 4, -3, -3, -3, -3, -3, -3, -3, -3]
+        );
+        // The same rule on the slice path, which stitches the whole image
+        // before extracting the region.
+        assert_eq!(
+            ds.read_slice::<i32>(&[2], &[6]).unwrap(),
+            vec![3, 4, -3, -3, -3, -3]
+        );
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
     /// `%%` is an escaped literal `%`, not a substitution: the mapping is an
     /// ordinary bounded one, and the source it resolves against is the name
     /// with a single `%` in it.
@@ -9476,6 +9652,177 @@ mod tests {
         let ds = file.dataset("vds").unwrap();
         assert_eq!(ds.shape(), vec![5, 2]);
         assert_eq!(ds.read_raw::<i32>().unwrap(), (0..10).collect::<Vec<i32>>());
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The blocks-0/1/3 printf file every dataset-access test below reads,
+    /// laid out exactly like `a_printf_mapping_stitches_one_source_per_block`
+    /// so the gap is the only thing that changes.
+    fn printf_gap_file(tag: &str) -> std::path::PathBuf {
+        use crate::Selection;
+        let path = temp_path(tag);
+        let file = H5File::create(&path).unwrap();
+        for (b, base) in [(0, 0i32), (1, 100), (3, 300)] {
+            file.new_dataset::<i32>()
+                .shape([2usize])
+                .create(&format!("block{b}"))
+                .unwrap()
+                .write_raw(&[base, base + 1])
+                .unwrap();
+        }
+        file.new_dataset::<i32>()
+            .shape([1usize, 2])
+            .max_shape(&[None, Some(2)])
+            .fill_value(-7i32)
+            .virtual_mapping(unlimited_rows(), ".", "block%b", Selection::All)
+            .create("vds")
+            .unwrap();
+        file.close().unwrap();
+        path
+    }
+
+    /// `H5Pset_virtual_printf_gap` lets the block scan look past a missing
+    /// source, and the blocks it looked past stay inside the extent reading
+    /// as the fill value (H5Dvirtual.c:1519-1614, :2661-2665). Measured
+    /// against libhdf5 1.14.6 through h5py's `h5p.PropDAID`: gap 0 gives
+    /// two rows, gap 1 and gap 2 both give four with row 2 filled.
+    #[test]
+    fn a_printf_gap_looks_past_the_missing_block() {
+        use crate::DatasetAccess;
+        let path = printf_gap_file("vds_printf_gap");
+        let file = H5File::open(&path).unwrap();
+        for (gap, shape, data) in [
+            (0u64, vec![2usize, 2], vec![0i32, 1, 100, 101]),
+            (1, vec![4, 2], vec![0, 1, 100, 101, -7, -7, 300, 301]),
+            (2, vec![4, 2], vec![0, 1, 100, 101, -7, -7, 300, 301]),
+        ] {
+            let ds = file
+                .dataset_with("vds", DatasetAccess::new().virtual_printf_gap(gap))
+                .unwrap();
+            assert_eq!(ds.shape(), shape, "gap {gap}");
+            assert_eq!(ds.read_raw::<i32>().unwrap(), data, "gap {gap}");
+        }
+        // Back to the default: the extent follows the properties the open
+        // names, in both directions.
+        let ds = file.dataset("vds").unwrap();
+        assert_eq!(ds.shape(), vec![2, 2]);
+        assert_eq!(ds.read_raw::<i32>().unwrap(), vec![0, 1, 100, 101]);
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `H5D_VDS_FIRST_MISSING` ignores the printf gap: `H5D__virtual_init`
+    /// reads the gap property only under `H5D_VDS_LAST_AVAILABLE` and forces
+    /// it to 0 otherwise (H5Dvirtual.c:2182-2188). Measured against libhdf5
+    /// 1.14.6: gap 2 under this view still gives two rows.
+    #[test]
+    fn the_first_missing_view_ignores_the_printf_gap() {
+        use crate::{DatasetAccess, VirtualView};
+        let path = printf_gap_file("vds_printf_first_missing");
+        let file = H5File::open(&path).unwrap();
+        for gap in [0u64, 2] {
+            let ds = file
+                .dataset_with(
+                    "vds",
+                    DatasetAccess::new()
+                        .virtual_view(VirtualView::FirstMissing)
+                        .virtual_printf_gap(gap),
+                )
+                .unwrap();
+            assert_eq!(ds.shape(), vec![2, 2], "gap {gap}");
+            assert_eq!(
+                ds.read_raw::<i32>().unwrap(),
+                vec![0, 1, 100, 101],
+                "gap {gap}"
+            );
+        }
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// On a mapping unlimited on both sides the view is
+    /// `H5S_hyper_get_clip_extent_match`'s `incl_trail`
+    /// (H5Dvirtual.c:1447-1451): with a stride wider than its block, the
+    /// extent under `H5D_VDS_LAST_AVAILABLE` ends at the last mapped row,
+    /// and under `H5D_VDS_FIRST_MISSING` it runs on to where the next block
+    /// would start. Measured against libhdf5 1.14.6 over a three-row source
+    /// with stride 3 and block 2: two rows and three rows.
+    #[test]
+    fn the_view_decides_whether_a_trailing_gap_is_inside_the_extent() {
+        use crate::format::selection::UNLIMITED;
+        use crate::{DatasetAccess, Hyperslab, RegularHyperslab, Selection, VirtualView};
+        let strided = || Selection::Hyperslab {
+            rank: 2,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: vec![0, 0],
+                stride: vec![3, 1],
+                count: vec![UNLIMITED, 1],
+                block: vec![2, 2],
+            }),
+        };
+        let path = temp_path("vds_view_trail");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([3usize, 2])
+                .max_shape(&[None, Some(2)])
+                .chunk(&[1, 2])
+                .create("src")
+                .unwrap()
+                .write_raw(&(0..6i32).collect::<Vec<_>>())
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([1usize, 2])
+                .max_shape(&[None, Some(2)])
+                .fill_value(-9i32)
+                .virtual_mapping(strided(), ".", "src", strided())
+                .create("vds")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let last = file.dataset("vds").unwrap();
+        assert_eq!(last.shape(), vec![2, 2]);
+        assert_eq!(last.read_raw::<i32>().unwrap(), vec![0, 1, 2, 3]);
+        let first = file
+            .dataset_with(
+                "vds",
+                DatasetAccess::new().virtual_view(VirtualView::FirstMissing),
+            )
+            .unwrap();
+        assert_eq!(first.shape(), vec![3, 2]);
+        assert_eq!(first.read_raw::<i32>().unwrap(), vec![0, 1, 2, 3, -9, -9]);
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The property list reads back what was set (`H5Pget_virtual_view`,
+    /// `H5Pget_virtual_printf_gap`), and the gap `HSIZE_UNDEF` that
+    /// `H5Pset_virtual_printf_gap` refuses is refused by the open that would
+    /// have used it.
+    #[test]
+    fn the_access_property_list_reads_back_and_refuses_hsize_undef() {
+        use crate::{DatasetAccess, VirtualView};
+        let plist = DatasetAccess::new();
+        assert_eq!(plist.view(), VirtualView::LastAvailable);
+        assert_eq!(plist.printf_gap(), 0);
+        let set = plist
+            .virtual_view(VirtualView::FirstMissing)
+            .virtual_printf_gap(4);
+        assert_eq!(set.view(), VirtualView::FirstMissing);
+        // The *property* keeps what was set even though the resolution under
+        // this view scans with 0.
+        assert_eq!(set.printf_gap(), 4);
+
+        let path = printf_gap_file("vds_printf_gap_undef");
+        let file = H5File::open(&path).unwrap();
+        let err = match file.dataset_with("vds", DatasetAccess::new().virtual_printf_gap(u64::MAX))
+        {
+            Ok(_) => panic!("HSIZE_UNDEF is not a valid printf gap size"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("HSIZE_UNDEF"), "{err}");
         drop(file);
         std::fs::remove_file(&path).ok();
     }

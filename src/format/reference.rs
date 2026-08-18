@@ -29,8 +29,10 @@
 //! ```
 //!
 //! and the encoded reference itself is `H5R__encode`: a token (its length, then
-//! the target's object header address), then the serialized selection for a
-//! region and the attribute name for an attribute reference.
+//! the target's object header address), then — when the flags carry
+//! `H5R_IS_EXTERNAL` — the name of the file the target lives in, then the
+//! serialized selection for a region and the attribute name for an attribute
+//! reference.
 
 use crate::format::bytes::{read_le_addr, read_le_uint};
 use crate::format::messages::datatype::ReferenceKind;
@@ -118,6 +120,8 @@ pub enum RevisedElement<'a> {
     /// An element naming nothing: reference type 0 over a nil blob id.
     Null,
     /// The encoded reference, less its two-byte header, stored in the element.
+    /// Never external: `H5T__ref_disk_getsize` takes the direct-copy arm only
+    /// for an `H5R_OBJECT2` whose flags are clear (H5Tref.c:890).
     Inline {
         /// The kind the element's own type byte names.
         kind: ReferenceKind,
@@ -128,6 +132,9 @@ pub enum RevisedElement<'a> {
     Heap {
         /// The kind the element's own type byte names.
         kind: ReferenceKind,
+        /// Whether the element's flags carry `H5R_IS_EXTERNAL`, in which case
+        /// the encoded reference names the file the target lives in.
+        external: bool,
         /// Address of the collection holding the blob.
         collection: u64,
         /// Index of the blob's object within that collection.
@@ -180,13 +187,9 @@ pub fn decode_revised_element<'a>(
             FormatError::InvalidData(format!("reference type {code} in a 1.12 element"))
         })?;
 
-    if flags & REVISED_FLAG_EXTERNAL != 0 {
-        return Err(FormatError::UnsupportedFeature(
-            "a reference naming an object in another file".into(),
-        ));
-    }
+    let external = flags & REVISED_FLAG_EXTERNAL != 0;
 
-    if kind == ReferenceKind::Object2 {
+    if !external && kind == ReferenceKind::Object2 {
         return Ok(RevisedElement::Inline {
             kind,
             body: &elem[REVISED_HEADER..],
@@ -203,6 +206,7 @@ pub fn decode_revised_element<'a>(
     let index = read_le_uint(&elem[heap_id + sa..heap_id + sa + 4], 4) as u32;
     Ok(RevisedElement::Heap {
         kind,
+        external,
         collection,
         index,
     })
@@ -364,14 +368,35 @@ pub enum ReferenceTarget {
     Attribute(String),
 }
 
+/// Everything `H5R__decode` recovers from an encoded reference: where the
+/// target is, and what is named there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedReference {
+    /// Object header address the token names.
+    pub address: u64,
+    /// The file the target lives in, as the reference records it — the name
+    /// that file was open under when the reference was written
+    /// (`H5F_get_name`, not a canonical path). `None` when the flags do not
+    /// carry `H5R_IS_EXTERNAL`, which means the file holding the reference.
+    pub file: Option<String>,
+    /// What the reference names at that address.
+    pub target: ReferenceTarget,
+}
+
 /// Decode an encoded 1.12 reference — `H5R__decode` from the token onwards —
-/// into the address it names and what it names there, or `None` when the token
+/// into where its target is and what it names there, or `None` when the token
 /// names no object.
+///
+/// `external` is the element's `H5R_IS_EXTERNAL` flag, which decides whether a
+/// file name sits between the token and the kind's own payload; the flag lives
+/// in the element, not in the encoded reference, so it has to be handed in
+/// (`H5R__decode`, H5Rint.c:991-999).
 pub fn decode_revised_body(
     kind: ReferenceKind,
+    external: bool,
     body: &[u8],
     ctx: &FormatContext,
-) -> FormatResult<Option<(u64, ReferenceTarget)>> {
+) -> FormatResult<Option<DecodedReference>> {
     let sa = ctx.sizeof_addr as usize;
     let mut r = Cursor::new(body);
 
@@ -391,6 +416,14 @@ pub fn decode_revised_body(
         return Ok(None);
     };
 
+    // `H5R__encode` writes the file name straight after the token and before
+    // the kind's own payload (H5Rint.c:903-905).
+    let file = if external {
+        Some(decode_string(&mut r)?)
+    } else {
+        None
+    };
+
     let target = match kind {
         ReferenceKind::Object2 => ReferenceTarget::Object,
         ReferenceKind::DatasetRegion2 => {
@@ -401,20 +434,28 @@ pub fn decode_revised_body(
             let _rank = r.u32()?;
             ReferenceTarget::Region(Selection::decode(r.take(len)?)?.0)
         }
-        ReferenceKind::Attr => {
-            let len = r.u16()? as usize;
-            let name = r.take(len)?;
-            ReferenceTarget::Attribute(String::from_utf8(name.to_vec()).map_err(|_| {
-                FormatError::InvalidData("attribute name in a reference is not UTF-8".into())
-            })?)
-        }
+        ReferenceKind::Attr => ReferenceTarget::Attribute(decode_string(&mut r)?),
         ReferenceKind::Object1 | ReferenceKind::DatasetRegion1 => {
             return Err(FormatError::InvalidData(format!(
                 "{kind:?} is not a 1.12 encoded reference"
             )))
         }
     };
-    Ok(Some((address, target)))
+    Ok(Some(DecodedReference {
+        address,
+        file,
+        target,
+    }))
+}
+
+/// One `H5R__encode_string` field: a 16-bit length, then that many unterminated
+/// bytes. Both a reference's file name and an attribute reference's name are
+/// written this way, so both are read back through here.
+fn decode_string(r: &mut Cursor<'_>) -> FormatResult<String> {
+    let len = r.u16()? as usize;
+    let bytes = r.take(len)?;
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| FormatError::InvalidData("a string in a reference is not UTF-8".into()))
 }
 
 /// One reference element, decoded and resolved against the file it came from.
@@ -432,6 +473,8 @@ pub enum Reference {
     Object {
         /// Object header address of the target.
         address: u64,
+        /// The file the target lives in; see [`Reference::file`].
+        file: Option<String>,
         /// Absolute path of the target.
         path: Option<String>,
     },
@@ -440,6 +483,8 @@ pub enum Reference {
     Region {
         /// Object header address of the target dataset.
         address: u64,
+        /// The file the target dataset lives in; see [`Reference::file`].
+        file: Option<String>,
         /// Absolute path of the target dataset.
         path: Option<String>,
         /// The selection the reference carries.
@@ -450,6 +495,8 @@ pub enum Reference {
     Attr {
         /// Object header address of the object the attribute belongs to.
         address: u64,
+        /// The file that object lives in; see [`Reference::file`].
+        file: Option<String>,
         /// Absolute path of that object.
         path: Option<String>,
         /// Name of the attribute.
@@ -458,6 +505,23 @@ pub enum Reference {
 }
 
 impl Reference {
+    /// The file the target lives in, for a reference that names another file
+    /// — `H5Rget_file_name` on an un-opened external reference. `None` means
+    /// the file holding the reference, which is every reference libhdf5 can
+    /// write without the `H5R_IS_EXTERNAL` flag.
+    ///
+    /// The name is the one the target file was open under when the reference
+    /// was written, recorded verbatim, and [`path`](Self::path) is a path
+    /// inside *that* file.
+    pub fn file(&self) -> Option<&str> {
+        match self {
+            Self::Null => None,
+            Self::Object { file, .. } | Self::Region { file, .. } | Self::Attr { file, .. } => {
+                file.as_deref()
+            }
+        }
+    }
+
     /// The target's absolute path, when the file names it.
     pub fn path(&self) -> Option<&str> {
         match self {
@@ -669,6 +733,36 @@ mod tests {
         0x08, 0xC3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x6E, 0x6F, 0x74, 0x65,
     ];
 
+    /// The name every external reference in `tests/fixtures/ext_refs.h5`
+    /// carries: the path its target file was created under, relative to the
+    /// crate root the generator ran in.
+    const EXT_FILE: &str = "tests/fixtures/ext_ref_target.h5";
+
+    /// The first element of that fixture's `extobjrefs`: an `H5R_OBJECT2`
+    /// whose flags carry `H5R_IS_EXTERNAL`, which sends it to the heap
+    /// although its kind alone would keep it inline.
+    const EXT_OBJ2_ELEMENT: [u8; 18] = [
+        0x02, 0x01, 0x2B, 0x00, 0x00, 0x00, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00,
+    ];
+
+    /// Its blob: token, then the file name, and nothing after it.
+    const EXT_OBJ2_BLOB: [u8; 43] = [
+        0x08, 0x20, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x74, 0x65, 0x73, 0x74,
+        0x73, 0x2F, 0x66, 0x69, 0x78, 0x74, 0x75, 0x72, 0x65, 0x73, 0x2F, 0x65, 0x78, 0x74, 0x5F,
+        0x72, 0x65, 0x66, 0x5F, 0x74, 0x61, 0x72, 0x67, 0x65, 0x74, 0x2E, 0x68, 0x35,
+    ];
+
+    /// The blob of the same fixture's `extattrrefs`: the file name sits
+    /// between the token and the attribute name, so the two strings are only
+    /// told apart by their order.
+    const EXT_ATTR_BLOB: [u8; 49] = [
+        0x08, 0x20, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x74, 0x65, 0x73, 0x74,
+        0x73, 0x2F, 0x66, 0x69, 0x78, 0x74, 0x75, 0x72, 0x65, 0x73, 0x2F, 0x65, 0x78, 0x74, 0x5F,
+        0x72, 0x65, 0x66, 0x5F, 0x74, 0x61, 0x72, 0x67, 0x65, 0x74, 0x2E, 0x68, 0x35, 0x04, 0x00,
+        0x6E, 0x6F, 0x74, 0x65,
+    ];
+
     /// An `H5R_OBJECT2` element keeps its encoded reference inline; the other
     /// two kinds point at a heap blob.
     #[test]
@@ -680,14 +774,19 @@ mod tests {
         };
         assert_eq!(kind, ReferenceKind::Object2);
         assert_eq!(
-            decode_revised_body(kind, body, &ctx()).unwrap(),
-            Some((0xC3, ReferenceTarget::Object))
+            decode_revised_body(kind, false, body, &ctx()).unwrap(),
+            Some(DecodedReference {
+                address: 0xC3,
+                file: None,
+                target: ReferenceTarget::Object,
+            })
         );
 
         assert_eq!(
             decode_revised_element(&REGION2_ELEMENT, &ctx()).unwrap(),
             RevisedElement::Heap {
                 kind: ReferenceKind::DatasetRegion2,
+                external: false,
                 collection: 0x8A8,
                 index: 1,
             }
@@ -696,6 +795,7 @@ mod tests {
             decode_revised_element(&ATTR_ELEMENT, &ctx()).unwrap(),
             RevisedElement::Heap {
                 kind: ReferenceKind::Attr,
+                external: false,
                 collection: 0x8A8,
                 index: 3,
             }
@@ -708,13 +808,14 @@ mod tests {
     fn revised_region_blobs_decode_to_their_selections() {
         let hyper = decode_revised_body(
             ReferenceKind::DatasetRegion2,
+            false,
             &REGION2_HYPERSLAB_BLOB,
             &ctx(),
         )
         .unwrap()
         .unwrap();
-        assert_eq!(hyper.0, 0xC3);
-        let ReferenceTarget::Region(selection) = &hyper.1 else {
+        assert_eq!(hyper.address, 0xC3);
+        let ReferenceTarget::Region(selection) = &hyper.target else {
             panic!("a region reference names a selection");
         };
         assert_eq!(
@@ -723,11 +824,15 @@ mod tests {
             "{selection:?}"
         );
 
-        let points =
-            decode_revised_body(ReferenceKind::DatasetRegion2, &REGION2_POINT_BLOB, &ctx())
-                .unwrap()
-                .unwrap();
-        let ReferenceTarget::Region(selection) = &points.1 else {
+        let points = decode_revised_body(
+            ReferenceKind::DatasetRegion2,
+            false,
+            &REGION2_POINT_BLOB,
+            &ctx(),
+        )
+        .unwrap()
+        .unwrap();
+        let ReferenceTarget::Region(selection) = &points.target else {
             panic!("a region reference names a selection");
         };
         assert_eq!(
@@ -743,15 +848,19 @@ mod tests {
     #[test]
     fn an_attribute_reference_carries_its_name() {
         assert_eq!(
-            decode_revised_body(ReferenceKind::Attr, &ATTR_BLOB, &ctx()).unwrap(),
-            Some((0xC3, ReferenceTarget::Attribute("note".into())))
+            decode_revised_body(ReferenceKind::Attr, false, &ATTR_BLOB, &ctx()).unwrap(),
+            Some(DecodedReference {
+                address: 0xC3,
+                file: None,
+                target: ReferenceTarget::Attribute("note".into()),
+            })
         );
     }
 
     /// An unwritten element is reference type 0 over a nil blob id
-    /// (`H5T__ref_disk_isnull`); a type byte outside the 1.12 kinds, an
-    /// external-file reference and a foreign token width are all reported
-    /// rather than read as something else.
+    /// (`H5T__ref_disk_isnull`); a type byte outside the 1.12 kinds and a
+    /// foreign token width are both reported rather than read as something
+    /// else.
     #[test]
     fn revised_elements_that_name_nothing_or_cannot_be_followed() {
         assert_eq!(
@@ -777,18 +886,11 @@ mod tests {
             FormatError::InvalidData(_)
         ));
 
-        let mut external = OBJ2_ELEMENT;
-        external[1] = 0x01;
-        assert!(matches!(
-            decode_revised_element(&external, &ctx()).unwrap_err(),
-            FormatError::UnsupportedFeature(_)
-        ));
-
         let mut foreign = ATTR_BLOB;
         foreign[0] = 16;
         assert!(
             matches!(
-                decode_revised_body(ReferenceKind::Attr, &foreign, &ctx()).unwrap_err(),
+                decode_revised_body(ReferenceKind::Attr, false, &foreign, &ctx()).unwrap_err(),
                 FormatError::UnsupportedFeature(_)
             ),
             "a token that is not a file address belongs to another VOL connector"
@@ -801,9 +903,52 @@ mod tests {
             panic!("an object reference is stored in the element");
         };
         assert_eq!(
-            decode_revised_body(kind, body, &ctx()).unwrap(),
+            decode_revised_body(kind, false, body, &ctx()).unwrap(),
             None,
             "a zero token names no object"
+        );
+    }
+
+    /// An element flagged `H5R_IS_EXTERNAL` names the file its target lives
+    /// in, and takes the heap even when its kind would otherwise be stored
+    /// inline (`H5T__ref_disk_getsize`, H5Tref.c:890).
+    #[test]
+    fn an_external_reference_names_the_file_its_target_is_in() {
+        assert_eq!(
+            decode_revised_element(&EXT_OBJ2_ELEMENT, &ctx()).unwrap(),
+            RevisedElement::Heap {
+                kind: ReferenceKind::Object2,
+                external: true,
+                collection: 0x824,
+                index: 1,
+            }
+        );
+        assert_eq!(
+            decode_revised_body(ReferenceKind::Object2, true, &EXT_OBJ2_BLOB, &ctx()).unwrap(),
+            Some(DecodedReference {
+                address: 0x320,
+                file: Some(EXT_FILE.into()),
+                target: ReferenceTarget::Object,
+            })
+        );
+
+        // The file name precedes the kind's own payload, so reading it as if
+        // the reference were internal would take the name for the payload.
+        assert_eq!(
+            decode_revised_body(ReferenceKind::Attr, true, &EXT_ATTR_BLOB, &ctx()).unwrap(),
+            Some(DecodedReference {
+                address: 0x320,
+                file: Some(EXT_FILE.into()),
+                target: ReferenceTarget::Attribute("note".into()),
+            })
+        );
+        let internal = decode_revised_body(ReferenceKind::Attr, false, &EXT_ATTR_BLOB, &ctx())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            internal.target,
+            ReferenceTarget::Attribute(EXT_FILE.into()),
+            "the flag is what tells the file name from the attribute name"
         );
     }
 
@@ -881,11 +1026,11 @@ mod tests {
     /// actually produced.
     #[test]
     fn revised_blobs_encode_to_what_libhdf5_reads_back() {
-        let (address, target) = decode_revised_body(ReferenceKind::Attr, &ATTR_BLOB, &ctx())
+        let attr = decode_revised_body(ReferenceKind::Attr, false, &ATTR_BLOB, &ctx())
             .unwrap()
             .unwrap();
         assert_eq!(
-            encode_revised_blob(address, &target, 0, &ctx()).unwrap(),
+            encode_revised_blob(attr.address, &attr.target, 0, &ctx()).unwrap(),
             ATTR_BLOB
         );
 
@@ -893,16 +1038,23 @@ mod tests {
             (ReferenceKind::DatasetRegion2, &REGION2_HYPERSLAB_BLOB[..]),
             (ReferenceKind::DatasetRegion2, &REGION2_POINT_BLOB[..]),
         ] {
-            let (address, target) = decode_revised_body(kind, golden, &ctx()).unwrap().unwrap();
+            let DecodedReference {
+                address, target, ..
+            } = decode_revised_body(kind, false, golden, &ctx())
+                .unwrap()
+                .unwrap();
             let blob = encode_revised_blob(address, &target, 2, &ctx()).unwrap();
             // Token and rank are byte-identical; the selection is re-encoded.
             assert_eq!(blob[..9], golden[..9]);
             assert_eq!(blob[13..17], golden[13..17], "the extent rank");
             let selection_len = u32::from_le_bytes(blob[9..13].try_into().unwrap()) as usize;
             assert_eq!(blob.len(), 17 + selection_len);
-            let (back, read) = decode_revised_body(kind, &blob, &ctx()).unwrap().unwrap();
-            assert_eq!(back, address);
-            let (ReferenceTarget::Region(was), ReferenceTarget::Region(now)) = (&target, &read)
+            let back = decode_revised_body(kind, false, &blob, &ctx())
+                .unwrap()
+                .unwrap();
+            assert_eq!(back.address, address);
+            let (ReferenceTarget::Region(was), ReferenceTarget::Region(now)) =
+                (&target, &back.target)
             else {
                 panic!("a region reference names a selection");
             };
@@ -921,8 +1073,12 @@ mod tests {
             encode_revised_blob(0xC3, &ReferenceTarget::Region(Selection::All), 3, &ctx()).unwrap();
         assert_eq!(u32::from_le_bytes(all[13..17].try_into().unwrap()), 3);
         assert_eq!(
-            decode_revised_body(ReferenceKind::DatasetRegion2, &all, &ctx()).unwrap(),
-            Some((0xC3, ReferenceTarget::Region(Selection::All)))
+            decode_revised_body(ReferenceKind::DatasetRegion2, false, &all, &ctx()).unwrap(),
+            Some(DecodedReference {
+                address: 0xC3,
+                file: None,
+                target: ReferenceTarget::Region(Selection::All),
+            })
         );
 
         // An object reference's blob is the token alone; that is also the body

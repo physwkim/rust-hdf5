@@ -104,7 +104,8 @@ pub mod types;
 
 pub use attribute::{AttrShape, H5Attribute};
 pub use dataset::{
-    AllocTime, ChunkIndex, FillTime, FillValue, H5Dataset, ReadNumeric, StorageLayout,
+    AllocTime, ChunkIndex, DatasetAccess, FillTime, FillValue, H5Dataset, ReadNumeric,
+    StorageLayout, VirtualView,
 };
 pub use error::{Hdf5Error, Result};
 pub use file::{H5File, H5FileOptions};
