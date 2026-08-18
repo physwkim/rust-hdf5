@@ -1,0 +1,3885 @@
+{
+ "meta": {
+  "hdf5_version": "2.0.0",
+  "h5py_version": "3.16.0",
+  "numpy_version": "2.5.2",
+  "python": "/home/stevek/micromamba/envs/h5py316/bin/python",
+  "probe": "/home/stevek/work/rust-hdf5/target/release/oracle_probe",
+  "cases": 98
+ },
+ "results": [
+  {
+   "case": "int_i8",
+   "group": "dtype-int",
+   "note": "1-D ramp of i1",
+   "rust_case": "int_i8",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "int_u8",
+   "group": "dtype-int",
+   "note": "1-D ramp of u1",
+   "rust_case": "int_u8",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "int_i16le",
+   "group": "dtype-int",
+   "note": "1-D ramp of <i2",
+   "rust_case": "int_i16le",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "int_u16le",
+   "group": "dtype-int",
+   "note": "1-D ramp of <u2",
+   "rust_case": "int_u16le",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "int_i32le",
+   "group": "dtype-int",
+   "note": "1-D ramp of <i4",
+   "rust_case": "int_i32le",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "int_u32le",
+   "group": "dtype-int",
+   "note": "1-D ramp of <u4",
+   "rust_case": "int_u32le",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "int_i64le",
+   "group": "dtype-int",
+   "note": "1-D ramp of <i8",
+   "rust_case": "int_i64le",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "int_u64le",
+   "group": "dtype-int",
+   "note": "1-D ramp of <u8",
+   "rust_case": "int_u64le",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "int_i16be",
+   "group": "dtype-int",
+   "note": "1-D ramp of >i2",
+   "rust_case": "int_i16be",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "int_i32be",
+   "group": "dtype-int",
+   "note": "1-D ramp of >i4",
+   "rust_case": "int_i32be",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "int_u64be",
+   "group": "dtype-int",
+   "note": "1-D ramp of >u8",
+   "rust_case": "int_u64be",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "float_f16le",
+   "group": "dtype-float",
+   "note": "1-D ramp of <f2",
+   "rust_case": "float_f16le",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "float_f32le",
+   "group": "dtype-float",
+   "note": "1-D ramp of <f4",
+   "rust_case": "float_f32le",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "float_f64le",
+   "group": "dtype-float",
+   "note": "1-D ramp of <f8",
+   "rust_case": "float_f64le",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "float_f64be",
+   "group": "dtype-float",
+   "note": "1-D ramp of >f8",
+   "rust_case": "float_f64be",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "float_specials",
+   "group": "dtype-float",
+   "note": "NaN payload, +/-inf, -0.0, denormal \u2014 bit patterns must survive",
+   "rust_case": "float_specials",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "str_fixed_ascii",
+   "group": "dtype-string",
+   "note": "8-byte fixed ASCII strings",
+   "rust_case": "str_fixed_ascii",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "str_fixed_utf8",
+   "group": "dtype-string",
+   "note": "16-byte fixed UTF-8 strings",
+   "rust_case": "str_fixed_utf8",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "str_fixed_nullpad",
+   "group": "dtype-string",
+   "note": "fixed string with STR_NULLPAD",
+   "rust_case": "str_fixed_nullpad",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "str_fixed_spacepad",
+   "group": "dtype-string",
+   "note": "fixed string with STR_SPACEPAD",
+   "rust_case": "str_fixed_spacepad",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "str_vlen_ascii",
+   "group": "dtype-string",
+   "note": "variable-length ASCII strings via the global heap",
+   "rust_case": "str_vlen_ascii",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "str_vlen_utf8",
+   "group": "dtype-string",
+   "note": "variable-length UTF-8 strings via the global heap",
+   "rust_case": "str_vlen_utf8",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "compound_simple",
+   "group": "dtype-composite",
+   "note": "two f32 members, no padding",
+   "rust_case": "compound_simple",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "compound_nested",
+   "group": "dtype-composite",
+   "note": "compound member inside a compound",
+   "rust_case": "compound_nested",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "compound_with_string",
+   "group": "dtype-composite",
+   "note": "fixed string member",
+   "rust_case": "compound_with_string",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "compound_padded",
+   "group": "dtype-composite",
+   "note": "member offsets with gaps and trailing padding",
+   "rust_case": "compound_padded",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "compound_dtype_v4",
+   "group": "dtype-composite",
+   "note": "version-4 datatype message (libver v1.12 bounds)",
+   "rust_case": "compound_dtype_v4",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "array_dtype",
+   "group": "dtype-composite",
+   "note": "H5T_ARRAY element type (2x3 f64)",
+   "rust_case": "array_dtype",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "enum_i8",
+   "group": "dtype-composite",
+   "note": "3-member i8 enum",
+   "rust_case": "enum_i8",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "enum_i32",
+   "group": "dtype-composite",
+   "note": "i32 enum with a negative member",
+   "rust_case": "enum_i32",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "opaque",
+   "group": "dtype-composite",
+   "note": "H5T_OPAQUE with a tag",
+   "rust_case": "opaque",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "bitfield",
+   "group": "dtype-composite",
+   "note": "H5T_BITFIELD (STD_B8LE)",
+   "rust_case": "bitfield",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "ref_object",
+   "group": "dtype-composite",
+   "note": "object references to a dataset and a group",
+   "rust_case": "ref_object",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 52,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "ref_region",
+   "group": "dtype-composite",
+   "note": "dataset region references",
+   "rust_case": "ref_region",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 45,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "vlen_numeric",
+   "group": "dtype-composite",
+   "note": "variable-length i32 sequences",
+   "rust_case": "vlen_numeric",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "vlen_bytes",
+   "group": "dtype-composite",
+   "note": "variable-length u8 sequences",
+   "rust_case": "vlen_bytes",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "named_datatype",
+   "group": "dtype-composite",
+   "note": "committed datatype object, and a dataset that shares it",
+   "rust_case": "named_datatype",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/t#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5NamedDatatype exposes no compact/dense attribute storage accessor"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 50,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "layout_compact",
+   "group": "layout",
+   "note": "compact layout \u2014 data inside the object header",
+   "rust_case": "layout_compact",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "layout_contiguous",
+   "group": "layout",
+   "note": "contiguous layout",
+   "rust_case": "layout_contiguous",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "layout_contiguous_v110",
+   "group": "layout",
+   "note": "contiguous layout under v1.10 bounds \u2014 data layout message v4",
+   "rust_case": "layout_contiguous_v110",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "layout_chunked_v110",
+   "group": "layout",
+   "note": "chunked layout under v1.10 bounds \u2014 the control for the case above",
+   "rust_case": "layout_chunked_v110",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "chunkidx_btree1",
+   "group": "layout",
+   "note": "layout v3 + version-1 B-tree chunk index (libver earliest)",
+   "rust_case": "chunkidx_btree1",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "chunkidx_single",
+   "group": "layout",
+   "note": "single-chunk index",
+   "rust_case": "chunkidx_single",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "chunkidx_implicit",
+   "group": "layout",
+   "note": "implicit index \u2014 fixed shape, early allocation, no filter",
+   "rust_case": "chunkidx_implicit",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "chunkidx_farray",
+   "group": "layout",
+   "note": "fixed-array index",
+   "rust_case": "chunkidx_farray",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "chunkidx_earray",
+   "group": "layout",
+   "note": "extensible-array index \u2014 one unlimited dimension",
+   "rust_case": "chunkidx_earray",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "chunkidx_earray_unlim_inner",
+   "group": "layout",
+   "note": "extensible-array index \u2014 the unlimited dimension is dim 1, not dim 0",
+   "rust_case": "chunkidx_earray_unlim_inner",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "chunkidx_btree2",
+   "group": "layout",
+   "note": "version-2 B-tree index \u2014 two unlimited dimensions",
+   "rust_case": "chunkidx_btree2",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "layout_contiguous_v108",
+   "group": "layout",
+   "note": "contiguous layout under v1.8 bounds \u2014 the v1.10 pair's control",
+   "rust_case": "layout_contiguous_v108",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "layout_chunked_v108",
+   "group": "layout",
+   "note": "chunked layout under v1.8 bounds",
+   "rust_case": "layout_chunked_v108",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "chunkidx_earray_dim1",
+   "group": "layout",
+   "note": "extensible-array index whose unlimited dimension is not the first",
+   "rust_case": "chunkidx_earray_dim1",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "external_storage",
+   "group": "layout",
+   "note": "contiguous data held in an external raw file",
+   "rust_case": "external_storage",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "vds",
+   "group": "layout",
+   "note": "virtual dataset mapped onto a dataset in a sibling file",
+   "rust_case": "vds",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "filter_deflate",
+   "group": "filter",
+   "note": "deflate level 6",
+   "rust_case": "filter_deflate",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "filter_shuffle",
+   "group": "filter",
+   "note": "shuffle only",
+   "rust_case": "filter_shuffle",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "filter_fletcher32",
+   "group": "filter",
+   "note": "fletcher32 checksum",
+   "rust_case": "filter_fletcher32",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "filter_deflate_shuffle",
+   "group": "filter",
+   "note": "shuffle then deflate",
+   "rust_case": "filter_deflate_shuffle",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "filter_scaleoffset",
+   "group": "filter",
+   "note": "scale-offset, library-computed minimum bits",
+   "rust_case": "filter_scaleoffset",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "fill_default",
+   "group": "fillvalue",
+   "note": "default (zero) fill, nothing written",
+   "rust_case": "fill_default",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "fill_set_int",
+   "group": "fillvalue",
+   "note": "user-defined integer fill, first chunk written",
+   "rust_case": "fill_set_int",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "fill_set_float_nan",
+   "group": "fillvalue",
+   "note": "user-defined NaN fill",
+   "rust_case": "fill_set_float_nan",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "space_scalar",
+   "group": "dataspace",
+   "note": "scalar (rank 0) dataspace",
+   "rust_case": "space_scalar",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "space_null",
+   "group": "dataspace",
+   "note": "NULL dataspace \u2014 no elements at all",
+   "rust_case": "space_null",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "space_zerosized",
+   "group": "dataspace",
+   "note": "simple dataspace with a zero-length dimension",
+   "rust_case": "space_zerosized",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "space_unlimited_resized",
+   "group": "dataspace",
+   "note": "unlimited maxshape, grown after creation",
+   "rust_case": "space_unlimited_resized",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "groups_nested",
+   "group": "group",
+   "note": "three levels of nested groups plus an empty leaf group",
+   "rust_case": "groups_nested",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 66,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "link_hard",
+   "group": "link",
+   "note": "two names for one object",
+   "rust_case": "link_hard",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 45,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "link_soft",
+   "group": "link",
+   "note": "soft link to /orig",
+   "rust_case": "link_soft",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 29,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "link_external",
+   "group": "link",
+   "note": "external link into a sibling file",
+   "rust_case": "link_external",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 30,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "link_external_read",
+   "group": "link",
+   "note": "datasets read through external links, plus a dangling object and a dangling file",
+   "rust_case": "link_external_read",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 21,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "link_nonascii",
+   "group": "link",
+   "note": "non-ASCII link names at the earliest bound \u2014 the root converts to link messages, the ASCII-named subgroups keep their symbol tables",
+   "rust_case": "link_nonascii",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 84,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "links_dense",
+   "group": "link",
+   "note": "12 links in one group \u2014 dense link storage (fractal heap + v2 B-tree)",
+   "rust_case": "links_dense",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 232,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "track_order",
+   "group": "group",
+   "note": "creation-order indices on links and attributes",
+   "rust_case": "track_order",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/@alpha#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@alpha#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@alpha#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@alpha#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:01000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x01\""
+     },
+     {
+      "key": "/@mu#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@mu#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@mu#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@mu#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:02000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x02\""
+     },
+     {
+      "key": "/@zeta#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@zeta#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@zeta#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@zeta#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:00000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\""
+     },
+     {
+      "key": "/g@first#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@first#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@first#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@first#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:01000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x01\""
+     },
+     {
+      "key": "/g@second#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@second#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@second#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@second#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:02000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x02\""
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 55,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "group_storage_modern_root",
+   "group": "group",
+   "note": "symbol-table group with children under a link-message root",
+   "rust_case": "group_storage_modern_root",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 59,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "group_storage_legacy_root",
+   "group": "group",
+   "note": "link-message group with children under a symbol-table root",
+   "rust_case": "group_storage_legacy_root",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 84,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "attr_scalar_num",
+   "group": "attribute",
+   "note": "scalar f64 and i32 attributes",
+   "rust_case": "attr_scalar_num",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/data@count#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/data@gain#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 33,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "attr_array_num",
+   "group": "attribute",
+   "note": "1-D and 2-D numeric attributes",
+   "rust_case": "attr_array_num",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/data@matrix#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[2,3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/data@offsets#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[4]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 33,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "attr_string",
+   "group": "attribute",
+   "note": "vlen UTF-8 string attributes on a dataset and a group",
+   "rust_case": "attr_string",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/data@units#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/g@NX_class#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "vstr,cset=utf8",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@NX_class#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@NX_class#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": ".=null",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@NX_class#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "vals:[\"NXdetector\"]",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"NXdetector\""
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 37,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "attrs_dense",
+   "group": "attribute",
+   "note": "12 attributes \u2014 dense attribute storage",
+   "rust_case": "attrs_dense",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/data@a00#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/data@a01#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/data@a02#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/data@a03#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/data@a04#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/data@a05#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/data@a06#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/data@a07#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/data@a08#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/data@a09#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/data@a10#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/data@a11#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 63,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "attrs_dense_group",
+   "group": "attribute",
+   "note": "12 attributes on a group and on the root \u2014 dense storage",
+   "rust_case": "attrs_dense_group",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/@r00#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r00#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r00#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r00#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:00000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\""
+     },
+     {
+      "key": "/@r01#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r01#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r01#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r01#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:01000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x01\""
+     },
+     {
+      "key": "/@r02#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r02#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r02#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r02#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:02000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x02\""
+     },
+     {
+      "key": "/@r03#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r03#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r03#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r03#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:03000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x03\""
+     },
+     {
+      "key": "/@r04#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r04#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r04#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r04#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:04000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x04\""
+     },
+     {
+      "key": "/@r05#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r05#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r05#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r05#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:05000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x05\""
+     },
+     {
+      "key": "/@r06#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r06#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r06#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r06#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:06000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x06\""
+     },
+     {
+      "key": "/@r07#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r07#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r07#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r07#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:07000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x07\""
+     },
+     {
+      "key": "/@r08#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r08#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r08#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r08#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:08000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x08\""
+     },
+     {
+      "key": "/@r09#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r09#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r09#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r09#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:09000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x09\""
+     },
+     {
+      "key": "/@r10#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r10#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r10#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r10#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:0a000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x0a\""
+     },
+     {
+      "key": "/@r11#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r11#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r11#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@r11#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:0b000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x0b\""
+     },
+     {
+      "key": "/g@g00#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g00#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g00#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g00#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:00000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\""
+     },
+     {
+      "key": "/g@g01#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g01#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g01#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g01#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:01000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x01\""
+     },
+     {
+      "key": "/g@g02#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g02#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g02#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g02#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:02000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x02\""
+     },
+     {
+      "key": "/g@g03#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g03#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g03#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g03#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:03000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x03\""
+     },
+     {
+      "key": "/g@g04#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g04#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g04#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g04#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:04000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x04\""
+     },
+     {
+      "key": "/g@g05#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g05#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g05#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g05#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:05000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x05\""
+     },
+     {
+      "key": "/g@g06#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g06#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g06#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g06#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:06000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x06\""
+     },
+     {
+      "key": "/g@g07#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g07#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g07#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g07#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:07000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x07\""
+     },
+     {
+      "key": "/g@g08#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g08#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g08#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g08#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:08000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x08\""
+     },
+     {
+      "key": "/g@g09#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g09#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g09#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g09#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:09000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x09\""
+     },
+     {
+      "key": "/g@g10#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g10#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g10#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g10#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:0a000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x0a\""
+     },
+     {
+      "key": "/g@g11#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i32le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g11#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g11#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/g@g11#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:0b000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x0b\""
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 34,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "attr_on_root",
+   "group": "attribute",
+   "note": "attributes on the root group",
+   "rust_case": "attr_on_root",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/@title#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "vstr,cset=utf8",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@title#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@title#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": ".=null",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@title#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "vals:[\"root\"]",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"root\""
+     },
+     {
+      "key": "/@version#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "i64le",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@version#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@version#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@version#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:0300000000000000",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"\\x03\""
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "attr_large",
+   "group": "attribute",
+   "note": "single 100 KiB attribute \u2014 dense storage forced by size, not count",
+   "rust_case": "attr_large",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/data@big#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[25600]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 30,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "attr_ref_object",
+   "group": "attribute",
+   "note": "object references stored in attributes of a dataset, a group and the root",
+   "rust_case": "attr_ref_object",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/@entry#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "objref",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@entry#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[2]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@entry#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@entry#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "vals:[objref:/grp,objref:/data]",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"x\\x05\""
+     },
+     {
+      "key": "/data@neighbours#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[2]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/grp@owner#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "objref",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/grp@owner#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/grp@owner#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/grp@owner#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "vals:[objref:/data]",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \" \\x03\""
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 37,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "libver_earliest",
+   "group": "superblock",
+   "note": "libver earliest \u2014 superblock v0, symbol-table groups",
+   "rust_case": "libver_earliest",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 34,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "libver_v108",
+   "group": "superblock",
+   "note": "libver v1.8 bounds",
+   "rust_case": "libver_v108",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 34,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "libver_v110",
+   "group": "superblock",
+   "note": "libver v1.10 bounds",
+   "rust_case": "libver_v110",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 34,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "libver_latest",
+   "group": "superblock",
+   "note": "libver latest \u2014 superblock v3, new-style groups",
+   "rust_case": "libver_latest",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 34,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "userblock",
+   "group": "superblock",
+   "note": "512-byte userblock \u2014 the superblock, and every address, is based at 512",
+   "rust_case": "userblock",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 34,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "reopen_append_earliest",
+   "group": "superblock",
+   "note": "classic file reopened under the default fapl \u2014 stays superblock v0, the appended chunked dataset takes the version-1 B-tree",
+   "rust_case": "reopen_append_earliest",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 52,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "reopen_append_v108",
+   "group": "superblock",
+   "note": "v1.8 file reopened under the default fapl \u2014 stays superblock v2, the appended chunked dataset takes the version-1 B-tree",
+   "rust_case": "reopen_append_v108",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 52,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "reopen_append_latest",
+   "group": "superblock",
+   "note": "v1.10+ file reopened under the default fapl \u2014 stays superblock v3, the appended chunked dataset takes a v1.10 index",
+   "rust_case": "reopen_append_latest",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 52,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [
+     {
+      "key": "/appended#chunkindex",
+      "field": "chunkindex",
+      "ref": "btree1",
+      "rust": "farray",
+      "expected": null
+     }
+    ],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "swmr_created",
+   "group": "swmr",
+   "note": "file created through the SWMR writer path and appended frame by frame",
+   "rust_case": "swmr_created",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "large_multi_mb",
+   "group": "bulk",
+   "note": "2 MiB chunked f64 dataset \u2014 payload compared by SHA-256",
+   "rust_case": "large_multi_mb",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "sohm_list",
+   "group": "sohm",
+   "note": "shared datatype/dataspace/attribute messages, list index (H5Pset_shared_mesg_index) + a committed datatype",
+   "rust_case": "sohm_list",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/named_i32#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5NamedDatatype exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/shared0@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared1@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared2@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared3@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 116,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "sohm_btree",
+   "group": "sohm",
+   "note": "the same file with the shared-message index forced to a v2 B-tree",
+   "rust_case": "sohm_btree",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/named_i32#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5NamedDatatype exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/shared0@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared1@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared2@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared3@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 116,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "sohm_list_append",
+   "group": "sohm",
+   "note": "a file with a shared-message list index reopened and appended to \u2014 the table is laid out whole, so the append replaces it",
+   "rust_case": "sohm_list_append",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/named_i32#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5NamedDatatype exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/shared0@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared1@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared2@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared3@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 134,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "sohm_btree_append",
+   "group": "sohm",
+   "note": "the same reopen over a v2 B-tree index",
+   "rust_case": "sohm_btree_append",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/named_i32#attrstore",
+      "kind": "unsupported",
+      "field": "attrstore",
+      "structural": true,
+      "ref": "compact",
+      "probe": "UNSUPPORTED(attrstore): H5NamedDatatype exposes no compact/dense attribute storage accessor"
+     },
+     {
+      "key": "/shared0@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared1@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared2@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     },
+     {
+      "key": "/shared3@cal#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[3]",
+      "probe": "UNSUPPORTED(shape): H5Attribute exposes no shape() accessor"
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 134,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "ochk_root",
+   "group": "objectheader",
+   "note": "root group whose object header spills into two continuation chunks",
+   "rust_case": "ochk_root",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [
+     {
+      "key": "/@note0#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "str[256],pad=null,cset=ascii",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note0#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note0#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note0#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:30787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787800",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"0xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""
+     },
+     {
+      "key": "/@note1#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "str[256],pad=null,cset=ascii",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note1#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note1#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note1#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:31787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787800",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""
+     },
+     {
+      "key": "/@note2#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "str[256],pad=null,cset=ascii",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note2#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note2#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note2#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:32787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787800",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"2xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""
+     },
+     {
+      "key": "/@note3#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "str[256],pad=null,cset=ascii",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note3#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note3#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note3#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:33787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787800",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"3xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""
+     },
+     {
+      "key": "/@note4#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "str[256],pad=null,cset=ascii",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note4#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note4#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note4#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:34787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787800",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"4xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""
+     },
+     {
+      "key": "/@note5#dtype",
+      "kind": "unsupported",
+      "field": "dtype",
+      "structural": true,
+      "ref": "str[256],pad=null,cset=ascii",
+      "probe": "UNSUPPORTED(dtype): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note5#shape",
+      "kind": "unsupported",
+      "field": "shape",
+      "structural": true,
+      "ref": "[]",
+      "probe": "UNSUPPORTED(shape): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note5#strpad",
+      "kind": "unsupported",
+      "field": "strpad",
+      "structural": true,
+      "ref": "-",
+      "probe": "UNSUPPORTED(strpad): H5Group has no attr() handle in read mode"
+     },
+     {
+      "key": "/@note5#value",
+      "kind": "unsupported",
+      "field": "value",
+      "structural": true,
+      "ref": "raw:35787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787800",
+      "probe": "UNSUPPORTED(value): H5Group has no attr() handle; attr_string() gave \"5xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""
+     }
+    ],
+    "oracle_errors": [],
+    "matched": 27,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  }
+ ],
+ "findings": [
+  {
+   "kind": "structural",
+   "signature": "shape \u2014 H5Attribute exposes no shape() accessor",
+   "cases": [
+    "attr_scalar_num",
+    "attr_array_num",
+    "attr_string",
+    "attrs_dense",
+    "attr_large",
+    "attr_ref_object",
+    "sohm_list",
+    "sohm_btree",
+    "sohm_list_append",
+    "sohm_btree_append"
+   ],
+   "example": "/data@count#shape"
+  },
+  {
+   "kind": "structural",
+   "signature": "dtype \u2014 H5Group has no attr() handle in read mode",
+   "cases": [
+    "track_order",
+    "attr_string",
+    "attrs_dense_group",
+    "attr_on_root",
+    "attr_ref_object",
+    "ochk_root"
+   ],
+   "example": "/@alpha#dtype"
+  },
+  {
+   "kind": "structural",
+   "signature": "shape \u2014 H5Group has no attr() handle in read mode",
+   "cases": [
+    "track_order",
+    "attr_string",
+    "attrs_dense_group",
+    "attr_on_root",
+    "attr_ref_object",
+    "ochk_root"
+   ],
+   "example": "/@alpha#shape"
+  },
+  {
+   "kind": "structural",
+   "signature": "strpad \u2014 H5Group has no attr() handle in read mode",
+   "cases": [
+    "track_order",
+    "attr_string",
+    "attrs_dense_group",
+    "attr_on_root",
+    "attr_ref_object",
+    "ochk_root"
+   ],
+   "example": "/@alpha#strpad"
+  },
+  {
+   "kind": "structural",
+   "signature": "value \u2014 H5Group has no attr() handle",
+   "cases": [
+    "track_order",
+    "attr_string",
+    "attrs_dense_group",
+    "attr_on_root",
+    "attr_ref_object",
+    "ochk_root"
+   ],
+   "example": "/@alpha#value"
+  },
+  {
+   "kind": "structural",
+   "signature": "attrstore \u2014 H5NamedDatatype exposes no compact/dense attribute storage accessor",
+   "cases": [
+    "named_datatype",
+    "sohm_list",
+    "sohm_btree",
+    "sohm_list_append",
+    "sohm_btree_append"
+   ],
+   "example": "/t#attrstore"
+  }
+ ],
+ "expected_deviations": [],
+ "unexpected_deviations": [
+  {
+   "key": "/appended#chunkindex",
+   "ref": "btree1",
+   "rust": "farray",
+   "cases": [
+    "reopen_append_latest"
+   ]
+  }
+ ]
+}
