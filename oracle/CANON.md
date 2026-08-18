@@ -1,4 +1,4 @@
-# The canonical dump format (`!canon 9`)
+# The canonical dump format (`!canon 10`)
 
 Both sides of the oracle — `oracle/canon.py` (h5py / libhdf5 1.14.6) and
 `src/bin/oracle_probe.rs` (rust-hdf5 public API) — emit this format, so the
@@ -8,7 +8,7 @@ two dumps of the same file are comparable as text and, more usefully, as a
 ## Grammar
 
     line   := header | record
-    header := "!canon" TAB "9"
+    header := "!canon" TAB "10"
     record := key TAB value
     key    := path [ "@" attrname ] "#" field
     value  := <no TAB, no LF>
@@ -75,12 +75,12 @@ decodes.
 Group fields: `kind`, `linkorder`, `attrorder`, `linkstore`, `shared`,
 `msgflags`, `hdrtimes`, `nattrs`, then attributes.
 
-Dataset fields, in order: `kind`, `dtype`, `strpad`, `shape`, `maxshape`,
+Dataset fields, in order: `kind`, `dtype`, `strpad`, `dtypever`, `shape`, `maxshape`,
 `layout`, `chunk`, `chunkindex`, `external`, `virtual`, `filters`,
 `fillvalue`, `filltime`, `alloctime`, `shared`, `msgflags`, `hdrtimes`,
 `nattrs`, attributes, `data`.
 
-Committed datatype fields: `kind`, `dtype`, `strpad`, `msgflags`,
+Committed datatype fields: `kind`, `dtype`, `strpad`, `dtypever`, `msgflags`,
 `hdrtimes`, `nattrs`, attributes.
 
 Link fields: `kind`, `target`, and for an external link `resolved`.
@@ -104,6 +104,7 @@ Link fields: `kind`, `target`, and for an external link `resolved`.
 | `linkorder`  | `-` \| `tracked` \| `tracked+indexed` — link creation-order tracking       |
 | `attrorder`  | as `linkorder`, for attributes                                            |
 | `strpad`     | `-`, or `.=null;.member=spacepad` for each vlen string in the type tree   |
+| `dtypever`   | `[compound:1,float:1,...]` — `class:version` per datatype message          |
 | `shared`     | `[]`, or `[dataspace:shareable,attribute:sohm,...]` — `class:storage`      |
 | `msgflags`   | `[datatype:C,layout:none,...]` — `class:flags` for every message           |
 | `hdrtimes`   | `yes` \| `no` — whether the header records the times it can hold           |
@@ -170,6 +171,34 @@ afterwards forces a second chunk and a continuation. A null message has no
 decode, encode, size or copy method at all (H5Onull.c:28-49) — it is free
 space wearing a message header — so a field over the present mask would be
 comparing padding.
+
+`dtypever` is the version byte each datatype message body claims, for the
+message in the object header and every type nested inside it, in the order
+`H5O__dtype_debug` prints them: the type itself, then depth-first through
+compound members, an enum's base and an array's base (H5Odtype.c:1984-2027). A
+vlen's base is not in the list because that walk does not descend into it, and
+a vlen's version is its base's anyway (`H5T__upgrade_version_cb`,
+H5T.c:6522-6524).
+
+It is a separate observable from `dtype` because a decode drops it: the same
+type is written at version 1 in a default file, 3 under `H5F_LIBVER_V18` and 4
+under `H5F_LIBVER_V112`, which is what says how old a library may be and still
+read the type. `H5T_set_version` raises compound, array and enum to
+`H5O_dtype_ver_bounds[H5F_LOW_BOUND(f)]` and leaves every atomic class at the
+version its construction gave it — 1 from `H5T__alloc` (H5T.c:4030), 2 for an
+array (H5Tarray.c:169), the newest member for a compound (H5Tcompound.c:458-465),
+4 for a revised reference (H5T.c:327) — so the bound alone does not predict it
+(H5T.c:605-612, :6584-6591).
+
+The h5py side reads it from `h5debug`, which has no h5py binding but decodes
+the message with `H5O_DECODEIO_NOCHANGE` and so prints what the file carries
+rather than what it would be upgraded to (H5Odtype.c:553-556); the rust side
+reads it from `H5File::object_datatype_versions`. Both follow a stored-shared
+datatype to the committed type it names, so a dataset typed by a committed
+datatype reports that type's version. Only the object header's own datatype
+message is measured: an attribute carries one too, but a dense attribute's sits
+in a fractal heap `h5debug` cannot reach, and it comes out of the same encoder
+at the same bound.
 
 `msgflags` is the flags byte of *every* message in the header — the same
 sorted `class:flags` shape as `shared`, with the tokens `H5O__debug_real`

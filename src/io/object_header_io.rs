@@ -23,7 +23,7 @@ use crate::format::fractal_heap::{
     collect_managed_blocks, read_heap_object, FractalHeapHeader, HeapId,
 };
 use crate::format::messages::attribute::{ATTR_FLAG_SPACE_SHARED, ATTR_FLAG_TYPE_SHARED};
-use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::messages::datatype::{DatatypeMessage, DatatypeNodeVersion};
 use crate::format::messages::shared::{MessageStorage, MSG_FLAG_SHARED};
 use crate::format::messages::MSG_FLAG_SHAREABLE;
 use crate::format::messages::{
@@ -149,6 +149,32 @@ pub(crate) fn read_header_message_flags(
         .filter(|m| !matches!(m.msg_type, MSG_NULL | MSG_OBJ_HEADER_CONTINUATION))
         .map(|m| (m.msg_type, m.flags))
         .collect())
+}
+
+/// The class and version of every datatype message in the tree the object
+/// header at `addr` carries, outermost first.
+///
+/// Read through [`read_object_header_full`], not the raw chain its two
+/// neighbours above use, precisely because a stored-shared datatype must be
+/// followed: the version that describes the object is the committed type's
+/// own, which is what `H5O__shared_debug` makes `h5debug` print too
+/// (H5Oshared.c:682-706).
+pub(crate) fn read_header_datatype_versions(
+    handle: &mut FileHandle,
+    meta: &FileMeta,
+    addr: u64,
+) -> IoResult<Vec<DatatypeNodeVersion>> {
+    let header = read_object_header_full(handle, meta, addr)?;
+    let msg = header
+        .messages
+        .iter()
+        .find(|m| m.msg_type == MSG_DATATYPE)
+        .ok_or_else(|| {
+            crate::io::IoError::NotFound(format!(
+                "object header at {addr:#x} holds no datatype message"
+            ))
+        })?;
+    Ok(DatatypeMessage::decode_versions(&msg.data)?)
 }
 
 /// The times the object header at `addr` records, wherever its version keeps

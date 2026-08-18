@@ -26,7 +26,7 @@ use crate::io::{Hdf5Reader, Hdf5Writer};
 
 use crate::dataset::{DatasetAccess, DatasetBuilder, H5Dataset};
 use crate::error::{Hdf5Error, Result};
-use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::messages::datatype::{DatatypeMessage, DatatypeNodeVersion};
 use crate::format::messages::filter::FilterPipeline;
 use crate::format::messages::shared::MessageStorage;
 use crate::format::LibverBound;
@@ -688,6 +688,26 @@ impl H5File {
             H5FileInner::Reader(reader) => Ok(reader.object_message_flags(path)?),
             _ => Err(Hdf5Error::InvalidState(
                 "object_message_flags is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// The class and version of every datatype message the object at `path`
+    /// carries, outermost first and then depth-first through compound
+    /// members, an enum's base and an array's base.
+    ///
+    /// The version is the one part of a datatype message a decode drops, and
+    /// it is not free: `H5T_set_version` (H5T.c:6584-6591) picks it from the
+    /// file's low libver bound and the type's own construction, so it is what
+    /// says which generation of library can read the type back. A
+    /// stored-shared datatype is followed to the committed type it names, so
+    /// what comes back is the version that actually describes the object.
+    pub fn object_datatype_versions(&self, path: &str) -> Result<Vec<DatatypeNodeVersion>> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => Ok(reader.object_datatype_versions(path)?),
+            _ => Err(Hdf5Error::InvalidState(
+                "object_datatype_versions is only available in read mode".into(),
             )),
         }
     }

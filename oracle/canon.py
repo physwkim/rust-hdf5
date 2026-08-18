@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Canonical h5py-side dump of an HDF5 file — the reference half of the oracle.
 
-Emits the `!canon 9` format described in oracle/CANON.md. The rust-hdf5 side
+Emits the `!canon 10` format described in oracle/CANON.md. The rust-hdf5 side
 (`src/bin/oracle_probe.rs`, `dump` subcommand) emits the same format from the
 same file, so the two are comparable line by line and field by field.
 
@@ -26,7 +26,7 @@ import hdf5env  # noqa: F401  (must precede h5py; see the module docstring)
 import h5py
 from h5py import h5d, h5o, h5p, h5s, h5t
 
-CANON_VERSION = "9"
+CANON_VERSION = "10"
 RAW_LIMIT = 1024
 MAX_DEPTH = 32
 
@@ -592,6 +592,12 @@ _H5DEBUG_MSG_NAME_RE = re.compile(
 _H5DEBUG_MSG_FLAGS_RE = re.compile(r"Message flags:\s+<([^>]*)>")
 _H5DEBUG_SHARED_TYPE_RE = re.compile(r"Shared Message type:\s+(.+?)\s*$", re.M)
 _H5DEBUG_TIMESTAMPS_RE = re.compile(r"^Timestamps:\s+(\w+)", re.M)
+# `H5O__dtype_debug` prints "Type class:", "Size:" and "Version:" for every
+# node of a datatype, in that order and at a deeper indent per level
+# (H5Odtype.c:2010-2016).
+_H5DEBUG_DTYPE_NODE_RE = re.compile(
+    r"^\s*(?:Type class:\s+(?P<cls>.+?)|Version:\s+(?P<ver>\d+))\s*$", re.M
+)
 
 
 def _h5debug_messages(filename, addr):
@@ -709,6 +715,60 @@ def hdrtimes_str(obj_id, filename):
         return "yes" if stamps.group(1) == "Enabled" else "no"
     names = (_H5DEBUG_MSG_NAME_RE.search(b) for b in _h5debug_messages(filename, addr))
     return "yes" if any(n and n.group(1) == "mtime_new" for n in names) else "no"
+
+
+# `H5O__dtype_debug`'s class strings (H5Odtype.c:1959-2010) mapped to the one
+# word the canon uses, so a class and its version fit a `class:version` pair.
+_DTYPE_CLASS_NAMES = {
+    "floating-point": "float",
+    "date and time": "time",
+    "text string": "string",
+    "bit field": "bitfield",
+}
+
+
+def _dtype_versions(block):
+    """`class:version` for every datatype node `h5debug` printed in `block`,
+    in its print order: the type itself, then depth-first through compound
+    members, an enum's base and an array's base. A vlen's base is not in the
+    list because `H5O__dtype_debug` does not recurse into it."""
+    parts, pending = [], None
+    for m in _H5DEBUG_DTYPE_NODE_RE.finditer(block):
+        if m.group("cls") is not None:
+            pending = m.group("cls")
+        elif pending is not None:
+            cls = _DTYPE_CLASS_NAMES.get(pending, pending)
+            parts.append("%s:%s" % (cls, m.group("ver")))
+            pending = None
+    return "[" + ",".join(parts) + "]"
+
+
+def dtypever_str(obj_id, filename):
+    """The `dtypever` field: the version each datatype message body claims.
+
+    A datatype is born at the version its own construction calls for —
+    `H5T__alloc` starts every type at 1 (H5T.c:4030), `H5T__array_create`
+    raises an array to 2 (H5Tarray.c:169), `H5T__insert` raises a compound to
+    its newest member (H5Tcompound.c:458-465) — and `H5T_set_version` then
+    raises compound, array and enum to `H5O_dtype_ver_bounds[H5F_LOW_BOUND(f)]`
+    if that is higher, leaving every atomic class alone (H5T.c:6584-6591, table
+    H5T.c:605-612). Nothing in the h5py API reports it, so it is read from
+    `h5debug`, which decodes the message with `H5O_DECODEIO_NOCHANGE` and so
+    prints the version the file carries rather than one it would upgrade to
+    (H5Odtype.c:553-556).
+
+    Only the object header's own datatype message: an attribute carries one
+    too, but a dense attribute's lives in a fractal heap where `h5debug` does
+    not reach it, and it comes out of the same encoder at the same bound as
+    the message measured here.
+    """
+    addr = h5o.get_info(obj_id).addr
+    for block in _h5debug_messages(filename, addr):
+        name = _H5DEBUG_MSG_NAME_RE.search(block)
+        if not name or name.group(1) != "datatype":
+            continue
+        return _dtype_versions(block)
+    return "-"
 
 
 _LAYOUTS = {
@@ -1013,6 +1073,10 @@ class Dumper:
                 self.field(child, "dtype", lambda o=obj: canon_dtype(o.id))
                 self.field(child, "strpad", lambda o=obj: strpad_str(o.id))
                 self.field(
+                    child, "dtypever",
+                    lambda o=obj: dtypever_str(o.id, o.file.filename),
+                )
+                self.field(
                     child, "msgflags",
                     lambda o=obj: msgflags_str(o.id, o.file.filename),
                 )
@@ -1050,6 +1114,7 @@ class Dumper:
 
         self.field(path, "dtype", lambda: canon_dtype(tid))
         self.field(path, "strpad", lambda: strpad_str(tid))
+        self.field(path, "dtypever", lambda: dtypever_str(dsid, dset.file.filename))
 
         if space_type == h5s.NULL:
             shape, maxshape = None, None
