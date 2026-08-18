@@ -56,6 +56,47 @@ pub const FILTER_BITGROOM: u16 = 32022;
 pub const FILTER_BITROUND: u16 = 32023;
 pub const FILTER_BLOSC2: u16 = 32026;
 
+/// Filter flags (`H5Zpublic.h`). A mandatory filter must run; if it can't
+/// (e.g. a compressor whose output would be larger than its input), the
+/// write fails. An optional filter is silently skipped for that chunk
+/// instead, with the skip recorded in the chunk's filter mask.
+///
+/// Every builtin and registered filter libhdf5 sets through its own
+/// `H5Pset_*` convenience call (`H5Pset_deflate`, `H5Pset_shuffle`,
+/// `H5Pset_szip`, `H5Pset_nbit`, `H5Pset_scaleoffset`) or through
+/// `H5Pset_filter` for a dynamically loaded one (h5py's `filters.py`
+/// `fill_dcpl`) uses `H5Z_FLAG_OPTIONAL`. `H5Pset_fletcher32` is the sole
+/// exception: a checksum is meaningless if it can be skipped, so it is
+/// `H5Z_FLAG_MANDATORY` (H5Pocpl.c).
+pub const FLAG_OPTIONAL: u16 = 1;
+/// See [`FLAG_OPTIONAL`]. Matches `H5Z_FLAG_MANDATORY`; used only by
+/// `H5Pset_fletcher32`.
+pub const FLAG_MANDATORY: u16 = 0;
+
+/// The name libhdf5 registers a filter under, for the filters libhdf5
+/// registers itself — the `H5Z_class2_t` name field of `H5Z_DEFLATE`,
+/// `H5Z_SHUFFLE`, `H5Z_FLETCHER32`, `H5Z_SZIP`, `H5Z_NBIT` and
+/// `H5Z_SCALEOFFSET`.
+///
+/// Only these. Everything at or above `H5Z_FILTER_RESERVED` (256,
+/// H5Zpublic.h:84) is a third-party filter whose registered name belongs to
+/// the plugin that registers it, and this crate does not know what the reader
+/// on the other side will have loaded — a guessed name would be a claim about
+/// someone else's plugin. `None` is what a version-1 pipeline writes as a
+/// zero name length, exactly as `H5O__pline_encode` does when `H5Z_find`
+/// resolves nothing.
+fn registered_name(id: u16) -> Option<&'static str> {
+    match id {
+        FILTER_DEFLATE => Some("deflate"),
+        FILTER_SHUFFLE => Some("shuffle"),
+        FILTER_FLETCHER32 => Some("fletcher32"),
+        FILTER_SZIP => Some("szip"),
+        FILTER_NBIT => Some("nbit"),
+        FILTER_SCALEOFFSET => Some("scaleoffset"),
+        _ => None,
+    }
+}
+
 /// A single filter in the pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Filter {
@@ -83,8 +124,30 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_DEFLATE,
-                flags: 0, // mandatory
+                flags: FLAG_OPTIONAL, // H5Pset_deflate (H5Pocpl.c)
                 cd_values: vec![level],
+            }],
+        }
+    }
+
+    /// Create a pipeline with a single shuffle filter.
+    ///
+    /// Shuffle reorders a chunk's bytes by their position within an element,
+    /// gathering each element's first bytes together, then each element's
+    /// second bytes, and so on. It compresses nothing by itself — its output
+    /// is a permutation of its input, exactly as long — so it is normally the
+    /// first stage before a compressor. `H5Pset_shuffle` sets it alone all the
+    /// same, and libhdf5 stores the permuted bytes with no filter behind it.
+    ///
+    /// `element_size` is the size of each data element in bytes; the filter
+    /// carries it as its one client-data value, since the raw chunk bytes do
+    /// not say where the element boundaries are.
+    pub fn shuffle(element_size: u32) -> Self {
+        Self {
+            filters: vec![Filter {
+                id: FILTER_SHUFFLE,
+                flags: FLAG_OPTIONAL, // H5Pset_shuffle (H5Pdcpl.c)
+                cd_values: vec![element_size],
             }],
         }
     }
@@ -99,12 +162,12 @@ impl FilterPipeline {
             filters: vec![
                 Filter {
                     id: FILTER_SHUFFLE,
-                    flags: 0,
+                    flags: FLAG_OPTIONAL,
                     cd_values: vec![element_size],
                 },
                 Filter {
                     id: FILTER_DEFLATE,
-                    flags: 0,
+                    flags: FLAG_OPTIONAL,
                     cd_values: vec![level],
                 },
             ],
@@ -116,7 +179,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_LZ4,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // dynamically registered filter (H5Pset_filter)
                 cd_values: vec![],
             }],
         }
@@ -129,7 +192,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_ZSTD,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // dynamically registered filter (H5Pset_filter)
                 cd_values: vec![level],
             }],
         }
@@ -146,7 +209,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_BSHUF,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // dynamically registered filter (H5Pset_filter)
                 // [major, minor, elem_size, block_size, compression]
                 cd_values: vec![0, 0, element_size, 0, 0],
             }],
@@ -163,7 +226,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_BSHUF,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // dynamically registered filter (H5Pset_filter)
                 cd_values: vec![0, 0, element_size, 0, BSHUF_COMPRESS_LZ4],
             }],
         }
@@ -223,7 +286,7 @@ impl FilterPipeline {
         Self {
             filters: vec![Filter {
                 id: FILTER_NBIT,
-                flags: 0,
+                flags: FLAG_OPTIONAL, // H5Pset_nbit (H5Pdcpl.c)
                 // [nparms, need_not_compress, d_nelmts, class, size, order,
                 //  precision, offset] — total 8 (3 base + 5 atomic).
                 cd_values: vec![
@@ -240,11 +303,139 @@ impl FilterPipeline {
         }
     }
 
+    /// Create a pipeline with a single scale-offset filter
+    /// (`H5Z_FILTER_SCALEOFFSET`, id 6) for an atomic numeric datatype.
+    ///
+    /// `d_nelmts` is the number of elements per chunk and `scale_factor` is
+    /// what `H5Pset_scaleoffset` takes: for an integer datatype the minimum
+    /// number of bits to store each offset (0 lets the filter work it out per
+    /// chunk), for a floating-point datatype the number of decimal digits to
+    /// keep. The `cd_values` layout mirrors `H5Z__set_local_scaleoffset`,
+    /// which fills all 20 entries; the fill value is left at zero and flagged
+    /// defined, which is what libhdf5 records for a dataset that never set
+    /// one.
+    ///
+    /// Only fixed-point and floating-point datatypes can be scale-offset
+    /// filtered; anything else returns `None`, as `H5Z__set_local_scaleoffset`
+    /// errors on it.
+    pub fn scaleoffset(
+        dt: &crate::format::messages::datatype::DatatypeMessage,
+        d_nelmts: usize,
+        scale_factor: i32,
+    ) -> Option<Self> {
+        use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+        use crate::format::nbit_scaleoffset::{
+            SO_CLS_FLOAT, SO_CLS_INTEGER, SO_FLOAT_DSCALE, SO_INT, SO_ORDER_BE, SO_ORDER_LE,
+            SO_SGN_2, SO_SGN_NONE, SO_TOTAL_NPARMS,
+        };
+
+        let (scale_type, class, size, sign, byte_order) = match dt {
+            DatatypeMessage::FixedPoint {
+                size,
+                byte_order,
+                signed,
+                ..
+            } => (
+                SO_INT,
+                SO_CLS_INTEGER,
+                *size,
+                if *signed { SO_SGN_2 } else { SO_SGN_NONE },
+                *byte_order,
+            ),
+            DatatypeMessage::FloatingPoint {
+                size, byte_order, ..
+            } => (SO_FLOAT_DSCALE, SO_CLS_FLOAT, *size, 0, *byte_order),
+            _ => return None,
+        };
+        let order = match byte_order {
+            ByteOrder::LittleEndian => SO_ORDER_LE,
+            ByteOrder::BigEndian => SO_ORDER_BE,
+        };
+
+        let mut cd_values = vec![0u32; SO_TOTAL_NPARMS];
+        cd_values[0] = scale_type;
+        cd_values[1] = scale_factor as u32;
+        cd_values[2] = d_nelmts as u32;
+        cd_values[3] = class;
+        cd_values[4] = size;
+        cd_values[5] = sign;
+        cd_values[6] = order;
+        cd_values[7] = 1; // fill value defined, and it is the zero left below
+        Some(Self {
+            filters: vec![Filter {
+                id: FILTER_SCALEOFFSET,
+                flags: FLAG_OPTIONAL, // H5Pset_scaleoffset (H5Pdcpl.c)
+                cd_values,
+            }],
+        })
+    }
+
     /// Create an empty pipeline (no filters).
     pub fn none() -> Self {
         Self {
             filters: Vec::new(),
         }
+    }
+
+    /// Encode at the version `format` calls for (`H5O_pline_ver_bounds`,
+    /// H5Opline.c:85): version 1 in a classic file, version 2 otherwise.
+    pub fn encode_for(&self, format: crate::format::ObjectFormat) -> Vec<u8> {
+        match format.filter_pipeline_version() {
+            1 => self.encode_v1(),
+            _ => self.encode(),
+        }
+    }
+
+    /// Encode as a version-1 filter pipeline message, the one libhdf5 writes
+    /// at `H5F_LIBVER_EARLIEST`.
+    ///
+    /// Version 1 differs from version 2 in three ways, all of them alignment
+    /// (`H5O__pline_encode`, H5Opline.c:280-350): six reserved bytes follow
+    /// the filter count, every filter carries a name length whether or not it
+    /// is one of libhdf5's own, and both the name and the client-data array
+    /// are padded — the name to a multiple of 8 bytes, the array to an even
+    /// number of values.
+    ///
+    /// The name written is the one the filter is registered under
+    /// ([`registered_name`]), because that is what `H5O__pline_encode` reaches
+    /// for when the message carries none of its own. A filter this crate has
+    /// no registered name for gets a zero name length, which is what libhdf5
+    /// writes when `H5Z_find` does not resolve the id either.
+    pub fn encode_v1(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64);
+
+        buf.push(1);
+        buf.push(self.filters.len() as u8);
+        buf.extend_from_slice(&[0u8; 6]);
+
+        for f in &self.filters {
+            buf.extend_from_slice(&f.id.to_le_bytes());
+
+            // The stored length counts the NUL terminator and is rounded up
+            // to the 8-byte multiple the name is padded to (`H5O_ALIGN_OLD`,
+            // H5Opkg.h:57).
+            let name = registered_name(f.id);
+            let name_len = name.map_or(0, |n| n.len() + 1);
+            let padded_len = name_len.div_ceil(8) * 8;
+            buf.extend_from_slice(&(padded_len as u16).to_le_bytes());
+
+            buf.extend_from_slice(&f.flags.to_le_bytes());
+            buf.extend_from_slice(&(f.cd_values.len() as u16).to_le_bytes());
+
+            if let Some(name) = name {
+                buf.extend_from_slice(name.as_bytes());
+                buf.resize(buf.len() + (padded_len - name.len()), 0);
+            }
+
+            for &cd in &f.cd_values {
+                buf.extend_from_slice(&cd.to_le_bytes());
+            }
+            if !f.cd_values.len().is_multiple_of(2) {
+                buf.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+
+        buf
     }
 
     /// Encode as a version-2 filter pipeline message.
@@ -426,11 +617,17 @@ impl FilterPipeline {
 /// Returns the compressed data. If no filters are configured, returns the
 /// input unchanged.
 pub fn apply_filters(pipeline: &FilterPipeline, data: &[u8]) -> FormatResult<Vec<u8>> {
-    let mut buf = data.to_vec();
+    let mut buf: Option<Vec<u8>> = None;
     for filter in &pipeline.filters {
-        buf = apply_single_filter(filter, &buf, true)?;
+        buf = Some(apply_single_filter(
+            filter,
+            buf.as_deref().unwrap_or(data),
+            true,
+        )?);
     }
-    Ok(buf)
+    // Only an empty pipeline leaves `buf` unset, and only then is a copy of
+    // the input the answer; every stage already produces a fresh buffer.
+    Ok(buf.unwrap_or_else(|| data.to_vec()))
 }
 
 /// Reverse the filter pipeline, skipping any filter whose bit is set in
@@ -448,20 +645,98 @@ pub fn reverse_filters_masked(
     data: &[u8],
     filter_mask: u32,
 ) -> FormatResult<Vec<u8>> {
-    let mut buf = data.to_vec();
+    let mut buf: Option<Vec<u8>> = None;
     for (i, filter) in pipeline.filters.iter().enumerate().rev() {
         if i < 32 && filter_mask & (1u32 << i) != 0 {
             continue;
         }
-        buf = apply_single_filter(filter, &buf, false)?;
+        buf = Some(apply_single_filter(
+            filter,
+            buf.as_deref().unwrap_or(data),
+            false,
+        )?);
     }
-    Ok(buf)
+    // Reached only when every filter was masked off (or the pipeline is
+    // empty): the stored bytes are already the chunk's data.
+    Ok(buf.unwrap_or_else(|| data.to_vec()))
 }
 
 /// Reverse filter pipeline to decompress raw chunk data (the full pipeline,
 /// no per-chunk mask). Equivalent to [`reverse_filters_masked`] with mask 0.
 pub fn reverse_filters(pipeline: &FilterPipeline, data: &[u8]) -> FormatResult<Vec<u8>> {
     reverse_filters_masked(pipeline, data, 0)
+}
+
+/// Reverse the filter pipeline straight into `out`, returning the length of
+/// the image it produced.
+///
+/// A chunk's decoded image is frequently one contiguous stretch of the read's
+/// output — for a whole chunk of a full read it always is — and then the image
+/// *is* those output bytes: the last reverse stage writes them where they
+/// belong and no staging buffer is allocated, filled and copied out. Stages
+/// before the last still materialize their own buffer; only the last one has a
+/// destination the caller can name.
+///
+/// The returned length is the whole image the pipeline produced, which may
+/// exceed `out.len()` — the surplus is discarded, exactly as a caller copying
+/// `out.len()` bytes out of a materialized image discards it. A length below
+/// `out.len()` means the stored chunk decoded short of its image; `out` past
+/// that length is then left **unspecified**, because the inflate writes its
+/// output in blocks and the last one can run past the byte the stream ends on.
+/// A caller whose destination may outlast the image owns every byte of it,
+/// not just the tail past the image.
+pub fn reverse_filters_masked_into(
+    pipeline: &FilterPipeline,
+    data: &[u8],
+    filter_mask: u32,
+    out: &mut [u8],
+) -> FormatResult<usize> {
+    let masked = |i: usize| i < 32 && filter_mask & (1u32 << i) != 0;
+    // The last stage to run is the lowest-numbered filter still in play; it is
+    // the one whose output is the image, so it is the one that writes to `out`.
+    let Some(last) = (0..pipeline.filters.len()).find(|i| !masked(*i)) else {
+        // Every filter masked off (or an empty pipeline): the stored bytes are
+        // already the chunk's image.
+        return Ok(copy_image_into(data, out));
+    };
+    let mut buf: Option<Vec<u8>> = None;
+    for (i, filter) in pipeline.filters.iter().enumerate().rev() {
+        if masked(i) || i == last {
+            continue;
+        }
+        buf = Some(apply_single_filter(
+            filter,
+            buf.as_deref().unwrap_or(data),
+            false,
+        )?);
+    }
+    reverse_single_filter_into(&pipeline.filters[last], buf.as_deref().unwrap_or(data), out)
+}
+
+/// Copy an already-decoded image into a caller's destination, returning the
+/// image's own length so a short image is visible to the caller as one.
+fn copy_image_into(image: &[u8], out: &mut [u8]) -> usize {
+    let n = image.len().min(out.len());
+    out[..n].copy_from_slice(&image[..n]);
+    image.len()
+}
+
+/// Reverse one filter into `out`, returning the length of the image it
+/// produced (which may exceed `out.len()`; see
+/// [`reverse_filters_masked_into`]).
+///
+/// Only the inflate has a decoder that can be pointed at a caller's buffer;
+/// every other filter builds its image and copies it, which is what the caller
+/// would have done with it anyway.
+fn reverse_single_filter_into(filter: &Filter, data: &[u8], out: &mut [u8]) -> FormatResult<usize> {
+    #[cfg(feature = "deflate")]
+    if filter.id == FILTER_DEFLATE {
+        return inflate_zlib_into(data, out);
+    }
+    Ok(copy_image_into(
+        &apply_single_filter(filter, data, false)?,
+        out,
+    ))
 }
 
 /// Apply the shuffle filter (byte transposition).
@@ -511,6 +786,118 @@ fn unshuffle(data: &[u8], bytesoftype: usize) -> Vec<u8> {
     dest
 }
 
+/// Inflate one zlib stream, growing a single output buffer.
+///
+/// The engine is zlib-rs rather than the miniz_oxide behind `flate2`: on the
+/// same level-6 streams it inflates 1.2x faster on incompressible chunks and
+/// 1.7x faster on text-like ones. Compression stays on miniz_oxide
+/// ([`apply_single_filter`]) because zlib-rs's deflate below level 9 gives up
+/// a large part of the ratio on periodic data.
+///
+/// `Read::read_to_end` was the obvious spelling but the wrong one for chunk
+/// data: it grows the buffer up from nothing and re-enters the decoder once
+/// per growth step, which on a 2 MiB chunk that compresses well costs about
+/// as much as the inflate itself.
+///
+/// `expected` is the uncompressed length when the caller knows it — blosc
+/// records one in its own header. The deflate filter does not: HDF5 keeps the
+/// uncompressed chunk size nowhere the filter can see, so its buffer starts at
+/// the next power of two above the compressed length and doubles. Chunk sizes
+/// are themselves powers of two often enough that this usually lands on the
+/// exact size in two or three steps; doubling from the compressed length
+/// instead overshoots by up to 2x and cost more than `read_to_end` did.
+#[cfg(feature = "deflate")]
+fn inflate_zlib(data: &[u8], expected: Option<usize>) -> FormatResult<Vec<u8>> {
+    use zlib_rs::{Inflate, InflateFlush, Status};
+
+    let err = |what: &str| FormatError::InvalidData(format!("deflate decompress error: {what}"));
+    // 15 is the largest LZ77 window; a stream that declares a smaller one in
+    // its zlib header still inflates against it.
+    let mut inflate = Inflate::new(true, 15);
+    let start = expected
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| data.len().max(4096).next_power_of_two());
+    let mut out = vec![0u8; start];
+    loop {
+        let consumed = inflate.total_in() as usize;
+        let filled = inflate.total_out() as usize;
+        if filled == out.len() {
+            out.resize(out.len() * 2, 0);
+        }
+        let status = inflate
+            .decompress(&data[consumed..], &mut out[filled..], InflateFlush::NoFlush)
+            .map_err(|e| err(e.as_str()))?;
+        if status == Status::StreamEnd {
+            break;
+        }
+        // Neither side moved with output still to spare: the stored bytes end
+        // before the stream does.
+        if inflate.total_in() as usize == consumed && inflate.total_out() as usize == filled {
+            return Err(err("truncated stream"));
+        }
+    }
+    out.truncate(inflate.total_out() as usize);
+    Ok(out)
+}
+
+/// Bytes of scratch the overflow drain works through when a stream turns out
+/// to be longer than the destination the caller named. Allocated only when
+/// that happens, which for a chunk whose image is the size the layout says it
+/// is never does.
+#[cfg(feature = "deflate")]
+const INFLATE_DRAIN_BYTES: usize = 32 * 1024;
+
+/// Inflate one zlib stream straight into `out`, returning the stream's whole
+/// decompressed length.
+///
+/// The destination is fixed, so nothing is allocated, grown or copied: the
+/// [`inflate_zlib`] growth loop exists only because that spelling has no
+/// destination to write to. A stream longer than `out` keeps inflating through
+/// a small scratch buffer and the surplus is dropped — so a stream that is
+/// malformed past the caller's window still fails here, as it does when
+/// `inflate_zlib` grows a buffer to the stream's end.
+///
+/// `out` past the returned length is left unspecified: the decoder copies
+/// output in blocks and the block that finishes the stream may reach past the
+/// stream's last byte, into slack the caller offered.
+#[cfg(feature = "deflate")]
+fn inflate_zlib_into(data: &[u8], out: &mut [u8]) -> FormatResult<usize> {
+    use zlib_rs::{Inflate, InflateFlush, Status};
+
+    let err = |what: &str| FormatError::InvalidData(format!("deflate decompress error: {what}"));
+    let mut inflate = Inflate::new(true, 15);
+    let mut drain: Vec<u8> = Vec::new();
+    let mut filled = 0usize;
+    let mut produced = 0usize;
+    loop {
+        let consumed = inflate.total_in() as usize;
+        let before = inflate.total_out();
+        let status = if filled < out.len() {
+            inflate.decompress(&data[consumed..], &mut out[filled..], InflateFlush::NoFlush)
+        } else {
+            if drain.is_empty() {
+                drain = vec![0u8; INFLATE_DRAIN_BYTES];
+            }
+            inflate.decompress(&data[consumed..], &mut drain, InflateFlush::NoFlush)
+        }
+        .map_err(|e| err(e.as_str()))?;
+        let made = (inflate.total_out() - before) as usize;
+        if filled < out.len() {
+            filled += made;
+        }
+        produced += made;
+        if status == Status::StreamEnd {
+            break;
+        }
+        // Neither side moved with output still to spare: the stored bytes end
+        // before the stream does.
+        if inflate.total_in() as usize == consumed && made == 0 {
+            return Err(err("truncated stream"));
+        }
+    }
+    Ok(produced)
+}
+
 fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatResult<Vec<u8>> {
     match filter.id {
         #[cfg(feature = "deflate")]
@@ -529,15 +916,7 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
                     .finish()
                     .map_err(|e| FormatError::InvalidData(format!("deflate finish error: {}", e)))
             } else {
-                use flate2::read::ZlibDecoder;
-                use std::io::Read;
-
-                let mut decoder = ZlibDecoder::new(data);
-                let mut out = Vec::new();
-                decoder.read_to_end(&mut out).map_err(|e| {
-                    FormatError::InvalidData(format!("deflate decompress error: {}", e))
-                })?;
-                Ok(out)
+                inflate_zlib(data, None)
             }
         }
         #[cfg(not(feature = "deflate"))]
@@ -628,14 +1007,12 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
 
         // =====================================================================
         // Scale-offset (6) — stores values as small integers relative to a
-        // per-chunk minimum (H5Zscaleoffset.c). Decompress only; compress is
-        // not implemented (the writer never needs it).
+        // per-chunk minimum (H5Zscaleoffset.c). Both directions are byte-exact
+        // with libhdf5.
         // =====================================================================
         FILTER_SCALEOFFSET => {
             if compress {
-                Err(FormatError::UnsupportedFeature(
-                    "scale-offset filter compression is not implemented".into(),
-                ))
+                crate::format::nbit_scaleoffset::forward_scaleoffset(data, &filter.cd_values)
             } else {
                 crate::format::nbit_scaleoffset::reverse_scaleoffset(data, &filter.cd_values)
             }
@@ -916,7 +1293,7 @@ fn fletcher32(data: &[u8]) -> u32 {
 #[cfg(feature = "parallel")]
 pub fn apply_filters_parallel(
     pipeline: &FilterPipeline,
-    chunks: &[Vec<u8>],
+    chunks: &[&[u8]],
 ) -> FormatResult<Vec<Vec<u8>>> {
     use rayon::prelude::*;
     // Run on rust-hdf5's private half-cores pool, not rayon's global pool; fall
@@ -1645,15 +2022,8 @@ fn blosc_sub_decompress(compressor: u32, data: &[u8], nbytes: usize) -> FormatRe
                 .map_err(|e| FormatError::InvalidData(format!("blosc snappy: {}", e)))
         }
         #[cfg(feature = "deflate")]
-        BLOSC_ZLIB => {
-            use flate2::read::ZlibDecoder;
-            use std::io::Read;
-            let mut dec = ZlibDecoder::new(data);
-            let mut out = Vec::with_capacity(nbytes);
-            dec.read_to_end(&mut out)
-                .map_err(|e| FormatError::InvalidData(format!("blosc zlib: {}", e)))?;
-            Ok(out)
-        }
+        BLOSC_ZLIB => inflate_zlib(data, Some(nbytes))
+            .map_err(|e| FormatError::InvalidData(format!("blosc zlib: {e}"))),
         #[cfg(not(feature = "deflate"))]
         BLOSC_ZLIB => Err(FormatError::UnsupportedFeature(
             "blosc zlib sub-codec requires the 'deflate' feature".into(),
@@ -2121,6 +2491,168 @@ fn blosclz_decompress(input: &[u8], maxout: usize) -> FormatResult<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// Byte-for-byte against what libhdf5 writes. Each expected slice was
+    /// read out of a file h5py created with `libver='earliest'` and a chunked
+    /// dataset carrying that pipeline, which is the only authority on the
+    /// padding rules — `H5O__pline_encode` states them, but the file is what
+    /// a reader parses.
+    ///
+    /// The pipelines are the ones this crate's own builders produce, so the
+    /// flags byte in each expected slice is the flag the builder stored and
+    /// not a value written into the test: `H5Z_FLAG_OPTIONAL` for deflate and
+    /// shuffle, `H5Z_FLAG_MANDATORY` for fletcher32 ([`FLAG_OPTIONAL`]).
+    /// libhdf5 makes the same split, so a hardcoded flags byte on either
+    /// side of it would fail here.
+    #[test]
+    fn version_1_encodes_the_bytes_libhdf5_writes() {
+        // gzip level 4: name "deflate\0" is 8 bytes and needs no padding,
+        // and the single client-data value is padded out to an even count.
+        assert_eq!(
+            FilterPipeline::deflate(4).encode_v1(),
+            b"\x01\x01\x00\x00\x00\x00\x00\x00\
+              \x01\x00\x08\x00\x01\x00\x01\x00\
+              deflate\x00\
+              \x04\x00\x00\x00\x00\x00\x00\x00"
+        );
+
+        // shuffle over 4-byte elements: same shape, and libhdf5 records the
+        // element width `H5Z__set_local_shuffle` filled in.
+        assert_eq!(
+            FilterPipeline::shuffle(4).encode_v1(),
+            b"\x01\x01\x00\x00\x00\x00\x00\x00\
+              \x02\x00\x08\x00\x01\x00\x01\x00\
+              shuffle\x00\
+              \x04\x00\x00\x00\x00\x00\x00\x00"
+        );
+
+        // fletcher32: "fletcher32\0" is 11 bytes, so the name is padded to
+        // 16 and the declared length is the padded one. No client data, so
+        // no client-data padding either. Its flags byte is 0 — `H5Pset_fletcher32`
+        // is the one libhdf5 setter that asks for a mandatory filter.
+        let fletcher = FilterPipeline {
+            filters: vec![Filter {
+                id: FILTER_FLETCHER32,
+                flags: FLAG_MANDATORY,
+                cd_values: vec![],
+            }],
+        };
+        assert_eq!(
+            fletcher.encode_v1(),
+            b"\x01\x01\x00\x00\x00\x00\x00\x00\
+              \x03\x00\x10\x00\x00\x00\x00\x00\
+              fletcher32\x00\x00\x00\x00\x00\x00"
+        );
+
+        // Two filters in one message: the six reserved bytes are the
+        // message's, not each filter's, and shuffle precedes deflate the way
+        // libhdf5 applies them.
+        assert_eq!(
+            FilterPipeline::shuffle_deflate(4, 4).encode_v1(),
+            b"\x01\x02\x00\x00\x00\x00\x00\x00\
+              \x02\x00\x08\x00\x01\x00\x01\x00\
+              shuffle\x00\
+              \x04\x00\x00\x00\x00\x00\x00\x00\
+              \x01\x00\x08\x00\x01\x00\x01\x00\
+              deflate\x00\
+              \x04\x00\x00\x00\x00\x00\x00\x00"
+        );
+
+        // A mandatory filter beside an optional one, `fletcher32=True` with
+        // `compression='gzip'`. Each filter carries its own flags byte, so
+        // one message holds both values — an encoder emitting a constant
+        // cannot produce this.
+        let mixed = FilterPipeline {
+            filters: vec![
+                FilterPipeline::deflate(4).filters[0].clone(),
+                fletcher.filters[0].clone(),
+            ],
+        };
+        assert_eq!(
+            mixed.encode_v1(),
+            b"\x01\x02\x00\x00\x00\x00\x00\x00\
+              \x01\x00\x08\x00\x01\x00\x01\x00\
+              deflate\x00\
+              \x04\x00\x00\x00\x00\x00\x00\x00\
+              \x03\x00\x10\x00\x00\x00\x00\x00\
+              fletcher32\x00\x00\x00\x00\x00\x00"
+        );
+    }
+
+    /// A filter this crate has no registered name for gets a zero name
+    /// length and no name bytes — what `H5O__pline_encode` writes when
+    /// `H5Z_find` resolves nothing — and the client-data padding still
+    /// applies.
+    #[test]
+    fn version_1_names_only_the_filters_libhdf5_registers() {
+        let pipeline = FilterPipeline {
+            filters: vec![Filter {
+                id: FILTER_ZSTD,
+                flags: 0,
+                cd_values: vec![3],
+            }],
+        };
+        assert_eq!(
+            pipeline.encode_v1(),
+            b"\x01\x01\x00\x00\x00\x00\x00\x00\
+              \x0f\x7d\x00\x00\x00\x00\x01\x00\
+              \x03\x00\x00\x00\x00\x00\x00\x00"
+        );
+        let (decoded, consumed) = FilterPipeline::decode(&pipeline.encode_v1()).unwrap();
+        assert_eq!(consumed, pipeline.encode_v1().len());
+        assert_eq!(decoded, pipeline);
+    }
+
+    /// Every pipeline this crate can build survives its own version-1
+    /// encoding, whatever the name length and client-data count do to the
+    /// padding. The decoder is the one libhdf5 files are read with, so a
+    /// round trip through it is what says the two agree on where each field
+    /// ends.
+    #[test]
+    fn version_1_round_trips_through_the_decoder() {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let dt = DatatypeMessage::i32_type();
+        let single = |id, cd_values| FilterPipeline {
+            filters: vec![Filter {
+                id,
+                flags: 0,
+                cd_values,
+            }],
+        };
+        for pipeline in [
+            FilterPipeline::none(),
+            FilterPipeline::deflate(6),
+            FilterPipeline::shuffle(4),
+            FilterPipeline::shuffle_deflate(4, 9),
+            single(FILTER_FLETCHER32, vec![]),
+            single(FILTER_SZIP, vec![4, 32, 32, 256]),
+            FilterPipeline::nbit(&dt, 16),
+            FilterPipeline::scaleoffset(&dt, 16, 0).unwrap(),
+            FilterPipeline::zstd(3),
+            FilterPipeline::bshuf_lz4(4),
+        ] {
+            let encoded = pipeline.encode_v1();
+            assert_eq!(encoded[0], 1, "{pipeline:?}");
+            assert_eq!(encoded[1] as usize, pipeline.filters.len(), "{pipeline:?}");
+            let (decoded, consumed) = FilterPipeline::decode(&encoded).unwrap();
+            assert_eq!(consumed, encoded.len(), "{pipeline:?}");
+            assert_eq!(decoded, pipeline);
+        }
+    }
+
+    /// The version follows the file's format and nothing else.
+    #[test]
+    fn the_object_format_picks_the_pipeline_version() {
+        use crate::format::ObjectFormat;
+
+        let pipeline = FilterPipeline::deflate(6);
+        assert_eq!(
+            pipeline.encode_for(ObjectFormat::Legacy),
+            pipeline.encode_v1()
+        );
+        assert_eq!(pipeline.encode_for(ObjectFormat::Modern), pipeline.encode());
+    }
+
     #[test]
     fn encode_decode_deflate() {
         let pipeline = FilterPipeline::deflate(6);
@@ -2275,6 +2807,152 @@ mod tests {
         );
     }
 
+    /// Boundaries of the growing inflate buffer in [`inflate_zlib`]: output
+    /// below the first guess, exactly on a power-of-two step, and several
+    /// doublings past it.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn deflate_output_sizes_around_the_buffer_boundary() {
+        let pipeline = FilterPipeline::deflate(6);
+        for len in [0usize, 1, 4095, 4096, 4097, 65_536, 1 << 20] {
+            let original: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let compressed = apply_filters(&pipeline, &original).unwrap();
+            let decompressed = reverse_filters(&pipeline, &compressed).unwrap();
+            assert_eq!(decompressed, original, "length {len}");
+        }
+    }
+
+    /// Decoding into a caller's destination lands the same bytes the
+    /// materializing spelling produces, for every pipeline shape: a lone
+    /// deflate, a deflate behind another filter, and a pipeline masked down to
+    /// nothing.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn reverse_into_a_destination_matches_reverse_into_a_vec() {
+        let original: Vec<u8> = (0..40_000u32).map(|i| (i % 17) as u8).collect();
+        let cases = [
+            FilterPipeline::deflate(6),
+            FilterPipeline {
+                filters: vec![
+                    Filter {
+                        id: FILTER_SHUFFLE,
+                        flags: 0,
+                        cd_values: vec![8],
+                    },
+                    Filter {
+                        id: FILTER_DEFLATE,
+                        flags: 0,
+                        cd_values: vec![6],
+                    },
+                ],
+            },
+            FilterPipeline {
+                filters: vec![
+                    Filter {
+                        id: FILTER_DEFLATE,
+                        flags: 0,
+                        cd_values: vec![6],
+                    },
+                    Filter {
+                        id: FILTER_FLETCHER32,
+                        flags: 0,
+                        cd_values: vec![],
+                    },
+                ],
+            },
+        ];
+        for (case, pipeline) in cases.iter().enumerate() {
+            let compressed = apply_filters(pipeline, &original).unwrap();
+            let want = reverse_filters(pipeline, &compressed).unwrap();
+            let mut got = vec![0xAAu8; want.len()];
+            assert_eq!(
+                reverse_filters_masked_into(pipeline, &compressed, 0, &mut got).unwrap(),
+                want.len(),
+                "case {case}"
+            );
+            assert_eq!(got, want, "case {case}");
+
+            // Masked down to nothing: the stored bytes are the image.
+            let mask = u32::MAX;
+            let mut raw = vec![0u8; compressed.len()];
+            assert_eq!(
+                reverse_filters_masked_into(pipeline, &compressed, mask, &mut raw).unwrap(),
+                compressed.len(),
+                "case {case}"
+            );
+            assert_eq!(
+                raw,
+                reverse_filters_masked(pipeline, &compressed, mask).unwrap(),
+                "case {case}"
+            );
+        }
+    }
+
+    /// The returned length is the image the pipeline produced, not what fitted:
+    /// a destination shorter than the image keeps its first bytes and reports
+    /// the whole length, a longer one is written only as far as the image goes.
+    /// Both are what a caller copying out of a materialized image would see.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn reverse_into_reports_the_image_length_not_the_destination() {
+        let pipeline = FilterPipeline::deflate(6);
+        let original: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+        let compressed = apply_filters(&pipeline, &original).unwrap();
+
+        let mut short = vec![0u8; 1000];
+        assert_eq!(
+            reverse_filters_masked_into(&pipeline, &compressed, 0, &mut short).unwrap(),
+            original.len()
+        );
+        assert_eq!(short, original[..1000]);
+
+        // A destination outlasting the image keeps the image; what the slack
+        // past it holds is unspecified (the inflate's last output block can
+        // reach past the byte the stream ends on), which is why a caller that
+        // sees a short image owns the whole destination, not just that tail.
+        let mut long = vec![0xCDu8; original.len() + 4096];
+        assert_eq!(
+            reverse_filters_masked_into(&pipeline, &compressed, 0, &mut long).unwrap(),
+            original.len()
+        );
+        assert_eq!(&long[..original.len()], &original[..]);
+    }
+
+    /// A stream that is malformed past the destination still fails: the
+    /// overflow is inflated through a scratch buffer rather than abandoned at
+    /// the destination's end, which is where a growing buffer would have found
+    /// the same error.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn reverse_into_a_short_destination_still_validates_the_rest_of_the_stream() {
+        let pipeline = FilterPipeline::deflate(6);
+        let original: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let compressed = apply_filters(&pipeline, &original).unwrap();
+        let cut = &compressed[..compressed.len() / 2];
+        let mut small = vec![0u8; 4096];
+        assert!(reverse_filters_masked_into(&pipeline, cut, 0, &mut small).is_err());
+        assert!(reverse_filters(&pipeline, cut).is_err());
+    }
+
+    /// A chunk read `at_most` can carry bytes past the end of the stream (the
+    /// reader does not always know the exact stored length); inflate stops at
+    /// the stream end and ignores them. A stream cut short is an error.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn deflate_tolerates_trailing_bytes_but_not_a_cut_stream() {
+        let pipeline = FilterPipeline::deflate(6);
+        let original: Vec<u8> = (0..40_000).map(|i| (i % 13) as u8).collect();
+        let compressed = apply_filters(&pipeline, &original).unwrap();
+
+        let mut padded = compressed.clone();
+        padded.extend_from_slice(&[0xAB; 64]);
+        assert_eq!(reverse_filters(&pipeline, &padded).unwrap(), original);
+
+        let cut = &compressed[..compressed.len() / 2];
+        assert!(reverse_filters(&pipeline, cut).is_err());
+        assert!(reverse_filters(&pipeline, &[]).is_err());
+    }
+
     #[cfg(feature = "deflate")]
     #[test]
     fn deflate_level_zero() {
@@ -2392,7 +3070,8 @@ mod tests {
             .map(|i| vec![(i as u8).wrapping_mul(42); 1024])
             .collect();
 
-        let compressed = apply_filters_parallel(&pipeline, &chunks).unwrap();
+        let borrowed: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let compressed = apply_filters_parallel(&pipeline, &borrowed).unwrap();
         assert_eq!(compressed.len(), 8);
         // Each compressed chunk should be smaller (repeated data compresses well)
         for c in &compressed {
@@ -2410,8 +3089,8 @@ mod tests {
     /// helpers, never be swallowed into raw bytes. If it were swallowed, a
     /// caller recording the chunk under filter_mask=0 would claim the pipeline
     /// ran, and the reader would try to reverse-filter raw data and corrupt it.
-    /// Scale-offset compression is unimplemented, so apply_single_filter errors
-    /// deterministically (no feature flag needed).
+    /// Scale-offset with empty `cd_values` cannot describe a datatype, so
+    /// apply_single_filter errors deterministically (no feature flag needed).
     #[cfg(feature = "parallel")]
     #[test]
     fn parallel_compress_propagates_filter_error() {
@@ -2422,7 +3101,7 @@ mod tests {
                 cd_values: vec![],
             }],
         };
-        let chunks: Vec<Vec<u8>> = vec![vec![1u8; 64], vec![2u8; 64]];
+        let chunks: [&[u8]; 2] = [&[1u8; 64], &[2u8; 64]];
         assert!(
             apply_filters_parallel(&pipeline, &chunks).is_err(),
             "scale-offset compress error must propagate, not be swallowed"
@@ -2854,6 +3533,63 @@ mod tests {
         );
         let back = reverse_filters(&pipeline, &packed).unwrap();
         assert_eq!(back, data, "nbit 12-bit roundtrip mismatch");
+    }
+
+    #[test]
+    fn scaleoffset_cd_values_layout() {
+        use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
+        // int32 LE, library-computed minbits: the layout libhdf5 stores for a
+        // dataset created with `H5Pset_scaleoffset(H5Z_SO_INT, 0)`.
+        let dt = DatatypeMessage::i32_type();
+        let f = &FilterPipeline::scaleoffset(&dt, 100, 0).unwrap().filters[0];
+        assert_eq!(f.id, FILTER_SCALEOFFSET);
+        // [scale_type, scale_factor, d_nelmts, class, size, sign, order,
+        //  filavail, fill value ...]
+        assert_eq!(
+            f.cd_values,
+            vec![2, 0, 100, 0, 4, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+
+        // Unsigned drops the sign code; big-endian raises the order code.
+        let be = DatatypeMessage::FixedPoint {
+            size: 2,
+            byte_order: ByteOrder::BigEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 16,
+        };
+        let f = &FilterPipeline::scaleoffset(&be, 8, 0).unwrap().filters[0];
+        assert_eq!((f.cd_values[5], f.cd_values[6]), (0, 1));
+
+        // A float carries the D-scale type and the digit count, and no sign.
+        let f = &FilterPipeline::scaleoffset(&DatatypeMessage::f64_type(), 8, 3)
+            .unwrap()
+            .filters[0];
+        assert_eq!(f.cd_values[..8], [0, 3, 8, 1, 8, 0, 0, 1]);
+
+        // Classes the filter cannot describe are refused, as H5Z__set_local
+        // does.
+        assert!(FilterPipeline::scaleoffset(&DatatypeMessage::fixed_string(4), 8, 0).is_none());
+    }
+
+    /// The `d_nelmts` a pipeline is built with is what both directions read
+    /// the chunk length from, so a pipeline and its chunk must agree.
+    #[test]
+    fn scaleoffset_pipeline_roundtrips_its_own_chunk() {
+        use crate::format::messages::datatype::DatatypeMessage;
+        let n = 40usize;
+        let pipeline = FilterPipeline::scaleoffset(&DatatypeMessage::i32_type(), n, 0).unwrap();
+        let data: Vec<u8> = (0..n as i32)
+            .flat_map(|i| (-40 + i * 3).to_le_bytes())
+            .collect();
+        let packed = apply_filters(&pipeline, &data).unwrap();
+        assert!(
+            packed.len() < data.len(),
+            "scaleoffset did not pack: {} >= {}",
+            packed.len(),
+            data.len()
+        );
+        assert_eq!(reverse_filters(&pipeline, &packed).unwrap(), data);
     }
 
     // --- BitGroom golden test ---

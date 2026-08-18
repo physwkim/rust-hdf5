@@ -85,11 +85,94 @@ fn metadata_datasets_and_attributes_round_trip() {
         r.group_attr_string("/entry", "NX_class").unwrap(),
         "NXentry"
     );
-    assert!(r.group_attr_names("/entry").iter().any(|n| n == "version"));
+    assert!(r
+        .group_attr_names("/entry")
+        .unwrap()
+        .iter()
+        .any(|n| n == "version"));
     assert_eq!(
         r.group_attr_string("/", "file_name").unwrap(),
         "metadata.h5"
     );
+
+    cleanup(&path);
+}
+
+/// The SWMR metadata writers declare the character set they are named for,
+/// and the ASCII twin refuses a string that declaration would misdescribe.
+#[test]
+fn string_dataset_writers_declare_their_character_set() {
+    use rust_hdf5::{DatatypeMessage, H5File};
+
+    let path = unique_tmp("string_cset");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        w.write_string_dataset("utf8", &["\u{e9}t\u{e9}"]).unwrap();
+        w.write_string_dataset_ascii("ascii", &["2026-05-18T10:00:00"])
+            .unwrap();
+        let err = w
+            .write_string_dataset_ascii("rejected", &["\u{c548}\u{b155}"])
+            .expect_err("a non-ASCII string was accepted under an ASCII datatype")
+            .to_string();
+        assert!(err.contains("is not ASCII"), "got: {err}");
+        w.close().unwrap();
+    }
+
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("ascii").unwrap().datatype().unwrap(),
+        DatatypeMessage::VarLenString {
+            padding: 0,
+            charset: 0,
+        }
+    );
+    assert_eq!(
+        file.dataset("utf8").unwrap().datatype().unwrap(),
+        DatatypeMessage::VarLenString {
+            padding: 0,
+            charset: 1,
+        }
+    );
+    assert_eq!(
+        file.dataset("ascii").unwrap().read_strings().unwrap(),
+        vec!["2026-05-18T10:00:00".to_string()]
+    );
+    file.close().unwrap();
+
+    cleanup(&path);
+}
+
+/// The SWMR typed reads reinterpret the element image like `read_raw` does,
+/// so they owe the same byte-order conversion: a big-endian dataset read as
+/// `u32` must give the stored values, not their byte-reversed images.
+#[test]
+fn big_endian_dataset_reads_as_values() {
+    use rust_hdf5::{ByteOrder, DatatypeMessage, H5File};
+
+    let path = unique_tmp("big_endian");
+    let values: [u32; 4] = [1, 0x0102_0304, 0xdead_beef, u32::MAX];
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<u32>()
+            .datatype(DatatypeMessage::FixedPoint {
+                size: 4,
+                byte_order: ByteOrder::BigEndian,
+                signed: false,
+                bit_offset: 0,
+                bit_precision: 32,
+            })
+            .shape([values.len()])
+            .create("be")
+            .unwrap();
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_be_bytes()).collect();
+        ds.write_raw_bytes(&bytes).unwrap();
+        file.close().unwrap();
+    }
+
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.read_dataset::<u32>("be").unwrap(), values);
+    assert_eq!(r.read_slice::<u32>("be", &[1], &[2]).unwrap(), values[1..3]);
 
     cleanup(&path);
 }
@@ -261,7 +344,7 @@ fn dataset_array_attribute_round_trips() {
 
     // SWMR reader sees the attribute name.
     {
-        let r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+        let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
         assert!(
             r.dataset_attr_names("axis")
                 .unwrap()
@@ -330,7 +413,7 @@ fn grid_dataset_positioned_writes_round_trip() {
 
     // SWMR reader sees the full bounded shape.
     {
-        let r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+        let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
         assert_eq!(r.dataset_shape("grid").unwrap(), vec![NA, NB, H, W]);
     }
 

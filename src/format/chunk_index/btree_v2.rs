@@ -14,7 +14,7 @@
 
 use crate::format::bytes::{read_le_addr as read_addr, read_le_uint as read_size};
 use crate::format::checksum::checksum_metadata;
-use crate::format::{FormatContext, FormatError, FormatResult, UNDEF_ADDR};
+use crate::format::{BlockReader, FormatContext, FormatError, FormatResult, UNDEF_ADDR};
 
 /// Signature for the B-tree v2 header.
 pub const BTHD_SIGNATURE: [u8; 4] = *b"BTHD";
@@ -43,6 +43,21 @@ pub const BT2_SPLIT_PERCENT: u8 = 100;
 /// Percentage below which a node is merged (`H5D_BT2_MERGE_PERC`).
 pub const BT2_MERGE_PERCENT: u8 = 40;
 
+/// Record type: indirectly accessed, unfiltered "huge" fractal heap objects
+/// (`H5B2_FHEAP_HUGE_INDIR_ID`).
+pub const BT2_TYPE_FHEAP_HUGE_INDIR: u8 = 1;
+/// Record type: name index for dense link storage in groups
+/// (`H5B2_GRP_DENSE_NAME_ID`).
+pub const BT2_TYPE_GRP_NAME: u8 = 5;
+/// Record type: creation-order index for dense link storage in groups
+/// (`H5B2_GRP_DENSE_CORDER_ID`).
+pub const BT2_TYPE_GRP_CORDER: u8 = 6;
+/// Record type: name index for dense attribute storage
+/// (`H5B2_ATTR_DENSE_NAME_ID`).
+pub const BT2_TYPE_ATTR_NAME: u8 = 8;
+/// Record type: creation-order index for dense attribute storage
+/// (`H5B2_ATTR_DENSE_CORDER_ID`).
+pub const BT2_TYPE_ATTR_CORDER: u8 = 9;
 /// Record type: unfiltered chunks (non-filtered chunked datasets).
 pub const BT2_TYPE_CHUNK_UNFILT: u8 = 10;
 /// Record type: filtered chunks (filtered chunked datasets).
@@ -669,6 +684,149 @@ impl Bt2Geometry {
 }
 
 // ==========================================================================
+// Whole-tree record walk
+// ==========================================================================
+
+/// One walk of a v2 B-tree: every record it read, and every node block it
+/// read them from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Bt2Walk {
+    /// Records in tree order, packed at `header.record_size` bytes each.
+    pub records: Vec<u8>,
+    /// Address of every node visited, in visit order. All are `node_size`
+    /// bytes long, so this is the tree's node footprint as well as its shape.
+    pub node_addrs: Vec<u64>,
+}
+
+/// Read every record in a v2 B-tree, in tree order, as one packed byte run of
+/// `header.record_size`-byte records.
+///
+/// Record-type agnostic: the caller decodes the bytes according to
+/// `header.record_type`. Both v2 B-tree users — the chunk index and the dense
+/// link/attribute name index — go through this one walker so the node geometry
+/// is derived in a single place.
+pub fn collect_btree_v2_records<R: BlockReader>(
+    header: &Bt2Header,
+    ctx: &FormatContext,
+    reader: &mut R,
+) -> FormatResult<Vec<u8>> {
+    Ok(walk_btree_v2(header, ctx, reader)?.records)
+}
+
+/// [`collect_btree_v2_records`] plus the address of every node the walk read.
+///
+/// One traversal serves both: a caller that only wants the records goes
+/// through the wrapper above, and a caller freeing the tree's file space needs
+/// the node addresses the same walk already visited.
+pub fn walk_btree_v2<R: BlockReader>(
+    header: &Bt2Header,
+    ctx: &FormatContext,
+    reader: &mut R,
+) -> FormatResult<Bt2Walk> {
+    if header.root_node_addr == UNDEF_ADDR || header.total_num_records == 0 {
+        return Ok(Bt2Walk::default());
+    }
+    let geo = Bt2Geometry::new(
+        header.node_size,
+        header.record_size,
+        header.depth,
+        ctx.sizeof_addr,
+    );
+    let mut collector = Bt2Collector {
+        reader,
+        ctx,
+        geo: &geo,
+        record_size: header.record_size,
+        node_size: header.node_size,
+        out: Bt2Walk::default(),
+    };
+    collector.collect(
+        header.root_node_addr,
+        header.depth,
+        header.num_records_in_root,
+    )?;
+    Ok(collector.out)
+}
+
+/// The file, node geometry and record size a [`Bt2Walk`] descent reads
+/// through, and the accumulator it fills — held together so `collect` takes
+/// only what changes per level: the node's address, its depth, and how many
+/// records it holds.
+struct Bt2Collector<'a, R: BlockReader> {
+    reader: &'a mut R,
+    ctx: &'a FormatContext,
+    geo: &'a Bt2Geometry,
+    record_size: u16,
+    node_size: u32,
+    out: Bt2Walk,
+}
+
+impl<R: BlockReader> Bt2Collector<'_, R> {
+    fn collect(&mut self, addr: u64, depth: u16, nrec: u16) -> FormatResult<()> {
+        self.out.node_addrs.push(addr);
+        let buf = self.reader.read_block(addr, self.node_size as usize)?;
+        if depth == 0 {
+            let leaf = Bt2LeafNode::decode(&buf, nrec, self.record_size)?;
+            self.out.records.extend_from_slice(&leaf.record_data);
+            return Ok(());
+        }
+        let node = Bt2InternalNode::decode(
+            &buf,
+            self.ctx,
+            depth,
+            nrec,
+            self.record_size,
+            self.geo.max_nrec_size,
+            self.geo.child_total_size(depth),
+        )?;
+        // A node's own records separate its children, so key order is
+        // child[0], record[0], child[1], record[1], ... record[n-1], child[n] --
+        // an in-order walk. Emitting the node's records ahead of its children
+        // would hand the caller a sequence that is sorted only within each node.
+        let children: Vec<(u64, u16)> = node
+            .child_addrs
+            .iter()
+            .zip(node.child_nrecords.iter())
+            .map(|(&a, &n)| (a, n))
+            .collect();
+        let rec = self.record_size as usize;
+        for (i, (child_addr, child_nrec)) in children.into_iter().enumerate() {
+            self.collect(child_addr, depth - 1, child_nrec)?;
+            if let Some(record) = node.record_data.get(i * rec..(i + 1) * rec) {
+                self.out.records.extend_from_slice(record);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Every file extent the v2 B-tree headed at `header_addr` occupies: the
+/// header block and every node block.
+///
+/// The single place that knows a v2 B-tree's on-disk footprint, so freeing one
+/// does not re-derive the sizes its writer allocated
+/// (`Bt2Header::encoded_size` for the header, `node_size` for each node).
+pub fn collect_btree_v2_extents<R: BlockReader>(
+    header_addr: u64,
+    ctx: &FormatContext,
+    reader: &mut R,
+) -> FormatResult<Vec<(u64, u64)>> {
+    // The header's on-disk size depends only on the address/length widths, so
+    // a generous prefix read covers it.
+    let buf = reader.read_block(header_addr, 256)?;
+    let header = Bt2Header::decode(&buf, ctx)?;
+    let walk = walk_btree_v2(&header, ctx, reader)?;
+    let mut extents = Vec::with_capacity(walk.node_addrs.len() + 1);
+    extents.push((header_addr, header.encoded_size(ctx) as u64));
+    extents.extend(
+        walk.node_addrs
+            .into_iter()
+            .map(|addr| (addr, header.node_size as u64)),
+    );
+    Ok(extents)
+}
+
+// ==========================================================================
 // Bulk-loaded tree
 // ==========================================================================
 
@@ -907,6 +1065,48 @@ impl Bt2Tree {
             total_num_records: self.total_records(),
         }
     }
+}
+
+/// Bulk-load one v2 B-tree over `records` — the encoded records in key order —
+/// and lay its header and nodes out in file space.
+///
+/// `alloc` allocates `len` bytes and returns the address. Returns the header
+/// address and every `(address, image)` pair to write; the images are exactly
+/// what was allocated for them, node images included, so a caller can write
+/// them without re-deriving a length.
+pub fn build_index(
+    record_type: u8,
+    record_size: u16,
+    node_size: u32,
+    records: &[u8],
+    ctx: &FormatContext,
+    alloc: &mut dyn FnMut(u64) -> u64,
+) -> (u64, Vec<(u64, Vec<u8>)>) {
+    let tree = Bt2Tree::build(
+        record_type,
+        record_size,
+        node_size,
+        ctx.sizeof_addr,
+        records,
+    );
+    // The header address is taken first so it keeps the low address libhdf5
+    // gives it, but its image needs the root's address, which only exists once
+    // every node has one.
+    let header_addr = alloc(tree.header(UNDEF_ADDR).encoded_size(ctx) as u64);
+    let node_addrs: Vec<u64> = tree
+        .nodes
+        .iter()
+        .map(|_| alloc(tree.node_size as u64))
+        .collect();
+    let mut blocks: Vec<(u64, Vec<u8>)> = tree
+        .encode(ctx, &node_addrs)
+        .into_iter()
+        .zip(&node_addrs)
+        .map(|(image, &addr)| (addr, image))
+        .collect();
+    let root_addr = node_addrs.last().copied().unwrap_or(UNDEF_ADDR);
+    blocks.push((header_addr, tree.header(root_addr).encode(ctx)));
+    (header_addr, blocks)
 }
 
 // ==========================================================================
@@ -1679,69 +1879,118 @@ mod tests {
         let mut out = Vec::new();
         if hdr.root_node_addr != UNDEF_ADDR {
             let geo = Bt2Geometry::new(hdr.node_size, hdr.record_size, hdr.depth, ctx.sizeof_addr);
-            walk_node(
-                &blocks,
-                hdr.root_node_addr,
-                hdr.depth,
-                hdr.num_records_in_root,
-                &hdr,
-                &geo,
+            let mut walker = NodeWalker {
+                blocks: &blocks,
+                hdr: &hdr,
+                geo: &geo,
                 ctx,
-                &mut out,
-            );
+                out: &mut out,
+            };
+            walker.walk(hdr.root_node_addr, hdr.depth, hdr.num_records_in_root);
         }
         (hdr, out)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn walk_node(
-        blocks: &[(u64, Vec<u8>)],
-        addr: u64,
-        depth: u16,
-        nrec: u16,
-        hdr: &Bt2Header,
-        geo: &Bt2Geometry,
-        ctx: &FormatContext,
-        out: &mut Vec<u8>,
-    ) {
-        let buf = &blocks
-            .iter()
-            .find(|(a, _)| *a == addr)
-            .unwrap_or_else(|| panic!("no node at {addr:#x}"))
-            .1;
-        let rec = hdr.record_size as usize;
-        assert!(
-            10 + nrec as usize * rec <= hdr.node_size as usize,
-            "node at depth {depth} holds {nrec} records, more than its block fits"
-        );
-        if depth == 0 {
-            let leaf = Bt2LeafNode::decode(buf, nrec, hdr.record_size).unwrap();
-            out.extend_from_slice(&leaf.record_data);
-            return;
+    /// A serialized tree laid out contiguously, so the production record walk
+    /// can be pointed at it the way it is pointed at a file.
+    struct NodePool {
+        base: u64,
+        image: Vec<u8>,
+    }
+
+    impl BlockReader for NodePool {
+        fn read_block(&mut self, offset: u64, len: usize) -> FormatResult<Vec<u8>> {
+            let start = (offset - self.base) as usize;
+            let end = (start + len).min(self.image.len());
+            Ok(self.image[start..end].to_vec())
         }
-        let node = Bt2InternalNode::decode(
-            buf,
-            ctx,
-            depth,
-            nrec,
-            hdr.record_size,
-            geo.max_nrec_size,
-            geo.child_total_size(depth),
-        )
-        .unwrap();
-        for i in 0..=nrec as usize {
-            walk_node(
-                blocks,
-                node.child_addrs[i],
-                depth - 1,
-                node.child_nrecords[i],
-                hdr,
-                geo,
-                ctx,
-                out,
+    }
+
+    /// Serialize `idx` into one contiguous pool and return it with its header.
+    fn serialize_into_pool(idx: &Bt2ChunkIndex, ctx: &FormatContext) -> (Bt2Header, NodePool) {
+        let tree = idx.build_tree(ctx);
+        let base = 0x1000u64;
+        let addrs: Vec<u64> = (0..tree.nodes.len() as u64)
+            .map(|i| base + i * tree.node_size as u64)
+            .collect();
+        let mut image = vec![0u8; tree.nodes.len() * tree.node_size as usize];
+        for (i, node) in tree.encode(ctx, &addrs).into_iter().enumerate() {
+            let at = i * tree.node_size as usize;
+            image[at..at + node.len()].copy_from_slice(&node);
+        }
+        let hdr = tree.header(addrs.last().copied().unwrap_or(UNDEF_ADDR));
+        (hdr, NodePool { base, image })
+    }
+
+    /// `collect_btree_v2_records` is what the dense-attribute reader and
+    /// `open_append`'s index rebuild both walk with. An internal node's
+    /// records separate its children, so emitting them ahead of the subtrees
+    /// yields a sequence sorted only within each node — enough to fool any
+    /// caller that re-keys the records, and wrong for one that does not.
+    #[test]
+    fn the_record_walk_returns_key_order_across_levels() {
+        let ctx = ctx8();
+        for n in [84u64, 85, 5270] {
+            let idx = index_with(n);
+            let (hdr, mut pool) = serialize_into_pool(&idx, &ctx);
+            let walked = collect_btree_v2_records(&hdr, &ctx, &mut pool).unwrap();
+            assert_eq!(
+                walked,
+                idx.encode_records(&ctx),
+                "{n} records at depth {} came back out of key order",
+                hdr.depth
             );
-            if i < nrec as usize {
-                out.extend_from_slice(&node.record_data[i * rec..(i + 1) * rec]);
+        }
+    }
+
+    /// The block pool, header, geometry and context a [`walk`](Self::walk)
+    /// reads through, and the accumulator it fills — held together so `walk`
+    /// takes only what changes per level: the node's address, its depth, and
+    /// how many records it holds. The test-side twin of [`Bt2Collector`],
+    /// re-deriving the walk order independently instead of sharing the
+    /// production walker, so a bug in one is caught by the other.
+    struct NodeWalker<'a> {
+        blocks: &'a [(u64, Vec<u8>)],
+        hdr: &'a Bt2Header,
+        geo: &'a Bt2Geometry,
+        ctx: &'a FormatContext,
+        out: &'a mut Vec<u8>,
+    }
+
+    impl NodeWalker<'_> {
+        fn walk(&mut self, addr: u64, depth: u16, nrec: u16) {
+            let buf = &self
+                .blocks
+                .iter()
+                .find(|(a, _)| *a == addr)
+                .unwrap_or_else(|| panic!("no node at {addr:#x}"))
+                .1;
+            let rec = self.hdr.record_size as usize;
+            assert!(
+                10 + nrec as usize * rec <= self.hdr.node_size as usize,
+                "node at depth {depth} holds {nrec} records, more than its block fits"
+            );
+            if depth == 0 {
+                let leaf = Bt2LeafNode::decode(buf, nrec, self.hdr.record_size).unwrap();
+                self.out.extend_from_slice(&leaf.record_data);
+                return;
+            }
+            let node = Bt2InternalNode::decode(
+                buf,
+                self.ctx,
+                depth,
+                nrec,
+                self.hdr.record_size,
+                self.geo.max_nrec_size,
+                self.geo.child_total_size(depth),
+            )
+            .unwrap();
+            for i in 0..=nrec as usize {
+                self.walk(node.child_addrs[i], depth - 1, node.child_nrecords[i]);
+                if i < nrec as usize {
+                    self.out
+                        .extend_from_slice(&node.record_data[i * rec..(i + 1) * rec]);
+                }
             }
         }
     }

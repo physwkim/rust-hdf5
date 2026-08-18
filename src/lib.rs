@@ -98,15 +98,41 @@ pub mod dataset;
 pub mod error;
 pub mod file;
 pub mod group;
+/// Zero-copy views of a dataset's stored bytes. Requires the `mmap` feature.
+#[cfg(feature = "mmap")]
+pub mod mapped;
+pub mod named_datatype;
 pub mod swmr;
 pub mod types;
 
 pub use attribute::{AttrShape, H5Attribute};
-pub use dataset::{H5Dataset, ReadNumeric};
+pub use dataset::{
+    AllocTime, ChunkIndex, DatasetAccess, FillTime, FillValue, H5Dataset, ReadNumeric,
+    StorageLayout, VirtualView,
+};
 pub use error::{Hdf5Error, Result};
 pub use file::{H5File, H5FileOptions};
+pub use format::creation_order::CreationOrder;
 pub use format::messages::datatype::{ByteOrder, DatatypeMessage};
-pub use format::messages::filter::FilterPipeline;
+pub use format::messages::filter::{Filter, FilterPipeline};
+pub use format::messages::superblock_ext::{
+    BtreeKMessage, DriverInfoMessage, FileSpaceInfoMessage, FileSpaceStrategy,
+    SharedMessageTableMessage,
+};
+pub use format::messages::virtual_mapping::VirtualMapping;
+pub use format::reference::Reference;
+pub use format::selection::{
+    Hyperslab, HyperslabBlock, PointSelection, RegularHyperslab, Selection,
+};
+pub use format::storage_kind::{AttributeStorage, LinkStorage};
+pub use format::LibverBound;
 pub use group::H5Group;
 pub use io::locking::{FileLocking, LockMode};
+pub use io::reader::ExternalFileSegment;
+pub use io::reader::LinkClass;
+pub use io::reader::SuperblockExtension;
+pub use io::writer::{MAX_COMPACT_DATA, MIN_USERBLOCK};
+#[cfg(feature = "mmap")]
+pub use mapped::{MappedView, ViewRefusal};
+pub use named_datatype::H5NamedDatatype;
 pub use types::{Complex32, Complex64, CompoundType, H5Type, HBool, VarLenUnicode};

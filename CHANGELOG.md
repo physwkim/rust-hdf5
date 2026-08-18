@@ -1,6 +1,186 @@
 # Changelog
 
+## 0.5.0
+
+### Added
+
+- `DatasetBuilder::efile_prefix` (`H5Pset_efile_prefix` on the dapl
+  `H5Dcreate2` takes) and `H5File::dataset_writer_with` /
+  `H5Group::dataset_writer_with` (`H5Dopen2` with a dapl, in write mode):
+  where the raw data files of an external file list are created and
+  looked for on the way out. The write side used to consult only
+  `HDF5_EXTFILE_PREFIX`, so a dataset written under a prefix a reader
+  then named could not be read back. The prefix is settled once by the
+  open, as `H5D__build_file_prefix` settles `shared->extfile_prefix`, and
+  a second open that disagrees is refused for as long as the first is
+  held.
+
+- `Hdf5Reader::dataset_raw_size`: how many bytes a dataset's full image
+  is, which is what `read_dataset_raw` returns and what
+  `read_dataset_raw_into` requires its buffer to be. Answered in the file
+  that owns the dataset, so a name crossing an external link gets the
+  target's size.
+
+- `H5Dataset::read_mapped::<T>()` and `read_mapped_slice`, under the
+  `mmap` feature: a `MappedView<T>` dereferencing to `&[T]` that points
+  straight into the file's memory map — no read, no copy, no allocation.
+  It works for a contiguous, allocated dataset whose stored elements are
+  already the host image of a `T`, and the slice form additionally
+  requires the selection to be one contiguous run of the stored image;
+  everything else is refused with a `ViewRefusal` naming the reason,
+  never a silent copy. The view holds a share of the map, so it outlives
+  the dataset, the file, and a SWMR `refresh` that retook the map,
+  showing the file as of the moment its map was taken. On the `perf/`
+  contig-view probe (open a 128 MiB f64 dataset and sum every element),
+  the view takes 19.2 ms where `read_raw` takes 66.3 ms, and 0.94x of
+  libhdf5 1.14.6's own idiom for the same thing — `H5Dget_offset` plus a
+  caller-made map, since `H5Dread` cannot hand back the file's bytes.
+
+### Changed
+
+- The `mmap` feature now does something: a file opened for reading maps
+  itself and serves its reads out of the map instead of `pread`, chosen
+  once inside `FileHandle` so every read entry point goes through it and
+  a mapping that cannot be taken falls back to the descriptor invisibly.
+  Reads above 8 KiB stay on `pread` — mapping helps only where the
+  syscall is the larger half of the work, and a big read into a
+  freshly allocated buffer is dominated by faulting that buffer in, which
+  the map only adds to. Against libhdf5 1.14.6 on the `perf/` probes,
+  opening and reading 2000 small datasets goes from 0.28x to 0.21x of its
+  time; no other workload moves by more than 2%, and the default build is
+  untouched. A writable handle is never mapped, so the accumulator's
+  flush-before-read contract is unaffected. What the map does not do is
+  make a large read cheaper: that needs the read to hand back a borrowed
+  view of the mapped bytes rather than a `Vec`, which is an API addition
+  this does not make.
+
+  The mapped bytes are the file as of the moment the map was taken, so a
+  SWMR reader picks up its writer's appends when `refresh` retakes the
+  map, and a read past the mapped length fails the way a read past the
+  end of a file does.
+
+- `Hdf5Reader::open_mmap` and `MmapFileHandle` are gone. They mapped a
+  second copy of the file and handed it to the caller, who had no way to
+  make the reader read through it; the mapping now lives under the one
+  handle the reader already reads from.
+
+- Reading a whole dataset is faster and no longer scales with how many
+  datasets the file holds. A typed full read now lands in the vector it
+  returns instead of being zeroed, read, and copied into a second buffer
+  of the same size; path resolution asks the alias and link catalogs by
+  key instead of comparing every entry; and datasets are found by name
+  through an index rather than a scan. Against libhdf5 1.14.6 on the
+  `perf/` probes: a 128 MiB contiguous read went from 1.79x to 0.89x of
+  its time, and opening plus reading 2000 small datasets from 2.52x to
+  0.29x. No stored bytes and no read result change.
+
+- The `deflate` feature now also pulls in `zlib-rs`, which inflates
+  filtered chunks; `flate2`/`miniz_oxide` still compresses them. Neither
+  engine is the better choice for both directions — zlib-rs inflates the
+  same streams 1.2x to 1.7x faster, while its deflate below level 9
+  gives up as much as 2.5x of the compression ratio on periodic data. Written files are
+  byte-for-byte what they were. Reading a 64 MiB deflated dataset in
+  2 MiB chunks went from 123 ms to 92 ms against libhdf5 1.14.6's 46 ms,
+  a third of which came from replacing `read_to_end` with an inflate
+  loop over one grown buffer.
+
+- **Breaking.** `DatasetAccess` no longer implements `Copy`. It gained
+  the dapl prefix properties `virtual_prefix` and `efile_prefix`
+  (`H5Pset_virtual_prefix` / `H5Pset_efile_prefix`), which are owned
+  strings, so implicit copies became moves. `Clone` is still derived —
+  add `.clone()` where a copy was relied on.
+
+### Performance
+
+- A reader now keeps the decompressed image of a filtered chunk a read
+  did not consume whole, so the next read that wants the rest of that
+  chunk places bytes out of it instead of inflating it again — libhdf5's
+  per-dataset raw chunk cache, at its own 1 MiB / 521-slot defaults, and
+  what makes a region-of-interest or row-at-a-time walk of a compressed
+  dataset cost one inflate per chunk rather than one per read. On the
+  `perf/run.py` deflate-slice workload (1024 sequential 8192-element
+  slices of 64 MiB of f64 in 256 KiB deflated chunks, four slices to a
+  chunk) that is 33.6 ms down to 12.0 ms against libhdf5 1.14.6's
+  28.1 ms. A read that takes every chunk entire — any whole-dataset read
+  — keeps nothing and pays nothing, and an unfiltered chunk still reads
+  only the byte ranges the selection intersects. Read results are
+  unchanged, byte for byte. The images live inside the dataset's decoded
+  chunk index, so whatever drops that index drops them with it.
+
+- A filtered chunk whose bytes land whole and contiguous in a read's
+  output — every full chunk of a full read — now decodes straight into
+  those output bytes instead of into a buffer of its own that was then
+  copied out, which is the shape the unfiltered read already had. The
+  chunks that do need scattering decode into an image sized from the
+  chunk shape rather than one grown to it by doubling. On the
+  `perf/run.py` deflate-read workload (64 MiB of f64 in 2 MiB chunks at
+  level 6) that is 54 ms down to 23 ms against libhdf5 1.14.6's 46 ms,
+  and a selection that stages every chunk instead goes from 39 ms to
+  36 ms. Read results are unchanged, byte for byte.
+
+- A hyperslab read of an unfiltered chunked dataset now reads only the
+  byte ranges the selection intersects, as libhdf5 does, instead of every
+  overlapping chunk whole: the 1000 64 KiB slices of a 128 MiB dataset
+  chunked at 2 MiB that took 331 ms take 15 ms, and a full read of the
+  same dataset drops from 223 ms to 161 ms by landing each chunk's bytes
+  straight in the output. A filtered chunk still reads and decodes whole,
+  and so does an unfiltered one whose selected runs are too small for a
+  positioned read each to pay for itself.
+
+- Writing a whole image into a chunked dataset no longer stages every
+  chunk in a buffer of its own. A chunk whose bytes are already one
+  complete run of the image — every full chunk of a 1-D dataset, and any
+  chunk that spans the trailing axes whole — goes to the file straight
+  out of the caller's slice, and the chunks that do need a gather share
+  one buffer. On the `perf/run.py` chunked-write workload (128 MiB of
+  f64 in 2 MiB chunks) that is 112 ms down to 47 ms, against libhdf5
+  1.14.6's 49 ms, with the spread between the median and the minimum
+  gone. The filtered batch writers compress from borrowed bytes for the
+  same reason, halving what a window in flight holds.
+
+- Creating many objects in one file no longer walks the whole file model
+  per create, and the small metadata writes each one makes now leave as
+  one write. Names are checked against an index instead of the six
+  registries in turn, and `FileHandle` stages writes below 8 KiB into a
+  1 MiB run that is emitted when the next write leaves it, so a gap the
+  run bridges is read back and written out unchanged rather than
+  invented. On the `perf/run.py` small-write workload (2000 datasets of
+  128 f64) that is 15.5 ms down to 6.0 ms against libhdf5 1.14.6's
+  13.0 ms, and 4072 `pwrite` calls down to 7 against its 2364. Written
+  files are byte-for-byte what they were. The accumulator stays off
+  under `threadsafe`, where concurrent writers would take turns flushing
+  each other's bytes.
+
+- A reader now decodes a chunked dataset's index once and keeps it,
+  dropped the moment the dataset's catalog entry changes or a SWMR
+  refresh replaces the catalog, so repeated slice reads stop re-walking
+  the B-tree per call: the 1000-slice `perf/run.py` workload fell from
+  5228 syscalls to 1233 and from 1.79x of libhdf5 1.14.6 to 0.91x.
+  A typed hyperslab or point read lands in the vector it returns
+  instead of staging a byte image, the fill pass covers only what the
+  chunk plan proves it must, and a batch below two live chunks or
+  256 KiB stays off the rayon pool — entering it per batch was what
+  held the `parallel` build's slice read at 108 ms; it reads 8.7 ms now.
+
+### Fixed
+
+- Declaring a fill value on a dataset stored through an external file
+  list no longer creates and fills its raw data files. `H5D__alloc_storage`
+  allocates nothing for such a dataset and so never reaches the
+  `H5D__init_storage` that would tile the fill into it; the files come
+  into existence when something writes them.
+
 ## 0.4.3
+
+### Changed
+
+- **Breaking.** `Hdf5Writer::create_chunked_dataset_compressed` is gone.
+  Its body was `create_chunked_dataset_with_pipeline` line for line, down
+  to the filtered extensible-array header it lays out, differing only in
+  building the pipeline itself; call that with
+  `FilterPipeline::deflate(level)` instead. Two copies of a chunk-index
+  layout is one copy too many — the v5 layout-version rule had to be
+  written into both.
 
 ### Added
 

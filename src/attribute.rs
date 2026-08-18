@@ -20,6 +20,7 @@ use std::marker::PhantomData;
 
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::reference::Reference;
 
 use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
@@ -117,6 +118,54 @@ impl H5Attribute {
                     crate::io::writer::AttrTarget::Dataset(self.ds_index),
                     &self.name,
                     values,
+                    &dims_u64,
+                )?;
+                Ok(())
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot write attributes in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
+    /// Write an object-reference attribute — h5py's
+    /// `ds.attrs['source'] = f['/data'].ref`.
+    ///
+    /// The attribute is given its shape via [`AttrBuilder::shape`] (empty =
+    /// the scalar shape a single reference takes) and `paths` must hold
+    /// exactly the product of those dimensions, in row-major order. Each path
+    /// names a dataset or a group (`/` is the root group) and must already
+    /// exist; what reaches the file is the target's object header address,
+    /// which is assigned when the file is finalized.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("refs.h5").unwrap();
+    /// let ds = file.new_dataset::<f32>().shape(&[4]).create("data").unwrap();
+    /// let attr = ds.new_attr::<u64>().shape(()).create("self").unwrap();
+    /// attr.write_object_references(&["/data"]).unwrap();
+    /// ```
+    pub fn write_object_references(&self, paths: &[&str]) -> Result<()> {
+        // Product of an empty shape is 1 (a scalar holds one element).
+        let expected: usize = self.write_dims.iter().product();
+        if paths.len() != expected {
+            return Err(Hdf5Error::InvalidState(format!(
+                "attribute '{}' shape {:?} needs {} references, got {}",
+                self.name,
+                self.write_dims,
+                expected,
+                paths.len()
+            )));
+        }
+        let dims_u64: Vec<u64> = self.write_dims.iter().map(|&d| d as u64).collect();
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => {
+                writer.set_object_reference_attribute(
+                    crate::io::writer::AttrTarget::Dataset(self.ds_index),
+                    &self.name,
+                    paths,
                     &dims_u64,
                 )?;
                 Ok(())
@@ -284,14 +333,11 @@ impl H5Attribute {
         match &mut *inner {
             H5FileInner::Reader(reader) => Ok(reader.attr_string_value(attr)?),
             _ => {
-                // No reader available — fall back to the raw fixed-length
-                // interpretation.
-                let end = attr
-                    .data
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(attr.data.len());
-                Ok(String::from_utf8_lossy(&attr.data[..end]).to_string())
+                // No reader available, so a variable-length value cannot be
+                // resolved through the heap — but a fixed-length one is right
+                // here, and its padding rule is read the same way it is on the
+                // reader path.
+                Ok(crate::io::reader::fixed_string_attr_value(attr)?)
             }
         }
     }
@@ -327,6 +373,32 @@ impl H5Attribute {
             .ok_or_else(|| {
                 Hdf5Error::InvalidState("attribute has no read data (write-mode handle?)".into())
             })
+    }
+
+    /// Read a reference attribute's elements, each resolved to the object it
+    /// names — the attribute counterpart of
+    /// [`H5Dataset::read_references`](crate::dataset::H5Dataset::read_references).
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::open("refs.h5").unwrap();
+    /// let ds = file.dataset("image").unwrap();
+    /// let target = ds.attr("source").unwrap().read_references().unwrap();
+    /// println!("{:?}", target[0].path());
+    /// ```
+    pub fn read_references(&self) -> Result<Vec<Reference>> {
+        let attr = self.read_attr.as_ref().ok_or_else(|| {
+            Hdf5Error::InvalidState("attribute has no read data (write-mode handle?)".into())
+        })?;
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => Ok(reader.attr_references(attr)?),
+            // References name file addresses, so resolving them needs the
+            // reader's view of the file.
+            _ => Err(Hdf5Error::InvalidState(
+                "cannot read references from an attribute in write mode".into(),
+            )),
+        }
     }
 
     /// Read the raw attribute data bytes.

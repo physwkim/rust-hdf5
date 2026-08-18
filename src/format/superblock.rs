@@ -8,10 +8,14 @@
 /// - v2/v3 superblocks (encode + decode)
 /// - v0/v1 superblocks (decode only, for reading legacy files)
 use crate::format::checksum::checksum_metadata;
-use crate::format::{FormatError, FormatResult, UNDEF_ADDR};
+use crate::format::{FormatError, FormatResult};
 
 /// The 8-byte HDF5 file signature that begins every superblock.
 pub const HDF5_SIGNATURE: [u8; 8] = [0x89, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a];
+
+/// `HDF5_SUPERBLOCK_VERSION_DEF`, the version `H5F__super_init` starts from
+/// and the one `HDF5_superblock_ver_bounds` gives `H5F_LIBVER_EARLIEST`.
+pub const SUPERBLOCK_V0: u8 = 0;
 
 /// Superblock version 2.
 pub const SUPERBLOCK_V2: u8 = 2;
@@ -53,20 +57,34 @@ pub struct SuperblockV2V3 {
     pub sizeof_lengths: u8,
     /// File consistency flags (see `FLAG_*` constants).
     pub file_consistency_flags: u8,
-    /// Base address of the file (usually 0).
+    /// Base address of the file: the size of the userblock the superblock
+    /// follows, and the offset every other address in the file is measured
+    /// from. Usually 0.
     pub base_address: u64,
     /// Address of the superblock extension object header, or UNDEF.
     pub superblock_extension_address: u64,
-    /// End-of-file address.
+    /// End-of-file address, measured from the start of the *file* — the one
+    /// field here that includes [`base_address`](Self::base_address).
+    /// `H5F__super_read` takes the allocated end as `end_of_file_address -
+    /// base_address` and calls the file truncated when the real end is below
+    /// it.
     pub end_of_file_address: u64,
-    /// Address of the root group object header.
+    /// Address of the root group object header, relative to
+    /// [`base_address`](Self::base_address).
     pub root_group_object_header_address: u64,
 }
 
 impl SuperblockV2V3 {
     /// Returns the total encoded size in bytes: 12 + 4*O + 4 (checksum).
     pub fn encoded_size(&self) -> usize {
-        12 + 4 * (self.sizeof_offsets as usize) + 4
+        Self::size_for(self.sizeof_offsets)
+    }
+
+    /// The size a superblock with this offset width encodes to. Versions 2
+    /// and 3 have the same layout, so a writer that must reserve the space
+    /// before it knows which of the two it will emit can ask for it here.
+    pub fn size_for(sizeof_offsets: u8) -> usize {
+        12 + 4 * (sizeof_offsets as usize) + 4
     }
 
     /// Encode the superblock to a byte vector, including the trailing checksum.
@@ -369,19 +387,46 @@ mod tests {
 // Superblock v0/v1 — decode only (for reading legacy HDF5 files)
 // =========================================================================
 
+/// The 16-byte scratch pad of a symbol table entry, read according to the
+/// entry's cache type (`H5G_cache_t` / `H5G__ent_decode`). Modelling it as a
+/// sum type keeps the soft-link case representable: a `H5G_CACHED_SLINK`
+/// entry has no object header at all, and its whole content is the offset of
+/// the link's value string in the group's local heap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SymbolTableCache {
+    /// `H5G_NOTHING_CACHED` — the scratch pad holds nothing.
+    Nothing,
+    /// `H5G_CACHED_STAB` — the child group's B-tree and local heap.
+    SymbolTable { btree_addr: u64, heap_addr: u64 },
+    /// `H5G_CACHED_SLINK` — this entry is a soft link, and the scratch pad
+    /// holds the offset of its value string in the group's local heap.
+    SoftLink { value_offset: u32 },
+}
+
 /// Symbol table entry, as stored in the root group's superblock (v0/v1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolTableEntry {
     /// Offset of the name in the local heap.
     pub name_offset: u64,
-    /// Address of the object header.
+    /// Address of the object header. Undefined for a soft-link entry, which
+    /// names no object.
     pub obj_header_addr: u64,
-    /// Cache type: 0 = nothing cached, 1 = symbol table (group).
-    pub cache_type: u32,
-    /// If cache_type == 1: B-tree address for group children.
-    pub btree_addr: u64,
-    /// If cache_type == 1: local heap address for group names.
-    pub heap_addr: u64,
+    /// The scratch pad, decoded per this entry's cache type.
+    pub cache: SymbolTableCache,
+}
+
+impl SymbolTableEntry {
+    /// The cached B-tree and local heap of the child group this entry names,
+    /// or `None` when the scratch pad caches something else (or nothing).
+    pub fn cached_symbol_table(&self) -> Option<(u64, u64)> {
+        match self.cache {
+            SymbolTableCache::SymbolTable {
+                btree_addr,
+                heap_addr,
+            } => Some((btree_addr, heap_addr)),
+            _ => None,
+        }
+    }
 }
 
 /// Superblock v0/v1 structure (decode only).
@@ -412,14 +457,69 @@ pub struct SuperblockV0V1 {
     pub sym_leaf_k: u16,
     pub btree_internal_k: u16,
     pub indexed_storage_k: Option<u16>,
+    /// The userblock size; every other address in the file is measured from
+    /// it, and it is usually 0.
     pub base_address: u64,
     pub superblock_extension_address: u64,
+    /// Measured from the start of the *file*, unlike every other address —
+    /// see [`SuperblockV2V3::end_of_file_address`].
     pub end_of_file_address: u64,
     pub driver_info_address: u64,
     pub root_symbol_table_entry: SymbolTableEntry,
 }
 
 impl SuperblockV0V1 {
+    /// The total encoded size in bytes, symbol table entry included.
+    pub fn encoded_size(&self) -> usize {
+        let o = self.sizeof_offsets as usize;
+        let s = self.sizeof_lengths as usize;
+        16 + 8 + if self.version == 1 { 4 } else { 0 } + 4 * o + symbol_table_entry_size(o, s)
+    }
+
+    /// Re-emit this superblock.
+    ///
+    /// The version is written back as it was read: an append to a classic file
+    /// leaves it classic, so a reader that could open the file before the
+    /// append can still open it after. The three sub-format version bytes
+    /// (free space, root symbol table entry, shared header) are 0 in every
+    /// file libhdf5 writes — `HDF5_FREESPACE_VERSION`, `HDF5_OBJECTDIR_VERSION`
+    /// and `HDF5_SHAREDHEADER_VERSION` are compile-time constants, not
+    /// per-file choices — so they are re-emitted as 0 rather than carried.
+    pub fn encode(&self) -> Vec<u8> {
+        let o = self.sizeof_offsets as usize;
+        let s = self.sizeof_lengths as usize;
+        let size = self.encoded_size();
+        let mut buf = Vec::with_capacity(size);
+
+        buf.extend_from_slice(&HDF5_SIGNATURE);
+        buf.push(self.version);
+        buf.push(0); // free-space storage version
+        buf.push(0); // root group symbol table entry version
+        buf.push(0); // reserved
+        buf.push(0); // shared header message format version
+        buf.push(self.sizeof_offsets);
+        buf.push(self.sizeof_lengths);
+        buf.push(0); // reserved
+        buf.extend_from_slice(&self.sym_leaf_k.to_le_bytes());
+        buf.extend_from_slice(&self.btree_internal_k.to_le_bytes());
+        buf.extend_from_slice(&self.file_consistency_flags.to_le_bytes());
+        if self.version == 1 {
+            // Only a version-1 superblock has the field; a version-0 file
+            // leaves the chunked-storage rank at the library default.
+            buf.extend_from_slice(&self.indexed_storage_k.unwrap_or(32).to_le_bytes());
+            buf.extend_from_slice(&[0u8; 2]); // reserved
+        }
+
+        encode_offset(&mut buf, self.base_address, o);
+        encode_offset(&mut buf, self.superblock_extension_address, o);
+        encode_offset(&mut buf, self.end_of_file_address, o);
+        encode_offset(&mut buf, self.driver_info_address, o);
+        encode_symbol_table_entry(&mut buf, &self.root_symbol_table_entry, o, s);
+
+        debug_assert_eq!(buf.len(), size);
+        buf
+    }
+
     /// Decode a v0/v1 superblock from `buf`. The buffer must start at the
     /// 8-byte HDF5 signature. Returns the parsed superblock.
     pub fn decode(buf: &[u8]) -> FormatResult<Self> {
@@ -526,6 +626,55 @@ impl SuperblockV0V1 {
     }
 }
 
+/// A symbol table entry's on-disk size: name offset, object header address,
+/// cache type, reserved word and the 16-byte scratch pad (`H5G_SIZEOF_ENTRY`).
+pub fn symbol_table_entry_size(sizeof_addr: usize, sizeof_size: usize) -> usize {
+    sizeof_size + sizeof_addr + 4 + 4 + 16
+}
+
+/// Encode one symbol table entry, scratch pad included (`H5G__ent_encode`).
+///
+/// The scratch pad is a fixed 16 bytes whatever the cache type puts in it, and
+/// the bytes past what the type uses are zero: `H5G__ent_encode` memsets the
+/// whole pad before writing the cache, so a `H5G_NOTHING_CACHED` entry is 16
+/// zero bytes rather than whatever the entry held before.
+pub fn encode_symbol_table_entry(
+    out: &mut Vec<u8>,
+    entry: &SymbolTableEntry,
+    sizeof_addr: usize,
+    sizeof_size: usize,
+) {
+    let start = out.len();
+    encode_offset(out, entry.name_offset, sizeof_size);
+    encode_offset(out, entry.obj_header_addr, sizeof_addr);
+    let cache_type: u32 = match entry.cache {
+        SymbolTableCache::Nothing => 0,
+        SymbolTableCache::SymbolTable { .. } => 1,
+        SymbolTableCache::SoftLink { .. } => 2,
+    };
+    out.extend_from_slice(&cache_type.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    let scratch = out.len();
+    match entry.cache {
+        SymbolTableCache::Nothing => {}
+        SymbolTableCache::SymbolTable {
+            btree_addr,
+            heap_addr,
+        } => {
+            encode_offset(out, btree_addr, sizeof_addr);
+            encode_offset(out, heap_addr, sizeof_addr);
+        }
+        SymbolTableCache::SoftLink { value_offset } => {
+            out.extend_from_slice(&value_offset.to_le_bytes());
+        }
+    }
+    out.resize(scratch + 16, 0);
+    debug_assert_eq!(
+        out.len() - start,
+        symbol_table_entry_size(sizeof_addr, sizeof_size)
+    );
+}
+
 /// Decode a symbol table entry from buf at the given position.
 pub fn decode_symbol_table_entry(
     buf: &[u8],
@@ -548,27 +697,32 @@ pub fn decode_symbol_table_entry(
     // reserved u32
     *pos += 4;
 
-    // Scratch pad: 16 bytes
-    let (btree_addr, heap_addr) = if cache_type == 1 {
-        let btree = decode_offset(buf, pos, sizeof_addr);
-        let heap = decode_offset(buf, pos, sizeof_addr);
-        // Skip remaining scratch pad bytes
-        let used = 2 * sizeof_addr;
-        if used < 16 {
-            *pos += 16 - used;
+    // Scratch pad: 16 bytes, read per the cache type (`H5G__ent_decode`).
+    let scratch_start = *pos;
+    let cache = match cache_type {
+        1 => {
+            let btree_addr = decode_offset(buf, pos, sizeof_addr);
+            let heap_addr = decode_offset(buf, pos, sizeof_addr);
+            SymbolTableCache::SymbolTable {
+                btree_addr,
+                heap_addr,
+            }
         }
-        (btree, heap)
-    } else {
-        *pos += 16;
-        (UNDEF_ADDR, UNDEF_ADDR)
+        2 => {
+            let value_offset =
+                u32::from_le_bytes([buf[*pos], buf[*pos + 1], buf[*pos + 2], buf[*pos + 3]]);
+            *pos += 4;
+            SymbolTableCache::SoftLink { value_offset }
+        }
+        _ => SymbolTableCache::Nothing,
     };
+    // The scratch pad is a fixed 16 bytes whatever the cache type consumed.
+    *pos = scratch_start + 16;
 
     Ok(SymbolTableEntry {
         name_offset,
         obj_header_addr,
-        cache_type,
-        btree_addr,
-        heap_addr,
+        cache,
     })
 }
 
@@ -590,6 +744,7 @@ pub fn detect_superblock_version(buf: &[u8]) -> FormatResult<u8> {
 #[cfg(test)]
 mod tests_v0v1 {
     use super::*;
+    use crate::format::UNDEF_ADDR;
 
     /// Build a minimal v0 superblock for testing.
     fn build_v0_superblock(
@@ -653,6 +808,58 @@ mod tests_v0v1 {
         buf
     }
 
+    /// The first 96 bytes libhdf5 1.14.6 wrote for a default h5py file: an
+    /// append re-emits them, so the decoder and the encoder have to agree with
+    /// the library byte for byte, not merely with each other.
+    #[test]
+    fn a_v0_superblock_re_emits_the_bytes_libhdf5_wrote() {
+        let buf = build_v0_superblock(0x60, 0x88, 0x2a8, 4896);
+        let sb = SuperblockV0V1::decode(&buf).unwrap();
+        assert_eq!(sb.encoded_size(), buf.len());
+        assert_eq!(sb.encode(), buf);
+    }
+
+    /// A version-1 superblock carries the chunked-storage internal "K" the
+    /// version-0 layout has no field for; dropping it on re-emission would
+    /// change the node size every v1 chunk B-tree in the file is measured by.
+    #[test]
+    fn a_v1_superblock_re_emits_its_indexed_storage_k() {
+        let mut buf = build_v0_superblock(0x60, 0x88, 0x2a8, 4896);
+        buf[8] = 1;
+        buf.splice(24..24, [0x40u8, 0x00, 0x00, 0x00]);
+        let sb = SuperblockV0V1::decode(&buf).unwrap();
+        assert_eq!(sb.version, 1);
+        assert_eq!(sb.indexed_storage_k, Some(0x40));
+        assert_eq!(sb.encode(), buf);
+    }
+
+    /// A soft-link entry's scratch pad is a 4-byte heap offset in 16 bytes of
+    /// pad; a nothing-cached entry's is 16 zero bytes.
+    #[test]
+    fn every_symbol_table_cache_shape_round_trips() {
+        for cache in [
+            SymbolTableCache::Nothing,
+            SymbolTableCache::SymbolTable {
+                btree_addr: 0x88,
+                heap_addr: 0x2a8,
+            },
+            SymbolTableCache::SoftLink { value_offset: 24 },
+        ] {
+            let entry = SymbolTableEntry {
+                name_offset: 8,
+                obj_header_addr: 0x320,
+                cache: cache.clone(),
+            };
+            let mut buf = Vec::new();
+            encode_symbol_table_entry(&mut buf, &entry, 8, 8);
+            assert_eq!(buf.len(), symbol_table_entry_size(8, 8));
+            let mut pos = 0;
+            let back = decode_symbol_table_entry(&buf, &mut pos, 8, 8).unwrap();
+            assert_eq!(pos, buf.len());
+            assert_eq!(back, entry);
+        }
+    }
+
     #[test]
     fn test_decode_v0() {
         let buf = build_v0_superblock(0x100, 0x200, 0x300, 0x1000);
@@ -667,9 +874,10 @@ mod tests_v0v1 {
         assert_eq!(sb.base_address, 0);
         assert_eq!(sb.end_of_file_address, 0x1000);
         assert_eq!(sb.root_symbol_table_entry.obj_header_addr, 0x100);
-        assert_eq!(sb.root_symbol_table_entry.cache_type, 1);
-        assert_eq!(sb.root_symbol_table_entry.btree_addr, 0x200);
-        assert_eq!(sb.root_symbol_table_entry.heap_addr, 0x300);
+        assert_eq!(
+            sb.root_symbol_table_entry.cached_symbol_table(),
+            Some((0x200, 0x300))
+        );
     }
 
     #[test]
@@ -710,7 +918,10 @@ mod tests_v0v1 {
         let sb = SuperblockV0V1::decode(&buf).expect("decode failed");
         assert_eq!(sb.version, 1);
         assert_eq!(sb.indexed_storage_k, Some(16));
-        assert_eq!(sb.root_symbol_table_entry.btree_addr, 0x200);
+        assert_eq!(
+            sb.root_symbol_table_entry.cached_symbol_table(),
+            Some((0x200, 0x300))
+        );
     }
 
     #[test]

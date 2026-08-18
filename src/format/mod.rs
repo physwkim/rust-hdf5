@@ -8,12 +8,22 @@ pub mod btree_v1;
 pub(crate) mod bytes;
 pub mod checksum;
 pub mod chunk_index;
+pub mod creation_order;
+pub mod dense_attr;
+pub mod dense_link;
 pub mod fractal_heap;
+pub mod fractal_heap_write;
+pub mod free_space;
 pub mod global_heap;
 pub mod local_heap;
 pub mod messages;
 pub mod nbit_scaleoffset;
 pub mod object_header;
+pub mod reference;
+pub mod selection;
+pub mod sohm;
+pub mod sohm_write;
+pub mod storage_kind;
 pub mod superblock;
 pub mod symbol_table;
 pub mod szip;
@@ -34,8 +44,190 @@ impl FormatContext {
     }
 }
 
+/// The low half of libhdf5's `H5Pset_libver_bounds` — the oldest library
+/// release a file must stay readable by.
+///
+/// It is the file-wide switch that picks between on-disk message versions:
+/// libhdf5 keeps one table per message type (`H5O_dtype_ver_bounds`,
+/// `H5O_layout_ver_bounds`, ...) mapping the bound to the version it stamps.
+/// Raising the bound lets the library use newer, tighter encodings; lowering
+/// it keeps older readers able to open the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum LibverBound {
+    /// `H5F_LIBVER_EARLIEST`, the default: every message at its oldest
+    /// version that can express what the file holds.
+    #[default]
+    Earliest,
+    /// `H5F_LIBVER_V18`.
+    V18,
+    /// `H5F_LIBVER_V110`.
+    V110,
+    /// `H5F_LIBVER_V112`.
+    V112,
+    /// `H5F_LIBVER_V114`.
+    V114,
+    /// `H5F_LIBVER_V200`, which is `H5F_LIBVER_LATEST` for libhdf5 2.0.
+    V200,
+}
+
+impl LibverBound {
+    /// The datatype message version this bound calls for — libhdf5's
+    /// `H5O_dtype_ver_bounds` (H5T.c), the floor `H5T_set_version` raises a
+    /// datatype to.
+    pub fn dtype_version(self) -> u8 {
+        match self {
+            Self::Earliest => 1,
+            Self::V18 | Self::V110 => 3,
+            Self::V112 | Self::V114 => 4,
+            Self::V200 => 5,
+        }
+    }
+
+    /// The data layout message version this bound calls for — libhdf5's
+    /// `H5O_layout_ver_bounds` (H5Dlayout.c:44).
+    ///
+    /// It is what decides the chunk index, before the dataspace gets a say:
+    /// `H5D__chunk_set_info` reaches the v1.10 indexes — extensible array,
+    /// fixed array, v2 B-tree, single chunk, implicit — only once this
+    /// version is 4 or more (H5Dchunk.c:936). Below that the layout message
+    /// has no index-type field at all and the chunks are indexed by the
+    /// version-1 B-tree, which is why `V18` and `Earliest` share one index
+    /// despite differing in every other message version.
+    pub fn layout_version(self) -> u8 {
+        match self {
+            Self::Earliest => 1,
+            Self::V18 => 3,
+            Self::V110 | Self::V112 | Self::V114 => 4,
+            Self::V200 => 5,
+        }
+    }
+
+    /// The superblock version this bound calls for — libhdf5's
+    /// `HDF5_superblock_ver_bounds` (H5Fsuper.c:68), the floor
+    /// `H5F__super_init` raises the content-derived version to.
+    ///
+    /// Version 0 is the `H5F_LIBVER_EARLIEST` entry
+    /// (`HDF5_SUPERBLOCK_VERSION_DEF`); a writer whose own structures need
+    /// more takes the higher of the two.
+    pub fn superblock_version(self) -> u8 {
+        match self {
+            Self::Earliest => 0,
+            Self::V18 => 2,
+            Self::V110 | Self::V112 | Self::V114 | Self::V200 => 3,
+        }
+    }
+
+    /// The lowest bound whose [`superblock_version`](Self::superblock_version)
+    /// matches an on-disk version byte.
+    ///
+    /// Lossy in one direction: superblock version 3 is shared by four bounds
+    /// (`V110` through `V200`), because raising the low bound past `V18` never
+    /// raises the superblock further — the version alone cannot tell them
+    /// apart, so this reports the lowest, `V110`. A version this crate's own
+    /// writer never emits (1) reads back as `Earliest`, the same legacy
+    /// generation as 0; anything past 3 has no bound to report and falls back
+    /// to the library's newest.
+    pub fn from_superblock_version(version: u8) -> Self {
+        match version {
+            0 | 1 => Self::Earliest,
+            2 => Self::V18,
+            3 => Self::V110,
+            _ => Self::V200,
+        }
+    }
+}
+
+/// Which generation of the on-disk object format one file's objects are
+/// written in.
+///
+/// Not a second [`LibverBound`]: the bound picks the datatype version a
+/// *caller* asked for, while this says which superblock generation the file
+/// already is. The two never combine freely — libhdf5 derives both from the
+/// same low bound, so a version-0/1 superblock always carries version-1 object
+/// headers and the `H5F_LIBVER_EARLIEST` row of every message-version table,
+/// and a version-2/3 superblock always carries version-2 headers and the
+/// `H5F_LIBVER_V18` row. Choosing per message is what would let this writer
+/// emit a combination libhdf5 never writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ObjectFormat {
+    /// A version-0/1 superblock file: version-1 object headers, symbol-table
+    /// groups, and the oldest message versions that can express the content.
+    Legacy,
+    /// A version-2/3 superblock file: version-2 object headers and the
+    /// message versions `H5F_LIBVER_V18` calls for.
+    #[default]
+    Modern,
+}
+
+impl ObjectFormat {
+    /// The object header version (`H5O_obj_ver_bounds`, H5Oint.c:125).
+    pub fn object_header_version(self) -> u8 {
+        match self {
+            Self::Legacy => 1,
+            Self::Modern => 2,
+        }
+    }
+
+    /// The floor for a dataspace message's version
+    /// (`H5O_sdspace_ver_bounds`, H5S.c:61). A null dataspace cannot be
+    /// expressed at version 1 and raises itself.
+    pub fn dataspace_version(self) -> u8 {
+        match self {
+            Self::Legacy => 1,
+            Self::Modern => 2,
+        }
+    }
+
+    /// The fill-value message version.
+    ///
+    /// `H5O_fill_ver_bounds` (H5Ofill.c:150) is `H5O_FILL_VERSION_1` at the
+    /// earliest bound, but the bound is only half of it: `H5O__fill_set_version`
+    /// takes `MAX(fill->version, bound)`, and the default creation property list
+    /// starts every fill value at `H5O_FILL_VERSION_2` (H5Pdcpl.c:163). Nothing
+    /// in the public API lowers it, so version 1 is unreachable and a classic
+    /// file's new fill message is version 2.
+    ///
+    /// Version 1 is not the "fill value (old)" message either — that is a
+    /// separate message type (0x04, `MSG_FILL_VALUE_OLD`) with its own
+    /// size-and-bytes encoding, which a classic file carries *alongside* this
+    /// one when the fill value is user-defined.
+    pub fn fill_value_version(self) -> u8 {
+        match self {
+            Self::Legacy => 2,
+            Self::Modern => 3,
+        }
+    }
+
+    /// The attribute message version (`H5O_attr_ver_bounds`, H5Aint.c:95).
+    pub fn attribute_version(self) -> u8 {
+        match self {
+            Self::Legacy => 1,
+            Self::Modern => 3,
+        }
+    }
+
+    /// The filter pipeline message version (`H5O_pline_ver_bounds`,
+    /// H5Opline.c:85).
+    pub fn filter_pipeline_version(self) -> u8 {
+        match self {
+            Self::Legacy => 1,
+            Self::Modern => 2,
+        }
+    }
+}
+
 /// UNDEF address constant
 pub const UNDEF_ADDR: u64 = u64::MAX;
+
+/// Fetches arbitrary file regions for the structure walkers that cannot hold a
+/// file handle themselves (fractal heap, v2 B-tree, dense attribute storage).
+pub trait BlockReader {
+    /// Read up to `len` bytes starting at `offset`. Returning fewer bytes is
+    /// only permitted at end of file; every caller re-checks the length it
+    /// actually needs, so a short read surfaces as `BufferTooShort` rather
+    /// than a misparse.
+    fn read_block(&mut self, offset: u64, len: usize) -> FormatResult<Vec<u8>>;
+}
 
 /// Encode/decode error
 #[derive(Debug)]

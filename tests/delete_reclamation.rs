@@ -14,6 +14,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rust_hdf5::types::VarLenUnicode;
 use rust_hdf5::H5File;
 
 fn unique_tmp(label: &str) -> PathBuf {
@@ -131,6 +132,35 @@ fn deleted_fixed_array_dataset_frees_chunks_and_index() {
                 ds.write_chunk(f, &row).unwrap();
             }
             file.delete_dataset("grid").unwrap();
+        }
+        file.close().unwrap();
+        let n = std::fs::metadata(&path).unwrap().len();
+        cleanup(&path);
+        n
+    };
+
+    assert_eq!(size_after(20), size_after(2), "20 delete cycles against 2");
+}
+
+/// Single-chunk-indexed dataset (a fixed shape covered by exactly one
+/// chunk): the delete frees that one chunk — the whole of its storage,
+/// addressed directly from the layout message rather than through any
+/// index structure of its own.
+#[test]
+fn deleted_single_chunk_dataset_frees_its_one_chunk() {
+    let size_after = |cycles: usize| {
+        let path = unique_tmp(&format!("single_chunk_{cycles}"));
+        let file = H5File::create(&path).unwrap();
+        let row: Vec<u8> = (0..16i32).flat_map(|v| v.to_le_bytes()).collect();
+        for _ in 0..cycles {
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([16usize])
+                .chunk(&[16])
+                .create("data")
+                .unwrap();
+            ds.write_chunk(0, &row).unwrap();
+            file.delete_dataset("data").unwrap();
         }
         file.close().unwrap();
         let n = std::fs::metadata(&path).unwrap().len();
@@ -263,3 +293,75 @@ fn reopen_session_delete_frees_the_previous_sessions_storage() {
 
     assert_eq!(size_after(10), size_after(2), "10 reopen cycles against 2");
 }
+
+/// A reopen rebuilds dense attribute storage from scratch for every object
+/// whose header it rewrites. The heap, its name index and its creation-order
+/// index that the previous session left on disk are what the rewrite
+/// supersedes, so they must go back to the allocator — otherwise every
+/// open/close cycle strands one whole set of them.
+///
+/// All three attribute scopes at once: the root group, a subgroup and a
+/// dataset each carry more than `max_compact` attributes, and one of them is
+/// too large for a header message so the heap also holds a "huge" object.
+#[test]
+fn reopening_dense_attribute_storage_reuses_the_heap_it_replaces() {
+    let size_after = |sessions: usize| {
+        let path = unique_tmp(&format!("dense_attr_reopen_{sessions}"));
+        let big = "x".repeat(70_000);
+        {
+            let file = H5File::create(&path).unwrap();
+            let g = file.root_group().create_group("run").unwrap();
+            let ds = file.new_dataset::<f32>().shape([8]).create("temp").unwrap();
+            for i in 0..12 {
+                file.set_attr_string(&format!("root{i:02}"), "v").unwrap();
+                g.set_attr_string(&format!("grp{i:02}"), "v").unwrap();
+                ds.new_attr::<VarLenUnicode>()
+                    .shape(())
+                    .create(&format!("ds{i:02}"))
+                    .unwrap()
+                    .write_string("v")
+                    .unwrap();
+            }
+            file.set_attr_string("huge", &big).unwrap();
+            file.close().unwrap();
+        }
+        for _ in 0..sessions {
+            let file = H5File::options().no_locking().open_rw(&path).unwrap();
+            // Nothing is added: carrying the attribute sets forward is by
+            // itself enough to rebuild every heap.
+            file.close().unwrap();
+        }
+        let read = H5File::open(&path).unwrap();
+        assert_eq!(read.attr_names().unwrap().len(), 13);
+        assert_eq!(read.attr_string("huge").unwrap(), big);
+        assert_eq!(
+            read.root_group()
+                .group("run")
+                .unwrap()
+                .attr_names()
+                .unwrap()
+                .len(),
+            12,
+            "subgroup attributes survive the reopen"
+        );
+        assert_eq!(
+            read.dataset("temp").unwrap().attr_names().unwrap().len(),
+            12,
+            "dataset attributes survive the reopen"
+        );
+        drop(read);
+        let n = std::fs::metadata(&path).unwrap().len();
+        cleanup(&path);
+        n
+    };
+
+    assert_eq!(size_after(10), size_after(2), "10 reopen cycles against 2");
+}
+
+// Dense *link* storage is reclaimed by the same owner, but its file-size
+// oracle does not exist yet: a reopen does not carry dense links forward, so
+// a group past the link phase change comes back empty and everything it named
+// is orphaned. That loss dominates any size comparison, so the link half is
+// asserted directly on the freed blocks instead — see
+// `a_reopen_frees_the_dense_link_storage_its_rewrite_supersedes` in
+// `src/io/writer.rs`.

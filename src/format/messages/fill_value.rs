@@ -33,6 +33,49 @@ const FLAG_HAVE_VALUE: u8 = 0x20;
 const FLAGS_ALL: u8 =
     FLAG_MASK_ALLOC | (FLAG_MASK_FILL << FLAG_SHIFT_FILL) | FLAG_UNDEFINED | FLAG_HAVE_VALUE;
 
+/// `H5D_ALLOC_TIME_EARLY` (`H5Dpublic.h`): space is allocated as soon as the
+/// dataset is created. `H5P__set_layout`'s default switch (H5Pdcpl.c:1864-
+/// 1877) gives this to a compact dataset — its storage *is* the object
+/// header, so it exists as soon as the dataset does.
+pub const ALLOC_TIME_EARLY: u8 = 1;
+
+/// `H5D_ALLOC_TIME_LATE`: space is allocated when data is first written.
+/// The default for a contiguous dataset (`H5P__set_layout`, H5Pdcpl.c:1870).
+pub const ALLOC_TIME_LATE: u8 = 2;
+
+/// `H5D_ALLOC_TIME_INCR`: space is allocated incrementally, as chunks (or
+/// virtual source datasets) are written. The default for a chunked or
+/// virtual dataset (`H5P__set_layout`, H5Pdcpl.c:1874-1877).
+pub const ALLOC_TIME_INCR: u8 = 3;
+
+/// `H5D_FILL_TIME_ALLOC` (`H5Dpublic.h`): fill at allocation regardless of
+/// whether a fill value was ever set — an unset value fills with the
+/// default (zeros), same as leaving newly allocated space untouched.
+pub const FILL_TIME_ALLOC: u8 = 0;
+
+/// `H5D_FILL_TIME_NEVER`: the fill value is never written into allocated
+/// storage. `H5D__chunk_lock`'s cache-miss path (H5Dchunk.c:4894) gates on
+/// it, and this crate's writer mirrors that gate at its own two eager-fill
+/// sites — the immediate tiling `set_dataset_fill_value` does for a
+/// compact/contiguous/implicit dataset, and the buffer a chunked partial
+/// write builds for a chunk touched for the first time — unlike a shrink's
+/// straddler refill (`H5D__chunk_prune_fill`), which fills unconditionally
+/// because it is repairing data about to become reachable again, not
+/// filling at allocation.
+pub const FILL_TIME_NEVER: u8 = 1;
+
+/// `H5D_FILL_TIME_IFSET`, the write time the default dataset creation
+/// property list carries (`H5D_CRT_FILL_TIME_DEF`, H5Dpkg.h) and therefore the
+/// one every dataset gets unless `H5Pset_fill_time` says otherwise.
+///
+/// It means "fill at allocation only when the user set a fill value", where
+/// `H5D_FILL_TIME_ALLOC` fills at allocation either way. The two differ only
+/// for a dataset with no fill value of its own, where `ALLOC` writes the
+/// default fill — zeros — and `IFSET` writes nothing into space that reads as
+/// zeros regardless. So this is what the writer's own allocation-time fills
+/// already do, whichever of the two the message claimed.
+pub const FILL_TIME_IFSET: u8 = 2;
+
 /// Fill value message payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FillValueMessage {
@@ -49,9 +92,9 @@ pub struct FillValueMessage {
 impl Default for FillValueMessage {
     fn default() -> Self {
         Self {
-            alloc_time: 2,      // late
-            fill_write_time: 0, // on alloc
-            fill_defined: 1,    // default value (zeros)
+            alloc_time: ALLOC_TIME_LATE,
+            fill_write_time: FILL_TIME_IFSET,
+            fill_defined: 1, // default value (zeros)
             fill_value: None,
         }
     }
@@ -61,8 +104,8 @@ impl FillValueMessage {
     /// A user-defined fill value.
     pub fn with_value(data: Vec<u8>) -> Self {
         Self {
-            alloc_time: 2,
-            fill_write_time: 0,
+            alloc_time: ALLOC_TIME_LATE,
+            fill_write_time: FILL_TIME_IFSET,
             fill_defined: 2,
             fill_value: Some(data),
         }
@@ -71,8 +114,8 @@ impl FillValueMessage {
     /// An undefined fill value (no fill is performed).
     pub fn undefined() -> Self {
         Self {
-            alloc_time: 2,
-            fill_write_time: 1, // never
+            alloc_time: ALLOC_TIME_LATE,
+            fill_write_time: FILL_TIME_NEVER,
             fill_defined: 0,
             fill_value: None,
         }
@@ -82,6 +125,34 @@ impl FillValueMessage {
 
     /// Encode as a version-3 fill-value message (`H5O__fill_new_encode`).
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_for(crate::format::ObjectFormat::Modern)
+    }
+
+    /// Encode at the version a file of this `format` calls for
+    /// (`H5O__fill_new_encode`, H5Ofill.c:409).
+    ///
+    /// Version 2 spells out allocation time, write time and definedness as
+    /// three bytes instead of packing them into flags, and — the part a
+    /// version-3 reader must not assume — always writes the four-byte size
+    /// field when the value is defined, even when the size is zero. That
+    /// `defined = 1, size = 0` shape is what libhdf5 writes for the default
+    /// fill of a contiguous dataset in a classic file.
+    pub fn encode_for(&self, format: crate::format::ObjectFormat) -> Vec<u8> {
+        if format.fill_value_version() < VERSION {
+            let mut buf = Vec::with_capacity(12);
+            buf.push(format.fill_value_version());
+            buf.push(self.alloc_time);
+            buf.push(self.fill_write_time);
+            if self.fill_defined == 0 {
+                buf.push(0);
+                return buf;
+            }
+            buf.push(1);
+            let value = self.fill_value.as_deref().unwrap_or(&[]);
+            buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            buf.extend_from_slice(value);
+            return buf;
+        }
         let mut buf = Vec::with_capacity(10);
         buf.push(VERSION);
 
@@ -485,5 +556,40 @@ mod tests {
         );
         // Partial tail when total is not a multiple of the pattern width.
         assert_eq!(tiled_fill(5, Some(&[1, 2])), vec![1, 2, 1, 2, 1]);
+    }
+
+    /// The 8 bytes libhdf5 1.14.6 wrote for the default fill of a contiguous
+    /// dataset in a default (superblock-0) file: version 2, and the size field
+    /// present-but-zero that a version-3 reader never sees.
+    #[test]
+    fn a_legacy_fill_value_matches_the_bytes_libhdf5_wrote() {
+        let fv = FillValueMessage {
+            alloc_time: 2,
+            fill_write_time: 2,
+            fill_defined: 1,
+            fill_value: None,
+        };
+        let buf = fv.encode_for(crate::format::ObjectFormat::Legacy);
+        assert_eq!(buf, vec![0x02, 0x02, 0x02, 0x01, 0, 0, 0, 0]);
+        let (back, consumed) = FillValueMessage::decode(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(back, fv);
+    }
+
+    #[test]
+    fn a_legacy_user_fill_value_round_trips() {
+        let fv = FillValueMessage::with_value(vec![7, 0, 0, 0]);
+        let buf = fv.encode_for(crate::format::ObjectFormat::Legacy);
+        assert_eq!(&buf[..4], &[0x02, 0x02, 0x02, 0x01]);
+        let (back, _) = FillValueMessage::decode(&buf).unwrap();
+        assert_eq!(back, fv);
+    }
+
+    #[test]
+    fn a_legacy_undefined_fill_value_writes_no_size() {
+        let buf = FillValueMessage::undefined().encode_for(crate::format::ObjectFormat::Legacy);
+        assert_eq!(buf, vec![0x02, 0x02, 0x01, 0x00]);
+        let (back, _) = FillValueMessage::decode(&buf).unwrap();
+        assert_eq!(back, FillValueMessage::undefined());
     }
 }

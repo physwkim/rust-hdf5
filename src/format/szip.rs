@@ -29,29 +29,24 @@
 // Based on the CCSDS recommended standard 121.0-B-3.
 
 // ---------------------------------------------------------------------------
-// SZIP option masks (HDF5 filter interface, see H5Zpublic.h / szlib.h)
+// SZIP option masks (HDF5 filter interface, see H5Zpublic.h / szlib.h).
+// convert_options below only ever tests MSB and NN: the interleave and
+// endianness choices are the only ones this port implements. The rest of
+// the mask enumeration is not modeled as constants (they would be dead
+// code — nothing here reads them), but is listed for reference against the
+// upstream bit positions: SZ_ALLOW_K13_OPTION_MASK = 1, SZ_CHIP_OPTION_MASK
+// = 2, SZ_EC_OPTION_MASK = 4, SZ_LSB_OPTION_MASK = 8, SZ_RAW_OPTION_MASK =
+// 128 — the last of which libaec's szlib wrapper itself accepts but does
+// not act on for the interleave decision (see sz_compat.c).
 // ---------------------------------------------------------------------------
-#[allow(dead_code)]
-const SZ_ALLOW_K13_OPTION_MASK: u32 = 1;
-#[allow(dead_code)]
-const SZ_CHIP_OPTION_MASK: u32 = 2;
-#[allow(dead_code)]
-const SZ_EC_OPTION_MASK: u32 = 4;
-#[allow(dead_code)]
-const SZ_LSB_OPTION_MASK: u32 = 8;
 const SZ_MSB_OPTION_MASK: u32 = 16;
 const SZ_NN_OPTION_MASK: u32 = 32;
-// RAW: libaec's szlib wrapper accepts but does not act on this mask for the
-// interleave decision (see sz_compat.c). Kept for documentation only.
-#[allow(dead_code)]
-const SZ_RAW_OPTION_MASK: u32 = 128;
 
 // ---------------------------------------------------------------------------
-// AEC flags
+// AEC flags. AEC_DATA_3BYTE (=2) is part of the upstream enumeration but
+// unused: this port never encounters 3-byte sample data.
 // ---------------------------------------------------------------------------
 const AEC_DATA_SIGNED: u32 = 1;
-#[allow(dead_code)]
-const AEC_DATA_3BYTE: u32 = 2;
 const AEC_DATA_MSB: u32 = 4;
 const AEC_DATA_PREPROCESS: u32 = 8;
 const AEC_RESTRICTED: u32 = 16;

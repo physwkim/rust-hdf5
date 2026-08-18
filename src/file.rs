@@ -18,12 +18,18 @@
 
 use std::path::Path;
 
+use crate::format::messages::superblock_ext::FileSpaceStrategy;
 use crate::io::locking::FileLocking;
+use crate::io::reader::SuperblockExtension;
+use crate::io::writer::{FileSpaceConfig, SharedMessageConfig};
 use crate::io::{Hdf5Reader, Hdf5Writer};
 
-use crate::dataset::{DatasetBuilder, H5Dataset};
+use crate::dataset::{DatasetAccess, DatasetBuilder, H5Dataset};
 use crate::error::{Hdf5Error, Result};
+use crate::format::messages::datatype::{DatatypeMessage, DatatypeNodeVersion};
 use crate::format::messages::filter::FilterPipeline;
+use crate::format::messages::shared::MessageStorage;
+use crate::format::LibverBound;
 use crate::group::H5Group;
 use crate::types::H5Type;
 
@@ -48,6 +54,19 @@ pub(crate) fn borrow_inner(inner: &SharedInner) -> std::cell::Ref<'_, H5FileInne
 #[cfg(not(feature = "threadsafe"))]
 pub(crate) fn borrow_inner_mut(inner: &SharedInner) -> std::cell::RefMut<'_, H5FileInner> {
     inner.borrow_mut()
+}
+
+/// [`borrow_inner_mut`] where failing to get the lock must not panic.
+///
+/// Only [`H5Dataset`]'s drop uses this: a `Drop` that panics while another
+/// panic unwinds aborts the process, and the one thing it does with the lock
+/// — releasing cross-file handles a closed virtual dataset was holding — is
+/// re-run by the next handle drop or extent resolution.
+#[cfg(not(feature = "threadsafe"))]
+pub(crate) fn try_borrow_inner_mut(
+    inner: &SharedInner,
+) -> Option<std::cell::RefMut<'_, H5FileInner>> {
+    inner.try_borrow_mut().ok()
 }
 
 /// Helper to clone a SharedInner.
@@ -81,6 +100,15 @@ pub(crate) fn borrow_inner_mut(
     inner.write().unwrap()
 }
 
+/// [`borrow_inner_mut`] where failing to get the lock must not panic; see the
+/// single-threaded twin for why.
+#[cfg(feature = "threadsafe")]
+pub(crate) fn try_borrow_inner_mut(
+    inner: &SharedInner,
+) -> Option<std::sync::RwLockWriteGuard<'_, H5FileInner>> {
+    inner.write().ok()
+}
+
 #[cfg(feature = "threadsafe")]
 pub(crate) fn clone_inner(inner: &SharedInner) -> SharedInner {
     std::sync::Arc::clone(inner)
@@ -97,8 +125,12 @@ pub(crate) fn new_shared(inner: H5FileInner) -> SharedInner {
 /// Enable the `threadsafe` feature to use `Arc<Mutex<>>` instead, making
 /// `H5File` `Send + Sync`.
 pub(crate) enum H5FileInner {
-    Writer(Hdf5Writer),
-    Reader(Hdf5Reader),
+    // Boxed: `Hdf5Writer` and `Hdf5Reader` are both far larger than the
+    // zero-sized `Closed` sentinel, and inlining either here would size
+    // every `H5FileInner` to that variant's footprint regardless of which
+    // mode a given file is actually in.
+    Writer(Box<Hdf5Writer>),
+    Reader(Box<Hdf5Reader>),
     /// Sentinel value used during `close()` to take ownership of the writer.
     Closed,
 }
@@ -117,7 +149,7 @@ impl H5File {
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
         let writer = Hdf5Writer::create(path.as_ref())?;
         Ok(Self {
-            inner: new_shared(H5FileInner::Writer(writer)),
+            inner: new_shared(H5FileInner::Writer(Box::new(writer))),
         })
     }
 
@@ -125,7 +157,7 @@ impl H5File {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let reader = Hdf5Reader::open(path.as_ref())?;
         Ok(Self {
-            inner: new_shared(H5FileInner::Reader(reader)),
+            inner: new_shared(H5FileInner::Reader(Box::new(reader))),
         })
     }
 
@@ -145,7 +177,7 @@ impl H5File {
     pub fn open_rw<P: AsRef<Path>>(path: P) -> Result<Self> {
         let writer = Hdf5Writer::open_append(path.as_ref())?;
         Ok(Self {
-            inner: new_shared(H5FileInner::Writer(writer)),
+            inner: new_shared(H5FileInner::Writer(Box::new(writer))),
         })
     }
 
@@ -176,16 +208,109 @@ impl H5File {
     /// *expands* a chunk, but the file is only readable by libhdf5 ≥ 2.0
     /// (h5py bundling hdf5 1.14 rejects it with "bad version number").
     ///
-    /// Off by default; unfiltered and contiguous datasets are unaffected.
-    /// Independent of this setting, a chunk larger than 4 GiB forces version 5
-    /// because version 4 cannot represent its size field, matching libhdf5.
+    /// It also sets the file's library-version low bound, and so its
+    /// superblock version: version 3, where a file this crate writes without
+    /// it is version 2 (or 3 anyway, once it holds a chunked dataset).
+    ///
+    /// Off by default; the data layout of unfiltered and contiguous datasets
+    /// is unaffected. Independent of this setting, a chunk larger than 4 GiB
+    /// forces version 5 because version 4 cannot represent its size field,
+    /// matching libhdf5.
+    ///
+    /// `false` is not "back to the default": it is
+    /// [`LibverBound::Earliest`], the opposite end of the same table, where
+    /// the data layout message is version 3 and chunked datasets created
+    /// after the call go on the version-1 B-tree. A file that has never been
+    /// told a bound is the one at the crate default.
     ///
     /// Errors in read mode.
     pub fn set_libver_latest(&self, latest: bool) -> Result<()> {
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {
             H5FileInner::Writer(writer) => {
-                writer.set_libver_latest(latest);
+                writer.set_libver_latest(latest)?;
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
+        }
+    }
+
+    /// Set the file's low libver bound — `H5Pset_libver_bounds`'s `low`
+    /// argument, the oldest libhdf5 release the file must stay readable by.
+    ///
+    /// Objects created after this call encode their messages at the versions
+    /// that bound calls for: a compound, enum or array datatype message moves
+    /// to version 3 at [`LibverBound::V18`] and version 4 at
+    /// [`LibverBound::V112`], the way `H5T_set_version` upgrades a datatype,
+    /// while an integer or string message stays at version 1 in every file.
+    /// [`LibverBound::V200`] additionally selects the version-5 data layout
+    /// for filtered chunked datasets, as [`Self::set_libver_latest`] does.
+    ///
+    /// The bound also picks the chunk index, through the data layout message
+    /// version `H5O_layout_ver_bounds` gives it: below [`LibverBound::V110`]
+    /// that version is 3, which has no index-type field, so a chunked dataset
+    /// created after this call is indexed by the version-1 B-tree rather than
+    /// by the v1.10 index its shape would otherwise select. Datasets already
+    /// created keep the index they were made with, exactly as libhdf5 keeps
+    /// what a dataset's creation property list settled.
+    ///
+    /// Naming a bound is not the same as leaving it unset: a file created
+    /// through [`H5File::create`] names none and uses the v1.10 indexes.
+    ///
+    /// Errors in read mode.
+    pub fn set_libver_bound(&self, libver: LibverBound) -> Result<()> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                writer.set_libver_bound(libver)?;
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
+        }
+    }
+
+    /// Record creation order for the links and the attributes of every
+    /// object created after this call — the equivalent of h5py's
+    /// `h5py.get_config().track_order = True`, i.e. `H5Pset_link_creation_order`
+    /// and `H5Pset_attr_creation_order` set to
+    /// `H5P_CRT_ORDER_TRACKED | H5P_CRT_ORDER_INDEXED` on the creation
+    /// property lists those objects are made with.
+    ///
+    /// Creation-order tracking belongs to the object, so groups and datasets
+    /// made before this call keep the policy they were made under — the same
+    /// split h5py has between its global config and each object's property
+    /// list. The root group is created with the file; configure it with
+    /// [`H5FileOptions::track_order`], h5py's `File(..., track_order=True)`.
+    ///
+    /// Off by default. Errors in read mode.
+    pub fn set_track_order(&self, track: bool) -> Result<()> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                writer.set_track_order(track);
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
+        }
+    }
+
+    /// Record the times of every object created after this call —
+    /// `H5Pset_obj_track_times` on the creation property lists those objects
+    /// are made with, h5py's `track_times=` argument to `create_dataset` and
+    /// `create_group`.
+    ///
+    /// Off by default; see [`H5FileOptions::track_times`] for why that is
+    /// h5py's answer and not libhdf5's. Like creation-order tracking it
+    /// belongs to the object, so objects made before this call keep the policy
+    /// they were made under, and the root group takes its own from
+    /// [`H5FileOptions::track_times`].
+    ///
+    /// Errors in read mode.
+    pub fn set_track_times(&self, track: bool) -> Result<()> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                writer.set_track_times(track);
                 Ok(())
             }
             _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
@@ -208,6 +333,57 @@ impl H5File {
     /// ```
     pub fn create_group(&self, name: &str) -> Result<H5Group> {
         self.root_group().create_group(name)
+    }
+
+    /// Create a soft link in the root of the file.
+    ///
+    /// See [`H5Group::create_soft_link`](crate::group::H5Group::create_soft_link).
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    /// let file = H5File::create("soft.h5").unwrap();
+    /// file.new_dataset::<i32>().shape([8]).create("orig").unwrap();
+    /// file.create_soft_link("alias", "/orig").unwrap();
+    /// ```
+    pub fn create_soft_link(&self, link_name: &str, target_path: &str) -> Result<()> {
+        self.root_group().create_soft_link(link_name, target_path)
+    }
+
+    /// Create an external link in the root of the file.
+    ///
+    /// See [`H5Group::create_external_link`](crate::group::H5Group::create_external_link).
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    /// let file = H5File::create("master.h5").unwrap();
+    /// file.create_external_link("ext", "payload.h5", "/data").unwrap();
+    /// ```
+    pub fn create_external_link(
+        &self,
+        link_name: &str,
+        target_file: &str,
+        target_path: &str,
+    ) -> Result<()> {
+        self.root_group()
+            .create_external_link(link_name, target_file, target_path)
+    }
+
+    /// Commit a datatype in the root of the file.
+    ///
+    /// See [`H5Group::commit_datatype`](crate::group::H5Group::commit_datatype).
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    /// use rust_hdf5::format::messages::datatype::DatatypeMessage;
+    /// let file = H5File::create("committed.h5").unwrap();
+    /// file.commit_datatype("temperature", DatatypeMessage::f64_type()).unwrap();
+    /// ```
+    pub fn commit_datatype(
+        &self,
+        name: &str,
+        datatype: crate::format::messages::datatype::DatatypeMessage,
+    ) -> Result<()> {
+        self.root_group().commit_datatype(name, datatype)
     }
 
     /// Start building a new dataset with the given element type.
@@ -249,6 +425,56 @@ impl H5File {
         let es = T::element_size();
         let raw = unsafe { std::slice::from_raw_parts(value as *const T as *const u8, es) };
         let attr = AttributeMessage::scalar_numeric(name, T::hdf5_type(), raw.to_vec());
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => {
+                writer.add_root_attribute(attr)?;
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
+        }
+    }
+
+    /// Add a scalar attribute to the file (root group) whose datatype and raw
+    /// value the caller supplies.
+    ///
+    /// The escape hatch for a type this crate has no Rust mapping for — a
+    /// fixed-length string of a size the value alone does not imply, say,
+    /// which is what `H5Tcopy(H5T_C_S1)` plus `H5Tset_size` produces.
+    /// [`DatasetBuilder::datatype`](crate::dataset::DatasetBuilder::datatype)
+    /// is the same hatch for a dataset; every typed setter here builds one of
+    /// these underneath.
+    ///
+    /// `value` is the raw element image and must be exactly as long as the
+    /// datatype's element size.
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::{DatatypeMessage, H5File};
+    /// let file = H5File::create("notes.h5").unwrap();
+    /// let mut text = vec![b'x'; 256];
+    /// text[255] = 0;
+    /// file.set_attr_typed(
+    ///     "note",
+    ///     DatatypeMessage::FixedString { size: 256, padding: 0, charset: 0 },
+    ///     text,
+    /// )
+    /// .unwrap();
+    /// ```
+    pub fn set_attr_typed(
+        &self,
+        name: &str,
+        datatype: DatatypeMessage,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        use crate::format::messages::attribute::AttributeMessage;
+        if value.len() as u64 != u64::from(datatype.element_size()) {
+            return Err(Hdf5Error::InvalidState(format!(
+                "attribute '{name}' was given {} bytes for a datatype whose element is {}",
+                value.len(),
+                datatype.element_size()
+            )));
+        }
+        let attr = AttributeMessage::scalar_numeric(name, datatype, value);
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
@@ -358,12 +584,72 @@ impl H5File {
         }
     }
 
+    /// Add (or replace) an object-reference attribute on the file (root group)
+    /// — h5py's `f.attrs['entry'] = f['/data'].ref`.
+    ///
+    /// `path` names a dataset or a group (`/` is the root group) and must
+    /// already exist. The attribute takes the scalar shape h5py gives a single
+    /// reference; [`set_attr_object_references`](Self::set_attr_object_references)
+    /// is the array form. What reaches the file is the target's object header
+    /// address, which is assigned when the file is finalized.
+    pub fn set_attr_object_reference(&self, name: &str, path: &str) -> Result<()> {
+        self.set_root_reference_attr(name, &[path], &[])
+    }
+
+    /// Add (or replace) a 1-D array of object references as a file-level
+    /// attribute — the array counterpart of
+    /// [`set_attr_object_reference`](Self::set_attr_object_reference).
+    pub fn set_attr_object_references(&self, name: &str, paths: &[&str]) -> Result<()> {
+        self.set_root_reference_attr(name, paths, &[paths.len() as u64])
+    }
+
+    fn set_root_reference_attr(&self, name: &str, paths: &[&str], dims: &[u64]) -> Result<()> {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => {
+                writer.set_object_reference_attribute(
+                    crate::io::writer::AttrTarget::Root,
+                    name,
+                    paths,
+                    dims,
+                )?;
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
+        }
+    }
+
     /// Return the names of file-level (root group) attributes.
     pub fn attr_names(&self) -> Result<Vec<String>> {
         let inner = borrow_inner(&self.inner);
         match &*inner {
-            H5FileInner::Reader(reader) => Ok(reader.root_attr_names()),
+            H5FileInner::Reader(reader) => Ok(reader.root_attr_names()?),
             _ => Ok(vec![]),
+        }
+    }
+
+    /// Why the file-level attribute `name` cannot be read, or `None` when it
+    /// can be. See [`H5Dataset::attr_unreadable_reason`](crate::H5Dataset::attr_unreadable_reason).
+    pub fn attr_unreadable_reason(&self, name: &str) -> Result<Option<String>> {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => {
+                Ok(reader.root_attr_unreadable_reason(name).map(str::to_string))
+            }
+            _ => Err(Hdf5Error::InvalidState("not in read mode".into())),
+        }
+    }
+
+    /// Why the file-level attribute *set* cannot be listed, or `None` when it
+    /// can be. See
+    /// [`H5Dataset::attrs_unreadable_reason`](crate::H5Dataset::attrs_unreadable_reason).
+    pub fn attrs_unreadable_reason(&self) -> Result<Option<String>> {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => {
+                Ok(reader.root_attrs_unreadable_reason().map(str::to_string))
+            }
+            _ => Err(Hdf5Error::InvalidState("not in read mode".into())),
         }
     }
 
@@ -372,14 +658,153 @@ impl H5File {
         let mut inner = borrow_inner_mut(&self.inner);
         match &mut *inner {
             H5FileInner::Reader(reader) => {
-                let attr = reader
-                    .root_attr(name)
-                    .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?
-                    .clone();
+                let attr = reader.root_attr(name)?.clone();
                 Ok(reader.attr_string_value(&attr)?)
             }
             _ => Err(Hdf5Error::InvalidState("not in read mode".into())),
         }
+    }
+
+    /// The file-level metadata carried by the superblock extension: the
+    /// shared-message table, the v1 B-tree K values, the driver-info block and
+    /// the file-space strategy.
+    ///
+    /// Every field is `None` for a file written without an extension, and for
+    /// a file this handle has open for writing.
+    pub fn superblock_extension(&self) -> SuperblockExtension {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => reader.superblock_extension().clone(),
+            _ => SuperblockExtension::default(),
+        }
+    }
+
+    /// How the object header at `path` stores each message it does not hold
+    /// privately, as `(message type, storage)` in header order.
+    ///
+    /// This is the flags byte `h5debug` prints as `<S>` / `<SA>`, and the
+    /// pointer kind beneath a shared one — the only place a file says whether
+    /// a message body is the message or a reference to one held elsewhere.
+    /// Read mode only.
+    pub fn object_message_storage(&self, path: &str) -> Result<Vec<(u8, MessageStorage)>> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => Ok(reader.object_message_storage(path)?),
+            _ => Err(Hdf5Error::InvalidState(
+                "object_message_storage is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// The flags byte of every message the object header at `path` holds, as
+    /// `(message type, flags)` in header order, null and continuation
+    /// messages left out.
+    ///
+    /// What `h5debug` prints as `<C>`, `<DS>`, `<S>` and the rest
+    /// (`H5O__debug_real`, H5Odbg.c:409-455): which messages the library may
+    /// cache as never-changing, which it refuses to move to the shared-message
+    /// heap, and which are already there. Read mode only.
+    pub fn object_message_flags(&self, path: &str) -> Result<Vec<(u8, u8)>> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => Ok(reader.object_message_flags(path)?),
+            _ => Err(Hdf5Error::InvalidState(
+                "object_message_flags is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// The class and version of every datatype message the object at `path`
+    /// carries, outermost first and then depth-first through compound
+    /// members, an enum's base and an array's base.
+    ///
+    /// The version is the one part of a datatype message a decode drops, and
+    /// it is not free: `H5T_set_version` (H5T.c:6584-6591) picks it from the
+    /// file's low libver bound and the type's own construction, so it is what
+    /// says which generation of library can read the type back. A
+    /// stored-shared datatype is followed to the committed type it names, so
+    /// what comes back is the version that actually describes the object.
+    pub fn object_datatype_versions(&self, path: &str) -> Result<Vec<DatatypeNodeVersion>> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => Ok(reader.object_datatype_versions(path)?),
+            _ => Err(Hdf5Error::InvalidState(
+                "object_datatype_versions is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Whether the object at `path` records its times —
+    /// `H5Pget_obj_track_times` on the creation property list it was made
+    /// with, read back from the header that answers it.
+    ///
+    /// A version-2 header says so with `H5O_HDR_STORE_TIMES` and the four
+    /// times behind it; a version-1 dataset says so by carrying an
+    /// `H5O_MTIME_NEW` message. A version-1 group or committed datatype says
+    /// nothing either way — it has nowhere to record a time — so this is
+    /// `false` for one however it was created. Read mode only.
+    pub fn object_records_times(&self, path: &str) -> Result<bool> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => Ok(reader.object_records_times(path)?),
+            _ => Err(Hdf5Error::InvalidState(
+                "object_records_times is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Bytes this file's on-disk free-space managers record as free —
+    /// libhdf5's `H5Fget_freespace`, and the number `h5stat -S` prints as
+    /// "Amount of tracked free space".
+    ///
+    /// Zero for a file that persists no managers, which is every file created
+    /// without [`H5FileOptions::file_space`] asking for `persist`. Read mode
+    /// only: an open writer's freed blocks are not on disk yet, so the two
+    /// would be different questions with one name.
+    pub fn tracked_free_space(&self) -> Result<u64> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => Ok(reader.tracked_free_space()?),
+            _ => Err(Hdf5Error::InvalidState(
+                "tracked_free_space is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Size in bytes of the userblock this file was written with — the
+    /// application-owned prefix the superblock follows (`H5Pget_userblock`).
+    /// Zero for a file without one, whichever mode the handle is in.
+    pub fn userblock_size(&self) -> u64 {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => reader.userblock_size(),
+            H5FileInner::Writer(writer) => writer.userblock_size(),
+            H5FileInner::Closed => 0,
+        }
+    }
+
+    /// This file's on-disk superblock format version (0-3) — libhdf5's
+    /// `H5F_get_info2`'s `super_version`, read from the file's own header
+    /// rather than derived from any bound a caller asked for.
+    pub fn superblock_version(&self) -> Result<u8> {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(reader.superblock_version()),
+            _ => Err(Hdf5Error::InvalidState(
+                "superblock_version is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// The lowest [`LibverBound`] consistent with this file's on-disk
+    /// superblock version — a *view* reconstructed from
+    /// [`superblock_version`](Self::superblock_version), not the bound a
+    /// writer may have named: [`LibverBound::superblock_version`] maps four
+    /// bounds onto version 3, so a version-3 file reports [`LibverBound::V110`]
+    /// regardless of which of the four actually wrote it.
+    pub fn libver_bound(&self) -> Result<LibverBound> {
+        self.superblock_version()
+            .map(LibverBound::from_superblock_version)
     }
 
     /// Check if the file is in write/append mode.
@@ -391,33 +816,45 @@ impl H5File {
     /// Create a variable-length string dataset and write data.
     ///
     /// This is a convenience method for writing h5py-compatible vlen string
-    /// datasets using global heap storage.
+    /// datasets using global heap storage. The datatype declares UTF-8, which
+    /// a Rust `&str` always is; [`write_vlen_strings_ascii`] writes the same
+    /// dataset under an ASCII declaration, the type h5py's
+    /// `string_dtype("ascii")` produces.
+    ///
+    /// [`write_vlen_strings_ascii`]: Self::write_vlen_strings_ascii
     pub fn write_vlen_strings(&self, name: &str, strings: &[&str]) -> Result<H5Dataset> {
+        self.write_vlen_strings_charset(name, strings, 1)
+    }
+
+    /// Create a variable-length **ASCII** string dataset and write data.
+    ///
+    /// The ASCII twin of [`write_vlen_strings`](Self::write_vlen_strings),
+    /// named after the [`DatatypeMessage::vlen_string_ascii`] /
+    /// [`DatatypeMessage::vlen_string_utf8`] pair it selects between. A string
+    /// that is not 7-bit is rejected rather than stored under a datatype that
+    /// misdescribes it, so the file reads the same in every library that
+    /// trusts the declaration.
+    ///
+    /// [`DatatypeMessage::vlen_string_ascii`]: crate::DatatypeMessage::vlen_string_ascii
+    /// [`DatatypeMessage::vlen_string_utf8`]: crate::DatatypeMessage::vlen_string_utf8
+    pub fn write_vlen_strings_ascii(&self, name: &str, strings: &[&str]) -> Result<H5Dataset> {
+        self.write_vlen_strings_charset(name, strings, 0)
+    }
+
+    /// The single owner of one-call vlen-string dataset creation: the two
+    /// public entry points differ only in the character set they declare.
+    fn write_vlen_strings_charset(
+        &self,
+        name: &str,
+        strings: &[&str],
+        charset: u8,
+    ) -> Result<H5Dataset> {
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let idx = writer.create_vlen_string_dataset(name, strings)?;
-                // If the name contains '/', assign the dataset to its parent group
-                if let Some(slash_pos) = name.rfind('/') {
-                    let group_path = &name[..slash_pos];
-                    let abs_group_path = if group_path.starts_with('/') {
-                        group_path.to_string()
-                    } else {
-                        format!("/{}", group_path)
-                    };
-                    writer.assign_dataset_to_group(&abs_group_path, idx)?;
-                }
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(idx);
-                Ok(H5Dataset::new_writer(
-                    clone_inner(&self.inner),
-                    idx,
-                    shape,
-                    element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
-                ))
+                let idx = writer.create_vlen_string_dataset(name, strings, charset)?;
+                let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
+                Ok(H5Dataset::new_writer(clone_inner(&self.inner), idx, parts))
             }
             H5FileInner::Reader(_) => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
@@ -432,32 +869,37 @@ impl H5File {
     /// sequence of `u8` in global heap storage. h5py reads it back as an array
     /// of `uint8` arrays. Returns a writer-mode handle so attributes can be
     /// attached, like [`write_vlen_strings`](Self::write_vlen_strings).
+    ///
+    /// The `u8` case of [`write_vlen_numeric`](Self::write_vlen_numeric).
     pub fn write_vlen_bytes(&self, name: &str, items: &[&[u8]]) -> Result<H5Dataset> {
+        self.write_vlen_numeric(name, items)
+    }
+
+    /// Create a variable-length numeric-sequence dataset and write data.
+    ///
+    /// Each `&[T]` becomes one element of variable length, stored as a global
+    /// heap object under a vlen sequence datatype over `T`; h5py reads the
+    /// dataset back as an array of `T`-typed arrays, the type
+    /// `h5py.vlen_dtype(np.dtype(...))` produces. Sequences may have any
+    /// length, including zero. Returns a writer-mode handle so attributes can
+    /// be attached, like [`write_vlen_strings`](Self::write_vlen_strings).
+    ///
+    /// ```no_run
+    /// # use rust_hdf5::H5File;
+    /// let file = H5File::create("v.h5").unwrap();
+    /// let a: &[i32] = &[1, 2, 3];
+    /// let b: &[i32] = &[];
+    /// file.write_vlen_numeric("data", &[a, b]).unwrap();
+    /// ```
+    pub fn write_vlen_numeric<T: H5Type>(&self, name: &str, items: &[&[T]]) -> Result<H5Dataset> {
+        let images = crate::dataset::vlen_sequence_images(items)?;
+        let images: Vec<&[u8]> = images.iter().map(|c| c.as_ref()).collect();
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let idx = writer.create_vlen_bytes_dataset(name, items)?;
-                // If the name contains '/', assign the dataset to its parent group
-                if let Some(slash_pos) = name.rfind('/') {
-                    let group_path = &name[..slash_pos];
-                    let abs_group_path = if group_path.starts_with('/') {
-                        group_path.to_string()
-                    } else {
-                        format!("/{}", group_path)
-                    };
-                    writer.assign_dataset_to_group(&abs_group_path, idx)?;
-                }
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(idx);
-                Ok(H5Dataset::new_writer(
-                    clone_inner(&self.inner),
-                    idx,
-                    shape,
-                    element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
-                ))
+                let idx = writer.create_vlen_sequence_dataset(name, T::hdf5_type(), &images)?;
+                let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
+                Ok(H5Dataset::new_writer(clone_inner(&self.inner), idx, parts))
             }
             H5FileInner::Reader(_) => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
@@ -484,26 +926,8 @@ impl H5File {
             H5FileInner::Writer(writer) => {
                 let idx = writer
                     .create_vlen_string_dataset_compressed(name, strings, chunk_size, pipeline)?;
-                if let Some(slash_pos) = name.rfind('/') {
-                    let group_path = &name[..slash_pos];
-                    let abs_group_path = if group_path.starts_with('/') {
-                        group_path.to_string()
-                    } else {
-                        format!("/{}", group_path)
-                    };
-                    writer.assign_dataset_to_group(&abs_group_path, idx)?;
-                }
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(idx);
-                Ok(H5Dataset::new_writer(
-                    clone_inner(&self.inner),
-                    idx,
-                    shape,
-                    element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
-                ))
+                let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
+                Ok(H5Dataset::new_writer(clone_inner(&self.inner), idx, parts))
             }
             H5FileInner::Reader(_) => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
@@ -527,26 +951,8 @@ impl H5File {
             H5FileInner::Writer(writer) => {
                 let idx =
                     writer.create_appendable_vlen_string_dataset(name, chunk_size, pipeline)?;
-                if let Some(slash_pos) = name.rfind('/') {
-                    let group_path = &name[..slash_pos];
-                    let abs_group_path = if group_path.starts_with('/') {
-                        group_path.to_string()
-                    } else {
-                        format!("/{}", group_path)
-                    };
-                    writer.assign_dataset_to_group(&abs_group_path, idx)?;
-                }
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(idx);
-                Ok(H5Dataset::new_writer(
-                    clone_inner(&self.inner),
-                    idx,
-                    shape,
-                    element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
-                ))
+                let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
+                Ok(H5Dataset::new_writer(clone_inner(&self.inner), idx, parts))
             }
             H5FileInner::Reader(_) => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
@@ -560,9 +966,7 @@ impl H5File {
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let ds_index = writer
-                    .dataset_index(name)
-                    .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?;
+                let ds_index = writer.open_dataset_index(name)?;
                 writer.append_vlen_strings(ds_index, strings)?;
                 Ok(())
             }
@@ -612,13 +1016,57 @@ impl H5File {
     }
 
     /// Open an existing dataset by name (read mode).
+    ///
+    /// Uses libhdf5's default dataset-access properties; name others with
+    /// [`dataset_with`](Self::dataset_with).
     pub fn dataset(&self, name: &str) -> Result<H5Dataset> {
-        let inner = borrow_inner(&self.inner);
-        match &*inner {
+        self.dataset_with(name, DatasetAccess::default())
+    }
+
+    /// [`dataset`](Self::dataset) under named dataset-access properties —
+    /// `H5Dopen2` with a dapl instead of `H5P_DEFAULT`.
+    ///
+    /// Three of the properties [`DatasetAccess`] carries decide how a
+    /// *virtual* dataset's extent is resolved and where its sources are
+    /// looked for; [`DatasetAccess::efile_prefix`] says where the raw data
+    /// files of a dataset stored through an external file list are. For a
+    /// dataset that is neither, this is exactly [`dataset`](Self::dataset).
+    ///
+    /// First open wins: while any handle on that dataset is alive, a later
+    /// open of it joins that open and its own `access` is ignored, exactly
+    /// as `H5Dopen2` ignores the dapl of an open that finds the dataset
+    /// already in `H5FO_opened` (H5Dint.c:1496-1500, :1523-1528) — only the
+    /// open that creates the shared info reaches `H5D__virtual_init`, which
+    /// is where the view and the printf gap are read out of the dapl
+    /// (H5Dvirtual.c:2178-2188). Once every handle is dropped the next open
+    /// resolves afresh under its own properties.
+    ///
+    /// libhdf5 keys that shared info on the *file* rather than on one
+    /// `H5Fopen`, so there a second `H5Fopen` of the same path still joins
+    /// the first open's view; here each [`H5File`] is its own reader and
+    /// binds independently.
+    ///
+    /// # Errors
+    ///
+    /// Beyond [`dataset`](Self::dataset)'s own errors, a
+    /// [`DatasetAccess::virtual_printf_gap`] of `u64::MAX` — libhdf5's
+    /// `HSIZE_UNDEF` — is refused, as `H5Pset_virtual_printf_gap` refuses it.
+    ///
+    /// The one property a joining open may not disagree about is
+    /// [`DatasetAccess::efile_prefix`]: `H5D__open_name` refuses an open
+    /// whose expanded external file prefix differs from the open dataset's
+    /// (H5Dint.c:1533-1545), and so does this.
+    pub fn dataset_with(&self, name: &str, access: DatasetAccess) -> Result<H5Dataset> {
+        access.validate()?;
+        // Mutable: a name that crosses an external link opens the file that
+        // link names, and the reader caches that handle for the next one.
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
             H5FileInner::Reader(reader) => {
-                let info = reader
-                    .dataset_info(name)
-                    .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?;
+                // The reader's open gate reports *why* a name cannot be
+                // opened — a dangling soft link and an unsupported object are
+                // both present in the listing, and neither is an absence.
+                let (open, info) = reader.open_dataset_with(name, &access)?;
                 let shape: Vec<usize> = info.dataspace.dims.iter().map(|&d| d as usize).collect();
                 let element_size = info.datatype.element_size() as usize;
                 Ok(H5Dataset::new_reader(
@@ -626,6 +1074,7 @@ impl H5File {
                     name.to_string(),
                     shape,
                     element_size,
+                    open,
                 ))
             }
             H5FileInner::Writer(_) => Err(Hdf5Error::InvalidState(
@@ -650,22 +1099,46 @@ impl H5File {
     /// Returns [`Hdf5Error::NotFound`] if no live dataset with that name
     /// exists, and an error in read mode (use [`dataset`](Self::dataset)).
     pub fn dataset_writer(&self, name: &str) -> Result<H5Dataset> {
+        self.dataset_writer_with(name, DatasetAccess::default())
+    }
+
+    /// [`dataset_writer`](Self::dataset_writer) under named dataset-access
+    /// properties — `H5Dopen2` with a dapl instead of `H5P_DEFAULT`, in write
+    /// mode.
+    ///
+    /// The one property that reaches a write is
+    /// [`DatasetAccess::efile_prefix`]: `H5D__efl_write` joins each slot name
+    /// of an external file list against `dset->shared->extfile_prefix`
+    /// (H5Defl.c:429-431), which the open that settled the dataset's shared
+    /// info built from its dapl. So this is how a dataset reopened from an
+    /// existing file is told where its raw data files are before being
+    /// written to; the other properties decide a *virtual* dataset's extent,
+    /// which this writer never resolves.
+    ///
+    /// First open wins, and a joining open may not disagree about that
+    /// prefix — see
+    /// [`H5File::dataset_with`](Self::dataset_with) for the same rule on the
+    /// read side. A dataset this session created settled its prefix from
+    /// [`DatasetBuilder::efile_prefix`](crate::DatasetBuilder::efile_prefix),
+    /// so while its handle is alive this call must name the same one;
+    /// once every handle is dropped the next call settles it afresh.
+    ///
+    /// # Errors
+    ///
+    /// [`dataset_writer`](Self::dataset_writer)'s errors, plus a refusal when
+    /// `access` names an external file prefix that disagrees with the one an
+    /// open of this dataset is still holding.
+    pub fn dataset_writer_with(&self, name: &str, access: DatasetAccess) -> Result<H5Dataset> {
+        access.validate()?;
         let inner = borrow_inner(&self.inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let index = writer
-                    .dataset_index(name)
-                    .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?;
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(index);
+                let index = writer.open_dataset_index(name)?;
+                let parts = writer.dataset_handle_parts(index, &access)?;
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.inner),
                     index,
-                    shape,
-                    element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
+                    parts,
                 ))
             }
             H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
@@ -694,6 +1167,55 @@ impl H5File {
                 .map(|s| s.to_string())
                 .collect(),
             H5FileInner::Closed => Vec::new(),
+        }
+    }
+
+    /// The paths of every committed (named) datatype in this file.
+    ///
+    /// A committed datatype is an object in its own right, in neither
+    /// [`dataset_names`](Self::dataset_names) nor the group listing. In write
+    /// mode these are the types [`commit_datatype`](Self::commit_datatype)
+    /// committed this session.
+    pub fn named_datatype_names(&self) -> Vec<String> {
+        let inner = borrow_inner(&self.inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => reader
+                .named_datatype_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            H5FileInner::Writer(writer) => writer.committed_datatype_names(),
+            H5FileInner::Closed => Vec::new(),
+        }
+    }
+
+    /// Open a committed (named) datatype by path (read mode).
+    ///
+    /// The handle opens whenever the object is there; a type this crate
+    /// cannot decode reports why from
+    /// [`H5NamedDatatype::datatype`](crate::named_datatype::H5NamedDatatype::datatype),
+    /// so its attributes stay reachable.
+    ///
+    /// # Errors
+    ///
+    /// [`Hdf5Error::NotFound`] when no committed datatype is at that path.
+    pub fn named_datatype(&self, path: &str) -> Result<crate::H5NamedDatatype> {
+        // Mutable: a path that crosses an external link opens the file that
+        // link names, and the reader caches that handle for the next one.
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => {
+                reader.named_datatype_info(path)?;
+                drop(inner);
+                Ok(crate::H5NamedDatatype::new_reader(
+                    clone_inner(&self.inner),
+                    path.to_string(),
+                ))
+            }
+            H5FileInner::Writer(_) => Err(Hdf5Error::InvalidState(
+                "committed datatypes are readable only in read mode".to_string(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".to_string())),
         }
     }
 
@@ -747,12 +1269,20 @@ impl H5File {
         }
     }
 
-    /// Flush the file to disk. Only meaningful in write mode.
+    /// Hand every byte written so far to the operating system. Only
+    /// meaningful in write mode.
+    ///
+    /// This empties the write accumulator, so another process reading the file
+    /// afterwards sees everything written up to this point. It does not
+    /// finalize the file — object headers and the superblock are still
+    /// [`close`](Self::close)'s work — and it does not `fsync`.
     pub fn flush(&self) -> Result<()> {
-        // The underlying writer does not expose a standalone flush; data is
-        // written to disk immediately via pwrite. This is a compatibility
-        // method that does nothing for now.
-        Ok(())
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => Ok(writer.handle().flush()?),
+            H5FileInner::Reader(_) => Ok(()),
+            H5FileInner::Closed => Ok(()),
+        }
     }
 }
 
@@ -765,6 +1295,14 @@ impl H5File {
 #[derive(Debug, Default, Clone)]
 pub struct H5FileOptions {
     locking: Option<FileLocking>,
+    track_order: bool,
+    track_times: bool,
+    libver: Option<LibverBound>,
+    userblock: u64,
+    shared_messages: SharedMessageConfig,
+    file_space: Option<FileSpaceConfig>,
+    file_space_page_size: Option<u64>,
+    elink_prefix: Option<String>,
 }
 
 impl H5FileOptions {
@@ -792,6 +1330,282 @@ impl H5FileOptions {
         self.locking(FileLocking::BestEffort)
     }
 
+    /// `H5Pset_elink_prefix` (H5Plapl.c:923): a directory the *target file*
+    /// of an external link is looked for under, after `HDF5_EXT_PREFIX` and
+    /// before the linking file's own directory — step 3 of
+    /// `H5F_prefix_open_file`'s order (H5Fint.c:938-950).
+    ///
+    /// Unlike [`DatasetAccess::virtual_prefix`](crate::DatasetAccess), this
+    /// one is *not* shadowed by its environment variable and gets no
+    /// `${ORIGIN}` expansion: `H5L__extern_traverse` peeks the property
+    /// verbatim and hands it straight to the search (H5Lexternal.c:210-215),
+    /// with no `H5D__build_file_prefix` step in between. Measured against
+    /// libhdf5 1.14.6 and 2.0.0: with `HDF5_EXT_PREFIX` naming a directory
+    /// that has no target, this property still resolves it, while the same
+    /// arrangement for a virtual source does not; and a `${ORIGIN}` written
+    /// here stays a literal directory name.
+    ///
+    /// # Where this lives, and why not on the call
+    ///
+    /// libhdf5 keeps it in a *link access* property list, an argument every
+    /// `H5*_by_name` call carries. Here it is a property of the open,
+    /// because that is the narrowest scope this crate can honour: a reader
+    /// resolves each external link's file name once and then holds that
+    /// answer for its own life, so a prefix passed per call could not change
+    /// a name another call had already resolved. Making it file-scoped also
+    /// keeps it with the one other cross-file policy libhdf5 takes from a
+    /// property list and applies to every file a path touches — the locking
+    /// mode — and, like that one, it propagates down a chain of links, which
+    /// is what a lapl does upstream (measured: a two-hop chain resolves its
+    /// second hop under the prefix given at the first).
+    ///
+    /// Read-side only: nothing the writer does traverses an external link.
+    pub fn elink_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.elink_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Create the file's root group with creation-order tracking, and make
+    /// that the policy for objects created in it — h5py's
+    /// `File(path, "w", track_order=True)`.
+    ///
+    /// Only [`create`](Self::create) reads this; opening an existing file
+    /// takes the policy from the root group already on disk. Change it for
+    /// later objects with [`H5File::set_track_order`].
+    pub fn track_order(mut self, track: bool) -> Self {
+        self.track_order = track;
+        self
+    }
+
+    /// Create the file's root group recording its times, and make that the
+    /// policy for objects created in it — `H5Pset_obj_track_times`, h5py's
+    /// `File(path, "w", track_times=True)`.
+    ///
+    /// An object recording times keeps the ones its header version can hold:
+    /// four in a version-2 header's prefix, one modification time in a
+    /// version-1 dataset's `H5O_MTIME_NEW` message, and none at all in a
+    /// version-1 group or committed datatype, which have nowhere to put one.
+    ///
+    /// Off unless this says otherwise — h5py's default, not libhdf5's. h5py's
+    /// high-level API passes `track_times=False` for every object it makes
+    /// (`_hl/files.py:189`, `_hl/dataset.py:39`, `_hl/group.py:42`), while a
+    /// bare creation property list leaves it on (`H5O_CRT_OHDR_FLAGS_DEF` is
+    /// `H5O_HDR_STORE_TIMES`, H5Opkg.h:74), which is what `h5py.h5d.create`
+    /// and libhdf5's own C API get.
+    ///
+    /// Only [`create`](Self::create) reads this; the root group of an existing
+    /// file was made under whatever created it. Change it for later objects
+    /// with [`H5File::set_track_times`].
+    pub fn track_times(mut self, track: bool) -> Self {
+        self.track_times = track;
+        self
+    }
+
+    /// Create the file under a library-version low bound — h5py's
+    /// `File(path, "w", libver=("v108", "v108"))`, libhdf5's
+    /// `H5Pset_libver_bounds` `low` argument.
+    ///
+    /// The bound decides the superblock version the file is written with
+    /// ([`LibverBound::superblock_version`]) as well as the message versions
+    /// of the objects created in it, so unlike
+    /// [`H5File::set_libver_bound`] — which only reaches objects created
+    /// after the call — it applies to the file itself.
+    ///
+    /// [`LibverBound::Earliest`] asks for the whole classic generation, the
+    /// file libhdf5 writes at `H5F_LIBVER_EARLIEST`: a version-0 superblock,
+    /// a symbol-table root group, version-1 object headers, symbol-table
+    /// subgroups and the version-1 B-tree chunk index. Such a file is
+    /// readable by libhdf5 1.6, and correspondingly gives up everything
+    /// newer — SWMR ([`crate::swmr`]) and virtual datasets are refused in
+    /// it, and a chunk larger than 4 GiB does not fit its index key.
+    ///
+    /// [`LibverBound::V18`] asks for the file libhdf5 writes at
+    /// `H5F_LIBVER_V18`: a version-2 superblock over link-message groups and
+    /// version-2 object headers, but still the version-3 data layout message
+    /// and so still the version-1 B-tree chunk index — `H5O_layout_ver_bounds`
+    /// does not reach version 4 until `V110`, and the v1.10 indexes live in
+    /// nothing older. SWMR is refused in such a file: its status flags need a
+    /// version-3 superblock, which this bound's row does not reach.
+    ///
+    /// Not calling this at all is *not* the same as asking for `Earliest`,
+    /// nor for `V18`: the default file has the version-2 superblock and
+    /// link-message groups of the v1.8 bound over the v1.10 chunk indexes,
+    /// which no single bound describes.
+    ///
+    /// Only [`create`](Self::create) reads this; an existing file keeps the
+    /// superblock it already has.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::{H5File, LibverBound};
+    /// let file = H5File::options()
+    ///     .libver(LibverBound::V110)
+    ///     .create("v110.h5")
+    ///     .unwrap();
+    /// # let _ = file;
+    /// ```
+    pub fn libver(mut self, libver: LibverBound) -> Self {
+        self.libver = Some(libver);
+        self
+    }
+
+    /// Reserve `size` bytes in front of the superblock for the application's
+    /// own use — h5py's `File(path, "w", userblock_size=512)`, libhdf5's
+    /// `H5Pset_userblock`.
+    ///
+    /// The block is the file's first `size` bytes and belongs to whoever
+    /// writes it: an executable header, a checksum, a provenance record. HDF5
+    /// itself only skips it — the superblock and every address in the file are
+    /// based at `size`, and a reader finds the superblock by looking at offset
+    /// 0 and then at [`MIN_USERBLOCK`](crate::MIN_USERBLOCK) doubled
+    /// repeatedly, which is why the size must be zero (no block) or a power of
+    /// two of at least that many bytes. [`create`](Self::create) reports any
+    /// other size as an error; it is not rounded up.
+    ///
+    /// This crate writes the block zero-filled and never reads it back, so
+    /// filling it is a plain write to the front of the file after
+    /// [`H5File::close`].
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    /// let file = H5File::options().userblock(512).create("prefixed.h5").unwrap();
+    /// assert_eq!(file.userblock_size(), 512);
+    /// ```
+    pub fn userblock(mut self, size: u64) -> Self {
+        self.userblock = size;
+        self
+    }
+
+    /// Create the file with shared object header messages — libhdf5's
+    /// `H5Pset_shared_mesg_nindexes` + `H5Pset_shared_mesg_index` +
+    /// `H5Pset_shared_mesg_phase_change`, which h5py exposes no binding for.
+    ///
+    /// A message class covered by an index is written once into a
+    /// shared-message fractal heap, and every object header that would have
+    /// held that exact body holds a pointer to it instead. `indexes` gives
+    /// one `(message types, minimum message size)` pair per index, where the
+    /// type mask is built from
+    /// [`type_flag`](crate::format::sohm::type_flag); `list_max` and
+    /// `btree_min` are the file-wide counts at which an index changes between
+    /// list and v2 B-tree form.
+    ///
+    /// Only [`create`](Self::create) reads this, and it refuses a
+    /// configuration libhdf5 would refuse: more than eight indexes, an index
+    /// covering no type, or thresholds that overlap.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::{H5File, format::sohm::type_flag};
+    /// use rust_hdf5::format::messages::{MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE};
+    ///
+    /// let types = type_flag(MSG_DATATYPE).unwrap()
+    ///     | type_flag(MSG_DATASPACE).unwrap()
+    ///     | type_flag(MSG_ATTRIBUTE).unwrap();
+    /// let file = H5File::options()
+    ///     .shared_messages(&[(types, 0)], 50, 40)
+    ///     .create("sohm.h5")
+    ///     .unwrap();
+    /// # let _ = file;
+    /// ```
+    pub fn shared_messages(
+        mut self,
+        indexes: &[(u16, u32)],
+        list_max: u16,
+        btree_min: u16,
+    ) -> Self {
+        self.shared_messages = SharedMessageConfig::new(indexes, list_max, btree_min);
+        self
+    }
+
+    /// Create the file under a file-space handling strategy — libhdf5's
+    /// `H5Pset_file_space_strategy`, h5py's `File(..., fs_strategy=...,
+    /// fs_persist=..., fs_threshold=...)`.
+    ///
+    /// `strategy` picks how released space is reused:
+    /// [`FileSpaceStrategy::FsmAggr`] keeps free-space managers and the
+    /// metadata/raw-data aggregators (the library default),
+    /// [`FileSpaceStrategy::Aggr`] the aggregators alone, and
+    /// [`FileSpaceStrategy::None`] neither, so every allocation comes from the
+    /// end of the file. [`FileSpaceStrategy::Page`] allocates on file-space
+    /// page boundaries instead, packing everything smaller than a page into
+    /// pages of its own kind; [`file_space_page_size`](Self::file_space_page_size)
+    /// sets how big those pages are.
+    ///
+    /// `persist` writes the free-space managers into the file on close, so a
+    /// later session — this crate or libhdf5 — finds the space this one
+    /// released instead of appending past it. `threshold` is the smallest
+    /// section a manager records; anything smaller is space the file leaks
+    /// rather than tracks. Both are ignored for the two strategies that have
+    /// no managers, exactly as `H5P__set_file_space_strategy` ignores them.
+    ///
+    /// Only [`create`](Self::create) reads this. A file that already exists
+    /// declares its own strategy in its superblock extension, and this crate
+    /// honours what it finds there.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::{FileSpaceStrategy, H5File};
+    /// let file = H5File::options()
+    ///     .file_space(FileSpaceStrategy::FsmAggr, true, 1)
+    ///     .create("persisting.h5")
+    ///     .unwrap();
+    /// # let _ = file;
+    /// ```
+    pub fn file_space(
+        mut self,
+        strategy: FileSpaceStrategy,
+        persist: bool,
+        threshold: u64,
+    ) -> Self {
+        self.file_space = Some(FileSpaceConfig::new(strategy, persist, threshold));
+        self
+    }
+
+    /// `H5Pset_file_space_page_size`, h5py's `File(..., fs_page_size=...)`.
+    ///
+    /// The file-space page is the unit [`FileSpaceStrategy::Page`] allocates
+    /// in: a request smaller than one page is packed into a page holding only
+    /// that kind of data, and a larger one is page-aligned. `size` is between
+    /// 512 (`H5F_FILE_SPACE_PAGE_SIZE_MIN`) and 1 GiB — no power of two
+    /// required — and anything outside that is refused by
+    /// [`create`](Self::create), as `H5Pset_file_space_page_size` refuses it.
+    ///
+    /// Setting it is enough on its own to give the file a file-space info
+    /// message, because the page size is one of the four properties
+    /// `H5F__super_init` compares against the library defaults. Under any
+    /// other strategy that is all it does: the file records the size and
+    /// allocates without it.
+    ///
+    /// Only [`create`](Self::create) reads this. A reopened file keeps the
+    /// page size its own message carries.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::{FileSpaceStrategy, H5File};
+    /// let file = H5File::options()
+    ///     .file_space(FileSpaceStrategy::Page, true, 1)
+    ///     .file_space_page_size(8192)
+    ///     .create("paged.h5")
+    ///     .unwrap();
+    /// # let _ = file;
+    /// ```
+    pub fn file_space_page_size(mut self, size: u64) -> Self {
+        self.file_space_page_size = Some(size);
+        self
+    }
+
+    /// The one [`FileSpaceConfig`] the two file-space builders describe
+    /// between them.
+    ///
+    /// They are separate properties of one property list —
+    /// `H5Pset_file_space_strategy` and `H5Pset_file_space_page_size` write
+    /// different fcpl entries and neither reads the other — so each is
+    /// recorded by whether it was called, and joining them here is what keeps
+    /// either call order meaning the same thing.
+    fn resolved_file_space(&self) -> FileSpaceConfig {
+        let config = self.file_space.unwrap_or_default();
+        match self.file_space_page_size {
+            Some(size) => config.with_page_size(size),
+            None => config,
+        }
+    }
+
     fn resolved_locking(&self) -> FileLocking {
         match self.locking {
             Some(p) => p,
@@ -799,27 +1613,112 @@ impl H5FileOptions {
         }
     }
 
+    /// Refuse an `open`/`open_rw` call that set an option only [`create`]
+    /// reads — the fcpl/fapl split each of those setters' docs already
+    /// describe: `track_order`, `track_times`, `libver`, `userblock` and
+    /// `shared_messages` all bake into a file at creation, so an existing
+    /// file's root group,
+    /// superblock and shared-message table are already fixed by whatever
+    /// created it. Silently ignoring the option, the previous behavior,
+    /// hides a builder call that has no effect at all; one gate here checks
+    /// every such field instead of a scattered check per opener.
+    ///
+    /// The `libver` arm tests `is_some`, not inequality against a default
+    /// value: [`LibverBound::default`] is `Earliest`, so a gate written as
+    /// `libver != default()` would let the one bound that asks for a whole
+    /// classic file through unrefused. Whether the builder was *called* is
+    /// the question, and `Option` is what records it.
+    ///
+    /// [`create`]: Self::create
+    fn refuse_create_only_options(&self) -> Result<()> {
+        let mut offending = Vec::new();
+        if self.track_order {
+            offending.push("track_order");
+        }
+        if self.track_times {
+            offending.push("track_times");
+        }
+        if self.libver.is_some() {
+            offending.push("libver");
+        }
+        if self.userblock != 0 {
+            offending.push("userblock");
+        }
+        if self.shared_messages != SharedMessageConfig::default() {
+            offending.push("shared_messages");
+        }
+        if self.file_space.is_some() {
+            offending.push("file_space");
+        }
+        if self.file_space_page_size.is_some() {
+            offending.push("file_space_page_size");
+        }
+        if offending.is_empty() {
+            Ok(())
+        } else {
+            Err(Hdf5Error::InvalidState(format!(
+                "these options only take effect when creating a file, not when \
+                 opening an existing one: {}",
+                offending.join(", ")
+            )))
+        }
+    }
+
+    /// The mirror of [`refuse_create_only_options`](Self::refuse_create_only_options)
+    /// for the options only a read-mode open can honour, refused by the two
+    /// openers that produce a writer.
+    ///
+    /// [`elink_prefix`](Self::elink_prefix) is one because nothing on the
+    /// write side traverses an external link, so a file opened for writing
+    /// would silently never use it.
+    fn refuse_read_only_options(&self) -> Result<()> {
+        if self.elink_prefix.is_none() {
+            return Ok(());
+        }
+        Err(Hdf5Error::InvalidState(
+            "these options only take effect when opening a file for reading: \
+             elink_prefix"
+                .to_string(),
+        ))
+    }
+
     /// Create a new HDF5 file at `path` with the configured options.
     pub fn create<P: AsRef<Path>>(self, path: P) -> Result<H5File> {
-        let writer = Hdf5Writer::create_with_locking(path.as_ref(), self.resolved_locking())?;
+        self.refuse_read_only_options()?;
+        let writer = Hdf5Writer::create_with_options(
+            path.as_ref(),
+            crate::io::writer::FileCreateOptions {
+                locking: self.resolved_locking(),
+                track_order: self.track_order,
+                track_times: self.track_times,
+                libver: self.libver,
+                userblock: self.userblock,
+                shared_messages: self.shared_messages,
+                file_space: self.resolved_file_space(),
+            },
+        )?;
         Ok(H5File {
-            inner: new_shared(H5FileInner::Writer(writer)),
+            inner: new_shared(H5FileInner::Writer(Box::new(writer))),
         })
     }
 
     /// Open an existing HDF5 file for reading with the configured options.
     pub fn open<P: AsRef<Path>>(self, path: P) -> Result<H5File> {
-        let reader = Hdf5Reader::open_with_locking(path.as_ref(), self.resolved_locking())?;
+        self.refuse_create_only_options()?;
+        let mut reader = Hdf5Reader::open_with_locking(path.as_ref(), self.resolved_locking())?;
+        reader.set_elink_prefix(self.elink_prefix);
         Ok(H5File {
-            inner: new_shared(H5FileInner::Reader(reader)),
+            inner: new_shared(H5FileInner::Reader(Box::new(reader))),
         })
     }
 
     /// Open an existing HDF5 file for read/write with the configured options.
     pub fn open_rw<P: AsRef<Path>>(self, path: P) -> Result<H5File> {
+        self.refuse_create_only_options()?;
+        self.refuse_read_only_options()?;
         let writer = Hdf5Writer::open_append_with_locking(path.as_ref(), self.resolved_locking())?;
         Ok(H5File {
-            inner: new_shared(H5FileInner::Writer(writer)),
+            inner: new_shared(H5FileInner::Writer(Box::new(writer))),
         })
     }
 }
@@ -1784,6 +2683,86 @@ mod integration_tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// The one-call writers declare the character set they are named for —
+    /// `write_vlen_strings` UTF-8, `write_vlen_strings_ascii` ASCII — and the
+    /// ASCII one refuses a string its declaration would misdescribe, before
+    /// anything reaches the file.
+    #[test]
+    fn vlen_string_writers_declare_their_character_set() {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let path = temp_path("vlen_cset");
+        let file = H5File::create(&path).unwrap();
+        file.write_vlen_strings_ascii("ascii", &["alpha", "b", ""])
+            .unwrap();
+        file.write_vlen_strings("utf8", &["été", "日本"]).unwrap();
+        let err = file
+            .write_vlen_strings_ascii("rejected", &["ok", "안녕"])
+            .err()
+            .expect("a non-ASCII string was accepted under an ASCII datatype")
+            .to_string();
+        assert!(
+            err.contains("string 1") && err.contains("is not ASCII"),
+            "got: {err}"
+        );
+        file.close().unwrap();
+
+        let file = H5File::open(&path).unwrap();
+        let ascii = file.dataset("ascii").unwrap();
+        assert_eq!(
+            ascii.datatype().unwrap(),
+            DatatypeMessage::VarLenString {
+                padding: 0,
+                charset: 0,
+            }
+        );
+        assert_eq!(ascii.read_strings().unwrap(), vec!["alpha", "b", ""]);
+        let utf8 = file.dataset("utf8").unwrap();
+        assert_eq!(
+            utf8.datatype().unwrap(),
+            DatatypeMessage::VarLenString {
+                padding: 0,
+                charset: 1,
+            }
+        );
+        assert_eq!(utf8.read_strings().unwrap(), vec!["été", "日本"]);
+        // The refused write left nothing behind.
+        assert!(file.dataset("rejected").is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The group-level twin declares ASCII the same way the file-level one
+    /// does, for a dataset inside the group.
+    #[test]
+    fn group_vlen_string_writer_declares_ascii() {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let path = temp_path("vlen_cset_group");
+        let file = H5File::create(&path).unwrap();
+        let g = file.create_group("entry").unwrap();
+        g.write_vlen_strings_ascii("notes", &["alpha", "b"])
+            .unwrap();
+        let err = g
+            .write_vlen_strings_ascii("rejected", &["안녕"])
+            .err()
+            .expect("a non-ASCII string was accepted under an ASCII datatype")
+            .to_string();
+        assert!(err.contains("is not ASCII"), "got: {err}");
+        file.close().unwrap();
+
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("entry/notes").unwrap();
+        assert_eq!(
+            ds.datatype().unwrap(),
+            DatatypeMessage::VarLenString {
+                padding: 0,
+                charset: 0,
+            }
+        );
+        assert_eq!(ds.read_strings().unwrap(), vec!["alpha", "b"]);
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn vlen_bytes_write_read() {
         let path = temp_path("vlen_bytes_wr");
@@ -1800,6 +2779,89 @@ mod integration_tests {
             let expected: Vec<Vec<u8>> = items.iter().map(|s| s.to_vec()).collect();
             assert_eq!(got, expected);
         }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A vlen sequence over a wider base stores element counts, not byte
+    /// counts, in the `H5T_VLEN` length field, and the datatype names the
+    /// base — so the file says what it holds for every width.
+    #[test]
+    fn vlen_numeric_write_read() {
+        use crate::format::global_heap::decode_vlen_reference;
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let path = temp_path("vlen_numeric_wr");
+        let a: &[i32] = &[1, 2, 3];
+        let b: &[i32] = &[];
+        let c: &[i32] = &[-7];
+        {
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_numeric("data", &[a, b, c]).unwrap();
+            let f64s: &[f64] = &[1.5, -2.5];
+            file.write_vlen_numeric("wide", &[f64s]).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("data").unwrap();
+        assert_eq!(
+            ds.datatype().unwrap(),
+            DatatypeMessage::VarLenSequence {
+                base: Box::new(DatatypeMessage::i32_type()),
+            }
+        );
+        let decoded: Vec<Vec<i32>> = ds
+            .read_vlen_bytes()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                item.chunks_exact(4)
+                    .map(|w| i32::from_le_bytes(w.try_into().unwrap()))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(decoded, vec![a.to_vec(), b.to_vec(), c.to_vec()]);
+
+        // The length field counts elements: 3 i32s, not 12 bytes.
+        let ctx = crate::format::FormatContext::default_v3();
+        let raw = ds.read_raw_bytes().unwrap();
+        let (seq_len, _, _) = decode_vlen_reference(&raw, &ctx).unwrap();
+        assert_eq!(seq_len, 3);
+
+        let wide = file.dataset("wide").unwrap();
+        assert_eq!(
+            wide.datatype().unwrap(),
+            DatatypeMessage::VarLenSequence {
+                base: Box::new(DatatypeMessage::f64_type()),
+            }
+        );
+        let (seq_len, _, _) = decode_vlen_reference(&wide.read_raw_bytes().unwrap(), &ctx).unwrap();
+        assert_eq!(seq_len, 2);
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `write_vlen_bytes` is the `u8` case of the same writer, so the byte
+    /// datatype and the byte-per-element length field are unchanged.
+    #[test]
+    fn vlen_bytes_is_the_u8_case_of_vlen_numeric() {
+        use crate::format::messages::datatype::DatatypeMessage;
+
+        let path = temp_path("vlen_bytes_u8");
+        let items: [&[u8]; 2] = [b"abc", b""];
+        {
+            let file = H5File::create(&path).unwrap();
+            file.write_vlen_bytes("blobs", &items).unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("blobs").unwrap();
+        assert_eq!(ds.datatype().unwrap(), DatatypeMessage::vlen_bytes());
+        let ctx = crate::format::FormatContext::default_v3();
+        let (seq_len, _, _) =
+            crate::format::global_heap::decode_vlen_reference(&ds.read_raw_bytes().unwrap(), &ctx)
+                .unwrap();
+        assert_eq!(seq_len, 3);
+        drop(file);
         std::fs::remove_file(&path).ok();
     }
 
@@ -2196,9 +3258,6 @@ mod integration_tests {
 mod h5py_compat_tests {
     use super::*;
 
-    // Only the deflate-gated h5dump test creates files; without that
-    // feature this helper has no callers.
-    #[cfg(feature = "deflate")]
     fn temp_path(name: &str) -> std::path::PathBuf {
         super::unique_test_path(name)
     }
@@ -2317,5 +3376,87 @@ mod h5py_compat_tests {
         assert_eq!(ds2.shape(), vec![3, 64, 64]);
         let images = ds2.read_raw::<u16>().unwrap();
         assert_eq!(images.len(), 3 * 64 * 64);
+    }
+
+    /// `track_order`, `libver`, `userblock` and `shared_messages` only take
+    /// effect on [`H5FileOptions::create`]; setting any of them for
+    /// [`H5FileOptions::open_rw`] on an already-created file must be
+    /// refused, naming the option, rather than silently doing nothing.
+    #[test]
+    fn open_rw_refuses_every_create_only_option() {
+        let path = temp_path("open_rw_refuses");
+        H5File::create(&path).unwrap().close().unwrap();
+
+        let err = H5File::options()
+            .track_order(true)
+            .open_rw(&path)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("track_order"), "{err}");
+
+        let err = H5File::options()
+            .libver(LibverBound::V110)
+            .open_rw(&path)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("libver"), "{err}");
+
+        // Every bound, not just the ones that differ from `LibverBound`'s
+        // own default. `Earliest` *is* that default and is the bound that
+        // asks for a classic file, so a gate comparing against the default
+        // value would pass this call through as if nothing had been set.
+        for bound in [
+            LibverBound::Earliest,
+            LibverBound::V18,
+            LibverBound::V112,
+            LibverBound::V114,
+            LibverBound::V200,
+        ] {
+            let err = H5File::options()
+                .libver(bound)
+                .open_rw(&path)
+                .err()
+                .unwrap();
+            assert!(err.to_string().contains("libver"), "{bound:?}: {err}");
+        }
+
+        let err = H5File::options()
+            .userblock(512)
+            .open_rw(&path)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("userblock"), "{err}");
+
+        let types = crate::format::sohm::type_flag(crate::format::messages::MSG_DATATYPE).unwrap();
+        let err = H5File::options()
+            .shared_messages(&[(types, 0)], 50, 40)
+            .open_rw(&path)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("shared_messages"), "{err}");
+
+        // A default builder — no create-only option touched — still opens.
+        H5File::options().open_rw(&path).unwrap().close().unwrap();
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// [`H5FileOptions::open`] shares the same gate as `open_rw` — it goes
+    /// through the same `refuse_create_only_options` check.
+    #[test]
+    fn open_refuses_a_create_only_option() {
+        let path = temp_path("open_refuses");
+        H5File::create(&path).unwrap().close().unwrap();
+
+        let err = H5File::options()
+            .track_order(true)
+            .open(&path)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("track_order"), "{err}");
+
+        H5File::options().open(&path).unwrap().close().unwrap();
+
+        std::fs::remove_file(&path).ok();
     }
 }

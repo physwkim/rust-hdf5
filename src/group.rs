@@ -17,11 +17,15 @@
 //!     .unwrap();
 //! ```
 
-use crate::dataset::{DatasetBuilder, H5Dataset};
+use crate::dataset::{DatasetAccess, DatasetBuilder, H5Dataset};
 use crate::error::{Hdf5Error, Result};
 use crate::file::{borrow_inner, borrow_inner_mut, clone_inner, H5FileInner, SharedInner};
+use crate::format::creation_order::CreationOrder;
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::filter::FilterPipeline;
+use crate::format::messages::link::LinkTarget;
+use crate::format::storage_kind::{AttributeStorage, LinkStorage};
+use crate::io::reader::LinkClass;
 use crate::types::H5Type;
 
 /// A handle to an HDF5 group.
@@ -118,6 +122,116 @@ impl H5Group {
         }
     }
 
+    /// Create a soft link — `H5Lcreate_soft`, h5py's `h5py.SoftLink`.
+    ///
+    /// The link stores `target_path` as text and HDF5 resolves it on every
+    /// traversal, so it may name an object that does not exist yet, or one
+    /// that never will: unlike [`link`](Self::link), nothing is checked here
+    /// and a dangling soft link is a legal file.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    ///
+    /// let file = H5File::create("soft.h5").unwrap();
+    /// file.new_dataset::<i32>().shape([8]).create("orig").unwrap();
+    /// file.root_group().create_soft_link("alias", "/orig").unwrap();
+    /// ```
+    pub fn create_soft_link(&self, link_name: &str, target_path: &str) -> Result<()> {
+        self.create_symbolic_link(
+            link_name,
+            LinkTarget::Soft {
+                target: target_path.to_string(),
+            },
+        )
+    }
+
+    /// Create an external link — `H5Lcreate_external`, h5py's
+    /// `h5py.ExternalLink`.
+    ///
+    /// The link names `target_path` inside `target_file`; neither is opened
+    /// here, and libhdf5 resolves `target_file` against the directory holding
+    /// *this* file, so a relative name is the portable form. As with
+    /// [`create_soft_link`](Self::create_soft_link) the link may dangle: a
+    /// file that is not there and an object that is not there are both legal.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    ///
+    /// let file = H5File::create("master.h5").unwrap();
+    /// file.root_group()
+    ///     .create_external_link("ext", "payload.h5", "/data")
+    ///     .unwrap();
+    /// ```
+    pub fn create_external_link(
+        &self,
+        link_name: &str,
+        target_file: &str,
+        target_path: &str,
+    ) -> Result<()> {
+        self.create_symbolic_link(
+            link_name,
+            LinkTarget::External {
+                file: target_file.to_string(),
+                path: target_path.to_string(),
+            },
+        )
+    }
+
+    /// Commit a datatype in this group under `name` — `H5Tcommit2`, h5py's
+    /// `group["name"] = dtype`.
+    ///
+    /// The type becomes an object of its own, so datasets can be built on it
+    /// with [`DatasetBuilder::committed_type`](crate::dataset::DatasetBuilder::committed_type)
+    /// and share one definition instead of each carrying a copy. A committed
+    /// datatype no dataset ever uses is still a complete object, and h5py
+    /// reads it back as a `Datatype`.
+    ///
+    /// ```no_run
+    /// use rust_hdf5::H5File;
+    /// use rust_hdf5::format::messages::datatype::DatatypeMessage;
+    ///
+    /// let file = H5File::create("committed.h5").unwrap();
+    /// let grp = file.create_group("types").unwrap();
+    /// grp.commit_datatype("temperature", DatatypeMessage::f64_type()).unwrap();
+    /// ```
+    pub fn commit_datatype(
+        &self,
+        name: &str,
+        datatype: crate::format::messages::datatype::DatatypeMessage,
+    ) -> Result<()> {
+        let full_name = if self.name == "/" {
+            name.to_string()
+        } else {
+            format!("{}/{}", self.name.trim_start_matches('/'), name)
+        };
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => {
+                writer.commit_datatype(&full_name, datatype)?;
+                Ok(())
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot commit datatypes in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
+    /// Both symbolic-link constructors, behind one writer-mode check.
+    fn create_symbolic_link(&self, link_name: &str, target: LinkTarget) -> Result<()> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => {
+                writer.create_symbolic_link(&self.name, link_name, target)?;
+                Ok(())
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot create links in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
     /// Open an existing sub-group by name (read mode).
     pub fn group(&self, name: &str) -> Result<H5Group> {
         let full_name = if self.name == "/" {
@@ -134,10 +248,26 @@ impl H5Group {
         let full_name = match &*inner {
             H5FileInner::Reader(reader) => {
                 let group_path = full_name.trim_start_matches('/');
+                // A group handle lists and reads through the reader it was
+                // made from, and that reader is one file. Opening the target
+                // file directly is the way across; saying so beats handing
+                // back a handle whose listings would all come up empty.
+                if let Some(edge) = reader.external_edge(group_path) {
+                    return Err(Hdf5Error::Unsupported(format!(
+                        "'{}' resolves through the external link '{}' to '{}' in '{}'; \
+                         a group handle does not cross into another file — open '{}' \
+                         and start from there (datasets read through the link)",
+                        full_name, edge.link, edge.path, edge.file, edge.file
+                    )));
+                }
                 if !reader.has_group(group_path) {
                     return Err(Hdf5Error::NotFound(full_name));
                 }
-                full_name
+                // Store the traversed path, as write mode does below: the
+                // handle's listings key off it, so a group reached through a
+                // soft link or a group hard link lists the same children as
+                // the group it names.
+                format!("/{}", reader.canonical_path(group_path))
             }
             // In write mode the handle stores the tree path, so a path
             // through hard links resolves once here and every operation
@@ -197,8 +327,31 @@ impl H5Group {
     ///
     /// Returns a writer-mode handle to the created dataset so attributes can be
     /// attached to it (e.g. units, descriptions) just like a dataset created
-    /// via [`new_dataset`](Self::new_dataset).
+    /// via [`new_dataset`](Self::new_dataset). The datatype declares UTF-8;
+    /// [`write_vlen_strings_ascii`](Self::write_vlen_strings_ascii) is the
+    /// ASCII-declaring twin, as on [`H5File`](crate::H5File).
     pub fn write_vlen_strings(&self, name: &str, strings: &[&str]) -> Result<H5Dataset> {
+        self.write_vlen_strings_charset(name, strings, 1)
+    }
+
+    /// Create a variable-length **ASCII** string dataset within this group.
+    ///
+    /// The group-level twin of
+    /// [`H5File::write_vlen_strings_ascii`](crate::H5File::write_vlen_strings_ascii),
+    /// with the same rejection of a string the ASCII declaration would
+    /// misdescribe.
+    pub fn write_vlen_strings_ascii(&self, name: &str, strings: &[&str]) -> Result<H5Dataset> {
+        self.write_vlen_strings_charset(name, strings, 0)
+    }
+
+    /// The single owner of group-level vlen-string dataset creation: the two
+    /// public entry points differ only in the character set they declare.
+    fn write_vlen_strings_charset(
+        &self,
+        name: &str,
+        strings: &[&str],
+        charset: u8,
+    ) -> Result<H5Dataset> {
         let full_name = if self.name == "/" {
             name.to_string()
         } else {
@@ -209,20 +362,12 @@ impl H5Group {
         let inner = borrow_inner(&self.file_inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let idx = writer.create_vlen_string_dataset(&full_name, strings)?;
-                if self.name != "/" {
-                    writer.assign_dataset_to_group(&self.name, idx)?;
-                }
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(idx);
+                let idx = writer.create_vlen_string_dataset(&full_name, strings, charset)?;
+                let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.file_inner),
                     idx,
-                    shape,
-                    element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
+                    parts,
                 ))
             }
             H5FileInner::Reader(_) => {
@@ -239,7 +384,19 @@ impl H5Group {
     /// sequence of `u8`. h5py reads it back as an array of `uint8` arrays.
     /// Returns a writer-mode handle so attributes can be attached, like
     /// [`write_vlen_strings`](Self::write_vlen_strings).
+    ///
+    /// The `u8` case of [`write_vlen_numeric`](Self::write_vlen_numeric).
     pub fn write_vlen_bytes(&self, name: &str, items: &[&[u8]]) -> Result<H5Dataset> {
+        self.write_vlen_numeric(name, items)
+    }
+
+    /// Create a variable-length numeric-sequence dataset within this group.
+    ///
+    /// The group-level twin of
+    /// [`H5File::write_vlen_numeric`](crate::H5File::write_vlen_numeric).
+    pub fn write_vlen_numeric<T: H5Type>(&self, name: &str, items: &[&[T]]) -> Result<H5Dataset> {
+        let images = crate::dataset::vlen_sequence_images(items)?;
+        let images: Vec<&[u8]> = images.iter().map(|c| c.as_ref()).collect();
         let full_name = if self.name == "/" {
             name.to_string()
         } else {
@@ -250,20 +407,13 @@ impl H5Group {
         let inner = borrow_inner(&self.file_inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let idx = writer.create_vlen_bytes_dataset(&full_name, items)?;
-                if self.name != "/" {
-                    writer.assign_dataset_to_group(&self.name, idx)?;
-                }
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(idx);
+                let idx =
+                    writer.create_vlen_sequence_dataset(&full_name, T::hdf5_type(), &images)?;
+                let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.file_inner),
                     idx,
-                    shape,
-                    element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
+                    parts,
                 ))
             }
             H5FileInner::Reader(_) => {
@@ -297,19 +447,11 @@ impl H5Group {
                 let idx = writer.create_vlen_string_dataset_compressed(
                     &full_name, strings, chunk_size, pipeline,
                 )?;
-                if self.name != "/" {
-                    writer.assign_dataset_to_group(&self.name, idx)?;
-                }
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(idx);
+                let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.file_inner),
                     idx,
-                    shape,
-                    element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
+                    parts,
                 ))
             }
             H5FileInner::Reader(_) => {
@@ -342,19 +484,11 @@ impl H5Group {
             H5FileInner::Writer(writer) => {
                 let idx = writer
                     .create_appendable_vlen_string_dataset(&full_name, chunk_size, pipeline)?;
-                if self.name != "/" {
-                    writer.assign_dataset_to_group(&self.name, idx)?;
-                }
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(idx);
+                let parts = writer.dataset_handle_parts(idx, &DatasetAccess::default())?;
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.file_inner),
                     idx,
-                    shape,
-                    element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
+                    parts,
                 ))
             }
             H5FileInner::Reader(_) => {
@@ -376,9 +510,7 @@ impl H5Group {
         let inner = borrow_inner(&self.file_inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let ds_index = writer
-                    .dataset_index(&full_name)
-                    .ok_or_else(|| Hdf5Error::NotFound(full_name.clone()))?;
+                let ds_index = writer.open_dataset_index(&full_name)?;
                 writer.append_vlen_strings(ds_index, strings)?;
                 Ok(())
             }
@@ -396,6 +528,15 @@ impl H5Group {
     /// (including via the vlen-string helpers) can be reopened to attach
     /// attributes or append chunks. `name` is the link name within this group.
     pub fn dataset_writer(&self, name: &str) -> Result<H5Dataset> {
+        self.dataset_writer_with(name, DatasetAccess::default())
+    }
+
+    /// [`dataset_writer`](Self::dataset_writer) under named dataset-access
+    /// properties, mirroring
+    /// [`H5File::dataset_writer_with`](crate::file::H5File::dataset_writer_with)
+    /// — which is where the properties that reach a write are described.
+    pub fn dataset_writer_with(&self, name: &str, access: DatasetAccess) -> Result<H5Dataset> {
+        access.validate()?;
         let full_name = if self.name == "/" {
             name.to_string()
         } else {
@@ -406,19 +547,12 @@ impl H5Group {
         let inner = borrow_inner(&self.file_inner);
         match &*inner {
             H5FileInner::Writer(writer) => {
-                let index = writer
-                    .dataset_index(&full_name)
-                    .ok_or_else(|| Hdf5Error::NotFound(full_name.clone()))?;
-                let (shape, element_size, chunked, btree2, fixed_array) =
-                    writer.dataset_handle_parts(index);
+                let index = writer.open_dataset_index(&full_name)?;
+                let parts = writer.dataset_handle_parts(index, &access)?;
                 Ok(H5Dataset::new_writer(
                     clone_inner(&self.file_inner),
                     index,
-                    shape,
-                    element_size,
-                    chunked,
-                    btree2,
-                    fixed_array,
+                    parts,
                 ))
             }
             H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
@@ -480,6 +614,196 @@ impl H5Group {
             H5FileInner::Closed => return Ok(vec![]),
         }
         Ok(groups.into_iter().collect())
+    }
+
+    /// List every link that is a direct child of this group — hard, soft and
+    /// external alike, in name order.
+    ///
+    /// This is the listing of *links* (`H5Lget_name_by_idx`, h5py's
+    /// `grp.keys()`), not of the objects they reach:
+    /// [`dataset_names`](Self::dataset_names) and
+    /// [`group_names`](Self::group_names) answer the object question, and a
+    /// soft or external link appears here whether or not its target resolves.
+    /// Pair it with [`link_class`](Self::link_class) to tell the kinds apart.
+    pub fn link_names(&self) -> Result<Vec<String>> {
+        let prefix = if self.name == "/" {
+            String::new()
+        } else {
+            format!("{}/", self.name.trim_start_matches('/'))
+        };
+
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => {
+                let mut names = std::collections::BTreeSet::new();
+                for path in reader.links().keys() {
+                    let stripped = if prefix.is_empty() {
+                        path.as_str()
+                    } else if let Some(rest) = path.strip_prefix(&prefix) {
+                        rest
+                    } else {
+                        continue;
+                    };
+                    if !stripped.is_empty() && !stripped.contains('/') {
+                        names.insert(stripped.to_string());
+                    }
+                }
+                Ok(names.into_iter().collect())
+            }
+            // A hard link to one of the writer's own objects is in the object
+            // listings, so those are the union — plus every link that names a
+            // path instead: a soft or external link made this session, or one
+            // a reopened file brought in.
+            H5FileInner::Writer(writer) => {
+                let mut names = std::collections::BTreeSet::new();
+                for (path, _) in writer.path_link_classes() {
+                    let stripped = if prefix.is_empty() {
+                        path.as_str()
+                    } else if let Some(rest) = path.strip_prefix(&prefix) {
+                        rest
+                    } else {
+                        continue;
+                    };
+                    if !stripped.is_empty() && !stripped.contains('/') {
+                        names.insert(stripped.to_string());
+                    }
+                }
+                drop(inner);
+                names.extend(self.dataset_names()?);
+                names.extend(self.group_names()?);
+                names.extend(self.named_datatype_names()?);
+                Ok(names.into_iter().collect())
+            }
+            H5FileInner::Closed => Ok(vec![]),
+        }
+    }
+
+    /// The committed (named) datatypes that are direct children of this
+    /// group, in the order the catalog holds them.
+    pub fn named_datatype_names(&self) -> Result<Vec<String>> {
+        let inner = borrow_inner(&self.file_inner);
+        let all = match &*inner {
+            H5FileInner::Reader(reader) => reader
+                .named_datatype_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            H5FileInner::Writer(writer) => writer.committed_datatype_names(),
+            H5FileInner::Closed => return Ok(vec![]),
+        };
+        Ok(all
+            .iter()
+            .filter_map(|path| self.direct_child(path))
+            .collect())
+    }
+
+    /// Open a committed (named) datatype that is a child of this group.
+    pub fn named_datatype(&self, name: &str) -> Result<crate::H5NamedDatatype> {
+        let full_name = if self.name == "/" {
+            name.to_string()
+        } else {
+            format!("{}/{}", self.name.trim_start_matches('/'), name)
+        };
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => {
+                reader.named_datatype_info(&full_name)?;
+                drop(inner);
+                Ok(crate::H5NamedDatatype::new_reader(
+                    clone_inner(&self.file_inner),
+                    full_name,
+                ))
+            }
+            H5FileInner::Writer(_) => Err(Hdf5Error::InvalidState(
+                "committed datatypes are readable only in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
+    /// `path` as a direct child name of this group, or `None` when it is not
+    /// one.
+    fn direct_child(&self, path: &str) -> Option<String> {
+        let prefix = if self.name == "/" {
+            String::new()
+        } else {
+            format!("{}/", self.name.trim_start_matches('/'))
+        };
+        let stripped = if prefix.is_empty() {
+            path
+        } else {
+            path.strip_prefix(&prefix)?
+        };
+        if stripped.is_empty() || stripped.contains('/') {
+            None
+        } else {
+            Some(stripped.to_string())
+        }
+    }
+
+    /// The class of the link `name` in this group, carrying the value
+    /// `H5Lget_val` returns for the classes that have one — the target path
+    /// of a soft link, the file and path of an external link.
+    ///
+    /// # Errors
+    ///
+    /// [`Hdf5Error::NotFound`] when this group holds no link of that name.
+    pub fn link_class(&self, name: &str) -> Result<LinkClass> {
+        let full_name = if self.name == "/" {
+            name.to_string()
+        } else {
+            format!("{}/{}", self.name.trim_start_matches('/'), name)
+        };
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => reader
+                .link_class(&full_name)
+                .cloned()
+                .ok_or(Hdf5Error::NotFound(full_name)),
+            // Anything the writer holds by a path — created here or carried
+            // in by a reopen — answers with the class it was made with; every
+            // other name it knows reaches an object of its own, so it is hard.
+            H5FileInner::Writer(writer) => {
+                let by_path = writer
+                    .path_link_classes()
+                    .into_iter()
+                    .find(|(p, _)| *p == full_name)
+                    .map(|(_, class)| class);
+                drop(inner);
+                match by_path {
+                    Some(class) => Ok(class),
+                    None if self.link_names()?.iter().any(|n| n == name) => Ok(LinkClass::Hard),
+                    None => Err(Hdf5Error::NotFound(full_name)),
+                }
+            }
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
+    /// Why the dataset `name` in this group cannot be read, or `None` when it
+    /// can be.
+    ///
+    /// A dataset whose datatype (or any other message its payload depends on)
+    /// this crate cannot decode is still listed by
+    /// [`dataset_names`](Self::dataset_names) — the file contains it — and
+    /// this says what stands in the way. Opening it through
+    /// [`H5File::dataset`](crate::H5File::dataset) fails with
+    /// [`Hdf5Error::Unsupported`] carrying the same text.
+    pub fn unreadable_reason(&self, name: &str) -> Result<Option<String>> {
+        let full_name = if self.name == "/" {
+            name.to_string()
+        } else {
+            format!("{}/{}", self.name.trim_start_matches('/'), name)
+        };
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => {
+                Ok(reader.unreadable_reason(&full_name).map(str::to_string))
+            }
+            // The writer only holds datasets it built itself.
+            H5FileInner::Writer(_) => Ok(None),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
     }
 
     /// Add (or replace) a string attribute on this group.
@@ -608,6 +932,41 @@ impl H5Group {
         }
     }
 
+    /// Add (or replace) an object-reference attribute on this group — h5py's
+    /// `g.attrs['owner'] = f['/data'].ref`.
+    ///
+    /// `path` names a dataset or a group (`/` is the root group) and must
+    /// already exist. The attribute takes the scalar shape h5py gives a single
+    /// reference; [`set_attr_object_references`](Self::set_attr_object_references)
+    /// is the array form. What reaches the file is the target's object header
+    /// address, which is assigned when the file is finalized.
+    pub fn set_attr_object_reference(&self, name: &str, path: &str) -> Result<()> {
+        self.set_reference_attr(name, &[path], &[])
+    }
+
+    /// Add (or replace) a 1-D array of object references as an attribute on
+    /// this group — the array counterpart of
+    /// [`set_attr_object_reference`](Self::set_attr_object_reference).
+    pub fn set_attr_object_references(&self, name: &str, paths: &[&str]) -> Result<()> {
+        self.set_reference_attr(name, paths, &[paths.len() as u64])
+    }
+
+    /// Route a reference attribute to the writer, the way
+    /// [`add_attr`](Self::add_attr) routes every other kind.
+    fn set_reference_attr(&self, name: &str, paths: &[&str], dims: &[u64]) -> Result<()> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Writer(writer) => {
+                writer.set_object_reference_attribute(self.attr_target(), name, paths, dims)?;
+                Ok(())
+            }
+            H5FileInner::Reader(_) => Err(Hdf5Error::InvalidState(
+                "cannot write attributes in read mode".into(),
+            )),
+            H5FileInner::Closed => Err(Hdf5Error::InvalidState("file is closed".into())),
+        }
+    }
+
     /// The writer-side attribute list this group's attributes live in: the
     /// root group's is the file-level list, any other group's is its own.
     fn attr_target(&self) -> crate::io::writer::AttrTarget<'_> {
@@ -636,17 +995,154 @@ impl H5Group {
 
     /// List this group's attribute names (read mode).
     pub fn attr_names(&self) -> Result<Vec<String>> {
-        let inner = borrow_inner(&self.file_inner);
-        match &*inner {
+        let mut inner = borrow_inner_mut(&self.file_inner);
+        match &mut *inner {
             H5FileInner::Reader(reader) => {
                 if self.name == "/" {
-                    Ok(reader.root_attr_names())
+                    Ok(reader.root_attr_names()?)
                 } else {
-                    Ok(reader.group_attr_names(self.name.trim_start_matches('/')))
+                    Ok(reader.group_attr_names(self.name.trim_start_matches('/'))?)
                 }
             }
             _ => Err(Hdf5Error::InvalidState(
                 "attr_names is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// This group's own attribute creation-order policy — the equivalent of
+    /// `H5Pget_attr_creation_order(gid.get_create_plist())` — `-` when
+    /// neither `TRACKED` nor `INDEXED` is set, and never derived from
+    /// whether the group currently holds any attributes: a group can track
+    /// creation order and still be empty (read mode).
+    pub fn attr_creation_order(&self) -> Result<CreationOrder> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_attr_creation_order()
+            } else {
+                reader.group_attr_creation_order(self.name.trim_start_matches('/'))
+            }),
+            _ => Err(Hdf5Error::InvalidState(
+                "attr_creation_order is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// This group's own compact-vs-dense attribute storage — the equivalent
+    /// of `h5py.h5o.get_info(gid.id).meta_size.attr.index_size` being
+    /// nonzero.
+    pub fn attr_storage(&self) -> Result<AttributeStorage> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_attr_storage()
+            } else {
+                reader.group_attr_storage(self.name.trim_start_matches('/'))
+            }),
+            _ => Err(Hdf5Error::InvalidState(
+                "attr_storage is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// This group's own object-header attribute count — the equivalent of
+    /// `h5py.h5o.get_info(gid.id).num_attrs`, which need not equal
+    /// [`attr_names`](Self::attr_names)'s length when the set could not be
+    /// read whole.
+    pub fn header_attr_count(&self) -> Result<u64> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_header_attr_count()?
+            } else {
+                reader.group_header_attr_count(self.name.trim_start_matches('/'))?
+            }),
+            _ => Err(Hdf5Error::InvalidState(
+                "header_attr_count is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// This group's own link creation-order policy — the equivalent of
+    /// `H5Pget_link_creation_order(gid.get_create_plist())`. A fact about
+    /// the group's own `Link Info` message, independent of
+    /// [`attr_creation_order`](Self::attr_creation_order): a group can track
+    /// one without the other.
+    pub fn link_creation_order(&self) -> Result<CreationOrder> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_link_creation_order()
+            } else {
+                reader.group_link_creation_order(self.name.trim_start_matches('/'))
+            }),
+            _ => Err(Hdf5Error::InvalidState(
+                "link_creation_order is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// This group's own link storage kind — the equivalent of libhdf5's
+    /// `H5Gget_info(gid).storage_type`: `SymbolTable` for a pre-1.8 group
+    /// (a v1 B-tree plus local heap, present regardless of the object
+    /// header's own version), `Compact` while links live as messages in the
+    /// header, or `Dense` once the phase change moves the whole set into a
+    /// fractal heap plus name index.
+    pub fn link_storage(&self) -> Result<LinkStorage> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_link_storage()
+            } else {
+                reader.group_link_storage(self.name.trim_start_matches('/'))
+            }),
+            _ => Err(Hdf5Error::InvalidState(
+                "link_storage is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Why this group's attribute `name` cannot be read, or `None` when it
+    /// can be. The attribute counterpart of
+    /// [`unreadable_reason`](Self::unreadable_reason)'s shape for datasets:
+    /// an attribute this crate cannot decode stays in
+    /// [`attr_names`](Self::attr_names) and answers here.
+    pub fn attr_unreadable_reason(&self, name: &str) -> Result<Option<String>> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_attr_unreadable_reason(name)
+            } else {
+                reader.group_attr_unreadable_reason(self.name.trim_start_matches('/'), name)
+            }
+            .map(str::to_string)),
+            _ => Err(Hdf5Error::InvalidState(
+                "attr_unreadable_reason is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Why this group's attribute *set* cannot be listed, or `None` when it
+    /// can be.
+    ///
+    /// The object-scope counterpart of
+    /// [`attr_unreadable_reason`](Self::attr_unreadable_reason): a failure
+    /// that belongs to no single name — a dense set whose heap or name index
+    /// will not read — leaves nothing to list, so
+    /// [`attr_names`](Self::attr_names) returns it as an error and this
+    /// reports it without one.
+    pub fn attrs_unreadable_reason(&self) -> Result<Option<String>> {
+        let inner = borrow_inner(&self.file_inner);
+        match &*inner {
+            H5FileInner::Reader(reader) => Ok(if self.name == "/" {
+                reader.root_attrs_unreadable_reason()
+            } else {
+                reader.group_attrs_unreadable_reason(self.name.trim_start_matches('/'))
+            }
+            .map(str::to_string)),
+            _ => Err(Hdf5Error::InvalidState(
+                "attrs_unreadable_reason is only available in read mode".into(),
             )),
         }
     }
@@ -660,8 +1156,7 @@ impl H5Group {
                     reader.root_attr(name)
                 } else {
                     reader.group_attr(self.name.trim_start_matches('/'), name)
-                }
-                .ok_or_else(|| Hdf5Error::NotFound(name.to_string()))?
+                }?
                 .clone();
                 Ok(reader.attr_string_value(&attr)?)
             }

@@ -572,6 +572,11 @@ impl SwmrWriter {
     /// 1. Flush EA index structures -> fsync
     /// 2. Re-write dataset object headers in place (updated dataspace) -> fsync
     /// 3. Re-write superblock (updated EOF) -> fsync
+    ///
+    /// A deleted dataset is skipped by both loops, the rule both finalize
+    /// paths already follow: `release_dataset_storage` returned that dataset's
+    /// header block and index blocks to the allocator, so writing either back
+    /// puts an object header over whatever now owns the block.
     pub fn flush(&mut self) -> IoResult<()> {
         // Step 1: Flush chunk index structures for all chunked datasets —
         // extensible array (streaming), fixed array (fixed grid), and v2
@@ -580,7 +585,8 @@ impl SwmrWriter {
             let is_indexed = {
                 let ds = self.writer.ds(i);
                 let m = ds.lock();
-                m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some()
+                !m.deleted
+                    && (m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some())
             };
             if is_indexed {
                 self.writer.flush_dataset(i)?;
@@ -591,7 +597,12 @@ impl SwmrWriter {
         if self.swmr_active {
             // Step 2: Re-write dataset object headers in place with updated dims.
             for i in 0..self.writer.dataset_count() {
-                if self.writer.ds(i).lock().obj_header_written_addr.is_some() {
+                let rewrite = {
+                    let ds = self.writer.ds(i);
+                    let m = ds.lock();
+                    !m.deleted && m.obj_header_written_addr.is_some()
+                };
+                if rewrite {
                     self.writer.write_dataset_header_inplace(i)?;
                 }
             }
@@ -836,6 +847,59 @@ mod swmr_hardlink_tests {
         assert_eq!(r.dataset_shape("frames").unwrap(), vec![2, 2, 2]);
     }
 
+    /// Regression: `flush` must leave a deleted dataset alone. Both finalize
+    /// paths skip one, because `release_dataset_storage` has already returned
+    /// its header block to the allocator — a flush that rewrote the header
+    /// would stamp an object header over whatever now owns that block.
+    ///
+    /// The deleted state is set directly rather than through
+    /// `delete_dataset`, which refuses while SWMR streaming is active and
+    /// clears the header address on the way out: what is under test is the
+    /// flush loop's own rule, not the delete path that currently keeps it
+    /// from being exercised.
+    #[test]
+    fn flush_leaves_a_deleted_datasets_header_alone() {
+        let dir = TmpDir::new("deleted");
+        let path = dir.file();
+
+        let mut w = SwmrWriter::create(&path).unwrap();
+        let keep = w
+            .create_streaming_dataset("frames", DatatypeMessage::u8_type(), &[2, 2])
+            .unwrap();
+        let gone = w
+            .create_streaming_dataset("scratch", DatatypeMessage::u8_type(), &[2, 2])
+            .unwrap();
+        w.start_swmr().unwrap();
+        w.append_frame(keep, &[1u8, 2, 3, 4]).unwrap();
+        w.append_frame(gone, &[9u8, 9, 9, 9]).unwrap();
+
+        // Stand in for the block having been reused: the header address holds
+        // bytes that are no longer this dataset's header.
+        let (addr, size) = {
+            let ds = w.writer_mut().ds(gone);
+            let m = ds.lock();
+            let &(addr, size) = m.obj_header_blocks.first().expect("header written");
+            (addr, size as usize)
+        };
+        let sentinel = vec![0xABu8; size];
+        w.writer_mut().handle().write_at(addr, &sentinel).unwrap();
+        w.writer_mut().ds(gone).lock().deleted = true;
+
+        w.flush().unwrap();
+
+        let after = w.writer_mut().handle().read_at(addr, size).unwrap();
+        assert_eq!(
+            after, sentinel,
+            "flush rewrote the object header of a deleted dataset at {addr:#x}"
+        );
+
+        w.close().unwrap();
+        let mut r = Hdf5Reader::open(&path).unwrap();
+        let names: Vec<String> = r.dataset_names().iter().map(|s| s.to_string()).collect();
+        assert_eq!(names, vec!["frames".to_string()]);
+        assert_eq!(r.read_dataset_raw("frames").unwrap(), vec![1u8, 2, 3, 4]);
+    }
+
     /// A reader attached during the SWMR window must still resolve the file
     /// after `close`, even though the full re-finalize relocates every object
     /// header. `refresh` re-reads the superblock and follows the new root
@@ -879,6 +943,38 @@ mod swmr_hardlink_tests {
         assert!(
             names.iter().any(|n| n == "alias"),
             "refreshed reader missing hard link: {names:?}"
+        );
+    }
+
+    /// A read decodes the dataset's chunk index and the reader keeps it, so
+    /// `refresh` has to leave nothing of it behind: the frames appended after
+    /// that read live in chunks the decoded index has no entry for, and after
+    /// the re-finalize at an address nothing in it points at.
+    #[test]
+    fn a_refresh_drops_the_chunk_index_the_last_read_decoded() {
+        use crate::io::locking::FileLocking;
+
+        let dir = TmpDir::new("refresh_index");
+        let path = dir.file();
+
+        let mut w = SwmrWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+        let idx = w
+            .create_streaming_dataset("frames", DatatypeMessage::u8_type(), &[2, 2])
+            .unwrap();
+        w.start_swmr().unwrap();
+        w.append_frame(idx, &[1u8, 2, 3, 4]).unwrap();
+        w.flush().unwrap();
+
+        let mut r = Hdf5Reader::open_swmr_with_locking(&path, FileLocking::Disabled).unwrap();
+        assert_eq!(r.read_dataset_raw("frames").unwrap(), vec![1u8, 2, 3, 4]);
+
+        w.append_frame(idx, &[5u8, 6, 7, 8]).unwrap();
+        w.close().unwrap();
+
+        r.refresh().unwrap();
+        assert_eq!(
+            r.read_dataset_raw("frames").unwrap(),
+            vec![1u8, 2, 3, 4, 5, 6, 7, 8]
         );
     }
 
