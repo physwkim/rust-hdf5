@@ -756,6 +756,83 @@ impl DatatypeMessage {
         }
     }
 
+    /// Whether this is the definition of one of libhdf5's predefined library
+    /// types — the ones `H5T_INIT_TYPE` stamps `H5T_STATE_IMMUTABLE`
+    /// (H5T.c:461), which is what `H5T_is_immutable` reports (H5T.c:6699-6712)
+    /// and what `H5O__dtype_can_share` refuses to share (H5Odtype.c:1893-1896).
+    ///
+    /// The question is about the definition, not about provenance. libhdf5
+    /// tells `H5T_STD_I32LE` apart from `H5Tcopy(H5T_STD_I32LE)` — which
+    /// encode to the same message — by the state of the `H5T_t` the caller
+    /// handed it, a copy being `H5T_STATE_RDONLY` (H5T.c:4461-4462). This
+    /// crate has no `H5Tcopy`: a datatype it can name at all is the predefined
+    /// type itself, so the definition is the whole answer here.
+    ///
+    /// The one predefined type below the crate's horizon is
+    /// `H5T_NATIVE_LDOUBLE`, the 80-bit extended float: nothing produces or
+    /// reads one, since [`ieee_format`](Self::ieee_format) is what decides
+    /// whether a float is a Rust float at all.
+    pub fn is_predefined(&self) -> bool {
+        /// The widths the `H5T_STD_*` families come in, at full precision with
+        /// no offset — anything narrower is an `H5Tset_precision` away from a
+        /// predefined type and therefore a mutable copy of one.
+        fn whole_word(size: u32, bit_offset: u16, bit_precision: u16) -> bool {
+            matches!(size, 1 | 2 | 4 | 8) && bit_offset == 0 && u32::from(bit_precision) == size * 8
+        }
+        match self {
+            // H5T_STD_{I,U}{8,16,32,64}{BE,LE}, and every H5T_NATIVE integer,
+            // which `H5T__init_native` builds by copying one of them.
+            Self::FixedPoint {
+                size,
+                bit_offset,
+                bit_precision,
+                ..
+            }
+            // H5T_STD_B{8,16,32,64}{BE,LE} and H5T_NATIVE_B{8,16,32,64}.
+            | Self::BitField {
+                size,
+                bit_offset,
+                bit_precision,
+                ..
+            } => whole_word(*size, *bit_offset, *bit_precision),
+            // H5T_IEEE_F{16,32,64}{BE,LE} and H5T_NATIVE_{FLOAT16,FLOAT,DOUBLE}.
+            Self::FloatingPoint { .. } => self.ieee_format().is_some(),
+            // H5T_C_S1, one ASCII byte padded `H5T_STR_NULLTERM`, and
+            // H5T_FORTRAN_S1, the same padded `H5T_STR_SPACEPAD`
+            // (H5T.c:370-387). Any other width is an `H5Tset_size` away.
+            Self::FixedString {
+                size: 1,
+                padding,
+                charset: 0,
+            } => matches!(padding, 0 | 2),
+            // H5T_STD_REF_OBJ, H5T_STD_REF_DSETREG and H5T_STD_REF.
+            Self::Reference { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Whether this type changes between memory and disk —
+    /// `H5T_is_relocatable` (H5T.c:7072-7087), which is true for a
+    /// variable-length or reference type anywhere in the tree.
+    ///
+    /// The term that stops a predefined *reference* type from taking the
+    /// immutable path: `H5D__init_type` copies a relocatable type whatever its
+    /// state (H5Dint.c:572).
+    pub fn is_relocatable(&self) -> bool {
+        match self {
+            Self::VarLenString { .. } | Self::VarLenSequence { .. } | Self::Reference { .. } => {
+                true
+            }
+            Self::Enum { base, .. } | Self::Array { base, .. } => base.is_relocatable(),
+            Self::Compound { members, .. } => members.iter().any(|m| m.datatype.is_relocatable()),
+            Self::FixedPoint { .. }
+            | Self::FloatingPoint { .. }
+            | Self::BitField { .. }
+            | Self::Opaque { .. }
+            | Self::FixedString { .. } => false,
+        }
+    }
+
     /// Returns the element size in bytes.
     ///
     /// For `VarLenString`, this returns the on-disk reference size assuming
