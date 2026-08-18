@@ -7533,6 +7533,45 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// The staged spelling of the case above: a selection that takes only part
+    /// of the short chunk decodes it into a buffer sized from the layout, and
+    /// what that buffer holds past the stream is cut off rather than kept — a
+    /// run inside the decoded bytes is real data, a run reaching past them is
+    /// fill.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn a_staged_chunk_carries_only_what_its_stream_decoded() {
+        use crate::format::messages::filter::{apply_filters, FilterPipeline};
+        let path = temp_path("short_chunk_image_staged");
+        let pipeline = FilterPipeline::deflate(4);
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<i32>()
+                .shape([0])
+                .chunk(&[4])
+                .max_shape(&[None])
+                .fill_value(-1i32)
+                .deflate(4)
+                .create("v")
+                .unwrap();
+            let short: Vec<u8> = [7i32, 8].iter().flat_map(|v| v.to_le_bytes()).collect();
+            ds.write_chunk_raw(0, &apply_filters(&pipeline, &short).unwrap(), 0)
+                .unwrap();
+            ds.set_extent(&[4]).unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("v").unwrap();
+            // Inside the decoded bytes.
+            assert_eq!(ds.read_slice::<i32>(&[0], &[2]).unwrap(), vec![7, 8]);
+            // Straddling their end: the run is not placed at all.
+            assert_eq!(ds.read_slice::<i32>(&[1], &[2]).unwrap(), vec![-1, -1]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
     #[cfg(feature = "deflate")]
     #[test]
     fn write_chunk_raw_ea_per_chunk_mask_roundtrip() {
