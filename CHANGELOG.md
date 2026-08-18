@@ -15,7 +15,23 @@
   a second open that disagrees is refused for as long as the first is
   held.
 
+- `Hdf5Reader::dataset_raw_size`: how many bytes a dataset's full image
+  is, which is what `read_dataset_raw` returns and what
+  `read_dataset_raw_into` requires its buffer to be. Answered in the file
+  that owns the dataset, so a name crossing an external link gets the
+  target's size.
+
 ### Changed
+
+- Reading a whole dataset is faster and no longer scales with how many
+  datasets the file holds. A typed full read now lands in the vector it
+  returns instead of being zeroed, read, and copied into a second buffer
+  of the same size; path resolution asks the alias and link catalogs by
+  key instead of comparing every entry; and datasets are found by name
+  through an index rather than a scan. Against libhdf5 1.14.6 on the
+  `perf/` probes: a 128 MiB contiguous read went from 1.79x to 0.89x of
+  its time, and opening plus reading 2000 small datasets from 2.52x to
+  0.29x. No stored bytes and no read result change.
 
 - **Breaking.** `DatasetAccess` no longer implements `Copy`. It gained
   the dapl prefix properties `virtual_prefix` and `efile_prefix`
