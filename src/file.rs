@@ -1269,12 +1269,20 @@ impl H5File {
         }
     }
 
-    /// Flush the file to disk. Only meaningful in write mode.
+    /// Hand every byte written so far to the operating system. Only
+    /// meaningful in write mode.
+    ///
+    /// This empties the write accumulator, so another process reading the file
+    /// afterwards sees everything written up to this point. It does not
+    /// finalize the file — object headers and the superblock are still
+    /// [`close`](Self::close)'s work — and it does not `fsync`.
     pub fn flush(&self) -> Result<()> {
-        // The underlying writer does not expose a standalone flush; data is
-        // written to disk immediately via pwrite. This is a compatibility
-        // method that does nothing for now.
-        Ok(())
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => Ok(writer.handle().flush()?),
+            H5FileInner::Reader(_) => Ok(()),
+            H5FileInner::Closed => Ok(()),
+        }
     }
 }
 

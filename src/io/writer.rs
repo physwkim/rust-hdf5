@@ -3198,6 +3198,10 @@ fn write_external_file_bytes(
         })?;
         let this_write = (slot.size - skip).min((data.len() - written) as u64) as usize;
         ext_handle.write_at(slot.offset + skip, &data[written..written + this_write])?;
+        // This handle is dropped at the end of the iteration, and `Drop` can
+        // only print a flush failure. Empty the accumulator here instead, so a
+        // full disk on an external raw-data file reaches the caller.
+        ext_handle.flush()?;
 
         written += this_write;
         skip = 0;

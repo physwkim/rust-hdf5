@@ -1,5 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use crate::io::locking::{self, FileLocking, LockMode};
 
@@ -33,14 +35,30 @@ compile_error!(
 /// without holding a global lock (see
 /// `docs/threadsafe-fine-grained-locking.md`).
 ///
-/// There is no application-level read or write buffer. The structural reads the
+/// There is no application-level read buffer. The structural reads the
 /// reader makes are at scattered offsets and already over-read whole structures
 /// per call (`read_at_most` grabs e.g. a 64 KiB window), so a `BufReader` —
 /// whose buffer is discarded on every non-adjacent `seek` — added little for
 /// this access pattern, and a buffer would have blocked the `&self` positioned
 /// reads the concurrent write path needs.
+///
+/// Writes do go through one: [`Accum`], the write accumulator, which is the
+/// same trade `H5Faccum.c` makes for the C library's sec2 driver. Metadata
+/// leaves the writer in 30-to-500-byte pieces laid down in address order, and
+/// one `pwrite` per piece costs far more in syscalls than the memcpy that
+/// coalesces them.
 pub struct FileHandle {
     file: File,
+    /// The write accumulator. Only [`write_at`](Self::write_at) puts bytes in
+    /// it and only [`flush`](Self::flush) takes them out; `file` is private, so
+    /// no caller can reach the descriptor around it.
+    accum: Mutex<Accum>,
+    /// Whether `accum` holds anything, kept outside the mutex so that a read,
+    /// or a write large enough to go straight out, can tell there is nothing
+    /// to flush without taking it. That matters under `threadsafe`, where many
+    /// threads issue positioned writes at once and must not queue behind one
+    /// another on a lock they have no bytes in.
+    accum_dirty: AtomicBool,
     /// False for files opened read-only; [`write_at`](Self::write_at) then
     /// errors instead of attempting a write.
     writable: bool,
@@ -56,7 +74,181 @@ pub struct FileHandle {
     base: u64,
 }
 
+/// Upper bound on the buffered range, as `H5F_ACCUM_MAX_SIZE` bounds
+/// libhdf5's accumulator.
+const ACCUM_MAX: usize = 1 << 20;
+
+/// A write of at least this many bytes goes straight to `pwrite`.
+///
+/// Raw data must not be copied through the buffer — a chunk write is already
+/// one large syscall and staging it would only add a pass over memory — but
+/// `FileHandle` is handed offsets and bytes, never the `H5FD_mem_t` class that
+/// tells libhdf5 metadata from raw data. Size stands in for the class: every
+/// metadata structure the writer emits is far below this, and every raw write
+/// worth passing through is above it.
+#[cfg(not(feature = "threadsafe"))]
+const ACCUM_PASSTHROUGH: usize = 8 << 10;
+
+/// Whether a write of `len` bytes is worth staging rather than issuing.
+#[cfg(not(feature = "threadsafe"))]
+fn stageable(len: usize) -> bool {
+    len < ACCUM_PASSTHROUGH
+}
+
+/// Never, under `threadsafe`: every write goes straight out.
+///
+/// Coalescing is a single-writer trade. This build's whole premise is that
+/// many threads issue positioned writes at distinct offsets at once
+/// (`docs/threadsafe-fine-grained-locking.md`), and one shared run is exactly
+/// the queue that design exists to remove — two threads writing unrelated
+/// datasets would take turns flushing each other's bytes, and a run bridged
+/// across a gap would read back and rewrite bytes another thread owns.
+/// libhdf5 can accumulate because its accumulator sits behind the global API
+/// lock; this build has no such lock, so it keeps the behaviour it had before
+/// the accumulator existed.
+#[cfg(feature = "threadsafe")]
+fn stageable(_len: usize) -> bool {
+    false
+}
+
+/// Widest gap the accumulator will bridge to keep one run going.
+///
+/// The writer aligns each object header block, so consecutive headers land a
+/// few bytes apart with the slack in between never written. Bridging that
+/// slack is what turns 2000 header writes into one; a page bounds how much of
+/// the file a bridge can pull into the run.
+const ACCUM_MAX_GAP: u64 = 4096;
+
+/// The write accumulator: one contiguous run of bytes waiting for a single
+/// `pwrite`, the trade `H5F__accum_write` (H5Faccum.c) makes for the C
+/// library's sec2 driver.
+///
+/// INVARIANT: `buf` holds the bytes the file must end up with over
+/// `start .. start + buf.len()`, and `gaps` names every sub-range of it that
+/// no write filled. A gap is a placeholder, never a value: [`Accum::flush`]
+/// reads each one back off the file and writes it out unchanged, so joining a
+/// run across a gap cannot change a byte of the file — no matter what the
+/// gap held, and whether or not it lies past the end of the file.
+struct Accum {
+    /// Absolute file offset of `buf[0]`. Meaningless while `buf` is empty.
+    start: u64,
+    buf: Vec<u8>,
+    /// Bridged gaps, as offsets into `buf`. Disjoint and ascending.
+    gaps: Vec<std::ops::Range<usize>>,
+}
+
+impl Accum {
+    fn new() -> Self {
+        Accum {
+            start: 0,
+            buf: Vec::new(),
+            gaps: Vec::new(),
+        }
+    }
+
+    /// Absolute file offset one past the last buffered byte.
+    fn end(&self) -> u64 {
+        self.start + self.buf.len() as u64
+    }
+
+    /// Write the buffered run out and empty it.
+    fn flush(&mut self, file: &File) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let result = self.write_out(file);
+        // Empty the run whatever happened: a failed write has already been
+        // reported to the caller, and retrying it from `Drop` would only
+        // report it a second time.
+        self.buf.clear();
+        self.gaps.clear();
+        result
+    }
+
+    /// One `pwrite` of the whole run, after every bridged gap is put back to
+    /// the bytes the file already holds there.
+    fn write_out(&mut self, file: &File) -> std::io::Result<()> {
+        if !self.gaps.is_empty() {
+            // Zeroed, so the tail of a run that reaches past the end of the
+            // file keeps the zeros a hole reads as.
+            let mut on_disk = vec![0u8; self.buf.len()];
+            pread_upto(file, self.start, &mut on_disk)?;
+            for gap in std::mem::take(&mut self.gaps) {
+                self.buf[gap.clone()].copy_from_slice(&on_disk[gap]);
+            }
+        }
+        pwrite_all(file, self.start, &self.buf)
+    }
+
+    /// Put `data` at absolute file offset `at` into the run, breaking the run
+    /// and starting a new one where it cannot join.
+    fn stage(&mut self, file: &File, at: u64, end: u64, data: &[u8]) -> std::io::Result<()> {
+        if !self.buf.is_empty() && end.saturating_sub(self.start) as usize <= ACCUM_MAX {
+            // Overwrites part of the run, or extends it: splice in place.
+            if at >= self.start && at <= self.end() {
+                let off = (at - self.start) as usize;
+                if off + data.len() > self.buf.len() {
+                    self.buf.resize(off + data.len(), 0);
+                }
+                self.buf[off..off + data.len()].copy_from_slice(data);
+                self.fill_gaps(off..off + data.len());
+                return Ok(());
+            }
+            // Sits a short way past the run: bridge the untouched bytes in
+            // between rather than pay a syscall to break the run here.
+            if at > self.end() && at - self.end() <= ACCUM_MAX_GAP {
+                let gap = self.buf.len()..(at - self.start) as usize;
+                self.buf.resize(gap.end, 0);
+                self.buf.extend_from_slice(data);
+                self.gaps.push(gap);
+                return Ok(());
+            }
+        }
+        self.flush(file)?;
+        self.buf.extend_from_slice(data);
+        self.start = at;
+        Ok(())
+    }
+
+    /// Drop `written` out of the recorded gaps: those bytes now carry a value
+    /// the flush must keep, not a placeholder for what the file holds.
+    fn fill_gaps(&mut self, written: std::ops::Range<usize>) {
+        match self.gaps.last() {
+            Some(last) if written.start < last.end => {}
+            _ => return,
+        }
+        let mut kept = Vec::with_capacity(self.gaps.len() + 1);
+        for gap in self.gaps.drain(..) {
+            if written.end <= gap.start || written.start >= gap.end {
+                kept.push(gap);
+                continue;
+            }
+            if gap.start < written.start {
+                kept.push(gap.start..written.start);
+            }
+            if written.end < gap.end {
+                kept.push(written.end..gap.end);
+            }
+        }
+        self.gaps = kept;
+    }
+}
+
 impl FileHandle {
+    /// Wrap an already-opened file. Every constructor goes through here, so
+    /// every handle starts with an empty accumulator over its own descriptor.
+    fn new(file: File, writable: bool, lock_policy: FileLocking, lock_held: bool) -> Self {
+        Self {
+            file,
+            accum: Mutex::new(Accum::new()),
+            accum_dirty: AtomicBool::new(false),
+            writable,
+            lock_policy,
+            lock_held,
+            base: 0,
+        }
+    }
+
     /// Create a new file with the env-var-derived locking policy.
     #[cfg(test)]
     pub fn create(path: &Path) -> std::io::Result<Self> {
@@ -87,13 +279,7 @@ impl FileHandle {
         if file.metadata()?.len() > 0 {
             file.set_len(0)?;
         }
-        Ok(Self {
-            file,
-            writable: true,
-            lock_policy: policy,
-            lock_held,
-            base: 0,
-        })
+        Ok(Self::new(file, true, policy, lock_held))
     }
 
     /// Open a file for read/write access, creating it when it does not exist
@@ -116,13 +302,7 @@ impl FileHandle {
             .truncate(false)
             .open(path)?;
         let lock_held = locking::try_acquire(&file, LockMode::Exclusive, policy)?;
-        Ok(Self {
-            file,
-            writable: true,
-            lock_policy: policy,
-            lock_held,
-            base: 0,
-        })
+        Ok(Self::new(file, true, policy, lock_held))
     }
 
     /// Open an existing file for read-only access with the env-var-derived
@@ -137,13 +317,7 @@ impl FileHandle {
     pub fn open_read_with_locking(path: &Path, policy: FileLocking) -> std::io::Result<Self> {
         let file = OpenOptions::new().read(true).open(path)?;
         let lock_held = locking::try_acquire(&file, LockMode::Shared, policy)?;
-        Ok(Self {
-            file,
-            writable: false,
-            lock_policy: policy,
-            lock_held,
-            base: 0,
-        })
+        Ok(Self::new(file, false, policy, lock_held))
     }
 
     /// Open an existing file for read/write access with an explicit locking
@@ -151,13 +325,7 @@ impl FileHandle {
     pub fn open_readwrite_with_locking(path: &Path, policy: FileLocking) -> std::io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let lock_held = locking::try_acquire(&file, LockMode::Exclusive, policy)?;
-        Ok(Self {
-            file,
-            writable: true,
-            lock_policy: policy,
-            lock_held,
-            base: 0,
-        })
+        Ok(Self::new(file, true, policy, lock_held))
     }
 
     /// Byte offset of the HDF5 address space within the file — the userblock
@@ -182,6 +350,7 @@ impl FileHandle {
     /// offsets.
     pub fn locate_signature(&self) -> std::io::Result<Option<u64>> {
         use crate::format::superblock::HDF5_SIGNATURE;
+        self.flush()?;
         let file_len = self.file.metadata()?.len();
         let mut buf = [0u8; HDF5_SIGNATURE.len()];
         let mut addr = 0u64;
@@ -216,8 +385,9 @@ impl FileHandle {
         if !self.lock_held || matches!(self.lock_policy, FileLocking::Disabled) {
             return Ok(());
         }
-        // Positioned writes hit the OS directly (no application buffer), so
-        // there is nothing to flush before the lock window opens.
+        // A reader attaches the moment the lock is gone, so the accumulator
+        // must not still be holding bytes it would then miss.
+        self.flush()?;
         locking::release(&self.file)?;
         self.lock_held = false;
         Ok(())
@@ -235,11 +405,57 @@ impl FileHandle {
                 "file opened read-only",
             ));
         }
-        pwrite_all(&self.file, self.abs(offset)?, data)
+        let at = self.abs(offset)?;
+        let end = at.checked_add(data.len() as u64).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "write of {} bytes at {offset} overflows the address space",
+                    data.len()
+                ),
+            )
+        })?;
+        if !stageable(data.len()) {
+            // Buffered bytes under this write are older than it, so they have
+            // to reach the file first or the flush would undo it. The write
+            // itself then goes out with no lock held, which is what keeps
+            // concurrent positioned writes at distinct offsets overlapping.
+            if self.accum_dirty.load(Ordering::Acquire) {
+                let mut accum = self.accum.lock().unwrap();
+                if at < accum.end() && end > accum.start {
+                    let result = accum.flush(&self.file);
+                    self.accum_dirty.store(false, Ordering::Release);
+                    result?;
+                }
+            }
+            return pwrite_all(&self.file, at, data);
+        }
+        let mut accum = self.accum.lock().unwrap();
+        let result = accum.stage(&self.file, at, end, data);
+        self.accum_dirty
+            .store(!accum.buf.is_empty(), Ordering::Release);
+        result
+    }
+
+    /// Write out everything the accumulator holds.
+    ///
+    /// The one finalizer: every read, every look at the file's length, every
+    /// `fsync`, the lock release SWMR opens its window with, and `Drop` all
+    /// come through here, so no exit leaves buffered bytes unwritten and no
+    /// observer sees a file the accumulator is still holding bytes back from.
+    pub fn flush(&self) -> std::io::Result<()> {
+        if !self.accum_dirty.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut accum = self.accum.lock().unwrap();
+        let result = accum.flush(&self.file);
+        self.accum_dirty.store(false, Ordering::Release);
+        result
     }
 
     /// Read exactly `len` bytes starting at the given byte offset.
     pub fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        self.flush()?;
         // `offset`/`len` are often file-derived; reject a request larger than
         // the file before allocating, so a corrupt size field cannot drive an
         // unbounded allocation.
@@ -271,11 +487,13 @@ impl FileHandle {
     /// read returns `UnexpectedEof` when it cannot fill `buf` — but without
     /// paying a per-call `fstat` on the hot coalesced-read path.
     pub fn read_exact_at_into(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.flush()?;
         pread_exact(&self.file, self.abs(offset)?, buf)
     }
 
     /// Read up to `max_len` bytes starting at the given byte offset.
     pub fn read_at_most(&self, offset: u64, max_len: usize) -> std::io::Result<Vec<u8>> {
+        self.flush()?;
         // Clamp the allocation to what the file can actually hold.
         let file_len = self.file.metadata()?.len();
         let start = self.abs(offset)?;
@@ -311,11 +529,13 @@ impl FileHandle {
 
     /// Flush file data (not necessarily metadata) to disk.
     pub fn sync_data(&self) -> std::io::Result<()> {
+        self.flush()?;
         self.file.sync_data()
     }
 
     /// Flush both file data and metadata to disk.
     pub fn sync_all(&self) -> std::io::Result<()> {
+        self.flush()?;
         self.file.sync_all()
     }
 
@@ -324,6 +544,7 @@ impl FileHandle {
     /// directly comparable against an HDF5 address (which is what
     /// `H5FD_get_eof` returns for the same reason).
     pub fn file_size(&self) -> std::io::Result<u64> {
+        self.flush()?;
         Ok(self.file.metadata()?.len().saturating_sub(self.base))
     }
 
@@ -337,11 +558,33 @@ impl FileHandle {
     /// unaccounted space. Both are closed here rather than by a rule that
     /// every allocation must be written, which nothing can enforce.
     pub fn set_eof(&self, eof: u64) -> std::io::Result<()> {
+        // Buffered bytes first: they can be what makes the file the length it
+        // should already be, and a truncation that ran before them would cut
+        // off bytes this handle then wrote back past the new end.
+        self.flush()?;
         let want = eof + self.base;
         if self.file.metadata()?.len() != want {
             self.file.set_len(want)?;
         }
         Ok(())
+    }
+}
+
+impl Drop for FileHandle {
+    fn drop(&mut self) {
+        // Backstop. Every ordinary exit — close, `sync_data`/`sync_all`,
+        // `set_eof`, `release_lock`, any read — has already been through
+        // `flush` and returned its error to a caller who could act on it.
+        // Reaching here with bytes still buffered means the handle was
+        // abandoned without one of those, so report rather than swallow, the
+        // way `Hdf5Writer::drop` reports a failed finalize.
+        if let Err(e) = self.flush() {
+            eprintln!(
+                "rust-hdf5: failed to flush buffered file writes on drop: {e}. \
+                 The file may be incomplete or corrupt; call H5File::close() \
+                 to handle this error explicitly."
+            );
+        }
     }
 }
 
@@ -415,6 +658,25 @@ fn pread(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut f = file;
     f.seek(SeekFrom::Start(offset))?;
     f.read(buf)
+}
+
+/// Positioned read of as much of `buf` as the file holds at `offset`, leaving
+/// the bytes past the end of the file untouched.
+///
+/// The accumulator reads a run's gaps back through this before flushing, and a
+/// run may reach past the end of the file — where a plain `pread_exact` would
+/// fail on bytes that a `pwrite` is about to create as a zero-filled hole.
+fn pread_upto(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    let mut total = 0;
+    while total < buf.len() {
+        match pread(file, offset + total as u64, &mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Positioned read of exactly `buf.len()` bytes from `file` at `offset`,
@@ -547,5 +809,184 @@ impl MmapFileHandle {
             .saturating_add(max_len as u64)
             .min(self.mmap.len() as u64) as usize;
         &self.mmap[start as usize..end]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn tmp(label: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "rust_hdf5_accum_{}_{}_{}",
+            label,
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("f.bin")
+    }
+
+    /// Hand one piece straight to the accumulator, the way `write_at` does
+    /// for a write below the pass-through size.
+    fn stage(accum: &mut Accum, file: &File, at: u64, data: &[u8]) {
+        accum.stage(file, at, at + data.len() as u64, data).unwrap();
+    }
+
+    fn scratch() -> (std::path::PathBuf, File) {
+        let path = tmp("accum_unit");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        (path, file)
+    }
+
+    /// The owner path: consecutive pieces land in one run, so one `pwrite`
+    /// carries what used to be three.
+    #[test]
+    fn adjoining_writes_join_one_run() {
+        let (_p, file) = scratch();
+        let mut accum = Accum::new();
+        stage(&mut accum, &file, 100, &[1u8; 10]);
+        stage(&mut accum, &file, 110, &[2u8; 10]);
+        stage(&mut accum, &file, 120, &[3u8; 10]);
+        assert_eq!(accum.start, 100);
+        assert_eq!(accum.buf.len(), 30);
+        assert!(accum.gaps.is_empty());
+        assert_eq!(file.metadata().unwrap().len(), 0, "nothing written yet");
+        accum.flush(&file).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 130);
+    }
+
+    /// A short hop past the run is bridged rather than breaking it, and the
+    /// bridged bytes are recorded as a gap, not as a value.
+    #[test]
+    fn a_short_hop_is_bridged_and_recorded() {
+        let (_p, file) = scratch();
+        let mut accum = Accum::new();
+        stage(&mut accum, &file, 100, &[1u8; 10]);
+        stage(&mut accum, &file, 116, &[2u8; 10]);
+        assert_eq!(accum.start, 100);
+        assert_eq!(accum.gaps, vec![10..16]);
+        // Beyond the bridge width the run breaks instead.
+        stage(&mut accum, &file, 116 + 10 + ACCUM_MAX_GAP + 1, &[3u8; 10]);
+        assert_eq!(accum.start, 116 + 10 + ACCUM_MAX_GAP + 1);
+        assert!(accum.gaps.is_empty());
+    }
+
+    /// The reason a bridge is safe: whatever the file already holds under the
+    /// gap is read back and written out unchanged. Reclaimed space can hold
+    /// anything, so zero fill would corrupt it.
+    #[test]
+    fn a_bridge_keeps_the_bytes_already_under_it() {
+        let path = tmp("bridge_keeps");
+        let handle = FileHandle::create(&path).unwrap();
+        handle.write_at(0, &[0xABu8; 64]).unwrap();
+        handle.flush().unwrap();
+
+        handle.write_at(0, &[1, 2, 3, 4]).unwrap();
+        handle.write_at(60, &[5, 6, 7, 8]).unwrap();
+        handle.flush().unwrap();
+
+        let got = handle.read_at(0, 64).unwrap();
+        assert_eq!(&got[0..4], &[1, 2, 3, 4]);
+        assert_eq!(&got[4..60], &[0xABu8; 56]);
+        assert_eq!(&got[60..64], &[5, 6, 7, 8]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A write landing inside an already-bridged gap owns those bytes: the
+    /// flush must keep them, not restore what the file held.
+    #[test]
+    fn a_write_into_a_bridged_gap_wins_over_the_read_back() {
+        let path = tmp("gap_overwrite");
+        let handle = FileHandle::create(&path).unwrap();
+        handle.write_at(0, &[0xABu8; 64]).unwrap();
+        handle.flush().unwrap();
+
+        handle.write_at(0, &[1, 2, 3, 4]).unwrap();
+        handle.write_at(60, &[5, 6, 7, 8]).unwrap();
+        handle.write_at(30, &[9, 9]).unwrap();
+        handle.flush().unwrap();
+
+        let got = handle.read_at(0, 64).unwrap();
+        assert_eq!(&got[28..34], &[0xAB, 0xAB, 9, 9, 0xAB, 0xAB]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// `read_at` used to go straight to the descriptor. It must not be able
+    /// to read around bytes the accumulator is still holding.
+    #[test]
+    fn a_read_sees_writes_still_in_the_accumulator() {
+        let path = tmp("read_through");
+        let handle = FileHandle::create(&path).unwrap();
+        handle.write_at(0, &[7u8; 32]).unwrap();
+        assert_eq!(handle.read_at(0, 32).unwrap(), vec![7u8; 32]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// So must `file_size`, which used to `fstat` straight through, and
+    /// `set_eof`, which used to truncate against that stale length.
+    #[test]
+    fn the_file_length_accounts_for_buffered_writes() {
+        let path = tmp("file_len");
+        let handle = FileHandle::create(&path).unwrap();
+        handle.write_at(0, &[7u8; 300]).unwrap();
+        assert_eq!(handle.file_size().unwrap(), 300);
+        handle.write_at(300, &[8u8; 100]).unwrap();
+        handle.set_eof(400).unwrap();
+        assert_eq!(handle.file_size().unwrap(), 400);
+        assert_eq!(handle.read_at(299, 2).unwrap(), vec![7, 8]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A write too large to be worth staging goes straight out, but only
+    /// after the older bytes it covers have. Under `threadsafe` nothing is
+    /// ever staged, so there is no older run for it to overtake.
+    #[cfg(not(feature = "threadsafe"))]
+    #[test]
+    fn a_pass_through_write_lands_after_the_bytes_it_covers() {
+        let path = tmp("pass_through");
+        let handle = FileHandle::create(&path).unwrap();
+        handle.write_at(0, &[1u8; 64]).unwrap();
+        handle.write_at(0, &vec![2u8; ACCUM_PASSTHROUGH]).unwrap();
+        handle.flush().unwrap();
+        assert_eq!(handle.read_at(0, 64).unwrap(), vec![2u8; 64]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Dropping a handle without any of the explicit exits still flushes.
+    #[test]
+    fn drop_flushes_what_is_left() {
+        let path = tmp("drop_flush");
+        {
+            let handle = FileHandle::create(&path).unwrap();
+            handle.write_at(0, &[42u8; 16]).unwrap();
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), vec![42u8; 16]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A userblock shifts the address space; the accumulator works in
+    /// absolute offsets, so a run spanning the shift is still one write.
+    #[test]
+    fn a_userblock_does_not_break_the_run() {
+        let path = tmp("userblock");
+        let mut handle = FileHandle::create(&path).unwrap();
+        handle.write_at(0, &[0u8; 512]).unwrap();
+        handle.set_base(512);
+        handle.write_at(0, &[3u8; 8]).unwrap();
+        handle.write_at(8, &[4u8; 8]).unwrap();
+        handle.flush().unwrap();
+        assert_eq!(handle.file_size().unwrap(), 16);
+        assert_eq!(std::fs::read(&path).unwrap().len(), 528);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
