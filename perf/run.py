@@ -3,8 +3,10 @@
 
 The C side compiles perf/probe.c with h5cc (default: the pinned libhdf5
 1.14.6 in ~/micromamba/envs/tomo); the Rust side is the crate's own
-src/bin/perf_probe.rs built --release. Both time each workload in-process;
-this runner reports the per-workload minimum, which is the least-noise
+src/bin/perf_probe.rs built --release, three times over: the default
+build, the `parallel` build, and the `mmap` build, each into its own
+target dir so they coexist. Both time each workload in-process; this
+runner reports the per-workload minimum, which is the least-noise
 estimate of the work itself.
 
 Environment:
@@ -60,6 +62,23 @@ def build(prefix):
         cwd=ROOT,
         check=True,
     )
+    # Likewise for the mmap variant: a read-only open serves its reads from a
+    # whole-file map instead of pread, so this column is the read side's.
+    subprocess.run(
+        [
+            "cargo",
+            "build",
+            "--release",
+            "--bin",
+            "perf_probe",
+            "--features",
+            "mmap",
+            "--target-dir",
+            str(ROOT / "target" / "mmap"),
+        ],
+        cwd=ROOT,
+        check=True,
+    )
     c_bin = ROOT / "target" / "release" / "perf_probe_c"
     # Conda's h5cc insists on the conda-internal compiler; link with the
     # system cc against the env's libhdf5 directly instead.
@@ -80,6 +99,7 @@ def build(prefix):
     return (
         ROOT / "target" / "release" / "perf_probe",
         ROOT / "target" / "parallel" / "release" / "perf_probe",
+        ROOT / "target" / "mmap" / "release" / "perf_probe",
         c_bin,
     )
 
@@ -115,23 +135,26 @@ def main():
         (w, r) for w, r in WORKLOADS if only is None or w in only.split(",")
     ]
 
-    rust_bin, par_bin, c_bin = build(prefix)
+    rust_bin, par_bin, mmap_bin, c_bin = build(prefix)
     print(f"{'workload':<14} {'C min ms':>10} {'rust min ms':>12} "
-          f"{'ratio':>7} {'par min ms':>11} {'par':>7}")
+          f"{'ratio':>7} {'par min ms':>11} {'par':>7} "
+          f"{'mmap min ms':>12} {'mmap':>7}")
     for workload, reps in matrix:
         # Interleave C and Rust invocations: this box swings whole-process
         # throughput between invocations, so running all C reps before all
         # Rust reps folds that drift into the ratio.
         per_round = max(2, (reps + 1) // 2)
-        c_ns, r_ns, p_ns = [], [], []
+        c_ns, r_ns, p_ns, m_ns = [], [], [], []
         for _ in range(2):
             c_ns += run_probe(c_bin, workdir, workload, per_round)
             r_ns += run_probe(rust_bin, workdir, workload, per_round)
             p_ns += run_probe(par_bin, workdir, workload, per_round)
+            m_ns += run_probe(mmap_bin, workdir, workload, per_round)
         cmin, rmin = min(c_ns) / 1e6, min(r_ns) / 1e6
-        pmin = min(p_ns) / 1e6
+        pmin, mmin = min(p_ns) / 1e6, min(m_ns) / 1e6
         print(f"{workload:<14} {cmin:>10.2f} {rmin:>12.2f} "
-              f"{rmin / cmin:>6.2f}x {pmin:>11.2f} {pmin / cmin:>6.2f}x")
+              f"{rmin / cmin:>6.2f}x {pmin:>11.2f} {pmin / cmin:>6.2f}x "
+              f"{mmin:>12.2f} {mmin / cmin:>6.2f}x")
         sys.stdout.flush()
     for leftover in workdir.iterdir():
         leftover.unlink()

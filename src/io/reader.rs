@@ -55,8 +55,6 @@ use crate::format::symbol_table::SymbolTableNode;
 use crate::format::{BlockReader, FormatContext, UNDEF_ADDR};
 
 use crate::io::file_handle::FileHandle;
-#[cfg(feature = "mmap")]
-use crate::io::file_handle::MmapFileHandle;
 use crate::io::hyperslab::{compute_strides, for_each_contiguous_run};
 use crate::io::locking::FileLocking;
 use crate::io::{FileMeta, IoResult};
@@ -2680,23 +2678,6 @@ fn read_and_decompress_chunks(
 }
 
 impl Hdf5Reader {
-    /// Open an existing HDF5 file using memory-mapped I/O for zero-copy reads.
-    ///
-    /// Available when the `mmap` feature is enabled. The entire file is
-    /// mapped into memory, avoiding read syscalls. This can be significantly
-    /// faster for random-access patterns on large files.
-    #[cfg(feature = "mmap")]
-    pub fn open_mmap(path: &Path) -> IoResult<(Self, MmapFileHandle)> {
-        // Open normally first to parse metadata
-        let reader = Self::open(path)?;
-        // Also open an mmap handle for zero-copy data access, in the same
-        // address space the reader located the superblock in — otherwise every
-        // address read through the mmap would be short by the userblock.
-        let mut mmap = MmapFileHandle::open(path)?;
-        mmap.set_base(reader.userblock_size());
-        Ok((reader, mmap))
-    }
-
     /// Open an existing HDF5 file in SWMR read mode using the env-var-derived
     /// locking policy.
     ///
@@ -5398,6 +5379,12 @@ impl Hdf5Reader {
     /// the root group is re-scanned for updated dataset headers (which may
     /// contain updated dataspace dimensions and chunk index addresses).
     pub fn refresh(&mut self) -> IoResult<()> {
+        // Whatever the handle reads from must cover the file as the SWMR
+        // writer has left it: a memory map taken at open ends where the file
+        // ended then, so it is retaken before a byte of the new metadata is
+        // decoded. Nothing happens for a handle reading through `pread`.
+        self.handle.refresh_read_source();
+
         // Re-read superblock to get latest EOF and root group address.
         let sb_buf = self.handle.read_at_most(0, 256)?;
 
