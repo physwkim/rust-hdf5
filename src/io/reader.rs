@@ -1916,6 +1916,35 @@ fn decompress_chunk(
     }
 }
 
+/// Planned chunk bytes a batch must carry before the rayon pool earns its
+/// entry cost.
+///
+/// `ThreadPool::install` injects a job and blocks on a latch; with the workers
+/// parked that costs tens of microseconds, which is more than a small
+/// selection's entire read. One 64 KiB slice of a chunked dataset plans one or
+/// two chunks, so it decodes on the thread that planned it and never pays the
+/// dispatch.
+#[cfg(feature = "parallel")]
+const PARALLEL_MIN_JOB_BYTES: u64 = 256 * 1024;
+
+/// Whether a batch is worth handing to the pool: more than one chunk to read,
+/// and enough bytes behind them to repay [`PARALLEL_MIN_JOB_BYTES`]. Skipped
+/// chunks (`None`) count for nothing — a slice whose chunks were all placed by
+/// [`read_chunk_runs_into`] leaves no work at all.
+#[cfg(feature = "parallel")]
+fn worth_parallel(jobs: &[Option<ChunkReadJob>]) -> bool {
+    let mut n = 0usize;
+    let mut bytes = 0u64;
+    for j in jobs.iter().flatten() {
+        n += 1;
+        bytes = bytes.saturating_add(j.len as u64);
+        if n > 1 && bytes >= PARALLEL_MIN_JOB_BYTES {
+            return true;
+        }
+    }
+    false
+}
+
 /// Read and decompress a batch of chunk jobs, preserving job order.
 ///
 /// `jobs[i] == None` yields `Ok(None)` — a chunk skipped as out-of-selection
@@ -1953,8 +1982,9 @@ fn read_and_decompress_chunks(
             }
         };
         // Run on rust-hdf5's private half-cores pool, not rayon's global pool;
-        // fall back to serial if the pool could not be built.
-        match crate::parallel::io_pool() {
+        // fall back to serial if the pool could not be built, and for a batch
+        // too small to repay entering it.
+        match crate::parallel::io_pool().filter(|_| worth_parallel(&jobs)) {
             Some(pool) => pool.install(|| {
                 jobs.into_par_iter()
                     .map(&decode)
@@ -1969,6 +1999,7 @@ fn read_and_decompress_chunks(
         // No positioned read API here: concurrent reads would race the shared
         // file cursor, so read serially, then parallelize decompression on
         // rust-hdf5's private half-cores pool (not rayon's global pool).
+        let parallel = worth_parallel(&jobs);
         let raws: Vec<Option<(Vec<u8>, u32)>> = jobs
             .into_iter()
             .map(|job| match job {
@@ -1982,8 +2013,9 @@ fn read_and_decompress_chunks(
                 None => Ok(None),
             }
         };
-        // Fall back to serial if the private pool could not be built.
-        match crate::parallel::io_pool() {
+        // Fall back to serial if the private pool could not be built, and for
+        // a batch too small to repay entering it.
+        match crate::parallel::io_pool().filter(|_| parallel) {
             Some(pool) => pool.install(|| {
                 raws.into_par_iter()
                     .map(&decode)
