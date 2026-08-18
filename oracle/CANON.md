@@ -1,4 +1,4 @@
-# The canonical dump format (`!canon 7`)
+# The canonical dump format (`!canon 8`)
 
 Both sides of the oracle — `oracle/canon.py` (h5py / libhdf5 1.14.6) and
 `src/bin/oracle_probe.rs` (rust-hdf5 public API) — emit this format, so the
@@ -8,7 +8,7 @@ two dumps of the same file are comparable as text and, more usefully, as a
 ## Grammar
 
     line   := header | record
-    header := "!canon" TAB "7"
+    header := "!canon" TAB "8"
     record := key TAB value
     key    := path [ "@" attrname ] "#" field
     value  := <no TAB, no LF>
@@ -72,11 +72,12 @@ decodes.
 `kind` is always first: `group`, `dataset`, `softlink`, `extlink`,
 `committed-datatype`, `unknown`.
 
-Group fields: `kind`, `linkorder`, `attrorder`, `nattrs`, then attributes.
+Group fields: `kind`, `linkorder`, `attrorder`, `linkstore`, `shared`,
+`nattrs`, then attributes.
 
 Dataset fields, in order: `kind`, `dtype`, `strpad`, `shape`, `maxshape`,
 `layout`, `chunk`, `chunkindex`, `external`, `virtual`, `filters`,
-`fillvalue`, `filltime`, `alloctime`, `nattrs`, attributes, `data`.
+`fillvalue`, `filltime`, `alloctime`, `shared`, `nattrs`, attributes, `data`.
 
 Committed datatype fields: `kind`, `dtype`, `strpad`, `nattrs`, attributes.
 
@@ -101,6 +102,7 @@ Link fields: `kind`, `target`, and for an external link `resolved`.
 | `linkorder`  | `-` \| `tracked` \| `tracked+indexed` — link creation-order tracking       |
 | `attrorder`  | as `linkorder`, for attributes                                            |
 | `strpad`     | `-`, or `.=null;.member=spacepad` for each vlen string in the type tree   |
+| `shared`     | `[]`, or `[dataspace:shareable,attribute:sohm,...]` — `class:storage`      |
 | `data`       | see below                                                                 |
 | `target`     | soft: the link path; external: `<file>::<path>`                           |
 | `resolved`   | external only: `dataset <shape> <data>` \| `group` \| `committed-datatype` \| `dangling` |
@@ -138,6 +140,32 @@ bleeding through uncleared memory in the in-memory reconstruction. Routing
 `filters` through `h5debug` for every case (filtered or not, not just
 scale-offset) makes both oracle arms measure the same on-disk bytes; see
 `canon.py`'s `filters_str`.
+
+`shared` is how the object header stores each message it does not hold
+privately: `class:storage` pairs, sorted, for every message whose flags byte
+carries `H5O_MSG_FLAG_SHARED` or `H5O_MSG_FLAG_SHAREABLE`. The storage is
+`sohm` (a shared-message heap object), `committed` (another object header, as
+a committed datatype is stored), `here`, or `shareable` — the last meaning the
+body is still literal in this header and a shared-message index names it
+there. That case is why the field is not `hdr.mesg.shared` from
+`H5Oget_info`: that mask only sees a message stored as a *pointer*, and
+`H5SM__write_mesg` leaves the first copy of a share-in-object-header class
+where it was written (H5SM.c:1400-1417), flagging it `SHAREABLE` rather than
+`SHARED` (H5SM.c:1112). The h5py side reads `h5debug`'s rendering of the flags
+byte (`H5O__debug_real`, H5Odbg.c:409-455) and of the pointer beneath a shared
+message (`H5O__shared_debug`, H5Oshared.c:682-706); the rust side reads the
+same two things off the header chain through `H5File::object_message_storage`.
+
+Deliberately *not* `hdr.mesg.present`, which counts the null and continuation
+messages too (H5Oint.c:2067-2069). Where those fall is the writer's allocation
+strategy: libhdf5 creates a dataset header at a 256-byte size hint
+(`H5D_MINHDR_SIZE`, H5Dpkg.h:42) whose unused tail stays one null message
+(H5Oint.c:516-522), and a committed datatype at the exact size of its datatype
+message (H5Tcommit.c:468, :475), so the reference-count message added
+afterwards forces a second chunk and a continuation. A null message has no
+decode, encode, size or copy method at all (H5Onull.c:28-49) — it is free
+space wearing a message header — so a field over the present mask would be
+comparing padding.
 
 ## `data`
 

@@ -19,11 +19,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rust_hdf5::format::btree_v1::BTreeV1Config;
 use rust_hdf5::format::chunk_index::btree_v2::{collect_btree_v2_records, Bt2Header};
 use rust_hdf5::format::messages::shared::MSG_FLAG_SHARED;
-use rust_hdf5::format::messages::{MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE};
+use rust_hdf5::format::messages::{MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE, MSG_FLAG_SHAREABLE};
 use rust_hdf5::format::object_header::{ObjectHeader, ObjectHeaderMessage};
 use rust_hdf5::format::sohm::{
     record_size, type_flag, SharedLocation, SharedMessagePointer, SohmIndexHeader, SohmMasterTable,
-    SOHM_HEAP_ID_LEN, SOHM_INDEX_BTREE, SOHM_INDEX_LIST, SOHM_IN_HEAP,
+    SOHM_HEAP_ID_LEN, SOHM_INDEX_BTREE, SOHM_INDEX_LIST, SOHM_IN_HEAP, SOHM_IN_OH,
 };
 use rust_hdf5::format::superblock::SuperblockV2V3;
 use rust_hdf5::format::{BlockReader, FormatContext, FormatResult, LibverBound};
@@ -137,13 +137,25 @@ fn master_table(path: &PathBuf) -> SohmMasterTable {
     SohmMasterTable::decode(&bytes[at..at + size], &ctx, smt.nindexes).unwrap()
 }
 
-/// Every record of one index, whichever form it is in, as `(heap id, ref
-/// count)`.
-fn index_records(
-    bytes: &[u8],
-    ctx: &FormatContext,
-    header: &SohmIndexHeader,
-) -> Vec<([u8; SOHM_HEAP_ID_LEN], u32)> {
+/// A record in whichever of the two forms `H5SM__message_encode` writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Record {
+    /// `H5SM_IN_HEAP`: the body is a heap object. `ref_count` counts every
+    /// use of it — including the literal first copy still sitting in the
+    /// header that offered it, which is why the count reaches two the moment
+    /// a second object wants the body (H5SM.c:1298-1306).
+    Heap {
+        heap_id: [u8; SOHM_HEAP_ID_LEN],
+        ref_count: u32,
+    },
+    /// `H5SM_IN_OH`: one object uses this body and it is still literal in
+    /// that object's header, so the index names the header instead of a heap
+    /// object (H5SM.c:1400-1417).
+    Ohdr { msg_type: u8, oh_addr: u64 },
+}
+
+/// Every record of one index, whichever form it is in.
+fn index_records(bytes: &[u8], ctx: &FormatContext, header: &SohmIndexHeader) -> Vec<Record> {
     let size = record_size(ctx);
     let at = header.index_addr as usize;
     let raw = if header.index_type == SOHM_INDEX_LIST {
@@ -154,12 +166,36 @@ fn index_records(
         collect_btree_v2_records(&bt2, ctx, &mut Bytes(bytes)).unwrap()
     };
     raw.chunks_exact(size)
-        .map(|r| {
-            assert_eq!(r[0], SOHM_IN_HEAP, "a record this crate wrote is in a heap");
-            (
-                r[9..9 + SOHM_HEAP_ID_LEN].try_into().unwrap(),
-                u32::from_le_bytes(r[5..9].try_into().unwrap()),
-            )
+        .map(|r| match r[0] {
+            SOHM_IN_HEAP => Record::Heap {
+                heap_id: r[9..9 + SOHM_HEAP_ID_LEN].try_into().unwrap(),
+                ref_count: u32::from_le_bytes(r[5..9].try_into().unwrap()),
+            },
+            SOHM_IN_OH => {
+                let mut addr = [0u8; 8];
+                let width = ctx.sizeof_addr as usize;
+                addr[..width].copy_from_slice(&r[9..9 + width]);
+                Record::Ohdr {
+                    msg_type: r[6],
+                    oh_addr: u64::from_le_bytes(addr),
+                }
+            }
+            other => panic!("record location {other} is neither a heap nor a header"),
+        })
+        .collect()
+}
+
+/// The heap records of one index, as `(heap id, ref count)`.
+fn heap_records(
+    bytes: &[u8],
+    ctx: &FormatContext,
+    header: &SohmIndexHeader,
+) -> Vec<([u8; SOHM_HEAP_ID_LEN], u32)> {
+    index_records(bytes, ctx, header)
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::Heap { heap_id, ref_count } => Some((heap_id, ref_count)),
+            Record::Ohdr { .. } => None,
         })
         .collect()
 }
@@ -227,14 +263,18 @@ fn all_messages(bytes: &[u8], at: usize) -> Vec<ObjectHeaderMessage> {
 /// A file with shared messages has a version-2 superblock over symbol-table
 /// groups, so a census that followed only Link messages would stop at the root
 /// and find no pointers at all.
-fn symbol_table_targets(bytes: &[u8], ctx: &FormatContext, body: &[u8]) -> Vec<u64> {
+fn symbol_table_targets(bytes: &[u8], ctx: &FormatContext, body: &[u8]) -> Vec<(String, u64)> {
     use rust_hdf5::format::btree_v1::{BTreeV1Config, BTreeV1Node};
+    use rust_hdf5::format::local_heap::{local_heap_get_string, LocalHeapHeader};
     use rust_hdf5::format::symbol_table::SymbolTableNode;
     use rust_hdf5::format::UNDEF_ADDR;
 
     let sa = ctx.sizeof_addr as usize;
     let ss = ctx.sizeof_size as usize;
     let btree_addr = u64::from_le_bytes(body[..8].try_into().unwrap());
+    let heap_addr = u64::from_le_bytes(body[8..16].try_into().unwrap());
+    let heap = LocalHeapHeader::decode(&bytes[heap_addr as usize..], sa, ss).unwrap();
+    let heap_data = &bytes[heap.data_addr as usize..][..heap.data_size as usize];
     // A version-2 superblock keeps its "K" ranks in a B-tree-K message, which
     // none of these fixtures carries: every node in them is the library-default
     // width. (`tests/superblock_extension.rs` covers a file that does carry
@@ -264,15 +304,20 @@ fn symbol_table_targets(bytes: &[u8], ctx: &FormatContext, body: &[u8]) -> Vec<u
         out.extend(
             snod.entries
                 .iter()
-                .map(|e| e.obj_header_addr)
-                .filter(|&a| a != UNDEF_ADDR && a != 0),
+                .filter(|e| e.obj_header_addr != UNDEF_ADDR && e.obj_header_addr != 0)
+                .map(|e| {
+                    (
+                        local_heap_get_string(heap_data, e.name_offset).unwrap(),
+                        e.obj_header_addr,
+                    )
+                }),
         );
     }
     out
 }
 
 /// Every object header reachable from the root of a version-2 file, by path.
-fn every_header(bytes: &[u8], ctx: &FormatContext) -> Vec<(String, Vec<ObjectHeaderMessage>)> {
+fn every_header(bytes: &[u8], ctx: &FormatContext) -> Vec<(String, u64, Vec<ObjectHeaderMessage>)> {
     use rust_hdf5::format::messages::link::{LinkMessage, LinkTarget};
     use rust_hdf5::format::messages::{MSG_LINK, MSG_SYMBOL_TABLE};
 
@@ -295,17 +340,14 @@ fn every_header(bytes: &[u8], ctx: &FormatContext) -> Vec<(String, Vec<ObjectHea
                     }
                 }
                 MSG_SYMBOL_TABLE => {
-                    for (i, target) in symbol_table_targets(bytes, ctx, &m.data)
-                        .into_iter()
-                        .enumerate()
-                    {
-                        queue.push((format!("{path}stab{i}/"), target));
+                    for (name, target) in symbol_table_targets(bytes, ctx, &m.data) {
+                        queue.push((format!("{path}{name}/"), target));
                     }
                 }
                 _ => {}
             }
         }
-        out.push((path, messages));
+        out.push((path, addr, messages));
     }
     out
 }
@@ -355,7 +397,7 @@ fn heap_bodies(
     let raw = reader.read_block(header.heap_addr, 512).unwrap();
     let heap = FractalHeapHeader::decode(&raw, ctx).unwrap();
     let blocks = collect_managed_blocks(&heap, ctx, &mut reader).unwrap();
-    index_records(bytes, ctx, header)
+    heap_records(bytes, ctx, header)
         .into_iter()
         .map(|(id, _)| {
             let parsed = HeapId::parse(&id, &heap, ctx).unwrap();
@@ -366,10 +408,14 @@ fn heap_bodies(
 }
 
 /// The invariant on `SohmState`, checked against the file the append wrote:
-/// a record's reference count is the number of pointers that name its heap
-/// object, counting the whole-message form in an object header, the
-/// datatype/dataspace an attribute body carries there, and the same two
-/// carried by an attribute body that is itself in the heap.
+/// a record's reference count is the number of uses of its body. A use is a
+/// pointer naming the heap object — the whole-message form in an object
+/// header, the datatype/dataspace an attribute body carries there, and the
+/// same two carried by an attribute body that is itself in the heap — or the
+/// literal first copy a share-in-object-header class leaves behind in the
+/// header that offered it, which `H5SM__write_mesg` counts as the first of the
+/// two references it gives the body when it moves it to the heap
+/// (H5SM.c:1298-1306).
 fn reference_counts_match_the_pointers(path: &PathBuf) -> Vec<u32> {
     let bytes = std::fs::read(path).unwrap();
     let ctx = FormatContext::default_v3();
@@ -382,11 +428,17 @@ fn reference_counts_match_the_pointers(path: &PathBuf) -> Vec<u32> {
             }
         }
     };
-    for (_, messages) in every_header(&bytes, &ctx) {
+    // The bodies left literal, by the header holding them: a record either
+    // names one of these or names a heap object one of these is a use of.
+    let mut literals: Vec<(u64, u8, Vec<u8>)> = Vec::new();
+    for (_, addr, messages) in every_header(&bytes, &ctx) {
         for msg in &messages {
             if msg.flags & MSG_FLAG_SHARED != 0 {
                 count(&msg.data);
-            } else if msg.msg_type == MSG_ATTRIBUTE {
+            } else if msg.flags & MSG_FLAG_SHAREABLE != 0 {
+                literals.push((addr, msg.msg_type, msg.data.clone()));
+            }
+            if msg.msg_type == MSG_ATTRIBUTE && msg.flags & MSG_FLAG_SHARED == 0 {
                 for (_, raw) in attribute_shared_fields(&msg.data) {
                     count(raw);
                 }
@@ -414,14 +466,30 @@ fn reference_counts_match_the_pointers(path: &PathBuf) -> Vec<u32> {
     }
 
     let mut counts = Vec::new();
-    for header in &table.indexes {
-        for (heap_id, ref_count) in index_records(&bytes, &ctx, header) {
-            counts.push(ref_count);
-            assert_eq!(
-                pointers.remove(&heap_id),
-                Some(ref_count),
-                "record {heap_id:02x?} claims {ref_count} references"
-            );
+    for (header, index) in table.indexes.iter().zip(&bodies) {
+        for record in index_records(&bytes, &ctx, header) {
+            match record {
+                Record::Heap { heap_id, ref_count } => {
+                    let body = &index[&heap_id];
+                    let literal = literals.iter().filter(|(_, _, b)| b == body).count() as u32;
+                    assert!(literal <= 1, "{literal} headers keep the same body literal");
+                    counts.push(ref_count);
+                    assert_eq!(
+                        pointers.remove(&heap_id).unwrap_or(0) + literal,
+                        ref_count,
+                        "record {heap_id:02x?} claims {ref_count} references"
+                    );
+                }
+                Record::Ohdr { msg_type, oh_addr } => {
+                    counts.push(1);
+                    assert!(
+                        literals
+                            .iter()
+                            .any(|&(at, class, _)| (at, class) == (oh_addr, msg_type)),
+                        "no literal message {msg_type} in the header at {oh_addr:#x} the index names"
+                    );
+                }
+            }
         }
     }
     assert_eq!(
@@ -451,7 +519,7 @@ fn nested_attribute_census(path: &PathBuf) -> Vec<(u32, Vec<u32>)> {
     let mut counts: std::collections::HashMap<(usize, [u8; SOHM_HEAP_ID_LEN]), u32> =
         Default::default();
     for (i, header) in table.indexes.iter().enumerate() {
-        for (id, ref_count) in index_records(&bytes, &ctx, header) {
+        for (id, ref_count) in heap_records(&bytes, &ctx, header) {
             counts.insert((i, id), ref_count);
         }
     }
@@ -623,6 +691,69 @@ fn a_list_index_file_takes_a_new_dataset() {
     cleanup(&path);
 }
 
+/// A reopen re-encodes every header it rewrites, so the encoding it picks has
+/// to be the one the file already holds.
+///
+/// libhdf5 never rewrites a message it did not touch. Opening a version-2
+/// superblock raises the low bound to `H5F_LIBVER_V18` (hdf5_1.14.6
+/// H5Fsuper.c:460-462), and that bound governs only the objects the reopening
+/// session goes on to create. `sohm_list.h5` was written at
+/// `H5F_LIBVER_EARLIEST`, so its four datasets carry version-1 dataspaces (24
+/// bytes for one dimension with a maximum) and immutable `H5T_STD_I32LE`
+/// datatypes that `H5SM__can_share_common` refuses (H5SM.c:895-899,
+/// H5Odtype.c:1893-1901); the dataset the append adds gets the version-2
+/// dataspace (20 bytes) and the shareable copied type the raised bound calls
+/// for (H5Dint.c:569-572).
+///
+/// This writer has to lay the whole header out again whenever the
+/// shared-message heap moves, so the preservation is a decision it makes
+/// rather than one it inherits from not touching the bytes.
+#[test]
+fn an_append_keeps_the_encoding_the_datasets_it_found_were_written_in() {
+    let path = copy_fixture("sohm_list.h5", "keeps_encoding");
+    append_dataset(&path, "appended", 200);
+    check_fixture_contents(&path, &[("appended", 200)]);
+
+    let bytes = std::fs::read(&path).unwrap();
+    let ctx = FormatContext::default_v3();
+    let mut seen = Vec::new();
+    for (path, _, messages) in every_header(&bytes, &ctx) {
+        let name = path.trim_matches('/').to_string();
+        if !name.starts_with("shared") && name != "appended" {
+            continue;
+        }
+        let space = messages
+            .iter()
+            .find(|m| m.msg_type == MSG_DATASPACE)
+            .expect("a dataset says its shape");
+        // A shared dataspace is a heap pointer, not an extent, so only the
+        // literal first copy answers which version was encoded.
+        let version = (space.flags & MSG_FLAG_SHARED == 0).then(|| space.data[0]);
+        let dtype = messages
+            .iter()
+            .find(|m| m.msg_type == MSG_DATATYPE)
+            .expect("a dataset says its type");
+        seen.push((
+            name,
+            version,
+            space.data.len(),
+            dtype.flags & MSG_FLAG_SHAREABLE != 0,
+        ));
+    }
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("appended".into(), Some(2), 20, true),
+            ("shared0".into(), Some(1), 24, false),
+            ("shared1".into(), None, 10, false),
+            ("shared2".into(), None, 10, false),
+            ("shared3".into(), None, 10, false),
+        ]
+    );
+    cleanup(&path);
+}
+
 /// A reopen carries the nested reference counts across unchanged: the shared
 /// `cal` body is still named by four datasets, and the datatype and dataspace
 /// it points at are still named once each — by that one body, not by the four
@@ -744,9 +875,9 @@ fn a_reopened_symbol_table_group_keeps_its_symbol_table() {
 
     let bytes = std::fs::read(&path).unwrap();
     let ctx = FormatContext::default_v3();
-    let (_, root) = every_header(&bytes, &ctx)
+    let (_, _, root) = every_header(&bytes, &ctx)
         .into_iter()
-        .find(|(p, _)| p == "/")
+        .find(|(p, _, _)| p == "/")
         .expect("the root group has a header");
     let kinds: Vec<u8> = root.iter().map(|m| m.msg_type).collect();
     assert!(

@@ -17,7 +17,7 @@ $RUST_HDF5_ORACLE_PYTHON oracle/run.py        # or just: python3 oracle/run.py
 
 `PASS` tolerates the 0 accessors that are missing from the API *everywhere* () — they are counted once each in the findings table below rather than against every case that happens to contain a dataset.
 
-**Direction B** (rust-hdf5 writes, h5py/libhdf5 reads) — `PASS` h5py read it, every core field (kind, dtype, shape, data, attributes, link targets) matched the reference and `h5diff`/`h5dump` were clean; `INVALID` one of those failed; `UNSUPPORTED-API` the public API cannot express the case. Differences confined to `attrorder`, `chunkindex`, `fillvalue`, `filters`, `layout`, `linkorder`, `linkstore`, `maxshape`, `superblock` are recorded as metadata deviations and do not fail a case, because the values libhdf5 reads are identical.
+**Direction B** (rust-hdf5 writes, h5py/libhdf5 reads) — `PASS` h5py read it, every core field (kind, dtype, shape, data, attributes, link targets) matched the reference and `h5diff`/`h5dump` were clean; `INVALID` one of those failed; `UNSUPPORTED-API` the public API cannot express the case. Differences confined to `attrorder`, `chunkindex`, `fillvalue`, `filters`, `layout`, `linkorder`, `linkstore`, `maxshape`, `shared`, `superblock` are recorded as metadata deviations and do not fail a case, because the values libhdf5 reads are identical.
 
 ## Headline
 
@@ -171,8 +171,10 @@ The rust-written file carries the same data, type and shape as the h5py referenc
 | id | field | libhdf5 | rust-hdf5 | observed | cases |
 |---|---|---|---|---|---|
 | `chunkindex-v3-superblock-low-bound` | `chunkindex` | `btree1` | `farray` | yes | 1 (reopen_append_latest) |
+| `shared-v2-superblock-low-bound` | `shared` | `[dataspace:sohm,datatype:shareabl…` | `[dataspace:shareable,datatype:sha…` | yes | 2 (sohm_list_append, sohm_btree_append) |
 
 - `chunkindex-v3-superblock-low-bound`: Reopening a v3-superblock file to append: libhdf5 1.14.6 raises the file's low_bound on every open from the superblock version it finds — v2 to V18, v3 to V110 (H5Fsuper.c:460-466) — so the reopened file writes a V110 chunk index. 2.0.0 raises it only under H5F_ACC_SWMR_WRITE (H5Fsuper.c:448-454), so the same file reopened non-SWMR keeps the default bound and libhdf5 writes a version-1 B-tree index where it used to write a fixed/extensible array. This crate's write rule is pinned to 1.14.6 semantics by decision, so under a 2.0 reference the two disagree; against the pinned 1.14.6 reference they do not, and that run declares no deviation at all.; observed as `btree1 -> farray`
+- `shared-v2-superblock-low-bound`: The same low_bound change as chunkindex-v3-superblock-low-bound, seen through the shared-message flags instead of the chunk index. gen_sohm.c writes sohm_list.h5 at H5F_LIBVER_EARLIEST, so its four datasets carry version-1 dataspaces. 1.14.6 raises the low bound to V18 on opening the version-2 superblock the shared-message table forces (H5Fsuper.c:460-462), so the dataset the append creates gets a version-2 dataspace — a body no existing record matches, which H5SM__write_mesg leaves literal in the new header under H5O_MSG_FLAG_SHAREABLE (H5SM.c:1400-1417). 2.0.0 raises the bound only under H5F_ACC_SWMR_WRITE (H5Fsuper.c:448-454), so the appended dataset gets a version-1 dataspace equal to the four already indexed, the matching record's reference count rises and the body moves to the heap. Witnessed on the reference files themselves: h5debug reports /appended's dataspace message as 20 bytes <SA> under 1.14.6 and 10 bytes <S> under 2.0.0, with /shared0's unchanged at 24 bytes <SA> in both. Pinned to 1.14.6 by decision, this crate writes what the 1.14.6 reference writes, and that run declares no deviation.; observed as `[dataspace:sohm,datatype:shareable] -> [dataspace:shareable,datatype:…`
 
 ## Direction B unexpected deviations
 
