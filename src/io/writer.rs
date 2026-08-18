@@ -16098,8 +16098,14 @@ impl Hdf5Writer {
                 fill_value: None,
             }
         };
+        // `H5O_MSG_FLAG_CONSTANT`, as `H5D__update_oh_info` appends it
+        // (H5Dint.c:965) — the same flag the datatype message beside it
+        // carries (H5Dint.c:961) and the old fill value below (H5Dint.c:981).
+        // A dataset's fill value is fixed at creation: `H5Pset_fill_value` is
+        // a creation property, so nothing can rewrite the message in place and
+        // libhdf5 tells the header so.
         let fv_msg = fv.encode_for(format);
-        let (flags, fv_msg) = self.share_message(owner, MSG_FILL_VALUE, 0x00, fv_msg);
+        let (flags, fv_msg) = self.share_message(owner, MSG_FILL_VALUE, MSG_FLAG_CONSTANT, fv_msg);
         header.add_message(MSG_FILL_VALUE, flags, fv_msg);
 
         // The "fill value (old)" message (type 0x04) beside the new one, for a

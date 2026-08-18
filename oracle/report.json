@@ -4,7 +4,7 @@
   "h5py_version": "3.15.1",
   "numpy_version": "1.26.4",
   "python": "/home/stevek/micromamba/envs/tomo/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/target/release/oracle_probe",
+  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-ohflags-50f2cfe5-1/target/release/oracle_probe",
   "cases": 111
  },
  "results": [
