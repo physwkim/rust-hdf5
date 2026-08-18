@@ -97,8 +97,14 @@ def main():
     print(f"{'workload':<14} {'C min ms':>10} {'rust min ms':>12} "
           f"{'ratio':>7}  {'C med':>10} {'rust med':>10}")
     for workload, reps in matrix:
-        c_ns = run_probe(c_bin, workdir, workload, reps)
-        r_ns = run_probe(rust_bin, workdir, workload, reps)
+        # Interleave C and Rust invocations: this box swings whole-process
+        # throughput between invocations, so running all C reps before all
+        # Rust reps folds that drift into the ratio.
+        per_round = max(2, (reps + 1) // 2)
+        c_ns, r_ns = [], []
+        for _ in range(2):
+            c_ns += run_probe(c_bin, workdir, workload, per_round)
+            r_ns += run_probe(rust_bin, workdir, workload, per_round)
         cmin, rmin = min(c_ns) / 1e6, min(r_ns) / 1e6
         cmed = statistics.median(c_ns) / 1e6
         rmed = statistics.median(r_ns) / 1e6
