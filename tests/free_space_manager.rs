@@ -112,9 +112,14 @@ fn h5clear_accepts(py: &str, path: &std::path::Path) {
 /// Write a file with the managers this is about: `fsm` strategy, persisted,
 /// and a threshold of one byte so every freed block is recorded.
 fn write_persisting_file(py: &str, path: &std::path::Path) {
+    write_persisting_file_with(py, path, "fsm")
+}
+
+/// [`write_persisting_file`] under a named strategy — `fsm` or `page`.
+fn write_persisting_file_with(py: &str, path: &std::path::Path, strategy: &str) {
     let script = format!(
         "import h5py, numpy as np\n\
-         f = h5py.File(r'{}', 'w', fs_strategy='fsm', fs_persist=True, fs_threshold=1)\n\
+         f = h5py.File(r'{}', 'w', fs_strategy='{strategy}', fs_persist=True, fs_threshold=1)\n\
          f.create_dataset('keep', data=np.arange(16, dtype='i4'))\n\
          f.create_group('grp').create_dataset('inner', data=np.arange(8, dtype='f8'))\n\
          f.create_dataset('drop', data=np.arange(64, dtype='i4'))\n\
@@ -171,16 +176,23 @@ fn a_crate_append_spends_and_rewrites_the_persisted_managers() {
 
     crate_appends(&path, "added");
     let after = h5stat_space(py, &path);
-    // The whole append fits in space the managers named, so the end of the
-    // file does not move. Before this, every byte of it came from the end.
-    assert_eq!(
-        after.total, before.total,
-        "the append grew a file that had {} bytes free",
+    // Most of the append comes out of the space the managers named. What it
+    // cannot take is the raw-data manager's sections for a metadata block:
+    // `H5MF_alloc` asks `fs_man[fs_type]` and no other, so metadata that
+    // outruns the metadata sections comes from the end of the file however
+    // much raw-data space is free.
+    assert!(
+        after.total < before.total + before.tracked,
+        "the append took nothing from the {} bytes free: {after:?}",
         before.tracked
     );
     assert!(
         after.tracked > 0,
         "the append left the file with no tracked free space: {after:?}"
+    );
+    assert_eq!(
+        after.unaccounted, 0,
+        "the append left space no manager records: {after:?}"
     );
 
     h5clear_accepts(py, &path);
@@ -300,9 +312,12 @@ fn a_crate_created_persisting_file_is_one_libhdf5_accepts() {
     }
 
     let created = h5stat_space(py, &path);
+    // What the creation freed is the alignment fragments before each block;
+    // the managers record every one of them, so nothing in the file is
+    // unaccounted for even before anything is deleted.
     assert_eq!(
-        created.tracked, 0,
-        "nothing was freed while the file was created: {created:?}"
+        created.unaccounted, 0,
+        "the created file leaks space: {created:?}"
     );
     let info = H5File::open(&path)
         .unwrap()
@@ -311,15 +326,25 @@ fn a_crate_created_persisting_file_is_one_libhdf5_accepts() {
         .expect("the created file declares its strategy");
     assert_eq!(info.strategy, FileSpaceStrategy::FsmAggr);
     assert!(info.persist);
+    // `h5clear -s` opens the file read-write and closes it, and libhdf5's own
+    // close drops the managers of a file it did not modify and shrinks the
+    // file over their blocks. The sections they recorded that were not at the
+    // end become libhdf5's own unaccounted space, so the append below is
+    // measured against what libhdf5 left, not against zero.
     h5clear_accepts(py, &path);
+    let cleared = h5stat_space(py, &path);
 
     // The append supersedes the root header and the extension; that is the
     // first free space this file has, and the managers are where it goes.
     crate_appends(&path, "added");
     let appended = h5stat_space(py, &path);
     assert!(
-        appended.tracked > 0,
+        appended.tracked > cleared.tracked,
         "the append recorded nothing: {appended:?}"
+    );
+    assert_eq!(
+        appended.unaccounted, cleared.unaccounted,
+        "the append leaked space on top of the {cleared:?} libhdf5 left"
     );
     h5clear_accepts(py, &path);
     h5py_reads_and_appends(py, &path, "by_libhdf5");
@@ -427,14 +452,22 @@ fn the_paged_fixture_persists_no_manager_to_rewrite() {
         .expect("the paged fixture declares a strategy");
     assert_eq!(info.strategy, FileSpaceStrategy::Page);
     assert!(!info.persist, "the fixture would have managers to read");
-    assert_eq!(h5stat_space(py, &path).tracked, 0);
+    let before = h5stat_space(py, &path);
+    assert_eq!(before.tracked, 0);
 
     crate_appends(&path, "added");
+    let after = h5stat_space(py, &path);
     assert_eq!(
-        h5stat_space(py, &path).tracked,
-        0,
+        after.tracked, 0,
         "a file that persists nothing came back with a manager"
     );
+    // Paged allocation is the file's whether or not it persists managers, so
+    // the append still lands on the page grid and ends the file on it. It
+    // grows by a page: with no managers on disk there is nothing that says
+    // the space the fixture is not using is free, so this session cannot
+    // reuse it any more than libhdf5 could.
+    assert_eq!(after.total % info.page_size, 0, "{after:?}");
+    assert_eq!(after.total, before.total + info.page_size, "{after:?}");
     h5clear_accepts(py, &path);
     // The fixture's own datasets, not the ones the persisting file has.
     let script = format!(
@@ -648,5 +681,227 @@ sorted(f.keys())\n\
         upgraded.version, 1,
         "libhdf5 no longer upgrades a mapped file-space info message"
     );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The same account on a file libhdf5 wrote with paged aggregation.
+///
+/// A paged file's free space is sorted into per-page managers by
+/// `H5MF__alloc_to_fs_type` (H5MF.c:265) rather than the dichotomy's two, and
+/// its allocations are page-shaped: everything below a page is packed into a
+/// page of its own kind and everything at or above one is page-aligned with
+/// the misaligned tail returned to the large manager
+/// (`H5MF__alloc_pagefs`, H5MF.c:858). An append that got any of that wrong
+/// leaves either a section libhdf5 will not take back or bytes nothing
+/// records, and `h5stat -S` names both.
+#[test]
+fn a_crate_append_rewrites_a_paged_files_managers() {
+    let Some(py) = python() else { return };
+    let path = tmp("paged_append");
+    write_persisting_file_with(py, &path, "page");
+
+    let before = h5stat_space(py, &path);
+    assert!(before.tracked > 0, "{before:?} has nothing to reuse");
+    assert_eq!(before.unaccounted, 0, "libhdf5 left the file accounted for");
+    let info = H5File::open(&path)
+        .unwrap()
+        .superblock_extension()
+        .file_space_info
+        .expect("the paged file declares its strategy");
+    assert_eq!(info.strategy, FileSpaceStrategy::Page);
+
+    crate_appends(&path, "added");
+    let after = h5stat_space(py, &path);
+    assert_eq!(
+        after.unaccounted, 0,
+        "the append left space no manager records: {after:?}"
+    );
+    assert!(
+        after.tracked > 0,
+        "the append left the file with no tracked free space: {after:?}"
+    );
+    assert_eq!(
+        after.total % info.page_size,
+        0,
+        "the append left the file off its page grid: {after:?}"
+    );
+
+    h5clear_accepts(py, &path);
+    h5py_reads_and_appends(py, &path, "by_libhdf5");
+
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.dataset_names();
+    names.sort();
+    assert_eq!(names, ["added", "by_libhdf5", "grp/inner", "keep"]);
+    assert_eq!(
+        file.dataset("keep").unwrap().read_raw::<i32>().unwrap(),
+        (0..16).collect::<Vec<i32>>()
+    );
+    assert_eq!(
+        file.dataset("added").unwrap().read_raw::<i32>().unwrap(),
+        (0..8).collect::<Vec<i32>>()
+    );
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The page size the builder names is the one libhdf5 reads back off the file:
+/// a non-default size lays the file out and comes back through the fcpl,
+/// exactly as `H5Pget_file_space_page_size` reports what
+/// `H5Pset_file_space_page_size` set.
+#[test]
+fn a_crate_created_paged_file_keeps_a_non_default_page_size() {
+    let Some(py) = python() else { return };
+    const PAGE: u64 = 8192;
+    let path = tmp("paged_page_size");
+    {
+        let file = H5File::options()
+            .file_space(FileSpaceStrategy::Page, true, 1)
+            .file_space_page_size(PAGE)
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape([16usize])
+            .create("keep")
+            .unwrap()
+            .write_raw(&(0..16i32).collect::<Vec<_>>())
+            .unwrap();
+        file.create_group("grp").unwrap();
+        file.new_dataset::<f64>()
+            .shape([8usize])
+            .create("grp/inner")
+            .unwrap()
+            .write_raw(&(0..8).map(f64::from).collect::<Vec<_>>())
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let created = h5stat_space(py, &path);
+    assert_eq!(
+        created.unaccounted, 0,
+        "the created file leaks space: {created:?}"
+    );
+    assert_eq!(
+        created.total % PAGE,
+        0,
+        "the file ends on one of its {PAGE}-byte pages: {created:?}"
+    );
+    let info = H5File::open(&path)
+        .unwrap()
+        .superblock_extension()
+        .file_space_info
+        .expect("the created file declares its strategy");
+    assert_eq!(info.page_size, PAGE);
+    h5clear_accepts(py, &path);
+
+    let script = format!(
+        "import h5py\n\
+         f = h5py.File(r'{}', 'r')\n\
+         size = f.id.get_create_plist().get_file_space_page_size()\n\
+         assert size == {PAGE}, size\n\
+         assert list(f['keep'][:]) == list(range(16)), list(f['keep'][:])\n\
+         assert list(f['grp/inner'][:]) == list(range(8)), list(f['grp/inner'][:])\n\
+         f.close()\n",
+        path.display()
+    );
+    run(py, &["-c", &script], "h5py page-size read-back");
+
+    h5py_reads_and_appends(py, &path, "by_libhdf5");
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.dataset_names();
+    names.sort();
+    assert_eq!(names, ["by_libhdf5", "grp/inner", "keep"]);
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `H5Pset_file_space_page_size` refuses a size below 512 outright
+/// (H5Pfcpl.c:1389); this crate's builder cannot fail on the call itself, so
+/// the same bound is enforced where the file is made.
+#[test]
+fn a_page_size_below_the_library_minimum_is_refused() {
+    let path = tmp("paged_page_size_small");
+    let Err(err) = H5File::options()
+        .file_space(FileSpaceStrategy::Page, true, 1)
+        .file_space_page_size(256)
+        .create(&path)
+    else {
+        panic!("a 256-byte file-space page was accepted");
+    };
+    assert!(
+        format!("{err}").contains("between 512 bytes and 1073741824"),
+        "{err}"
+    );
+    assert!(
+        !path.exists() || std::fs::metadata(&path).unwrap().len() == 0,
+        "a refused create left a file behind"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A paged file this crate creates is one libhdf5 opens, appends to and finds
+/// fully accounted for.
+#[test]
+fn a_crate_created_paged_file_is_one_libhdf5_accepts() {
+    let Some(py) = python() else { return };
+    let path = tmp("paged_created");
+    {
+        let file = H5File::options()
+            .file_space(FileSpaceStrategy::Page, true, 1)
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape([16usize])
+            .create("keep")
+            .unwrap()
+            .write_raw(&(0..16i32).collect::<Vec<_>>())
+            .unwrap();
+        file.create_group("grp").unwrap();
+        file.new_dataset::<f64>()
+            .shape([8usize])
+            .create("grp/inner")
+            .unwrap()
+            .write_raw(&(0..8).map(f64::from).collect::<Vec<_>>())
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let created = h5stat_space(py, &path);
+    assert_eq!(
+        created.unaccounted, 0,
+        "the created paged file leaks space: {created:?}"
+    );
+    let info = H5File::open(&path)
+        .unwrap()
+        .superblock_extension()
+        .file_space_info
+        .expect("the created file declares its strategy");
+    assert_eq!(info.strategy, FileSpaceStrategy::Page);
+    assert!(info.persist);
+    assert_eq!(
+        created.total % info.page_size,
+        0,
+        "a paged file ends on a page boundary: {created:?}"
+    );
+    // As in `a_crate_created_persisting_file_is_one_libhdf5_accepts`, libhdf5's
+    // own close drops the managers of a file it did not modify, so the append
+    // is measured against what `h5clear -s` left rather than against zero.
+    h5clear_accepts(py, &path);
+    let cleared = h5stat_space(py, &path);
+
+    crate_appends(&path, "added");
+    let appended = h5stat_space(py, &path);
+    assert_eq!(
+        appended.unaccounted, cleared.unaccounted,
+        "the append leaked space on top of the {cleared:?} libhdf5 left"
+    );
+    h5clear_accepts(py, &path);
+    h5py_reads_and_appends(py, &path, "by_libhdf5");
+
+    let file = H5File::open(&path).unwrap();
+    let mut names = file.dataset_names();
+    names.sort();
+    assert_eq!(names, ["added", "by_libhdf5", "grp/inner", "keep"]);
+    drop(file);
     let _ = std::fs::remove_file(&path);
 }

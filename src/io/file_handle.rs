@@ -326,6 +326,23 @@ impl FileHandle {
     pub fn file_size(&self) -> std::io::Result<u64> {
         Ok(self.file.metadata()?.len().saturating_sub(self.base))
     }
+
+    /// Set the file's length to `eof` in this handle's address space —
+    /// `H5FD_truncate`, which every close calls so the file on disk ends where
+    /// the superblock says the address space does.
+    ///
+    /// A file shorter than its recorded end of file is one libhdf5 refuses as
+    /// truncated (`H5F__super_read`, H5Fsuper.c:573); a longer one has bytes
+    /// no structure in it accounts for, which is what `h5stat -S` reports as
+    /// unaccounted space. Both are closed here rather than by a rule that
+    /// every allocation must be written, which nothing can enforce.
+    pub fn set_eof(&self, eof: u64) -> std::io::Result<()> {
+        let want = eof + self.base;
+        if self.file.metadata()?.len() != want {
+            self.file.set_len(want)?;
+        }
+        Ok(())
+    }
 }
 
 /// Write all of `data` to `file` starting at `offset` using a positioned

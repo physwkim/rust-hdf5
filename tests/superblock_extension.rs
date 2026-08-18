@@ -386,10 +386,11 @@ fn the_rewritten_symbol_table_is_sized_by_the_files_k_ranks() {
 }
 
 /// A file whose extension carries persisted free-space managers: the message
-/// names twelve manager addresses, and the append neither drops it nor
-/// allocates over what it points at.
+/// names twelve manager addresses, and the append rewrites the managers it
+/// points at while every other property of the message stays what the file was
+/// created with.
 #[test]
-fn a_paged_file_keeps_its_persisted_free_space_managers() {
+fn a_paged_file_rewrites_its_persisted_free_space_managers() {
     let path = copy_fixture("sbext_paged.h5", "paged");
     let before = H5File::open(&path).unwrap().superblock_extension();
     let fs = before.file_space_info.clone().expect("file space info");
@@ -399,7 +400,16 @@ fn a_paged_file_keeps_its_persisted_free_space_managers() {
     append_dataset(&path, "appended");
 
     let file = H5File::open(&path).unwrap();
-    assert_eq!(file.superblock_extension(), before);
+    let after = file
+        .superblock_extension()
+        .file_space_info
+        .expect("file space info");
+    assert_eq!(after.strategy, fs.strategy);
+    assert_eq!(after.persist, fs.persist);
+    assert_eq!(after.threshold, fs.threshold);
+    assert_eq!(after.page_size, fs.page_size);
+    assert_eq!(after.fs_addr.len(), fs.fs_addr.len());
+    assert_ne!(after.fs_addr, fs.fs_addr, "the managers were not rewritten");
     drop(file);
     if let Some(text) = tool_output("h5dump", &["-pBH", path.to_str().unwrap()]) {
         assert!(

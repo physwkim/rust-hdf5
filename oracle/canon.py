@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Canonical h5py-side dump of an HDF5 file — the reference half of the oracle.
 
-Emits the `!canon 6` format described in oracle/CANON.md. The rust-hdf5 side
+Emits the `!canon 7` format described in oracle/CANON.md. The rust-hdf5 side
 (`src/bin/oracle_probe.rs`, `dump` subcommand) emits the same format from the
 same file, so the two are comparable line by line and field by field.
 
@@ -25,7 +25,7 @@ import hdf5env  # noqa: F401  (must precede h5py; see the module docstring)
 import h5py
 from h5py import h5d, h5o, h5p, h5s, h5t
 
-CANON_VERSION = "6"
+CANON_VERSION = "7"
 RAW_LIMIT = 1024
 MAX_DEPTH = 32
 
@@ -881,21 +881,28 @@ _FS_STRATEGY_NAMES = {0: "fsmaggr", 1: "page", 2: "aggr", 3: "none"}
 
 
 def fspace_str(path):
-    """The `fspace` field: `<strategy>/<persist>/<threshold>`.
+    """The `fspace` field: `<strategy>/<persist>/<threshold>/<page size>`.
 
     Read from the file creation property list, which `H5F__super_read` fills
     from the on-disk file-space info message when the file carries one and
     leaves at the library defaults (`H5F_FILE_SPACE_STRATEGY_DEF` = FSM_AGGR,
-    no persist, threshold 1) when it does not. That is the same question the
-    rust side answers from the message itself, so a file without the message
-    reports the defaults on both sides.
+    no persist, threshold 1, page size 4096) when it does not. That is the
+    same question the rust side answers from the message itself, so a file
+    without the message reports the defaults on both sides.
+
+    All four are here because all four are what `H5F__super_init` compares
+    against those defaults to decide whether the file needs the message at
+    all: a file differing only in its page size still carries one.
     """
     with h5py.File(path, "r") as f:
-        strategy, persist, threshold = f.id.get_create_plist().get_file_space_strategy()
-    return "%s/%s/%d" % (
+        plist = f.id.get_create_plist()
+        strategy, persist, threshold = plist.get_file_space_strategy()
+        page_size = plist.get_file_space_page_size()
+    return "%s/%s/%d/%d" % (
         _FS_STRATEGY_NAMES.get(strategy, "unknown(%d)" % strategy),
         "true" if persist else "false",
         threshold,
+        page_size,
     )
 
 

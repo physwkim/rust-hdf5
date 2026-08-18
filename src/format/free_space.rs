@@ -18,6 +18,9 @@
 
 use crate::format::bytes::read_le_uint as read_uint;
 use crate::format::checksum::checksum_metadata;
+use crate::format::messages::superblock_ext::{
+    FileSpaceInfoMessage, FileSpaceStrategy, PAGE_SIZE_MIN,
+};
 use crate::format::{FormatContext, FormatError, FormatResult};
 
 /// Free-space header signature (`H5FS_HDR_MAGIC`).
@@ -33,8 +36,16 @@ const FS_VERSION: u8 = 0;
 pub const CLIENT_FILE: u8 = 1;
 
 /// `H5MF_FSPACE_SECT_SIMPLE`: the section class a non-paged file uses for
-/// every section. The paged strategy's `SMALL` and `LARGE` classes are 1 and 2.
+/// every section.
 pub const SECT_CLASS_SIMPLE: u8 = 0;
+
+/// `H5MF_FSPACE_SECT_SMALL`: a paged file's section shorter than one page,
+/// which by construction lies inside a single page.
+pub const SECT_CLASS_SMALL: u8 = 1;
+
+/// `H5MF_FSPACE_SECT_LARGE`: a paged file's section at least one page long,
+/// and the remainder left when one is carved down.
+pub const SECT_CLASS_LARGE: u8 = 2;
 
 /// Section classes `H5MF__create_fstype` registers, and so the count every
 /// manager the file client owns declares.
@@ -110,19 +121,123 @@ pub enum FreeSpaceClass {
 }
 
 impl FreeSpaceClass {
-    /// Both managers, in `fs_addr` order.
+    /// Both classes, in `fs_addr` order.
     pub const ALL: [Self; 2] = [Self::Metadata, Self::RawData];
+}
+
+/// One of a file's free-space managers: the `H5F_mem_page_t` that
+/// `H5MF__alloc_to_fs_type` (H5MF.c:265) maps a request to.
+///
+/// Under every strategy but paged aggregation the mapping is
+/// `H5MF_ALLOC_TO_FS_AGGR_TYPE` alone, so the manager *is* the
+/// [`FreeSpaceClass`] and only the first two variants occur. Paged aggregation
+/// adds a size test: a request at least one page long goes to the large
+/// manager whatever it holds, because the sec2 driver declares no
+/// `H5FD_FEAT_PAGED_AGGR` and the mapping therefore collapses every large
+/// request onto `H5F_MEM_PAGE_GENERIC`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FreeSpaceManager {
+    /// `H5F_MEM_PAGE_SUPER` (= `H5F_MEM_PAGE_META`), and `H5FD_MEM_SUPER` when
+    /// the file is not paged.
+    Metadata,
+    /// `H5F_MEM_PAGE_DRAW`, and `H5FD_MEM_DRAW` when the file is not paged.
+    RawData,
+    /// `H5F_MEM_PAGE_GENERIC` (= `H5F_MEM_PAGE_LARGE_SUPER`): every request of
+    /// at least one page, metadata and raw data alike. Paged files only.
+    Large,
+}
+
+impl FreeSpaceManager {
+    /// Every manager a paged file can have, in `fs_addr` order.
+    pub const ALL: [Self; 3] = [Self::Metadata, Self::RawData, Self::Large];
 
     /// Which slot of the file-space info message names this manager.
     ///
     /// `H5F__super_read` copies `fsinfo.fs_addr[u - 1]` into
     /// `f->shared->fs_addr[u]` (H5Fsuper.c:831-833), so message slot `i` is the
-    /// manager for `H5FD_mem_t` value `i + 1`: `H5FD_MEM_SUPER` is 1 and lands
-    /// in slot 0, `H5FD_MEM_DRAW` is 3 and lands in slot 2.
+    /// manager for enum value `i + 1`. Unpaged, that enum is `H5FD_mem_t`:
+    /// `H5FD_MEM_SUPER` is 1 and lands in slot 0, `H5FD_MEM_DRAW` is 3 and
+    /// lands in slot 2. Paged, it is `H5F_mem_page_t`, whose first six values
+    /// are the same six in the same order, and whose `H5F_MEM_PAGE_GENERIC` is
+    /// 7 and lands in slot 6.
     pub fn message_slot(self) -> usize {
         match self {
             Self::Metadata => 0,
             Self::RawData => 2,
+            Self::Large => 6,
+        }
+    }
+
+    /// The manager a message slot names, or `None` for a slot no file this
+    /// crate writes for ever fills.
+    pub fn from_message_slot(slot: usize) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.message_slot() == slot)
+    }
+}
+
+/// How a file's file-space strategy maps requests onto managers and pages.
+///
+/// The one place the paged rules and the unpaged ones differ, so a caller that
+/// holds a policy needs no strategy test of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpacePolicy {
+    /// `H5F_FSPACE_STRATEGY_FSM_AGGR`, `_AGGR` and `_NONE`: one manager per
+    /// allocation class, no page structure, `H5MF_FSPACE_SECT_SIMPLE`
+    /// throughout.
+    Aggr,
+    /// `H5F_FSPACE_STRATEGY_PAGE`, with the file's file-space page size.
+    Paged {
+        /// `f->shared->fs_page_size`.
+        page: u64,
+    },
+}
+
+impl SpacePolicy {
+    /// The policy a file's file-space info message declares.
+    ///
+    /// `H5Pset_file_space_page_size` refuses anything below
+    /// `H5F_FILE_SPACE_PAGE_SIZE_MIN` and the message decoder refuses a zero,
+    /// so the guard here is unreachable from a file on disk; it is what keeps
+    /// the page arithmetic below total for a message built in memory.
+    pub fn for_message(info: &FileSpaceInfoMessage) -> Self {
+        match info.strategy {
+            FileSpaceStrategy::Page if info.page_size >= PAGE_SIZE_MIN => Self::Paged {
+                page: info.page_size,
+            },
+            _ => Self::Aggr,
+        }
+    }
+
+    /// The page size, for a paged file only.
+    pub fn page(self) -> Option<u64> {
+        match self {
+            Self::Aggr => None,
+            Self::Paged { page } => Some(page),
+        }
+    }
+
+    /// `H5MF__alloc_to_fs_type`: which manager a request of `size` bytes for
+    /// `class` belongs to, and so which manager a block of that size freed as
+    /// `class` goes back into (`H5MF_xfree` asks the same question).
+    pub fn manager(self, class: FreeSpaceClass, size: u64) -> FreeSpaceManager {
+        match self {
+            Self::Paged { page } if size >= page => FreeSpaceManager::Large,
+            _ => match class {
+                FreeSpaceClass::Metadata => FreeSpaceManager::Metadata,
+                FreeSpaceClass::RawData => FreeSpaceManager::RawData,
+            },
+        }
+    }
+
+    /// `H5MF_SECT_CLASS_TYPE` (H5MFpkg.h:57), asked of a manager rather than
+    /// of a size: a section's class and the manager holding it are decided by
+    /// the same page-size test, and a section carved down below a page keeps
+    /// the class of the manager it stayed in.
+    pub fn section_class(self, manager: FreeSpaceManager) -> u8 {
+        match (self, manager) {
+            (Self::Aggr, _) => SECT_CLASS_SIMPLE,
+            (Self::Paged { .. }, FreeSpaceManager::Large) => SECT_CLASS_LARGE,
+            (Self::Paged { .. }, _) => SECT_CLASS_SMALL,
         }
     }
 }
@@ -459,33 +574,30 @@ pub fn decode_sections(
     Ok(sections)
 }
 
-/// Merge `blocks` into one address-ordered section list with adjacent regions
-/// coalesced — `H5FS__sect_merge`'s effect on a set of `(addr, len)` pairs.
+/// Check that no two of `blocks` claim the same bytes.
 ///
-/// Overlap is a contradiction rather than something to merge over: two callers
-/// each believing they own the same bytes is what the caller must not do, so
-/// it is reported instead of being papered over.
-pub fn merge_sections(blocks: &[(u64, u64)]) -> Result<Vec<FreeSection>, String> {
+/// Overlap is a contradiction rather than something to merge over: two
+/// managers, or two sections of one, each believing they own a byte is a file
+/// this crate must not read as if it were consistent.
+///
+/// Coalescing the adjacent ones is deliberately not done here.
+/// `H5FS__sect_merge` runs per manager, and on a paged file two adjacent small
+/// sections still refuse to merge unless they sit in the same page
+/// (`H5MF__sect_small_can_merge`, H5MFsection.c:684-686) — rules that belong
+/// to the allocator, which knows the file's strategy, not to the on-disk
+/// format.
+pub fn check_disjoint(blocks: &[(u64, u64)]) -> Result<(), String> {
     let mut sorted: Vec<(u64, u64)> = blocks.iter().copied().filter(|b| b.1 > 0).collect();
     sorted.sort_unstable();
-    let mut merged: Vec<FreeSection> = Vec::with_capacity(sorted.len());
-    for (addr, len) in sorted {
-        match merged.last_mut() {
-            Some(last) if last.addr + last.len == addr => last.len += len,
-            Some(last) if last.addr + last.len > addr => {
-                return Err(format!(
-                    "free block {addr:#x}+{len} overlaps {:#x}+{}",
-                    last.addr, last.len
-                ))
-            }
-            _ => merged.push(FreeSection {
-                addr,
-                len,
-                class: SECT_CLASS_SIMPLE,
-            }),
+    for pair in sorted.windows(2) {
+        let ((addr, len), (next, next_len)) = (pair[0], pair[1]);
+        if addr + len > next {
+            return Err(format!(
+                "free block {next:#x}+{next_len} overlaps {addr:#x}+{len}"
+            ));
         }
     }
-    Ok(merged)
+    Ok(())
 }
 
 fn verify_checksum(buf: &[u8], what: &str) -> FormatResult<()> {
@@ -639,24 +751,10 @@ mod tests {
     }
 
     #[test]
-    fn merge_coalesces_adjacent_blocks_and_rejects_overlap() {
-        assert_eq!(
-            merge_sections(&[(64, 16), (16, 16), (32, 32), (200, 8)]).unwrap(),
-            vec![
-                FreeSection {
-                    addr: 16,
-                    len: 64,
-                    class: SECT_CLASS_SIMPLE
-                },
-                FreeSection {
-                    addr: 200,
-                    len: 8,
-                    class: SECT_CLASS_SIMPLE
-                },
-            ]
-        );
-        assert!(merge_sections(&[(16, 32), (32, 8)]).is_err());
-        assert!(merge_sections(&[(16, 0)]).unwrap().is_empty());
+    fn disjoint_accepts_adjacent_blocks_and_rejects_overlapping_ones() {
+        assert!(check_disjoint(&[(64, 16), (16, 16), (32, 32), (200, 8)]).is_ok());
+        assert!(check_disjoint(&[(16, 32), (32, 8)]).is_err());
+        assert!(check_disjoint(&[(16, 0), (16, 8)]).is_ok());
     }
 
     #[test]

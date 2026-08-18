@@ -22,7 +22,9 @@ use crate::format::chunk_index::fixed_array::{
 use crate::format::creation_order::CreationOrder;
 use crate::format::dense_attr::build_dense_attributes;
 use crate::format::dense_link::build_dense_links;
-use crate::format::free_space::{self, FreeSection, FreeSpaceClass, FreeSpaceHeader};
+use crate::format::free_space::{
+    self, FreeSection, FreeSpaceClass, FreeSpaceHeader, FreeSpaceManager,
+};
 use crate::format::local_heap::{
     local_heap_header_size, LocalHeapHeader, LocalHeapImage, LOCAL_HEAP_FREE_NULL,
 };
@@ -45,7 +47,7 @@ use crate::format::messages::link::{CharacterSet, LinkMessage, LinkTarget};
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::superblock_ext::{
     FileSpaceInfoMessage, FileSpaceStrategy, SharedMessageTableMessage,
-    DEFAULT_FILE_SPACE_PAGE_SIZE, FS_ADDR_COUNT_V1,
+    DEFAULT_FILE_SPACE_PAGE_SIZE, FS_ADDR_COUNT_V1, PAGE_SIZE_MAX, PAGE_SIZE_MIN,
 };
 use crate::format::messages::virtual_mapping::{
     parse_source_name, VirtualMapping, VirtualMappingList,
@@ -3277,53 +3279,43 @@ struct FileSpaceState {
 }
 
 impl FileSpaceState {
-    /// Whether this file keeps free-space managers on disk. The two
-    /// non-manager strategies and `persist: false` all still carry the
-    /// message; they just have nothing to write into it.
+    /// Whether this file keeps free-space managers on disk. Both strategies
+    /// that have managers do — paged aggregation has the same managers plus a
+    /// large one — while the two aggregator-only strategies and
+    /// `persist: false` still carry the message with nothing to write into it.
     fn records_free_space(&self) -> bool {
-        self.info.persist && self.info.strategy == FileSpaceStrategy::FsmAggr
+        self.info.persist
+            && matches!(
+                self.info.strategy,
+                FileSpaceStrategy::FsmAggr | FileSpaceStrategy::Page
+            )
     }
 }
 
-/// Where one free-space manager's own two blocks go, and what it records.
+/// One free-space manager that has been given its own two blocks, and the
+/// sections it will write into them.
 ///
-/// An address is `None` when nothing free was big enough and the block has to
-/// come from past the end of the file; the caller allocates those in the order
-/// [`settle_free_space_managers`](Hdf5Writer::settle_free_space_managers)
-/// carved them.
-struct ManagerLayout {
-    /// The sections this manager records once every manager's own blocks are
-    /// out of them, in serialization order. Empty when the manager has nothing
-    /// to record, which is when it gets no address at all
-    /// (`H5MF__close_delete_fstype`).
-    sections: Vec<FreeSection>,
-    /// Header block address, or `None` for one past the end of the file.
-    hdr_addr: Option<u64>,
-    /// Sections block address, on the same terms.
-    sect_addr: Option<u64>,
-    /// Bytes the sections image needs, which is also the block's size.
+/// Produced by
+/// [`settle_free_space_managers`](Hdf5Writer::settle_free_space_managers).
+/// Both blocks are ordinary allocations out of the same [`FileAllocator`] the
+/// rest of the file uses, because upstream's are too:
+/// `H5FS_vfd_alloc_hdr_and_section_info_if_needed` calls `H5MF_alloc`
+/// (H5FSsection.c:2352, 2406).
+struct PlacedManager {
+    /// Which of the file's managers this is; its message slot names it in the
+    /// file-space info message.
+    manager: FreeSpaceManager,
+    /// Header block address.
+    hdr_addr: u64,
+    /// Sections block address.
+    sect_addr: u64,
+    /// Bytes the sections block occupies. What the header records as both
+    /// `sect_size` and `alloc_sect_size`, so an image shorter than the block
+    /// is padded rather than reported short.
     sect_size: u64,
-}
-
-/// Both managers a non-paged file can have, in the order they settle.
-struct FsmLayout {
-    /// `H5FD_MEM_DRAW`, settled first: its own two blocks are metadata
-    /// allocations, so they come out of the other manager's sections.
-    raw_data: ManagerLayout,
-    /// `H5FD_MEM_SUPER`, settled second, having funded all four blocks.
-    metadata: ManagerLayout,
-}
-
-impl FsmLayout {
-    /// The managers with something to record, paired with their class.
-    fn written(&self) -> impl Iterator<Item = (FreeSpaceClass, &ManagerLayout)> {
-        [
-            (FreeSpaceClass::RawData, &self.raw_data),
-            (FreeSpaceClass::Metadata, &self.metadata),
-        ]
-        .into_iter()
-        .filter(|(_, m)| !m.sections.is_empty())
-    }
+    /// The sections this manager records, in serialization order. Filled on
+    /// the settling round, once no allocation can change them.
+    sections: Vec<FreeSection>,
 }
 
 /// The manager header for `sections`, before its own blocks have addresses.
@@ -3350,25 +3342,6 @@ fn manager_header(sections: &[FreeSection]) -> FreeSpaceHeader {
         sect_size: 0,
         alloc_sect_size: 0,
     }
-}
-
-/// Take `size` bytes out of the best-fitting section, or report that nothing
-/// fits — `H5MF_alloc`'s order, and the file allocator's own.
-fn carve(sections: &mut Vec<FreeSection>, size: u64) -> Option<u64> {
-    let pos = sections
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.len >= size)
-        .min_by_key(|(_, s)| (s.len, s.addr))
-        .map(|(i, _)| i)?;
-    let taken = sections[pos];
-    if taken.len > size {
-        sections[pos].addr += size;
-        sections[pos].len -= size;
-    } else {
-        sections.remove(pos);
-    }
-    Some(taken.addr)
 }
 
 impl Default for CarriedExtension {
@@ -3840,14 +3813,15 @@ pub struct FileCreateOptions {
     pub file_space: FileSpaceConfig,
 }
 
-/// The file-space handling properties a new file is created with —
-/// `H5Pset_file_space_strategy`'s three arguments.
+/// The file-space handling properties a new file is created with — the three
+/// arguments of `H5Pset_file_space_strategy` and the one of
+/// `H5Pset_file_space_page_size`.
 ///
-/// The page size (`H5Pset_file_space_page_size`) is the fourth property
-/// `H5F__super_init` reads and is not here: it only means anything under the
-/// paged strategy, which [`validate`](Self::validate) refuses, so it stays at
-/// libhdf5's default of 4096 and reaches the file only as the value the
-/// message must carry.
+/// The four together are what `H5F__super_init` compares against the library
+/// defaults to decide whether the file needs a file-space info message at all
+/// (H5Fsuper.c:1092-1097), which is why the page size belongs here even though
+/// only paged aggregation allocates by it: a file that names a page size and
+/// nothing else still carries the message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileSpaceConfig {
     /// `H5F_fspace_strategy_t`.
@@ -3857,16 +3831,22 @@ pub struct FileSpaceConfig {
     /// The smallest section a manager records; a block freed below it is
     /// space the file leaks rather than tracks.
     pub threshold: u64,
+    /// `H5Pset_file_space_page_size`: the file-space page every allocation of
+    /// a paged file is shaped by, and the value the message carries whatever
+    /// the strategy.
+    pub page_size: u64,
 }
 
 impl Default for FileSpaceConfig {
-    /// `H5F_FILE_SPACE_STRATEGY_DEF`, `H5F_FREE_SPACE_PERSIST_DEF` and
-    /// `H5F_FREE_SPACE_THRESHOLD_DEF` (H5Fprivate.h:326-332).
+    /// `H5F_FILE_SPACE_STRATEGY_DEF`, `H5F_FREE_SPACE_PERSIST_DEF`,
+    /// `H5F_FREE_SPACE_THRESHOLD_DEF` and `H5F_FILE_SPACE_PAGE_SIZE_DEF`
+    /// (H5Fprivate.h:326-336).
     fn default() -> Self {
         Self {
             strategy: FileSpaceStrategy::FsmAggr,
             persist: false,
             threshold: 1,
+            page_size: DEFAULT_FILE_SPACE_PAGE_SIZE,
         }
     }
 }
@@ -3889,7 +3869,21 @@ impl FileSpaceConfig {
             } else {
                 Self::default().threshold
             },
+            ..Self::default()
         }
+    }
+
+    /// `H5Pset_file_space_page_size`, the fourth file-space property and the
+    /// one libhdf5 sets on its own call.
+    ///
+    /// Independent of the strategy, as upstream is: the value reaches the
+    /// file-space info message whatever the strategy is, and only paged
+    /// aggregation allocates by it. Out-of-range sizes are refused where the
+    /// file is created ([`validate`](Self::validate)) rather than here, so a
+    /// builder chain stays a builder chain.
+    pub fn with_page_size(mut self, page_size: u64) -> Self {
+        self.page_size = page_size;
+        self
     }
 
     /// Whether the file has to say any of this on disk. `H5F__super_init`
@@ -3902,20 +3896,22 @@ impl FileSpaceConfig {
     }
 
     /// Refuse what this writer cannot make. `H5Pset_file_space_strategy`
-    /// itself only refuses a strategy outside the enum (H5Pfcpl.c:1223); the
-    /// paged refusal is this crate's, and is by name because a paged file is a
-    /// different allocator — page-aligned allocations whose misaligned tail is
-    /// returned to one of twelve page-typed managers
-    /// (`H5MF__alloc_pagefs`, H5MF.c:858) — not a different message.
+    /// itself only refuses a strategy outside the enum (H5Pfcpl.c:1223), and
+    /// `H5Pset_file_space_page_size` a page size outside `[512, 1 GiB]`
+    /// (H5Pfcpl.c:1389-1393) — no power of two required, only the bounds.
     fn validate(&self) -> IoResult<()> {
+        if !(PAGE_SIZE_MIN..=PAGE_SIZE_MAX).contains(&self.page_size) {
+            return Err(crate::io::IoError::InvalidState(format!(
+                "a file-space page size is between {PAGE_SIZE_MIN} bytes and \
+                 {PAGE_SIZE_MAX}, not {}",
+                self.page_size
+            )));
+        }
         match self.strategy {
-            FileSpaceStrategy::FsmAggr | FileSpaceStrategy::Aggr | FileSpaceStrategy::None => {
-                Ok(())
-            }
-            FileSpaceStrategy::Page => Err(crate::io::IoError::InvalidState(
-                "the paged file-space strategy is not implemented: it allocates on                  file-space page boundaries and sorts free sections into twelve                  page-typed managers, neither of which this writer models"
-                    .into(),
-            )),
+            FileSpaceStrategy::FsmAggr
+            | FileSpaceStrategy::Aggr
+            | FileSpaceStrategy::None
+            | FileSpaceStrategy::Page => Ok(()),
             FileSpaceStrategy::Unknown(b) => Err(crate::io::IoError::InvalidState(format!(
                 "invalid file-space strategy {b}"
             ))),
@@ -3934,7 +3930,7 @@ impl FileSpaceConfig {
             strategy: self.strategy,
             persist: self.persist,
             threshold: self.threshold,
-            page_size: DEFAULT_FILE_SPACE_PAGE_SIZE,
+            page_size: self.page_size,
             pgend_meta_thres: 0,
             eoa_pre_fsm_fsalloc: UNDEF_ADDR,
             fs_addr: vec![UNDEF_ADDR; FS_ADDR_COUNT_V1],
@@ -4292,6 +4288,20 @@ impl Hdf5Writer {
                  search offset from {MIN_USERBLOCK}, so no other size can hold one"
             )));
         }
+        let policy = free_space::SpacePolicy::for_message(&file_space.message());
+        // `H5F__super_init` (H5Fsuper.c:1182-1192) refuses a userblock that is
+        // not a whole number of allocation units, which for a paged file is
+        // the file-space page: everything after the userblock is addressed
+        // from its end, so a userblock that is not a page multiple would put
+        // every page boundary off the file's own grid.
+        if let Some(page) = policy.page() {
+            if userblock != 0 && userblock % page != 0 {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "a paged file's userblock is a multiple of its {page}-byte \
+                     file-space page, not {userblock}"
+                )));
+            }
+        }
         let mut handle = FileHandle::create_with_locking(path, locking)?;
         if userblock != 0 {
             // Written while the handle is still unbased, so offset 0 is the
@@ -4343,7 +4353,15 @@ impl Hdf5Writer {
             }
             _ => SuperblockV2V3::size_for(ctx.sizeof_addr),
         };
-        let allocator = FileAllocator::new(superblock_size as u64);
+        // The superblock is an ordinary allocation, not a reservation: under
+        // paged aggregation it takes the whole of page zero and leaves the
+        // rest of that page as a section of the metadata manager, which is
+        // what `H5F__super_init` gets from `H5MF_alloc(f, H5FD_MEM_SUPER, ...)`
+        // going through `H5MF__alloc_pagefs`. Unpaged it returns offset zero
+        // and moves the end of the file to `superblock_size`, which is what
+        // reserving it did.
+        let allocator = FileAllocator::with_policy(0, policy);
+        allocator.allocate(superblock_size as u64, FreeSpaceClass::Metadata);
 
         Ok(Self {
             handle,
@@ -5029,11 +5047,7 @@ impl Hdf5Writer {
     ///
     /// Returns `None` — nothing read, nothing to write back — for a file with
     /// no file-space info message, one that does not persist, and one whose
-    /// strategy is paged aggregation. The paged strategy sorts sections into
-    /// twelve page-typed managers under `H5MF_ALLOC_TO_FS_TYPE`'s rules and
-    /// aligns its allocations on the file-space page, which this writer does
-    /// not model; reading its managers without honouring those rules would let
-    /// the close write back a section set the paged allocator cannot use.
+    /// strategy keeps no managers at all.
     fn reopen_free_space(
         handle: &mut FileHandle,
         meta: &crate::io::FileMeta,
@@ -5046,7 +5060,10 @@ impl Hdf5Writer {
         let Some(info) = ext.file_space_info.as_ref().filter(|i| i.persist) else {
             return Ok(none());
         };
-        if info.strategy != FileSpaceStrategy::FsmAggr {
+        if !matches!(
+            info.strategy,
+            FileSpaceStrategy::FsmAggr | FileSpaceStrategy::Page
+        ) {
             return Ok(none());
         }
         let found = crate::io::free_space_io::read_managers(handle, &meta.ctx, info)?;
@@ -5602,7 +5619,17 @@ impl Hdf5Writer {
             creation_seq += 1;
         }
 
-        let allocator = FileAllocator::new(file_size);
+        // The strategy is the file's, not this session's: a paged file
+        // allocates on its own page grid however it was opened, `persist`
+        // deciding only whether the managers survive the close.
+        let allocator = FileAllocator::with_policy(
+            file_size,
+            ext.file_space_info
+                .as_ref()
+                .map_or(free_space::SpacePolicy::Aggr, |info| {
+                    free_space::SpacePolicy::for_message(info)
+                }),
+        );
         // The sections the file's own managers recorded are free space, so
         // they are what this session allocates from first — `H5MF_alloc` asks
         // the free-space manager before it bumps the end of the file, and a
@@ -8313,7 +8340,7 @@ impl Hdf5Writer {
                 continue;
             }
             let dense = build_dense_links(&links, &self.ctx, order, &mut |len| {
-                self.allocator.allocate(len)
+                self.allocator.allocate(len, FreeSpaceClass::Metadata)
             })?;
             for block in &dense.blocks {
                 self.handle.write_at(block.addr, &block.image)?;
@@ -8754,7 +8781,7 @@ impl Hdf5Writer {
                 continue;
             }
             let dense = build_dense_attributes(&attributes, &self.ctx, order, &mut |len| {
-                self.allocator.allocate(len)
+                self.allocator.allocate(len, FreeSpaceClass::Metadata)
             })?;
             for block in &dense.blocks {
                 self.handle.write_at(block.addr, &block.image)?;
@@ -8945,8 +8972,9 @@ impl Hdf5Writer {
         for (addr, len) in std::mem::take(&mut *sohm.superseded.lock()) {
             self.allocator.free(addr, len, FreeSpaceClass::Metadata);
         }
-        let built =
-            build_shared_messages(&indexes, &self.ctx, &mut |len| self.allocator.allocate(len))?;
+        let built = build_shared_messages(&indexes, &self.ctx, &mut |len| {
+            self.allocator.allocate(len, FreeSpaceClass::Metadata)
+        })?;
         for block in &built.blocks {
             self.handle.write_at(block.addr, &block.image)?;
         }
@@ -8968,7 +8996,7 @@ impl Hdf5Writer {
     /// allocated after this point would land in space a manager still claims.
     ///
     /// INVARIANT: from the moment this returns, every byte the allocator holds
-    /// free is a byte the sections block records, and the two blocks the
+    /// free is a byte some sections block records, and the two blocks each
     /// manager itself occupies are held by neither. Nothing may allocate
     /// between here and the superblock write; `write_object_headers` writes
     /// over blocks reserved in an earlier phase and is the only thing that
@@ -8989,194 +9017,190 @@ impl Hdf5Writer {
             return Ok(Some(fs.info.encode(&self.ctx)?));
         }
         // The managers a reopen found are superseded whole by the ones below,
-        // so their blocks go back before the section set is taken: the space
-        // the old manager occupied is free space the new one records, and the
-        // new one may be laid out in it.
+        // so their blocks go back before anything is laid out: the space the
+        // old manager occupied is free space the new one records, and the new
+        // one may be laid out in it.
         for &(addr, len) in &fs.superseded {
             self.allocator.free(addr, len, FreeSpaceClass::Metadata);
         }
-        // Out of the allocator entirely while the layout is chosen: the
-        // manager's own blocks come out of this set, and nothing else may be
-        // handed a byte of it in the meantime. The list already holds what the
-        // reopen read as well as what this session released, and the allocator
-        // merged the two as it went — `H5FS__sect_merge`'s rule, so a block
-        // freed against a section the file already had is one section here
-        // rather than two.
-        let free = self.allocator.take_all_free();
-        let mut sets = Vec::new();
-        for class in FreeSpaceClass::ALL {
-            let blocks: Vec<(u64, u64)> = free
-                .iter()
-                .filter(|b| b.class == class)
-                .map(|b| (b.addr, b.len))
-                .collect();
-            let mut sections = free_space::merge_sections(&blocks).map_err(|why| {
-                crate::io::IoError::InvalidState(format!(
-                    "this session freed overlapping blocks: {why}"
-                ))
-            })?;
-            // `H5FS_sect_add` refuses a section below the file's threshold, so
-            // a block smaller than it is space the file leaks rather than
-            // records — the same trade the threshold is there to make.
-            sections.retain(|s| s.len >= fs.info.threshold);
-            sets.push(sections);
-        }
-        let (metadata, raw_data) = (&sets[0], &sets[1]);
 
-        let layout = Self::settle_free_space_managers(metadata, raw_data, &self.ctx);
         let hdr_size = FreeSpaceHeader::encoded_size(&self.ctx) as u64;
+        let settled = self.settle_free_space_managers(hdr_size, fs.info.threshold)?;
+
         let mut info = fs.info.clone();
         info.fs_addr = vec![UNDEF_ADDR; info.fs_addr.len()];
-
-        // Each manager's two blocks in the order the layout carved them, so an
-        // address it left open comes from past the end of the file, where the
-        // allocator now has nothing to reuse.
-        let mut remaining: Vec<FreeBlock> = Vec::new();
-        for (class, manager) in layout.written() {
-            let hdr_addr = match manager.hdr_addr {
-                Some(addr) => addr,
-                None => self.allocator.allocate_at_end(hdr_size),
-            };
-            let sect_addr = match manager.sect_addr {
-                Some(addr) => addr,
-                None => self.allocator.allocate_at_end(manager.sect_size),
-            };
-
-            let mut header = manager_header(&manager.sections);
-            // The layout's own rounds sized the block; that the encode agrees
-            // is the invariant that makes `sect_size` a length a reader can
-            // trust.
-            let needed = free_space::sinfo_encoded_size(&header, &manager.sections, &self.ctx);
-            if needed > manager.sect_size {
+        for placed in &settled {
+            let mut header = manager_header(&placed.sections);
+            // The settle loop sized the block; that the encode agrees is the
+            // invariant that makes `sect_size` a length a reader can trust.
+            let needed = free_space::sinfo_encoded_size(&header, &placed.sections, &self.ctx);
+            if needed > placed.sect_size {
                 return Err(crate::io::IoError::InvalidState(format!(
                     "the free-space sections need {needed} bytes, not the {} laid out",
-                    manager.sect_size
+                    placed.sect_size
                 )));
             }
-            header.sect_addr = sect_addr;
-            header.sect_size = manager.sect_size;
-            header.alloc_sect_size = manager.sect_size;
+            header.sect_addr = placed.sect_addr;
+            header.sect_size = placed.sect_size;
+            header.alloc_sect_size = placed.sect_size;
             self.handle.write_at(
-                sect_addr,
+                placed.sect_addr,
                 &free_space::encode_sections(
                     &header,
-                    hdr_addr,
-                    &manager.sections,
-                    manager.sect_size as usize,
+                    placed.hdr_addr,
+                    &placed.sections,
+                    placed.sect_size as usize,
                     &self.ctx,
                 ),
             )?;
-            self.handle.write_at(hdr_addr, &header.encode(&self.ctx))?;
+            self.handle
+                .write_at(placed.hdr_addr, &header.encode(&self.ctx))?;
             // `H5MF__close_delete_fstype` leaves a manager with no sections
             // without an address, so only the ones written name themselves.
-            info.fs_addr[class.message_slot()] = hdr_addr;
-            remaining.extend(manager.sections.iter().map(|s| FreeBlock {
-                addr: s.addr,
-                len: s.len,
-                class,
-            }));
+            info.fs_addr[placed.manager.message_slot()] = placed.hdr_addr;
         }
-
-        // What the layouts left over is the file's free space, and the blocks
-        // just written are not part of it.
-        self.allocator.reset_free_list(&remaining);
         info.eoa_pre_fsm_fsalloc = self.allocator.eof();
         Ok(Some(info.encode(&self.ctx)?))
     }
 
-    /// Choose where each manager's own two blocks go, given the sections they
-    /// are about to record.
+    /// The file's free space as each manager will record it: address-ordered
+    /// per manager, tagged with the section class that manager writes, and
+    /// with everything below `threshold` left out.
     ///
-    /// Self-referential, which is the whole difficulty: a manager's header and
-    /// sections block come out of the sections a manager records, and taking
-    /// them changes the set, which changes how many bytes the sections block
-    /// needs. Upstream reruns its allocation pass until no manager allocates
-    /// anything further (`H5MF__continue_alloc_fsm`); this reruns the layout
-    /// until a round's carve leaves the size it was planned for. The fallback
-    /// terminates by construction: placing the blocks past the end of the file
-    /// leaves the section sets untouched, so the sizes computed from them are
-    /// exact.
-    ///
-    /// All four blocks come out of the *metadata* set. `H5FD_MEM_FSPACE_HDR`
-    /// and `H5FD_MEM_FSPACE_SINFO` are `H5FD_MEM_OHDR` and `H5FD_MEM_LHEAP`
-    /// (H5FDdevelop.h:75-80), so even the raw-data manager's own blocks are
-    /// metadata allocations — which is exactly why upstream settles the
-    /// raw-data manager first and the metadata managers second (H5C.c:689-696,
-    /// and `H5MF_settle_raw_data_fsm`'s own prologue). The raw-data set is
-    /// therefore untouched by the layout and its section block's size is exact
-    /// from the first round.
-    fn settle_free_space_managers(
-        metadata: &[FreeSection],
-        raw_data: &[FreeSection],
-        ctx: &FormatContext,
-    ) -> FsmLayout {
-        /// Rounds before the layout is placed past the end of the file
-        /// instead. A round changes the plan only by adding or removing a
-        /// section or a distinct size, so two or three settle it in practice.
-        const ROUNDS: usize = 8;
-
-        let hdr_size = FreeSpaceHeader::encoded_size(ctx) as u64;
-        let size_of =
-            |set: &[FreeSection]| free_space::sinfo_encoded_size(&manager_header(set), set, ctx);
-
-        let raw = free_space::serialization_order(raw_data);
-        let meta = free_space::serialization_order(metadata);
-        let raw_sect_size = if raw.is_empty() { 0 } else { size_of(&raw) };
-        let build = |raw_hdr,
-                     raw_sect,
-                     meta_sections: Vec<FreeSection>,
-                     meta_hdr,
-                     meta_sect,
-                     meta_sect_size| FsmLayout {
-            raw_data: ManagerLayout {
-                sections: raw.clone(),
-                hdr_addr: raw_hdr,
-                sect_addr: raw_sect,
-                sect_size: raw_sect_size,
-            },
-            metadata: ManagerLayout {
-                sections: meta_sections,
-                hdr_addr: meta_hdr,
-                sect_addr: meta_sect,
-                sect_size: meta_sect_size,
-            },
-        };
-        if meta.is_empty() {
-            // Nothing metadata-side to fund any block: whatever the raw-data
-            // manager needs comes from past the end of the file.
-            return build(None, None, meta, None, None, 0);
-        }
-
-        let mut meta_sect_size = size_of(&meta);
-        for _ in 0..ROUNDS {
-            let mut trial = meta.clone();
-            // Raw first, in `H5MF_settle_raw_data_fsm`'s order.
-            let (raw_hdr, raw_sect) = if raw.is_empty() {
-                (None, None)
-            } else {
-                (
-                    carve(&mut trial, hdr_size),
-                    carve(&mut trial, raw_sect_size),
-                )
-            };
-            let meta_hdr = carve(&mut trial, hdr_size);
-            let meta_sect = carve(&mut trial, meta_sect_size);
-            let trial = free_space::serialization_order(&trial);
-            let next = size_of(&trial);
-            if next == meta_sect_size {
-                return build(
-                    raw_hdr,
-                    raw_sect,
-                    trial,
-                    meta_hdr,
-                    meta_sect,
-                    meta_sect_size,
-                );
+    /// The allocator is the single owner of merging — `H5FS__sect_merge`'s
+    /// rules, per manager and, on a paged file, per page — so nothing merges
+    /// here; overlap is checked because two overlapping sections would be a
+    /// manager claiming space another structure holds.
+    fn free_sections(&self, threshold: u64) -> IoResult<Vec<(FreeSpaceManager, Vec<FreeSection>)>> {
+        let policy = self.allocator.policy();
+        let extents = self.allocator.free_extents();
+        let mut sets = Vec::new();
+        for manager in FreeSpaceManager::ALL {
+            let mut sections: Vec<FreeSection> = extents
+                .iter()
+                .filter(|b| b.manager == manager)
+                // `H5FS_sect_add` refuses a section below the file's
+                // threshold, so a block smaller than it is space the file
+                // leaks rather than records — the same trade the threshold is
+                // there to make.
+                .filter(|b| b.len >= threshold)
+                .map(|b| FreeSection {
+                    addr: b.addr,
+                    len: b.len,
+                    class: policy.section_class(manager),
+                })
+                .collect();
+            sections.sort_unstable_by_key(|s| s.addr);
+            if let Some(bad) = sections
+                .windows(2)
+                .find(|w| w[0].addr + w[0].len > w[1].addr)
+            {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "this session freed overlapping blocks: {:#x}+{} overlaps {:#x}",
+                    bad[0].addr, bad[0].len, bad[1].addr
+                )));
             }
-            meta_sect_size = next;
+            sets.push((manager, sections));
         }
-        let meta_sect_size = size_of(&meta);
-        build(None, None, meta, None, None, meta_sect_size)
+        Ok(sets)
+    }
+
+    /// Give every manager that records anything its own header and sections
+    /// blocks, and return what each will write.
+    ///
+    /// Self-referential, which is the whole difficulty: a manager's two blocks
+    /// come out of the free space the managers record, and taking them changes
+    /// that space, which changes how many bytes the sections block needs.
+    /// Upstream reruns the allocation pass until no manager allocates anything
+    /// further — the `do { ... } while (continue_alloc_fsm)` loop in
+    /// `H5MF_settle_meta_data_fsm` (H5MF.c:3213-3247) around
+    /// `H5FS_vfd_alloc_hdr_and_section_info_if_needed`, which allocates
+    /// through `H5MF_alloc` like everything else. So does this: the blocks
+    /// come out of the same [`FileAllocator`], under the same strategy, so a
+    /// paged file's manager blocks land in pages and their page remainders are
+    /// recorded like any others.
+    ///
+    /// Two rules make it terminate. A manager, once placed, stays placed: were
+    /// its blocks released because its sections had been consumed, freeing
+    /// them would put those sections back and the next round would place it
+    /// again. And a sections block only ever grows: upstream frees a block
+    /// that turned out too small and reallocates it next round
+    /// (H5FSsection.c:2418-2423), and a size that only rises reaches its
+    /// bound.
+    fn settle_free_space_managers(
+        &self,
+        hdr_size: u64,
+        threshold: u64,
+    ) -> IoResult<Vec<PlacedManager>> {
+        /// Rounds before the layout is called divergent. A round either places
+        /// a manager or grows one sections block, and there are three
+        /// managers, so a file that needs more than this is not converging.
+        const ROUNDS: usize = 16;
+
+        // Raw data first and metadata last, in `H5MF_settle_raw_data_fsm`'s
+        // order (H5C.c:689-696): every manager's own blocks are metadata
+        // allocations, so the metadata manager funds all of them and is the
+        // one whose section set the others change.
+        const ORDER: [FreeSpaceManager; 3] = [
+            FreeSpaceManager::RawData,
+            FreeSpaceManager::Large,
+            FreeSpaceManager::Metadata,
+        ];
+
+        let size_of = |sections: &[FreeSection]| {
+            let ordered = free_space::serialization_order(sections);
+            free_space::sinfo_encoded_size(&manager_header(&ordered), &ordered, &self.ctx)
+        };
+        let mut placed: Vec<PlacedManager> = Vec::new();
+        for _ in 0..ROUNDS {
+            let sets = self.free_sections(threshold)?;
+            let sections_of = |manager: FreeSpaceManager| {
+                sets.iter()
+                    .find(|(m, _)| *m == manager)
+                    .map(|(_, s)| s.as_slice())
+                    .unwrap_or_default()
+            };
+
+            let mut changed = false;
+            for manager in ORDER {
+                let sections = sections_of(manager);
+                if sections.is_empty() || placed.iter().any(|p| p.manager == manager) {
+                    continue;
+                }
+                let sect_size = size_of(sections);
+                let hdr_addr = self.allocator.allocate(hdr_size, FreeSpaceClass::Metadata);
+                let sect_addr = self.allocator.allocate(sect_size, FreeSpaceClass::Metadata);
+                placed.push(PlacedManager {
+                    manager,
+                    hdr_addr,
+                    sect_addr,
+                    sect_size,
+                    sections: Vec::new(),
+                });
+                changed = true;
+            }
+            if !changed {
+                for p in &mut placed {
+                    let needed = size_of(sections_of(p.manager));
+                    if needed > p.sect_size {
+                        self.allocator
+                            .free(p.sect_addr, p.sect_size, FreeSpaceClass::Metadata);
+                        p.sect_size = needed;
+                        p.sect_addr = self.allocator.allocate(needed, FreeSpaceClass::Metadata);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                for p in &mut placed {
+                    p.sections = free_space::serialization_order(sections_of(p.manager));
+                }
+                return Ok(placed);
+            }
+        }
+        Err(crate::io::IoError::InvalidState(format!(
+            "the free-space managers did not settle in {ROUNDS} rounds"
+        )))
     }
 
     /// Write the file's superblock extension, and the sole owner of that
@@ -9266,7 +9290,9 @@ impl Hdf5Writer {
         for &(addr, len) in &self.extension.superseded {
             self.allocator.free(addr, len, FreeSpaceClass::Metadata);
         }
-        let addr = self.allocator.allocate(image.len() as u64);
+        let addr = self
+            .allocator
+            .allocate(image.len() as u64, FreeSpaceClass::Metadata);
 
         // Every block of this file now has an address, so the allocator holds
         // exactly the file's free space: settle the free-space managers over
@@ -9324,7 +9350,7 @@ impl Hdf5Writer {
 
         // Allocate space for the raw data.
         let data_addr = if data_size > 0 {
-            self.allocator.allocate(data_size)
+            self.allocator.allocate(data_size, FreeSpaceClass::RawData)
         } else {
             UNDEF_ADDR
         };
@@ -9510,10 +9536,13 @@ impl Hdf5Writer {
         let sa = self.ctx.sizeof_addr as usize;
         let ss = self.ctx.sizeof_size as usize;
         let heap_bytes = heap.as_bytes().to_vec();
-        let heap_addr = self
+        let heap_addr = self.allocator.allocate(
+            local_heap_header_size(sa, ss) as u64,
+            FreeSpaceClass::Metadata,
+        );
+        let heap_data_addr = self
             .allocator
-            .allocate(local_heap_header_size(sa, ss) as u64);
-        let heap_data_addr = self.allocator.allocate(heap_bytes.len() as u64);
+            .allocate(heap_bytes.len() as u64, FreeSpaceClass::Metadata);
         let heap_hdr = LocalHeapHeader {
             data_size: heap_bytes.len() as u64,
             // Sized to hold exactly these names, so no block of it is free.
@@ -9853,7 +9882,9 @@ impl Hdf5Writer {
 
         // Allocate and write EA header (placeholder, will be updated)
         let hdr_encoded = ea_header.encode(&self.ctx);
-        let ea_header_addr = self.allocator.allocate(hdr_encoded.len() as u64);
+        let ea_header_addr = self
+            .allocator
+            .allocate(hdr_encoded.len() as u64, FreeSpaceClass::Metadata);
 
         // Create EA index block with pre-allocated super block address slots
         let ea_iblk = ExtensibleArrayIndexBlock::new(
@@ -9865,7 +9896,9 @@ impl Hdf5Writer {
 
         // Allocate and write EA index block
         let iblk_encoded = ea_iblk.encode(&self.ctx);
-        let ea_iblk_addr = self.allocator.allocate(iblk_encoded.len() as u64);
+        let ea_iblk_addr = self
+            .allocator
+            .allocate(iblk_encoded.len() as u64, FreeSpaceClass::Metadata);
 
         // Update header with index block address
         ea_header.idx_blk_addr = ea_iblk_addr;
@@ -10093,9 +10126,9 @@ impl Hdf5Writer {
                 if !self.swmr_active {
                     self.allocator.free(addr, len, FreeSpaceClass::RawData);
                 }
-                self.allocator.allocate(new_len)
+                self.allocator.allocate(new_len, FreeSpaceClass::RawData)
             }
-            _ => self.allocator.allocate(new_len),
+            _ => self.allocator.allocate(new_len, FreeSpaceClass::RawData),
         }
     }
 
@@ -10245,7 +10278,9 @@ impl Hdf5Writer {
                             ndblks_in_sblk,
                         );
                         let enc = sb.encode(&self.ctx, max_nelmts_bits);
-                        sblk_addr = self.allocator.allocate(enc.len() as u64);
+                        sblk_addr = self
+                            .allocator
+                            .allocate(enc.len() as u64, FreeSpaceClass::Metadata);
                         self.handle.write_at(sblk_addr, &enc)?;
                         let c = m.chunked.as_mut().unwrap();
                         if is_filtered {
@@ -10303,7 +10338,9 @@ impl Hdf5Writer {
                 dblk.elements[loc.offset_in_dblk as usize] = entry;
                 let enc = dblk.encode(&self.ctx, max_nelmts_bits, chunk_size_len);
                 if created {
-                    dblk_addr = self.allocator.allocate(enc.len() as u64);
+                    dblk_addr = self
+                        .allocator
+                        .allocate(enc.len() as u64, FreeSpaceClass::Metadata);
                 }
                 self.handle.write_at(dblk_addr, &enc)?;
                 if created {
@@ -10332,7 +10369,9 @@ impl Hdf5Writer {
                 dblk.elements[loc.offset_in_dblk as usize] = chunk_addr;
                 let enc = dblk.encode(&self.ctx, max_nelmts_bits);
                 if created {
-                    dblk_addr = self.allocator.allocate(enc.len() as u64);
+                    dblk_addr = self
+                        .allocator
+                        .allocate(enc.len() as u64, FreeSpaceClass::Metadata);
                 }
                 self.handle.write_at(dblk_addr, &enc)?;
                 if created {
@@ -10975,7 +11014,9 @@ impl Hdf5Writer {
                 i += 1;
             }
             let encoded = gcol.encode(&self.ctx);
-            let addr = self.allocator.allocate(encoded.len() as u64);
+            let addr = self
+                .allocator
+                .allocate(encoded.len() as u64, FreeSpaceClass::RawData);
             self.handle.write_at(addr, &encoded)?;
             for idx in 1..=next_idx {
                 placements.push((addr, idx));
@@ -11034,9 +11075,12 @@ impl Hdf5Writer {
             }
             let new_need = size.max(want.saturating_sub(free));
             if size + new_need > GCOL_MAX_SIZE
-                || !self
-                    .allocator
-                    .try_extend(addr, size as u64, new_need as u64)
+                || !self.allocator.try_extend(
+                    addr,
+                    size as u64,
+                    new_need as u64,
+                    FreeSpaceClass::RawData,
+                )
             {
                 pos += 1;
                 continue;
@@ -11096,7 +11140,9 @@ impl Hdf5Writer {
         }
 
         // Allocate and write raw data
-        let data_addr = self.allocator.allocate(data_size as u64);
+        let data_addr = self
+            .allocator
+            .allocate(data_size as u64, FreeSpaceClass::RawData);
         self.handle.write_at(data_addr, &raw_data)?;
 
         // Create the dataset with vlen string datatype
@@ -11220,7 +11266,9 @@ impl Hdf5Writer {
         }
 
         // Allocate and write raw data.
-        let data_addr = self.allocator.allocate(data_size as u64);
+        let data_addr = self
+            .allocator
+            .allocate(data_size as u64, FreeSpaceClass::RawData);
         self.handle.write_at(data_addr, &raw_data)?;
 
         let datatype = DatatypeMessage::VarLenSequence {
@@ -11336,7 +11384,9 @@ impl Hdf5Writer {
         ea_header.max_dblk_page_nelmts_bits = earray_params.max_dblk_page_nelmts_bits;
 
         let hdr_encoded = ea_header.encode(&self.ctx);
-        let ea_header_addr = self.allocator.allocate(hdr_encoded.len() as u64);
+        let ea_header_addr = self
+            .allocator
+            .allocate(hdr_encoded.len() as u64, FreeSpaceClass::Metadata);
 
         // Create filtered index block
         let filt_iblk = FilteredIndexBlock::new(
@@ -11346,7 +11396,9 @@ impl Hdf5Writer {
             nsblk_addrs,
         );
         let iblk_encoded = filt_iblk.encode(&self.ctx, chunk_size_len);
-        let ea_iblk_addr = self.allocator.allocate(iblk_encoded.len() as u64);
+        let ea_iblk_addr = self
+            .allocator
+            .allocate(iblk_encoded.len() as u64, FreeSpaceClass::Metadata);
 
         ea_header.idx_blk_addr = ea_iblk_addr;
 
@@ -12917,7 +12969,9 @@ impl Hdf5Writer {
             FixedArrayHeader::new_for_chunks(&self.ctx, num_chunks)
         };
         let hdr_encoded = fa_header.encode(&self.ctx);
-        let fa_header_addr = self.allocator.allocate(hdr_encoded.len() as u64);
+        let fa_header_addr = self
+            .allocator
+            .allocate(hdr_encoded.len() as u64, FreeSpaceClass::Metadata);
 
         // Create the FA data block. libhdf5 switches to a paged layout once
         // num_elmts exceeds dblk_page_nelmts; both layouts allocate space
@@ -12929,7 +12983,7 @@ impl Hdf5Writer {
             FixedArrayDataBlock::new_unfiltered(fa_header_addr, num_chunks as usize)
         };
         let dblk_size = fixed_array_dblk_disk_size(&self.ctx, &fa_header);
-        let fa_dblk_addr = self.allocator.allocate(dblk_size);
+        let fa_dblk_addr = self.allocator.allocate(dblk_size, FreeSpaceClass::Metadata);
 
         // Update header with data block address
         fa_header.data_blk_addr = fa_dblk_addr;
@@ -13041,7 +13095,7 @@ impl Hdf5Writer {
         // out rather than merely reserved because the file's end-of-file
         // address is what libhdf5 checks a file's completeness against — a
         // reserved-but-absent tail is a truncated file to it.
-        let data_addr = self.allocator.allocate(data_size);
+        let data_addr = self.allocator.allocate(data_size, FreeSpaceClass::RawData);
         self.handle.write_at(
             data_addr,
             &crate::format::messages::fill_value::tiled_fill(data_size as usize, None),
@@ -13132,7 +13186,7 @@ impl Hdf5Writer {
             // bytes are written now, not merely reserved, because the
             // file's end-of-file address is what libhdf5 checks a file's
             // completeness against.
-            let addr = self.allocator.allocate(data_size);
+            let addr = self.allocator.allocate(data_size, FreeSpaceClass::RawData);
             self.handle.write_at(
                 addr,
                 &crate::format::messages::fill_value::tiled_fill(data_size as usize, None),
@@ -13464,7 +13518,9 @@ impl Hdf5Writer {
             Bt2Header::new_for_chunks(&self.ctx, ndims)
         };
         let hdr_encoded = hdr.encode(&self.ctx);
-        let bt2_header_addr = self.allocator.allocate(hdr_encoded.len() as u64);
+        let bt2_header_addr = self
+            .allocator
+            .allocate(hdr_encoded.len() as u64, FreeSpaceClass::Metadata);
         self.handle.write_at(bt2_header_addr, &hdr_encoded)?;
 
         let dataspace = DataspaceMessage {
@@ -13558,7 +13614,9 @@ impl Hdf5Writer {
         ea_header.max_dblk_page_nelmts_bits = earray_params.max_dblk_page_nelmts_bits;
 
         let hdr_encoded = ea_header.encode(&self.ctx);
-        let ea_header_addr = self.allocator.allocate(hdr_encoded.len() as u64);
+        let ea_header_addr = self
+            .allocator
+            .allocate(hdr_encoded.len() as u64, FreeSpaceClass::Metadata);
 
         let filt_iblk = FilteredIndexBlock::new(
             ea_header_addr,
@@ -13567,7 +13625,9 @@ impl Hdf5Writer {
             nsblk_addrs,
         );
         let iblk_encoded = filt_iblk.encode(&self.ctx, chunk_size_len);
-        let ea_iblk_addr = self.allocator.allocate(iblk_encoded.len() as u64);
+        let ea_iblk_addr = self
+            .allocator
+            .allocate(iblk_encoded.len() as u64, FreeSpaceClass::Metadata);
 
         ea_header.idx_blk_addr = ea_iblk_addr;
         let hdr_encoded = ea_header.encode(&self.ctx);
@@ -14991,7 +15051,10 @@ impl Hdf5Writer {
             let tree = bt2.index.build_tree(&self.ctx);
             let mut node_addrs = bt2.node_addrs.clone();
             while node_addrs.len() < tree.nodes.len() {
-                node_addrs.push(self.allocator.allocate(tree.node_size as u64));
+                node_addrs.push(
+                    self.allocator
+                        .allocate(tree.node_size as u64, FreeSpaceClass::Metadata),
+                );
             }
             // A tree with fewer nodes than last flush releases the surplus
             // rather than leaving it recorded and unreachable, so the pool is
@@ -15037,7 +15100,7 @@ impl Hdf5Writer {
             let node_size = tree.node_size() as u64;
             let mut node_addrs = bt1.node_addrs.clone();
             while node_addrs.len() < tree.node_count() {
-                node_addrs.push(self.allocator.allocate(node_size));
+                node_addrs.push(self.allocator.allocate(node_size, FreeSpaceClass::Metadata));
             }
             // A tree with fewer nodes than last flush releases the surplus
             // straight away, where the v2 B-tree has to keep it out of the
@@ -15389,6 +15452,7 @@ impl Hdf5Writer {
 
         // 4. Write superblock with SWMR flags.
         self.write_superblock(FLAG_WRITE_ACCESS | FLAG_SWMR_WRITE)?;
+        self.handle.set_eof(self.allocator.eof())?;
 
         self.handle.sync_all()?;
         // Readers can now be following this file, so a chunk that moves must
@@ -15570,6 +15634,13 @@ impl Hdf5Writer {
         // 5. Write superblock at offset 0.
         self.write_superblock(0)?;
 
+        // 6. End the file where its address space ends (`H5FD_truncate`, which
+        // `H5F__dest` calls on every close). Allocated-but-unwritten space at
+        // the end would otherwise leave the file shorter than the end-of-file
+        // address the superblock just recorded, which libhdf5 reads as a
+        // truncated file.
+        self.handle.set_eof(self.allocator.eof())?;
+
         // Durability is opt-in per call: `close` passes `true`, `close_no_sync`
         // passes `false`, and `Drop` passes `true` so an un-`close`d writer is
         // still finalized durably by default.
@@ -15607,7 +15678,9 @@ impl Hdf5Writer {
             let rc = self.object_link_count(HardLinkTarget::Dataset(i));
             let header = self.build_dataset_header(i)?;
             let size = self.header_encoded_size(&header, rc, self.dataset_header_format(i))?;
-            let addr = self.allocator.allocate(size as u64);
+            let addr = self
+                .allocator
+                .allocate(size as u64, FreeSpaceClass::Metadata);
             self.ds(i).lock().obj_header_addr = addr;
             layout.datasets.push((i, addr, size));
         }
@@ -15618,14 +15691,18 @@ impl Hdf5Writer {
             let rc = self.object_link_count(HardLinkTarget::Group(gi));
             let header = self.build_group_header(gi)?;
             let size = self.header_encoded_size(&header, rc, self.group_header_format(gi))?;
-            let addr = self.allocator.allocate(size as u64);
+            let addr = self
+                .allocator
+                .allocate(size as u64, FreeSpaceClass::Metadata);
             self.grp(gi).lock().obj_header_addr = addr;
             layout.groups.push((gi, addr, size));
         }
         let header = self.build_root_group_header()?;
         let size =
             self.header_encoded_size(&header, 1, self.header_format(self.root_track_order))?;
-        let addr = self.allocator.allocate(size as u64);
+        let addr = self
+            .allocator
+            .allocate(size as u64, FreeSpaceClass::Metadata);
         self.root_group_addr = Some(addr);
         layout.root = (addr, size);
         Ok(layout)
@@ -15948,7 +16025,9 @@ impl Hdf5Writer {
                 continue;
             }
             let encoded = self.build_committed_datatype_header(i, rc).encode()?;
-            let addr = self.allocator.allocate(encoded.len() as u64);
+            let addr = self
+                .allocator
+                .allocate(encoded.len() as u64, FreeSpaceClass::Metadata);
             self.handle.write_at(addr, &encoded)?;
             self.committed_datatypes.lock()[i].obj_header_addr = addr;
         }
@@ -16561,7 +16640,9 @@ mod tests {
         img.extend_from_slice(&8u64.to_le_bytes()); // data size
         img.extend_from_slice(b"deadbeef");
         assert_eq!(img.len(), 40);
-        let addr = writer.allocator.allocate(img.len() as u64);
+        let addr = writer
+            .allocator
+            .allocate(img.len() as u64, FreeSpaceClass::RawData);
         writer.handle.write_at(addr, &img).unwrap();
 
         // The superseded reference names index 2, which the collection does
@@ -16627,9 +16708,9 @@ mod tests {
         let addr = p1[0].0;
         // Land a block right after the collection, pin the file end past
         // it, then release it: extension must use the released space.
-        let spacer = writer.allocator.allocate(8192);
+        let spacer = writer.allocator.allocate(8192, FreeSpaceClass::RawData);
         assert_eq!(spacer, addr + 4096, "spacer not adjacent; layout changed");
-        writer.allocator.allocate(8);
+        writer.allocator.allocate(8, FreeSpaceClass::RawData);
         writer.allocator.free(spacer, 8192, FreeSpaceClass::RawData);
 
         let big = vec![0x42u8; 5000];
@@ -16643,7 +16724,7 @@ mod tests {
 
         // The remainder of the released block is still allocatable.
         assert_eq!(
-            writer.allocator.allocate(4096),
+            writer.allocator.allocate(4096, FreeSpaceClass::RawData),
             addr + 8192,
             "the freed block's tail was lost"
         );
@@ -17579,7 +17660,9 @@ mod tests {
 
         // The surplus went back to the allocator, not on the floor: the next
         // node-sized allocation lands inside the region the two blocks covered.
-        let reused = writer.allocator.allocate(BT2_NODE_SIZE as u64);
+        let reused = writer
+            .allocator
+            .allocate(BT2_NODE_SIZE as u64, FreeSpaceClass::Metadata);
         assert!(
             (grown[1]..grown[1] + 2 * BT2_NODE_SIZE as u64).contains(&reused),
             "a node block allocated at {reused:#x}, outside the freed \
@@ -18778,9 +18861,11 @@ mod tests {
         assert!(info.persist);
         assert_eq!(info.threshold, 1);
         assert_eq!(info.page_size, 4096);
-        // Nothing was freed while the file was created, so it names no
-        // manager yet — `H5F__super_init` writes every address undefined.
-        assert!(info.fs_addr.iter().all(|&a| a == UNDEF_ADDR));
+        // The alignment fragments the creation left behind are the file's
+        // first free space, so the metadata manager already has an address
+        // and the raw-data one, which nothing freed into, does not.
+        assert_ne!(info.fs_addr[0], UNDEF_ADDR);
+        assert!(info.fs_addr.iter().skip(1).all(|&a| a == UNDEF_ADDR));
 
         // An append supersedes the root header and the extension, and that
         // freed space is what the managers now record.
@@ -18859,34 +18944,181 @@ mod tests {
             .clone()
     }
 
-    /// Paged is refused by name rather than half-written.
+    /// A created paged file is laid out on its page grid: the superblock takes
+    /// the whole of page zero and the rest of that page is the metadata
+    /// manager's first section, which is what `H5MF__alloc_pagefs` gives
+    /// `H5F__super_init`'s `H5MF_alloc(f, H5FD_MEM_SUPER, ...)`.
     #[test]
-    fn the_paged_strategy_is_refused_at_creation() {
-        let path = temp_path("fsm_paged_refused");
+    fn a_created_paged_file_lays_its_pages_out() {
+        let path = temp_path("fsm_paged_created");
+        {
+            let w = Hdf5Writer::create_with_options(
+                &path,
+                FileCreateOptions {
+                    file_space: FileSpaceConfig::new(FileSpaceStrategy::Page, true, 1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let i = w
+                .create_dataset("keep", DatatypeMessage::i32_type(), &[8])
+                .unwrap();
+            w.write_dataset_raw(i, &[0u8; 32]).unwrap();
+            w.close().unwrap();
+        }
+        let info = read_only_append(&path)
+            .free_space
+            .as_deref()
+            .expect("the created file declares a strategy")
+            .info
+            .clone();
+        assert_eq!(info.strategy, FileSpaceStrategy::Page);
+        assert!(info.persist);
+        assert_eq!(info.page_size, 4096);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() % info.page_size,
+            0,
+            "a paged file ends on a page boundary"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A userblock has to be a whole number of pages, or every page boundary
+    /// after it is off the file's own grid — `H5F__super_init` refuses one
+    /// that is not (H5Fsuper.c:1182-1192).
+    #[test]
+    fn a_paged_file_refuses_a_userblock_smaller_than_its_page() {
+        let path = temp_path("fsm_paged_userblock");
         let Err(err) = Hdf5Writer::create_with_options(
             &path,
             FileCreateOptions {
                 file_space: FileSpaceConfig::new(FileSpaceStrategy::Page, true, 1),
+                userblock: 512,
                 ..Default::default()
             },
         ) else {
-            panic!("the paged strategy was accepted");
+            panic!("a 512-byte userblock was accepted on a 4096-byte page");
         };
         assert!(
-            format!("{err}").contains("paged file-space strategy is not implemented"),
+            format!("{err}").contains("multiple of its 4096-byte"),
             "{err}"
         );
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The paged strategy sorts sections into twelve page-typed managers and
-    /// aligns its allocations on the file-space page; neither is modelled
-    /// here, so a paged file's managers are left alone.
+    /// A page size the builder names is the page the file is actually laid
+    /// out in, not just a number the message repeats: every allocation is
+    /// shaped by it and the file ends on one of its boundaries.
     #[test]
-    fn a_paged_file_reports_no_managers_to_rewrite() {
+    fn a_file_created_at_a_non_default_page_size_allocates_by_it() {
+        let path = temp_path("fsm_page_size_8k");
+        {
+            let w = Hdf5Writer::create_with_options(
+                &path,
+                FileCreateOptions {
+                    file_space: FileSpaceConfig::new(FileSpaceStrategy::Page, true, 1)
+                        .with_page_size(8192),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let i = w
+                .create_dataset("keep", DatatypeMessage::i32_type(), &[8])
+                .unwrap();
+            w.write_dataset_raw(i, &[0u8; 32]).unwrap();
+            w.close().unwrap();
+        }
+        let info = read_only_append(&path)
+            .free_space
+            .as_deref()
+            .expect("the created file declares a strategy")
+            .info
+            .clone();
+        assert_eq!(info.page_size, 8192);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() % 8192,
+            0,
+            "the file ends on one of the pages it was created with"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The page size is the fourth of the four properties `H5F__super_init`
+    /// compares against the library defaults (H5Fsuper.c:1092-1097), so
+    /// naming it is on its own enough to give a file the message — under the
+    /// default strategy, which allocates without it.
+    #[test]
+    fn a_non_default_page_size_alone_gives_the_file_a_message() {
+        let path = temp_path("fsm_page_size_only");
+        {
+            let w = Hdf5Writer::create_with_options(
+                &path,
+                FileCreateOptions {
+                    file_space: FileSpaceConfig::default().with_page_size(1024),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            w.close().unwrap();
+        }
+        let info = declared_file_space(&path)
+            .expect("a file naming only a page size still carries the message");
+        assert_eq!(info.strategy, FileSpaceStrategy::FsmAggr);
+        assert!(!info.persist);
+        assert_eq!(info.page_size, 1024);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `H5Pset_file_space_page_size` refuses anything below 512 or above
+    /// 1 GiB (H5Pfcpl.c:1389-1393), and nothing between: no power of two is
+    /// required, so a size the bounds admit is one the file may carry.
+    #[test]
+    fn a_page_size_outside_the_library_bounds_is_refused() {
+        for size in [0, 1, 511, PAGE_SIZE_MAX + 1] {
+            let path = temp_path(&format!("fsm_page_size_bad_{size}"));
+            let Err(err) = Hdf5Writer::create_with_options(
+                &path,
+                FileCreateOptions {
+                    file_space: FileSpaceConfig::new(FileSpaceStrategy::Page, true, 1)
+                        .with_page_size(size),
+                    ..Default::default()
+                },
+            ) else {
+                panic!("a {size}-byte file-space page was accepted");
+            };
+            assert!(
+                format!("{err}").contains("between 512 bytes and 1073741824"),
+                "{err}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+        let path = temp_path("fsm_page_size_odd");
+        let w = Hdf5Writer::create_with_options(
+            &path,
+            FileCreateOptions {
+                file_space: FileSpaceConfig::new(FileSpaceStrategy::Page, true, 1)
+                    .with_page_size(513),
+                ..Default::default()
+            },
+        )
+        .expect("513 is inside the bounds, and no power of two is required");
+        w.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A paged file's managers are read on reopen, the same as any other
+    /// file's: paged aggregation changes which manager a request maps to, not
+    /// whether the file has managers to rewrite.
+    #[test]
+    fn a_paged_file_reports_the_managers_it_persists() {
         let path = fixture_copy("fsm_persist_page.h5", "fsm_read_paged");
         let writer = Hdf5Writer::open_append(&path).unwrap();
-        assert!(writer.free_space.is_none());
+        let fs = writer.free_space.as_deref().expect("no managers read");
+        assert_eq!(fs.info.strategy, FileSpaceStrategy::Page);
+        assert!(
+            !writer.allocator.free_extents().is_empty(),
+            "the sections the file records were not put back in circulation"
+        );
         drop(writer);
         let _ = std::fs::remove_file(&path);
     }
@@ -18993,10 +19225,17 @@ mod tests {
             "with the manager rewrite disabled the number must not move"
         );
 
-        // The whole append — dataset, header, rewritten extension and
-        // managers — fits in what the file already held free, so the file
-        // does not grow. Without the reuse it does.
-        assert_eq!(size, original, "the append grew a file that had room");
+        // The new dataset's raw data comes out of the raw-data sections the
+        // file already recorded, so the append grows the file by less than the
+        // same append with the reuse off. It does not stop the growth:
+        // `H5MF_alloc` asks one manager and no other, and of this fixture's
+        // 1910 free bytes 1848 are raw-data ones, so the metadata the append
+        // writes still comes from the end of the file.
+        assert!(
+            size < control_size,
+            "the append took nothing from the {before} bytes free: \
+             {original} grew to {size}, the control to {control_size}"
+        );
         assert!(
             control_size > original,
             "the control has to grow or it proves nothing"
@@ -19043,6 +19282,74 @@ mod tests {
         };
         assert_eq!(internal, reread);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The paged half of
+    /// [`the_manager_records_the_free_list_the_close_ends_with`]: a paged
+    /// file's sections carry a page and a class as well as an address, and a
+    /// section written into the wrong manager or split across a page boundary
+    /// would come back different.
+    #[test]
+    fn the_manager_records_the_free_list_a_paged_close_ends_with() {
+        let path = fixture_copy("fsm_persist_page.h5", "fsm_paged_roundtrip");
+        let internal = {
+            let mut w = Hdf5Writer::open_append(&path).unwrap();
+            let i = w
+                .create_dataset("added", DatatypeMessage::i32_type(), &[8])
+                .unwrap();
+            w.write_dataset_raw(i, &[0u8; 32]).unwrap();
+            w.finalize(true).unwrap();
+            let blocks = w.allocator.free_extents();
+            w.closed = true;
+            blocks
+        };
+        assert!(!internal.is_empty(), "the append freed nothing");
+
+        let reread = {
+            let w = read_only_append(&path);
+            assert!(w.free_space.is_some(), "managers were written");
+            w.allocator.free_extents()
+        };
+        assert_eq!(internal, reread);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Negative control for the paged managers: with the read and the rewrite
+    /// both off — the file as this crate handled a paged file before — the
+    /// space the append frees is recorded nowhere, and the number this crate
+    /// reads back is the fixture's own.
+    #[test]
+    fn a_paged_append_records_nothing_without_the_manager_rewrite() {
+        let path = fixture_copy("fsm_persist_page.h5", "fsm_paged_measured");
+        let control = fixture_copy("fsm_persist_page.h5", "fsm_paged_control");
+        let before = tracked_free_space(&path);
+        let original = std::fs::metadata(&path).unwrap().len();
+
+        append_one(&path, "added", false);
+        append_one(&control, "added", true);
+
+        assert_eq!(
+            tracked_free_space(&control),
+            before,
+            "the control moved the number it is there to hold still"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            original,
+            "the append grew a paged file with {before} bytes recorded free"
+        );
+        assert!(
+            std::fs::metadata(&control).unwrap().len() > original,
+            "the control has to grow or it proves nothing"
+        );
+        assert_ne!(
+            tracked_free_space(&path),
+            before,
+            "the managers came back holding what the fixture wrote"
+        );
+        for p in [&path, &control] {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     /// A block released from a dataset's raw data is recorded by the manager
@@ -19104,7 +19411,7 @@ mod tests {
         let raw: Vec<&FreeBlock> = found
             .sections
             .iter()
-            .filter(|b| b.class == FreeSpaceClass::RawData)
+            .filter(|b| b.manager == FreeSpaceManager::RawData)
             .collect();
         assert!(
             !raw.is_empty(),
@@ -19118,7 +19425,7 @@ mod tests {
             found
                 .sections
                 .iter()
-                .filter(|b| b.class == FreeSpaceClass::Metadata)
+                .filter(|b| b.manager == FreeSpaceManager::Metadata)
                 .all(|b| !inside(b)),
             "raw-data bytes were recorded by the metadata manager"
         );
@@ -19126,37 +19433,86 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A paged file has no manager this writer will rewrite, so its bytes
-    /// outside what the append itself changes must be the fixture's.
+    /// A reopened paged file's managers are this writer's to rewrite, and the
+    /// three the sec2 driver can reach are the only ones it names.
+    ///
+    /// `H5MF__alloc_to_fs_type` (H5MF.c:265) sends a request of at least one
+    /// page to `H5F_MEM_PAGE_GENERIC` unless the driver declares
+    /// `H5FD_FEAT_PAGED_AGGR`, which only the multi and split drivers do, so a
+    /// sec2 file has the dichotomy's two small managers and that one large
+    /// one: message slots 0, 2 and 6.
     #[test]
-    fn a_paged_file_keeps_the_managers_it_came_with() {
+    fn a_paged_file_names_only_the_managers_sec2_can_reach() {
         let path = fixture_copy("fsm_persist_page.h5", "fsm_write_paged");
-        let before = std::fs::read(fixture("fsm_persist_page.h5")).unwrap();
+        assert!(
+            read_only_append(&path).free_space.is_some(),
+            "the paged fixture's managers were not read"
+        );
         append_one(&path, "added", false);
-        let after = std::fs::read(&path).unwrap();
-        // The fixture's own bytes are a prefix of the result: an append that
-        // rewrites headers moves them, so only the manager blocks are checked
-        // — they are where the fixture put them, byte for byte.
-        assert!(read_only_append(&path).free_space.is_none());
-        let managers = paged_manager_blocks(&before);
-        assert!(!managers.is_empty(), "the paged fixture persists managers");
-        for (addr, len) in managers {
-            assert_eq!(
-                after[addr as usize..(addr + len) as usize],
-                before[addr as usize..(addr + len) as usize],
-                "the paged manager at {addr:#x} was rewritten"
-            );
+
+        let mut w = read_only_append(&path);
+        let info = w
+            .free_space
+            .as_deref()
+            .expect("the file persists managers")
+            .info
+            .clone();
+        assert_eq!(info.strategy, FileSpaceStrategy::Page);
+        for (slot, &addr) in info.fs_addr.iter().enumerate() {
+            if !matches!(slot, 0 | 2 | 6) {
+                assert_eq!(addr, UNDEF_ADDR, "slot {slot} names a manager");
+            }
         }
+        assert!(
+            info.fs_addr.iter().any(|&a| a != UNDEF_ADDR),
+            "the rewritten file records nothing free"
+        );
+        crate::io::free_space_io::read_managers(&mut w.handle, &w.ctx, &info).unwrap();
+        drop(w);
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Every `FSHD` block in `image`, found by signature, with its size.
-    fn paged_manager_blocks(image: &[u8]) -> Vec<(u64, u64)> {
-        let size = FreeSpaceHeader::encoded_size(&FormatContext::default_v3()) as u64;
-        (0..image.len().saturating_sub(size as usize))
-            .filter(|&i| image[i..i + 4] == free_space::FSHD_SIGNATURE)
-            .filter(|&i| FreeSpaceHeader::decode(&image[i..], &FormatContext::default_v3()).is_ok())
-            .map(|i| (i as u64, size))
-            .collect()
+    /// Every section a paged file records sits inside one page, and the pages
+    /// its small managers use are pages of their own kind — the invariant
+    /// `H5MF__alloc_pagefs` maintains by giving each small request a whole
+    /// page of its class and recording the rest of it in that class's manager.
+    #[test]
+    fn a_paged_files_small_sections_stay_inside_one_page_of_one_kind() {
+        let path = fixture_copy("fsm_persist_page.h5", "fsm_paged_pages");
+        append_one(&path, "added", false);
+
+        let mut w = read_only_append(&path);
+        let info = w
+            .free_space
+            .as_deref()
+            .expect("the file persists managers")
+            .info
+            .clone();
+        let page = info.page_size;
+        let found = crate::io::free_space_io::read_managers(&mut w.handle, &w.ctx, &info).unwrap();
+        let mut kind_of_page: std::collections::HashMap<u64, FreeSpaceManager> =
+            std::collections::HashMap::new();
+        for section in &found.sections {
+            if section.manager == FreeSpaceManager::Large {
+                continue;
+            }
+            assert_eq!(
+                section.addr / page,
+                (section.addr + section.len - 1) / page,
+                "the section at {:#x} crosses a page boundary",
+                section.addr
+            );
+            let owner = kind_of_page
+                .entry(section.addr / page)
+                .or_insert(section.manager);
+            assert_eq!(
+                *owner,
+                section.manager,
+                "page {} holds sections of two kinds",
+                section.addr / page
+            );
+        }
+        drop(w);
+        let _ = std::fs::remove_file(&path);
     }
 }
