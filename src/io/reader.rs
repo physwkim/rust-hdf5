@@ -96,15 +96,6 @@ enum ChunkTarget<'a> {
 }
 
 impl<'a> ChunkTarget<'a> {
-    /// Dimensions of the produced output buffer: the dataset dims for `Full`,
-    /// the selection extent for `Slice`.
-    fn out_dims(&self, dims: &'a [u64]) -> &'a [u64] {
-        match self {
-            ChunkTarget::Full => dims,
-            ChunkTarget::Slice { counts, .. } => counts,
-        }
-    }
-
     /// Whether a chunk at chunk-grid `coords` (extent `chunk_dims`) intersects
     /// the target. `Full` always intersects; a `Slice` intersects iff every
     /// dimension's chunk span `[origin, origin+chunk_dims)` overlaps the
@@ -2389,12 +2380,6 @@ impl Hdf5Reader {
     /// the file's contents but never its own format version.
     pub fn superblock_version(&self) -> u8 {
         self.superblock_version
-    }
-
-    /// The v1 B-tree split ranks in force for this file, after the superblock
-    /// and the extension's K message have both been applied.
-    pub fn btree_config(&self) -> BTreeV1Config {
-        self.meta.btree
     }
 
     /// Rewrite a path (no leading `/`) into the path of the object it reaches
@@ -5465,13 +5450,6 @@ pub struct ObjectAttributes {
 }
 
 impl ObjectAttributes {
-    /// Whether this object has nothing to say about attributes: none read,
-    /// and no failure to report. An incomplete empty set is *not* empty — the
-    /// reason is the thing worth keeping.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.incomplete.is_none()
-    }
-
     /// Record an attribute this collector could name.
     fn push(&mut self, entry: AttributeEntry) {
         self.entries.push(entry);
@@ -5525,11 +5503,6 @@ impl ObjectAttributes {
     /// without replaying its v1-header/v2-header branch here.
     pub fn header_count(&self, owner: &str) -> IoResult<u64> {
         Ok(self.complete(owner)?.len() as u64)
-    }
-
-    /// Nothing worth recording: no attribute read, and no failure to report.
-    pub(crate) fn is_absent(&self) -> bool {
-        self.entries.is_empty() && self.incomplete.is_none()
     }
 
     /// The entries, once the set is known to be whole.
