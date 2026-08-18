@@ -945,6 +945,12 @@ pub struct Hdf5Reader {
     /// target's map, so the first reader in a chain transitively holds the
     /// whole chain open.
     external: std::collections::BTreeMap<PathBuf, Box<Hdf5Reader>>,
+    /// What each virtual mapping's stored source file name resolved to,
+    /// keyed by that name exactly as the mapping holds it. Separate from
+    /// [`external_resolved`](Self::external_resolved) because the two
+    /// searches read different environment variables and property lists, so
+    /// one name can resolve two ways depending on which named it.
+    vds_resolved: std::collections::BTreeMap<String, PathBuf>,
     /// What each external link's stored file name resolved to, keyed by that
     /// name exactly as the link holds it.
     ///
@@ -1689,6 +1695,7 @@ impl Hdf5Reader {
             external: Default::default(),
             external_resolved: Default::default(),
             virtual_access: Default::default(),
+            vds_resolved: Default::default(),
             // Overwritten by `open_with_locking` once this returns.
             source_dir: PathBuf::new(),
         })
@@ -1775,6 +1782,7 @@ impl Hdf5Reader {
             external: Default::default(),
             external_resolved: Default::default(),
             virtual_access: Default::default(),
+            vds_resolved: Default::default(),
             // Overwritten by `open_with_locking` once this returns.
             source_dir: PathBuf::new(),
         })
@@ -2614,17 +2622,33 @@ impl Hdf5Reader {
         }
     }
 
-    /// Candidate filesystem paths for an external link's target file, in the
-    /// order `H5F_prefix_open_file` tries them: an absolute name as given,
-    /// then each `HDF5_EXT_PREFIX` component, then the directory holding this
-    /// file, then the working directory. An absolute name that does not exist
-    /// falls back to its last component for the later attempts, as the C does.
+    /// Candidate filesystem paths for a file named from inside this one, in
+    /// the order `H5F_prefix_open_file` tries them (H5Fint.c:826-1025):
     ///
-    /// The one step of that order this does not implement is the link-access
-    /// property list's `H5Pset_elink_prefix`, which has no equivalent in this
-    /// crate's API yet; it would sit between the environment variable and this
-    /// file's directory.
-    fn external_candidates(&self, file: &str) -> Vec<PathBuf> {
+    /// 1. an absolute name exactly as given (:854-887) — and if that misses,
+    ///    every later step uses its last component instead, as the C does;
+    /// 2. each `:`-separated component of `env_var`, joined with that name
+    ///    (:889-937);
+    /// 3. `prop_prefix`, the property-list prefix (:938-950);
+    /// 4. the directory of the path this file was opened by — libhdf5's
+    ///    `H5F_EXTPATH` (:952-969);
+    /// 5. the bare relative name, against the process's working directory
+    ///    (:971-977);
+    /// 6. the directory of that path *resolved* — libhdf5's
+    ///    `H5F_ACTUAL_NAME`, which differs from step 4 through a symlink
+    ///    (:979-1004).
+    ///
+    /// Both kinds of cross-file name run this one order and differ only in
+    /// the two parameters: an external link is `H5F_PREFIX_ELINK` with
+    /// `HDF5_EXT_PREFIX` and `H5Pset_elink_prefix` (H5Lexternal.c:210-215),
+    /// a virtual dataset's source is `H5F_PREFIX_VDS` with
+    /// `HDF5_VDS_PREFIX` and `H5Pset_virtual_prefix` (H5Dvirtual.c:877-882).
+    fn prefix_open_candidates(
+        &self,
+        env_var: &str,
+        prop_prefix: Option<&Path>,
+        file: &str,
+    ) -> Vec<PathBuf> {
         let raw = Path::new(file);
         let mut candidates = Vec::new();
         if raw.is_absolute() {
@@ -2636,7 +2660,7 @@ impl Hdf5Reader {
         } else {
             raw
         };
-        if let Ok(prefixes) = std::env::var("HDF5_EXT_PREFIX") {
+        if let Ok(prefixes) = std::env::var(env_var) {
             candidates.extend(
                 prefixes
                     .split(':')
@@ -2644,11 +2668,36 @@ impl Hdf5Reader {
                     .map(|p| Path::new(p).join(base)),
             );
         }
+        if let Some(prefix) = prop_prefix {
+            candidates.push(prefix.join(base));
+        }
         if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
             candidates.push(dir.join(base));
         }
         candidates.push(base.to_path_buf());
+        if !self.source_dir.as_os_str().is_empty() {
+            candidates.push(self.source_dir.join(base));
+        }
         candidates
+    }
+
+    /// [`prefix_open_candidates`](Self::prefix_open_candidates) for an
+    /// external link. The one step this cannot take is the link-access
+    /// property list's `H5Pset_elink_prefix`, which has no equivalent in
+    /// this crate's API yet.
+    fn external_candidates(&self, file: &str) -> Vec<PathBuf> {
+        self.prefix_open_candidates("HDF5_EXT_PREFIX", None, file)
+    }
+
+    /// [`prefix_open_candidates`](Self::prefix_open_candidates) for a
+    /// virtual dataset's source. The property-list step is
+    /// `HDF5_VDS_PREFIX` with `${ORIGIN}` expanded, which is what
+    /// `H5D__build_file_prefix` puts there when the environment names one
+    /// (H5Dint.c:1076-1119); `H5Pset_virtual_prefix`, the property it falls
+    /// back to, has no equivalent in this crate's API yet.
+    fn vds_candidates(&self, file: &str) -> Vec<PathBuf> {
+        let prop = resolve_vdsfile_prefix(&self.source_dir);
+        self.prefix_open_candidates("HDF5_VDS_PREFIX", prop.as_deref(), file)
     }
 
     /// Open one external link's target file, or hand back the handle a
@@ -2729,9 +2778,26 @@ impl Hdf5Reader {
     /// is asked to *try*, and a null source file is "no data there yet",
     /// not a failure.
     fn vds_source_file(&mut self, file_name: &str) -> Option<&mut Hdf5Reader> {
-        let prefix = resolve_vdsfile_prefix(&self.source_dir);
-        let full_path = combine_prefixed_path(prefix.as_deref(), file_name);
-        self.cross_file(full_path).ok()
+        // A name that has resolved once stays resolved, the same way an
+        // external link's does — the handle this reader already holds is the
+        // answer, whatever the filesystem does next. A name that has *not*
+        // resolved is searched again on the next read, which is what the C
+        // does too: it re-runs `H5D__virtual_open_source_dset` whenever the
+        // source dataset is still unopened (H5Dvirtual.c:1421-1423,
+        // :2558-2561).
+        let resolved = match self.vds_resolved.get(file_name) {
+            Some(resolved) => resolved.clone(),
+            None => {
+                let resolved = self
+                    .vds_candidates(file_name)
+                    .into_iter()
+                    .find(|p| p.is_file())?;
+                self.vds_resolved
+                    .insert(file_name.to_string(), resolved.clone());
+                resolved
+            }
+        };
+        self.cross_file(resolved).ok()
     }
 
     /// The reader that owns `name`, the path of `name` inside it, and the last

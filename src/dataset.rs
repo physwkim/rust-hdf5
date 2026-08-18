@@ -9730,6 +9730,55 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// A relatively-named source is found next to the virtual dataset even
+    /// when the process is somewhere else entirely: `H5F_prefix_open_file`
+    /// tries the primary file's `H5F_EXTPATH` — the directory it was opened
+    /// from — before the bare relative name against the working directory
+    /// (H5Fint.c:952-977). Measured against libhdf5 1.14.6 through h5py: a
+    /// `VirtualSource("src.h5", ...)` beside its VDS reads its data with
+    /// `HDF5_VDS_PREFIX` unset and the working directory elsewhere; before
+    /// the reader took that step it read back all fill value.
+    #[test]
+    fn a_relative_source_resolves_next_to_the_virtual_dataset() {
+        use crate::Selection;
+        let dir = std::env::temp_dir().join(format!(
+            "rust_hdf5_vds_beside_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let file = H5File::create(dir.join("src.h5")).unwrap();
+            file.new_dataset::<i32>()
+                .shape([2usize, 4])
+                .create("data")
+                .unwrap()
+                .write_raw(&(0..8i32).collect::<Vec<_>>())
+                .unwrap();
+            file.close().unwrap();
+        }
+        {
+            let file = H5File::create(dir.join("v.h5")).unwrap();
+            file.new_dataset::<i32>()
+                .shape([2usize, 4])
+                .fill_value(-9i32)
+                // Named relatively, as h5py's `VirtualSource("src.h5", ...)`
+                // stores it — nothing in the file says where it lives.
+                .virtual_mapping(Selection::All, "src.h5", "data", Selection::All)
+                .create("v")
+                .unwrap();
+            file.close().unwrap();
+        }
+        // The working directory is the crate root under `cargo test`, not
+        // `dir`, so only the extpath step can find `src.h5`.
+        assert_ne!(std::env::current_dir().unwrap(), dir);
+        let file = H5File::open(dir.join("v.h5")).unwrap();
+        let ds = file.dataset("v").unwrap();
+        assert_eq!(ds.read_raw::<i32>().unwrap(), (0..8i32).collect::<Vec<_>>());
+        drop(file);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The first open of a virtual dataset fixes its access properties for
     /// every open that overlaps it: only the open that finds no shared info
     /// in `H5FO_opened` runs `H5D__open_oid(dataset, dapl_id)`, and a later
