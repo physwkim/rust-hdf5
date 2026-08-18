@@ -8353,7 +8353,20 @@ impl Hdf5Writer {
             info
         });
         header.add_message(MSG_LINK_INFO, 0x00, link_info.encode(&self.ctx));
-        header.add_message(MSG_GROUP_INFO, 0x00, GroupInfoMessage::default().encode());
+        // The link info message takes no flags and the group info message
+        // takes `H5O_MSG_FLAG_CONSTANT`, exactly as `H5G__obj_create_real`
+        // creates the pair (H5Gobj.c:255, :259) and as
+        // `H5G__obj_insert`'s phase change re-creates it (H5Gobj.c:526). The
+        // asymmetry is real: the link info message records the group's
+        // storage and its creation-order counter, both of which change as
+        // links come and go, while the group info message holds the phase
+        // change and estimated-name-length constants of the creation property
+        // list, which nothing after creation rewrites.
+        header.add_message(
+            MSG_GROUP_INFO,
+            MSG_FLAG_CONSTANT,
+            GroupInfoMessage::default().encode(),
+        );
         if dense {
             return;
         }
