@@ -686,29 +686,79 @@ fn reject_printf_source_name(dataset: &str, what: &str, name: &str) -> IoResult<
     Ok(())
 }
 
-/// Refuse an unlimited (`H5S_UNLIMITED`) mapping selection.
+/// The legality checks `H5Pset_virtual` runs over one mapping —
+/// `H5D_virtual_check_mapping_pre` and `H5D_virtual_check_mapping_post`
+/// (H5Dvirtual.c).
 ///
-/// A mapping whose count or block is unlimited grows with its source: libhdf5
-/// clips it against the source dataset's real extent every time the virtual
-/// dataset is opened (`H5D__virtual_set_extent_unlim`), which is a resolution
-/// step this writer does not perform.
-fn reject_unlimited_selection(dataset: &str, which: &str, sel: &Selection) -> IoResult<()> {
-    use crate::format::selection::{Hyperslab, UNLIMITED as SEL_UNLIMITED};
-    let Selection::Hyperslab {
-        form: Hyperslab::Regular(r),
-        ..
-    } = sel
-    else {
-        return Ok(());
-    };
-    if r.count.contains(&SEL_UNLIMITED) || r.block.contains(&SEL_UNLIMITED) {
-        return Err(crate::io::IoError::Unsupported(format!(
-            "virtual dataset '{dataset}' has an unlimited (H5S_UNLIMITED) {which} \
-             selection; such a mapping is clipped against the source's extent every \
-             time the dataset is opened, which this writer does not model"
+/// The two upstream checks that need the *source dataset's* own extent (the
+/// limited/limited element-count match, and a printf mapping's single-block
+/// match) are not run here for the same reason upstream skips them when the
+/// source space status is `H5O_VIRTUAL_STATUS_INVALID`: a mapping may name a
+/// source that does not exist yet, and nothing here opens one.
+fn check_virtual_mapping(dataset: &str, m: &VirtualMapping) -> IoResult<()> {
+    for (which, sel) in [
+        ("virtual", &m.virtual_selection),
+        ("source", &m.source_selection),
+    ] {
+        if matches!(sel, Selection::Points(_)) {
+            return Err(crate::io::IoError::Unsupported(format!(
+                "virtual dataset '{dataset}' has a point {which} selection, which \
+                 H5D_virtual_check_mapping_pre refuses for every virtual dataset mapping \
+                 (\"point selections not currently supported with virtual datasets\")"
+            )));
+        }
+    }
+
+    let unlim_virtual = m.virtual_selection.unlim_dim().is_some();
+    let unlim_source = m.source_selection.unlim_dim().is_some();
+
+    // Both sides unbounded: the mapping grows with its source, so the slices
+    // they exchange must be the same shape whatever either extent becomes.
+    if unlim_virtual && unlim_source {
+        if let (Some(v), Some(sr)) = (
+            regular_hyperslab(&m.virtual_selection),
+            regular_hyperslab(&m.source_selection),
+        ) {
+            let (nv, ns) = (v.num_elem_non_unlim(), sr.num_elem_non_unlim());
+            if nv != ns {
+                return Err(crate::io::IoError::InvalidState(format!(
+                    "virtual dataset '{dataset}' maps an unlimited source selection onto an \
+                     unlimited virtual selection, but a slice of the non-unlimited \
+                     dimensions holds {ns:?} source elements and {nv:?} virtual ones"
+                )));
+            }
+        }
+    }
+
+    // The other half of `H5D_virtual_check_mapping_post`: an unlimited
+    // virtual selection over a limited source selection is the printf shape,
+    // where each block of the virtual selection is filled by a *different*
+    // source dataset named by substitution. Without a `%b` in either source
+    // name there is no second dataset for the second block, and upstream
+    // refuses the mapping outright.
+    if unlim_virtual && !unlim_source {
+        return Err(crate::io::IoError::InvalidState(format!(
+            "virtual dataset '{dataset}' has an unlimited virtual selection over a limited \
+             source selection, which H5D_virtual_check_mapping_post only accepts with a \
+             printf substitution in a source name (\"unlimited virtual selection, limited \
+             source selection, and no printf specifiers in source names\") — and a printf \
+             source name is refused here"
         )));
     }
     Ok(())
+}
+
+/// The regular (start, stride, count, block) form behind a selection, or
+/// `None` — the only form that can carry `H5S_UNLIMITED`, so every unlimited
+/// check goes through it.
+fn regular_hyperslab(sel: &Selection) -> Option<&crate::format::selection::RegularHyperslab> {
+    match sel {
+        Selection::Hyperslab {
+            form: crate::format::selection::Hyperslab::Regular(r),
+            ..
+        } => Some(r),
+        _ => None,
+    }
 }
 
 fn virtual_write_refused() -> crate::io::IoError {
@@ -8618,16 +8668,19 @@ impl Hdf5Writer {
     /// address and index (`H5D__virtual_store_layout`), which is why this
     /// allocates a heap object and nothing else.
     ///
-    /// Two things `H5Pset_virtual` takes and this does not, refused rather
-    /// than silently written as literal text or a bounded selection:
-    /// `printf`-style source names (`%b` block substitution, which turns one
-    /// mapping into a family of them) and unlimited selections (a mapping
-    /// that grows with its source).
+    /// An unlimited (`H5S_UNLIMITED`) selection is written as one: the
+    /// mapping grows with its source, and the virtual dataset's extent in
+    /// that dimension is whatever the sources reachable at read time supply
+    /// (`H5D__virtual_set_extent_unlim`). What `H5Pset_virtual` takes and
+    /// this does not is a `printf`-style source name (`%b` block
+    /// substitution, which turns one mapping into a family of them), refused
+    /// rather than written as literal text.
     pub fn create_virtual_dataset(
         &self,
         name: &str,
         datatype: DatatypeMessage,
         dims: &[u64],
+        max_dims: Option<&[u64]>,
         mappings: &[VirtualMapping],
     ) -> IoResult<usize> {
         if mappings.is_empty() {
@@ -8639,8 +8692,7 @@ impl Hdf5Writer {
         for m in mappings {
             reject_printf_source_name(name, "file", &m.source_file_name)?;
             reject_printf_source_name(name, "dataset", &m.source_dset_name)?;
-            reject_unlimited_selection(name, "source", &m.source_selection)?;
-            reject_unlimited_selection(name, "virtual", &m.virtual_selection)?;
+            check_virtual_mapping(name, m)?;
         }
 
         let create = self.begin_create(name)?;
@@ -8658,7 +8710,9 @@ impl Hdf5Writer {
         let dataspace = if dims.is_empty() {
             DataspaceMessage::scalar()
         } else {
-            DataspaceMessage::simple(dims)
+            let mut ds = DataspaceMessage::simple(dims);
+            ds.max_dims = max_dims.map(<[u64]>::to_vec);
+            ds
         };
 
         let idx = self.push_dataset(

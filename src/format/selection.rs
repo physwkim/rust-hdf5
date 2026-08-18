@@ -106,6 +106,113 @@ pub struct RegularHyperslab {
     pub block: Vec<u64>,
 }
 
+impl RegularHyperslab {
+    /// The one dimension whose `count` or `block` is [`UNLIMITED`], or `None`
+    /// when the selection is bounded — `H5S_get_select_unlim_dim`, which
+    /// returns a single dimension because `H5Sselect_hyperslab` refuses a
+    /// second unlimited one.
+    pub fn unlim_dim(&self) -> Option<usize> {
+        (0..self.count.len())
+            .find(|&d| self.count[d] == UNLIMITED || self.block.get(d) == Some(&UNLIMITED))
+    }
+
+    /// The `(count, block)` this dimension takes once its extent is known —
+    /// `H5S__hyper_get_clip_diminfo`. A zero in either field means the
+    /// selection ends up empty.
+    fn clip_diminfo(start: u64, stride: u64, count: u64, block: u64, clip_size: u64) -> (u64, u64) {
+        if start >= clip_size {
+            if block == UNLIMITED {
+                (count, 0)
+            } else {
+                (0, block)
+            }
+        } else if block == UNLIMITED || block == stride {
+            (1, clip_size - start)
+        } else {
+            // The other unlimited form: an unbounded count of fixed blocks.
+            let stride = stride.max(1);
+            ((clip_size - start).div_ceil(stride), block)
+        }
+    }
+
+    /// How many slices of the unlimited dimension this selection covers when
+    /// its dataspace extent is `clip_size` — the slice count
+    /// `H5S_hyper_get_clip_extent_match` computes from the *match* space
+    /// before handing it to [`Self::clip_extent`].
+    pub fn num_slices(&self, clip_size: u64) -> u64 {
+        let Some(d) = self.unlim_dim() else {
+            return 0;
+        };
+        let (start, stride) = (self.start[d], self.stride[d]);
+        let (count, block) =
+            Self::clip_diminfo(start, stride, self.count[d], self.block[d], clip_size);
+        if block == 0 || count == 0 {
+            return 0;
+        }
+        if count == 1 {
+            return block;
+        }
+        let span = stride * (count - 1) + block;
+        let avail = clip_size - start;
+        if span > avail {
+            block * count - (span - avail)
+        } else {
+            block * count
+        }
+    }
+
+    /// The virtual extent that makes this selection cover exactly `num_slices`
+    /// slices of its unlimited dimension — `H5S__hyper_get_clip_extent_real`.
+    /// `incl_trail` is the `H5D_VDS_FIRST_MISSING` view; the default
+    /// `H5D_VDS_LAST_AVAILABLE` passes `false`.
+    pub fn clip_extent(&self, num_slices: u64, incl_trail: bool) -> u64 {
+        let Some(d) = self.unlim_dim() else {
+            return 0;
+        };
+        let (start, stride, block) = (self.start[d], self.stride[d], self.block[d]);
+        if num_slices == 0 {
+            return if incl_trail { start } else { 0 };
+        }
+        if block == UNLIMITED || block == stride {
+            return start + num_slices;
+        }
+        let block = block.max(1);
+        let count = num_slices / block;
+        let rem = num_slices - count * block;
+        if rem > 0 {
+            start + count * stride + rem
+        } else if incl_trail {
+            start + count * stride
+        } else {
+            start + (count - 1) * stride + block
+        }
+    }
+
+    /// Elements in one slice through the dimensions that are *not* the
+    /// unlimited one — `H5S_get_select_num_elem_non_unlim`, the quantity two
+    /// unlimited selections in one mapping must agree on.
+    pub fn num_elem_non_unlim(&self) -> Option<u64> {
+        let d = self.unlim_dim()?;
+        (0..self.count.len())
+            .filter(|&i| i != d)
+            .try_fold(1u64, |acc, i| {
+                acc.checked_mul(self.count[i])?.checked_mul(self.block[i])
+            })
+    }
+
+    /// Block `index` of the unlimited dimension on its own, every other
+    /// dimension left as it is — `H5S_hyper_get_unlim_block`, the selection a
+    /// printf mapping's `index`-th source dataset fills.
+    pub fn unlim_block(&self, index: u64) -> Self {
+        let mut out = self.clone();
+        if let Some(d) = self.unlim_dim() {
+            out.start[d] = self.start[d] + index * self.stride[d];
+            out.count[d] = 1;
+        }
+        out
+    }
+}
+
 /// The two wire forms a hyperslab selection can take
 /// (`H5S__hyper_deserialize`, H5Shyper.c): a single compact
 /// (start, stride, count, block) tuple per dimension, or an explicit list
@@ -280,6 +387,82 @@ impl Selection {
         }
     }
 
+    /// The one dimension this selection grows in, or `None` when it is
+    /// bounded — `H5S_get_select_unlim_dim`. Only a regular hyperslab can
+    /// carry `H5S_UNLIMITED` at all (`H5Sselect_hyperslab` refuses it for
+    /// every other form), so every other selection answers `None`.
+    pub fn unlim_dim(&self) -> Option<usize> {
+        match self {
+            Self::Hyperslab {
+                form: Hyperslab::Regular(r),
+                ..
+            } => r.unlim_dim(),
+            _ => None,
+        }
+    }
+
+    /// This selection with its unlimited dimension clipped to an extent of
+    /// `clip_size` — `H5S_hyper_clip_unlim` (H5Shyper.c), which is how a
+    /// virtual dataset's unlimited mapping becomes the finite one a read
+    /// walks.
+    ///
+    /// The result is a block list rather than a regular hyperslab because the
+    /// last block may be cut in half by the extent: upstream builds a span
+    /// tree and intersects it with `clip_size` for exactly that case, and an
+    /// explicit block list is the same set of elements. A selection that
+    /// clips away to nothing becomes [`Selection::None`]; a bounded selection
+    /// is returned unchanged.
+    pub fn clip_unlimited(&self, clip_size: u64) -> FormatResult<Self> {
+        let Self::Hyperslab {
+            rank,
+            form: Hyperslab::Regular(r),
+        } = self
+        else {
+            return Ok(self.clone());
+        };
+        let Some(d) = r.unlim_dim() else {
+            return Ok(self.clone());
+        };
+        let (count, block) = RegularHyperslab::clip_diminfo(
+            r.start[d],
+            r.stride[d],
+            r.count[d],
+            r.block[d],
+            clip_size,
+        );
+        if count == 0 || block == 0 {
+            return Ok(Self::None);
+        }
+        let mut clipped = r.clone();
+        clipped.count[d] = count;
+        clipped.block[d] = block;
+
+        let mut blocks = Vec::new();
+        for (start, count) in regular_hyperslab_to_boxes(&clipped)? {
+            // Trim the block the extent cuts through, and drop one that
+            // starts past it — the intersection upstream's span tree takes
+            // against `block[unlim_dim] = clip_size`.
+            if start[d] >= clip_size {
+                continue;
+            }
+            let mut count = count;
+            count[d] = count[d].min(clip_size - start[d]);
+            let end = start
+                .iter()
+                .zip(&count)
+                .map(|(&s, &c)| s + c - 1)
+                .collect::<Vec<u64>>();
+            blocks.push(HyperslabBlock { start, end });
+        }
+        if blocks.is_empty() {
+            return Ok(Self::None);
+        }
+        Ok(Self::Hyperslab {
+            rank: *rank,
+            form: Hyperslab::Blocks(blocks),
+        })
+    }
+
     /// The inclusive bounding box of the selection — `H5Sget_select_bounds`
     /// — or `None` when the selection has no bounds of its own:
     /// [`Selection::All`] takes the extent it is bound against,
@@ -439,11 +622,56 @@ fn hyperslab_to_block_list(rank: usize, form: &Hyperslab) -> FormatResult<Vec<Hy
     }
 }
 
+/// The version-2 REGULAR wire form: `(start, stride, count, block)` per
+/// dimension at 8 bytes each, which is the only encoding that can carry
+/// `H5S_UNLIMITED` at the default low format-version bound
+/// (`H5S__hyper_serialize`'s `version == 2` arm).
+fn encode_regular_hyperslab_v2(rank: usize, r: &RegularHyperslab) -> FormatResult<Vec<u8>> {
+    if r.start.len() != rank
+        || r.stride.len() != rank
+        || r.count.len() != rank
+        || r.block.len() != rank
+    {
+        return Err(FormatError::InvalidData(format!(
+            "regular hyperslab field length does not match rank {rank}"
+        )));
+    }
+    let mut buf = Vec::with_capacity(17 + rank * 32);
+    buf.extend_from_slice(&SEL_HYPERSLABS.to_le_bytes());
+    buf.extend_from_slice(&HYPER_VERSION_2.to_le_bytes());
+    buf.push(HYPER_REGULAR_FLAG);
+    // The length field version 2 keeps where version 3 keeps its encoded-size
+    // tag: the rank field plus the four 8-byte fields per dimension, exactly
+    // what `H5S__hyper_serialize` accumulates into `len`. `rank <= MAX_RANK`,
+    // so this cannot overflow.
+    let len = 4u32 + 32 * rank as u32;
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(&(rank as u32).to_le_bytes());
+    for d in 0..rank {
+        buf.extend_from_slice(&r.start[d].to_le_bytes());
+        buf.extend_from_slice(&r.stride[d].to_le_bytes());
+        buf.extend_from_slice(&r.count[d].to_le_bytes());
+        buf.extend_from_slice(&r.block[d].to_le_bytes());
+    }
+    Ok(buf)
+}
+
 fn encode_hyperslab(rank: usize, form: &Hyperslab) -> FormatResult<Vec<u8>> {
     if rank == 0 || rank > MAX_RANK {
         return Err(FormatError::InvalidData(format!(
             "invalid hyperslab selection rank {rank}"
         )));
+    }
+    // `H5S__hyper_get_version_enc_size` takes `MAX(H5S_HYPER_VERSION_2, ...)`
+    // the moment the selection has an unlimited dimension, whatever the low
+    // format-version bound: version 1 is a block list, and a list of blocks
+    // cannot spell an unbounded one. Version 2 fixes the encoded width at 8
+    // bytes, so `H5S_UNLIMITED` goes out as the all-ones field `read_dim`
+    // reads back.
+    if let Hyperslab::Regular(r) = form {
+        if r.unlim_dim().is_some() {
+            return encode_regular_hyperslab_v2(rank, r);
+        }
     }
     let blocks = hyperslab_to_block_list(rank, form)?;
     let num_blocks: u32 = blocks.len().try_into().map_err(|_| {
@@ -1802,21 +2030,164 @@ mod tests {
         assert!(matches!(err, FormatError::UnsupportedFeature(_)));
     }
 
-    /// A Regular form's UNLIMITED count cannot become a finite block list
-    /// (the same reason [`Selection::to_boxes`] rejects it) — encode must
-    /// surface that as a clean error, not silently drop the dimension.
+    /// The libhdf5 image of an unlimited hyperslab, byte for byte.
+    ///
+    /// Captured from the virtual-dataset mapping list h5py 3.15.1 writes for
+    /// `layout[:h5py.h5s.UNLIMITED, :] = vsrc[:h5py.h5s.UNLIMITED, :]` over a
+    /// rank-2 `(1, 2)` layout — the two selections are identical, so this is
+    /// the image of both. An unlimited dimension forces version 2
+    /// (`H5S__hyper_get_version_enc_size`), whose REGULAR form spells the
+    /// unlimited count as an all-ones 8-byte field.
+    const LIBHDF5_UNLIMITED_HYPERSLAB: &[u8] = &[
+        0x02, 0x00, 0x00, 0x00, // H5S_SEL_HYPERSLABS
+        0x02, 0x00, 0x00, 0x00, // version 2
+        0x01, // flags: H5S_HYPER_REGULAR
+        0x44, 0x00, 0x00, 0x00, // length: 4 + 32 * rank
+        0x02, 0x00, 0x00, 0x00, // rank
+        // dim 0: start 0, stride 1, count H5S_UNLIMITED, block 1
+        0, 0, 0, 0, 0, 0, 0, 0, //
+        1, 0, 0, 0, 0, 0, 0, 0, //
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, //
+        1, 0, 0, 0, 0, 0, 0, 0, //
+        // dim 1: start 0, stride 1, count 1, block 2
+        0, 0, 0, 0, 0, 0, 0, 0, //
+        1, 0, 0, 0, 0, 0, 0, 0, //
+        1, 0, 0, 0, 0, 0, 0, 0, //
+        2, 0, 0, 0, 0, 0, 0, 0, //
+    ];
+
+    fn unlimited_rows() -> Selection {
+        Selection::Hyperslab {
+            rank: 2,
+            form: Hyperslab::Regular(RegularHyperslab {
+                start: vec![0, 0],
+                stride: vec![1, 1],
+                count: vec![UNLIMITED, 1],
+                block: vec![1, 2],
+            }),
+        }
+    }
+
+    /// An unlimited count encodes to exactly what libhdf5 writes: the
+    /// version-2 REGULAR form, not the version-1 block list every bounded
+    /// hyperslab takes.
     #[test]
-    fn encode_hyperslab_rejects_regular_unlimited_count() {
+    fn unlimited_hyperslab_encodes_as_the_libhdf5_version_2_image() {
+        assert_eq!(
+            unlimited_rows().encode().unwrap(),
+            LIBHDF5_UNLIMITED_HYPERSLAB
+        );
+    }
+
+    /// And the decoder reads that image back as the same selection, so a
+    /// mapping list survives a write/read round trip unchanged.
+    #[test]
+    fn unlimited_hyperslab_decodes_from_the_libhdf5_image() {
+        let (sel, used) = Selection::decode(LIBHDF5_UNLIMITED_HYPERSLAB).unwrap();
+        assert_eq!(used, LIBHDF5_UNLIMITED_HYPERSLAB.len());
+        assert_eq!(sel, unlimited_rows());
+        assert_eq!(sel.unlim_dim(), Some(0));
+    }
+
+    /// An unlimited selection has no bounds — `H5Sget_select_bounds` fails on
+    /// one, which is why the oracle's canon renders it as `?`.
+    #[test]
+    fn an_unlimited_selection_has_no_bounds() {
+        assert_eq!(unlimited_rows().bounds(), None);
+    }
+
+    /// `H5S_hyper_clip_unlim`: the unlimited dimension is cut to the extent,
+    /// and the result covers exactly the elements inside it.
+    #[test]
+    fn clip_unlimited_cuts_the_unlimited_dimension_to_the_extent() {
+        let clipped = unlimited_rows().clip_unlimited(3).unwrap();
+        assert_eq!(
+            // `H5S__hyper_get_clip_diminfo` collapses a contiguous run
+            // (block == stride) into one block of the whole extent, so the
+            // three unit rows come back as one 3-row box.
+            clipped.to_boxes(&[3, 2]).unwrap(),
+            vec![(vec![0, 0], vec![3, 2])]
+        );
+        // Nothing available: the mapping selects nothing at all, rather than
+        // an empty block list.
+        assert_eq!(unlimited_rows().clip_unlimited(0).unwrap(), Selection::None);
+        // A bounded selection is its own clip.
+        assert_eq!(Selection::All.clip_unlimited(7).unwrap(), Selection::All);
+    }
+
+    /// A stride wider than the block leaves a gap, and the extent can cut
+    /// through the middle of a block — `H5S__hyper_get_clip_diminfo`'s
+    /// unlimited-count arm, where the last block comes back short.
+    #[test]
+    fn clip_unlimited_truncates_the_block_the_extent_cuts_through() {
         let sel = Selection::Hyperslab {
             rank: 1,
             form: Hyperslab::Regular(RegularHyperslab {
-                start: vec![0],
-                stride: vec![1],
+                start: vec![1],
+                stride: vec![4],
                 count: vec![UNLIMITED],
-                block: vec![1],
+                block: vec![3],
             }),
         };
-        let err = sel.encode().unwrap_err();
-        assert!(matches!(err, FormatError::UnsupportedFeature(_)));
+        // Blocks at [1,4) and [5,8); an extent of 7 cuts the second short.
+        assert_eq!(
+            sel.clip_unlimited(7).unwrap().to_boxes(&[7]).unwrap(),
+            vec![(vec![1], vec![3]), (vec![5], vec![2])]
+        );
+    }
+
+    /// `H5S_hyper_get_clip_extent_match`, both halves: how many slices a
+    /// source extent supplies, and the virtual extent that covers exactly
+    /// that many.
+    #[test]
+    fn clip_extent_matches_the_slices_the_source_supplies() {
+        let Selection::Hyperslab {
+            form: Hyperslab::Regular(rows),
+            ..
+        } = unlimited_rows()
+        else {
+            unreachable!()
+        };
+        // Contiguous unit blocks: slices and extent are the source extent.
+        for extent in [0u64, 1, 6, 10] {
+            assert_eq!(rows.num_slices(extent), extent);
+            assert_eq!(rows.clip_extent(extent, false), extent);
+        }
+
+        // Strided blocks: 3 elements every 4, so an extent of 10 supplies
+        // 3 + 3 + 2 = 8 slices, and covering 8 slices needs an extent of 10.
+        let strided = RegularHyperslab {
+            start: vec![0],
+            stride: vec![4],
+            count: vec![UNLIMITED],
+            block: vec![3],
+        };
+        assert_eq!(strided.num_slices(10), 8);
+        assert_eq!(strided.clip_extent(8, false), 10);
+        // Two whole blocks: `incl_trail` is the difference between ending at
+        // the last block's end and ending before the first missing block.
+        assert_eq!(strided.clip_extent(6, false), 7);
+        assert_eq!(strided.clip_extent(6, true), 8);
+        assert_eq!(strided.clip_extent(0, false), 0);
+    }
+
+    /// `H5S_get_select_num_elem_non_unlim` and `H5S_hyper_get_unlim_block`:
+    /// the per-slice element count two unlimited selections must agree on,
+    /// and the single block a printf mapping's `index`-th source fills.
+    #[test]
+    fn unlimited_slice_shape_and_block_extraction() {
+        let Selection::Hyperslab {
+            form: Hyperslab::Regular(rows),
+            ..
+        } = unlimited_rows()
+        else {
+            unreachable!()
+        };
+        assert_eq!(rows.num_elem_non_unlim(), Some(2));
+        let third = rows.unlim_block(3);
+        assert_eq!(third.start, vec![3, 0]);
+        assert_eq!(third.count, vec![1, 1]);
+        assert_eq!(third.block, vec![1, 2]);
+        assert_eq!(third.unlim_dim(), None);
     }
 }

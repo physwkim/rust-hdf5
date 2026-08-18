@@ -33,7 +33,7 @@ use crate::format::messages::shared::MSG_FLAG_SHARED;
 use crate::format::messages::superblock_ext::{
     BtreeKMessage, DriverInfoMessage, FileSpaceInfoMessage, SharedMessageTableMessage,
 };
-use crate::format::messages::virtual_mapping::VirtualMappingList;
+use crate::format::messages::virtual_mapping::{VirtualMapping, VirtualMappingList};
 use crate::format::messages::*;
 use crate::format::object_header::ObjectHeader;
 use crate::format::reference::{
@@ -191,6 +191,29 @@ pub struct DatasetReadInfo {
     /// names a mapping list (`heap_index != 0`); `None` for every other
     /// layout, and for a virtual dataset that has no mappings yet.
     pub virtual_mappings: Option<VirtualMappingList>,
+    /// What each mapping in [`virtual_mappings`](Self::virtual_mappings)
+    /// resolved to when the file was opened, in the same order — see
+    /// [`MappingResolution`] and `Hdf5Reader::resolve_virtual_extents`.
+    /// `None` for every non-virtual dataset and for a virtual one with no
+    /// mapping list.
+    pub virtual_resolution: Option<Vec<MappingResolution>>,
+}
+
+/// What one virtual-dataset mapping resolved to at open time —
+/// `H5D__virtual_set_extent_unlim` (H5Dvirtual.c), which libhdf5 runs when
+/// the dataset is opened and which both the dataset's reported extent and
+/// every read of it depend on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MappingResolution {
+    /// Neither selection grows: the mapping is already concrete, and the
+    /// dataset's stored extent is its extent.
+    Bounded,
+    /// Both selections are unlimited (`unlim_dim_virtual >= 0` and
+    /// `unlim_dim_source >= 0`). `virtual_clip` is how far this mapping
+    /// reaches in its unlimited virtual dimension, `source_clip` the source
+    /// dataset's own extent in its unlimited source dimension — the two
+    /// values `H5S_hyper_clip_unlim` clips the mapping's selections to.
+    Unlimited { virtual_clip: u64, source_clip: u64 },
 }
 
 /// The class of one link record in a group: what `H5Lget_info` reports,
@@ -1118,6 +1141,76 @@ fn read_external_file_bytes(
 /// overflows; real VDS chains do not nest anywhere near this deep.
 const MAX_VIRTUAL_DEPTH: usize = 16;
 
+/// Replace every unlimited mapping with the concrete mapping its open-time
+/// resolution makes it — the clipped selections `H5D__virtual_set_extent_unlim`
+/// leaves in `clipped_virtual_select` / `clipped_source_select` for a read to
+/// use (`H5D__virtual_read` never sees the unclipped ones).
+///
+/// A mapping with no resolution recorded is passed through unchanged, which is
+/// what a bounded mapping needs and what a mapping list written before this
+/// pass existed reduces to.
+fn concrete_virtual_mappings(
+    list: &VirtualMappingList,
+    resolution: &[MappingResolution],
+) -> IoResult<Vec<VirtualMapping>> {
+    let mut out = Vec::with_capacity(list.mappings.len());
+    for (i, m) in list.mappings.iter().enumerate() {
+        match resolution.get(i) {
+            Some(MappingResolution::Unlimited {
+                virtual_clip,
+                source_clip,
+            }) => out.push(VirtualMapping {
+                virtual_selection: m.virtual_selection.clip_unlimited(*virtual_clip)?,
+                source_selection: m.source_selection.clip_unlimited(*source_clip)?,
+                ..m.clone()
+            }),
+            _ => out.push(m.clone()),
+        }
+    }
+    Ok(out)
+}
+
+/// Recursion bound for open-time virtual-extent resolution.
+///
+/// Resolving a virtual dataset's extent opens the source datasets its
+/// unlimited mappings name, and a source may itself be a virtual dataset in
+/// another file whose own open resolves its own extent. A crafted cyclic
+/// chain would otherwise recurse until the stack overflows, so the nesting is
+/// counted per thread and the resolution is skipped once it reaches
+/// [`MAX_VIRTUAL_DEPTH`] — a dataset that deep keeps its stored extent
+/// instead of taking one from a cycle.
+struct VirtualResolveDepth;
+
+thread_local! {
+    static VIRTUAL_RESOLVE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl VirtualResolveDepth {
+    fn enter<F: FnOnce() -> IoResult<()>>(f: F) -> IoResult<()> {
+        let depth = VIRTUAL_RESOLVE_DEPTH.with(std::cell::Cell::get);
+        if depth >= MAX_VIRTUAL_DEPTH {
+            return Ok(());
+        }
+        VIRTUAL_RESOLVE_DEPTH.with(|d| d.set(depth + 1));
+        let out = f();
+        VIRTUAL_RESOLVE_DEPTH.with(|d| d.set(depth));
+        out
+    }
+}
+
+/// The regular (start, stride, count, block) form behind a selection, or
+/// `None` — the only form `H5S_UNLIMITED` can appear in, so every unlimited
+/// computation goes through it.
+fn regular_hyperslab(sel: &Selection) -> Option<&RegularHyperslab> {
+    match sel {
+        Selection::Hyperslab {
+            form: Hyperslab::Regular(r),
+            ..
+        } => Some(r),
+        _ => None,
+    }
+}
+
 /// Detect a printf-style `%b` block-index substitution pattern in a
 /// virtual dataset source name (`H5D_virtual_parse_source_name`,
 /// H5Dvirtual.c) — used for unlimited/growable mappings whose source
@@ -1453,6 +1546,9 @@ impl Hdf5Reader {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_default();
+        // Only now, with `source_dir` set, can a source name be resolved —
+        // and a virtual dataset's extent is not final until they are.
+        VirtualResolveDepth::enter(|| reader.resolve_virtual_extents())?;
         Ok(reader)
     }
 
@@ -2115,6 +2211,10 @@ impl Hdf5Reader {
                 alloc_time,
                 external_files,
                 virtual_mappings,
+                // Filled in by `resolve_virtual_extents` once the reader has
+                // the directory source names resolve against; a catalog on
+                // its own cannot open another file.
+                virtual_resolution: None,
             })),
             // The three messages are present and none of them reported an
             // error, so this is unreachable; report it as unreadable rather
@@ -3201,6 +3301,129 @@ impl Hdf5Reader {
         Ok(())
     }
 
+    /// Set every virtual dataset's extent from the sources its unlimited
+    /// mappings can reach — `H5D__virtual_set_extent_unlim` (H5Dvirtual.c),
+    /// which libhdf5 runs when it opens such a dataset.
+    ///
+    /// INVARIANT: a virtual dataset's `dataspace.dims` are the extent its
+    /// available sources give it. This is the single owner of that
+    /// resolution: the dims a VDS with an unlimited mapping reports are not
+    /// the ones its dataspace message stores, and every shape query, read and
+    /// slice bound must see the same value, so the resolved extent is stamped
+    /// in once — here, immediately after a catalog is built — rather than
+    /// recomputed per call. The per-mapping clip sizes the extent came from
+    /// are kept beside it in
+    /// [`virtual_resolution`](DatasetReadInfo::virtual_resolution) so a read
+    /// walks exactly the sources the extent was derived from.
+    ///
+    /// A source that cannot be opened contributes a clip size of 0, never an
+    /// error: a virtual dataset whose sources are not written yet is legal,
+    /// and reads back as the fill value (upstream's "clip_size = 0" arm when
+    /// `H5D__virtual_open_source_dset` leaves the dataset closed).
+    ///
+    /// The default view is assumed throughout — `H5D_VDS_LAST_AVAILABLE` is
+    /// `H5D_ACS_VDS_VIEW_DEF`, and `H5Pset_virtual_view` sets a *dataset
+    /// access* property that is never stored in the file, so a reader opening
+    /// a file it did not create always sees the default.
+    fn resolve_virtual_extents(&mut self) -> IoResult<()> {
+        let targets: Vec<usize> = (0..self.datasets.len())
+            .filter(|&i| self.datasets[i].virtual_mappings.is_some())
+            .collect();
+        for i in targets {
+            let mappings = self.datasets[i].virtual_mappings.clone().unwrap();
+            let curr_dims = self.datasets[i].dataspace.dims.clone();
+            let (resolution, dims) = self.resolve_one_virtual_extent(&mappings, &curr_dims)?;
+            self.datasets[i].dataspace.dims = dims;
+            self.datasets[i].virtual_resolution = Some(resolution);
+        }
+        Ok(())
+    }
+
+    /// [`resolve_virtual_extents`](Self::resolve_virtual_extents) for one
+    /// dataset: the per-mapping resolutions and the extent they imply.
+    fn resolve_one_virtual_extent(
+        &mut self,
+        mappings: &VirtualMappingList,
+        curr_dims: &[u64],
+    ) -> IoResult<(Vec<MappingResolution>, Vec<u64>)> {
+        let rank = curr_dims.len();
+        let mut resolution = Vec::with_capacity(mappings.mappings.len());
+        let mut new_dims: Vec<Option<u64>> = vec![None; rank];
+        // `H5D_virtual_update_min_dims`: whatever the unlimited dimension
+        // resolves to, the extent must still hold every bounded mapping.
+        let mut min_dims = vec![0u64; rank];
+
+        for m in &mappings.mappings {
+            let unlim_virtual = m.virtual_selection.unlim_dim();
+            let res = match (unlim_virtual, m.source_selection.unlim_dim()) {
+                (Some(vd), Some(sd)) => {
+                    let source_clip = self
+                        .virtual_source_dims(m)
+                        .ok()
+                        .flatten()
+                        .and_then(|d| d.get(sd).copied())
+                        .unwrap_or(0);
+                    let virtual_clip = match (
+                        regular_hyperslab(&m.virtual_selection),
+                        regular_hyperslab(&m.source_selection),
+                    ) {
+                        // `H5S_hyper_get_clip_extent_match`: how many slices
+                        // the source supplies, then the virtual extent that
+                        // covers exactly that many.
+                        (Some(v), Some(sr)) => v.clip_extent(sr.num_slices(source_clip), false),
+                        _ => 0,
+                    };
+                    if new_dims[vd].is_none_or(|d| virtual_clip > d) {
+                        new_dims[vd] = Some(virtual_clip);
+                    }
+                    MappingResolution::Unlimited {
+                        virtual_clip,
+                        source_clip,
+                    }
+                }
+                _ => MappingResolution::Bounded,
+            };
+            if let Some((_, hi)) = m.virtual_selection.bounds() {
+                for (d, &e) in hi.iter().enumerate().take(rank) {
+                    if Some(d) != unlim_virtual && e + 1 > min_dims[d] {
+                        min_dims[d] = e + 1;
+                    }
+                }
+            }
+            resolution.push(res);
+        }
+
+        let dims = (0..rank)
+            .map(|d| match new_dims[d] {
+                Some(v) => v.max(min_dims[d]),
+                None => curr_dims[d],
+            })
+            .collect();
+        Ok((resolution, dims))
+    }
+
+    /// The extent of the source dataset one mapping names, or `None` when it
+    /// cannot be reached — `H5D__virtual_open_source_dset` leaving the source
+    /// closed, which upstream reads as "no data there yet" rather than an
+    /// error.
+    fn virtual_source_dims(&mut self, m: &VirtualMapping) -> IoResult<Option<Vec<u64>>> {
+        let source_name = m.source_dset_name.trim_start_matches('/');
+        if m.source_file_name == "." {
+            return Ok(self
+                .dataset_info_local(source_name)
+                .map(|i| i.dataspace.dims.clone()));
+        }
+        let prefix = resolve_vdsfile_prefix(&self.source_dir);
+        let full_path = combine_prefixed_path(prefix.as_deref(), &m.source_file_name);
+        let Ok(mut reader) = Hdf5Reader::open_with_locking(&full_path, FileLocking::Disabled)
+        else {
+            return Ok(None);
+        };
+        Ok(reader
+            .dataset_info(source_name)
+            .map(|i| i.dataspace.dims.clone()))
+    }
+
     /// Fill `out` (shaped like the virtual dataset's own extent) by
     /// stitching each mapping's source bytes in order (`H5D__virtual_read`,
     /// H5Dvirtual.c). `out` must already be pre-filled with the tiled fill
@@ -3233,6 +3456,11 @@ impl Hdf5Reader {
             // `out` is already the fill value the caller pre-filled it with.
             return Ok(());
         };
+        // Every unlimited mapping is replaced by the concrete one its
+        // open-time resolution makes it, so the walk below only ever sees
+        // bounded selections.
+        let resolution = info.virtual_resolution.clone().unwrap_or_default();
+        let mappings = concrete_virtual_mappings(&mappings, &resolution)?;
         let source_dir = self.source_dir.clone();
 
         // Cross-file source readers, opened at most once per distinct
@@ -3240,7 +3468,7 @@ impl Hdf5Reader {
         let mut cross_file_cache: std::collections::HashMap<PathBuf, Hdf5Reader> =
             std::collections::HashMap::new();
 
-        for mapping in &mappings.mappings {
+        for mapping in &mappings {
             if has_virtual_printf_pattern(&mapping.source_file_name)
                 || has_virtual_printf_pattern(&mapping.source_dset_name)
             {
@@ -3419,6 +3647,10 @@ impl Hdf5Reader {
         self.group_aliases = catalog.group_aliases;
         self.links = catalog.links;
         self.datatypes = catalog.datatypes;
+        // The catalog is freshly built, so every virtual dataset's resolved
+        // extent went with the old one — a SWMR refresh is exactly when a
+        // source may have grown.
+        self.resolve_virtual_extents()?;
 
         Ok(())
     }

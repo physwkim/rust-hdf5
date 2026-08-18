@@ -508,9 +508,14 @@ impl<T: H5Type> DatasetBuilder<T> {
     /// kind — and makes writing to it an error, since its elements belong to
     /// the source datasets.
     ///
-    /// `printf`-style source names (libhdf5's `%b` block substitution) and
-    /// unlimited (`H5S_UNLIMITED`) selections are refused at
-    /// [`create`](Self::create) rather than written as something else.
+    /// An unlimited (`H5S_UNLIMITED`) selection is written as one: such a
+    /// mapping grows with its source, and the dataset's extent in that
+    /// dimension is whatever the sources reachable when it is opened supply
+    /// (`H5D__virtual_set_extent_unlim`). Give it a
+    /// [`max_shape`](Self::max_shape) unlimited in the same dimension, as
+    /// libhdf5 requires of the dataspace behind one. `printf`-style source
+    /// names (libhdf5's `%b` block substitution) are refused at
+    /// [`create`](Self::create) rather than written as literal text.
     ///
     /// ```no_run
     /// # use rust_hdf5::{H5File, Selection};
@@ -879,6 +884,14 @@ impl<T: H5Type> DatasetBuilder<T> {
                             &full_name,
                             datatype,
                             &dims_u64,
+                            self.max_shape
+                                .as_ref()
+                                .map(|max| {
+                                    max.iter()
+                                        .map(|m| m.map_or(u64::MAX, |v| v as u64))
+                                        .collect::<Vec<u64>>()
+                                })
+                                .as_deref(),
                             &self.virtual_mappings,
                         )?;
                         // The fill value is what a read of an unmapped — or
@@ -9200,34 +9213,76 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// An unlimited mapping is clipped against its source's extent at every
-    /// open, which this writer does not model — refused rather than written
-    /// as the all-ones count it would encode to.
+    /// An unlimited mapping takes its extent from the source it names, so a
+    /// virtual dataset written with one reports the source's rows, not the
+    /// seed extent its dataspace message stores
+    /// (`H5D__virtual_set_extent_unlim`). Same file, so the resolution runs
+    /// without opening another one.
     #[test]
-    fn an_unlimited_mapping_selection_is_refused() {
+    fn an_unlimited_mapping_takes_its_extent_from_its_source() {
+        let path = temp_path("vds_unlimited");
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<i32>()
+                .shape([5usize, 2])
+                .chunk(&[5, 2])
+                .max_shape(&[None, Some(2)])
+                .create("src")
+                .unwrap()
+                .write_raw(&(0..10i32).collect::<Vec<_>>())
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape([1usize, 2])
+                .max_shape(&[None, Some(2)])
+                .virtual_mapping(unlimited_rows(), ".", "src", unlimited_rows())
+                .create("vds")
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset("vds").unwrap();
+        assert_eq!(ds.shape(), vec![5, 2]);
+        assert_eq!(ds.read_raw::<i32>().unwrap(), (0..10).collect::<Vec<i32>>());
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The rank-2 `count = (H5S_UNLIMITED, 1)`, `block = (1, 2)` selection
+    /// both sides of an unlimited row-wise mapping use.
+    fn unlimited_rows() -> crate::Selection {
         use crate::format::selection::UNLIMITED;
         use crate::{Hyperslab, RegularHyperslab, Selection};
-        let path = temp_path("vds_unlimited");
-        let file = H5File::create(&path).unwrap();
-        let unlimited = Selection::Hyperslab {
-            rank: 1,
+        Selection::Hyperslab {
+            rank: 2,
             form: Hyperslab::Regular(RegularHyperslab {
-                start: vec![0],
-                stride: vec![1],
-                count: vec![UNLIMITED],
-                block: vec![1],
+                start: vec![0, 0],
+                stride: vec![1, 1],
+                count: vec![UNLIMITED, 1],
+                block: vec![1, 2],
             }),
-        };
+        }
+    }
+
+    /// An unlimited virtual selection over a *limited* source selection is
+    /// the printf shape, and without a `%b` in a source name there is no
+    /// second dataset to fill the second block —
+    /// `H5D_virtual_check_mapping_post` refuses it, and so does this.
+    #[test]
+    fn an_unlimited_virtual_selection_over_a_limited_source_is_refused() {
+        use crate::Selection;
+        let path = temp_path("vds_unlim_limited_src");
+        let file = H5File::create(&path).unwrap();
         let err = match file
             .new_dataset::<i32>()
-            .shape([16usize])
-            .virtual_mapping(unlimited, "src.h5", "src", Selection::All)
+            .shape([1usize, 2])
+            .max_shape(&[None, Some(2)])
+            .virtual_mapping(unlimited_rows(), "src.h5", "src", Selection::All)
             .create("vds")
         {
-            Ok(_) => panic!("an unlimited mapping needs clipping this writer does not do"),
+            Ok(_) => panic!("no printf substitution names the mapping's later blocks"),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("H5S_UNLIMITED"), "{err}");
+        assert!(err.contains("printf"), "{err}");
         file.close().unwrap();
         std::fs::remove_file(&path).ok();
     }
