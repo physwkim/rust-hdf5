@@ -23,6 +23,32 @@
 
 ### Changed
 
+- The `mmap` feature now does something: a file opened for reading maps
+  itself and serves its reads out of the map instead of `pread`, chosen
+  once inside `FileHandle` so every read entry point goes through it and
+  a mapping that cannot be taken falls back to the descriptor invisibly.
+  Reads above 8 KiB stay on `pread` — mapping helps only where the
+  syscall is the larger half of the work, and a big read into a
+  freshly allocated buffer is dominated by faulting that buffer in, which
+  the map only adds to. Against libhdf5 1.14.6 on the `perf/` probes,
+  opening and reading 2000 small datasets goes from 0.28x to 0.21x of its
+  time; no other workload moves by more than 2%, and the default build is
+  untouched. A writable handle is never mapped, so the accumulator's
+  flush-before-read contract is unaffected. What the map does not do is
+  make a large read cheaper: that needs the read to hand back a borrowed
+  view of the mapped bytes rather than a `Vec`, which is an API addition
+  this does not make.
+
+  The mapped bytes are the file as of the moment the map was taken, so a
+  SWMR reader picks up its writer's appends when `refresh` retakes the
+  map, and a read past the mapped length fails the way a read past the
+  end of a file does.
+
+- `Hdf5Reader::open_mmap` and `MmapFileHandle` are gone. They mapped a
+  second copy of the file and handed it to the caller, who had no way to
+  make the reader read through it; the mapping now lives under the one
+  handle the reader already reads from.
+
 - Reading a whole dataset is faster and no longer scales with how many
   datasets the file holds. A typed full read now lands in the vector it
   returns instead of being zeroed, read, and copied into a second buffer
