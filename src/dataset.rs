@@ -1941,6 +1941,19 @@ impl DatasetAccess {
     }
 }
 
+/// Elements a selection of `counts` holds, refusing a product that overflows
+/// `usize` rather than wrapping it into a small allocation.
+fn element_count(counts: &[u64]) -> Result<usize> {
+    counts
+        .iter()
+        .try_fold(1usize, |acc, &c| {
+            usize::try_from(c).ok().and_then(|c| acc.checked_mul(c))
+        })
+        .ok_or_else(|| {
+            Hdf5Error::InvalidState(format!("selection {counts:?} has more elements than usize"))
+        })
+}
+
 impl H5Dataset {
     /// Create a reader-mode dataset handle (called internally by `H5File::dataset`).
     pub(crate) fn new_reader(
@@ -3761,38 +3774,18 @@ impl H5Dataset {
                 let starts_u64: Vec<u64> = starts.iter().map(|&s| s as u64).collect();
                 let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
 
-                let mut raw = {
-                    let mut inner = borrow_inner_mut(&self.file_inner);
-                    match &mut *inner {
-                        H5FileInner::Reader(reader) => {
-                            reader.read_slice(name, &starts_u64, &counts_u64)?
-                        }
-                        _ => {
-                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()))
-                        }
-                    }
+                let count = element_count(&counts_u64)?;
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                let H5FileInner::Reader(reader) = &mut *inner else {
+                    return Err(Hdf5Error::InvalidState("file is not in read mode".into()));
                 };
-                to_host_byte_order(&mut raw, &datatype, T::element_size())?;
-
-                if raw.len() % T::element_size() != 0 {
-                    return Err(Hdf5Error::TypeMismatch(format!(
-                        "raw data size {} is not a multiple of element size {}",
-                        raw.len(),
-                        T::element_size(),
-                    )));
-                }
-
-                let count = raw.len() / T::element_size();
-                let mut result = Vec::<T>::with_capacity(count);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        raw.as_ptr(),
-                        result.as_mut_ptr() as *mut u8,
-                        raw.len(),
-                    );
-                    result.set_len(count);
-                }
-                Ok(result)
+                // The selection lands in the vector this returns, so its bytes
+                // are touched once instead of being read into a byte buffer and
+                // copied into a second one of the same size.
+                read_image_into_new(count, |image| {
+                    reader.read_slice_into(name, &starts_u64, &counts_u64, image)?;
+                    to_host_byte_order(image, &datatype, T::element_size())
+                })
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "cannot read_slice from a dataset in write mode".into(),
@@ -3842,42 +3835,27 @@ impl H5Dataset {
                 let count_u64: Vec<u64> = count.iter().map(|&c| c as u64).collect();
                 let block_u64: Vec<u64> = block.iter().map(|&b| b as u64).collect();
 
-                let mut raw = {
-                    let mut inner = borrow_inner_mut(&self.file_inner);
-                    match &mut *inner {
-                        H5FileInner::Reader(reader) => reader.read_hyperslab(
-                            name,
-                            &start_u64,
-                            &stride_u64,
-                            &count_u64,
-                            &block_u64,
-                        )?,
-                        _ => {
-                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()))
-                        }
-                    }
+                let selected: Vec<u64> = count_u64
+                    .iter()
+                    .zip(&block_u64)
+                    .map(|(&c, &b)| c.saturating_mul(b))
+                    .collect();
+                let n = element_count(&selected)?;
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                let H5FileInner::Reader(reader) = &mut *inner else {
+                    return Err(Hdf5Error::InvalidState("file is not in read mode".into()));
                 };
-                to_host_byte_order(&mut raw, &datatype, T::element_size())?;
-
-                if raw.len() % T::element_size() != 0 {
-                    return Err(Hdf5Error::TypeMismatch(format!(
-                        "raw data size {} is not a multiple of element size {}",
-                        raw.len(),
-                        T::element_size(),
-                    )));
-                }
-
-                let count = raw.len() / T::element_size();
-                let mut result = Vec::<T>::with_capacity(count);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        raw.as_ptr(),
-                        result.as_mut_ptr() as *mut u8,
-                        raw.len(),
-                    );
-                    result.set_len(count);
-                }
-                Ok(result)
+                read_image_into_new(n, |image| {
+                    reader.read_hyperslab_into(
+                        name,
+                        &start_u64,
+                        &stride_u64,
+                        &count_u64,
+                        &block_u64,
+                        image,
+                    )?;
+                    to_host_byte_order(image, &datatype, T::element_size())
+                })
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "cannot read_hyperslab from a dataset in write mode".into(),
@@ -3917,36 +3895,14 @@ impl H5Dataset {
                     .map(|p| p.iter().map(|&c| c as u64).collect())
                     .collect();
 
-                let mut raw = {
-                    let mut inner = borrow_inner_mut(&self.file_inner);
-                    match &mut *inner {
-                        H5FileInner::Reader(reader) => reader.read_points(name, &points_u64)?,
-                        _ => {
-                            return Err(Hdf5Error::InvalidState("file is not in read mode".into()))
-                        }
-                    }
+                let mut inner = borrow_inner_mut(&self.file_inner);
+                let H5FileInner::Reader(reader) = &mut *inner else {
+                    return Err(Hdf5Error::InvalidState("file is not in read mode".into()));
                 };
-                to_host_byte_order(&mut raw, &datatype, T::element_size())?;
-
-                if raw.len() % T::element_size() != 0 {
-                    return Err(Hdf5Error::TypeMismatch(format!(
-                        "raw data size {} is not a multiple of element size {}",
-                        raw.len(),
-                        T::element_size(),
-                    )));
-                }
-
-                let count = raw.len() / T::element_size();
-                let mut result = Vec::<T>::with_capacity(count);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        raw.as_ptr(),
-                        result.as_mut_ptr() as *mut u8,
-                        raw.len(),
-                    );
-                    result.set_len(count);
-                }
-                Ok(result)
+                read_image_into_new(points_u64.len(), |image| {
+                    reader.read_points_into(name, &points_u64, image)?;
+                    to_host_byte_order(image, &datatype, T::element_size())
+                })
             }
             DatasetInfo::Writer { .. } => Err(Hdf5Error::InvalidState(
                 "cannot read_points from a dataset in write mode".into(),
