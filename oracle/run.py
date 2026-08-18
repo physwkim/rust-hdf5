@@ -83,15 +83,23 @@ B_TOLERATED_FIELDS = {
     "attrorder",
     "linkstore",
     "shared",
+    "msgflags",
 }
 
 # Direction-B metadata deviations that are known, understood and stable: the
 # rust writer describes the file differently from libhdf5 while the data,
-# datatype and shape it stores read back identically. Each entry is matched
-# against (field, libhdf5 value, rust-hdf5 value); `None` matches anything.
-# A deviation that matches none of these is reported as unexpected, and an
-# entry that matches nothing in a run is reported as no longer observed — so
-# a rerun after a writer fix shows the change rather than hiding it.
+# datatype and shape it stores read back identically.
+#
+# An entry is one deviation — one cause, one `why` — and its `faces` are the
+# fields that cause shows up in, each matched against (field, libhdf5 value,
+# rust-hdf5 value) with `None` matching anything. A cause visible in two
+# fields is one entry with two faces, not two entries: splitting it would say
+# the crate has two unexplained behaviours where it has one, and the second
+# copy of the explanation would drift from the first.
+#
+# A deviation that matches no face is reported as unexpected, and a face that
+# matches nothing in a run is reported as no longer observed — so a rerun
+# after a writer fix shows the change rather than hiding it.
 #
 # `min_hdf5` scopes an entry to a reference library at or above that version.
 # It is for a deviation that exists only because the reference changed
@@ -100,9 +108,9 @@ B_TOLERATED_FIELDS = {
 EXPECTED_DEVIATIONS = [
     {
         "id": "chunkindex-v3-superblock-low-bound",
-        "field": "chunkindex",
-        "ref": "btree1",
-        "rust": "farray",
+        "faces": [
+            {"field": "chunkindex", "ref": "btree1", "rust": "farray"},
+        ],
         "min_hdf5": (2, 0),
         "why": (
             "Reopening a v3-superblock file to append: libhdf5 1.14.6 raises "
@@ -120,9 +128,21 @@ EXPECTED_DEVIATIONS = [
     },
     {
         "id": "shared-v2-superblock-low-bound",
-        "field": "shared",
-        "ref": "[dataspace:sohm,datatype:shareable]",
-        "rust": "[dataspace:shareable,datatype:shareable]",
+        "faces": [
+            {
+                "field": "shared",
+                "ref": "[dataspace:sohm,datatype:shareable]",
+                "rust": "[dataspace:shareable,datatype:shareable]",
+            },
+            # The same dataspace message, seen as the raw flags byte rather
+            # than as the storage behind it: `S` is the body on the heap,
+            # `SA` is the body still literal in this header.
+            {
+                "field": "msgflags",
+                "ref": "[dataspace:S,datatype:C+SA,fill_new:C,layout:none]",
+                "rust": "[dataspace:SA,datatype:C+SA,fill_new:C,layout:none]",
+            },
+        ],
         "min_hdf5": (2, 0),
         "why": (
             "The same low_bound change as chunkindex-v3-superblock-low-bound, "
@@ -173,22 +193,23 @@ def declared_deviations():
 
 
 def expected_deviation(entry):
-    """The EXPECTED_DEVIATIONS id matching this diff, or None."""
+    """The EXPECTED_DEVIATIONS id whose face matches this diff, or None."""
     ref, rust = entry["ref"], entry["rust"]
     if ref is None or rust is None:
         # One side does not describe the field at all. That is a missing
         # object or a missing field, never one of the declared deviations.
         return None
     for exp in declared_deviations():
-        if exp["field"] != entry["field"]:
-            continue
-        if exp["ref"] is not None and exp["ref"] != ref:
-            continue
-        if exp["rust"] is not None and exp["rust"] != rust:
-            continue
-        if "check" in exp and not exp["check"](ref, rust):
-            continue
-        return exp["id"]
+        for face in exp["faces"]:
+            if face["field"] != entry["field"]:
+                continue
+            if face["ref"] is not None and face["ref"] != ref:
+                continue
+            if face["rust"] is not None and face["rust"] != rust:
+                continue
+            if "check" in face and not face["check"](ref, rust):
+                continue
+            return exp["id"]
     return None
 
 
@@ -545,8 +566,10 @@ def deviation_tables(results):
     so an entry that stops firing stays visible as `observed: no`.
     """
     declared = declared_deviations()
-    hits = {exp["id"]: [] for exp in declared}
-    seen = {exp["id"]: (None, None) for exp in declared}
+    # One row per face, so a face that stops firing is visible even when its
+    # entry's other face still does.
+    hits = {(exp["id"], f["field"]): [] for exp in declared for f in exp["faces"]}
+    seen = {key: (None, None) for key in hits}
     unexpected = {}
     for r in results:
         for d in r["b"].get("metadata_diffs", []):
@@ -555,25 +578,30 @@ def deviation_tables(results):
                 unexpected.setdefault(
                     (d["key"], d["ref"], d["rust"]), []
                 ).append(r["case"])
-            elif r["case"] not in hits[eid]:
-                hits[eid].append(r["case"])
-                seen[eid] = (d["ref"], d["rust"])
+                continue
+            key = (eid, d["field"])
+            if r["case"] not in hits[key]:
+                hits[key].append(r["case"])
+                seen[key] = (d["ref"], d["rust"])
     expected = []
     for exp in declared:
-        ref, rust = seen[exp["id"]]
-        expected.append(
-            {
-                "id": exp["id"],
-                "field": exp["field"],
-                # `*` where the entry deliberately matches a family of values
-                # rather than one pair; the example then carries a real pair.
-                "ref": exp["ref"] or "*",
-                "rust": exp["rust"] or "*",
-                "example": None if ref is None else "%s -> %s" % (ref, rust),
-                "why": exp["why"],
-                "cases": hits[exp["id"]],
-            }
-        )
+        for face in exp["faces"]:
+            key = (exp["id"], face["field"])
+            ref, rust = seen[key]
+            expected.append(
+                {
+                    "id": exp["id"],
+                    "field": face["field"],
+                    # `*` where the face deliberately matches a family of
+                    # values rather than one pair; the example then carries a
+                    # real pair.
+                    "ref": face["ref"] or "*",
+                    "rust": face["rust"] or "*",
+                    "example": None if ref is None else "%s -> %s" % (ref, rust),
+                    "why": exp["why"],
+                    "cases": hits[key],
+                }
+            )
     return expected, sorted(unexpected.items())
 
 
@@ -866,14 +894,21 @@ def write_report(results, gaps, meta, md_path, json_path):
                 )
             )
         L.append("")
-        for e in expected:
+        # One bullet per entry, not per row: the faces of one deviation share
+        # the explanation, and repeating it would read as two causes.
+        for eid in dict.fromkeys(e["id"] for e in expected):
+            faces = [e for e in expected if e["id"] == eid]
+            observed = [
+                "`%s` as `%s`" % (e["field"], clip(e["example"], 70))
+                for e in faces
+                if e["example"]
+            ]
             L.append(
                 "- `%s`: %s%s"
                 % (
-                    e["id"],
-                    e["why"],
-                    ("; observed as `%s`" % clip(e["example"], 70))
-                    if e["example"] else "",
+                    eid,
+                    faces[0]["why"],
+                    ("; observed in " + ", ".join(observed)) if observed else "",
                 )
             )
     L.append("")

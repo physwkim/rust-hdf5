@@ -1291,32 +1291,6 @@ fn recover_track_order(
     }
 }
 
-/// The times an object already on disk tracks, wherever its header version
-/// keeps them.
-///
-/// The inverse of [`touch_oh`], and the reopen half of the single meaning
-/// [`DatasetInfo::times`] documents: a version-2 header's prefix holds all
-/// four, a version-1 dataset's `H5O_MTIME_NEW` message holds one, and a
-/// version-1 group or committed datatype holds none whatever its creation
-/// property list said — so a header with neither reads back as an object that
-/// does not track times, which is the only answer its bytes support.
-///
-/// The one time a version-1 header stores fills all four fields. Only
-/// [`ObjectTimes::change`] is written back for that version, so the other
-/// three exist to keep one struct across both versions rather than to claim
-/// the file said anything about them.
-fn recover_times(header: &crate::format::object_header::ObjectHeader) -> Option<ObjectTimes> {
-    if let Some(times) = header.times {
-        return Some(times);
-    }
-    header
-        .messages
-        .iter()
-        .find(|m| m.msg_type == crate::format::messages::MSG_MOD_TIME)
-        .and_then(|m| ModificationTime::decode(&m.data).ok())
-        .map(|t| ObjectTimes::created_at(t.0))
-}
-
 /// `H5O_touch_oh` (H5Oint.c:1273): put an object's tracked times where its
 /// header version keeps them.
 ///
@@ -2130,7 +2104,7 @@ struct DatasetParts {
     track_order: TrackOrder,
     /// The times the on-disk header records, for the same reason: whether an
     /// object tracks them is settled when it is created, not when it is
-    /// rewritten. Recovered by [`recover_times`].
+    /// rewritten. Recovered by [`ObjectHeader::recorded_times`].
     times: Option<ObjectTimes>,
     /// The dense storage the rewrite supersedes and must free.
     dense: DenseCarry,
@@ -2253,7 +2227,7 @@ impl<'a> ReopenWalk<'a> {
         // from the whole chain: all three are properties of the object, not of
         // any one message the loop below happens to reach.
         let track_order = recover_track_order(&header, ctx);
-        let times = recover_times(&header);
+        let times = header.recorded_times();
         let (dense_attrs, dense_links) = superseded_dense(&header, ctx);
 
         // Attributes come from the reader's collector rather than from the
@@ -2330,7 +2304,7 @@ impl<'a> ReopenWalk<'a> {
             }
             match msg.msg_type {
                 // The pre-1.6 modification time, a formatted date string
-                // (`H5O_MTIME`, type 0x0E). `recover_times` reads only the
+                // (`H5O_MTIME`, type 0x0E). `recorded_times` reads only the
                 // modern form, and a rewrite emits only that, so an object
                 // carrying this one would come back out with the time it
                 // recorded gone. Keeping its bytes is the same answer an

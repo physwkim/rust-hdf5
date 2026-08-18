@@ -16,6 +16,9 @@ pub mod superblock_ext;
 pub mod virtual_mapping;
 
 // Message type IDs
+/// `H5O_NULL_ID` — space in an object header that holds no message
+/// (H5Oprivate.h:206).
+pub const MSG_NULL: u8 = 0x00;
 pub const MSG_DATASPACE: u8 = 0x01;
 pub const MSG_LINK_INFO: u8 = 0x02;
 pub const MSG_DATATYPE: u8 = 0x03;

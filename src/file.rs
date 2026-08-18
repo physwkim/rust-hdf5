@@ -674,6 +674,43 @@ impl H5File {
         }
     }
 
+    /// The flags byte of every message the object header at `path` holds, as
+    /// `(message type, flags)` in header order, null and continuation
+    /// messages left out.
+    ///
+    /// What `h5debug` prints as `<C>`, `<DS>`, `<S>` and the rest
+    /// (`H5O__debug_real`, H5Odbg.c:409-455): which messages the library may
+    /// cache as never-changing, which it refuses to move to the shared-message
+    /// heap, and which are already there. Read mode only.
+    pub fn object_message_flags(&self, path: &str) -> Result<Vec<(u8, u8)>> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => Ok(reader.object_message_flags(path)?),
+            _ => Err(Hdf5Error::InvalidState(
+                "object_message_flags is only available in read mode".into(),
+            )),
+        }
+    }
+
+    /// Whether the object at `path` records its times —
+    /// `H5Pget_obj_track_times` on the creation property list it was made
+    /// with, read back from the header that answers it.
+    ///
+    /// A version-2 header says so with `H5O_HDR_STORE_TIMES` and the four
+    /// times behind it; a version-1 dataset says so by carrying an
+    /// `H5O_MTIME_NEW` message. A version-1 group or committed datatype says
+    /// nothing either way — it has nowhere to record a time — so this is
+    /// `false` for one however it was created. Read mode only.
+    pub fn object_records_times(&self, path: &str) -> Result<bool> {
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Reader(reader) => Ok(reader.object_records_times(path)?),
+            _ => Err(Hdf5Error::InvalidState(
+                "object_records_times is only available in read mode".into(),
+            )),
+        }
+    }
+
     /// Bytes this file's on-disk free-space managers record as free —
     /// libhdf5's `H5Fget_freespace`, and the number `h5stat -S` prints as
     /// "Amount of tracked free space".

@@ -32,8 +32,11 @@ use rust_hdf5::format::messages::filter::{
 };
 use rust_hdf5::format::messages::shared::MessageStorage;
 use rust_hdf5::format::messages::{
-    MSG_ATTRIBUTE, MSG_DATASPACE, MSG_DATATYPE, MSG_FILL_VALUE, MSG_FILL_VALUE_OLD,
-    MSG_FILTER_PIPELINE,
+    MSG_ATTRIBUTE, MSG_ATTR_INFO, MSG_BTREE_K, MSG_DATASPACE, MSG_DATATYPE, MSG_DATA_LAYOUT,
+    MSG_DRIVER_INFO, MSG_EXTERNAL_FILE_LIST, MSG_FILE_SPACE_INFO, MSG_FILL_VALUE,
+    MSG_FILL_VALUE_OLD, MSG_FILTER_PIPELINE, MSG_GROUP_INFO, MSG_LINK, MSG_LINK_INFO, MSG_MOD_TIME,
+    MSG_MOD_TIME_OLD, MSG_NULL, MSG_OBJ_HEADER_CONTINUATION, MSG_OBJ_REF_COUNT,
+    MSG_SHARED_MESSAGE_TABLE, MSG_SYMBOL_TABLE,
 };
 use rust_hdf5::format::sohm::SharedLocation;
 use rust_hdf5::types::VarLenUnicode;
@@ -45,7 +48,7 @@ use rust_hdf5::{
 };
 use rust_hdf5::{FileSpaceInfoMessage, FileSpaceStrategy};
 
-const CANON_VERSION: &str = "8";
+const CANON_VERSION: &str = "9";
 const RAW_LIMIT: usize = 1024;
 const MAX_DEPTH: usize = 32;
 
@@ -790,14 +793,89 @@ fn crt_order_str(order: CreationOrder) -> &'static str {
 /// `H5O_SHARE_IS_SHARABLE` (H5SM.c:895-899).
 fn message_class_name(msg_type: u8) -> String {
     match msg_type {
+        MSG_NULL => "null".into(),
         MSG_DATASPACE => "dataspace".into(),
+        MSG_LINK_INFO => "linfo".into(),
         MSG_DATATYPE => "datatype".into(),
         MSG_FILL_VALUE_OLD => "fill".into(),
         MSG_FILL_VALUE => "fill_new".into(),
+        MSG_LINK => "link".into(),
+        MSG_EXTERNAL_FILE_LIST => "external_file_list".into(),
+        MSG_DATA_LAYOUT => "layout".into(),
+        MSG_GROUP_INFO => "ginfo".into(),
         MSG_FILTER_PIPELINE => "filter_pipeline".into(),
         MSG_ATTRIBUTE => "attribute".into(),
+        MSG_MOD_TIME_OLD => "mtime".into(),
+        MSG_SHARED_MESSAGE_TABLE => "shared_message_table".into(),
+        MSG_OBJ_HEADER_CONTINUATION => "hdr_continuation".into(),
+        MSG_SYMBOL_TABLE => "stab".into(),
+        MSG_MOD_TIME => "mtime_new".into(),
+        MSG_BTREE_K => "btreek".into(),
+        MSG_DRIVER_INFO => "driver_info".into(),
+        MSG_ATTR_INFO => "ainfo".into(),
+        MSG_OBJ_REF_COUNT => "refcount".into(),
+        MSG_FILE_SPACE_INFO => "fsinfo".into(),
         other => format!("msg0x{other:02x}"),
     }
+}
+
+/// The twin of `canon.py`'s `msgflags_str`: the flags byte every message in
+/// the object header at `path` carries, as sorted `class:flags` pairs.
+///
+/// Sorted for the reason `shared_str`'s pairs are: where a writer puts a
+/// message is its own business, while the flags are what a reader acts on.
+/// Null and continuation messages are left out on both sides — the crate
+/// drops them in `object_message_flags`, `canon.py` in `msgflags_str` — as
+/// the chunk allocation CANON.md already declares unmeasured.
+fn msgflags_str(file: &H5File, path: &str) -> std::result::Result<String, String> {
+    let mut parts: Vec<String> = file
+        .object_message_flags(path)
+        .map_err(oneline)?
+        .into_iter()
+        .map(|(msg_type, flags)| {
+            format!(
+                "{}:{}",
+                message_class_name(msg_type),
+                message_flags_name(flags)
+            )
+        })
+        .collect();
+    parts.sort();
+    Ok(format!("[{}]", parts.join(",")))
+}
+
+/// The tokens `H5O_debug_real` prints for a message's flags byte, in its
+/// order (H5Odbg.c:410-442), joined with `+`; `none` for a byte with no bit
+/// set, which is what upstream renders as `<none>`.
+fn message_flags_name(flags: u8) -> String {
+    const TOKENS: [(u8, &str); 8] = [
+        (0x01, "C"),
+        (0x02, "S"),
+        (0x04, "DS"),
+        (0x08, "FIUW"),
+        (0x10, "MIU"),
+        (0x20, "WU"),
+        (0x40, "SA"),
+        (0x80, "FIUA"),
+    ];
+    let set: Vec<&str> = TOKENS
+        .iter()
+        .filter(|(bit, _)| flags & bit != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    if set.is_empty() {
+        "none".to_string()
+    } else {
+        set.join("+")
+    }
+}
+
+/// The twin of `canon.py`'s `hdrtimes_str`: whether the object header at
+/// `path` records the times it can hold.
+fn hdrtimes_str(file: &H5File, path: &str) -> std::result::Result<String, String> {
+    file.object_records_times(path)
+        .map(|yes| if yes { "yes" } else { "no" }.to_string())
+        .map_err(oneline)
 }
 
 /// The twin of `canon.py`'s `shared_str`: what the object header at `path`
@@ -870,6 +948,8 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
             .map_err(oneline)
     });
     d.field(path, "shared", || shared_str(file, path));
+    d.field(path, "msgflags", || msgflags_str(file, path));
+    d.field(path, "hdrtimes", || hdrtimes_str(file, path));
     dump_group_attrs(d, path, group);
 
     if depth >= MAX_DEPTH {
@@ -1010,7 +1090,7 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
                 }
             }
             Child::NamedDatatype => match guarded(|| group.named_datatype(&name)) {
-                Ok(Ok(t)) => dump_named_datatype(d, &cpath, &t),
+                Ok(Ok(t)) => dump_named_datatype(d, file, &cpath, &t),
                 Ok(Err(e)) => d.emit(&format!("{cpath}#kind"), unsupported("kind", &oneline(e))),
                 Err(p) => d.emit(
                     &format!("{cpath}#kind"),
@@ -1207,6 +1287,8 @@ fn dump_dataset(d: &mut Dump, file: &H5File, path: &str, ds: &H5Dataset) {
     });
 
     d.field(path, "shared", || shared_str(file, path));
+    d.field(path, "msgflags", || msgflags_str(file, path));
+    d.field(path, "hdrtimes", || hdrtimes_str(file, path));
     dump_object_attrs(d, path, ds);
 
     d.field(path, "data", || dataset_payload(ds, dtype.as_ref()));
@@ -1311,7 +1393,7 @@ impl AttrSource for H5NamedDatatype {
 }
 
 /// A committed (named) datatype: the type it commits, then its attributes.
-fn dump_named_datatype(d: &mut Dump, path: &str, t: &H5NamedDatatype) {
+fn dump_named_datatype(d: &mut Dump, file: &H5File, path: &str, t: &H5NamedDatatype) {
     d.emit(&format!("{path}#kind"), "committed-datatype");
 
     let dtype = guarded(|| t.datatype()).ok().and_then(|r| r.ok());
@@ -1320,6 +1402,8 @@ fn dump_named_datatype(d: &mut Dump, path: &str, t: &H5NamedDatatype) {
         None => Err("H5NamedDatatype::datatype() failed or is unavailable".into()),
     });
     d.field(path, "strpad", || strpad_field(dtype.as_ref()));
+    d.field(path, "msgflags", || msgflags_str(file, path));
+    d.field(path, "hdrtimes", || hdrtimes_str(file, path));
 
     dump_object_attrs(d, path, t);
 }
