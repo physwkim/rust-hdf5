@@ -1023,6 +1023,21 @@ enum CrossFileOwner {
     /// reference's by `H5R__reopen_file`'s file handle; this crate's
     /// equivalent of those objects is the reader itself, which holds the
     /// target's whole catalog and answers every later name from it.
+    ///
+    /// This is a **deliberate difference from libhdf5**, not a match.
+    /// Measured against 1.14.6 by watching `/proc/self/fd`: a link target's
+    /// descriptor appears at the traversal, survives while any object opened
+    /// through the link is open, and goes at that object's close — and a
+    /// traversal that keeps no object (`f["ext/data"][...]`, a listing, an
+    /// `H5Lget_info`) leaves nothing open at all. It is *not* cached past
+    /// that: see this enum's own note on the disabled default EFC.
+    ///
+    /// Matching it would mean this crate re-walked a target file's whole
+    /// catalog on every name that crosses the link, because a reader — not
+    /// a per-object handle — is what it opens a target *as*. The delta is a
+    /// descriptor-and-lock window with no effect on any byte read or
+    /// written, so the reader's lifetime stands and the window is documented
+    /// here rather than paid for with that redesign.
     Reader,
     /// The virtual datasets that named this file as a source, by canonical
     /// path in *this* reader. Dropped once none of them has a live open.
