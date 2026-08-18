@@ -2190,6 +2190,56 @@ fn committed_datatypes_read_back_through_h5py() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A committed datatype's object header is created from the datatype creation
+/// property list and nothing else (`H5T__commit`, H5Tcommit.c:468), so
+/// `H5O__set_version` gives it the file's floor exactly as it gives every
+/// other object one: version 1 in a classic file, version 2 where the bound
+/// raises it. That decides where the hard link count is recorded — the
+/// version-1 prefix's `nlink` field, or a Reference Count message, which
+/// `H5O__link_oh` only ever creates for `oh->version > H5O_VERSION_1`
+/// (H5Oint.c:851). The two bounds are the boundary: a type shared by a dataset
+/// has `rc == 2` under both, and only the version says whether a second
+/// message carries it.
+#[test]
+fn a_committed_datatype_takes_the_header_version_its_file_calls_for() {
+    use rust_hdf5::LibverBound;
+    let Some(py) = python() else { return };
+    for (bound, version, nmesgs) in [
+        (LibverBound::Earliest, 1u32, 1u32),
+        (LibverBound::V112, 2, 2),
+    ] {
+        let path = tmp(&format!("committed_hdr_{bound:?}"));
+        {
+            // The bound has to be named at create: a classic file is one whose
+            // superblock says so, and `set_libver_bound` after the fact moves
+            // only the message encoders.
+            let file = H5File::options().libver(bound).create(&path).unwrap();
+            file.commit_datatype("t", DatatypeMessage::i32_type())
+                .unwrap();
+            file.new_dataset::<i32>()
+                .committed_type("t")
+                .shape([8])
+                .create("shared")
+                .unwrap()
+                .write_raw(&(0..8i32).collect::<Vec<_>>())
+                .unwrap();
+            file.close().unwrap();
+        }
+        read_back_with_h5py(
+            py,
+            &path,
+            &format!(
+                "hdr = h5py.h5o.get_info(f['t'].id).hdr\n\
+                 assert hdr.version == {version}, hdr.version\n\
+                 assert hdr.nmesgs == {nmesgs}, hdr.nmesgs\n\
+                 assert h5py.h5o.get_info(f['t'].id).rc == 2\n\
+                 assert f['shared'].id.get_type().committed()\n"
+            ),
+        );
+        std::fs::remove_file(&path).ok();
+    }
+}
+
 /// A committed datatype's attributes have no rust-hdf5 write path
 /// (`H5NamedDatatype` is read-only), so the only way to exercise
 /// `named_datatype_attr_names`'s ordering is a datatype h5py commits and

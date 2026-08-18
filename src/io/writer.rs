@@ -16311,7 +16311,10 @@ impl Hdf5Writer {
                 // nothing in the file could reach the header.
                 continue;
             }
-            let encoded = self.build_committed_datatype_header(i, rc).encode()?;
+            let format = self.committed_datatype_header_format();
+            let encoded = self
+                .build_committed_datatype_header(i, rc, format)
+                .encode_for(format, rc)?;
             let addr = self
                 .allocator
                 .allocate(encoded.len() as u64, FreeSpaceClass::Metadata);
@@ -16321,9 +16324,25 @@ impl Hdf5Writer {
         Ok(())
     }
 
+    /// The header format a committed datatype gets.
+    ///
+    /// `H5T__commit` creates the header from the datatype creation property
+    /// list (H5Tcommit.c:468), which carries no link order and, by default, no
+    /// attribute order — so the version is the file's floor exactly as
+    /// `H5O__set_version` computes it, and a committed datatype in a classic
+    /// file is a version-1 header like every other object in it.
+    fn committed_datatype_header_format(&self) -> ObjectFormat {
+        self.header_format(TrackOrder::default())
+    }
+
     /// Build the object header for a committed datatype: the type, and the
     /// reference count when more than one name reaches it.
-    fn build_committed_datatype_header(&self, index: usize, rc: u32) -> ObjectHeader {
+    fn build_committed_datatype_header(
+        &self,
+        index: usize,
+        rc: u32,
+        format: ObjectFormat,
+    ) -> ObjectHeader {
         let datatype = self.committed_datatypes.lock()[index].datatype.clone();
         let mut header = ObjectHeader::new();
         // No attributes to emit, so nothing else would apply the file-wide
@@ -16339,9 +16358,11 @@ impl Hdf5Writer {
             MSG_FLAG_CONSTANT | MSG_FLAG_DONTSHARE,
             datatype.encode_at(&self.ctx, self.encoding_libver()),
         );
-        if rc > 1 {
-            header.add_message(MSG_OBJ_REF_COUNT, MSG_FLAG_DONTSHARE, encode_refcount(rc));
-        }
+        // Through the same owner as every other object's count: a dataset
+        // sharing this type raises it (`H5O__shared_link_adj`, H5Oshared.c:249)
+        // just as a second name does, and where that count is recorded is the
+        // header version's business, not the caller's.
+        self.emit_refcount(&mut header, rc, format);
         header
     }
 
