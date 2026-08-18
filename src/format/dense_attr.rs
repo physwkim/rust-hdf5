@@ -362,6 +362,24 @@ mod tests {
         (file, read)
     }
 
+    /// `entry` as it comes back out of a file: a simple dataspace is written
+    /// with the maximum dimensions `H5S_set_extent_simple` fills in from the
+    /// current ones (H5S.c:1292-1299), so a reader names them even when the
+    /// constructor left them implicit.
+    fn with_stored_max_dims(entry: &AttributeEntry) -> AttributeEntry {
+        use crate::format::messages::dataspace::DataspaceClass;
+
+        let mut message = entry
+            .readable()
+            .expect("a built attribute is readable")
+            .clone();
+        if message.dataspace.class == DataspaceClass::Simple && message.dataspace.max_dims.is_none()
+        {
+            message.dataspace.max_dims = Some(message.dataspace.dims.clone());
+        }
+        message.into()
+    }
+
     fn numeric(name: &str, value: i32) -> AttributeEntry {
         AttributeMessage::scalar_numeric(
             name,
@@ -408,7 +426,7 @@ mod tests {
         assert_eq!(read.len(), 2);
         for want in &attrs {
             let got = read.iter().find(|a| a.name() == want.name()).unwrap();
-            assert_eq!(got, want);
+            assert_eq!(got, &with_stored_max_dims(want));
         }
     }
 

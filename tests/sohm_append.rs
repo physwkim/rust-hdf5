@@ -674,14 +674,16 @@ fn a_deleted_dataset_gives_back_the_reference_its_shared_attribute_held() {
 }
 
 /// A second, different `cal` is a second heap body, and each body holds its
-/// own pointer to what they have in common — so the datatype goes to two
-/// references, not to five.
+/// own pointer to what they have in common — so the datatype and the
+/// dataspace each go to two references, not to five.
 ///
-/// Only the datatype: the four attributes this fixture already had carry the
-/// maximum dimensions `H5Screate_simple` set, which the reopen keeps, while a
-/// dataspace created here has none. Those are two different dataspace
-/// messages and so two records of one reference each — a difference in what
-/// the reopen preserves, not in how a nested reference is counted.
+/// The dataspace is the half that only works because a simple extent is
+/// written with the maximum dimensions `H5S_set_extent_simple` fills in
+/// (H5S.c:1292-1299): the four attributes this fixture already had carry
+/// libhdf5's maximum, and the one created here reaches the same bytes. While
+/// this writer left the maximum out, those were two dataspace messages and
+/// the counts came back `[2, 1]` — the value to expect again if the encoder
+/// ever stops naming an implicit maximum.
 #[test]
 fn a_second_attribute_body_takes_its_own_reference_on_the_shared_internals() {
     let path = copy_fixture("sohm_nested.h5", "nested_rewrite");
@@ -705,7 +707,7 @@ fn a_second_attribute_body_takes_its_own_reference_on_the_shared_internals() {
     reference_counts_match_the_pointers(&path);
     assert_eq!(
         nested_attribute_census(&path),
-        vec![(1, vec![2, 1]), (4, vec![2, 1])]
+        vec![(1, vec![2, 2]), (4, vec![2, 2])]
     );
 
     let file = H5File::open(&path).unwrap();

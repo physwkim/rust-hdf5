@@ -659,7 +659,12 @@ mod tests {
         assert_eq!(decoded.name, "dim_offset");
         assert_eq!(decoded.dataspace.dims, vec![3]);
         assert_eq!(decoded.data, data);
-        assert_eq!(decoded, msg);
+        // The attribute's dataspace comes back naming the maximum dimensions
+        // a simple extent is always written with, which `array_numeric` left
+        // to the encoder to fill in.
+        assert_eq!(decoded.dataspace.max_dims, Some(vec![3]));
+        assert_eq!(decoded.datatype, msg.datatype);
+        assert_eq!(decoded.dataspace.class, msg.dataspace.class);
     }
 
     #[test]
