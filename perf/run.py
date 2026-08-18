@@ -27,6 +27,7 @@ WORKLOADS = [
     ("chunked-read", 5),
     ("deflate-write", 3),
     ("deflate-read", 5),
+    ("deflate-slice", 5),
     ("slice-read", 5),
     ("small-write", 3),
     ("small-read", 5),

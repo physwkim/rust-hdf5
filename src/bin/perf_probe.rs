@@ -18,6 +18,9 @@ const DEFLATE_N: usize = 8 * 1024 * 1024; // f64 -> 64 MiB
 const DEFLATE_LEVEL: u32 = 6;
 const SLICE_READS: usize = 1000;
 const SLICE_ELEMS: usize = 8192;
+// deflate-slice: chunks small enough for libhdf5's default 1 MiB chunk
+// cache, so its reuse across consecutive slices is part of the workload.
+const DSLICE_CHUNK: usize = 32 * 1024; // 256 KiB chunks
 const SMALL_DSETS: usize = 2000;
 const SMALL_N: usize = 128;
 const ATTRS: usize = 1000;
@@ -64,12 +67,12 @@ fn write_contig(path: &Path, data: &[f64]) {
     file.close().unwrap();
 }
 
-fn write_chunked(path: &Path, data: &[f64], deflate: bool) {
+fn write_chunked(path: &Path, data: &[f64], deflate: bool, chunk_elems: usize) {
     let file = H5File::create(path).unwrap();
     let mut b = file
         .new_dataset::<f64>()
         .shape([data.len()])
-        .chunk(&[CHUNK_ELEMS]);
+        .chunk(&[chunk_elems]);
     if deflate {
         b = b.deflate(DEFLATE_LEVEL);
     }
@@ -108,13 +111,13 @@ fn main() {
             let data = ramp(CONTIG_N);
             let path = p("rs-chunked.h5");
             timed(&workload, reps, || {
-                write_chunked(&path, &data, false);
+                write_chunked(&path, &data, false, CHUNK_ELEMS);
                 std::fs::remove_file(&path).unwrap();
             });
         }
         "chunked-read" => {
             let path = p("rs-chunked-in.h5");
-            write_chunked(&path, &ramp(CONTIG_N), false);
+            write_chunked(&path, &ramp(CONTIG_N), false, CHUNK_ELEMS);
             timed(&workload, reps, || {
                 let file = H5File::open(&path).unwrap();
                 let ds = file.dataset("data").unwrap();
@@ -126,13 +129,13 @@ fn main() {
             let data = compressible(DEFLATE_N);
             let path = p("rs-deflate.h5");
             timed(&workload, reps, || {
-                write_chunked(&path, &data, true);
+                write_chunked(&path, &data, true, CHUNK_ELEMS);
                 std::fs::remove_file(&path).unwrap();
             });
         }
         "deflate-read" => {
             let path = p("rs-deflate-in.h5");
-            write_chunked(&path, &compressible(DEFLATE_N), true);
+            write_chunked(&path, &compressible(DEFLATE_N), true, CHUNK_ELEMS);
             timed(&workload, reps, || {
                 let file = H5File::open(&path).unwrap();
                 let ds = file.dataset("data").unwrap();
@@ -142,7 +145,7 @@ fn main() {
         }
         "slice-read" => {
             let path = p("rs-slice-in.h5");
-            write_chunked(&path, &ramp(CONTIG_N), false);
+            write_chunked(&path, &ramp(CONTIG_N), false, CHUNK_ELEMS);
             timed(&workload, reps, || {
                 let file = H5File::open(&path).unwrap();
                 let ds = file.dataset("data").unwrap();
@@ -154,6 +157,22 @@ fn main() {
                     total += v.len();
                 }
                 assert_eq!(total, SLICE_READS * SLICE_ELEMS);
+            });
+        }
+        "deflate-slice" => {
+            let path = p("rs-deflate-slice-in.h5");
+            write_chunked(&path, &compressible(DEFLATE_N), true, DSLICE_CHUNK);
+            timed(&workload, reps, || {
+                let file = H5File::open(&path).unwrap();
+                let ds = file.dataset("data").unwrap();
+                let mut total = 0usize;
+                for k in 0..DEFLATE_N / SLICE_ELEMS {
+                    let v = ds
+                        .read_slice::<f64>(&[k * SLICE_ELEMS], &[SLICE_ELEMS])
+                        .unwrap();
+                    total += v.len();
+                }
+                assert_eq!(total, DEFLATE_N);
             });
         }
         "small-write" => {

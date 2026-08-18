@@ -18,6 +18,9 @@
 #define DEFLATE_LEVEL 6
 #define SLICE_READS 1000
 #define SLICE_ELEMS 8192
+/* deflate-slice: chunks small enough for the default 1 MiB chunk cache,
+ * so its reuse across consecutive slices is part of the workload. */
+#define DSLICE_CHUNK (32 * 1024)
 #define SMALL_DSETS 2000
 #define SMALL_N 128
 #define ATTRS 1000
@@ -72,12 +75,11 @@ static void write_contig(const char *path, const double *data, hsize_t n) {
 }
 
 static void write_chunked(const char *path, const double *data, hsize_t n,
-                          int deflate) {
+                          int deflate, hsize_t chunk) {
     hid_t f = H5Fcreate(path, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
     CHECK(f);
     hid_t sp = H5Screate_simple(1, &n, NULL);
     hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
-    hsize_t chunk = CHUNK_ELEMS;
     CHECK(H5Pset_chunk(dcpl, 1, &chunk));
     if (deflate) CHECK(H5Pset_deflate(dcpl, DEFLATE_LEVEL));
     hid_t d = H5Dcreate2(f, "data", H5T_NATIVE_DOUBLE, sp, H5P_DEFAULT, dcpl,
@@ -142,30 +144,56 @@ int main(int argc, char **argv) {
         double *data = ramp(CONTIG_N);
         snprintf(path, sizeof path, "%s/c-chunked.h5", workdir);
         TIMED({
-            write_chunked(path, data, CONTIG_N, 0);
+            write_chunked(path, data, CONTIG_N, 0, CHUNK_ELEMS);
             remove(path);
         });
     } else if (strcmp(wl, "chunked-read") == 0) {
         double *data = ramp(CONTIG_N);
         snprintf(path, sizeof path, "%s/c-chunked-in.h5", workdir);
-        write_chunked(path, data, CONTIG_N, 0);
+        write_chunked(path, data, CONTIG_N, 0, CHUNK_ELEMS);
         TIMED({ free(read_full(path, CONTIG_N)); });
     } else if (strcmp(wl, "deflate-write") == 0) {
         double *data = compressible(DEFLATE_N);
         snprintf(path, sizeof path, "%s/c-deflate.h5", workdir);
         TIMED({
-            write_chunked(path, data, DEFLATE_N, 1);
+            write_chunked(path, data, DEFLATE_N, 1, CHUNK_ELEMS);
             remove(path);
         });
     } else if (strcmp(wl, "deflate-read") == 0) {
         double *data = compressible(DEFLATE_N);
         snprintf(path, sizeof path, "%s/c-deflate-in.h5", workdir);
-        write_chunked(path, data, DEFLATE_N, 1);
+        write_chunked(path, data, DEFLATE_N, 1, CHUNK_ELEMS);
         TIMED({ free(read_full(path, DEFLATE_N)); });
+    } else if (strcmp(wl, "deflate-slice") == 0) {
+        double *data = compressible(DEFLATE_N);
+        snprintf(path, sizeof path, "%s/c-deflate-slice-in.h5", workdir);
+        write_chunked(path, data, DEFLATE_N, 1, DSLICE_CHUNK);
+        double *sbuf = malloc(SLICE_ELEMS * sizeof(double));
+        TIMED({
+            hid_t f = H5Fopen(path, H5F_ACC_RDONLY, H5P_DEFAULT);
+            hid_t d = H5Dopen2(f, "data", H5P_DEFAULT);
+            hid_t fsp = H5Dget_space(d);
+            hsize_t count = SLICE_ELEMS;
+            hid_t msp = H5Screate_simple(1, &count, NULL);
+            size_t total = 0;
+            for (int k = 0; k < DEFLATE_N / SLICE_ELEMS; k++) {
+                hsize_t off = (hsize_t)k * SLICE_ELEMS;
+                CHECK(H5Sselect_hyperslab(fsp, H5S_SELECT_SET, &off, NULL,
+                                          &count, NULL));
+                CHECK(H5Dread(d, H5T_NATIVE_DOUBLE, msp, fsp, H5P_DEFAULT,
+                              sbuf));
+                total += SLICE_ELEMS;
+            }
+            if (total != (size_t)DEFLATE_N) exit(1);
+            H5Sclose(msp);
+            H5Sclose(fsp);
+            H5Dclose(d);
+            H5Fclose(f);
+        });
     } else if (strcmp(wl, "slice-read") == 0) {
         double *data = ramp(CONTIG_N);
         snprintf(path, sizeof path, "%s/c-slice-in.h5", workdir);
-        write_chunked(path, data, CONTIG_N, 0);
+        write_chunked(path, data, CONTIG_N, 0, CHUNK_ELEMS);
         double *buf = malloc(SLICE_ELEMS * sizeof(double));
         TIMED({
             hid_t f = H5Fopen(path, H5F_ACC_RDONLY, H5P_DEFAULT);
