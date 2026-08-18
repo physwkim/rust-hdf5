@@ -323,7 +323,7 @@ fn a_virtual_source_takes_the_virtual_file_s_lock() {
     }
     assert!(
         enabled().open_rw(&src).is_ok(),
-        "expected the source lock to go with the virtual file's reader"
+        "expected the source lock to go with the handles that took it"
     );
 
     // The same read under a virtual file opened with locking off leaves the
@@ -338,4 +338,200 @@ fn a_virtual_source_takes_the_virtual_file_s_lock() {
         );
     }
     let _ = std::fs::remove_dir_all(src.parent().unwrap());
+}
+
+/// A virtual dataset's source file is held by the *dataset's* open, not by
+/// the virtual file's.
+///
+/// `H5D__virtual_open_source_dset` leaves the source dataset open in the
+/// virtual dataset's shared layout (H5Dvirtual.c:901-902); the source file
+/// it was opened from is released back to the (by default absent) external
+/// file cache immediately (:927, H5Fefc.c:420-426, `H5F_ACS_EFC_SIZE_DEF` 0
+/// at H5Pfapl.c:191), so what keeps the file open is that source dataset —
+/// and `H5D__virtual_reset_layout` closes it at the last `H5Dclose` of the
+/// virtual dataset (H5Dvirtual.c:709-710, :955).
+///
+/// Measured against libhdf5 1.14.6 / h5py 3.15.1 by watching
+/// `/proc/self/fd` across the same sequence: the source appears at the read,
+/// is gone after `H5Dclose`, and reappears on the next read — while the
+/// virtual file stays open throughout.
+#[test]
+fn a_virtual_source_is_unlocked_by_the_last_dataset_handle() {
+    use rust_hdf5::Selection;
+    let src = unique_tmp("vds_handle_source");
+    let vds = src.parent().unwrap().join("vds_handle_holder.h5");
+    enabled()
+        .create(&src)
+        .unwrap()
+        .new_dataset::<i32>()
+        .shape([2usize, 4])
+        .create("data")
+        .unwrap()
+        .write_raw(&(0..8i32).collect::<Vec<_>>())
+        .unwrap();
+    {
+        let file = enabled().create(&vds).unwrap();
+        file.new_dataset::<i32>()
+            .shape([2usize, 4])
+            .fill_value(-9i32)
+            .virtual_mapping(
+                Selection::All,
+                src.to_str().unwrap(),
+                "data",
+                Selection::All,
+            )
+            .create("v")
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let want: Vec<i32> = (0..8).collect();
+    let reader = enabled().open(&vds).unwrap();
+    let ds = reader.dataset("v").unwrap();
+    assert_eq!(ds.read_raw::<i32>().unwrap(), want);
+    assert!(
+        enabled().open_rw(&src).is_err(),
+        "expected the read to leave the source locked"
+    );
+
+    // The virtual file is still open; only the dataset handle goes.
+    drop(ds);
+    assert!(
+        enabled().open_rw(&src).is_ok(),
+        "expected the source to be released by the last handle on the virtual \
+         dataset, not by the virtual file's close"
+    );
+
+    // A later open of the same virtual dataset takes the source again, the
+    // way libhdf5 reopens it on the next read.
+    let ds = reader.dataset("v").unwrap();
+    assert_eq!(ds.read_raw::<i32>().unwrap(), want);
+    assert!(
+        enabled().open_rw(&src).is_err(),
+        "expected a later read to take the source lock again"
+    );
+    drop(ds);
+    drop(reader);
+    let _ = std::fs::remove_dir_all(src.parent().unwrap());
+}
+
+/// Which virtual dataset closed decides which source is released: two
+/// virtual datasets in one file, one source each. Measured against libhdf5
+/// 1.14.6 — closing the first drops only its own source's descriptor.
+#[test]
+fn each_virtual_dataset_releases_only_its_own_source() {
+    use rust_hdf5::Selection;
+    let a = unique_tmp("vds_two_a");
+    let dir = a.parent().unwrap().to_path_buf();
+    let b = dir.join("vds_two_b.h5");
+    let vds = dir.join("vds_two_holder.h5");
+    for p in [&a, &b] {
+        enabled()
+            .create(p)
+            .unwrap()
+            .new_dataset::<i32>()
+            .shape([4usize])
+            .create("data")
+            .unwrap()
+            .write_raw(&[1i32, 2, 3, 4])
+            .unwrap();
+    }
+    {
+        let file = enabled().create(&vds).unwrap();
+        for (name, src) in [("va", &a), ("vb", &b)] {
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .fill_value(-1i32)
+                .virtual_mapping(
+                    Selection::All,
+                    src.to_str().unwrap(),
+                    "data",
+                    Selection::All,
+                )
+                .create(name)
+                .unwrap();
+        }
+        file.close().unwrap();
+    }
+
+    let reader = enabled().open(&vds).unwrap();
+    let da = reader.dataset("va").unwrap();
+    let db = reader.dataset("vb").unwrap();
+    assert_eq!(da.read_raw::<i32>().unwrap(), vec![1, 2, 3, 4]);
+    assert_eq!(db.read_raw::<i32>().unwrap(), vec![1, 2, 3, 4]);
+    assert!(enabled().open_rw(&a).is_err(), "source a should be locked");
+    assert!(enabled().open_rw(&b).is_err(), "source b should be locked");
+
+    drop(da);
+    assert!(
+        enabled().open_rw(&a).is_ok(),
+        "closing va should release its own source"
+    );
+    assert!(
+        enabled().open_rw(&b).is_err(),
+        "closing va must not release vb's source"
+    );
+    drop(db);
+    assert!(
+        enabled().open_rw(&b).is_ok(),
+        "closing vb should release its source"
+    );
+    drop(reader);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One source named by two virtual datasets stays open until *both* are
+/// closed — libhdf5 shares the one `H5F_shared_t` between the two source
+/// datasets (H5Fint.c:1906-1918), so its descriptor survives the first
+/// `H5Dclose` and goes with the second. Measured against libhdf5 1.14.6.
+#[test]
+fn a_shared_virtual_source_waits_for_the_last_of_its_readers() {
+    use rust_hdf5::Selection;
+    let src = unique_tmp("vds_shared_src");
+    let dir = src.parent().unwrap().to_path_buf();
+    let vds = dir.join("vds_shared_holder.h5");
+    enabled()
+        .create(&src)
+        .unwrap()
+        .new_dataset::<i32>()
+        .shape([4usize])
+        .create("data")
+        .unwrap()
+        .write_raw(&[5i32, 6, 7, 8])
+        .unwrap();
+    {
+        let file = enabled().create(&vds).unwrap();
+        for name in ["va", "vb"] {
+            file.new_dataset::<i32>()
+                .shape([4usize])
+                .fill_value(-1i32)
+                .virtual_mapping(
+                    Selection::All,
+                    src.to_str().unwrap(),
+                    "data",
+                    Selection::All,
+                )
+                .create(name)
+                .unwrap();
+        }
+        file.close().unwrap();
+    }
+
+    let reader = enabled().open(&vds).unwrap();
+    let da = reader.dataset("va").unwrap();
+    let db = reader.dataset("vb").unwrap();
+    assert_eq!(da.read_raw::<i32>().unwrap(), vec![5, 6, 7, 8]);
+    assert_eq!(db.read_raw::<i32>().unwrap(), vec![5, 6, 7, 8]);
+    drop(da);
+    assert!(
+        enabled().open_rw(&src).is_err(),
+        "the source is still named by vb's open"
+    );
+    drop(db);
+    assert!(
+        enabled().open_rw(&src).is_ok(),
+        "the last of the two opens should release the shared source"
+    );
+    drop(reader);
+    let _ = std::fs::remove_dir_all(&dir);
 }

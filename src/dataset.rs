@@ -1357,6 +1357,31 @@ pub struct H5Dataset {
     _open: Option<crate::io::reader::DatasetOpenToken>,
 }
 
+impl Drop for H5Dataset {
+    /// Closing a virtual dataset's last handle closes the source files that
+    /// open was holding, which is what `H5D__virtual_reset_layout` does at
+    /// the last `H5Dclose` (H5Dvirtual.c:709-710, closing each
+    /// `source_dset->dset` at :955 and with it the file that dataset kept
+    /// open). Nothing else in this crate can end a virtual open, so this is
+    /// where the reader is told.
+    ///
+    /// The token is dropped *before* the reader is asked, so the reader's
+    /// `Weak` already reads dead for the handle going away here. Handles on
+    /// anything but a virtual dataset carry no token and take no lock.
+    fn drop(&mut self) {
+        let Some(open) = self._open.take() else {
+            return;
+        };
+        drop(open);
+        let Some(mut inner) = crate::file::try_borrow_inner_mut(&self.file_inner) else {
+            return;
+        };
+        if let crate::file::H5FileInner::Reader(reader) = &mut *inner {
+            reader.release_closed_virtual_sources();
+        }
+    }
+}
+
 /// One chunk's bytes on the way to the file, and who filtered them.
 ///
 /// This is what separates a normal chunk write from a direct one; everything

@@ -56,6 +56,19 @@ pub(crate) fn borrow_inner_mut(inner: &SharedInner) -> std::cell::RefMut<'_, H5F
     inner.borrow_mut()
 }
 
+/// [`borrow_inner_mut`] where failing to get the lock must not panic.
+///
+/// Only [`H5Dataset`]'s drop uses this: a `Drop` that panics while another
+/// panic unwinds aborts the process, and the one thing it does with the lock
+/// — releasing cross-file handles a closed virtual dataset was holding — is
+/// re-run by the next handle drop or extent resolution.
+#[cfg(not(feature = "threadsafe"))]
+pub(crate) fn try_borrow_inner_mut(
+    inner: &SharedInner,
+) -> Option<std::cell::RefMut<'_, H5FileInner>> {
+    inner.try_borrow_mut().ok()
+}
+
 /// Helper to clone a SharedInner.
 #[cfg(not(feature = "threadsafe"))]
 pub(crate) fn clone_inner(inner: &SharedInner) -> SharedInner {
@@ -85,6 +98,15 @@ pub(crate) fn borrow_inner_mut(
     inner: &SharedInner,
 ) -> std::sync::RwLockWriteGuard<'_, H5FileInner> {
     inner.write().unwrap()
+}
+
+/// [`borrow_inner_mut`] where failing to get the lock must not panic; see the
+/// single-threaded twin for why.
+#[cfg(feature = "threadsafe")]
+pub(crate) fn try_borrow_inner_mut(
+    inner: &SharedInner,
+) -> Option<std::sync::RwLockWriteGuard<'_, H5FileInner>> {
+    inner.write().ok()
 }
 
 #[cfg(feature = "threadsafe")]
