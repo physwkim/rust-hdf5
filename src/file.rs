@@ -101,8 +101,12 @@ pub(crate) fn new_shared(inner: H5FileInner) -> SharedInner {
 /// Enable the `threadsafe` feature to use `Arc<Mutex<>>` instead, making
 /// `H5File` `Send + Sync`.
 pub(crate) enum H5FileInner {
-    Writer(Hdf5Writer),
-    Reader(Hdf5Reader),
+    // Boxed: `Hdf5Writer` and `Hdf5Reader` are both far larger than the
+    // zero-sized `Closed` sentinel, and inlining either here would size
+    // every `H5FileInner` to that variant's footprint regardless of which
+    // mode a given file is actually in.
+    Writer(Box<Hdf5Writer>),
+    Reader(Box<Hdf5Reader>),
     /// Sentinel value used during `close()` to take ownership of the writer.
     Closed,
 }
@@ -121,7 +125,7 @@ impl H5File {
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
         let writer = Hdf5Writer::create(path.as_ref())?;
         Ok(Self {
-            inner: new_shared(H5FileInner::Writer(writer)),
+            inner: new_shared(H5FileInner::Writer(Box::new(writer))),
         })
     }
 
@@ -129,7 +133,7 @@ impl H5File {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let reader = Hdf5Reader::open(path.as_ref())?;
         Ok(Self {
-            inner: new_shared(H5FileInner::Reader(reader)),
+            inner: new_shared(H5FileInner::Reader(Box::new(reader))),
         })
     }
 
@@ -149,7 +153,7 @@ impl H5File {
     pub fn open_rw<P: AsRef<Path>>(path: P) -> Result<Self> {
         let writer = Hdf5Writer::open_append(path.as_ref())?;
         Ok(Self {
-            inner: new_shared(H5FileInner::Writer(writer)),
+            inner: new_shared(H5FileInner::Writer(Box::new(writer))),
         })
     }
 
@@ -1312,7 +1316,7 @@ impl H5FileOptions {
             },
         )?;
         Ok(H5File {
-            inner: new_shared(H5FileInner::Writer(writer)),
+            inner: new_shared(H5FileInner::Writer(Box::new(writer))),
         })
     }
 
@@ -1321,7 +1325,7 @@ impl H5FileOptions {
         self.refuse_create_only_options()?;
         let reader = Hdf5Reader::open_with_locking(path.as_ref(), self.resolved_locking())?;
         Ok(H5File {
-            inner: new_shared(H5FileInner::Reader(reader)),
+            inner: new_shared(H5FileInner::Reader(Box::new(reader))),
         })
     }
 
@@ -1330,7 +1334,7 @@ impl H5FileOptions {
         self.refuse_create_only_options()?;
         let writer = Hdf5Writer::open_append_with_locking(path.as_ref(), self.resolved_locking())?;
         Ok(H5File {
-            inner: new_shared(H5FileInner::Writer(writer)),
+            inner: new_shared(H5FileInner::Writer(Box::new(writer))),
         })
     }
 }
