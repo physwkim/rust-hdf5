@@ -932,8 +932,12 @@ pub struct Hdf5Reader {
     /// setting (or one `H5FileOptions::locking` call) governs every file a
     /// path touches, not just the first.
     locking: crate::io::locking::FileLocking,
-    /// External-link target files, keyed by the resolved path that opened
-    /// them, so N links naming one file share one open handle.
+    /// Files opened on another file's behalf — external-link targets,
+    /// external-reference targets and virtual-dataset sources — keyed by the
+    /// resolved path that opened them, so N names for one file share one
+    /// open handle. libhdf5 pools all three the same way, in the primary
+    /// file's external file cache keyed by the name the open used
+    /// (H5Fefc.c:245).
     ///
     /// An entry is created the first time a path actually crosses the link and
     /// lives until this reader is dropped — that is, for the life of the
@@ -2677,11 +2681,12 @@ impl Hdf5Reader {
     /// same file already opened.
     ///
     /// The single owner of every file this reader opens on another file's
-    /// behalf, so a path named by any number of external links and external
-    /// references is opened once and read through one handle. What resolved
-    /// the name to this path is the caller's business, and differs by kind:
-    /// an external link runs `H5F_prefix_open_file`'s search order, a
-    /// reference has no search order at all.
+    /// behalf, so a path named by any number of external links, external
+    /// references and virtual-dataset sources is opened once and read
+    /// through one handle. What resolved the name to this path is the
+    /// caller's business, and differs by kind: an external link and a
+    /// virtual source each run `H5F_prefix_open_file`'s search order under
+    /// their own prefix, a reference has no search order at all.
     fn cross_file(&mut self, resolved: PathBuf) -> IoResult<&mut Hdf5Reader> {
         let locking = self.locking;
         match self.external.entry(resolved) {
@@ -2691,6 +2696,42 @@ impl Hdf5Reader {
                 Ok(&mut **e.insert(Box::new(reader)))
             }
         }
+    }
+
+    /// Open the file a virtual mapping's source name points at, or hand back
+    /// the handle a previous mapping to the same file already opened.
+    ///
+    /// A virtual dataset's source is not opened by any path of its own:
+    /// `H5D__virtual_open_source_dset` hands the name to
+    /// `H5F_prefix_open_file` (H5Dvirtual.c:877-882) against the *primary*
+    /// file's external file cache and with `source_fapl`, a copy of the
+    /// primary file's own file-access property list
+    /// (H5Dvirtual.c:2193-2194), which carries its `use_file_locking`
+    /// verbatim (H5Fint.c:389). That is the same cache and the same call
+    /// external links reach, keyed by the name the open used
+    /// (H5Fefc.c:245), and it is released back to it with `H5F_efc_close`
+    /// (H5Dvirtual.c:925-927). So a source file is this reader's
+    /// [`cross_file`](Self::cross_file) like any other target: one handle
+    /// per path, under this file's locking policy — measured against
+    /// libhdf5 1.14.6, reading a cross-file VDS leaves the source flock'd
+    /// under the default `HDF5_USE_FILE_LOCKING` and unlocked under
+    /// `HDF5_USE_FILE_LOCKING=FALSE`.
+    ///
+    /// The one delta left is how long the handle lives. libhdf5 drops the
+    /// source when the *virtual dataset* is closed (`H5D__virtual_reset_layout`
+    /// frees the entries at the last `H5Dclose`, H5Dvirtual.c:707-710);
+    /// this reader keeps every cross-file handle until the `H5File` itself
+    /// goes, which is the model [`cross_file`](Self::cross_file) already
+    /// applies to external links and references, so a source stays locked
+    /// from the first read to the file's close rather than to the dataset's.
+    ///
+    /// `None` where the file cannot be opened at all: `H5F_prefix_open_file`
+    /// is asked to *try*, and a null source file is "no data there yet",
+    /// not a failure.
+    fn vds_source_file(&mut self, file_name: &str) -> Option<&mut Hdf5Reader> {
+        let prefix = resolve_vdsfile_prefix(&self.source_dir);
+        let full_path = combine_prefixed_path(prefix.as_deref(), file_name);
+        self.cross_file(full_path).ok()
     }
 
     /// The reader that owns `name`, the path of `name` inside it, and the last
@@ -3738,9 +3779,7 @@ impl Hdf5Reader {
                 .dataset_info_local(dset_name)
                 .map(|i| i.dataspace.dims.clone());
         }
-        let prefix = resolve_vdsfile_prefix(&self.source_dir);
-        let full_path = combine_prefixed_path(prefix.as_deref(), file_name);
-        let mut reader = Hdf5Reader::open_with_locking(&full_path, FileLocking::Disabled).ok()?;
+        let reader = self.vds_source_file(file_name)?;
         reader.apply_dataset_access(dset_name, access).ok()?;
         reader
             .dataset_info(dset_name)
@@ -3795,16 +3834,10 @@ impl Hdf5Reader {
         // bounded selections.
         let resolution = info.virtual_resolution.clone().unwrap_or_default();
         let mappings = concrete_virtual_mappings(&mappings, &resolution)?;
-        let source_dir = self.source_dir.clone();
         // The same properties the extent resolved under reach every source
         // (H5Dvirtual.c:2224-2226, :901-902), so a source that is itself a
         // virtual dataset is read the same way this one is.
         let access = self.access_in_force(&self.canonical_path(name));
-
-        // Cross-file source readers, opened at most once per distinct
-        // resolved path for the duration of this call.
-        let mut cross_file_cache: std::collections::HashMap<PathBuf, Hdf5Reader> =
-            std::collections::HashMap::new();
 
         for mapping in &mappings {
             let virtual_sel = mapping.virtual_selection.resolve(&dims).map_err(|e| {
@@ -3845,19 +3878,9 @@ impl Hdf5Reader {
                     out,
                 )?;
             } else {
-                let prefix = resolve_vdsfile_prefix(&source_dir);
-                let full_path = combine_prefixed_path(prefix.as_deref(), &mapping.source_file_name);
-                let cache_key =
-                    std::fs::canonicalize(&full_path).unwrap_or_else(|_| full_path.clone());
-                if !cross_file_cache.contains_key(&cache_key) {
-                    let Ok(reader) =
-                        Hdf5Reader::open_with_locking(&full_path, FileLocking::Disabled)
-                    else {
-                        continue;
-                    };
-                    cross_file_cache.insert(cache_key.clone(), reader);
-                }
-                let src_reader = cross_file_cache.get_mut(&cache_key).unwrap();
+                let Some(src_reader) = self.vds_source_file(&mapping.source_file_name) else {
+                    continue;
+                };
                 src_reader.apply_dataset_access(source_name, access)?;
                 let Some(src_dims) = src_reader
                     .dataset_info(source_name)
