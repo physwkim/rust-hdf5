@@ -1357,6 +1357,31 @@ pub struct H5Dataset {
     _open: Option<crate::io::reader::DatasetOpenToken>,
 }
 
+impl Drop for H5Dataset {
+    /// Closing a virtual dataset's last handle closes the source files that
+    /// open was holding, which is what `H5D__virtual_reset_layout` does at
+    /// the last `H5Dclose` (H5Dvirtual.c:709-710, closing each
+    /// `source_dset->dset` at :955 and with it the file that dataset kept
+    /// open). Nothing else in this crate can end a virtual open, so this is
+    /// where the reader is told.
+    ///
+    /// The token is dropped *before* the reader is asked, so the reader's
+    /// `Weak` already reads dead for the handle going away here. Handles on
+    /// anything but a virtual dataset carry no token and take no lock.
+    fn drop(&mut self) {
+        let Some(open) = self._open.take() else {
+            return;
+        };
+        drop(open);
+        let Some(mut inner) = crate::file::try_borrow_inner_mut(&self.file_inner) else {
+            return;
+        };
+        if let crate::file::H5FileInner::Reader(reader) = &mut *inner {
+            reader.release_closed_virtual_sources();
+        }
+    }
+}
+
 /// One chunk's bytes on the way to the file, and who filtered them.
 ///
 /// This is what separates a normal chunk write from a direct one; everything
@@ -1695,10 +1720,15 @@ pub enum VirtualView {
 /// The dataset *access* properties this crate models — libhdf5's
 /// `H5P_DATASET_ACCESS` property list, as much of it as affects reading.
 ///
-/// Both knobs govern how a virtual dataset's extent is resolved when it is
-/// opened (`H5D__virtual_set_extent_unlim`, H5Dvirtual.c:1386), and neither
-/// is stored in the file: opening a virtual dataset without naming them
-/// reads it exactly as libhdf5's default dapl does.
+/// [`virtual_view`](Self::virtual_view) and
+/// [`virtual_printf_gap`](Self::virtual_printf_gap) govern how a virtual
+/// dataset's extent is resolved when it is opened
+/// (`H5D__virtual_set_extent_unlim`, H5Dvirtual.c:1386);
+/// [`virtual_prefix`](Self::virtual_prefix) and
+/// [`efile_prefix`](Self::efile_prefix) say where the *other files* a
+/// dataset's data lives in are looked for. None of them is stored in the
+/// file: opening a dataset without naming them reads it exactly as
+/// libhdf5's default dapl does.
 ///
 /// Pass one to [`H5File::dataset_with`](crate::H5File::dataset_with).
 ///
@@ -1711,10 +1741,12 @@ pub enum VirtualView {
 ///     .virtual_printf_gap(2);
 /// let ds = file.dataset_with("vds", access).unwrap();
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DatasetAccess {
     view: VirtualView,
     printf_gap: u64,
+    virtual_prefix: Option<String>,
+    efile_prefix: Option<String>,
 }
 
 impl DatasetAccess {
@@ -1752,11 +1784,84 @@ impl DatasetAccess {
         self.view
     }
 
+    /// `H5Pset_virtual_prefix` (H5Pdapl.c:1478): a directory a virtual
+    /// dataset's *source file names* are looked for under, before the
+    /// virtual file's own directory and after `HDF5_VDS_PREFIX`.
+    ///
+    /// It is the third step of `H5F_prefix_open_file`'s search order
+    /// (H5Fint.c:938-950), and it is reached only when `HDF5_VDS_PREFIX` is
+    /// unset or empty: `H5D__build_file_prefix` reads the environment first
+    /// and falls back to this property (H5Dint.c:1077-1082), so an
+    /// environment prefix shadows this one outright rather than being tried
+    /// alongside it.
+    ///
+    /// A leading `${ORIGIN}` stands for the directory holding the virtual
+    /// dataset's own file (H5Dint.c:1105-1113), and `"."` or `""` means "no
+    /// prefix" (:1096-1100), both exactly as for the environment variable.
+    ///
+    /// Like the other two, this is a *dataset access* property that is never
+    /// stored in the file, and the first open of a virtual dataset fixes it
+    /// for every open that overlaps it.
+    pub fn virtual_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.virtual_prefix = Some(prefix.into());
+        self
+    }
+
+    /// `H5Pset_efile_prefix` (H5Pdapl.c:1392): a directory the *raw data
+    /// files* of a dataset stored through an external file list are looked
+    /// for under.
+    ///
+    /// This one takes no search at all, unlike the other two prefixes:
+    /// `H5D__efl_read` joins the prefix to the stored name with
+    /// `H5_combine_path` and opens exactly that one path (H5Defl.c:315-317).
+    /// With no prefix in force the stored name is used as written, so a
+    /// relative one resolves against the *process's current directory* and
+    /// not against the directory holding the HDF5 file — measured under
+    /// libhdf5 1.14.6 and 2.0.0: a raw data file next to the HDF5 file is
+    /// not found, while the same name under the current directory is.
+    ///
+    /// It shares [`virtual_prefix`](Self::virtual_prefix)'s expansion rules,
+    /// because both are built by `H5D__build_file_prefix`: `HDF5_EXTFILE_PREFIX`
+    /// shadows this property outright rather than merely preceding it
+    /// (H5Dint.c:1084-1090), a leading `${ORIGIN}` stands for the directory
+    /// holding the HDF5 file (:1105-1113), and `"."` or `""` means no prefix
+    /// (:1098-1102).
+    ///
+    /// # A second open must name the same one
+    ///
+    /// Where a mismatched [`virtual_prefix`](Self::virtual_prefix) is
+    /// silently ignored by the second open, a mismatched external file prefix
+    /// is an *error*: `H5D_open` compares the expanded prefix against the one
+    /// the already-open dataset resolved under and refuses the open when they
+    /// differ (H5Dint.c:1533-1545). Expanded, so two opens that differ only
+    /// in a property the environment shadows still agree. Closing every
+    /// handle releases the answer, and the next open sets its own.
+    pub fn efile_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.efile_prefix = Some(prefix.into());
+        self
+    }
+
     /// `H5Pget_virtual_printf_gap` (H5Pdapl.c:1243) — the value set, not the
     /// one the extent resolution ends up using; see
     /// [`VirtualView::FirstMissing`].
     pub fn printf_gap(&self) -> u64 {
         self.printf_gap
+    }
+
+    /// `H5Pget_virtual_prefix` (H5Pdapl.c:1510) — the property as set, before
+    /// `HDF5_VDS_PREFIX` gets to shadow it and before `${ORIGIN}` is
+    /// expanded. `None` is `H5D_ACS_VDS_PREFIX_DEF`, a null prefix
+    /// (H5Pdapl.c:72).
+    pub fn virtual_prefix_value(&self) -> Option<&str> {
+        self.virtual_prefix.as_deref()
+    }
+
+    /// `H5Pget_efile_prefix` (H5Pdapl.c:1422) — the property as set, before
+    /// `HDF5_EXTFILE_PREFIX` gets to shadow it and before `${ORIGIN}` is
+    /// expanded. `None` is `H5D_ACS_EFILE_PREFIX_DEF`, a null prefix
+    /// (H5Pdapl.c:90).
+    pub fn efile_prefix_value(&self) -> Option<&str> {
+        self.efile_prefix.as_deref()
     }
 
     /// The printf gap `H5D__virtual_set_extent_unlim` actually scans with:

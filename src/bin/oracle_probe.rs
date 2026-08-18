@@ -1104,7 +1104,7 @@ fn dump_group(d: &mut Dump, file: &H5File, path: &str, group: &H5Group, depth: u
             },
             Child::Dataset => {
                 let lookup = cpath.trim_start_matches('/').to_string();
-                let access = d.access;
+                let access = d.access.clone();
                 match guarded(|| file.dataset_with(&lookup, access)) {
                     Ok(Ok(ds)) => dump_dataset(d, file, &cpath, &ds),
                     Ok(Err(e)) => {
