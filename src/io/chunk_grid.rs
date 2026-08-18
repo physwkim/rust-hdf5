@@ -161,9 +161,46 @@ pub(crate) fn coords_of(
     let ndims = dims.len();
     let grid = index_grid(dims, max_dims, chunk_dims)?;
     let unlim_dim = single_unlimited_dim(max_dims, ndims)?;
-    let seed_dim = unlim_dim.unwrap_or(0);
-
     let mut coords = vec![0u64; ndims];
+    coords_into(&grid, unlim_dim, linear, &mut coords)?;
+    Ok(coords)
+}
+
+/// Grid coordinates of every chunk slot `0..count`, packed row-major as
+/// `count * dims.len()` values — [`coords_of`] for a whole index at once,
+/// resolving the grid and the seed dimension once for the lot.
+///
+/// A chunked read decodes the position of every slot its index records, so
+/// what `coords_of` spends per slot is what the read spends per chunk; the
+/// packed table is one allocation for all of them.
+pub(crate) fn coords_table(
+    dims: &[u64],
+    max_dims: Option<&[u64]>,
+    chunk_dims: &[u64],
+    count: usize,
+) -> IoResult<Vec<u64>> {
+    let ndims = dims.len();
+    let grid = index_grid(dims, max_dims, chunk_dims)?;
+    let unlim_dim = single_unlimited_dim(max_dims, ndims)?;
+    let mut table = vec![0u64; count.saturating_mul(ndims)];
+    for (linear, coords) in table.chunks_mut(ndims.max(1)).enumerate() {
+        coords_into(&grid, unlim_dim, linear as u64, &mut coords[..ndims])?;
+    }
+    Ok(table)
+}
+
+/// Write the grid coordinates of chunk slot `linear` into `coords`, against a
+/// grid and unlimited dimension already resolved. The arithmetic both
+/// [`coords_of`] and [`coords_table`] read through, so a slot decodes the same
+/// way however many of them a caller asks for at once.
+fn coords_into(
+    grid: &[u64],
+    unlim_dim: Option<usize>,
+    linear: u64,
+    coords: &mut [u64],
+) -> IoResult<()> {
+    let ndims = coords.len();
+    let seed_dim = unlim_dim.unwrap_or(0);
     let mut rem = linear;
     for d in (0..ndims).rev() {
         if d == seed_dim {
@@ -189,7 +226,7 @@ pub(crate) fn coords_of(
             "chunk index {linear} is outside the chunk grid"
         )));
     }
-    Ok(coords)
+    Ok(())
 }
 
 #[cfg(test)]

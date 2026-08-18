@@ -6990,6 +6990,15 @@ impl Hdf5Writer {
             .unwrap_or_else(|| m.dataspace.dims.clone())
     }
 
+    /// Whether a dataset stores its raw data through a filter pipeline.
+    ///
+    /// The write paths ask before choosing how to hand a chunk over: an
+    /// unfiltered chunk's bytes go to the file exactly as the caller holds
+    /// them, while a filtered one has to be compressed first.
+    pub(crate) fn dataset_is_filtered(&self, index: usize) -> bool {
+        self.ds(index).lock().filter_pipeline.is_some()
+    }
+
     /// Return the datatype a dataset declares on disk.
     ///
     /// The typed write paths need it to store bytes in the declared byte
@@ -14684,7 +14693,7 @@ impl Hdf5Writer {
             // compression below runs off the lock.
             let pipeline = self.ds(ds_index).lock().filter_pipeline.clone();
             if let Some(ref pipeline) = pipeline {
-                let chunk_data: Vec<Vec<u8>> = chunks.iter().map(|(_, d)| d.to_vec()).collect();
+                let chunk_data: Vec<&[u8]> = chunks.iter().map(|&(_, d)| d).collect();
                 // Propagate a filter error rather than storing raw bytes under a
                 // filter_mask that claims the pipeline ran (see
                 // apply_filters_parallel). Ok reaching here means every chunk
@@ -14725,7 +14734,7 @@ impl Hdf5Writer {
             // compression below runs off the lock.
             let pipeline = self.ds(ds_index).lock().filter_pipeline.clone();
             if let Some(ref pipeline) = pipeline {
-                let chunk_data: Vec<Vec<u8>> = chunks.iter().map(|(_, d)| d.to_vec()).collect();
+                let chunk_data: Vec<&[u8]> = chunks.iter().map(|&(_, d)| d).collect();
                 // Same single owner as the EA batch: apply_filters_parallel
                 // propagates a filter error instead of storing raw bytes under a
                 // filter_mask that claims the pipeline ran. Ok here means every

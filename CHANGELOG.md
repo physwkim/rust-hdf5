@@ -15,13 +15,61 @@
   a second open that disagrees is refused for as long as the first is
   held.
 
+- `Hdf5Reader::dataset_raw_size`: how many bytes a dataset's full image
+  is, which is what `read_dataset_raw` returns and what
+  `read_dataset_raw_into` requires its buffer to be. Answered in the file
+  that owns the dataset, so a name crossing an external link gets the
+  target's size.
+
 ### Changed
+
+- Reading a whole dataset is faster and no longer scales with how many
+  datasets the file holds. A typed full read now lands in the vector it
+  returns instead of being zeroed, read, and copied into a second buffer
+  of the same size; path resolution asks the alias and link catalogs by
+  key instead of comparing every entry; and datasets are found by name
+  through an index rather than a scan. Against libhdf5 1.14.6 on the
+  `perf/` probes: a 128 MiB contiguous read went from 1.79x to 0.89x of
+  its time, and opening plus reading 2000 small datasets from 2.52x to
+  0.29x. No stored bytes and no read result change.
+
+- The `deflate` feature now also pulls in `zlib-rs`, which inflates
+  filtered chunks; `flate2`/`miniz_oxide` still compresses them. Neither
+  engine is the better choice for both directions — zlib-rs inflates the
+  same streams 1.2x to 1.7x faster, while its deflate below level 9
+  gives up as much as 2.5x of the compression ratio on periodic data. Written files are
+  byte-for-byte what they were. Reading a 64 MiB deflated dataset in
+  2 MiB chunks went from 123 ms to 92 ms against libhdf5 1.14.6's 46 ms,
+  a third of which came from replacing `read_to_end` with an inflate
+  loop over one grown buffer.
 
 - **Breaking.** `DatasetAccess` no longer implements `Copy`. It gained
   the dapl prefix properties `virtual_prefix` and `efile_prefix`
   (`H5Pset_virtual_prefix` / `H5Pset_efile_prefix`), which are owned
   strings, so implicit copies became moves. `Clone` is still derived —
   add `.clone()` where a copy was relied on.
+
+### Performance
+
+- A hyperslab read of an unfiltered chunked dataset now reads only the
+  byte ranges the selection intersects, as libhdf5 does, instead of every
+  overlapping chunk whole: the 1000 64 KiB slices of a 128 MiB dataset
+  chunked at 2 MiB that took 331 ms take 15 ms, and a full read of the
+  same dataset drops from 223 ms to 161 ms by landing each chunk's bytes
+  straight in the output. A filtered chunk still reads and decodes whole,
+  and so does an unfiltered one whose selected runs are too small for a
+  positioned read each to pay for itself.
+
+- Writing a whole image into a chunked dataset no longer stages every
+  chunk in a buffer of its own. A chunk whose bytes are already one
+  complete run of the image — every full chunk of a 1-D dataset, and any
+  chunk that spans the trailing axes whole — goes to the file straight
+  out of the caller's slice, and the chunks that do need a gather share
+  one buffer. On the `perf/run.py` chunked-write workload (128 MiB of
+  f64 in 2 MiB chunks) that is 112 ms down to 47 ms, against libhdf5
+  1.14.6's 49 ms, with the spread between the median and the minimum
+  gone. The filtered batch writers compress from borrowed bytes for the
+  same reason, halving what a window in flight holds.
 
 ### Fixed
 

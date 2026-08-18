@@ -629,7 +629,19 @@ impl SwmrFileReader {
     pub fn read_dataset<T: H5Type>(&mut self, name: &str) -> Result<Vec<T>> {
         self.check_element_width::<T>(name)?;
         let datatype = self.dataset_datatype(name)?;
-        bytes_to_typed(self.reader.read_dataset_raw(name)?, &datatype)
+        let es = T::element_size();
+        let total = self.reader.dataset_raw_size(name)? as usize;
+        if es == 0 || !total.is_multiple_of(es) {
+            return Err(crate::error::Hdf5Error::TypeMismatch(format!(
+                "raw data size {total} is not a multiple of element size {es}"
+            )));
+        }
+        // As the non-SWMR full read: the image lands in the vector this
+        // returns rather than in a byte buffer copied into it afterwards.
+        crate::io::reader::read_image_into_new(total / es, |image| {
+            self.reader.read_dataset_raw_into(name, image)?;
+            crate::dataset::to_host_byte_order(image, &datatype, es)
+        })
     }
 
     /// Read a slice (hyperslab) of a dataset as raw bytes.
