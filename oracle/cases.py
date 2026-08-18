@@ -623,6 +623,13 @@ def gen_vds_view_trail(path):
         ssid = h5s.create_simple((1, 2), (h5s.UNLIMITED, 2))
         ssid.select_hyperslab((0, 0), (h5s.UNLIMITED, 1), stride=(3, 1), block=(2, 2))
         dcpl = h5p.create(h5p.DATASET_CREATE)
+        # `H5Pset_virtual` pokes the layout straight into the list
+        # (H5Pdcpl.c:2146) and so leaves the allocation time at the contiguous
+        # default, while `H5Pset_layout` resets it to the layout's own
+        # (H5Pdcpl.c:1762-1782). h5py's VDS path always makes this call
+        # (`VirtualLayout.__init__`, vds.py:174), so every virtual dataset
+        # written through an API rather than by hand is incremental.
+        dcpl.set_layout(h5d.VIRTUAL)
         dcpl.set_fill_value(np.array(-9, dtype="<i4"))
         dcpl.set_virtual(vsid, b".", b"/src", ssid)
         lowlevel_dataset(f, "vds", h5t.STD_I32LE, vsid, dcpl=dcpl)
@@ -684,21 +691,21 @@ LAYOUT_CASES = [
          "virtual dataset whose mapping is unlimited on both sides — the "
          "extent comes from the source",
          ext_files=("_src.h5",)),
-    Case("vds_printf_gap", "layout", gen_vds_printf_gap, None,
+    Case("vds_printf_gap", "layout", gen_vds_printf_gap, "vds_printf_gap",
          "printf mapping with block 2 missing, read at the default printf "
          "gap of 0 — the extent stops at the gap"),
-    Case("vds_printf_gap_1", "layout", gen_vds_printf_gap, None,
+    Case("vds_printf_gap_1", "layout", gen_vds_printf_gap, "vds_printf_gap",
          "the same file read with H5Pset_virtual_printf_gap(1) — block 3 is "
          "reached and block 2 reads as the fill value",
          access={"printf_gap": 1}),
-    Case("vds_printf_gap_first_missing", "layout", gen_vds_printf_gap, None,
+    Case("vds_printf_gap_first_missing", "layout", gen_vds_printf_gap, "vds_printf_gap",
          "the same file under H5D_VDS_FIRST_MISSING with a gap of 2, which "
          "H5D__virtual_init forces back to 0 (H5Dvirtual.c:2182-2188)",
          access={"view": "first_missing", "printf_gap": 2}),
-    Case("vds_view_trail", "layout", gen_vds_view_trail, None,
+    Case("vds_view_trail", "layout", gen_vds_view_trail, "vds_view_trail",
          "unlimited mapping whose stride exceeds its block, read at the "
          "default H5D_VDS_LAST_AVAILABLE view"),
-    Case("vds_view_trail_first_missing", "layout", gen_vds_view_trail, None,
+    Case("vds_view_trail_first_missing", "layout", gen_vds_view_trail, "vds_view_trail",
          "the same file under H5D_VDS_FIRST_MISSING — the extent runs on to "
          "where the next block would start",
          access={"view": "first_missing"}),

@@ -2132,6 +2132,76 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             file.close()?;
             Ok(Ok(()))
         }
+        "vds_printf_gap" => {
+            // Blocks 0, 1 and 3: what the reader makes of the hole at 2 is
+            // the dataset access properties' business, not the file's.
+            let stem = std::path::Path::new(path)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            for b in [0u64, 1, 3] {
+                let block = std::path::Path::new(path).with_file_name(format!("{stem}_b{b}.h5"));
+                let src = earliest_file(block.to_string_lossy().as_ref())?;
+                src.new_dataset::<i32>()
+                    .shape([4usize])
+                    .create("data")?
+                    .write_raw(&(0..4i32).map(|i| i + 10 * b as i32).collect::<Vec<_>>())?;
+                src.close()?;
+            }
+            let unlim_rows = Selection::Hyperslab {
+                rank: 2,
+                form: Hyperslab::Regular(rust_hdf5::RegularHyperslab {
+                    start: vec![0, 0],
+                    stride: vec![1, 1],
+                    count: vec![rust_hdf5::format::selection::UNLIMITED, 1],
+                    block: vec![1, 4],
+                }),
+            };
+            let file = earliest_file(path)?;
+            file.new_dataset::<i32>()
+                .shape([1usize, 4])
+                .max_shape(&[None, Some(4)])
+                .fill_value(-7i32)
+                .virtual_mapping(
+                    unlim_rows,
+                    &format!("{stem}_b%b.h5"),
+                    "data",
+                    Selection::All,
+                )
+                .create("vds")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "vds_view_trail" => {
+            // Stride 3 over blocks of 2, so the third source row is followed
+            // by a gap: whether the extent stops before it or runs on to
+            // where the next block would start is the view's business.
+            let strided = || Selection::Hyperslab {
+                rank: 2,
+                form: Hyperslab::Regular(rust_hdf5::RegularHyperslab {
+                    start: vec![0, 0],
+                    stride: vec![3, 1],
+                    count: vec![rust_hdf5::format::selection::UNLIMITED, 1],
+                    block: vec![2, 2],
+                }),
+            };
+            let file = earliest_file(path)?;
+            file.new_dataset::<i32>()
+                .shape([3usize, 2])
+                .max_shape(&[None, Some(2)])
+                .chunk(&[1, 2])
+                .create("src")?
+                .write_raw(&ramp_n::<i32>(6))?;
+            file.new_dataset::<i32>()
+                .shape([1usize, 2])
+                .max_shape(&[None, Some(2)])
+                .fill_value(-9i32)
+                .virtual_mapping(strided(), ".", "/src", strided())
+                .create("vds")?;
+            file.close()?;
+            Ok(Ok(()))
+        }
         "layout_contiguous_v108" => layout_at_libver(path, LibverBound::V18, None),
         "layout_contiguous_v110" => layout_at_libver(path, LibverBound::V110, None),
         "layout_chunked_v108" => layout_at_libver(path, LibverBound::V18, Some(&[16])),
