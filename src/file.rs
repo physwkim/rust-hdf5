@@ -1283,6 +1283,7 @@ pub struct H5FileOptions {
     shared_messages: SharedMessageConfig,
     file_space: Option<FileSpaceConfig>,
     file_space_page_size: Option<u64>,
+    elink_prefix: Option<String>,
 }
 
 impl H5FileOptions {
@@ -1308,6 +1309,41 @@ impl H5FileOptions {
     /// (equivalent to `HDF5_USE_FILE_LOCKING=BEST_EFFORT`).
     pub fn best_effort_locking(self) -> Self {
         self.locking(FileLocking::BestEffort)
+    }
+
+    /// `H5Pset_elink_prefix` (H5Plapl.c:923): a directory the *target file*
+    /// of an external link is looked for under, after `HDF5_EXT_PREFIX` and
+    /// before the linking file's own directory — step 3 of
+    /// `H5F_prefix_open_file`'s order (H5Fint.c:938-950).
+    ///
+    /// Unlike [`DatasetAccess::virtual_prefix`](crate::DatasetAccess), this
+    /// one is *not* shadowed by its environment variable and gets no
+    /// `${ORIGIN}` expansion: `H5L__extern_traverse` peeks the property
+    /// verbatim and hands it straight to the search (H5Lexternal.c:210-215),
+    /// with no `H5D__build_file_prefix` step in between. Measured against
+    /// libhdf5 1.14.6 and 2.0.0: with `HDF5_EXT_PREFIX` naming a directory
+    /// that has no target, this property still resolves it, while the same
+    /// arrangement for a virtual source does not; and a `${ORIGIN}` written
+    /// here stays a literal directory name.
+    ///
+    /// # Where this lives, and why not on the call
+    ///
+    /// libhdf5 keeps it in a *link access* property list, an argument every
+    /// `H5*_by_name` call carries. Here it is a property of the open,
+    /// because that is the narrowest scope this crate can honour: a reader
+    /// resolves each external link's file name once and then holds that
+    /// answer for its own life, so a prefix passed per call could not change
+    /// a name another call had already resolved. Making it file-scoped also
+    /// keeps it with the one other cross-file policy libhdf5 takes from a
+    /// property list and applies to every file a path touches — the locking
+    /// mode — and, like that one, it propagates down a chain of links, which
+    /// is what a lapl does upstream (measured: a two-hop chain resolves its
+    /// second hop under the prefix given at the first).
+    ///
+    /// Read-side only: nothing the writer does traverses an external link.
+    pub fn elink_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.elink_prefix = Some(prefix.into());
+        self
     }
 
     /// Create the file's root group with creation-order tracking, and make
@@ -1609,8 +1645,27 @@ impl H5FileOptions {
         }
     }
 
+    /// The mirror of [`refuse_create_only_options`](Self::refuse_create_only_options)
+    /// for the options only a read-mode open can honour, refused by the two
+    /// openers that produce a writer.
+    ///
+    /// [`elink_prefix`](Self::elink_prefix) is one because nothing on the
+    /// write side traverses an external link, so a file opened for writing
+    /// would silently never use it.
+    fn refuse_read_only_options(&self) -> Result<()> {
+        if self.elink_prefix.is_none() {
+            return Ok(());
+        }
+        Err(Hdf5Error::InvalidState(
+            "these options only take effect when opening a file for reading: \
+             elink_prefix"
+                .to_string(),
+        ))
+    }
+
     /// Create a new HDF5 file at `path` with the configured options.
     pub fn create<P: AsRef<Path>>(self, path: P) -> Result<H5File> {
+        self.refuse_read_only_options()?;
         let writer = Hdf5Writer::create_with_options(
             path.as_ref(),
             crate::io::writer::FileCreateOptions {
@@ -1631,7 +1686,8 @@ impl H5FileOptions {
     /// Open an existing HDF5 file for reading with the configured options.
     pub fn open<P: AsRef<Path>>(self, path: P) -> Result<H5File> {
         self.refuse_create_only_options()?;
-        let reader = Hdf5Reader::open_with_locking(path.as_ref(), self.resolved_locking())?;
+        let mut reader = Hdf5Reader::open_with_locking(path.as_ref(), self.resolved_locking())?;
+        reader.set_elink_prefix(self.elink_prefix);
         Ok(H5File {
             inner: new_shared(H5FileInner::Reader(Box::new(reader))),
         })
@@ -1640,6 +1696,7 @@ impl H5FileOptions {
     /// Open an existing HDF5 file for read/write with the configured options.
     pub fn open_rw<P: AsRef<Path>>(self, path: P) -> Result<H5File> {
         self.refuse_create_only_options()?;
+        self.refuse_read_only_options()?;
         let writer = Hdf5Writer::open_append_with_locking(path.as_ref(), self.resolved_locking())?;
         Ok(H5File {
             inner: new_shared(H5FileInner::Writer(Box::new(writer))),

@@ -942,6 +942,13 @@ pub struct Hdf5Reader {
     /// setting (or one `H5FileOptions::locking` call) governs every file a
     /// path touches, not just the first.
     locking: crate::io::locking::FileLocking,
+    /// `H5Pset_elink_prefix` for every external link this reader crosses —
+    /// [`H5FileOptions::elink_prefix`](crate::H5FileOptions::elink_prefix).
+    /// Propagated verbatim to every target this reader opens, the way a lapl
+    /// reaches the next hop of a link chain upstream (measured against
+    /// libhdf5 1.14.6: a two-hop chain resolves its second hop under the
+    /// prefix given at the first).
+    elink_prefix: Option<String>,
     /// Files opened on another file's behalf — external-link targets,
     /// external-reference targets and virtual-dataset sources — keyed by the
     /// resolved path that opened them, so N names for one file share one
@@ -1797,6 +1804,7 @@ impl Hdf5Reader {
             datatypes: catalog.datatypes,
             path: origin.path,
             locking: origin.locking,
+            elink_prefix: None,
             external: Default::default(),
             external_resolved: Default::default(),
             virtual_access: Default::default(),
@@ -1884,6 +1892,7 @@ impl Hdf5Reader {
             datatypes: catalog.datatypes,
             path: origin.path,
             locking: origin.locking,
+            elink_prefix: None,
             external: Default::default(),
             external_resolved: Default::default(),
             virtual_access: Default::default(),
@@ -2786,12 +2795,25 @@ impl Hdf5Reader {
         candidates
     }
 
+    /// Put an external-link prefix in force for this reader and every file
+    /// it opens on another's behalf. Set once at open, before any name has
+    /// been resolved, because an external link's answer is fixed the first
+    /// time it is asked ([`external_resolved`](Self::external_resolved)).
+    pub(crate) fn set_elink_prefix(&mut self, prefix: Option<String>) {
+        self.elink_prefix = prefix;
+    }
+
     /// [`prefix_open_candidates`](Self::prefix_open_candidates) for an
-    /// external link. The one step this cannot take is the link-access
-    /// property list's `H5Pset_elink_prefix`, which has no equivalent in
-    /// this crate's API yet.
+    /// external link. The property-list step is
+    /// [`H5FileOptions::elink_prefix`](crate::H5FileOptions::elink_prefix)
+    /// exactly as given: `H5L__extern_traverse` peeks
+    /// `H5L_ACS_ELINK_PREFIX_NAME` and hands it straight to the search
+    /// (H5Lexternal.c:210-215), so unlike a virtual dataset's prefix it goes
+    /// through no `H5D__build_file_prefix` — no `${ORIGIN}` expansion, and
+    /// `HDF5_EXT_PREFIX` does not shadow it.
     fn external_candidates(&self, file: &str) -> Vec<PathBuf> {
-        self.prefix_open_candidates("HDF5_EXT_PREFIX", None, file)
+        let prop = self.elink_prefix.as_deref().map(Path::new);
+        self.prefix_open_candidates("HDF5_EXT_PREFIX", prop, file)
     }
 
     /// [`prefix_open_candidates`](Self::prefix_open_candidates) for a
@@ -2852,6 +2874,7 @@ impl Hdf5Reader {
         owner: CrossFileOwner,
     ) -> IoResult<&mut Hdf5Reader> {
         let locking = self.locking;
+        let elink_prefix = self.elink_prefix.clone();
         match self.external.entry(resolved) {
             std::collections::btree_map::Entry::Occupied(e) => {
                 let e = e.into_mut();
@@ -2859,7 +2882,8 @@ impl Hdf5Reader {
                 Ok(&mut *e.reader)
             }
             std::collections::btree_map::Entry::Vacant(e) => {
-                let reader = Hdf5Reader::open_with_locking(e.key(), locking)?;
+                let mut reader = Hdf5Reader::open_with_locking(e.key(), locking)?;
+                reader.elink_prefix.clone_from(&elink_prefix);
                 Ok(&mut *e
                     .insert(CrossFileEntry {
                         reader: Box::new(reader),
