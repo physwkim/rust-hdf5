@@ -1011,16 +1011,12 @@ impl DatasetInfo {
 pub struct ChunkedDatasetInfo {
     /// Chunk dimension sizes.
     pub chunk_dims: Vec<u64>,
-    /// Maximum dimensions (u64::MAX = unlimited).
-    pub max_dims: Vec<u64>,
     /// Extensible array parameters.
     pub earray_params: EarrayParams,
     /// File offset of the EA header.
     pub ea_header_addr: u64,
     /// File offset of the EA index block.
     pub ea_iblk_addr: u64,
-    /// Number of data block address slots in the index block.
-    pub ndblk_addrs: usize,
     /// In-memory copy of the EA header (for updating statistics).
     pub ea_header: ExtensibleArrayHeader,
     /// In-memory copy of the EA index block (for unfiltered datasets).
@@ -1627,8 +1623,6 @@ impl BtreeV1DatasetInfo {
 pub struct Bt2DatasetInfo {
     /// Chunk dimension sizes.
     pub chunk_dims: Vec<u64>,
-    /// Maximum dimensions (u64::MAX = unlimited).
-    pub max_dims: Vec<u64>,
     /// File offset of the BT2 header.
     pub bt2_header_addr: u64,
     /// Pool of node-size blocks (the index's
@@ -2713,19 +2707,11 @@ fn rebuild_dataset(
                         (eib, None)
                     };
 
-                    let max_dims = info
-                        .dataspace
-                        .max_dims
-                        .clone()
-                        .unwrap_or_else(|| info.dataspace.dims.clone());
-
                     info.chunked = Some(ChunkedDatasetInfo {
                         chunk_dims: real_chunk_dims,
-                        max_dims,
                         earray_params: ep,
                         ea_header_addr: *index_address,
                         ea_iblk_addr,
-                        ndblk_addrs,
                         ea_header,
                         ea_iblk,
                         chunks_written: 0,
@@ -2870,14 +2856,8 @@ fn rebuild_dataset(
                             }
                         }
                     }
-                    let max_dims = info
-                        .dataspace
-                        .max_dims
-                        .clone()
-                        .unwrap_or_else(|| info.dataspace.dims.clone());
                     info.btree_v2 = Some(Bt2DatasetInfo {
                         chunk_dims: real_chunk_dims,
-                        max_dims,
                         bt2_header_addr: *index_address,
                         node_addrs,
                         index,
@@ -4096,12 +4076,6 @@ impl Hdf5Writer {
         }
         self.libver = Some(libver);
         Ok(())
-    }
-
-    /// The file's low libver bound, or `None` when no caller has named one
-    /// and the file is at this crate's default (see the `libver` field).
-    pub fn libver(&self) -> Option<LibverBound> {
-        self.libver
     }
 
     /// The generation the *message* encoders follow — dataspace, datatype,
@@ -6239,14 +6213,6 @@ impl Hdf5Writer {
     /// one could disagree with what the header will say.
     pub fn dataset_datatype(&self, index: usize) -> DatatypeMessage {
         self.ds(index).lock().datatype.clone()
-    }
-
-    /// Return the names of all groups created so far.
-    pub fn group_names(&self) -> Vec<String> {
-        self.group_refs()
-            .iter()
-            .map(|g| g.lock().name.clone())
-            .collect()
     }
 
     /// Create a group in the file hierarchy.
@@ -8940,11 +8906,9 @@ impl Hdf5Writer {
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
                     chunk_dims: chunk_dims.to_vec(),
-                    max_dims: max_dims.to_vec(),
                     earray_params,
                     ea_header_addr,
                     ea_iblk_addr,
-                    ndblk_addrs,
                     ea_header,
                     ea_iblk,
                     chunks_written: 0,
@@ -10177,6 +10141,11 @@ impl Hdf5Writer {
     /// byte image and its element count are the same number.
     ///
     /// [`create_vlen_sequence_dataset`]: Self::create_vlen_sequence_dataset
+    ///
+    /// Superseded in production by [`write_vlen_numeric`](crate::H5File::write_vlen_numeric)
+    /// (`H5Group::write_vlen_bytes` routes through it, not through here);
+    /// kept as a direct entry point for this crate's own white-box tests.
+    #[cfg(test)]
     pub fn create_vlen_bytes_dataset(&self, name: &str, items: &[&[u8]]) -> IoResult<usize> {
         use crate::format::messages::datatype::DatatypeMessage;
 
@@ -10422,11 +10391,9 @@ impl Hdf5Writer {
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
                     chunk_dims: chunk_dims.clone(),
-                    max_dims: max_dims.clone(),
                     earray_params,
                     ea_header_addr,
                     ea_iblk_addr,
-                    ndblk_addrs,
                     ea_header,
                     ea_iblk,
                     chunks_written: 0,
@@ -10942,15 +10909,6 @@ impl Hdf5Writer {
     /// header when the file is finalized.
     pub fn add_dataset_attribute(&self, ds_index: usize, attr: AttributeMessage) -> IoResult<()> {
         self.set_attribute(AttrTarget::Dataset(ds_index), attr)
-    }
-
-    /// Add (or replace) an attribute on a group identified by its full path.
-    ///
-    /// The attribute is written into the group's object header when the
-    /// file is finalized. An existing attribute with the same name is
-    /// replaced, matching [`add_root_attribute`](Self::add_root_attribute).
-    pub fn add_group_attribute(&self, group_path: &str, attr: AttributeMessage) -> IoResult<()> {
-        self.set_attribute(AttrTarget::Group(group_path), attr)
     }
 
     /// Build a variable-length UTF-8 string attribute message.
@@ -11874,6 +11832,14 @@ impl Hdf5Writer {
     /// (`FixedArrayFilteredChunkElement`), and the dataset gets a filter
     /// pipeline. Chunks written via `write_chunk_fixed_array` are compressed and
     /// their compressed size + filter mask are recorded in the data block.
+    ///
+    /// A convenience over [`create_fixed_array_dataset_with_max`]'s own
+    /// pipeline argument; production dataset creation calls that directly,
+    /// so this is kept as a direct entry point for this crate's own
+    /// white-box tests.
+    ///
+    /// [`create_fixed_array_dataset_with_max`]: Self::create_fixed_array_dataset_with_max
+    #[cfg(test)]
     pub fn create_fixed_array_dataset_with_pipeline(
         &self,
         name: &str,
@@ -12530,7 +12496,6 @@ impl Hdf5Writer {
                 btree_v1: None,
                 btree_v2: Some(Bt2DatasetInfo {
                     chunk_dims: chunk_dims.to_vec(),
-                    max_dims: max_dims.to_vec(),
                     bt2_header_addr,
                     node_addrs: Vec::new(),
                     index: bt2_index,
@@ -12644,11 +12609,9 @@ impl Hdf5Writer {
                 btree_v2: None,
                 chunked: Some(ChunkedDatasetInfo {
                     chunk_dims: chunk_dims.to_vec(),
-                    max_dims: max_dims.to_vec(),
                     earray_params,
                     ea_header_addr,
                     ea_iblk_addr,
-                    ndblk_addrs,
                     ea_header,
                     ea_iblk,
                     chunks_written: 0,
@@ -12732,20 +12695,8 @@ impl Hdf5Writer {
     ///
     /// Requires a filtered dataset — only the filtered FA element carries the
     /// size+mask slot.
-    pub fn write_compressed_chunk_fixed_array(
-        &self,
-        index: usize,
-        chunk_coords: &[u64],
-        data: &[u8],
-        filter_mask: u32,
-    ) -> IoResult<()> {
-        let ds = self.ds(index);
-        let _op = ds.op.lock();
-        self.write_compressed_chunk_fixed_array_inner(index, chunk_coords, data, filter_mask)
-    }
-
-    /// [`Self::write_compressed_chunk_fixed_array`] body; the caller holds
-    /// the dataset's op lock or the writer exclusively.
+    ///
+    /// The caller holds the dataset's op lock or the writer exclusively.
     pub(crate) fn write_compressed_chunk_fixed_array_inner(
         &self,
         index: usize,
@@ -12918,20 +12869,8 @@ impl Hdf5Writer {
     ///
     /// Requires a filtered dataset — only the filtered single-chunk layout
     /// carries a size+mask slot.
-    pub fn write_compressed_chunk_single_chunk(
-        &self,
-        index: usize,
-        chunk_coords: &[u64],
-        data: &[u8],
-        filter_mask: u32,
-    ) -> IoResult<()> {
-        let ds = self.ds(index);
-        let _op = ds.op.lock();
-        self.write_compressed_chunk_single_chunk_inner(index, chunk_coords, data, filter_mask)
-    }
-
-    /// [`Self::write_compressed_chunk_single_chunk`] body; the caller holds
-    /// the dataset's op lock or the writer exclusively.
+    ///
+    /// The caller holds the dataset's op lock or the writer exclusively.
     pub(crate) fn write_compressed_chunk_single_chunk_inner(
         &self,
         index: usize,
@@ -13011,6 +12950,12 @@ impl Hdf5Writer {
     /// `chunk_coords` is the scaled chunk coordinates (one per dimension).
     /// `data` is the chunk's unfiltered bytes; if the dataset has a filter
     /// pipeline it runs here and the index records the stored size and mask.
+    ///
+    /// Production writes call [`write_chunk_btree_v2_inner`](Self::write_chunk_btree_v2_inner)
+    /// directly (they already hold the dataset's op lock); this self-locking
+    /// form is kept as a direct entry point for this crate's own white-box
+    /// tests.
+    #[cfg(test)]
     pub fn write_chunk_btree_v2(
         &self,
         index: usize,
@@ -13075,20 +13020,8 @@ impl Hdf5Writer {
     /// filter *i* of the pipeline was **not** applied and must be skipped on
     /// read. Requires a filtered dataset — only a type-11 record has a slot for
     /// a stored size and mask.
-    pub fn write_compressed_chunk_btree_v2(
-        &self,
-        index: usize,
-        chunk_coords: &[u64],
-        data: &[u8],
-        filter_mask: u32,
-    ) -> IoResult<()> {
-        let ds = self.ds(index);
-        let _op = ds.op.lock();
-        self.write_compressed_chunk_btree_v2_inner(index, chunk_coords, data, filter_mask)
-    }
-
-    /// [`Self::write_compressed_chunk_btree_v2`] body; the caller holds the
-    /// dataset's op lock or the writer exclusively.
+    ///
+    /// The caller holds the dataset's op lock or the writer exclusively.
     pub(crate) fn write_compressed_chunk_btree_v2_inner(
         &self,
         index: usize,
@@ -13222,18 +13155,8 @@ impl Hdf5Writer {
     /// the parallel compressor is the only place a filter runs. Falls back to
     /// per-chunk [`write_chunk_fixed_array`](Self::write_chunk_fixed_array) when
     /// unfiltered or when `parallel` is off.
-    pub fn write_chunks_fixed_array_batch(
-        &self,
-        ds_index: usize,
-        chunks: &[(&[u64], &[u8])],
-    ) -> IoResult<()> {
-        let ds = self.ds(ds_index);
-        let _op = ds.op.lock();
-        self.write_chunks_fixed_array_batch_inner(ds_index, chunks)
-    }
-
-    /// [`Self::write_chunks_fixed_array_batch`] body; the caller holds the
-    /// dataset's op lock or the writer exclusively.
+    ///
+    /// The caller holds the dataset's op lock or the writer exclusively.
     pub(crate) fn write_chunks_fixed_array_batch_inner(
         &self,
         ds_index: usize,
@@ -13277,20 +13200,8 @@ impl Hdf5Writer {
     ///
     /// Requires a filtered dataset — only the filtered EA entry carries the
     /// size+mask slot. An unfiltered dataset has nowhere to record either.
-    pub fn write_compressed_chunk(
-        &self,
-        index: usize,
-        chunk_idx: u64,
-        compressed_data: &[u8],
-        filter_mask: u32,
-    ) -> IoResult<()> {
-        let ds = self.ds(index);
-        let _op = ds.op.lock();
-        self.write_compressed_chunk_inner(index, chunk_idx, compressed_data, filter_mask)
-    }
-
-    /// [`Self::write_compressed_chunk`] body; the caller holds the dataset's
-    /// op lock or the writer exclusively.
+    ///
+    /// The caller holds the dataset's op lock or the writer exclusively.
     pub(crate) fn write_compressed_chunk_inner(
         &self,
         index: usize,
@@ -14179,11 +14090,6 @@ impl Hdf5Writer {
     /// Provide mutable access to the underlying file handle.
     pub fn handle(&mut self) -> &mut FileHandle {
         &mut self.handle
-    }
-
-    /// Return the current end-of-file offset.
-    pub fn eof(&self) -> u64 {
-        self.allocator.eof()
     }
 
     /// The superblock version this file will be written with.

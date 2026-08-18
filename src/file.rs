@@ -201,11 +201,14 @@ impl H5File {
     ///
     /// Errors in read mode.
     pub fn set_libver_latest(&self, latest: bool) -> Result<()> {
-        self.set_libver_bound(if latest {
-            LibverBound::V200
-        } else {
-            LibverBound::Earliest
-        })
+        let mut inner = borrow_inner_mut(&self.inner);
+        match &mut *inner {
+            H5FileInner::Writer(writer) => {
+                writer.set_libver_latest(latest)?;
+                Ok(())
+            }
+            _ => Err(Hdf5Error::InvalidState("cannot write in read mode".into())),
+        }
     }
 
     /// Set the file's low libver bound — `H5Pset_libver_bounds`'s `low`
