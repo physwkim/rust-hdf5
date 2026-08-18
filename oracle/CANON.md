@@ -1,4 +1,4 @@
-# The canonical dump format (`!canon 6`)
+# The canonical dump format (`!canon 7`)
 
 Both sides of the oracle — `oracle/canon.py` (h5py / libhdf5 1.14.6) and
 `src/bin/oracle_probe.rs` (rust-hdf5 public API) — emit this format, so the
@@ -8,7 +8,7 @@ two dumps of the same file are comparable as text and, more usefully, as a
 ## Grammar
 
     line   := header | record
-    header := "!canon" TAB "6"
+    header := "!canon" TAB "7"
     record := key TAB value
     key    := path [ "@" attrname ] "#" field
     value  := <no TAB, no LF>
@@ -40,7 +40,7 @@ Everything else is an observed value and must match byte for byte.
 |--------------|----------------------------------------------------------|
 | `superblock` | superblock version integer (0, 2, 3)                      |
 | `userblock`  | user block size in bytes; `0` when there is none          |
-| `fspace`     | `<strategy>/<persist>/<threshold>`                        |
+| `fspace`     | `<strategy>/<persist>/<threshold>/<page size>`            |
 | `freespace`  | `tracked` or `none`                                       |
 
 The user block displaces the superblock, so `userblock` is the offset at
@@ -49,8 +49,11 @@ which the HDF5 signature was found (0, or the first power of two >= 512).
 `fspace` is the file-space strategy the file was created with: one of
 `fsmaggr`, `page`, `aggr`, `none` (`H5F_fspace_strategy_t`), then `true` or
 `false` for whether free-space manager state persists across close, then the
-smallest section a manager tracks. A file carrying no file-space info message
-reports the library defaults, `fsmaggr/false/1`. The h5py side reads the file
+smallest section a manager tracks, then the file-space page size. Those four
+are the properties `H5F__super_init` weighs against the library defaults when
+deciding whether the file needs a file-space info message at all, so a file
+differing only in its page size still carries one. A file with no message
+reports the defaults, `fsmaggr/false/1/4096`. The h5py side reads the file
 creation property list, which `H5F__super_read` fills from the on-disk
 message; the rust side reads the message itself.
 

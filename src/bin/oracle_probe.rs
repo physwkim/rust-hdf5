@@ -39,7 +39,7 @@ use rust_hdf5::{
 };
 use rust_hdf5::{FileSpaceInfoMessage, FileSpaceStrategy};
 
-const CANON_VERSION: &str = "6";
+const CANON_VERSION: &str = "7";
 const RAW_LIMIT: usize = 1024;
 const MAX_DEPTH: usize = 32;
 
@@ -716,14 +716,19 @@ fn dump_file(path: &str) -> std::result::Result<String, String> {
     Ok(d.lines.join("\n") + "\n")
 }
 
-/// The twin of `canon.py`'s `fspace_str`: `<strategy>/<persist>/<threshold>`.
+/// The twin of `canon.py`'s `fspace_str`:
+/// `<strategy>/<persist>/<threshold>/<page size>`.
 ///
 /// A file with no file-space info message reports the library defaults
-/// (`H5F_FILE_SPACE_STRATEGY_DEF`, no persist, threshold 1) — the same values
-/// the h5py side reads off an untouched creation property list.
+/// (`H5F_FILE_SPACE_STRATEGY_DEF`, no persist, threshold 1, page size 4096) —
+/// the same values the h5py side reads off an untouched creation property
+/// list. All four are the properties `H5F__super_init` weighs against those
+/// defaults when deciding whether to write the message at all.
 fn fspace_str(info: Option<&FileSpaceInfoMessage>) -> String {
     let Some(info) = info else {
-        return "fsmaggr/false/1".to_string();
+        // `H5F_FILE_SPACE_PAGE_SIZE_DEF` (H5Fprivate.h:335), spelled out
+        // here as the other three defaults already are.
+        return "fsmaggr/false/1/4096".to_string();
     };
     let strategy = match info.strategy {
         FileSpaceStrategy::FsmAggr => "fsmaggr".to_string(),
@@ -732,7 +737,10 @@ fn fspace_str(info: Option<&FileSpaceInfoMessage>) -> String {
         FileSpaceStrategy::None => "none".to_string(),
         FileSpaceStrategy::Unknown(v) => format!("unknown({v})"),
     };
-    format!("{strategy}/{}/{}", info.persist, info.threshold)
+    format!(
+        "{strategy}/{}/{}/{}",
+        info.persist, info.threshold, info.page_size
+    )
 }
 
 /// The twin of `canon.py`'s `crt_order_str`: `-`, `tracked`, or
@@ -2531,6 +2539,31 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
             let file = H5File::options()
                 .libver(LibverBound::Earliest)
                 .file_space(FileSpaceStrategy::Page, true, 1)
+                .create(path)?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("data")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.new_dataset::<i32>()
+                .shape([256usize])
+                .create("bulk")?
+                .write_raw(&(0..256).collect::<Vec<i32>>())?;
+            file.root_group().create_group("g")?;
+            file.close()?;
+            let file = H5File::open_rw(path)?;
+            file.delete_dataset("bulk")?;
+            file.new_dataset::<i32>()
+                .shape([8usize])
+                .create("appended")?
+                .write_raw(&ramp_n::<i32>(8))?;
+            file.close()?;
+            Ok(Ok(()))
+        }
+        "fsm_page_size" => {
+            let file = H5File::options()
+                .libver(LibverBound::Earliest)
+                .file_space(FileSpaceStrategy::Page, true, 1)
+                .file_space_page_size(512)
                 .create(path)?;
             file.new_dataset::<i32>()
                 .shape([8usize])

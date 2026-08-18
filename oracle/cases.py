@@ -1074,6 +1074,28 @@ def gen_fsm_persist_page(path):
         f.create_dataset("appended", data=ramp("<i4"))
 
 
+def gen_fsm_page_size(path):
+    """[`gen_fsm_persist_page`] on a page size that is not the library default.
+
+    `H5Pset_file_space_page_size` takes anything from 512
+    (`H5F_FILE_SPACE_PAGE_SIZE_MIN`) to 1 GiB with no power-of-two
+    requirement, and the size decides which side of `H5MF__alloc_to_fs_type`
+    every request falls on. At 512 the `bulk` dataset's raw data is larger
+    than a page and is page-aligned as `H5F_MEM_PAGE_GENERIC`, where at the
+    4096-byte default the same bytes are packed into a page — so this is a
+    different manager set, not the same file with a different number in the
+    message.
+    """
+    with h5py.File(path, "w", fs_strategy="page", fs_persist=True,
+                   fs_threshold=1, fs_page_size=512) as f:
+        f.create_dataset("data", data=ramp("<i4"))
+        f.create_dataset("bulk", data=ramp("<i4", 256))
+        f.create_group("g")
+    with h5py.File(path, "a") as f:
+        del f["bulk"]
+        f.create_dataset("appended", data=ramp("<i4"))
+
+
 MISC_CASES = [
     Case("swmr_created", "swmr", gen_swmr_created, "swmr_created",
          "file created through the SWMR writer path and appended frame by frame"),
@@ -1083,6 +1105,9 @@ MISC_CASES = [
     Case("fsm_persist_page", "freespace", gen_fsm_persist_page, "fsm_persist_page",
          "persisting PAGE file reopened and appended — the freed blocks must "
          "come back as page-shaped free-space manager sections"),
+    Case("fsm_page_size", "freespace", gen_fsm_page_size, "fsm_page_size",
+         "persisting PAGE file on a 512-byte file-space page — the non-default "
+         "size must reach the message and shape the allocation"),
     Case("large_multi_mb", "bulk", gen_large_multi_mb, "large_multi_mb",
          "2 MiB chunked f64 dataset — payload compared by SHA-256"),
 ]
