@@ -710,11 +710,11 @@ impl ObjectHeader {
     ///
     /// Refuses a header carrying [`times`](Self::times) for the same reason.
     /// The four times and the `H5O_HDR_STORE_TIMES` bit that announces them
-    /// are version-2 prefix fields; a version-1 header records only its
-    /// modification time, in an `H5O_MTIME_NEW` message, which this writer
-    /// does not emit. Refusing keeps the version gate at the one encoder that
-    /// knows which prefix it is writing, instead of letting a v2-shaped header
-    /// reach `encode_v1` and come back out with its times gone.
+    /// are version-2 prefix fields; a version-1 header records at most a
+    /// modification time, in an `H5O_MTIME_NEW` message among the messages
+    /// below. Refusing keeps the version gate at the one encoder that knows
+    /// which prefix it is writing, instead of letting a v2-shaped header reach
+    /// `encode_v1` and come back out with its times gone.
     pub fn encode_v1(&self, nlink: u32) -> FormatResult<Vec<u8>> {
         if self.flags & (FLAG_ATTR_CREATION_ORDER_TRACKED | FLAG_ATTR_CREATION_ORDER_INDEXED) != 0 {
             return Err(FormatError::InvalidData(

@@ -27,6 +27,7 @@ pub const MSG_DATA_LAYOUT: u8 = 0x08;
 pub const MSG_GROUP_INFO: u8 = 0x0A;
 pub const MSG_FILTER_PIPELINE: u8 = 0x0B;
 pub const MSG_ATTRIBUTE: u8 = 0x0C;
+pub const MSG_MOD_TIME_OLD: u8 = 0x0E;
 pub const MSG_SHARED_MESSAGE_TABLE: u8 = 0x0F;
 pub const MSG_OBJ_HEADER_CONTINUATION: u8 = 0x10;
 pub const MSG_SYMBOL_TABLE: u8 = 0x11;
