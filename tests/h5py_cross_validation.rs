@@ -4105,8 +4105,9 @@ fn a_reference_to_a_missing_path_is_refused() {
 }
 
 /// The file's low libver bound picks the datatype message version, the way
-/// `H5T_set_version` does: at `H5F_LIBVER_V112` a compound message is tagged
-/// version 4, and libhdf5 reads that file as readily as the default one.
+/// `H5T_set_version` does: a compound is born at version 1 and the bound
+/// raises it — 3 at `H5F_LIBVER_V18`, 4 at `H5F_LIBVER_V112` — and libhdf5
+/// reads every one of those files.
 #[test]
 fn the_libver_bound_picks_the_datatype_message_version() {
     use rust_hdf5::format::messages::datatype::CompoundMember;
@@ -4136,7 +4137,7 @@ fn the_libver_bound_picks_the_datatype_message_version() {
     let ctx = FormatContext::default_v3();
 
     for (bound, version) in [
-        (LibverBound::Earliest, 3u8),
+        (LibverBound::Earliest, 1u8),
         (LibverBound::V18, 3),
         (LibverBound::V112, 4),
     ] {
@@ -4162,7 +4163,7 @@ fn the_libver_bound_picks_the_datatype_message_version() {
         let occurrences =
             |needle: &[u8]| image.windows(needle.len()).filter(|w| *w == needle).count();
         assert_eq!(occurrences(&wanted), 1, "{bound:?}: v{version} message");
-        for other in [3u8, 4, 5] {
+        for other in [1u8, 2, 3, 4, 5] {
             if other == version {
                 continue;
             }
