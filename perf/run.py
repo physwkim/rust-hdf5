@@ -29,6 +29,10 @@ WORKLOADS = [
     # workload is "obtain the data and sum it", and the view is what changes
     # between builds. See src/bin/perf_probe.rs.
     ("contig-view", 5),
+    # Buffer-reuse steady state: open and the first read are setup, timed
+    # reads land in an already-faulted buffer.
+    ("into-read", 5),
+    ("into-slice", 5),
     ("chunked-write", 5),
     ("chunked-read", 5),
     ("deflate-write", 3),

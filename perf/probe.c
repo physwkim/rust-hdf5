@@ -188,6 +188,55 @@ int main(int argc, char **argv) {
         write_contig(path, data, CONTIG_N);
         free(data);
         TIMED({ sink = view_and_sum(path, CONTIG_N); });
+    } else if (strcmp(wl, "into-read") == 0) {
+        /* Buffer reuse: open and the first read are setup, so every timed
+         * read lands in an already-faulted buffer. */
+        double *data = ramp(CONTIG_N);
+        snprintf(path, sizeof path, "%s/c-intoread-in.h5", workdir);
+        write_contig(path, data, CONTIG_N);
+        free(data);
+        double *buf = malloc(CONTIG_N * sizeof(double));
+        hid_t f = H5Fopen(path, H5F_ACC_RDONLY, H5P_DEFAULT);
+        hid_t d = H5Dopen2(f, "data", H5P_DEFAULT);
+        CHECK(H5Dread(d, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, buf));
+        TIMED({
+            CHECK(H5Dread(d, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, buf));
+            if (buf[CONTIG_N - 1] != (double)(CONTIG_N - 1)) abort();
+        });
+        H5Dclose(d);
+        H5Fclose(f);
+        free(buf);
+    } else if (strcmp(wl, "into-slice") == 0) {
+        /* The same reuse per piece: sequential 128 KiB slices into one
+         * buffer, covering the dataset once per rep. */
+        const int PIECE = 16 * 1024;
+        double *data = ramp(CONTIG_N);
+        snprintf(path, sizeof path, "%s/c-intoslice-in.h5", workdir);
+        write_contig(path, data, CONTIG_N);
+        free(data);
+        double *buf = malloc(PIECE * sizeof(double));
+        hid_t f = H5Fopen(path, H5F_ACC_RDONLY, H5P_DEFAULT);
+        hid_t d = H5Dopen2(f, "data", H5P_DEFAULT);
+        hid_t fsp = H5Dget_space(d);
+        hsize_t count = PIECE;
+        hid_t msp = H5Screate_simple(1, &count, NULL);
+        hsize_t off0 = 0;
+        CHECK(H5Sselect_hyperslab(fsp, H5S_SELECT_SET, &off0, NULL, &count, NULL));
+        CHECK(H5Dread(d, H5T_NATIVE_DOUBLE, msp, fsp, H5P_DEFAULT, buf));
+        TIMED({
+            for (int k = 0; k < CONTIG_N / PIECE; k++) {
+                hsize_t off = (hsize_t)k * PIECE;
+                CHECK(H5Sselect_hyperslab(fsp, H5S_SELECT_SET, &off, NULL,
+                                          &count, NULL));
+                CHECK(H5Dread(d, H5T_NATIVE_DOUBLE, msp, fsp, H5P_DEFAULT, buf));
+            }
+            if (buf[PIECE - 1] != (double)(CONTIG_N - 1)) abort();
+        });
+        H5Sclose(msp);
+        H5Sclose(fsp);
+        H5Dclose(d);
+        H5Fclose(f);
+        free(buf);
     } else if (strcmp(wl, "chunked-write") == 0) {
         double *data = ramp(CONTIG_N);
         snprintf(path, sizeof path, "%s/c-chunked.h5", workdir);

@@ -137,6 +137,41 @@ fn main() {
                 std::hint::black_box(total);
             });
         }
+        // The buffer-reuse pattern: the destination is faulted in once, so
+        // every timed read pays only for moving bytes, not for growing a
+        // fresh allocation. Open and the first (untimed) read happen in
+        // setup — this times the steady state of a reader that keeps its
+        // buffer.
+        "into-read" => {
+            let path = p("rs-intoread-in.h5");
+            write_contig(&path, &ramp(CONTIG_N));
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("data").unwrap();
+            let mut buf = vec![0f64; CONTIG_N];
+            ds.read_raw_into(&mut buf).unwrap();
+            timed(&workload, reps, || {
+                ds.read_raw_into(&mut buf).unwrap();
+                assert_eq!(buf[CONTIG_N - 1], (CONTIG_N - 1) as f64);
+            });
+        }
+        // The same reuse pattern per piece: sequential 128 KiB slices into
+        // one buffer, covering the dataset once per rep.
+        "into-slice" => {
+            const PIECE: usize = 16 * 1024; // f64 -> 128 KiB
+            let path = p("rs-intoslice-in.h5");
+            write_contig(&path, &ramp(CONTIG_N));
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("data").unwrap();
+            let mut buf = vec![0f64; PIECE];
+            ds.read_slice_into(&mut buf, &[0], &[PIECE]).unwrap();
+            timed(&workload, reps, || {
+                for k in 0..CONTIG_N / PIECE {
+                    ds.read_slice_into(&mut buf, &[k * PIECE], &[PIECE])
+                        .unwrap();
+                }
+                assert_eq!(buf[PIECE - 1], (CONTIG_N - 1) as f64);
+            });
+        }
         "chunked-write" => {
             let data = ramp(CONTIG_N);
             let path = p("rs-chunked.h5");
