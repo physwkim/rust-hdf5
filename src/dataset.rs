@@ -15,6 +15,7 @@ use crate::format::messages::virtual_mapping::VirtualMapping;
 use crate::format::reference::{Reference, ReferenceTarget};
 use crate::format::selection::Selection;
 use crate::format::storage_kind::AttributeStorage;
+use crate::io::file_handle::ReadDst;
 use crate::io::reader::{read_image_into_new, ExternalFileSegment};
 use crate::io::writer::ChunkIndexKind;
 use crate::types::H5Type;
@@ -3811,7 +3812,13 @@ impl H5Dataset {
                 // are touched once instead of being read into a byte buffer and
                 // copied into a second one of the same size.
                 read_image_into_new(count, |image| {
-                    reader.read_slice_into(name, &starts_u64, &counts_u64, image)?;
+                    reader.read_slice_into_dst(
+                        name,
+                        &starts_u64,
+                        &counts_u64,
+                        image,
+                        ReadDst::Fresh,
+                    )?;
                     to_host_byte_order(image, &datatype, T::element_size())
                 })
             }
@@ -4419,7 +4426,7 @@ impl H5Dataset {
                 // bytes are touched once rather than being zeroed, read, and
                 // then copied into a second buffer of the same size.
                 read_image_into_new(total / T::element_size(), |image| {
-                    reader.read_dataset_raw_into(name, image)?;
+                    reader.read_dataset_raw_into_dst(name, image, ReadDst::Fresh)?;
                     to_host_byte_order(image, &datatype, T::element_size())
                 })
             }

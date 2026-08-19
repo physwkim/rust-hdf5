@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Under the `mmap` feature, the buffer-reuse read paths —
+  `H5Dataset::read_raw_into` and `read_slice_into`, and the reader's
+  `read_dataset_raw_into` / `read_slice_into` — serve contiguous reads
+  of any size from the file's memory map. The map's 8 KiB read ceiling
+  prices the cold case, where faulting a fresh allocation in during the
+  copy costs more than `pread` past that size; a caller who keeps the
+  destination buffer has already paid that fault, and for a kept buffer
+  the map wins at every size, so the into-reads take it with no ceiling.
+  Rereading a 128 MiB contiguous dataset into a kept buffer goes from
+  1.04x libhdf5 to 0.39x, and covering it in 128 KiB slices from 0.92x
+  to 0.48x. The allocating reads (`read_raw`, `read_slice`) keep the
+  ceiling: their destination is fresh by construction.
+
 ## 0.5.0
 
 ### Added

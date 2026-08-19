@@ -54,7 +54,7 @@ use crate::format::superblock::{
 use crate::format::symbol_table::SymbolTableNode;
 use crate::format::{BlockReader, FormatContext, UNDEF_ADDR};
 
-use crate::io::file_handle::FileHandle;
+use crate::io::file_handle::{FileHandle, ReadDst};
 use crate::io::hyperslab::{compute_strides, for_each_contiguous_run};
 use crate::io::locking::FileLocking;
 use crate::io::{FileMeta, IoResult};
@@ -4837,7 +4837,7 @@ impl Hdf5Reader {
         }
         let (datatype, total) = self.raw_size_and_datatype(name)?;
         read_image_into_new(total as usize, |data| {
-            self.read_dataset_raw_into_unconverted(name, data)?;
+            self.read_dataset_raw_into_unconverted(name, data, ReadDst::Fresh)?;
             Self::apply_post_filter_conversion(data, &datatype)
         })
     }
@@ -4851,9 +4851,22 @@ impl Hdf5Reader {
     /// point for reading directly into a pinned/registered host buffer for an
     /// H2D transfer.
     pub fn read_dataset_raw_into(&mut self, name: &str, out: &mut [u8]) -> IoResult<()> {
+        self.read_dataset_raw_into_dst(name, out, ReadDst::Reused)
+    }
+
+    /// [`read_dataset_raw_into`](Self::read_dataset_raw_into) with the
+    /// caller's destination fact made explicit, for internal callers whose
+    /// buffer is a fresh allocation rather than a kept one (the allocating
+    /// wrappers in `dataset.rs` / `swmr.rs`).
+    pub(crate) fn read_dataset_raw_into_dst(
+        &mut self,
+        name: &str,
+        out: &mut [u8],
+        dst: ReadDst,
+    ) -> IoResult<()> {
         if self.external_edge(name).is_some() {
             let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
-            return owner.read_dataset_raw_into(&path, out);
+            return owner.read_dataset_raw_into_dst(&path, out, dst);
         }
         let (datatype, total) = self.raw_size_and_datatype(name)?;
         if out.len() as u64 != total {
@@ -4863,7 +4876,7 @@ impl Hdf5Reader {
                 total
             )));
         }
-        self.read_dataset_raw_into_unconverted(name, out)?;
+        self.read_dataset_raw_into_unconverted(name, out, dst)?;
         Self::apply_post_filter_conversion(out, &datatype)?;
         Ok(())
     }
@@ -4876,8 +4889,16 @@ impl Hdf5Reader {
     /// allocating `read_dataset_raw` and the zero-copy `read_dataset_raw_into`
     /// wrap it and apply the conversion exactly once.
     ///
-    /// `out.len()` must equal `product(dims) * element_size`.
-    fn read_dataset_raw_into_unconverted(&mut self, name: &str, out: &mut [u8]) -> IoResult<()> {
+    /// `out.len()` must equal `product(dims) * element_size`. `dst` is the
+    /// caller's destination fact ([`ReadDst`]): whether `out` is a fresh
+    /// allocation or a buffer the caller keeps across reads, which decides
+    /// whether a mapped contiguous read is priced at the cold or the warm row.
+    fn read_dataset_raw_into_unconverted(
+        &mut self,
+        name: &str,
+        out: &mut [u8],
+        dst: ReadDst,
+    ) -> IoResult<()> {
         let info = self
             .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
@@ -4899,7 +4920,7 @@ impl Hdf5Reader {
                     fill_tiled_into(out, fill_value.as_deref());
                 } else {
                     // Read exactly the logical image straight into `out`.
-                    self.handle.read_exact_at_into(*address, out)?;
+                    self.handle.read_exact_at_into_dst(*address, out, dst)?;
                 }
             }
             DataLayoutMessage::Compact { data } => {
@@ -5409,7 +5430,18 @@ impl Hdf5Reader {
                     ))
                 })?;
                 copy_matched_selections(
-                    |s, c, buf| self.read_slice_into_unconverted(source_name, s, c, buf, depth + 1),
+                    |s, c, buf| {
+                        // `buf` is `copy_matched_selections`' fresh per-box
+                        // buffer, never the virtual dataset's own `out`.
+                        self.read_slice_into_unconverted(
+                            source_name,
+                            s,
+                            c,
+                            buf,
+                            depth + 1,
+                            ReadDst::Fresh,
+                        )
+                    },
                     &source_sel,
                     &virtual_sel,
                     element_size,
@@ -5435,7 +5467,15 @@ impl Hdf5Reader {
                 })?;
                 copy_matched_selections(
                     |s, c, buf| {
-                        src_reader.read_slice_into_unconverted(source_name, s, c, buf, depth + 1)
+                        // As above: `buf` is a fresh per-box buffer.
+                        src_reader.read_slice_into_unconverted(
+                            source_name,
+                            s,
+                            c,
+                            buf,
+                            depth + 1,
+                            ReadDst::Fresh,
+                        )
                     },
                     &source_sel,
                     &virtual_sel,
@@ -6894,7 +6934,7 @@ impl Hdf5Reader {
         // `read_slice_into_unconverted` defines every byte of the buffer it is
         // handed, so there is nothing to zero first and nothing to copy after.
         read_image_into_new::<u8, _, _>(out_bytes as usize, |image| {
-            self.read_slice_into_unconverted(name, starts, counts, image, 0)?;
+            self.read_slice_into_unconverted(name, starts, counts, image, 0, ReadDst::Fresh)?;
             Self::apply_post_filter_conversion(image, &datatype)
         })
     }
@@ -6913,9 +6953,24 @@ impl Hdf5Reader {
         counts: &[u64],
         out: &mut [u8],
     ) -> IoResult<()> {
+        self.read_slice_into_dst(name, starts, counts, out, ReadDst::Reused)
+    }
+
+    /// [`read_slice_into`](Self::read_slice_into) with the caller's
+    /// destination fact made explicit, for internal callers whose buffer is a
+    /// fresh allocation rather than a kept one (the allocating wrappers in
+    /// `dataset.rs`).
+    pub(crate) fn read_slice_into_dst(
+        &mut self,
+        name: &str,
+        starts: &[u64],
+        counts: &[u64],
+        out: &mut [u8],
+        dst: ReadDst,
+    ) -> IoResult<()> {
         if self.external_edge(name).is_some() {
             let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
-            return owner.read_slice_into(&path, starts, counts, out);
+            return owner.read_slice_into_dst(&path, starts, counts, out, dst);
         }
         let (datatype, out_bytes) = self.slice_size_and_datatype(name, counts)?;
         if out.len() as u64 != out_bytes {
@@ -6925,7 +6980,7 @@ impl Hdf5Reader {
                 out_bytes
             )));
         }
-        self.read_slice_into_unconverted(name, starts, counts, out, 0)?;
+        self.read_slice_into_unconverted(name, starts, counts, out, 0, dst)?;
         Self::apply_post_filter_conversion(out, &datatype)?;
         Ok(())
     }
@@ -6956,7 +7011,10 @@ impl Hdf5Reader {
     /// `out.len()` must equal `product(counts) * element_size`. `depth`
     /// counts virtual-dataset nesting for a caller reached through
     /// [`read_virtual_into`](Self::read_virtual_into); pass `0` for a
-    /// top-level call.
+    /// top-level call. `dst` is the caller's destination fact ([`ReadDst`]):
+    /// whether `out` is a fresh allocation or a buffer the caller keeps
+    /// across reads, which decides whether a mapped contiguous read is priced
+    /// at the cold or the warm row.
     fn read_slice_into_unconverted(
         &mut self,
         name: &str,
@@ -6964,6 +7022,7 @@ impl Hdf5Reader {
         counts: &[u64],
         out: &mut [u8],
         depth: usize,
+        dst: ReadDst,
     ) -> IoResult<()> {
         let info = self
             .dataset_info_local(name)
@@ -7038,9 +7097,10 @@ impl Hdf5Reader {
                         element_size,
                         |src_off, out_off, len| {
                             self.handle
-                                .read_exact_at_into(
+                                .read_exact_at_into_dst(
                                     base + src_off,
                                     &mut out[out_off..out_off + len],
+                                    dst,
                                 )
                                 .map_err(Into::into)
                         },
@@ -7248,7 +7308,11 @@ impl Hdf5Reader {
         // first, exactly as the allocating form always did.
         fill_tiled_into(out, None);
         copy_matched_selections(
-            |bstart, bcount, buf| self.read_slice_into_unconverted(name, bstart, bcount, buf, 0),
+            |bstart, bcount, buf| {
+                // `buf` is `copy_matched_selections`' fresh per-box buffer,
+                // not the caller's `out`.
+                self.read_slice_into_unconverted(name, bstart, bcount, buf, 0, ReadDst::Fresh)
+            },
             &src_sel.resolve(&dims)?,
             &dst_sel.resolve(&out_dims)?,
             element_size,
@@ -7320,12 +7384,15 @@ impl Hdf5Reader {
             )));
         }
         for (i, (bstart, bcount)) in boxes.iter().enumerate() {
+            // One element per read: at or under the map ceiling either way,
+            // so the destination fact does not change how it is served.
             self.read_slice_into_unconverted(
                 name,
                 bstart,
                 bcount,
                 &mut out[i * es..(i + 1) * es],
                 0,
+                ReadDst::Fresh,
             )?;
         }
         Self::apply_post_filter_conversion(out, &datatype)
