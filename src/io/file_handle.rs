@@ -728,14 +728,12 @@ impl FileHandle {
     /// no allocation to bound. A read past EOF still fails — the positioned
     /// read returns `UnexpectedEof` when it cannot fill `buf` — but without
     /// paying a per-call `fstat` on the hot coalesced-read path.
-    pub fn read_exact_at_into(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        self.read_exact_at_into_dst(offset, buf, ReadDst::Fresh)
-    }
-
-    /// [`read_exact_at_into`](Self::read_exact_at_into) with the caller's
-    /// word on where `buf` came from ([`ReadDst`]): a reused buffer lets a
-    /// mapped handle serve the read from its map at any size.
-    pub fn read_exact_at_into_dst(
+    ///
+    /// `dst` is the caller's word on where `buf` came from ([`ReadDst`]):
+    /// a reused buffer lets a mapped handle serve the read from its map at
+    /// any size. The fact is a required argument, not a defaulted wrapper,
+    /// so no call site can leave it unstated.
+    pub fn read_exact_at_into(
         &self,
         offset: u64,
         buf: &mut [u8],
@@ -1264,7 +1262,9 @@ mod read_source_tests {
         assert_eq!(handle.read_at_most(1000, 64).unwrap(), Vec::<u8>::new());
         assert_eq!(handle.read_at_most(990, 64).unwrap(), bytes[990..].to_vec());
         let mut out = [0u8; 10];
-        handle.read_exact_at_into(990, &mut out).unwrap();
+        handle
+            .read_exact_at_into(990, &mut out, ReadDst::Fresh)
+            .unwrap();
         assert_eq!(&out, &bytes[990..]);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1287,7 +1287,9 @@ mod read_source_tests {
                 "read_at({offset}, {len})"
             );
             let mut out = vec![0u8; len];
-            let err = handle.read_exact_at_into(offset, &mut out).unwrap_err();
+            let err = handle
+                .read_exact_at_into(offset, &mut out, ReadDst::Fresh)
+                .unwrap_err();
             assert_eq!(
                 err.kind(),
                 std::io::ErrorKind::UnexpectedEof,
@@ -1299,7 +1301,9 @@ mod read_source_tests {
         // reports `InvalidInput` where the map reports `UnexpectedEof`. What
         // the two owe each other is that neither reads.
         assert!(handle.read_at(u64::MAX, 8).is_err());
-        assert!(handle.read_exact_at_into(u64::MAX, &mut [0u8; 8]).is_err());
+        assert!(handle
+            .read_exact_at_into(u64::MAX, &mut [0u8; 8], ReadDst::Fresh)
+            .is_err());
 
         // `read_at_most` is the one that reports a short read by returning
         // what there was, so past the end it returns nothing.
@@ -1427,7 +1431,9 @@ mod read_source_tests {
                 "read_at_most"
             );
             let mut out = vec![0u8; len];
-            handle.read_exact_at_into(offset, &mut out).unwrap();
+            handle
+                .read_exact_at_into(offset, &mut out, ReadDst::Fresh)
+                .unwrap();
             assert_eq!(out, want, "read_exact_at_into");
         }
         let _ = std::fs::remove_dir_all(&d);

@@ -120,15 +120,19 @@ impl<'a> ChunkTarget<'a> {
 /// reading: the filter pipeline the chunks were stored through, the box of the
 /// dataset it fills, and the fill value every byte no chunk covers takes.
 ///
-/// Carried as one value because all three are constant across a read and are
+/// Carried as one value because all four are constant across a read and are
 /// threaded unchanged from the entry point through each index type down to
 /// [`place_chunk_jobs`] — so a new index reader cannot pick up the target and
-/// forget the fill.
+/// forget the fill or the destination fact.
 #[derive(Clone, Copy)]
 struct ChunkReadRequest<'a> {
     pipeline: Option<&'a FilterPipeline>,
     target: ChunkTarget<'a>,
     fill_value: Option<&'a [u8]>,
+    /// The caller's destination fact ([`ReadDst`]) for the output buffer,
+    /// which prices the per-run direct reads that land straight in it.
+    /// Whole-chunk reads into a fresh image are unaffected.
+    dst: ReadDst,
 }
 
 /// The dataset extent, chunk shape and element size a chunk-placement call
@@ -2199,7 +2203,7 @@ fn push_skipped(skipped: &mut Vec<(usize, usize)>, out_len: usize, dst: usize, l
 /// own order, so every run of the intersection is one positioned read — the
 /// byte ranges libhdf5 reads for the same selection instead of the whole chunk
 /// (`H5D__chunk_read`, H5Dchunk.c). Adjacent runs coalesce into one read.
-/// `image_len` is how many bytes of the chunk the whole-chunk read would have
+/// `job.len` is how many bytes of the chunk the whole-chunk read would have
 /// held, so the runs placed here are exactly the runs
 /// [`copy_chunk_runs`] would have placed out of that image.
 ///
@@ -2214,19 +2218,20 @@ fn push_skipped(skipped: &mut Vec<(usize, usize)>, out_len: usize, dst: usize, l
 /// output.
 fn read_chunk_runs_into(
     handle: &FileHandle,
-    addr: u64,
-    image_len: usize,
+    job: &ChunkReadJob,
     place: &ChunkPlacement,
     chunk_coords: &[u64],
     output: &mut [u8],
     skipped: &mut Vec<(usize, usize)>,
+    dst: ReadDst,
 ) -> bool {
+    let (addr, image_len) = (job.addr, job.len);
     // (file offset, offset in output, length), coalesced as they are planned.
     let mut runs: Vec<(u64, usize, usize)> = Vec::new();
     let mut selected = 0u64;
     let out_len = output.len();
-    for_each_chunk_run(place, chunk_coords, |src, dst, len| {
-        let (s, d) = (src as usize, dst as usize);
+    for_each_chunk_run(place, chunk_coords, |src, out_off, len| {
+        let (s, d) = (src as usize, out_off as usize);
         if s + len > image_len || d + len > out_len {
             push_skipped(skipped, out_len, d, len);
             return;
@@ -2251,9 +2256,9 @@ fn read_chunk_runs_into(
     if (runs.len() as u64 - 1).saturating_mul(PREAD_COST_BYTES) > image_len as u64 + selected {
         return false;
     }
-    for (offset, dst, len) in runs {
+    for (offset, at, len) in runs {
         if handle
-            .read_exact_at_into(offset, &mut output[dst..dst + len])
+            .read_exact_at_into(offset, &mut output[at..at + len], dst)
             .is_err()
         {
             return false;
@@ -2303,6 +2308,7 @@ fn place_chunk_jobs(
         pipeline,
         target,
         fill_value,
+        dst,
     } = req;
     let rank = geo.dims.len();
     let zeros = vec![0u64; rank];
@@ -2321,7 +2327,7 @@ fn place_chunk_jobs(
         for (i, job) in jobs.iter_mut().enumerate() {
             let Some(j) = job.as_ref() else { continue };
             let mark = skipped.len();
-            if read_chunk_runs_into(handle, j.addr, j.len, &place, at(i), output, &mut skipped) {
+            if read_chunk_runs_into(handle, j, &place, at(i), output, &mut skipped, dst) {
                 *job = None;
             } else {
                 // The whole-chunk path re-places this chunk and records what
@@ -4920,7 +4926,7 @@ impl Hdf5Reader {
                     fill_tiled_into(out, fill_value.as_deref());
                 } else {
                     // Read exactly the logical image straight into `out`.
-                    self.handle.read_exact_at_into_dst(*address, out, dst)?;
+                    self.handle.read_exact_at_into(*address, out, dst)?;
                 }
             }
             DataLayoutMessage::Compact { data } => {
@@ -4947,6 +4953,7 @@ impl Hdf5Reader {
                         pipeline: pipeline.as_ref(),
                         target: ChunkTarget::Full,
                         fill_value: fill_value.as_deref(),
+                        dst,
                     },
                     out,
                 )?;
@@ -4973,6 +4980,7 @@ impl Hdf5Reader {
                         pipeline: pipeline.as_ref(),
                         target: ChunkTarget::Full,
                         fill_value: fill_value.as_deref(),
+                        dst,
                     },
                     out,
                 )?;
@@ -5626,9 +5634,7 @@ impl Hdf5Reader {
         output: &mut [u8],
     ) -> IoResult<()> {
         let ChunkReadRequest {
-            pipeline,
-            target,
-            fill_value: _,
+            pipeline, target, ..
         } = req;
         let ChunkIndexDesc {
             index_type,
@@ -7097,7 +7103,7 @@ impl Hdf5Reader {
                         element_size,
                         |src_off, out_off, len| {
                             self.handle
-                                .read_exact_at_into_dst(
+                                .read_exact_at_into(
                                     base + src_off,
                                     &mut out[out_off..out_off + len],
                                     dst,
@@ -7140,6 +7146,7 @@ impl Hdf5Reader {
                         pipeline: pipeline.as_ref(),
                         target: ChunkTarget::Slice { starts, counts },
                         fill_value: fill_value.as_deref(),
+                        dst,
                     },
                     out,
                 )?;
@@ -7170,6 +7177,7 @@ impl Hdf5Reader {
                         pipeline: pipeline.as_ref(),
                         target: ChunkTarget::Slice { starts, counts },
                         fill_value: fill_value.as_deref(),
+                        dst,
                     },
                     out,
                 )?;
@@ -7340,15 +7348,19 @@ impl Hdf5Reader {
     /// One element-sized box per point covers the buffer exactly, so every
     /// byte of `out` is defined before it returns `Ok` and a typed caller
     /// reads straight into the vector it keeps.
+    /// `dst` is the caller's destination fact ([`ReadDst`]) for `out` — a
+    /// required argument rather than a defaulted wrapper, since unlike the
+    /// raw/slice pair this read has no kept-buffer caller to assert it for.
     pub fn read_points_into(
         &mut self,
         name: &str,
         points: &[Vec<u64>],
         out: &mut [u8],
+        dst: ReadDst,
     ) -> IoResult<()> {
         if self.external_edge(name).is_some() {
             let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
-            return owner.read_points_into(&path, points, out);
+            return owner.read_points_into(&path, points, out, dst);
         }
         let info = self
             .dataset_info_local(name)
@@ -7384,15 +7396,13 @@ impl Hdf5Reader {
             )));
         }
         for (i, (bstart, bcount)) in boxes.iter().enumerate() {
-            // One element per read: at or under the map ceiling either way,
-            // so the destination fact does not change how it is served.
             self.read_slice_into_unconverted(
                 name,
                 bstart,
                 bcount,
                 &mut out[i * es..(i + 1) * es],
                 0,
-                ReadDst::Fresh,
+                dst,
             )?;
         }
         Self::apply_post_filter_conversion(out, &datatype)
@@ -8250,6 +8260,7 @@ mod tests {
                     pipeline: None,
                     target: ChunkTarget::Full,
                     fill_value: Some(&FILL),
+                    dst: ReadDst::Fresh,
                 },
                 &geo,
                 None,

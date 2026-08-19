@@ -17,6 +17,14 @@
   to 0.48x. The allocating reads (`read_raw`, `read_slice`) keep the
   ceiling: their destination is fresh by construction.
 
+- The same for an unfiltered chunked dataset's into-reads: the chunk
+  runs that land straight in the caller's buffer (never materializing a
+  chunk image) carry the same destination fact, so a kept buffer serves
+  them from the map at any size too. A full 128 MiB chunked reread into
+  a kept buffer goes from 0.98x libhdf5 to 0.62x, and 1000 random
+  64 KiB slices from 0.98x to 0.50x. Whole-chunk reads (a fresh image
+  by construction, and every filtered chunk) are unchanged.
+
 ## 0.5.0
 
 ### Added
