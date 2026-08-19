@@ -35,6 +35,10 @@ WORKLOADS = [
     ("into-slice", 5),
     ("chunked-write", 5),
     ("chunked-read", 5),
+    # The buffer-reuse pair on an unfiltered chunked dataset: full rereads
+    # and slice-read's random selections into a kept buffer.
+    ("chunked-into-read", 5),
+    ("chunked-into-slice", 5),
     ("deflate-write", 3),
     ("deflate-read", 5),
     ("deflate-slice", 5),

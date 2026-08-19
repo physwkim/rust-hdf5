@@ -190,6 +190,41 @@ fn main() {
                 assert_eq!(v.len(), CONTIG_N);
             });
         }
+        // The buffer-reuse pair again, on an unfiltered chunked dataset:
+        // the chunk runs land straight in the kept buffer, never
+        // materializing a chunk image.
+        "chunked-into-read" => {
+            let path = p("rs-chunkintoread-in.h5");
+            write_chunked(&path, &ramp(CONTIG_N), false, CHUNK_ELEMS);
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("data").unwrap();
+            let mut buf = vec![0f64; CONTIG_N];
+            ds.read_raw_into(&mut buf).unwrap();
+            timed(&workload, reps, || {
+                ds.read_raw_into(&mut buf).unwrap();
+                assert_eq!(buf[CONTIG_N - 1], (CONTIG_N - 1) as f64);
+            });
+        }
+        // slice-read's random 64 KiB selections, into a kept buffer.
+        "chunked-into-slice" => {
+            let path = p("rs-chunkintoslice-in.h5");
+            write_chunked(&path, &ramp(CONTIG_N), false, CHUNK_ELEMS);
+            let file = H5File::open(&path).unwrap();
+            let ds = file.dataset("data").unwrap();
+            let mut buf = vec![0f64; SLICE_ELEMS];
+            ds.read_slice_into(&mut buf, &[0], &[SLICE_ELEMS]).unwrap();
+            timed(&workload, reps, || {
+                let mut rng = Lcg(1);
+                let mut last = 0usize;
+                for _ in 0..SLICE_READS {
+                    let off = (rng.next() % (CONTIG_N - SLICE_ELEMS) as u64) as usize;
+                    ds.read_slice_into(&mut buf, &[off], &[SLICE_ELEMS])
+                        .unwrap();
+                    last = off;
+                }
+                assert_eq!(buf[0], last as f64);
+            });
+        }
         "deflate-write" => {
             let data = compressible(DEFLATE_N);
             let path = p("rs-deflate.h5");
