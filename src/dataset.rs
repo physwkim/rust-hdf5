@@ -3935,7 +3935,7 @@ impl H5Dataset {
                     return Err(Hdf5Error::InvalidState("file is not in read mode".into()));
                 };
                 read_image_into_new(points_u64.len(), |image| {
-                    reader.read_points_into(name, &points_u64, image)?;
+                    reader.read_points_into(name, &points_u64, image, ReadDst::Fresh)?;
                     to_host_byte_order(image, &datatype, T::element_size())
                 })
             }
