@@ -143,8 +143,27 @@ enum ReadSource {
 /// 64 KiB and a whole chunk is megabytes; those stay on `pread`, and it
 /// matters that they do: at a 64 KiB ceiling the 1000-random-slice read
 /// workload lost 7.7%, which this ceiling gives back.
+///
+/// The ceiling only prices the cold row of the table. A read whose
+/// destination the caller keeps — [`ReadDst::Reused`], asserted by the
+/// public `*_into` dataset reads — is the warm row, where the map wins at
+/// every size, so it is served from the map with no ceiling at all.
 #[cfg(feature = "mmap")]
 const MAP_MAX_READ: usize = 8 << 10;
+
+/// Where a read's bytes land, as far as the fault cost of the destination
+/// is concerned. The table on [`MAP_MAX_READ`] is priced by this fact:
+/// `Fresh` is its cold row (the read's own allocation, faulted in as it
+/// fills), `Reused` its warm row (a buffer the caller holds across calls,
+/// already faulted). Callers state the fact; [`ReadSource::map_for`] alone
+/// turns it into a choice.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReadDst {
+    /// The destination was allocated for this read.
+    Fresh,
+    /// The destination is a buffer the caller reuses across reads.
+    Reused,
+}
 
 impl ReadSource {
     /// The best source a read-only handle can have: a whole-file map when one
@@ -180,12 +199,13 @@ impl ReadSource {
     /// The map to serve a read of `len` bytes from, or `None` when this read
     /// goes to the descriptor — either because the handle has no map, or
     /// because the read is too big to be worth taking out of one
-    /// ([`MAP_MAX_READ`]). The one place that decides, so that no read entry
-    /// point can pick for itself and none can be added that skips the choice.
+    /// ([`MAP_MAX_READ`]) for the destination it lands in ([`ReadDst`]).
+    /// The one place that decides, so that no read entry point can pick for
+    /// itself and none can be added that skips the choice.
     #[cfg(feature = "mmap")]
-    fn map_for(&self, len: usize) -> Option<&memmap2::Mmap> {
+    fn map_for(&self, len: usize, dst: ReadDst) -> Option<&memmap2::Mmap> {
         match self {
-            ReadSource::Mapped(map) if len <= MAP_MAX_READ => Some(map),
+            ReadSource::Mapped(map) if dst == ReadDst::Reused || len <= MAP_MAX_READ => Some(map),
             _ => None,
         }
     }
@@ -206,7 +226,7 @@ impl ReadSource {
     /// a buffer that is about to be overwritten is a second pass over it.
     fn read_vec(&self, file: &File, at: u64, len: usize) -> std::io::Result<Vec<u8>> {
         #[cfg(feature = "mmap")]
-        if let Some(map) = self.map_for(len) {
+        if let Some(map) = self.map_for(len, ReadDst::Fresh) {
             return Ok(mapped_range(map, at, len)?.to_vec());
         }
         let mut buf = vec![0u8; len];
@@ -218,7 +238,7 @@ impl ReadSource {
     /// what the source holds.
     fn read_vec_upto(&self, file: &File, at: u64, max_len: usize) -> std::io::Result<Vec<u8>> {
         #[cfg(feature = "mmap")]
-        if let Some(map) = self.map_for(max_len) {
+        if let Some(map) = self.map_for(max_len, ReadDst::Fresh) {
             let avail = (map.len() as u64).saturating_sub(at) as usize;
             return Ok(mapped_range(map, at, max_len.min(avail))?.to_vec());
         }
@@ -239,12 +259,19 @@ impl ReadSource {
     /// Exactly `buf.len()` bytes at absolute offset `at`, straight into
     /// `buf`. Fails with `UnexpectedEof` when the source is too short, which
     /// is what a short `pread` reports.
-    fn read_exact_into(&self, file: &File, at: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    fn read_exact_into(
+        &self,
+        file: &File,
+        at: u64,
+        buf: &mut [u8],
+        dst: ReadDst,
+    ) -> std::io::Result<()> {
         #[cfg(feature = "mmap")]
-        if let Some(map) = self.map_for(buf.len()) {
+        if let Some(map) = self.map_for(buf.len(), dst) {
             buf.copy_from_slice(mapped_range(map, at, buf.len())?);
             return Ok(());
         }
+        let _ = dst;
         pread_exact(file, at, buf)
     }
 }
@@ -572,7 +599,8 @@ impl FileHandle {
         let mut addr = 0u64;
         loop {
             if addr + HDF5_SIGNATURE.len() as u64 <= file_len {
-                self.source.read_exact_into(&self.file, addr, &mut buf)?;
+                self.source
+                    .read_exact_into(&self.file, addr, &mut buf, ReadDst::Fresh)?;
                 if buf == HDF5_SIGNATURE {
                     return Ok(Some(addr));
                 }
@@ -700,10 +728,20 @@ impl FileHandle {
     /// no allocation to bound. A read past EOF still fails — the positioned
     /// read returns `UnexpectedEof` when it cannot fill `buf` — but without
     /// paying a per-call `fstat` on the hot coalesced-read path.
-    pub fn read_exact_at_into(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    ///
+    /// `dst` is the caller's word on where `buf` came from ([`ReadDst`]):
+    /// a reused buffer lets a mapped handle serve the read from its map at
+    /// any size. The fact is a required argument, not a defaulted wrapper,
+    /// so no call site can leave it unstated.
+    pub fn read_exact_at_into(
+        &self,
+        offset: u64,
+        buf: &mut [u8],
+        dst: ReadDst,
+    ) -> std::io::Result<()> {
         self.flush()?;
         self.source
-            .read_exact_into(&self.file, self.abs(offset)?, buf)
+            .read_exact_into(&self.file, self.abs(offset)?, buf, dst)
     }
 
     /// Read up to `max_len` bytes starting at the given byte offset.
@@ -1224,7 +1262,9 @@ mod read_source_tests {
         assert_eq!(handle.read_at_most(1000, 64).unwrap(), Vec::<u8>::new());
         assert_eq!(handle.read_at_most(990, 64).unwrap(), bytes[990..].to_vec());
         let mut out = [0u8; 10];
-        handle.read_exact_at_into(990, &mut out).unwrap();
+        handle
+            .read_exact_at_into(990, &mut out, ReadDst::Fresh)
+            .unwrap();
         assert_eq!(&out, &bytes[990..]);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1247,7 +1287,9 @@ mod read_source_tests {
                 "read_at({offset}, {len})"
             );
             let mut out = vec![0u8; len];
-            let err = handle.read_exact_at_into(offset, &mut out).unwrap_err();
+            let err = handle
+                .read_exact_at_into(offset, &mut out, ReadDst::Fresh)
+                .unwrap_err();
             assert_eq!(
                 err.kind(),
                 std::io::ErrorKind::UnexpectedEof,
@@ -1259,7 +1301,9 @@ mod read_source_tests {
         // reports `InvalidInput` where the map reports `UnexpectedEof`. What
         // the two owe each other is that neither reads.
         assert!(handle.read_at(u64::MAX, 8).is_err());
-        assert!(handle.read_exact_at_into(u64::MAX, &mut [0u8; 8]).is_err());
+        assert!(handle
+            .read_exact_at_into(u64::MAX, &mut [0u8; 8], ReadDst::Fresh)
+            .is_err());
 
         // `read_at_most` is the one that reports a short read by returning
         // what there was, so past the end it returns nothing.
@@ -1387,7 +1431,9 @@ mod read_source_tests {
                 "read_at_most"
             );
             let mut out = vec![0u8; len];
-            handle.read_exact_at_into(offset, &mut out).unwrap();
+            handle
+                .read_exact_at_into(offset, &mut out, ReadDst::Fresh)
+                .unwrap();
             assert_eq!(out, want, "read_exact_at_into");
         }
         let _ = std::fs::remove_dir_all(&d);

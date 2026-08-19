@@ -639,7 +639,11 @@ impl SwmrFileReader {
         // As the non-SWMR full read: the image lands in the vector this
         // returns rather than in a byte buffer copied into it afterwards.
         crate::io::reader::read_image_into_new(total / es, |image| {
-            self.reader.read_dataset_raw_into(name, image)?;
+            self.reader.read_dataset_raw_into_dst(
+                name,
+                image,
+                crate::io::file_handle::ReadDst::Fresh,
+            )?;
             crate::dataset::to_host_byte_order(image, &datatype, es)
         })
     }
