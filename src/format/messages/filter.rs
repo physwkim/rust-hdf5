@@ -1429,8 +1429,19 @@ fn lzf_compress(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Decode a raw LZF stream. `max_output` is the size the filter's
+/// `cd_values[2]` declares, and like h5py's `lzf_filter.c` (which grows its
+/// buffer on `E2BIG`) it is a sizing hint, not a bound on what the stream may
+/// expand to; the stream itself bounds that, at 88 bytes of output per byte
+/// of input (a 3-byte back-reference of 264 bytes), so a declared size past
+/// what the input could produce sizes nothing.
 fn lzf_decompress(input: &[u8], max_output: usize) -> FormatResult<Vec<u8>> {
-    let mut out = Vec::with_capacity(max_output);
+    const MAX_EXPANSION: usize = 88;
+    let reserve = max_output.min(input.len().saturating_mul(MAX_EXPANSION));
+    let mut out = Vec::new();
+    out.try_reserve_exact(reserve).map_err(|_| {
+        FormatError::InvalidData(format!("LZF: cannot reserve {reserve} bytes of output"))
+    })?;
     let mut ip = 0;
 
     while ip < input.len() {
@@ -3148,6 +3159,24 @@ mod tests {
         assert!(compressed.len() < data.len());
         let decompressed = lzf_decompress(&compressed, data.len()).unwrap();
         assert_eq!(decompressed, data);
+    }
+
+    /// The declared output size is a hint: past what the input could expand
+    /// to it sizes nothing, so a crafted `cd_values[2]` neither aborts nor
+    /// reserves, and a stream that expands past its declaration still
+    /// decodes, as h5py's filter does.
+    #[test]
+    fn lzf_declared_size_is_a_hint_not_a_reservation() {
+        assert_eq!(lzf_decompress(&[], usize::MAX).unwrap(), Vec::<u8>::new());
+        // One literal byte under a declaration of 2^60 bytes.
+        let out = lzf_decompress(&[0x00, 0x41], 1 << 60).unwrap();
+        assert_eq!(out, b"A");
+        assert!(out.capacity() <= 88 * 2);
+
+        let data = vec![7u8; 4096];
+        let compressed = lzf_compress(&data);
+        assert_eq!(lzf_decompress(&compressed, 16).unwrap(), data);
+        assert_eq!(lzf_decompress(&compressed, 0).unwrap(), data);
     }
 
     #[test]
