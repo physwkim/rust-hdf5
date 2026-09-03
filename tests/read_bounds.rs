@@ -331,3 +331,56 @@ fn a_fixed_array_element_count_past_the_file_is_refused() {
 
     cleanup(&path);
 }
+
+/// An external file list slot whose file offset is a few bytes short of
+/// `u64::MAX`: a selection that starts past that gap wraps, and the read
+/// refuses rather than serving the slot from the wrapped offset.
+#[test]
+fn an_external_slot_offset_that_wraps_is_refused() {
+    let path = unique_tmp("wrap_efl");
+    let dir = path.parent().unwrap().to_path_buf();
+    // The raw file holds 0..24 at slot offset 12345. The slot records that
+    // offset next to its size, the one place the two numbers sit together.
+    let mut raw = vec![0u8; 12345];
+    raw.extend(0..24u8);
+    std::fs::write(dir.join("raw.bin"), &raw).unwrap();
+    {
+        let file = H5File::create(&path).unwrap();
+        file.new_dataset::<u8>()
+            .shape([24usize])
+            .external(&[("raw.bin", 12345, 24)])
+            .efile_prefix(dir.display().to_string())
+            .create("e")
+            .unwrap();
+        file.close().unwrap();
+    }
+    let access = || rust_hdf5::DatasetAccess::new().efile_prefix(dir.display().to_string());
+    {
+        let file = H5File::open(&path).unwrap();
+        let ds = file.dataset_with("e", access()).unwrap();
+        assert_eq!(
+            ds.read_slice::<u8>(&[8], &[8]).unwrap(),
+            (8..16).collect::<Vec<_>>()
+        );
+        drop(ds);
+        file.close().unwrap();
+    }
+
+    let mut needle = 12345u64.to_le_bytes().to_vec();
+    needle.extend_from_slice(&24u64.to_le_bytes());
+    patch_unique(&path, &needle, |m| {
+        m[..8].copy_from_slice(&(u64::MAX - 4).to_le_bytes());
+    });
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset_with("e", access()).unwrap();
+    let err = ds
+        .read_slice::<u8>(&[8], &[8])
+        .expect_err("a wrapping slot offset must not read");
+    let msg = format!("{err}");
+    assert!(msg.contains("overflows"), "unexpected error: {msg}");
+    drop(ds);
+    file.close().unwrap();
+
+    cleanup(&path);
+}
