@@ -176,9 +176,15 @@ fn a_short_compact_payload_survives_a_read_write_reopen_by_its_bytes() {
     patch_dim0(&path, 4, 5);
 
     let file = H5File::open_rw(&path).unwrap();
+    let err = file
+        .dataset_writer("dset")
+        .err()
+        .expect("a write-mode open of the mismatched dataset should fail");
+    let msg = format!("{err}");
     assert!(
-        file.dataset("dset").is_err(),
-        "a write-mode open of the mismatched dataset should fail"
+        msg.contains("kept exactly as it found it")
+            && msg.contains("compact storage holds 24 bytes"),
+        "unexpected error: {msg}"
     );
     file.close().unwrap();
 

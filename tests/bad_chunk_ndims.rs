@@ -88,9 +88,15 @@ fn mismatched_chunk_rank_survives_a_read_write_reopen_by_its_bytes() {
     std::fs::copy(fixture("bad_chunk_ndims.h5"), &path).unwrap();
 
     let file = H5File::open_rw(&path).unwrap();
+    let err = file
+        .dataset_writer("dset")
+        .err()
+        .expect("a write-mode open of the mismatched dataset should fail");
+    let msg = format!("{err}");
     assert!(
-        file.dataset("dset").is_err(),
-        "a write-mode open of the mismatched dataset should fail"
+        msg.contains("kept exactly as it found it")
+            && msg.contains("chunk dimensionality 3 over a rank-3 dataspace"),
+        "unexpected error: {msg}"
     );
     file.close().unwrap();
 
