@@ -728,6 +728,9 @@ struct BitReader<'a> {
     pos: usize,
     acc: u64,
     bitp: i32,
+    /// Zero bits fabricated past the end of `data` that are still in the
+    /// accumulator (see [`exhausted`](Self::exhausted)).
+    padded: i32,
 }
 
 impl<'a> BitReader<'a> {
@@ -737,6 +740,7 @@ impl<'a> BitReader<'a> {
             pos: 0,
             acc: 0,
             bitp: 0,
+            padded: 0,
         }
     }
 
@@ -746,6 +750,14 @@ impl<'a> BitReader<'a> {
             self.pos += 1;
             self.bitp += 8;
         }
+    }
+
+    /// Whether every bit of the stream has been consumed: nothing left in
+    /// the input, and nothing in the accumulator but zeros this reader made
+    /// up. The stream's own bits are the accumulator's high bits and go
+    /// first, so the fabricated ones are whatever is left below `padded`.
+    fn exhausted(&self) -> bool {
+        self.pos >= self.data.len() && self.bitp <= self.padded
     }
 
     fn get_bits(&mut self, n: i32) -> u32 {
@@ -758,9 +770,11 @@ impl<'a> BitReader<'a> {
                 // pad with zeros
                 self.acc <<= 8;
                 self.bitp += 8;
+                self.padded += 8;
             }
         }
         self.bitp -= n;
+        self.padded = self.padded.min(self.bitp);
         ((self.acc >> self.bitp) & ((1u64 << n) - 1)) as u32
     }
 
@@ -778,6 +792,7 @@ impl<'a> BitReader<'a> {
             fs += self.bitp as u32;
             self.acc = 0;
             self.bitp = 0;
+            self.padded = 0;
             // read more bytes
             let to_read = std::cmp::min(7, self.data.len() - self.pos);
             if to_read == 0 {
@@ -794,6 +809,7 @@ impl<'a> BitReader<'a> {
         let highest = 63 - self.acc.leading_zeros() as i32;
         fs += (self.bitp - highest - 1) as u32;
         self.bitp = highest; // consume the 1 bit
+        self.padded = self.padded.min(self.bitp);
         fs
     }
 }
@@ -911,16 +927,35 @@ impl Decoder {
         let rsi_samples = (self.rsi * self.block_size) as usize;
         let pp = self.flags & AEC_DATA_PREPROCESS != 0;
 
-        let mut all_output: Vec<u32> = Vec::with_capacity(output_samples);
+        // `output_samples` is the chunk's declared size; the stream has to
+        // produce it, so a claim past what memory can hold is an error
+        // here rather than an abort.
+        let mut all_output: Vec<u32> = Vec::new();
+        all_output.try_reserve_exact(output_samples).map_err(|_| {
+            format!("cannot reserve {output_samples} samples for the declared output")
+        })?;
 
         while all_output.len() < output_samples {
             // Decode one RSI
             let mut rsi_buf: Vec<u32> = Vec::with_capacity(rsi_samples);
             let mut first_block_in_rsi = true;
 
-            while rsi_buf.len() < rsi_samples
-                && all_output.len() + rsi_buf.len() < output_samples + rsi_samples
-            {
+            while rsi_buf.len() < rsi_samples {
+                // libaec stops where the stream does: an encoder emits blocks
+                // until the last real sample is covered and no further, so a
+                // stream that ends inside an RSI is complete once the samples
+                // decoded reach the declared output, and truncated otherwise.
+                // Left to run on, the zero padding would decode as zero
+                // blocks for as long as the declared output asked.
+                if reader.exhausted() {
+                    if all_output.len() + rsi_buf.len() >= output_samples {
+                        break;
+                    }
+                    return Err(format!(
+                        "compressed stream ends after {} of {output_samples} samples",
+                        all_output.len() + rsi_buf.len()
+                    ));
+                }
                 let has_ref = pp && first_block_in_rsi;
                 let encoded_block_size = if has_ref {
                     self.block_size - 1
@@ -1095,6 +1130,47 @@ impl Decoder {
 //  Public API
 // ===========================================================================
 
+/// `SZ_MAX_PIXELS_PER_BLOCK` (szlib.h): the largest block szlib/libaec
+/// accept, and the cap `H5Z__set_local_szip` applies.
+pub const MAX_PIXELS_PER_BLOCK: u32 = 32;
+/// `SZ_MAX_PIXELS_PER_SCANLINE` (szlib.h): `SZ_MAX_BLOCKS_PER_SCANLINE`
+/// (128) blocks of the largest size; `H5Z__set_local_szip` clamps the
+/// scanline it derives from the chunk to it.
+pub const MAX_PIXELS_PER_SCANLINE: u32 = 128 * MAX_PIXELS_PER_BLOCK;
+
+/// The parameter checks `SZ_BufftoBuffCompress` / `SZ_BufftoBuffDecompress`
+/// (sz_compat.c) make before either codec runs, shared by both directions so
+/// the encoder cannot write a stream the decoder refuses. The limits bound
+/// every size derived from the parameters: an RSI is at most
+/// `MAX_PIXELS_PER_SCANLINE` samples.
+fn validate_params(
+    bits_per_pixel: u32,
+    pixels_per_block: u32,
+    pixels_per_scanline: u32,
+) -> Result<(), String> {
+    if pixels_per_scanline == 0
+        || pixels_per_block == 0
+        || pixels_per_block & 1 != 0
+        || bits_per_pixel == 0
+        || (bits_per_pixel > 32 && bits_per_pixel != 64)
+    {
+        return Err("invalid SZIP parameters".into());
+    }
+    if pixels_per_block > MAX_PIXELS_PER_BLOCK {
+        return Err(format!(
+            "SZIP pixels_per_block {pixels_per_block} exceeds the szlib limit of \
+             {MAX_PIXELS_PER_BLOCK}"
+        ));
+    }
+    if pixels_per_scanline > MAX_PIXELS_PER_SCANLINE {
+        return Err(format!(
+            "SZIP pixels_per_scanline {pixels_per_scanline} exceeds the szlib limit of \
+             {MAX_PIXELS_PER_SCANLINE}"
+        ));
+    }
+    Ok(())
+}
+
 /// Compress data using the SZIP (AEC) algorithm.
 ///
 /// Parameters match the HDF5 SZIP filter interface:
@@ -1110,14 +1186,7 @@ pub fn compress(
     pixels_per_scanline: u32,
     options_mask: u32,
 ) -> Result<Vec<u8>, String> {
-    if pixels_per_scanline == 0
-        || pixels_per_block == 0
-        || pixels_per_block & 1 != 0
-        || bits_per_pixel == 0
-        || (bits_per_pixel > 32 && bits_per_pixel != 64)
-    {
-        return Err("invalid SZIP parameters".into());
-    }
+    validate_params(bits_per_pixel, pixels_per_block, pixels_per_scanline)?;
 
     let flags = AEC_NOT_ENFORCE | convert_options(options_mask);
     let block_size = pixels_per_block;
@@ -1200,14 +1269,7 @@ pub fn decompress(
     pixels_per_scanline: u32,
     options_mask: u32,
 ) -> Result<Vec<u8>, String> {
-    if pixels_per_scanline == 0
-        || pixels_per_block == 0
-        || pixels_per_block & 1 != 0
-        || bits_per_pixel == 0
-        || (bits_per_pixel > 32 && bits_per_pixel != 64)
-    {
-        return Err("invalid SZIP parameters".into());
-    }
+    validate_params(bits_per_pixel, pixels_per_block, pixels_per_scanline)?;
 
     let flags = convert_options(options_mask);
     let block_size = pixels_per_block;
@@ -1464,6 +1526,46 @@ mod tests {
             err.contains("not a multiple of pixel size"),
             "unexpected error message: {err}"
         );
+    }
+
+    /// The szlib limits, on both directions: a block over 32 pixels or a
+    /// scanline over 4096 is refused before either codec runs, and the
+    /// largest values in range still round-trip.
+    #[test]
+    fn parameters_past_the_szlib_limits_are_refused() {
+        let mask = SZ_NN_OPTION_MASK | SZ_MSB_OPTION_MASK;
+        let data: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        roundtrip(&data, 8, 32, 4096, mask);
+        let err = compress(&data, 8, 34, 4096, mask).unwrap_err();
+        assert!(err.contains("pixels_per_block 34"), "{err}");
+        let err = compress(&data, 8, 32, 4097, mask).unwrap_err();
+        assert!(err.contains("pixels_per_scanline 4097"), "{err}");
+        assert!(decompress(&[0u8; 16], 64, 8, 34, 4096, mask).is_err());
+        assert!(decompress(&[0u8; 16], 64, 8, 32, 4097, mask).is_err());
+    }
+
+    /// A stream that ends before the declared output is an error at the
+    /// point it ends, not zero blocks for as long as the declaration asks:
+    /// an empty stream under a 2^40-sample claim neither reserves for it
+    /// nor loops over it, and a stream cut short reports how far it got.
+    #[test]
+    fn a_stream_that_ends_early_is_an_error_not_zero_padding() {
+        let mask = SZ_NN_OPTION_MASK | SZ_MSB_OPTION_MASK;
+        let err = decompress(&[], 1 << 40, 8, 32, 256, mask).unwrap_err();
+        assert!(
+            err.contains("ends after 0 of") || err.contains("cannot reserve"),
+            "{err}"
+        );
+
+        let data: Vec<u8> = (0..4096u32).map(|i| (i * 7919 % 256) as u8).collect();
+        let compressed = compress(&data, 8, 16, 256, mask).unwrap();
+        assert_eq!(
+            decompress(&compressed, data.len(), 8, 16, 256, mask).unwrap(),
+            data
+        );
+        let cut = &compressed[..compressed.len() / 2];
+        let err = decompress(cut, data.len(), 8, 16, 256, mask).unwrap_err();
+        assert!(err.contains("ends after"), "{err}");
     }
 
     #[test]
