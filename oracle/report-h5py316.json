@@ -4,8 +4,8 @@
   "h5py_version": "3.16.0",
   "numpy_version": "2.5.2",
   "python": "/home/stevek/micromamba/envs/h5py316/bin/python",
-  "probe": "/home/stevek/work/rust-hdf5/.caucus/worktrees/QAS5ZKN5CY-wp-xfile-c2223ac1-1/target/release/oracle_probe",
-  "cases": 111
+  "probe": "target/release/oracle_probe",
+  "cases": 113
  },
  "results": [
   {
@@ -1474,6 +1474,50 @@
    "group": "filter",
    "note": "scale-offset, library-computed minimum bits",
    "rust_case": "filter_scaleoffset",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 36,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "filter_szip_ec",
+   "group": "filter",
+   "note": "szip entropy coding, 8 pixels per block",
+   "rust_case": "filter_szip_ec",
+   "a": {
+    "verdict": "PASS",
+    "divergences": [],
+    "gaps": [],
+    "oracle_errors": [],
+    "matched": 36,
+    "detail": ""
+   },
+   "b": {
+    "verdict": "PASS",
+    "detail": "",
+    "core_diffs": [],
+    "metadata_diffs": [],
+    "h5diff_rc": 0,
+    "h5dump_rc": 0
+   }
+  },
+  {
+   "case": "filter_szip_nn",
+   "group": "filter",
+   "note": "szip nearest neighbour, 16 pixels per block",
+   "rust_case": "filter_szip_nn",
    "a": {
     "verdict": "PASS",
     "divergences": [],

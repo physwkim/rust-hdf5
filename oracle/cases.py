@@ -771,6 +771,12 @@ FILTER_CASES = [
     _filter_case("filter_scaleoffset", "filter_scaleoffset",
                  "scale-offset, library-computed minimum bits",
                  scaleoffset=0),
+    _filter_case("filter_szip_ec", "filter_szip_ec",
+                 "szip entropy coding, 8 pixels per block",
+                 compression="szip", compression_opts=("ec", 8)),
+    _filter_case("filter_szip_nn", "filter_szip_nn",
+                 "szip nearest neighbour, 16 pixels per block",
+                 compression="szip", compression_opts=("nn", 16)),
 ]
 
 

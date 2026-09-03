@@ -28,7 +28,7 @@ use rust_hdf5::format::messages::datatype::{
 use rust_hdf5::format::messages::filter::{
     Filter, FilterPipeline, FILTER_BLOSC, FILTER_BSHUF, FILTER_BZIP2, FILTER_DEFLATE,
     FILTER_FLETCHER32, FILTER_LZ4, FILTER_LZF, FILTER_NBIT, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
-    FILTER_SZIP, FILTER_ZSTD, FLAG_MANDATORY,
+    FILTER_SZIP, FILTER_ZSTD, FLAG_MANDATORY, FLAG_OPTIONAL,
 };
 use rust_hdf5::format::messages::shared::MessageStorage;
 use rust_hdf5::format::messages::{
@@ -2503,6 +2503,8 @@ fn write_case(case: &str, path: &str) -> rust_hdf5::Result<WriteResult> {
                 }],
             })
         }),
+        "filter_szip_ec" => filtered(path, |b| b.filter_pipeline(szip(141, 8))),
+        "filter_szip_nn" => filtered(path, |b| b.filter_pipeline(szip(169, 16))),
         "filter_scaleoffset" => filtered(path, |b| {
             // `filtered` writes 64 i32 elements in chunks of 16, and the
             // filter parameters carry that per-chunk element count.
@@ -3236,6 +3238,20 @@ fn chunked_ramp(
     ds.write_raw(&ramp_n::<i32>(n as u8))?;
     file.close()?;
     Ok(Ok(()))
+}
+
+/// SZIP as `H5Pset_szip` stores it for `filtered`'s i32 chunks of 16: the
+/// `cd_values` are the options mask, the pixels per block, 32 bits per pixel
+/// and a 16-pixel scanline (one chunk), and the filter is optional, the flag
+/// `H5Pset_szip` sets so a chunk it cannot shrink is stored raw.
+fn szip(options_mask: u32, pixels_per_block: u32) -> FilterPipeline {
+    FilterPipeline {
+        filters: vec![Filter {
+            id: FILTER_SZIP,
+            flags: FLAG_OPTIONAL,
+            cd_values: vec![options_mask, pixels_per_block, 32, 16],
+        }],
+    }
 }
 
 fn filtered(
