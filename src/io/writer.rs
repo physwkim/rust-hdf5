@@ -70,9 +70,10 @@ use crate::format::sohm_write::{
 use crate::format::superblock::*;
 use crate::format::{FormatContext, LibverBound, ObjectFormat, UNDEF_ADDR};
 
+use crate::format::selection::check_hyperslab;
 use crate::io::allocator::{FileAllocator, FreeBlock};
 use crate::io::file_handle::FileHandle;
-use crate::io::hyperslab::{check_hyperslab, for_each_contiguous_run, for_each_dual_run};
+use crate::io::hyperslab::{for_each_contiguous_run, for_each_dual_run};
 use crate::io::symbol_table_io::{free_stab, write_stab, Stab, StabExtents, StabLink, StabTarget};
 use crate::io::{FileMeta, IoResult};
 

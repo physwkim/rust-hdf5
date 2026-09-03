@@ -52,6 +52,14 @@ impl From<crate::format::FormatError> for Hdf5Error {
     }
 }
 
+/// A caller's hyperslab the extent does not admit is a bad request, not a
+/// malformed file.
+impl From<crate::format::selection::HyperslabError> for Hdf5Error {
+    fn from(e: crate::format::selection::HyperslabError) -> Self {
+        Self::InvalidState(e.to_string())
+    }
+}
+
 impl From<crate::io::IoError> for Hdf5Error {
     fn from(e: crate::io::IoError) -> Self {
         // Every outcome that names *why* a lookup failed carries through as

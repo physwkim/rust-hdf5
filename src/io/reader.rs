@@ -54,8 +54,9 @@ use crate::format::superblock::{
 use crate::format::symbol_table::SymbolTableNode;
 use crate::format::{BlockReader, FormatContext, UNDEF_ADDR};
 
+use crate::format::selection::check_hyperslab;
 use crate::io::file_handle::{FileHandle, ReadDst};
-use crate::io::hyperslab::{check_hyperslab, compute_strides, for_each_contiguous_run};
+use crate::io::hyperslab::{compute_strides, for_each_contiguous_run};
 use crate::io::locking::FileLocking;
 use crate::io::{FileMeta, IoResult};
 

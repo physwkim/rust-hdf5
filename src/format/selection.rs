@@ -289,6 +289,92 @@ fn row_major_strides(dims: &[u64]) -> FormatResult<Vec<u64>> {
     Ok(strides)
 }
 
+/// A hyperslab `[starts, counts)` that an extent does not admit.
+///
+/// One rule for every strideless selection, whoever supplies it — a slice
+/// read or written through the public API, a point read, the boxes of a
+/// region reference — owned by [`check_hyperslab`] alone. Each layer that
+/// meets it converts it to its own class: a file's selection is invalid
+/// data, a caller's slice an invalid request. The text is the same either
+/// way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HyperslabError {
+    /// `starts` or `counts` has a different length than the extent.
+    Rank { got: usize, rank: usize },
+    /// `start + count` wraps, or lands past the extent, in `dim`.
+    OutOfBounds {
+        dim: usize,
+        start: u64,
+        count: u64,
+        extent: u64,
+    },
+}
+
+impl std::fmt::Display for HyperslabError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rank { got, rank } => {
+                write!(f, "selection rank {got} does not match dataset rank {rank}")
+            }
+            Self::OutOfBounds {
+                dim,
+                start,
+                count,
+                extent,
+            } => write!(
+                f,
+                "slice out of bounds in dimension {dim}: start {start} + count {count} exceeds extent {extent}"
+            ),
+        }
+    }
+}
+
+impl From<HyperslabError> for FormatError {
+    fn from(e: HyperslabError) -> Self {
+        FormatError::InvalidData(e.to_string())
+    }
+}
+
+/// Refuse a hyperslab `[starts, counts)` that `dims` does not admit: the
+/// rank must match and every edge `starts[d] + counts[d]` must stay inside
+/// the extent. The edge is computed checked, so a start near `u64::MAX`
+/// (caller input, or a box a file supplied) is refused here rather than
+/// wrapping into an offset that lands inside the extent and reads
+/// unrelated bytes.
+pub(crate) fn check_hyperslab(
+    dims: &[u64],
+    starts: &[u64],
+    counts: &[u64],
+) -> Result<(), HyperslabError> {
+    let rank = dims.len();
+    if starts.len() != rank {
+        return Err(HyperslabError::Rank {
+            got: starts.len(),
+            rank,
+        });
+    }
+    if counts.len() != rank {
+        return Err(HyperslabError::Rank {
+            got: counts.len(),
+            rank,
+        });
+    }
+    for (dim, &extent) in dims.iter().enumerate() {
+        if starts[dim]
+            .checked_add(counts[dim])
+            .is_none_or(|end| end > extent)
+        {
+            return Err(HyperslabError::OutOfBounds {
+                dim,
+                start: starts[dim],
+                count: counts[dim],
+                extent,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Append the runs one box contributes, in the box's own row-major order.
 ///
 /// Consecutive runs that are adjacent in *both* the box and the extent are
@@ -304,23 +390,7 @@ fn push_box_runs(
     runs: &mut Vec<SelectionRun>,
 ) -> FormatResult<()> {
     let rank = dims.len();
-    if start.len() != rank || count.len() != rank {
-        return Err(FormatError::InvalidData(format!(
-            "selection box of rank {} against a {rank}-dimensional extent",
-            start.len()
-        )));
-    }
-    for d in 0..rank {
-        let end = start[d]
-            .checked_add(count[d])
-            .ok_or_else(|| FormatError::InvalidData("selection box coordinate overflows".into()))?;
-        if end > dims[d] {
-            return Err(FormatError::InvalidData(format!(
-                "selection box covers [{}, {end}) of dimension {d}, past the extent {}",
-                start[d], dims[d]
-            )));
-        }
-    }
+    check_hyperslab(dims, start, count)?;
     if count.contains(&0) {
         return Ok(());
     }
@@ -1882,6 +1952,64 @@ mod tests {
     /// `to_boxes` deliberately does not clip a block against the extent, so
     /// `resolve` — which needs every box's offset within that extent to mean
     /// something — is the caller that rejects one reaching past it.
+    /// The one bounds rule, at each of its boundaries: an edge on the
+    /// extent is in, one past it is out, a sum that wraps is out, and a
+    /// rank that differs is out before any edge is looked at.
+    #[test]
+    fn check_hyperslab_by_boundary() {
+        let dims = [4u64, 6];
+        assert_eq!(check_hyperslab(&dims, &[1, 2], &[3, 4]), Ok(()));
+        assert_eq!(check_hyperslab(&dims, &[4, 0], &[0, 6]), Ok(()));
+        assert_eq!(
+            check_hyperslab(&dims, &[1, 2], &[3, 5]),
+            Err(HyperslabError::OutOfBounds {
+                dim: 1,
+                start: 2,
+                count: 5,
+                extent: 6
+            })
+        );
+        assert_eq!(
+            check_hyperslab(&dims, &[u64::MAX, 0], &[1, 1]),
+            Err(HyperslabError::OutOfBounds {
+                dim: 0,
+                start: u64::MAX,
+                count: 1,
+                extent: 4
+            })
+        );
+        assert_eq!(
+            check_hyperslab(&dims, &[1, 0], &[u64::MAX, 1]),
+            Err(HyperslabError::OutOfBounds {
+                dim: 0,
+                start: 1,
+                count: u64::MAX,
+                extent: 4
+            })
+        );
+        assert_eq!(check_hyperslab(&[], &[], &[]), Ok(()));
+        assert_eq!(
+            check_hyperslab(&dims, &[0], &[1, 1]),
+            Err(HyperslabError::Rank { got: 1, rank: 2 })
+        );
+        assert_eq!(
+            check_hyperslab(&dims, &[0, 0, 0], &[1, 1, 1]),
+            Err(HyperslabError::Rank { got: 3, rank: 2 })
+        );
+        assert_eq!(
+            check_hyperslab(&dims, &[0, 0], &[1]),
+            Err(HyperslabError::Rank { got: 1, rank: 2 })
+        );
+        let text = HyperslabError::OutOfBounds {
+            dim: 0,
+            start: 3,
+            count: 2,
+            extent: 4,
+        }
+        .to_string();
+        assert!(text.contains("out of bounds"), "{text}");
+    }
+
     #[test]
     fn resolve_rejects_a_box_past_the_extent() {
         let sel = Selection::Hyperslab {
@@ -1893,7 +2021,8 @@ mod tests {
         };
         let err = sel.resolve(&[4]).unwrap_err();
         assert!(
-            format!("{err}").contains("past the extent"),
+            format!("{err}")
+                .contains("out of bounds in dimension 0: start 2 + count 4 exceeds extent 4"),
             "unexpected error: {err}"
         );
     }

@@ -9,7 +9,7 @@
 //! another is fixed. [`for_each_contiguous_run`] is the special case where the
 //! second array *is* the selection.
 
-use crate::io::{IoError, IoResult};
+use crate::io::IoResult;
 
 /// Compute row-major byte strides for an N-dimensional array.
 pub(crate) fn compute_strides(dims: &[u64], element_size: u64) -> Vec<u64> {
@@ -23,30 +23,6 @@ pub(crate) fn compute_strides(dims: &[u64], element_size: u64) -> Vec<u64> {
         strides[d] = strides[d + 1] * dims[d + 1];
     }
     strides
-}
-
-/// Refuse a hyperslab `[starts, counts)` that `dims` does not admit: the
-/// rank must match and every edge `starts[d] + counts[d]` must stay inside the
-/// extent. The edge is computed checked, so a start near `u64::MAX` (caller
-/// input; `usize` on the public API) is refused here rather than wrapping into
-/// an offset that lands inside the extent and reads unrelated bytes. The
-/// single owner of this rule for the reader's slice/point paths and the
-/// writer's `write_slice`.
-pub(crate) fn check_hyperslab(dims: &[u64], starts: &[u64], counts: &[u64]) -> IoResult<()> {
-    if starts.len() != dims.len() || counts.len() != dims.len() {
-        return Err(IoError::InvalidState(
-            "starts/counts length must match dataset rank".into(),
-        ));
-    }
-    for (d, &dim) in dims.iter().enumerate() {
-        if starts[d].checked_add(counts[d]).is_none_or(|end| end > dim) {
-            return Err(IoError::InvalidState(format!(
-                "slice out of bounds in dimension {d}: start {} + count {} exceeds extent {dim}",
-                starts[d], counts[d]
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// Visit the maximal contiguous byte-runs of a strideless hyperslab.
@@ -163,24 +139,6 @@ pub(crate) fn for_each_dual_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// One case per boundary of the bounds rule: an edge on the extent is
-    /// in, one past it is out, an edge that overflows `u64` is out (not
-    /// wrapped back in), and the rank must match.
-    #[test]
-    fn check_hyperslab_boundaries() {
-        let dims = [4u64, 6];
-        assert!(check_hyperslab(&dims, &[0, 0], &[4, 6]).is_ok());
-        assert!(check_hyperslab(&dims, &[3, 5], &[1, 1]).is_ok());
-        assert!(check_hyperslab(&dims, &[4, 6], &[0, 0]).is_ok());
-        assert!(check_hyperslab(&dims, &[3, 5], &[2, 1]).is_err());
-        assert!(check_hyperslab(&dims, &[0, 0], &[4, 7]).is_err());
-        assert!(check_hyperslab(&dims, &[u64::MAX, 0], &[1, 1]).is_err());
-        assert!(check_hyperslab(&dims, &[1, 0], &[u64::MAX, 1]).is_err());
-        assert!(check_hyperslab(&dims, &[0], &[1]).is_err());
-        assert!(check_hyperslab(&dims, &[0, 0, 0], &[1, 1, 1]).is_err());
-        assert!(check_hyperslab(&[], &[], &[]).is_ok());
-    }
 
     /// Collect `(dst_off, src_off, len)` for every run of a dual walk.
     fn dual(
