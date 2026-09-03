@@ -5939,10 +5939,34 @@ impl Hdf5Reader {
         // Compute chunk byte size
         let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
 
+        // Bytes one element takes in the data block (or a page of it).
+        let elem_size = if is_filtered {
+            sizeof_addr + chunk_size_len + 4
+        } else {
+            sizeof_addr
+        };
+        // The element count is the header's claim, and everything below is
+        // sized from it: refuse one whose elements could not all be in the
+        // file before it sizes a reservation, a read, or a page count.
+        let file_size = self.handle.file_size()?;
+        let num_elmts = usize::try_from(fa_hdr.num_elmts)
+            .ok()
+            .filter(|&n| {
+                (n as u64)
+                    .checked_mul(elem_size as u64)
+                    .is_some_and(|bytes| bytes <= file_size)
+            })
+            .ok_or_else(|| {
+                crate::io::IoError::InvalidState(format!(
+                    "fixed array declares {} elements of {elem_size} bytes, more than the \
+                     {file_size}-byte file holds",
+                    fa_hdr.num_elmts
+                ))
+            })?;
+
         // Collect per-chunk (address, compressed_size). compressed_size is the
         // exact on-disk byte count for filtered chunks, or chunk_bytes when
         // unfiltered.
-        let num_elmts = fa_hdr.num_elmts as usize;
         // (chunk address, on-disk byte count, filter mask). The mask is the
         // per-chunk filter mask for filtered chunks, 0 when unfiltered.
         let mut chunk_entries: Vec<(u64, u64, u32)> = Vec::with_capacity(num_elmts);
@@ -5955,11 +5979,6 @@ impl Hdf5Reader {
             let prefix_buf = self.handle.read_at_most(fa_hdr.data_blk_addr, prefix_len)?;
             let prefix = FixedArrayPagedPrefix::decode(&prefix_buf, &self.meta.ctx, npages)?;
 
-            let elem_size = if is_filtered {
-                sizeof_addr + chunk_size_len + 4
-            } else {
-                sizeof_addr
-            };
             // All pages have the same on-disk stride; only the last page holds
             // fewer elements (libhdf5: dblk_page_size is constant).
             let page_stride = dblk_page_nelmts as usize * elem_size + 4;
@@ -6008,11 +6027,6 @@ impl Hdf5Reader {
             }
         } else {
             // Non-paged data block: all elements live inline in the data block.
-            let elem_size = if is_filtered {
-                sizeof_addr + chunk_size_len + 4
-            } else {
-                sizeof_addr
-            };
             let dblk_size = 4 + 1 + 1 + sizeof_addr + num_elmts * elem_size + 4;
             let dblk_buf = self.handle.read_at_most(fa_hdr.data_blk_addr, dblk_size)?;
 
@@ -6675,7 +6689,10 @@ impl Hdf5Reader {
         };
 
         let ref_size = vlen_reference_size(&self.meta.ctx);
-        let mut items: Vec<Vec<u8>> = Vec::with_capacity(total_elements as usize);
+        // The extent is the file's claim; the loop below stops at the image
+        // it actually read, so the reservation is bounded by that image.
+        let mut items: Vec<Vec<u8>> =
+            Vec::with_capacity((total_elements as usize).min(raw.len() / ref_size));
 
         // Cache global heap collections to avoid re-reading.
         // Store as (collection, index→offset lookup) for O(1) object access.

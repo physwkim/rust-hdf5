@@ -168,35 +168,7 @@ fn patch_unique(path: &PathBuf, needle: &[u8], mutate: impl FnOnce(&mut [u8])) {
     assert_eq!(hits.len(), 1, "pattern occurs {} times", hits.len());
     let at = hits[0];
     mutate(&mut bytes[at..]);
-
-    // OHDR v2: signature, version, flags, optional times (flag 0x20),
-    // optional attribute phase-change (0x10), chunk-0 size in 1 << (flags & 3)
-    // bytes, the messages, then a checksum over everything before it.
-    let ohdr = bytes[..at]
-        .windows(4)
-        .rposition(|w| w == b"OHDR")
-        .expect("an OHDR before the patched bytes");
-    let flags = bytes[ohdr + 5];
-    let mut p = ohdr + 6;
-    if flags & 0x20 != 0 {
-        p += 16;
-    }
-    if flags & 0x10 != 0 {
-        p += 4;
-    }
-    let width = 1usize << (flags & 3);
-    let mut chunk0 = 0u64;
-    for i in 0..width {
-        chunk0 |= (bytes[p + i] as u64) << (8 * i);
-    }
-    p += width;
-    let end = p + chunk0 as usize;
-    assert!(
-        at < end,
-        "patched bytes are not in the header's first chunk"
-    );
-    let sum = rust_hdf5::format::checksum::checksum_metadata(&bytes[ohdr..end]);
-    bytes[end..end + 4].copy_from_slice(&sum.to_le_bytes());
+    refresh_ohdr_checksum(&mut bytes, at);
     std::fs::write(path, &bytes).unwrap();
 }
 
@@ -232,6 +204,128 @@ fn a_contiguous_address_that_wraps_is_refused() {
     assert!(msg.contains("overflows"), "unexpected error: {msg}");
     // A run that does not wrap fails on the read itself, never silently.
     assert!(ds.read_slice::<u8>(&[0, 0], &[1, 1]).is_err());
+    drop(ds);
+    file.close().unwrap();
+
+    cleanup(&path);
+}
+
+/// Patch the one `OHDR` the byte offset `at` falls in: refresh the checksum
+/// of its first chunk (these headers are one chunk).
+fn refresh_ohdr_checksum(bytes: &mut [u8], at: usize) {
+    let ohdr = bytes[..at]
+        .windows(4)
+        .rposition(|w| w == b"OHDR")
+        .expect("an OHDR before the patched bytes");
+    let flags = bytes[ohdr + 5];
+    let mut p = ohdr + 6;
+    if flags & 0x20 != 0 {
+        p += 16;
+    }
+    if flags & 0x10 != 0 {
+        p += 4;
+    }
+    let width = 1usize << (flags & 3);
+    let mut chunk0 = 0u64;
+    for i in 0..width {
+        chunk0 |= (bytes[p + i] as u64) << (8 * i);
+    }
+    p += width;
+    let end = p + chunk0 as usize;
+    assert!(
+        at < end,
+        "patched bytes are not in the header's first chunk"
+    );
+    let sum = rust_hdf5::format::checksum::checksum_metadata(&bytes[ohdr..end]);
+    bytes[end..end + 4].copy_from_slice(&sum.to_le_bytes());
+}
+
+/// A variable-length dataset whose extent claims far more elements than its
+/// reference image holds: the read is bounded by the image, not sized by
+/// the claim.
+#[test]
+fn a_vlen_extent_past_its_image_does_not_size_the_read() {
+    let path = unique_tmp("vlen_extent");
+    let strings: Vec<String> = (0..37).map(|i| format!("s{i}")).collect();
+    let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+    {
+        let file = H5File::create(&path).unwrap();
+        file.write_vlen_strings("notes", &refs).unwrap();
+        file.close().unwrap();
+    }
+
+    // The dataspace stores the extent and then its maximum as adjacent
+    // 8-byte counts; the pair is what tells them from any other 37.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let mut needle = 37u64.to_le_bytes().to_vec();
+    needle.extend_from_slice(&37u64.to_le_bytes());
+    let hits: Vec<usize> = bytes
+        .windows(16)
+        .enumerate()
+        .filter(|(_, w)| *w == needle.as_slice())
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(hits.len(), 1, "extent pair found at {hits:?}");
+    let at = hits[0];
+    bytes[at..at + 8].copy_from_slice(&(1u64 << 40).to_le_bytes());
+    bytes[at + 8..at + 16].copy_from_slice(&(1u64 << 40).to_le_bytes());
+    refresh_ohdr_checksum(&mut bytes, at);
+    std::fs::write(&path, &bytes).unwrap();
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("notes").unwrap();
+    assert_eq!(ds.shape(), vec![1usize << 40]);
+    assert_eq!(ds.read_vlen_strings().unwrap(), strings);
+    drop(ds);
+    file.close().unwrap();
+
+    cleanup(&path);
+}
+
+/// A fixed-array chunk index whose header claims more elements than the file
+/// could hold is refused before the claim sizes anything.
+#[test]
+fn a_fixed_array_element_count_past_the_file_is_refused() {
+    let path = unique_tmp("fa_count");
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([8usize, 4])
+            .chunk(&[1, 4])
+            .max_shape(&[Some(8), Some(4)])
+            .create("grid")
+            .unwrap();
+        ds.write_slice(&[0, 0], &[8, 4], &(0..32).collect::<Vec<i32>>())
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    // FAHD: signature, version, client id, element size, page-size bits,
+    // the element count (8 bytes here), data block address, checksum.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let fahd = bytes
+        .windows(4)
+        .position(|w| w == b"FAHD")
+        .expect("a fixed array header");
+    let count = u64::from_le_bytes(bytes[fahd + 8..fahd + 16].try_into().unwrap());
+    assert_eq!(count, 8);
+    bytes[fahd + 8..fahd + 16].copy_from_slice(&(1u64 << 40).to_le_bytes());
+    let end = fahd + 8 + 8 + 8;
+    let sum = rust_hdf5::format::checksum::checksum_metadata(&bytes[fahd..end]);
+    bytes[end..end + 4].copy_from_slice(&sum.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+
+    let file = H5File::open(&path).unwrap();
+    let ds = file.dataset("grid").unwrap();
+    let err = ds
+        .read_slice::<i32>(&[0, 0], &[1, 4])
+        .expect_err("a count past the file must not size the read");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("more than the") && msg.contains("file holds"),
+        "unexpected error: {msg}"
+    );
     drop(ds);
     file.close().unwrap();
 

@@ -528,7 +528,13 @@ pub fn decode_sections(
         )));
     }
 
-    let mut sections = Vec::with_capacity(hdr.serial_sections as usize);
+    // The section count is the header's claim; every record takes at least
+    // an offset and a class byte, so the block bounds what it can hold.
+    let mut sections = Vec::with_capacity(
+        usize::try_from(hdr.serial_sections)
+            .unwrap_or(usize::MAX)
+            .min(buf.len() / (hdr.sect_off_size() + 1)),
+    );
     if hdr.serial_sections == 0 {
         return Ok(sections);
     }
