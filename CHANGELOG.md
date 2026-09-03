@@ -19,13 +19,15 @@
   back inside the extent and read unrelated bytes (a panic under overflow
   checks). `H5Dataset::read_slice` refuses an oversized count as a
   selection before it sizes the destination instead of failing the
-  allocation. One helper now owns the rule the writer and the region
-  reference path each checked on their own.
+  allocation. `H5Dataset::write_slice` refuses one for its bounds, against
+  the extent as extended, before it sizes the data. One helper now owns
+  the rule the writer and the region reference path each checked on their
+  own.
 
 - A contiguous dataset whose stored address is close enough to `u64::MAX`
   that adding a slice's offset wraps is refused instead of served from
   the wrapped offset. The external file list path checks its slot offset
-  the same way.
+  the same way, on write as on read.
 
 - A compact dataset whose payload is not exactly the extent's element
   count times the element size is refused where its layout is checked
@@ -65,8 +67,8 @@
   extent, reading back as fill. A failure on that path is reported on
   stderr; `close` returns it.
 
-- Under the `mmap` feature a read-only open maps the file only while it
-  holds its shared lock, and releasing the lock drops the map. A handle
+- Under the `mmap` feature a read-only open maps the file only when it
+  holds its shared lock. A handle
   whose locking policy waived the lock (`FileLocking::Disabled`, or
   `BestEffort` on a filesystem without locks) reads through the descriptor
   instead, and a zero-copy view of such a file is refused, as a view of any
@@ -87,6 +89,27 @@
   keeps the old one, as chunk rewrites under SWMR always have, so each
   flush of a partial filtered band costs the band's chunks in file space
   for the rest of the session.
+
+- `SwmrWriter::start_swmr` writes the band a multi-frame-chunk dataset is
+  still filling before it publishes an extent that counts those frames, so
+  a reader attaching before the first flush sees them rather than fill.
+
+- A `SwmrWriter` band write that failed used to leave the band buffered
+  past the frame count that triggers the write, so the next write indexed
+  past the band, a panic the writer's `Drop` turned into an abort. A band
+  write now writes every complete band the buffer holds and drains them,
+  so a later append or flush retries the same chunks; the extent grows
+  before a frame is buffered, so a buffered frame is always where the
+  extent says.
+
+- Deleting a multi-frame-chunk dataset under a `SwmrWriter` drops its band
+  buffer with it; every later band write used to fail on the buffered
+  frames of a dataset with no chunks left.
+
+- `SwmrWriter::close` finalizes the file whatever its band drain did,
+  reporting both errors when both fail, instead of returning the drain's
+  error while the writer's `Drop` finalized the file anyway and printed
+  its own message over it.
 
 ## 0.5.1
 
