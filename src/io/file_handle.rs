@@ -120,12 +120,14 @@ enum ReadSource {
 ///
 /// The lock is held on the open file, not on any one descriptor, so a
 /// duplicate of the handle's descriptor keeps it for as long as the
-/// duplicate is open. Holding one here makes the map's lifetime the lock's:
-/// a share of the map that outlives its handle — a zero-copy view — still
-/// keeps out every writer that honours locks, and a truncation under the
-/// map stays impossible for as long as the map is reachable. The one way
-/// the lock could go first, [`FileHandle::release_lock`], refuses read-only
-/// handles for this reason.
+/// duplicate is open — the contract [`std::fs::File::lock_shared`] states
+/// for every platform: the lock goes when the file is closed along with
+/// every descriptor or handle duplicated from it. Holding one here makes
+/// the map's lifetime the lock's: a share of the map that outlives its
+/// handle — a zero-copy view — still keeps out every writer that honours
+/// locks, and a truncation under the map stays impossible for as long as
+/// the map is reachable. The one way the lock could go first,
+/// [`FileHandle::release_lock`], refuses read-only handles for this reason.
 #[cfg(feature = "mmap")]
 pub(crate) struct LockedMap {
     map: memmap2::Mmap,

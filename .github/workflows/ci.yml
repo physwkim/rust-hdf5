@@ -21,6 +21,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+      - name: With mmap
+        run: cargo test --workspace --features mmap
 
   test-features:
     name: Feature combinations
