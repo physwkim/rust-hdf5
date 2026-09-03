@@ -55,8 +55,9 @@
   in `szlib.h`) on compress as well as decompress, reserves the declared
   output fallibly, and reports a compressed stream that runs out before
   its declared output as an error instead of decoding fabricated zero
-  bits for as long as the declaration asks. A stream that ends once the
-  declared output is complete still decodes.
+  bits for as long as the declaration asks: no bit is made up past the
+  stream's end, so a block the stream cannot finish holds no sample. A
+  stream that ends once the declared output is complete still decodes.
 
 - Dropping a `SwmrWriter` without calling `close` writes the frames its
   band buffers hold (a multi-frame-chunk dataset's frames that have not
