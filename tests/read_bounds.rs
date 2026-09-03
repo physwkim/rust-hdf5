@@ -382,5 +382,18 @@ fn an_external_slot_offset_that_wraps_is_refused() {
     drop(ds);
     file.close().unwrap();
 
+    // The writer walks the same slots, and must not land bytes at the
+    // wrapped offset either.
+    let file = H5File::open_rw(&path).unwrap();
+    let ds = file.dataset_writer_with("e", access()).unwrap();
+    let err = ds
+        .write_slice(&[8], &[8], &[0u8; 8])
+        .expect_err("a wrapping slot offset must not write");
+    let msg = format!("{err}");
+    assert!(msg.contains("overflows"), "unexpected error: {msg}");
+    drop(ds);
+    file.close().unwrap();
+    assert_eq!(std::fs::read(dir.join("raw.bin")).unwrap(), raw);
+
     cleanup(&path);
 }
