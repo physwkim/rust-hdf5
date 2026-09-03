@@ -355,6 +355,38 @@ fn a_flush_publishes_a_partial_band() {
     cleanup(&path);
 }
 
+/// `start_swmr` publishes the extent, which counts the frames of a band
+/// still filling, so it writes that band first: a reader attaching right
+/// after it sees the frames, not fill.
+#[test]
+fn start_swmr_publishes_a_partial_band() {
+    let path = unique_tmp("start_band");
+    let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+    let ds = w
+        .create_streaming_dataset_chunked::<u8>("frames", &[2, 2], &[3, 2, 2])
+        .unwrap();
+    let frame = |f: u8| {
+        let v = 4 * f + 1;
+        [v, v + 1, v + 2, v + 3]
+    };
+    let published = |n: u8| -> Vec<u8> { (0..n).flat_map(frame).collect() };
+    w.append_frame(ds, &frame(0)).unwrap();
+    w.append_frame(ds, &frame(1)).unwrap();
+    w.start_swmr().unwrap();
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.dataset_shape("frames").unwrap(), vec![2, 2, 2]);
+    assert_eq!(r.read_dataset::<u8>("frames").unwrap(), published(2));
+
+    // The band completes after the switch and is written whole.
+    w.append_frame(ds, &frame(2)).unwrap();
+    w.flush().unwrap();
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.read_dataset::<u8>("frames").unwrap(), published(3));
+    w.close().unwrap();
+
+    cleanup(&path);
+}
+
 /// Resuming a multi-frame-chunk dataset (`chunk[0] > 1`) after `open_append`
 /// is rejected with a clear error rather than corrupting the chunk grid.
 #[test]

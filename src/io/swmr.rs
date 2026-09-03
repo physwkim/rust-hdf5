@@ -359,7 +359,12 @@ impl SwmrWriter {
     /// root group, and the superblock with SWMR flags. After this call,
     /// readers can open the file in SWMR mode. Subsequent data writes use
     /// in-place header updates via `flush()`.
+    ///
+    /// The headers published here count every frame a multi-frame-chunk
+    /// dataset has buffered, so the bands those frames sit in are written
+    /// first, zero-padded, as `flush` writes them.
     pub fn start_swmr(&mut self) -> IoResult<()> {
+        self.write_band_buffers(Tail::Write)?;
         self.writer.finalize_for_swmr()?;
         // Release the writer's exclusive lock so concurrent SWMR readers
         // can attach. Note: the SWMR protocol assumes a single writer —
