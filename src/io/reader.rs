@@ -3404,13 +3404,14 @@ impl Hdf5Reader {
             }
         }
 
-        // `H5O__layout_decode` refuses a chunked layout against its sibling
-        // dataspace message as it decodes; the two decode side by side here,
-        // so this is where that check lands.
-        if let (Some(ds), Some(dl)) = (&dataspace, &layout) {
-            if let Err(e) = dl.check_chunk_rank(ds) {
+        // libhdf5 checks a layout against its sibling dataspace and datatype
+        // as the dataset opens (`H5O__layout_decode` for the chunk rank,
+        // `H5D__compact_init` for the compact size); the three decode side
+        // by side here, so this is where those checks land.
+        if let (Some(ds), Some(dt), Some(dl)) = (&dataspace, &datatype, &layout) {
+            if let Err(e) = dl.check_against_dataset(ds, dt, ctx) {
                 block(format!(
-                    "the dimensionality of its chunks doesn't match the dataspace: {e}"
+                    "its layout doesn't fit its dataspace and datatype: {e}"
                 ));
             }
         }

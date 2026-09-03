@@ -2526,14 +2526,16 @@ impl<'a> ReopenWalk<'a> {
             }
         }
 
-        // `H5O__layout_decode` refuses a chunked layout against its sibling
-        // dataspace message as it decodes; modelled anyway, the disagreeing
-        // ranks would decode the index keys at the wrong rank, so the dataset
-        // keeps its bytes, exactly as unreadable as the file already had it.
-        if let (Some((ds, _)), Some(dl)) = (&dataspace, &layout) {
-            if let Err(e) = dl.check_chunk_rank(ds) {
+        // libhdf5 refuses a layout that disagrees with its sibling dataspace
+        // and datatype as the dataset opens (`H5O__layout_decode` for the
+        // chunk rank, `H5D__compact_init` for the compact size); modelled
+        // anyway, the disagreement would be read at the wrong rank or past
+        // the compact payload, so the dataset keeps its bytes, exactly as
+        // unreadable as the file already had it.
+        if let (Some((ds, _)), Some(dt), Some(dl)) = (&dataspace, &datatype, &layout) {
+            if let Err(e) = dl.check_against_dataset(ds, dt, ctx) {
                 return Ok(ObjectPlan::preserve(format!(
-                    "the dimensionality of its chunks doesn't match the dataspace: {e}"
+                    "its layout doesn't fit its dataspace and datatype: {e}"
                 )));
             }
         }

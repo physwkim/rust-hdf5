@@ -255,30 +255,61 @@ pub enum DataLayoutMessage {
 }
 
 impl DataLayoutMessage {
-    /// The check `H5O__layout_decode` (H5Olayout.c) makes against the
-    /// sibling dataspace message as a chunked layout decodes: the stored
-    /// dimensionality is the chunk rank plus one trailing element-size
-    /// dimension, so it must be exactly one more than the dataspace rank
-    /// (HDFGroup/hdf5#6508, CVE-2026-19025). Left to chunk I/O, disagreeing
-    /// ranks decode the index keys at the wrong rank and the chunk grid
-    /// cannot be indexed. Any other layout has no chunks and always passes.
-    pub fn check_chunk_rank(
+    /// The checks libhdf5 makes between a layout and the dataset's sibling
+    /// dataspace and datatype messages as the dataset opens, gathered in the
+    /// one place the three decode side by side:
+    ///
+    /// - A chunked layout's stored dimensionality is the chunk rank plus one
+    ///   trailing element-size dimension, so it must be exactly one more
+    ///   than the dataspace rank (`H5O__layout_decode`, H5Olayout.c;
+    ///   HDFGroup/hdf5#6508, CVE-2026-19025). Left to chunk I/O, disagreeing
+    ///   ranks decode the index keys at the wrong rank and the chunk grid
+    ///   cannot be indexed.
+    /// - A compact layout's stored bytes must be exactly the extent's
+    ///   element count times the stored element size (`H5D__compact_init`,
+    ///   H5Dcompact.c:255-269). Left to I/O, a short payload is read past
+    ///   its end by any selection that reaches the missing elements.
+    ///
+    /// Contiguous and virtual layouts have neither and always pass.
+    pub fn check_against_dataset(
         &self,
         dataspace: &crate::format::messages::dataspace::DataspaceMessage,
+        datatype: &crate::format::messages::datatype::DatatypeMessage,
+        ctx: &FormatContext,
     ) -> FormatResult<()> {
-        let (Self::ChunkedV3 { chunk_dims, .. } | Self::ChunkedV4 { chunk_dims, .. }) = self else {
-            return Ok(());
-        };
-        let rank = dataspace.dims.len();
-        if chunk_dims.len() != rank + 1 {
-            return Err(FormatError::InvalidData(format!(
-                "chunk dimensionality {} over a rank-{rank} dataspace; the chunk rank plus \
-                 the element-size dimension must be {}",
-                chunk_dims.len(),
-                rank + 1
-            )));
+        match self {
+            Self::ChunkedV3 { chunk_dims, .. } | Self::ChunkedV4 { chunk_dims, .. } => {
+                let rank = dataspace.dims.len();
+                if chunk_dims.len() != rank + 1 {
+                    return Err(FormatError::InvalidData(format!(
+                        "chunk dimensionality {} over a rank-{rank} dataspace; the chunk rank \
+                         plus the element-size dimension must be {}",
+                        chunk_dims.len(),
+                        rank + 1
+                    )));
+                }
+                Ok(())
+            }
+            Self::Compact { data } => {
+                let dt_size = datatype.element_size_ctx(ctx) as u64;
+                let nelmts = dataspace.element_count();
+                let Some(expected) = nelmts.and_then(|n| n.checked_mul(dt_size)) else {
+                    return Err(FormatError::InvalidData(
+                        "the size of the dataset's compact storage overflows".into(),
+                    ));
+                };
+                if data.len() as u64 != expected {
+                    return Err(FormatError::InvalidData(format!(
+                        "compact storage holds {} bytes but the dataset's {} elements of \
+                         {dt_size} bytes need {expected}",
+                        data.len(),
+                        nelmts.unwrap_or(0)
+                    )));
+                }
+                Ok(())
+            }
+            Self::Contiguous { .. } | Self::Virtual { .. } => Ok(()),
         }
-        Ok(())
     }
 
     /// The storage class and message version, for a message that has to name
@@ -1440,35 +1471,99 @@ mod tests {
     /// dataspace rank plus one": exactly one more passes, one fewer and one
     /// more than that fail, and a layout without chunks never fails.
     #[test]
-    fn check_chunk_rank_boundaries() {
+    fn check_against_dataset_chunk_rank_boundaries() {
         use crate::format::messages::dataspace::DataspaceMessage;
+        use crate::format::messages::datatype::DatatypeMessage;
+        let ctx = FormatContext::default_v3();
+        let i32_t = DatatypeMessage::i32_type();
         let rank2 = DataspaceMessage::simple(&[3, 4]);
         // chunk_dims = [2, 2, elem] over a rank-2 dataspace: rank + 1.
         let v3 = DataLayoutMessage::chunked_v3_btree_v1(vec![2, 2, 4], 0x1000);
-        assert!(v3.check_chunk_rank(&rank2).is_ok());
+        assert!(v3.check_against_dataset(&rank2, &i32_t, &ctx).is_ok());
         let v4 = DataLayoutMessage::chunked_v4_single(vec![2, 2, 4], 0x1000);
-        assert!(v4.check_chunk_rank(&rank2).is_ok());
+        assert!(v4.check_against_dataset(&rank2, &i32_t, &ctx).is_ok());
 
         // One too few: the fixture's patched byte, [2, 2, 4] read as rank-2
         // chunks of 4-byte elements over a rank-3 dataspace.
         let rank3 = DataspaceMessage::simple(&[3, 4, 5]);
-        let err = v3.check_chunk_rank(&rank3).unwrap_err();
+        let err = v3.check_against_dataset(&rank3, &i32_t, &ctx).unwrap_err();
         assert!(
             matches!(err, FormatError::InvalidData(ref s) if s.contains("must be 4")),
             "{err}"
         );
-        assert!(v4.check_chunk_rank(&rank3).is_err());
+        assert!(v4.check_against_dataset(&rank3, &i32_t, &ctx).is_err());
 
         // One too many, and the scalar extent a chunked layout never fits.
         let rank1 = DataspaceMessage::simple(&[8]);
-        assert!(v3.check_chunk_rank(&rank1).is_err());
-        assert!(v3.check_chunk_rank(&DataspaceMessage::scalar()).is_err());
+        assert!(v3.check_against_dataset(&rank1, &i32_t, &ctx).is_err());
+        assert!(v3
+            .check_against_dataset(&DataspaceMessage::scalar(), &i32_t, &ctx)
+            .is_err());
 
         // No chunks, no rank to disagree.
         let contiguous = DataLayoutMessage::contiguous_unallocated(96);
-        assert!(contiguous.check_chunk_rank(&rank3).is_ok());
         assert!(contiguous
-            .check_chunk_rank(&DataspaceMessage::scalar())
+            .check_against_dataset(&rank3, &i32_t, &ctx)
             .is_ok());
+        assert!(contiguous
+            .check_against_dataset(&DataspaceMessage::scalar(), &i32_t, &ctx)
+            .is_ok());
+    }
+
+    /// One case per boundary of the compact size rule: exact passes; one
+    /// element short or long fails; a scalar holds one element, a null
+    /// dataspace none; the vlen size is the stored reference, not the
+    /// default; an extent whose product overflows is refused, not wrapped.
+    #[test]
+    fn check_against_dataset_compact_size_boundaries() {
+        use crate::format::messages::dataspace::DataspaceMessage;
+        use crate::format::messages::datatype::DatatypeMessage;
+        let ctx = FormatContext::default_v3();
+        let i32_t = DatatypeMessage::i32_type();
+        let d = DataspaceMessage::simple(&[3, 4]);
+        let ok = DataLayoutMessage::compact(vec![0u8; 48]);
+        assert!(ok.check_against_dataset(&d, &i32_t, &ctx).is_ok());
+        let short = DataLayoutMessage::compact(vec![0u8; 44]);
+        let err = short.check_against_dataset(&d, &i32_t, &ctx).unwrap_err();
+        assert!(
+            matches!(err, FormatError::InvalidData(ref s) if s.contains("44 bytes") && s.contains("need 48")),
+            "{err}"
+        );
+        let long = DataLayoutMessage::compact(vec![0u8; 52]);
+        assert!(long.check_against_dataset(&d, &i32_t, &ctx).is_err());
+
+        let one = DataLayoutMessage::compact(vec![0u8; 4]);
+        assert!(one
+            .check_against_dataset(&DataspaceMessage::scalar(), &i32_t, &ctx)
+            .is_ok());
+        assert!(one
+            .check_against_dataset(&DataspaceMessage::null(), &i32_t, &ctx)
+            .is_err());
+        let none = DataLayoutMessage::compact(vec![]);
+        assert!(none
+            .check_against_dataset(&DataspaceMessage::null(), &i32_t, &ctx)
+            .is_ok());
+        assert!(none
+            .check_against_dataset(&DataspaceMessage::simple(&[0, 5]), &i32_t, &ctx)
+            .is_ok());
+
+        // A vlen element is stored as a reference of sizeof_addr + 8 bytes.
+        let vlen = DatatypeMessage::vlen_string_ascii();
+        let small_ctx = FormatContext {
+            sizeof_addr: 4,
+            sizeof_size: 4,
+        };
+        let refs = DataLayoutMessage::compact(vec![0u8; 2 * 12]);
+        assert!(refs
+            .check_against_dataset(&DataspaceMessage::simple(&[2]), &vlen, &small_ctx)
+            .is_ok());
+        assert!(refs
+            .check_against_dataset(&DataspaceMessage::simple(&[2]), &vlen, &ctx)
+            .is_err());
+
+        let huge = DataspaceMessage::simple(&[u64::MAX, 2]);
+        assert!(ok.check_against_dataset(&huge, &i32_t, &ctx).is_err());
+        let huge_bytes = DataspaceMessage::simple(&[u64::MAX / 2]);
+        assert!(ok.check_against_dataset(&huge_bytes, &i32_t, &ctx).is_err());
     }
 }

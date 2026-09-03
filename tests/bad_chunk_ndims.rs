@@ -72,7 +72,7 @@ fn mismatched_chunk_rank_is_listed_but_refused_at_open() {
     let file = H5File::open(fixture("bad_chunk_ndims.h5")).unwrap();
     let err = refusal(&file);
     assert!(
-        err.contains("dimensionality of its chunks"),
+        err.contains("chunk dimensionality"),
         "open failed for a reason other than the chunk rank: {err}"
     );
 }
@@ -97,7 +97,7 @@ fn mismatched_chunk_rank_survives_a_read_write_reopen_by_its_bytes() {
     let file = H5File::open(&path).unwrap();
     let err = refusal(&file);
     assert!(
-        err.contains("dimensionality of its chunks"),
+        err.contains("chunk dimensionality"),
         "after the reopen the dataset is refused for a different reason: {err}"
     );
     drop(file);

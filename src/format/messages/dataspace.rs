@@ -127,6 +127,17 @@ impl DataspaceMessage {
         self.class == DataspaceClass::Null
     }
 
+    /// The number of elements in the extent (`H5S_GET_EXTENT_NPOINTS`): none
+    /// for a null dataspace, one for a scalar, the product of the dimensions
+    /// otherwise. `None` when that product does not fit in a `u64`.
+    pub fn element_count(&self) -> Option<u64> {
+        match self.class {
+            DataspaceClass::Null => Some(0),
+            DataspaceClass::Scalar => Some(1),
+            DataspaceClass::Simple => self.dims.iter().try_fold(1u64, |n, &d| n.checked_mul(d)),
+        }
+    }
+
     // ------------------------------------------------------------------ encode
 
     pub fn encode(&self, ctx: &FormatContext) -> Vec<u8> {
