@@ -685,8 +685,17 @@ impl SwmrWriter {
         // here; left in the buffer, `Drop` would retry the same write and
         // print over the error the caller is already handling.
         self.band_buffers.clear();
-        drained?;
-        self.writer.close_in_place()
+        // The file is finalized whatever the drain did, and marked closed by
+        // it, so that `Drop` does not finalize it a second time and print
+        // over the error returned here.
+        let closed = self.writer.close_in_place();
+        match (drained, closed) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+            (Err(drain), Err(close)) => Err(crate::io::IoError::InvalidState(format!(
+                "{drain}; finalizing the file then failed too: {close}"
+            ))),
+        }
     }
 }
 
