@@ -15884,6 +15884,15 @@ impl Hdf5Writer {
     /// Writes the dataset object headers, root group object header, and
     /// superblock. After this call the file is a valid HDF5 file.
     pub fn close(mut self) -> IoResult<()> {
+        self.close_in_place()
+    }
+
+    /// [`close`](Self::close) for a holder that cannot give the writer up by
+    /// value because it has a `Drop` of its own ([`SwmrWriter`]): the same
+    /// one-shot commit, after which this writer's `Drop` is a no-op.
+    ///
+    /// [`SwmrWriter`]: crate::io::swmr::SwmrWriter
+    pub(crate) fn close_in_place(&mut self) -> IoResult<()> {
         // Mark closed BEFORE finalizing: finalize writes external truth
         // (object headers + superblock) and must run exactly once. If we
         // finalized first and it failed, the `?` would return with `closed`

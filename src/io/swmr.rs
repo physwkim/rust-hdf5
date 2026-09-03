@@ -627,8 +627,30 @@ impl SwmrWriter {
     /// Any partially filled multi-frame chunk band is written (zero-padded)
     /// before the file is finalized.
     pub fn close(mut self) -> IoResult<()> {
-        self.flush_band_buffers()?;
-        self.writer.close()
+        let drained = self.flush_band_buffers();
+        // A band the drain could not write is lost with the error returned
+        // here; left in the buffer, `Drop` would retry the same write and
+        // print over the error the caller is already handling.
+        self.band_buffers.clear();
+        drained?;
+        self.writer.close_in_place()
+    }
+}
+
+impl Drop for SwmrWriter {
+    fn drop(&mut self) {
+        // The band buffers are this type's, not the writer's, so the writer's
+        // own finalizer cannot see them: every frame in one has already been
+        // counted into its dataset's extent, and would read back as fill if
+        // the file were finalized around it. Drain them here, ahead of the
+        // field drop that finalizes the file; after `close` they are empty.
+        if let Err(e) = self.flush_band_buffers() {
+            eprintln!(
+                "rust-hdf5: failed to write the buffered frames of a multi-frame-chunk \
+                 dataset on drop: {e}. Those frames read back as fill; call \
+                 SwmrWriter::close() to handle this error explicitly."
+            );
+        }
     }
 }
 

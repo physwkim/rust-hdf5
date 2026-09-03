@@ -283,6 +283,36 @@ fn open_append_resumes_streaming() {
     cleanup(&path);
 }
 
+/// A multi-frame-chunk writer dropped without `close` still writes the band
+/// it was buffering: every appended frame is already in the extent, so the
+/// frames of the partial band would otherwise read back as fill.
+#[test]
+fn a_dropped_writer_writes_its_partial_band() {
+    let path = unique_tmp("drop_band");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        let ds = w
+            .create_streaming_dataset_chunked::<u8>("frames", &[2, 2], &[3, 2, 2])
+            .unwrap();
+        w.start_swmr().unwrap();
+        // One full band (frames 0..3) and one frame of the next.
+        for f in 0..4u8 {
+            let v = 4 * f + 1;
+            w.append_frame(ds, &[v, v + 1, v + 2, v + 3]).unwrap();
+        }
+        drop(w);
+    }
+
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.dataset_shape("frames").unwrap(), vec![4, 2, 2]);
+    assert_eq!(
+        r.read_dataset::<u8>("frames").unwrap(),
+        (1u8..=16).collect::<Vec<_>>()
+    );
+
+    cleanup(&path);
+}
+
 /// Resuming a multi-frame-chunk dataset (`chunk[0] > 1`) after `open_append`
 /// is rejected with a clear error rather than corrupting the chunk grid.
 #[test]
