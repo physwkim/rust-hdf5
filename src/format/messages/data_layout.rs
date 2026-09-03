@@ -1467,7 +1467,7 @@ mod tests {
         assert_eq!(encoded[4], 3); // enc_bytes_per_dim = 3 (65536 = 0x10000, needs 3 bytes)
     }
 
-    /// `check_chunk_rank` at each boundary of "chunk dimensionality is the
+    /// `check_against_dataset` at each boundary of "chunk dimensionality is the
     /// dataspace rank plus one": exactly one more passes, one fewer and one
     /// more than that fail, and a layout without chunks never fails.
     #[test]
