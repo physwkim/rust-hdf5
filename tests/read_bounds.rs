@@ -133,9 +133,11 @@ fn a_wrapping_start_is_refused_on_write() {
         &[1, 2],
         &[99, 99]
     )));
-    assert!(ds
-        .write_slice::<u8>(&[0, 0], &[usize::MAX, usize::MAX], &[99])
-        .is_err());
+    assert!(is_refused(ds.write_slice::<u8>(
+        &[0, 0],
+        &[usize::MAX, usize::MAX],
+        &[99]
+    )));
     ds.write_slice::<u8>(&[3, 5], &[1, 1], &[99]).unwrap();
     drop(ds);
     file.close().unwrap();

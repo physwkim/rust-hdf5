@@ -4025,6 +4025,18 @@ impl H5Dataset {
                 let starts_u64: Vec<u64> = starts.iter().map(|&s| s as u64).collect();
                 let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
 
+                let inner = borrow_inner(&self.file_inner);
+                let H5FileInner::Writer(writer) = &*inner else {
+                    return Err(Hdf5Error::InvalidState(
+                        "file is no longer in write mode".into(),
+                    ));
+                };
+
+                // Bounds before sizing, against the extent the writer holds
+                // now (an extend since this handle was taken counts): a
+                // selection the extent does not admit is refused for that
+                // reason, not for the size it would have had.
+                check_hyperslab(&writer.dataset_dims(*index), &starts_u64, &counts_u64)?;
                 let expected = element_count(&counts_u64)?;
                 if data.len() != expected {
                     return Err(Hdf5Error::InvalidState(format!(
@@ -4038,18 +4050,10 @@ impl H5Dataset {
                 let host =
                     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
 
-                let inner = borrow_inner(&self.file_inner);
-                match &*inner {
-                    H5FileInner::Writer(writer) => {
-                        let datatype = writer.dataset_datatype(*index);
-                        let stored = to_stored_byte_order(host, &datatype, T::element_size())?;
-                        writer.write_slice(*index, &starts_u64, &counts_u64, &stored)?;
-                        Ok(())
-                    }
-                    _ => Err(Hdf5Error::InvalidState(
-                        "file is no longer in write mode".into(),
-                    )),
-                }
+                let datatype = writer.dataset_datatype(*index);
+                let stored = to_stored_byte_order(host, &datatype, T::element_size())?;
+                writer.write_slice(*index, &starts_u64, &counts_u64, &stored)?;
+                Ok(())
             }
             DatasetInfo::Reader { .. } => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
