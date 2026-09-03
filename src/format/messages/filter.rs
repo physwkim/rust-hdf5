@@ -46,7 +46,7 @@ pub const FILTER_LZF: u16 = 32000;
 pub const FILTER_BLOSC: u16 = 32001;
 pub const FILTER_LZ4: u16 = 32004;
 pub const FILTER_BSHUF: u16 = 32008;
-/// Bitshuffle compression sub-option (cd_values[4]): apply LZ4 after the
+/// Bitshuffle compression sub-option (`cd_values[4]`): apply LZ4 after the
 /// bit transpose. Matches `BSHUF_H5_COMPRESS_LZ4` in the canonical filter.
 pub const BSHUF_COMPRESS_LZ4: u32 = 2;
 pub const FILTER_ZFP: u16 = 32013;
@@ -397,7 +397,7 @@ impl FilterPipeline {
     /// number of values.
     ///
     /// The name written is the one the filter is registered under
-    /// ([`registered_name`]), because that is what `H5O__pline_encode` reaches
+    /// (`registered_name`), because that is what `H5O__pline_encode` reaches
     /// for when the message carries none of its own. A filter this crate has
     /// no registered name for gets a zero name length, which is what libhdf5
     /// writes when `H5Z_find` does not resolve the id either.

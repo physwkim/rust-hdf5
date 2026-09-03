@@ -230,12 +230,12 @@ pub struct FileSpaceInfoMessage {
     /// End-of-address before free-space header/section allocation.
     pub eoa_pre_fsm_fsalloc: u64,
     /// Addresses of the free-space managers, indexed by
-    /// [`FreeSpaceClass::message_slot`](crate::format::free_space::FreeSpaceClass::message_slot).
+    /// [`FreeSpaceManager::message_slot`](crate::format::free_space::FreeSpaceManager::message_slot).
     ///
     /// Always [`FS_ADDR_COUNT_V1`] entries, undefined where there is no
     /// manager — including for a non-persisting message, which stores none of
     /// them, and for a version-0 message, which stores only the first
-    /// [`FS_ADDR_COUNT_V0`]. Upstream keeps the same full-width array for the
+    /// `FS_ADDR_COUNT_V0`. Upstream keeps the same full-width array for the
     /// same reason (`H5O__fsinfo_decode` fills all twelve with `HADDR_UNDEF`
     /// before reading any): a caller indexes a slot without first asking which
     /// encoding the slot came from.

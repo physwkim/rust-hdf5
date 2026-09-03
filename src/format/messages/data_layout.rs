@@ -34,7 +34,7 @@
 //!   + index_address(sizeof_addr)
 //!
 //! Version 5 (libhdf5 2.0) differs from version 4 only in the version byte;
-//! see [`VERSION_5`] for its effect on filtered chunk indexes.
+//! see `VERSION_5` for its effect on filtered chunk indexes.
 //!
 //! Binary layout (versions 4 and 5, virtual only):
 //!   Byte 0: version = 4 or 5

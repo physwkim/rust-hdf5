@@ -58,7 +58,8 @@
 //! Empirically confirmed against libhdf5 1.14.6 (h5py's `VirtualLayout`
 //! writes hyperslab selections in the version-1 block-list form — with
 //! exactly one block — even for a selection that is mathematically a
-//! single regular block; see [`h5py_single_block_selection_is_version_one`]).
+//! single regular block; see the test
+//! `h5py_single_block_selection_is_version_one`).
 
 use crate::format::{FormatError, FormatResult};
 

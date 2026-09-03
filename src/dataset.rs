@@ -4469,7 +4469,7 @@ impl H5Dataset {
     ///
     /// Zero-copy is a contract, not an optimization: when the bytes cannot be
     /// handed over as they lie, this returns
-    /// [`Hdf5Error::NotViewable`](crate::Hdf5Error::NotViewable) naming the
+    /// [`Hdf5Error::NotViewable`] naming the
     /// reason and never quietly falls back to copying. Every
     /// [`ViewRefusal`](crate::ViewRefusal) is a case where
     /// [`read_raw`](Self::read_raw) still works: the file is not mapped (an

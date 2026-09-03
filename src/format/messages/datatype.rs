@@ -189,7 +189,7 @@ fn class_name(class: u8) -> &'static str {
 pub struct DatatypeNodeVersion {
     /// 0 for the outermost message, one more for each nesting level.
     pub depth: usize,
-    /// The class name [`class_name`] gives, e.g. `compound`.
+    /// The class name `class_name` gives, e.g. `compound`.
     pub class: &'static str,
     /// The version nibble of the message's first byte.
     pub version: u8,

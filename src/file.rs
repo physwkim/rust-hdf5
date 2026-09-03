@@ -1119,7 +1119,7 @@ impl H5File {
     /// prefix — see
     /// [`H5File::dataset_with`](Self::dataset_with) for the same rule on the
     /// read side. A dataset this session created settled its prefix from
-    /// [`DatasetBuilder::efile_prefix`](crate::DatasetBuilder::efile_prefix),
+    /// [`DatasetBuilder::efile_prefix`](crate::dataset::DatasetBuilder::efile_prefix),
     /// so while its handle is alive this call must name the same one;
     /// once every handle is dropped the next call settles it afresh.
     ///
