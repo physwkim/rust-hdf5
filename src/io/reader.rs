@@ -1750,7 +1750,13 @@ fn read_external_file_bytes(
         // A short physical file — the reserved slot size exceeds what was
         // ever actually written to it — reads back as zero for the
         // remainder, exactly like `H5D__efl_read`.
-        let got = ext_handle.read_at_most(slot.offset + skip, this_read)?;
+        let at = slot.offset.checked_add(skip).ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!(
+                "external file '{}' slot offset {} overflows {skip} bytes into the slot",
+                slot.name, slot.offset
+            ))
+        })?;
+        let got = ext_handle.read_at_most(at, this_read)?;
         dst[..got.len()].copy_from_slice(&got);
         dst[got.len()..].fill(0);
 
@@ -7106,12 +7112,17 @@ impl Hdf5Reader {
                         counts,
                         element_size,
                         |src_off, out_off, len| {
+                            // `base` is the file's claim; a sum that wraps
+                            // would land on unrelated bytes, so it is an
+                            // error, not an offset.
+                            let at = base.checked_add(src_off).ok_or_else(|| {
+                                crate::io::IoError::InvalidState(format!(
+                                    "dataset '{name}' claims raw data at {base}, which \
+                                     overflows {src_off} bytes into the selection"
+                                ))
+                            })?;
                             self.handle
-                                .read_exact_at_into(
-                                    base + src_off,
-                                    &mut out[out_off..out_off + len],
-                                    dst,
-                                )
+                                .read_exact_at_into(at, &mut out[out_off..out_off + len], dst)
                                 .map_err(Into::into)
                         },
                     )?;
