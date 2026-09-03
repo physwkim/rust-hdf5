@@ -70,6 +70,7 @@ use crate::format::sohm_write::{
 use crate::format::superblock::*;
 use crate::format::{FormatContext, LibverBound, ObjectFormat, UNDEF_ADDR};
 
+use crate::format::selection::check_hyperslab;
 use crate::io::allocator::{FileAllocator, FreeBlock};
 use crate::io::file_handle::FileHandle;
 use crate::io::hyperslab::{for_each_contiguous_run, for_each_dual_run};
@@ -2526,6 +2527,20 @@ impl<'a> ReopenWalk<'a> {
             }
         }
 
+        // libhdf5 refuses a layout that disagrees with its sibling dataspace
+        // and datatype as the dataset opens (`H5O__layout_decode` for the
+        // chunk rank, `H5D__compact_init` for the compact size); modelled
+        // anyway, the disagreement would be read at the wrong rank or past
+        // the compact payload, so the dataset keeps its bytes, exactly as
+        // unreadable as the file already had it.
+        if let (Some((ds, _)), Some(dt), Some(dl)) = (&dataspace, &datatype, &layout) {
+            if let Err(e) = dl.check_against_dataset(ds, dt, ctx) {
+                return Ok(ObjectPlan::preserve(format!(
+                    "its layout doesn't fit its dataspace and datatype: {e}"
+                )));
+            }
+        }
+
         match (datatype, dataspace, layout) {
             // A layout `rebuild_dataset` has no arm for leaves the registry
             // entry with an undefined data address, and the close then rewrites
@@ -3197,7 +3212,13 @@ fn write_external_file_bytes(
             ))
         })?;
         let this_write = (slot.size - skip).min((data.len() - written) as u64) as usize;
-        ext_handle.write_at(slot.offset + skip, &data[written..written + this_write])?;
+        let at = slot.offset.checked_add(skip).ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!(
+                "external file '{}' slot offset {} overflows {skip} bytes into the slot",
+                slot.name, slot.offset
+            ))
+        })?;
+        ext_handle.write_at(at, &data[written..written + this_write])?;
         // This handle is dropped at the end of the iteration, and `Drop` can
         // only print a flush failure. Empty the accumulator here instead, so a
         // full disk on an external raw-data file reaches the caller.
@@ -11201,29 +11222,13 @@ impl Hdf5Writer {
         let element_size = ds.datatype.element_size() as u64;
         let ndims = dims.len();
 
-        if starts.len() != ndims || counts.len() != ndims {
-            return Err(crate::io::IoError::InvalidState(
-                "starts/counts length must match dataset rank".into(),
-            ));
-        }
+        // Every hyperslab edge must stay inside the dataset; without this an
+        // out-of-bounds selection writes raw bytes over neighbouring data.
+        check_hyperslab(dims, starts, counts)?;
         if ndims == 0 {
             return Err(crate::io::IoError::InvalidState(
                 "write_slice does not support scalar datasets; use write_dataset_raw".into(),
             ));
-        }
-
-        // Every hyperslab edge must stay inside the dataset; without this an
-        // out-of-bounds selection writes raw bytes over neighbouring data.
-        for d in 0..ndims {
-            let end = starts[d]
-                .checked_add(counts[d])
-                .ok_or_else(|| crate::io::IoError::InvalidState("slice extent overflow".into()))?;
-            if end > dims[d] {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "slice out of bounds in dimension {}: start {} + count {} exceeds extent {}",
-                    d, starts[d], counts[d], dims[d]
-                )));
-            }
         }
 
         let out_elems: u64 = counts.iter().product();
@@ -15886,6 +15891,15 @@ impl Hdf5Writer {
     /// Writes the dataset object headers, root group object header, and
     /// superblock. After this call the file is a valid HDF5 file.
     pub fn close(mut self) -> IoResult<()> {
+        self.close_in_place()
+    }
+
+    /// [`close`](Self::close) for a holder that cannot give the writer up by
+    /// value because it has a `Drop` of its own ([`SwmrWriter`]): the same
+    /// one-shot commit, after which this writer's `Drop` is a no-op.
+    ///
+    /// [`SwmrWriter`]: crate::io::swmr::SwmrWriter
+    pub(crate) fn close_in_place(&mut self) -> IoResult<()> {
         // Mark closed BEFORE finalizing: finalize writes external truth
         // (object headers + superblock) and must run exactly once. If we
         // finalized first and it failed, the `?` would return with `closed`

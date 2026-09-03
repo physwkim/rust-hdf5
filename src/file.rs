@@ -1119,7 +1119,7 @@ impl H5File {
     /// prefix — see
     /// [`H5File::dataset_with`](Self::dataset_with) for the same rule on the
     /// read side. A dataset this session created settled its prefix from
-    /// [`DatasetBuilder::efile_prefix`](crate::DatasetBuilder::efile_prefix),
+    /// [`DatasetBuilder::efile_prefix`](crate::dataset::DatasetBuilder::efile_prefix),
     /// so while its handle is alive this call must name the same one;
     /// once every handle is dropped the next call settles it afresh.
     ///
@@ -1319,7 +1319,9 @@ impl H5FileOptions {
     }
 
     /// Disable OS-level file locking entirely (equivalent to
-    /// `HDF5_USE_FILE_LOCKING=FALSE`).
+    /// `HDF5_USE_FILE_LOCKING=FALSE`). Under the `mmap` feature such an open
+    /// reads through the descriptor rather than a map, which is taken only
+    /// under the shared lock, so a zero-copy view of it is refused.
     pub fn no_locking(self) -> Self {
         self.locking(FileLocking::Disabled)
     }
@@ -2203,8 +2205,10 @@ mod integration_tests {
             let ds = file.dataset("image").unwrap();
             let off = ds.attr("NDArrayDimOffset").unwrap().read_raw().unwrap();
             let got: Vec<i32> = off
-                .chunks_exact(4)
-                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| i32::from_le_bytes(*b))
                 .collect();
             assert_eq!(got, vec![0, 4, 8]);
             let uid: i32 = ds.attr("NDUniqueId").unwrap().read_numeric().unwrap();
@@ -2814,8 +2818,10 @@ mod integration_tests {
             .unwrap()
             .iter()
             .map(|item| {
-                item.chunks_exact(4)
-                    .map(|w| i32::from_le_bytes(w.try_into().unwrap()))
+                item.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|w| i32::from_le_bytes(*w))
                     .collect()
             })
             .collect();

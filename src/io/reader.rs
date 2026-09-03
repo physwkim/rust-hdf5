@@ -54,6 +54,7 @@ use crate::format::superblock::{
 use crate::format::symbol_table::SymbolTableNode;
 use crate::format::{BlockReader, FormatContext, UNDEF_ADDR};
 
+use crate::format::selection::check_hyperslab;
 use crate::io::file_handle::{FileHandle, ReadDst};
 use crate::io::hyperslab::{compute_strides, for_each_contiguous_run};
 use crate::io::locking::FileLocking;
@@ -268,7 +269,7 @@ pub(crate) enum ViewStorage {
 pub(crate) struct DatasetViewSource {
     /// The owning file's whole-file map, or `None` when that file is read
     /// through `pread`.
-    pub map: Option<std::sync::Arc<memmap2::Mmap>>,
+    pub map: Option<std::sync::Arc<crate::io::file_handle::LockedMap>>,
     /// Where the dataset's image lies in that file.
     pub storage: ViewStorage,
     /// How one element is stored, which decides whether the stored bytes are
@@ -1750,7 +1751,13 @@ fn read_external_file_bytes(
         // A short physical file — the reserved slot size exceeds what was
         // ever actually written to it — reads back as zero for the
         // remainder, exactly like `H5D__efl_read`.
-        let got = ext_handle.read_at_most(slot.offset + skip, this_read)?;
+        let at = slot.offset.checked_add(skip).ok_or_else(|| {
+            crate::io::IoError::InvalidState(format!(
+                "external file '{}' slot offset {} overflows {skip} bytes into the slot",
+                slot.name, slot.offset
+            ))
+        })?;
+        let got = ext_handle.read_at_most(at, this_read)?;
         dst[..got.len()].copy_from_slice(&got);
         dst[got.len()..].fill(0);
 
@@ -2237,13 +2244,17 @@ fn read_chunk_runs_into(
             return;
         }
         selected += len as u64;
+        // `addr` is the index's claim: a run end that does not fit in a u64
+        // simply does not coalesce, and the read at that address fails on
+        // its own terms.
+        let at = addr.saturating_add(src);
         if let Some(last) = runs.last_mut() {
-            if last.0 + last.2 as u64 == addr.saturating_add(src) && last.1 + last.2 == d {
+            if last.0.checked_add(last.2 as u64) == Some(at) && last.1 + last.2 == d {
                 last.2 += len;
                 return;
             }
         }
-        runs.push((addr.saturating_add(src), d, len));
+        runs.push((at, d, len));
     });
     if runs.is_empty() {
         // Nothing to place, which only a chunk outside the extent or a short
@@ -3395,6 +3406,18 @@ impl Hdf5Reader {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // libhdf5 checks a layout against its sibling dataspace and datatype
+        // as the dataset opens (`H5O__layout_decode` for the chunk rank,
+        // `H5D__compact_init` for the compact size); the three decode side
+        // by side here, so this is where those checks land.
+        if let (Some(ds), Some(dt), Some(dl)) = (&dataspace, &datatype, &layout) {
+            if let Err(e) = dl.check_against_dataset(ds, dt, ctx) {
+                block(format!(
+                    "its layout doesn't fit its dataspace and datatype: {e}"
+                ));
             }
         }
 
@@ -5921,10 +5944,34 @@ impl Hdf5Reader {
         // Compute chunk byte size
         let chunk_bytes: u64 = saturating_byte_len(chunk_dims, element_size);
 
+        // Bytes one element takes in the data block (or a page of it).
+        let elem_size = if is_filtered {
+            sizeof_addr + chunk_size_len + 4
+        } else {
+            sizeof_addr
+        };
+        // The element count is the header's claim, and everything below is
+        // sized from it: refuse one whose elements could not all be in the
+        // file before it sizes a reservation, a read, or a page count.
+        let file_size = self.handle.file_size()?;
+        let num_elmts = usize::try_from(fa_hdr.num_elmts)
+            .ok()
+            .filter(|&n| {
+                (n as u64)
+                    .checked_mul(elem_size as u64)
+                    .is_some_and(|bytes| bytes <= file_size)
+            })
+            .ok_or_else(|| {
+                crate::io::IoError::InvalidState(format!(
+                    "fixed array declares {} elements of {elem_size} bytes, more than the \
+                     {file_size}-byte file holds",
+                    fa_hdr.num_elmts
+                ))
+            })?;
+
         // Collect per-chunk (address, compressed_size). compressed_size is the
         // exact on-disk byte count for filtered chunks, or chunk_bytes when
         // unfiltered.
-        let num_elmts = fa_hdr.num_elmts as usize;
         // (chunk address, on-disk byte count, filter mask). The mask is the
         // per-chunk filter mask for filtered chunks, 0 when unfiltered.
         let mut chunk_entries: Vec<(u64, u64, u32)> = Vec::with_capacity(num_elmts);
@@ -5937,11 +5984,6 @@ impl Hdf5Reader {
             let prefix_buf = self.handle.read_at_most(fa_hdr.data_blk_addr, prefix_len)?;
             let prefix = FixedArrayPagedPrefix::decode(&prefix_buf, &self.meta.ctx, npages)?;
 
-            let elem_size = if is_filtered {
-                sizeof_addr + chunk_size_len + 4
-            } else {
-                sizeof_addr
-            };
             // All pages have the same on-disk stride; only the last page holds
             // fewer elements (libhdf5: dblk_page_size is constant).
             let page_stride = dblk_page_nelmts as usize * elem_size + 4;
@@ -5990,11 +6032,6 @@ impl Hdf5Reader {
             }
         } else {
             // Non-paged data block: all elements live inline in the data block.
-            let elem_size = if is_filtered {
-                sizeof_addr + chunk_size_len + 4
-            } else {
-                sizeof_addr
-            };
             let dblk_size = 4 + 1 + 1 + sizeof_addr + num_elmts * elem_size + 4;
             let dblk_buf = self.handle.read_at_most(fa_hdr.data_blk_addr, dblk_size)?;
 
@@ -6657,7 +6694,10 @@ impl Hdf5Reader {
         };
 
         let ref_size = vlen_reference_size(&self.meta.ctx);
-        let mut items: Vec<Vec<u8>> = Vec::with_capacity(total_elements as usize);
+        // The extent is the file's claim; the loop below stops at the image
+        // it actually read, so the reservation is bounded by that image.
+        let mut items: Vec<Vec<u8>> =
+            Vec::with_capacity((total_elements as usize).min(raw.len() / ref_size));
 
         // Cache global heap collections to avoid re-reading.
         // Store as (collection, index→offset lookup) for O(1) object access.
@@ -6935,7 +6975,7 @@ impl Hdf5Reader {
             let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
             return owner.read_slice(&path, starts, counts);
         }
-        let (datatype, out_bytes) = self.slice_size_and_datatype(name, counts)?;
+        let (datatype, out_bytes) = self.slice_size_and_datatype(name, starts, counts)?;
         // The selection lands in the vector this returns:
         // `read_slice_into_unconverted` defines every byte of the buffer it is
         // handed, so there is nothing to zero first and nothing to copy after.
@@ -6978,7 +7018,7 @@ impl Hdf5Reader {
             let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
             return owner.read_slice_into_dst(&path, starts, counts, out, dst);
         }
-        let (datatype, out_bytes) = self.slice_size_and_datatype(name, counts)?;
+        let (datatype, out_bytes) = self.slice_size_and_datatype(name, starts, counts)?;
         if out.len() as u64 != out_bytes {
             return Err(crate::io::IoError::InvalidState(format!(
                 "read_slice_into: buffer is {} bytes but selection needs {}",
@@ -6996,11 +7036,16 @@ impl Hdf5Reader {
     fn slice_size_and_datatype(
         &self,
         name: &str,
+        starts: &[u64],
         counts: &[u64],
     ) -> IoResult<(DatatypeMessage, u64)> {
         let info = self
             .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        // Bounds first: a selection the extent does not admit is refused
+        // before its byte size is computed, so an oversized count is reported
+        // as such rather than as a failed allocation.
+        check_hyperslab(&info.dataspace.dims, starts, counts)?;
         let out_bytes = saturating_byte_len(counts, info.datatype.element_size() as u64);
         Ok((info.datatype.clone(), out_bytes))
     }
@@ -7041,23 +7086,11 @@ impl Hdf5Reader {
         let external_files = info.external_files.clone();
         let ndims = dims.len();
 
-        if starts.len() != ndims || counts.len() != ndims {
-            return Err(crate::io::IoError::InvalidState(
-                "starts/counts length must match dataset rank".into(),
-            ));
-        }
+        check_hyperslab(&dims, starts, counts)?;
         if ndims == 0 {
             return Err(crate::io::IoError::InvalidState(
                 "read_slice does not support scalar datasets; use read_dataset_raw".into(),
             ));
-        }
-        for d in 0..ndims {
-            if starts[d] + counts[d] > dims[d] {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "slice out of bounds: dim {} start {} + count {} > {}",
-                    d, starts[d], counts[d], dims[d]
-                )));
-            }
         }
 
         match &layout {
@@ -7102,12 +7135,17 @@ impl Hdf5Reader {
                         counts,
                         element_size,
                         |src_off, out_off, len| {
+                            // `base` is the file's claim; a sum that wraps
+                            // would land on unrelated bytes, so it is an
+                            // error, not an offset.
+                            let at = base.checked_add(src_off).ok_or_else(|| {
+                                crate::io::IoError::InvalidState(format!(
+                                    "dataset '{name}' claims raw data at {base}, which \
+                                     overflows {src_off} bytes into the selection"
+                                ))
+                            })?;
                             self.handle
-                                .read_exact_at_into(
-                                    base + src_off,
-                                    &mut out[out_off..out_off + len],
-                                    dst,
-                                )
+                                .read_exact_at_into(at, &mut out[out_off..out_off + len], dst)
                                 .map_err(Into::into)
                         },
                     )?;
@@ -8330,6 +8368,54 @@ mod tests {
             assert_eq!(out, b"ABCD~~~~");
             let _ = std::fs::remove_file(path);
         }
+
+        /// A chunk the index places a few bytes short of `u64::MAX` has runs
+        /// whose ends do not fit in a `u64`. Two rows of one chunk are the
+        /// second run that asks whether it continues the first; the answer
+        /// comes from the read at that address (fill for a read that may
+        /// come up short, an error for one that may not), not from the
+        /// arithmetic.
+        #[test]
+        fn a_chunk_address_near_u64_max_fails_the_read_not_the_arithmetic() {
+            let (path, handle) = handle_over("cover_wrap", b"ABEFCDGH");
+            let dims = [2u64, 4];
+            let chunks = [2u64, 2];
+            let geo = ChunkOutputGeometry {
+                dims: &dims,
+                chunk_dims: &chunks,
+                element_size: 1,
+            };
+            let run = |at_most: bool, out: &mut [u8]| {
+                place_chunk_jobs(
+                    &handle,
+                    vec![
+                        job(0, 4),
+                        Some(ChunkReadJob {
+                            addr: u64::MAX - 1,
+                            len: 4,
+                            at_most,
+                            mask: 0,
+                        }),
+                    ],
+                    &[0, 0, 0, 1],
+                    ChunkReadRequest {
+                        pipeline: None,
+                        target: ChunkTarget::Full,
+                        fill_value: Some(&FILL),
+                        dst: ReadDst::Fresh,
+                    },
+                    &geo,
+                    None,
+                    out,
+                )
+            };
+            let mut out = vec![0xAAu8; 8];
+            run(true, &mut out).unwrap();
+            assert_eq!(out, b"AB~~EF~~");
+            let mut out = vec![0xAAu8; 8];
+            run(false, &mut out).expect_err("an exact read at u64::MAX - 1 cannot succeed");
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     /// Helper: write a little-endian u64 truncated to `n` bytes.
@@ -8644,8 +8730,10 @@ mod tests {
 
         // Verify the values
         let read_values: Vec<i32> = data
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         assert_eq!(read_values, values);
 
@@ -8672,8 +8760,10 @@ mod tests {
 
         let data = reader.read_dataset_raw("data_1d").unwrap();
         let read_values: Vec<i32> = data
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         assert_eq!(read_values, values);
 
@@ -8702,8 +8792,10 @@ mod tests {
 
         let data = reader.read_dataset_raw("test").unwrap();
         let vals: Vec<i32> = data
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         assert_eq!(vals, vec![1, 2, 3, 4]);
 
@@ -8812,8 +8904,10 @@ mod tests {
             out
         };
         let decode = |raw: Vec<u8>| -> Vec<i32> {
-            raw.chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
                 .collect()
         };
 
@@ -9121,8 +9215,10 @@ mod h5py_debug_tests {
         // Element-exact read of one dataset.
         let raw = reader.read_dataset_raw("ds_3").unwrap();
         let vals: Vec<i32> = raw
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         assert_eq!(vals, (30..40).collect::<Vec<i32>>());
         let _ = std::fs::remove_file(&path);
@@ -9157,8 +9253,10 @@ mod h5py_debug_tests {
         // Element-exact read of one dense-stored dataset.
         let raw = reader.read_dataset_raw("dense/d07").unwrap();
         let vals: Vec<f64> = raw
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c))
             .collect();
         assert_eq!(vals, vec![7.0; 4]);
         let _ = std::fs::remove_file(&path);
@@ -9196,8 +9294,10 @@ mod h5py_debug_tests {
         // Element-exact read of a doubly-nested dataset.
         let raw = reader.read_dataset_raw("grp1/sub/b").unwrap();
         let vals: Vec<i64> = raw
-            .chunks_exact(8)
-            .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| i64::from_le_bytes(*c))
             .collect();
         assert_eq!(vals, (0..7).collect::<Vec<i64>>());
         let _ = std::fs::remove_file(&path);
@@ -9241,8 +9341,10 @@ mod h5py_debug_tests {
         // Unsigned u4, precision 17, bit offset 3.
         let raw = reader.read_dataset_raw("u4_p17_o3").unwrap();
         let got: Vec<u32> = raw
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
         assert_eq!(
             got,
@@ -9253,8 +9355,10 @@ mod h5py_debug_tests {
         // Signed i4 with negatives, precision 13, bit offset 5.
         let raw = reader.read_dataset_raw("i4_p13_o5").unwrap();
         let got: Vec<i32> = raw
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         assert_eq!(
             got,
@@ -9265,8 +9369,10 @@ mod h5py_debug_tests {
         // Signed i2 with negatives, precision 9, bit offset 4.
         let raw = reader.read_dataset_raw("i2_p9_o4").unwrap();
         let got: Vec<i16> = raw
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| i16::from_le_bytes(*c))
             .collect();
         assert_eq!(
             got,
@@ -9277,8 +9383,10 @@ mod h5py_debug_tests {
         // 2D signed i4, precision 11, bit offset 6 (1-row chunks).
         let raw = reader.read_dataset_raw("i4_2d_p11_o6").unwrap();
         let got: Vec<i32> = raw
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         assert_eq!(
             got,
@@ -9289,16 +9397,20 @@ mod h5py_debug_tests {
         // read_slice path must also apply the conversion exactly once.
         let raw = reader.read_slice("i4_p13_o5", &[4], &[3]).unwrap();
         let got: Vec<i32> = raw
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         assert_eq!(got, vec![7i32, -4096, 4095], "read_slice must convert too");
 
         // 2D slice: second row, all columns.
         let raw = reader.read_slice("i4_2d_p11_o6", &[1, 0], &[1, 4]).unwrap();
         let got: Vec<i32> = raw
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         assert_eq!(
             got,
@@ -9361,8 +9473,10 @@ mod h5py_debug_tests {
             out
         };
         let decode = |raw: Vec<u8>| -> Vec<i32> {
-            raw.chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
                 .collect()
         };
         let cases: &[([u64; 3], [u64; 3])] = &[
@@ -9450,8 +9564,10 @@ mod h5py_debug_tests {
             out
         };
         let decode = |raw: Vec<u8>| -> Vec<f64> {
-            raw.chunks_exact(8)
-                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            raw.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
                 .collect()
         };
         let cases: &[([u64; 2], [u64; 2])] = &[

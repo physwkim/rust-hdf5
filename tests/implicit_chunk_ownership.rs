@@ -105,8 +105,10 @@ fn an_implicit_chunk_write_lands_in_its_grid_slot_and_nowhere_else() {
     let grid = index_address as usize;
     let grid_bytes = &bytes[grid..grid + 64];
     let values: Vec<i32> = grid_bytes
-        .chunks_exact(4)
-        .map(|w| i32::from_le_bytes(w.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|w| i32::from_le_bytes(*w))
         .collect();
     let mut expected = vec![-9i32; 16];
     expected[8..12].copy_from_slice(&[100, 101, 102, 103]);

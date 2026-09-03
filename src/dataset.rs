@@ -13,6 +13,7 @@ use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
 use crate::format::messages::filter::Filter;
 use crate::format::messages::virtual_mapping::VirtualMapping;
 use crate::format::reference::{Reference, ReferenceTarget};
+use crate::format::selection::check_hyperslab;
 use crate::format::selection::Selection;
 use crate::format::storage_kind::AttributeStorage;
 use crate::io::file_handle::ReadDst;
@@ -1755,11 +1756,13 @@ impl FillTime {
 /// `H5Pset_alloc_time`/`H5Pget_alloc_time`'s `H5D_alloc_time_t`, read back
 /// from the same fill-value message [`FillTime`] is.
 ///
-/// Not user-settable: `H5P__set_layout` (H5Pdcpl.c) picks this from the
-/// dataset's storage class alone (`H5D_ALLOC_TIME_DEFAULT` per layout —
-/// compact is `Early`, chunked and virtual are `Incr`, contiguous is
-/// `Late`), and this crate has no `DatasetBuilder` setter that overrides it.
-/// [`H5Dataset::alloc_time`] exists to read back what the writer declared.
+/// `H5P__set_layout` (H5Pdcpl.c) picks this from the dataset's storage
+/// class (`H5D_ALLOC_TIME_DEFAULT` per layout — compact is `Early`,
+/// chunked and virtual are `Incr`, contiguous is `Late`). The one override
+/// this crate's builder offers is [`DatasetBuilder::early_allocation`],
+/// which a chunked dataset reads back as `Early` where the writer took it
+/// up: an implicit index, or a single unfiltered chunk.
+/// [`H5Dataset::alloc_time`] reads back what the writer declared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllocTime {
     /// Space is allocated as soon as the dataset is created.
@@ -3790,7 +3793,9 @@ impl H5Dataset {
     pub fn read_slice<T: H5Type>(&self, starts: &[usize], counts: &[usize]) -> Result<Vec<T>> {
         match &self.info {
             DatasetInfo::Reader {
-                name, element_size, ..
+                name,
+                shape,
+                element_size,
             } => {
                 if T::element_size() != *element_size {
                     return Err(Hdf5Error::TypeMismatch(format!(
@@ -3803,6 +3808,11 @@ impl H5Dataset {
                 let starts_u64: Vec<u64> = starts.iter().map(|&s| s as u64).collect();
                 let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
 
+                // Bounds before sizing: the destination is allocated here,
+                // ahead of the reader's own check, so a selection the extent
+                // does not admit must be refused before its size is computed.
+                let dims: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
+                check_hyperslab(&dims, &starts_u64, &counts_u64)?;
                 let count = element_count(&counts_u64)?;
                 let mut inner = borrow_inner_mut(&self.file_inner);
                 let H5FileInner::Reader(reader) = &mut *inner else {
@@ -4014,7 +4024,22 @@ impl H5Dataset {
                     )));
                 }
 
-                let expected: usize = counts.iter().product();
+                let starts_u64: Vec<u64> = starts.iter().map(|&s| s as u64).collect();
+                let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
+
+                let inner = borrow_inner(&self.file_inner);
+                let H5FileInner::Writer(writer) = &*inner else {
+                    return Err(Hdf5Error::InvalidState(
+                        "file is no longer in write mode".into(),
+                    ));
+                };
+
+                // Bounds before sizing, against the extent the writer holds
+                // now (an extend since this handle was taken counts): a
+                // selection the extent does not admit is refused for that
+                // reason, not for the size it would have had.
+                check_hyperslab(&writer.dataset_dims(*index), &starts_u64, &counts_u64)?;
+                let expected = element_count(&counts_u64)?;
                 if data.len() != expected {
                     return Err(Hdf5Error::InvalidState(format!(
                         "data length {} does not match slice size {}",
@@ -4023,25 +4048,14 @@ impl H5Dataset {
                     )));
                 }
 
-                let starts_u64: Vec<u64> = starts.iter().map(|&s| s as u64).collect();
-                let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
-
                 let byte_len = data.len() * T::element_size();
                 let host =
                     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
 
-                let inner = borrow_inner(&self.file_inner);
-                match &*inner {
-                    H5FileInner::Writer(writer) => {
-                        let datatype = writer.dataset_datatype(*index);
-                        let stored = to_stored_byte_order(host, &datatype, T::element_size())?;
-                        writer.write_slice(*index, &starts_u64, &counts_u64, &stored)?;
-                        Ok(())
-                    }
-                    _ => Err(Hdf5Error::InvalidState(
-                        "file is no longer in write mode".into(),
-                    )),
-                }
+                let datatype = writer.dataset_datatype(*index);
+                let stored = to_stored_byte_order(host, &datatype, T::element_size())?;
+                writer.write_slice(*index, &starts_u64, &counts_u64, &stored)?;
+                Ok(())
             }
             DatasetInfo::Reader { .. } => {
                 Err(Hdf5Error::InvalidState("cannot write in read mode".into()))
@@ -4457,11 +4471,12 @@ impl H5Dataset {
     ///
     /// Zero-copy is a contract, not an optimization: when the bytes cannot be
     /// handed over as they lie, this returns
-    /// [`Hdf5Error::NotViewable`](crate::Hdf5Error::NotViewable) naming the
+    /// [`Hdf5Error::NotViewable`] naming the
     /// reason and never quietly falls back to copying. Every
     /// [`ViewRefusal`](crate::ViewRefusal) is a case where
-    /// [`read_raw`](Self::read_raw) still works: the file is not mapped, the
-    /// layout is chunked, compact, virtual, or external, no storage is
+    /// [`read_raw`](Self::read_raw) still works: the file is not mapped (an
+    /// open that holds no shared lock never maps), the layout is chunked,
+    /// compact, virtual, or external, no storage is
     /// allocated (the dataset reads as its fill value), `T` is the wrong
     /// width, the stored elements need a byte-order swap or bit unpacking,
     /// the data lands at an offset `T`'s alignment does not permit, or the
@@ -4474,15 +4489,20 @@ impl H5Dataset {
     /// dropped, and after a SWMR refresh has retaken the map — a live view
     /// keeps showing the file as it was when *its* map was taken, while the
     /// refreshed handle reads the new one. Nothing about a view is
-    /// invalidated by anything this process does.
+    /// invalidated by anything this process does. The share carries the
+    /// shared file lock the map was taken under, so for as long as any view
+    /// is alive a writer that honours locks cannot open the file, whether or
+    /// not the reader that took the map is still open.
     ///
     /// # Truncation
     ///
     /// The pages are the file's own. Another process writing the file in
     /// place is seen through the view, and one *truncating* it under the map
-    /// faults with `SIGBUS` on the pages that went away. That is the standing
-    /// risk of mapping the file at all; a view does not add to it, and no
-    /// guard inside this process can close it.
+    /// faults with `SIGBUS` on the pages that went away. The shared lock the
+    /// view keeps is what stands between the map and such a writer; one that
+    /// waives locks ([`FileLocking::Disabled`](crate::FileLocking::Disabled),
+    /// or a filesystem without them) is outside what any guard inside this
+    /// process can see.
     ///
     /// ```no_run
     /// # use rust_hdf5::H5File;
@@ -5454,8 +5474,10 @@ mod tests {
             let ds = file.dataset("grid").unwrap();
             let as_i32 = |bytes: Vec<u8>| -> Vec<i32> {
                 bytes
-                    .chunks_exact(4)
-                    .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| i32::from_le_bytes(*b))
                     .collect()
             };
             // The chunk that precedes each edge chunk is full, so a leak would
@@ -5765,8 +5787,10 @@ mod tests {
             let raw = a.read_raw().unwrap();
             assert_eq!(raw.len(), 3 * 4);
             let got: Vec<i32> = raw
-                .chunks_exact(4)
-                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| i32::from_le_bytes(*b))
                 .collect();
             assert_eq!(got, offsets);
         }

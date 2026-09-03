@@ -378,7 +378,7 @@ impl ObjectHeader {
     /// and trailing checksum, with every message in chunk 0.
     ///
     /// Fails when any message payload exceeds [`MAX_MESSAGE_SIZE`] — see
-    /// [`check_message_sizes`](Self::check_message_sizes).
+    /// `check_message_sizes`.
     pub fn encode(&self) -> FormatResult<Vec<u8>> {
         self.encode_chunk0(&self.messages, self.messages_data_size())
     }

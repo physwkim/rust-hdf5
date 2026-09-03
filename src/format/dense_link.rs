@@ -404,7 +404,9 @@ mod tests {
 
         let records = collect_btree_v2_records(&bt2, &ctx(), &mut file).unwrap();
         let hashes: Vec<u32> = records
-            .chunks_exact(NAME_RECORD_LEN)
+            .as_chunks::<NAME_RECORD_LEN>()
+            .0
+            .iter()
             .map(|r| u32::from_le_bytes(r[0..4].try_into().unwrap()))
             .collect();
         assert_eq!(hashes.len(), links.len());
@@ -442,7 +444,9 @@ mod tests {
 
         let records = collect_btree_v2_records(&bt2, &ctx(), &mut file).unwrap();
         let corders: Vec<i64> = records
-            .chunks_exact(CORDER_RECORD_LEN)
+            .as_chunks::<CORDER_RECORD_LEN>()
+            .0
+            .iter()
             .map(|r| i64::from_le_bytes(r[0..8].try_into().unwrap()))
             .collect();
         assert_eq!(corders, (0..12i64).collect::<Vec<_>>());

@@ -1,6 +1,8 @@
 //! Attribute message (type 0x0C) -- describes an attribute attached to an object.
 //!
 //! Binary layout (version 3, no shared datatypes):
+//!
+//! ```text
 //!   Byte 0:    version = 3
 //!   Byte 1:    flags (0 for non-shared)
 //!   Bytes 2-3: name_size (u16 LE, including null terminator)
@@ -11,6 +13,7 @@
 //!   <encoded datatype message: datatype_size bytes>
 //!   <encoded dataspace message: dataspace_size bytes>
 //!   <raw attribute data>
+//! ```
 
 use crate::format::messages::dataspace::DataspaceMessage;
 use crate::format::messages::datatype::DatatypeMessage;

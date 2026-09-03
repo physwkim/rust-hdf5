@@ -1,5 +1,116 @@
 # Changelog
 
+## 0.5.2
+
+### Fixed
+
+- A chunked dataset whose stored chunk dimensionality is not the dataspace
+  rank plus one (the trailing element-size dimension) is refused where its
+  layout is checked against its dataspace, the check libhdf5 moved into
+  `H5O__layout_decode` for CVE-2026-19025 (HDFGroup/hdf5#6508). A reader
+  lists the dataset and
+  reports the disagreement as its unreadable reason instead of handing back
+  a handle whose index keys decode at the wrong rank; a read-write reopen
+  keeps the dataset by its bytes instead of modelling it. The regression
+  fixture is upstream's `test/testfiles/bad_chunk_ndims.h5`.
+
+- `read_slice` and its buffer-reuse and unconverted forms refuse a
+  selection whose start plus count wraps past `u64::MAX`; it used to wrap
+  back inside the extent and read unrelated bytes (a panic under overflow
+  checks). `H5Dataset::read_slice` refuses an oversized count as a
+  selection before it sizes the destination instead of failing the
+  allocation. `H5Dataset::write_slice` refuses one for its bounds, against
+  the extent as extended, before it sizes the data. One helper now owns
+  the rule the writer and the region reference path each checked on their
+  own.
+
+- A contiguous dataset whose stored address is close enough to `u64::MAX`
+  that adding a slice's offset wraps is refused instead of served from
+  the wrapped offset. The external file list path checks its slot offset
+  the same way, on write as on read.
+
+- A compact dataset whose payload is not exactly the extent's element
+  count times the element size is refused where its layout is checked
+  against its dataspace and datatype, as `H5D__compact_init` refuses it;
+  a short payload used to be indexed past its end by the slice path. The
+  reader lists the dataset with the disagreement as its unreadable
+  reason; a read-write reopen keeps it by its bytes.
+
+- Reservations made from a file's own counts are bounded by what the
+  file holds: the vlen reference read reserves no more references than
+  its image has, a fixed array whose element count does not fit in the
+  file is refused before anything is sized from it, and a free-space
+  section count is bounded by its block. Each used to abort the process
+  on allocation from a crafted count.
+
+- Coalescing chunk runs asks whether one run continues the next with a
+  checked sum, so an index entry a few bytes short of `u64::MAX` fails
+  its read instead of overflowing the arithmetic in front of it.
+
+- `lzf` decompression reserves its output from the input's size (the
+  stream expands at most 88x) instead of from `cd_values[2]`, which
+  h5py's `lzf_filter.c` treats as a hint it grows past; a crafted
+  declared size used to abort the process on allocation.
+
+- SZIP refuses `pixels_per_block` above 32 and `pixels_per_scanline`
+  above 4096 (`SZ_MAX_PIXELS_PER_BLOCK` and `SZ_MAX_PIXELS_PER_SCANLINE`
+  in `szlib.h`) on compress as well as decompress, reserves the declared
+  output fallibly, and reports a compressed stream that runs out before
+  its declared output as an error instead of decoding fabricated zero
+  bits for as long as the declaration asks: no bit is made up past the
+  stream's end, so a block the stream cannot finish holds no sample. A
+  stream that ends once the declared output is complete still decodes.
+
+- Dropping a `SwmrWriter` without calling `close` writes the frames its
+  band buffers hold (a multi-frame-chunk dataset's frames that have not
+  filled a chunk yet) instead of leaving them, already counted into the
+  extent, reading back as fill. A failure on that path is reported on
+  stderr; `close` returns it.
+
+- Under the `mmap` feature a read-only open maps the file only when it
+  holds its shared lock. A handle
+  whose locking policy waived the lock (`FileLocking::Disabled`, or
+  `BestEffort` on a filesystem without locks) reads through the descriptor
+  instead, and a zero-copy view of such a file is refused, as a view of any
+  unmapped file is. A page a writer's truncation took away faults the
+  process on its next touch, where a positioned read past the new end is
+  an error, and the shared lock is what keeps a writer that honours locks
+  from opening the file while the map is out. A zero-copy view keeps a
+  share of that lock with its share of the map, so such a writer stays out
+  for as long as any view is alive, after the file that produced it is
+  closed too; a read-only handle cannot release its lock. A SWMR reader
+  opened with the default policy holds the lock and keeps its map.
+
+- `SwmrWriter::flush` writes the band a multi-frame-chunk dataset is
+  still filling, zero-padded, and keeps its frames, so a reader sees them
+  where the published extent already counts them instead of as fill. The
+  completing append writes the same chunks whole; for a filtered dataset
+  that rewrite takes a new block whenever the compressed size changed and
+  keeps the old one, as chunk rewrites under SWMR always have, so each
+  flush of a partial filtered band costs the band's chunks in file space
+  for the rest of the session.
+
+- `SwmrWriter::start_swmr` writes the band a multi-frame-chunk dataset is
+  still filling before it publishes an extent that counts those frames, so
+  a reader attaching before the first flush sees them rather than fill.
+
+- A `SwmrWriter` band write that failed used to leave the band buffered
+  past the frame count that triggers the write, so the next write indexed
+  past the band, a panic the writer's `Drop` turned into an abort. A band
+  write now writes every complete band the buffer holds and drains them,
+  so a later append or flush retries the same chunks; the extent grows
+  before a frame is buffered, so a buffered frame is always where the
+  extent says.
+
+- Deleting a multi-frame-chunk dataset under a `SwmrWriter` drops its band
+  buffer with it; every later band write used to fail on the buffered
+  frames of a dataset with no chunks left.
+
+- `SwmrWriter::close` finalizes the file whatever its band drain did,
+  reporting both errors when both fail, instead of returning the drain's
+  error while the writer's `Drop` finalized the file anyway and printed
+  its own message over it.
+
 ## 0.5.1
 
 ### Changed

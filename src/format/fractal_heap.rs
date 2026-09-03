@@ -41,7 +41,7 @@ const MAX_BLOCKS: usize = 65_536;
 /// Every field libhdf5 stores is here, because this type is both ends of the
 /// round trip: [`decode`](Self::decode) fills it from a file and
 /// [`encode`](Self::encode) writes one back. The derived fields below the
-/// stored ones are recomputed by [`derive`](Self::derive) either way, so a
+/// stored ones are recomputed by `derive` either way, so a
 /// heap this crate writes and a heap libhdf5 wrote parse through identical
 /// arithmetic.
 #[derive(Debug, Clone)]

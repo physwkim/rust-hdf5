@@ -79,6 +79,14 @@ impl From<crate::format::FormatError> for IoError {
     }
 }
 
+/// A caller's hyperslab the extent does not admit is a bad request, not a
+/// malformed file.
+impl From<crate::format::selection::HyperslabError> for IoError {
+    fn from(e: crate::format::selection::HyperslabError) -> Self {
+        Self::InvalidState(e.to_string())
+    }
+}
+
 impl std::fmt::Display for IoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

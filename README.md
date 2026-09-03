@@ -24,7 +24,7 @@ Read and write HDF5 files with contiguous, chunked, and compressed datasets, hie
 - **File locking** — OS-level advisory locks (`flock` / `LockFileEx`) honoring `HDF5_USE_FILE_LOCKING`
 - **Hyperslab I/O** — `read_slice` / `write_slice` for partial N-dimensional access, on contiguous and chunked (including compressed) datasets
 - **Buffered I/O** — BufWriter/BufReader with automatic mode switching
-- **Memory-mapped I/O** — optional `mmap` feature: a read-only open serves its small reads from a memory map
+- **Memory-mapped I/O** — optional `mmap` feature: a read-only open that holds the shared file lock serves its small reads from a memory map
 - **Thread safety** — optional `threadsafe` feature (`Arc<Mutex>` instead of `Rc<RefCell>`)
 - **Legacy format support** — reads v0/v1 superblock and v1 object header files (h5py, HDF5 C library)
 - **Variable-length strings** — read and write h5py-compatible vlen string datasets via global heap
@@ -290,7 +290,7 @@ and the form a v2-B-tree dataset uses).
 | `all_filters` | All compression filters |
 | `parallel` | Parallel chunk compression via rayon |
 | `threadsafe` | `Send + Sync` file handles (`Arc<Mutex>`) |
-| `mmap` | Read-only opens serve reads from a memory map |
+| `mmap` | Read-only opens that hold the file lock serve reads from a memory map |
 
 ## HDF5 format support
 

@@ -13,7 +13,7 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use memmap2::Mmap;
+use crate::io::file_handle::LockedMap;
 
 use crate::io::reader::{DatasetViewSource, ViewStorage};
 use crate::types::H5Type;
@@ -29,9 +29,11 @@ use crate::types::H5Type;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewRefusal {
     /// The file holding this dataset is not memory-mapped. A read-only open
-    /// takes a whole-file map when it can, but an empty file, a file larger
-    /// than the address space, and a filesystem that refuses `mmap` all leave
-    /// the handle reading through `pread`, with nothing to point at.
+    /// takes a whole-file map when it can, but an open whose locking policy
+    /// waived the shared lock (or could not get one), an empty file, a file
+    /// larger than the address space, and a filesystem that refuses `mmap`
+    /// all leave the handle reading through `pread`, with nothing to point
+    /// at.
     NotMapped,
     /// The dataset's raw data is not one stretch of the mapped file. The
     /// phrase says what it is instead — chunked, compact, virtual, or held in
@@ -250,14 +252,17 @@ fn slab_run(dims: &[u64], starts: &[usize], counts: &[usize]) -> Result<(u64, u6
 /// copied, or allocated to produce them — and the view holds a share of the
 /// map, so it stays readable after the dataset, the file handle, and even a
 /// [`refresh`](crate::swmr::SwmrFileReader::refresh) that retook the map are
-/// gone. What it shows is the file as it was when *that* map was taken.
+/// gone. What it shows is the file as it was when *that* map was taken. The
+/// share carries the shared file lock the map was taken under, so a writer
+/// that honours locks is kept out for as long as the view is alive.
 ///
 /// See [`H5Dataset::read_mapped`](crate::H5Dataset::read_mapped) for how one
 /// is obtained and when it is refused.
 pub struct MappedView<T> {
     /// The map the elements live in. Held, not borrowed: this is what keeps
-    /// the pages mapped for as long as the view exists.
-    map: Arc<Mmap>,
+    /// the pages mapped, and the file's shared lock held, for as long as the
+    /// view exists.
+    map: Arc<LockedMap>,
     /// Byte offset of the first element within `map`.
     start: usize,
     /// How many elements the view holds.
@@ -274,7 +279,7 @@ impl<T: H5Type> MappedView<T> {
     /// private to this module and [`view`] is its only caller, so no code
     /// anywhere can reach [`Deref`] around these checks or around the
     /// viewability decision that precedes them.
-    fn new(map: Arc<Mmap>, offset: u64, count: u64) -> Result<Self, ViewRefusal> {
+    fn new(map: Arc<LockedMap>, offset: u64, count: u64) -> Result<Self, ViewRefusal> {
         let mapped = map.len();
         let past = |end: u64| ViewRefusal::PastMappedEnd {
             end,
@@ -314,9 +319,10 @@ impl<T> Deref for MappedView<T> {
         // by `MappedView::new`, which is the only way to reach this:
         //
         // * Alignment — `new` checked this exact pointer, `map[start..]`'s,
-        //   against `align_of::<T>()`. `map` is an `Arc<Mmap>` that has not
-        //   moved since (the mapping's address is fixed for its lifetime, and
-        //   `Arc` never relocates the `Mmap`), so the pointer is the same one.
+        //   against `align_of::<T>()`. `map` is an `Arc<LockedMap>` whose
+        //   mapping has not moved since (its address is fixed for its
+        //   lifetime, and `Arc` never relocates it), so the pointer is the
+        //   same one.
         // * Size — `new` checked `start + count * size_of::<T>() <= map.len()`,
         //   so the `count` elements lie entirely inside the mapping, and
         //   `start <= map.len()` makes the index valid.
@@ -368,7 +374,7 @@ mod tests {
     use super::*;
     use crate::file::{borrow_inner_mut, H5FileInner};
     use crate::format::messages::datatype::{ByteOrder, DatatypeMessage};
-    use crate::{FileSpaceStrategy, H5Dataset, H5File, Hdf5Error};
+    use crate::{FileLocking, FileSpaceStrategy, H5Dataset, H5File, Hdf5Error};
     use std::path::PathBuf;
 
     fn temp_path(name: &str) -> PathBuf {
@@ -750,9 +756,56 @@ mod tests {
         );
     }
 
+    /// A view keeps the shared lock its map was taken under, so a writer
+    /// that honours locks is kept out for as long as the view is alive —
+    /// after the file that produced it is closed too — and let in once the
+    /// view is dropped.
+    #[test]
+    fn a_view_keeps_the_shared_lock_its_map_was_taken_under() {
+        let path = temp_path("view_lock");
+        let data: Vec<f64> = (0..8).map(|i| i as f64).collect();
+        {
+            let file = H5File::create(&path).unwrap();
+            file.new_dataset::<f64>()
+                .shape([8usize])
+                .create("d")
+                .unwrap()
+                .write_raw(&data)
+                .unwrap();
+            file.close().unwrap();
+        }
+        let file = H5File::options()
+            .locking(FileLocking::Enabled)
+            .open(&path)
+            .unwrap();
+        let view = file.dataset("d").unwrap().read_mapped::<f64>().unwrap();
+        drop(file);
+        assert!(
+            H5File::options()
+                .locking(FileLocking::Enabled)
+                .open_rw(&path)
+                .is_err(),
+            "a writer opened the file under a live view"
+        );
+        assert_eq!(&*view, &data[..]);
+        drop(view);
+        H5File::options()
+            .locking(FileLocking::Enabled)
+            .open_rw(&path)
+            .unwrap()
+            .close()
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A view is a snapshot that owns its pages: it outlives the dataset, the
     /// file, and a refresh that retakes the handle's map, while the refreshed
     /// handle goes on to read a file the old map does not cover.
+    ///
+    /// The reader holds its shared lock, which is what lets it map, and the
+    /// writer that grows the file behind it waives its own. A shared `flock`
+    /// lets that writer write; a Windows shared lock forbids it.
+    #[cfg(not(windows))]
     #[test]
     fn a_view_outlives_the_file_and_a_refresh_that_retakes_the_map() {
         let path = temp_path("snapshot");
@@ -770,7 +823,7 @@ mod tests {
         }
         let mapped_len = std::fs::metadata(&path).unwrap().len();
 
-        let file = H5File::options().no_locking().open(&path).unwrap();
+        let file = H5File::open(&path).unwrap();
         let ds = file.dataset("first").unwrap();
         let view = ds.read_mapped::<f64>().unwrap();
 

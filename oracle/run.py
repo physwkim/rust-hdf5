@@ -34,6 +34,16 @@ import traceback
 DEFAULT_PYTHON = "/home/stevek/micromamba/envs/tomo/bin/python"
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
+
+def report_path(p):
+    """`p` relative to the repo root when it lies under it, so a report made
+    in a worktree names the same probe as one made in the main checkout."""
+    p = pathlib.Path(p).resolve()
+    try:
+        return str(p.relative_to(REPO))
+    except ValueError:
+        return str(p)
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import hdf5env  # noqa: E402,F401  (must precede h5py; see the module docstring)
@@ -1079,7 +1089,7 @@ def main():
         "h5py_version": h5py.__version__,
         "numpy_version": __import__("numpy").__version__,
         "python": sys.executable,
-        "probe": probe,
+        "probe": report_path(probe),
         "cases": len(results),
     }
     suffix = "-%s" % args.variant if args.variant else ""

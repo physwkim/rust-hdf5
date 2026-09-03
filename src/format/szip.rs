@@ -723,6 +723,15 @@ fn encode_se(
 //  DECODER
 // ===========================================================================
 
+/// The compressed stream ran out under a read.
+///
+/// Not a corruption on its own: an encoder pads its last byte with zero
+/// bits, and a decoder that has covered the declared output reads those as
+/// the start of one more block before finding there is nothing behind them.
+/// Whether the end is fine or early is [`Decoder::decode`]'s call, made from
+/// how many samples the stream had completed by then.
+struct StreamEnd;
+
 struct BitReader<'a> {
     data: &'a [u8],
     pos: usize,
@@ -748,23 +757,27 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    fn get_bits(&mut self, n: i32) -> u32 {
+    /// The next `n` bits, or [`StreamEnd`] when the stream holds fewer.
+    /// Nothing is made up past the end of `data`: a sample that would need
+    /// bits the stream does not have is not a sample.
+    fn get_bits(&mut self, n: i32) -> Result<u32, StreamEnd> {
         while self.bitp < n {
-            if self.pos < self.data.len() {
-                self.acc = (self.acc << 8) | self.data[self.pos] as u64;
-                self.pos += 1;
-                self.bitp += 8;
-            } else {
-                // pad with zeros
-                self.acc <<= 8;
-                self.bitp += 8;
+            if self.pos >= self.data.len() {
+                return Err(StreamEnd);
             }
+            self.acc = (self.acc << 8) | self.data[self.pos] as u64;
+            self.pos += 1;
+            self.bitp += 8;
         }
         self.bitp -= n;
-        ((self.acc >> self.bitp) & ((1u64 << n) - 1)) as u32
+        Ok(((self.acc >> self.bitp) & ((1u64 << n) - 1)) as u32)
     }
 
-    fn get_fs(&mut self) -> u32 {
+    /// The next fundamental-sequence code: the number of zero bits before
+    /// the next set bit, which is consumed with them. A stream that ends
+    /// before that set bit has no code there, so its trailing zeros are
+    /// [`StreamEnd`] rather than a count.
+    fn get_fs(&mut self) -> Result<u32, StreamEnd> {
         let mut fs = 0u32;
 
         // Mask accumulator to valid bits
@@ -781,7 +794,7 @@ impl<'a> BitReader<'a> {
             // read more bytes
             let to_read = std::cmp::min(7, self.data.len() - self.pos);
             if to_read == 0 {
-                return fs;
+                return Err(StreamEnd);
             }
             for _ in 0..to_read {
                 self.acc = (self.acc << 8) | self.data[self.pos] as u64;
@@ -794,7 +807,21 @@ impl<'a> BitReader<'a> {
         let highest = 63 - self.acc.leading_zeros() as i32;
         fs += (self.bitp - highest - 1) as u32;
         self.bitp = highest; // consume the 1 bit
-        fs
+        Ok(fs)
+    }
+}
+
+/// Why one block could not be decoded.
+enum BlockError {
+    /// The stream ended inside the block (see [`StreamEnd`]).
+    StreamEnd,
+    /// The block's codes are not ones an encoder emits.
+    Corrupt(String),
+}
+
+impl From<StreamEnd> for BlockError {
+    fn from(StreamEnd: StreamEnd) -> Self {
+        BlockError::StreamEnd
     }
 }
 
@@ -911,115 +938,43 @@ impl Decoder {
         let rsi_samples = (self.rsi * self.block_size) as usize;
         let pp = self.flags & AEC_DATA_PREPROCESS != 0;
 
-        let mut all_output: Vec<u32> = Vec::with_capacity(output_samples);
+        // `output_samples` is the chunk's declared size; the stream has to
+        // produce it, so a claim past what memory can hold is an error
+        // here rather than an abort.
+        let mut all_output: Vec<u32> = Vec::new();
+        all_output.try_reserve_exact(output_samples).map_err(|_| {
+            format!("cannot reserve {output_samples} samples for the declared output")
+        })?;
 
         while all_output.len() < output_samples {
             // Decode one RSI
             let mut rsi_buf: Vec<u32> = Vec::with_capacity(rsi_samples);
             let mut first_block_in_rsi = true;
 
-            while rsi_buf.len() < rsi_samples
-                && all_output.len() + rsi_buf.len() < output_samples + rsi_samples
-            {
+            while rsi_buf.len() < rsi_samples {
                 let has_ref = pp && first_block_in_rsi;
-                let encoded_block_size = if has_ref {
-                    self.block_size - 1
-                } else {
-                    self.block_size
-                } as usize;
-
-                // Read ID
-                let id = reader.get_bits(self.id_len as i32);
-
-                if id == 0 {
-                    // Low entropy
-                    let sub_id = reader.get_bits(1);
-                    if sub_id == 1 {
-                        // Second extension
-                        if has_ref {
-                            rsi_buf.push(reader.get_bits(self.bits_per_sample as i32));
+                let block_start = rsi_buf.len();
+                match self.decode_block(&mut reader, &mut rsi_buf, has_ref, &se_table) {
+                    Ok(()) => first_block_in_rsi = false,
+                    Err(BlockError::Corrupt(msg)) => return Err(msg),
+                    Err(BlockError::StreamEnd) => {
+                        // libaec stops where the stream does: an encoder
+                        // emits blocks until the last real sample is covered
+                        // and no further, then pads its last byte with zero
+                        // bits. A block the stream cannot finish is that
+                        // padding read as one, or a truncation; either way
+                        // it holds no sample, so the stream is complete if
+                        // what it did finish reaches the declared output and
+                        // short otherwise. Nothing past its end is made up.
+                        rsi_buf.truncate(block_start);
+                        if all_output.len() + rsi_buf.len() >= output_samples {
+                            break;
                         }
-                        // SE decoding: i starts at ref (0 or 1), runs to block_size
-                        // Each iteration reads one FS and produces 1 or 2 samples
-                        let ref_offset = if has_ref { 1usize } else { 0 };
-                        let mut i = ref_offset;
-                        while i < self.block_size as usize {
-                            let m = reader.get_fs();
-                            if m as usize > SE_TABLE_SIZE {
-                                return Err("SE table overflow".into());
-                            }
-                            let d1 = m as i32 - se_table[2 * m as usize + 1];
-
-                            if (i & 1) == 0 {
-                                rsi_buf.push((se_table[2 * m as usize] - d1) as u32);
-                                i += 1;
-                            }
-                            rsi_buf.push(d1 as u32);
-                            i += 1;
-                        }
-                    } else {
-                        // Zero block
-                        if has_ref {
-                            rsi_buf.push(reader.get_bits(self.bits_per_sample as i32));
-                        }
-                        let fs = reader.get_fs();
-                        let mut zero_blocks = fs + 1;
-
-                        if zero_blocks == ROS_DEC {
-                            let b = rsi_buf.len() / self.block_size as usize;
-                            let remaining = self.rsi as usize - b;
-                            let boundary = 64 - (b % 64);
-                            zero_blocks = std::cmp::min(remaining, boundary) as u32;
-                        } else if zero_blocks > ROS_DEC {
-                            zero_blocks -= 1;
-                        }
-
-                        // `fs` (hence `zero_blocks`) is bitstream-derived; a
-                        // corrupt run of zero bits could ask for a huge
-                        // expansion. Clamp to what remains in the RSI so a
-                        // bad stream cannot drive an unbounded allocation.
-                        let zero_samples = (zero_blocks as usize * self.block_size as usize)
-                            .saturating_sub(if has_ref { 1 } else { 0 })
-                            .min(
-                                (self.rsi as usize * self.block_size as usize)
-                                    .saturating_sub(rsi_buf.len()),
-                            );
-                        rsi_buf.extend(std::iter::repeat_n(0, zero_samples));
+                        return Err(format!(
+                            "compressed stream ends after {} of {output_samples} samples",
+                            all_output.len() + rsi_buf.len()
+                        ));
                     }
-                } else if id == (1u32 << self.id_len) - 1 {
-                    // Uncompressed
-                    for _ in 0..self.block_size {
-                        rsi_buf.push(reader.get_bits(self.bits_per_sample as i32));
-                    }
-                } else {
-                    // Split (Golomb-Rice) with k = id - 1
-                    let k = id - 1;
-
-                    if has_ref {
-                        rsi_buf.push(reader.get_bits(self.bits_per_sample as i32));
-                    }
-
-                    // Read FS parts
-                    let base = rsi_buf.len();
-                    for _ in 0..encoded_block_size {
-                        let fs = reader.get_fs();
-                        rsi_buf.push(fs << k);
-                    }
-
-                    // Read binary parts and add
-                    if k > 0 {
-                        for j in 0..encoded_block_size {
-                            let bits = reader.get_bits(k as i32);
-                            rsi_buf[base + j] += bits;
-                        }
-                    }
-                }
-
-                first_block_in_rsi = false;
-
-                // Check if RSI is complete
-                if rsi_buf.len() >= rsi_samples {
-                    break;
                 }
             }
 
@@ -1038,6 +993,113 @@ impl Decoder {
 
         all_output.truncate(output_samples);
         Ok(all_output)
+    }
+
+    /// Decode one block of the current RSI onto the end of `rsi_buf`.
+    /// `has_ref` marks the first block of a preprocessed RSI, which carries
+    /// a reference sample ahead of its codes. On [`BlockError::StreamEnd`]
+    /// `rsi_buf` may hold part of the block; the caller decides what that
+    /// end means and truncates.
+    fn decode_block(
+        &self,
+        reader: &mut BitReader<'_>,
+        rsi_buf: &mut Vec<u32>,
+        has_ref: bool,
+        se_table: &[i32; 2 * (SE_TABLE_SIZE + 1)],
+    ) -> Result<(), BlockError> {
+        let encoded_block_size = if has_ref {
+            self.block_size - 1
+        } else {
+            self.block_size
+        } as usize;
+
+        // Read ID
+        let id = reader.get_bits(self.id_len as i32)?;
+
+        if id == 0 {
+            // Low entropy
+            let sub_id = reader.get_bits(1)?;
+            if sub_id == 1 {
+                // Second extension
+                if has_ref {
+                    rsi_buf.push(reader.get_bits(self.bits_per_sample as i32)?);
+                }
+                // SE decoding: i starts at ref (0 or 1), runs to block_size
+                // Each iteration reads one FS and produces 1 or 2 samples
+                let ref_offset = if has_ref { 1usize } else { 0 };
+                let mut i = ref_offset;
+                while i < self.block_size as usize {
+                    let m = reader.get_fs()?;
+                    if m as usize > SE_TABLE_SIZE {
+                        return Err(BlockError::Corrupt("SE table overflow".into()));
+                    }
+                    let d1 = m as i32 - se_table[2 * m as usize + 1];
+
+                    if (i & 1) == 0 {
+                        rsi_buf.push((se_table[2 * m as usize] - d1) as u32);
+                        i += 1;
+                    }
+                    rsi_buf.push(d1 as u32);
+                    i += 1;
+                }
+            } else {
+                // Zero block
+                if has_ref {
+                    rsi_buf.push(reader.get_bits(self.bits_per_sample as i32)?);
+                }
+                let fs = reader.get_fs()?;
+                let mut zero_blocks = fs + 1;
+
+                if zero_blocks == ROS_DEC {
+                    let b = rsi_buf.len() / self.block_size as usize;
+                    let remaining = self.rsi as usize - b;
+                    let boundary = 64 - (b % 64);
+                    zero_blocks = std::cmp::min(remaining, boundary) as u32;
+                } else if zero_blocks > ROS_DEC {
+                    zero_blocks -= 1;
+                }
+
+                // `fs` (hence `zero_blocks`) is bitstream-derived; a
+                // corrupt run of zero bits could ask for a huge
+                // expansion. Clamp to what remains in the RSI so a
+                // bad stream cannot drive an unbounded allocation.
+                let zero_samples = (zero_blocks as usize * self.block_size as usize)
+                    .saturating_sub(if has_ref { 1 } else { 0 })
+                    .min(
+                        (self.rsi as usize * self.block_size as usize)
+                            .saturating_sub(rsi_buf.len()),
+                    );
+                rsi_buf.extend(std::iter::repeat_n(0, zero_samples));
+            }
+        } else if id == (1u32 << self.id_len) - 1 {
+            // Uncompressed
+            for _ in 0..self.block_size {
+                rsi_buf.push(reader.get_bits(self.bits_per_sample as i32)?);
+            }
+        } else {
+            // Split (Golomb-Rice) with k = id - 1
+            let k = id - 1;
+
+            if has_ref {
+                rsi_buf.push(reader.get_bits(self.bits_per_sample as i32)?);
+            }
+
+            // Read FS parts
+            let base = rsi_buf.len();
+            for _ in 0..encoded_block_size {
+                let fs = reader.get_fs()?;
+                rsi_buf.push(fs << k);
+            }
+
+            // Read binary parts and add
+            if k > 0 {
+                for j in 0..encoded_block_size {
+                    let bits = reader.get_bits(k as i32)?;
+                    rsi_buf[base + j] += bits;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn write_samples(&self, samples: &[u32], output_size: usize) -> Vec<u8> {
@@ -1095,6 +1157,47 @@ impl Decoder {
 //  Public API
 // ===========================================================================
 
+/// `SZ_MAX_PIXELS_PER_BLOCK` (szlib.h): the largest block szlib/libaec
+/// accept, and the cap `H5Z__set_local_szip` applies.
+pub const MAX_PIXELS_PER_BLOCK: u32 = 32;
+/// `SZ_MAX_PIXELS_PER_SCANLINE` (szlib.h): `SZ_MAX_BLOCKS_PER_SCANLINE`
+/// (128) blocks of the largest size; `H5Z__set_local_szip` clamps the
+/// scanline it derives from the chunk to it.
+pub const MAX_PIXELS_PER_SCANLINE: u32 = 128 * MAX_PIXELS_PER_BLOCK;
+
+/// The parameter checks `SZ_BufftoBuffCompress` / `SZ_BufftoBuffDecompress`
+/// (sz_compat.c) make before either codec runs, shared by both directions so
+/// the encoder cannot write a stream the decoder refuses. The limits bound
+/// every size derived from the parameters: an RSI is at most
+/// `MAX_PIXELS_PER_SCANLINE` samples.
+fn validate_params(
+    bits_per_pixel: u32,
+    pixels_per_block: u32,
+    pixels_per_scanline: u32,
+) -> Result<(), String> {
+    if pixels_per_scanline == 0
+        || pixels_per_block == 0
+        || pixels_per_block & 1 != 0
+        || bits_per_pixel == 0
+        || (bits_per_pixel > 32 && bits_per_pixel != 64)
+    {
+        return Err("invalid SZIP parameters".into());
+    }
+    if pixels_per_block > MAX_PIXELS_PER_BLOCK {
+        return Err(format!(
+            "SZIP pixels_per_block {pixels_per_block} exceeds the szlib limit of \
+             {MAX_PIXELS_PER_BLOCK}"
+        ));
+    }
+    if pixels_per_scanline > MAX_PIXELS_PER_SCANLINE {
+        return Err(format!(
+            "SZIP pixels_per_scanline {pixels_per_scanline} exceeds the szlib limit of \
+             {MAX_PIXELS_PER_SCANLINE}"
+        ));
+    }
+    Ok(())
+}
+
 /// Compress data using the SZIP (AEC) algorithm.
 ///
 /// Parameters match the HDF5 SZIP filter interface:
@@ -1110,14 +1213,7 @@ pub fn compress(
     pixels_per_scanline: u32,
     options_mask: u32,
 ) -> Result<Vec<u8>, String> {
-    if pixels_per_scanline == 0
-        || pixels_per_block == 0
-        || pixels_per_block & 1 != 0
-        || bits_per_pixel == 0
-        || (bits_per_pixel > 32 && bits_per_pixel != 64)
-    {
-        return Err("invalid SZIP parameters".into());
-    }
+    validate_params(bits_per_pixel, pixels_per_block, pixels_per_scanline)?;
 
     let flags = AEC_NOT_ENFORCE | convert_options(options_mask);
     let block_size = pixels_per_block;
@@ -1200,14 +1296,7 @@ pub fn decompress(
     pixels_per_scanline: u32,
     options_mask: u32,
 ) -> Result<Vec<u8>, String> {
-    if pixels_per_scanline == 0
-        || pixels_per_block == 0
-        || pixels_per_block & 1 != 0
-        || bits_per_pixel == 0
-        || (bits_per_pixel > 32 && bits_per_pixel != 64)
-    {
-        return Err("invalid SZIP parameters".into());
-    }
+    validate_params(bits_per_pixel, pixels_per_block, pixels_per_scanline)?;
 
     let flags = convert_options(options_mask);
     let block_size = pixels_per_block;
@@ -1464,6 +1553,80 @@ mod tests {
             err.contains("not a multiple of pixel size"),
             "unexpected error message: {err}"
         );
+    }
+
+    /// The szlib limits, on both directions: a block over 32 pixels or a
+    /// scanline over 4096 is refused before either codec runs, and the
+    /// largest values in range still round-trip.
+    #[test]
+    fn parameters_past_the_szlib_limits_are_refused() {
+        let mask = SZ_NN_OPTION_MASK | SZ_MSB_OPTION_MASK;
+        let data: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        roundtrip(&data, 8, 32, 4096, mask);
+        let err = compress(&data, 8, 34, 4096, mask).unwrap_err();
+        assert!(err.contains("pixels_per_block 34"), "{err}");
+        let err = compress(&data, 8, 32, 4097, mask).unwrap_err();
+        assert!(err.contains("pixels_per_scanline 4097"), "{err}");
+        assert!(decompress(&[0u8; 16], 64, 8, 34, 4096, mask).is_err());
+        assert!(decompress(&[0u8; 16], 64, 8, 32, 4097, mask).is_err());
+    }
+
+    /// A stream that ends before the declared output is an error at the
+    /// point it ends, not zero blocks for as long as the declaration asks:
+    /// an empty stream under a 2^40-sample claim neither reserves for it
+    /// nor loops over it, and a stream cut short reports how far it got.
+    #[test]
+    fn a_stream_that_ends_early_is_an_error_not_zero_padding() {
+        let mask = SZ_NN_OPTION_MASK | SZ_MSB_OPTION_MASK;
+        let err = decompress(&[], 1 << 40, 8, 32, 256, mask).unwrap_err();
+        assert!(
+            err.contains("ends after 0 of") || err.contains("cannot reserve"),
+            "{err}"
+        );
+
+        let data: Vec<u8> = (0..4096u32).map(|i| (i * 7919 % 256) as u8).collect();
+        let compressed = compress(&data, 8, 16, 256, mask).unwrap();
+        assert_eq!(
+            decompress(&compressed, data.len(), 8, 16, 256, mask).unwrap(),
+            data
+        );
+        let cut = &compressed[..compressed.len() / 2];
+        let err = decompress(cut, data.len(), 8, 16, 256, mask).unwrap_err();
+        assert!(err.contains("ends after"), "{err}");
+    }
+
+    /// The encoder's last byte ends in zero bits, and a decoder that already
+    /// has its declared output reads them as the start of a block it cannot
+    /// finish. That block is nothing, not zeros: a declared output that runs
+    /// past what the stream completed is refused, whatever the padding
+    /// would have decoded as.
+    #[test]
+    fn a_block_the_stream_cannot_finish_yields_no_samples() {
+        let mask = SZ_NN_OPTION_MASK | SZ_MSB_OPTION_MASK;
+        let inputs: [Vec<u8>; 3] = [
+            vec![0u8; 256],
+            vec![42u8; 256],
+            (0..256u32).map(|i| (i * 7 + 13) as u8).collect(),
+        ];
+        for data in inputs {
+            let compressed = compress(&data, 8, 8, 256, mask).unwrap();
+            assert_eq!(decompress(&compressed, 256, 8, 8, 256, mask).unwrap(), data);
+            let err = decompress(&compressed, 264, 8, 8, 256, mask).unwrap_err();
+            assert!(err.contains("ends after 256 of 264"), "{err}");
+        }
+    }
+
+    /// A stream may end inside its last RSI: the encoder pads only its last
+    /// block, not the scanline, so a total that is not a multiple of the RSI
+    /// comes back whole from a stream that stops after its last real block,
+    /// with whatever byte padding that leaves.
+    #[test]
+    fn a_stream_ending_inside_its_last_rsi_is_complete_once_the_output_is() {
+        let mask = SZ_NN_OPTION_MASK | SZ_MSB_OPTION_MASK;
+        for len in [4096 + 904, 4097, 4103, 5000] {
+            let data: Vec<u8> = (0..len as u32).map(|i| (i * 7919 % 251) as u8).collect();
+            roundtrip(&data, 8, 16, 256, mask);
+        }
     }
 
     #[test]

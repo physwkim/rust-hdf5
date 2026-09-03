@@ -1224,7 +1224,9 @@ fn v4_datatype_message_from_h5py_is_readable() {
     );
     let raw = ds.read_raw_bytes().unwrap();
     let xs: Vec<f32> = raw
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|e| f32::from_le_bytes(e[0..4].try_into().unwrap()))
         .collect();
     assert_eq!(xs, vec![0.0, 1.0, 2.0, 3.0]);
@@ -1329,12 +1331,16 @@ fn v2_compound_from_h5py_decodes_member_offsets() {
     let raw = ds.read_raw_bytes().unwrap();
     assert_eq!(raw.len(), 3 * 12);
     let alpha: Vec<i32> = raw
-        .chunks_exact(12)
+        .as_chunks::<12>()
+        .0
+        .iter()
         .map(|e| i32::from_le_bytes(e[0..4].try_into().unwrap()))
         .collect();
     assert_eq!(alpha, vec![1, 2, 3]);
     let beta: Vec<f32> = raw
-        .chunks_exact(12)
+        .as_chunks::<12>()
+        .0
+        .iter()
         .flat_map(|e| {
             [
                 f32::from_le_bytes(e[4..8].try_into().unwrap()),
