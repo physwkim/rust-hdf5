@@ -13,6 +13,61 @@
   keeps the dataset by its bytes instead of modelling it. The regression
   fixture is upstream's `test/testfiles/bad_chunk_ndims.h5`.
 
+- `read_slice` and its buffer-reuse and unconverted forms refuse a
+  selection whose start plus count wraps past `u64::MAX`; it used to wrap
+  back inside the extent and read unrelated bytes (a panic under overflow
+  checks). `H5Dataset::read_slice` refuses an oversized count as a
+  selection before it sizes the destination instead of failing the
+  allocation. One helper now owns the rule the writer and the region
+  reference path each checked on their own.
+
+- A contiguous dataset whose stored address is close enough to `u64::MAX`
+  that adding a slice's offset wraps is refused instead of served from
+  the wrapped offset. The external file list path checks its slot offset
+  the same way.
+
+- A compact dataset whose payload is not exactly the extent's element
+  count times the element size is refused where its layout is checked
+  against its dataspace and datatype, as `H5D__compact_init` refuses it;
+  a short payload used to be indexed past its end by the slice path. The
+  reader lists the dataset with the disagreement as its unreadable
+  reason; a read-write reopen keeps it by its bytes.
+
+- Reservations made from a file's own counts are bounded by what the
+  file holds: the vlen reference read reserves no more references than
+  its image has, a fixed array whose element count does not fit in the
+  file is refused before anything is sized from it, and a free-space
+  section count is bounded by its block. Each used to abort the process
+  on allocation from a crafted count.
+
+- Coalescing chunk runs asks whether one run continues the next with a
+  checked sum, so an index entry a few bytes short of `u64::MAX` fails
+  its read instead of overflowing the arithmetic in front of it.
+
+- `lzf` decompression reserves its output from the input's size (the
+  stream expands at most 88x) instead of from `cd_values[2]`, which
+  h5py's `lzf_filter.c` treats as a hint it grows past; a crafted
+  declared size used to abort the process on allocation.
+
+- SZIP refuses `pixels_per_block` above 32 and `pixels_per_scanline`
+  above 4096 (`SZ_MAX_PIXELS_PER_BLOCK` and `SZ_MAX_PIXELS_PER_SCANLINE`
+  in `szlib.h`) on compress as well as decompress, reserves the declared
+  output fallibly, and reports a compressed stream that runs out before
+  its declared output as an error instead of decoding fabricated zero
+  bits for as long as the declaration asks. A stream that ends once the
+  declared output is complete still decodes.
+
+- Dropping a `SwmrWriter` without calling `close` writes the frames its
+  band buffers hold (a multi-frame-chunk dataset's frames that have not
+  filled a chunk yet) instead of leaving them, already counted into the
+  extent, reading back as fill. A failure on that path is reported on
+  stderr; `close` returns it.
+
+- `SwmrWriter::flush` writes the band a multi-frame-chunk dataset is
+  still filling, zero-padded, and keeps its frames, so a reader sees them
+  where the published extent already counts them instead of as fill. The
+  completing append writes the same chunks whole.
+
 ## 0.5.1
 
 ### Changed
