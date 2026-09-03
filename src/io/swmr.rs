@@ -498,32 +498,35 @@ impl SwmrWriter {
 
         // A full band is written immediately.
         if self.band_buffers[&ds_index].frames.len() as u64 == frames_per_chunk {
-            self.write_band(ds_index)?;
+            self.write_band(ds_index, false)?;
         }
         Ok(())
     }
 
     /// Assemble and write every chunk of the currently buffered band of a
-    /// multi-frame-chunk dataset, then clear the buffer. A band shorter than
-    /// `frames_per_chunk` (the final band at close) yields zero-padded
-    /// chunks; the dataset's logical extent is not changed.
-    fn write_band(&mut self, ds_index: usize) -> IoResult<()> {
-        let (frames, n, frame_dims, tile_dims, elem_size) = {
-            let bb = self
-                .band_buffers
-                .get_mut(&ds_index)
-                .expect("band buffer present");
-            if bb.frames.is_empty() {
-                return Ok(());
-            }
-            (
-                std::mem::take(&mut bb.frames),
-                bb.frames_per_chunk,
-                bb.frame_dims.clone(),
-                bb.tile_dims.clone(),
-                bb.elem_size,
-            )
-        };
+    /// multi-frame-chunk dataset. A band shorter than `frames_per_chunk`
+    /// yields zero-padded chunks; the dataset's logical extent is not
+    /// changed.
+    ///
+    /// With `keep`, the frames stay buffered: a flush publishes what the
+    /// extent already counts, and the same chunks are written again, whole,
+    /// when the band completes (or at close). Without it the buffer is
+    /// cleared, which is the band's final write.
+    fn write_band(&mut self, ds_index: usize, keep: bool) -> IoResult<()> {
+        let bb = self
+            .band_buffers
+            .get_mut(&ds_index)
+            .expect("band buffer present");
+        if bb.frames.is_empty() {
+            return Ok(());
+        }
+        let (frames, n, frame_dims, tile_dims, elem_size) = (
+            &bb.frames,
+            bb.frames_per_chunk,
+            &bb.frame_dims,
+            &bb.tile_dims,
+            bb.elem_size,
+        );
 
         let count = frames.len() as u64;
         // Band index: the logical extent already counts every appended
@@ -541,7 +544,7 @@ impl SwmrWriter {
         // Split each frame into its tiles once (row-major cell order).
         let per_frame_tiles: Vec<Vec<Vec<u8>>> = frames
             .iter()
-            .map(|f| split_frame_into_tiles(f, &frame_dims, &tile_dims, elem_size))
+            .map(|f| split_frame_into_tiles(f, frame_dims, tile_dims, elem_size))
             .collect();
 
         // For each tile-grid cell, assemble the [n, tile...] chunk: frame
@@ -554,16 +557,26 @@ impl SwmrWriter {
             let linear = band * cells + cell as u64;
             self.writer.write_chunk(ds_index, linear, &chunk)?;
         }
+        if !keep {
+            bb.frames.clear();
+        }
+        Ok(())
+    }
+
+    /// Write the currently buffered band of every multi-frame-chunk dataset:
+    /// its final write (`keep == false`, at close), or the write a flush
+    /// publishes ahead of the band completing.
+    fn write_band_buffers(&mut self, keep: bool) -> IoResult<()> {
+        let indices: Vec<usize> = self.band_buffers.keys().copied().collect();
+        for ds_index in indices {
+            self.write_band(ds_index, keep)?;
+        }
         Ok(())
     }
 
     /// Write the final partial band of every multi-frame-chunk dataset.
     fn flush_band_buffers(&mut self) -> IoResult<()> {
-        let indices: Vec<usize> = self.band_buffers.keys().copied().collect();
-        for ds_index in indices {
-            self.write_band(ds_index)?;
-        }
-        Ok(())
+        self.write_band_buffers(false)
     }
 
     /// Flush with ordered semantics for SWMR safety.
@@ -578,6 +591,12 @@ impl SwmrWriter {
     /// header block and index blocks to the allocator, so writing either back
     /// puts an object header over whatever now owns the block.
     pub fn flush(&mut self) -> IoResult<()> {
+        // Step 0: The extent already counts every frame a band buffer holds,
+        // and the headers written below publish that extent; a band still
+        // filling is written zero-padded first, and kept, so the frames a
+        // reader is told about are frames it can read.
+        self.write_band_buffers(true)?;
+
         // Step 1: Flush chunk index structures for all chunked datasets —
         // extensible array (streaming), fixed array (fixed grid), and v2
         // B-tree alike, matching finalize_for_swmr.

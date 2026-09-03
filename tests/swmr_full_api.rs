@@ -313,6 +313,48 @@ fn a_dropped_writer_writes_its_partial_band() {
     cleanup(&path);
 }
 
+/// A flush publishes the frames of a band still filling, not just the
+/// extent that counts them: a reader opened after each flush sees every
+/// appended frame, through the band completing and the next one starting.
+#[test]
+fn a_flush_publishes_a_partial_band() {
+    let path = unique_tmp("flush_band");
+    let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+    let ds = w
+        .create_streaming_dataset_chunked::<u8>("frames", &[2, 2], &[3, 2, 2])
+        .unwrap();
+    w.start_swmr().unwrap();
+    let frame = |f: u8| {
+        let v = 4 * f + 1;
+        [v, v + 1, v + 2, v + 3]
+    };
+    let published = |n: u8| -> Vec<u8> { (0..n).flat_map(frame).collect() };
+
+    // Two frames: a partial first band.
+    w.append_frame(ds, &frame(0)).unwrap();
+    w.append_frame(ds, &frame(1)).unwrap();
+    w.flush().unwrap();
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.dataset_shape("frames").unwrap(), vec![2, 2, 2]);
+    assert_eq!(r.read_dataset::<u8>("frames").unwrap(), published(2));
+
+    // Two more: the first band completes, the second starts.
+    w.append_frame(ds, &frame(2)).unwrap();
+    w.append_frame(ds, &frame(3)).unwrap();
+    w.flush().unwrap();
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.dataset_shape("frames").unwrap(), vec![4, 2, 2]);
+    assert_eq!(r.read_dataset::<u8>("frames").unwrap(), published(4));
+
+    // A flush with nothing new to say changes nothing.
+    w.flush().unwrap();
+    w.close().unwrap();
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.read_dataset::<u8>("frames").unwrap(), published(4));
+
+    cleanup(&path);
+}
+
 /// Resuming a multi-frame-chunk dataset (`chunk[0] > 1`) after `open_append`
 /// is rejected with a clear error rather than corrupting the chunk grid.
 #[test]
