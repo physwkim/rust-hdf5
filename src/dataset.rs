@@ -16,6 +16,7 @@ use crate::format::reference::{Reference, ReferenceTarget};
 use crate::format::selection::Selection;
 use crate::format::storage_kind::AttributeStorage;
 use crate::io::file_handle::ReadDst;
+use crate::io::hyperslab::check_hyperslab;
 use crate::io::reader::{read_image_into_new, ExternalFileSegment};
 use crate::io::writer::ChunkIndexKind;
 use crate::types::H5Type;
@@ -3790,7 +3791,9 @@ impl H5Dataset {
     pub fn read_slice<T: H5Type>(&self, starts: &[usize], counts: &[usize]) -> Result<Vec<T>> {
         match &self.info {
             DatasetInfo::Reader {
-                name, element_size, ..
+                name,
+                shape,
+                element_size,
             } => {
                 if T::element_size() != *element_size {
                     return Err(Hdf5Error::TypeMismatch(format!(
@@ -3803,6 +3806,11 @@ impl H5Dataset {
                 let starts_u64: Vec<u64> = starts.iter().map(|&s| s as u64).collect();
                 let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
 
+                // Bounds before sizing: the destination is allocated here,
+                // ahead of the reader's own check, so a selection the extent
+                // does not admit must be refused before its size is computed.
+                let dims: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
+                check_hyperslab(&dims, &starts_u64, &counts_u64)?;
                 let count = element_count(&counts_u64)?;
                 let mut inner = borrow_inner_mut(&self.file_inner);
                 let H5FileInner::Reader(reader) = &mut *inner else {
@@ -4014,7 +4022,10 @@ impl H5Dataset {
                     )));
                 }
 
-                let expected: usize = counts.iter().product();
+                let starts_u64: Vec<u64> = starts.iter().map(|&s| s as u64).collect();
+                let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
+
+                let expected = element_count(&counts_u64)?;
                 if data.len() != expected {
                     return Err(Hdf5Error::InvalidState(format!(
                         "data length {} does not match slice size {}",
@@ -4022,9 +4033,6 @@ impl H5Dataset {
                         expected,
                     )));
                 }
-
-                let starts_u64: Vec<u64> = starts.iter().map(|&s| s as u64).collect();
-                let counts_u64: Vec<u64> = counts.iter().map(|&c| c as u64).collect();
 
                 let byte_len = data.len() * T::element_size();
                 let host =

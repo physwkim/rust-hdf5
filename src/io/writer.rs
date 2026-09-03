@@ -72,7 +72,7 @@ use crate::format::{FormatContext, LibverBound, ObjectFormat, UNDEF_ADDR};
 
 use crate::io::allocator::{FileAllocator, FreeBlock};
 use crate::io::file_handle::FileHandle;
-use crate::io::hyperslab::{for_each_contiguous_run, for_each_dual_run};
+use crate::io::hyperslab::{check_hyperslab, for_each_contiguous_run, for_each_dual_run};
 use crate::io::symbol_table_io::{free_stab, write_stab, Stab, StabExtents, StabLink, StabTarget};
 use crate::io::{FileMeta, IoResult};
 
@@ -11213,29 +11213,13 @@ impl Hdf5Writer {
         let element_size = ds.datatype.element_size() as u64;
         let ndims = dims.len();
 
-        if starts.len() != ndims || counts.len() != ndims {
-            return Err(crate::io::IoError::InvalidState(
-                "starts/counts length must match dataset rank".into(),
-            ));
-        }
+        // Every hyperslab edge must stay inside the dataset; without this an
+        // out-of-bounds selection writes raw bytes over neighbouring data.
+        check_hyperslab(dims, starts, counts)?;
         if ndims == 0 {
             return Err(crate::io::IoError::InvalidState(
                 "write_slice does not support scalar datasets; use write_dataset_raw".into(),
             ));
-        }
-
-        // Every hyperslab edge must stay inside the dataset; without this an
-        // out-of-bounds selection writes raw bytes over neighbouring data.
-        for d in 0..ndims {
-            let end = starts[d]
-                .checked_add(counts[d])
-                .ok_or_else(|| crate::io::IoError::InvalidState("slice extent overflow".into()))?;
-            if end > dims[d] {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "slice out of bounds in dimension {}: start {} + count {} exceeds extent {}",
-                    d, starts[d], counts[d], dims[d]
-                )));
-            }
         }
 
         let out_elems: u64 = counts.iter().product();

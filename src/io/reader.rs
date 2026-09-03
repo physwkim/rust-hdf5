@@ -55,7 +55,7 @@ use crate::format::symbol_table::SymbolTableNode;
 use crate::format::{BlockReader, FormatContext, UNDEF_ADDR};
 
 use crate::io::file_handle::{FileHandle, ReadDst};
-use crate::io::hyperslab::{compute_strides, for_each_contiguous_run};
+use crate::io::hyperslab::{check_hyperslab, compute_strides, for_each_contiguous_run};
 use crate::io::locking::FileLocking;
 use crate::io::{FileMeta, IoResult};
 
@@ -6946,7 +6946,7 @@ impl Hdf5Reader {
             let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
             return owner.read_slice(&path, starts, counts);
         }
-        let (datatype, out_bytes) = self.slice_size_and_datatype(name, counts)?;
+        let (datatype, out_bytes) = self.slice_size_and_datatype(name, starts, counts)?;
         // The selection lands in the vector this returns:
         // `read_slice_into_unconverted` defines every byte of the buffer it is
         // handed, so there is nothing to zero first and nothing to copy after.
@@ -6989,7 +6989,7 @@ impl Hdf5Reader {
             let (owner, path, _) = self.external_owner(name, MAX_EXTERNAL_HOPS)?;
             return owner.read_slice_into_dst(&path, starts, counts, out, dst);
         }
-        let (datatype, out_bytes) = self.slice_size_and_datatype(name, counts)?;
+        let (datatype, out_bytes) = self.slice_size_and_datatype(name, starts, counts)?;
         if out.len() as u64 != out_bytes {
             return Err(crate::io::IoError::InvalidState(format!(
                 "read_slice_into: buffer is {} bytes but selection needs {}",
@@ -7007,11 +7007,16 @@ impl Hdf5Reader {
     fn slice_size_and_datatype(
         &self,
         name: &str,
+        starts: &[u64],
         counts: &[u64],
     ) -> IoResult<(DatatypeMessage, u64)> {
         let info = self
             .dataset_info_local(name)
             .ok_or_else(|| crate::io::IoError::NotFound(name.to_string()))?;
+        // Bounds first: a selection the extent does not admit is refused
+        // before its byte size is computed, so an oversized count is reported
+        // as such rather than as a failed allocation.
+        check_hyperslab(&info.dataspace.dims, starts, counts)?;
         let out_bytes = saturating_byte_len(counts, info.datatype.element_size() as u64);
         Ok((info.datatype.clone(), out_bytes))
     }
@@ -7052,23 +7057,11 @@ impl Hdf5Reader {
         let external_files = info.external_files.clone();
         let ndims = dims.len();
 
-        if starts.len() != ndims || counts.len() != ndims {
-            return Err(crate::io::IoError::InvalidState(
-                "starts/counts length must match dataset rank".into(),
-            ));
-        }
+        check_hyperslab(&dims, starts, counts)?;
         if ndims == 0 {
             return Err(crate::io::IoError::InvalidState(
                 "read_slice does not support scalar datasets; use read_dataset_raw".into(),
             ));
-        }
-        for d in 0..ndims {
-            if starts[d] + counts[d] > dims[d] {
-                return Err(crate::io::IoError::InvalidState(format!(
-                    "slice out of bounds: dim {} start {} + count {} > {}",
-                    d, starts[d], counts[d], dims[d]
-                )));
-            }
         }
 
         match &layout {
