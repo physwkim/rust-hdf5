@@ -588,9 +588,17 @@ impl SwmrWriter {
     }
 
     /// [`write_band`](Self::write_band) for every multi-frame-chunk dataset.
+    ///
+    /// A deleted dataset is skipped, the rule `flush` applies to its header
+    /// and index, and its buffer goes with it: the frames have nowhere to go,
+    /// and a buffer left behind would fail every later write here.
     fn write_band_buffers(&mut self, tail: Tail) -> IoResult<()> {
         let indices: Vec<usize> = self.band_buffers.keys().copied().collect();
         for ds_index in indices {
+            if self.writer.ds(ds_index).lock().deleted {
+                self.band_buffers.remove(&ds_index);
+                continue;
+            }
             self.write_band(ds_index, tail)?;
         }
         Ok(())
@@ -928,6 +936,33 @@ mod swmr_hardlink_tests {
         }
         let mut r = Hdf5Reader::open(&path).unwrap();
         assert_eq!(r.read_dataset_raw("frames").unwrap(), frames(6));
+    }
+
+    /// A dataset deleted with frames buffered takes its band buffer with it:
+    /// the frames have nowhere to go, and a buffer left behind would fail
+    /// every later band write with the dataset's missing chunk index.
+    #[test]
+    fn a_deleted_dataset_takes_its_band_buffer_with_it() {
+        let dir = TmpDir::new("deleted_band");
+        let path = dir.file();
+        let mut w = SwmrWriter::create(&path).unwrap();
+        let idx = w
+            .create_streaming_dataset_chunked(
+                "frames",
+                DatatypeMessage::u8_type(),
+                &[2, 2],
+                &[3, 2, 2],
+            )
+            .unwrap();
+        w.append_frame(idx, &[1u8, 2, 3, 4]).unwrap();
+        w.append_frame(idx, &[5u8, 6, 7, 8]).unwrap();
+        w.writer_mut().delete_dataset("frames").unwrap();
+        w.start_swmr().unwrap();
+        assert!(!w.band_buffers.contains_key(&idx));
+        w.flush().unwrap();
+        w.close().unwrap();
+        let r = Hdf5Reader::open(&path).unwrap();
+        assert!(r.dataset_names().is_empty());
     }
 
     /// Regression: a hard link created AFTER `start_swmr` is a structural
