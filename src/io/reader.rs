@@ -269,7 +269,7 @@ pub(crate) enum ViewStorage {
 pub(crate) struct DatasetViewSource {
     /// The owning file's whole-file map, or `None` when that file is read
     /// through `pread`.
-    pub map: Option<std::sync::Arc<memmap2::Mmap>>,
+    pub map: Option<std::sync::Arc<crate::io::file_handle::LockedMap>>,
     /// Where the dataset's image lies in that file.
     pub storage: ViewStorage,
     /// How one element is stored, which decides whether the stored bytes are

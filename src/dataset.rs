@@ -4487,15 +4487,20 @@ impl H5Dataset {
     /// dropped, and after a SWMR refresh has retaken the map — a live view
     /// keeps showing the file as it was when *its* map was taken, while the
     /// refreshed handle reads the new one. Nothing about a view is
-    /// invalidated by anything this process does.
+    /// invalidated by anything this process does. The share carries the
+    /// shared file lock the map was taken under, so for as long as any view
+    /// is alive a writer that honours locks cannot open the file, whether or
+    /// not the reader that took the map is still open.
     ///
     /// # Truncation
     ///
     /// The pages are the file's own. Another process writing the file in
     /// place is seen through the view, and one *truncating* it under the map
-    /// faults with `SIGBUS` on the pages that went away. That is the standing
-    /// risk of mapping the file at all; a view does not add to it, and no
-    /// guard inside this process can close it.
+    /// faults with `SIGBUS` on the pages that went away. The shared lock the
+    /// view keeps is what stands between the map and such a writer; one that
+    /// waives locks ([`FileLocking::Disabled`](crate::FileLocking::Disabled),
+    /// or a filesystem without them) is outside what any guard inside this
+    /// process can see.
     ///
     /// ```no_run
     /// # use rust_hdf5::H5File;

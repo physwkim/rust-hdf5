@@ -109,9 +109,37 @@ enum ReadSource {
     /// borrows nothing: it clones this handle, so the pages stay mapped for
     /// as long as the view lives even after
     /// [`FileHandle::refresh_read_source`] has retaken the map or the handle
-    /// itself is gone.
+    /// itself is gone — and, the share being a [`LockedMap`], so does the
+    /// shared lock the map was taken under.
     #[cfg(feature = "mmap")]
-    Mapped(Arc<memmap2::Mmap>),
+    Mapped(Arc<LockedMap>),
+}
+
+/// A read-only map of the file together with the shared lock it was taken
+/// under.
+///
+/// The lock is held on the open file, not on any one descriptor, so a
+/// duplicate of the handle's descriptor keeps it for as long as the
+/// duplicate is open. Holding one here makes the map's lifetime the lock's:
+/// a share of the map that outlives its handle — a zero-copy view — still
+/// keeps out every writer that honours locks, and a truncation under the
+/// map stays impossible for as long as the map is reachable. The one way
+/// the lock could go first, [`FileHandle::release_lock`], refuses read-only
+/// handles for this reason.
+#[cfg(feature = "mmap")]
+pub(crate) struct LockedMap {
+    map: memmap2::Mmap,
+    /// Declared after `map`, so the pages go before the lock does.
+    _lock: File,
+}
+
+#[cfg(feature = "mmap")]
+impl std::ops::Deref for LockedMap {
+    type Target = memmap2::Mmap;
+
+    fn deref(&self) -> &memmap2::Mmap {
+        &self.map
+    }
 }
 
 /// Largest read a mapped handle serves out of its map.
@@ -183,7 +211,8 @@ impl ReadSource {
     ///
     /// Mapping failure is not an open failure. An empty file (`mmap` rejects a
     /// zero length), a file longer than the address space holds, a filesystem
-    /// or platform that refuses `mmap` — each lands on `Pread`, which every
+    /// or platform that refuses `mmap`, a descriptor that cannot be
+    /// duplicated to keep the lock — each lands on `Pread`, which every
     /// caller already cannot tell from a map.
     fn for_read_only(file: &File, lock_held: bool) -> Self {
         #[cfg(feature = "mmap")]
@@ -199,8 +228,9 @@ impl ReadSource {
                 // the mapped bytes as a snapshot: nothing here caches a
                 // borrowed slice, so a concurrent modification can only be
                 // seen or not seen, never half-seen.
-                if let Ok(map) = unsafe { memmap2::Mmap::map(file) } {
-                    return ReadSource::Mapped(Arc::new(map));
+                if let (Ok(lock), Ok(map)) = (file.try_clone(), unsafe { memmap2::Mmap::map(file) })
+                {
+                    return ReadSource::Mapped(Arc::new(LockedMap { map, _lock: lock }));
                 }
             }
         }
@@ -215,7 +245,7 @@ impl ReadSource {
     /// The one place that decides, so that no read entry point can pick for
     /// itself and none can be added that skips the choice.
     #[cfg(feature = "mmap")]
-    fn map_for(&self, len: usize, dst: ReadDst) -> Option<&memmap2::Mmap> {
+    fn map_for(&self, len: usize, dst: ReadDst) -> Option<&LockedMap> {
         match self {
             ReadSource::Mapped(map) if dst == ReadDst::Reused || len <= MAP_MAX_READ => Some(map),
             _ => None,
@@ -637,7 +667,19 @@ impl FileHandle {
     /// release the lock entirely — matching the HDF5 C library, which
     /// also doesn't enforce reader/writer separation purely through
     /// OS locks during SWMR streaming.
+    ///
+    /// A read-only handle is refused: its shared lock is the map's and every
+    /// live share of the map's ([`LockedMap`]), and releasing it here would
+    /// release it for the duplicates too. Nothing needs to attach behind a
+    /// reader in any case; the release is the SWMR writer's downgrade.
     pub fn release_lock(&mut self) -> std::io::Result<()> {
+        if !self.writable {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "a read-only handle keeps its shared lock: its map, and every view of it, \
+                 were taken under it",
+            ));
+        }
         if !self.lock_held || matches!(self.lock_policy, FileLocking::Disabled) {
             return Ok(());
         }
@@ -646,13 +688,6 @@ impl FileHandle {
         self.flush()?;
         locking::release(&self.file)?;
         self.lock_held = false;
-        // A map is only ever held under the lock (`ReadSource::for_read_only`);
-        // a read-only handle that gives its lock up reads through the
-        // descriptor from here on.
-        #[cfg(feature = "mmap")]
-        {
-            self.source = ReadSource::Pread;
-        }
         Ok(())
     }
 
@@ -809,12 +844,13 @@ impl FileHandle {
     /// The bytes are the file's own, so a caller must not assume they stop
     /// changing: another process writing the file in place through a shared
     /// mapping is seen through this one too, and a truncation past the map's
-    /// end takes `SIGBUS` on the pages that went away. The map exists only
-    /// under this handle's shared lock ([`ReadSource::for_read_only`]), which
-    /// keeps out every writer that honours locks; one that waives them is
-    /// outside what any guard in this process can see.
+    /// end takes `SIGBUS` on the pages that went away. The share carries the
+    /// shared lock the map was taken under ([`LockedMap`]), which keeps out
+    /// every writer that honours locks for as long as the share is alive;
+    /// one that waives them is outside what any guard in this process can
+    /// see.
     #[cfg(feature = "mmap")]
-    pub fn map_snapshot(&self) -> Option<Arc<memmap2::Mmap>> {
+    pub fn map_snapshot(&self) -> Option<Arc<LockedMap>> {
         match &self.source {
             ReadSource::Mapped(map) => Some(Arc::clone(map)),
             ReadSource::Pread => None,
@@ -1282,11 +1318,36 @@ mod read_source_tests {
 
         let mut locked = FileHandle::open_read_with_locking(&path, FileLocking::Enabled).unwrap();
         assert_eq!(locked.is_mapped(), cfg!(feature = "mmap"));
-        locked.release_lock().unwrap();
-        assert!(!locked.is_mapped());
+        // The lock is the map's, and every share of the map's: a read-only
+        // handle has no way to give it up.
+        assert!(locked.release_lock().is_err());
+        assert_eq!(locked.is_mapped(), cfg!(feature = "mmap"));
         assert_eq!(locked.read_at(0, 4).unwrap(), vec![7u8; 4]);
-        locked.refresh_read_source();
-        assert!(!locked.is_mapped());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A share of the map carries the shared lock it was taken under: a
+    /// writer that honours locks is refused while the share is alive, even
+    /// once the handle that took the map is gone, and admitted after.
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn a_map_share_keeps_the_shared_lock_after_its_handle() {
+        let d = dir("map_keeps_lock");
+        let path = d.join("f.bin");
+        std::fs::write(&path, vec![7u8; 4096]).unwrap();
+
+        let handle = FileHandle::open_read_with_locking(&path, FileLocking::Enabled).unwrap();
+        let share = handle
+            .map_snapshot()
+            .expect("a locked read-only handle maps");
+        drop(handle);
+        assert!(
+            FileHandle::open_readwrite_with_locking(&path, FileLocking::Enabled).is_err(),
+            "a writer took the lock under a live map share"
+        );
+        assert_eq!(&share[..4], &[7u8; 4]);
+        drop(share);
+        FileHandle::open_readwrite_with_locking(&path, FileLocking::Enabled).unwrap();
         let _ = std::fs::remove_dir_all(&d);
     }
 

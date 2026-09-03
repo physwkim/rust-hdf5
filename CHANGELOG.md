@@ -73,8 +73,11 @@
   unmapped file is. A page a writer's truncation took away faults the
   process on its next touch, where a positioned read past the new end is
   an error, and the shared lock is what keeps a writer that honours locks
-  from opening the file while the map is out. A SWMR reader opened with
-  the default policy holds the lock and keeps its map.
+  from opening the file while the map is out. A zero-copy view keeps a
+  share of that lock with its share of the map, so such a writer stays out
+  for as long as any view is alive, after the file that produced it is
+  closed too; a read-only handle cannot release its lock. A SWMR reader
+  opened with the default policy holds the lock and keeps its map.
 
 - `SwmrWriter::flush` writes the band a multi-frame-chunk dataset is
   still filling, zero-padded, and keeps its frames, so a reader sees them
