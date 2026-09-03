@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A chunked dataset whose stored chunk dimensionality is not the dataspace
+  rank plus one (the trailing element-size dimension) is refused as its
+  layout decodes, the check libhdf5 moved into `H5O__layout_decode` for
+  CVE-2026-19025 (HDFGroup/hdf5#6508). A reader lists the dataset and
+  reports the disagreement as its unreadable reason instead of handing back
+  a handle whose index keys decode at the wrong rank; a read-write reopen
+  keeps the dataset by its bytes instead of modelling it. The regression
+  fixture is upstream's `test/testfiles/bad_chunk_ndims.h5`.
+
 ## 0.5.1
 
 ### Changed

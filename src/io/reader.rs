@@ -3398,6 +3398,17 @@ impl Hdf5Reader {
             }
         }
 
+        // `H5O__layout_decode` refuses a chunked layout against its sibling
+        // dataspace message as it decodes; the two decode side by side here,
+        // so this is where that check lands.
+        if let (Some(ds), Some(dl)) = (&dataspace, &layout) {
+            if let Err(e) = dl.check_chunk_rank(ds) {
+                block(format!(
+                    "the dimensionality of its chunks doesn't match the dataspace: {e}"
+                ));
+            }
+        }
+
         if let Some(why) = blocked {
             return ObjectKind::UnreadableDataset(why);
         }

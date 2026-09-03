@@ -255,6 +255,32 @@ pub enum DataLayoutMessage {
 }
 
 impl DataLayoutMessage {
+    /// The check `H5O__layout_decode` (H5Olayout.c) makes against the
+    /// sibling dataspace message as a chunked layout decodes: the stored
+    /// dimensionality is the chunk rank plus one trailing element-size
+    /// dimension, so it must be exactly one more than the dataspace rank
+    /// (HDFGroup/hdf5#6508, CVE-2026-19025). Left to chunk I/O, disagreeing
+    /// ranks decode the index keys at the wrong rank and the chunk grid
+    /// cannot be indexed. Any other layout has no chunks and always passes.
+    pub fn check_chunk_rank(
+        &self,
+        dataspace: &crate::format::messages::dataspace::DataspaceMessage,
+    ) -> FormatResult<()> {
+        let (Self::ChunkedV3 { chunk_dims, .. } | Self::ChunkedV4 { chunk_dims, .. }) = self else {
+            return Ok(());
+        };
+        let rank = dataspace.dims.len();
+        if chunk_dims.len() != rank + 1 {
+            return Err(FormatError::InvalidData(format!(
+                "chunk dimensionality {} over a rank-{rank} dataspace; the chunk rank plus \
+                 the element-size dimension must be {}",
+                chunk_dims.len(),
+                rank + 1
+            )));
+        }
+        Ok(())
+    }
+
     /// The storage class and message version, for a message that has to name
     /// which layout it is talking about.
     pub fn describe(&self) -> &'static str {
@@ -1408,5 +1434,41 @@ mod tests {
         let msg = DataLayoutMessage::chunked_v4_earray(4, vec![1, 65536], params, 0x4000);
         let encoded = msg.encode(&ctx8());
         assert_eq!(encoded[4], 3); // enc_bytes_per_dim = 3 (65536 = 0x10000, needs 3 bytes)
+    }
+
+    /// `check_chunk_rank` at each boundary of "chunk dimensionality is the
+    /// dataspace rank plus one": exactly one more passes, one fewer and one
+    /// more than that fail, and a layout without chunks never fails.
+    #[test]
+    fn check_chunk_rank_boundaries() {
+        use crate::format::messages::dataspace::DataspaceMessage;
+        let rank2 = DataspaceMessage::simple(&[3, 4]);
+        // chunk_dims = [2, 2, elem] over a rank-2 dataspace: rank + 1.
+        let v3 = DataLayoutMessage::chunked_v3_btree_v1(vec![2, 2, 4], 0x1000);
+        assert!(v3.check_chunk_rank(&rank2).is_ok());
+        let v4 = DataLayoutMessage::chunked_v4_single(vec![2, 2, 4], 0x1000);
+        assert!(v4.check_chunk_rank(&rank2).is_ok());
+
+        // One too few: the fixture's patched byte, [2, 2, 4] read as rank-2
+        // chunks of 4-byte elements over a rank-3 dataspace.
+        let rank3 = DataspaceMessage::simple(&[3, 4, 5]);
+        let err = v3.check_chunk_rank(&rank3).unwrap_err();
+        assert!(
+            matches!(err, FormatError::InvalidData(ref s) if s.contains("must be 4")),
+            "{err}"
+        );
+        assert!(v4.check_chunk_rank(&rank3).is_err());
+
+        // One too many, and the scalar extent a chunked layout never fits.
+        let rank1 = DataspaceMessage::simple(&[8]);
+        assert!(v3.check_chunk_rank(&rank1).is_err());
+        assert!(v3.check_chunk_rank(&DataspaceMessage::scalar()).is_err());
+
+        // No chunks, no rank to disagree.
+        let contiguous = DataLayoutMessage::contiguous_unallocated(96);
+        assert!(contiguous.check_chunk_rank(&rank3).is_ok());
+        assert!(contiguous
+            .check_chunk_rank(&DataspaceMessage::scalar())
+            .is_ok());
     }
 }
