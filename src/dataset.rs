@@ -5474,8 +5474,10 @@ mod tests {
             let ds = file.dataset("grid").unwrap();
             let as_i32 = |bytes: Vec<u8>| -> Vec<i32> {
                 bytes
-                    .chunks_exact(4)
-                    .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| i32::from_le_bytes(*b))
                     .collect()
             };
             // The chunk that precedes each edge chunk is full, so a leak would
@@ -5785,8 +5787,10 @@ mod tests {
             let raw = a.read_raw().unwrap();
             assert_eq!(raw.len(), 3 * 4);
             let got: Vec<i32> = raw
-                .chunks_exact(4)
-                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| i32::from_le_bytes(*b))
                 .collect();
             assert_eq!(got, offsets);
         }

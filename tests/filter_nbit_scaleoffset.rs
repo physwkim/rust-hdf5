@@ -323,8 +323,8 @@ fn scaleoffset_float64() {
     let pl = pipeline(FILTER_SCALEOFFSET, cd);
     let out = reverse_filters(&pl, &chunk).expect("scaleoffset f64 reverse");
     assert_eq!(out.len(), 80 * 8);
-    for (i, e) in out.chunks_exact(8).enumerate() {
-        let got = f64::from_le_bytes(e.try_into().unwrap());
+    for (i, e) in out.as_chunks::<8>().0.iter().enumerate() {
+        let got = f64::from_le_bytes(*e);
         let want = 3.14159 + i as f64 * 0.001;
         assert!(
             (got - want).abs() <= 5e-4,
@@ -352,8 +352,8 @@ fn scaleoffset_float32() {
     let pl = pipeline(FILTER_SCALEOFFSET, cd);
     let out = reverse_filters(&pl, &chunk).expect("scaleoffset f32 reverse");
     assert_eq!(out.len(), 60 * 4);
-    for (i, e) in out.chunks_exact(4).enumerate() {
-        let got = f32::from_le_bytes(e.try_into().unwrap());
+    for (i, e) in out.as_chunks::<4>().0.iter().enumerate() {
+        let got = f32::from_le_bytes(*e);
         let want = 2.5 + i as f32 * 0.01;
         assert!(
             (got - want).abs() <= 5e-3,
@@ -386,8 +386,8 @@ fn scaleoffset_float_fill_value_sentinel() {
     let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     let chunk = apply_filters(&pl, &data).expect("scaleoffset f64 compress");
     let out = reverse_filters(&pl, &chunk).expect("scaleoffset f64 reverse");
-    for (i, e) in out.chunks_exact(8).enumerate() {
-        let got = f64::from_le_bytes(e.try_into().unwrap());
+    for (i, e) in out.as_chunks::<8>().0.iter().enumerate() {
+        let got = f64::from_le_bytes(*e);
         assert!(
             (got - values[i]).abs() <= 5e-3,
             "elem {i}: got {got}, want {}",

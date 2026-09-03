@@ -2205,8 +2205,10 @@ mod integration_tests {
             let ds = file.dataset("image").unwrap();
             let off = ds.attr("NDArrayDimOffset").unwrap().read_raw().unwrap();
             let got: Vec<i32> = off
-                .chunks_exact(4)
-                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| i32::from_le_bytes(*b))
                 .collect();
             assert_eq!(got, vec![0, 4, 8]);
             let uid: i32 = ds.attr("NDUniqueId").unwrap().read_numeric().unwrap();
@@ -2816,8 +2818,10 @@ mod integration_tests {
             .unwrap()
             .iter()
             .map(|item| {
-                item.chunks_exact(4)
-                    .map(|w| i32::from_le_bytes(w.try_into().unwrap()))
+                item.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|w| i32::from_le_bytes(*w))
                     .collect()
             })
             .collect();

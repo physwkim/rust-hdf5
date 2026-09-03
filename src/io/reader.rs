@@ -8730,8 +8730,10 @@ mod tests {
 
         // Verify the values
         let read_values: Vec<i32> = data
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         assert_eq!(read_values, values);
 
@@ -8758,8 +8760,10 @@ mod tests {
 
         let data = reader.read_dataset_raw("data_1d").unwrap();
         let read_values: Vec<i32> = data
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         assert_eq!(read_values, values);
 
@@ -8788,8 +8792,10 @@ mod tests {
 
         let data = reader.read_dataset_raw("test").unwrap();
         let vals: Vec<i32> = data
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         assert_eq!(vals, vec![1, 2, 3, 4]);
 
@@ -8898,8 +8904,10 @@ mod tests {
             out
         };
         let decode = |raw: Vec<u8>| -> Vec<i32> {
-            raw.chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
                 .collect()
         };
 
@@ -9207,8 +9215,10 @@ mod h5py_debug_tests {
         // Element-exact read of one dataset.
         let raw = reader.read_dataset_raw("ds_3").unwrap();
         let vals: Vec<i32> = raw
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         assert_eq!(vals, (30..40).collect::<Vec<i32>>());
         let _ = std::fs::remove_file(&path);
@@ -9243,8 +9253,10 @@ mod h5py_debug_tests {
         // Element-exact read of one dense-stored dataset.
         let raw = reader.read_dataset_raw("dense/d07").unwrap();
         let vals: Vec<f64> = raw
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c))
             .collect();
         assert_eq!(vals, vec![7.0; 4]);
         let _ = std::fs::remove_file(&path);
@@ -9282,8 +9294,10 @@ mod h5py_debug_tests {
         // Element-exact read of a doubly-nested dataset.
         let raw = reader.read_dataset_raw("grp1/sub/b").unwrap();
         let vals: Vec<i64> = raw
-            .chunks_exact(8)
-            .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| i64::from_le_bytes(*c))
             .collect();
         assert_eq!(vals, (0..7).collect::<Vec<i64>>());
         let _ = std::fs::remove_file(&path);
@@ -9327,8 +9341,10 @@ mod h5py_debug_tests {
         // Unsigned u4, precision 17, bit offset 3.
         let raw = reader.read_dataset_raw("u4_p17_o3").unwrap();
         let got: Vec<u32> = raw
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
         assert_eq!(
             got,
@@ -9339,8 +9355,10 @@ mod h5py_debug_tests {
         // Signed i4 with negatives, precision 13, bit offset 5.
         let raw = reader.read_dataset_raw("i4_p13_o5").unwrap();
         let got: Vec<i32> = raw
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         assert_eq!(
             got,
@@ -9351,8 +9369,10 @@ mod h5py_debug_tests {
         // Signed i2 with negatives, precision 9, bit offset 4.
         let raw = reader.read_dataset_raw("i2_p9_o4").unwrap();
         let got: Vec<i16> = raw
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| i16::from_le_bytes(*c))
             .collect();
         assert_eq!(
             got,
@@ -9363,8 +9383,10 @@ mod h5py_debug_tests {
         // 2D signed i4, precision 11, bit offset 6 (1-row chunks).
         let raw = reader.read_dataset_raw("i4_2d_p11_o6").unwrap();
         let got: Vec<i32> = raw
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         assert_eq!(
             got,
@@ -9375,16 +9397,20 @@ mod h5py_debug_tests {
         // read_slice path must also apply the conversion exactly once.
         let raw = reader.read_slice("i4_p13_o5", &[4], &[3]).unwrap();
         let got: Vec<i32> = raw
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         assert_eq!(got, vec![7i32, -4096, 4095], "read_slice must convert too");
 
         // 2D slice: second row, all columns.
         let raw = reader.read_slice("i4_2d_p11_o6", &[1, 0], &[1, 4]).unwrap();
         let got: Vec<i32> = raw
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         assert_eq!(
             got,
@@ -9447,8 +9473,10 @@ mod h5py_debug_tests {
             out
         };
         let decode = |raw: Vec<u8>| -> Vec<i32> {
-            raw.chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
                 .collect()
         };
         let cases: &[([u64; 3], [u64; 3])] = &[
@@ -9536,8 +9564,10 @@ mod h5py_debug_tests {
             out
         };
         let decode = |raw: Vec<u8>| -> Vec<f64> {
-            raw.chunks_exact(8)
-                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            raw.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
                 .collect()
         };
         let cases: &[([u64; 2], [u64; 2])] = &[

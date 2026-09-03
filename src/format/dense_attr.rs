@@ -453,7 +453,9 @@ mod tests {
 
         let records = collect_btree_v2_records(&bt2, &ctx(), &mut file).unwrap();
         let corders: Vec<u32> = records
-            .chunks_exact(CORDER_RECORD_LEN)
+            .as_chunks::<CORDER_RECORD_LEN>()
+            .0
+            .iter()
             .map(|r| u32::from_le_bytes(r[FHEAP_ID_LEN + 1..CORDER_RECORD_LEN].try_into().unwrap()))
             .collect();
         assert_eq!(corders, (0..12u32).collect::<Vec<_>>());
@@ -468,7 +470,9 @@ mod tests {
         .unwrap();
         let name_records = collect_btree_v2_records(&name_bt2, &ctx(), &mut file).unwrap();
         let mut seen: Vec<u32> = name_records
-            .chunks_exact(NAME_RECORD_LEN)
+            .as_chunks::<NAME_RECORD_LEN>()
+            .0
+            .iter()
             .map(|r| u32::from_le_bytes(r[FHEAP_ID_LEN + 1..FHEAP_ID_LEN + 5].try_into().unwrap()))
             .collect();
         seen.sort_unstable();
@@ -520,7 +524,9 @@ mod tests {
         let bt2 = Bt2Header::decode(&file.read_block(addr, 256).unwrap(), &ctx()).unwrap();
         let records = collect_btree_v2_records(&bt2, &ctx(), &mut file).unwrap();
         let corders: Vec<u32> = records
-            .chunks_exact(CORDER_RECORD_LEN)
+            .as_chunks::<CORDER_RECORD_LEN>()
+            .0
+            .iter()
             .map(|r| u32::from_le_bytes(r[FHEAP_ID_LEN + 1..CORDER_RECORD_LEN].try_into().unwrap()))
             .collect();
         assert_eq!(corders, vec![0u32, 2, 5, 9]);
@@ -549,7 +555,9 @@ mod tests {
         let records = collect_btree_v2_records(&bt2, &ctx(), &mut file).unwrap();
 
         let hashes: Vec<u32> = records
-            .chunks_exact(NAME_RECORD_LEN)
+            .as_chunks::<NAME_RECORD_LEN>()
+            .0
+            .iter()
             .map(|r| u32::from_le_bytes(r[13..17].try_into().unwrap()))
             .collect();
         assert_eq!(hashes.len(), attrs.len());
@@ -558,7 +566,7 @@ mod tests {
             "name index is not hash-ordered: {hashes:?}"
         );
         // Every record carries the "no creation index" sentinel.
-        for rec in records.chunks_exact(NAME_RECORD_LEN) {
+        for rec in records.as_chunks::<NAME_RECORD_LEN>().0 {
             assert_eq!(rec[FHEAP_ID_LEN], 0, "no record is shared");
             assert_eq!(
                 u32::from_le_bytes(rec[9..13].try_into().unwrap()),

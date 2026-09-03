@@ -82,7 +82,9 @@ fn concurrent_same_dataset_appends_serialize_wholly() {
 
         // No torn frames: each row is uniform.
         let rows: Vec<i32> = got
-            .chunks_exact(W)
+            .as_chunks::<W>()
+            .0
+            .iter()
             .enumerate()
             .map(|(r, row)| {
                 assert!(

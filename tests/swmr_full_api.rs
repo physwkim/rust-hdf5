@@ -465,8 +465,10 @@ fn dataset_array_attribute_round_trips() {
         let raw = ds.attr("NDArrayDimOffset").unwrap().read_raw().unwrap();
         assert_eq!(raw.len(), 3 * 4);
         let got: Vec<i32> = raw
-            .chunks_exact(4)
-            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| i32::from_le_bytes(*b))
             .collect();
         assert_eq!(got, vec![0, 4, 8]);
     }
