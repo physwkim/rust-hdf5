@@ -2243,13 +2243,17 @@ fn read_chunk_runs_into(
             return;
         }
         selected += len as u64;
+        // `addr` is the index's claim: a run end that does not fit in a u64
+        // simply does not coalesce, and the read at that address fails on
+        // its own terms.
+        let at = addr.saturating_add(src);
         if let Some(last) = runs.last_mut() {
-            if last.0 + last.2 as u64 == addr.saturating_add(src) && last.1 + last.2 == d {
+            if last.0.checked_add(last.2 as u64) == Some(at) && last.1 + last.2 == d {
                 last.2 += len;
                 return;
             }
         }
-        runs.push((addr.saturating_add(src), d, len));
+        runs.push((at, d, len));
     });
     if runs.is_empty() {
         // Nothing to place, which only a chunk outside the extent or a short
@@ -8361,6 +8365,54 @@ mod tests {
         fn a_chunk_read_short_has_its_runs_filled_after_placement() {
             let (path, out) = place("cover_short", vec![job(0, 4), job(4, 2)], &[0, 1]);
             assert_eq!(out, b"ABCD~~~~");
+            let _ = std::fs::remove_file(path);
+        }
+
+        /// A chunk the index places a few bytes short of `u64::MAX` has runs
+        /// whose ends do not fit in a `u64`. Two rows of one chunk are the
+        /// second run that asks whether it continues the first; the answer
+        /// comes from the read at that address (fill for a read that may
+        /// come up short, an error for one that may not), not from the
+        /// arithmetic.
+        #[test]
+        fn a_chunk_address_near_u64_max_fails_the_read_not_the_arithmetic() {
+            let (path, handle) = handle_over("cover_wrap", b"ABEFCDGH");
+            let dims = [2u64, 4];
+            let chunks = [2u64, 2];
+            let geo = ChunkOutputGeometry {
+                dims: &dims,
+                chunk_dims: &chunks,
+                element_size: 1,
+            };
+            let run = |at_most: bool, out: &mut [u8]| {
+                place_chunk_jobs(
+                    &handle,
+                    vec![
+                        job(0, 4),
+                        Some(ChunkReadJob {
+                            addr: u64::MAX - 1,
+                            len: 4,
+                            at_most,
+                            mask: 0,
+                        }),
+                    ],
+                    &[0, 0, 0, 1],
+                    ChunkReadRequest {
+                        pipeline: None,
+                        target: ChunkTarget::Full,
+                        fill_value: Some(&FILL),
+                        dst: ReadDst::Fresh,
+                    },
+                    &geo,
+                    None,
+                    out,
+                )
+            };
+            let mut out = vec![0xAAu8; 8];
+            run(true, &mut out).unwrap();
+            assert_eq!(out, b"AB~~EF~~");
+            let mut out = vec![0xAAu8; 8];
+            run(false, &mut out).expect_err("an exact read at u64::MAX - 1 cannot succeed");
             let _ = std::fs::remove_file(path);
         }
     }
