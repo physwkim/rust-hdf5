@@ -1319,7 +1319,9 @@ impl H5FileOptions {
     }
 
     /// Disable OS-level file locking entirely (equivalent to
-    /// `HDF5_USE_FILE_LOCKING=FALSE`).
+    /// `HDF5_USE_FILE_LOCKING=FALSE`). Under the `mmap` feature such an open
+    /// reads through the descriptor rather than a map, which is taken only
+    /// under the shared lock, so a zero-copy view of it is refused.
     pub fn no_locking(self) -> Self {
         self.locking(FileLocking::Disabled)
     }

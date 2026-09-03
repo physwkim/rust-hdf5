@@ -63,6 +63,17 @@
   extent, reading back as fill. A failure on that path is reported on
   stderr; `close` returns it.
 
+- Under the `mmap` feature a read-only open maps the file only while it
+  holds its shared lock, and releasing the lock drops the map. A handle
+  whose locking policy waived the lock (`FileLocking::Disabled`, or
+  `BestEffort` on a filesystem without locks) reads through the descriptor
+  instead, and a zero-copy view of such a file is refused, as a view of any
+  unmapped file is. A page a writer's truncation took away faults the
+  process on its next touch, where a positioned read past the new end is
+  an error, and the shared lock is what keeps a writer that honours locks
+  from opening the file while the map is out. A SWMR reader opened with
+  the default policy holds the lock and keeps its map.
+
 - `SwmrWriter::flush` writes the band a multi-frame-chunk dataset is
   still filling, zero-padded, and keeps its frames, so a reader sees them
   where the published extent already counts them instead of as fill. The

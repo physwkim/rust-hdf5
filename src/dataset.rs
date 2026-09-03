@@ -4468,8 +4468,9 @@ impl H5Dataset {
     /// [`Hdf5Error::NotViewable`](crate::Hdf5Error::NotViewable) naming the
     /// reason and never quietly falls back to copying. Every
     /// [`ViewRefusal`](crate::ViewRefusal) is a case where
-    /// [`read_raw`](Self::read_raw) still works: the file is not mapped, the
-    /// layout is chunked, compact, virtual, or external, no storage is
+    /// [`read_raw`](Self::read_raw) still works: the file is not mapped (an
+    /// open that holds no shared lock never maps), the layout is chunked,
+    /// compact, virtual, or external, no storage is
     /// allocated (the dataset reads as its fill value), `T` is the wrong
     /// width, the stored elements need a byte-order swap or bit unpacking,
     /// the data lands at an offset `T`'s alignment does not permit, or the

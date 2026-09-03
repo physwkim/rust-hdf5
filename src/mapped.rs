@@ -29,9 +29,11 @@ use crate::types::H5Type;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewRefusal {
     /// The file holding this dataset is not memory-mapped. A read-only open
-    /// takes a whole-file map when it can, but an empty file, a file larger
-    /// than the address space, and a filesystem that refuses `mmap` all leave
-    /// the handle reading through `pread`, with nothing to point at.
+    /// takes a whole-file map when it can, but an open whose locking policy
+    /// waived the shared lock (or could not get one), an empty file, a file
+    /// larger than the address space, and a filesystem that refuses `mmap`
+    /// all leave the handle reading through `pread`, with nothing to point
+    /// at.
     NotMapped,
     /// The dataset's raw data is not one stretch of the mapped file. The
     /// phrase says what it is instead — chunked, compact, virtual, or held in
@@ -753,6 +755,11 @@ mod tests {
     /// A view is a snapshot that owns its pages: it outlives the dataset, the
     /// file, and a refresh that retakes the handle's map, while the refreshed
     /// handle goes on to read a file the old map does not cover.
+    ///
+    /// The reader holds its shared lock, which is what lets it map, and the
+    /// writer that grows the file behind it waives its own. A shared `flock`
+    /// lets that writer write; a Windows shared lock forbids it.
+    #[cfg(not(windows))]
     #[test]
     fn a_view_outlives_the_file_and_a_refresh_that_retakes_the_map() {
         let path = temp_path("snapshot");
@@ -770,7 +777,7 @@ mod tests {
         }
         let mapped_len = std::fs::metadata(&path).unwrap().len();
 
-        let file = H5File::options().no_locking().open(&path).unwrap();
+        let file = H5File::open(&path).unwrap();
         let ds = file.dataset("first").unwrap();
         let view = ds.read_mapped::<f64>().unwrap();
 
