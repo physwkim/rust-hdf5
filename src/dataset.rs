@@ -1756,11 +1756,13 @@ impl FillTime {
 /// `H5Pset_alloc_time`/`H5Pget_alloc_time`'s `H5D_alloc_time_t`, read back
 /// from the same fill-value message [`FillTime`] is.
 ///
-/// Not user-settable: `H5P__set_layout` (H5Pdcpl.c) picks this from the
-/// dataset's storage class alone (`H5D_ALLOC_TIME_DEFAULT` per layout —
-/// compact is `Early`, chunked and virtual are `Incr`, contiguous is
-/// `Late`), and this crate has no `DatasetBuilder` setter that overrides it.
-/// [`H5Dataset::alloc_time`] exists to read back what the writer declared.
+/// `H5P__set_layout` (H5Pdcpl.c) picks this from the dataset's storage
+/// class (`H5D_ALLOC_TIME_DEFAULT` per layout — compact is `Early`,
+/// chunked and virtual are `Incr`, contiguous is `Late`). The one override
+/// this crate's builder offers is [`DatasetBuilder::early_allocation`],
+/// which a chunked dataset reads back as `Early` where the writer took it
+/// up: an implicit index, or a single unfiltered chunk.
+/// [`H5Dataset::alloc_time`] reads back what the writer declared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllocTime {
     /// Space is allocated as soon as the dataset is created.
