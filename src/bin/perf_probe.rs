@@ -120,7 +120,12 @@ fn main() {
             let path = p("rs-contig-in.h5");
             write_contig(&path, &ramp(CONTIG_N));
             timed(&workload, reps, || {
-                let file = H5File::open(&path).unwrap();
+                // The view needs the map, and the map needs the shared lock,
+                // whatever `HDF5_USE_FILE_LOCKING` says in this environment.
+                let file = H5File::options()
+                    .locking(rust_hdf5::FileLocking::Enabled)
+                    .open(&path)
+                    .unwrap();
                 let ds = file.dataset("data").unwrap();
                 #[cfg(feature = "mmap")]
                 let total: f64 = {
