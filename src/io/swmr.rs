@@ -590,6 +590,15 @@ impl SwmrWriter {
     /// paths already follow: `release_dataset_storage` returned that dataset's
     /// header block and index blocks to the allocator, so writing either back
     /// puts an object header over whatever now owns the block.
+    ///
+    /// A band a multi-frame-chunk dataset is still filling is written first,
+    /// zero-padded, so a reader sees the frames the extent already counts
+    /// (see `write_band`); its chunks are written again, whole, when the band
+    /// completes. For a filtered dataset a rewrite whose compressed size
+    /// changed takes a new block and keeps the old one for a reader that may
+    /// still hold its address (the `H5D__chunk_file_alloc` rule under SWMR),
+    /// so every flush of a partial filtered band costs that band's chunks in
+    /// file space for the rest of the session.
     pub fn flush(&mut self) -> IoResult<()> {
         // Step 0: The extent already counts every frame a band buffer holds,
         // and the headers written below publish that extent; a band still

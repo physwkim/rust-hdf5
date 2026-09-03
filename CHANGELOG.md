@@ -66,7 +66,11 @@
 - `SwmrWriter::flush` writes the band a multi-frame-chunk dataset is
   still filling, zero-padded, and keeps its frames, so a reader sees them
   where the published extent already counts them instead of as fill. The
-  completing append writes the same chunks whole.
+  completing append writes the same chunks whole; for a filtered dataset
+  that rewrite takes a new block whenever the compressed size changed and
+  keeps the old one, as chunk rewrites under SWMR always have, so each
+  flush of a partial filtered band costs the band's chunks in file space
+  for the rest of the session.
 
 ## 0.5.1
 
