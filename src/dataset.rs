@@ -4816,14 +4816,6 @@ pub(crate) mod numeric {
     use crate::error::{Hdf5Error, Result};
     use crate::format::messages::datatype::{ByteOrder, DatatypeMessage, IeeeFormat};
 
-    /// A source element, normalized: every standard integer width — u64::MAX
-    /// included — fits in `i128` without loss.
-    pub enum NumericSource {
-        Int(i128),
-        F32(f32),
-        F64(f64),
-    }
-
     /// The on-disk element shape `classify` accepted.
     #[derive(Clone, Copy)]
     pub enum SourceKind {
@@ -4949,58 +4941,13 @@ pub(crate) mod numeric {
         }
     }
 
-    fn decode_element(kind: SourceKind, bytes: &[u8]) -> NumericSource {
-        match kind {
-            SourceKind::Int {
-                size,
-                signed,
-                byte_order,
-            } => {
-                let mut le = [0u8; 8];
-                match byte_order {
-                    ByteOrder::LittleEndian => le[..size].copy_from_slice(bytes),
-                    ByteOrder::BigEndian => {
-                        for (dst, src) in le[..size].iter_mut().zip(bytes.iter().rev()) {
-                            *dst = *src;
-                        }
-                    }
-                }
-                let zero_extended = u64::from_le_bytes(le);
-                let value = if signed {
-                    // Arithmetic right shift sign-extends the low `size` bytes.
-                    let shift = 64 - 8 * size as u32;
-                    i128::from(((zero_extended as i64) << shift) >> shift)
-                } else {
-                    i128::from(zero_extended)
-                };
-                NumericSource::Int(value)
-            }
-            SourceKind::F16(byte_order) => {
-                let arr: [u8; 2] = bytes.try_into().unwrap();
-                let bits = match byte_order {
-                    ByteOrder::LittleEndian => u16::from_le_bytes(arr),
-                    ByteOrder::BigEndian => u16::from_be_bytes(arr),
-                };
-                NumericSource::F32(f16_bits_to_f32(bits))
-            }
-            SourceKind::F32(byte_order) => {
-                let arr: [u8; 4] = bytes.try_into().unwrap();
-                NumericSource::F32(match byte_order {
-                    ByteOrder::LittleEndian => f32::from_le_bytes(arr),
-                    ByteOrder::BigEndian => f32::from_be_bytes(arr),
-                })
-            }
-            SourceKind::F64(byte_order) => {
-                let arr: [u8; 8] = bytes.try_into().unwrap();
-                NumericSource::F64(match byte_order {
-                    ByteOrder::LittleEndian => f64::from_le_bytes(arr),
-                    ByteOrder::BigEndian => f64::from_be_bytes(arr),
-                })
-            }
-        }
-    }
-
     /// Decode and convert every element of `raw` into `T`.
+    ///
+    /// One loop per source width and lane type, so an element is a
+    /// fixed-size load, a sign extension and a range check, and the
+    /// `TypeMismatch` for an element that does not fit is built only when
+    /// one is found. An empty input converts to an empty vector whatever
+    /// the classes.
     pub fn convert<T: Sealed>(kind: SourceKind, raw: &[u8]) -> Result<Vec<T>> {
         let size = kind.element_size();
         if !raw.len().is_multiple_of(size) {
@@ -5009,93 +4956,229 @@ pub(crate) mod numeric {
                 raw.len(),
             )));
         }
-        raw.chunks_exact(size)
-            .enumerate()
-            .map(|(index, bytes)| T::from_source(decode_element(kind, bytes), index))
-            .collect()
+        let mut out = vec![T::default(); raw.len() / size];
+        match kind {
+            SourceKind::Int {
+                size,
+                signed,
+                byte_order,
+            } => {
+                let le = byte_order == ByteOrder::LittleEndian;
+                match (size, signed) {
+                    (1, true) => ints::<1, i64, T>(raw, le, &mut out),
+                    (1, false) => ints::<1, u64, T>(raw, le, &mut out),
+                    (2, true) => ints::<2, i64, T>(raw, le, &mut out),
+                    (2, false) => ints::<2, u64, T>(raw, le, &mut out),
+                    (4, true) => ints::<4, i64, T>(raw, le, &mut out),
+                    (4, false) => ints::<4, u64, T>(raw, le, &mut out),
+                    (8, true) => ints::<8, i64, T>(raw, le, &mut out),
+                    (8, false) => ints::<8, u64, T>(raw, le, &mut out),
+                    _ => unreachable!("classify admits 1-, 2-, 4- and 8-byte integers only"),
+                }
+            }
+            SourceKind::F16(order) => floats::<2, T>(raw, order, &mut out, |b| {
+                T::from_f32(f16_bits_to_f32(u16::from_le_bytes(b)))
+            }),
+            SourceKind::F32(order) => {
+                floats::<4, T>(raw, order, &mut out, |b| T::from_f32(f32::from_le_bytes(b)))
+            }
+            SourceKind::F64(order) => {
+                floats::<8, T>(raw, order, &mut out, |b| T::from_f64(f64::from_le_bytes(b)))
+            }
+        }?;
+        Ok(out)
     }
 
-    /// The sealed half of `ReadNumeric`: how one normalized source element
-    /// becomes a `Self`, or a `TypeMismatch` explaining why it cannot.
-    pub trait Sealed: Sized {
-        fn from_source(src: NumericSource, index: usize) -> Result<Self>;
+    /// The integer elements of `raw`, `N` bytes each, through lane `L`.
+    fn ints<const N: usize, L: IntLane, T: Sealed>(
+        raw: &[u8],
+        le: bool,
+        out: &mut [T],
+    ) -> Result<()> {
+        let (chunks, _) = raw.as_chunks::<N>();
+        for (index, (o, &chunk)) in out.iter_mut().zip(chunks).enumerate() {
+            let mut bytes = chunk;
+            if !le {
+                bytes.reverse();
+            }
+            *o = L::load(bytes).into_target(index)?;
+        }
+        Ok(())
+    }
+
+    /// The float elements of `raw`, `N` bytes each, `decode` taking each
+    /// one's little-endian bytes.
+    fn floats<const N: usize, T: Sealed>(
+        raw: &[u8],
+        order: ByteOrder,
+        out: &mut [T],
+        decode: impl Fn([u8; N]) -> Result<T>,
+    ) -> Result<()> {
+        let (chunks, _) = raw.as_chunks::<N>();
+        for (o, &chunk) in out.iter_mut().zip(chunks) {
+            let mut bytes = chunk;
+            if order == ByteOrder::BigEndian {
+                bytes.reverse();
+            }
+            *o = decode(bytes)?;
+        }
+        Ok(())
+    }
+
+    /// The lane an integer source decodes to: `i64` for a signed source,
+    /// `u64` for an unsigned one, so every standard width — u64::MAX
+    /// included — is held without loss.
+    pub trait IntLane: Copy {
+        /// The value of an element's little-endian `bytes`, `N` in 1..=8.
+        fn load<const N: usize>(bytes: [u8; N]) -> Self;
+        fn into_target<T: Sealed>(self, index: usize) -> Result<T>;
+    }
+
+    impl IntLane for u64 {
+        fn load<const N: usize>(bytes: [u8; N]) -> Self {
+            let mut padded = [0u8; 8];
+            padded[..N].copy_from_slice(&bytes);
+            u64::from_le_bytes(padded)
+        }
+        fn into_target<T: Sealed>(self, index: usize) -> Result<T> {
+            T::from_u64(self, index)
+        }
+    }
+
+    impl IntLane for i64 {
+        fn load<const N: usize>(bytes: [u8; N]) -> Self {
+            // Arithmetic right shift sign-extends the low `N` bytes.
+            let shift = 64 - 8 * N as u32;
+            ((u64::load(bytes) << shift) as i64) >> shift
+        }
+        fn into_target<T: Sealed>(self, index: usize) -> Result<T> {
+            T::from_i64(self, index)
+        }
+    }
+
+    /// The sealed half of `ReadNumeric`: how one source element becomes a
+    /// `Self`, or a `TypeMismatch` explaining why it cannot. `index` is the
+    /// element's position, for the message.
+    pub trait Sealed: Copy + Default {
+        fn from_i64(v: i64, index: usize) -> Result<Self>;
+        fn from_u64(v: u64, index: usize) -> Result<Self>;
+        fn from_f32(v: f32) -> Result<Self>;
+        fn from_f64(v: f64) -> Result<Self>;
     }
 
     macro_rules! int_targets {
         ($($t:ty),* $(,)?) => {$(
             impl Sealed for $t {
-                fn from_source(src: NumericSource, index: usize) -> Result<Self> {
-                    match src {
-                        NumericSource::Int(v) => <$t>::try_from(v).map_err(|_| {
-                            Hdf5Error::TypeMismatch(format!(
-                                concat!(
-                                    "value {} at element {} does not fit in ",
-                                    stringify!($t),
-                                ),
-                                v, index,
-                            ))
-                        }),
-                        NumericSource::F32(_) | NumericSource::F64(_) => {
-                            Err(Hdf5Error::TypeMismatch(
-                                concat!(
-                                    "cannot read a floating-point dataset as ",
-                                    stringify!($t),
-                                    "; read as f64 and convert explicitly",
-                                )
-                                .into(),
-                            ))
-                        }
-                    }
+                fn from_i64(v: i64, index: usize) -> Result<Self> {
+                    <$t>::try_from(v).map_err(|_| int_overflow::<$t>(v, index))
+                }
+                fn from_u64(v: u64, index: usize) -> Result<Self> {
+                    <$t>::try_from(v).map_err(|_| int_overflow::<$t>(v, index))
+                }
+                fn from_f32(_: f32) -> Result<Self> {
+                    Err(float_as_int::<$t>())
+                }
+                fn from_f64(_: f64) -> Result<Self> {
+                    Err(float_as_int::<$t>())
                 }
             }
         )*};
     }
-    int_targets!(i8, i16, i32, i64, u8, u16, u32, u64, u128);
+    int_targets!(i8, i16, i32, i64, u8, u16, u32, u64);
 
-    // Not in the macro: `i128::try_from(i128)` is infallible, which trips
-    // clippy::unnecessary_fallible_conversions.
+    // Not in the macro: `i128::try_from` and `u128::try_from(u64)` are
+    // infallible, which trips clippy::unnecessary_fallible_conversions.
     impl Sealed for i128 {
-        fn from_source(src: NumericSource, _index: usize) -> Result<Self> {
-            match src {
-                NumericSource::Int(v) => Ok(v),
-                NumericSource::F32(_) | NumericSource::F64(_) => Err(Hdf5Error::TypeMismatch(
-                    "cannot read a floating-point dataset as i128; read as f64 and \
-                     convert explicitly"
-                        .into(),
-                )),
-            }
+        fn from_i64(v: i64, _index: usize) -> Result<Self> {
+            Ok(Self::from(v))
         }
+        fn from_u64(v: u64, _index: usize) -> Result<Self> {
+            Ok(Self::from(v))
+        }
+        fn from_f32(_: f32) -> Result<Self> {
+            Err(float_as_int::<i128>())
+        }
+        fn from_f64(_: f64) -> Result<Self> {
+            Err(float_as_int::<i128>())
+        }
+    }
+
+    impl Sealed for u128 {
+        fn from_i64(v: i64, index: usize) -> Result<Self> {
+            Self::try_from(v).map_err(|_| int_overflow::<u128>(v, index))
+        }
+        fn from_u64(v: u64, _index: usize) -> Result<Self> {
+            Ok(Self::from(v))
+        }
+        fn from_f32(_: f32) -> Result<Self> {
+            Err(float_as_int::<u128>())
+        }
+        fn from_f64(_: f64) -> Result<Self> {
+            Err(float_as_int::<u128>())
+        }
+    }
+
+    fn int_overflow<T>(v: impl std::fmt::Display, index: usize) -> Hdf5Error {
+        Hdf5Error::TypeMismatch(format!(
+            "value {v} at element {index} does not fit in {}",
+            std::any::type_name::<T>()
+        ))
+    }
+
+    fn float_as_int<T>() -> Hdf5Error {
+        Hdf5Error::TypeMismatch(format!(
+            "cannot read a floating-point dataset as {}; read as f64 and convert explicitly",
+            std::any::type_name::<T>()
+        ))
     }
 
     impl Sealed for f32 {
-        fn from_source(src: NumericSource, _index: usize) -> Result<Self> {
-            match src {
-                NumericSource::F32(v) => Ok(v),
-                NumericSource::F64(_) => Err(Hdf5Error::TypeMismatch(
-                    "narrowing an f64 dataset to f32 loses precision; read as f64".into(),
-                )),
-                NumericSource::Int(_) => Err(Hdf5Error::TypeMismatch(
-                    "cannot read an integer dataset as f32; read as an integer type and \
-                     convert explicitly"
-                        .into(),
-                )),
-            }
+        fn from_i64(_: i64, _index: usize) -> Result<Self> {
+            Err(int_as_f32())
+        }
+        fn from_u64(_: u64, _index: usize) -> Result<Self> {
+            Err(int_as_f32())
+        }
+        fn from_f32(v: f32) -> Result<Self> {
+            Ok(v)
+        }
+        fn from_f64(_: f64) -> Result<Self> {
+            Err(Hdf5Error::TypeMismatch(
+                "narrowing an f64 dataset to f32 loses precision; read as f64".into(),
+            ))
         }
     }
 
+    fn int_as_f32() -> Hdf5Error {
+        Hdf5Error::TypeMismatch(
+            "cannot read an integer dataset as f32; read as an integer type and convert \
+             explicitly"
+                .into(),
+        )
+    }
+
     impl Sealed for f64 {
-        fn from_source(src: NumericSource, _index: usize) -> Result<Self> {
-            match src {
-                NumericSource::F64(v) => Ok(v),
-                // Every f32 is exactly representable as f64.
-                NumericSource::F32(v) => Ok(f64::from(v)),
-                NumericSource::Int(_) => Err(Hdf5Error::TypeMismatch(
-                    "cannot read an integer dataset as f64; integers above 2^53 lose \
-                     precision — read as an integer type and convert explicitly"
-                        .into(),
-                )),
-            }
+        fn from_i64(_: i64, _index: usize) -> Result<Self> {
+            Err(int_as_f64())
         }
+        fn from_u64(_: u64, _index: usize) -> Result<Self> {
+            Err(int_as_f64())
+        }
+        // Every f32 is exactly representable as f64.
+        fn from_f32(v: f32) -> Result<Self> {
+            Ok(f64::from(v))
+        }
+        fn from_f64(v: f64) -> Result<Self> {
+            Ok(v)
+        }
+    }
+
+    fn int_as_f64() -> Hdf5Error {
+        Hdf5Error::TypeMismatch(
+            "cannot read an integer dataset as f64; integers above 2^53 lose precision — \
+             read as an integer type and convert explicitly"
+                .into(),
+        )
     }
 
     #[cfg(test)]
