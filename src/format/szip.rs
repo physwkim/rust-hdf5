@@ -85,15 +85,13 @@ fn bits_to_bytes(bits: u32) -> u32 {
 // ---------------------------------------------------------------------------
 // SZIP interleaving (for 32/64-bit samples)
 // ---------------------------------------------------------------------------
+use crate::format::shuffle::{trans_byte_elem, untrans_byte_elem};
+
 fn interleave_buffer(src: &[u8], wordsize: usize) -> Vec<u8> {
     let n = src.len();
     let count = n / wordsize;
     let mut dest = vec![0u8; n];
-    for i in 0..count {
-        for j in 0..wordsize {
-            dest[j * count + i] = src[i * wordsize + j];
-        }
-    }
+    trans_byte_elem(src, &mut dest, count, wordsize);
     dest
 }
 
@@ -101,11 +99,7 @@ fn deinterleave_buffer(src: &[u8], wordsize: usize) -> Vec<u8> {
     let n = src.len();
     let count = n / wordsize;
     let mut dest = vec![0u8; n];
-    for i in 0..count {
-        for j in 0..wordsize {
-            dest[i * wordsize + j] = src[j * count + i];
-        }
-    }
+    untrans_byte_elem(src, &mut dest, count, wordsize);
     dest
 }
 

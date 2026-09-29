@@ -32,6 +32,10 @@
 //!   [if num_cd_values is odd: 4 bytes padding]
 //! ```
 
+use crate::format::shuffle::{
+    bitshuffle_block_into, bitunshuffle_block_into, trans_byte_elem, untrans_byte_elem,
+    BitshuffleScratch,
+};
 use crate::format::{FormatError, FormatResult};
 
 /// Well-known filter IDs.
@@ -751,13 +755,7 @@ fn shuffle(data: &[u8], bytesoftype: usize) -> Vec<u8> {
     let numofelements = data.len() / bytesoftype;
     let total = numofelements * bytesoftype;
     let mut dest = vec![0u8; data.len()];
-
-    for i in 0..bytesoftype {
-        let dest_start = i * numofelements;
-        for j in 0..numofelements {
-            dest[dest_start + j] = data[j * bytesoftype + i];
-        }
-    }
+    trans_byte_elem(data, &mut dest, numofelements, bytesoftype);
     // Copy any leftover bytes unchanged
     if data.len() > total {
         dest[total..].copy_from_slice(&data[total..]);
@@ -773,13 +771,7 @@ fn unshuffle(data: &[u8], bytesoftype: usize) -> Vec<u8> {
     let numofelements = data.len() / bytesoftype;
     let total = numofelements * bytesoftype;
     let mut dest = vec![0u8; data.len()];
-
-    for i in 0..bytesoftype {
-        let src_start = i * numofelements;
-        for j in 0..numofelements {
-            dest[j * bytesoftype + i] = data[src_start + j];
-        }
-    }
+    untrans_byte_elem(data, &mut dest, numofelements, bytesoftype);
     if data.len() > total {
         dest[total..].copy_from_slice(&data[total..]);
     }
@@ -1248,11 +1240,20 @@ fn apply_single_filter(filter: &Filter, data: &[u8], compress: bool) -> FormatRe
 /// twice at the end. Per-word `% 65535` is a different function — it maps
 /// an exact `0xFFFF` partial sum to `0` where the fold keeps `0xFFFF`.
 fn fletcher32(data: &[u8]) -> u32 {
-    let mut sum1: u32 = 0;
-    let mut sum2: u32 = 0;
+    #[cfg(feature = "simd")]
+    let (sum1, sum2, done) =
+        fearless_simd::dispatch!(crate::simd::level(), s => fletcher_simd::runs(s, data));
+    #[cfg(not(feature = "simd"))]
+    let (sum1, sum2, done) = (0, 0, 0);
+    fletcher32_from(sum1, sum2, done, data)
+}
 
-    let mut words = data.len() / 2;
-    let mut i = 0;
+/// The run loop of [`fletcher32`] from byte `done`, a multiple of 720 (a
+/// whole number of 360-word runs), with the accumulators as they stand
+/// there.
+fn fletcher32_from(mut sum1: u32, mut sum2: u32, done: usize, data: &[u8]) -> u32 {
+    let mut words = (data.len() - done) / 2;
+    let mut i = done;
     while words > 0 {
         let mut tlen = words.min(360);
         words -= tlen;
@@ -1280,6 +1281,81 @@ fn fletcher32(data: &[u8]) -> u32 {
     sum2 = (sum2 & 0xffff) + (sum2 >> 16);
 
     (sum2 << 16) | sum1
+}
+
+/// The whole 360-word runs of [`fletcher32`] on `fearless_simd` lanes.
+///
+/// The scalar recurrence is wrapping `u32` arithmetic, a ring, so a run of
+/// `m` words `w_0..w_m` starting from `(s1, s2)` has the closed form
+/// `s1' = s1 + Σ w_i` and `s2' = s2 + m·s1 + Σ (m - i)·w_i`, and any
+/// lane-parallel evaluation of those sums lands on the scalar's exact
+/// value. The 360-word fold points are kept as they are.
+#[cfg(feature = "simd")]
+mod fletcher_simd {
+    use fearless_simd::{prelude::*, Simd};
+    use fearless_simd_macros::simd;
+
+    const RUN_WORDS: usize = 360;
+
+    #[inline(always)]
+    fn hsum<S: Simd>(v: S::u32s) -> u32 {
+        v.as_slice().iter().fold(0u32, |s, &x| s.wrapping_add(x))
+    }
+
+    /// Fold the whole runs at the front of `data`; returns `(sum1, sum2)`
+    /// after them and the bytes they covered, a multiple of 720.
+    ///
+    /// Within a run the vector chunks of `L` words keep three lane
+    /// accumulators: `a`, the chunk sums; `e`, the sum over chunks of the
+    /// chunk sums before it; and `b`, the chunk words weighted by their
+    /// lane index. With `m = C·L` words covered, `Σ (m - i)·w_i =
+    /// L·Σa + L·Σe - Σb`, so the run's state is one scalar combine; the
+    /// words a run has past its vector chunks (360 is not a multiple of
+    /// every lane count) go through the scalar recurrence.
+    #[simd]
+    pub(super) fn runs<S: Simd>(simd: S, data: &[u8]) -> (u32, u32, usize) {
+        let l = S::u16s::LEN;
+        let chunks = RUN_WORDS / l;
+        let vec_words = chunks * l;
+        let k_lo = S::u32s::from_fn(simd, |k| k as u32);
+        let k_hi = S::u32s::from_fn(simd, |k| (k + l / 2) as u32);
+        let mut sum1 = 0u32;
+        let mut sum2 = 0u32;
+        let mut pos = 0;
+        while pos + 2 * RUN_WORDS <= data.len() {
+            let mut a = S::u32s::splat(simd, 0);
+            let mut e = a;
+            let mut b = a;
+            for c in 0..chunks {
+                let off = pos + 2 * c * l;
+                let w = S::u16s::from_bytes(S::u8s::from_slice(simd, &data[off..off + 2 * l]));
+                // Big-endian words on little-endian lanes.
+                let w = (w << 8) | (w >> 8);
+                let (lo, hi) = w.widen();
+                e += a;
+                a = a + lo + hi;
+                b = b + lo * k_lo + hi * k_hi;
+            }
+            let (ha, he, hb) = (hsum::<S>(a), hsum::<S>(e), hsum::<S>(b));
+            let l32 = l as u32;
+            sum2 = sum2
+                .wrapping_add((vec_words as u32).wrapping_mul(sum1))
+                .wrapping_add(l32.wrapping_mul(ha))
+                .wrapping_add(l32.wrapping_mul(he))
+                .wrapping_sub(hb);
+            sum1 = sum1.wrapping_add(ha);
+            for i in vec_words..RUN_WORDS {
+                let at = pos + 2 * i;
+                let word = ((data[at] as u32) << 8) | (data[at + 1] as u32);
+                sum1 = sum1.wrapping_add(word);
+                sum2 = sum2.wrapping_add(sum1);
+            }
+            sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+            sum2 = (sum2 & 0xffff) + (sum2 >> 16);
+            pos += 2 * RUN_WORDS;
+        }
+        (sum1, sum2, pos)
+    }
 }
 
 /// Compress multiple chunks in parallel using rayon.
@@ -1552,43 +1628,22 @@ fn bshuf_block_plan(n_elems: usize, block_elems: usize) -> Vec<usize> {
     blocks
 }
 
-fn bitshuffle_block(input: &[u8], elem_size: usize) -> Vec<u8> {
-    let n_elems = input.len() / elem_size;
-    let nbits = elem_size * 8;
-    let mut out = vec![0u8; input.len()];
-
-    for bit in 0..nbits {
-        let byte_idx = bit / 8;
-        let bit_idx = bit % 8; // LSB-first within the source byte
-        for elem in 0..n_elems {
-            let src_byte = input[elem * elem_size + byte_idx];
-            let src_bit = (src_byte >> bit_idx) & 1;
-            let dst_bit_pos = bit * n_elems + elem;
-            let dst_byte_idx = dst_bit_pos / 8;
-            let dst_bit_idx = dst_bit_pos % 8; // LSB-first within the output byte
-            out[dst_byte_idx] |= src_bit << dst_bit_idx;
-        }
+/// Append the bit transpose of one planned block (`inverse` for the
+/// untranspose) to `out`, in place in its tail.
+fn push_bitshuffled(
+    out: &mut Vec<u8>,
+    block: &[u8],
+    scratch: &mut BitshuffleScratch,
+    elem_size: usize,
+    inverse: bool,
+) {
+    let pos = out.len();
+    out.resize(pos + block.len(), 0);
+    if inverse {
+        bitunshuffle_block_into(block, scratch, &mut out[pos..], elem_size);
+    } else {
+        bitshuffle_block_into(block, scratch, &mut out[pos..], elem_size);
     }
-    out
-}
-
-fn bitunshuffle_block(input: &[u8], elem_size: usize) -> Vec<u8> {
-    let n_elems = input.len() / elem_size;
-    let nbits = elem_size * 8;
-    let mut out = vec![0u8; input.len()];
-
-    for bit in 0..nbits {
-        let byte_idx = bit / 8;
-        let bit_idx = bit % 8; // LSB-first within the destination byte
-        for elem in 0..n_elems {
-            let src_bit_pos = bit * n_elems + elem;
-            let src_byte_idx = src_bit_pos / 8;
-            let src_bit_idx = src_bit_pos % 8; // LSB-first within the source byte
-            let src_bit = (input[src_byte_idx] >> src_bit_idx) & 1;
-            out[elem * elem_size + byte_idx] |= src_bit << bit_idx;
-        }
-    }
-    out
 }
 
 fn bitshuffle_compress(
@@ -1604,6 +1659,7 @@ fn bitshuffle_compress(
     let n_elems = data.len() / elem_size;
     let block_elems = bshuf_resolve_block_elems(block_size, elem_size);
     let blocks = bshuf_block_plan(n_elems, block_elems);
+    let mut scratch = BitshuffleScratch::new(block_elems * elem_size);
 
     if comp_type == 0 {
         // Bitshuffle only, no compression, no header. Each planned block is
@@ -1613,7 +1669,7 @@ fn bitshuffle_compress(
         for &block in &blocks {
             let start = elem_pos * elem_size;
             let end = start + block * elem_size;
-            out.extend_from_slice(&bitshuffle_block(&data[start..end], elem_size));
+            push_bitshuffled(&mut out, &data[start..end], &mut scratch, elem_size, false);
             elem_pos += block;
         }
         out.extend_from_slice(&data[elem_pos * elem_size..]);
@@ -1643,12 +1699,14 @@ fn bitshuffle_compress(
         // Each planned block: BE u32 LZ4-compressed size, then the raw LZ4
         // block of the bit-transposed data. Trailing `n_elems % 8` elements
         // are copied raw with no length prefix.
+        let mut shuffled = vec![0u8; block_elems * elem_size];
         let mut elem_pos = 0;
         for &block in &blocks {
             let start = elem_pos * elem_size;
             let end = start + block * elem_size;
-            let shuffled = bitshuffle_block(&data[start..end], elem_size);
-            let compressed = lz4_flex::compress(&shuffled);
+            let shuffled = &mut shuffled[..end - start];
+            bitshuffle_block_into(&data[start..end], &mut scratch, shuffled, elem_size);
+            let compressed = lz4_flex::compress(shuffled);
             out.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
             out.extend_from_slice(&compressed);
             elem_pos += block;
@@ -1675,12 +1733,13 @@ fn bitshuffle_decompress(
         let n_elems = data.len() / elem_size;
         let block_elems = bshuf_resolve_block_elems(block_size, elem_size);
         let blocks = bshuf_block_plan(n_elems, block_elems);
+        let mut scratch = BitshuffleScratch::new(block_elems * elem_size);
         let mut out = Vec::with_capacity(data.len());
         let mut elem_pos = 0;
         for &block in &blocks {
             let start = elem_pos * elem_size;
             let end = start + block * elem_size;
-            out.extend_from_slice(&bitunshuffle_block(&data[start..end], elem_size));
+            push_bitshuffled(&mut out, &data[start..end], &mut scratch, elem_size, true);
             elem_pos += block;
         }
         out.extend_from_slice(&data[elem_pos * elem_size..]);
@@ -1730,6 +1789,8 @@ fn bitshuffle_decompress(
         let mut rpos = 12;
 
         let n_elems = orig_size / elem_size;
+        let mut scratch = BitshuffleScratch::new(block_bytes);
+        let mut decompressed = vec![0u8; block_bytes];
         // Every block (full or final) is a length-prefixed LZ4 block; only the
         // `n_elems % 8` trailing elements are stored raw.
         for &block in &bshuf_block_plan(n_elems, block_elems) {
@@ -1748,9 +1809,15 @@ fn bitshuffle_decompress(
                 ));
             }
             let exp_size = block * elem_size;
-            let decompressed = lz4_flex::decompress(&data[rpos..rpos + comp_size], exp_size)
+            let decompressed = &mut decompressed[..exp_size];
+            let got = lz4_flex::block::decompress_into(&data[rpos..rpos + comp_size], decompressed)
                 .map_err(|e| FormatError::InvalidData(format!("bshuf LZ4: {}", e)))?;
-            output.extend_from_slice(&bitunshuffle_block(&decompressed, elem_size));
+            if got != exp_size {
+                return Err(FormatError::InvalidData(format!(
+                    "bshuf LZ4: block decompressed to {got} bytes, expected {exp_size}"
+                )));
+            }
+            push_bitshuffled(&mut output, decompressed, &mut scratch, elem_size, true);
             rpos += comp_size;
         }
 
@@ -3037,6 +3104,45 @@ mod tests {
         let range256: Vec<u8> = (0..=255u8).collect();
         assert_eq!(fletcher32(&range256), 0x5575_c03f);
         assert_eq!(fletcher32(&[0u8; 1000]), 0x0000_0000);
+    }
+
+    /// The lane kernel finished by the scalar loop against the scalar loop
+    /// alone, on every level the host offers, over lengths on both sides of
+    /// every run boundary and on the all-ones input that drives the
+    /// accumulators to their fold ceiling.
+    #[cfg(feature = "simd")]
+    #[test]
+    fn fletcher32_lanes_match_the_scalar_loop_on_every_level() {
+        use fearless_simd::Level;
+        let top = crate::simd::level();
+        let mut levels = vec![top, Level::baseline()];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            levels.extend(top.as_avx2().map(Level::Avx2));
+            levels.extend(top.as_sse4_2().map(Level::Sse4_2));
+            levels.extend(top.as_sse2().map(Level::Sse2));
+        }
+        let mut lengths: Vec<usize> = vec![0, 1, 2, 3, 15, 16, 17];
+        for run in 1..=4 {
+            lengths.extend([720 * run - 1, 720 * run, 720 * run + 1, 720 * run + 2]);
+        }
+        lengths.extend([8192, 65_536 + 3, 100_001]);
+        let mixed: Vec<u8> = (0..100_001)
+            .map(|i| ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let ones = vec![0xFFu8; 100_001];
+        for &level in &levels {
+            for &len in &lengths {
+                for (name, input) in [("mixed", &mixed[..len]), ("ones", &ones[..len])] {
+                    let want = fletcher32_from(0, 0, 0, input);
+                    let (s1, s2, done) =
+                        fearless_simd::dispatch!(level, s => fletcher_simd::runs(s, input));
+                    assert_eq!(done, len / 720 * 720, "{level:?} {name} len={len} done");
+                    let got = fletcher32_from(s1, s2, done, input);
+                    assert_eq!(got, want, "{level:?} {name} len={len}");
+                }
+            }
+        }
     }
 
     #[test]

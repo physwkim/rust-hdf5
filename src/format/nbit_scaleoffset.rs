@@ -28,297 +28,291 @@ struct NbitAtomic {
     offset: u32,
 }
 
-/// A bit cursor over a packed nbit buffer (`j` = byte index,
-/// `buf_len` = remaining unread bits in the current byte).
-struct NbitCursor {
+/// A packed bit stream being written, most significant bit first within
+/// each byte, the way `H5Z__nbit_compress_one_byte` and
+/// `H5Z__scaleoffset_compress_one_byte` fill it: `j` is the next byte to
+/// complete, `acc` holds the `nacc` bits (fewer than 8) that do not yet
+/// fill one. The buffer is zero-filled, so a completed byte is stored, not
+/// or-ed in.
+struct BitWriter<'a> {
+    buf: &'a mut [u8],
     j: usize,
-    buf_len: usize,
+    acc: u64,
+    nacc: u32,
 }
 
-impl NbitCursor {
-    fn next_byte(&mut self) {
-        self.j += 1;
-        self.buf_len = 8;
+impl<'a> BitWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self {
+            buf,
+            j: 0,
+            acc: 0,
+            nacc: 0,
+        }
     }
-}
 
-/// `~((unsigned)(~0) << n)` over the low 32 bits.
-fn mask_u32(n: usize) -> u32 {
-    if n >= 32 {
-        u32::MAX
-    } else {
-        !(u32::MAX << n)
-    }
-}
-
-/// Which datatype field one nbit byte loop is packing, and the endpoints of
-/// the byte range that field spans — everything [`nbit_decompress_one_byte`]
-/// and [`nbit_compress_one_byte`] need that stays constant across the whole
-/// loop, so only `k`, which byte of the range, is left as a call parameter.
-#[derive(Clone, Copy)]
-struct NbitByteRange<'p> {
-    data_offset: usize,
-    begin_i: u32,
-    end_i: u32,
-    p: &'p NbitAtomic,
-    datatype_len: u32,
-}
-
-/// Decompress one atomic byte, mirroring `H5Z__nbit_decompress_one_byte`.
-fn nbit_decompress_one_byte(
-    data: &mut [u8],
-    k: u32,
-    buffer: &[u8],
-    cur: &mut NbitCursor,
-    range: &NbitByteRange,
-) -> FormatResult<()> {
-    let NbitByteRange {
-        data_offset,
-        begin_i,
-        end_i,
-        p,
-        datatype_len,
-    } = *range;
-    if cur.j >= buffer.len() {
-        return Err(FormatError::InvalidData("nbit: buffer too short".into()));
-    }
-    let mut val = buffer[cur.j];
-    let mut dat_offset: usize = 0;
-    let mut dat_len: usize;
-
-    if begin_i != end_i {
-        if k == begin_i {
-            dat_len = 8 - ((datatype_len - p.precision - p.offset) % 8) as usize;
-        } else if k == end_i {
-            dat_len = 8 - (p.offset % 8) as usize;
-            dat_offset = 8 - dat_len;
+    /// Append the low `n` bits of `v`, most significant first, `n <= 64`.
+    #[inline]
+    fn put(&mut self, v: u64, n: u32) {
+        if n > 32 {
+            self.put_half(v >> 32, n - 32);
+            self.put_half(v, 32);
         } else {
-            dat_len = 8;
+            self.put_half(v, n);
         }
-    } else {
-        dat_offset = (p.offset % 8) as usize;
-        dat_len = p.precision as usize;
     }
 
-    let idx = data_offset + k as usize;
-    if cur.buf_len > dat_len {
-        data[idx] =
-            (((val >> (cur.buf_len - dat_len)) as u32 & mask_u32(dat_len)) << dat_offset) as u8;
-        cur.buf_len -= dat_len;
+    /// `put` for `n <= 32`, so `acc` never holds more than 39 bits.
+    #[inline]
+    fn put_half(&mut self, v: u64, n: u32) {
+        self.acc = (self.acc << n) | (v & mask_u64(n as usize));
+        self.nacc += n;
+        while self.nacc >= 8 {
+            self.nacc -= 8;
+            self.buf[self.j] = (self.acc >> self.nacc) as u8;
+            self.j += 1;
+        }
+    }
+
+    /// Store the hanging bits and return the C cursor's byte index: the
+    /// partial byte, or one past the last byte when the final bit filled it.
+    fn finish(self) -> usize {
+        if self.nacc > 0 {
+            self.buf[self.j] = (self.acc << (8 - self.nacc)) as u8;
+        }
+        self.j
+    }
+}
+
+/// A packed bit stream being read, the counterpart of [`BitWriter`]:
+/// `acc` holds the `nacc` bits already taken from the buffer and not yet
+/// consumed. A byte is loaded only once a value needs it, so the stream
+/// runs short exactly where the C's byte cursor did, with `short` as the
+/// message.
+struct BitReader<'a> {
+    buf: &'a [u8],
+    j: usize,
+    acc: u64,
+    nacc: u32,
+    short: &'static str,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(buf: &'a [u8], short: &'static str) -> Self {
+        Self {
+            buf,
+            j: 0,
+            acc: 0,
+            nacc: 0,
+            short,
+        }
+    }
+
+    /// Take the next `n` bits, most significant first, `n <= 64`.
+    #[inline]
+    fn get(&mut self, n: u32) -> FormatResult<u64> {
+        if n > 32 {
+            let hi = self.get_half(n - 32)?;
+            let lo = self.get_half(32)?;
+            Ok((hi << 32) | lo)
+        } else {
+            self.get_half(n)
+        }
+    }
+
+    /// `get` for `n <= 32`, so `acc` never holds more than 39 bits.
+    #[inline]
+    fn get_half(&mut self, n: u32) -> FormatResult<u64> {
+        while self.nacc < n {
+            let Some(&b) = self.buf.get(self.j) else {
+                return Err(FormatError::InvalidData(self.short.into()));
+            };
+            self.acc = (self.acc << 8) | u64::from(b);
+            self.j += 1;
+            self.nacc += 8;
+        }
+        self.nacc -= n;
+        Ok((self.acc >> self.nacc) & mask_u64(n as usize))
+    }
+}
+
+const NBIT_SHORT: &str = "nbit: buffer too short";
+
+/// The bytes of one atomic element that carry packed bits, in stream
+/// order: `(index, bits, shift)` — the byte, how many of its bits the
+/// stream holds, and where in the byte they sit. This is the byte walk of
+/// `H5Z__nbit_compress_one_atomic`: from the byte holding the field's most
+/// significant bit to the one holding its least, each contributing the
+/// field bits it covers, so the stream carries the `precision`-bit field
+/// most significant bit first.
+fn nbit_bytes(p: &NbitAtomic) -> impl Iterator<Item = (usize, u32, u32)> {
+    let len = p.size * 8;
+    let top = p.precision + p.offset;
+    let (begin, end, step): (i64, i64, i64) = if p.order == NBIT_ORDER_LE {
+        let begin = if top.is_multiple_of(8) {
+            top / 8 - 1
+        } else {
+            top / 8
+        };
+        (i64::from(begin), i64::from(p.offset / 8), -1)
     } else {
-        data[idx] =
-            (((val as u32 & mask_u32(cur.buf_len)) << (dat_len - cur.buf_len)) << dat_offset) as u8;
-        dat_len -= cur.buf_len;
-        cur.next_byte();
-        if dat_len == 0 {
-            return Ok(());
+        let end = if p.offset.is_multiple_of(8) {
+            (len - p.offset) / 8 - 1
+        } else {
+            (len - p.offset) / 8
+        };
+        (i64::from((len - top) / 8), i64::from(end), 1)
+    };
+    let p = *p;
+    std::iter::successors(Some(begin), move |&k| (k != end).then(|| k + step)).map(move |k| {
+        let (bits, shift) = if begin == end {
+            (p.precision, p.offset % 8)
+        } else if k == begin {
+            (8 - (len - top) % 8, 0)
+        } else if k == end {
+            let bits = 8 - p.offset % 8;
+            (bits, 8 - bits)
+        } else {
+            (8, 0)
+        };
+        (k as usize, bits, shift)
+    })
+}
+
+/// An `N`-byte element as one integer, `N <= 8`. The width is a constant
+/// so the copy compiles to a load rather than a `memcpy` call per element.
+#[inline]
+fn load_uint<const N: usize>(bytes: [u8; N], le: bool) -> u64 {
+    let mut padded = [0u8; 8];
+    if le {
+        padded[..N].copy_from_slice(&bytes);
+        u64::from_le_bytes(padded)
+    } else {
+        padded[8 - N..].copy_from_slice(&bytes);
+        u64::from_be_bytes(padded)
+    }
+}
+
+/// The `N`-byte element holding `v`, `N <= 8`.
+#[inline]
+fn store_uint<const N: usize>(v: u64, le: bool) -> [u8; N] {
+    let mut out = [0u8; N];
+    if le {
+        out.copy_from_slice(&v.to_le_bytes()[..N]);
+    } else {
+        out.copy_from_slice(&v.to_be_bytes()[8 - N..]);
+    }
+    out
+}
+
+/// Call `$f::<N>($args)` with `N` the element width, one of 1, 2, 4 and
+/// 8 — the widths `H5Z__scaleoffset_get_type` admits and the ones an nbit
+/// atomic takes the single-load path for.
+macro_rules! by_width {
+    ($size:expr, $f:ident($($arg:expr),* $(,)?)) => {
+        match $size {
+            1 => $f::<1>($($arg),*),
+            2 => $f::<2>($($arg),*),
+            4 => $f::<4>($($arg),*),
+            8 => $f::<8>($($arg),*),
+            n => unreachable!("element width {n} is not 1, 2, 4 or 8"),
         }
-        if cur.j >= buffer.len() {
-            return Err(FormatError::InvalidData("nbit: buffer too short".into()));
-        }
-        val = buffer[cur.j];
-        data[idx] |=
-            (((val >> (cur.buf_len - dat_len)) as u32 & mask_u32(dat_len)) << dat_offset) as u8;
-        cur.buf_len -= dat_len;
+    };
+}
+
+/// The packed field of one element, `N` bytes wide.
+#[inline]
+fn nbit_field<const N: usize>(elem: &[u8], le: bool, offset: u32) -> u64 {
+    load_uint::<N>(elem.try_into().expect("elem is N bytes"), le) >> offset
+}
+
+/// Store a field read back from the stream into its `N`-byte element.
+#[inline]
+fn nbit_place<const N: usize>(elem: &mut [u8], le: bool, offset: u32, field: u64) {
+    elem.copy_from_slice(&store_uint::<N>(field << offset, le));
+}
+
+/// Pack a whole buffer of `N`-byte atomic elements: the top-level atomic
+/// case, run as one loop with the width fixed instead of a dispatch per
+/// element.
+fn nbit_compress_atomics<const N: usize>(data: &[u8], w: &mut BitWriter, p: &NbitAtomic) {
+    let le = p.order == NBIT_ORDER_LE;
+    let (elems, _) = data.as_chunks::<N>();
+    for &e in elems {
+        w.put(load_uint(e, le) >> p.offset, p.precision);
+    }
+}
+
+/// Unpack a whole buffer of `N`-byte atomic elements.
+fn nbit_decompress_atomics<const N: usize>(
+    out: &mut [u8],
+    r: &mut BitReader,
+    p: &NbitAtomic,
+) -> FormatResult<()> {
+    let le = p.order == NBIT_ORDER_LE;
+    let (elems, _) = out.as_chunks_mut::<N>();
+    for e in elems {
+        *e = store_uint(r.get(p.precision)? << p.offset, le);
     }
     Ok(())
-}
-
-/// Compress one atomic byte, mirroring `H5Z__nbit_compress_one_byte`.
-fn nbit_compress_one_byte(
-    data: &[u8],
-    k: u32,
-    buffer: &mut [u8],
-    cur: &mut NbitCursor,
-    range: &NbitByteRange,
-) {
-    let NbitByteRange {
-        data_offset,
-        begin_i,
-        end_i,
-        p,
-        datatype_len,
-    } = *range;
-    let mut val = data[data_offset + k as usize];
-    let mut dat_len: usize;
-
-    if begin_i != end_i {
-        if k == begin_i {
-            dat_len = 8 - ((datatype_len - p.precision - p.offset) % 8) as usize;
-        } else if k == end_i {
-            dat_len = 8 - (p.offset % 8) as usize;
-            val >>= 8 - dat_len;
-        } else {
-            dat_len = 8;
-        }
-    } else {
-        val >>= p.offset % 8;
-        dat_len = p.precision as usize;
-    }
-
-    if cur.buf_len > dat_len {
-        buffer[cur.j] |= ((val as u32 & mask_u32(dat_len)) << (cur.buf_len - dat_len)) as u8;
-        cur.buf_len -= dat_len;
-    } else {
-        buffer[cur.j] |= ((val as u32 >> (dat_len - cur.buf_len)) & mask_u32(cur.buf_len)) as u8;
-        dat_len -= cur.buf_len;
-        cur.next_byte();
-        if dat_len == 0 {
-            return;
-        }
-        buffer[cur.j] = ((val as u32 & mask_u32(dat_len)) << (cur.buf_len - dat_len)) as u8;
-        cur.buf_len -= dat_len;
-    }
 }
 
 /// Decompress one nooptype element, mirroring `H5Z__nbit_decompress_one_nooptype`.
 fn nbit_decompress_one_nooptype(
     data: &mut [u8],
     data_offset: usize,
-    buffer: &[u8],
-    cur: &mut NbitCursor,
+    r: &mut BitReader,
     size: u32,
 ) -> FormatResult<()> {
-    for i in 0..size as usize {
-        if cur.j >= buffer.len() {
-            return Err(FormatError::InvalidData("nbit: buffer too short".into()));
-        }
-        let mut val = buffer[cur.j];
-        let mut dat_len: usize = 8;
-        data[data_offset + i] =
-            ((val as u32 & mask_u32(cur.buf_len)) << (dat_len - cur.buf_len)) as u8;
-        dat_len -= cur.buf_len;
-        cur.next_byte();
-        if dat_len == 0 {
-            continue;
-        }
-        if cur.j >= buffer.len() {
-            return Err(FormatError::InvalidData("nbit: buffer too short".into()));
-        }
-        val = buffer[cur.j];
-        data[data_offset + i] |=
-            ((val >> (cur.buf_len - dat_len)) as u32 & mask_u32(dat_len)) as u8;
-        cur.buf_len -= dat_len;
+    for b in &mut data[data_offset..data_offset + size as usize] {
+        *b = r.get(8)? as u8;
     }
     Ok(())
 }
 
 /// Compress one nooptype element, mirroring `H5Z__nbit_compress_one_nooptype`.
-fn nbit_compress_one_nooptype(
-    data: &[u8],
-    data_offset: usize,
-    buffer: &mut [u8],
-    cur: &mut NbitCursor,
-    size: u32,
-) {
-    for i in 0..size as usize {
-        let val = data[data_offset + i];
-        let mut dat_len: usize = 8;
-        buffer[cur.j] |= ((val as u32 >> (dat_len - cur.buf_len)) & mask_u32(cur.buf_len)) as u8;
-        dat_len -= cur.buf_len;
-        cur.next_byte();
-        if dat_len == 0 {
-            continue;
-        }
-        buffer[cur.j] = ((val as u32 & mask_u32(dat_len)) << (cur.buf_len - dat_len)) as u8;
-        cur.buf_len -= dat_len;
+fn nbit_compress_one_nooptype(data: &[u8], data_offset: usize, w: &mut BitWriter, size: u32) {
+    for &b in &data[data_offset..data_offset + size as usize] {
+        w.put(u64::from(b), 8);
     }
 }
 
 /// Decompress one atomic element, mirroring `H5Z__nbit_decompress_one_atomic`.
+///
+/// The bytes outside the field stay zero, as the C leaves them in its
+/// zero-filled output.
 fn nbit_decompress_one_atomic(
     data: &mut [u8],
     data_offset: usize,
-    buffer: &[u8],
-    cur: &mut NbitCursor,
+    r: &mut BitReader,
     p: &NbitAtomic,
 ) -> FormatResult<()> {
-    let datatype_len = p.size * 8;
-    if p.order == NBIT_ORDER_LE {
-        let begin_i = if !(p.precision + p.offset).is_multiple_of(8) {
-            (p.precision + p.offset) / 8
-        } else {
-            (p.precision + p.offset) / 8 - 1
-        };
-        let end_i = p.offset / 8;
-        let range = NbitByteRange {
-            data_offset,
-            begin_i,
-            end_i,
-            p,
-            datatype_len,
-        };
-        let mut k = begin_i as i64;
-        while k >= end_i as i64 {
-            nbit_decompress_one_byte(data, k as u32, buffer, cur, &range)?;
-            k -= 1;
-        }
-    } else {
-        let begin_i = (datatype_len - p.precision - p.offset) / 8;
-        let end_i = if !p.offset.is_multiple_of(8) {
-            (datatype_len - p.offset) / 8
-        } else {
-            (datatype_len - p.offset) / 8 - 1
-        };
-        let range = NbitByteRange {
-            data_offset,
-            begin_i,
-            end_i,
-            p,
-            datatype_len,
-        };
-        for k in begin_i..=end_i {
-            nbit_decompress_one_byte(data, k, buffer, cur, &range)?;
-        }
+    let elem = &mut data[data_offset..data_offset + p.size as usize];
+    if matches!(p.size, 1 | 2 | 4 | 8) {
+        let field = r.get(p.precision)?;
+        let le = p.order == NBIT_ORDER_LE;
+        by_width!(p.size, nbit_place(elem, le, p.offset, field));
+        return Ok(());
+    }
+    for (k, bits, shift) in nbit_bytes(p) {
+        elem[k] = (r.get(bits)? << shift) as u8;
     }
     Ok(())
 }
 
 /// Compress one atomic element, mirroring `H5Z__nbit_compress_one_atomic`.
-fn nbit_compress_one_atomic(
-    data: &[u8],
-    data_offset: usize,
-    buffer: &mut [u8],
-    cur: &mut NbitCursor,
-    p: &NbitAtomic,
-) {
-    let datatype_len = p.size * 8;
-    if p.order == NBIT_ORDER_LE {
-        let begin_i = if !(p.precision + p.offset).is_multiple_of(8) {
-            (p.precision + p.offset) / 8
-        } else {
-            (p.precision + p.offset) / 8 - 1
-        };
-        let end_i = p.offset / 8;
-        let range = NbitByteRange {
-            data_offset,
-            begin_i,
-            end_i,
-            p,
-            datatype_len,
-        };
-        let mut k = begin_i as i64;
-        while k >= end_i as i64 {
-            nbit_compress_one_byte(data, k as u32, buffer, cur, &range);
-            k -= 1;
-        }
-    } else {
-        let begin_i = (datatype_len - p.precision - p.offset) / 8;
-        let end_i = if !p.offset.is_multiple_of(8) {
-            (datatype_len - p.offset) / 8
-        } else {
-            (datatype_len - p.offset) / 8 - 1
-        };
-        let range = NbitByteRange {
-            data_offset,
-            begin_i,
-            end_i,
-            p,
-            datatype_len,
-        };
-        for k in begin_i..=end_i {
-            nbit_compress_one_byte(data, k, buffer, cur, &range);
-        }
+fn nbit_compress_one_atomic(data: &[u8], data_offset: usize, w: &mut BitWriter, p: &NbitAtomic) {
+    let elem = &data[data_offset..data_offset + p.size as usize];
+    if matches!(p.size, 1 | 2 | 4 | 8) {
+        let le = p.order == NBIT_ORDER_LE;
+        w.put(
+            by_width!(p.size, nbit_field(elem, le, p.offset)),
+            p.precision,
+        );
+        return;
+    }
+    for (k, bits, shift) in nbit_bytes(p) {
+        w.put(u64::from(elem[k] >> shift), bits);
     }
 }
 
@@ -358,8 +352,7 @@ fn read_atomic(parms: &[u32], idx: &mut usize) -> FormatResult<NbitAtomic> {
 fn nbit_decompress_one_array(
     data: &mut [u8],
     data_offset: usize,
-    buffer: &[u8],
-    cur: &mut NbitCursor,
+    r: &mut BitReader,
     parms: &[u32],
     parms_index: &mut usize,
 ) -> FormatResult<()> {
@@ -377,13 +370,7 @@ fn nbit_decompress_one_array(
             let p = read_atomic(parms, parms_index)?;
             let n = total_size / p.size;
             for i in 0..n as usize {
-                nbit_decompress_one_atomic(
-                    data,
-                    data_offset + i * p.size as usize,
-                    buffer,
-                    cur,
-                    &p,
-                )?;
+                nbit_decompress_one_atomic(data, data_offset + i * p.size as usize, r, &p)?;
             }
         }
         NBIT_ARRAY => {
@@ -395,8 +382,7 @@ fn nbit_decompress_one_array(
                 nbit_decompress_one_array(
                     data,
                     data_offset + i * base_size as usize,
-                    buffer,
-                    cur,
+                    r,
                     parms,
                     parms_index,
                 )?;
@@ -411,8 +397,7 @@ fn nbit_decompress_one_array(
                 nbit_decompress_one_compound(
                     data,
                     data_offset + i * base_size as usize,
-                    buffer,
-                    cur,
+                    r,
                     parms,
                     parms_index,
                 )?;
@@ -420,7 +405,7 @@ fn nbit_decompress_one_array(
         }
         NBIT_NOOPTYPE => {
             *parms_index += 1; // skip size of no-op type
-            nbit_decompress_one_nooptype(data, data_offset, buffer, cur, total_size)?;
+            nbit_decompress_one_nooptype(data, data_offset, r, total_size)?;
         }
         _ => {
             return Err(FormatError::InvalidData(format!(
@@ -436,8 +421,7 @@ fn nbit_decompress_one_array(
 fn nbit_decompress_one_compound(
     data: &mut [u8],
     data_offset: usize,
-    buffer: &[u8],
-    cur: &mut NbitCursor,
+    r: &mut BitReader,
     parms: &[u32],
     parms_index: &mut usize,
 ) -> FormatResult<()> {
@@ -463,14 +447,13 @@ fn nbit_decompress_one_compound(
         match member_class {
             NBIT_ATOMIC => {
                 let p = read_atomic(parms, parms_index)?;
-                nbit_decompress_one_atomic(data, data_offset + member_offset, buffer, cur, &p)?;
+                nbit_decompress_one_atomic(data, data_offset + member_offset, r, &p)?;
             }
             NBIT_ARRAY => {
                 nbit_decompress_one_array(
                     data,
                     data_offset + member_offset,
-                    buffer,
-                    cur,
+                    r,
                     parms,
                     parms_index,
                 )?;
@@ -479,8 +462,7 @@ fn nbit_decompress_one_compound(
                 nbit_decompress_one_compound(
                     data,
                     data_offset + member_offset,
-                    buffer,
-                    cur,
+                    r,
                     parms,
                     parms_index,
                 )?;
@@ -488,7 +470,7 @@ fn nbit_decompress_one_compound(
             NBIT_NOOPTYPE => {
                 let size = parms[*parms_index];
                 *parms_index += 1;
-                nbit_decompress_one_nooptype(data, data_offset + member_offset, buffer, cur, size)?;
+                nbit_decompress_one_nooptype(data, data_offset + member_offset, r, size)?;
             }
             _ => {
                 return Err(FormatError::InvalidData(format!(
@@ -505,8 +487,7 @@ fn nbit_decompress_one_compound(
 fn nbit_compress_one_array(
     data: &[u8],
     data_offset: usize,
-    buffer: &mut [u8],
-    cur: &mut NbitCursor,
+    w: &mut BitWriter,
     parms: &[u32],
     parms_index: &mut usize,
 ) -> FormatResult<()> {
@@ -524,7 +505,7 @@ fn nbit_compress_one_array(
             let p = read_atomic(parms, parms_index)?;
             let n = total_size / p.size;
             for i in 0..n as usize {
-                nbit_compress_one_atomic(data, data_offset + i * p.size as usize, buffer, cur, &p);
+                nbit_compress_one_atomic(data, data_offset + i * p.size as usize, w, &p);
             }
         }
         NBIT_ARRAY => {
@@ -536,8 +517,7 @@ fn nbit_compress_one_array(
                 nbit_compress_one_array(
                     data,
                     data_offset + i * base_size as usize,
-                    buffer,
-                    cur,
+                    w,
                     parms,
                     parms_index,
                 )?;
@@ -552,8 +532,7 @@ fn nbit_compress_one_array(
                 nbit_compress_one_compound(
                     data,
                     data_offset + i * base_size as usize,
-                    buffer,
-                    cur,
+                    w,
                     parms,
                     parms_index,
                 )?;
@@ -561,7 +540,7 @@ fn nbit_compress_one_array(
         }
         NBIT_NOOPTYPE => {
             *parms_index += 1;
-            nbit_compress_one_nooptype(data, data_offset, buffer, cur, total_size);
+            nbit_compress_one_nooptype(data, data_offset, w, total_size);
         }
         _ => {
             return Err(FormatError::InvalidData(format!(
@@ -577,8 +556,7 @@ fn nbit_compress_one_array(
 fn nbit_compress_one_compound(
     data: &[u8],
     data_offset: usize,
-    buffer: &mut [u8],
-    cur: &mut NbitCursor,
+    w: &mut BitWriter,
     parms: &[u32],
     parms_index: &mut usize,
 ) -> FormatResult<()> {
@@ -604,24 +582,16 @@ fn nbit_compress_one_compound(
         match member_class {
             NBIT_ATOMIC => {
                 let p = read_atomic(parms, parms_index)?;
-                nbit_compress_one_atomic(data, data_offset + member_offset, buffer, cur, &p);
+                nbit_compress_one_atomic(data, data_offset + member_offset, w, &p);
             }
             NBIT_ARRAY => {
-                nbit_compress_one_array(
-                    data,
-                    data_offset + member_offset,
-                    buffer,
-                    cur,
-                    parms,
-                    parms_index,
-                )?;
+                nbit_compress_one_array(data, data_offset + member_offset, w, parms, parms_index)?;
             }
             NBIT_COMPOUND => {
                 nbit_compress_one_compound(
                     data,
                     data_offset + member_offset,
-                    buffer,
-                    cur,
+                    w,
                     parms,
                     parms_index,
                 )?;
@@ -629,7 +599,7 @@ fn nbit_compress_one_compound(
             NBIT_NOOPTYPE => {
                 let size = parms[*parms_index];
                 *parms_index += 1;
-                nbit_compress_one_nooptype(data, data_offset + member_offset, buffer, cur, size);
+                nbit_compress_one_nooptype(data, data_offset + member_offset, w, size);
             }
             _ => {
                 return Err(FormatError::InvalidData(format!(
@@ -676,41 +646,31 @@ pub fn apply_nbit(data: &[u8], cd_values: &[u32], compress: bool) -> FormatResul
         }
         // Worst case the packed buffer is the same size as the unpacked one.
         let mut buffer = vec![0u8; unpacked_size + 1];
-        let mut cur = NbitCursor { j: 0, buf_len: 8 };
+        let mut w = BitWriter::new(&mut buffer);
         match cd_values[3] {
             NBIT_ATOMIC => {
                 let mut idx = 4;
                 let p = read_atomic(cd_values, &mut idx)?;
-                for i in 0..d_nelmts {
-                    nbit_compress_one_atomic(data, i * p.size as usize, &mut buffer, &mut cur, &p);
+                if matches!(p.size, 1 | 2 | 4 | 8) {
+                    by_width!(p.size, nbit_compress_atomics(data, &mut w, &p));
+                } else {
+                    for i in 0..d_nelmts {
+                        nbit_compress_one_atomic(data, i * p.size as usize, &mut w, &p);
+                    }
                 }
             }
             NBIT_ARRAY => {
                 let size = cd_values[4] as usize;
                 for i in 0..d_nelmts {
                     let mut idx = 4;
-                    nbit_compress_one_array(
-                        data,
-                        i * size,
-                        &mut buffer,
-                        &mut cur,
-                        cd_values,
-                        &mut idx,
-                    )?;
+                    nbit_compress_one_array(data, i * size, &mut w, cd_values, &mut idx)?;
                 }
             }
             NBIT_COMPOUND => {
                 let size = cd_values[4] as usize;
                 for i in 0..d_nelmts {
                     let mut idx = 4;
-                    nbit_compress_one_compound(
-                        data,
-                        i * size,
-                        &mut buffer,
-                        &mut cur,
-                        cd_values,
-                        &mut idx,
-                    )?;
+                    nbit_compress_one_compound(data, i * size, &mut w, cd_values, &mut idx)?;
                 }
             }
             other => {
@@ -721,11 +681,12 @@ pub fn apply_nbit(data: &[u8], cd_values: &[u32], compress: bool) -> FormatResul
             }
         }
         // libhdf5 reports new_size + 1 (any hanging bits round up).
-        buffer.truncate(cur.j + 1);
+        let j = w.finish();
+        buffer.truncate(j + 1);
         Ok(buffer)
     } else {
         let mut out = vec![0u8; unpacked_size];
-        let mut cur = NbitCursor { j: 0, buf_len: 8 };
+        let mut r = BitReader::new(data, NBIT_SHORT);
         match cd_values[3] {
             NBIT_ATOMIC => {
                 let mut idx = 4;
@@ -735,36 +696,26 @@ pub fn apply_nbit(data: &[u8], cd_values: &[u32], compress: bool) -> FormatResul
                         "nbit: invalid precision/offset".into(),
                     ));
                 }
-                for i in 0..d_nelmts {
-                    nbit_decompress_one_atomic(&mut out, i * p.size as usize, data, &mut cur, &p)?;
+                if matches!(p.size, 1 | 2 | 4 | 8) {
+                    by_width!(p.size, nbit_decompress_atomics(&mut out, &mut r, &p))?;
+                } else {
+                    for i in 0..d_nelmts {
+                        nbit_decompress_one_atomic(&mut out, i * p.size as usize, &mut r, &p)?;
+                    }
                 }
             }
             NBIT_ARRAY => {
                 let size = cd_values[4] as usize;
                 for i in 0..d_nelmts {
                     let mut idx = 4;
-                    nbit_decompress_one_array(
-                        &mut out,
-                        i * size,
-                        data,
-                        &mut cur,
-                        cd_values,
-                        &mut idx,
-                    )?;
+                    nbit_decompress_one_array(&mut out, i * size, &mut r, cd_values, &mut idx)?;
                 }
             }
             NBIT_COMPOUND => {
                 let size = cd_values[4] as usize;
                 for i in 0..d_nelmts {
                     let mut idx = 4;
-                    nbit_decompress_one_compound(
-                        &mut out,
-                        i * size,
-                        data,
-                        &mut cur,
-                        cd_values,
-                        &mut idx,
-                    )?;
+                    nbit_decompress_one_compound(&mut out, i * size, &mut r, cd_values, &mut idx)?;
                 }
             }
             other => {
@@ -814,6 +765,8 @@ pub(crate) const SO_TOTAL_NPARMS: usize = 20;
 /// 21-byte parameter header stored in front of every scale-offset chunk.
 const SO_BUF_OFFSET: usize = 21;
 
+const SO_SHORT: &str = "scaleoffset: buffer too short";
+
 /// `H5Z__scaleoffset_log2`: the ceiling of log2, with `log2(0) == 1`.
 fn so_log2(num: u64) -> u32 {
     let mut v = 0u32;
@@ -862,7 +815,9 @@ impl SoParams {
         let size = cd_values[SO_PARM_SIZE] as usize;
         let fill_defined = cd_values[SO_PARM_FILAVAIL] == SO_FILL_DEFINED;
 
-        if size == 0 || size > 8 {
+        // `H5Z__scaleoffset_get_type` maps the size to a C integer type and
+        // has none for the other widths.
+        if !matches!(size, 1 | 2 | 4 | 8) {
             return Err(FormatError::InvalidData(format!(
                 "scaleoffset: unsupported datatype size {}",
                 size
@@ -946,217 +901,26 @@ fn mask_u64(n: usize) -> u64 {
     }
 }
 
-/// Which byte starts the range one scale-offset byte loop is packing, and
-/// the datatype's minimum bit count and bit length — everything
-/// [`so_decompress_one_byte`] and [`so_compress_one_byte`] need that stays
-/// constant across the whole loop, so only `k`, which byte of the range, is
-/// left as a call parameter.
-#[derive(Clone, Copy)]
-struct SoByteRange {
-    data_offset: usize,
-    begin_i: u32,
-    minbits: u32,
-    dtype_len: u32,
+/// Pack every `N`-byte element of `buf` as its low `minbits` bits.
+fn so_pack<const N: usize>(buf: &[u8], le: bool, minbits: u32, w: &mut BitWriter) {
+    let (elems, _) = buf.as_chunks::<N>();
+    for &elem in elems {
+        w.put(load_uint(elem, le), minbits);
+    }
 }
 
-/// Decompress one scale-offset byte, mirroring
-/// `H5Z__scaleoffset_decompress_one_byte`.
-fn so_decompress_one_byte(
-    data: &mut [u8],
-    k: u32,
-    buffer: &[u8],
-    cur: &mut NbitCursor,
-    range: &SoByteRange,
+/// Unpack `minbits` bits into every `N`-byte element of `out`.
+fn so_unpack<const N: usize>(
+    out: &mut [u8],
+    le: bool,
+    minbits: u32,
+    r: &mut BitReader,
 ) -> FormatResult<()> {
-    let SoByteRange {
-        data_offset,
-        begin_i,
-        minbits,
-        dtype_len,
-    } = *range;
-    if cur.j >= buffer.len() {
-        return Err(FormatError::InvalidData(
-            "scaleoffset: buffer too short".into(),
-        ));
-    }
-    let mut val = buffer[cur.j];
-    let mut bits_to_copy: usize = if k == begin_i {
-        8 - ((dtype_len - minbits) % 8) as usize
-    } else {
-        8
-    };
-
-    let idx = data_offset + k as usize;
-    if cur.buf_len > bits_to_copy {
-        data[idx] = ((val >> (cur.buf_len - bits_to_copy)) as u32 & mask_u32(bits_to_copy)) as u8;
-        cur.buf_len -= bits_to_copy;
-    } else {
-        data[idx] = ((val as u32 & mask_u32(cur.buf_len)) << (bits_to_copy - cur.buf_len)) as u8;
-        bits_to_copy -= cur.buf_len;
-        cur.next_byte();
-        if bits_to_copy == 0 {
-            return Ok(());
-        }
-        if cur.j >= buffer.len() {
-            return Err(FormatError::InvalidData(
-                "scaleoffset: buffer too short".into(),
-            ));
-        }
-        val = buffer[cur.j];
-        data[idx] |= ((val >> (cur.buf_len - bits_to_copy)) as u32 & mask_u32(bits_to_copy)) as u8;
-        cur.buf_len -= bits_to_copy;
+    let (elems, _) = out.as_chunks_mut::<N>();
+    for elem in elems {
+        *elem = store_uint(r.get(minbits)?, le);
     }
     Ok(())
-}
-
-/// Decompress one scale-offset atomic element, mirroring
-/// `H5Z__scaleoffset_decompress_one_atomic`.
-fn so_decompress_one_atomic(
-    data: &mut [u8],
-    data_offset: usize,
-    buffer: &[u8],
-    cur: &mut NbitCursor,
-    size: u32,
-    minbits: u32,
-    order: u32,
-) -> FormatResult<()> {
-    let dtype_len = size * 8;
-    if order == SO_ORDER_LE {
-        let begin_i = size - 1 - (dtype_len - minbits) / 8;
-        let range = SoByteRange {
-            data_offset,
-            begin_i,
-            minbits,
-            dtype_len,
-        };
-        let mut k = begin_i as i64;
-        while k >= 0 {
-            so_decompress_one_byte(data, k as u32, buffer, cur, &range)?;
-            k -= 1;
-        }
-    } else {
-        let begin_i = (dtype_len - minbits) / 8;
-        let range = SoByteRange {
-            data_offset,
-            begin_i,
-            minbits,
-            dtype_len,
-        };
-        for k in begin_i..=(size - 1) {
-            so_decompress_one_byte(data, k, buffer, cur, &range)?;
-        }
-    }
-    Ok(())
-}
-
-/// Compress one scale-offset byte, mirroring
-/// `H5Z__scaleoffset_compress_one_byte`.
-///
-/// `cur.buf_len` is the C's `bits_to_fill`: how much room is left in the
-/// buffer byte the cursor sits on.
-fn so_compress_one_byte(
-    data: &[u8],
-    k: u32,
-    buffer: &mut [u8],
-    cur: &mut NbitCursor,
-    range: &SoByteRange,
-) {
-    let SoByteRange {
-        data_offset,
-        begin_i,
-        minbits,
-        dtype_len,
-    } = *range;
-    let val = data[data_offset + k as usize];
-    let mut bits_to_copy: usize = if k == begin_i {
-        8 - ((dtype_len - minbits) % 8) as usize
-    } else {
-        8
-    };
-
-    if cur.buf_len > bits_to_copy {
-        buffer[cur.j] |=
-            ((val as u32 & mask_u32(bits_to_copy)) << (cur.buf_len - bits_to_copy)) as u8;
-        cur.buf_len -= bits_to_copy;
-    } else {
-        buffer[cur.j] |=
-            ((val >> (bits_to_copy - cur.buf_len)) as u32 & mask_u32(cur.buf_len)) as u8;
-        bits_to_copy -= cur.buf_len;
-        cur.next_byte();
-        if bits_to_copy == 0 {
-            return;
-        }
-        buffer[cur.j] =
-            ((val as u32 & mask_u32(bits_to_copy)) << (cur.buf_len - bits_to_copy)) as u8;
-        cur.buf_len -= bits_to_copy;
-    }
-}
-
-/// Compress one scale-offset atomic element, mirroring
-/// `H5Z__scaleoffset_compress_one_atomic`.
-fn so_compress_one_atomic(
-    data: &[u8],
-    data_offset: usize,
-    buffer: &mut [u8],
-    cur: &mut NbitCursor,
-    size: u32,
-    minbits: u32,
-    order: u32,
-) {
-    let dtype_len = size * 8;
-    if order == SO_ORDER_LE {
-        let begin_i = size - 1 - (dtype_len - minbits) / 8;
-        let range = SoByteRange {
-            data_offset,
-            begin_i,
-            minbits,
-            dtype_len,
-        };
-        let mut k = begin_i as i64;
-        while k >= 0 {
-            so_compress_one_byte(data, k as u32, buffer, cur, &range);
-            k -= 1;
-        }
-    } else {
-        let begin_i = (dtype_len - minbits) / 8;
-        let range = SoByteRange {
-            data_offset,
-            begin_i,
-            minbits,
-            dtype_len,
-        };
-        for k in begin_i..=(size - 1) {
-            so_compress_one_byte(data, k, buffer, cur, &range);
-        }
-    }
-}
-
-/// Read a little-/big-endian integer of `size` bytes from `data` at `offset`.
-fn read_uint(data: &[u8], offset: usize, size: usize, order: u32) -> u64 {
-    let mut v: u64 = 0;
-    if order == SO_ORDER_LE {
-        for i in 0..size {
-            v |= (data[offset + i] as u64) << (i * 8);
-        }
-    } else {
-        for i in 0..size {
-            v = (v << 8) | data[offset + i] as u64;
-        }
-    }
-    v
-}
-
-/// Write a little-/big-endian integer of `size` bytes into `data` at `offset`.
-fn write_uint(data: &mut [u8], offset: usize, size: usize, order: u32, v: u64) {
-    if order == SO_ORDER_LE {
-        for i in 0..size {
-            data[offset + i] = (v >> (i * 8)) as u8;
-        }
-    } else {
-        for i in 0..size {
-            data[offset + i] = (v >> ((size - 1 - i) * 8)) as u8;
-        }
-    }
 }
 
 /// Reverse the HDF5 scale-offset filter (decompress only).
@@ -1174,9 +938,7 @@ pub fn reverse_scaleoffset(data: &[u8], cd_values: &[u32]) -> FormatResult<Vec<u
         // forward/reverse split in `H5Z__filter_scaleoffset`): the chunk is
         // the raw element buffer, with no parameter header in front of it.
         if data.len() < size_out {
-            return Err(FormatError::InvalidData(
-                "scaleoffset: buffer too short".into(),
-            ));
+            return Err(FormatError::InvalidData(SO_SHORT.into()));
         }
         return Ok(data[..size_out].to_vec());
     }
@@ -1205,9 +967,7 @@ pub fn reverse_scaleoffset(data: &[u8], cd_values: &[u32]) -> FormatResult<Vec<u
     // Special case: full precision -> payload copied verbatim.
     if minbits as usize == size * 8 {
         if data.len() < SO_BUF_OFFSET + size_out {
-            return Err(FormatError::InvalidData(
-                "scaleoffset: buffer too short".into(),
-            ));
+            return Err(FormatError::InvalidData(SO_SHORT.into()));
         }
         return Ok(data[SO_BUF_OFFSET..SO_BUF_OFFSET + size_out].to_vec());
     }
@@ -1216,23 +976,11 @@ pub fn reverse_scaleoffset(data: &[u8], cd_values: &[u32]) -> FormatResult<Vec<u
 
     if minbits != 0 {
         if data.len() < SO_BUF_OFFSET {
-            return Err(FormatError::InvalidData(
-                "scaleoffset: buffer too short".into(),
-            ));
+            return Err(FormatError::InvalidData(SO_SHORT.into()));
         }
-        let payload = &data[SO_BUF_OFFSET..];
-        let mut cur = NbitCursor { j: 0, buf_len: 8 };
-        for i in 0..d_nelmts {
-            so_decompress_one_atomic(
-                &mut out,
-                i * size,
-                payload,
-                &mut cur,
-                size as u32,
-                minbits,
-                order,
-            )?;
-        }
+        let mut r = BitReader::new(&data[SO_BUF_OFFSET..], SO_SHORT);
+        let le = order == SO_ORDER_LE;
+        by_width!(size, so_unpack(&mut out, le, minbits, &mut r))?;
     }
     // minbits == 0: out stays all-zero (all elements identical, no fill value).
 
@@ -1276,7 +1024,7 @@ pub fn forward_scaleoffset(data: &[u8], cd_values: &[u32]) -> FormatResult<Vec<u
     // that offset needs.
     let mut buf = data.to_vec();
     let (minbits, minval) = if p.dtype_class == SO_CLS_INTEGER {
-        precompress_int(&mut buf, &p)
+        by_width!(p.size, precompress_int(&mut buf, &p))
     } else {
         precompress_float(&mut buf, &p)?
     };
@@ -1301,44 +1049,36 @@ pub fn forward_scaleoffset(data: &[u8], cd_values: &[u32]) -> FormatResult<Vec<u
         return Ok(out);
     }
     if minbits != 0 {
-        let (header, payload) = out.split_at_mut(SO_BUF_OFFSET);
-        let _ = header;
-        let mut cur = NbitCursor { j: 0, buf_len: 8 };
-        for i in 0..p.d_nelmts {
-            so_compress_one_atomic(
-                &buf,
-                i * p.size,
-                payload,
-                &mut cur,
-                p.size as u32,
-                minbits,
-                p.order,
-            );
-        }
+        let mut w = BitWriter::new(&mut out[SO_BUF_OFFSET..]);
+        let le = p.order == SO_ORDER_LE;
+        by_width!(p.size, so_pack(&buf, le, minbits, &mut w));
+        w.finish();
     }
     // minbits == 0: every element is the chunk minimum, so the payload is
     // the single zero byte the size formula leaves.
     Ok(out)
 }
 
-/// Preprocess an integer chunk, mirroring `H5Z__scaleoffset_precompress_i`.
+/// Preprocess an integer chunk of `N`-byte elements, mirroring
+/// `H5Z__scaleoffset_precompress_i`.
 ///
 /// Returns `(minbits, minval)` and leaves `buf` holding each element's offset
 /// from the chunk minimum — or the all-ones sentinel where the element was
 /// the fill value.
-fn precompress_int(buf: &mut [u8], p: &SoParams) -> (u32, u64) {
+fn precompress_int<const N: usize>(buf: &mut [u8], p: &SoParams) -> (u32, u64) {
     let signed = p.dtype_sign == SO_SGN_2;
+    let le = p.order == SO_ORDER_LE;
     let width_mask = p.width_mask();
     // The comparison key: a signed element orders by its sign-extended
     // value, an unsigned one by its raw bits. `i128` holds both.
     let key = |raw: u64| -> i128 {
         if signed {
-            sign_extend(raw, p.size) as i128
+            i128::from(sign_extend::<N>(raw))
         } else {
-            raw as i128
+            i128::from(raw)
         }
     };
-    let elem = |buf: &[u8], i: usize| read_uint(buf, i * p.size, p.size, p.order);
+    let (elems, _) = buf.as_chunks_mut::<N>();
 
     let mut minbits = p.scale_factor as u32;
     let mut min: i128 = 0;
@@ -1346,12 +1086,12 @@ fn precompress_int(buf: &mut [u8], p: &SoParams) -> (u32, u64) {
 
     if p.fill_defined {
         // Fill elements take no part in the range.
-        let first = (0..p.d_nelmts).find(|&i| elem(buf, i) != p.filval);
+        let first = elems.iter().position(|&e| load_uint(e, le) != p.filval);
         if let Some(f) = first {
-            min = key(elem(buf, f));
+            min = key(load_uint(elems[f], le));
             max = min;
-            for i in f..p.d_nelmts {
-                let raw = elem(buf, i);
+            for &e in &elems[f..] {
+                let raw = load_uint(e, le);
                 if raw == p.filval {
                     continue;
                 }
@@ -1371,21 +1111,23 @@ fn precompress_int(buf: &mut [u8], p: &SoParams) -> (u32, u64) {
         }
         if minbits != p.dtype_len() {
             let sentinel = mask_u64(minbits as usize);
-            for i in 0..p.d_nelmts {
-                let raw = elem(buf, i);
+            for e in elems.iter_mut() {
+                let raw = load_uint(*e, le);
                 let v = if raw == p.filval {
                     sentinel
                 } else {
                     (key(raw) - min) as u64 & width_mask
                 };
-                write_uint(buf, i * p.size, p.size, p.order, v);
+                *e = store_uint(v, le);
             }
         }
     } else {
-        min = key(elem(buf, 0));
-        max = min;
-        for i in 0..p.d_nelmts {
-            let v = key(elem(buf, i));
+        if let Some(&e0) = elems.first() {
+            min = key(load_uint(e0, le));
+            max = min;
+        }
+        for &e in elems.iter() {
+            let v = key(load_uint(e, le));
             max = max.max(v);
             min = min.min(v);
         }
@@ -1397,9 +1139,9 @@ fn precompress_int(buf: &mut [u8], p: &SoParams) -> (u32, u64) {
             minbits = so_log2(span_minus_1 + 1);
         }
         if minbits != p.dtype_len() {
-            for i in 0..p.d_nelmts {
-                let v = (key(elem(buf, i)) - min) as u64 & width_mask;
-                write_uint(buf, i * p.size, p.size, p.order, v);
+            for e in elems.iter_mut() {
+                let v = (key(load_uint(*e, le)) - min) as u64 & width_mask;
+                *e = store_uint(v, le);
             }
         }
     }
@@ -1414,11 +1156,22 @@ fn precompress_int(buf: &mut [u8], p: &SoParams) -> (u32, u64) {
 /// element's own precision: `powf`/`roundf`/`lroundf` for a 4-byte element,
 /// `pow`/`round`/`lround` for an 8-byte one. Doing them all in `f64` would
 /// pick a different `minbits` at the boundary for `float` data.
-trait SoFloat: Copy + PartialOrd + std::ops::Mul<Output = Self> + std::ops::Sub<Output = Self> {
+trait SoFloat:
+    Copy
+    + PartialOrd
+    + std::ops::Mul<Output = Self>
+    + std::ops::Sub<Output = Self>
+    + std::ops::Div<Output = Self>
+    + std::ops::Add<Output = Self>
+{
     const ZERO: Self;
     fn from_stored(v: u64) -> Self;
     fn to_stored(self) -> u64;
     fn widen(self) -> f64;
+    /// `(type)v` for a `double`.
+    fn narrow(v: f64) -> Self;
+    /// `(type)v` for a `long long`.
+    fn from_int(v: i64) -> Self;
     /// `pow_fun((type)base, (type)exp)`.
     fn pow(base: f64, exp: f64) -> Self;
     fn abs(self) -> Self;
@@ -1438,6 +1191,12 @@ impl SoFloat for f32 {
     }
     fn widen(self) -> f64 {
         self as f64
+    }
+    fn narrow(v: f64) -> Self {
+        v as f32
+    }
+    fn from_int(v: i64) -> Self {
+        v as f32
     }
     fn pow(base: f64, exp: f64) -> Self {
         (base as f32).powf(exp as f32)
@@ -1464,6 +1223,12 @@ impl SoFloat for f64 {
     fn widen(self) -> f64 {
         self
     }
+    fn narrow(v: f64) -> Self {
+        v
+    }
+    fn from_int(v: i64) -> Self {
+        v as f64
+    }
     fn pow(base: f64, exp: f64) -> Self {
         base.powf(exp)
     }
@@ -1487,19 +1252,21 @@ impl SoFloat for f64 {
 /// as a float — the form [`postdecompress`] reads it back in.
 fn precompress_float(buf: &mut [u8], p: &SoParams) -> FormatResult<(u32, u64)> {
     match p.size {
-        4 => Ok(precompress_float_typed::<f32>(buf, p)),
-        8 => Ok(precompress_float_typed::<f64>(buf, p)),
+        4 => Ok(precompress_float_typed::<f32, 4>(buf, p)),
+        8 => Ok(precompress_float_typed::<f64, 8>(buf, p)),
         n => Err(FormatError::InvalidData(format!(
             "scaleoffset: no floating-point type of {n} bytes"
         ))),
     }
 }
 
-fn precompress_float_typed<T: SoFloat>(buf: &mut [u8], p: &SoParams) -> (u32, u64) {
+fn precompress_float_typed<T: SoFloat, const N: usize>(buf: &mut [u8], p: &SoParams) -> (u32, u64) {
     let d_val = p.scale_factor as f64;
     let pow10 = T::pow(10.0, d_val);
     let filval = T::from_stored(p.filval);
-    let get = |buf: &[u8], i: usize| T::from_stored(read_uint(buf, i * p.size, p.size, p.order));
+    let le = p.order == SO_ORDER_LE;
+    let get = |e: [u8; N]| T::from_stored(load_uint(e, le));
+    let (elems, _) = buf.as_chunks_mut::<N>();
     // `H5Z_scaleoffset_max_min_3` widens the difference to `double` and
     // compares against a `double` threshold whatever the element type is,
     // while `H5Z_scaleoffset_modify_1` stays in the element type. For a
@@ -1513,11 +1280,11 @@ fn precompress_float_typed<T: SoFloat>(buf: &mut [u8], p: &SoParams) -> (u32, u6
     let mut min = T::ZERO;
     let mut max = T::ZERO;
     if p.fill_defined {
-        if let Some(f) = (0..p.d_nelmts).find(|&i| !is_fill_scan(get(buf, i))) {
-            min = get(buf, f);
+        if let Some(f) = elems.iter().position(|&e| !is_fill_scan(get(e))) {
+            min = get(elems[f]);
             max = min;
-            for i in f..p.d_nelmts {
-                let v = get(buf, i);
+            for &e in &elems[f..] {
+                let v = get(e);
                 if is_fill_scan(v) {
                     continue;
                 }
@@ -1529,11 +1296,11 @@ fn precompress_float_typed<T: SoFloat>(buf: &mut [u8], p: &SoParams) -> (u32, u6
                 }
             }
         }
-    } else if p.d_nelmts > 0 {
-        min = get(buf, 0);
+    } else if let Some(&e0) = elems.first() {
+        min = get(e0);
         max = min;
-        for i in 0..p.d_nelmts {
-            let v = get(buf, i);
+        for &e in elems.iter() {
+            let v = get(e);
             if v > max {
                 max = v;
             }
@@ -1561,27 +1328,24 @@ fn precompress_float_typed<T: SoFloat>(buf: &mut [u8], p: &SoParams) -> (u32, u6
 
     if minbits != dtype_len {
         let sentinel = mask_u64(minbits as usize);
-        for i in 0..p.d_nelmts {
-            let v = get(buf, i);
+        for e in elems.iter_mut() {
+            let v = get(*e);
             let stored = if p.fill_defined && is_fill_modify(v) {
                 sentinel
             } else {
                 (v * pow10 - min * pow10).lround() as u64 & p.width_mask()
             };
-            write_uint(buf, i * p.size, p.size, p.order, stored);
+            *e = store_uint(stored, le);
         }
     }
 
     (minbits, min.to_stored())
 }
 
-/// Sign-extend the low `size*8` bits of `v` to a full `i64`.
-fn sign_extend(v: u64, size: usize) -> i64 {
-    if size >= 8 {
-        return v as i64;
-    }
-    let bits = size * 8;
-    let shift = 64 - bits;
+/// Sign-extend the low `N * 8` bits of `v` to a full `i64`.
+#[inline]
+fn sign_extend<const N: usize>(v: u64) -> i64 {
+    let shift = 64 - 8 * N as u32;
     ((v << shift) as i64) >> shift
 }
 
@@ -1592,75 +1356,58 @@ fn sign_extend(v: u64, size: usize) -> i64 {
 /// needs is exactly what [`SoParams`] already parsed once for both filter
 /// directions.
 fn postdecompress(out: &mut [u8], p: &SoParams, minbits: u32, minval: u64) {
-    let SoParams {
-        scale_factor,
-        d_nelmts,
-        dtype_class,
-        size,
-        dtype_sign,
-        order,
-        fill_defined,
-        filval,
-    } = *p;
-
     // Sentinel: a fully decompressed value equal to (1 << minbits) - 1 is
     // restored to the fill value rather than offset-added.
-    let sentinel: u64 = if (minbits as usize) >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << minbits) - 1
-    };
-    let width_mask: u64 = if size >= 8 {
-        u64::MAX
-    } else {
-        (1u64 << (size * 8)) - 1
-    };
-
-    if dtype_class == SO_CLS_INTEGER {
-        // buf[i] = (buf[i] == sentinel) ? filval : buf[i] + minval.
-        for i in 0..d_nelmts {
-            let off = i * size;
-            let v = read_uint(out, off, size, order);
-            let result = if fill_defined && v == sentinel {
-                filval
-            } else {
-                v.wrapping_add(minval) & width_mask
-            };
-            write_uint(out, off, size, order, result);
-        }
-        let _ = dtype_sign;
+    let sentinel = mask_u64(minbits as usize);
+    if p.dtype_class == SO_CLS_INTEGER {
+        by_width!(p.size, postdecompress_int(out, p, sentinel, minval));
     } else {
         // Float D-scale: value = (signed decompressed int) / 10^D + min,
         // where `min` reinterprets `minval`'s low bits as the float type.
-        let d_val = scale_factor as f64;
-        let divisor = 10f64.powf(d_val);
-        if size == 4 {
-            let min = f32::from_bits(minval as u32);
-            let filval_f = f32::from_bits(filval as u32);
-            for i in 0..d_nelmts {
-                let off = i * size;
-                let raw = read_uint(out, off, size, order);
-                let val = if fill_defined && raw == sentinel {
-                    filval_f
-                } else {
-                    (sign_extend(raw, size) as f32) / (divisor as f32) + min
-                };
-                write_uint(out, off, size, order, val.to_bits() as u64);
-            }
-        } else if size == 8 {
-            let min = f64::from_bits(minval);
-            let filval_f = f64::from_bits(filval);
-            for i in 0..d_nelmts {
-                let off = i * size;
-                let raw = read_uint(out, off, size, order);
-                if fill_defined && raw == sentinel {
-                    write_uint(out, off, size, order, filval_f.to_bits());
-                    continue;
-                }
-                let val = (sign_extend(raw, size) as f64) / divisor + min;
-                write_uint(out, off, size, order, val.to_bits());
-            }
+        match p.size {
+            4 => postdecompress_float::<f32, 4>(out, p, sentinel, minval),
+            8 => postdecompress_float::<f64, 8>(out, p, sentinel, minval),
+            _ => {}
         }
+    }
+}
+
+/// `buf[i] = (buf[i] == sentinel) ? filval : buf[i] + minval` over `N`-byte
+/// elements.
+fn postdecompress_int<const N: usize>(out: &mut [u8], p: &SoParams, sentinel: u64, minval: u64) {
+    let le = p.order == SO_ORDER_LE;
+    let width_mask = p.width_mask();
+    let (elems, _) = out.as_chunks_mut::<N>();
+    for e in elems {
+        let v = load_uint(*e, le);
+        let result = if p.fill_defined && v == sentinel {
+            p.filval
+        } else {
+            v.wrapping_add(minval) & width_mask
+        };
+        *e = store_uint(result, le);
+    }
+}
+
+fn postdecompress_float<T: SoFloat, const N: usize>(
+    out: &mut [u8],
+    p: &SoParams,
+    sentinel: u64,
+    minval: u64,
+) {
+    let le = p.order == SO_ORDER_LE;
+    let divisor = T::narrow(10f64.powf(p.scale_factor as f64));
+    let min = T::from_stored(minval);
+    let filval = T::from_stored(p.filval);
+    let (elems, _) = out.as_chunks_mut::<N>();
+    for e in elems {
+        let raw = load_uint(*e, le);
+        let val = if p.fill_defined && raw == sentinel {
+            filval
+        } else {
+            T::from_int(sign_extend::<N>(raw)) / divisor + min
+        };
+        *e = store_uint(val.to_stored(), le);
     }
 }
 

@@ -21,6 +21,7 @@ pub mod nbit_scaleoffset;
 pub mod object_header;
 pub mod reference;
 pub mod selection;
+pub(crate) mod shuffle;
 pub mod sohm;
 pub mod sohm_write;
 pub mod storage_kind;
