@@ -18,6 +18,7 @@ Read and write HDF5 files with contiguous, chunked, and compressed datasets, hie
 - **Chunked storage** — extensible array, fixed array, B-tree v2 indices
 - **Compression** — deflate (gzip), shuffle, Fletcher-32, LZ4, Zstandard filters
 - **Parallel compression** — per-chunk compression/decompression via rayon
+- **SIMD filter kernels** — default `simd` feature: shuffle, bitshuffle and Fletcher-32 dispatch on the CPU level detected at run time (AVX2/AVX-512, NEON) via `fearless_simd`
 - **Groups** — hierarchical group structure with nested object headers
 - **Attributes** — string and numeric attributes on datasets and root
 - **SWMR** — Single Writer / Multiple Reader streaming protocol
@@ -34,7 +35,7 @@ Read and write HDF5 files with contiguous, chunked, and compressed datasets, hie
 
 ```toml
 [dependencies]
-rust-hdf5 = "0.4"
+rust-hdf5 = "0.6"
 ```
 
 > Requires Rust 1.89+ (uses `std::fs::File::lock` for cross-platform
@@ -268,7 +269,7 @@ for ensuring no second writer attaches during streaming.
 ```toml
 # Enable LZ4 + Zstandard
 [dependencies]
-rust-hdf5 = { version = "0.4", features = ["lz4", "zstd"] }
+rust-hdf5 = { version = "0.6", features = ["lz4", "zstd"] }
 ```
 
 Filters apply to every chunked layout, whichever chunk index the dataspace
@@ -291,6 +292,7 @@ and the form a v2-B-tree dataset uses).
 | `parallel` | Parallel chunk compression via rayon |
 | `threadsafe` | `Send + Sync` file handles (`Arc<Mutex>`) |
 | `mmap` | Read-only opens that hold the file lock serve reads from a memory map |
+| `simd` | Run-time dispatched SIMD kernels for the shuffle, bitshuffle and Fletcher-32 filters (default) |
 
 ## HDF5 format support
 
