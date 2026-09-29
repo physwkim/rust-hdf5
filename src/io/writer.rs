@@ -13652,7 +13652,7 @@ impl Hdf5Writer {
     /// white-box tests.
     ///
     /// [`create_fixed_array_dataset_with_max`]: Self::create_fixed_array_dataset_with_max
-    #[cfg(test)]
+    #[cfg(all(test, feature = "deflate"))]
     pub fn create_fixed_array_dataset_with_pipeline(
         &self,
         name: &str,
