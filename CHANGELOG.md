@@ -1,5 +1,65 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- A `simd` feature, on by default, that dispatches the filter kernels
+  on the CPU level detected at run time through `fearless_simd` (AVX2
+  and AVX-512 on x86_64, NEON on aarch64) instead of the SSE2 baseline
+  the compiler's own vectorization is limited to. It adds
+  `fearless_simd` and `fearless_simd_macros` as optional dependencies
+  and keeps the crate's MSRV of 1.89. Every kernel is checked against
+  its scalar loop on every level the host can run.
+
+### Changed
+
+- A scale-offset filter whose element size is not 1, 2, 4 or 8 bytes is
+  refused where its parameters are parsed, as
+  `H5Z__scaleoffset_get_type` refuses it; sizes 3, 5, 6 and 7 used to be
+  packed as if libhdf5 had a C integer type for them.
+
+- The bitshuffle filter's LZ4 blocks are decompressed into their exact
+  slot, and a block that does not decode to the size its header claims
+  fails the read instead of being accepted at whatever length it took.
+
+- A scale-offset chunk of no elements and no fill value is stored, where
+  it used to index an empty buffer.
+
+### Performance
+
+- The bitshuffle filter runs the canonical three-stage transpose
+  (`trans_byte_elem`, `trans_bit_byte`, `trans_bitrow_eight`) on SIMD
+  lanes instead of walking bits one at a time: on an 8 MiB chunk of
+  2-byte elements a shuffle goes from 95 ms to 2.0 ms, the inverse from
+  96 ms to 2.4 ms, and bitshuffle+LZ4 decompression from 13.4 ms to
+  6.8 ms.
+
+- The shuffle filter and the byte transposes blosc and szip do share one
+  owner, `format::shuffle`, whose lanes bring an 8 MiB shuffle from
+  4.9 ms to 1.65 ms and the inverse from 3.4 ms to 1.45 ms.
+
+- Fletcher32 folds its 360-word runs on lanes, exact against the scalar
+  loop because wrapping `u32` arithmetic has a closed form for a run:
+  4.3 ms to 1.3 ms on 8 MiB, output copy included.
+
+- Numeric reads decode each element in a loop fixed to its source width
+  and lane, instead of normalizing every element through an `i128`
+  and matching its class again: 4M elements of `u16` read as `u64` go
+  from 38 ms to 3 ms, `i64` as `i64` from 32 ms to 3 ms, `f32` as
+  `f64` from 24 ms to 2 ms, each within about 1 ms of allocating the
+  output. No SIMD kernel is involved.
+
+- The N-bit and scale-offset filters pack and unpack through one 64-bit
+  accumulator per element, reproducing the C's byte-at-a-time stream
+  bit for bit, and run their element loops fixed to the element width:
+  on 8 MiB, N-bit `i32` at 12 bits goes from 17.7 ms to 3.3 ms
+  (unpack 20.5 ms to 6.0 ms), scale-offset `i32` from 35 ms to 7.7 ms
+  (reverse 25 ms to 6.6 ms) and scale-offset `f32` from 38 ms to 13 ms
+  (reverse 37 ms to 8 ms). A differential run of 32306 random cases
+  against the previous implementation, every filter direction and
+  truncated inputs included, found no other difference.
+
 ## 0.5.2
 
 ### Fixed
