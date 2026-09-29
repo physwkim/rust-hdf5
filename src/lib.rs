@@ -93,6 +93,11 @@ pub(crate) mod io;
 #[cfg(feature = "parallel")]
 pub(crate) mod parallel;
 
+/// The run-time SIMD level the filter kernels dispatch on; only present
+/// under the `simd` feature.
+#[cfg(feature = "simd")]
+pub(crate) mod simd;
+
 pub mod attribute;
 pub mod dataset;
 pub mod error;

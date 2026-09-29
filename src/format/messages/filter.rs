@@ -32,6 +32,7 @@
 //!   [if num_cd_values is odd: 4 bytes padding]
 //! ```
 
+use crate::format::shuffle::{bitshuffle_block_into, bitunshuffle_block_into, BitshuffleScratch};
 use crate::format::{FormatError, FormatResult};
 
 /// Well-known filter IDs.
@@ -1552,43 +1553,22 @@ fn bshuf_block_plan(n_elems: usize, block_elems: usize) -> Vec<usize> {
     blocks
 }
 
-fn bitshuffle_block(input: &[u8], elem_size: usize) -> Vec<u8> {
-    let n_elems = input.len() / elem_size;
-    let nbits = elem_size * 8;
-    let mut out = vec![0u8; input.len()];
-
-    for bit in 0..nbits {
-        let byte_idx = bit / 8;
-        let bit_idx = bit % 8; // LSB-first within the source byte
-        for elem in 0..n_elems {
-            let src_byte = input[elem * elem_size + byte_idx];
-            let src_bit = (src_byte >> bit_idx) & 1;
-            let dst_bit_pos = bit * n_elems + elem;
-            let dst_byte_idx = dst_bit_pos / 8;
-            let dst_bit_idx = dst_bit_pos % 8; // LSB-first within the output byte
-            out[dst_byte_idx] |= src_bit << dst_bit_idx;
-        }
+/// Append the bit transpose of one planned block (`inverse` for the
+/// untranspose) to `out`, in place in its tail.
+fn push_bitshuffled(
+    out: &mut Vec<u8>,
+    block: &[u8],
+    scratch: &mut BitshuffleScratch,
+    elem_size: usize,
+    inverse: bool,
+) {
+    let pos = out.len();
+    out.resize(pos + block.len(), 0);
+    if inverse {
+        bitunshuffle_block_into(block, scratch, &mut out[pos..], elem_size);
+    } else {
+        bitshuffle_block_into(block, scratch, &mut out[pos..], elem_size);
     }
-    out
-}
-
-fn bitunshuffle_block(input: &[u8], elem_size: usize) -> Vec<u8> {
-    let n_elems = input.len() / elem_size;
-    let nbits = elem_size * 8;
-    let mut out = vec![0u8; input.len()];
-
-    for bit in 0..nbits {
-        let byte_idx = bit / 8;
-        let bit_idx = bit % 8; // LSB-first within the destination byte
-        for elem in 0..n_elems {
-            let src_bit_pos = bit * n_elems + elem;
-            let src_byte_idx = src_bit_pos / 8;
-            let src_bit_idx = src_bit_pos % 8; // LSB-first within the source byte
-            let src_bit = (input[src_byte_idx] >> src_bit_idx) & 1;
-            out[elem * elem_size + byte_idx] |= src_bit << bit_idx;
-        }
-    }
-    out
 }
 
 fn bitshuffle_compress(
@@ -1604,6 +1584,7 @@ fn bitshuffle_compress(
     let n_elems = data.len() / elem_size;
     let block_elems = bshuf_resolve_block_elems(block_size, elem_size);
     let blocks = bshuf_block_plan(n_elems, block_elems);
+    let mut scratch = BitshuffleScratch::new(block_elems * elem_size);
 
     if comp_type == 0 {
         // Bitshuffle only, no compression, no header. Each planned block is
@@ -1613,7 +1594,7 @@ fn bitshuffle_compress(
         for &block in &blocks {
             let start = elem_pos * elem_size;
             let end = start + block * elem_size;
-            out.extend_from_slice(&bitshuffle_block(&data[start..end], elem_size));
+            push_bitshuffled(&mut out, &data[start..end], &mut scratch, elem_size, false);
             elem_pos += block;
         }
         out.extend_from_slice(&data[elem_pos * elem_size..]);
@@ -1643,12 +1624,14 @@ fn bitshuffle_compress(
         // Each planned block: BE u32 LZ4-compressed size, then the raw LZ4
         // block of the bit-transposed data. Trailing `n_elems % 8` elements
         // are copied raw with no length prefix.
+        let mut shuffled = vec![0u8; block_elems * elem_size];
         let mut elem_pos = 0;
         for &block in &blocks {
             let start = elem_pos * elem_size;
             let end = start + block * elem_size;
-            let shuffled = bitshuffle_block(&data[start..end], elem_size);
-            let compressed = lz4_flex::compress(&shuffled);
+            let shuffled = &mut shuffled[..end - start];
+            bitshuffle_block_into(&data[start..end], &mut scratch, shuffled, elem_size);
+            let compressed = lz4_flex::compress(shuffled);
             out.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
             out.extend_from_slice(&compressed);
             elem_pos += block;
@@ -1675,12 +1658,13 @@ fn bitshuffle_decompress(
         let n_elems = data.len() / elem_size;
         let block_elems = bshuf_resolve_block_elems(block_size, elem_size);
         let blocks = bshuf_block_plan(n_elems, block_elems);
+        let mut scratch = BitshuffleScratch::new(block_elems * elem_size);
         let mut out = Vec::with_capacity(data.len());
         let mut elem_pos = 0;
         for &block in &blocks {
             let start = elem_pos * elem_size;
             let end = start + block * elem_size;
-            out.extend_from_slice(&bitunshuffle_block(&data[start..end], elem_size));
+            push_bitshuffled(&mut out, &data[start..end], &mut scratch, elem_size, true);
             elem_pos += block;
         }
         out.extend_from_slice(&data[elem_pos * elem_size..]);
@@ -1730,6 +1714,8 @@ fn bitshuffle_decompress(
         let mut rpos = 12;
 
         let n_elems = orig_size / elem_size;
+        let mut scratch = BitshuffleScratch::new(block_bytes);
+        let mut decompressed = vec![0u8; block_bytes];
         // Every block (full or final) is a length-prefixed LZ4 block; only the
         // `n_elems % 8` trailing elements are stored raw.
         for &block in &bshuf_block_plan(n_elems, block_elems) {
@@ -1748,9 +1734,15 @@ fn bitshuffle_decompress(
                 ));
             }
             let exp_size = block * elem_size;
-            let decompressed = lz4_flex::decompress(&data[rpos..rpos + comp_size], exp_size)
+            let decompressed = &mut decompressed[..exp_size];
+            let got = lz4_flex::block::decompress_into(&data[rpos..rpos + comp_size], decompressed)
                 .map_err(|e| FormatError::InvalidData(format!("bshuf LZ4: {}", e)))?;
-            output.extend_from_slice(&bitunshuffle_block(&decompressed, elem_size));
+            if got != exp_size {
+                return Err(FormatError::InvalidData(format!(
+                    "bshuf LZ4: block decompressed to {got} bytes, expected {exp_size}"
+                )));
+            }
+            push_bitshuffled(&mut output, decompressed, &mut scratch, elem_size, true);
             rpos += comp_size;
         }
 
