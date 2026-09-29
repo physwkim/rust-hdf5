@@ -232,6 +232,31 @@ fn nbit_place<const N: usize>(elem: &mut [u8], le: bool, offset: u32, field: u64
     elem.copy_from_slice(&store_uint::<N>(field << offset, le));
 }
 
+/// Pack a whole buffer of `N`-byte atomic elements: the top-level atomic
+/// case, run as one loop with the width fixed instead of a dispatch per
+/// element.
+fn nbit_compress_atomics<const N: usize>(data: &[u8], w: &mut BitWriter, p: &NbitAtomic) {
+    let le = p.order == NBIT_ORDER_LE;
+    let (elems, _) = data.as_chunks::<N>();
+    for &e in elems {
+        w.put(load_uint(e, le) >> p.offset, p.precision);
+    }
+}
+
+/// Unpack a whole buffer of `N`-byte atomic elements.
+fn nbit_decompress_atomics<const N: usize>(
+    out: &mut [u8],
+    r: &mut BitReader,
+    p: &NbitAtomic,
+) -> FormatResult<()> {
+    let le = p.order == NBIT_ORDER_LE;
+    let (elems, _) = out.as_chunks_mut::<N>();
+    for e in elems {
+        *e = store_uint(r.get(p.precision)? << p.offset, le);
+    }
+    Ok(())
+}
+
 /// Decompress one nooptype element, mirroring `H5Z__nbit_decompress_one_nooptype`.
 fn nbit_decompress_one_nooptype(
     data: &mut [u8],
@@ -626,8 +651,12 @@ pub fn apply_nbit(data: &[u8], cd_values: &[u32], compress: bool) -> FormatResul
             NBIT_ATOMIC => {
                 let mut idx = 4;
                 let p = read_atomic(cd_values, &mut idx)?;
-                for i in 0..d_nelmts {
-                    nbit_compress_one_atomic(data, i * p.size as usize, &mut w, &p);
+                if matches!(p.size, 1 | 2 | 4 | 8) {
+                    by_width!(p.size, nbit_compress_atomics(data, &mut w, &p));
+                } else {
+                    for i in 0..d_nelmts {
+                        nbit_compress_one_atomic(data, i * p.size as usize, &mut w, &p);
+                    }
                 }
             }
             NBIT_ARRAY => {
@@ -667,8 +696,12 @@ pub fn apply_nbit(data: &[u8], cd_values: &[u32], compress: bool) -> FormatResul
                         "nbit: invalid precision/offset".into(),
                     ));
                 }
-                for i in 0..d_nelmts {
-                    nbit_decompress_one_atomic(&mut out, i * p.size as usize, &mut r, &p)?;
+                if matches!(p.size, 1 | 2 | 4 | 8) {
+                    by_width!(p.size, nbit_decompress_atomics(&mut out, &mut r, &p))?;
+                } else {
+                    for i in 0..d_nelmts {
+                        nbit_decompress_one_atomic(&mut out, i * p.size as usize, &mut r, &p)?;
+                    }
                 }
             }
             NBIT_ARRAY => {
@@ -890,34 +923,6 @@ fn so_unpack<const N: usize>(
     Ok(())
 }
 
-/// Read a little-/big-endian integer of `size` bytes from `data` at `offset`.
-fn read_uint(data: &[u8], offset: usize, size: usize, order: u32) -> u64 {
-    let mut v: u64 = 0;
-    if order == SO_ORDER_LE {
-        for i in 0..size {
-            v |= (data[offset + i] as u64) << (i * 8);
-        }
-    } else {
-        for i in 0..size {
-            v = (v << 8) | data[offset + i] as u64;
-        }
-    }
-    v
-}
-
-/// Write a little-/big-endian integer of `size` bytes into `data` at `offset`.
-fn write_uint(data: &mut [u8], offset: usize, size: usize, order: u32, v: u64) {
-    if order == SO_ORDER_LE {
-        for i in 0..size {
-            data[offset + i] = (v >> (i * 8)) as u8;
-        }
-    } else {
-        for i in 0..size {
-            data[offset + i] = (v >> ((size - 1 - i) * 8)) as u8;
-        }
-    }
-}
-
 /// Reverse the HDF5 scale-offset filter (decompress only).
 ///
 /// `cd_values` follows `H5Zscaleoffset.c`'s 20-entry schema. The output is
@@ -1019,7 +1024,7 @@ pub fn forward_scaleoffset(data: &[u8], cd_values: &[u32]) -> FormatResult<Vec<u
     // that offset needs.
     let mut buf = data.to_vec();
     let (minbits, minval) = if p.dtype_class == SO_CLS_INTEGER {
-        precompress_int(&mut buf, &p)
+        by_width!(p.size, precompress_int(&mut buf, &p))
     } else {
         precompress_float(&mut buf, &p)?
     };
@@ -1054,24 +1059,26 @@ pub fn forward_scaleoffset(data: &[u8], cd_values: &[u32]) -> FormatResult<Vec<u
     Ok(out)
 }
 
-/// Preprocess an integer chunk, mirroring `H5Z__scaleoffset_precompress_i`.
+/// Preprocess an integer chunk of `N`-byte elements, mirroring
+/// `H5Z__scaleoffset_precompress_i`.
 ///
 /// Returns `(minbits, minval)` and leaves `buf` holding each element's offset
 /// from the chunk minimum — or the all-ones sentinel where the element was
 /// the fill value.
-fn precompress_int(buf: &mut [u8], p: &SoParams) -> (u32, u64) {
+fn precompress_int<const N: usize>(buf: &mut [u8], p: &SoParams) -> (u32, u64) {
     let signed = p.dtype_sign == SO_SGN_2;
+    let le = p.order == SO_ORDER_LE;
     let width_mask = p.width_mask();
     // The comparison key: a signed element orders by its sign-extended
     // value, an unsigned one by its raw bits. `i128` holds both.
     let key = |raw: u64| -> i128 {
         if signed {
-            sign_extend(raw, p.size) as i128
+            i128::from(sign_extend::<N>(raw))
         } else {
-            raw as i128
+            i128::from(raw)
         }
     };
-    let elem = |buf: &[u8], i: usize| read_uint(buf, i * p.size, p.size, p.order);
+    let (elems, _) = buf.as_chunks_mut::<N>();
 
     let mut minbits = p.scale_factor as u32;
     let mut min: i128 = 0;
@@ -1079,12 +1086,12 @@ fn precompress_int(buf: &mut [u8], p: &SoParams) -> (u32, u64) {
 
     if p.fill_defined {
         // Fill elements take no part in the range.
-        let first = (0..p.d_nelmts).find(|&i| elem(buf, i) != p.filval);
+        let first = elems.iter().position(|&e| load_uint(e, le) != p.filval);
         if let Some(f) = first {
-            min = key(elem(buf, f));
+            min = key(load_uint(elems[f], le));
             max = min;
-            for i in f..p.d_nelmts {
-                let raw = elem(buf, i);
+            for &e in &elems[f..] {
+                let raw = load_uint(e, le);
                 if raw == p.filval {
                     continue;
                 }
@@ -1104,21 +1111,23 @@ fn precompress_int(buf: &mut [u8], p: &SoParams) -> (u32, u64) {
         }
         if minbits != p.dtype_len() {
             let sentinel = mask_u64(minbits as usize);
-            for i in 0..p.d_nelmts {
-                let raw = elem(buf, i);
+            for e in elems.iter_mut() {
+                let raw = load_uint(*e, le);
                 let v = if raw == p.filval {
                     sentinel
                 } else {
                     (key(raw) - min) as u64 & width_mask
                 };
-                write_uint(buf, i * p.size, p.size, p.order, v);
+                *e = store_uint(v, le);
             }
         }
     } else {
-        min = key(elem(buf, 0));
-        max = min;
-        for i in 0..p.d_nelmts {
-            let v = key(elem(buf, i));
+        if let Some(&e0) = elems.first() {
+            min = key(load_uint(e0, le));
+            max = min;
+        }
+        for &e in elems.iter() {
+            let v = key(load_uint(e, le));
             max = max.max(v);
             min = min.min(v);
         }
@@ -1130,9 +1139,9 @@ fn precompress_int(buf: &mut [u8], p: &SoParams) -> (u32, u64) {
             minbits = so_log2(span_minus_1 + 1);
         }
         if minbits != p.dtype_len() {
-            for i in 0..p.d_nelmts {
-                let v = (key(elem(buf, i)) - min) as u64 & width_mask;
-                write_uint(buf, i * p.size, p.size, p.order, v);
+            for e in elems.iter_mut() {
+                let v = (key(load_uint(*e, le)) - min) as u64 & width_mask;
+                *e = store_uint(v, le);
             }
         }
     }
@@ -1147,11 +1156,22 @@ fn precompress_int(buf: &mut [u8], p: &SoParams) -> (u32, u64) {
 /// element's own precision: `powf`/`roundf`/`lroundf` for a 4-byte element,
 /// `pow`/`round`/`lround` for an 8-byte one. Doing them all in `f64` would
 /// pick a different `minbits` at the boundary for `float` data.
-trait SoFloat: Copy + PartialOrd + std::ops::Mul<Output = Self> + std::ops::Sub<Output = Self> {
+trait SoFloat:
+    Copy
+    + PartialOrd
+    + std::ops::Mul<Output = Self>
+    + std::ops::Sub<Output = Self>
+    + std::ops::Div<Output = Self>
+    + std::ops::Add<Output = Self>
+{
     const ZERO: Self;
     fn from_stored(v: u64) -> Self;
     fn to_stored(self) -> u64;
     fn widen(self) -> f64;
+    /// `(type)v` for a `double`.
+    fn narrow(v: f64) -> Self;
+    /// `(type)v` for a `long long`.
+    fn from_int(v: i64) -> Self;
     /// `pow_fun((type)base, (type)exp)`.
     fn pow(base: f64, exp: f64) -> Self;
     fn abs(self) -> Self;
@@ -1171,6 +1191,12 @@ impl SoFloat for f32 {
     }
     fn widen(self) -> f64 {
         self as f64
+    }
+    fn narrow(v: f64) -> Self {
+        v as f32
+    }
+    fn from_int(v: i64) -> Self {
+        v as f32
     }
     fn pow(base: f64, exp: f64) -> Self {
         (base as f32).powf(exp as f32)
@@ -1197,6 +1223,12 @@ impl SoFloat for f64 {
     fn widen(self) -> f64 {
         self
     }
+    fn narrow(v: f64) -> Self {
+        v
+    }
+    fn from_int(v: i64) -> Self {
+        v as f64
+    }
     fn pow(base: f64, exp: f64) -> Self {
         base.powf(exp)
     }
@@ -1220,19 +1252,21 @@ impl SoFloat for f64 {
 /// as a float — the form [`postdecompress`] reads it back in.
 fn precompress_float(buf: &mut [u8], p: &SoParams) -> FormatResult<(u32, u64)> {
     match p.size {
-        4 => Ok(precompress_float_typed::<f32>(buf, p)),
-        8 => Ok(precompress_float_typed::<f64>(buf, p)),
+        4 => Ok(precompress_float_typed::<f32, 4>(buf, p)),
+        8 => Ok(precompress_float_typed::<f64, 8>(buf, p)),
         n => Err(FormatError::InvalidData(format!(
             "scaleoffset: no floating-point type of {n} bytes"
         ))),
     }
 }
 
-fn precompress_float_typed<T: SoFloat>(buf: &mut [u8], p: &SoParams) -> (u32, u64) {
+fn precompress_float_typed<T: SoFloat, const N: usize>(buf: &mut [u8], p: &SoParams) -> (u32, u64) {
     let d_val = p.scale_factor as f64;
     let pow10 = T::pow(10.0, d_val);
     let filval = T::from_stored(p.filval);
-    let get = |buf: &[u8], i: usize| T::from_stored(read_uint(buf, i * p.size, p.size, p.order));
+    let le = p.order == SO_ORDER_LE;
+    let get = |e: [u8; N]| T::from_stored(load_uint(e, le));
+    let (elems, _) = buf.as_chunks_mut::<N>();
     // `H5Z_scaleoffset_max_min_3` widens the difference to `double` and
     // compares against a `double` threshold whatever the element type is,
     // while `H5Z_scaleoffset_modify_1` stays in the element type. For a
@@ -1246,11 +1280,11 @@ fn precompress_float_typed<T: SoFloat>(buf: &mut [u8], p: &SoParams) -> (u32, u6
     let mut min = T::ZERO;
     let mut max = T::ZERO;
     if p.fill_defined {
-        if let Some(f) = (0..p.d_nelmts).find(|&i| !is_fill_scan(get(buf, i))) {
-            min = get(buf, f);
+        if let Some(f) = elems.iter().position(|&e| !is_fill_scan(get(e))) {
+            min = get(elems[f]);
             max = min;
-            for i in f..p.d_nelmts {
-                let v = get(buf, i);
+            for &e in &elems[f..] {
+                let v = get(e);
                 if is_fill_scan(v) {
                     continue;
                 }
@@ -1262,11 +1296,11 @@ fn precompress_float_typed<T: SoFloat>(buf: &mut [u8], p: &SoParams) -> (u32, u6
                 }
             }
         }
-    } else if p.d_nelmts > 0 {
-        min = get(buf, 0);
+    } else if let Some(&e0) = elems.first() {
+        min = get(e0);
         max = min;
-        for i in 0..p.d_nelmts {
-            let v = get(buf, i);
+        for &e in elems.iter() {
+            let v = get(e);
             if v > max {
                 max = v;
             }
@@ -1294,27 +1328,24 @@ fn precompress_float_typed<T: SoFloat>(buf: &mut [u8], p: &SoParams) -> (u32, u6
 
     if minbits != dtype_len {
         let sentinel = mask_u64(minbits as usize);
-        for i in 0..p.d_nelmts {
-            let v = get(buf, i);
+        for e in elems.iter_mut() {
+            let v = get(*e);
             let stored = if p.fill_defined && is_fill_modify(v) {
                 sentinel
             } else {
                 (v * pow10 - min * pow10).lround() as u64 & p.width_mask()
             };
-            write_uint(buf, i * p.size, p.size, p.order, stored);
+            *e = store_uint(stored, le);
         }
     }
 
     (minbits, min.to_stored())
 }
 
-/// Sign-extend the low `size*8` bits of `v` to a full `i64`.
-fn sign_extend(v: u64, size: usize) -> i64 {
-    if size >= 8 {
-        return v as i64;
-    }
-    let bits = size * 8;
-    let shift = 64 - bits;
+/// Sign-extend the low `N * 8` bits of `v` to a full `i64`.
+#[inline]
+fn sign_extend<const N: usize>(v: u64) -> i64 {
+    let shift = 64 - 8 * N as u32;
     ((v << shift) as i64) >> shift
 }
 
@@ -1325,75 +1356,58 @@ fn sign_extend(v: u64, size: usize) -> i64 {
 /// needs is exactly what [`SoParams`] already parsed once for both filter
 /// directions.
 fn postdecompress(out: &mut [u8], p: &SoParams, minbits: u32, minval: u64) {
-    let SoParams {
-        scale_factor,
-        d_nelmts,
-        dtype_class,
-        size,
-        dtype_sign,
-        order,
-        fill_defined,
-        filval,
-    } = *p;
-
     // Sentinel: a fully decompressed value equal to (1 << minbits) - 1 is
     // restored to the fill value rather than offset-added.
-    let sentinel: u64 = if (minbits as usize) >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << minbits) - 1
-    };
-    let width_mask: u64 = if size >= 8 {
-        u64::MAX
-    } else {
-        (1u64 << (size * 8)) - 1
-    };
-
-    if dtype_class == SO_CLS_INTEGER {
-        // buf[i] = (buf[i] == sentinel) ? filval : buf[i] + minval.
-        for i in 0..d_nelmts {
-            let off = i * size;
-            let v = read_uint(out, off, size, order);
-            let result = if fill_defined && v == sentinel {
-                filval
-            } else {
-                v.wrapping_add(minval) & width_mask
-            };
-            write_uint(out, off, size, order, result);
-        }
-        let _ = dtype_sign;
+    let sentinel = mask_u64(minbits as usize);
+    if p.dtype_class == SO_CLS_INTEGER {
+        by_width!(p.size, postdecompress_int(out, p, sentinel, minval));
     } else {
         // Float D-scale: value = (signed decompressed int) / 10^D + min,
         // where `min` reinterprets `minval`'s low bits as the float type.
-        let d_val = scale_factor as f64;
-        let divisor = 10f64.powf(d_val);
-        if size == 4 {
-            let min = f32::from_bits(minval as u32);
-            let filval_f = f32::from_bits(filval as u32);
-            for i in 0..d_nelmts {
-                let off = i * size;
-                let raw = read_uint(out, off, size, order);
-                let val = if fill_defined && raw == sentinel {
-                    filval_f
-                } else {
-                    (sign_extend(raw, size) as f32) / (divisor as f32) + min
-                };
-                write_uint(out, off, size, order, val.to_bits() as u64);
-            }
-        } else if size == 8 {
-            let min = f64::from_bits(minval);
-            let filval_f = f64::from_bits(filval);
-            for i in 0..d_nelmts {
-                let off = i * size;
-                let raw = read_uint(out, off, size, order);
-                if fill_defined && raw == sentinel {
-                    write_uint(out, off, size, order, filval_f.to_bits());
-                    continue;
-                }
-                let val = (sign_extend(raw, size) as f64) / divisor + min;
-                write_uint(out, off, size, order, val.to_bits());
-            }
+        match p.size {
+            4 => postdecompress_float::<f32, 4>(out, p, sentinel, minval),
+            8 => postdecompress_float::<f64, 8>(out, p, sentinel, minval),
+            _ => {}
         }
+    }
+}
+
+/// `buf[i] = (buf[i] == sentinel) ? filval : buf[i] + minval` over `N`-byte
+/// elements.
+fn postdecompress_int<const N: usize>(out: &mut [u8], p: &SoParams, sentinel: u64, minval: u64) {
+    let le = p.order == SO_ORDER_LE;
+    let width_mask = p.width_mask();
+    let (elems, _) = out.as_chunks_mut::<N>();
+    for e in elems {
+        let v = load_uint(*e, le);
+        let result = if p.fill_defined && v == sentinel {
+            p.filval
+        } else {
+            v.wrapping_add(minval) & width_mask
+        };
+        *e = store_uint(result, le);
+    }
+}
+
+fn postdecompress_float<T: SoFloat, const N: usize>(
+    out: &mut [u8],
+    p: &SoParams,
+    sentinel: u64,
+    minval: u64,
+) {
+    let le = p.order == SO_ORDER_LE;
+    let divisor = T::narrow(10f64.powf(p.scale_factor as f64));
+    let min = T::from_stored(minval);
+    let filval = T::from_stored(p.filval);
+    let (elems, _) = out.as_chunks_mut::<N>();
+    for e in elems {
+        let raw = load_uint(*e, le);
+        let val = if p.fill_defined && raw == sentinel {
+            filval
+        } else {
+            T::from_int(sign_extend::<N>(raw)) / divisor + min
+        };
+        *e = store_uint(val.to_stored(), le);
     }
 }
 
