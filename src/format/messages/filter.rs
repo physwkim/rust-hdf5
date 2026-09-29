@@ -32,7 +32,10 @@
 //!   [if num_cd_values is odd: 4 bytes padding]
 //! ```
 
-use crate::format::shuffle::{bitshuffle_block_into, bitunshuffle_block_into, BitshuffleScratch};
+use crate::format::shuffle::{
+    bitshuffle_block_into, bitunshuffle_block_into, trans_byte_elem, untrans_byte_elem,
+    BitshuffleScratch,
+};
 use crate::format::{FormatError, FormatResult};
 
 /// Well-known filter IDs.
@@ -752,13 +755,7 @@ fn shuffle(data: &[u8], bytesoftype: usize) -> Vec<u8> {
     let numofelements = data.len() / bytesoftype;
     let total = numofelements * bytesoftype;
     let mut dest = vec![0u8; data.len()];
-
-    for i in 0..bytesoftype {
-        let dest_start = i * numofelements;
-        for j in 0..numofelements {
-            dest[dest_start + j] = data[j * bytesoftype + i];
-        }
-    }
+    trans_byte_elem(data, &mut dest, numofelements, bytesoftype);
     // Copy any leftover bytes unchanged
     if data.len() > total {
         dest[total..].copy_from_slice(&data[total..]);
@@ -774,13 +771,7 @@ fn unshuffle(data: &[u8], bytesoftype: usize) -> Vec<u8> {
     let numofelements = data.len() / bytesoftype;
     let total = numofelements * bytesoftype;
     let mut dest = vec![0u8; data.len()];
-
-    for i in 0..bytesoftype {
-        let src_start = i * numofelements;
-        for j in 0..numofelements {
-            dest[j * bytesoftype + i] = data[src_start + j];
-        }
-    }
+    untrans_byte_elem(data, &mut dest, numofelements, bytesoftype);
     if data.len() > total {
         dest[total..].copy_from_slice(&data[total..]);
     }

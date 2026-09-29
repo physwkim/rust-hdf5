@@ -1,8 +1,11 @@
 //! The byte and bit transposes behind the shuffle-family filters.
 //!
-//! The bitshuffle stages follow the canonical library
-//! (kiyo-masui/bitshuffle `bitshuffle_core.c`) stage for stage, so the
-//! on-disk image is the one h5py and libhdf5 produce.
+//! One owner for every "gather byte `k` of each element" loop in the crate:
+//! the shuffle filter, the blosc byte shuffle, the szip interleave and the
+//! first stage of bitshuffle are all [`trans_byte_elem`] (or its inverse
+//! [`untrans_byte_elem`]); the bit-level stages of bitshuffle follow the
+//! canonical library (kiyo-masui/bitshuffle `bitshuffle_core.c`) stage for
+//! stage, so the on-disk image is the one h5py and libhdf5 produce.
 //!
 //! Every stage has a scalar loop that handles any element size. With the
 //! `simd` feature the 1-, 2-, 4- and 8-byte element sizes run a
@@ -45,7 +48,9 @@ macro_rules! dispatch {
 /// Gather byte `k` of every element into plane `k`: `out[k * size + i] =
 /// input[i * elem_size + k]` for `size` elements of `elem_size` bytes.
 ///
-/// The library's `bshuf_trans_byte_elem_scal` (bitshuffle_core.c:174). Only the first `size * elem_size` bytes of
+/// This is the HDF5 shuffle filter (`H5Z__filter_shuffle`), blosc's byte
+/// shuffle, szip's interleave and the library's `bshuf_trans_byte_elem_scal`
+/// (bitshuffle_core.c:174). Only the first `size * elem_size` bytes of
 /// either slice are touched.
 pub(crate) fn trans_byte_elem(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
     if elem_size == 1 {
@@ -77,6 +82,37 @@ fn trans_byte_elem_from(from: usize, input: &[u8], out: &mut [u8], size: usize, 
             out[jj * size + ii] = input[ii * elem_size + jj];
         }
         ii += 1;
+    }
+}
+
+/// The inverse of [`trans_byte_elem`]: `out[i * elem_size + k] =
+/// input[k * size + i]`. The HDF5 unshuffle, blosc unshuffle and szip
+/// deinterleave.
+pub(crate) fn untrans_byte_elem(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
+    if elem_size == 1 {
+        out[..size].copy_from_slice(&input[..size]);
+        return;
+    }
+    #[cfg(feature = "simd")]
+    let done = dispatch!(s => simd::untrans_byte_elem(s, input, out, size, elem_size));
+    #[cfg(not(feature = "simd"))]
+    let done = 0;
+    untrans_byte_elem_from(done, input, out, size, elem_size);
+}
+
+/// The element loop of [`untrans_byte_elem`] from element `from`.
+fn untrans_byte_elem_from(
+    from: usize,
+    input: &[u8],
+    out: &mut [u8],
+    size: usize,
+    elem_size: usize,
+) {
+    for jj in 0..elem_size {
+        let plane = &input[jj * size..(jj + 1) * size];
+        for ii in from..size {
+            out[ii * elem_size + jj] = plane[ii];
+        }
     }
 }
 
@@ -306,6 +342,50 @@ mod simd {
             }
             for (k, x) in v[..elem_size].iter().enumerate() {
                 x.store_slice(&mut out[k * size + ii..k * size + ii + n]);
+            }
+            ii += n;
+        }
+        ii
+    }
+
+    /// [`super::untrans_byte_elem`] for 2-, 4- and 8-byte elements: the
+    /// deinterleave tree of [`trans_byte_elem`] run backwards, one
+    /// interleave level per halving of the plane stride, so after
+    /// `log2(elem_size)` levels vector `k` holds elements `k * LEN /
+    /// elem_size ..` in element order. Returns the elements done, 0 for any
+    /// other element size.
+    #[simd]
+    pub(super) fn untrans_byte_elem<S: Simd>(
+        simd: S,
+        input: &[u8],
+        out: &mut [u8],
+        size: usize,
+        elem_size: usize,
+    ) -> usize {
+        if !matches!(elem_size, 2 | 4 | 8) {
+            return 0;
+        }
+        let n = S::u8s::LEN;
+        let mut v = [S::u8s::splat(simd, 0); 8];
+        let mut ii = 0;
+        while ii + n <= size {
+            for (k, x) in v[..elem_size].iter_mut().enumerate() {
+                *x = S::u8s::from_slice(simd, &input[k * size + ii..k * size + ii + n]);
+            }
+            let mut stride = 1;
+            while stride < elem_size {
+                let mut prev = v;
+                for k in 0..elem_size / 2 {
+                    let (lo, hi) = v[k].interleave(v[elem_size / 2 + k]);
+                    prev[2 * k] = lo;
+                    prev[2 * k + 1] = hi;
+                }
+                v = prev;
+                stride *= 2;
+            }
+            let chunk = &mut out[ii * elem_size..(ii + n) * elem_size];
+            for (k, x) in v[..elem_size].iter().enumerate() {
+                x.store_slice(&mut chunk[k * n..(k + 1) * n]);
             }
             ii += n;
         }
@@ -566,6 +646,9 @@ mod tests {
                 trans_byte_elem(&input, &mut got, size, elem_size);
                 let want = byte_transpose_reference(&input, size, elem_size);
                 assert_eq!(got, want, "trans elem_size={elem_size} size={size}");
+                let mut back = vec![0u8; input.len()];
+                untrans_byte_elem(&got, &mut back, size, elem_size);
+                assert_eq!(back, input, "untrans elem_size={elem_size} size={size}");
             }
         }
     }
@@ -600,6 +683,12 @@ mod tests {
                     assert_eq!(done % 8, 0, "{what} trans_byte_elem done");
                     trans_byte_elem_from(done, &input, &mut got, size, elem_size);
                     assert_eq!(got, want, "{what} trans_byte_elem");
+
+                    untrans_byte_elem_from(0, &input, &mut want, size, elem_size);
+                    got.fill(0);
+                    let done = fearless_simd::dispatch!(level, s => simd::untrans_byte_elem(s, &input, &mut got, size, elem_size));
+                    untrans_byte_elem_from(done, &input, &mut got, size, elem_size);
+                    assert_eq!(got, want, "{what} untrans_byte_elem");
 
                     trans_bit_byte_from(0, &input, &mut want, nbyte);
                     got.fill(0);
